@@ -1419,7 +1419,7 @@ async function registerDetachedTask(
 	backgroundTaskService.registerAbortController(narratorId, run.cancel);
 	return (
 		`<background_task_id>${alias}</background_task_id>\n\n` +
-		`Subagent detached to background. Await({ type: "agent", id: "${alias}" })`
+		`Subagent detached to background. Results notify automatically. Watch({ type: "agent", id: "${alias}" }) registers an observation or retrieves the saved result.`
 	);
 }
 

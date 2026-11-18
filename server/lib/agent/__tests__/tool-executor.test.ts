@@ -98,7 +98,7 @@ afterEach(() => {
 	toolRegistry.unregister(ADMISSION_TOOL_NAME);
 	toolRegistry.unregister(DISABLED_ADMISSION_TOOL_NAME);
 	toolRegistry.unregister("Agent");
-	toolRegistry.unregister("Await");
+	toolRegistry.unregister("Watch");
 	toolRegistry.unregister("Bash");
 	toolContinuationService.upsert = originalUpsertContinuation;
 	toolContinuationService.checkpoint = originalCheckpointContinuation;
@@ -433,7 +433,7 @@ describe("executeTool trusted runtime policy", () => {
 			config.runtimePolicy = resolveRuntimePolicy([
 				compileDelegationPolicy({
 					template: "custom",
-					customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
+					customDefinition: { toolAccess: "custom", customTools: ["Read", "Watch"] },
 				}),
 			]);
 			const result = await executeTool(
@@ -484,6 +484,30 @@ describe("executeTool trusted runtime policy", () => {
 });
 
 describe("executeTool update admission gate", () => {
+	test("a stale registered Await definition is rejected before permission or dispatch", async () => {
+		const previous = toolRegistry.get("Await");
+		const execute = mock(async () => ({ output: "must not run" }));
+		const permission = mock(async () => ({ behavior: "allow" as const }));
+		toolRegistry.register({
+			name: "Await",
+			description: "stale epoch",
+			parameters: z.object({}),
+			execute,
+		});
+		try {
+			const result = await executeTool(
+				{ toolUseId: "retired-await", name: "Await", input: {} },
+				makeConfig(permission),
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Await is retired");
+			expect(execute).not.toHaveBeenCalled();
+			expect(permission).not.toHaveBeenCalled();
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister("Await");
+		}
+	});
 	test("classifies background Bash and resumable agent routes", () => {
 		expect(
 			classifyToolUpdateExecution({
@@ -501,11 +525,11 @@ describe("executeTool update admission gate", () => {
 		).toBe("resumable");
 		expect(
 			classifyToolUpdateExecution({
-				toolUseId: "classify-await",
-				name: "Await",
+				toolUseId: "classify-watch",
+				name: "Watch",
 				input: { type: "agent", id: "worker" },
 			}),
-		).toBe("resumable");
+		).toBe("ordinary");
 		expect(
 			classifyToolUpdateExecution({
 				toolUseId: "classify-background-agent",
@@ -848,11 +872,11 @@ describe("executeTool update admission gate", () => {
 		});
 	});
 
-	test("phase 2 pauses unknown, disabled, unauthorized, Agent, Await, and Bash before failures", async () => {
+	test("phase 2 pauses unknown, disabled, unauthorized, Agent, Watch, and Bash before failures", async () => {
 		const continuationRecords: Array<Record<string, unknown>> = [];
 		stubAdmissionPersistence(continuationRecords);
 		const executed: string[] = [];
-		for (const name of [DISABLED_ADMISSION_TOOL_NAME, "Agent", "Await", "Bash"]) {
+		for (const name of [DISABLED_ADMISSION_TOOL_NAME, "Agent", "Watch", "Bash"]) {
 			toolRegistry.register({
 				name,
 				description: `phase 2 matrix ${name}`,
@@ -897,7 +921,7 @@ describe("executeTool update admission gate", () => {
 				makeConfig(basePermission),
 			),
 			executeTool(
-				{ toolUseId: "matrix-await", name: "Await", input: { type: "agent", id: "worker" } },
+				{ toolUseId: "matrix-await", name: "Watch", input: { type: "agent", id: "worker" } },
 				makeConfig(basePermission),
 			),
 			executeTool(
@@ -924,7 +948,7 @@ describe("executeTool update admission gate", () => {
 		expect(results[1]?.output).toContain("disabled");
 		expect(results[2]?.output).toContain("not allowed");
 		expect(results.slice(3).every((result) => !result.isError)).toBe(true);
-		expect(executed).toEqual(["Agent", "Await", "Bash"]);
+		expect(executed).toEqual(["Agent", "Watch", "Bash"]);
 	});
 
 	test("phase two pauses a newly requested background Agent", async () => {

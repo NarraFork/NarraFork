@@ -89,8 +89,8 @@ export const sendTool: ToolDefinition = {
 		"something the recipient needs in order to act: new information, a changed requirement, a " +
 		'concrete correction, a finding, or a blocker. Acknowledgements, thanks, "still working" ' +
 		"updates and status checks carry none of that, so leave them unsent; to learn what another " +
-		"agent knows or is doing, use ContextAsk, and to wait for its result, use Await. An Await " +
-		"timeout is not a reason to message the agent. Put everything the recipient needs into one " +
+		"agent knows or is doing, use ContextAsk. Results notify automatically; Watch registers a " +
+		"non-blocking observation and returns immediately. An observation timeout is not a reason to message the agent. Put everything the recipient needs into one " +
 		"message rather than several short ones. " +
 		"The person watching this session skims agent messages as one-line summaries. When a " +
 		"message is one they would want to read in full (a finding, a conclusion, a decision, a " +

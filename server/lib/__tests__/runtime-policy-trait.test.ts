@@ -48,7 +48,7 @@ describe("delegation templates compile to ordinary ceilings", () => {
 
 		for (const name of ["general", "explore", "plan", "review", "search", "missing"]) {
 			const caps = viaTraits(name).capabilities;
-			expect([caps.spawnAgent, caps.awaitAgent, caps.planApproval]).toEqual([false, false, false]);
+			expect([caps.spawnAgent, caps.watchAgent, caps.planApproval]).toEqual([false, false, false]);
 			expect(caps.askUserQuestion).toBe("disabled");
 			expect(caps.stopHooks).toBe(false);
 			expect(caps.switchWorkingDirectory).toBe(false);
@@ -232,6 +232,27 @@ describe("run registration", () => {
 });
 
 describe("retired capabilities", () => {
+	test("stored awaitAgent deny also denies Watch(agent) without widening old allowlists", () => {
+		const stored = `${RUNTIME_POLICY_TRAIT_PREFIX}${Buffer.from(
+			JSON.stringify({
+				version: 1,
+				tools: ["Read", "Await"],
+				deny: ["awaitAgent"],
+			}),
+		).toString("base64url")}`;
+		const traits = parseRuntimePolicyTraits([stored]);
+		expect(traits[0].deny).toEqual(["awaitAgent"]);
+		const policy = resolveRuntimePolicy(traits);
+		expect(policy.capabilities.watchAgent).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Watch")).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Await")).toBe(false);
+		expect(
+			isRuntimeToolAllowed(resolveRuntimePolicy([{ version: 1, tools: ["Await"] }]), "Watch"),
+		).toBe(false);
+		expect(
+			resolveRuntimePolicy([{ version: 1, deny: ["awaitAgent"] }]).capabilities.watchAgent,
+		).toBe(false);
+	});
 	test("a stored ceiling that still denies sendAwait parses and drops it", () => {
 		const stored = `${RUNTIME_POLICY_TRAIT_PREFIX}${Buffer.from(
 			JSON.stringify({ version: 1, deny: ["spawnAgent", "sendAwait", "planApproval"] }),
@@ -241,7 +262,7 @@ describe("retired capabilities", () => {
 		expect(trait?.deny).toEqual(["spawnAgent", "planApproval"]);
 		const policy = resolveRuntimePolicy([trait]);
 		expect(policy.capabilities.spawnAgent).toBe(false);
-		expect(policy.capabilities.awaitAgent).toBe(true);
+		expect(policy.capabilities.watchAgent).toBe(true);
 		// Re-encoding the parsed ceiling writes only current capabilities.
 		const [reparsed] = parseRuntimePolicyTraits(withRuntimePolicyTrait([], trait));
 		expect(reparsed?.deny).toEqual(["spawnAgent", "planApproval"]);

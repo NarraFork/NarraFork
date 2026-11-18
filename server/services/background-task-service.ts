@@ -20,6 +20,7 @@ import {
 	type Column,
 	desc,
 	eq,
+	exists,
 	getTableColumns,
 	gt,
 	inArray,
@@ -59,10 +60,10 @@ import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
-import { TERMINAL_WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
 
 const TERMINAL_WATCH_RESTART_NOTICE =
-	"Terminal watch ended because the server restarted; it is not resumed. Check the terminal before continuing.";
+	"Observation interrupted by server restart; the target was not stopped. Check its status before observing again.";
 
 // === Types ===
 
@@ -348,6 +349,13 @@ function toListPreview(output: string | null | undefined): {
 }
 
 // === Service ===
+
+/** SQLite and PostgreSQL disagree on negative substr offsets; use an explicit positive tail. */
+function boundedOutputTail(column: Column, limit: number) {
+	return sql<
+		string | null
+	>`substr(${column}, case when length(${column}) > ${limit} then length(${column}) - ${limit} + 1 else 1 end, ${limit})`;
+}
 
 class BackgroundTaskService {
 	/** Abort controllers for running tasks (bash process abort, agent loop abort) */
@@ -971,37 +979,16 @@ class BackgroundTaskService {
 	async createTransferTask(opts: {
 		parentNarratorId: string;
 		transferTaskId: string;
+		runGeneration?: number;
 		title: string;
 		toolUseId?: string;
 		alias?: string;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
-		const existing = await this.getByTransferTaskId(opts.transferTaskId);
-		if (existing) {
-			// A resumed transfer: clear the terminal-ish state its previous run left so
-			// the drawer stops showing "paused" (and its restart notice) while bytes are
-			// moving again.
-			const [revived] = await db
-				.update(backgroundTasks)
-				.set({
-					status: "running",
-					output: null,
-					completedAt: null,
-					notified: false,
-					// Backfilled, never overwritten: a row created before the alias was carried
-					// here has none, and that is the row a restarted transfer resumes into —
-					// exactly when the model's handle has to resolve from the database.
-					...(opts.alias && !existing.alias ? { alias: opts.alias } : {}),
-					updatedAt: now,
-				})
-				.where(eq(backgroundTasks.id, existing.id))
-				.returning();
-			this.parentNarratorCache.set(existing.id, existing.parentNarratorId);
-			this.queueTaskUpsert(existing.parentNarratorId, existing.id);
-			return (revived ?? existing) as BackgroundTaskRecord;
-		}
-
-		const row: typeof backgroundTasks.$inferInsert = {
+		const row: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId"> & {
+			type: "transfer";
+			transferTaskId: string;
+		} = {
 			id: `bgtx_${generateShortId()}`,
 			parentNarratorId: opts.parentNarratorId,
 			type: "transfer",
@@ -1020,11 +1007,17 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		await db.insert(backgroundTasks).values(row);
-		this.parentNarratorCache.set(row.id, opts.parentNarratorId);
-		this.queueTaskUpsert(opts.parentNarratorId, row.id);
+		// Revival and admission share one transaction: a failed generation has spent
+		// its terminal slot, while a paused one keeps the still-reserved slot.
+		const task = await getRuntimePublicationService().startTransferTask({
+			taskRow: row,
+			runGeneration: opts.runGeneration,
+		});
+		if (!task) throw new ValidationError("Transfer generation is no longer running");
+		this.parentNarratorCache.set(task.id, task.parentNarratorId);
+		this.queueTaskUpsert(task.parentNarratorId, task.id);
 		this.maybeCleanup();
-		return row as BackgroundTaskRecord;
+		return task;
 	}
 
 	/** The projection row for a transfer, if one exists. */
@@ -1046,7 +1039,11 @@ class BackgroundTaskService {
 	 * terminal answer for work that is still pending, and mark the row `notified`
 	 * so the eventual real completion is never announced.
 	 */
-	async markTransferPaused(transferTaskId: string, reason: string | null): Promise<void> {
+	async markTransferPaused(
+		transferTaskId: string,
+		reason: string | null,
+		runGeneration?: number,
+	): Promise<void> {
 		const existing = await this.getByTransferTaskId(transferTaskId);
 		if (!existing || existing.status !== "running") return;
 		const now = new Date().toISOString();
@@ -1059,7 +1056,25 @@ class BackgroundTaskService {
 				output: reason,
 				updatedAt: now,
 			})
-			.where(and(eq(backgroundTasks.id, existing.id), eq(backgroundTasks.status, "running")));
+			.where(
+				and(
+					eq(backgroundTasks.id, existing.id),
+					eq(backgroundTasks.status, "running"),
+					runGeneration !== undefined
+						? exists(
+								db
+									.select({ one: sql`1` })
+									.from(deviceTransferTasks)
+									.where(
+										and(
+											eq(deviceTransferTasks.id, transferTaskId),
+											eq(deviceTransferTasks.runGeneration, runGeneration),
+										),
+									),
+							)
+						: undefined,
+				),
+			);
 		this.queueTaskUpsert(existing.parentNarratorId, existing.id);
 	}
 
@@ -1074,37 +1089,68 @@ class BackgroundTaskService {
 			| { status: "completed"; summary: string }
 			| { status: "failed"; error: string }
 			| { status: "cancelled" },
+		runGeneration?: number,
 	): Promise<void> {
 		const existing = await this.getByTransferTaskId(transferTaskId);
-		// Only a live row transitions. A cancel already recorded by the drawer, or a
-		// second terminal report from a racing generation, must not overwrite it.
 		if (!existing || (existing.status !== "running" && existing.status !== "paused")) return;
-
-		// The mark* methods all guard on `status = "running"` (their job is to refuse
-		// overwriting a terminal row), so a PAUSED row would silently fail to
-		// transition — a cancelled or restarted-then-cancelled transfer would sit in
-		// the drawer as "paused" forever with no error anywhere. Lift it back to
-		// `running` first, under the same guard, so the terminal write applies.
-		if (existing.status === "paused") {
-			const now = new Date().toISOString();
-			const [lifted] = await db
-				.update(backgroundTasks)
-				.set({ status: "running", updatedAt: now })
-				.where(and(eq(backgroundTasks.id, existing.id), eq(backgroundTasks.status, "paused")))
-				.returning();
-			// Lost the race to another writer; whatever it wrote is authoritative.
-			if (!lifted) return;
-		}
-
-		if (outcome.status === "completed") {
-			await this.markCompleted(existing.id, outcome.summary);
-			return;
-		}
-		if (outcome.status === "failed") {
-			await this.markFailed(existing.id, outcome.error);
-			return;
-		}
-		await this.markCancelled(existing.id);
+		const [owner] = await db
+			.select({ generation: deviceTransferTasks.runGeneration })
+			.from(deviceTransferTasks)
+			.where(eq(deviceTransferTasks.id, transferTaskId))
+			.limit(1);
+		if (!owner) return;
+		const generation = runGeneration ?? owner.generation;
+		const now = new Date().toISOString();
+		const output =
+			outcome.status === "completed"
+				? outcome.summary
+				: outcome.status === "failed"
+					? outcome.error
+					: "(cancelled)";
+		const outputBytes = Buffer.byteLength(output, "utf-8");
+		const storedOutput = truncateToBytes(output, MAX_OUTPUT_BYTES);
+		const pub = getRuntimePublicationService();
+		const task = await pub.commitTerminalTransition({
+			taskId: existing.id,
+			expectedTransfer: { id: transferTaskId, generation },
+			setFields: {
+				status: outcome.status,
+				output: storedOutput,
+				outputBytes,
+				outputTruncated: outputBytes > MAX_OUTPUT_BYTES,
+				completedAt: now,
+				updatedAt: now,
+			},
+			fullOutput: output,
+			eventKind: outcome.status,
+			summary: `[System] Background transfer "${existing.title ?? existing.alias ?? existing.id}" (ID: ${existing.alias ?? existing.id}) ${outcome.status}. Use TeamStatus({ action: "get_task", target_id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
+		});
+		if (!task) return;
+		pub.schedule();
+		const receipt = {
+			taskId: task.id,
+			parentNarratorId: task.parentNarratorId,
+			taskType: "transfer" as const,
+			...terminalWaitReceipt(task),
+		};
+		if (outcome.status === "completed")
+			eventBus.emit({ type: "background_task:completed", ...receipt, output: storedOutput });
+		else if (outcome.status === "failed")
+			eventBus.emit({
+				type: "background_task:failed",
+				...receipt,
+				status: "failed",
+				error: storedOutput,
+			});
+		else eventBus.emit({ type: "background_task:cancelled", ...receipt, output: storedOutput });
+		this.broadcastStatus(
+			task.parentNarratorId,
+			task.id,
+			outcome.status,
+			storedOutput,
+			task.toolUseId,
+		);
+		this.cleanupRuntime(task.id);
 	}
 
 	// ── Status updates ──────────────────────────────────────────────────
@@ -1181,7 +1227,7 @@ class BackgroundTaskService {
 			const taskType = (setFields.type as string) ?? "task";
 			const taskAlias = (setFields.alias as string | null) ?? null;
 			const taskTitle = (setFields.title as string | null) ?? null;
-			const summary = `[System] Background ${taskType} "${taskTitle ?? taskAlias ?? taskId}" (ID: ${taskAlias ?? taskId}) ${setFields.status}. Use Await({ type: "${taskType}", id: "${taskAlias ?? taskId}" }) to read the stored result.`;
+			const summary = `[System] Background ${taskType} "${taskTitle ?? taskAlias ?? taskId}" (ID: ${taskAlias ?? taskId}) ${setFields.status}. Use TeamStatus({ action: "get_task", target_id: "${taskAlias ?? taskId}" }) to read the stored result.`;
 			const task = await pub.commitTerminalTransition({
 				taskId,
 				setFields,
@@ -1190,6 +1236,7 @@ class BackgroundTaskService {
 				eventKind: eventKind as Exclude<PublicationEvent, "started">,
 				deferPublication,
 			});
+			if (task) pub.schedule();
 			// The composite returns partial fields; cast to BackgroundTaskRecord
 			// (callers access parentNarratorId, type, title, alias, toolUseId, id).
 			return task as BackgroundTaskRecord | undefined;
@@ -1242,7 +1289,18 @@ class BackgroundTaskService {
 				);
 			}
 			const task = write(tx);
-			if (!task || task.type === "transfer" || deferPublication) return task;
+			if (!task || deferPublication) return task;
+			// Transfers use the existing bash notice channel, not a new producer kind.
+			// Legacy transfer rows lack a reservation; only the winning terminal CAS backfills it.
+			if (task.type === "transfer" && !task.logicalRunId) {
+				const run = runtimePublication.newBashRun(task.id, task.parentNarratorId);
+				runtimePublication.reserve(run, tx);
+				tx.update(backgroundTasks)
+					.set({ logicalRunId: run.logicalRunId })
+					.where(eq(backgroundTasks.id, task.id))
+					.run();
+				task.logicalRunId = run.logicalRunId;
+			}
 			const run = taskPublicationRun(task);
 			const resultRef = runtimePublication.persistResult(
 				run,
@@ -1263,7 +1321,7 @@ class BackgroundTaskService {
 					...run,
 					eventKind: publicationEvent(task.status),
 					resultRef,
-					summary: `[System] Background ${task.type} "${task.title ?? task.alias ?? task.id}" (ID: ${task.alias ?? task.id}) ${task.status}. Use Await({ type: "${task.type}", id: "${task.alias ?? task.id}" }) to read the stored result.`,
+					summary: `[System] Background ${task.type} "${task.title ?? task.alias ?? task.id}" (ID: ${task.alias ?? task.id}) ${task.status}. Use TeamStatus({ action: "get_task", target_id: "${task.alias ?? task.id}" }) to read the stored result.`,
 				},
 				tx,
 			);
@@ -1271,6 +1329,32 @@ class BackgroundTaskService {
 		});
 		if (task) runtimePublication.schedule();
 		return task;
+	}
+
+	/** Settle only an observation's own projection, without publishing another result. */
+	async finishObservationSilently(taskId: string, output: string): Promise<boolean> {
+		const now = new Date().toISOString();
+		const outputBytes = Buffer.byteLength(output, "utf-8");
+		const task = await getRuntimePublicationService().commitTerminalTransition({
+			taskId,
+			setFields: {
+				status: "completed",
+				output: truncateToBytes(output, MAX_OUTPUT_BYTES),
+				outputBytes,
+				outputTruncated: outputBytes > MAX_OUTPUT_BYTES,
+				notified: true,
+				completedAt: now,
+				updatedAt: now,
+			},
+			fullOutput: output,
+			summary: "",
+			eventKind: "completed",
+			silentObservation: true,
+		});
+		if (!task) return false;
+		this.broadcastStatus(task.parentNarratorId, taskId, "completed", task.output, task.toolUseId);
+		this.cleanupRuntime(taskId);
+		return true;
 	}
 
 	async markCompleted(
@@ -1498,6 +1582,7 @@ class BackgroundTaskService {
 				this.cleanupRuntime(taskId, expectedAbortController);
 				return false;
 			}
+			pub.schedule();
 			// In-memory side effects after the composite commits.
 			eventBus.emit({
 				type: "background_task:cancelled",
@@ -1740,6 +1825,120 @@ class BackgroundTaskService {
 		return row ?? null;
 	}
 
+	/** Non-blocking, owner-scoped durable detail; never depends on an alias cache or device liveness. */
+	async readTaskSnapshot(parentNarratorId: string, selector: string) {
+		const target = selector.trim();
+		if (!target || target.length > 512) return null;
+		const limit = OUTPUT_TAIL_MAX_CHARS;
+		const [row] = await db
+			.select({
+				id: backgroundTasks.id,
+				type: backgroundTasks.type,
+				status: backgroundTasks.status,
+				alias: sql<string | null>`substr(${backgroundTasks.alias}, 1, 200)`,
+				title: sql<string | null>`substr(${backgroundTasks.title}, 1, 200)`,
+				transferTaskId: backgroundTasks.transferTaskId,
+				exitCode: backgroundTasks.exitCode,
+				startedAt: backgroundTasks.startedAt,
+				completedAt: backgroundTasks.completedAt,
+				output: boundedOutputTail(backgroundTasks.output, limit),
+				storedChars: sql<number>`coalesce(length(${backgroundTasks.output}), 0)`,
+				outputTruncated: backgroundTasks.outputTruncated,
+			})
+			.from(backgroundTasks)
+			.where(
+				and(
+					eq(backgroundTasks.parentNarratorId, parentNarratorId),
+					or(
+						eq(backgroundTasks.id, target),
+						eq(backgroundTasks.alias, target),
+						eq(backgroundTasks.transferTaskId, target),
+					),
+				),
+			)
+			.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+			.limit(1);
+
+		if (row && row.type !== "transfer") {
+			const buffered =
+				row.status === "running" ? this.getOutputTailFromChunks(row.id, limit) : null;
+			const { storedChars, ...detail } = row;
+			return {
+				...detail,
+				output: buffered?.tail ?? row.output ?? "",
+				outputTruncated:
+					row.outputTruncated ||
+					Number(storedChars) > limit ||
+					(buffered ? buffered.totalChars > limit : false),
+				live: !!buffered,
+			};
+		}
+
+		// The owning row exists before claim creates a background projection. It also
+		// survives restarts/offline devices, so queued/paused status and aliases stay readable.
+		const [transfer] = await db
+			.select({
+				id: deviceTransferTasks.id,
+				status: deviceTransferTasks.status,
+				alias: sql<string | null>`substr(${deviceTransferTasks.alias}, 1, 200)`,
+				direction: deviceTransferTasks.direction,
+				deviceId: deviceTransferTasks.deviceId,
+				bytesTransferred: deviceTransferTasks.bytesTransferred,
+				totalBytes: deviceTransferTasks.totalBytes,
+				filesTransferred: deviceTransferTasks.filesTransferred,
+				totalFiles: deviceTransferTasks.totalFiles,
+				currentFile: sql<string | null>`substr(${deviceTransferTasks.currentFile}, 1, 300)`,
+				error: boundedOutputTail(deviceTransferTasks.error, limit),
+				errorChars: sql<number>`coalesce(length(${deviceTransferTasks.error}), 0)`,
+				startedAt: deviceTransferTasks.startedAt,
+				completedAt: deviceTransferTasks.completedAt,
+			})
+			.from(deviceTransferTasks)
+			.where(
+				and(
+					eq(deviceTransferTasks.parentNarratorId, parentNarratorId),
+					row?.transferTaskId
+						? eq(deviceTransferTasks.id, row.transferTaskId)
+						: or(eq(deviceTransferTasks.id, target), eq(deviceTransferTasks.alias, target)),
+				),
+			)
+			.orderBy(desc(deviceTransferTasks.createdAt), desc(deviceTransferTasks.id))
+			.limit(1);
+		const id = row?.id ?? transfer?.id;
+		const status = transfer?.status ?? row?.status;
+		if (!id || !status) return null;
+		const { storedChars, ...detail } = row ?? { storedChars: 0 };
+		return {
+			...detail,
+			id,
+			type: "transfer" as const,
+			transferTaskId: transfer?.id ?? row?.transferTaskId,
+			status,
+			alias: transfer?.alias ?? row?.alias ?? null,
+			title: row?.title ?? `${transfer?.direction ?? "file"} transfer`,
+			output: transfer?.error ?? row?.output ?? "",
+			outputTruncated:
+				!!row?.outputTruncated ||
+				Number(storedChars) > limit ||
+				Number(transfer?.errorChars ?? 0) > limit,
+			live: false,
+			startedAt: transfer?.startedAt ?? row?.startedAt ?? null,
+			completedAt: transfer?.completedAt ?? row?.completedAt ?? null,
+			...(transfer
+				? {
+						progress: {
+							deviceId: transfer.deviceId,
+							bytesTransferred: transfer.bytesTransferred,
+							totalBytes: transfer.totalBytes,
+							filesTransferred: transfer.filesTransferred,
+							totalFiles: transfer.totalFiles,
+							currentFile: transfer.currentFile,
+						},
+					}
+				: {}),
+		};
+	}
+
 	/**
 	 * Read the TAIL of a task's output without materializing the whole buffer.
 	 *
@@ -1776,9 +1975,8 @@ class BackgroundTaskService {
 				startedAt: backgroundTasks.startedAt,
 				completedAt: backgroundTasks.completedAt,
 				storedChars: sql<number>`coalesce(length(${backgroundTasks.output}), 0)`,
-				// A negative start index makes substr() return the last N chars, so a
-				// large stored output never crosses the JS boundary in full.
-				storedTail: sql<string | null>`substr(${backgroundTasks.output}, ${-limit})`,
+				// A portable SQL-side tail keeps large output off the JS boundary.
+				storedTail: boundedOutputTail(backgroundTasks.output, limit),
 			})
 			.from(backgroundTasks)
 			.where(eq(backgroundTasks.id, taskId))
@@ -2767,6 +2965,14 @@ class BackgroundTaskService {
 		options?.assertAuthorized?.();
 
 		const ctrl = this.abortControllers.get(taskId);
+		const observation =
+			task.type === "bash" &&
+			(task.command?.startsWith(WATCH_COMMAND_PREFIX) ||
+				task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX));
+		const observationKillHandler = observation ? this.killHandlers.get(taskId) : undefined;
+		// An observation has no process to stop. Persist its cancellation before dropping
+		// its delivery owner; a failed write must leave the original watch retryable.
+		if (observation && !(await this.markCancelled(taskId, ctrl))) return false;
 		if (ctrl) {
 			try {
 				ctrl.abort();
@@ -2775,7 +2981,7 @@ class BackgroundTaskService {
 			}
 		}
 
-		const killHandler = this.killHandlers.get(taskId);
+		const killHandler = observation ? observationKillHandler : this.killHandlers.get(taskId);
 		if (killHandler) {
 			try {
 				killHandler();
@@ -2787,6 +2993,7 @@ class BackgroundTaskService {
 			}
 		}
 
+		if (observation) return true;
 		const cancelled = await this.markCancelled(taskId, ctrl);
 		if (!cancelled) return false;
 		if (task.type === "agent") {
@@ -3538,13 +3745,15 @@ class BackgroundTaskService {
 		if (endedIds.length > 0) {
 			for (const task of staleTasks) {
 				if (task.type === "transfer") continue;
-				const text =
-					task.type === "bash"
-						? "command" in task &&
-							typeof task.command === "string" &&
-							task.command.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
-							? TERMINAL_WATCH_RESTART_NOTICE
-							: "Execution outcome unknown after restart; the command was not rerun."
+				const isObservation =
+					task.type === "bash" &&
+					typeof task.command === "string" &&
+					(task.command.startsWith(TERMINAL_WATCH_COMMAND_PREFIX) ||
+						task.command.startsWith(WATCH_COMMAND_PREFIX));
+				const text = isObservation
+					? TERMINAL_WATCH_RESTART_NOTICE
+					: task.type === "bash"
+						? "Execution outcome unknown after restart; the command was not rerun."
 						: "Background task was interrupted by a server restart.";
 				const eventKind = (task.type === "bash" ? "failed" : "cancelled") as "failed" | "cancelled";
 
@@ -3572,16 +3781,20 @@ class BackgroundTaskService {
 					};
 					const run = task.logicalRunId
 						? taskPublicationRun(task)
-						: task.type === "bash" && !task.toolCallId && !task.executionAttempt
-							? runtimePublication.store.registerLegacyUnknownBashFailure(source, tx)
-							: runtimePublication.store.registerLegacyRunningRunSlots(
-									source,
-									{ kind: "persisted_task" },
-									{},
-									tx,
-								);
+						: isObservation
+							? runtimePublication.newBashRun(task.id, task.parentNarratorId)
+							: task.type === "bash" && !task.toolCallId && !task.executionAttempt
+								? runtimePublication.store.registerLegacyUnknownBashFailure(source, tx)
+								: runtimePublication.store.registerLegacyRunningRunSlots(
+										source,
+										{ kind: "persisted_task" },
+										{},
+										tx,
+									);
+					if (isObservation && !task.logicalRunId) runtimePublication.reserve(run, tx);
 					tx.update(backgroundTasks)
 						.set({
+							logicalRunId: run.logicalRunId,
 							status: task.type === "bash" ? "failed" : "cancelled",
 							output: text,
 							outputBytes: Buffer.byteLength(text),
@@ -3872,7 +4085,7 @@ class BackgroundTaskService {
 		const deletable: typeof rows = [];
 		for (const row of rows) {
 			if (this.activeAgentContinuations.has(row.id)) continue;
-			if (!row.logicalRunId || row.type === "transfer") {
+			if (!row.logicalRunId) {
 				deletable.push(row);
 				continue;
 			}
@@ -4006,7 +4219,11 @@ class BackgroundTaskService {
 		for (const task of running) {
 			// A terminal watch has no process to kill. Leave its row running so restart
 			// recovery tells the session the watch ended, instead of cancelling it silently.
-			if (task.type === "bash" && task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)) {
+			if (
+				task.type === "bash" &&
+				(task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX) ||
+					task.command?.startsWith(WATCH_COMMAND_PREFIX))
+			) {
 				this.cleanupRuntime(task.id);
 				continue;
 			}

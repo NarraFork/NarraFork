@@ -275,8 +275,10 @@ describe("depth backstops", () => {
 		]);
 		expect(worker.delegationDepth).toBe(1);
 		expect(worker.capabilities.spawnAgent).toBe(true);
-		expect(worker.capabilities.awaitAgent).toBe(true);
+		expect(worker.capabilities.watchAgent).toBe(true);
 		expect(isRuntimeToolAllowed(worker, "Agent")).toBe(true);
+		expect(isRuntimeToolAllowed(worker, "Watch")).toBe(true);
+		expect(isRuntimeToolAllowed(worker, "Await")).toBe(false);
 		// A worker template at the deepest level, and an unrestricted declaration that only
 		// says "level 2", both lose spawning and agent waits.
 		for (const declarations of [
@@ -289,7 +291,7 @@ describe("depth backstops", () => {
 		]) {
 			const policy = resolveRuntimePolicy(declarations);
 			expect(policy.capabilities.spawnAgent).toBe(false);
-			expect(policy.capabilities.awaitAgent).toBe(false);
+			expect(policy.capabilities.watchAgent).toBe(false);
 			for (const name of ["Agent", "Task", "ContinueTask", "ForkNarrator"])
 				expect(isRuntimeToolAllowed(policy, name)).toBe(false);
 		}
@@ -410,7 +412,7 @@ describe("reach", () => {
 		expect(JSON.stringify(queued[0])).not.toContain("sibling subagent");
 	});
 
-	test("Await: only agents the caller launched", async () => {
+	test("Watch: only agents the caller launched", async () => {
 		const { primary, worker, sibling, helper } = await tree();
 		const wait = (caller: string, id: string) =>
 			awaitAgentResultDetailed({
@@ -425,9 +427,45 @@ describe("reach", () => {
 		await expect(wait(worker, sibling)).rejects.toThrow("not a subagent this narrator launched");
 		await expect(wait(primary, helper)).rejects.toThrow("not a subagent this narrator launched");
 		// A helper and an ordinary subagent may not wait for agents at all.
-		await expect(wait(helper, worker)).rejects.toThrow("Await");
-		await expect(wait(sibling, worker)).rejects.toThrow("Await");
+		await expect(wait(helper, worker)).rejects.toThrow("Watch");
+		await expect(wait(sibling, worker)).rejects.toThrow("Watch");
 	});
+});
+
+test("Watch registers a worker's own helper without widening sibling or deepest-level access", async () => {
+	const { worker, sibling, helper } = await tree();
+	await backgroundRun(worker, helper);
+	const projection = await backgroundTaskService.getById(helper);
+	expect(projection?.logicalRunId).toBeString();
+	await db
+		.update(narrators)
+		.set({ logicalRunId: projection?.logicalRunId })
+		.where(eq(narrators.id, helper));
+	await narratorService.updateStatus(helper, "working");
+	const { watchTool } = await import("../../lib/agent/tools/watch");
+	const workerContext = {
+		...ctx(worker),
+		runtimePolicy: await resolveNarratorRuntimePolicy(worker),
+	};
+	const result = await watchTool.execute({ type: "agent", id: helper }, workerContext);
+	expect(result.isError).toBeFalsy();
+	expect(result.metadata).toMatchObject({ status: "watching", id: helper });
+	const observationId = result.metadata?.watchId as string | undefined;
+	expect(observationId).toBeDefined();
+	try {
+		const foreign = await watchTool.execute({ type: "agent", id: sibling }, workerContext);
+		expect(foreign.isError).toBe(true);
+		const deepest = await watchTool.execute(
+			{ type: "agent", id: worker },
+			{
+				...ctx(helper),
+				runtimePolicy: await resolveNarratorRuntimePolicy(helper),
+			},
+		);
+		expect(deepest.isError).toBe(true);
+	} finally {
+		if (observationId) await backgroundTaskService.cancel(observationId);
+	}
 });
 
 describe("approvals reach the root", () => {

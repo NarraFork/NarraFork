@@ -238,7 +238,7 @@ describe("a user-continued run delivers its own result once", () => {
 				expect(formatted).not.toContain("OLD RESULT");
 				if (result.length > 12000) {
 					expect(formatted).toContain("truncated");
-					expect(formatted).toContain("Await(");
+					expect(formatted).toContain("Watch(");
 				}
 				// The destination's conclusion is this run's, not the superseded one.
 				const call = db

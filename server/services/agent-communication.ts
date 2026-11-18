@@ -1,3 +1,4 @@
+import { NotFoundError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
@@ -88,6 +89,8 @@ export interface AwaitAgentInput {
 	userId?: string | null;
 	timeoutMs?: number;
 	signal: AbortSignal;
+	/** Read the current run without registering a waiter. Used by Watch admission. */
+	snapshotOnly?: boolean;
 	/**
 	 * Optional reschedulable-timeout signal (from the Await tool). When it fires
 	 * the wait ends with a "timeout" status rather than "aborted", so the UI can
@@ -404,7 +407,7 @@ export function formatAgentAwaitResult(
 		case "aborted":
 			return (
 				`${tag}\n\n` +
-				`Wait interrupted; agent ${label} is still running. Await again with the same id.` +
+				`Observation interrupted; agent ${label} is still running. Register Watch again only if another observation is useful.` +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
 			);
 		case "running":
@@ -412,7 +415,7 @@ export function formatAgentAwaitResult(
 			return (
 				`${tag}\n\n` +
 				`Agent ${label} is still running — this wait timed out, not the subagent. ` +
-				`Await again with the same id. ` +
+				`Its completion will be delivered automatically; use Watch only to register another observation. ` +
 				`Do not send a progress check or interrupt it merely because this wait expired.` +
 				activitySection +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
@@ -426,7 +429,7 @@ export function formatAgentAwaitResult(
 		case "taken_over":
 			return (
 				`${tag}\n\n` +
-				`Agent ${label} is being taken over by the user. Await again after takeover ends.` +
+				`Agent ${label} is being taken over by the user. This is not a completed result; Watch may be registered after takeover ends.` +
 				(partial ? `\n\nOutput so far:\n${partial}` : "")
 			);
 		default:
@@ -551,6 +554,21 @@ async function readSubagentTerminal(
 				? (current.backgroundResult ?? "(no output)")
 				: await getSubagentFinalText(subagentId));
 	const latest = await narratorService.getById(subagentId);
+	if (
+		current.logicalRunId !== latest.logicalRunId ||
+		(observedRunningRunId && current.logicalRunId !== observedRunningRunId)
+	) {
+		return {
+			status: "superseded",
+			output: "The observed run was replaced while its result was being read.",
+		};
+	}
+	if (isTakenOver(subagentId)) {
+		return {
+			status: "taken_over",
+			output: "The agent is under human control; this is not a completed result.",
+		};
+	}
 	const status = settledSubagentStatus(
 		current,
 		current.isBackground && current.backgroundStatus && current.backgroundStatus !== "running"
@@ -582,9 +600,28 @@ export async function waitForSubagentResult(opts: {
 	recipientId: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	/** Watch follows one run, rather than an unrelated later continuation. */
+	expectedRunId?: string;
+	reportTakenOver?: boolean;
 }): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const current = await narratorService.getById(opts.subagentId);
+	const lifecycleResult = (narrator: Narrator): SubagentWaitResult | undefined => {
+		if (opts.expectedRunId && narrator.logicalRunId !== opts.expectedRunId) {
+			return {
+				status: "superseded",
+				output: "The observed run was replaced by a later continuation.",
+			};
+		}
+		if (opts.reportTakenOver && isTakenOver(opts.subagentId)) {
+			return {
+				status: "taken_over",
+				output: "The agent is under human control; this is not a completed result.",
+			};
+		}
+	};
+	const initialLifecycle = lifecycleResult(current);
+	if (initialLifecycle) return initialLifecycle;
 	if (current.status !== "working" && current.status !== "waiting") {
 		return readSubagentTerminal(opts.subagentId, opts.recipientId, current);
 	}
@@ -600,6 +637,7 @@ export async function waitForSubagentResult(opts: {
 			if (timer) clearTimeout(timer);
 			eventBus.off("narrator:subagent_completed", onCompleted);
 			eventBus.off("narrator:status_changed", onStatusChanged);
+			eventBus.off("narrator:deleted", onDeleted);
 			opts.signal?.removeEventListener("abort", onAbort);
 		};
 
@@ -609,6 +647,13 @@ export async function waitForSubagentResult(opts: {
 			finishing = true;
 			try {
 				const current = await narratorService.getById(opts.subagentId);
+				const lifecycle = lifecycleResult(current);
+				if (lifecycle) {
+					if (settled) return;
+					cleanup();
+					resolve(lifecycle);
+					return;
+				}
 				if (
 					!subagentRunHasSettled(opts.subagentId, current.status, parseSubstatus(current.substatus))
 				)
@@ -623,6 +668,10 @@ export async function waitForSubagentResult(opts: {
 				cleanup();
 				resolve(result);
 			} catch (err) {
+				if (err instanceof NotFoundError) {
+					onDeleted({ narratorId: opts.subagentId });
+					return;
+				}
 				logger.warn("Failed to read subagent terminal result", {
 					subagentId: opts.subagentId,
 					error: String(err),
@@ -663,7 +712,12 @@ export async function waitForSubagentResult(opts: {
 		}) => {
 			if (settled) return;
 			if (event.narratorId !== opts.subagentId) return;
-			if (!subagentRunHasSettled(opts.subagentId, event.status, event.substatus)) return;
+			if (
+				!opts.expectedRunId &&
+				!opts.reportTakenOver &&
+				!subagentRunHasSettled(opts.subagentId, event.status, event.substatus)
+			)
+				return;
 			// The status carries no result text, so `finish` re-reads the row and lets
 			// `settledSubagentStatus` decide the real outcome (completed/failed/
 			// cancelled/timed_out) rather than assuming success here.
@@ -672,11 +726,20 @@ export async function waitForSubagentResult(opts: {
 
 		const onAbort = () => {
 			cleanup();
-			resolve({ status: "aborted", output: "Await aborted." });
+			resolve({ status: "aborted", output: "Observation cancelled." });
+		};
+		const onDeleted = (event: { narratorId: string }) => {
+			if (settled || event.narratorId !== opts.subagentId) return;
+			cleanup();
+			resolve({
+				status: "unavailable",
+				output: "The observed agent was deleted; no result is available.",
+			});
 		};
 
 		eventBus.on("narrator:subagent_completed", onCompleted);
 		eventBus.on("narrator:status_changed", onStatusChanged);
+		eventBus.on("narrator:deleted", onDeleted);
 		if (opts.signal) {
 			if (opts.signal.aborted) {
 				onAbort();
@@ -702,6 +765,7 @@ export async function waitForSubagentResult(opts: {
 			.then((fresh) => {
 				if (settled) return;
 				if (
+					!lifecycleResult(fresh) &&
 					!subagentRunHasSettled(opts.subagentId, fresh.status, parseSubstatus(fresh.substatus))
 				) {
 					return;
@@ -709,6 +773,10 @@ export async function waitForSubagentResult(opts: {
 				void finish("completed");
 			})
 			.catch((err) => {
+				if (err instanceof NotFoundError) {
+					onDeleted({ narratorId: opts.subagentId });
+					return;
+				}
 				// A failed re-read is not a reason to end the wait: the listeners are
 				// already live, so the ordinary path still works.
 				logger.warn("Failed to re-check subagent status after subscribing to its result", {
@@ -785,6 +853,25 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 		return null;
 	}
 
+	if (opts.snapshotOnly) {
+		const running =
+			task.status === "running" || current?.status === "working" || current?.status === "waiting";
+		return {
+			id: subagentId,
+			status: running ? "running" : task.status === "timeout" ? "timed_out" : task.status,
+			output: running ? null : task.output,
+			title: current?.title ?? null,
+			terminalResultReceived: !running && task.logicalRunId !== null,
+			publicationRun: task.logicalRunId
+				? {
+						producerKind: "agent" as const,
+						taskId: subagentId,
+						logicalRunId: task.logicalRunId,
+						recipientId: task.parentNarratorId,
+					}
+				: undefined,
+		};
+	}
 	// The terminal row can restart before the waiter rechecks it. Both paths must
 	// use the same deadline signal and preserve the waiter's exact result/run receipt.
 	const { signal, relabel } = buildAwaitTimeoutContext(opts);
@@ -858,7 +945,22 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		// If the subagent is being taken over by the user, do not block waiting for
 		// a result that only arrives when takeover ends. Report it immediately.
 		if (isTakenOver(target.id)) {
-			return build("taken_over", await getSubagentFinalText(target.id));
+			return build(
+				"taken_over",
+				"The agent is under human control; this is not a completed result.",
+			);
+		}
+		if (opts.snapshotOnly) {
+			return build("running", null, {
+				publicationRun: target.logicalRunId
+					? {
+							producerKind: "agent",
+							taskId: target.id,
+							logicalRunId: target.logicalRunId,
+							recipientId,
+						}
+					: undefined,
+			});
 		}
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForSubagentResult({

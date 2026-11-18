@@ -1360,7 +1360,7 @@ function resolveBlacklistDecision(
 const ALWAYS_ALLOW_TOOLS = [
 	"EnterPlanMode",
 	"WebSearch",
-	"Await",
+	"Watch",
 	"Stop",
 	"Question",
 	"Skill",
@@ -1402,7 +1402,7 @@ const READ_ONLY_TOOLS = [
 	"StructView",
 	"ShareFile",
 	"ContextAsk",
-	"Await",
+	"Watch",
 	"KnowledgeSearch",
 	"KnowledgeRead",
 	"KnowledgeLibrary",

@@ -2570,6 +2570,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	subagentRecoveryToBackground: "to background",
 	subagentRecoveryResumeAndNotify: "Resume and notify",
 	subagentRecoveryResumeAndWait: "Resume and wait",
+	subagentRecoveryResumeAndWatch: "Resume and observe",
+	subagentRecoveryResolvedWatch:
+		"Restarted {count} subagent(s) and registered observations; results will notify automatically.",
 	subagentRecoveryResolvedNotify:
 		"Restarted {count} subagent(s); the narrator was told to await them.",
 	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
@@ -3708,13 +3711,15 @@ function adaptSystemBlock(
 				subagents: rows,
 				summary: countLabel(
 					ctx,
-					block.mode === "await"
-						? "subagentRecoveryResolvedWait"
-						: "subagentRecoveryResolvedNotify",
+					block.mode === "watch"
+						? "subagentRecoveryResolvedWatch"
+						: block.mode === "await"
+							? "subagentRecoveryResolvedWait"
+							: "subagentRecoveryResolvedNotify",
 					resumedCount,
 				),
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
-				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
+				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWatch"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
 				// Close button (aria-label + tooltip). Height-neutral: it sits inside
 				// the header lane the measure layer already reserves.
@@ -4843,6 +4848,8 @@ const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
  * will never be killed is the divergence this reproduces correctly.
  */
 function effectiveTimeoutMs(tc: AdapterToolItem["tc"], category: string): number | undefined {
+	// Watch's timeout belongs to the observation, not an active tool execution.
+	if (category === "watch") return undefined;
 	if (category !== "bash" && category !== "await") return readFiniteNumber(tc._timeoutMs);
 	const explicit =
 		readFiniteNumber(tc._timeoutMs) ?? readFiniteNumber(asObject(tc.inputJson).timeout);

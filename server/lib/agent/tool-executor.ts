@@ -423,10 +423,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
-	if (
-		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent")
-	) {
+	if (tu.name === "Agent" && typeof tu.input.stop !== "string") {
 		return "resumable";
 	}
 	return "ordinary";
@@ -476,9 +473,6 @@ async function upsertDeferredTool(
 			executionAttempt: binding.attempt,
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
-			...(tu.name === "Await" && typeof tu.input.type === "string"
-				? { awaitType: tu.input.type }
-				: {}),
 			...(tu.name === "Agent"
 				? {
 						runInBackground: tu.input.run_in_background === true || tu.input.background === true,
@@ -940,6 +934,15 @@ async function executeToolUntraced(
 			await preAdmitToolExecution(tu, config, { state: admissionState });
 		}
 		config.assertWorkspaceCurrent?.();
+		// A frozen epoch or a stale registry entry must not revive the removed waiter.
+		if (tu.name === "Await") {
+			return {
+				output:
+					"Await is retired and cannot execute. Use Watch to register a non-blocking observation.",
+				isError: true,
+				durationMs: 0,
+			};
+		}
 		const tool = toolRegistry.get(tu.name);
 
 		// Defense-in-depth: when unified native search is enabled for this provider/model,

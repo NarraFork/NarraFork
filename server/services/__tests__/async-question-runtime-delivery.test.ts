@@ -21,6 +21,7 @@ const {
 	isQuestionAnswerWakeEligible,
 	isQuestionAnswerDeliveryReady,
 	interruptNarrator,
+	consumeQuestionAnswerModelReceipts,
 } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
 const { MAILBOX_LIMITS } = await import("../agent-runtime/limits");
@@ -28,21 +29,22 @@ const { backgroundOccupancyStore } = await import("../background-occupancy-store
 const time = "2026-10-05T00:00:00.000Z";
 const narratorId = "question-runtime";
 
-async function captureAwaitRequests(
+async function captureQuestionRequests(
 	running: ActiveNarrator,
 	questionId: string,
-	groups: number[],
+	groups: number[] | ((turn: number) => number),
 	receipts: { id: string; text: string }[] = [],
 	currentText = receipts.map(({ text }) => text).join("\n"),
 ) {
 	const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 	const { agentLoop } = await import("../../lib/agent/loop");
 	const { toolRegistry } = await import("../../lib/agent/tool-registry");
-	const { awaitTool } = await import("../../lib/agent/tools/await");
+	const { questionTool } = await import("../../lib/agent/tools/question");
 	const { projectHistory } = await import("../../lib/agent/projection");
 	const requests: Array<{ history: unknown[]; content: string; toolResults: unknown[] }> = [];
 	const storedOutputs: string[] = [];
 	const adopted: string[][] = [];
+	const injected: Array<{ text: string; messageId?: string }> = [];
 	let turn = 0;
 	const adapter = {
 		formatTools: (tools: unknown) => tools,
@@ -91,13 +93,13 @@ async function captureAwaitRequests(
 					}),
 				),
 			);
-			const count = groups[turn++];
+			const count = typeof groups === "function" ? groups(turn++) : groups[turn++];
 			if (count)
 				yield {
 					toolUses: Array.from({ length: count }, (_, index) => ({
-						toolUseId: `await-${turn}-${index}`,
-						name: "Await",
-						input: { type: "question", id: questionId },
+						toolUseId: `question-get-${turn}-${index}`,
+						name: "Question",
+						input: { action: "get", id: questionId },
 					})),
 				};
 			else yield { text: "done" };
@@ -108,7 +110,7 @@ async function captureAwaitRequests(
 		resolve: (name) => (name === "questionruntime" ? adapter : null),
 		listReadiness: () => [],
 	});
-	toolRegistry.register(awaitTool);
+	toolRegistry.register(questionTool);
 	try {
 		for await (const event of agentLoop(
 			{
@@ -124,10 +126,15 @@ async function captureAwaitRequests(
 					...receipts,
 					...Array.from(running._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
 				],
-				getAfterToolsInjections: () => drainInjectionsIntoHistory(running, "en"),
+				getAfterToolsInjections: async () => {
+					const input = await drainInjectionsIntoHistory(running, "en");
+					injected.push(...input.parts);
+					return input;
+				},
 				onModelInputConsumed: (_history, _content, ids) => {
 					adopted.push(Array.from(ids ?? []));
 					running._questionAnswerAdoptedMessageIds = new Set(ids);
+					consumeQuestionAnswerModelReceipts(narratorId, running._questionAnswerAdoptedMessageIds);
 				},
 			},
 			currentText,
@@ -154,10 +161,70 @@ async function captureAwaitRequests(
 			visit(request);
 			expect(results.sort()).toEqual(uses.sort());
 		}
-		return { requests, storedOutputs, adopted };
+		return { requests, storedOutputs, adopted, injected };
 	} finally {
 		unregister();
 	}
+}
+
+async function fillNoticeInbox(prefix: string) {
+	const { runtimeInbox } = await import("../agent-runtime/inbox");
+	for (let i = 0; i < MAILBOX_LIMITS.noticePending; i++) {
+		const result = runtimeInbox.enqueue({
+			kind: "task_notice",
+			noticeKind: "agent",
+			narratorId,
+			sourceKey: `${prefix}-${i}`,
+			text: "older notice",
+			projectedByteSize: 100,
+			metadata: {
+				producerKind: "agent",
+				eventKind: "completed",
+				taskId: `${prefix}-task-${i}`,
+				logicalRunId: `${prefix}-run-${i}`,
+			},
+		});
+		expect(result.status).toBe("accepted");
+	}
+}
+
+async function waitForAnswerAdoption(answerId: string) {
+	const deadline = Date.now() + 2000;
+	while (true) {
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.recipientMessageId, answerId))
+			.get();
+		if (row?.currentAdoptedAt) return row;
+		if (Date.now() >= deadline)
+			throw new Error(`Question receipt ${answerId} was not acknowledged`);
+		// Receipt writes are deliberately asynchronous and yield between bounded batches.
+		await Bun.sleep(1);
+	}
+}
+
+function providerToolResults(request: { history: unknown[] }) {
+	return (request.history as Array<{ content: unknown }>).flatMap((turn) =>
+		Array.isArray(turn.content)
+			? (turn.content as Array<{ type?: string; tool_use_id?: string; content: string }>).filter(
+					(part) => part.type === "tool_result",
+				)
+			: [],
+	);
+}
+
+function providerUserText(request: { history: unknown[]; content: string }) {
+	return [
+		...(request.history as Array<{ role?: string; content: unknown }>).flatMap((turn) =>
+			turn.role === "user" && Array.isArray(turn.content)
+				? (turn.content as Array<{ type?: string; text: string }>)
+						.filter((part) => part.type === "text")
+						.map((part) => part.text)
+				: [],
+		),
+		request.content,
+	].join("\n");
 }
 
 function active(): ActiveNarrator {
@@ -418,24 +485,9 @@ describe("async question receipt runtime adoption", () => {
 				?.status,
 		).toBe("open");
 	});
-	test("a full inbox still releases Await with the complete receipt and retries after a safe drain", async () => {
+	test("a full inbox leaves Question queries repeatable and retries the automatic receipt after a safe drain", async () => {
 		const question = await seedQuestion();
-		const { runtimeInbox } = await import("../agent-runtime/inbox");
-		for (let i = 0; i < 100; i++)
-			runtimeInbox.enqueue({
-				kind: "task_notice",
-				noticeKind: "agent",
-				narratorId,
-				sourceKey: `full-${i}`,
-				text: "older notice",
-				projectedByteSize: 100,
-				metadata: {
-					producerKind: "agent",
-					eventKind: "completed",
-					taskId: `old-${i}`,
-					logicalRunId: `run-${i}`,
-				},
-			});
+		await fillNoticeInbox("full");
 		const running = {
 			...active(),
 			alive: true,
@@ -444,75 +496,91 @@ describe("async question receipt runtime adoption", () => {
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
 		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
-		const { awaitTool } = await import("../../lib/agent/tools/await");
-		const wait = awaitTool.execute(
-			{ type: "question", id: question.id, timeout: 2000 },
-			{
-				narratorId,
-				cwd: process.cwd(),
-				signal: running.abortController.signal,
-				locale: "en",
-				requestPermission: async () => ({ behavior: "allow" as const }),
-			},
-		);
-		const { answerAsyncQuestion } = await import("../narrator-question-service");
+		const { questionTool } = await import("../../lib/agent/tools/question");
+		const { answerAsyncQuestion, retryQuestionAnswerDelivery, isAsyncQuestionAwaited } =
+			await import("../narrator-question-service");
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "All except Redis" },
 		});
 		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(false);
-		const result = await wait;
-		expect(result.output).toContain("Cache decision; continue local investigation while waiting.");
-		expect(result.output).toContain("Memory");
-		expect(result.output).toContain("Redis");
-		expect(result.output).toContain("All except Redis");
-		expect(result.output).toContain("question_answer_fallback");
-		await drainInjectionsIntoHistory(running, "en");
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(true);
-		const { projectQuestionFallbackToolResults } = await import("../agent-runtime/history");
-		const row = db
-			.select()
-			.from(narratorMessages)
-			.where(eq(narratorMessages.id, answer.record.answerMessageId))
-			.get();
-		if (!row) throw new Error("receipt missing");
-		row.contentJson = readTestMessageContent(sqlite, row.id);
-		const replay = [
-			{
-				...row,
-				toolCalls: [
-					{
-						toolUseId: "await",
-						toolName: "Await",
-						inputJson: { type: "question" },
-						outputJson: result.output,
-						status: "success",
-					},
-				],
+		const answerId = answer.record.answerMessageId;
+		const delivery = () =>
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.sourceKey, `question-answer:${answerId}`))
+				.all();
+		const context = {
+			narratorId,
+			cwd: process.cwd(),
+			signal: running.abortController.signal,
+			locale: "en",
+		} as import("../../lib/agent/types").ToolContext;
+		const query = () => questionTool.execute({ action: "get", id: question.id }, context);
+		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		expect(delivery()).toEqual([]);
+		const [first, parallel] = await Promise.all([query(), query()]);
+		expect(first.isError).not.toBe(true);
+		expect(parallel).toEqual(first);
+		expect(JSON.parse(first.output)).toMatchObject({
+			record: {
+				id: question.id,
+				context: "Cache decision; continue local investigation while waiting.",
+				questions: [{ options: [{ header: "Memory" }, { header: "Redis" }] }],
+				answers: { choice: "All except Redis" },
+				answerMessageId: answerId,
+				resolution: null,
 			},
-		];
-		projectQuestionFallbackToolResults(replay);
-		expect(replay[0].toolCalls[0].outputJson).not.toContain("All except Redis");
-		expect(replay[0].toolCalls[0].outputJson).toContain(answer.record.answerMessageId);
-	});
-	test("actual provider input keeps one full fallback for parallel Await with a full inbox, including a later Await", async () => {
+			events: [{ messageId: answerId, kind: "answer" }],
+		});
+		expect(first.output).not.toContain("question_answer_fallback");
+		expect(delivery()).toEqual([]);
+		expect(isAsyncQuestionAwaited(question.id)).toBe(false);
+		expect(running._runPersonActed).not.toBe(true);
+
+		const freed = await drainInjectionsIntoHistory(running, "en");
+		expect(freed.text).not.toContain("All except Redis");
+		freed.onConsumed();
+		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
+		const accepted = delivery();
+		expect(accepted).toHaveLength(1);
+		expect(accepted[0]).toMatchObject({ state: "queued", currentAdoptedAt: null });
+		// Querying the now-scheduled answer does not claim or consume its automatic delivery.
+		expect(await query()).toEqual(first);
+		expect(delivery()).toEqual(accepted);
+		const answerParts: Array<{ text: string; messageId?: string }> = [];
+		for (let boundary = 0; boundary < MAILBOX_LIMITS.noticePending + 2; boundary++) {
+			const drained = await drainInjectionsIntoHistory(running, "en");
+			answerParts.push(...drained.parts.filter((part) => part.messageId === answerId));
+			drained.onConsumed();
+			if (answerParts.length) break;
+		}
+		expect(answerParts).toHaveLength(1);
+		expect(answerParts[0]?.text).toContain('kind="human"');
+		expect(answerParts[0]?.text).toContain("All except Redis");
+		expect(answerParts[0]?.text).toContain(
+			"Cache decision; continue local investigation while waiting.",
+		);
+		expect(answerParts[0]?.text).toContain("Memory");
+		expect(answerParts[0]?.text).toContain("Redis");
+		expect(running._runPersonActed).toBe(true);
+		expect(await waitForAnswerAdoption(answerId)).toMatchObject({
+			deliveryId: accepted[0]?.deliveryId,
+			state: "materialized",
+			currentAdoptedAt: expect.any(String),
+		});
+		await retryQuestionAnswerDelivery(narratorId, question.id);
+		await retryQuestionAnswerDelivery(narratorId, question.id);
+		expect((await drainInjectionsIntoHistory(running, "en")).parts).toEqual([]);
+		expect(delivery()).toHaveLength(1);
+		expect(
+			db.select().from(narratorMessages).where(eq(narratorMessages.id, answerId)).all(),
+		).toHaveLength(1);
+		expect(await query()).toEqual(first);
+	}, 15_000);
+	test("actual provider input adopts one automatic receipt after a full inbox without consuming parallel or later Question queries", async () => {
 		const question = await seedQuestion();
-		const { runtimeInbox } = await import("../agent-runtime/inbox");
-		for (let i = 0; i < 100; i++)
-			runtimeInbox.enqueue({
-				kind: "task_notice",
-				noticeKind: "agent",
-				narratorId,
-				sourceKey: `model-full-${i}`,
-				text: "older notice",
-				projectedByteSize: 100,
-				metadata: {
-					producerKind: "agent",
-					eventKind: "completed",
-					taskId: `model-${i}`,
-					logicalRunId: `model-run-${i}`,
-				},
-			});
+		await fillNoticeInbox("model-full");
 		const running = {
 			...active(),
 			alive: true,
@@ -521,37 +589,91 @@ describe("async question receipt runtime adoption", () => {
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
 		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
-		const { answerAsyncQuestion } = await import("../narrator-question-service");
+		const { answerAsyncQuestion, retryQuestionAnswerDelivery } = await import(
+			"../narrator-question-service"
+		);
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "UNIQUE_MODEL_ANSWER" },
 		});
 		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
-		const evidence = await captureAwaitRequests(running, question.id, [2, 1]);
-		expect(evidence.requests).toHaveLength(3);
-		for (const request of evidence.requests.slice(1)) {
-			expect(JSON.stringify(request).split("UNIQUE_MODEL_ANSWER")).toHaveLength(2);
-			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
+		const answerId = answer.record.answerMessageId;
+		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		let queriedAfterAdoption = false;
+		const evidence = await captureQuestionRequests(running, question.id, (turn) => {
+			if (turn > MAILBOX_LIMITS.noticePending + 2)
+				throw new Error(
+					"Automatic question receipt did not reach the provider within bounded drains",
+				);
+			if (running._questionAnswerAdoptedMessageIds?.has(answerId)) {
+				if (queriedAfterAdoption) return 0;
+				queriedAfterAdoption = true;
+			}
+			return turn === 0 ? 2 : 1;
+		});
+		expect(queriedAfterAdoption).toBe(true);
+		const adoptedAt = evidence.adopted.findIndex((ids) => ids.includes(answerId));
+		// Queries return the answer immediately, but only actual user input can adopt it.
+		expect(adoptedAt).toBeGreaterThan(1);
+		expect(evidence.adopted[0]).not.toContain(answerId);
+		expect(evidence.adopted[1]).not.toContain(answerId);
+		for (const [index, request] of evidence.requests.entries()) {
+			const userText = providerUserText(request);
+			expect(userText.split("UNIQUE_MODEL_ANSWER")).toHaveLength(index < adoptedAt ? 1 : 2);
+			if (index >= adoptedAt) {
+				expect(userText).toContain('kind="human"');
+				expect(userText).toContain(answerId);
+			}
+			const results = providerToolResults(request);
+			expect(results).toHaveLength(index === 0 ? 0 : index + 1);
+			for (const result of results) {
+				expect(JSON.parse(result.content)).toMatchObject({
+					record: {
+						id: question.id,
+						answers: { choice: "UNIQUE_MODEL_ANSWER" },
+						answerMessageId: answerId,
+						resolution: null,
+					},
+				});
+				expect(result.content).not.toContain("question_answer_fallback");
+			}
+			// Explicit read-only query output is retained, independently of the one user receipt.
+			expect(JSON.stringify(request).split("UNIQUE_MODEL_ANSWER")).toHaveLength(
+				results.length + (index < adoptedAt ? 0 : 1) + 1,
+			);
 		}
-		// The previous step's results are the request's last tool-result turn, in call order.
-		const lastResultIds = (request: { history: unknown[] }) =>
-			(request.history as Array<{ content: unknown }>)
-				.map((turn) =>
-					Array.isArray(turn.content)
-						? (turn.content as Array<{ type?: string; tool_use_id?: string }>)
-								.filter((part) => part.type === "tool_result")
-								.map((part) => part.tool_use_id)
-						: [],
-				)
-				.filter((ids) => ids.length > 0)
-				.at(-1);
-		expect(lastResultIds(evidence.requests[1])).toEqual(["await-1-0", "await-1-1"]);
-		expect(lastResultIds(evidence.requests[2])).toEqual(["await-2-0"]);
-		expect(evidence.storedOutputs[0]).toContain("UNIQUE_MODEL_ANSWER");
-		expect(evidence.storedOutputs[1]).toContain("UNIQUE_MODEL_ANSWER");
-		expect(evidence.adopted[0]).not.toContain(answer.record.answerMessageId);
-		expect(evidence.adopted[1]).toContain(answer.record.answerMessageId);
-	});
-	test("actual provider request does not repeat a previously consumed user receipt in Await results", async () => {
+		expect(providerToolResults(evidence.requests[1]).map((result) => result.tool_use_id)).toEqual([
+			"question-get-1-0",
+			"question-get-1-1",
+		]);
+		expect(providerToolResults(evidence.requests[2]).at(-1)?.tool_use_id).toBe("question-get-2-0");
+		expect(evidence.storedOutputs).toHaveLength(evidence.requests.length);
+		for (const output of evidence.storedOutputs) expect(output).toBe(evidence.storedOutputs[0]);
+		expect(evidence.injected.filter((part) => part.messageId === answerId)).toHaveLength(1);
+		await waitForAnswerAdoption(answerId);
+		const beforeRetry = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.recipientMessageId, answerId))
+			.all();
+		expect(beforeRetry).toHaveLength(1);
+		expect(beforeRetry[0]).toMatchObject({
+			state: "materialized",
+			currentAdoptedAt: expect.any(String),
+		});
+		await retryQuestionAnswerDelivery(narratorId, question.id);
+		expect((await drainInjectionsIntoHistory(running, "en")).parts).toEqual([]);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.recipientMessageId, answerId))
+				.all(),
+		).toEqual(beforeRetry);
+		expect(
+			db.select().from(narratorMessages).where(eq(narratorMessages.id, answerId)).all(),
+		).toHaveLength(1);
+	}, 15_000);
+	test("actual provider input keeps consumed user receipts once while repeated Question reads retain the answer", async () => {
 		const question = await seedQuestion();
 		const running = {
 			...active(),
@@ -575,25 +697,32 @@ describe("async question receipt runtime adoption", () => {
 		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const { questionModelReceipts } = await import("../agent-runtime/history");
 		const receipts = questionModelReceipts([row]);
-		const evidence = await captureAwaitRequests(running, question.id, [1, 1], receipts);
+		const evidence = await captureQuestionRequests(running, question.id, [1, 1], receipts);
 		expect(evidence.requests).toHaveLength(3);
-		for (const request of evidence.requests) {
-			expect(JSON.stringify(request).split("PREVIOUSLY_CONSUMED_ANSWER")).toHaveLength(2);
-			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
+		for (const [index, request] of evidence.requests.entries()) {
+			const userText = providerUserText(request);
+			expect(userText.split("PREVIOUSLY_CONSUMED_ANSWER")).toHaveLength(2);
+			expect(userText).toContain('kind="human"');
+			const results = providerToolResults(request);
+			expect(results).toHaveLength(index);
+			for (const result of results)
+				expect(JSON.parse(result.content)).toMatchObject({
+					record: {
+						id: question.id,
+						answerMessageId: answer.record.answerMessageId,
+						answers: { choice: "PREVIOUSLY_CONSUMED_ANSWER" },
+						resolution: null,
+					},
+				});
+			expect(JSON.stringify(request).split("PREVIOUSLY_CONSUMED_ANSWER")).toHaveLength(index + 2);
 		}
-		// Tool results now ride in the history; none of them repeats the consumed receipt.
-		for (const request of evidence.requests.slice(1))
-			expect(
-				JSON.stringify(
-					(request.history as Array<{ content: unknown }>).flatMap((turn) =>
-						Array.isArray(turn.content)
-							? (turn.content as Array<{ type?: string }>).filter(
-									(part) => part.type === "tool_result",
-								)
-							: [],
-					),
-				),
-			).not.toContain("PREVIOUSLY_CONSUMED_ANSWER");
+		expect(evidence.storedOutputs).toHaveLength(2);
+		expect(evidence.storedOutputs[1]).toBe(evidence.storedOutputs[0]);
+		expect(
+			evidence.injected.filter((part) => part.messageId === answer.record.answerMessageId),
+		).toEqual([]);
+		expect((await drainInjectionsIntoHistory(running, "en")).parts).toEqual([]);
+		await waitForAnswerAdoption(answer.record.answerMessageId);
 		expect(
 			evidence.adopted.every((ids) => ids.includes(answer.record.answerMessageId as string)),
 		).toBe(true);
@@ -615,7 +744,7 @@ describe("async question receipt runtime adoption", () => {
 			id: "event-unsent",
 			text: '<sender kind="human" />\n{"answerMessageId":"event-unsent","answer":"same answer"}',
 		};
-		const evidence = await captureAwaitRequests(
+		const evidence = await captureQuestionRequests(
 			running,
 			"unused",
 			[],

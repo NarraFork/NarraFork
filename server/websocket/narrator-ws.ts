@@ -26,7 +26,6 @@ import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls, terminals } from "../db/schema";
-import { updateAwaitTimeout } from "../lib/agent/tools/await";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { eventBus } from "../lib/event-bus";
@@ -2361,11 +2360,8 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_timeout": {
-				// Bash and Await both maintain live-timeout registries keyed by toolUseId;
-				// only one will match a given running tool.
-				const newMs =
-					updateBashTimeout(msg.toolUseId, msg.timeoutMs) ??
-					updateAwaitTimeout(msg.toolUseId, msg.timeoutMs);
+				// Only Bash execution has an editable live timeout. Watch already returned.
+				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
 				if (newMs != null) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "timeout_updated",

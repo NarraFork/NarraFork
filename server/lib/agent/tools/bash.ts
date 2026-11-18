@@ -298,7 +298,7 @@ export const bashTool: ToolDefinition = {
 			},
 			run_in_background: {
 				description:
-					'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
+					'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
 				type: "boolean",
 			},
 			strict_serial: {
@@ -364,7 +364,7 @@ export const bashTool: ToolDefinition = {
 					.boolean()
 					.optional()
 					.describe(
-						'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
+						'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
 					),
 				strict_serial: z
 					.boolean()
@@ -698,7 +698,7 @@ export const bashTool: ToolDefinition = {
 						resolveDetached({
 							output:
 								`<background_task_id>${alias}</background_task_id>\n\n` +
-								`Bash moved to background: ${title}\nAwait({ type: "bash", id: "${alias}" })`,
+								`Bash moved to background: ${title}\nWatch({ type: "bash", id: "${alias}" })`,
 							title,
 							metadata: {
 								background_task_id: taskId,
@@ -988,7 +988,7 @@ async function _runInBackground(
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Background bash ${backgroundKind} started: ${title}\n` +
-		`Await({ type: "bash", id: "${alias}" })`;
+		`Watch({ type: "bash", id: "${alias}" })`;
 
 	if (conflicted) {
 		output +=

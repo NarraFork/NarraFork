@@ -204,12 +204,12 @@ export function projectPendingInjection(
 			const ref = task?.alias ?? metadata.taskId;
 			let output = result?.output;
 			if (output != null && Buffer.byteLength(output, "utf8") >= 5120) {
-				// Old tasks (or a failed spill) retain their bounded original for Await.
-				output = `${output.slice(0, 256)}\n[Output preview truncated; captured output file unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`;
+				// Old tasks (or a failed spill) retain their bounded original for Watch.
+				output = `${output.slice(0, 256)}\n[Output preview truncated; captured output file unavailable. Use Watch({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`;
 			}
 			const outputPreview =
 				output == null
-					? `${row.text}\n[Result snapshot unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`
+					? `${row.text}\n[Result snapshot unavailable. Use Watch({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`
 					: `${output || "(empty output)"}${result?.exitCode != null ? `\n[exit code: ${result.exitCode}]` : ""}`;
 			return {
 				kind: "bg_bash",

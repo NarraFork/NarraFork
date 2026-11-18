@@ -43,7 +43,7 @@ interface RenderSubagentRecoveryProps {
 	/** Toggle the checkbox at `rowIndex`. Omit to render read-only. */
 	onToggleRow?: (rowIndex: number) => void;
 	/** Submit the selection in the given mode. Omit to render read-only. */
-	onResume?: (mode: "notify" | "await") => void;
+	onResume?: (mode: "notify" | "watch") => void;
 	/**
 	 * Withdraw the offer without resuming anything. Omit to paint no close button at
 	 * all (read-only shares have nothing to dismiss).
@@ -170,7 +170,7 @@ export function RenderSubagentRecovery({
 						size="compact-sm"
 						color="orange"
 						disabled={!interactive || selectedCount === 0}
-						onClick={interactive ? () => onResume?.("await") : undefined}
+						onClick={interactive ? () => onResume?.("watch") : undefined}
 					>
 						{data.waitLabel}
 					</Button>

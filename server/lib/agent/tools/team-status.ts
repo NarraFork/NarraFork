@@ -20,7 +20,14 @@ async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promi
 	}
 }
 
-type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
+type TeamAction =
+	| "list"
+	| "list_agents"
+	| "list_bash"
+	| "get_task"
+	| "file_changes"
+	| "broadcast"
+	| "send";
 
 /**
  * Default and maximum rows PER KIND (agents, bash) for the list actions.
@@ -97,7 +104,7 @@ function bashLabel(title: string | null, command: string | null): string {
  * would report "no file changes" or "not a direct subagent".
  *
  * Accepts real ids, id prefixes, titles, title slugs and persisted aliases (the
- * same selector grammar Send/Await honour). Returns the input unchanged when
+ * same selector grammar Send/Watch honour). Returns the input unchanged when
  * nothing matches, so the caller's own validation produces the error.
  */
 async function resolveTeamMemberId(callerNarratorId: string, selector: string): Promise<string> {
@@ -118,24 +125,28 @@ export const teamStatusTool: ToolDefinition = {
 		'- "list": List background agents and background bash tasks (kind=agent|bash; bash includes background_kind=task|service)\n' +
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
+		'- "get_task": Read one owned bash/agent/transfer task immediately by durable ID or alias (requires target_id). Includes bounded output and transfer progress; queued, paused and offline transfers remain queryable. Does not wait or consume completion notifications.\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
 		'- "broadcast": Send ONLY to working/waiting direct subagents. Returns recipient names and idle subagents active within the last hour (name + slug + id), which are NOT sent to or woken; use a separate Send if needed. More than 100 candidates is refused; use explicit Send instead.\n' +
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
 		"- Agent listings are a tree: each agent's own helper agents (the second level) are indented under it.\n" +
+		"- get_task is limited to tasks started by the current narrator.\n" +
 		"- broadcast, send and file_changes are limited to the current narrator's direct subagent team.\n" +
 		`- The list actions are bounded: active members come first, then a few recent finished ones, up to ${LIST_DEFAULT_LIMIT} rows per kind. A trailing note reports what was omitted.\n` +
 		"- Use `query` to find a specific member by name/alias/id prefix past that window, and `limit` to widen it.\n" +
 		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.",
 	parameters: z.object({
 		action: z
-			.enum(["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"])
+			.enum(["list", "list_agents", "list_bash", "get_task", "file_changes", "broadcast", "send"])
 			.describe("The action to perform"),
 		target_id: z
 			.string()
 			.optional()
-			.describe("Target subagent ID (required for 'send', optional for 'file_changes')"),
+			.describe(
+				"Target task ID/persisted alias for 'get_task'; subagent ID for 'send'/'file_changes'",
+			),
 		message: z.string().optional().describe("Message text (required for 'broadcast' and 'send')"),
 		query: z
 			.string()
@@ -157,10 +168,11 @@ export const teamStatusTool: ToolDefinition = {
 			action: {
 				description: "The action to perform",
 				type: "string",
-				enum: ["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"],
+				enum: ["list", "list_agents", "list_bash", "get_task", "file_changes", "broadcast", "send"],
 			},
 			target_id: {
-				description: "Target subagent ID (required for 'send', optional for 'file_changes')",
+				description:
+					"Target task ID/persisted alias for 'get_task'; subagent ID for 'send'/'file_changes'",
 				type: "string",
 			},
 			message: {
@@ -188,6 +200,21 @@ export const teamStatusTool: ToolDefinition = {
 			query?: string;
 			limit?: number;
 		};
+
+		if (action === "get_task") {
+			if (!target_id) return { output: "Error: get_task requires target_id.", isError: true };
+			const { backgroundTaskService } = await import("@server/services/background-task-service");
+			const task = await backgroundTaskService.readTaskSnapshot(ctx.narratorId, target_id);
+			if (!task)
+				return {
+					output: `Error: No owned task matches "${target_id.slice(0, 200)}".`,
+					isError: true,
+				};
+			return {
+				output: JSON.stringify(task),
+				metadata: { kind: "team_status", action, targetId: task.id, status: task.status },
+			};
+		}
 
 		// A narrator nobody controls is its own team root; a member shares its root's scope.
 		const { narratorService: sessions } = await import("@server/services/narrator-service");

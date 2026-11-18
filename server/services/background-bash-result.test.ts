@@ -42,7 +42,7 @@ describe("background Bash captured output", () => {
 		expect(result.content).toContain("captured output");
 		expect(result.content).toContain('device: "local"');
 		expect(result.content).toContain("Read or Grep");
-		expect(result.content).toContain("No Await is needed");
+		expect(result.content).toContain("No observation is needed");
 		expect(result.content).toContain("If Read reports that the file was cleaned up");
 		expect(result.content).toContain("may retain only a preview");
 		expect(result.content).toContain("does not guarantee complete output");
@@ -89,9 +89,9 @@ describe("background Bash captured output", () => {
 			const result = await prepare(`${secret}${"😀".repeat(2000)}`);
 			expect(result.outputPath).toBeUndefined();
 			expect(result.content).toContain("Failed to save captured output");
-			expect(result.content).toContain('Await with type: "bash", id: "task"');
+			expect(result.content).toContain('Watch with the original target type and id: "task"');
 			expect(Buffer.byteLength(preview(result.content))).toBeLessThanOrEqual(1024);
-			expect(warn).toHaveBeenCalledWith("Background Bash captured output could not be saved", {
+			expect(warn).toHaveBeenCalledWith("Captured output could not be saved", {
 				taskId: "task",
 				reason: "write_failed",
 			});
@@ -124,7 +124,7 @@ describe("background Bash captured output", () => {
 			const result = await prepare("x".repeat(5120));
 			expect(result.outputPath).toBeUndefined();
 			expect(result.content).toContain("timed out");
-			expect(warn).toHaveBeenCalledWith("Background Bash captured output could not be saved", {
+			expect(warn).toHaveBeenCalledWith("Captured output could not be saved", {
 				taskId: "task",
 				reason: "write_timeout",
 			});

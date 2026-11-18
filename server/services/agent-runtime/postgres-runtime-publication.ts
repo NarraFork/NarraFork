@@ -66,6 +66,7 @@ import { withPgRetry } from "../../db/pg-retry";
 import {
 	backgroundTasks,
 	runtimeAwaitedTerminalConsumptions as consumptions,
+	deviceTransferTasks,
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
 	narrators,
@@ -73,6 +74,7 @@ import {
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
 } from "../../db/postgres-schema";
+import type { backgroundTasks as sqliteBackgroundTasks } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
@@ -84,6 +86,7 @@ import {
 	type PgPersistedMessageRef,
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { PublicationTerminalCommit, StartedRun, StartRunInput } from "./publication";
 import {
@@ -300,6 +303,15 @@ export interface PgUpdateNarratorBackgroundInput {
  * Terminal transition for a background task: the CAS update + publication
  * commit in ONE section, eliminating the two-phase read-update gap.
  */
+export interface PgStartTransferTaskInput {
+	readonly taskRow: Omit<typeof sqliteBackgroundTasks.$inferInsert, "logicalRunId"> & {
+		type: "transfer";
+		transferTaskId: string;
+	};
+	/** The claiming runner's real generation, not a publication retry count. */
+	readonly runGeneration?: number;
+}
+
 export interface PgTerminalTransitionInput {
 	readonly taskId: string;
 	readonly setFields: Record<string, unknown>;
@@ -307,6 +319,10 @@ export interface PgTerminalTransitionInput {
 	readonly summary: string;
 	readonly eventKind: Exclude<PublicationEvent, "started">;
 	readonly deferPublication?: boolean;
+	/** Observation-only CAS: release its own reservation without publishing or consuming the target. */
+	readonly silentObservation?: boolean;
+	/** Transfer callbacks must not settle a newer generation after resume. */
+	readonly expectedTransfer?: { id: string; generation: number };
 }
 
 /**
@@ -1009,6 +1025,93 @@ export function createPostgresRuntimePublication(
 			});
 		},
 
+		/** Claim/resume the existing transfer projection and reserve its result atomically. */
+		async startTransferTask(
+			input: PgStartTransferTaskInput,
+		): Promise<BackgroundTaskRecord | undefined> {
+			return runComposite("publication.startTransferTask", async (tx) => {
+				const [owner] = await tx
+					.select({
+						id: deviceTransferTasks.id,
+						parentNarratorId: deviceTransferTasks.parentNarratorId,
+						status: deviceTransferTasks.status,
+						generation: deviceTransferTasks.runGeneration,
+					})
+					.from(deviceTransferTasks)
+					.where(eq(deviceTransferTasks.id, input.taskRow.transferTaskId))
+					.limit(1)
+					.for("update");
+				if (!owner || owner.parentNarratorId !== input.taskRow.parentNarratorId) return undefined;
+				const [existing] = await tx
+					.select()
+					.from(backgroundTasks)
+					.where(
+						and(
+							eq(backgroundTasks.transferTaskId, owner.id),
+							eq(backgroundTasks.parentNarratorId, owner.parentNarratorId),
+						),
+					)
+					.limit(1)
+					.for("update");
+				if (
+					owner.status !== "running" ||
+					(input.runGeneration !== undefined && input.runGeneration !== owner.generation)
+				)
+					return existing;
+				const generationRunId = `transfer:${owner.id}:${owner.generation}`;
+				const alias = existing?.alias ?? input.taskRow.alias ?? null;
+				if (existing?.status === "running" && existing.logicalRunId) {
+					if (alias !== existing.alias) {
+						const [updated] = await tx
+							.update(backgroundTasks)
+							.set({ alias })
+							.where(eq(backgroundTasks.id, existing.id))
+							.returning();
+						return updated;
+					}
+					return existing;
+				}
+				// A repeated claim for an already settled generation cannot resurrect it.
+				if (existing && existing.status !== "paused" && existing.logicalRunId === generationRunId)
+					return existing;
+				const run: PublicationRun = {
+					producerKind: "bash",
+					taskId: existing?.id ?? input.taskRow.id,
+					recipientId: owner.parentNarratorId,
+					logicalRunId:
+						existing?.status === "paused" && existing.logicalRunId
+							? existing.logicalRunId
+							: generationRunId,
+				};
+				const reservation = await primitives.reserveRunSlots(tx, run);
+				if (reservation.status === "full") throw capacityError();
+				if (existing) {
+					const [updated] = await tx
+						.update(backgroundTasks)
+						.set({
+							status: "running",
+							logicalRunId: run.logicalRunId,
+							alias,
+							output: null,
+							outputBytes: 0,
+							outputTruncated: false,
+							exitCode: null,
+							completedAt: null,
+							notified: false,
+							updatedAt: input.taskRow.updatedAt,
+						})
+						.where(eq(backgroundTasks.id, existing.id))
+						.returning();
+					return updated;
+				}
+				const [created] = await tx
+					.insert(backgroundTasks)
+					.values({ ...input.taskRow, logicalRunId: run.logicalRunId })
+					.returning();
+				return created;
+			});
+		},
+
 		/** The result snapshot as its own section (the composite terminals embed it). */
 		async persistResult(run: PublicationRun, text: string): Promise<string> {
 			if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
@@ -1340,7 +1443,7 @@ export function createPostgresRuntimePublication(
 						...run,
 						eventKind,
 						resultRef: section.resultRef,
-						summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Await({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
+						summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Watch({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
 					});
 				}
 			});
@@ -1371,10 +1474,39 @@ export function createPostgresRuntimePublication(
 		> {
 			const raisedFloorNarratorIds = new Set<string>();
 			const result = await runComposite("publication.commitTerminalTransition", async (tx) => {
+				if (input.expectedTransfer) {
+					const [owner] = await tx
+						.select({ generation: deviceTransferTasks.runGeneration })
+						.from(deviceTransferTasks)
+						.where(eq(deviceTransferTasks.id, input.expectedTransfer.id))
+						.limit(1)
+						.for("update");
+					if (owner?.generation !== input.expectedTransfer.generation) return undefined;
+				}
 				const [task] = await tx
 					.update(backgroundTasks)
 					.set(input.setFields)
-					.where(and(eq(backgroundTasks.id, input.taskId), eq(backgroundTasks.status, "running")))
+					.where(
+						and(
+							eq(backgroundTasks.id, input.taskId),
+							input.expectedTransfer
+								? and(
+										eq(backgroundTasks.type, "transfer"),
+										eq(backgroundTasks.transferTaskId, input.expectedTransfer.id),
+										inArray(backgroundTasks.status, ["running", "paused"]),
+									)
+								: eq(backgroundTasks.status, "running"),
+							input.silentObservation
+								? and(
+										eq(backgroundTasks.type, "bash"),
+										or(
+											like(backgroundTasks.command, `${WATCH_COMMAND_PREFIX}%`),
+											like(backgroundTasks.command, `${TERMINAL_WATCH_COMMAND_PREFIX}%`),
+										),
+									)
+								: undefined,
+						),
+					)
 					.returning({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
@@ -1386,7 +1518,39 @@ export function createPostgresRuntimePublication(
 						toolUseId: backgroundTasks.toolUseId,
 						logicalRunId: backgroundTasks.logicalRunId,
 					});
-				if (!task || task.type === "transfer" || input.deferPublication) return task;
+				if (!task) return undefined;
+				if (input.silentObservation) {
+					if (task.logicalRunId) {
+						await tx
+							.delete(outbox)
+							.where(
+								and(
+									eq(outbox.producerKind, "bash"),
+									eq(outbox.taskId, task.id),
+									eq(outbox.logicalRunId, task.logicalRunId),
+									eq(outbox.recipientId, task.parentNarratorId),
+									eq(outbox.state, "reserved"),
+								),
+							);
+					}
+					return task;
+				}
+				if (input.deferPublication) return task;
+				if (task.type === "transfer" && !task.logicalRunId) {
+					const run: PublicationRun = {
+						producerKind: "bash",
+						taskId: task.id,
+						recipientId: task.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, task.id));
+					task.logicalRunId = run.logicalRunId;
+				}
 				if (!task.logicalRunId) {
 					logger.warn("Terminal transition skipped: task has no logicalRunId", {
 						taskId: input.taskId,
@@ -1395,7 +1559,7 @@ export function createPostgresRuntimePublication(
 					return task;
 				}
 				const run: PublicationRun = {
-					producerKind: task.type as "agent" | "bash",
+					producerKind: task.type === "transfer" ? "bash" : (task.type as "agent" | "bash"),
 					taskId: input.taskId,
 					logicalRunId: task.logicalRunId,
 					recipientId: task.parentNarratorId,
@@ -1444,6 +1608,7 @@ export function createPostgresRuntimePublication(
 						logicalRunId: backgroundTasks.logicalRunId,
 						toolCallId: backgroundTasks.toolCallId,
 						executionAttempt: backgroundTasks.executionAttempt,
+						command: backgroundTasks.command,
 					});
 				if (!task) return undefined;
 				if (task.type === "agent") {
@@ -1459,6 +1624,26 @@ export function createPostgresRuntimePublication(
 						.where(eq(narrators.id, task.subagentNarratorId ?? task.id));
 				}
 				if (task.type === "transfer") return task;
+				if (
+					task.type === "bash" &&
+					!task.logicalRunId &&
+					(task.command?.startsWith(WATCH_COMMAND_PREFIX) ||
+						task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX))
+				) {
+					const run: PublicationRun = {
+						producerKind: "bash",
+						taskId: task.id,
+						recipientId: task.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, task.id));
+					task.logicalRunId = run.logicalRunId;
+				}
 				const source = {
 					producerKind: task.type as "agent" | "bash",
 					taskId: task.id,
@@ -1574,12 +1759,12 @@ export function createPostgresRuntimePublication(
 
 				const deletable: PgCleanupTaskResult[] = [];
 				for (const row of candidates) {
-					if (!row.logicalRunId || row.type === "transfer") {
+					if (!row.logicalRunId) {
 						deletable.push(row);
 						continue;
 					}
 					const run: PublicationRun = {
-						producerKind: row.type as "agent" | "bash",
+						producerKind: row.type === "transfer" ? "bash" : (row.type as "agent" | "bash"),
 						taskId: row.id,
 						logicalRunId: row.logicalRunId,
 						recipientId: row.parentNarratorId,
@@ -1706,13 +1891,29 @@ export function createPostgresRuntimePublication(
 					});
 				if (!updated) return null;
 
-				// Commit the publication terminal intent in the same section.
-				if (existing.type !== "transfer" && existing.logicalRunId) {
+				// Transfer terminal notices reuse the existing bash publication channel.
+				if (updated.type === "transfer" && !updated.logicalRunId) {
 					const run: PublicationRun = {
-						producerKind: existing.type as "agent" | "bash",
+						producerKind: "bash",
+						taskId: updated.id,
+						recipientId: updated.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, updated.id));
+					updated.logicalRunId = run.logicalRunId;
+				}
+				// Commit the publication terminal intent in the same section.
+				if (updated.logicalRunId) {
+					const run: PublicationRun = {
+						producerKind: updated.type === "transfer" ? "bash" : (updated.type as "agent" | "bash"),
 						taskId: input.taskId,
-						logicalRunId: existing.logicalRunId,
-						recipientId: existing.parentNarratorId,
+						logicalRunId: updated.logicalRunId,
+						recipientId: updated.parentNarratorId,
 					};
 					const section = await persistResultSection(
 						tx,
@@ -1733,7 +1934,7 @@ export function createPostgresRuntimePublication(
 						eventKind: "cancelled",
 						resultRef: section.resultRef,
 						summary: summarize(
-							`[System] Background ${existing.type} cancelled. Use Await({ type: "${existing.type}", id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
+							`[System] Background ${existing.type} cancelled. Use TeamStatus({ action: "get_task", target_id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
 						),
 					});
 				}
@@ -1873,7 +2074,7 @@ export function createPostgresRuntimePublication(
 					eventKind: input.hasError ? "failed" : "completed",
 					resultRef: section.resultRef,
 					summary: summarize(
-						`[System] Background agent "${updated.title ?? updated.alias ?? updated.id}" (ID: ${updated.alias ?? updated.id}) ${terminalStatus}. Use Await({ type: "agent", id: "${updated.alias ?? updated.id}" }) to read the stored result.`,
+						`[System] Background agent "${updated.title ?? updated.alias ?? updated.id}" (ID: ${updated.alias ?? updated.id}) ${terminalStatus}. Use Watch({ type: "agent", id: "${updated.alias ?? updated.id}" }) to read the stored result.`,
 					),
 				});
 				return { id: updated.id, parentNarratorId: updated.parentNarratorId };

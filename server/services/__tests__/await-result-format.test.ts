@@ -72,7 +72,7 @@ describe("Await agent result wording", () => {
 		expect(text).not.toMatch(/status: aborted/);
 		expect(text).not.toMatch(/\(no output\)/);
 		expect(text.toLowerCase()).toContain("still running");
-		expect(text.toLowerCase()).toContain("await again");
+		expect(text.toLowerCase()).toContain("watch");
 		// The tag carries the label: it is the selector the model is told to reuse.
 		expect(text).toContain(`<subagent_id>${AGENT_LABEL}</subagent_id>`);
 	});
@@ -98,7 +98,7 @@ describe("Await agent result wording", () => {
 		for (const status of ["timeout", "running"]) {
 			const text = formatAgentAwaitResult(AGENT_LABEL, status, null);
 			expect(text.toLowerCase()).toContain("still running");
-			expect(text.toLowerCase()).toContain("await again");
+			expect(text.toLowerCase()).toContain("watch");
 			expect(text).not.toMatch(/\(no output\)/);
 		}
 	});
@@ -181,7 +181,7 @@ describe("Await bash result wording", () => {
 	test("aborted wait makes clear the task is still running and can be awaited again", () => {
 		const text = formatResult(TASK_ID, "aborted", null);
 		expect(text.toLowerCase()).toContain("still running");
-		expect(text.toLowerCase()).toContain("await again");
+		expect(text.toLowerCase()).toContain("watch");
 		// The old wording implied the await/task was over.
 		expect(text).not.toMatch(/await was aborted/i);
 	});
@@ -189,7 +189,7 @@ describe("Await bash result wording", () => {
 	test("timeout/running wait keeps the task alive in the wording", () => {
 		const text = formatResult(TASK_ID, "timeout", "partial log line");
 		expect(text.toLowerCase()).toContain("still running");
-		expect(text.toLowerCase()).toContain("await again");
+		expect(text.toLowerCase()).toContain("watch");
 		expect(text).toContain("partial log line");
 	});
 
@@ -247,7 +247,7 @@ describe("Await question result wording", () => {
 		expect(text.toLowerCase()).toContain("still open");
 		expect(text.toLowerCase()).not.toContain("default");
 		expect(text).toContain("Question action=get");
-		expect(text).toContain("Await again");
+		expect(text).toContain("Answers notify automatically");
 	});
 
 	test("a dismissal reports no selected answer without inventing permission to proceed", () => {

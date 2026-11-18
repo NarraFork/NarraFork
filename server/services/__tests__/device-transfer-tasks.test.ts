@@ -220,11 +220,11 @@ describe("narrator-facing projection hooks", () => {
 			onTransferClaimed: async (payload) => {
 				calls.push({ kind: "claimed", payload });
 			},
-			onTransferPaused: async (transferTaskId, reason) => {
-				calls.push({ kind: "paused", payload: { transferTaskId, reason } });
+			onTransferPaused: async (transferTaskId, reason, runGeneration) => {
+				calls.push({ kind: "paused", payload: { transferTaskId, reason, runGeneration } });
 			},
-			onTransferFinished: async (transferTaskId, outcome) => {
-				calls.push({ kind: "finished", payload: { transferTaskId, outcome } });
+			onTransferFinished: async (transferTaskId, outcome, runGeneration) => {
+				calls.push({ kind: "finished", payload: { transferTaskId, outcome, runGeneration } });
 			},
 			onTransferProgress: (transferTaskId, progress) => {
 				calls.push({ kind: "progress", payload: { transferTaskId, progress } });
@@ -269,6 +269,34 @@ describe("narrator-facing projection hooks", () => {
 		};
 		expect(finished.outcome.status).toBe("completed");
 		expect(finished.outcome.summary).toContain("Uploaded");
+	});
+
+	test("failed transfer resume carries the actual generation through projection hooks", async () => {
+		let attempts = 0;
+		const { manager, calls } = makeManager({
+			beforeUploadReturns: async () => {
+				if (attempts++ === 0) throw new Error("first generation failed");
+			},
+		});
+		const task = await manager.start({
+			deviceId,
+			direction: "upload",
+			remotePath: "/remote/retry.txt",
+			localPath: await sourceFile("retry.txt"),
+			parentNarratorId: "narrator-1",
+		});
+		await waitFor(() => calls.filter((call) => call.kind === "finished").length === 1);
+		expect((await manager.get(deviceId, task.id))?.status).toBe("failed");
+		expect((await manager.resume(deviceId, task.id))?.runGeneration).toBe(1);
+		await waitFor(() => calls.filter((call) => call.kind === "finished").length === 2);
+		expect((await manager.get(deviceId, task.id))?.status).toBe("completed");
+		for (const kind of ["claimed", "finished"]) {
+			expect(
+				calls
+					.filter((call) => call.kind === kind)
+					.map((call) => (call.payload as { runGeneration: number }).runGeneration),
+			).toEqual([0, 1]);
+		}
 	});
 
 	test("an admin transfer with NO narrator gets no projection at all", async () => {
