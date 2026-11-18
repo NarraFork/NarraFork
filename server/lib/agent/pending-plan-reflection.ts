@@ -36,9 +36,13 @@ export interface PendingPlanReflectionGateResult {
 /**
  * Runs one plan reflection against the input the pending approval is showing, and resolves to
  * the reviewer's decision. It never resolves the permission itself.
+ *
+ * `signal` aborts the review when the request is decided first: the wait it describes no longer
+ * exists, and a nested agent loop left running would burn a provider call to answer nobody.
  */
 export type PendingPlanReflectionRunner = (
 	input: Record<string, unknown>,
+	options?: { signal?: AbortSignal },
 ) => Promise<PendingPlanReflectionGateResult>;
 
 interface PendingPlanReflectionRegistration {

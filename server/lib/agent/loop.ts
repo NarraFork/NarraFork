@@ -2168,8 +2168,14 @@ async function runPendingExitPlanReflection(args: {
 	toolUse: AgentToolUse;
 	input: Record<string, unknown>;
 	toolCallId: string | null;
+	signal?: AbortSignal;
 }): Promise<PendingPlanReflectionGateResult> {
-	const { config, rows, toolUse, input, toolCallId } = args;
+	const { rows, toolUse, input, toolCallId } = args;
+	// A review whose request was decided meanwhile has nothing left to answer, so the gate's
+	// caller can cut it short. `config.signal` still belongs to the parent pass.
+	const config: AgentConfig = args.signal
+		? { ...args.config, signal: AbortSignal.any([args.config.signal, args.signal]) }
+		: args.config;
 	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
@@ -2251,13 +2257,14 @@ export function createPendingPlanReflectionRunner(
 	// Resolved at call time: the tool-call binding is assigned by `executeTool`, which has not
 	// run yet when the runner is registered.
 	const toolCallId = () => config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
-	return (input) =>
+	return (input, options) =>
 		runPendingExitPlanReflection({
 			config,
 			rows,
 			toolUse,
 			input,
 			toolCallId: toolCallId(),
+			signal: options?.signal,
 		});
 }
 
