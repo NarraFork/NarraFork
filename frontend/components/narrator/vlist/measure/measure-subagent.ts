@@ -43,10 +43,10 @@
  * we only need to know whether the content exceeds the cap.
  *
  * P10 DEPENDENCY: pendingPermissions render a ToolCallCard each (owned by P10,
- * `measure-tool-call.ts`, which is not yet available). Each pending card uses a
- * conservative placeholder height; when the caller supplies InlinePermissionData
- * per pending permission we refine it via measureInlinePermission + a header
- * estimate. Reported back to the main agent.
+ * `measure-tool-call.ts`). Each pending card uses a conservative placeholder
+ * height only when there is no InlinePermissionData; when the caller supplies
+ * InlinePermissionData per pending permission we refine it via
+ * measureInlinePermission + a header estimate.
  *
  * Zero DOM. Follows the measure-reasoning.ts / measure-web-search.ts template.
  */
