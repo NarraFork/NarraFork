@@ -51,6 +51,7 @@ import { useOutlineHost } from "../outline-host";
 import { OutlineHrefLink } from "../outline-nav";
 import type { OutlineViewState } from "../view-state";
 import { type BlockMark, chromeText } from "./chrome";
+import { levelLoaderOf } from "./level-loader";
 import type { LiveClient, LiveTransport, Peer } from "./live-client";
 import {
 	acquireLiveSession,
@@ -229,6 +230,14 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	const callbacks = useRef(props);
 	callbacks.current = props;
 	const [refusal, setRefusal] = useState<OutlineRefusal | null>(null);
+	// Part of what is shown could not be loaded (by levels: a limit was reached).
+	const [notLoaded, setNotLoaded] = useState(false);
+	useEffect(() => {
+		const loader = levelLoaderOf(client);
+		const update = () => setNotLoaded(loader.notLoaded.size > 0);
+		update();
+		return loader.onChange(update);
+	}, [client]);
 	// Structure refused while connecting: the "connecting" badge nudges.
 	const [nudge, setNudge] = useState(0);
 
@@ -332,8 +341,12 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	useEffect(
 		() =>
 			client.on((event) => {
-				if (event !== "rejected" || client.lastReject?.code !== "too_large") return;
-				notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+				if (event !== "rejected") return;
+				const code = client.lastReject?.code;
+				if (code === "too_large")
+					notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+				else if (code === "children_changed")
+					notifications.show({ color: "yellow", message: t("editor.childrenChanged") });
 			}),
 		[client, t],
 	);
@@ -475,7 +488,13 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		if (!refusal) return;
 		notifications.show({
 			color: "yellow",
-			message: t(refusal === "too-large" ? "editor.tooLarge" : "editor.rootKept"),
+			message: t(
+				refusal === "too-large"
+					? "editor.tooLarge"
+					: refusal === "unloaded"
+						? "editor.unloaded"
+						: "editor.rootKept",
+			),
 		});
 		setRefusal(null);
 	}, [refusal, t]);
@@ -637,6 +656,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 				</Group>
 			</Group>
 			<UnsavedTextsNotice pageId={pageId} client={client} />
+			{notLoaded && (
+				<Alert color="yellow" variant="light" py={6} data-testid="outline-not-loaded">
+					<Text size="sm">{t("editor.notLoaded")}</Text>
+				</Alert>
+			)}
 			{deleted && (
 				<Alert color="yellow" variant="light" py={6} data-testid="outline-deleted-notice">
 					<Group gap="xs" wrap="wrap">

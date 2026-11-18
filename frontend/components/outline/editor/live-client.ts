@@ -505,6 +505,7 @@ export class LiveClient {
 		this.space = options.space ?? "";
 		this.watches = [...(options.watch ?? [{ s: pageId }])];
 		this.scope = scopeOf(this.watches);
+		this.watchKeys = new Set(this.watches.map(liveWatchKey));
 		this.confirmed = new Store(pageId, this.scope);
 		this.visible = new Store(pageId, this.scope);
 		this.off.push(transport.onFrame((frame) => this.receive(frame)));
@@ -1030,6 +1031,36 @@ export class LiveClient {
 	}
 
 	/**
+	 * Whether a watch is in the set (`set`), asked for and not answered yet (`asked`), or
+	 * neither (null).
+	 */
+	watching(key: string): "set" | "asked" | null {
+		if (this.watchToRemove.has(key)) return null;
+		if (this.watchKeys.has(key)) return "set";
+		return this.watchAsked.has(key) ? "asked" : null;
+	}
+
+	/**
+	 * The root's subtree is too large for one watch (`too_large`): watch its level instead, and
+	 * load what is under it as the reader opens it (`level-loader.ts`). A level does not show its
+	 * parent: the root itself comes with its own parent's level (the top level for a page; the
+	 * parent a seed or an earlier snapshot named otherwise). False when the client does not watch
+	 * its root's subtree (it already watches by levels).
+	 */
+	private watchLevelsInstead(): boolean {
+		const key = liveWatchKey({ s: this.pageId });
+		if (!this.watches.some((w) => liveWatchKey(w) === key)) return false;
+		this.watches = this.watches.filter((w) => liveWatchKey(w) !== key);
+		const parent = this.confirmed.get(this.pageId)?.parentId ?? null;
+		for (const w of [{ l: parent }, { l: this.pageId }] as LiveWatchWire[])
+			if (!this.watches.some((x) => liveWatchKey(x) === liveWatchKey(w))) this.watches.push(w);
+		this.watchRefused.set(key, "too_large");
+		this.log.push("too large to watch whole: watching its levels");
+		this.rescope();
+		return true;
+	}
+
+	/**
 	 * Change what it watches. Removals take effect at once: what no remaining watch shows goes
 	 * from this client (its structure and texts; its undo steps lose their text there). Additions
 	 * are answered by the server (`watched`): the structure and text they show join this client,
@@ -1115,7 +1146,11 @@ export class LiveClient {
 		if (remove.length > 0) this.pruneAfter = w;
 	}
 
+	/** Keys of {@link watches}, kept with the scope (`rescope`). */
+	private watchKeys = new Set<string>();
+
 	private rescope(): void {
+		this.watchKeys = new Set(this.watches.map(liveWatchKey));
 		const next = scopeOf(this.watches);
 		this.scope.roots.clear();
 		this.scope.levels.clear();
@@ -1196,6 +1231,13 @@ export class LiveClient {
 			this.scheduleWatch(delay);
 		}
 		if ((head.ok ?? []).length > 0) this.watchTooFast = 0;
+		// The page answered for these blocks' children: the scope says what is known now.
+		for (const w of [
+			...(head.ok ?? []),
+			...(head.gone ?? []),
+			...(head.refused ?? []).map(([x]) => x),
+		])
+			this.madeHere.delete("s" in w ? w.s : (w.l ?? ""));
 		const ended = [...(head.gone ?? []), ...refusedNow.map(([w]) => w)];
 		for (const [w, code] of refusedNow) {
 			this.watchRefused.set(liveWatchKey(w), code);
@@ -1208,9 +1250,11 @@ export class LiveClient {
 			const wanted = this.watchAsked.has(key);
 			this.watchAsked.delete(key);
 			this.watchRefused.delete(key);
-			if (this.watches.some((x) => liveWatchKey(x) === key)) continue;
-			if (wanted) this.watches.push(w);
-			else unwanted.push(w);
+			if (this.watchKeys.has(key)) continue;
+			if (wanted) {
+				this.watches.push(w);
+				this.watchKeys.add(key);
+			} else unwanted.push(w);
 		}
 		if (ended.length > 0) {
 			const keys = new Set(ended.map(liveWatchKey));
@@ -1431,6 +1475,7 @@ export class LiveClient {
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
 				ops.push(op);
+				if (op.t === "i") this.madeHere.add(op.id);
 				this.textCache.delete(op.id);
 			}
 			for (const b of input.bodies) {
@@ -1631,6 +1676,8 @@ export class LiveClient {
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
 				ops.push(op);
+				// Brought back by undo: only the block itself comes back, nothing under it.
+				if (op.t === "i") this.madeHere.add(op.id);
 				this.textCache.delete(op.id);
 			}
 			for (const [id, item] of step.texts) {
@@ -1662,6 +1709,36 @@ export class LiveClient {
 		};
 	}
 
+	/**
+	 * Blocks this client made (or brought back by undo) in this session that no watch has
+	 * answered for yet: nothing can be under them that this client did not see (a block made
+	 * here starts empty; one brought back comes back alone), so their children count as known
+	 * until a watch of them is answered (then the scope says).
+	 */
+	private readonly madeHere = new Set<string>();
+
+	/**
+	 * Whether every child of a block is here: inside a subtree watched whole, a watched level's
+	 * parent, or a block made here with no watch answered for it yet. Only such a block may be
+	 * deleted.
+	 */
+	childrenKnown(id: string, v: Store = this.visible): boolean {
+		return v.open(id) || this.madeHere.has(id);
+	}
+
+	/**
+	 * Blocks made here that went out of view before any watch of them was asked for (hidden in
+	 * the moment the loader waits to batch): no longer counted as known-empty (unknown, as any
+	 * block whose watch was never answered). `hidden`: whether the block is folded away now.
+	 */
+	forgetMadeHere(hidden: (id: string) => boolean): void {
+		for (const id of this.madeHere) {
+			if (!hidden(id)) continue;
+			const asked = (w: LiveWatchWire) => this.watching(liveWatchKey(w)) !== null;
+			if (!asked({ s: id }) && !asked({ l: id })) this.madeHere.delete(id);
+		}
+	}
+
 	/** Whether an operation still fits the visible structure. */
 	private validLocally(op: ClientOp | LiveOp, v: Store = this.visible): boolean {
 		switch (op.t) {
@@ -1676,7 +1753,9 @@ export class LiveClient {
 					op.id !== this.pageId
 				);
 			case "d":
-				return !!v.alive(op.id) && op.id !== this.pageId;
+				// Never a block whose children are not loaded (watched by levels): what it holds
+				// would go unseen, and undoing could not bring it back.
+				return !!v.alive(op.id) && op.id !== this.pageId && this.childrenKnown(op.id, v);
 			case "k":
 				return v.inPage(op.id);
 		}
@@ -1876,6 +1955,13 @@ export class LiveClient {
 	}
 
 	private onJoined(head: LiveJoinedHead, body: Uint8Array): void {
+		// Entries of its set the join did not take (the person's watch budget): out of the set.
+		if (head.refused && head.refused.length > 0) {
+			const keys = new Set(head.refused.map(([w]) => liveWatchKey(w)));
+			this.watches = this.watches.filter((w) => !keys.has(liveWatchKey(w)));
+			for (const [w, code] of head.refused) this.watchRefused.set(liveWatchKey(w), code);
+			this.rescope();
+		}
 		this.retries = 0;
 		this.roomAsked = false;
 		this.me = head.me;
@@ -2156,9 +2242,18 @@ export class LiveClient {
 		// sessions' grace period, `live-sessions.ts`) count as open on the server. Let them go
 		// and ask once more: a person moving on in one tab is not refused for the page they just
 		// left. Once only per refusal, so it never goes round.
-		if ((code === "user_limit" || code === "space_full") && !this.roomAsked && this.makeRoom?.()) {
+		if (
+			(code === "user_limit" || code === "space_full" || code === "watch_cap") &&
+			!this.roomAsked &&
+			this.makeRoom?.()
+		) {
 			this.roomAsked = true;
 			this.log.push(`refused (${code}): let this tab's left pages go and joined again`);
+			this.join();
+			return;
+		}
+		// The root's subtree no longer fits one watch: joined again watching it by levels.
+		if (code === "too_large" && this.watchLevelsInstead()) {
 			this.join();
 			return;
 		}

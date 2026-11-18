@@ -1,6 +1,8 @@
 /**
  * The live editor on the largest page a session takes (P0 acceptance item 7 of design §6.9):
- * 2000 blocks open, typing and splitting work, the other person sees it. Behaviour only; the
+ * 2000 blocks open, typing and splitting work, the other person sees it. And pages mostly
+ * closed (pageless L4: only expanded blocks are in the editor document): 2,000 blocks in one
+ * watch, and 5,000 blocks, loaded by levels. Behaviour only; the
  * timings are printed with `NF_OUTLINE_PERF_LOG=1` (headless Chromium, no GPU: relative
  * numbers, measured locally, never asserted in CI).
  *
@@ -123,3 +125,74 @@ test("a 2000-block page: opens, takes typing and splits, and the other person se
 	expect(errorsOf(a)).toEqual([]);
 	expect(errorsOf(b)).toEqual([]);
 }, 120_000);
+
+/**
+ * A page of finished tasks (closed by default), each with its notes: `sections` × (1 + `notes`)
+ * blocks under the page; the block typed in is the first section's title.
+ */
+async function closedPage(title: string, sections: number, notes: number) {
+	const lines: string[] = [];
+	for (let i = 0; i < sections; i++) {
+		lines.push(`[x] Section ${i} plain`);
+		for (let k = 0; k < notes; k++) lines.push(`  note ${i}.${k} with some words in it`);
+	}
+	return { ...(await seedPage(h, title, lines)), lines };
+}
+
+async function typingLatency(a: Awaited<ReturnType<typeof openEditor>>, id: string) {
+	await a.call((f, x) => {
+		f.caret(x as never);
+		const w = window as unknown as { __lat: number[] };
+		w.__lat = [];
+		f.view().pm.dom.addEventListener(
+			"keydown",
+			() => {
+				const t = performance.now();
+				requestAnimationFrame(() => w.__lat.push(performance.now() - t));
+			},
+			true,
+		);
+	}, id);
+	await a.page.keyboard.type("abcdefghijklmnopqrst", { delay: 30 });
+	await settle(a);
+	return summary(await a.page.evaluate(() => (window as unknown as { __lat: number[] }).__lat));
+}
+
+for (const size of [
+	{ label: "1,961 blocks, one watch", sections: 40, notes: 48 },
+	{ label: "5,000 blocks, by levels", sections: 50, notes: 99 },
+]) {
+	test(`a page mostly closed (${size.label}): only what is open is in the document; typing`, async () => {
+		const { pageId, ids, lines } = await closedPage(
+			`Closed ${size.sections}`,
+			size.sections,
+			size.notes,
+		);
+		const t1 = performance.now();
+		const a = await openEditor(h, h.owner, pageId);
+		const openMs = performance.now() - t1;
+		const total = lines.length + 1;
+		// Everything is loaded (each section fits a watch), only the sections are in the document.
+		await until(a, (f, n) => f.blockCount() >= (n as number), [total], 20_000);
+		expect(await a.call(() => document.querySelectorAll(".ob-block").length)).toBe(
+			size.sections + 1,
+		);
+		const loadedMs = performance.now() - t1;
+		const lat = await typingLatency(a, ids[0] as string);
+		expect(
+			serverText(pageId, ids[0] as string) ?? (await a.call((f, x) => f.text(x as never), ids[0])),
+		).toBe("Section 0 plainabcdefghijklmnopqrst");
+		if (LOG)
+			console.log(
+				JSON.stringify({
+					case: size.label,
+					openMs: Math.round(openMs),
+					allLoadedMs: Math.round(loadedMs),
+					blocksInDocument: size.sections + 1,
+					blocksLoaded: total,
+					keyToFrameMs: lat,
+				}),
+			);
+		expect(errorsOf(a)).toEqual([]);
+	}, 120_000);
+}

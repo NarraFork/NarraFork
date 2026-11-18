@@ -753,6 +753,8 @@ export class EditSurface {
 	/** The outline's cursor at the end of a block's body, without scrolling. */
 	placeCaret(id: string): void {
 		const v = this.outline;
+		// Folded away (not in the document): it comes on screen first, as a jump does.
+		v.show([id]);
 		const doc = v.pm.state.doc;
 		const pos = findBlockPos(doc, id);
 		if (pos == null) return;

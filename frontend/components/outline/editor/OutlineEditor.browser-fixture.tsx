@@ -32,6 +32,7 @@ import {
 	toggleTask,
 } from "./commands";
 import { serializePM } from "./convert";
+import { type LevelLoader, levelLoaderOf } from "./level-loader";
 import type { LiveClient, LiveTransport } from "./live-client";
 import { OutlineEditor } from "./OutlineEditor";
 import { keyBetweenLoose } from "./store";
@@ -277,6 +278,11 @@ export function client(): LiveClient {
 	return current.client;
 }
 
+/** The client's level loader (`level-loader.ts`). */
+export function loader(): LevelLoader {
+	return levelLoaderOf(client());
+}
+
 export function view(): OutlineView {
 	const v = current?.view();
 	if (!v) throw new Error("editor view not mounted");
@@ -343,7 +349,8 @@ export function unmount(): void {
 export function viewText(blockId: string): string | null {
 	const v = view();
 	const pos = findBlockPos(v.pm.state.doc, blockId);
-	if (pos == null) return null;
+	// Folded away (not in the document): the text the editor would show.
+	if (pos == null) return v.client.visible.alive(blockId) ? v.client.textOf(blockId) : null;
 	const node = v.pm.state.doc.nodeAt(pos);
 	return node ? serializePM(node.child(0)) : null;
 }
@@ -351,6 +358,8 @@ export function viewText(blockId: string): string | null {
 /** Insert text at an offset of a block through the editor (another person typing elsewhere). */
 export function insertAt(blockId: string, offset: number, text: string): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	v.pm.dispatch(v.pm.state.tr.insertText(text, pos));
@@ -371,6 +380,8 @@ const COMMANDS = {
 /** Run an outline command with the cursor at a block offset (another person's keystroke). */
 export function cmd(name: keyof typeof COMMANDS, blockId: string, offset = 0): boolean {
 	const v = view();
+	// (That person has the block on screen: what folds it away opens for them.)
+	v.show([blockId]);
 	const pos = v.pointToPos(v.pm.state.doc, { blockId, offset });
 	if (pos == null) return false;
 	const state = v.pm.state.apply(
@@ -391,11 +402,39 @@ export function viewOutline(): string {
 				.split("\n")
 				.join(`\n${"  ".repeat(depth + 1)}`);
 			lines.push(`${"  ".repeat(depth)}- ${task}${body}`);
-			if (child.childCount > 1) walk(child.child(1), depth + 1);
+			if (child.childCount > 1) {
+				// A closed block never has children in the document.
+				if (child.attrs.collapsed) lines.push("!! a closed block with children in the document");
+				walk(child.child(1), depth + 1);
+			} else if (child.attrs.collapsed) hidden(child.attrs.id, depth + 1);
 		});
 	};
-	const root = view().pm.state.doc.child(0);
-	if (root.childCount > 1) walk(root.child(1), 0);
+	// What a closed block hides is not in the document: read from the client's block model
+	// here (not through the editor's own code), so the two are compared, not one with itself.
+	const c = view().client;
+	// The facts view leaves tasks and questions out (as the document does for open rows),
+	// unless the root is inside a task.
+	let facts = view().lens === "facts";
+	for (
+		let cur: string | null = view().rootId;
+		facts && cur;
+		cur = c.visible.get(cur)?.parentId ?? null
+	)
+		if (c.visible.get(cur)?.task || c.visible.get(cur)?.question) facts = false;
+	const hidden = (id: string, depth: number) => {
+		for (const k of c.visible.children(id)) {
+			if (facts && (c.visible.get(k)?.task || c.visible.get(k)?.question)) continue;
+			const t = c.visible.get(k)?.task;
+			const body = c
+				.textOf(k)
+				.split("\n")
+				.join(`\n${"  ".repeat(depth + 1)}`);
+			lines.push(`${"  ".repeat(depth)}- ${t ? `[${t}] ` : ""}${body}`);
+			hidden(k, depth + 1);
+		}
+	};
+	const r = view().pm.state.doc.child(0);
+	if (r.childCount > 1) walk(r.child(1), 0);
 	return lines.join("\n");
 }
 

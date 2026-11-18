@@ -160,8 +160,14 @@ export const OUTLINE_LIVE_LIMITS = {
 	maxWatchBlocks: 2000,
 	/** UTF-8 bytes of all block content one watch takes at most. */
 	maxWatchBytes: 4 * 1024 * 1024,
-	/** Entries of one participant's watch set. */
+	/** Entries of one join's watch set, or of one `watch` frame's lists (the wire's bound). */
 	maxWatch: 1024,
+	/**
+	 * Watches one participant holds at most (pageless L4). A `watch` frame is taken up to it;
+	 * additions past it are refused `watch_cap` (the rest of the frame stands). Two wide views
+	 * of one person (2 × 512) cannot take the process's {@link liveWatches} from other spaces.
+	 */
+	watchBudget: 512,
 	/** Bytes of one client frame. */
 	maxClientFrameBytes: 256 * 1024,
 	/** Operations of one structural transaction (the write path's limit). */
@@ -392,6 +398,12 @@ export interface LiveJoinedHead {
 	 * them, unsent and not replayed, until a batch acknowledges them.
 	 */
 	dur?: number;
+	/**
+	 * Entries of the join's watch set not taken (pageless L4): past the person's watch budget
+	 * ({@link OUTLINE_LIVE_LIMITS.watchBudget}), `watch_cap`. The rest of the set is joined; the
+	 * client drops these from its set (asked again once there is room).
+	 */
+	refused?: Array<[LiveWatchWire, LiveCloseCode]>;
 }
 
 export interface LiveTxHead {
@@ -507,7 +519,13 @@ export type LiveCloseCode =
 	 * server takes them (`OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst` / `watchesPerSecond`). Nothing
 	 * was read; the client asks again after a while by itself.
 	 */
-	| "too_fast";
+	| "too_fast"
+	/**
+	 * Only in `watched.refused`: the participant's watch set is full
+	 * ({@link OUTLINE_LIVE_LIMITS.watchBudget}); nothing was read. The client asks again once its
+	 * set has room (it let other watches go).
+	 */
+	| "watch_cap";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
@@ -529,7 +547,13 @@ export type LiveRejectCode =
 	 * moved into a watched subtree: one watch's bound, the space's, the process's, or the
 	 * person's share). Nothing was written; the editor says why.
 	 */
-	| "too_large";
+	| "too_large"
+	/**
+	 * It deletes a block under which there is a live block it does not delete too (someone
+	 * added under it meanwhile, or the client did not have all of it: pageless L4). Nothing was
+	 * deleted; the editor says so.
+	 */
+	| "children_changed";
 
 /**
  * Why a change to a task was refused: someone else is doing it (setting it in progress claims

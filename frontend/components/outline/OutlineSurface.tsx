@@ -707,7 +707,7 @@ function SurfaceBody({
 								>
 									<Group gap="xs" wrap="wrap">
 										<Text size="sm">
-											{fallback === "user_limit"
+											{fallback === "user_limit" || fallback === "watch_cap"
 												? t("editor.userLimit")
 												: fallback === "space_full"
 													? t("editor.spaceFull")

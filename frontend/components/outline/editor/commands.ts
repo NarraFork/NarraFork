@@ -19,6 +19,20 @@ import { schema } from "./schema";
 
 const N = schema.nodes;
 
+/**
+ * Transaction meta: whole blocks are deleted as blocks (a block selection, the map's delete), and
+ * take what they hold, also what a closed block hides (`view.ts`).
+ */
+export const WHOLE_BLOCKS = "outlineWholeBlocks";
+
+/**
+ * Whether a block has children, in the document or not: a closed block's children are left out
+ * of the document (`collapsed`), and it is never treated as a leaf.
+ */
+export function hasChildren(node: PMNode): boolean {
+	return node.childCount > 1 || !!node.attrs.collapsed;
+}
+
 export interface CmdHost {
 	/** `focus`: a focused block and its subtree (the root is depth 1). `node`: one body only. */
 	surfaceKind: "focus" | "node";
@@ -191,7 +205,7 @@ export function joinBackward(_host: CmdHost): Command {
 			!targetIsParent &&
 			tBody.type === N.paragraph &&
 			tBody.content.size === 0 &&
-			tNode.childCount === 1
+			!hasChildren(tNode)
 		) {
 			const $t = state.doc.resolve(tPos);
 			if ($t.parent.type === N.children && $t.parent.childCount === 1)
@@ -202,7 +216,7 @@ export function joinBackward(_host: CmdHost): Command {
 			return true;
 		}
 		if (tBody.type === N.embed || tBody.type === N.table) {
-			if (body.content.size === 0 && kids.size === 0) {
+			if (body.content.size === 0 && !hasChildren(blockNode)) {
 				if (parent.childCount === 1 && d > 1) tr.delete($from.before(d - 1), $from.after(d - 1));
 				else tr.delete(blockPos, blockPos + blockNode.nodeSize);
 				tr.setSelection(NodeSelection.create(tr.doc, tr.mapping.map(tPos + 1)));
@@ -248,7 +262,7 @@ export function joinForward(host: CmdHost): Command {
 		if ($from.parent !== body || $from.parentOffset !== body.content.size) return false;
 		if (body.type === N.code_block) return false;
 		// An empty block without children goes; the cursor moves to the next (which keeps its id).
-		if (body.type === N.paragraph && body.content.size === 0 && $from.node(d).childCount === 1) {
+		if (body.type === N.paragraph && body.content.size === 0 && !hasChildren($from.node(d))) {
 			const bp = $from.before(d);
 			const parent = $from.node(d - 1);
 			if (bp + $from.node(d).nodeSize >= state.doc.content.size && d === 1) return true;
@@ -546,7 +560,7 @@ export function deleteBlock(): Command {
 		else tr.delete(pos, pos + node.nodeSize);
 		const near = Math.max(0, Math.min(tr.mapping.map(pos) - 1, tr.doc.content.size));
 		tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
-		dispatch?.(tr.scrollIntoView());
+		dispatch?.(tr.setMeta(WHOLE_BLOCKS, true).scrollIntoView());
 		return true;
 	};
 }

@@ -57,6 +57,7 @@ import {
 	splitBlock,
 	toggleTask,
 } from "../editor/commands";
+import { levelLoaderOf } from "../editor/level-loader";
 import type { LiveClient, SelInfo } from "../editor/live-client";
 import { liveFoldSource, liveUnderTask } from "../editor/live-fold";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
@@ -252,6 +253,10 @@ export class MindMapView {
 		readonly host: MapHost,
 		frame: HTMLElement,
 	) {
+		// What the map shows open is loaded (by levels where a subtree is too large to watch whole).
+		this.offLoader = levelLoaderOf(host.client).add({
+			foldTrees: () => (this.active && !this.destroyed ? [this.foldTree] : []),
+		});
 		this.stage = document.createElement("div");
 		this.stage.className = "mm-stage";
 		this.stage.tabIndex = 0;
@@ -313,8 +318,11 @@ export class MindMapView {
 		return this.host.state.layout;
 	}
 
+	private readonly offLoader: () => void;
+
 	destroy(): void {
 		this.destroyed = true;
+		this.offLoader();
 		this.exitEdit(false);
 		// A long press under way would fire on a destroyed map.
 		const g = this.gesture;
@@ -568,6 +576,7 @@ export class MindMapView {
 		this.order = order;
 		this.layoutDir = this.dir;
 		this.layoutSeq++;
+		levelLoaderOf(this.client).schedule();
 		this.dirtyLayout = false;
 		this.dirtyRender = true;
 		if (fresh && info.size > 1) {
