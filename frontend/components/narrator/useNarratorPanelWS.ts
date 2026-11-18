@@ -866,6 +866,29 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t],
 	);
 
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval.
+	 *
+	 * Nothing is removed optimistically: the review's own frames take the card over while it
+	 * runs, and the request is only settled once it decides — a review that cannot decide
+	 * leaves the card (and this permission) exactly where it was.
+	 */
+	const handlePlanReflect = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			try {
+				await api.reflectPlan(requestId);
+			} catch {
+				notifications.show({
+					message: t("planReflectFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+			}
+		},
+		[permissionDecisionsSupported, t],
+	);
+
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -876,6 +899,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onQuestionReflect: handleQuestionReflect,
 		onQuestionDeny: handleQuestionDeny,
 		onQuestionDefer: handleQuestionDefer,
+		onPlanReflect: handlePlanReflect,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -886,6 +910,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
+			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect?.(...args),
 		}),
 		[],
 	);

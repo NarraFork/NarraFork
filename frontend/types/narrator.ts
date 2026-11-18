@@ -38,6 +38,11 @@ export interface PendingPermission {
 	 * render a live countdown. Cleared once the timer is disarmed or fires.
 	 */
 	reflectionDeadline?: number;
+	/**
+	 * ExitPlanMode only: whether this waiting plan can still be reflected on (the loop that
+	 * raised it published a runner for the length of the wait). Absent → no 计划反思 entry.
+	 */
+	planReflectionAvailable?: boolean;
 }
 
 /** One question definition inside an async question record. */

@@ -99,6 +99,8 @@ export interface PermissionCallbacks {
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
+	/** Run one plan reflection for a plan that is already waiting for approval. */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
 	/**
