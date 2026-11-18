@@ -65,7 +65,8 @@ afterAll(() => {
 
 async function git(args: string[], cwd = source) {
 	const result = await safeSpawn({
-		cmd: ["git", "-C", cwd, ...args],
+		// CI runners have no git identity: every commit and merge in these fixtures needs one.
+		cmd: ["git", "-C", cwd, "-c", "user.name=T", "-c", "user.email=t@e.test", ...args],
 		timeout: 20_000,
 		maxOutputBytes: 1024 * 1024,
 	});
