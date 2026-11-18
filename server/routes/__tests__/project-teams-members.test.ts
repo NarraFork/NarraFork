@@ -105,7 +105,10 @@ async function call(
 const teamPath = (suffix: string) => `/projects/${projectId}/teams/${teamId}/${suffix}`;
 
 let clock = Date.now() + 60_000;
-const tick = () => new Date((clock += 1000)).toISOString();
+function tick() {
+	clock += 1000;
+	return new Date(clock).toISOString();
+}
 
 /** A pending call of `narratorId`, live in the permission registry; returns its decisions. */
 async function pendingCall(
