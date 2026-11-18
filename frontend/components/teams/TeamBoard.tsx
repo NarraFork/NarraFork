@@ -4,7 +4,10 @@
  * page's right pane and a 360 px phone; finished columns start folded.
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
-import { OutlineStatusIcon } from "@frontend/components/outline/OutlineStatusIcon";
+import {
+	OutlineStatusChip,
+	OutlineStatusIcon,
+} from "@frontend/components/outline/OutlineStatusIcon";
 import { useTeamBoardColumn } from "@frontend/hooks/useTeams";
 import {
 	Alert,
@@ -34,8 +37,10 @@ import {
 	BOARD_COLUMN_STATUS_ICON,
 	type CardMark,
 	cardMarks,
+	cardNeedsStateChip,
 	columnStartsFolded,
 	columnTotal,
+	liveWorkerStatus,
 	TEAM_BOARD_COLUMNS,
 	WORK_ITEM_STATUS_ICON,
 } from "./team-page-model";
@@ -52,12 +57,16 @@ const MARK_COLOR: Record<CardMark, string> = {
 export function TeamBoardCard({
 	item,
 	onOpenSession,
+	summary,
 }: {
 	item: TeamBoardItem;
 	onOpenSession?: (narratorId: string) => void;
+	/** Keeps the worker's status current without refetching the board. */
+	summary?: TeamPageSummary;
 }) {
 	const { t } = useTranslation("projects");
 	const marks = cardMarks(item);
+	const workerStatus = item.worker ? liveWorkerStatus(item.worker, summary) : null;
 	return (
 		<Card
 			withBorder
@@ -78,6 +87,15 @@ export function TeamBoardCard({
 						{item.title}
 					</Text>
 				</Group>
+				{cardNeedsStateChip(item) && (
+					<OutlineStatusChip
+						status={WORK_ITEM_STATUS_ICON[item.state]}
+						style={{ alignSelf: "flex-start" }}
+						data-testid="team-card-state"
+					>
+						{t(`teams.states.${item.state}`)}
+					</OutlineStatusChip>
+				)}
 				<Group gap={4} wrap="nowrap" c="dimmed" style={{ minWidth: 0 }}>
 					<IconGitBranch size={14} aria-hidden style={{ flexShrink: 0 }} />
 					<Text
@@ -96,10 +114,10 @@ export function TeamBoardCard({
 							onClick={() => item.worker && onOpenSession?.(item.worker.id)}
 							disabled={!onOpenSession}
 							data-testid="team-card-worker"
-							data-status={item.worker.status}
+							data-status={workerStatus ?? undefined}
 							style={{ display: "inline-flex", alignItems: "center", gap: 4, minWidth: 0 }}
 						>
-							<NarratorStatusIcon size={14} status={item.worker.status} />
+							<NarratorStatusIcon size={14} status={workerStatus} />
 							<Text size="xs" truncate maw={160}>
 								{item.worker.title || item.worker.id}
 							</Text>
@@ -174,7 +192,7 @@ function BoardColumn({
 }) {
 	const { t } = useTranslation("projects");
 	const [open, setOpen] = useState(!columnStartsFolded(column));
-	const pages = useTeamBoardColumn(projectId, teamId, column);
+	const pages = useTeamBoardColumn(projectId, teamId, column, open);
 	const items = pages.data?.pages.flatMap((page) => page.items) ?? [];
 	const total = columnTotal(column, summary, items.length);
 	const name = t(`teams.columns.${column}`);
@@ -214,7 +232,12 @@ function BoardColumn({
 						</Text>
 					)}
 					{items.map((item) => (
-						<TeamBoardCard key={item.id} item={item} onOpenSession={onOpenSession} />
+						<TeamBoardCard
+							key={item.id}
+							item={item}
+							onOpenSession={onOpenSession}
+							summary={summary}
+						/>
 					))}
 					{pages.hasNextPage && (
 						<Button

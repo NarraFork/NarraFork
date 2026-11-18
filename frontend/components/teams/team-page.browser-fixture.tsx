@@ -5,7 +5,9 @@
  * panel has its own browser suites. Live refresh rides the app's own narrator socket.
  */
 import "@mantine/core/styles.css";
-import { MantineProvider } from "@mantine/core";
+import "@mantine/notifications/styles.css";
+import { AppShell, MantineProvider } from "@mantine/core";
+import { Notifications } from "@mantine/notifications";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { createRoot, type Root } from "react-dom/client";
@@ -28,6 +30,8 @@ let root: Root | null = null;
 let queryClient: QueryClient | null = null;
 let mounted: React.ReactNode = null;
 let scheme: "light" | "dark" = "light";
+/** The app sidebar's width (the real shell's navbar: 250–480 px, hidden on phones). */
+let navWidth = 250;
 const opened: string[] = [];
 
 function render(): void {
@@ -36,11 +40,21 @@ function render(): void {
 		<I18nextProvider i18n={instance}>
 			<QueryClientProvider client={queryClient}>
 				<MantineProvider forceColorScheme={scheme}>
-					<div data-testid="page-frame" style={{ height: "100vh", display: "flex" }}>
-						<div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+					<Notifications />
+					{/* The app's shell: alt layout, a sidebar from the small breakpoint up, md padding. */}
+					<AppShell
+						layout="alt"
+						header={{ height: 0 }}
+						navbar={{ width: navWidth, breakpoint: "sm", collapsed: { mobile: true } }}
+						padding="md"
+					>
+						<AppShell.Navbar data-testid="app-sidebar">
+							<div style={{ padding: 12 }}>Sidebar</div>
+						</AppShell.Navbar>
+						<AppShell.Main data-testid="page-frame" style={{ height: "100dvh" }}>
 							{mounted}
-						</div>
-					</div>
+						</AppShell.Main>
+					</AppShell>
 				</MantineProvider>
 			</QueryClientProvider>
 		</I18nextProvider>,
@@ -59,9 +73,24 @@ export function ready(): boolean {
 	return true;
 }
 
+/** Whether the page's queries have all been asked and none is fetching. */
+export function idle(): boolean {
+	return (
+		!!queryClient &&
+		queryClient.isFetching() === 0 &&
+		queryClient.getQueryCache().getAll().length > 0
+	);
+}
+
 /** Mount the team page as a member or onlooker sees it (the token says who). */
-export function openTeam(projectId: string, teamId: string, canCreateTeam: boolean): void {
+export function openTeam(
+	projectId: string,
+	teamId: string,
+	canCreateTeam: boolean,
+	sidebarWidth = 250,
+): void {
 	narratorWSManager.connect();
+	navWidth = sidebarWidth;
 	mount(
 		<TeamPageView
 			projectId={projectId}
@@ -162,6 +191,14 @@ export function type(selector: string, value: string): void {
 	const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
 	setter?.call(input, value);
 	input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/** The width (px) of the element a selector names (the first visible), or 0. */
+export function widthOf(selector: string): number {
+	const element = [...document.querySelectorAll<HTMLElement>(selector)].find(
+		(candidate) => candidate.getBoundingClientRect().width > 0,
+	);
+	return element ? element.getBoundingClientRect().width : 0;
 }
 
 /** Whether the element a selector names is absent, hidden, or slid out of the viewport. */

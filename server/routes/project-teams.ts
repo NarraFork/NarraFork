@@ -4,7 +4,8 @@
  * Access: listing and creating need the project (read / write); everything about one team
  * follows its coordinator narrator's ACL — readers see it, writers (members) change it, others
  * get 404. The team page's reads (P4: summary, board, activity) follow the same ACL; pending
- * approvals are for members only (403 for an onlooker). The whole surface is refused on PostgreSQL with 503 before any access check, like the
+ * approvals and the running list for "pause all" are for members only (403 for an onlooker).
+ * The whole surface is refused on PostgreSQL with 503 before any access check, like the
  * narrator surface the team rides on and the project mutations.
  */
 
@@ -25,6 +26,7 @@ import {
 	readTeamApprovals,
 	readTeamBoardColumn,
 	readTeamPageSummary,
+	readTeamRunning,
 } from "../services/teams/team-board";
 import {
 	archiveTeam,
@@ -176,5 +178,13 @@ projectTeamRoutes.get("/:projectId/teams/:teamId/approvals", async (c) => {
 			narratorPrincipalOf(c),
 			c.req.param("projectId"),
 		),
+	);
+});
+
+/** The tree's running sessions for "pause all" (members only; at most 500, with `more`). */
+projectTeamRoutes.get("/:projectId/teams/:teamId/running", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamRunning(c.req.param("teamId"), narratorPrincipalOf(c), c.req.param("projectId")),
 	);
 });

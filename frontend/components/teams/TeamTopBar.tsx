@@ -30,7 +30,7 @@ import {
 import { IconPlayerPause, IconShieldQuestion } from "@tabler/icons-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { cappedCount } from "./team-page-model";
+import { cappedCount, pauseNotice } from "./team-page-model";
 
 const DEPTH_ROLE = ["coordinator", "worker", "helper"] as const;
 
@@ -87,7 +87,9 @@ function ApprovalRow({
 			</Group>
 			<Group gap={6} wrap="nowrap" justify="space-between">
 				<Text size="xs" fw={600}>
-					{approval.toolName}
+					{approval.kind === "tool"
+						? approval.toolName
+						: t(`teams.approvals.kinds.${approval.kind}`)}
 				</Text>
 				<Text size="xs" c="dimmed" title={approval.createdAt}>
 					{formatSmartTime(approval.createdAt)}
@@ -102,32 +104,66 @@ function ApprovalRow({
 					{approval.preview}
 				</Code>
 			)}
-			{approval.decisionReason && (
+			{approval.questions.length > 0 && (
+				<Stack gap={2} data-testid="team-approval-questions">
+					{approval.questions.map((question, index) => (
+						<Text
+							// biome-ignore lint/suspicious/noArrayIndexKey: the questions of one call, in order
+							key={index}
+							size="sm"
+							style={{ overflowWrap: "anywhere" }}
+						>
+							{question}
+						</Text>
+					))}
+				</Stack>
+			)}
+			{approval.decisionReason && approval.kind === "tool" && (
 				<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
 					{approval.decisionReason}
 				</Text>
 			)}
-			<Group gap="xs" justify="flex-end">
-				<Button
-					size="xs"
-					variant="default"
-					disabled={sent !== null}
-					loading={decide.isPending && decide.variables?.decision === "deny"}
-					onClick={() => send("deny")}
-					data-testid="team-approval-deny"
-				>
-					{t("teams.approvals.deny")}
-				</Button>
-				<Button
-					size="xs"
-					disabled={sent !== null}
-					loading={decide.isPending && decide.variables?.decision === "allow"}
-					onClick={() => send("allow")}
-					data-testid="team-approval-approve"
-				>
-					{t("teams.approvals.approve")}
-				</Button>
-			</Group>
+			{approval.kind === "tool" ? (
+				<Group gap="xs" justify="flex-end">
+					<Button
+						size="xs"
+						variant="default"
+						disabled={sent !== null}
+						loading={decide.isPending && decide.variables?.decision === "deny"}
+						onClick={() => send("deny")}
+						data-testid="team-approval-deny"
+					>
+						{t("teams.approvals.deny")}
+					</Button>
+					<Button
+						size="xs"
+						disabled={sent !== null}
+						loading={decide.isPending && decide.variables?.decision === "allow"}
+						onClick={() => send("allow")}
+						data-testid="team-approval-approve"
+					>
+						{t("teams.approvals.approve")}
+					</Button>
+				</Group>
+			) : (
+				// A question needs its answers, a plan or rule request its own choices: answered
+				// in the session, never with a bare approve here.
+				<Group gap="xs" justify="space-between" wrap="nowrap">
+					<Text size="xs" c="dimmed">
+						{t("teams.approvals.answerInSession")}
+					</Text>
+					<Button
+						size="xs"
+						variant="light"
+						disabled={!onOpenSession}
+						onClick={() => onOpenSession?.(approval.agent.id)}
+						data-testid="team-approval-open"
+						style={{ flexShrink: 0 }}
+					>
+						{t("teams.approvals.openSession")}
+					</Button>
+				</Group>
+			)}
 		</Stack>
 	);
 }
@@ -188,21 +224,25 @@ export function TeamTopBar({
 	const { t } = useTranslation("projects");
 	const [approvalsOpen, setApprovalsOpen] = useState(false);
 	const [confirmPause, setConfirmPause] = useState(false);
-	const pause = usePauseTeam(teamId);
+	const pause = usePauseTeam(projectId, teamId);
 	const member = summary?.access === "write";
 	const pending = summary?.pendingApprovalCount ?? 0;
 	const running = summary?.runningCount ?? 0;
 	const pauseAll = () => {
-		if (!summary) return;
-		pause.mutate(summary, {
-			onSuccess: ({ failed }) => {
+		pause.mutate(undefined, {
+			onSuccess: (outcome) => {
 				setConfirmPause(false);
-				notifications.show(
-					failed > 0
-						? { color: "red", message: t("teams.top.pauseFailed", { count: failed }) }
-						: { color: "green", message: t("teams.top.paused") },
-				);
+				const notice = pauseNotice(outcome);
+				notifications.show({
+					color: notice.color,
+					message: t(`teams.top.${notice.key}`, {
+						count: outcome.stopped,
+						stopped: outcome.stopped,
+						failed: outcome.failed,
+					}),
+				});
 			},
+			onError: () => notifications.show({ color: "red", message: t("teams.top.pauseError") }),
 		});
 	};
 	return (
@@ -288,7 +328,6 @@ export function TeamTopBar({
 						variant="light"
 						color="red"
 						leftSection={<IconPlayerPause size={14} aria-hidden />}
-						disabled={running === 0}
 						onClick={() => setConfirmPause(true)}
 						data-testid="team-pause-all"
 					>

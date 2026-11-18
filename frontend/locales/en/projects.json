@@ -254,10 +254,13 @@
 			"pauseConfirmTitle": "Pause the whole team?",
 			"pauseConfirm": "This stops the current turn of every running session in this team: the coordinator and its agents. They keep their history and can be resumed by sending a message.",
 			"pauseConfirmButton": "Pause all",
-			"paused": "Team paused",
-			"pauseFailed_one": "{{count}} session could not be stopped",
-			"pauseFailed_other": "{{count}} sessions could not be stopped",
-			"membersOnly": "Only team members can approve"
+			"membersOnly": "Only team members can approve",
+			"paused_one": "Stopped {{count}} session",
+			"paused_other": "Stopped {{count}} sessions",
+			"pausePartial": "Stopped {{stopped}}; {{failed}} could not be stopped",
+			"pauseNothing": "Nothing was running",
+			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
+			"pauseError": "Could not read the running sessions; nothing was stopped"
 		},
 		"approvals": {
 			"title": "Pending approvals",
@@ -271,11 +274,18 @@
 			"helper": "Helper",
 			"decided": "Decision sent",
 			"failed": "Could not send the decision",
-			"openSession": "Open session"
+			"openSession": "Open session",
+			"answerInSession": "Answered in the session",
+			"kinds": {
+				"question": "Question",
+				"plan": "Plan to approve",
+				"rule": "Permission rule request"
+			}
 		},
 		"agents": {
 			"title": "Running sessions"
 		},
-		"back": "Back to project"
+		"back": "Back to project",
+		"unavailable": "Teams are not available on this deployment."
 	}
 }

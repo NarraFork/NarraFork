@@ -269,7 +269,11 @@ async function seedItem(title: string, state: string, extra: Record<string, unkn
 	return id;
 }
 
-async function seedApproval(command: string) {
+async function seedApproval(
+	command: string,
+	toolName = "Bash",
+	input: Record<string, unknown> = { command },
+) {
 	const requestId = generateId();
 	const messageId = generateId();
 	const at = tick();
@@ -280,13 +284,12 @@ async function seedApproval(command: string) {
 		contentJson: [],
 		createdAt: at,
 	});
-	const input = { command };
 	await db.insert(narratorToolCalls).values({
 		id: requestId,
 		narratorId: workerId,
 		messageId,
 		toolUseId: `use-${requestId}`,
-		toolName: "Bash",
+		toolName,
 		status: "pending",
 		inputJson: input,
 		permissionStartedAt: at,
@@ -295,7 +298,7 @@ async function seedApproval(command: string) {
 	pendingPermissions.set(requestId, {
 		narratorId: workerId,
 		broadcastTargetId: teamId,
-		toolName: "Bash",
+		toolName,
 		toolUseId: `use-${requestId}`,
 		input,
 		cwd: "/work",
@@ -320,13 +323,22 @@ test("the board reflects work item state changes", async () => {
 		lastReview: "clear",
 		exclusiveKey: "docs",
 	});
-	const { page, errors } = await openPage(alice, { width: 1280, height: 860 });
+	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
+	const boardReads: string[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname.endsWith("/board")) boardReads.push(url.searchParams.get("column") ?? "");
+	});
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
 		await until(page, "the board", (f) => f.count("[data-testid=team-card]") === 2);
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
 			"columns",
 		);
+		// Folded columns (done, cancelled) read nothing.
+		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
+		// A ready item says so in words inside "In review".
+		expect(await call(page, (f) => f.text("[data-testid=team-card-state]"))).toBe("Ready to merge");
 		expect(await call(page, (f, id: string) => f.columnOf(id), movingId)).toBe("queued");
 		expect(await call(page, (f, id: string) => f.columnOf(id), readyId)).toBe("review");
 		expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Release crew");
@@ -374,6 +386,18 @@ test("the board reflects work item state changes", async () => {
 		);
 		await shot(page, "desktop-light-board");
 
+		// The worker starts waiting: the card follows from the summary, the board is not re-read.
+		const readsBefore = boardReads.length;
+		await db.update(narrators).set({ status: "waiting" }).where(eq(narrators.id, workerId));
+		nudge();
+		await until(
+			page,
+			"the worker waits",
+			(f) => f.attr("[data-testid=team-card-worker]", "data-status") === "waiting",
+		);
+		expect(boardReads.length).toBe(readsBefore);
+		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, workerId));
+
 		// The activity tab lists the change.
 		expect(
 			await call(page, (f) => f.click("[data-testid=team-side-switch] input[value=activity]")),
@@ -395,18 +419,39 @@ test("the board reflects work item state changes", async () => {
 	}
 }, 60_000);
 
-test("a member approves a pending tool call; an onlooker sees no approvals", async () => {
+test("a member approves a pending tool call; questions open their session; onlookers see none", async () => {
 	const requestId = await seedApproval("bun test --isolate server/routes");
-	const { page, errors } = await openPage(alice, { width: 1280, height: 860 });
+	const questionId = await seedApproval("", "AskUserQuestion", {
+		questions: [{ question: "Which branch first?", header: "Order", options: [{ label: "A" }] }],
+	});
+	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
 		await until(
 			page,
 			"approvals count",
-			(f) => f.attr("[data-testid=team-approvals-button]", "data-count") === "1",
+			(f) => f.attr("[data-testid=team-approvals-button]", "data-count") === "2",
 		);
 		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
-		await until(page, "approval row", (f) => f.count("[data-testid=team-approval]") === 1);
+		await until(page, "approval rows", (f) => f.count("[data-testid=team-approval]") === 2);
+		// The question: its text, no Approve / Deny, and a way to answer it in its session.
+		const question = `[data-testid=team-approval][data-request-id="${questionId}"]`;
+		expect(
+			await call(
+				page,
+				(f, q: string) => f.text(`${q} [data-testid=team-approval-questions]`),
+				question,
+			),
+		).toBe("Which branch first?");
+		expect(
+			await call(
+				page,
+				(f, q: string) => f.count(`${q} [data-testid=team-approval-approve]`),
+				question,
+			),
+		).toBe(0);
+		await call(page, (f, q: string) => f.click(`${q} [data-testid=team-approval-open]`), question);
+		expect(await call(page, (f) => f.openedTargets())).toContain(`session:${workerId}`);
 		expect(await call(page, (f) => f.text("[data-testid=team-approval-preview]"))).toBe(
 			"bun test --isolate server/routes",
 		);
@@ -416,8 +461,13 @@ test("a member approves a pending tool call; an onlooker sees no approvals", asy
 		});
 		await shot(page, "desktop-light-approvals");
 		await call(page, (f) => f.click("[data-testid=team-approval-approve]"));
-		await until(page, "approved", (f) => f.count("[data-testid=team-approvals-empty]") === 1);
+		await until(page, "approved", (f) => f.count("[data-testid=team-approval]") === 1);
 		expect(decisions).toEqual([`${requestId}:allow`]);
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "fail" })
+			.where(eq(narratorToolCalls.id, questionId));
+		pendingPermissions.delete(questionId);
 		expect(pendingPermissions.has(requestId)).toBe(false);
 		expect(errors).toEqual([]);
 	} finally {
@@ -426,7 +476,7 @@ test("a member approves a pending tool call; an onlooker sees no approvals", asy
 
 	// An onlooker: the board, but no approvals and no pause.
 	await seedApproval("echo hidden");
-	const reader = await openPage(bob, { width: 1280, height: 860 });
+	const reader = await openPage(bob, { width: 1600, height: 900 });
 	try {
 		await call(
 			reader.page,
@@ -445,9 +495,9 @@ test("a member approves a pending tool call; an onlooker sees no approvals", asy
 	}
 }, 60_000);
 
-test("pause all stops the running sessions of the tree", async () => {
+test("pause all reads the running sessions now and stops every one", async () => {
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, workerId));
-	const { page, errors } = await openPage(alice, { width: 1280, height: 860 });
+	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
 		await until(
@@ -455,6 +505,8 @@ test("pause all stops the running sessions of the tree", async () => {
 			"running",
 			(f) => f.attr("[data-testid=team-running-button]", "data-count") === "1",
 		);
+		// The coordinator starts working after the summary was read: pause still stops it.
+		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, teamId));
 		await call(page, (f) => f.click("[data-testid=team-pause-all]"));
 		await until(page, "confirm", (f) => f.count("[data-testid=team-pause-confirm]") === 1);
 		await call(page, (f) => f.click("[data-testid=team-pause-confirm]"));
@@ -463,16 +515,70 @@ test("pause all stops the running sessions of the tree", async () => {
 			"nothing running",
 			(f) => f.attr("[data-testid=team-running-button]", "data-count") === "0",
 		);
-		const worker = await db.query.narrators.findFirst({
-			where: eq(narrators.id, workerId),
-			columns: { status: true },
-		});
-		expect(worker?.status).toBe("idle");
+		await until(page, "notice", (f) => (f.text(".mantine-Notification-description") ?? "") !== "");
+		expect(await call(page, (f) => f.text(".mantine-Notification-description"))).toBe(
+			"Stopped 2 sessions",
+		);
+		for (const id of [teamId, workerId]) {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { status: true },
+			});
+			expect(row?.status).toBe("idle");
+		}
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
 	}
 }, 60_000);
+
+test("the layout follows the room beside the app sidebar; the conversation keeps 480 px", async () => {
+	const cases = [
+		{ viewport: 992, sidebar: 250, layout: "tabs" },
+		{ viewport: 1280, sidebar: 250, layout: "split" },
+		{ viewport: 1280, sidebar: 480, layout: "tabs" },
+		{ viewport: 1600, sidebar: 250, layout: "columns" },
+		{ viewport: 1400, sidebar: 480, layout: "split" },
+		{ viewport: 1600, sidebar: 480, layout: "columns" },
+	];
+	for (const { viewport, sidebar, layout } of cases) {
+		const { page, errors } = await openPage(alice, { width: viewport, height: 800 });
+		try {
+			await call(
+				page,
+				(f, p: string, t: string, w: number) => f.openTeam(p, t, true, w),
+				projectId,
+				teamId,
+				sidebar,
+			);
+			await until(
+				page,
+				`layout at ${viewport}/${sidebar}`,
+				(f) => f.attr("[data-testid=team-workspace]", "data-layout") !== "measuring",
+			);
+			const seen = {
+				viewport,
+				sidebar,
+				layout: await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout")),
+				sidebarShown: await call(page, (f) => f.widthOf("[data-testid=app-sidebar]")),
+			};
+			expect(seen).toEqual({ viewport, sidebar, layout, sidebarShown: sidebar });
+			if (layout !== "tabs") {
+				const conversation = await call(page, (f) => f.widthOf("[data-testid=team-conversation]"));
+				expect(conversation).toBeGreaterThanOrEqual(480);
+				expect(await call(page, (f) => f.count("[data-testid=project-teams]"))).toBe(
+					layout === "columns" ? 1 : 0,
+				);
+			}
+			const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-top-bar]"));
+			expect(fit).toEqual({ found: true, inside: true, scrolls: false });
+			if (viewport === 1280 && sidebar === 250) await shot(page, "laptop-sidebar-split");
+			expect(errors).toEqual([]);
+		} finally {
+			await page.close();
+		}
+	}
+}, 90_000);
 
 test("360 px: tabs without sideways scrolling, light and dark, English and Chinese", async () => {
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
@@ -529,6 +635,33 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 		await call(page, (f) => f.click("[data-testid=team-tab-activity]"));
 		await until(page, "activity", (f) => f.count("[data-testid=team-event]") > 0);
 		await shot(page, "phone-dark-activity-zh");
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("where teams are not available (503), the project page shows no teams section", async () => {
+	const { page, errors } = await openPage(alice, { width: 1280, height: 800 });
+	try {
+		await page.setRequestInterception(true);
+		let refused = 0;
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname.endsWith("/teams")) {
+				refused++;
+				void request.respond({
+					status: 503,
+					contentType: "application/json",
+					body: JSON.stringify({ error: "Project teams", code: "POSTGRES_UNSUPPORTED" }),
+				});
+			} else void request.continue();
+		});
+		await call(page, (f, p: string) => f.openProjectTeams(p, true), projectId);
+		await until(page, "the list was asked", (f) => f.idle());
+		expect(refused).toBe(1);
+		expect(await call(page, (f) => f.count("[data-testid=project-teams]"))).toBe(0);
+		expect(await call(page, (f) => f.count("[data-testid=new-team]"))).toBe(0);
+		expect(await call(page, (f) => f.count(".mantine-Alert-root"))).toBe(0);
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();

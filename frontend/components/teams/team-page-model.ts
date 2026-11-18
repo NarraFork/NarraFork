@@ -12,6 +12,7 @@
 import type { OutlineStatusKey } from "@shared/outline-status";
 import {
 	boardColumnIsFinished,
+	boardColumnOf,
 	TEAM_BOARD_COLUMNS,
 	type TeamActivityEvent,
 	type TeamBoardColumn,
@@ -20,17 +21,51 @@ import {
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 
-export { boardColumnOf, TEAM_BOARD_COLUMNS } from "@shared/project-teams";
+export { boardColumnOf, TEAM_BOARD_COLUMNS };
 
 /** A work item state as the outline's state badge (icon on a tinted background). */
 export const WORK_ITEM_STATUS_ICON: Record<TeamWorkItemState, OutlineStatusKey> = {
 	queued: "todo",
 	in_progress: "doing",
 	in_review: "waiting",
-	ready: "newly_done",
+	// An arrow handing on (not a check: a ready item is not done until merged back).
+	ready: "delegated",
 	merged: "done",
 	cancelled: "cancelled",
 };
+
+/**
+ * The state a column is named after. A card whose state differs (a ready item in the review
+ * column) also says its state in words, so its icon is never read as the column's.
+ */
+export const BOARD_COLUMN_PRIMARY_STATE: Record<TeamBoardColumn, TeamWorkItemState> = {
+	queued: "queued",
+	in_progress: "in_progress",
+	review: "in_review",
+	done: "merged",
+	cancelled: "cancelled",
+};
+
+export function cardNeedsStateChip(item: Pick<TeamBoardItem, "state">): boolean {
+	return BOARD_COLUMN_PRIMARY_STATE[boardColumnOf(item.state)] !== item.state;
+}
+
+/**
+ * A card's worker status, kept current without refetching the board: the summary lists every
+ * running session (when it is not capped), so a worker in it has that status and a worker the
+ * card last saw running but that is no longer listed has stopped.
+ */
+export function liveWorkerStatus(
+	worker: { id: string; status: string },
+	summary: Pick<TeamPageSummary, "runningAgents" | "runningCount"> | undefined,
+): string {
+	if (!summary) return worker.status;
+	const listed = summary.runningAgents.find((agent) => agent.id === worker.id);
+	if (listed) return listed.status;
+	const complete = summary.runningCount <= summary.runningAgents.length;
+	if (complete && (worker.status === "working" || worker.status === "waiting")) return "idle";
+	return worker.status;
+}
 
 /** A board column's header badge. */
 export const BOARD_COLUMN_STATUS_ICON: Record<TeamBoardColumn, OutlineStatusKey> = {
@@ -184,14 +219,13 @@ export function nextPollDelay(previous: number, changed: boolean): number {
 	return Math.min(SUMMARY_POLL_MAX_MS, Math.max(SUMMARY_POLL_MIN_MS, previous * 2));
 }
 
-/** What the board and the activity depend on: a change refetches them. */
+/**
+ * What the board's cards depend on: work item changes (every one writes an event; counts move
+ * with states). Agent statuses are not in it: cards take those from the summary.
+ */
 export function boardSignature(summary: TeamPageSummary | undefined): string {
 	if (!summary) return "";
-	return JSON.stringify([
-		summary.lastEventId,
-		summary.columnCounts,
-		summary.runningAgents.map((agent) => [agent.id, agent.status]),
-	]);
+	return JSON.stringify([summary.lastEventId, summary.columnCounts]);
 }
 
 /** Everything the top bar shows: a change resets the poll backoff. */
@@ -199,20 +233,62 @@ export function summarySignature(summary: TeamPageSummary | undefined): string {
 	if (!summary) return "";
 	return JSON.stringify([
 		boardSignature(summary),
+		summary.runningAgents.map((agent) => [agent.id, agent.status]),
 		summary.coordinatorStatus,
 		summary.runningCount,
 		summary.pendingApprovalCount,
 	]);
 }
 
+/** Coalescing of socket nudges: 400 ms after the last frame, but never more than 2 s after the first. */
+export const NUDGE_DEBOUNCE_MS = 400;
+export const NUDGE_MAX_WAIT_MS = 2_000;
+
+/** How long to wait before refetching, given how long ago the first pending frame came. */
+export function nudgeDelay(sinceFirstMs: number): number {
+	return Math.max(0, Math.min(NUDGE_DEBOUNCE_MS, NUDGE_MAX_WAIT_MS - sinceFirstMs));
+}
+
 /**
  * The sessions "pause all" stops, coordinator first (so it hands out no new work while its
- * workers stop), then the workers before their helpers as listed.
+ * workers stop), then the others in the order listed.
  */
-export function pauseOrder(teamId: string, summary: TeamPageSummary | undefined): string[] {
-	if (!summary) return [];
-	const ids = summary.runningAgents.map((agent) => agent.id);
+export function pauseOrder(teamId: string, running: readonly { id: string }[]): string[] {
+	const ids = running.map((agent) => agent.id);
 	return [...ids.filter((id) => id === teamId), ...ids.filter((id) => id !== teamId)];
+}
+
+/** What "pause all" did: stopped and failed requests; `more` when over the 500 it reads. */
+export interface PauseOutcome {
+	stopped: number;
+	failed: number;
+	more: boolean;
+}
+
+/** The notice after "pause all": paused only when every running session was stopped. */
+export function pauseNotice(outcome: PauseOutcome): {
+	color: "green" | "red" | "yellow";
+	key: "paused" | "pausePartial" | "pauseNothing" | "pauseMore";
+} {
+	if (outcome.failed > 0) return { color: "red", key: "pausePartial" };
+	if (outcome.more) return { color: "yellow", key: "pauseMore" };
+	if (outcome.stopped === 0) return { color: "yellow", key: "pauseNothing" };
+	return { color: "green", key: "paused" };
+}
+
+/** Widths of the team page's columns (px). */
+export const TEAM_TEAMS_WIDTH = 232;
+export const TEAM_SIDE_WIDTH = 380;
+/** The conversation never gets narrower than this beside other columns. */
+export const TEAM_CONVERSATION_MIN_WIDTH = 480;
+
+export type TeamWorkspaceLayout = "columns" | "split" | "tabs";
+
+/** The layout for the frame's own width (not the viewport's: the app sidebar takes some). */
+export function teamWorkspaceLayout(width: number): TeamWorkspaceLayout {
+	if (width >= TEAM_TEAMS_WIDTH + TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "columns";
+	if (width >= TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "split";
+	return "tabs";
 }
 
 /** The page's narrow-screen tabs. */

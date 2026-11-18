@@ -6,6 +6,7 @@ import type {
 	TeamDetail,
 	TeamListResponse,
 	TeamPageSummary,
+	TeamRunningResponse,
 } from "@shared/project-teams";
 import { request } from "./client";
 
@@ -61,4 +62,7 @@ export const teamsApi = {
 		request<TeamActivityPage>(`${teamBase(projectId, teamId)}/events${query({ cursor })}`),
 	getTeamApprovals: (projectId: string, teamId: string) =>
 		request<TeamApprovalsResponse>(`${teamBase(projectId, teamId)}/approvals`),
+	/** The tree's running sessions now, for "pause all" (members only, at most 500). */
+	getTeamRunning: (projectId: string, teamId: string) =>
+		request<TeamRunningResponse>(`${teamBase(projectId, teamId)}/running`),
 };

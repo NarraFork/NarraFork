@@ -4,7 +4,7 @@
  * creating its coordinator session (P1's route).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
-import { useCreateTeam, useProjectTeams } from "@frontend/hooks/useTeams";
+import { teamsUnavailable, useCreateTeam, useProjectTeams } from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import {
 	Alert,
@@ -138,6 +138,8 @@ export function ProjectTeamsList({
 	const [creating, setCreating] = useState(false);
 	const rows = teams.data?.pages.flatMap((page) => page.teams) ?? [];
 	const nav = variant === "nav";
+	// Teams are not available on this deployment (PostgreSQL): no section, no "new team".
+	if (teams.isError && teamsUnavailable(teams.error)) return null;
 	return (
 		<Stack gap={nav ? 4 : "xs"} data-testid="project-teams" data-variant={variant}>
 			<Group justify="space-between" gap="xs" wrap="nowrap">

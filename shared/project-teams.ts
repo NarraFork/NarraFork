@@ -257,8 +257,8 @@ export const TEAM_EVENTS_PAGE_LIMIT = 50;
 export const TEAM_APPROVALS_LIMIT = 50;
 /** Most running agents the summary names (the count is capped one higher). */
 export const TEAM_RUNNING_AGENTS_LIMIT = 20;
-/** Most sessions of one team tree the page looks at (coordinator + both subagent levels). */
-export const TEAM_TREE_LIMIT = 500;
+/** Most running sessions "pause all" stops in one go (coordinator + both subagent levels). */
+export const TEAM_PAUSE_LIMIT = 500;
 /** Characters of a tool call's input the approvals list shows. */
 export const TEAM_APPROVAL_PREVIEW_CHARS = 300;
 /** An event's detail is sent only when its JSON text is at most this many characters. */
@@ -320,6 +320,24 @@ export interface TeamActivityPage {
 	nextCursor: string | null;
 }
 
+/**
+ * Pending calls a person answers in the session itself, not with approve / deny: a question
+ * needs its answers, a plan its decision, a rule request its rule choice.
+ */
+export const TEAM_SESSION_DECIDED_TOOLS = {
+	AskUserQuestion: "question",
+	ExitPlanMode: "plan",
+	RequestPermissionRule: "rule",
+} as const;
+export type TeamApprovalKind =
+	| "tool"
+	| (typeof TEAM_SESSION_DECIDED_TOOLS)[keyof typeof TEAM_SESSION_DECIDED_TOOLS];
+
+/** The kind of a pending call: approve / deny ("tool"), or answered in its session. */
+export function teamApprovalKind(toolName: string): TeamApprovalKind {
+	return (TEAM_SESSION_DECIDED_TOOLS as Record<string, TeamApprovalKind>)[toolName] ?? "tool";
+}
+
 /** A tool call of the team tree waiting for a person. */
 export interface TeamPendingApproval {
 	/** The permission request id (the tool call id) the approve / deny routes take. */
@@ -328,10 +346,21 @@ export interface TeamPendingApproval {
 	/** 0 = the coordinator, 1 = a worker, 2 = a worker's helper. */
 	depth: number;
 	toolName: string;
+	/** "tool": approve / deny here; anything else is answered in the session (open it). */
+	kind: TeamApprovalKind;
 	/** A short, bounded view of the input (command, path, URL, …). */
 	preview: string;
+	/** For a question: the questions asked (at most three, each clipped). */
+	questions: string[];
 	decisionReason: string | null;
 	createdAt: string;
+}
+
+/** The running sessions of a tree, for "pause all" (members only). */
+export interface TeamRunningResponse {
+	agents: TeamAgentRef[];
+	/** More than {@link TEAM_PAUSE_LIMIT} are running. */
+	more: boolean;
 }
 
 export interface TeamApprovalsResponse {
@@ -345,7 +374,7 @@ export interface TeamPageSummary {
 	teamId: string;
 	access: TeamAccess;
 	coordinatorStatus: string;
-	/** Working or waiting sessions of the tree, coordinator first, at most the limit. */
+	/** Working or waiting sessions of the tree: coordinator first, then newest first, at most the limit. */
 	runningAgents: TeamAgentRef[];
 	/** Running sessions counted up to the limit + 1 (a count past the limit means "more"). */
 	runningCount: number;

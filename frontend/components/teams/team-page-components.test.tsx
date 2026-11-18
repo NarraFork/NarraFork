@@ -8,6 +8,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
+	TeamApprovalsResponse,
 	TeamBoardColumn,
 	TeamBoardColumnPage,
 	TeamBoardItem,
@@ -23,7 +24,7 @@ import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { TeamActivity } from "./TeamActivity";
 import { TeamBoard, TeamBoardCard } from "./TeamBoard";
-import { TeamTopBar } from "./TeamTopBar";
+import { TeamApprovalsList, TeamTopBar } from "./TeamTopBar";
 import { TEAM_BOARD_COLUMNS } from "./team-page-model";
 
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -140,6 +141,64 @@ describe("board card", () => {
 		const html = await render(<TeamBoardCard item={item()} />, new QueryClient(), "zh-CN");
 		expect(html).toContain("最近评审：有阻塞 · 2 轮评审");
 		expect(html).toContain('aria-label="进行中"');
+	});
+});
+
+describe("ready items and approvals answered in their session", () => {
+	test("a ready card in the review column says its state in words", async () => {
+		const html = await render(
+			<TeamBoardCard item={item({ state: "ready", lastReview: "clear" })} />,
+		);
+		expect(html).toContain('data-testid="team-card-state"');
+		expect(html).toContain("Ready to merge");
+		expect(html).toMatch(/data-status="delegated"/);
+		expect(html).not.toMatch(/data-status="newly_done"/);
+		const review = await render(<TeamBoardCard item={item({ state: "in_review" })} />);
+		expect(review).not.toContain("team-card-state");
+	});
+
+	test("questions show as text with Open session, never Approve / Deny", async () => {
+		const client = new QueryClient();
+		const approvals: TeamApprovalsResponse = {
+			more: false,
+			approvals: [
+				{
+					id: "q1",
+					agent: { id: "w", title: "Worker", status: "waiting" },
+					depth: 1,
+					toolName: "AskUserQuestion",
+					kind: "question",
+					preview: "",
+					questions: ["Which branch first?"],
+					decisionReason: null,
+					createdAt: "2026-11-18T00:00:00.000Z",
+				},
+				{
+					id: "t1",
+					agent: { id: "w", title: "Worker", status: "waiting" },
+					depth: 1,
+					toolName: "Bash",
+					kind: "tool",
+					preview: "bun test",
+					questions: [],
+					decisionReason: null,
+					createdAt: "2026-11-18T00:00:01.000Z",
+				},
+			],
+		};
+		client.setQueryData(teamKeys.approvals("lead"), approvals);
+		const html = await render(
+			<TeamApprovalsList projectId="p" teamId="lead" onOpenSession={() => {}} />,
+			client,
+		);
+		const [question, tool] = html.split('data-testid="team-approval"').slice(1);
+		expect(question).toContain("Question");
+		expect(question).toContain("Which branch first?");
+		expect(question).toContain("team-approval-open");
+		expect(question).not.toContain("team-approval-approve");
+		expect(question).not.toContain("questions&quot;");
+		expect(tool).toContain("team-approval-approve");
+		expect(tool).toContain("bun test");
 	});
 });
 

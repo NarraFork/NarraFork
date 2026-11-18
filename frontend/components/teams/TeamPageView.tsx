@@ -3,8 +3,9 @@
  * teams, the board and the activity. The route passes the coordinator's conversation (the
  * narrator panel) and the navigation; the browser fixture passes a stand-in conversation.
  */
-import { useTeam, useTeamSummary } from "@frontend/hooks/useTeams";
-import { ActionIcon, Alert, Skeleton } from "@mantine/core";
+import { teamsUnavailable, useTeam, useTeamSummary } from "@frontend/hooks/useTeams";
+import { APP_SHELL_FULL_BLEED_HEIGHT } from "@frontend/lib/safe-area";
+import { ActionIcon, Alert, Box, Skeleton } from "@mantine/core";
 import { IconArrowLeft } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -35,48 +36,61 @@ export function TeamPageView({
 	const { t } = useTranslation("projects");
 	const team = useTeam(projectId, teamId);
 	const summary = useTeamSummary(projectId, teamId);
-	if (team.isError) return <Alert color="red">{t("teams.notFound")}</Alert>;
+	if (team.isError)
+		return teamsUnavailable(team.error) ? (
+			<Alert color="gray">{t("teams.unavailable")}</Alert>
+		) : (
+			<Alert color="red">{t("teams.notFound")}</Alert>
+		);
 	return (
-		<TeamWorkspace
-			topBar={
-				<TeamTopBar
-					projectId={projectId}
-					teamId={teamId}
-					title={team.data?.name ?? <Skeleton height={18} width={140} />}
-					summary={summary.data}
-					onOpenSession={onOpenSession}
-					leading={
-						<ActionIcon
-							variant="subtle"
-							size="sm"
-							aria-label={t("teams.back")}
-							onClick={onBack}
-							data-testid="team-back"
-						>
-							<IconArrowLeft size={16} />
-						</ActionIcon>
-					}
-				/>
-			}
-			teams={
-				<ProjectTeamsList
-					projectId={projectId}
-					canCreate={canCreateTeam}
-					currentTeamId={teamId}
-					variant="nav"
-					onOpenTeam={onOpenTeam}
-				/>
-			}
-			conversation={conversation}
-			board={
-				<TeamBoard
-					projectId={projectId}
-					teamId={teamId}
-					summary={summary.data}
-					onOpenSession={onOpenSession}
-				/>
-			}
-			activity={<TeamActivity projectId={projectId} teamId={teamId} />}
-		/>
+		// Full bleed in the app shell's content box, like a session page.
+		<Box
+			h={APP_SHELL_FULL_BLEED_HEIGHT}
+			mx="calc(var(--mantine-spacing-md) * -1)"
+			my="calc(var(--mantine-spacing-md) * -1)"
+			style={{ overflow: "hidden", display: "flex", flexDirection: "column" }}
+		>
+			<TeamWorkspace
+				topBar={
+					<TeamTopBar
+						projectId={projectId}
+						teamId={teamId}
+						title={team.data?.name ?? <Skeleton height={18} width={140} />}
+						summary={summary.data}
+						onOpenSession={onOpenSession}
+						leading={
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								aria-label={t("teams.back")}
+								onClick={onBack}
+								data-testid="team-back"
+							>
+								<IconArrowLeft size={16} />
+							</ActionIcon>
+						}
+					/>
+				}
+				teams={
+					<ProjectTeamsList
+						projectId={projectId}
+						canCreate={canCreateTeam}
+						currentTeamId={teamId}
+						variant="nav"
+						onOpenTeam={onOpenTeam}
+					/>
+				}
+				conversation={conversation}
+				board={
+					<TeamBoard
+						projectId={projectId}
+						teamId={teamId}
+						summary={summary.data}
+						onOpenSession={onOpenSession}
+					/>
+				}
+				activity={<TeamActivity projectId={projectId} teamId={teamId} />}
+			/>
+		</Box>
 	);
 }

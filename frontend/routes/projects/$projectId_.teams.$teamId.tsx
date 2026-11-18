@@ -12,7 +12,6 @@ import { usePanelCompact } from "@frontend/components/narrator/panels/shared";
 import { TeamPageView } from "@frontend/components/teams/TeamPageView";
 import { useProject } from "@frontend/hooks/useProjects";
 import { lazyWithRetry } from "@frontend/lib/lazy-with-retry";
-import { APP_SHELL_FULL_BLEED_HEIGHT } from "@frontend/lib/safe-area";
 import { Box } from "@mantine/core";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { memo, Suspense, useCallback } from "react";
@@ -69,21 +68,14 @@ function TeamPage() {
 		[navigate, projectId],
 	);
 	return (
-		<Box
-			h={APP_SHELL_FULL_BLEED_HEIGHT}
-			mx="calc(var(--mantine-spacing-md) * -1)"
-			my="calc(var(--mantine-spacing-md) * -1)"
-			style={{ overflow: "hidden", display: "flex", flexDirection: "column" }}
-		>
-			<TeamPageView
-				projectId={projectId}
-				teamId={teamId}
-				canCreateTeam={!project.isError && project.data?.canWrite === true}
-				conversation={<CoordinatorConversation teamId={teamId} onOpenSession={openSession} />}
-				onOpenSession={openSession}
-				onOpenTeam={openTeam}
-				onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
-			/>
-		</Box>
+		<TeamPageView
+			projectId={projectId}
+			teamId={teamId}
+			canCreateTeam={!project.isError && project.data?.canWrite === true}
+			conversation={<CoordinatorConversation teamId={teamId} onOpenSession={openSession} />}
+			onOpenSession={openSession}
+			onOpenTeam={openTeam}
+			onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
+		/>
 	);
 }

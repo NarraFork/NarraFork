@@ -21,8 +21,8 @@ import {
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+	TEAM_PAUSE_LIMIT,
 	TEAM_RUNNING_AGENTS_LIMIT,
-	TEAM_TREE_LIMIT,
 	type TeamActivityEvent,
 	type TeamActivityPage,
 	type TeamAgentRef,
@@ -33,8 +33,10 @@ import {
 	type TeamEventActorKind,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamRunningResponse,
+	teamApprovalKind,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narrators,
@@ -48,7 +50,7 @@ import type { NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { loadTeamForAccess } from "./team-service";
 
-const RUNNING_STATUSES = ["working", "waiting"];
+const RUNNING_STATUSES: ("working" | "waiting")[] = ["working", "waiting"];
 
 // ── Cursors ─────────────────────────────────────────────────────────────────
 
@@ -76,52 +78,46 @@ function decodeCursor(cursor: string | undefined): { key: string; id: string } |
 
 // ── Tree ────────────────────────────────────────────────────────────────────
 
-interface TreeSession {
-	id: string;
-	title: string | null;
-	status: string;
-	parentNarratorId: string | null;
-}
+/**
+ * The tree of a team is the coordinator plus every subagent whose ACL root is the coordinator
+ * (both subagent levels carry it there). The tree can hold thousands of finished sessions, so
+ * nothing here lists the whole tree: each read asks for exactly what it shows, filtered in SQL
+ * before its LIMIT.
+ */
+const inTree = (teamId: string) =>
+	or(
+		eq(narrators.id, teamId),
+		and(eq(narrators.aclRootNarratorId, teamId), eq(narrators.type, "subagent")),
+	);
 
 /**
- * The sessions of a team tree that are not archived: the coordinator first, then subagents by
- * the ACL-root index, at most {@link TEAM_TREE_LIMIT}.
+ * The working or waiting sessions of a tree: the coordinator first, then the newest first
+ * (creation time, id), at most `limit`; `more` when there are others. Driven by the status
+ * index (only running sessions qualify), then filtered to the tree.
  */
-function liveTreeSessions(teamId: string): TreeSession[] {
-	const columns = {
-		id: narrators.id,
-		title: narrators.title,
-		status: narrators.status,
-		parentNarratorId: narrators.parentNarratorId,
-	};
-	const coordinator = db
-		.select(columns)
+export function runningTreeSessions(
+	teamId: string,
+	limit: number,
+): { agents: TeamAgentRef[]; more: boolean } {
+	const rows = db
+		.select({ id: narrators.id, title: narrators.title, status: narrators.status })
 		.from(narrators)
-		.where(eq(narrators.id, teamId))
-		.limit(1)
-		.get();
-	const subagents = db
-		.select(columns)
-		.from(narrators)
-		.where(
-			and(
-				eq(narrators.aclRootNarratorId, teamId),
-				eq(narrators.type, "subagent"),
-				ne(narrators.status, "archived"),
-			),
-		)
-		.limit(TEAM_TREE_LIMIT)
+		.where(and(inArray(narrators.status, RUNNING_STATUSES), inTree(teamId)))
+		.orderBy(desc(sql`${narrators.id} = ${teamId}`), desc(narrators.createdAt), desc(narrators.id))
+		.limit(limit + 1)
 		.all();
-	return [...(coordinator && coordinator.status !== "archived" ? [coordinator] : []), ...subagents];
+	return { agents: rows.slice(0, limit).map(agentRef), more: rows.length > limit };
 }
 
 function agentRef(session: { id: string; title: string | null; status: string }): TeamAgentRef {
 	return { id: session.id, title: session.title, status: session.status };
 }
 
-function depthOf(teamId: string, session: TreeSession): number {
+/** 0 = the coordinator, 1 = a worker (its parent is the coordinator, or unknown), 2 = a helper. */
+export function depthOf(teamId: string, session: { id: string; parentNarratorId: string | null }) {
 	if (session.id === teamId) return 0;
-	return session.parentNarratorId === teamId ? 1 : 2;
+	if (!session.parentNarratorId || session.parentNarratorId === teamId) return 1;
+	return 2;
 }
 
 // ── Summary ─────────────────────────────────────────────────────────────────
@@ -144,27 +140,85 @@ function columnCounts(teamId: string): Record<TeamBoardColumn, number> {
 	return counts;
 }
 
-function pendingRows(sessionIds: string[], limit: number) {
-	if (sessionIds.length === 0) return [];
-	return db
-		.select({
-			id: narratorToolCalls.id,
-			narratorId: narratorToolCalls.narratorId,
-			toolName: narratorToolCalls.toolName,
-			suggestions: narratorToolCalls.permissionSuggestions,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.where(
-			and(
-				inArray(narratorToolCalls.narratorId, sessionIds),
-				eq(narratorToolCalls.status, "pending"),
-			),
-		)
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-		.limit(limit)
-		.all()
-		.filter((row) => !shouldHidePendingPermission(row.suggestions));
+/** Rows of pending calls read per page while hidden ones (a reflection still running) are skipped. */
+const PENDING_PAGE = 100;
+/** Pages read at most: past this many hidden calls the list says "more" instead of counting on. */
+const PENDING_MAX_PAGES = 5;
+
+interface PendingRow {
+	id: string;
+	narratorId: string;
+	toolName: string;
+	createdAt: string;
+	title: string | null;
+	status: string;
+	parentNarratorId: string | null;
+}
+
+/**
+ * The tree's tool calls waiting for a person, oldest first, after the same visibility rule as
+ * the session's own list (a call whose reflection still runs is not waiting for a person).
+ * Driven by `idx_toolcalls_status_narrator_created` (status leads, and few calls are pending at
+ * any time) joined to the narrator by primary key; read in keyset pages until `wanted` visible
+ * rows are found, at most {@link PENDING_MAX_PAGES} pages. `complete` is false when the pages
+ * ran out before the pending calls did.
+ */
+export function visiblePendingCalls(
+	teamId: string,
+	wanted: number,
+): { rows: PendingRow[]; complete: boolean } {
+	const rows: PendingRow[] = [];
+	let after: { createdAt: string; id: string } | null = null;
+	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
+		const batch = db
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				toolName: narratorToolCalls.toolName,
+				suggestions: narratorToolCalls.permissionSuggestions,
+				createdAt: narratorToolCalls.createdAt,
+				title: narrators.title,
+				status: narrators.status,
+				parentNarratorId: narrators.parentNarratorId,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+			.where(
+				and(
+					eq(narratorToolCalls.status, "pending"),
+					inTree(teamId),
+					after
+						? or(
+								gt(narratorToolCalls.createdAt, after.createdAt),
+								and(
+									eq(narratorToolCalls.createdAt, after.createdAt),
+									gt(narratorToolCalls.id, after.id),
+								),
+							)
+						: undefined,
+				),
+			)
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+			.limit(PENDING_PAGE)
+			.all();
+		for (const row of batch) {
+			if (shouldHidePendingPermission(row.suggestions)) continue;
+			const { suggestions: _suggestions, ...visible } = row;
+			rows.push(visible);
+			if (rows.length >= wanted) return { rows, complete: true };
+		}
+		if (batch.length < PENDING_PAGE) return { rows, complete: true };
+		const last = batch.at(-1);
+		if (!last) return { rows, complete: true };
+		after = { createdAt: last.createdAt, id: last.id };
+	}
+	return { rows, complete: false };
+}
+
+/** Pending approvals counted up to the limit + 1 ("more" when the pages ran out too). */
+function pendingCount(teamId: string): number {
+	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
+	return complete ? rows.length : TEAM_APPROVALS_LIMIT + 1;
 }
 
 /** The top bar: running agents, pending approvals (members only), column counts, last event. */
@@ -174,8 +228,7 @@ export async function readTeamPageSummary(
 	projectId: string,
 ): Promise<TeamPageSummary> {
 	const { coordinator, access } = await loadTeamForAccess(teamId, principal, "read", projectId);
-	const tree = liveTreeSessions(teamId);
-	const running = tree.filter((session) => RUNNING_STATUSES.includes(session.status));
+	const running = runningTreeSessions(teamId, TEAM_RUNNING_AGENTS_LIMIT);
 	const lastEvent = db
 		.select({ id: teamWorkEvents.id, createdAt: teamWorkEvents.createdAt })
 		.from(teamWorkEvents)
@@ -187,15 +240,9 @@ export async function readTeamPageSummary(
 		teamId,
 		access,
 		coordinatorStatus: coordinator.status,
-		runningAgents: running.slice(0, TEAM_RUNNING_AGENTS_LIMIT).map(agentRef),
-		runningCount: Math.min(running.length, TEAM_RUNNING_AGENTS_LIMIT + 1),
-		pendingApprovalCount:
-			access === "write"
-				? pendingRows(
-						tree.map((session) => session.id),
-						TEAM_APPROVALS_LIMIT + 1,
-					).length
-				: null,
+		runningAgents: running.agents,
+		runningCount: running.agents.length + (running.more ? 1 : 0),
+		pendingApprovalCount: access === "write" ? pendingCount(teamId) : null,
 		columnCounts: columnCounts(teamId),
 		lastEventId: lastEvent?.id ?? null,
 		lastEventAt: lastEvent?.createdAt ?? null,
@@ -446,6 +493,43 @@ export function approvalPreview(prefix: string | null): string {
 	}
 }
 
+/** Questions shown per AskUserQuestion call, and characters per question. */
+const QUESTIONS_SHOWN = 3;
+const QUESTION_CHARS = 200;
+
+/**
+ * The questions of an AskUserQuestion call from a bounded prefix of its input: parsed when the
+ * prefix is whole, else each `"question": "…"` picked out of the text.
+ */
+export function questionPreview(prefix: string | null): string[] {
+	if (!prefix) return [];
+	const clip = (value: string) =>
+		value.length > QUESTION_CHARS ? `${value.slice(0, QUESTION_CHARS - 1)}…` : value;
+	let texts: string[] = [];
+	try {
+		const parsed = JSON.parse(prefix) as { questions?: unknown };
+		if (Array.isArray(parsed.questions))
+			texts = parsed.questions.map((question) =>
+				question && typeof question === "object"
+					? String((question as { question?: unknown }).question ?? "")
+					: "",
+			);
+	} catch {
+		for (const match of prefix.matchAll(/"question"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+			try {
+				texts.push(JSON.parse(`"${match[1]}"`) as string);
+			} catch {
+				texts.push(match[1] ?? "");
+			}
+		}
+	}
+	return texts
+		.map((text) => text.trim())
+		.filter(Boolean)
+		.slice(0, QUESTIONS_SHOWN)
+		.map(clip);
+}
+
 /**
  * The tool calls of the team tree waiting for a person, oldest first, at most
  * {@link TEAM_APPROVALS_LIMIT}. Members only: an onlooker gets 403 (a stranger 404). Each one
@@ -457,10 +541,8 @@ export async function readTeamApprovals(
 	projectId: string,
 ): Promise<TeamApprovalsResponse> {
 	await loadTeamForAccess(teamId, principal, "write", projectId);
-	const tree = liveTreeSessions(teamId);
-	const byId = new Map(tree.map((session) => [session.id, session]));
-	const pending = pendingRows([...byId.keys()], TEAM_APPROVALS_LIMIT + 1);
-	const shown = pending.slice(0, TEAM_APPROVALS_LIMIT);
+	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
+	const shown = rows.slice(0, TEAM_APPROVALS_LIMIT);
 	const details =
 		shown.length > 0
 			? new Map(
@@ -485,20 +567,30 @@ export async function readTeamApprovals(
 						.map((row) => [row.id, row]),
 				)
 			: new Map<string, { input: string | null; reason: string | null }>();
-	const approvals: TeamPendingApproval[] = [];
-	for (const row of shown) {
-		const session = byId.get(row.narratorId);
-		if (!session) continue;
+	const approvals: TeamPendingApproval[] = shown.map((row) => {
 		const detail = details.get(row.id);
-		approvals.push({
+		const kind = teamApprovalKind(row.toolName);
+		return {
 			id: row.id,
-			agent: agentRef(session),
-			depth: depthOf(teamId, session),
+			agent: agentRef({ id: row.narratorId, title: row.title, status: row.status }),
+			depth: depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
 			toolName: row.toolName,
-			preview: approvalPreview(detail?.input ?? null),
+			kind,
+			preview: kind === "question" ? "" : approvalPreview(detail?.input ?? null),
+			questions: kind === "question" ? questionPreview(detail?.input ?? null) : [],
 			decisionReason: detail?.reason ?? null,
 			createdAt: row.createdAt,
-		});
-	}
-	return { approvals, more: pending.length > TEAM_APPROVALS_LIMIT };
+		};
+	});
+	return { approvals, more: rows.length > TEAM_APPROVALS_LIMIT || !complete };
+}
+
+/** The running sessions of the tree for "pause all", at most {@link TEAM_PAUSE_LIMIT}. Members only. */
+export async function readTeamRunning(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+): Promise<TeamRunningResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	return runningTreeSessions(teamId, TEAM_PAUSE_LIMIT);
 }

@@ -16,14 +16,20 @@ import {
 	boardSignature,
 	cappedCount,
 	cardMarks,
+	cardNeedsStateChip,
 	eventLabelKey,
 	eventNote,
+	liveWorkerStatus,
 	nextPollDelay,
+	nudgeDelay,
+	pauseNotice,
 	pauseOrder,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
 	summarySignature,
 	TEAM_BOARD_COLUMNS,
+	TEAM_CONVERSATION_MIN_WIDTH,
+	teamWorkspaceLayout,
 	WORK_ITEM_STATUS_ICON,
 } from "./team-page-model";
 
@@ -86,6 +92,25 @@ describe("board mapping", () => {
 		for (const column of TEAM_BOARD_COLUMNS)
 			expect(OUTLINE_STATUS_KEYS).toContain(BOARD_COLUMN_STATUS_ICON[column]);
 		expect(new Set(Object.values(WORK_ITEM_STATUS_ICON)).size).toBe(TEAM_WORK_ITEM_STATES.length);
+	});
+
+	test("a ready item in the review column says its state in words; the icon is no check", () => {
+		expect(WORK_ITEM_STATUS_ICON.ready).toBe("delegated");
+		expect(cardNeedsStateChip({ state: "ready" })).toBe(true);
+		expect(cardNeedsStateChip({ state: "in_review" })).toBe(false);
+		for (const state of ["queued", "in_progress", "merged", "cancelled"] as const)
+			expect(cardNeedsStateChip({ state })).toBe(false);
+	});
+
+	test("layout follows the frame's width with room for the conversation", () => {
+		expect(teamWorkspaceLayout(360)).toBe("tabs");
+		// 1280 px window, 480 px app sidebar: 800 px frame.
+		expect(teamWorkspaceLayout(800)).toBe("tabs");
+		expect(teamWorkspaceLayout(TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("split");
+		// 1280 px window, 250 px sidebar.
+		expect(teamWorkspaceLayout(1030)).toBe("split");
+		expect(teamWorkspaceLayout(232 + TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("columns");
+		expect(TEAM_CONVERSATION_MIN_WIDTH).toBeGreaterThanOrEqual(480);
 	});
 
 	test("card marks: exclusive lock; a finished item still holding its worktree", () => {
@@ -160,7 +185,7 @@ describe("live updates", () => {
 		expect(seen).toEqual([8_000, 16_000, 32_000, 60_000, 60_000, 60_000]);
 	});
 
-	test("the board refetches on a new event, a column count or an agent status", () => {
+	test("the board refetches on work item changes only", () => {
 		const base = summary({
 			runningAgents: [{ id: "w", title: "w", status: "working" }],
 			runningCount: 1,
@@ -169,24 +194,59 @@ describe("live updates", () => {
 		expect(summarySignature(base)).not.toBe(summarySignature({ ...base, pendingApprovalCount: 4 }));
 		expect(boardSignature(base)).not.toBe(boardSignature({ ...base, lastEventId: "e2" }));
 		expect(boardSignature(base)).not.toBe(
-			boardSignature({ ...base, runningAgents: [{ id: "w", title: "w", status: "waiting" }] }),
+			boardSignature({ ...base, columnCounts: { ...base.columnCounts, queued: 1 } }),
 		);
+		// A worker's status flip does not refetch the board (cards take it from the summary)...
+		const flipped = { ...base, runningAgents: [{ id: "w", title: "w", status: "waiting" }] };
+		expect(boardSignature(base)).toBe(boardSignature(flipped));
+		// ...but it is a change for the top bar.
+		expect(summarySignature(base)).not.toBe(summarySignature(flipped));
 		expect(boardSignature(undefined)).toBe("");
 	});
 
-	test("pause all stops the coordinator first", () => {
-		expect(
-			pauseOrder(
-				"lead",
-				summary({
-					runningAgents: [
-						{ id: "w1", title: null, status: "working" },
-						{ id: "lead", title: "Lead", status: "working" },
-						{ id: "w2", title: null, status: "waiting" },
-					],
-				}),
-			),
-		).toEqual(["lead", "w1", "w2"]);
-		expect(pauseOrder("lead", undefined)).toEqual([]);
+	test("pause all stops the coordinator first, and says paused only when all stopped", () => {
+		expect(pauseOrder("lead", [{ id: "w1" }, { id: "lead" }, { id: "w2" }])).toEqual([
+			"lead",
+			"w1",
+			"w2",
+		]);
+		expect(pauseOrder("lead", [])).toEqual([]);
+		expect(pauseNotice({ stopped: 3, failed: 0, more: false })).toEqual({
+			color: "green",
+			key: "paused",
+		});
+		expect(pauseNotice({ stopped: 2, failed: 1, more: false }).key).toBe("pausePartial");
+		expect(pauseNotice({ stopped: 500, failed: 0, more: true }).key).toBe("pauseMore");
+		expect(pauseNotice({ stopped: 0, failed: 0, more: false }).key).toBe("pauseNothing");
+	});
+
+	test("socket nudges: 400 ms after the last frame, at most 2 s after the first", () => {
+		expect(nudgeDelay(0)).toBe(400);
+		expect(nudgeDelay(1_000)).toBe(400);
+		expect(nudgeDelay(1_800)).toBe(200);
+		expect(nudgeDelay(5_000)).toBe(0);
+	});
+
+	test("cards keep their worker's status from the summary", () => {
+		const worker = { id: "w", status: "working" };
+		expect(liveWorkerStatus(worker, undefined)).toBe("working");
+		const listed = summary({
+			runningAgents: [{ id: "w", title: null, status: "waiting" }],
+			runningCount: 1,
+		});
+		expect(liveWorkerStatus(worker, listed)).toBe("waiting");
+		// Not running any more (the summary lists every running session): idle.
+		expect(liveWorkerStatus(worker, summary())).toBe("idle");
+		// A capped list cannot tell: keep what the card read.
+		const capped = summary({
+			runningAgents: Array.from({ length: 20 }, (_, index) => ({
+				id: `x${index}`,
+				title: null,
+				status: "working",
+			})),
+			runningCount: 21,
+		});
+		expect(liveWorkerStatus(worker, capped)).toBe("working");
+		expect(liveWorkerStatus({ id: "w", status: "archived" }, summary())).toBe("archived");
 	});
 });

@@ -2,20 +2,21 @@
  * Project teams on the client (docs/PROJECT_TEAMS-PLAN.md P1, P4): a project's team list, one
  * team, and the team page's live reads.
  *
- * Live updates: the page subscribes to the coordinator on the narrator socket (the server
- * broadcasts the whole tree's status and approval frames to the ACL root, i.e. the
- * coordinator) and refetches the small summary on any of them; underneath, the summary is
- * polled with a backoff (4 s after a change, doubling to 60 s while nothing changes, paused
- * while the tab is hidden). The board, the activity and the approvals refetch only when the
- * summary says something they show has changed.
+ * Live updates: the page subscribes to the coordinator on the narrator socket and refetches
+ * the small summary on the frames listed in `SUMMARY_NUDGE_TYPES` (coalesced); underneath, the
+ * summary is polled with a backoff (4 s after a change, doubling to 60 s while nothing changes,
+ * paused while the tab is hidden). The board refetches only when work items changed (new event
+ * or column counts), the activity on a new event, the approvals when their count changed.
  */
 import type { CreateTeamPayload } from "@frontend/lib/api/teams";
-import type { TeamBoardColumn, TeamPageSummary } from "@shared/project-teams";
+import type { TeamBoardColumn } from "@shared/project-teams";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import {
 	boardSignature,
 	nextPollDelay,
+	nudgeDelay,
+	type PauseOutcome,
 	pauseOrder,
 	SUMMARY_POLL_MIN_MS,
 	summarySignature,
@@ -24,6 +25,11 @@ import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const TEAM_GC_TIME_MS = 60_000;
+
+/** Whether an error says teams are not available on this deployment (PostgreSQL: 503). */
+export function teamsUnavailable(error: unknown): boolean {
+	return (error as { status?: unknown } | null)?.status === 503;
+}
 
 export const teamKeys = {
 	list: (projectId: string) => ["teams", "project", projectId] as const,
@@ -39,6 +45,8 @@ export const teamKeys = {
 /** A project's active teams, a page at a time. */
 export function useProjectTeams(projectId: string, enabled = true) {
 	return useInfiniteQuery({
+		// Teams are not available on every deployment (PostgreSQL answers 503): do not retry that.
+		retry: (count, error) => !teamsUnavailable(error) && count < 1,
 		queryKey: teamKeys.list(projectId),
 		queryFn: ({ pageParam }) =>
 			api.listProjectTeams(projectId, { status: "active", cursor: pageParam, limit: 50 }),
@@ -53,6 +61,8 @@ export function useCreateTeam(projectId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: (payload: CreateTeamPayload) => api.createProjectTeam(projectId, payload),
+		// The dialog shows the failure.
+		meta: { suppressErrorToast: true },
 		onSuccess: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
 			void queryClient.invalidateQueries({ queryKey: ["narrators", "project", projectId] });
@@ -62,6 +72,7 @@ export function useCreateTeam(projectId: string) {
 
 export function useTeam(projectId: string, teamId: string) {
 	return useQuery({
+		retry: (count, error) => !teamsUnavailable(error) && count < 1,
 		queryKey: teamKeys.team(teamId),
 		queryFn: () => api.getProjectTeam(projectId, teamId),
 		enabled: !!projectId && !!teamId,
@@ -69,19 +80,23 @@ export function useTeam(projectId: string, teamId: string) {
 	});
 }
 
-/** Narrator socket frames that can change what the top bar shows. */
-const SUMMARY_NUDGE_TYPES = [
+/**
+ * Narrator socket frames on the coordinator that can change what the top bar shows. The server
+ * sends the coordinator its own status, the tree's permission frames (ACL root), its direct
+ * workers' start / finish (`subagent_*`), nested helpers' changes and its background task
+ * counts. Other changes (a helper finishing, work item states) arrive with the poll.
+ */
+export const SUMMARY_NUDGE_TYPES = [
 	"status_change",
-	"narrator:status_changed",
 	"substatus_change",
 	"permission_request",
 	"permission_resolved",
 	"subagent_status_changed",
 	"subagent_started",
+	"subagent_detached",
 	"subagent_nested_changed",
+	"background_task_count_changed",
 ];
-const NUDGE_DEBOUNCE_MS = 400;
-
 /**
  * The team page's summary, kept live (see the module comment). Also refetches the board, the
  * activity and the approvals when the summary says they changed.
@@ -111,14 +126,19 @@ export function useTeamSummary(projectId: string, teamId: string) {
 		if (!teamId) return;
 		const handle = narratorWSManager.subscribe([teamId]);
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let firstAt: number | null = null;
+		const fire = () => {
+			firstAt = null;
+			delay.current = SUMMARY_POLL_MIN_MS;
+			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+		};
 		const listener = narratorWSManager.addListener(
 			{ narratorIds: [teamId], types: SUMMARY_NUDGE_TYPES },
 			() => {
+				const now = Date.now();
+				firstAt ??= now;
 				clearTimeout(timer);
-				timer = setTimeout(() => {
-					delay.current = SUMMARY_POLL_MIN_MS;
-					void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
-				}, NUDGE_DEBOUNCE_MS);
+				timer = setTimeout(fire, nudgeDelay(now - firstAt));
 			},
 		);
 		return () => {
@@ -128,16 +148,24 @@ export function useTeamSummary(projectId: string, teamId: string) {
 		};
 	}, [teamId, queryClient]);
 
+	// Only work item changes refetch the board (worker statuses are overlaid from the summary)
+	// and only a new event refetches the activity.
 	const board = boardSignature(summary.data);
 	const seenBoard = useRef("");
 	useEffect(() => {
 		if (!board) return;
-		if (seenBoard.current && seenBoard.current !== board) {
+		if (seenBoard.current && seenBoard.current !== board)
 			void queryClient.invalidateQueries({ queryKey: [...teamKeys.page(teamId), "board"] });
-			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
-		}
 		seenBoard.current = board;
 	}, [board, teamId, queryClient]);
+	const lastEvent = summary.data?.lastEventId ?? null;
+	const seenEvent = useRef<string | null | undefined>(undefined);
+	useEffect(() => {
+		if (!summary.data) return;
+		if (seenEvent.current !== undefined && seenEvent.current !== lastEvent)
+			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
+		seenEvent.current = lastEvent;
+	}, [lastEvent, summary.data, teamId, queryClient]);
 
 	const pending = summary.data?.pendingApprovalCount ?? null;
 	const seenPending = useRef<number | null>(null);
@@ -150,13 +178,19 @@ export function useTeamSummary(projectId: string, teamId: string) {
 	return summary;
 }
 
-export function useTeamBoardColumn(projectId: string, teamId: string, column: TeamBoardColumn) {
+/** One column's cards; a folded column reads nothing. */
+export function useTeamBoardColumn(
+	projectId: string,
+	teamId: string,
+	column: TeamBoardColumn,
+	open = true,
+) {
 	return useInfiniteQuery({
 		queryKey: teamKeys.board(teamId, column),
 		queryFn: ({ pageParam }) => api.getTeamBoardColumn(projectId, teamId, column, pageParam),
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
-		enabled: !!projectId && !!teamId,
+		enabled: open && !!projectId && !!teamId,
 		gcTime: TEAM_GC_TIME_MS,
 		refetchOnWindowFocus: false,
 	});
@@ -190,6 +224,8 @@ export function useDecideApproval(teamId: string) {
 	return useMutation({
 		mutationFn: ({ requestId, decision }: { requestId: string; decision: "allow" | "deny" }) =>
 			decision === "allow" ? api.approvePermission(requestId) : api.denyPermission(requestId),
+		// The row says it failed itself.
+		meta: { suppressErrorToast: true },
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.approvals(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
@@ -198,24 +234,29 @@ export function useDecideApproval(teamId: string) {
 }
 
 /**
- * "Pause all": stop every running session of the tree through the ordinary Stop route (which
- * ends a session's turn, a detached run through its task), coordinator first. Each stop is its
- * own request with its own access check; the result counts the ones that failed.
+ * "Pause all": read the tree's running sessions now (not the summary, which names at most 20
+ * and may be a minute old), then stop each through the ordinary Stop route (which ends a
+ * session's turn, a detached run through its task), coordinator first. Each stop is its own
+ * request with its own access check; the result says how many were stopped and how many not.
  */
-export function usePauseTeam(teamId: string) {
+export function usePauseTeam(projectId: string, teamId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: async (summary: TeamPageSummary) => {
+		mutationFn: async (): Promise<PauseOutcome> => {
+			const running = await api.getTeamRunning(projectId, teamId);
+			let stopped = 0;
 			let failed = 0;
-			for (const id of pauseOrder(teamId, summary)) {
+			for (const id of pauseOrder(teamId, running.agents)) {
 				try {
 					await api.interruptNarrator(id);
+					stopped++;
 				} catch {
 					failed++;
 				}
 			}
-			return { failed };
+			return { stopped, failed, more: running.more };
 		},
+		meta: { suppressErrorToast: true },
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
 		},

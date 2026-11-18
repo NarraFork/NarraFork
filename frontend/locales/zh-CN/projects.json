@@ -254,10 +254,13 @@
 			"pauseConfirmTitle": "暂停整个团队？",
 			"pauseConfirm": "这会停止团队里每个运行中会话的当前一轮：协调者和它的代理。历史保留，发消息即可继续。",
 			"pauseConfirmButton": "全部暂停",
-			"paused": "团队已暂停",
-			"pauseFailed_one": "{{count}} 个会话未能停止",
-			"pauseFailed_other": "{{count}} 个会话未能停止",
-			"membersOnly": "只有团队成员能审批"
+			"membersOnly": "只有团队成员能审批",
+			"paused_one": "已停止 {{count}} 个会话",
+			"paused_other": "已停止 {{count}} 个会话",
+			"pausePartial": "已停止 {{stopped}} 个；{{failed}} 个未能停止",
+			"pauseNothing": "没有运行中的会话",
+			"pauseMore": "已停止 {{stopped}} 个；运行中的会话超过一次能读取的数量，请再暂停一次",
+			"pauseError": "无法读取运行中的会话，没有停止任何会话"
 		},
 		"approvals": {
 			"title": "待批",
@@ -271,11 +274,18 @@
 			"helper": "帮手",
 			"decided": "已提交决定",
 			"failed": "无法提交决定",
-			"openSession": "打开会话"
+			"openSession": "打开会话",
+			"answerInSession": "需在会话里回答",
+			"kinds": {
+				"question": "提问",
+				"plan": "待批准的计划",
+				"rule": "权限规则申请"
+			}
 		},
 		"agents": {
 			"title": "运行中的会话"
 		},
-		"back": "返回项目"
+		"back": "返回项目",
+		"unavailable": "这个部署不支持团队。"
 	}
 }
