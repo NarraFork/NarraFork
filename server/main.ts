@@ -1409,6 +1409,10 @@ if (activeDatabaseBackend === "sqlite") {
 	import("./services/teams/work-items")
 		.then(({ startTeamWorkLifecycle }) => startTeamWorkLifecycle())
 		.catch((err) => logger.warn("Team work lifecycle failed to start", { error: String(err) }));
+	// Team work items' changed paths stay current in the background (overlaps, exclusive paths).
+	import("./services/teams/team-overlap")
+		.then(({ startTeamOverlapJob }) => startTeamOverlapJob())
+		.catch((err) => logger.warn("Team overlap job failed to start", { error: String(err) }));
 	// Stop containers and release ports that removed chapters left behind.
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });

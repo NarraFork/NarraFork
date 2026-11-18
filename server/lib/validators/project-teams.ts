@@ -87,3 +87,11 @@ export const listProjectTeamsQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 	cursor: z.string().max(200).optional(),
 });
+
+/** `POST /api/projects/:projectId/team-locks/release`: a person releases the exclusive lock. */
+export const releaseTeamLockSchema = z
+	.object({
+		workItemId: z.string().min(1).max(200),
+		reason: z.string().max(500).optional(),
+	})
+	.strict();

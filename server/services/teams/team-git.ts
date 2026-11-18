@@ -9,8 +9,16 @@
  * index write, every configured filter emptied and every configuration-defined hook disabled by
  * name), after the once-per-process check that this git honors them. Reads reuse G1's query
  * functions with `gitService`'s read bounds (60 s, 1 MB).
+ *
+ * `changedPaths` (X) lists what a branch changed since its merge base with the base: a diff of
+ * two commits, which never reads the working tree, the index or a filter.
  */
 import { isAbsolute, resolve } from "node:path";
+import {
+	TEAM_CHANGED_DIR_SUFFIX,
+	TEAM_CHANGED_PATHS_MAX,
+	TEAM_CHANGED_PATHS_MAX_BYTES,
+} from "@shared/project-teams";
 import { GitError } from "../../lib/errors";
 import {
 	ensureConfigOverridesHonored,
@@ -27,12 +35,17 @@ import {
 	countCommitsNotIn,
 	type GitQueryRunner,
 	isAncestor,
+	mergeBase,
 	resolveCommit,
 	uncommittedChanges,
 } from "../git-ref-queries";
 
 const READ_TIMEOUT_MS = 60_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
+/** Name-only listing cap: well past {@link TEAM_CHANGED_PATHS_MAX} typical paths. */
+const CHANGED_LISTING_MAX_BYTES = 512 * 1024;
+/** Top-level listing cap (one raw record per changed top-level entry). */
+const TOP_LEVEL_LISTING_MAX_BYTES = 256 * 1024;
 
 async function spawnGit(
 	cwd: string,
@@ -77,12 +90,81 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 	return parseProgramConfig(result.stdout);
 }
 
+/** What a branch changed since its merge base with the base (committed changes only). */
+export interface ChangedPaths {
+	head: string;
+	mergeBase: string;
+	/** Sorted. When `collapsed`, top-level entries only, directories ending in `/`. */
+	paths: string[];
+	/** Over {@link TEAM_CHANGED_PATHS_MAX} paths or the byte budget: top-level entries kept. */
+	collapsed: boolean;
+}
+
 /** One worktree's hardened, read-only git: G1's queries. */
 export interface TeamGit {
 	resolveCommit(ref: string): Promise<string | null>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
 	countCommitsNotIn(tip: string, reachableFrom: readonly string[]): Promise<number>;
 	uncommittedChanges(): Promise<{ count: number; exact: boolean }>;
+	/**
+	 * Paths changed between the merge base of HEAD and `baseRef`, and HEAD (`diff --name-only
+	 * --no-renames`: a rename counts as both paths). Null when either does not resolve or the
+	 * histories are unrelated.
+	 */
+	changedPaths(baseRef: string): Promise<ChangedPaths | null>;
+}
+
+const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
+
+/** NUL-separated records; a truncated listing drops its last, possibly partial, record. */
+function nulRecords(stdout: string, truncated: boolean): string[] {
+	const records = stdout.split("\0");
+	records.pop();
+	if (truncated) records.pop();
+	return records;
+}
+
+async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<ChangedPaths | null> {
+	const head = await resolveCommit(run, "HEAD");
+	const base = await resolveCommit(run, baseRef);
+	if (!head || !base) return null;
+	const fork = await mergeBase(run, head, base);
+	if (!fork) return null;
+	const listing = await run(["diff", "--name-only", "--no-renames", "-z", fork, head], {
+		maxOutputBytes: CHANGED_LISTING_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError("git diff could not list the changed paths");
+	const paths = nulRecords(listing.stdout, listing.truncated === true).filter(Boolean);
+	if (
+		!listing.truncated &&
+		paths.length <= TEAM_CHANGED_PATHS_MAX &&
+		utf8Bytes(JSON.stringify(paths)) <= TEAM_CHANGED_PATHS_MAX_BYTES
+	)
+		return { head, mergeBase: fork, paths: paths.sort(), collapsed: false };
+	// Too many to keep: the top-level entries that changed (`diff-tree` without `-r` stops at
+	// the first level; a tree's mode is 040000).
+	const top = await run(["diff-tree", "--no-renames", "-z", fork, head], {
+		maxOutputBytes: TOP_LEVEL_LISTING_MAX_BYTES,
+	});
+	if (top.exitCode !== 0 || top.truncated)
+		throw new GitError("git diff-tree could not list the changed top-level entries");
+	const records = nulRecords(top.stdout, false);
+	const entries = new Set<string>();
+	for (let index = 0; index + 1 < records.length; index += 2) {
+		const meta = records[index] ?? "";
+		const name = records[index + 1] ?? "";
+		if (!meta.startsWith(":") || !name) continue;
+		const [srcMode, dstMode] = meta.slice(1).split(" ");
+		const isTree = srcMode === "040000" || dstMode === "040000";
+		entries.add(isTree ? `${name}${TEAM_CHANGED_DIR_SUFFIX}` : name);
+	}
+	const collapsed = [...entries].sort();
+	if (
+		collapsed.length > TEAM_CHANGED_PATHS_MAX ||
+		utf8Bytes(JSON.stringify(collapsed)) > TEAM_CHANGED_PATHS_MAX_BYTES
+	)
+		throw new GitError("The changed top-level entries do not fit the stored budget");
+	return { head, mergeBase: fork, paths: collapsed, collapsed: true };
 }
 
 export function teamGit(cwd: string): TeamGit {
@@ -106,6 +188,7 @@ export function teamGit(cwd: string): TeamGit {
 		isAncestor: (ancestor, descendant) => isAncestor(run, ancestor, descendant),
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
+		changedPaths: (baseRef) => changedPathsOf(run, baseRef),
 	};
 }
 
