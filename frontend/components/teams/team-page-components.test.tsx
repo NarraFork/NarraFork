@@ -241,6 +241,16 @@ describe("ready items and approvals answered in their session", () => {
 				}),
 				decision("d2", "approval.denied", { actorName: "bob", toolName: "Edit", depth: 2 }),
 				decision("d1", "approval.allowed", {}),
+				decision("dp", "approval.denied", {
+					actorName: "erin",
+					toolName: "ExitPlanMode",
+					approvalKind: "plan",
+				}),
+				decision("dd", "question.deferred", {
+					actorName: "frank",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
 				decision("d0", "question.ignored", {
 					actorName: "dave",
 					toolName: "AskUserQuestion",
@@ -264,16 +274,27 @@ describe("ready items and approvals answered in their session", () => {
 					'aria-label="Answered"',
 					"dave closed a question without telling the agent",
 					'aria-label="Closed silently"',
+					"erin denied a plan",
+					"frank chose to answer a question later",
+					'aria-label="Answer later"',
 				],
 			],
 			[
 				"zh-CN",
-				["carol 回答了提问", "bob 拒绝了 Edit", "alice 批准了 Bash", "协调者", "dave 关闭了提问"],
+				[
+					"carol 回答了提问",
+					"bob 拒绝了 Edit",
+					"alice 批准了 Bash",
+					"协调者",
+					"dave 关闭了提问",
+					"erin 拒绝了 一份计划",
+					"frank 选择稍后回答提问",
+				],
 			],
 		] as const) {
 			const html = await render(<TeamApprovalsList projectId="p" teamId="lead" />, client, lng);
 			expect(html).toContain("team-recent-decisions");
-			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(4);
+			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(6);
 			for (const text of expected) expect(html).toContain(text);
 		}
 	});

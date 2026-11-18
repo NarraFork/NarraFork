@@ -392,4 +392,33 @@ describe("the status section", () => {
 			await db.delete(aclGrants).where(inArray(aclGrants.id, ids));
 		}
 	});
+
+	test("public write audience: a project read grant makes a member, and members-only reads find them", async () => {
+		// Sorts first: earlier tests leave many project read grants behind (beyond the limits).
+		const reader = "people-0-public-reader";
+		await user(reader); // a project READ grant, nothing on the coordinator
+		const { canWriteNarrator, NARRATOR_ACL_COLUMNS } = await import("../../narrator-acl");
+		const { readTeamMemberIds } = await import("../team-members");
+		try {
+			await db
+				.update(narrators)
+				.set({ visibility: "public", writeAudience: "public" })
+				.where(eq(narrators.id, teamId));
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, teamId),
+				columns: NARRATOR_ACL_COLUMNS,
+			});
+			expect(row && (await canWriteNarrator(row, { userId: reader, isAdmin: false }))).toBe(true);
+			const drawer = await readTeamMembers(teamId);
+			expect(drawer?.members.find((m) => m.userId === reader)?.role).toBe("member");
+			// The notification fan-out's read.
+			expect(await readTeamMemberIds(teamId, 50)).toContain(reader);
+		} finally {
+			await db
+				.update(narrators)
+				.set({ visibility: "private", writeAudience: "owner" })
+				.where(eq(narrators.id, teamId));
+			await db.delete(aclGrants).where(eq(aclGrants.principalId, reader));
+		}
+	});
 });

@@ -1,28 +1,58 @@
 /**
  * A team session waits for a member (M1): a tab the server marked `teamOnlooker` (the user may
  * only read that coordinator or its subagent) raises no "waiting" alert — no favicon dot, sound
- * or PWA notification. Done / unread and every other tab are unchanged.
+ * or PWA notification — but a session that is also unread (done) still alerts as unread. Every
+ * other tab is unchanged.
  */
 import { describe, expect, test } from "bun:test";
-import { type RecentTab, silentForTeamOnlooker } from "./recent-tabs-utils";
+import {
+	accessChangeNeedsRuntimeRefresh,
+	isTeamOnlookerTab,
+	type RecentTab,
+	statusAttention,
+} from "./recent-tabs-utils";
 
 const tab = (patch: Partial<RecentTab>): RecentTab =>
 	({ type: "narrator", id: "n", title: "t", ...patch }) as RecentTab;
 
-describe("silentForTeamOnlooker", () => {
-	test("only a waiting team session the user may only read", () => {
+describe("team onlooker alerts", () => {
+	test("which tabs are a team onlooker's", () => {
 		const tabs = [
 			tab({ id: "lead", teamOnlooker: true }),
 			tab({ id: "worker", type: "subagent", teamOnlooker: true }),
 			tab({ id: "mine", teamOnlooker: false }),
 			tab({ id: "plain" }),
 		];
-		expect(silentForTeamOnlooker(tabs, "lead", "waiting")).toBe(true);
-		expect(silentForTeamOnlooker(tabs, "worker", "waiting")).toBe(true);
-		expect(silentForTeamOnlooker(tabs, "lead", "idle")).toBe(false);
-		expect(silentForTeamOnlooker(tabs, "lead", undefined)).toBe(false);
-		expect(silentForTeamOnlooker(tabs, "mine", "waiting")).toBe(false);
-		expect(silentForTeamOnlooker(tabs, "plain", "waiting")).toBe(false);
-		expect(silentForTeamOnlooker(tabs, "absent", "waiting")).toBe(false);
+		expect(isTeamOnlookerTab(tabs, "lead")).toBe(true);
+		expect(isTeamOnlookerTab(tabs, "worker")).toBe(true);
+		expect(isTeamOnlookerTab(tabs, "mine")).toBe(false);
+		expect(isTeamOnlookerTab(tabs, "plain")).toBe(false);
+		expect(isTeamOnlookerTab(tabs, "absent")).toBe(false);
+	});
+
+	test("waiting is silent for an onlooker; unread is not", () => {
+		expect(statusAttention("waiting", [], false)).toBe("waiting");
+		expect(statusAttention("waiting", [], true)).toBeNull();
+		expect(statusAttention("waiting", ["unread"], true)).toBe("unread");
+		expect(statusAttention("waiting", ["unread"], false)).toBe("waiting");
+		expect(statusAttention("idle", ["unread"], true)).toBe("unread");
+		expect(statusAttention("idle", ["unread"], false)).toBe("unread");
+		expect(statusAttention("idle", [], false)).toBeNull();
+		expect(statusAttention(undefined, null, true)).toBeNull();
+	});
+
+	test("an access change reads the runtime patches again when it may move the flag", () => {
+		const lead = tab({ id: "lead" });
+		expect(accessChangeNeedsRuntimeRefresh([lead], "lead")).toBe(true);
+		expect(accessChangeNeedsRuntimeRefresh([lead], "other")).toBe(false);
+		// A promoted onlooker: its stale flag must be read again, whatever narrator changed.
+		expect(accessChangeNeedsRuntimeRefresh([tab({ id: "w", teamOnlooker: true })], "lead")).toBe(
+			true,
+		);
+		// A subagent's root is not known on the client.
+		expect(accessChangeNeedsRuntimeRefresh([tab({ id: "w", type: "subagent" })], "lead")).toBe(
+			true,
+		);
+		expect(accessChangeNeedsRuntimeRefresh([], "lead")).toBe(false);
 	});
 });

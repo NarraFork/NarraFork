@@ -143,6 +143,7 @@ const KNOWN_EVENT_KINDS = new Set([
 	"question.dismissed",
 	"question.ignored",
 	"question.supplemented",
+	"question.deferred",
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -206,7 +207,8 @@ export function eventNote(
 		case "question.answered":
 		case "question.dismissed":
 		case "question.ignored":
-		case "question.supplemented": {
+		case "question.supplemented":
+		case "question.deferred": {
 			const tool = text(detail.tool, 120) ?? "";
 			const agent = text(detail.agentTitle, 120);
 			const depth = num(detail.depth) ?? 1;
@@ -336,6 +338,7 @@ const RECENT_DECISION_KEYS = {
 	"question.dismissed": "dismissed",
 	"question.ignored": "ignored",
 	"question.supplemented": "supplemented",
+	"question.deferred": "deferred",
 } as const satisfies Record<TeamPersonDecisionEventKind, string>;
 export type RecentDecisionKey = (typeof RECENT_DECISION_KEYS)[TeamPersonDecisionEventKind];
 

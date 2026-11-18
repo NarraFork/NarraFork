@@ -44,6 +44,8 @@ const { handleNarratorWS } = await import("../../websocket/narrator-ws");
 const { asyncQuestionAnswerSchema, permissionDecisionSchema } = await import(
 	"../../lib/validators"
 );
+const { outlinePlanDecisionSchema } = await import("../../lib/validators/outline");
+const outlinePlanMode = await import("../../services/outline-plan-mode");
 const { createAsyncQuestion, setQuestionServiceSeam } = await import(
 	"../../services/narrator-question-service"
 );
@@ -843,59 +845,200 @@ describe("onlookers are not alerted (M1)", () => {
 			(await enrichTabs(tabs(), userId)).map((tab) => tab.teamOnlooker === true);
 		expect(await marks(READER)).toEqual([true, true, false]);
 		expect(await marks(MEMBER)).toEqual([false, false, false]);
+		// Promoted to member: the next read (the client re-reads on narrator_access_changed)
+		// clears the flag; revoked again, it comes back.
+		const id = await grantWrite(READER);
+		expect(await marks(READER)).toEqual([false, false, false]);
+		await revoke(id);
+		expect(await marks(READER)).toEqual([true, true, false]);
 	});
 });
 
-describe("IM gateway approvals of a team call (M1)", () => {
-	test("only a chat bound to a member's account decides it, recorded with that member", async () => {
+describe("IM gateway and team calls (M1)", () => {
+	test("a team call is never decided from IM, through any path; other sessions are as before", async () => {
 		const { gateway } = await import("../../gateway/gateway");
 		const sent: string[] = [];
-		// biome-ignore lint/suspicious/noExplicitAny: driving the gateway's private command path
+		// biome-ignore lint/suspicious/noExplicitAny: driving the gateway's private paths
 		const im = gateway as any;
 		im.adapters.set("telegram", {
 			send: async (_chatId: string, text: string) => {
 				sent.push(text);
 			},
 		});
-		const now = new Date().toISOString();
-		const bind = async (chat: string, appUserId: string | null) => {
-			await db.insert(gatewaySessionMappings).values({
-				id: generateId(),
-				platform: "telegram",
-				chatId: chat,
-				userId: `im-${chat}`,
-				narratorId: teamId,
-				appUserId,
-				createdAt: now,
-				updatedAt: now,
-			});
-			return {
-				platform: "telegram" as const,
-				chatId: chat,
-				userId: `im-${chat}`,
-				username: chat,
-				text: "/approve",
-			};
+		const msg = {
+			platform: "telegram" as const,
+			chatId: "chat-im",
+			userId: "im-sender",
+			username: "im sender",
+			text: "",
 		};
 		try {
+			// The production path: a new chat gets its own session, its account auto-resolved
+			// (the first admin or only user; never a binding the sender proved) …
+			const mapping = await im.createNewMapping(msg, new Date().toISOString());
+			expect(mapping.appUserId).toBeTruthy();
+			// … then the sender switches the chat to the coordinator.
+			await im.handleCommand({ cmd: "/switch", args: teamId }, msg);
+			const bound = await db
+				.select({ narratorId: gatewaySessionMappings.narratorId })
+				.from(gatewaySessionMappings)
+				.where(eq(gatewaySessionMappings.id, mapping.id))
+				.get();
+			expect(bound?.narratorId).toBe(teamId);
+
+			const before = (await personEvents()).length;
 			const pending = await pendingCall(teamId);
-			for (const [chat, appUserId] of [
-				["chat-unbound", null],
-				["chat-onlooker", READER],
+			for (const [cmd, args] of [
+				["/approve", ""],
+				["/deny", "not now"],
 			] as const) {
-				await im.handleCommand({ cmd: "/approve", args: "" }, await bind(chat, appUserId));
-				expect(sent.at(-1)).toContain("only team members can decide it");
-				expect(pending.decisions).toEqual([]);
+				await im.handleCommand({ cmd, args }, { ...msg, text: `${cmd} ${args}` });
+				expect(sent.at(-1)).toContain("can't be approved, denied or answered from chat");
 			}
-			await im.handleCommand({ cmd: "/deny", args: "not now" }, await bind("chat-member", GRANTED));
-			expect(pending.decisions).toEqual(["deny"]);
-			const recorded = (await personEvents()).find(
-				(event) => event.detail?.requestId === pending.id,
-			);
-			expect(recorded).toMatchObject({ kind: "approval.denied", actorId: GRANTED });
+			// A quoted reply to the permission message is refused the same way.
+			im.trackPermMessageId("perm-message-1", pending.id);
+			const keyword = [...im.constructor.APPROVE_KEYWORDS][0] as string;
+			expect(
+				await im.handlePermissionByQuote({
+					...msg,
+					text: keyword,
+					raw: { message_reference: { message_id: "perm-message-1" } },
+				}),
+			).toBe(true);
+			expect(sent.at(-1)).toContain("can't be approved, denied or answered from chat");
+			expect(pending.decisions).toEqual([]);
+			expect(pendingPermissions.has(pending.id)).toBe(true);
+			expect((await personEvents()).length).toBe(before);
+			pendingPermissions.delete(pending.id);
+
+			// A session outside any team is decided from IM exactly as before.
+			await im.handleCommand({ cmd: "/switch", args: mapping.narratorId }, msg);
+			const own = await pendingCall(mapping.narratorId);
+			await im.handleCommand({ cmd: "/approve", args: "" }, { ...msg, text: "/approve" });
+			expect(own.decisions).toEqual(["allow"]);
 		} finally {
 			im.adapters.delete("telegram");
-			await db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.narratorId, teamId));
+			await db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.chatId, "chat-im"));
+		}
+	});
+});
+
+describe("plan decisions and answering later (M1)", () => {
+	const planBody = (action: "return" | "draft" | "lock") => ({ action, seenSeq: 0 });
+
+	test("a member's plan decision and a deferral are recorded; onlookers are refused", async () => {
+		// The outline's own plan handling is not under test: it resolves the waiting call.
+		const decide = spyOn(outlinePlanMode, "decideOutlinePlanRequest").mockImplementation(
+			async ({ requestId, body }) => {
+				pendingPermissions
+					.get(requestId)
+					?.resolve({ behavior: body.action === "return" ? "deny" : "allow" } as never);
+				pendingPermissions.delete(requestId);
+				return { commit: null };
+			},
+		);
+		try {
+			const returned = await pendingCall(workerId, "ExitPlanMode", { plan: "x" });
+			for (const user of [READER, OUTSIDER]) {
+				const refused = await call(user, `/narrators/permissions/${returned.id}/plan`, {
+					method: "POST",
+					body: planBody("draft"),
+				});
+				expect([403, 404]).toContain(refused.status);
+			}
+			expect(decide).not.toHaveBeenCalled();
+			expect(
+				(
+					await call(MEMBER, `/narrators/permissions/${returned.id}/plan`, {
+						method: "POST",
+						body: planBody("return"),
+					})
+				).status,
+			).toBe(200);
+			const approved = await pendingCall(teamId, "ExitPlanMode", { plan: "y" });
+			expect(
+				(
+					await call(GRANTED, `/narrators/permissions/${approved.id}/plan`, {
+						method: "POST",
+						body: planBody("draft"),
+					})
+				).status,
+			).toBe(200);
+
+			const asked = await pendingCall(workerId, "AskUserQuestion", { questions: [] });
+			for (const user of [READER, OUTSIDER]) {
+				const refused = await call(user, `/narrators/permissions/${asked.id}/defer`, {
+					method: "POST",
+				});
+				expect([403, 404]).toContain(refused.status);
+			}
+			expect(asked.decisions).toEqual([]);
+			expect(
+				(await call(MEMBER, `/narrators/permissions/${asked.id}/defer`, { method: "POST" })).status,
+			).toBe(200);
+			expect(asked.decisions).toEqual(["allow"]);
+
+			const events = await personEvents();
+			const of = (requestId: string) => events.find((e) => e.detail?.requestId === requestId);
+			expect(of(returned.id)).toMatchObject({
+				kind: "approval.denied",
+				actorId: MEMBER,
+				detail: { tool: "ExitPlanMode", approvalKind: "plan" },
+			});
+			expect(of(approved.id)).toMatchObject({ kind: "approval.allowed", actorId: GRANTED });
+			expect(of(asked.id)).toMatchObject({ kind: "question.deferred", actorId: MEMBER });
+		} finally {
+			decide.mockRestore();
+		}
+	});
+
+	test("a plan decision or a deferral in flight when access is revoked is refused", async () => {
+		const decide = spyOn(outlinePlanMode, "decideOutlinePlanRequest").mockImplementation(
+			async () => ({ commit: null }),
+		);
+		try {
+			const plan = await pendingCall(workerId, "ExitPlanMode", { plan: "z" });
+			let revoked = false;
+			const parse = spyOn(outlinePlanDecisionSchema, "safeParse").mockImplementation(((
+				value: unknown,
+			) => {
+				db.delete(aclGrants).where(eq(aclGrants.id, grantId)).run();
+				revoked = true;
+				parse.mockRestore();
+				return outlinePlanDecisionSchema.safeParse(value);
+			}) as typeof outlinePlanDecisionSchema.safeParse);
+			const response = await call(GRANTED, `/narrators/permissions/${plan.id}/plan`, {
+				method: "POST",
+				body: planBody("draft"),
+			});
+			parse.mockRestore();
+			expect(revoked).toBe(true);
+			expect([403, 404]).toContain(response.status);
+			expect(decide).not.toHaveBeenCalled();
+			pendingPermissions.delete(plan.id);
+			grantId = await grantWrite(GRANTED);
+
+			// Defer has no body: revoke while the call is read, just before the re-check.
+			const asked = await pendingCall(workerId, "AskUserQuestion", { questions: [] });
+			const decisions = await import("../../services/teams/team-decisions");
+			const read = spyOn(decisions, "readDecisionTarget").mockImplementation(async () => {
+				db.delete(aclGrants).where(eq(aclGrants.id, grantId)).run();
+				return { narratorId: workerId, toolName: "AskUserQuestion" };
+			});
+			try {
+				const deferred = await call(GRANTED, `/narrators/permissions/${asked.id}/defer`, {
+					method: "POST",
+				});
+				expect(read).toHaveBeenCalled();
+				expect([403, 404]).toContain(deferred.status);
+				expect(asked.decisions).toEqual([]);
+			} finally {
+				read.mockRestore();
+				pendingPermissions.delete(asked.id);
+				grantId = await grantWrite(GRANTED);
+			}
+		} finally {
+			decide.mockRestore();
 		}
 	});
 });

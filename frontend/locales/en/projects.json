@@ -236,7 +236,8 @@
 			"question_answered": "Answered a question",
 			"question_dismissed": "Dismissed a question",
 			"question_ignored": "Closed a question silently",
-			"question_supplemented": "Followed up on an answer"
+			"question_supplemented": "Followed up on an answer",
+			"question_deferred": "Chose to answer a question later"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -306,7 +307,10 @@
 				"supplemented": "{{who}} followed up on an answer",
 				"dismissedLabel": "Dismissed",
 				"ignoredLabel": "Closed silently",
-				"supplementedLabel": "Followed up"
+				"supplementedLabel": "Followed up",
+				"deferred": "{{who}} chose to answer a question later",
+				"deferredLabel": "Answer later",
+				"planWhat": "a plan"
 			}
 		},
 		"agents": {

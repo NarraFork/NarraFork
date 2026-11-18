@@ -30,24 +30,46 @@ export interface RecentTab extends PersistedRecentTab {
 	isScheduled?: boolean;
 }
 
+/** Whether this narrator's tab is a team session the user may only read (M1). */
+export function isTeamOnlookerTab(tabs: readonly RecentTab[], narratorId: string): boolean {
+	return tabs.some(
+		(tab) =>
+			(tab.type === "narrator" || tab.type === "subagent") &&
+			tab.id === narratorId &&
+			tab.teamOnlooker === true,
+	);
+}
+
 /**
- * Whether a "waiting for a person" alert (favicon, sound, PWA) must stay silent for this user:
- * the tab is a team session they may only read (M1). Only members can act on its calls.
+ * Whether an access change of `narratorId` may have changed `teamOnlooker` on these tabs, so
+ * their runtime patches must be read again (M1): a tab of that narrator, an onlooker tab (a
+ * subagent's root is not known here), or any subagent tab (its root may be that narrator).
  */
-export function silentForTeamOnlooker(
+export function accessChangeNeedsRuntimeRefresh(
 	tabs: readonly RecentTab[],
 	narratorId: string,
-	status: string | undefined,
 ): boolean {
-	return (
-		status === "waiting" &&
-		tabs.some(
-			(tab) =>
-				(tab.type === "narrator" || tab.type === "subagent") &&
-				tab.id === narratorId &&
-				tab.teamOnlooker === true,
-		)
+	return tabs.some(
+		(tab) =>
+			tab.type === "subagent" ||
+			tab.teamOnlooker === true ||
+			(tab.type === "narrator" && tab.id === narratorId),
 	);
+}
+
+/**
+ * The attention a narrator status calls for (after the reflecting and model-wait checks):
+ * "waiting" for a person, "unread" (done), or none. A team onlooker (M1) cannot act on what
+ * a team session waits for, so a waiting session alerts them only as far as it is unread.
+ */
+export function statusAttention(
+	status: string | undefined,
+	substatus: readonly string[] | null | undefined,
+	teamOnlooker: boolean,
+): "waiting" | "unread" | null {
+	if (status === "waiting" && !teamOnlooker) return "waiting";
+	if (substatus?.includes("unread")) return "unread";
+	return null;
 }
 
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;

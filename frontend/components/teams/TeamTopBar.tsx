@@ -34,6 +34,7 @@ import {
 } from "@shared/project-teams";
 import {
 	IconCheck,
+	IconClockPause,
 	IconEyeOff,
 	IconMessageCircle,
 	IconMessageOff,
@@ -196,6 +197,7 @@ const DECISION_ICON = {
 	dismissed: IconMessageOff,
 	ignored: IconEyeOff,
 	supplemented: IconMessagePlus,
+	deferred: IconClockPause,
 } as const satisfies Record<RecentDecisionKey, unknown>;
 const DECISION_COLOR = {
 	allowed: "green",
@@ -204,6 +206,7 @@ const DECISION_COLOR = {
 	dismissed: "gray",
 	ignored: "gray",
 	supplemented: "indigo",
+	deferred: "gray",
 } as const satisfies Record<RecentDecisionKey, string>;
 
 /** One decision a person took on a call of the tree: who, what, where, when. */
@@ -213,7 +216,8 @@ export function RecentDecisionRow({ decision }: { decision: TeamRecentDecision }
 	const Icon = DECISION_ICON[key];
 	const role = DEPTH_ROLE[Math.min(Math.max(decision.depth, 0), 2)];
 	const who = decision.actorName ?? t("teams.activity.unknownPerson");
-	const what = decision.toolName;
+	const what =
+		decision.approvalKind === "plan" ? t("teams.approvals.recent.planWhat") : decision.toolName;
 	return (
 		<Group
 			gap="xs"

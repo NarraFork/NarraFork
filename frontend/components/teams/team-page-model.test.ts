@@ -271,6 +271,7 @@ describe("people (M1)", () => {
 		expect(recentDecisionKey("question.dismissed")).toBe("dismissed");
 		expect(recentDecisionKey("question.ignored")).toBe("ignored");
 		expect(recentDecisionKey("question.supplemented")).toBe("supplemented");
+		expect(recentDecisionKey("question.deferred")).toBe("deferred");
 		for (const kind of [
 			"approval.allowed",
 			"approval.denied",
@@ -278,6 +279,7 @@ describe("people (M1)", () => {
 			"question.dismissed",
 			"question.ignored",
 			"question.supplemented",
+			"question.deferred",
 		])
 			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
 		expect(
