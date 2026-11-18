@@ -21,8 +21,33 @@ export interface RecentTab extends PersistedRecentTab {
 	viewerCount?: number;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
+	/**
+	 * Runtime-enriched marker: a team session (coordinator or one of its subagents) this user
+	 * may only read. Its calls wait for a member, so no "waiting for you" alert fires (M1).
+	 */
+	teamOnlooker?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
+}
+
+/**
+ * Whether a "waiting for a person" alert (favicon, sound, PWA) must stay silent for this user:
+ * the tab is a team session they may only read (M1). Only members can act on its calls.
+ */
+export function silentForTeamOnlooker(
+	tabs: readonly RecentTab[],
+	narratorId: string,
+	status: string | undefined,
+): boolean {
+	return (
+		status === "waiting" &&
+		tabs.some(
+			(tab) =>
+				(tab.type === "narrator" || tab.type === "subagent") &&
+				tab.id === narratorId &&
+				tab.teamOnlooker === true,
+		)
+	);
 }
 
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;

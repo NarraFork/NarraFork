@@ -1,9 +1,10 @@
 import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, terminals } from "../db/schema";
+import { narrators, projectTeams, terminals, users } from "../db/schema";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
+import { canWriteNarrator } from "./narrator-acl";
 import { getNarratorIdsWithDraft } from "./narrator-draft-service";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
@@ -113,6 +114,14 @@ export async function enrichTabs(
 			});
 		}
 
+		// Team trees (M1): a tab of a team session the user may only read is marked, so the
+		// client does not alert them that it waits for a person — only members can act on it.
+		try {
+			await markTeamOnlookerTabs(tabs, narratorIds, userId);
+		} catch (err) {
+			logger.warn("Failed to mark team onlooker tabs", { error: String(err) });
+		}
+
 		// Presence (from in-memory map)
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		for (const tab of tabs) {
@@ -127,6 +136,65 @@ export async function enrichTabs(
 	}
 
 	return tabs;
+}
+
+/**
+ * Set `teamOnlooker` on the tabs of team sessions (a coordinator, or a subagent whose ACL root
+ * is one) the user cannot write to; clear it elsewhere. Bounded by the tabs: one `IN` read of
+ * the narrators' ACL columns, one of `project_teams`, one of the user's role, and a write check
+ * per team session among the tabs (one batch per team).
+ */
+async function markTeamOnlookerTabs(
+	tabs: Record<string, unknown>[],
+	narratorIds: string[],
+	userId: string,
+): Promise<void> {
+	for (const tab of tabs) delete tab.teamOnlooker;
+	const rows = await db
+		.select({
+			id: narrators.id,
+			ownerUserId: narrators.ownerUserId,
+			visibility: narrators.visibility,
+			writeAudience: narrators.writeAudience,
+			type: narrators.type,
+			aclRootNarratorId: narrators.aclRootNarratorId,
+			contextProjectId: narrators.contextProjectId,
+		})
+		.from(narrators)
+		.where(inArray(narrators.id, narratorIds));
+	const teamOf = (row: (typeof rows)[number]) =>
+		row.type === "subagent" ? row.aclRootNarratorId : row.id;
+	const candidates = [...new Set(rows.map(teamOf).filter((id): id is string => !!id))];
+	if (candidates.length === 0) return;
+	const teams = new Set(
+		(
+			await db
+				.select({ id: projectTeams.narratorId })
+				.from(projectTeams)
+				.where(inArray(projectTeams.narratorId, candidates))
+		).map((row) => row.id),
+	);
+	if (teams.size === 0) return;
+	const user = await db
+		.select({ role: users.role })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1)
+		.get();
+	const principal = { userId, isAdmin: user?.role === "admin" };
+	const writable = new Map<string, boolean>();
+	for (const row of rows) {
+		const teamId = teamOf(row);
+		if (!teamId || !teams.has(teamId)) continue;
+		// A subagent's access is its root's: one decision per team.
+		let canWrite = writable.get(teamId);
+		if (canWrite === undefined) {
+			canWrite = await canWriteNarrator(row, principal);
+			writable.set(teamId, canWrite);
+		}
+		if (canWrite) continue;
+		for (const tab of tabs) if (getTabNarratorId(tab) === row.id) tab.teamOnlooker = true;
+	}
 }
 
 /** Enrich tabs and broadcast a snapshot to all of the user's WS connections. */

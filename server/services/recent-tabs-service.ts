@@ -1624,6 +1624,8 @@ export async function getRuntimePatches(
 			viewers: tab.viewers ?? [],
 			viewerCount: tab.viewerCount ?? 0,
 			containerStatus: tab.containerStatus ?? null,
+			// M1: a team session this user can only read (no "waiting for you" alerts).
+			teamOnlooker: tab.teamOnlooker === true,
 		},
 	}));
 	return { revision: snapshot.revision, patches };

@@ -1,6 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
-import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
+import { hasDirectorySubtitle, silentForTeamOnlooker } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -309,7 +309,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
-					event.awaited === true,
+					// A team onlooker cannot answer: never alerted (M1).
+					event.awaited === true && tab?.teamOnlooker !== true,
 					tab?.title,
 					userPrefsRef.current,
 				);
@@ -333,9 +334,13 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				const isWaitingForModel =
 					event.substatus?.includes("model_unavailable") ||
 					event.substatus?.includes("quota_exhausted");
+				// A team session waits for a member: an onlooker, who cannot approve or answer,
+				// gets no "waiting" alert (favicon, sound, PWA). M1.
+				const onlookerWaiting = silentForTeamOnlooker(tabsRef.current, narratorId, event.status);
 				const shouldNotify =
 					!isReflecting &&
 					!isWaitingForModel &&
+					!onlookerWaiting &&
 					(event.status === "waiting" || event.substatus?.includes("unread"));
 				if (isReflecting) {
 					setFaviconAlert(narratorId, "reflecting");
