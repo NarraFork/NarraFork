@@ -947,6 +947,15 @@ async function finishRun(
 		finalText,
 		terminalStatus: outcome.terminalStatus,
 	});
+	// A subagent done with its run gives back its browser tabs unless work is pending; a
+	// person holding it keeps everything open (`subagent-resources.ts`).
+	if (!hold)
+		void import("../subagent-resources").then(({ releaseSubagentBrowsersAtRunEnd }) =>
+			releaseSubagentBrowsersAtRunEnd(id, {
+				stopped: runStopsHelpers({ cancelled, timedOut }),
+				run,
+			}),
+		);
 	return result;
 }
 

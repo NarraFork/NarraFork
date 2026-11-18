@@ -7,8 +7,8 @@ Available agent types:
 - plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
 - search: Focused read-only web research agent. Tools: provider-native WebSearch and WebFetch; it does not inspect or modify local files.
 - general: General-purpose agent with write access. It can use the standard coding and coordination tools exposed to subagents (including Bash, Read, Write, Edit, Glob, Grep, Send, and TeamStatus), but cannot launch another Agent.
-- worker: Like general (write access and the same tools), and it may also launch and Await its own helper agents with Agent. Its helpers are the last level: they can never launch agents themselves. Only a narrator that may launch agents can create a worker, and a subagent's helpers are capped by that subagent's own limits (a read-only subagent cannot create a writable helper).
-- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, and necessary coordination tools; it must not modify files or require ConcludeReview.
+- worker: Like general (write access and the same tools), and it may also launch and Await its own helper agents with Agent. It starts with Terminal (interactive terminals for dev servers and REPLs, at most 3 running) and Browser (at most 2 sessions; a team holds at most 6) loaded; both keep their usual permission prompts. Its helpers are the last level: they can never launch agents themselves. Only a narrator that may launch agents can create a worker, and a subagent's helpers are capped by that subagent's own limits (a read-only subagent cannot create a writable helper).
+- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, Browser for looking at pages (no clicking, typing or scripts), and necessary coordination tools; it must not modify files or require ConcludeReview.
 - Custom types: Users can define custom subagent types with specialized prompts and tool access. Use the custom type name as the subagent_type value. Custom types have their own system prompts and tool permissions configured by the user.
 
 When to use each type:

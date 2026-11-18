@@ -87,7 +87,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
@@ -823,6 +823,7 @@ function NarratorPanelBody({
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
 	const activeTerminalCount = useMemo(
 		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
 		[narratorTerminals],
@@ -1600,7 +1601,9 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
+	// Hidden from read-only viewers: opening a terminal needs write access.
+	const terminalToolAvailable =
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals !== false;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
