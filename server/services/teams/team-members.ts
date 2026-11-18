@@ -8,16 +8,21 @@
  *
  * The ACL has broad audiences (`visibility`, `writeAudience`: project / public) that cannot
  * be enumerated cheaply, so the list is built from bounded candidate sources and every
- * candidate is judged by the real ACL (`canWriteNarrator` / `canReadNarrator`):
+ * candidate is judged by the narrator ACL's own rules, all at once (`judgeNarratorAccessBatch`:
+ * a handful of queries for the whole set, about 2 ms for 100 candidates):
  *   - the coordinator's owner;
- *   - explicit user grants on the coordinator (at most {@link TEAM_MEMBERS_LIST_LIMIT});
- *   - when an audience reaches the project: the project's owner and explicit user grants
- *     (at most {@link TEAM_MEMBERS_LIST_LIMIT});
- *   - the people who spoke among the coordinator's latest {@link TEAM_SPOKE_WINDOW} messages.
+ *   - explicit user grants on the coordinator (distinct users, members' capabilities first, at
+ *     most {@link TEAM_MEMBERS_LIST_LIMIT}; read grants are skipped for members-only reads, so
+ *     onlookers can never crowd a member out);
+ *   - the people who spoke among the coordinator's latest {@link TEAM_SPOKE_WINDOW} messages;
+ *   - when the coordinator belongs to a project and an audience reaches beyond its owner
+ *     (project or public): the project's owner and explicit user grants, same ordering.
  * Someone who reaches the team only through a `public` audience and has not spoken recently
- * is not listed; `more` says when a source was cut off. Everything is a primary-key probe or an
- * index range with a LIMIT: `acl_grants (scope_type, scope_id, …)`, `narrator_messages
- * (narrator_id, created_at)`. SQLite only, like the team surface.
+ * is not listed; `more` says when a source was cut off. People found only through the project
+ * are left out for a reader outside the project's door, and counted rather than named in the
+ * team status when the coordinator is readable outside the project. Everything is a primary-key
+ * probe or an index range with a LIMIT: `acl_grants (scope_type, scope_id)`,
+ * `narrator_messages (narrator_id, created_at)`. SQLite only, like the team surface.
  */
 
 import {
@@ -26,22 +31,28 @@ import {
 	type TeamMember,
 	type TeamMemberRole,
 } from "@shared/project-teams";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { aclGrants, narratorMessages, narrators, projects, users } from "../../db/schema";
 import {
-	canReadNarrator,
-	canWriteNarrator,
+	judgeNarratorAccessBatch,
 	NARRATOR_ACL_COLUMNS,
 	type NarratorAclRow,
+	type NarratorPrincipal,
 } from "../narrator-acl";
 import { resolveProjectIdForNarratorId } from "../narrator-project";
+import { resolveProjectGate } from "../project-acl";
 
 export interface TeamMembersRead {
 	members: TeamMember[];
+	/** A source was cut off at its limit, or more people were found than are returned. */
 	more: boolean;
 	visibility: string;
 	writeAudience: string;
+	/** Everyone found with access, by role (named or not); a lower bound when `more`. */
+	counts: { members: number; onlookers: number };
+	/** People with access found only through the project and not named (see options). */
+	hidden: number;
 }
 
 /**
@@ -73,9 +84,21 @@ export function readLastSpoken(teamId: string, window = TEAM_SPOKE_WINDOW): Map<
 	return spoken;
 }
 
-function grantees(scopeType: "narrator" | "project", scopeId: string, limit: number) {
+/**
+ * The distinct users granted on one scope, members' capabilities first (`write` / `manage`
+ * before `read`), then by id, at most `limit + 1` (the extra one says "more"). `membersOnly`
+ * leaves read-only grants out entirely: a read grant can never make a member, so it must never
+ * crowd one out of a bounded read. One range of `acl_grants (scope_type, scope_id)`.
+ */
+function grantees(
+	scopeType: "narrator" | "project",
+	scopeId: string,
+	limit: number,
+	membersOnly: boolean,
+): string[] {
+	const rank = sql<number>`min(case when ${aclGrants.capability} in ('write', 'manage') then 0 else 1 end)`;
 	return db
-		.select({ userId: aclGrants.principalId })
+		.select({ userId: aclGrants.principalId, rank })
 		.from(aclGrants)
 		.where(
 			and(
@@ -83,8 +106,11 @@ function grantees(scopeType: "narrator" | "project", scopeId: string, limit: num
 				eq(aclGrants.scopeId, scopeId),
 				eq(aclGrants.principalType, "user"),
 				isNull(aclGrants.domainKind),
+				membersOnly ? inArray(aclGrants.capability, ["write", "manage"]) : undefined,
 			),
 		)
+		.groupBy(aclGrants.principalId)
+		.orderBy(asc(rank), asc(aclGrants.principalId))
 		.limit(limit + 1)
 		.all()
 		.map((row) => row.userId);
@@ -102,15 +128,41 @@ export function compareTeamMembers(a: TeamMember, b: TeamMember): number {
 	);
 }
 
+/** Where a candidate was found: the coordinator's own ACL, the conversation, or the project. */
+type CandidateSource = "narrator" | "speaker" | "project";
+
+export interface ReadTeamMembersOptions {
+	/** Candidates taken from each source, and people returned (default 100). */
+	limit?: number;
+	/** Only people who may write (notifications): read grants are not even looked at. */
+	membersOnly?: boolean;
+	/**
+	 * Who is asking. A caller who cannot pass the project's door (a public coordinator read by
+	 * someone outside the project) is not shown people found only through the project.
+	 */
+	viewer?: NarratorPrincipal;
+	/**
+	 * Name people found only through the project? `false` counts them instead (`hidden`): the
+	 * team status is written once for everyone who can read the coordinator.
+	 */
+	nameProjectOnly?: boolean;
+}
+
 /**
- * The team's people with their role and when they last spoke, members first. `limit` bounds
- * both the candidates taken from each source and the people returned.
+ * The team's people with their role and when they last spoke, members first.
+ *
+ * Candidates (each source bounded by `limit`): the coordinator's owner and explicit grants
+ * (members' grants first), the people who spoke among the latest messages, and — when the
+ * coordinator belongs to a project and either audience reaches beyond its owner — the project's
+ * owner and grants. All candidates are judged together by `judgeNarratorAccessBatch` (the
+ * narrator ACL's own rules, a handful of queries for the whole set).
  */
 export async function readTeamMembers(
 	teamId: string,
-	options: { limit?: number } = {},
+	options: ReadTeamMembersOptions = {},
 ): Promise<TeamMembersRead | null> {
 	const limit = options.limit ?? TEAM_MEMBERS_LIST_LIMIT;
+	const membersOnly = options.membersOnly === true;
 	const coordinator = (await db.query.narrators.findFirst({
 		where: eq(narrators.id, teamId),
 		columns: NARRATOR_ACL_COLUMNS,
@@ -118,30 +170,45 @@ export async function readTeamMembers(
 	if (!coordinator) return null;
 
 	let more = false;
-	const candidates: string[] = [];
-	const add = (ids: string[]) => {
+	const sources = new Map<string, Set<CandidateSource>>();
+	const add = (ids: string[], source: CandidateSource) => {
 		if (ids.length > limit) more = true;
-		for (const id of ids.slice(0, limit)) if (!candidates.includes(id)) candidates.push(id);
-	};
-	if (coordinator.ownerUserId) add([coordinator.ownerUserId]);
-	add(grantees("narrator", teamId, limit));
-	const projectWide =
-		coordinator.visibility === "project" || coordinator.writeAudience === "project";
-	if (projectWide) {
-		const projectId = await resolveProjectIdForNarratorId(teamId);
-		if (projectId) {
-			const project = db
-				.select({ owner: projects.ownerUserId })
-				.from(projects)
-				.where(eq(projects.id, projectId))
-				.limit(1)
-				.get();
-			if (project?.owner) add([project.owner]);
-			add(grantees("project", projectId, limit));
+		for (const id of ids.slice(0, limit)) {
+			const known = sources.get(id);
+			if (known) known.add(source);
+			else sources.set(id, new Set([source]));
 		}
-	}
+	};
+	if (coordinator.ownerUserId) add([coordinator.ownerUserId], "narrator");
+	add(grantees("narrator", teamId, limit, membersOnly), "narrator");
 	const spoken = readLastSpoken(teamId);
-	add([...spoken.keys()]);
+	add([...spoken.keys()], "speaker");
+	const audiences = [coordinator.visibility, coordinator.writeAudience];
+	const projectId =
+		audiences.includes("project") || audiences.includes("public")
+			? await resolveProjectIdForNarratorId(teamId)
+			: null;
+	if (projectId) {
+		const project = db
+			.select({ owner: projects.ownerUserId })
+			.from(projects)
+			.where(eq(projects.id, projectId))
+			.limit(1)
+			.get();
+		if (project?.owner) add([project.owner], "project");
+		add(grantees("project", projectId, limit, membersOnly), "project");
+	}
+
+	// Someone outside the project's door sees only what the coordinator's own ACL and its
+	// conversation already show them.
+	let viewerSeesProject = true;
+	if (projectId && options.viewer)
+		viewerSeesProject = (await resolveProjectGate(projectId, options.viewer)).read;
+	const projectOnly = (id: string) => {
+		const found = sources.get(id);
+		return !!found && found.size === 1 && found.has("project");
+	};
+	const candidates = [...sources.keys()].filter((id) => viewerSeesProject || !projectOnly(id));
 
 	const people = new Map(
 		candidates.length
@@ -159,17 +226,29 @@ export async function readTeamMembers(
 					.map((user) => [user.id, user])
 			: [],
 	);
-	const members: TeamMember[] = [];
-	for (const userId of candidates) {
+	const principals = candidates.flatMap((userId) => {
 		const user = people.get(userId);
-		if (!user) continue;
-		const principal = { userId, isAdmin: user.role === "admin" };
-		const role: TeamMemberRole | null = (await canWriteNarrator(coordinator, principal))
+		return user ? [{ userId, isAdmin: user.role === "admin" }] : [];
+	});
+	const verdicts = await judgeNarratorAccessBatch(coordinator, principals);
+	const members: TeamMember[] = [];
+	let hidden = 0;
+	const counts = { member: 0, onlooker: 0 };
+	for (const { userId } of principals) {
+		const user = people.get(userId);
+		const verdict = verdicts.get(userId);
+		if (!user || !verdict) continue;
+		const role: TeamMemberRole | null = verdict.write
 			? "member"
-			: (await canReadNarrator(coordinator, principal))
+			: verdict.read && !membersOnly
 				? "onlooker"
 				: null;
 		if (!role) continue;
+		counts[role]++;
+		if (options.nameProjectOnly === false && projectOnly(userId)) {
+			hidden++;
+			continue;
+		}
 		members.push({
 			userId,
 			username: user.username,
@@ -187,11 +266,13 @@ export async function readTeamMembers(
 		more,
 		visibility: coordinator.visibility,
 		writeAudience: coordinator.writeAudience,
+		counts: { members: counts.member, onlookers: counts.onlooker },
+		hidden,
 	};
 }
 
 /** The team's members (write access) among the people {@link readTeamMembers} finds. */
 export async function readTeamMemberIds(teamId: string, limit: number): Promise<string[]> {
-	const read = await readTeamMembers(teamId, { limit });
+	const read = await readTeamMembers(teamId, { limit, membersOnly: true });
 	return (read?.members ?? []).filter((member) => member.role === "member").map((m) => m.userId);
 }

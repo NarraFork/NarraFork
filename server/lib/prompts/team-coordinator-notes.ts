@@ -157,6 +157,8 @@ export interface TeamStatusLabels {
 		spoke: string | null,
 	) => string;
 	morePeople: (count: string) => string;
+	peopleMore: string;
+	peopleHidden: (count: string) => string;
 	/** Broad audiences: everyone in the project, or anyone signed in. */
 	audienceProjectWrite: string;
 	audienceProjectRead: string;
@@ -217,7 +219,11 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 			`- ${name} — ${role === "member" ? "member" : "onlooker"}${owner ? " (owner)" : ""}${
 				role === "member" ? (spoke ? `, last spoke ${spoke}` : ", no recent message") : ""
 			}`,
-		morePeople: (count) => `- … and ${count} more`,
+		morePeople: (count) => `- … and ${count} more not listed here`,
+		peopleMore:
+			"These counts are of the people found; more may have access (only the first of each kind were looked at).",
+		peopleHidden: (count) =>
+			`${count} of them reach the team only through the project and are not named here.`,
 		audienceProjectWrite: "Everyone with write access to the project is a member too.",
 		audienceProjectRead: "Everyone in the project may look on.",
 		audiencePublicWrite: "Anyone signed in may speak here too.",
@@ -274,7 +280,9 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 			`- ${name} — ${role === "member" ? "成员" : "旁观者"}${owner ? "（所有者）" : ""}${
 				role === "member" ? (spoke ? `，最近发言 ${spoke}` : "，最近没有发言") : ""
 			}`,
-		morePeople: (count) => `- … 另有 ${count} 人`,
+		morePeople: (count) => `- … 另有 ${count} 人没有列出`,
+		peopleMore: "以上人数是找到的人；有权限的人可能更多（每类只查看了前面一部分）。",
+		peopleHidden: (count) => `其中 ${count} 人只是通过项目进入团队，这里不列名字。`,
 		audienceProjectWrite: "对项目有写权限的人也都是成员。",
 		audienceProjectRead: "项目里的人都可以旁观。",
 		audiencePublicWrite: "任何登录的人也都可以在这里说话。",

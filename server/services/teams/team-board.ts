@@ -672,7 +672,7 @@ export async function readTeamMembersPage(
 	projectId: string,
 ): Promise<TeamMembersResponse> {
 	const { coordinator } = await loadTeamForAccess(teamId, principal, "read", projectId);
-	const read = await readTeamMembers(teamId);
+	const read = await readTeamMembers(teamId, { viewer: principal });
 	return {
 		members: read?.members ?? [],
 		more: read?.more ?? false,

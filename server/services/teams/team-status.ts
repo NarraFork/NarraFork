@@ -155,8 +155,12 @@ export interface StatusPeople {
 		/** ISO time of the member's latest message among the window, or null. */
 		spokeAt: string | null;
 	}>;
-	/** More people exist than were looked at. */
+	/** More people may have access than were looked at (a source was cut off). */
 	more: boolean;
+	/** Everyone found with access, by role (named or not). */
+	counts: { members: number; onlookers: number };
+	/** Found only through the project and not named (the coordinator is readable outside it). */
+	hidden: number;
 	visibility: string;
 	writeAudience: string;
 }
@@ -363,7 +367,18 @@ async function readStatusState(teamId: string, now: number): Promise<StatusState
 async function readStatusPeople(teamId: string): Promise<StatusPeople | null> {
 	try {
 		const { readTeamMembers } = await import("./team-members");
-		const read = await readTeamMembers(teamId, { limit: TEAM_STATUS_LIMITS.peopleLooked });
+		const coordinator = db
+			.select({ visibility: narrators.visibility })
+			.from(narrators)
+			.where(eq(narrators.id, teamId))
+			.limit(1)
+			.get();
+		// The row is written once for everyone who can read the coordinator: when that reaches
+		// beyond the project, people found only through the project are counted, not named.
+		const read = await readTeamMembers(teamId, {
+			limit: TEAM_STATUS_LIMITS.peopleLooked,
+			nameProjectOnly: coordinator?.visibility !== "public",
+		});
 		if (!read) return null;
 		return {
 			list: read.members.map((member) => ({
@@ -373,6 +388,8 @@ async function readStatusPeople(teamId: string): Promise<StatusPeople | null> {
 				spokeAt: member.lastSpokeAt,
 			})),
 			more: read.more,
+			counts: read.counts,
+			hidden: read.hidden,
 			visibility: read.visibility,
 			writeAudience: read.writeAudience,
 		};
@@ -494,9 +511,9 @@ export function renderTeamStatus(
 	const people = state.people;
 	const peopleFixed: string[] = [];
 	if (people) {
-		const count = (role: "member" | "onlooker") =>
-			`${people.list.filter((person) => person.role === role).length}${people.more ? "+" : ""}`;
-		peopleFixed.push(t.people(count("member"), count("onlooker")));
+		peopleFixed.push(t.people(String(people.counts.members), String(people.counts.onlookers)));
+		if (people.more) peopleFixed.push(t.peopleMore);
+		if (people.hidden > 0) peopleFixed.push(t.peopleHidden(String(people.hidden)));
 		if (people.writeAudience === "project") peopleFixed.push(t.audienceProjectWrite);
 		if (people.writeAudience === "public") peopleFixed.push(t.audiencePublicWrite);
 		if (people.visibility === "project" && people.writeAudience !== "public")
@@ -572,7 +589,7 @@ export function renderTeamStatus(
 				),
 			),
 			total: people?.list.length ?? 0,
-			more: (count: number) => t.morePeople(`${count}${people?.more ? "+" : ""}`),
+			more: (count: number) => t.morePeople(String(count)),
 		},
 	} satisfies Record<string, ListSection>;
 

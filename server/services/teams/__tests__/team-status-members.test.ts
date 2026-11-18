@@ -215,7 +215,7 @@ describe("the status section", () => {
 			expect(text).toContain("People: members 33, onlookers 1");
 			const lines = text.split("\n").filter((line) => / — (member|onlooker)/.test(line));
 			expect(lines).toHaveLength(TEAM_STATUS_MEMBERS_LIMIT);
-			expect(text).toContain(`- … and ${34 - TEAM_STATUS_MEMBERS_LIMIT} more`);
+			expect(text).toContain(`- … and ${34 - TEAM_STATUS_MEMBERS_LIMIT} more not listed here`);
 		} finally {
 			await db.delete(aclGrants).where(inArray(aclGrants.id, ids));
 		}
@@ -244,13 +244,23 @@ describe("the status section", () => {
 				overrunTotal: 0,
 				decisions: [],
 				overlap: null,
-				people: { list, more: true, visibility: "project", writeAudience: "project" },
+				people: {
+					list,
+					more: true,
+					counts: { members: 26, onlookers: 14 },
+					hidden: 0,
+					visibility: "project",
+					writeAudience: "project",
+				},
 			},
 			"en",
 		);
 		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(TEAM_STATUS_MAX_BYTES);
-		expect(text).toContain("People: members 26+, onlookers 14+");
-		expect(text).toMatch(/- … and \d+\+ more/);
+		// True totals of the people found, and a plain note that more may have access.
+		expect(text).toContain("People: members 26, onlookers 14");
+		expect(text).toContain("These counts are of the people found; more may have access");
+		expect(text).toMatch(/- … and \d+ more not listed here/);
+		expect(text).not.toMatch(/\d\+/);
 	});
 
 	test("speaking alone never writes another row; a change to the people does", async () => {
@@ -289,6 +299,97 @@ describe("the status section", () => {
 			expect(rows[1]).toContain(`- ${DAVE} — onlooker`);
 		} finally {
 			await db.delete(aclGrants).where(and(eq(aclGrants.id, id)));
+		}
+	});
+
+	test("read grants never crowd a member out: 150 onlookers ahead of one writer", async () => {
+		const readers: string[] = [];
+		for (let i = 0; i < 150; i++) {
+			const id = `people-a-reader-${String(i).padStart(3, "0")}`;
+			await user(id);
+			readers.push(await grant(id, "read"));
+		}
+		// Sorts after every reader by id: only "members first" puts it inside the limit.
+		const writer = "people-zz-writer";
+		await user(writer);
+		const writerGrant = await grant(writer, "write");
+		try {
+			for (const limit of [40, 50, 100]) {
+				const read = await readTeamMembers(teamId, { limit });
+				expect(read?.members.some((m) => m.userId === writer && m.role === "member")).toBe(true);
+				expect(read?.more).toBe(true);
+			}
+			// The notification fan-out's read (members only, 50 per source).
+			const { readTeamMemberIds } = await import("../team-members");
+			expect(await readTeamMemberIds(teamId, 50)).toContain(writer);
+			expect((await readTeamMemberIds(teamId, 50)).some((id) => id.includes("reader"))).toBe(false);
+			// The status names them (members are listed before onlookers).
+			const text = await statusText();
+			expect(text).toContain(`- ${writer} — member`);
+			expect(text).toContain("These counts are of the people found; more may have access");
+		} finally {
+			await db.delete(aclGrants).where(inArray(aclGrants.id, [...readers, writerGrant]));
+		}
+	});
+
+	test("a coordinator readable outside the project names nobody found only through it", async () => {
+		// A project member with no grant on the coordinator.
+		const projectOnly = "people-project-only";
+		await user(projectOnly);
+		await db
+			.update(aclGrants)
+			.set({ capability: "write" })
+			.where(and(eq(aclGrants.scopeType, "project"), eq(aclGrants.principalId, projectOnly)));
+		try {
+			await db
+				.update(narrators)
+				.set({ visibility: "project", writeAudience: "project" })
+				.where(eq(narrators.id, teamId));
+			expect(await statusText()).toContain(`- ${projectOnly} — member`);
+			await db
+				.update(narrators)
+				.set({ visibility: "public", writeAudience: "project" })
+				.where(eq(narrators.id, teamId));
+			const text = await statusText();
+			expect(text).not.toContain(projectOnly);
+			expect(text).toContain(
+				"of them reach the team only through the project and are not named here.",
+			);
+		} finally {
+			await db
+				.update(narrators)
+				.set({ visibility: "private", writeAudience: "owner" })
+				.where(eq(narrators.id, teamId));
+			await db.delete(aclGrants).where(eq(aclGrants.principalId, projectOnly));
+		}
+	});
+
+	test("the people read is cheap: 100 candidates (measured)", async () => {
+		const ids: string[] = [];
+		for (let i = 0; i < 100; i++) {
+			const id = `people-cost-${String(i).padStart(3, "0")}`;
+			await user(id);
+			ids.push(await grant(id, i % 2 ? "write" : "read"));
+		}
+		try {
+			await readTeamMembers(teamId); // warm up statements
+			const members: number[] = [];
+			const statuses: number[] = [];
+			for (let run = 0; run < 5; run++) {
+				let started = performance.now();
+				await readTeamMembers(teamId);
+				members.push(performance.now() - started);
+				started = performance.now();
+				await statusText();
+				statuses.push(performance.now() - started);
+			}
+			const median = (values: number[]) => [...values].sort((a, b) => a - b)[2] ?? 0;
+			console.log(
+				`readTeamMembers (100 grants + owner): median ${median(members).toFixed(2)} ms; readTeamStatus: median ${median(statuses).toFixed(2)} ms`,
+			);
+			expect(median(members)).toBeLessThan(100);
+		} finally {
+			await db.delete(aclGrants).where(inArray(aclGrants.id, ids));
 		}
 	});
 });
