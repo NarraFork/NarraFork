@@ -16,10 +16,7 @@ import {
 	type NotificationChannel,
 	type NotificationDeliveryResult,
 } from "./notification-delivery";
-import {
-	getRecentTabUserIdsForNarrator,
-	getRecentTabUserIdsForNarratorAmong,
-} from "./recent-tabs-service";
+import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 import { readTeamMemberIds } from "./teams/team-members";
 import { teamIdOfNarrator } from "./teams/team-membership";
 
@@ -288,7 +285,9 @@ async function filterUsersWhoCanWrite(
 }
 
 /** Candidates of each source the team's members are read from for a "waiting" alert (M1). */
-const TEAM_ATTENTION_CANDIDATES = 50;
+const TEAM_ATTENTION_MEMBERS = 50;
+/** Recent-tab holders a team session's "waiting" alert also looks at (M1). */
+const TEAM_ATTENTION_TAB_HOLDERS = 200;
 
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
@@ -302,23 +301,29 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 
 	const narratorTitle = narrator.title || narratorId;
 	const displayStatus = reason === "done" ? "done" : "waiting";
-	const markdownText = `**${narratorTitle}** status: **${displayStatus}**`;
+	const teamId = reason === "waiting_permission" ? teamIdOfNarrator(narrator.id) : null;
+	const teamWaiting = !!teamId;
+	// A team call is decided only in NarraFork (M1): the alert says so, and is the only IM alert
+	// a team session sends (the IM gateway sends nothing of team sessions).
+	const markdownText = teamWaiting
+		? `**${narratorTitle}** status: **waiting** for a team member. Decide in NarraFork.`
+		: `**${narratorTitle}** status: **${displayStatus}**`;
 
 	// Recipients are everyone with this narrator in a recent tab, minus anyone who
 	// may no longer read it. Access can be revoked after a tab was opened, and a
 	// webhook carrying the narrator's title and status would otherwise keep
 	// delivering to them — a notification must never outlive the permission.
-	// A call waiting in a team tree waits for a member: onlookers (read only) are not told. The
-	// candidates start from the team's members (`readTeamMemberIds`, bounded) and keep those who
-	// have this session in their recent tabs, so any number of onlooker tab holders cannot push a
-	// member out; then one batch write check. Other sessions are unchanged.
-	const teamId = reason === "waiting_permission" ? teamIdOfNarrator(narrator.id) : null;
-	const teamWaiting = !!teamId;
+	// A call waiting in a team tree waits for a member: onlookers (read only) are not told. As in
+	// the notification center: the team's members (`readTeamMemberIds`, bounded per source) and a
+	// bounded page of recent-tab holders (admins, role-grant and public-audience writers, members
+	// past the per-source cut), then one batch write judgement. Other sessions are unchanged.
 	const recentTabUserIds = teamId
-		? await getRecentTabUserIdsForNarratorAmong(
-				narratorId,
-				await readTeamMemberIds(teamId, TEAM_ATTENTION_CANDIDATES),
-			)
+		? [
+				...new Set([
+					...(await readTeamMemberIds(teamId, TEAM_ATTENTION_MEMBERS)),
+					...(await getRecentTabUserIdsForNarrator(narratorId, TEAM_ATTENTION_TAB_HOLDERS)),
+				]),
+			]
 		: await getRecentTabUserIdsForNarrator(narratorId);
 	if (recentTabUserIds.length === 0) return;
 	let relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
