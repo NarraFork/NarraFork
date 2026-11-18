@@ -722,11 +722,7 @@ export async function decideOutlinePlanRequest(args: {
 	requestId: string;
 	principal: OutlinePrincipal;
 	body: OutlinePlanDecisionRequest;
-	/**
-	 * Re-checks that the person may still decide (Project Teams M1): run before the plan is
-	 * written and again right before the request is resolved. Throws to refuse; a decision
-	 * already written is taken back first.
-	 */
+	/** Re-checks the person may still decide, just before the plan is written (Teams M1). */
 	assertStillAllowed?: () => Promise<void>;
 }): Promise<{ commit: { id: string; seq: number } | null }> {
 	const { pendingPermissions } = await import("./narrator-session-state");
@@ -779,7 +775,6 @@ export async function decideOutlinePlanRequest(args: {
 			error instanceof OutlinePlanError &&
 			error.planCode === "OUTLINE_PLAN_NOT_FOUND"
 		) {
-			await args.assertStillAllowed?.();
 			const resolved = await resolvePermission(args.requestId, "deny", {
 				userId: principal.userId,
 				decidedBy: "user",
@@ -823,28 +818,7 @@ export async function decideOutlinePlanRequest(args: {
 		});
 		throw notWaiting(args.requestId);
 	};
-	// The last check before the request is resolved: refused, the written decision is taken back.
-	const stillAllowed = async () => {
-		if (!args.assertStillAllowed) return;
-		try {
-			await args.assertStillAllowed();
-		} catch (error) {
-			await undoOutlinePlanDecision({
-				session: narratorId,
-				decision,
-				responsibleUserId: principal.userId,
-			}).catch((undoError) => {
-				logger.error("A plan decision refused at its last check could not be taken back", {
-					narratorId,
-					root: submission.root.address,
-					error: String(undoError),
-				});
-			});
-			throw error;
-		}
-	};
 	if (decision.effective === "return") {
-		await stillAllowed();
 		const resolved = await resolvePermission(args.requestId, "deny", {
 			userId: principal.userId,
 			decidedBy: "user",
@@ -870,7 +844,6 @@ export async function decideOutlinePlanRequest(args: {
 		delegateTitle: lock?.delegate ? ((await narratorTitle(lock.delegate)) ?? null) : null,
 		edits,
 	};
-	await stillAllowed();
 	decisions.set(narratorId, record);
 	const resolved = await resolvePermission(args.requestId, "allow", {
 		userId: principal.userId,
