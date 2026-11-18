@@ -9,6 +9,7 @@ export const DEFAULT_WATCH_TIMEOUT_MS = 600_000;
 export const MAX_WATCH_TIMEOUT_MS = 86_400_000;
 export const MAX_WATCHES_PER_NARRATOR = 20;
 export const PUBLISH_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+export const MAX_PUBLISH_RETRY_DELAY_MS = 30_000;
 
 export interface ObservationResult {
 	status: "completed" | "timeout" | "failed";
@@ -25,6 +26,20 @@ export interface WatchObservation {
 	finish(result: ObservationResult): Promise<void>;
 	/** Release observation resources, without stopping the target or changing its task. */
 	release(): void;
+}
+
+/** A cancelled admission must not strand a task before its source observer exists. */
+export async function cancelWatchRegistration(observation: WatchObservation): Promise<void> {
+	try {
+		const { backgroundTaskService } = await import("./background-task-service");
+		await backgroundTaskService.cancel(observation.taskId);
+	} catch (error) {
+		await observation.finish({
+			status: "failed",
+			output: `Watch registration was interrupted, but its cancellation could not be saved: ${String(error)}. No target was stopped.`,
+		});
+		throw error;
+	}
 }
 
 const observations = hotSafe(
@@ -56,7 +71,8 @@ export async function createWatchObservation(input: {
 	title: string;
 	command: string;
 	toolUseId?: string;
-	onRelease?: () => void;
+	/** Release source resources once, independently of pending result delivery. */
+	onObservationEnd?: () => void;
 }): Promise<WatchObservation> {
 	if (state.suspended) throw new Error("The server is shutting down; no watch was registered.");
 	let active = 0;
@@ -73,6 +89,12 @@ export async function createWatchObservation(input: {
 	const { alias } = registerTaskAlias(input.narratorId, taskId, input.title);
 	const controller = new AbortController();
 	let released = false;
+	let sourceReleased = false;
+	const endObservation = () => {
+		if (sourceReleased) return;
+		sourceReleased = true;
+		input.onObservationEnd?.();
+	};
 	let frozen: ObservationResult | undefined;
 	let attempts = 0;
 	let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -84,7 +106,8 @@ export async function createWatchObservation(input: {
 		signal: controller.signal,
 		async finish(result) {
 			if (released || frozen || state.suspended) return;
-			frozen = result;
+			frozen = { ...result };
+			endObservation();
 			await publish();
 		},
 		release() {
@@ -93,7 +116,7 @@ export async function createWatchObservation(input: {
 			if (retryTimer) clearTimeout(retryTimer);
 			observations.delete(taskId);
 			controller.abort();
-			input.onRelease?.();
+			endObservation();
 		},
 	};
 	// Reserve the slot before asynchronous task creation, including parallel registrations.
@@ -114,15 +137,15 @@ export async function createWatchObservation(input: {
 			observation.release();
 		} catch (error) {
 			if (released) return;
-			const delay = PUBLISH_RETRY_DELAYS_MS[attempts - 1];
-			const details = { taskId, attempts, error: String(error) };
-			if (delay === undefined) {
-				// Keep the durable running row for the existing restart-interruption receipt.
-				logger.error("Watch result publication retries exhausted", details);
-				observation.release();
-				return;
-			}
-			logger.warn("Watch result publication deferred", { ...details, retryInMs: delay });
+			// Retain this one frozen result until storage recovers or the watch is cancelled.
+			// Pending delivery still occupies the existing per-narrator budget.
+			const delay = PUBLISH_RETRY_DELAYS_MS[attempts - 1] ?? MAX_PUBLISH_RETRY_DELAY_MS;
+			logger.warn("Watch result publication deferred", {
+				taskId,
+				attempts,
+				error: String(error),
+				retryInMs: delay,
+			});
 			retryTimer = setTimeout(() => void publish(), delay);
 			retryTimer.unref?.();
 		}

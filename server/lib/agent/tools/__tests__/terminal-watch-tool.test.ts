@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../../../tests/setup";
 import { db, sqlite } from "../../../../db";
 import { backgroundTasks, narrators, terminals } from "../../../../db/schema";
+import { eventBus } from "../../../../lib/event-bus";
 import type { TerminalReadObserver } from "../../../../services/terminal-service";
 import { BufferManager } from "../../../../terminal/buffer-manager";
 import type { ToolContext, ToolResult } from "../../types";
@@ -11,6 +12,8 @@ const NARRATOR = "terminal-tool-narrator";
 const TERMINAL = "terminal-tool-term";
 
 let buffer: BufferManager;
+let attached = true;
+let bufferAvailable = true;
 /** What the fake shell prints after echoing a written chunk. */
 let respond: (input: string) => string = () => "";
 let afterObservation: (() => Promise<void>) | undefined;
@@ -30,9 +33,9 @@ function emit(data: string) {
 mock.module("@server/services/terminal-service", () => ({
 	...realTerminalService,
 	terminalService: {
-		isAttached: () => true,
-		reattach: async () => true,
-		getActiveBuffer: () => buffer,
+		isAttached: () => attached,
+		reattach: async () => attached,
+		getActiveBuffer: () => (bufferAvailable ? buffer : undefined),
 		getScrollback: async (_id: string, observe?: TerminalReadObserver) => {
 			const source = buffer;
 			const data = await source.getContents(
@@ -75,6 +78,8 @@ beforeEach(() => {
 	fixtureBuffers.add(buffer);
 	buffer.append("user@host:~$ ");
 	respond = () => "";
+	attached = true;
+	bufferAvailable = true;
 	afterObservation = undefined;
 	resetCursorForTerminal(TERMINAL);
 });
@@ -105,10 +110,10 @@ function run(args: Record<string, unknown>, signal = new AbortController().signa
 	return pending;
 }
 
-function runWatch(args: Record<string, unknown> = {}) {
+function runWatch(args: Record<string, unknown> = {}, signal = new AbortController().signal) {
 	const pending = watchTool.execute({ type: "terminal", id: TERMINAL, ...args }, {
 		narratorId: NARRATOR,
-		signal: new AbortController().signal,
+		signal,
 	} as ToolContext);
 	pendingTools.add(pending);
 	void pending.then(
@@ -843,6 +848,286 @@ describe("Terminal tool watches", () => {
 		const done = await waitForWatchStatus();
 		expect(done?.status).toBe("completed");
 		expect(done?.output).toContain("the terminal exited");
-		expect(done?.output).toContain("last output before exit");
+		expect(done?.output).not.toContain("last output before exit");
+	});
+
+	test.each([
+		"exit",
+		"deadline",
+	] as const)("a lifecycle watch observes %s in a real alternate screen without a text cursor", async (boundary) => {
+		await run({ action: "read" });
+		emit("\x1b[?1049hfull screen");
+		await buffer.getContents();
+		expect(await buffer.markReadCursor()).toBeUndefined();
+		const mark = spyOn(buffer, "markReadCursor").mockImplementation(() => {
+			throw new Error("lifecycle watch must not mark text");
+		});
+		const clone = spyOn(buffer, "cloneReadCursor").mockImplementation(() => {
+			throw new Error("lifecycle watch must not clone text");
+		});
+		const read = spyOn(buffer, "readCursor").mockImplementation(() => {
+			throw new Error("lifecycle watch must not read text");
+		});
+		const markerRead = spyOn(buffer, "readFromMarker").mockImplementation(() => {
+			throw new Error("lifecycle watch must not read text markers");
+		});
+		try {
+			const result = await runWatch({ timeout: 1_000 });
+			expect(result.isError).toBeFalsy();
+			expect(result.output).not.toContain("Matching scope:");
+			emit("\r\nmore full-screen output");
+			if (boundary === "exit") {
+				await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+				eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: NARRATOR });
+			}
+			const done = await waitForWatchStatus();
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toContain(
+				boundary === "exit" ? "the terminal exited" : "observation reached its deadline",
+			);
+			expect(mark).not.toHaveBeenCalled();
+			expect(clone).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+			expect(markerRead).not.toHaveBeenCalled();
+		} finally {
+			mark.mockRestore();
+			clone.mockRestore();
+			read.mockRestore();
+			markerRead.mockRestore();
+		}
+	});
+
+	test("a lifecycle deadline works while no live normal buffer is exposed", async () => {
+		bufferAvailable = false;
+		const result = await runWatch({ timeout: 1_000 });
+		expect(result.isError).toBeFalsy();
+		expect((await watchRows())[0]?.status).toBe("running");
+		const done = await waitForWatchStatus();
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("observation reached its deadline");
+		expect(done?.output).toContain("may still be running");
+	});
+
+	test("buffer exit during asynchronous lifecycle registration cannot be lost", async () => {
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+				return create(input);
+			},
+		);
+		try {
+			expect((await runWatch()).isError).toBeFalsy();
+			const done = await waitForWatchStatus();
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toContain("the terminal exited or was closed");
+		} finally {
+			registration.mockRestore();
+		}
+	});
+
+	test("an exit event before lifecycle subscription is recovered by the post-registration status read", async () => {
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				await db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, TERMINAL));
+				eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: NARRATOR });
+				return create(input);
+			},
+		);
+		try {
+			expect((await runWatch()).isError).toBeFalsy();
+			const done = await waitForWatchStatus();
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toContain("the terminal exited or was closed");
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+		} finally {
+			registration.mockRestore();
+		}
+	});
+
+	test("disconnection during lifecycle registration is not reported as command completion", async () => {
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				attached = false;
+				return create(input);
+			},
+		);
+		try {
+			expect((await runWatch()).isError).toBeFalsy();
+			const done = await waitForWatchStatus();
+			expect(done?.status).toBe("failed");
+			expect(done?.output).toContain("disconnected");
+			expect(done?.output).toContain("may still be running");
+		} finally {
+			registration.mockRestore();
+		}
+	});
+
+	test("exit while reattachment fails is rechecked instead of reported as disconnection", async () => {
+		attached = false;
+		const { terminalService } = await import("@server/services/terminal-service");
+		const reattach = spyOn(terminalService, "reattach").mockImplementationOnce(async () => {
+			await db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, TERMINAL));
+			return false;
+		});
+		try {
+			const result = await runWatch();
+			expect(result.metadata).toMatchObject({ status: "exited" });
+			expect(await watchRows()).toEqual([]);
+		} finally {
+			reattach.mockRestore();
+		}
+	});
+
+	test.each([
+		undefined,
+		"READY",
+	])("abort during reattachment creates no %s terminal observation", async (pattern) => {
+		const controller = new AbortController();
+		attached = false;
+		const { terminalService } = await import("@server/services/terminal-service");
+		const reattach = spyOn(terminalService, "reattach").mockImplementationOnce(async () => {
+			attached = true;
+			controller.abort();
+			return true;
+		});
+		try {
+			const result = await runWatch({ pattern }, controller.signal);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("aborted");
+			expect(await watchRows()).toEqual([]);
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+		} finally {
+			reattach.mockRestore();
+		}
+	});
+
+	test.each([
+		undefined,
+		"READY",
+	])("abort during durable registration cancels the %s observation before source publication", async (pattern) => {
+		const controller = new AbortController();
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				const task = await create(input);
+				controller.abort();
+				emit("READY arrived during registration\r\n");
+				await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+				return task;
+			},
+		);
+		const read = spyOn(buffer, "readCursor");
+		const disposed = spyOn(buffer, "dispose");
+		try {
+			const result = await runWatch({ pattern }, controller.signal);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("aborted");
+			const rows = await watchRows();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.status).toBe("cancelled");
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+			expect(read).not.toHaveBeenCalled();
+			expect(disposed).not.toHaveBeenCalled();
+			expect(
+				(await db.query.terminals.findFirst({ where: eq(terminals.id, TERMINAL) }))?.status,
+			).toBe("running");
+			emit("the original terminal remains usable\r\n");
+			expect(await buffer.getContents()).toContain("remains usable");
+			eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: NARRATOR });
+			expect((await watchRows())[0]?.status).toBe("cancelled");
+		} finally {
+			registration.mockRestore();
+			read.mockRestore();
+			disposed.mockRestore();
+		}
+	});
+
+	test.each([
+		undefined,
+		"READY",
+	])("failed cancellation persistence during %s registration leaves a failed receipt, not an unobserved running task", async (pattern) => {
+		const controller = new AbortController();
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		const registration = spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(
+			async (input) => {
+				const task = await create(input);
+				controller.abort();
+				emit("READY during interrupted registration\r\n");
+				await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+				return task;
+			},
+		);
+		const cancellation = spyOn(backgroundTaskService, "markCancelled").mockRejectedValueOnce(
+			new Error("registration cancellation persistence fault"),
+		);
+		const read = spyOn(buffer, "readCursor");
+		const disposed = spyOn(buffer, "dispose");
+		try {
+			const result = await runWatch({ pattern }, controller.signal);
+			expect(result.isError).toBe(true);
+			const rows = await watchRows();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.status).toBe("failed");
+			expect(rows[0]?.output).toMatch(/registration.*interrupt/i);
+			expect(rows[0]?.output).toContain("cancellation could not be saved");
+			expect(rows[0]?.output).toContain("No target was stopped.");
+			expect(cancellation).toHaveBeenCalledTimes(1);
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+			expect(read).not.toHaveBeenCalled();
+			expect(disposed).not.toHaveBeenCalled();
+			expect(
+				(await db.query.terminals.findFirst({ where: eq(terminals.id, TERMINAL) }))?.status,
+			).toBe("running");
+			emit("the target remains usable after cancellation persistence fails\r\n");
+			expect(await buffer.getContents()).toContain("target remains usable");
+		} finally {
+			registration.mockRestore();
+			cancellation.mockRestore();
+			read.mockRestore();
+			disposed.mockRestore();
+		}
+	});
+
+	test.each([
+		undefined,
+		"READY",
+	])("a registered %s observation outlives the registering tool's signal", async (pattern) => {
+		const controller = new AbortController();
+		const result = await runWatch({ pattern }, controller.signal);
+		expect(result.isError).toBeFalsy();
+		controller.abort();
+		expect((await watchRows())[0]?.status).toBe("running");
+		if (pattern) emit("READY after the registering tool ended\r\n");
+		else await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		const done = await waitForWatchStatus();
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain(pattern ? "READY after" : "the terminal exited");
+	});
+
+	test("an already exited terminal requires no lifecycle task", async () => {
+		await db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, TERMINAL));
+		const result = await runWatch();
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata).toMatchObject({ status: "exited" });
+		expect(await watchRows()).toEqual([]);
+	});
+
+	test("a lifecycle watch does not consume the previous successful text observation", async () => {
+		await run({ action: "read" });
+		emit("READY unread before lifecycle registration\r\n");
+		expect((await runWatch()).isError).toBeFalsy();
+		expect((await runWatch({ pattern: "READY" })).isError).toBeFalsy();
+		const deadline = Date.now() + 3_000;
+		let rows = await watchRows();
+		while (rows.every((task) => task.status === "running") && Date.now() < deadline) {
+			await Bun.sleep(20);
+			rows = await watchRows();
+		}
+		expect(rows.filter((task) => task.status === "completed")).toHaveLength(1);
+		expect(rows.filter((task) => task.status === "running")).toHaveLength(1);
+		expect(rows.find((task) => task.status === "completed")?.output).toContain("READY unread");
 	});
 });

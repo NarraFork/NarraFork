@@ -2965,6 +2965,14 @@ class BackgroundTaskService {
 		options?.assertAuthorized?.();
 
 		const ctrl = this.abortControllers.get(taskId);
+		const observation =
+			task.type === "bash" &&
+			(task.command?.startsWith(WATCH_COMMAND_PREFIX) ||
+				task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX));
+		const observationKillHandler = observation ? this.killHandlers.get(taskId) : undefined;
+		// An observation has no process to stop. Persist its cancellation before dropping
+		// its delivery owner; a failed write must leave the original watch retryable.
+		if (observation && !(await this.markCancelled(taskId, ctrl))) return false;
 		if (ctrl) {
 			try {
 				ctrl.abort();
@@ -2973,7 +2981,7 @@ class BackgroundTaskService {
 			}
 		}
 
-		const killHandler = this.killHandlers.get(taskId);
+		const killHandler = observation ? observationKillHandler : this.killHandlers.get(taskId);
 		if (killHandler) {
 			try {
 				killHandler();
@@ -2985,6 +2993,7 @@ class BackgroundTaskService {
 			}
 		}
 
+		if (observation) return true;
 		const cancelled = await this.markCancelled(taskId, ctrl);
 		if (!cancelled) return false;
 		if (task.type === "agent") {

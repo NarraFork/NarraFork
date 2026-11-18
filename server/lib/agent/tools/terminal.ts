@@ -14,6 +14,7 @@ import {
 	startTerminalWatch,
 	type WatchStart,
 } from "../../../services/terminal-watch-service";
+import { cancelWatchRegistration } from "../../../services/watch-observation";
 import type { BufferManager, BufferReadCursor } from "../../../terminal/buffer-manager";
 import { truncateOutput } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
@@ -491,15 +492,15 @@ async function startWatch(
 	ctx: ToolContext,
 	pattern: string | undefined,
 	timeoutMs: number,
-	buffer: BufferManager,
-	marker: IMarker,
-	start: WatchStart,
+	buffer?: BufferManager,
+	marker?: IMarker,
+	start?: WatchStart,
 	point?: BufferReadCursor,
 	matchFrame?: ReturnType<typeof createWatchFrameMatcher>,
 ): Promise<ToolResult> {
-	if (terminalService.getActiveBuffer(terminalId) !== buffer) {
+	if (pattern !== undefined && terminalService.getActiveBuffer(terminalId) !== buffer) {
 		if (point) point.dispose();
-		else marker.dispose();
+		else marker?.dispose();
 		return {
 			output:
 				"Terminal connection changed; no watch was registered. Read the terminal before continuing; do not resend input automatically.",
@@ -513,6 +514,24 @@ async function startWatch(
 		pattern,
 		timeoutMs,
 		buffer,
+		readLifecycleState:
+			pattern === undefined
+				? async () => {
+						const current = await db.query.terminals.findFirst({
+							where: eq(terminals.id, terminalId),
+							columns: { status: true },
+						});
+						if (current?.status === "exited") return "exited";
+						if (
+							!current ||
+							!terminalService.isAttached(terminalId) ||
+							(buffer && terminalService.getActiveBuffer(terminalId) !== buffer)
+						) {
+							return "disconnected";
+						}
+						return "running";
+					}
+				: undefined,
 		cursor: point,
 		matchFrame,
 		layoutRevision: point?.layoutRevision,
@@ -522,14 +541,22 @@ async function startWatch(
 		prefixUnknown: point?.prefixUnknown,
 		start,
 		toolUseId: ctx.currentToolUseId,
+		registrationSignal: ctx.signal,
 	});
+	if (ctx.signal.aborted) {
+		if (started.status === "started") await cancelWatchRegistration(started.observation);
+		return makeAbortedResult(terminalName);
+	}
 	if (started.status === "error") return { output: started.message, isError: true };
 	return {
 		output:
 			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +
 			`(background task "${started.alias}", times out in ${Math.round(timeoutMs / 1000)}s). ` +
-			"End your turn or continue other work; you will be notified with the matching output, or " +
-			`when the watch times out, its observation budget expires or the terminal exits. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
+			"End your turn or continue other work; you will be notified " +
+			(pattern
+				? "with the matching output, or when the watch times out, its observation budget expires or the terminal exits. "
+				: "when the terminal exits/closes, disconnects, or the observation reaches its deadline; no terminal text is read. ") +
+			`Stop({ type: "bash", id: "${started.alias}" }) cancels only the observation.`,
 		title: terminalName,
 		metadata: {
 			kind: "watch",
@@ -563,13 +590,36 @@ export async function watchTerminal(
 			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "exited" },
 		};
 	}
-	if (!terminalService.isAttached(terminalId) && !(await terminalService.reattach(terminalId))) {
+	const attached =
+		terminalService.isAttached(terminalId) || (await terminalService.reattach(terminalId));
+	if (ctx.signal.aborted) return makeAbortedResult(terminal.name);
+	if (!attached) {
+		// The status captured by the access check may predate the exit that made
+		// reattachment fail. Do not mislabel that lifecycle boundary as a detach.
+		const current =
+			pattern === undefined
+				? await db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+						columns: { status: true },
+					})
+				: undefined;
+		if (current?.status === "exited") {
+			return {
+				output: "Terminal has exited; no observation is needed.",
+				metadata: { kind: "watch", type: "terminal", id: terminalId, status: "exited" },
+			};
+		}
 		return {
 			output: "Terminal is disconnected; no live PTY can be observed. Nothing was sent.",
 			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "disconnected" },
 		};
 	}
 	const buffer = terminalService.getActiveBuffer(terminalId);
+	if (pattern === undefined) {
+		// Exit/deadline observation must also work in vim/top or when text reads
+		// are unavailable. Do not touch (or replace) the last text observation.
+		return startWatch(terminalId, terminal.name, ctx, pattern, timeoutMs, buffer);
+	}
 	const key = cursorKey(ctx.narratorId, terminalId);
 	const previous = readCursors.get(key);
 	if (previous?.buffer && previous.buffer !== buffer) discardReadCursor(key);

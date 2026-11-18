@@ -432,6 +432,42 @@ describe("reach", () => {
 	});
 });
 
+test("Watch registers a worker's own helper without widening sibling or deepest-level access", async () => {
+	const { worker, sibling, helper } = await tree();
+	await backgroundRun(worker, helper);
+	const projection = await backgroundTaskService.getById(helper);
+	expect(projection?.logicalRunId).toBeString();
+	await db
+		.update(narrators)
+		.set({ logicalRunId: projection?.logicalRunId })
+		.where(eq(narrators.id, helper));
+	await narratorService.updateStatus(helper, "working");
+	const { watchTool } = await import("../../lib/agent/tools/watch");
+	const workerContext = {
+		...ctx(worker),
+		runtimePolicy: await resolveNarratorRuntimePolicy(worker),
+	};
+	const result = await watchTool.execute({ type: "agent", id: helper }, workerContext);
+	expect(result.isError).toBeFalsy();
+	expect(result.metadata).toMatchObject({ status: "watching", id: helper });
+	const observationId = result.metadata?.watchId as string | undefined;
+	expect(observationId).toBeDefined();
+	try {
+		const foreign = await watchTool.execute({ type: "agent", id: sibling }, workerContext);
+		expect(foreign.isError).toBe(true);
+		const deepest = await watchTool.execute(
+			{ type: "agent", id: worker },
+			{
+				...ctx(helper),
+				runtimePolicy: await resolveNarratorRuntimePolicy(helper),
+			},
+		);
+		expect(deepest.isError).toBe(true);
+	} finally {
+		if (observationId) await backgroundTaskService.cancel(observationId);
+	}
+});
+
 describe("approvals reach the root", () => {
 	test("a helper's request is forwarded to the root page and listed in its panel state", async () => {
 		const { primary, worker, helper } = await tree();

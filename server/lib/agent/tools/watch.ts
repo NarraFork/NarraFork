@@ -44,6 +44,7 @@ export const watchTool: ToolDefinition = {
 		"A text match, completion, or deadline delivers its result through the mailbox. " +
 		"A target's ordinary completion notice fulfils all watches of that recipient/run; it is not repeated. " +
 		"Already-finished targets return their saved result immediately without registering a watch. " +
+		"Observation handles are not watch targets: use the original target ID; inspect a handle with TeamStatus action get_task. " +
 		"Timeout ends only the observation, never the target. Stop({ type: 'bash', id: watchHandle }) cancels only the watch. " +
 		"Terminal matching uses rendered output, not command exit status; use Terminal.write.notify_on to atomically send and observe without matching the input echo. " +
 		"Agent observations follow one run; takeover or a replaced run is reported, not mistaken for a completed result. " +

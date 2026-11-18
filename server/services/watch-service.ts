@@ -4,8 +4,13 @@ import { prepareBackgroundBashResult } from "./background-bash-result";
 import { type BackgroundTaskRecord, backgroundTaskService } from "./background-task-service";
 import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
 import { resolveTaskAlias } from "./subagent-alias";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
-import { createWatchObservation, type WatchObservation } from "./watch-observation";
+import {
+	cancelWatchRegistration,
+	createWatchObservation,
+	type WatchObservation,
+} from "./watch-observation";
 
 export interface TaskWatchInput {
 	type: "bash" | "agent";
@@ -105,6 +110,22 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 	if (input.type === "agent") return watchAgent(input, ctx);
 	const task = await readBashTarget(ctx.narratorId, input.id);
 	const label = task.alias ?? task.id;
+	if (
+		[WATCH_COMMAND_PREFIX, TERMINAL_WATCH_COMMAND_PREFIX].some((prefix) =>
+			task.command?.startsWith(prefix),
+		)
+	) {
+		return {
+			output: `No watch was registered: ${JSON.stringify(label)} is an observation handle, not an execution target. Use the original terminal, Bash task or agent ID. Use this handle with Stop to cancel it, or TeamStatus({ action: "get_task", target_id: ${JSON.stringify(label)} }) to inspect it.`,
+			metadata: {
+				kind: "watch",
+				type: "bash",
+				id: task.id,
+				targetId: input.id,
+				status: "unsupported_target",
+			},
+		};
+	}
 	if (task.status !== "running" || (input.pattern && task.output?.includes(input.pattern))) {
 		const status = task.status === "running" ? "text_matched" : task.status;
 		return {
@@ -120,7 +141,7 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 		toolUseId: ctx.currentToolUseId,
 	});
 	if (ctx.signal.aborted) {
-		await backgroundTaskService.cancel(observation.taskId);
+		await cancelWatchRegistration(observation);
 		return { output: "Watch registration interrupted. The target was not stopped." };
 	}
 	void (async () => {
@@ -182,7 +203,7 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 		toolUseId: ctx.currentToolUseId,
 	});
 	if (ctx.signal.aborted) {
-		await backgroundTaskService.cancel(observation.taskId);
+		await cancelWatchRegistration(observation);
 		return { output: "Watch registration interrupted. The target was not stopped." };
 	}
 	void (async () => {

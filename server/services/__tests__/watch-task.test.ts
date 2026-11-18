@@ -23,8 +23,11 @@ import {
 } from "../agent-runtime/publication";
 import { backgroundTaskService } from "../background-task-service";
 import { clearAliasRegistry } from "../subagent-alias";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 import {
 	createWatchObservation,
+	MAX_PUBLISH_RETRY_DELAY_MS,
+	PUBLISH_RETRY_DELAYS_MS,
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 } from "../watch-observation";
@@ -151,7 +154,276 @@ afterEach(async () => {
 	resumeWatchObservationsForTests();
 });
 
+function acceleratePublicationRetries(): number[] {
+	const schedule = globalThis.setTimeout;
+	const delays: number[] = [];
+	spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const [handler, delay, ...rest] = args;
+		const retry =
+			delay === MAX_PUBLISH_RETRY_DELAY_MS || PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay);
+		if (retry && delay !== undefined) delays.push(delay);
+		return schedule(handler, retry ? 5 : delay, ...rest);
+	}) as typeof setTimeout);
+	return delays;
+}
+
+test("ordinary task cancellation still resolves its kill handler after abort side effects", async () => {
+	await bashTask();
+	const controller = new AbortController();
+	const original = mock(() => {});
+	const replacement = mock(() => {});
+	backgroundTaskService.registerAbortController(BASH, controller);
+	backgroundTaskService.registerKillHandler(BASH, original);
+	controller.signal.addEventListener("abort", () =>
+		backgroundTaskService.registerKillHandler(BASH, replacement),
+	);
+	expect(await backgroundTaskService.cancel(BASH)).toBe(true);
+	expect(original).not.toHaveBeenCalled();
+	expect(replacement).toHaveBeenCalledTimes(1);
+	expect(task(BASH)?.status).toBe("cancelled");
+});
+
+describe("Watch result delivery survives storage outages", () => {
+	test("retains one frozen result beyond the fast retry budget and releases source resources immediately", async () => {
+		const original = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		let attempts = 0;
+		spyOn(backgroundTaskService, "markCompleted").mockImplementation(async (...args) => {
+			if (++attempts <= PUBLISH_RETRY_DELAYS_MS.length + 1) throw new Error("storage unavailable");
+			return original(...args);
+		});
+		const delays = acceleratePublicationRetries();
+		const onObservationEnd = mock(() => {});
+		const observation = await createWatchObservation({
+			narratorId: PARENT,
+			title: "watch pending delivery",
+			command: "bash fixture",
+			onObservationEnd,
+		});
+		await observation.finish({ status: "completed", output: "the original frozen result" });
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+		expect(task(observation.taskId)?.status).toBe("running");
+		expect(observation.signal.aborted).toBe(false);
+		await observation.finish({ status: "timeout", output: "late deadline must not replace it" });
+		const done = await settled(observation.taskId);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toBe("the original frozen result");
+		expect(attempts).toBe(PUBLISH_RETRY_DELAYS_MS.length + 2);
+		expect(delays).toEqual([...PUBLISH_RETRY_DELAYS_MS, MAX_PUBLISH_RETRY_DELAY_MS]);
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+		expect(observation.signal.aborted).toBe(true);
+		expect(await notices()).toHaveLength(1);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("continued storage failure keeps capped retry work until explicitly cancelled", async () => {
+		const delays = acceleratePublicationRetries();
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("storage remains unavailable"),
+		);
+		const onObservationEnd = mock(() => {});
+		const observation = await createWatchObservation({
+			narratorId: PARENT,
+			title: "watch ongoing delivery",
+			command: "bash fixture",
+			onObservationEnd,
+		});
+		await observation.finish({ status: "completed", output: "retained result" });
+		const deadline = Date.now() + 1_000;
+		while (published.mock.calls.length < 6 && Date.now() < deadline) await Bun.sleep(5);
+		expect(published.mock.calls.length).toBeGreaterThanOrEqual(6);
+		expect(delays.slice(0, 3)).toEqual([...PUBLISH_RETRY_DELAYS_MS]);
+		expect(delays.slice(3).every((delay) => delay === MAX_PUBLISH_RETRY_DELAY_MS)).toBe(true);
+		expect(task(observation.taskId)?.status).toBe("running");
+		expect(observation.signal.aborted).toBe(false);
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+		expect(await backgroundTaskService.cancel(observation.taskId)).toBe(true);
+		const attempts = published.mock.calls.length;
+		await Bun.sleep(20);
+		expect(published).toHaveBeenCalledTimes(attempts);
+		expect(task(observation.taskId)?.status).toBe("cancelled");
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+	});
+
+	test.each([
+		"bash",
+		"agent",
+	] as const)("cancelled %s admission preserves failed delivery when cancellation storage also fails", async (type) => {
+		if (type === "bash") await bashTask();
+		acceleratePublicationRetries();
+		const controller = new AbortController();
+		const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+		spyOn(backgroundTaskService, "createBashTask").mockImplementation(async (input) => {
+			const row = await create(input);
+			controller.abort();
+			return row;
+		});
+		spyOn(backgroundTaskService, "markCancelled").mockRejectedValueOnce(
+			new Error("cancellation write failed"),
+		);
+		const markFailed = backgroundTaskService.markFailed.bind(backgroundTaskService);
+		let attempts = 0;
+		spyOn(backgroundTaskService, "markFailed").mockImplementation(async (...args) => {
+			if (++attempts === 1) throw new Error("failure receipt storage is temporarily unavailable");
+			return markFailed(...args);
+		});
+		const result = await watchTool.execute(
+			{ type, id: type === "bash" ? BASH : CHILD },
+			{ ...context(), signal: controller.signal },
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("cancellation write failed");
+		const pending = observations();
+		expect(pending).toHaveLength(1);
+		expect(pending[0]?.status).toBe("running");
+		const done = await settled(pending[0]?.id ?? "missing-observation");
+		expect(done?.status).toBe("failed");
+		expect(done?.output).toContain("registration was interrupted");
+		expect(done?.output).toContain("cancellation could not be saved");
+		expect(done?.output).toContain("No target was stopped");
+		expect(attempts).toBe(2);
+		if (type === "bash") expect(task(BASH)?.status).toBe("running");
+		else
+			expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
+				"working",
+			);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test.each([
+		"retry_cancel",
+		"recover_delivery",
+	] as const)("failed cancellation retains responsibility for %s", async (recovery) => {
+		acceleratePublicationRetries();
+		await bashTask();
+		const targetKill = mock(() => {});
+		backgroundTaskService.registerKillHandler(BASH, targetKill);
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("publication unavailable"),
+		);
+		const onObservationEnd = mock(() => {});
+		const observation = await createWatchObservation({
+			narratorId: PARENT,
+			title: "watch failed cancellation",
+			command: "bash fixture",
+			onObservationEnd,
+		});
+		await observation.finish({
+			status: "completed",
+			output: "frozen result survives failed cancellation",
+		});
+		const cancellation = spyOn(backgroundTaskService, "markCancelled").mockRejectedValueOnce(
+			new Error("cancellation write failed"),
+		);
+		const failed = await stopTool.execute({ type: "bash", id: observation.taskId }, context());
+		expect(failed.isError).toBe(true);
+		expect(failed.output).toContain("cancellation write failed");
+		expect(observation.signal.aborted).toBe(false);
+		expect(backgroundTaskService.isCancellationRequested(observation.taskId)).toBe(false);
+		expect(task(observation.taskId)?.status).toBe("running");
+		cancellation.mockRestore();
+		if (recovery === "retry_cancel") {
+			const stopped = await stopTool.execute({ type: "bash", id: observation.alias }, context());
+			expect(stopped.isError).toBeFalsy();
+			const attempts = published.mock.calls.length;
+			await Bun.sleep(20);
+			expect(published).toHaveBeenCalledTimes(attempts);
+			expect(task(observation.taskId)?.status).toBe("cancelled");
+		} else {
+			published.mockRestore();
+			expect((await settled(observation.taskId))?.status).toBe("completed");
+			expect(task(observation.taskId)?.output).toBe("frozen result survives failed cancellation");
+		}
+		expect(observation.signal.aborted).toBe(true);
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+		expect(targetKill).not.toHaveBeenCalled();
+		expect(task(BASH)?.status).toBe("running");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test.each([
+		"stop",
+		"owner_deleted",
+		"shutdown",
+	] as const)("%s cancels pending delivery without retrying or ending the target", async (reason) => {
+		await bashTask();
+		const targetKill = mock(() => {});
+		backgroundTaskService.registerKillHandler(BASH, targetKill);
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("storage unavailable"),
+		);
+		const schedule = globalThis.setTimeout;
+		let lateRetry: (() => void) | undefined;
+		spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [handler, delay, ...rest] = args;
+			if (PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay)) {
+				lateRetry = () => {
+					if (typeof handler === "function") handler(...rest);
+				};
+			}
+			return schedule(handler, delay, ...rest);
+		}) as typeof setTimeout);
+		const onObservationEnd = mock(() => {});
+		const observation = await createWatchObservation({
+			narratorId: PARENT,
+			title: "watch cancellable delivery",
+			command: "bash fixture",
+			onObservationEnd,
+		});
+		await observation.finish({ status: "completed", output: "frozen result awaiting storage" });
+		expect(lateRetry).toBeDefined();
+		if (reason === "stop")
+			expect(await backgroundTaskService.cancel(observation.taskId)).toBe(true);
+		else if (reason === "owner_deleted")
+			eventBus.emit({ type: "narrator:deleted", narratorId: PARENT, title: null });
+		else suspendWatchObservationsForShutdown();
+		lateRetry?.();
+		expect(published).toHaveBeenCalledTimes(1);
+		expect(observation.signal.aborted).toBe(true);
+		expect(onObservationEnd).toHaveBeenCalledTimes(1);
+		expect(targetKill).not.toHaveBeenCalled();
+		expect(task(BASH)?.status).toBe("running");
+		const delivered = await notices();
+		if (reason === "stop") {
+			expect(task(observation.taskId)?.status).toBe("cancelled");
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]?.text).toContain("cancelled");
+			expect(delivered[0]?.text).not.toContain("frozen result awaiting storage");
+		} else expect(delivered).toHaveLength(0);
+	});
+});
+
 describe("Watch observes Bash without owning its execution", () => {
+	test.each([
+		WATCH_COMMAND_PREFIX,
+		TERMINAL_WATCH_COMMAND_PREFIX,
+	])("%s handles cannot create a recursive watch, whether running or completed", async (prefix) => {
+		const id = `observation-${prefix === WATCH_COMMAND_PREFIX ? "current" : "legacy"}`;
+		const alias = `${id}-alias`;
+		await backgroundTaskService.createBashTask({
+			id,
+			alias,
+			parentNarratorId: PARENT,
+			command: `${prefix} fixture`,
+		});
+		for (const state of ["running", "completed"] as const) {
+			if (state === "completed")
+				await backgroundTaskService.markCompleted(id, "saved observation receipt");
+			for (const selector of [id, alias]) {
+				const result = await watchTool.execute({ type: "bash", id: selector }, context());
+				expect(result.isError).toBeFalsy();
+				expect(result.output).toContain("No watch was registered");
+				expect(result.output).toContain("original");
+				expect(result.output).toContain("TeamStatus");
+				expect(result.metadata).toMatchObject({ status: "unsupported_target", id });
+				expect(result.metadata?.watchId).toBeUndefined();
+				expect(db.select().from(backgroundTasks).all()).toHaveLength(1);
+				expect(task(id)?.status).toBe(state);
+			}
+		}
+	});
+
 	test("returns a handle without waiting for the running target", async () => {
 		await bashTask();
 		const started = Date.now();
@@ -631,7 +903,7 @@ describe("Watch follows an agent's registered current run", () => {
 			narratorId: PARENT,
 			title: "owner deletion",
 			command: `bash ${BASH}`,
-			onRelease: disposed,
+			onObservationEnd: disposed,
 		});
 		db.delete(narrators).where(eq(narrators.id, PARENT)).run();
 		eventBus.emit({ type: "narrator:deleted", narratorId: PARENT, title: null });
