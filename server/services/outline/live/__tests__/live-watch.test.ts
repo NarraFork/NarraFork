@@ -1229,3 +1229,77 @@ describe("review round 2", () => {
 		expect((await block(one.ids[1] as string))?.parentId).toBe(one.pageId);
 	});
 });
+
+describe("pageless L4: a participant's watch budget", () => {
+	/** A page with `n` blocks under it (written in chunks the write path takes). */
+	async function widePage(n: number, title: string, into: OutlineSpaceRow = space) {
+		const first = await page([], title, into);
+		const ids: string[] = [];
+		for (let at = 0; at < n; at += 200) {
+			const r = await writeOutline({
+				spaceId: into.id,
+				ops: Array.from({ length: Math.min(200, n - at) }, (_, i) => ({
+					op: "insert" as const,
+					parent: { id: first.pageId },
+					content: `w${at + i}`,
+				})),
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+			for (const x of r.results) ids.push(x.blockId);
+		}
+		return { pageId: first.pageId, ids };
+	}
+
+	const codes = (c: LiveClient) => {
+		const out: Record<string, number> = {};
+		for (const code of c.watchRefused.values()) out[code] = (out[code] ?? 0) + 1;
+		return out;
+	};
+
+	test("a frame over the budget is taken up to it; the rest is refused watch_cap", async () => {
+		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
+		const wide = await widePage(budget + 40, "Wide");
+		const a = open(link(owner), "", [{ l: wide.pageId }]);
+		await clock.until(() => a.ready, 5000, "joined");
+		a.watch({ add: wide.ids.map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		// One held already (the level): budget − 1 taken, the rest refused, nothing else.
+		expect(a.watchSet.length).toBe(budget);
+		expect(codes(a)).toEqual({ watch_cap: 40 + 1 });
+		expect(a.status).toBe("live");
+		// Letting some go makes room: asked again, they are taken.
+		const capped = wide.ids.filter((id) => a.watchRefused.has(`s:${id}`)).slice(0, 10);
+		a.watch({ remove: wide.ids.slice(0, 10).map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		a.watch({ add: capped.map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		expect(a.watchSet.length).toBe(budget);
+		for (const id of capped) expect(a.watchRefused.has(`s:${id}`)).toBe(false);
+	}, 120_000);
+
+	test("two wide views cannot take the process's watches: another space still joins", async () => {
+		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
+		const one = await widePage(budget + 100, "Wide one");
+		const two = await widePage(budget + 100, "Wide two");
+		const a = open(link(owner), "", [{ l: one.pageId }]);
+		const b = open(link(writer), "", [{ l: two.pageId }]);
+		await clock.until(() => a.ready && b.ready, 5000, "joined");
+		a.watch({ add: one.ids.map((s) => ({ s })) });
+		b.watch({ add: two.ids.map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		expect(a.watchSet.length).toBe(budget);
+		expect(b.watchSet.length).toBe(budget);
+		expect(liveSpaceOf(space.id)?.watchesHeld ?? 0).toBeLessThanOrEqual(2 * budget);
+		expect(2 * budget).toBeLessThan(OUTLINE_LIVE_LIMITS.liveWatches);
+		// Someone in another space joins.
+		const foreign = await page(["f"], "Foreign wide", otherSpace);
+		const c = client(link(third), foreign.pageId, "edit", {
+			space: otherSpace.id,
+			watch: [{ s: foreign.pageId }],
+		});
+		clients.push(c);
+		await clock.until(() => c.ready, 5000, "the other space joined");
+		expect(c.status).toBe("live");
+	}, 120_000);
+});

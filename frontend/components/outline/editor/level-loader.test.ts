@@ -129,9 +129,25 @@ describe("what the views need watched", () => {
 		const added = (
 			(change as { add: Array<{ s?: string; l?: string | null }> } | null)?.add ?? []
 		).map((w) => liveWatchKey(w as never));
-		// Refused for the person's share: its level is not asked for instead; it is listed.
-		expect(added).toEqual(["s:big"]);
-		expect([...full.loader.notLoaded]).toEqual([["small", "user_limit"]]);
+		// Refused for the person's share: its level (far smaller) is asked for instead.
+		expect(added).toEqual(["s:big", "l:small"]);
+		expect([...full.loader.notLoaded]).toEqual([]);
+		// Refused by the server's limits: not by its level either; it is listed.
+		const limited = setup({
+			set: ["l:", "l:page"],
+			refused: { "s:page": "too_large", "s:small": "unavailable" },
+		});
+		let next: { add: Array<{ s?: string; l?: string | null }> } | null = null;
+		(limited.client as unknown as { watch: (c: unknown) => void }).watch = (c) => {
+			next = c as never;
+		};
+		limited.loader.run();
+		expect(
+			((next as { add: Array<{ s?: string; l?: string | null }> } | null)?.add ?? []).map((w) =>
+				liveWatchKey(w as never),
+			),
+		).toEqual(["s:big"]);
+		expect([...limited.loader.notLoaded]).toEqual([["small", "unavailable"]]);
 	});
 });
 
@@ -187,16 +203,57 @@ describe("wide levels", () => {
 		expect((change as { add: unknown[] } | null)?.add.length).toBe(LOADER_BATCH);
 	});
 
-	test("the watch set never grows past its limit: the children past it are listed, not asked for", () => {
+	test("the watch set never grows past the budget: the children past it are listed, not asked for", () => {
 		const { loader } = wide(1100, 0);
 		const notLoaded = new Map();
 		const want = loader.wanted(notLoaded);
-		expect(want?.size).toBe(OUTLINE_LIVE_LIMITS.maxWatch);
+		expect(want?.size).toBe(OUTLINE_LIVE_LIMITS.watchBudget);
 		// The root's levels and the open block's level come first; then children in order.
 		expect(want?.has("l:big")).toBe(true);
 		expect(want?.has("s:k0")).toBe(true);
 		expect(want?.has("s:k1099")).toBe(false);
-		expect(notLoaded.size).toBe(1100 - (OUTLINE_LIVE_LIMITS.maxWatch - 3));
+		expect(notLoaded.size).toBe(1100 - (OUTLINE_LIVE_LIMITS.watchBudget - 3));
 		expect(notLoaded.get("k1099")).toBe("watch_cap");
+	});
+
+	test("watches held and asked for count first: new ones take only the room left", () => {
+		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
+		// The three levels and 500 children held, 6 more asked for: 3 left.
+		const { loader, client } = wide(700, 500);
+		const asked = Array.from({ length: 6 }, (_, i) => ({ s: `k${500 + i}` }));
+		(client as unknown as { watchAsked: Map<string, unknown> }).watchAsked = new Map(
+			asked.map((w) => [liveWatchKey(w), w]),
+		);
+		const notLoaded = new Map();
+		const want = loader.wanted(notLoaded);
+		expect(want?.size).toBe(budget);
+		const fresh = [...(want?.keys() ?? [])].filter((k) => client.watching(k) === null);
+		expect(fresh).toEqual(["s:k506", "s:k507", "s:k508"]);
+		expect(notLoaded.get("k509")).toBe("watch_cap");
+	});
+
+	test("a refusal for room is forgotten when the block is closed, or when watches are let go", () => {
+		// `a` was refused for the person's share; the reader closes `big`: forgotten.
+		const closed = setup({
+			set: ["l:", "l:page", "l:big", "s:small", "s:b"],
+			refused: { "s:page": "too_large", "s:big": "too_large", "s:a": "user_limit" },
+			view: { expanded: new Set(), collapsed: new Set(["big"]) },
+		});
+		closed.loader.run();
+		expect(closed.client.watchRefused.has("s:a")).toBe(false);
+		const shown = setup({
+			set: ["l:", "l:page", "l:big", "s:a", "s:b", "s:x"],
+			refused: { "s:page": "too_large", "s:big": "too_large", "s:small": "user_limit" },
+		});
+		// Still shown, nothing let go: kept (not asked again).
+		const kept = setup({
+			set: ["l:", "l:page", "l:big", "s:a", "s:b"],
+			refused: { "s:page": "too_large", "s:big": "too_large", "s:small": "user_limit" },
+		});
+		kept.loader.run();
+		expect(kept.client.watchRefused.get("s:small")).toBe("user_limit");
+		// `s:x` is no longer wanted: let go, so the refusal is forgotten (room may be there).
+		shown.loader.run();
+		expect(shown.client.watchRefused.has("s:small")).toBe(false);
 	});
 });

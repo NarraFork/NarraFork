@@ -77,7 +77,7 @@ import {
 	TextSelection,
 	type Transaction,
 } from "prosemirror-state";
-import { ReplaceStep } from "prosemirror-transform";
+import { dropPoint, ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
 import { plainClick, spokenLabel, takeFoldKey } from "../fold-controls";
 import {
@@ -385,8 +385,15 @@ export class OutlineView implements CmdHost, ClientView {
 					slice.openStart,
 					slice.openEnd,
 				),
-			// A drop (a dragged selection): moved as it is, or copied as new blocks.
-			transformPasted: (slice) => this.dropped(slice),
+			// A drop (a dragged selection): moved as it is, or copied as new blocks, as the drop
+			// itself decides (`moved`).
+			handleDrop: (view, event, slice, moved) => {
+				const at = view.posAtCoords({ left: event.clientX, top: event.clientY });
+				if (!at) return false;
+				const node = (view as unknown as { dragging?: { node?: NodeSelection } | null }).dragging
+					?.node;
+				return this.drop(slice, moved, at.pos, node);
+			},
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
 			handleKeyDown: (_v, ev) =>
@@ -2162,7 +2169,7 @@ export class OutlineView implements CmdHost, ClientView {
 			// refused) is never deleted: what it holds would go unseen and undo could not bring it
 			// back. The person is told to open it first.
 			const v = this.client.visible;
-			if (r.ops.some((op) => op.t === "d" && !v.open(op.id)))
+			if (r.ops.some((op) => op.t === "d" && !this.client.childrenKnown(op.id, v)))
 				return this.refuse(before, "unloaded");
 			const touched = [
 				...r.bodies.map((b) => b.id),
@@ -2318,6 +2325,36 @@ export class OutlineView implements CmdHost, ClientView {
 		return changed ? Fragment.from(out) : frag;
 	}
 
+	/**
+	 * Drop a slice at a position (`handleDrop`; ProseMirror's own drop, with {@link dropped}
+	 * applied as the drop decided): moved (`move`: the selection, or the dragged node, goes) or
+	 * copied. True: handled.
+	 */
+	drop(slice: Slice, move: boolean, at: number, node?: NodeSelection): boolean {
+		const s = this.dropped(slice, move);
+		const state = this.pm.state;
+		const insertPos = dropPoint(state.doc, at, s) ?? at;
+		const tr = state.tr;
+		if (move) {
+			if (node) node.replace(tr);
+			else tr.deleteSelection();
+		}
+		const pos = tr.mapping.map(insertPos);
+		const isNode = s.openStart === 0 && s.openEnd === 0 && s.content.childCount === 1;
+		const before = tr.doc;
+		if (isNode) tr.replaceRangeWith(pos, pos, s.content.firstChild as PMNode);
+		else tr.replaceRange(pos, pos, s);
+		if (tr.doc.eq(before)) return true;
+		let end = tr.mapping.map(insertPos);
+		tr.mapping.maps[tr.mapping.maps.length - 1]?.forEach((_f, _t, _nf, newTo) => {
+			end = newTo;
+		});
+		tr.setSelection(TextSelection.between(tr.doc.resolve(pos), tr.doc.resolve(end)));
+		this.pm.focus();
+		this.pm.dispatch(tr.setMeta("uiEvent", "drop"));
+		return true;
+	}
+
 	/** Children put back into copies of closed blocks (`withHidden`). */
 	private readonly putBack = new WeakSet<PMNode>();
 
@@ -2326,8 +2363,7 @@ export class OutlineView implements CmdHost, ClientView {
 	 * moved as they are, with what they hide (the children put back for the copy come out
 	 * again). Copied: every block in it is new (new ids), what closed blocks hid included.
 	 */
-	private dropped(slice: Slice): Slice {
-		const move = !!(this.pm as unknown as { dragging?: { move?: boolean } | null }).dragging?.move;
+	private dropped(slice: Slice, move: boolean): Slice {
 		const walk = (node: PMNode): PMNode => {
 			if (node.type !== N.block && node.type !== N.children) return node;
 			if (move && node.type === N.block && node.childCount > 1 && this.putBack.has(node.child(1)))

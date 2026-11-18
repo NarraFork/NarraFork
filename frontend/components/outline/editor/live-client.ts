@@ -1231,6 +1231,13 @@ export class LiveClient {
 			this.scheduleWatch(delay);
 		}
 		if ((head.ok ?? []).length > 0) this.watchTooFast = 0;
+		// The page answered for these blocks' children: the scope says what is known now.
+		for (const w of [
+			...(head.ok ?? []),
+			...(head.gone ?? []),
+			...(head.refused ?? []).map(([x]) => x),
+		])
+			this.madeHere.delete("s" in w ? w.s : (w.l ?? ""));
 		const ended = [...(head.gone ?? []), ...refusedNow.map(([w]) => w)];
 		for (const [w, code] of refusedNow) {
 			this.watchRefused.set(liveWatchKey(w), code);
@@ -1468,6 +1475,7 @@ export class LiveClient {
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
 				ops.push(op);
+				if (op.t === "i") this.madeHere.add(op.id);
 				this.textCache.delete(op.id);
 			}
 			for (const b of input.bodies) {
@@ -1668,6 +1676,8 @@ export class LiveClient {
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
 				ops.push(op);
+				// Brought back by undo: only the block itself comes back, nothing under it.
+				if (op.t === "i") this.madeHere.add(op.id);
 				this.textCache.delete(op.id);
 			}
 			for (const [id, item] of step.texts) {
@@ -1699,6 +1709,23 @@ export class LiveClient {
 		};
 	}
 
+	/**
+	 * Blocks this client made (or brought back by undo) in this session that no watch has
+	 * answered for yet: nothing can be under them that this client did not see (a block made
+	 * here starts empty; one brought back comes back alone), so their children count as known
+	 * until a watch of them is answered (then the scope says).
+	 */
+	private readonly madeHere = new Set<string>();
+
+	/**
+	 * Whether every child of a block is here: inside a subtree watched whole, a watched level's
+	 * parent, or a block made here with no watch answered for it yet. Only such a block may be
+	 * deleted.
+	 */
+	childrenKnown(id: string, v: Store = this.visible): boolean {
+		return v.open(id) || this.madeHere.has(id);
+	}
+
 	/** Whether an operation still fits the visible structure. */
 	private validLocally(op: ClientOp | LiveOp, v: Store = this.visible): boolean {
 		switch (op.t) {
@@ -1713,7 +1740,9 @@ export class LiveClient {
 					op.id !== this.pageId
 				);
 			case "d":
-				return !!v.alive(op.id) && op.id !== this.pageId;
+				// Never a block whose children are not loaded (watched by levels): what it holds
+				// would go unseen, and undoing could not bring it back.
+				return !!v.alive(op.id) && op.id !== this.pageId && this.childrenKnown(op.id, v);
 			case "k":
 				return v.inPage(op.id);
 		}

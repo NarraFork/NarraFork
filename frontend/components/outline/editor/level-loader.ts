@@ -15,8 +15,10 @@
  *
  * While a block's whole subtree is on its way, its level stays (no row goes blank meanwhile).
  * A watch refused for another reason (the person's share, the space full: budgets count what is
- * loaded) is not asked for again, nor its level instead; the watch set never grows past
- * `OUTLINE_LIVE_LIMITS.maxWatch` (the server refuses a larger one whole). Such blocks are listed
+ * loaded) is not asked for instead by its level, and is asked for again only once the block was
+ * closed and shown again, or watches were let go (there may be room then); the watch set never
+ * grows past the participant's budget (`OUTLINE_LIVE_LIMITS.watchBudget`, which the server
+ * enforces too: `watch_cap`). Such blocks are listed
  * in `notLoaded` (the editor says part of the outline is not loaded), and their rows take typing
  * but no delete or join (`view.ts` refuses deleting a block whose children are not loaded).
  *
@@ -42,9 +44,17 @@ export interface LoaderSource {
 /**
  * Why a shown block's children are not loaded (its rows can be typed in, not deleted or
  * joined): a refusal's code, or `watch_cap` (the watch set is full,
- * `OUTLINE_LIVE_LIMITS.maxWatch`).
+ * `OUTLINE_LIVE_LIMITS.watchBudget`).
  */
 export type NotLoaded = LiveCloseCode | "watch_cap";
+
+/** Refusals for room: asked for again once there may be room (see `run`). */
+const RETRIED: ReadonlySet<string> = new Set([
+	"user_limit",
+	"space_full",
+	"unavailable",
+	"watch_cap",
+]);
 
 /** New watches asked for at once (the rest follow as the answers come). */
 export const LOADER_BATCH = 64;
@@ -106,14 +116,14 @@ export class LevelLoader {
 		if (trees.length === 0) return null;
 		const want = new Map<string, LiveWatchWire>();
 		const v = c.visible;
-		const cap = OUTLINE_LIVE_LIMITS.maxWatch;
-		/** Wanted, unless it is new and the set is full (false then). */
-		const take = (w: LiveWatchWire): boolean => {
+		/** The block a new watch is for (what is not loaded when there is no room for it). */
+		const owner = new Map<string, string>();
+		const refusedSeen = new Set<string>();
+		const take = (w: LiveWatchWire, id: string): void => {
 			const key = liveWatchKey(w);
-			if (want.has(key)) return true;
-			if (want.size >= cap && c.watching(key) === null) return false;
+			if (want.has(key)) return;
 			want.set(key, w);
-			return true;
+			owner.set(key, id);
 		};
 		/** The subtree watched whole a block is in (itself or an ancestor), kept wanted. */
 		const covering = (id: string): boolean => {
@@ -143,30 +153,31 @@ export class LevelLoader {
 			if (covering(id)) return;
 			const levelSet = c.watching(kl) === "set";
 			const whole = c.watchRefused.get(ks);
+			if (whole !== undefined) refusedSeen.add(ks);
 			if (whole === undefined) {
-				if (!take(s)) notLoaded.set(id, "watch_cap");
+				take(s, id);
 				// Its level stays while the whole of it is on its way.
 				if (levelSet) want.set(kl, l);
 				return;
 			}
-			if (whole !== "too_large") {
-				// Refused for the person's share, a full space, the server's limits: not asked
-				// for again, and its level is not asked for instead (it would be refused the
-				// same way). What it has loaded stays.
+			if (whole !== "too_large" && whole !== "user_limit" && whole !== "space_full") {
+				// Refused by the server's limits (`unavailable`, the budget): not asked for again
+				// until there may be room (`run`), and not by its level instead (it would be
+				// refused the same way). What it has loaded stays.
 				notLoaded.set(id, whole);
 				if (levelSet) want.set(kl, l);
 				return;
 			}
-			// Too large to watch whole: its level, and what it shows opened.
+			// Too large to watch whole, or more than the person's share or the space has room
+			// for: its level (far smaller), and what it shows opened; if that is refused too,
+			// it is listed.
 			const level = c.watchRefused.get(kl);
+			if (level !== undefined) refusedSeen.add(kl);
 			if (level !== undefined && !levelSet) {
 				notLoaded.set(id, level);
 				return;
 			}
-			if (!take(l)) {
-				notLoaded.set(id, "watch_cap");
-				return;
-			}
+			take(l, id);
 			const node = tree.nodes.get(id);
 			if (!node?.open) return;
 			for (const k of node.kids) visit(tree, k);
@@ -182,8 +193,27 @@ export class LevelLoader {
 			base(tree.rootId);
 			visit(tree, tree.rootId);
 		}
+		// The participant's budget (`OUTLINE_LIVE_LIMITS.watchBudget`, the server's too): what is
+		// held or asked for and still wanted counts first; new watches take what room is left,
+		// in the order the views show them (the roots' own first).
+		let room = OUTLINE_LIVE_LIMITS.watchBudget;
+		for (const key of want.keys()) if (c.watching(key) !== null) room--;
+		for (const key of [...want.keys()]) {
+			if (c.watching(key) !== null) continue;
+			if (room > 0) {
+				room--;
+				continue;
+			}
+			want.delete(key);
+			const id = owner.get(key);
+			if (id !== undefined) notLoaded.set(id, "watch_cap");
+		}
+		this.refusedSeen = refusedSeen;
 		return want;
 	}
+
+	/** Refusals the last {@link wanted} came across (still needed). */
+	private refusedSeen = new Set<string>();
 
 	/** Ask for what is needed and let go of what is not. */
 	run(): void {
@@ -208,6 +238,12 @@ export class LevelLoader {
 		add.splice(Math.max(0, LOADER_BATCH - asked));
 		const remove: LiveWatchWire[] = [];
 		for (const w of c.watchSet) if (!want.has(liveWatchKey(w))) remove.push(w);
+		// A refusal for room (the person's share, a full space, the budget, the server's limits)
+		// is forgotten once the block is closed or gone, or when watches are let go: asked again
+		// when it is shown again, or at the next run (there may be room now).
+		for (const [key, code] of [...c.watchRefused])
+			if (RETRIED.has(code) && (remove.length > 0 || !this.refusedSeen.has(key)))
+				c.watchRefused.delete(key);
 		if (add.length === 0 && remove.length === 0) return;
 		this.runs++;
 		c.watch({ add, remove });

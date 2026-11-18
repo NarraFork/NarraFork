@@ -17,6 +17,7 @@
  */
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { liveSpaceOf } from "../../../../server/services/outline/live/registry";
+import { OUTLINE_LIVE_BOUNDS } from "../../../../server/services/outline/live/session";
 import { outlineStore } from "../../../../server/services/outline/store";
 import { writeOutline } from "../../../../server/services/outline/write";
 import {
@@ -397,32 +398,27 @@ test("an empty closed row: Backspace after it, Delete at its end and a paste int
 	}
 }, 120_000);
 
-/** Drop a selection the way ProseMirror does: dragged (`transformCopied`), then dropped. */
+/**
+ * Drop a selection the way ProseMirror does: dragged (`transformCopied`), then dropped at the
+ * end of a row's text through the editor's drop (`handleDrop`: moved or copied as the drop says).
+ * The drag itself starts as the other kind (the copy key pressed or let go on the way).
+ */
 async function drop(e: Editor, target: string, move: boolean) {
 	return e.call(
 		(f, t, mv) => {
-			const pm = f.view().pm;
+			const v = f.view();
+			const pm = v.pm;
 			let slice = pm.state.selection.content();
 			pm.someProp("transformCopied", (fn: (s: typeof slice, v: typeof pm) => typeof slice) => {
 				slice = fn(slice, pm);
 			});
-			(pm as unknown as { dragging: unknown }).dragging = { slice, move: mv, node: undefined };
-			pm.someProp(
-				"transformPasted",
-				(fn: (s: typeof slice, v: typeof pm, plain: boolean) => typeof slice) => {
-					slice = fn(slice, pm, false);
-				},
-			);
+			(pm as unknown as { dragging: unknown }).dragging = { slice, move: !mv, node: undefined };
 			let at = -1;
 			pm.state.doc.descendants((n, pos) => {
 				if (n.type.name === "block" && n.attrs.id === t) at = pos + 1 + n.child(0).nodeSize - 1;
 				return true;
 			});
-			const tr = pm.state.tr;
-			if (mv) tr.deleteSelection();
-			const p = tr.mapping.map(at);
-			tr.replaceRange(p, p, slice);
-			pm.dispatch(tr);
+			v.drop(slice, mv as boolean, at);
 			(pm as unknown as { dragging: unknown }).dragging = null;
 		},
 		target,
@@ -514,4 +510,140 @@ test("by levels, a row whose children are not loaded is never deleted or joined 
 	expect((await outlineStore.getBlock(c1))?.parentId).toBe(idOf("c0"));
 	expect(await a.call((f, id) => f.kids(id as never), k0)).toEqual([idOf("c0")]);
 	expect(errorsOf(a)).toEqual([]);
+}, 180_000);
+
+/** A page by levels: "Big" (an open fact) holds three parts of 700 notes each (too large). */
+async function bigPage(title: string) {
+	const lines = ["Big"];
+	for (let p = 0; p < 3; p++) {
+		lines.push(`  Part ${p}`);
+		for (let i = 0; i < 700; i++) lines.push(`    p${p} note ${i}`);
+	}
+	lines.push("Tail");
+	const { pageId, ids } = await seedPage(h, title, lines);
+	const idOf = (t: string) => ids[lines.findIndex((l) => l.trim() === t)] as string;
+	return {
+		pageId,
+		big: idOf("Big"),
+		parts: [0, 1, 2].map((p) => idOf(`Part ${p}`)),
+		tail: idOf("Tail"),
+	};
+}
+
+test("by levels, a block made here can be deleted at once; undo never deletes what is not loaded", async () => {
+	// Enter, then Backspace before the new block's own watch is answered (the socket held).
+	{
+		const { pageId, big } = await bigPage("Made here");
+		const a = await openEditor(h, h.owner, pageId);
+		await waitFor(
+			() => watches(a),
+			(w) => w.includes(`l:${big}`),
+			"big by levels",
+		);
+		const before = await refusals(a);
+		await a.call((f, id) => f.caret(id as never, -1), big);
+		await a.call((f) => f.net().hold(true));
+		await a.page.keyboard.press("Enter");
+		const x = await a.call((f) => f.where()?.blockId ?? null);
+		expect(x).not.toBe(big);
+		expect(await a.call((f, id) => f.client().visible.get(id as never)?.parentId, x)).toBe(big);
+		await a.page.keyboard.press("Backspace");
+		expect(await refusals(a)).toBe(before);
+		expect(await a.call((f, id) => !!f.client().visible.alive(id as never), x)).toBe(false);
+		await a.call((f) => f.net().hold(false));
+		await settle(a);
+		expect((await outlineStore.getBlock(x as string))?.deleted ?? true).toBe(true);
+		expect(errorsOf(a)).toEqual([]);
+	}
+	// A block made here, someone adds under it, the reader closes "Big" (its watch let go):
+	// undoing the insert must not delete it with what is under it.
+	{
+		const { pageId, big, tail } = await bigPage("Undo unloaded");
+		const a = await openEditor(h, h.owner, pageId);
+		await waitFor(
+			() => watches(a),
+			(w) => w.includes(`l:${big}`),
+			"big by levels",
+		);
+		await a.call((f, id) => f.caret(id as never, -1), big);
+		await a.page.keyboard.press("Enter");
+		await settle(a);
+		const x = (await a.call((f) => f.where()?.blockId ?? null)) as string;
+		await waitFor(
+			() => watches(a),
+			(w) => w.includes(`s:${x}`),
+			"x watched whole",
+		);
+		const r = await writeOutline({
+			spaceId: h.space.id,
+			ops: [{ op: "insert", parent: { id: x }, content: "Bob's child" }],
+			actor: { kind: "human", id: h.writer },
+			responsibleUserId: h.writer,
+		});
+		const bob = r.results[0]?.blockId as string;
+		await waitFor(
+			() => loaded(a, bob),
+			(v) => v,
+			"bob's child arrived",
+		);
+		await a.call((f, id) => f.caret(id as never, -1), tail);
+		await a.call((f, id) => f.view().toggleCollapse(id as never), big);
+		await waitFor(
+			() => loaded(a, bob),
+			(v) => !v,
+			"bob's child let go",
+		);
+		// Undo the insert: its children are not loaded now, so it is not deleted (the undo
+		// step is skipped, as for any structure that changed meanwhile).
+		await undo(a);
+		expect((await outlineStore.getBlock(bob))?.deleted).toBe(false);
+		expect((await outlineStore.getBlock(x))?.deleted).toBe(false);
+		expect(await a.call((f) => f.client().log.some((l) => l.includes("skipped d")))).toBe(true);
+		// Redo after it does no harm either.
+		await redo(a);
+		expect((await outlineStore.getBlock(bob))?.deleted).toBe(false);
+		expect(errorsOf(a)).toEqual([]);
+	}
+}, 240_000);
+
+test("by levels, what was refused for room loads once the reader closes something and opens it again", async () => {
+	const bounds = OUTLINE_LIVE_BOUNDS as { maxUserBlocks: number };
+	const saved = bounds.maxUserBlocks;
+	try {
+		// Room for two of the three parts.
+		bounds.maxUserBlocks = 1600;
+		const { pageId, big, parts } = await bigPage("Refused for room");
+		const a = await openEditor(h, h.owner, pageId);
+		const whole = (w: string[]) => parts.filter((p) => w.includes(`s:${p}`)).length;
+		await waitFor(
+			() => watches(a),
+			(w) => whole(w) === 2,
+			"two parts loaded",
+		);
+		await until(a, () => !!document.querySelector("[data-testid=outline-not-loaded]"));
+		const refused = await a.call(
+			(f, ids) =>
+				(ids as unknown as string[]).map((id) => f.client().watchRefused.get(`s:${id}`) ?? null),
+			parts,
+		);
+		expect(refused.filter((c) => c === "user_limit")).toHaveLength(1);
+		// Room again (the person closed views elsewhere); closing and opening "Big" asks again.
+		bounds.maxUserBlocks = saved;
+		await a.call((f, id) => f.view().toggleCollapse(id as never), big);
+		await waitFor(
+			() => watches(a),
+			(w) => whole(w) === 0,
+			"let go",
+		);
+		await a.call((f, id) => f.view().toggleCollapse(id as never), big);
+		await waitFor(
+			() => watches(a),
+			(w) => whole(w) === 3,
+			"all three loaded",
+		);
+		await until(a, () => !document.querySelector("[data-testid=outline-not-loaded]"));
+		expect(errorsOf(a)).toEqual([]);
+	} finally {
+		bounds.maxUserBlocks = saved;
+	}
 }, 180_000);

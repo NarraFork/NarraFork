@@ -2661,11 +2661,19 @@ export class LiveSpace {
 			p,
 			p.views.filter((v) => !kept.includes(v)),
 		);
+		// The participant's budget: taken up to it, the rest refused `watch_cap` (read nothing).
+		const capped: Array<[LiveWatchWire, LiveCloseCode]> = adding
+			.splice(Math.max(0, OUTLINE_LIVE_LIMITS.watchBudget - kept.length))
+			.map((x) => [x, "watch_cap"]);
 		const answerRefusing = (code: LiveCloseCode) =>
 			this.notify(p, {
 				w: w as number,
 				op: this.opSeq,
-				...(adding.length > 0 ? { refused: adding.map((x) => [x, code]) } : {}),
+				...(adding.length > 0 || capped.length > 0
+					? {
+							refused: [...adding.map((x): [LiveWatchWire, LiveCloseCode] => [x, code]), ...capped],
+						}
+					: {}),
 			});
 		if (adding.length === 0) {
 			answerRefusing("unavailable");
@@ -2673,10 +2681,6 @@ export class LiveSpace {
 		}
 		if (refuseAdding) {
 			answerRefusing(refuseAdding);
-			return;
-		}
-		if (keys.size > OUTLINE_LIVE_LIMITS.maxWatch) {
-			answerRefusing("unavailable");
 			return;
 		}
 		// Everything it sent is in the log and acknowledged, and every batch of its old set out:
@@ -2688,7 +2692,7 @@ export class LiveSpace {
 		if (this.participants.get(p.pno) !== p || this.closed) return;
 		const added: LiveView[] = [];
 		const ok: LiveWatchWire[] = [];
-		const refused: Array<[LiveWatchWire, LiveCloseCode]> = [];
+		const refused: Array<[LiveWatchWire, LiveCloseCode]> = [...capped];
 		const taking: WatchTaking = { userId: p.userId, views: added, rowsLeft: frameReads() };
 		const idleUnless = () => {
 			for (const view of added) if (view.participants.size === 0 && !view.gone) view.armIdle();

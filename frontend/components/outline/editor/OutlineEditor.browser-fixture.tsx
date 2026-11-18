@@ -406,8 +406,18 @@ export function viewOutline(): string {
 	// What a closed block hides is not in the document: read from the client's block model
 	// here (not through the editor's own code), so the two are compared, not one with itself.
 	const c = view().client;
+	// The facts view leaves tasks and questions out (as the document does for open rows),
+	// unless the root is inside a task.
+	let facts = view().lens === "facts";
+	for (
+		let cur: string | null = view().rootId;
+		facts && cur;
+		cur = c.visible.get(cur)?.parentId ?? null
+	)
+		if (c.visible.get(cur)?.task || c.visible.get(cur)?.question) facts = false;
 	const hidden = (id: string, depth: number) => {
 		for (const k of c.visible.children(id)) {
+			if (facts && (c.visible.get(k)?.task || c.visible.get(k)?.question)) continue;
 			const t = c.visible.get(k)?.task;
 			const body = c
 				.textOf(k)

@@ -160,8 +160,14 @@ export const OUTLINE_LIVE_LIMITS = {
 	maxWatchBlocks: 2000,
 	/** UTF-8 bytes of all block content one watch takes at most. */
 	maxWatchBytes: 4 * 1024 * 1024,
-	/** Entries of one participant's watch set. */
+	/** Entries of one join's watch set, or of one `watch` frame's lists (the wire's bound). */
 	maxWatch: 1024,
+	/**
+	 * Watches one participant holds at most (pageless L4). A `watch` frame is taken up to it;
+	 * additions past it are refused `watch_cap` (the rest of the frame stands). Two wide views
+	 * of one person (2 × 512) cannot take the process's {@link liveWatches} from other spaces.
+	 */
+	watchBudget: 512,
 	/** Bytes of one client frame. */
 	maxClientFrameBytes: 256 * 1024,
 	/** Operations of one structural transaction (the write path's limit). */
@@ -507,7 +513,13 @@ export type LiveCloseCode =
 	 * server takes them (`OUTLINE_LIVE_SOCKET_BOUNDS.watchBurst` / `watchesPerSecond`). Nothing
 	 * was read; the client asks again after a while by itself.
 	 */
-	| "too_fast";
+	| "too_fast"
+	/**
+	 * Only in `watched.refused`: the participant's watch set is full
+	 * ({@link OUTLINE_LIVE_LIMITS.watchBudget}); nothing was read. The client asks again once its
+	 * set has room (it let other watches go).
+	 */
+	| "watch_cap";
 
 export interface LiveClosedHead {
 	code: LiveCloseCode;
