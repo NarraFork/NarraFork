@@ -37,6 +37,10 @@ test("every team route is refused with 503 on PostgreSQL", async () => {
 		["PATCH", "/projects/p1/teams/t1", { brief: "x" }],
 		["POST", "/projects/p1/teams/t1/archive"],
 		["POST", "/projects/p1/teams/t1/unarchive"],
+		["GET", "/projects/p1/teams/t1/summary"],
+		["GET", "/projects/p1/teams/t1/board?column=queued"],
+		["GET", "/projects/p1/teams/t1/events"],
+		["GET", "/projects/p1/teams/t1/approvals"],
 	];
 	for (const [method, path, body] of cases) {
 		const response = await app.request(`http://localhost${path}`, {
