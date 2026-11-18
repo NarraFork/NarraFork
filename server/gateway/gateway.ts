@@ -986,14 +986,28 @@ class Gateway {
 	 * `notification-service.ts` is the one IM alert a team session sends.
 	 */
 	private isTeamSession(narratorId: string): boolean {
-		return !!teamIdOfNarrator(narratorId);
+		// Fixed when the session is created (a coordinator's team row, a subagent's ACL root), so
+		// the answer is remembered. Asked only where something would be sent to a chat, never for
+		// stream deltas (a team session never gets a stream consumer).
+		const known = this.teamSessionMemo.get(narratorId);
+		if (known !== undefined) return known;
+		const team = !!teamIdOfNarrator(narratorId);
+		if (this.teamSessionMemo.size >= Gateway.TEAM_SESSION_MEMO_LIMIT) {
+			const oldest = this.teamSessionMemo.keys().next().value;
+			if (oldest !== undefined) this.teamSessionMemo.delete(oldest);
+		}
+		this.teamSessionMemo.set(narratorId, team);
+		return team;
 	}
+
+	/** Remembered team-ness per narrator (M1), oldest dropped first. */
+	private readonly teamSessionMemo = new Map<string, boolean>();
+	private static readonly TEAM_SESSION_MEMO_LIMIT = 2000;
 
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
 		eventBus.on("narrator:status_changed", async (event) => {
-			if (this.isTeamSession(event.narratorId)) return;
 			// Handle the directly-bound narrator (deliver response on idle)
 			if (event.status === "idle") {
 				const consumer = this.streamConsumers.get(event.narratorId);
@@ -1021,13 +1035,11 @@ class Gateway {
 			// after the last background task emits a fresh unflagged "done".
 			// The reason check is defensive — the flag is only produced for done.
 			if (event.backgroundWorkActive && event.reason === "done") return;
-			if (this.isTeamSession(event.narratorId)) return;
 			await this.notifyRecentTabStatusChange(event.narratorId, event.reason);
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
 		eventBus.on("narrator:message_broadcast", async (event) => {
-			if (this.isTeamSession(event.narratorId)) return;
 			const msg = event.message;
 
 			// --- Stream consumer: text deltas ---
@@ -1065,7 +1077,7 @@ class Gateway {
 				msg.type === "permission_request"
 			) {
 				const mapping = await this.findMappingByNarrator(event.narratorId);
-				if (!mapping) return;
+				if (!mapping || this.isTeamSession(event.narratorId)) return;
 				const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 				if (!adapter) return;
 				const locale = await this.resolveLocaleForAppUser(mapping.appUserId);
@@ -1124,7 +1136,7 @@ class Gateway {
 					const contentText = typeof payload.contentText === "string" ? payload.contentText : "";
 					if (contentText.trim()) {
 						const mapping = await this.findMappingByNarrator(event.narratorId);
-						if (mapping) {
+						if (mapping && !this.isTeamSession(event.narratorId)) {
 							const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 							if (adapter) {
 								// Track that we already delivered this turn's messages
@@ -1141,10 +1153,9 @@ class Gateway {
 		eventBus.on("narrator:error", async (event) => {
 			// Clean up stream consumer
 			this.cleanupStreamConsumer(event.narratorId);
-			if (this.isTeamSession(event.narratorId)) return;
 
 			const mapping = await this.findMappingByNarrator(event.narratorId);
-			if (!mapping) return;
+			if (!mapping || this.isTeamSession(event.narratorId)) return;
 
 			const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 			if (!adapter) return;
@@ -1161,10 +1172,10 @@ class Gateway {
 		// If messages were already delivered via message_broadcast (non-streaming),
 		// skip the final delivery to avoid duplicates.
 		if (this.deliveredNarrators.delete(narratorId)) return;
-		if (this.isTeamSession(narratorId)) return;
 
 		const mapping = await this.findMappingByNarrator(narratorId);
 		if (!mapping) return; // Not an IM-bound narrator
+		if (this.isTeamSession(narratorId)) return;
 
 		const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 		if (!adapter) return;
@@ -1222,10 +1233,10 @@ class Gateway {
 		reason: "waiting_permission" | "done" | "error",
 	): Promise<void> {
 		if (this.adapters.size === 0) return;
-		if (this.isTeamSession(narratorId)) return;
 
 		const relevantUserIds = await getRecentTabUserIdsForNarrator(narratorId);
 		if (relevantUserIds.length === 0) return;
+		if (this.isTeamSession(narratorId)) return;
 
 		const mappings: Array<{
 			platform: string;
@@ -1419,6 +1430,8 @@ class Gateway {
 				});
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
+				} else if (await this.refuseTeamSession(mapping.narratorId, msg, adapter)) {
+					// A team session reveals nothing to IM (M1).
 				} else {
 					const narrator = await db.query.narrators.findFirst({
 						where: eq(narrators.id, mapping.narratorId),
@@ -1502,12 +1515,13 @@ class Gateway {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
 				}
+				// A team session reveals nothing to IM (M1), not even whether a call is waiting.
+				if (await this.refuseTeamSession(mapping.narratorId, msg, adapter)) break;
 				const pending = this.findPendingPermissionForNarrator(mapping.narratorId);
 				if (!pending) {
 					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
 					break;
 				}
-				if (await this.refuseTeamDecision(mapping.narratorId, msg.chatId, adapter, locale)) break;
 				const { resolvePermission } = await import("../services/narrator-permission");
 				await resolvePermission(pending.requestId, "allow");
 				await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
@@ -1526,12 +1540,12 @@ class Gateway {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
 				}
+				if (await this.refuseTeamSession(mapping.narratorId, msg, adapter)) break;
 				const pendingReq = this.findPendingPermissionForNarrator(mapping.narratorId);
 				if (!pendingReq) {
 					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
 					break;
 				}
-				if (await this.refuseTeamDecision(mapping.narratorId, msg.chatId, adapter, locale)) break;
 				const { resolvePermission: resolveP } = await import("../services/narrator-permission");
 				const denyReason = command.args || undefined;
 				await resolveP(pendingReq.requestId, "deny", {
