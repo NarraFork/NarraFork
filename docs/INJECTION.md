@@ -264,6 +264,12 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 
 **团队状态（`team_status`，`server/services/teams/team-status.ts`，Project Teams P2）**：团队协调者（带 `team` trait 的主叙述者）的团队简报、本周超出建议上限的次数、团队树里等人审批的调用、工作项和最近替人做的决定，一行 `role: sys`、body 为 `prose`，最多 6 KB，文本确定（同样的状态同样的字节，不带相对时间）。写的时机：每一 pass 读历史之前（`orchestrator.ts`）在运行开始时写（`schedule: none`；同一压缩周期里同样的文本还在历史里就不写）、最近一次压缩标记变了（压缩或清空上下文之后）立即写；长回合在工具边界最多每 10 分钟看一次、文本变了才写（`onNextTurn`）。简报全文每个压缩周期只写一次（或简报改了、带它的那一行被回退删掉时再写），之后的状态行只写一句「简报没变」，让小变化只占一小行。从不进系统提示。协调者自己的工具结果超出建议值时末尾追加的提醒不是注入行，是工具结果的一部分（`teams/coordinator-limits.ts`，经 `AgentConfig.annotateToolResult`）；大输出的全文存在 `~/.narrafork/coordinator-outputs/<叙述者 id>/`（按内容哈希命名、按 Read 一次能读全的大小分段、每个会话最多 200 MB 先删最旧、随会话删除，`teams/coordinator-outputs.ts`），只有这个叙述者自己读它免审批，Read 读它不截长行。
 
+**团队自检**（`server/services/teams/work-items.ts`，P3）：协调者 `Team({ action: "checkin", minutes })` 排一次唤醒，到点写一行：
+
+| source | body kind | schedule | 触发 |
+|---|---|---|---|
+| `team_checkin` | `prose` | `wakeIfIdle` | 自检到点（5 分钟到 1 天；每个 team 最多一个待发，新排的替换旧的；排定和触发各记一条 `team.checkin` 事件，重启或取消归档后按事件重排，已过点的立即触发；协调者归档或删除时取消，到点时 team 不再活跃就不唤醒；这一轮以排定它的人为执行身份 `executionPrincipal`） |
+
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
 loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：

@@ -164,3 +164,56 @@ export const TEAM_DECISION_EVENT_KIND = "team.decision";
 export const TEAM_STATUS_MAX_BYTES = 6 * 1024;
 /** A long run looks at the team status again at most this often. */
 export const TEAM_STATUS_CADENCE_MS = 10 * 60_000;
+
+// ── P3: work item lifecycle ──────────────────────────────────────────────────
+
+/**
+ * The coordinator's `Team` tool actions (plan §二.4). PR, CI and integration actions
+ * (`integrate`, `pr.*`, `merge.local`) are deferred with the hosting and integration PRs.
+ */
+export const TEAM_TOOL_ACTIONS = [
+	"work.list",
+	"work.create",
+	"work.review",
+	"work.ready",
+	"work.sync",
+	"work.cancel",
+	"brief",
+	"checkin",
+	"cleanup",
+	"decision",
+] as const;
+export type TeamToolAction = (typeof TEAM_TOOL_ACTIONS)[number];
+
+/**
+ * Kind of a work item made by `Agent({ isolation: "worktree" })`: its worktree is cleaned and the
+ * item cancelled when the subagent's run ends without a commit or an uncommitted change. Items
+ * made by `Team({ action: "work.create" })` keep the default kind and are never cleaned on their
+ * own.
+ */
+export const TEAM_ISOLATED_WORK_KIND = "isolated";
+/** Default kind of a work item. */
+export const TEAM_DEFAULT_WORK_KIND = "change";
+
+/** Longest work item title. */
+export const TEAM_WORK_TITLE_MAX_LENGTH = 200;
+/** Text budget (UTF-8 bytes) of a decision recorded on people's behalf. */
+export const TEAM_DECISION_MAX_BYTES = 2 * 1024;
+/** Bounds of a check-in delay in minutes: at least five minutes, at most one day. */
+export const TEAM_CHECKIN_MIN_MINUTES = 5;
+export const TEAM_CHECKIN_MAX_MINUTES = 24 * 60;
+/** Most work items one `work.list` returns (open ones first). */
+export const TEAM_WORK_LIST_LIMIT = 30;
+
+/** Work item and team events written by P3, each with its person or agent. */
+export type TeamWorkEventKind =
+	| "work.created"
+	| "work.started"
+	| "work.start_failed"
+	| "work.review"
+	| "work.ready"
+	| "work.sync"
+	| "work.cancelled"
+	| "work.cleanup"
+	| "team.checkin"
+	| typeof TEAM_DECISION_EVENT_KIND;
