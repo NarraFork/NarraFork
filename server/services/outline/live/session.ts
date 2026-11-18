@@ -258,6 +258,14 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 * never refused by it (the space's own bound still applies).
 	 */
 	maxUserBlocks: 8000,
+	/**
+	 * Watches past a person's budget (`OUTLINE_LIVE_LIMITS.watchBudget`) their joins may still
+	 * hold (each keeps its root: `JOIN_KEEPS`). Past budget + slack a join is refused
+	 * `watch_cap` outright.
+	 */
+	watchSlack: 64,
+	/** Live participants (joins) one person may hold in the process; past it, `user_limit`. */
+	participantsPerUser: 32,
 	/** Blocks put into or taken out of the mirror between two yields to the event loop. */
 	loadStep: 500,
 	/** Failed commits of a block as code after which it is no longer retried (until edited). */
@@ -482,6 +490,46 @@ interface WatchTaking {
 	 * frame says `too_fast` (the client asks again in a later frame); a join `user_limit`.
 	 */
 	spentCode?: LiveCloseCode;
+}
+
+/**
+ * A person's watch budget across the process (`OUTLINE_LIVE_LIMITS.watchBudget`): what they hold
+ * and what loads under way have reserved, by every participant of theirs but the one of client
+ * key `exceptKey` (a client joining again replaces its earlier participant).
+ */
+export interface LivePeople {
+	watches(userId: string, exceptKey?: string): number;
+	participants(userId: string, exceptKey?: string): number;
+	/** Hold `n` of the person's budget while a join or frame loads; returns the release. */
+	reserve(userId: string, n: number): () => void;
+}
+
+/** {@link LivePeople} over some participants (one session alone, or the registry's all). */
+export function localPeople(all: () => Iterable<Participant>): LivePeople {
+	const reserved = new Map<string, number>();
+	return {
+		watches(userId, exceptKey) {
+			let n = reserved.get(userId) ?? 0;
+			for (const q of all()) if (q.userId === userId && q.key !== exceptKey) n += q.views.length;
+			return n;
+		},
+		participants(userId, exceptKey) {
+			let n = 0;
+			for (const q of all()) if (q.userId === userId && q.key !== exceptKey) n++;
+			return n;
+		},
+		reserve(userId, n) {
+			reserved.set(userId, (reserved.get(userId) ?? 0) + n);
+			let done = false;
+			return () => {
+				if (done) return;
+				done = true;
+				const left = (reserved.get(userId) ?? 0) - n;
+				if (left > 0) reserved.set(userId, left);
+				else reserved.delete(userId);
+			};
+		},
+	};
 }
 
 /**
@@ -1267,14 +1315,11 @@ export class LiveSpace {
 		/** Watches the process may still load (`OUTLINE_LIVE_LIMITS.liveWatches`). */
 		private readonly watchRoom: () => number = () => Number.POSITIVE_INFINITY,
 		/**
-		 * Watches a person holds in every session of the process (all sockets, all spaces):
-		 * the budget `OUTLINE_LIVE_LIMITS.watchBudget` is the person's (the registry counts).
+		 * A person's watches and participants in every session of the process (all sockets, all
+		 * spaces): the budget `OUTLINE_LIVE_LIMITS.watchBudget` is the person's (the registry
+		 * counts, `LivePeople`). Alone (tests), this session's.
 		 */
-		private readonly userWatches: (userId: string) => number = (userId) => {
-			let n = 0;
-			for (const q of this.participants.values()) if (q.userId === userId) n += q.views.length;
-			return n;
-		},
+		private readonly people: LivePeople = localPeople(() => this.participants.values()),
 	) {}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2425,6 +2470,39 @@ export class LiveSpace {
 		lostBefore?: readonly LiveLostWire[],
 	): Promise<Participant | Refusal> {
 		if (this.closed || this.restartRequested) return { refused: "ended" };
+		// An earlier participant of the same client (a connection that never closed): replaced,
+		// and not counted against the person.
+		for (const q of [...this.participants.values()]) if (q.key === head.key) this.leave(q);
+		const userId = socket.userId;
+		if (this.people.participants(userId, head.key) >= OUTLINE_LIVE_BOUNDS.participantsPerUser)
+			return { refused: "user_limit" };
+		// The person's watch budget: past it a join keeps its first entries (its root), within a
+		// small slack; past the slack it is refused.
+		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
+		const ceiling = budget + OUTLINE_LIVE_BOUNDS.watchSlack;
+		const others = this.people.watches(userId, head.key);
+		if (others >= ceiling) return { refused: "watch_cap" };
+		const room = Math.min(ceiling - others, Math.max(JOIN_KEEPS, budget - others));
+		const release = this.people.reserve(userId, Math.min(room, head.watch.length));
+		try {
+			return await this.joinWithin(socket, handle, head, held, canWrite, room, dur, lostBefore);
+		} finally {
+			release();
+		}
+	}
+
+	private async joinWithin(
+		socket: LiveSocket,
+		handle: number,
+		head: LiveJoinHead,
+		held: Uint8Array,
+		canWrite: boolean,
+		/** Entries of `head.watch` it may take (the person's budget); the rest `watch_cap`. */
+		room: number,
+		dur?: number,
+		lostBefore?: readonly LiveLostWire[],
+	): Promise<Participant | Refusal> {
+		if (this.closed || this.restartRequested) return { refused: "ended" };
 		// People are numbered below the agents' numbers: a session that has seen that many joins
 		// starts afresh (everyone rejoins a new one), as one whose documents grew too large does.
 		if (this.nextPno >= OUTLINE_LIVE_AGENT_PNO_BASE) {
@@ -2439,12 +2517,6 @@ export class LiveSpace {
 			for (const v of views) if (v.participants.size === 0 && !v.gone) v.armIdle();
 		};
 		const taking: WatchTaking = { userId: socket.userId, views, rowsLeft: frameReads() };
-		// The person's watch budget across the process: entries past it are refused `watch_cap`
-		// (the join keeps its first few: its root).
-		const room = Math.max(
-			JOIN_KEEPS,
-			OUTLINE_LIVE_LIMITS.watchBudget - this.userWatches(socket.userId),
-		);
 		const capped: Array<[LiveWatchWire, LiveCloseCode]> = head.watch
 			.slice(room)
 			.map((w) => [w, "watch_cap"]);
@@ -2722,10 +2794,28 @@ export class LiveSpace {
 		);
 		// The person's budget (all their sessions in the process): taken up to it, the rest
 		// refused `watch_cap` (read nothing).
-		const others = this.userWatches(p.userId) - p.views.length;
+		const others = this.people.watches(p.userId, p.key);
 		const capped: Array<[LiveWatchWire, LiveCloseCode]> = adding
 			.splice(Math.max(0, OUTLINE_LIVE_LIMITS.watchBudget - others - kept.length))
 			.map((x) => [x, "watch_cap"]);
+		// Held while it loads (another space's frame of the same person counts it meanwhile).
+		const release = this.people.reserve(p.userId, adding.length);
+		try {
+			await this.takeWatches(p, w as number, kept, adding, capped, refuseAdding);
+		} finally {
+			release();
+		}
+	}
+
+	/** The rest of {@link handleWatch}: the additions taken (or refused), and the answer. */
+	private async takeWatches(
+		p: Participant,
+		w: number,
+		kept: readonly LiveView[],
+		adding: LiveWatchWire[],
+		capped: Array<[LiveWatchWire, LiveCloseCode]>,
+		refuseAdding?: LiveCloseCode,
+	): Promise<void> {
 		const answerRefusing = (code: LiveCloseCode) =>
 			this.notify(p, {
 				w: w as number,

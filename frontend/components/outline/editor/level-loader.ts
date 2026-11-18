@@ -28,6 +28,7 @@
  * they need differs from what is watched (the client puts close changes into one frame).
  */
 import type { FoldTree } from "@shared/outline-fold";
+import { cancelLiveTimer, type LiveTimer, liveTimeout } from "@shared/outline-live-clock";
 import {
 	type LiveCloseCode,
 	type LiveWatchWire,
@@ -54,7 +55,15 @@ const RETRIED: ReadonlySet<string> = new Set([
 	"space_full",
 	"unavailable",
 	"watch_cap",
+	// A frame's reads ran out and the client's own retries gave up.
+	"too_fast",
 ]);
+
+/**
+ * A backstop: refusals for the person's watch budget are asked again this long after (room may
+ * have come from another tab or space, which this client does not see).
+ */
+export const WATCH_CAP_RETRY_MS = 30_000;
 
 /** New watches asked for at once (the rest follow as the answers come). */
 export const LOADER_BATCH = 64;
@@ -70,6 +79,7 @@ export class LevelLoader {
 	notLoaded: ReadonlyMap<string, NotLoaded> = new Map();
 	/** Removes the client listener (`levelLoaderOf`). */
 	off: (() => void) | null = null;
+	private capTimer: LiveTimer | null = null;
 
 	constructor(private readonly client: LiveClient) {}
 
@@ -96,6 +106,8 @@ export class LevelLoader {
 		this.listeners.clear();
 		this.off?.();
 		this.off = null;
+		if (this.capTimer) cancelLiveTimer(this.capTimer);
+		this.capTimer = null;
 	}
 
 	/** Run after the current task (projections of several views coalesce). */
@@ -256,6 +268,14 @@ export class LevelLoader {
 		for (const [key, code] of [...c.watchRefused])
 			if (RETRIED.has(code) && (remove.length > 0 || !this.refusedSeen.has(key)))
 				c.watchRefused.delete(key);
+		// Refused for the budget: asked again after a while whatever happens here.
+		if (!this.capTimer && [...c.watchRefused.values()].includes("watch_cap"))
+			this.capTimer = liveTimeout(() => {
+				this.capTimer = null;
+				for (const [key, code] of [...c.watchRefused])
+					if (code === "watch_cap") c.watchRefused.delete(key);
+				this.schedule();
+			}, WATCH_CAP_RETRY_MS);
 		if (add.length === 0 && remove.length === 0) return;
 		this.runs++;
 		c.watch({ add, remove });

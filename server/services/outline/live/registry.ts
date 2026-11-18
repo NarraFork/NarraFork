@@ -58,6 +58,7 @@ import {
 	type LiveSocket,
 	LiveSpace,
 	type LiveView,
+	localPeople,
 	OUTLINE_LIVE_TIMING,
 	type Participant,
 } from "./session";
@@ -296,13 +297,13 @@ function takeWatchToken(socket: LiveSocket): boolean {
 	return true;
 }
 
-/** Watches a person holds in every session of the process (their watch budget's measure). */
-function userWatchCount(userId: string): number {
-	let n = 0;
-	for (const s of state.sessions.values())
-		for (const p of s.participants.values()) if (p.userId === userId) n += p.views.length;
-	return n;
-}
+/**
+ * Every person's watches and participants across the process's sessions, and the reservations
+ * of loads under way (their watch budget's measure, shared by all sessions).
+ */
+const people = localPeople(function* () {
+	for (const s of state.sessions.values()) yield* s.participants.values();
+});
 
 function watchCount(): number {
 	let n = 0;
@@ -479,7 +480,7 @@ async function openSession(space: OutlineSpaceRow): Promise<LiveSpace> {
 		// What the process may still load: checked with the size of the tree just read.
 		() => OUTLINE_LIVE_SOCKET_BOUNDS.processBlocks - loadedBlocks(),
 		() => OUTLINE_LIVE_LIMITS.liveWatches - watchCount(),
-		userWatchCount,
+		people,
 	);
 	state.sessions.set(space.id, opened);
 	state.spaces.set(space.id, space);

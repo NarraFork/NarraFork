@@ -2242,7 +2242,11 @@ export class LiveClient {
 		// sessions' grace period, `live-sessions.ts`) count as open on the server. Let them go
 		// and ask once more: a person moving on in one tab is not refused for the page they just
 		// left. Once only per refusal, so it never goes round.
-		if ((code === "user_limit" || code === "space_full") && !this.roomAsked && this.makeRoom?.()) {
+		if (
+			(code === "user_limit" || code === "space_full" || code === "watch_cap") &&
+			!this.roomAsked &&
+			this.makeRoom?.()
+		) {
 			this.roomAsked = true;
 			this.log.push(`refused (${code}): let this tab's left pages go and joined again`);
 			this.join();

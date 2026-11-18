@@ -5,13 +5,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildFoldTree, type FoldView } from "@shared/outline-fold";
+import { setLiveClockForTests } from "@shared/outline-live-clock";
 import {
 	type LiveCloseCode,
 	type LiveWatchWire,
 	liveWatchKey,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
-import { LevelLoader, LOADER_BATCH } from "./level-loader";
+import { LevelLoader, LOADER_BATCH, WATCH_CAP_RETRY_MS } from "./level-loader";
 import { LiveClient, type LiveTransport } from "./live-client";
 import { liveFoldSource } from "./live-fold";
 import { Store } from "./store";
@@ -149,6 +150,43 @@ describe("what the views need watched", () => {
 			),
 		).toEqual(["s:big"]);
 		expect([...limited.loader.notLoaded]).toEqual([["small", "unavailable"]]);
+	});
+});
+
+describe("refusals for the budget", () => {
+	test("asked again after a while (a backstop), and the read allowance's too_fast once let go", () => {
+		const timers: Array<{ fn: () => void; ms: number }> = [];
+		setLiveClockForTests({
+			now: () => 0,
+			setTimeout: (fn, ms) => {
+				timers.push({ fn, ms });
+				return { __liveTimer: true } as never;
+			},
+			clearTimeout: () => {},
+			yield: async () => {},
+		});
+		try {
+			const capped = setup({
+				set: ["l:", "l:page", "s:big"],
+				refused: { "s:page": "too_large", "s:small": "watch_cap" },
+			});
+			capped.loader.run();
+			expect(capped.client.watchRefused.get("s:small")).toBe("watch_cap");
+			const backstop = timers.find((t) => t.ms === WATCH_CAP_RETRY_MS);
+			expect(backstop).toBeDefined();
+			backstop?.fn();
+			expect(capped.client.watchRefused.has("s:small")).toBe(false);
+		} finally {
+			setLiveClockForTests(null);
+		}
+		// `too_fast` (the client's own retries gave up) is forgotten like the others once
+		// something is let go.
+		const fast = setup({
+			set: ["l:", "l:page", "s:big", "s:gone"],
+			refused: { "s:page": "too_large", "s:small": "too_fast" },
+		});
+		fast.loader.run();
+		expect(fast.client.watchRefused.has("s:small")).toBe(false);
 	});
 });
 
