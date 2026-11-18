@@ -23,31 +23,24 @@
 
 import type { IMarker } from "@xterm/headless";
 import { hotSafe } from "../lib/hot-safe";
-import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { BufferManager, BufferReadCursor, BufferReadFrame } from "../terminal/buffer-manager";
-import { registerTaskAlias } from "./subagent-alias";
-import { TERMINAL_WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+import {
+	createWatchObservation,
+	resumeWatchObservationsForTests,
+	suspendWatchObservationsForShutdown,
+	type WatchObservation,
+} from "./watch-observation";
 
-/**
- * Loaded on first use: terminal-service imports this module, and the task
- * service pulls in the runtime publication stack, which a terminal that never
- * has a watch does not need.
- */
-async function tasks() {
-	return (await import("./background-task-service")).backgroundTaskService;
-}
 /** Minimum gap between two checks of the same watch while output keeps arriving. */
 export const CHECK_INTERVAL_MS = 250;
-export const DEFAULT_WATCH_TIMEOUT_MS = 10 * 60_000;
+export { DEFAULT_WATCH_TIMEOUT_MS } from "./watch-observation";
 export const MIN_WATCH_TIMEOUT_MS = 1_000;
-export const MAX_WATCH_TIMEOUT_MS = 60 * 60_000;
-/** Watches one narrator may hold at a time. */
-export const MAX_WATCHES_PER_NARRATOR = 20;
+export { MAX_WATCH_TIMEOUT_MS, MAX_WATCHES_PER_NARRATOR } from "./watch-observation";
 /** Bounds the per-watch literal prefix table as well as input/notification work. */
 export const MAX_WATCH_PATTERN_CHARS = 16_384;
-/** Bounded retries for transient failures of the task-result/outbox transaction. */
-export const PUBLISH_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+export { PUBLISH_RETRY_DELAYS_MS } from "./watch-observation";
+
 /** Lines of context sent with a match, before and after the matching line. */
 const CONTEXT_LINES_BEFORE = 20;
 const CONTEXT_LINES_AFTER = 5;
@@ -65,7 +58,6 @@ export type WatchStart =
 interface WatchResult {
 	status: "completed" | "timeout" | "failed";
 	output: string;
-	attempts: number;
 }
 
 interface Watch {
@@ -75,6 +67,7 @@ interface Watch {
 	terminalId: string;
 	terminalName: string;
 	pattern: string;
+	observation: WatchObservation;
 	buffer: BufferManager;
 	/** Physical row boundaries are unusable after horizontal reflow, including ABA. */
 	layoutRevision: number;
@@ -86,12 +79,12 @@ interface Watch {
 	matchFrame: ReturnType<typeof createWatchFrameMatcher>;
 	timer: ReturnType<typeof setTimeout>;
 	checkTimer?: ReturnType<typeof setTimeout>;
-	publishTimer?: ReturnType<typeof setTimeout>;
 	/** Frozen once observation ends; retained until publication succeeds or is abandoned. */
 	result?: WatchResult;
 	dirty: boolean;
 	checking: boolean;
 	lastCheck: number;
+	lastText?: string;
 	settled: boolean;
 }
 
@@ -110,11 +103,13 @@ const shutdownState = hotSafe("narrafork:terminal-watch-shutdown", () => ({ susp
  */
 export function suspendTerminalWatchesForShutdown(): void {
 	shutdownState.suspended = true;
+	suspendWatchObservationsForShutdown();
 	for (const id of [...watches.keys()]) release(id);
 }
 
 export function resumeTerminalWatchesForTests(): void {
 	shutdownState.suspended = false;
+	resumeWatchObservationsForTests();
 }
 
 /** The rendered text uses "\n" only; treat "\r\n" and a lone "\r" in a pattern as line breaks. */
@@ -345,7 +340,7 @@ export interface StartWatchInput {
 	narratorId: string;
 	terminalId: string;
 	terminalName: string;
-	pattern: string;
+	pattern?: string;
 	timeoutMs: number;
 	buffer: BufferManager;
 	/** Owns the relocatable markers and queued layout checkpoints. */
@@ -380,19 +375,9 @@ function disposeWatchMarkers(
 
 export async function startTerminalWatch(input: StartWatchInput): Promise<StartWatchResult> {
 	const layoutRevision = input.layoutRevision ?? input.buffer.layoutRevision;
-	let active = 0;
-	for (const w of watches.values()) if (w.narratorId === input.narratorId) active++;
-	if (active >= MAX_WATCHES_PER_NARRATOR) {
-		disposeWatchMarkers(input);
-		return {
-			status: "error",
-			message: `This session already has ${active} active terminal watches (limit ${MAX_WATCHES_PER_NARRATOR}). Stop one before starting another.`,
-		};
-	}
-	// Bound raw input before normalization or scanning, matching the tool schema.
-	const tooLong = input.pattern.length > MAX_WATCH_PATTERN_CHARS;
-	const pattern = tooLong ? "" : normalizeWatchPattern(input.pattern);
-	if (tooLong || !pattern.trim()) {
+	const tooLong = (input.pattern?.length ?? 0) > MAX_WATCH_PATTERN_CHARS;
+	const pattern = tooLong ? "" : normalizeWatchPattern(input.pattern ?? "");
+	if (tooLong || (input.pattern !== undefined && !pattern.trim())) {
 		disposeWatchMarkers(input);
 		return {
 			status: "error",
@@ -401,27 +386,29 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 				: "Watch pattern must contain visible text.",
 		};
 	}
-	const taskId = `bash_${generateShortId()}`;
-	const title = `watch ${input.terminalName}: ${pattern.slice(0, 40)}`;
-	const { alias } = registerTaskAlias(input.narratorId, taskId, title);
-	const service = await tasks().catch((error) => {
-		disposeWatchMarkers(input);
-		throw error;
-	});
+	let observation: WatchObservation;
 	try {
-		await service.createBashTask({
-			id: taskId,
-			parentNarratorId: input.narratorId,
-			command: `${TERMINAL_WATCH_COMMAND_PREFIX} terminal "${input.terminalName}" (${input.terminalId}) for ${JSON.stringify(pattern)}`,
+		observation = await createWatchObservation({
+			narratorId: input.narratorId,
+			title: `watch ${input.terminalName}${pattern ? `: ${pattern.slice(0, 40)}` : ""}`,
+			command: `terminal ${JSON.stringify(input.terminalId)}${pattern ? ` for ${JSON.stringify(pattern)}` : ""}`,
 			toolUseId: input.toolUseId,
-			alias,
-			title,
+			onRelease: () => {
+				if (observation) release(observation.taskId);
+			},
 		});
-	} catch (err) {
+	} catch (error) {
 		disposeWatchMarkers(input);
-		throw err;
+		return { status: "error", message: error instanceof Error ? error.message : String(error) };
 	}
-
+	if (observation.signal.aborted) {
+		disposeWatchMarkers(input);
+		return {
+			status: "error",
+			message: "Watch registration was interrupted; no terminal input was sent.",
+		};
+	}
+	const { taskId, alias } = observation;
 	const watch: Watch = {
 		taskId,
 		alias,
@@ -429,6 +416,7 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		terminalId: input.terminalId,
 		terminalName: input.terminalName,
 		pattern,
+		observation,
 		buffer: input.buffer,
 		layoutRevision,
 		marker: input.marker,
@@ -451,13 +439,6 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		byTerminal.set(input.terminalId, set);
 	}
 	set.add(taskId);
-	// Stop aborts the controller, runs the kill handler, then marks the row cancelled.
-	const abort = new AbortController();
-	service.registerAbortController(taskId, abort);
-	service.registerKillHandler(taskId, () => release(taskId));
-	abort.signal.addEventListener("abort", () => release(taskId), { once: true });
-
-	// Output that arrived between the marker and now is checked right away.
 	scheduleCheck(watch);
 	return { status: "started", taskId, alias };
 }
@@ -496,8 +477,8 @@ export async function endWatchesForBuffer(
 		const text = await readText(watch);
 		await settle(
 			watch,
-			"failed",
-			`Terminal watch ended: ${reason} before ${JSON.stringify(watch.pattern)} appeared in terminal "${watch.terminalName}". Check the terminal before continuing.\nLast output:\n${tailLines(text)}`,
+			watch.pattern ? "failed" : "completed",
+			`Terminal watch ended: ${reason}${watch.pattern ? ` before ${JSON.stringify(watch.pattern)} appeared` : ""} in terminal "${watch.terminalName}". Check the terminal before continuing.\nLast output:\n${tailLines(text)}`,
 		);
 	}
 }
@@ -552,6 +533,8 @@ async function check(watch: Watch): Promise<void> {
 				);
 				return;
 			}
+			watch.lastText = tailLines(frame.text);
+			if (!watch.pattern) continue;
 			const at = watch.matchFrame(frame);
 			if (at === -1) continue;
 			await settle(
@@ -562,7 +545,9 @@ async function check(watch: Watch): Promise<void> {
 			return;
 		}
 	} catch (err) {
-		logger.warn("Terminal watch check failed", { taskId: watch.taskId, error: String(err) });
+		if (!watch.settled && !watch.result) {
+			logger.warn("Terminal watch check failed", { taskId: watch.taskId, error: String(err) });
+		}
 	} finally {
 		watch.checking = false;
 		if (watch.dirty && !watch.settled) scheduleCheck(watch);
@@ -572,16 +557,12 @@ async function check(watch: Watch): Promise<void> {
 async function timeOut(taskId: string): Promise<void> {
 	const watch = watches.get(taskId);
 	if (!watch || watch.settled || watch.result) return;
-	// A check may be in flight; wait for it rather than racing it.
-	while (watch.checking) await new Promise((resolve) => setTimeout(resolve, 10));
-	watch.dirty = true;
-	await check(watch);
-	if (watch.settled || watch.result) return;
-	const text = await readText(watch).catch(() => "");
+	// The deadline must not wait for an in-flight buffer read. Its eventual result
+	// cannot replace the frozen timeout; use only the last completed snapshot.
 	await settle(
 		watch,
 		"timeout",
-		`Terminal watch timed out: ${JSON.stringify(watch.pattern)} did not appear in terminal "${watch.terminalName}". The command may still be running.\nLast output:\n${tailLines(text)}`,
+		`Terminal watch timed out: ${watch.pattern ? `${JSON.stringify(watch.pattern)} did not appear in` : "observation reached its deadline for"} terminal "${watch.terminalName}". The command may still be running.\nLast observed output:\n${watch.lastText ?? "(no completed output snapshot)"}`,
 	);
 }
 
@@ -590,7 +571,7 @@ async function settle(watch: Watch, status: WatchResult["status"], output: strin
 	// Stop observing, but keep cancellation/shutdown ownership until the result
 	// and its notification have been committed. A failed transaction is retried
 	// with this same result, never by reading or executing the command again.
-	watch.result = { status, output, attempts: 0 };
+	watch.result = { status, output };
 	clearTimeout(watch.timer);
 	if (watch.checkTimer) clearTimeout(watch.checkTimer);
 	watch.checkTimer = undefined;
@@ -599,43 +580,7 @@ async function settle(watch: Watch, status: WatchResult["status"], output: strin
 
 async function publishResult(watch: Watch): Promise<void> {
 	if (watch.settled || !watch.result) return;
-	const result = watch.result;
-	result.attempts++;
-	try {
-		const service = await tasks();
-		if (watch.settled) return;
-		if (result.status === "completed") await service.markCompleted(watch.taskId, result.output);
-		else if (result.status === "timeout") await service.markTimedOut(watch.taskId, result.output);
-		else await service.markFailed(watch.taskId, result.output);
-		// false means the task is already terminal (for example Stop won).
-		release(watch.taskId);
-	} catch (err) {
-		if (watch.settled) return;
-		const delay = PUBLISH_RETRY_DELAYS_MS[result.attempts - 1];
-		const details = {
-			taskId: watch.taskId,
-			terminalId: watch.terminalId,
-			status: result.status,
-			attempts: result.attempts,
-			error: String(err),
-		};
-		if (delay === undefined) {
-			// Keep the durable running task for restart recovery, but do not retry
-			// indefinitely or retain a terminal buffer forever on permanent errors.
-			logger.error("Terminal watch result publication retries exhausted", details);
-			release(watch.taskId);
-			return;
-		}
-		logger.warn("Terminal watch could not publish its result; retrying", {
-			...details,
-			retryInMs: delay,
-		});
-		watch.publishTimer = setTimeout(() => {
-			watch.publishTimer = undefined;
-			void publishResult(watch);
-		}, delay);
-		watch.publishTimer.unref?.();
-	}
+	await watch.observation.finish(watch.result);
 }
 
 /** Drop in-memory state. The task row is settled by the caller (or by Stop). */
@@ -645,12 +590,12 @@ function release(taskId: string): void {
 	watch.settled = true;
 	clearTimeout(watch.timer);
 	if (watch.checkTimer) clearTimeout(watch.checkTimer);
-	if (watch.publishTimer) clearTimeout(watch.publishTimer);
 	disposeWatchMarkers(watch);
 	watches.delete(taskId);
 	const set = byTerminal.get(watch.terminalId);
 	set?.delete(taskId);
 	if (set?.size === 0) byTerminal.delete(watch.terminalId);
+	watch.observation.release();
 }
 
 /** Active watch task ids on a terminal. */

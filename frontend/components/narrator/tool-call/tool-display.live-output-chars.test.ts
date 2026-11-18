@@ -50,6 +50,21 @@ describe("Stop display and legacy cancellation history", () => {
 	});
 });
 
+describe("Watch registration summary", () => {
+	it("uses a distinct category and never presents a returned observation as live output", () => {
+		expect(getCategory("Watch")).toBe("watch");
+		const summary = getSummary(
+			"Watch",
+			{ type: "agent", id: "worker", timeout: 600000 },
+			{ status: "watching", _streamingOutput: "999" },
+			{ watchRegistered: "已登记观察" },
+		);
+		expect(summary).toBe("agent: worker · 已登记观察");
+		expect(summary).not.toContain("999");
+		expect(summary).not.toContain("600000");
+	});
+});
+
 describe("Agent header summary live output counter", () => {
 	const input = { subagent_type: "explore", description: "survey auth flow" };
 

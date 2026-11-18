@@ -15,7 +15,7 @@ export const stopTool: ToolDefinition = {
 		"Cancel a running background Bash task or agent owned by this narrator. " +
 		'Provide both type ("bash" or "agent") and id (task ID or alias). ' +
 		"This only cancels tracked background work; it cannot stop the NarraFork server or arbitrary PIDs. " +
-		"Use Bash to launch commands, Agent to launch/archive/unarchive agents, and Await to wait for results.",
+		"Use Bash to launch commands, Agent to launch/archive/unarchive agents, and Watch to register non-blocking observations.",
 	parameters,
 	rawJsonSchema: {
 		type: "object",

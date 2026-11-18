@@ -56,7 +56,7 @@ export function buildBackgroundAgentStartOutput(
 	return (
 		`<background_task_id>${taskIdOrAlias}</background_task_id>\n\n` +
 		`${agentMarkdownReference(narratorId, title || taskIdOrAlias)}\n\n` +
-		`Background task started. Await({ type: "agent", id: "${taskIdOrAlias}" })`
+		`Background task started. Completion notifies automatically. Watch({ type: "agent", id: "${taskIdOrAlias}" }) registers an observation or retrieves the saved result.`
 	);
 }
 
@@ -440,7 +440,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 						`${agentMarkdownReference(subagentId, title || aliasRegistration.alias)}\n\n` +
 						"Background task started. User takeover is already active. The initial prompt runs independently; " +
 						"turn completion will not notify or wake the parent. " +
-						"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
+						"The user can continue interacting until they explicitly end takeover. Do not automatically Watch this agent."
 					: buildBackgroundAgentStartOutput(aliasRegistration.alias, subagentId, title)) +
 				delegationNote +
 				formatSubagentModelFallbackNote(inheritance) +
@@ -495,7 +495,7 @@ export function aliasConflictNote(
 	return (
 		`\n\nNote: The requested alias "${requested}" was already taken. ` +
 		`This agent was assigned "${assigned}" instead.` +
-		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+		(background ? "" : " Use this alias with Watch or Send to reference this agent.")
 	);
 }
 

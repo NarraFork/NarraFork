@@ -237,7 +237,7 @@
 	"tpToolDescTaskCreate": "Create or update the todo list for the session.",
 	"tpToolDescAskUserQuestion": "Ask the user a question during execution.",
 	"tpToolDescSkill": "Invoke a skill within the conversation.",
-	"tpToolDescAwait": "Await an asynchronous agent or bash task.",
+	"tpToolDescWatch": "Register a non-blocking observation of terminal output or a bash/agent run. Results notify automatically.",
 	"tpToolDescStop": "Cancel an owned bash or agent task. Unavailable in review mode.",
 	"tpToolDescSend": "Send messages to accessible subagents.",
 	"tpToolDescShareFile": "Share a file by generating a temporary download link.",

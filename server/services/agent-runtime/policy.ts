@@ -29,10 +29,8 @@ export interface RuntimePolicy {
 	};
 	readonly capabilities: {
 		readonly spawnAgent: boolean;
-		readonly awaitAgent: boolean;
+		readonly watchAgent: boolean;
 		readonly askUserQuestion: "sync-or-async" | "disabled";
-		/** Waiting on an existing own question does not grant permission to create one. */
-		readonly awaitOwnQuestion: boolean;
 		readonly planApproval: boolean;
 		readonly stopHooks: boolean;
 		readonly switchWorkingDirectory: boolean;
@@ -48,7 +46,7 @@ const READ_TOOLS = Object.freeze([
 	"WebFetch",
 	BASH_TOOL_NAME,
 	"TeamStatus",
-	"Await",
+	"Watch",
 	"Stop",
 	"Question",
 	"ContextAsk",
@@ -62,7 +60,7 @@ const SEARCH_TOOLS = Object.freeze([
 	"WebSearch",
 	"WebFetch",
 	"TeamStatus",
-	"Await",
+	"Watch",
 	"Question",
 	"ContextAsk",
 	"Send",
@@ -71,7 +69,7 @@ const SEARCH_TOOLS = Object.freeze([
 /** Delegated work coordinates through its delegator; it never orchestrates or asks the user. */
 const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
 	"spawnAgent",
-	"awaitAgent",
+	"watchAgent",
 	"askUserQuestion",
 	"planApproval",
 	"stopHooks",
@@ -208,9 +206,9 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		}),
 		capabilities: Object.freeze({
 			spawnAgent: allowed("spawnAgent"),
-			awaitAgent: allowed("awaitAgent"),
+			// Stored v1 ceilings keep their meaning; never rewrite old allowlists.
+			watchAgent: allowed("watchAgent") && allowed("awaitAgent"),
 			askUserQuestion: allowed("askUserQuestion") ? "sync-or-async" : "disabled",
-			awaitOwnQuestion: true,
 			planApproval: allowed("planApproval"),
 			stopHooks: allowed("stopHooks"),
 			switchWorkingDirectory: allowed("switchWorkingDirectory"),
@@ -246,7 +244,9 @@ export function isRuntimeToolAllowed(
 	mcpBehavior?: string | null,
 ): boolean {
 	const caps = policy.capabilities;
-	if (toolName === "Question") return caps.awaitOwnQuestion;
+	// Frozen provider declarations and stored allowlists never revive the retired tool.
+	if (toolName === "Await") return false;
+	if (toolName === "Question") return true;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
 	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)
 		return false;
@@ -260,30 +260,25 @@ export function isRuntimeToolAllowed(
 	return policy.tools.builtin === "all" || policy.tools.builtin.includes(toolName);
 }
 
-export type RuntimeAwaitTarget = "agent" | "bash" | "transfer" | "question";
-export function runtimeAwaitTargets(policy: RuntimePolicy): RuntimeAwaitTarget[] {
-	return [
-		...(policy.capabilities.awaitAgent ? ["agent" as const] : []),
-		"bash",
-		"transfer",
-		...(policy.capabilities.awaitOwnQuestion ? ["question" as const] : []),
-	];
+export type RuntimeWatchTarget = "terminal" | "bash" | "agent";
+export function runtimeWatchTargets(policy: RuntimePolicy): RuntimeWatchTarget[] {
+	return ["terminal", "bash", ...(policy.capabilities.watchAgent ? ["agent" as const] : [])];
 }
 
 /** Interaction instructions are a projection of the same finite capability policy. */
 export function runtimeInteractionHint(policy: RuntimePolicy, locale: string): string {
 	const lines: string[] = [];
-	if (!policy.capabilities.awaitAgent)
+	if (!policy.capabilities.watchAgent)
 		lines.push(
 			locale === "zh-CN"
-				? "不得使用 Await(agent) 等待其他代理。"
-				: "Do not use Await(agent) to wait for other agents.",
+				? "不得使用 Watch(agent) 观察其他代理；需要传递信息时使用异步 Send。"
+				: "Do not use Watch(agent) to observe other agents; use asynchronous Send to deliver information.",
 		);
 	if (policy.capabilities.askUserQuestion === "disabled")
 		lines.push(
 			locale === "zh-CN"
-				? "当前不可调用 AskUserQuestion 发起问题；Await(question) 仅可等待本会话已有的问题，不代表获得提问权限。"
-				: "AskUserQuestion is unavailable; Await(question) may only wait on this session's existing questions and does not grant permission to ask new ones.",
+				? "当前不可调用 AskUserQuestion 发起问题；可用 Question 查询本会话已有问题，回答会自动通知。"
+				: "AskUserQuestion is unavailable; use Question to inspect this session's existing questions. Answers notify automatically.",
 		);
 	return lines.join("\n");
 }

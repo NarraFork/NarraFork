@@ -409,18 +409,67 @@ describe("terminal watch", () => {
 		const id = await start(buffer, "NEVER", { kind: "offset", offset: 0 }, 300);
 		output(buffer, "working...\r\n");
 		const done = await waitForStatus(id);
-		expect(done?.status).toBe("timeout");
-		expect(done?.output).toContain("timed out");
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toMatch(/timed out|deadline/i);
+		expect(done?.output).toMatch(/still (?:be )?running/);
 		expect(done?.output).toContain("working...");
 		expect((await notices()).length).toBe(1);
+	});
+
+	test("a stalled terminal read cannot delay its deadline or publish a late match", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const cursor = await buffer.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const releasedRead = Promise.withResolvers<void>();
+		const read = buffer.readCursor.bind(buffer);
+		spyOn(buffer, "readCursor").mockImplementationOnce(async (point) => {
+			const captured = await read(point);
+			entered.resolve();
+			await gate.promise;
+			releasedRead.resolve();
+			return captured;
+		});
+		try {
+			const result = await startTerminalWatch({
+				narratorId: PARENT,
+				terminalId: TERMINAL,
+				terminalName: "T",
+				pattern: "READY",
+				timeoutMs: 150,
+				buffer,
+				cursor,
+				marker: cursor.marker,
+				disposeMarkers: cursor.dispose,
+				start: { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+			});
+			if (result.status !== "started") throw new Error(result.message);
+			output(buffer, "READY while the read response is blocked\r\n");
+			await entered.promise;
+			const done = await waitForStatus(result.taskId);
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toMatch(/timed out|deadline/i);
+			expect(done?.output).toMatch(/still (?:be )?running/);
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+			expect(await notices()).toHaveLength(1);
+			gate.resolve();
+			await releasedRead.promise;
+			await Bun.sleep(20);
+			expect((await row(result.taskId))?.output).toBe(done?.output);
+			expect(await notices()).toHaveLength(1);
+		} finally {
+			gate.resolve();
+		}
 	});
 
 	test.each([
 		"completed",
 		"timeout",
 	] as const)("retries a rolled-back %s publication without losing or duplicating the notice", async (status) => {
-		const method = status === "completed" ? "markCompleted" : "markTimedOut";
-		const publish = backgroundTaskService[method].bind(backgroundTaskService);
+		const method = "markCompleted";
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
 		let attempts = 0;
 		const published = spyOn(backgroundTaskService, method).mockImplementation(async (...args) => {
 			attempts++;
@@ -439,7 +488,11 @@ describe("terminal watch", () => {
 		const id = await start(buffer, "READY", { kind: "offset", offset: 2 }, 300);
 		output(buffer, status === "completed" ? "READY\r\n" : "still working\r\n");
 		const done = await waitForStatus(id);
-		expect(done?.status).toBe(status);
+		expect(done?.status).toBe("completed");
+		if (status === "timeout") {
+			expect(done?.output).toMatch(/timed out|deadline/i);
+			expect(done?.output).toMatch(/still (?:be )?running/);
+		} else expect(done?.output).toContain('"READY" appeared');
 		expect(published).toHaveBeenCalledTimes(2);
 		const delivered = await notices();
 		expect(delivered).toHaveLength(1);
@@ -621,6 +674,7 @@ describe("terminal watch", () => {
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
 		const recovered = await row(id);
 		expect(recovered?.status).toBe("failed");
-		expect(recovered?.output).toContain("Terminal watch ended because the server restarted");
+		expect(recovered?.output).toMatch(/interrupted.*server restart/i);
+		expect(recovered?.output).toContain("target was not stopped");
 	});
 });

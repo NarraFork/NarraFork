@@ -1,7 +1,6 @@
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
-import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { contextAskTool } from "./context-ask";
@@ -53,6 +52,7 @@ import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
 import { toolSearchTool } from "./tool-search";
 import { transferFileTool } from "./transfer-file";
+import { watchTool } from "./watch";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { agentWorktreeTools, worktreeTool } from "./worktree";
@@ -137,7 +137,7 @@ const coreProvider: ToolProvider = {
 			exitPlanModeTool,
 			agentTool,
 			stopTool,
-			awaitTool,
+			watchTool,
 			contextAskTool,
 			sendTool,
 			teamStatusTool,

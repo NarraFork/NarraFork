@@ -4,3 +4,5 @@
  * watch service (which imports it back).
  */
 export const TERMINAL_WATCH_COMMAND_PREFIX = "[terminal watch]";
+/** All new observations, regardless of the target kind. */
+export const WATCH_COMMAND_PREFIX = "[watch]";

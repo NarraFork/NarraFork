@@ -61,6 +61,7 @@ mock.module("../terminal-service", () => ({
 	},
 }));
 const { terminalTool, resetCursorForTerminal } = await import("../../lib/agent/tools/terminal");
+const { watchTool } = await import("../../lib/agent/tools/watch");
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { drainQueuedMessagesAfterCompact } = await import("../compact-queue-drain");
@@ -111,8 +112,8 @@ function notices() {
 		.all();
 }
 async function watch(): Promise<void> {
-	const result = await terminalTool.execute(
-		{ action: "watch", terminal_id: terminalId, pattern: "READY", timeout: 30 },
+	const result = await watchTool.execute(
+		{ type: "terminal", id: terminalId, pattern: "READY", timeout: 30_000 },
 		{
 			narratorId,
 			signal: new AbortController().signal,

@@ -763,6 +763,24 @@ describe("classifyToolDetail — agent/generic", () => {
 	});
 });
 
+describe("Watch registration display", () => {
+	it("renders a settled registration receipt, not a live wait or output counter", () => {
+		const d = classifyToolDetail({
+			previewId: "watch-registration",
+			toolName: "Watch",
+			category: "watch",
+			status: "success",
+			inputJson: { type: "agent", id: "worker", timeout: 600000 },
+			outputJson: { _text: "Observation registered; results notify automatically." },
+			metadata: { kind: "watch", type: "agent", status: "watching", _streamingOutput: "123" },
+			labels: { watchRegistered: "已登记观察" },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["agent", "已登记观察"]);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toContain("Observation registered");
+		expect(metaIdentities(d)).toEqual([]);
+	});
+});
+
 describe("protocol receipts stay out of displayed tool output", () => {
 	it.each([
 		"<subagent_id>worker</subagent_id>\n\nStill running",

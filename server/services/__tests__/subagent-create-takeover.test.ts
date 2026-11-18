@@ -318,7 +318,7 @@ describe("Agent creation in user takeover mode", () => {
 		const { output, observedAtStart, childId } = await launch(false, "success");
 		expect(observedAtStart?.held).toBe(false);
 		expect(output).toContain("Background task started.");
-		expect(output).toContain("Await({");
+		expect(output).toContain("Watch({");
 		releaseExecution?.();
 		await until(() => runEnded(childId));
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });

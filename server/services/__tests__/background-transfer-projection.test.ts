@@ -12,7 +12,17 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { backgroundTasks, deviceTransferTasks, narrators, remoteDevices } from "../../db/schema";
+import {
+	backgroundTasks,
+	deviceTransferTasks,
+	narratorBufferedMessages,
+	narrators,
+	remoteDevices,
+	runtimeAwaitedTerminalConsumptions,
+	runtimePublicationOutbox,
+} from "../../db/schema";
+import type { ToolContext } from "../../lib/agent/types";
+import { eventBus } from "../../lib/event-bus";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -20,7 +30,14 @@ mock.module("../../db", () => ({ db, sqlite }));
 
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
 
-const { backgroundTaskService } = await import("../background-task-service");
+const { backgroundTaskService, OUTPUT_TAIL_MAX_CHARS } = await import("../background-task-service");
+const { runtimePublication, getRuntimePublicationService } = await import(
+	"../agent-runtime/publication"
+);
+const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
+const { WATCH_COMMAND_PREFIX, TERMINAL_WATCH_COMMAND_PREFIX } = await import(
+	"../terminal-watch-constants"
+);
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 // Injected rather than `mock.module`d: the service caches its lazily-imported
 // broadcast fn, so whichever test file resolves it first wins for the whole
@@ -31,7 +48,10 @@ backgroundTaskService.setBroadcastFnForTests((narratorId, message) => {
 	broadcasts.push({ narratorId, message: message as unknown as Record<string, unknown> });
 });
 const { isBackgroundTaskActiveStatus } = await import("@shared/background-task-list");
-const { TRANSFER_RESTART_PAUSE_NOTICE } = await import("../device-transfer-task-store");
+const { TRANSFER_RESTART_PAUSE_NOTICE, DeviceTransferTaskStore } = await import(
+	"../device-transfer-task-store"
+);
+const transferStore = new DeviceTransferTaskStore(db);
 const { eq } = await import("drizzle-orm");
 
 afterAll(() => {
@@ -47,6 +67,7 @@ beforeEach(() => {
 
 afterEach(async () => {
 	if (backgroundOccupancyStore.isReady) await flush();
+	await runtimePublication.flushRecipient(PARENT);
 	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
@@ -77,6 +98,7 @@ async function seedTransfer(
 	id: string,
 	opts: {
 		status?: "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
+		alias?: string;
 		bytesTransferred?: number;
 		totalBytes?: number;
 		startedAt?: string;
@@ -91,6 +113,7 @@ async function seedTransfer(
 		remotePath: `/remote/${id}.apk`,
 		localPath: `/local/${id}.apk`,
 		status: opts.status ?? "running",
+		alias: opts.alias,
 		bytesTransferred: opts.bytesTransferred ?? 0,
 		...(opts.totalBytes != null ? { totalBytes: opts.totalBytes } : {}),
 		parentNarratorId: PARENT,
@@ -491,5 +514,466 @@ describe("the handle the model was given must resolve", () => {
 			alias: "upload-app-apk-2",
 		});
 		expect((await projectionOf(transferId))?.alias).toBe("upload-app-apk");
+	});
+});
+
+async function queryTask(target: string, narratorId = PARENT) {
+	return teamStatusTool.execute({ action: "get_task", target_id: target }, {
+		narratorId,
+	} as ToolContext);
+}
+
+describe("durable non-blocking task detail", () => {
+	test.each([
+		"queued",
+		"paused",
+	] as const)("cold %s transfer resolves its persisted alias without a projection or live device", async (status) => {
+		await seedParent();
+		const transferId = await seedTransfer(`tx-cold-${status}`, {
+			status,
+			alias: "cold-upload",
+			bytesTransferred: 7,
+			totalBytes: 12,
+		});
+		expect(await projectionOf(transferId)).toBeNull();
+		for (const selector of [transferId, "cold-upload"]) {
+			const result = await queryTask(selector);
+			expect(result.isError).not.toBe(true);
+			expect(JSON.parse(result.output)).toMatchObject({
+				type: "transfer",
+				transferTaskId: transferId,
+				status,
+				progress: { bytesTransferred: 7, totalBytes: 12 },
+			});
+		}
+		expect((await queryTask("cold-upload", "other-parent")).isError).toBe(true);
+		expect((await queryTask(transferId, "other-parent")).isError).toBe(true);
+	});
+
+	test("projection IDs and aliases are owned, bounded, and reads do not consume mailbox notices", async () => {
+		await seedParent();
+		const transferId = await seedTransfer("tx-detail", { alias: "upload-detail" });
+		const projection = await backgroundTaskService.createTransferTask({
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "upload",
+			alias: "upload-detail",
+		});
+		const error = `${"x".repeat(OUTPUT_TAIL_MAX_CHARS + 100)}FAILURE TAIL`;
+		await db
+			.update(deviceTransferTasks)
+			.set({ status: "failed", error })
+			.where(eq(deviceTransferTasks.id, transferId));
+		await backgroundTaskService.finishTransferTask(transferId, { status: "failed", error });
+		await runtimePublication.flushRecipient(PARENT);
+		const before = await db.select().from(narratorBufferedMessages);
+		expect(before).toHaveLength(1);
+		for (const selector of [projection.id, transferId, "upload-detail"]) {
+			const result = await queryTask(selector);
+			const task = JSON.parse(result.output);
+			expect(task.status).toBe("failed");
+			expect(task.output).toHaveLength(OUTPUT_TAIL_MAX_CHARS);
+			expect(task.output).toEndWith("FAILURE TAIL");
+			expect(task.outputTruncated).toBe(true);
+			expect((await queryTask(selector, "other-parent")).isError).toBe(true);
+		}
+		expect(await db.select().from(narratorBufferedMessages)).toEqual(before);
+		expect(await db.select().from(runtimeAwaitedTerminalConsumptions)).toHaveLength(0);
+	});
+
+	test("bash detail uses bounded live output and terminal stored output", async () => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "bash-detail",
+			parentNarratorId: PARENT,
+			command: "build",
+			alias: "build-detail",
+		});
+		const output = `${"x".repeat(OUTPUT_TAIL_MAX_CHARS + 100)}TAIL`;
+		backgroundTaskService.appendOutput("bash-detail", output);
+		const running = JSON.parse((await queryTask("build-detail")).output);
+		expect(running).toMatchObject({
+			type: "bash",
+			status: "running",
+			live: true,
+			outputTruncated: true,
+		});
+		expect(running.output).toHaveLength(OUTPUT_TAIL_MAX_CHARS);
+		await backgroundTaskService.markCompleted("bash-detail", output);
+		const terminal = JSON.parse((await queryTask("build-detail")).output);
+		expect(terminal).toMatchObject({ status: "completed", live: false, outputTruncated: true });
+		expect(terminal.output).toEndWith("TAIL");
+	});
+});
+
+describe("transfer generation publication on resume", () => {
+	test.each([
+		"completed",
+		"failed",
+	] as const)("failed → resume → %s publishes once per actual generation", async (status) => {
+		await seedParent();
+		const transferId = await seedTransfer(`tx-retry-${status}`);
+		const input = {
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "retry upload",
+			runGeneration: 0,
+		};
+		const first = await backgroundTaskService.createTransferTask(input);
+		await transferStore.finishStoppedOrFailed({
+			taskId: transferId,
+			generation: 0,
+			error: "first failure",
+		});
+		await backgroundTaskService.finishTransferTask(
+			transferId,
+			{ status: "failed", error: "first failure" },
+			0,
+		);
+		await runtimePublication.flushRecipient(PARENT);
+		expect(await db.select().from(narratorBufferedMessages)).toHaveLength(1);
+
+		const resumed = await transferStore.resume(DEVICE, transferId);
+		expect(resumed?.runGeneration).toBe(1);
+		expect(await transferStore.claim(transferId, 1, new Date().toISOString())).not.toBeNull();
+		const second = await backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 });
+		expect(second.id).toBe(first.id);
+		expect(second.logicalRunId).not.toBe(first.logicalRunId);
+		expect(second.logicalRunId).toBe(`transfer:${transferId}:1`);
+		expect((await db.select().from(runtimePublicationOutbox)).map((row) => row.state)).toEqual([
+			"reserved",
+		]);
+		// Duplicate/stale claim, pause and terminal callbacks cannot overwrite the new run.
+		await backgroundTaskService.createTransferTask(input);
+		await backgroundTaskService.markTransferPaused(transferId, "late pause", 0);
+		await backgroundTaskService.finishTransferTask(
+			transferId,
+			{ status: "failed", error: "late failure" },
+			0,
+		);
+		expect(await projectionOf(transferId)).toMatchObject({
+			status: "running",
+			logicalRunId: second.logicalRunId,
+			output: null,
+		});
+
+		if (status === "completed")
+			await transferStore.complete(transferId, 1, { filesTransferred: 1, bytesTransferred: 12 });
+		else
+			await transferStore.finishStoppedOrFailed({
+				taskId: transferId,
+				generation: 1,
+				error: "second failure",
+			});
+		const outcome =
+			status === "completed"
+				? { status, summary: "Uploaded retry" }
+				: { status, error: "second failure" };
+		await Promise.all([
+			backgroundTaskService.finishTransferTask(transferId, outcome, 1),
+			backgroundTaskService.finishTransferTask(transferId, outcome, 1),
+		]);
+		await backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 });
+		await runtimePublication.flushRecipient(PARENT);
+		await runtimePublication.flushRecipient(PARENT);
+		const messages = await db.select().from(narratorBufferedMessages);
+		expect(messages).toHaveLength(2);
+		expect(new Set(messages.map((row) => row.dedupeKey)).size).toBe(2);
+		expect(messages.filter((row) => row.text.includes(` ${status}.`))).toHaveLength(
+			status === "failed" ? 2 : 1,
+		);
+		expect((await projectionOf(transferId))?.status).toBe(status);
+	});
+
+	test("paused → resume retains the unspent reservation and sends no intermediate terminal", async () => {
+		await seedParent();
+		const transferId = await seedTransfer("tx-paused-generation");
+		const input = {
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "paused upload",
+			runGeneration: 0,
+		};
+		const first = await backgroundTaskService.createTransferTask(input);
+		await transferStore.pause(DEVICE, transferId);
+		await backgroundTaskService.markTransferPaused(transferId, "paused", 0);
+		const slots = await db.select().from(runtimePublicationOutbox);
+		await transferStore.resume(DEVICE, transferId);
+		await transferStore.claim(transferId, 1, new Date().toISOString());
+		const resumed = await backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 });
+		expect(resumed.logicalRunId).toBe(first.logicalRunId);
+		expect(await db.select().from(runtimePublicationOutbox)).toEqual(slots);
+		await runtimePublication.flushRecipient(PARENT);
+		expect(await db.select().from(narratorBufferedMessages)).toHaveLength(0);
+		await transferStore.complete(transferId, 1, { filesTransferred: 1, bytesTransferred: 10 });
+		await backgroundTaskService.finishTransferTask(
+			transferId,
+			{ status: "completed", summary: "resumed" },
+			1,
+		);
+		await runtimePublication.flushRecipient(PARENT);
+		expect(await db.select().from(narratorBufferedMessages)).toHaveLength(1);
+	});
+
+	test("failed revival and its new reservation roll back together", async () => {
+		await seedParent();
+		const transferId = await seedTransfer("tx-retry-atomic");
+		const input = {
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "atomic upload",
+			runGeneration: 0,
+		};
+		const first = await backgroundTaskService.createTransferTask(input);
+		await transferStore.finishStoppedOrFailed({
+			taskId: transferId,
+			generation: 0,
+			error: "failed",
+		});
+		await backgroundTaskService.finishTransferTask(
+			transferId,
+			{ status: "failed", error: "failed" },
+			0,
+		);
+		await runtimePublication.flushRecipient(PARENT);
+		await transferStore.resume(DEVICE, transferId);
+		await transferStore.claim(transferId, 1, new Date().toISOString());
+		sqlite.run(
+			"CREATE TRIGGER reject_transfer_retry_slot BEFORE INSERT ON runtime_publication_outbox BEGIN SELECT RAISE(ABORT, 'retry slot failure'); END",
+		);
+		try {
+			await expect(
+				backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 }),
+			).rejects.toThrow("retry slot failure");
+			expect(await projectionOf(transferId)).toMatchObject({
+				status: "failed",
+				logicalRunId: first.logicalRunId,
+			});
+		} finally {
+			sqlite.run("DROP TRIGGER reject_transfer_retry_slot");
+		}
+		expect(
+			(await backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 })).status,
+		).toBe("running");
+	});
+});
+
+describe("transfer terminal mailbox publication", () => {
+	test.each([
+		"completed",
+		"failed",
+		"cancelled",
+	] as const)("%s is published exactly once after pause/resume", async (status) => {
+		await seedParent();
+		const transferId = await seedTransfer(`tx-mailbox-${status}`);
+		const projection = await backgroundTaskService.createTransferTask({
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "upload",
+			alias: "upload-terminal",
+		});
+		await backgroundTaskService.markTransferPaused(transferId, "offline");
+		await runtimePublication.flushRecipient(PARENT);
+		expect(await db.select().from(narratorBufferedMessages)).toHaveLength(0);
+		expect((await db.select().from(runtimePublicationOutbox)).map((row) => row.state)).toEqual([
+			"reserved",
+		]);
+		expect((await projectionOf(transferId))?.completedAt).toBeNull();
+		await backgroundTaskService.createTransferTask({
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "upload",
+		});
+		const outcome =
+			status === "completed"
+				? { status, summary: "Uploaded 12 bytes" }
+				: status === "failed"
+					? { status, error: "Device failed" }
+					: { status };
+		await Promise.all([
+			backgroundTaskService.finishTransferTask(transferId, outcome),
+			backgroundTaskService.finishTransferTask(transferId, outcome),
+		]);
+		await runtimePublication.flushRecipient(PARENT);
+		await runtimePublication.flushRecipient(PARENT);
+		await backgroundTaskService.finishTransferTask(transferId, outcome);
+		const messages = await db.select().from(narratorBufferedMessages);
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toMatchObject({ kind: "task_notice", noticeKind: "bash", state: "queued" });
+		expect(messages[0]?.text).toContain(`Background transfer`);
+		expect(messages[0]?.text).toContain("get_task");
+		expect(messages[0]?.text).not.toContain("Await");
+		expect((await backgroundTaskService.getById(projection.id))?.status).toBe(status);
+	});
+
+	test("pending transfer publication protects its stored result from age cleanup", async () => {
+		await seedParent();
+		const transferId = await seedTransfer("tx-pending-cleanup");
+		const projection = await backgroundTaskService.createTransferTask({
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "upload",
+		});
+		await backgroundTaskService.finishTransferTask(transferId, {
+			status: "completed",
+			summary: "durable completion",
+		});
+		await db
+			.update(backgroundTasks)
+			.set({ completedAt: "2000-01-01T00:00:00.000Z" })
+			.where(eq(backgroundTasks.id, projection.id));
+		await backgroundTaskService.cleanupCompleted(0);
+		expect(await backgroundTaskService.getById(projection.id)).not.toBeNull();
+		await runtimePublication.flushRecipient(PARENT);
+		await backgroundTaskService.cleanupCompleted(0);
+		expect(await backgroundTaskService.getById(projection.id)).not.toBeNull();
+	});
+
+	test("facade terminal CAS publishes transfers through the same durable channel", async () => {
+		await seedParent();
+		const transferId = await seedTransfer("tx-facade");
+		const projection = await backgroundTaskService.createTransferTask({
+			parentNarratorId: PARENT,
+			transferTaskId: transferId,
+			title: "upload",
+		});
+		const now = new Date().toISOString();
+		const input = {
+			taskId: projection.id,
+			setFields: { status: "completed", output: "complete", completedAt: now },
+			fullOutput: "complete",
+			summary: "transfer complete",
+			eventKind: "completed" as const,
+		};
+		expect(await getRuntimePublicationService().commitTerminalTransition(input)).toBeDefined();
+		expect(await getRuntimePublicationService().commitTerminalTransition(input)).toBeUndefined();
+		await runtimePublication.flushRecipient(PARENT);
+		expect(await db.select().from(narratorBufferedMessages)).toHaveLength(1);
+	});
+});
+
+describe("silent observation completion", () => {
+	test.each([
+		WATCH_COMMAND_PREFIX,
+		TERMINAL_WATCH_COMMAND_PREFIX,
+	])("%s clears only its own reservation, without a completion event or source consumption", async (prefix) => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "source-task",
+			parentNarratorId: PARENT,
+			command: "build",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "observe-source",
+			parentNarratorId: PARENT,
+			command: `${prefix} source-task`,
+		});
+		const completions: string[] = [];
+		const listener = (event: { taskId: string }) => completions.push(event.taskId);
+		eventBus.on("background_task:completed", listener);
+		try {
+			await backgroundTaskService.markCompleted("source-task", "actual result");
+			expect(
+				await backgroundTaskService.finishObservationSilently("observe-source", "source completed"),
+			).toBe(true);
+			expect(
+				await backgroundTaskService.finishObservationSilently("observe-source", "duplicate"),
+			).toBe(false);
+			expect(completions).toEqual(["source-task"]);
+		} finally {
+			eventBus.off("background_task:completed", listener);
+		}
+		expect(await backgroundTaskService.getById("observe-source")).toMatchObject({
+			status: "completed",
+			notified: true,
+			output: "source completed",
+		});
+		expect(
+			(await db.select().from(runtimePublicationOutbox)).some(
+				(row) => row.taskId === "observe-source",
+			),
+		).toBe(false);
+		expect(await db.select().from(runtimeAwaitedTerminalConsumptions)).toHaveLength(0);
+		await runtimePublication.flushRecipient(PARENT);
+		const messages = await db.select().from(narratorBufferedMessages);
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.text).toContain("source-task");
+		expect(
+			(await backgroundTaskService.drainCompletedNotifications(PARENT)).map((row) => row.id),
+		).toEqual(["source-task"]);
+	});
+
+	test.each([
+		WATCH_COMMAND_PREFIX,
+		TERMINAL_WATCH_COMMAND_PREFIX,
+	])("%s shutdown preserves the row and legacy recovery reports observation interruption", async (prefix) => {
+		await seedParent();
+		const id = "restart-observation";
+		await backgroundTaskService.createBashTask({
+			id,
+			parentNarratorId: PARENT,
+			command: `${prefix} source-task`,
+		});
+		// Emulate an old row lacking a publication run without leaving a modern slot.
+		await db.delete(runtimePublicationOutbox).where(eq(runtimePublicationOutbox.taskId, id));
+		await db.update(backgroundTasks).set({ logicalRunId: null }).where(eq(backgroundTasks.id, id));
+		let targetStopped = false;
+		backgroundTaskService.registerKillHandler(id, () => {
+			targetStopped = true;
+		});
+		await backgroundTaskService.killAll();
+		expect(targetStopped).toBe(false);
+		expect((await backgroundTaskService.getById(id))?.status).toBe("running");
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		expect((await backgroundTaskService.getById(id))?.output).toContain("Observation interrupted");
+		expect((await backgroundTaskService.getById(id))?.output).toContain("target was not stopped");
+		await runtimePublication.flushRecipient(PARENT);
+		const messages = await db.select().from(narratorBufferedMessages);
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.text).toContain("Observation interrupted");
+		expect(messages[0]?.text).not.toContain("Execution outcome unknown");
+	});
+
+	test("failed reservation cleanup rolls back the silent terminal CAS", async () => {
+		await seedParent();
+		const id = "rollback-observation";
+		await backgroundTaskService.createBashTask({
+			id,
+			parentNarratorId: PARENT,
+			command: `${WATCH_COMMAND_PREFIX} source`,
+		});
+		sqlite.run(
+			"CREATE TRIGGER reject_silent_slot_cleanup BEFORE DELETE ON runtime_publication_outbox BEGIN SELECT RAISE(ABORT, 'slot cleanup failure'); END",
+		);
+		try {
+			await expect(backgroundTaskService.finishObservationSilently(id, "done")).rejects.toThrow(
+				"slot cleanup failure",
+			);
+			expect(await backgroundTaskService.getById(id)).toMatchObject({
+				status: "running",
+				notified: false,
+			});
+			expect(
+				await db
+					.select()
+					.from(runtimePublicationOutbox)
+					.where(eq(runtimePublicationOutbox.taskId, id)),
+			).toHaveLength(1);
+		} finally {
+			sqlite.run("DROP TRIGGER reject_silent_slot_cleanup");
+		}
+	});
+
+	test("ordinary bash tasks cannot be silently completed", async () => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "not-observation",
+			parentNarratorId: PARENT,
+			command: "build",
+		});
+		expect(
+			await backgroundTaskService.finishObservationSilently("not-observation", "wrong target"),
+		).toBe(false);
+		expect((await backgroundTaskService.getById("not-observation"))?.status).toBe("running");
 	});
 });

@@ -231,7 +231,7 @@ describe("subagent result text without task (pinned)", () => {
 		const { output, childId } = await launch(true);
 		expect(output).toBe(
 			`<background_task_id>pin-run</background_task_id>\n\n[Pin run](nf-agent://open?id=${childId})\n\n` +
-				'Background task started. Await({ type: "agent", id: "pin-run" })',
+				'Background task started. Completion notifies automatically. Watch({ type: "agent", id: "pin-run" }) registers an observation or retrieves the saved result.',
 		);
 		expect(output).not.toContain("nf-agent://open?id=pin-run");
 		await until(() => runEnded(childId));

@@ -201,12 +201,10 @@ export const terminalTool: ToolDefinition = {
 		"On the first read (or after a buffer reset), the full buffer is returned. " +
 		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
-		"To wait for something to appear, do not poll with 'read': " +
-		"pass 'notify_on' with 'write' (wait for the command you are sending), or use action 'watch' " +
-		"(watch output since this session's last successful read/write, or from now if no cached observation exists). " +
-		"Use start_at: 'now' for only the next occurrence. A watch matches text, not a command's exit status; " +
-		"unobserved output may include commands typed by a human. Only successful read/write snapshots advance the observation. " +
-		"Both start a background watch and return at once; end your turn and you will be notified " +
+		"To observe output, use the Watch tool with type 'terminal'; do not poll with 'read'. " +
+		"For atomic send-and-observe, pass 'notify_on' with 'write'. This uses the same Watch service, " +
+		"starts before sending input, and excludes the command's echo. " +
+		"It starts a background watch and returns at once; end your turn and you will be notified " +
 		"with the matching output when the text appears, or when the watch times out or the " +
 		"terminal exits. Stop({ type: 'bash', id }) cancels a watch. " +
 		"Use action 'list' to list available terminals for the current narrator. " +
@@ -216,17 +214,15 @@ export const terminalTool: ToolDefinition = {
 		"with its exit code, and needs no completion marker.",
 	parameters: z.object({
 		action: z
-			.enum(["read", "write", "watch", "list", "create", "rename"])
+			.enum(["read", "write", "list", "create", "rename"])
 			.describe(
-				"The action to perform: 'read' buffer, 'write' input, 'watch' for a pattern, " +
-					"'list' terminals, 'create' a new terminal, or 'rename' an existing terminal",
+				"The action to perform: 'read' buffer, 'write' input, 'list' terminals, " +
+					"'create' a new terminal, or 'rename' an existing terminal. Use Watch to observe output.",
 			),
 		terminal_id: z
 			.string()
 			.optional()
-			.describe(
-				"Terminal ID or name to interact with. Required for 'read', 'write', 'watch' and 'rename'.",
-			),
+			.describe("Terminal ID or name to interact with. Required for 'read', 'write' and 'rename'."),
 		input: z
 			.string()
 			.optional()
@@ -259,52 +255,20 @@ export const terminalTool: ToolDefinition = {
 					"appears within the few seconds 'write' waits for output, the result says so and no " +
 					"watch is started. Case-sensitive substring of the rendered screen text.",
 			),
-		pattern: z
-			.string()
-			.max(MAX_WATCH_PATTERN_CHARS)
-			.optional()
-			.describe(
-				"For 'watch': case-sensitive substring of rendered output since this session's last " +
-					"successful read/write snapshot. Older observed text is excluded, including occurrences merely moving " +
-					"inside its prefix; new appended rows are matched independently. Indistinguishable same-prefix redraws " +
-					"are not proof of a new occurrence. With no cached observation, starts now. Watches survive " +
-					"terminal resizes; layout changes do not count as new output. Excessive retained layout history " +
-					"fails explicitly rather than replaying old output.",
-			),
-		start_at: z
-			.enum(["last_observation", "now"])
-			.optional()
-			.describe(
-				"For 'watch': last_observation (default) includes output that arrived after the last " +
-					"successful read/write but before registration. now waits only for the next occurrence. " +
-					"Observations expire on reset, reattach, cache eviction or layout-history budget exhaustion. This is not a command boundary.",
-			),
 		timeout: looseNumber(
-			`For 'watch', and for 'write' with 'notify_on': seconds before the watch gives up and ` +
+			`For 'write' with 'notify_on': seconds before the watch gives up and ` +
 				`notifies you (default ${DEFAULT_WATCH_TIMEOUT_MS / 1000}, max ${MAX_WATCH_TIMEOUT_MS / 1000}).`,
 		),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const {
-			action,
-			terminal_id,
-			input,
-			name,
-			last_n_lines,
-			notify_on,
-			pattern,
-			timeout,
-			start_at,
-		} = args as {
-			action: "read" | "write" | "watch" | "list" | "create" | "rename";
+		const { action, terminal_id, input, name, last_n_lines, notify_on, timeout } = args as {
+			action: "read" | "write" | "list" | "create" | "rename";
 			terminal_id?: string;
 			input?: string;
 			name?: string;
 			last_n_lines?: number;
 			notify_on?: string;
-			pattern?: string;
 			timeout?: number;
-			start_at?: "last_observation" | "now";
 		};
 		const timeoutMs =
 			(normalizeNumber(timeout, {
@@ -364,26 +328,6 @@ export const terminalTool: ToolDefinition = {
 				}
 				return await writeInput(resolved.id, ctx, input, notify_on, timeoutMs);
 			}
-			case "watch": {
-				if (!terminal_id) {
-					return { output: "terminal_id is required for 'watch' action", isError: true };
-				}
-				if (pattern && pattern.length > MAX_WATCH_PATTERN_CHARS) {
-					return {
-						output: `Watch pattern exceeds ${MAX_WATCH_PATTERN_CHARS} characters.`,
-						isError: true,
-					};
-				}
-				if (!pattern || normalizeWatchPattern(pattern).trim() === "") {
-					return { output: "pattern is required for 'watch' action", isError: true };
-				}
-				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
-				if ("error" in resolved) {
-					return { output: resolved.error, isError: true };
-				}
-				return await watchTerminal(resolved.id, ctx, pattern, timeoutMs, start_at);
-			}
-
 			default:
 				return { output: `Unknown action: ${action}`, isError: true };
 		}
@@ -545,7 +489,7 @@ async function startWatch(
 	terminalId: string,
 	terminalName: string,
 	ctx: ToolContext,
-	pattern: string,
+	pattern: string | undefined,
 	timeoutMs: number,
 	buffer: BufferManager,
 	marker: IMarker,
@@ -582,30 +526,48 @@ async function startWatch(
 	if (started.status === "error") return { output: started.message, isError: true };
 	return {
 		output:
-			`Watching terminal "${terminalName}" for ${JSON.stringify(normalizeWatchPattern(pattern))} ` +
+			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +
 			`(background task "${started.alias}", times out in ${Math.round(timeoutMs / 1000)}s). ` +
 			"End your turn or continue other work; you will be notified with the matching output, or " +
 			`when the watch times out, its observation budget expires or the terminal exits. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
 		title: terminalName,
+		metadata: {
+			kind: "watch",
+			type: "terminal",
+			id: terminalId,
+			targetId: terminalId,
+			watchId: started.taskId,
+			watchAlias: started.alias,
+			status: "watching",
+		},
 	};
 }
 
-async function watchTerminal(
+export async function watchTerminal(
 	terminalId: string,
 	ctx: ToolContext,
-	pattern: string,
+	pattern: string | undefined,
 	timeoutMs: number,
 	startAt: "last_observation" | "now" = "last_observation",
 ): Promise<ToolResult> {
+	const resolved = await resolveTerminalId(terminalId, ctx.narratorId);
+	if ("error" in resolved) return { output: resolved.error, isError: true };
+	terminalId = resolved.id;
 	const access = await assertTerminalAccess(terminalId, ctx.narratorId);
 	if (!access.allowed) return { output: access.error, isError: true };
 	const { terminal } = access;
 	if (ctx.signal.aborted) return makeAbortedResult(terminal.name);
 	if (terminal.status === "exited") {
-		return { output: "Terminal has exited. Cannot watch it.", isError: true };
+		return {
+			output: "Terminal has exited; no observation is needed.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "exited" },
+		};
 	}
 	if (!terminalService.isAttached(terminalId) && !(await terminalService.reattach(terminalId))) {
-		return { output: "Terminal is not attached (no active PTY connection).", isError: true };
+		return {
+			output: "Terminal is disconnected; no live PTY can be observed. Nothing was sent.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "disconnected" },
+		};
 	}
 	const buffer = terminalService.getActiveBuffer(terminalId);
 	const key = cursorKey(ctx.narratorId, terminalId);
@@ -619,8 +581,8 @@ async function watchTerminal(
 	if (!buffer || !point) {
 		return {
 			output:
-				"Cannot watch this terminal right now: no live normal buffer is available (a full-screen program may be active).",
-			isError: true,
+				"No live normal buffer is available (a full-screen program may be active); no observation was registered.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "unavailable" },
 		};
 	}
 	if (ctx.signal.aborted) {

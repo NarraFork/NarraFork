@@ -40,7 +40,7 @@ User takeover at creation:
 - Use takeover_by_user: true when creating a subagent specifically for the user to continue discussing or interacting with it.
 - The subagent enters user takeover mode immediately and still executes its initial prompt. The Agent call returns immediately, even without run_in_background: true.
 - Completing a turn does NOT notify or wake the parent. The subagent remains taken over, waiting for further user interaction, until the user explicitly ends takeover.
-- Do NOT automatically Await a user-taken-over agent or treat its turn completion as a delegated task result.
+- Do NOT automatically Watch a user-taken-over agent or treat its turn completion as a delegated task result.
 
 Delegating an outline task:
 - In a session whose tasks live in the outline, pass `task` (the task's address) to hand that task to the agent. Its instructions are written from the task's tree (its goal, notes, steps, questions and prerequisites), so `prompt` may be left out; what you write in `prompt` is added as further instructions.
@@ -56,16 +56,16 @@ Working directory:
 Usage notes:
 - Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
 - When the agent is run in foreground, it will return a single message back to you with its findings/results
-- When the agent is run in background, use `Await({ type: "agent", id })` to get results and `Send({ id, message })` to send follow-up instructions
+- Background results notify automatically. Use `Watch({ type: "agent", id })` to register a non-blocking observation or retrieve a saved result; use `Send({ id, message })` to send follow-up instructions
 - Each agent invocation starts with a fresh context. Provide a highly detailed task description so the agent can work autonomously
 - Use `reasoning_effort` to request subagent thinking intensity (`none`, `low`, `medium`, `high`, `xhigh`); models/providers without a configurable thinking option will ignore it
 - The agent's outputs should generally be trusted
 - Clearly tell the agent whether you expect it to write code or just to do research
 
 Coordination discipline:
-- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
-- Use Await when you need task completion. Send never waits for a reply: the recipient answers with its own Send, which arrives as a message and wakes you when idle, so after sending either continue other work or end your turn.
+- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds. A Watch timeout ends only the observation, not the agent run; it is not evidence that the agent is stuck.
+- Watch registers immediately and does not wait for task completion. When a result blocks the next step, end the turn and let completion notify you. Send never waits for a reply: the recipient answers with its own Send, which arrives as a message and wakes you when idle, so after sending either continue other work or end your turn.
 - When you only need a targeted answer from a subagent's existing persisted context, use ContextAsk instead of Send. ContextAsk reads through the summary model without messaging, waking, interrupting, or modifying the target; use Send only to deliver new information, requirements, or corrections.
 - Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
-- Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.
+- Never ask a working subagent to "stop immediately and summarize" merely because an observation timed out or you are impatient. That discards completed context and wastes resources.
 - `doInterrupt` is exceptional: use it only when the current work must stop immediately because it is clearly wrong/unsafe, conflicts with new user instructions, or the user explicitly requested interruption. Never use it as routine progress polling.

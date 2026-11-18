@@ -10,7 +10,7 @@ const TAKEOVER_BY_USER_DESCRIPTION =
 	"Set to true to create this subagent directly in user takeover mode for further human interaction. " +
 	"The Agent call returns immediately without requiring run_in_background. The initial prompt still runs, " +
 	"but completion does not notify or wake the parent; the subagent stays taken over until the user explicitly ends takeover. " +
-	"Do not automatically Await this agent.";
+	"Do not automatically Watch this agent.";
 
 const REASONING_EFFORT_DESCRIPTION =
 	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
@@ -129,7 +129,7 @@ function buildParameters() {
 				),
 			takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
 			timeout: looseNumber(
-				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
+				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Watch waiting.",
 			),
 			model: z.string().optional().describe(MODEL_PARAM_BASE),
 			reasoning_effort: z
@@ -153,7 +153,7 @@ function buildParameters() {
 				.describe(
 					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
 						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-						"Use this alias with Await or Send to reference the task later.",
+						"Use this alias with Watch or Send to reference the task later.",
 				),
 
 			archive: z
@@ -200,7 +200,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 			},
 			timeout: {
 				description:
-					"Optional execution timeout in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run, not Await waiting.",
+					"Optional execution timeout in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run, not Watch waiting.",
 				type: "number",
 			},
 			model: {
@@ -221,7 +221,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 				description:
 					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
 					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-					"Use this alias with Await or Send to reference the task later.",
+					"Use this alias with Watch or Send to reference the task later.",
 				type: "string",
 			},
 
@@ -255,7 +255,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 /**
  * Resolve an Agent archive/unarchive selector to a narrator id.
  *
- * Resolve a scoped task alias, then fall through to the shared Send/Await selector
+ * Resolve a scoped task alias, then fall through to the shared Send/Watch selector
  * grammar so a title or slug printed by TeamStatus can be archived directly.
  */
 async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {

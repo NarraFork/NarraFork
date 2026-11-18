@@ -640,7 +640,7 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 	"sidecar.bgAgentEntry": {
 		en: `[System] Background agent "{title}" (ID: {id}) {status}.
 Result preview: {preview}
-Use Await({ type: "agent", id: "{id}" }) to see the full result, or Send({ id: "{id}", message }) to continue.`,
+Use Watch({ type: "agent", id: "{id}" }) to retrieve the saved result, or Send({ id: "{id}", message }) to continue.`,
 	},
 	"sidecar.bgBashEntry": {
 		en: `[System] Background bash "{title}" (ID: {id}) {status}.

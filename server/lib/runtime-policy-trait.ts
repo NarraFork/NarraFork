@@ -16,6 +16,8 @@ export const RUNTIME_POLICY_TRAIT_PREFIX = "custom-runtime-policy:";
 /** Capabilities a layer may deny; `agent-runtime/policy.ts` merges declarations. */
 const CAPABILITY_KEYS = [
 	"spawnAgent",
+	"watchAgent",
+	// Legacy persisted deny remains authoritative for Watch(agent).
 	"awaitAgent",
 	"askUserQuestion",
 	"planApproval",

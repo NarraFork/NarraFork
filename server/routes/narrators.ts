@@ -482,7 +482,7 @@ import {
 	markRecoveryCardResolved,
 	resumeIncompleteAgentWorkForContinue,
 	resumeRecoverySubagents,
-	startRecoveryAwaitBatch,
+	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
@@ -3130,9 +3130,9 @@ narratorRoutes.post("/:id/continue", async (c) => {
 });
 
 // Resume error subagents listed on the recovery card inserted after a narrator error.
-// mode "notify": restart them and inject a prompt so the model awaits them itself.
-// mode "await":  restart them, then synthesize one assistant turn with N Await
-//                tool calls, run them server-side, and continue ONCE.
+// mode "notify": restart them and tell the model that normal completion will notify.
+// mode "watch": restart them and register non-blocking Watch calls, then return.
+// Legacy "await" requests normalize to "watch"; no blocking tool is synthesized.
 narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
@@ -3172,8 +3172,8 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
 	}
 
-	if (body.mode === "await") {
-		await startRecoveryAwaitBatch({
+	if (body.mode === "watch") {
+		await startRecoveryWatchBatch({
 			narratorId: id,
 			aliases: resumed,
 			locale,
@@ -3181,7 +3181,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			userId,
 			humanReplyContext: { locale, replyInUserLanguage },
 		});
-		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
+		return c.json({ ok: true, mode: "watch", resumed: resumed.length, skipped });
 	}
 
 	// notify: a `sys` message would be skipped by getLastContinuableTopLevelMessage

@@ -409,6 +409,8 @@ export function useVListLabels(): VListLabels {
 			workspaceDetached: t("workspaceDetached"),
 			backgroundTaskStarted: t("backgroundTaskStarted"),
 			sendAwaitReply: t("sendAwaitReply"),
+			watchRegistered: t("watchRegistered"),
+			watchResult: t("watchResult"),
 			communicationBroadcast: t("communicationBroadcast"),
 			communicationRecipientUnknown: t("communicationRecipientUnknown"),
 			communicationRunning: t("communicationRunning"),
@@ -502,6 +504,10 @@ export function useVListLabels(): VListLabels {
 			subagentRecoveryToBackground: t("subagentRecoveryToBackground"),
 			subagentRecoveryResumeAndNotify: t("subagentRecoveryResumeAndNotify"),
 			subagentRecoveryResumeAndWait: t("subagentRecoveryResumeAndWait"),
+			subagentRecoveryResumeAndWatch: t("subagentRecoveryResumeAndWatch"),
+			subagentRecoveryResolvedWatch: t("subagentRecoveryResolvedWatch", {
+				count: COUNT_PLACEHOLDER,
+			}),
 			subagentRecoveryResolvedNotify: t("subagentRecoveryResolvedNotify", {
 				count: COUNT_PLACEHOLDER,
 			}),

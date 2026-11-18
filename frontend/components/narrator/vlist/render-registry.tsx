@@ -462,7 +462,7 @@ export function renderElement(
 				<RenderSubagentRecovery
 					measured={m}
 					onToggleRow={extra.onToggleRow as ((rowIndex: number) => void) | undefined}
-					onResume={extra.onResume as ((mode: "notify" | "await") => void) | undefined}
+					onResume={extra.onResume as ((mode: "notify" | "watch") => void) | undefined}
 					onDismiss={extra.onDismiss as (() => void) | undefined}
 				/>
 			);

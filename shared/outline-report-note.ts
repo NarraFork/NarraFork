@@ -77,7 +77,7 @@ function withoutFileChanges(text: string): string {
  * line; `outline-report-note-trailers.test.ts` holds these to the writers.
  */
 const RUNNER_TRAILERS = [
-	/\n\nNote: The requested alias "[^\n]*" was already taken\. This agent was assigned "[^\n]*" instead\.(?: Use this alias with Await or Send to reference this agent\.)?$/,
+	/\n\nNote: The requested alias "[^\n]*" was already taken\. This agent was assigned "[^\n]*" instead\.(?: Use this alias with (?:Await|Watch) or Send to reference this agent\.)?$/,
 	/\n\nNote: the parent model "[^\n]*" is not in the allowed "[^\n]*" subagent model pool, so this subagent ran on "[^\n]*" instead\.$/,
 ];
 /** The runner's notes are short: only this much of the end is looked at for them. */

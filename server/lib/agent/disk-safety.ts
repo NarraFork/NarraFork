@@ -22,7 +22,7 @@ const READ_ONLY_TOOLS = new Set([
 	"WebFetch",
 	"ContextAsk",
 	"TeamStatus",
-	"Await",
+	"Watch",
 	"Recall",
 	...OUTLINE_READ_TOOLS,
 ]);

@@ -50,6 +50,7 @@ mock.module("@server/services/terminal-service", () => ({
 }));
 const { terminalTool, extractPlainText, resetCursorForTerminal, MAX_TERMINAL_READ_CURSORS } =
 	await import("../terminal");
+const { watchTool } = await import("../watch");
 const { backgroundTaskService } = await import("@server/services/background-task-service");
 const { runtimePublication } = await import("@server/services/agent-runtime/publication");
 runtimePublication.stop();
@@ -96,6 +97,19 @@ function run(args: Record<string, unknown>, signal = new AbortController().signa
 		narratorId: NARRATOR,
 		signal,
 	} as unknown as ToolContext);
+	pendingTools.add(pending);
+	void pending.then(
+		() => pendingTools.delete(pending),
+		() => pendingTools.delete(pending),
+	);
+	return pending;
+}
+
+function runWatch(args: Record<string, unknown> = {}) {
+	const pending = watchTool.execute({ type: "terminal", id: TERMINAL, ...args }, {
+		narratorId: NARRATOR,
+		signal: new AbortController().signal,
+	} as ToolContext);
 	pendingTools.add(pending);
 	void pending.then(
 		() => pendingTools.delete(pending),
@@ -157,9 +171,12 @@ async function waitForWatchStatus() {
 
 /** A completed real timeout proves that history was never matched, without timing a running row. */
 async function expectWatchToIgnoreHistory(pattern: string) {
-	const result = await run({ action: "watch", pattern, timeout: 1 });
+	const result = await runWatch({ pattern, timeout: 1_000 });
 	expect(result.isError).toBeFalsy();
-	expect((await waitForWatchStatus())?.status).toBe("timeout");
+	const done = await waitForWatchStatus();
+	expect(done?.status).toBe("completed");
+	expect(done?.output).toMatch(/timed out|deadline/i);
+	expect(done?.output).toMatch(/still (?:be )?running/);
 }
 
 describe("Terminal tool watches", () => {
@@ -167,18 +184,34 @@ describe("Terminal tool watches", () => {
 		expect(extractPlainText("a\r\nb\r\n$ ")).toBe("a\nb\n$ ");
 	});
 
-	test("the schema exposes start_at and no longer offers wait_for", () => {
-		const shape = (terminalTool.parameters as unknown as { shape: Record<string, unknown> }).shape;
-		expect(shape.wait_for).toBeUndefined();
-		expect(shape.notify_on).toBeDefined();
-		expect(shape.start_at).toBeDefined();
+	test("Watch exposes start_at while Terminal keeps only write notify_on", () => {
+		const terminalShape = (terminalTool.parameters as unknown as { shape: Record<string, unknown> })
+			.shape;
+		const watchShape = (watchTool.parameters as unknown as { shape: Record<string, unknown> })
+			.shape;
+		expect(terminalShape.wait_for).toBeUndefined();
+		expect(terminalShape.notify_on).toBeDefined();
+		expect(terminalShape.start_at).toBeUndefined();
+		expect(
+			terminalTool.parameters.safeParse({ action: "watch", terminal_id: TERMINAL }).success,
+		).toBe(false);
+		expect(watchShape.start_at).toBeDefined();
 		for (const start_at of ["last_observation", "now"]) {
 			expect(
-				terminalTool.parameters.safeParse({ action: "watch", pattern: "READY", start_at }).success,
+				watchTool.parameters.safeParse({
+					type: "terminal",
+					id: TERMINAL,
+					pattern: "READY",
+					start_at,
+				}).success,
 			).toBe(true);
 		}
 		expect(
-			terminalTool.parameters.safeParse({ action: "watch", start_at: "response_return" }).success,
+			watchTool.parameters.safeParse({
+				type: "terminal",
+				id: TERMINAL,
+				start_at: "response_return",
+			}).success,
 		).toBe(false);
 	});
 
@@ -216,7 +249,7 @@ describe("Terminal tool watches", () => {
 
 	test("watch only matches output from now on", async () => {
 		emit("old READY line\r\nuser@host:~$ ");
-		const result = await run({ action: "watch", pattern: "READY" });
+		const result = await runWatch({ pattern: "READY" });
 		expect(result.isError).toBeFalsy();
 		await Bun.sleep(600);
 		expect((await watchRows())[0]?.status).toBe("running");
@@ -232,7 +265,7 @@ describe("Terminal tool watches", () => {
 
 	test("watch matches a completion marker that overwrites the current progress row", async () => {
 		emit("working with a long progress message");
-		const result = await run({ action: "watch", pattern: "[release-and-quick] total" });
+		const result = await runWatch({ pattern: "[release-and-quick] total" });
 		expect(result.isError).toBeFalsy();
 		emit("\r\x1b[2K[release-and-quick] total 625.114s\r\nuser@host:~$ ");
 		const done = await waitForWatchStatus();
@@ -242,7 +275,7 @@ describe("Terminal tool watches", () => {
 
 	test("rewriting a prefix does not match an unchanged historical marker", async () => {
 		emit("working READY");
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit("\rUser@host:~$ Working");
 		await Bun.sleep(600);
 		expect((await watchRows())[0]?.status).toBe("running");
@@ -252,7 +285,7 @@ describe("Terminal tool watches", () => {
 
 	test("watch matches a rewritten marker split across output chunks", async () => {
 		emit("waiting for a long running deployment");
-		await run({ action: "watch", pattern: "[release-and-quick] total" });
+		await runWatch({ pattern: "[release-and-quick] total" });
 		emit("\r\x1b[2K[release-and-");
 		await Bun.sleep(600);
 		expect((await watchRows())[0]?.status).toBe("running");
@@ -264,7 +297,7 @@ describe("Terminal tool watches", () => {
 		emit("working...\r\n");
 		await run({ action: "read" });
 		emit("[release-and-quick] total 625.114s\r\nuser@host:~$ ");
-		await run({ action: "watch", pattern: "[release-and-quick] total" });
+		await runWatch({ pattern: "[release-and-quick] total" });
 		expect((await waitForWatchStatus())?.status).toBe("completed");
 	});
 
@@ -272,14 +305,14 @@ describe("Terminal tool watches", () => {
 		respond = () => "working...\r\n";
 		await run({ action: "write", input: "deploy\n" });
 		emit("READY\r\nuser@host:~$ ");
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		expect((await waitForWatchStatus())?.status).toBe("completed");
 	});
 
 	test("start_at now deliberately ignores unread output before registration", async () => {
 		await run({ action: "read" });
 		emit("READY from the registration gap\r\nuser@host:~$ ");
-		await run({ action: "watch", pattern: "READY", start_at: "now" });
+		await runWatch({ pattern: "READY", start_at: "now" });
 		await Bun.sleep(300);
 		expect((await watchRows())[0]?.status).toBe("running");
 		emit("\r\nREADY next occurrence\r\n");
@@ -290,7 +323,7 @@ describe("Terminal tool watches", () => {
 		emit("READY old command\r\nuser@host:~$ ");
 		await run({ action: "read", last_n_lines: 1 });
 		emit("new command still working\r\n");
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		await Bun.sleep(300);
 		expect((await watchRows())[0]?.status).toBe("running");
 		emit("READY new command\r\n");
@@ -300,9 +333,9 @@ describe("Terminal tool watches", () => {
 	test("independent watches retain their own clones of an earlier observation", async () => {
 		await run({ action: "read" });
 		emit("FIRST\r\nSECOND\r\nuser@host:~$ ");
-		await run({ action: "watch", pattern: "FIRST" });
+		await runWatch({ pattern: "FIRST" });
 		expect((await waitForWatchStatus())?.status).toBe("completed");
-		await run({ action: "watch", pattern: "SECOND" });
+		await runWatch({ pattern: "SECOND" });
 		const deadline = Date.now() + 3_000;
 		while ((await watchRows()).some((task) => task.status === "running") && Date.now() < deadline)
 			await Bun.sleep(20);
@@ -312,7 +345,7 @@ describe("Terminal tool watches", () => {
 	test("unread output is not a command boundary when a human starts another command", async () => {
 		await run({ action: "read" });
 		emit("A: READY\r\nB: still running\r\n");
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		const result = await waitForWatchStatus();
 		expect(result?.status).toBe("completed");
 		expect(result?.output).toContain("A: READY");
@@ -329,7 +362,7 @@ describe("Terminal tool watches", () => {
 			const result = await pending;
 			expect(result.isError).toBeFalsy();
 			expect(result.output).not.toContain("READY");
-			const watch = await run({ action: "watch", pattern: "READY" });
+			const watch = await runWatch({ pattern: "READY" });
 			expect(watch.isError).toBeFalsy();
 			const done = await waitForWatchStatus();
 			expect(done?.status).toBe("completed");
@@ -434,7 +467,7 @@ describe("Terminal tool watches", () => {
 					expect(result.result?.isError).toBe(true);
 					expect(result.result?.output).toContain("aborted");
 				}
-				const watch = await run({ action: "watch", pattern: "READY" });
+				const watch = await runWatch({ pattern: "READY" });
 				expect(watch.isError).toBeFalsy();
 				expect((await waitForWatchStatus())?.status).toBe("completed");
 				// A failed observation must not consume incremental output either.
@@ -463,7 +496,7 @@ describe("Terminal tool watches", () => {
 			const old = await pending;
 			expect(old.isError).toBeFalsy();
 			expect(old.output).not.toContain("replacement>");
-			const watch = await run({ action: "watch", pattern: "READY" });
+			const watch = await runWatch({ pattern: "READY" });
 			expect(watch.isError).toBeFalsy();
 			const done = await waitForWatchStatus();
 			expect(done?.status).toBe("completed");
@@ -478,7 +511,7 @@ describe("Terminal tool watches", () => {
 		emit(`${"x".repeat(70)} READY old`);
 		await run({ action: "read" });
 		await buffer.resize(160, 24);
-		const result = await run({ action: "watch", pattern: "READY" });
+		const result = await runWatch({ pattern: "READY" });
 		expect(result.output).toContain(
 			"Matching scope: since the last successful read/write snapshot",
 		);
@@ -494,7 +527,7 @@ describe("Terminal tool watches", () => {
 		emit("\r\nuser@host:~$ ");
 		await buffer.resize(160, 24);
 		await buffer.resize(80, 24);
-		const result = await run({ action: "watch", pattern: "READY" });
+		const result = await runWatch({ pattern: "READY" });
 		expect(result.output).toContain(
 			"Matching scope: since the last successful read/write snapshot",
 		);
@@ -510,7 +543,7 @@ describe("Terminal tool watches", () => {
 	])("an active watch survives narrowing its %s without matching history", async (_label, oldText) => {
 		emit(oldText);
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		await buffer.resize(40, 24);
 		notifyTerminalOutput(TERMINAL);
 		await Bun.sleep(600);
@@ -523,7 +556,7 @@ describe("Terminal tool watches", () => {
 	test("an active watch survives a horizontal layout ABA without matching history", async () => {
 		emit(`first\r\n${"x".repeat(70)} READY old\x1b[1A`);
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		await buffer.resize(40, 24);
 		await buffer.resize(80, 24);
 		notifyTerminalOutput(TERMINAL);
@@ -544,7 +577,7 @@ describe("Terminal tool watches", () => {
 			},
 		);
 		try {
-			expect((await run({ action: "watch", pattern: "READY" })).isError).toBeFalsy();
+			expect((await runWatch({ pattern: "READY" })).isError).toBeFalsy();
 			await Bun.sleep(600);
 			expect((await watchRows())[0]?.status).toBe("running");
 			emit("\r\nREADY after registration\r\n");
@@ -562,7 +595,7 @@ describe("Terminal tool watches", () => {
 		emit(`\r\x1b[2K${"x".repeat(60)} READY unread`);
 		await buffer.resize(cols, 24);
 		if (cols === 40) expect(await buffer.getContents()).not.toContain("READY");
-		const result = await run({ action: "watch", pattern: "READY" });
+		const result = await runWatch({ pattern: "READY" });
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("since the last successful read/write snapshot");
 		const done = await waitForWatchStatus();
@@ -581,7 +614,7 @@ describe("Terminal tool watches", () => {
 			},
 		);
 		try {
-			expect((await run({ action: "watch", pattern: "READY" })).isError).toBeFalsy();
+			expect((await runWatch({ pattern: "READY" })).isError).toBeFalsy();
 			expect((await waitForWatchStatus())?.status).toBe("completed");
 		} finally {
 			registration.mockRestore();
@@ -589,7 +622,7 @@ describe("Terminal tool watches", () => {
 	});
 
 	test("an active watch matches unchecked output saved before narrowing clips it", async () => {
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		// Do not notify: resize must retain output before any scheduled watch check sees it.
 		buffer.append(`\r\x1b[2K${"x".repeat(60)} READY unchecked`);
 		await buffer.resize(40, 24);
@@ -602,7 +635,7 @@ describe("Terminal tool watches", () => {
 
 	test("a partial new literal survives a resize between RE and ADY", async () => {
 		emit("\r\x1b[2K");
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit("RE");
 		await Bun.sleep(600);
 		expect((await watchRows())[0]?.status).toBe("running");
@@ -616,7 +649,7 @@ describe("Terminal tool watches", () => {
 		emit(`\r\x1b[2K${"x".repeat(60)} READY before resize`);
 		await buffer.resize(40, 24);
 		await buffer.resize(80, 24);
-		const result = await run({ action: "watch", pattern: "READY", start_at: "now" });
+		const result = await runWatch({ pattern: "READY", start_at: "now" });
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("Matching scope: new output from now");
 		await Bun.sleep(600);
@@ -662,7 +695,7 @@ describe("Terminal tool watches", () => {
 			return cursor;
 		});
 		try {
-			await run({ action: "watch", pattern: "NEVER" });
+			await runWatch({ pattern: "NEVER" });
 			await buffer.resize(40, 24);
 			const [task] = await watchRows();
 			expect(task?.status).toBe("running");
@@ -683,7 +716,7 @@ describe("Terminal tool watches", () => {
 	test("an active watch keeps matching after a row-only resize", async () => {
 		emit("old READY");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		await buffer.resize(80, 30);
 		emit("\r\nREADY after row-only resize\r\n");
 		await endWatchesForBuffer(TERMINAL, buffer, "row-only resize regression ended");
@@ -729,7 +762,7 @@ describe("Terminal tool watches", () => {
 	])("moving observed READY by %s cannot complete a watch", async (_label, movement) => {
 		emit("old READY");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit(movement);
 		await buffer.flush();
 		// A final, awaited check removes timer races from this negative assertion.
@@ -742,7 +775,7 @@ describe("Terminal tool watches", () => {
 	test("erasing an observed READY and appending a new READY in one batch still completes", async () => {
 		emit("old READY");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit("\r\x1b[2K\r\nREADY from a new row\r\n");
 		await endWatchesForBuffer(TERMINAL, buffer, "positive review regression ended");
 		const done = await waitForWatchStatus();
@@ -753,7 +786,7 @@ describe("Terminal tool watches", () => {
 	test("old rows inserted below the cursor stay behind the observed end marker", async () => {
 		emit("first old row\r\nold READY\x1b[1A");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit("\x1b[2;1H\x1b[L");
 		await buffer.flush();
 		await endWatchesForBuffer(TERMINAL, buffer, "row insertion review regression ended");
@@ -763,7 +796,7 @@ describe("Terminal tool watches", () => {
 	test("an observed trailing newline does not become new when an old tail row is erased", async () => {
 		emit("old READY\r\nold tail\x1b[1A");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY\n" });
+		await runWatch({ pattern: "READY\n" });
 		emit("\x1b[2;1H\x1b[2K\r\nunrelated new row");
 		await endWatchesForBuffer(TERMINAL, buffer, "old newline regression ended");
 		expect((await waitForWatchStatus())?.status).toBe("failed");
@@ -772,7 +805,7 @@ describe("Terminal tool watches", () => {
 	test("a new literal crossing the observed row into a soft wrap completes", async () => {
 		emit("old READY");
 		await run({ action: "read" });
-		await run({ action: "watch", pattern: "READY" });
+		await runWatch({ pattern: "READY" });
 		emit(`${" ".repeat(56)}READY`);
 		await endWatchesForBuffer(TERMINAL, buffer, "soft wrap review regression ended");
 		expect((await waitForWatchStatus())?.status).toBe("completed");
@@ -795,8 +828,21 @@ describe("Terminal tool watches", () => {
 		expect(await watchRows()).toEqual([]);
 	});
 
-	test("watch requires a pattern", async () => {
-		const result = await run({ action: "watch" });
+	test("Watch rejects an empty pattern without registering an observation", async () => {
+		const result = await runWatch({ pattern: "" });
 		expect(result.isError).toBe(true);
+		expect(await watchRows()).toEqual([]);
+	});
+
+	test("Watch without a pattern observes terminal exit", async () => {
+		const result = await runWatch();
+		expect(result.isError).toBeFalsy();
+		expect((await watchRows())[0]?.status).toBe("running");
+		emit("last output before exit\r\n");
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		const done = await waitForWatchStatus();
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("the terminal exited");
+		expect(done?.output).toContain("last output before exit");
 	});
 });

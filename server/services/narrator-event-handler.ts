@@ -24,7 +24,6 @@ import {
 	cleanupPartialImageGenerationResults,
 	saveImageGenerationResult,
 } from "../lib/agent/image-generation";
-import { listRunningAgentAwaitsForSubagent } from "../lib/agent/tools/await";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -879,17 +878,11 @@ const subagentOutputCharCounters = hotSafe<Map<string, SubagentOutputCharCounter
 );
 
 /** Push the current count to every card still showing it. */
-function emitSubagentOutputCharCount(
-	subagentNarratorId: string,
-	counter: SubagentOutputCharCounter,
-): void {
+function emitSubagentOutputCharCount(counter: SubagentOutputCharCounter): void {
 	counter.lastEmitAt = Date.now();
 	const payload = String(counter.totalChars);
-	// The spawning Agent card plus any in-flight Await watching this subagent.
-	const targets: Array<{ narratorId: string; toolUseId: string }> = [
-		{ narratorId: counter.parentNarratorId, toolUseId: counter.parentToolUseId },
-		...listRunningAgentAwaitsForSubagent(subagentNarratorId),
-	];
+	// Watch registrations have already returned; only the spawning card is live.
+	const targets = [{ narratorId: counter.parentNarratorId, toolUseId: counter.parentToolUseId }];
 	for (const target of targets) {
 		const chunk = streamingSnapshots.get(target.narratorId)?.toolChunks.get(target.toolUseId);
 		// No chunk → the call completed and its turn persisted; nobody is showing
@@ -919,7 +912,7 @@ export function retireSubagentOutputCharCount(narratorId: string): void {
 	const counter = subagentOutputCharCounters.get(narratorId);
 	if (!counter) return;
 	if (counter.timer) clearTimeout(counter.timer);
-	emitSubagentOutputCharCount(narratorId, counter);
+	emitSubagentOutputCharCount(counter);
 	subagentOutputCharCounters.delete(narratorId);
 }
 
@@ -994,13 +987,13 @@ function noteSubagentOutputText(
 			clearTimeout(counter.timer);
 			counter.timer = undefined;
 		}
-		emitSubagentOutputCharCount(key, counter);
+		emitSubagentOutputCharCount(counter);
 	} else if (!counter.timer) {
 		counter.timer = setTimeout(() => {
 			counter.timer = undefined;
 			// The entry may have retired while this timer was pending.
 			const live = subagentOutputCharCounters.get(key);
-			if (live) emitSubagentOutputCharCount(key, live);
+			if (live) emitSubagentOutputCharCount(live);
 		}, SUBAGENT_OUTPUT_COUNT_EMIT_MS - elapsed);
 	}
 }
