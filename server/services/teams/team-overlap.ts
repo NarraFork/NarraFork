@@ -9,20 +9,25 @@
  * current: every two minutes a sweep of at most {@link TEAM_CHANGED_PATHS_BATCH} items resuming
  * after the last item it looked at, and when a worker's run ends a pass over that worker's items
  * only. An item whose head did not move is not listed again. Each pass stops at
- * {@link PASS_DEADLINE_MS} (keeping its place), so a hung git never stalls the refreshes. Git runs
+ * {@link PASS_DEADLINE_MS}; the item it timed out on counts as failed, the sweep goes on after
+ * it, and it is skipped for the next {@link HUNG_BACKOFF_PASSES} passes, so a hung git never
+ * stalls the refreshes. Git runs
  * only through the hardened, read-only `team-git.ts` (one `teamGit` per item per pass; a diff of
  * two commits reads no working tree, index or filter); never on a request path. The pass writes
  * only the two path columns, never `updated_at`, so it never makes a coordinator's own change
  * look concurrent.
  *
- * LANDED ITEMS. There is no merge action yet, so the pass also notices an item that landed: one
- * with real work (stored changed paths, or a head other than the one it was created at) whose
- * head the base branch now contains (`merge-base --is-ancestor head base`, checked every pass
- * even when the head did not move). It becomes `merged` (`work.merged`, `detectedBy: ancestry`),
- * which releases its exclusive lock and drops it from the overlaps. LIMITS: a squash or rebase
- * merge (the head itself never reaches the base) and a base that moved only on the remote (the
- * local base branch of this repository is what is read) are not detected; such an item stays
- * open until it is cancelled, and a person can release its lock.
+ * LANDED ITEMS. There is no merge action yet, so the pass also notices a `ready` item that landed
+ * (`mergeIfLanded`, checked every pass even when the head did not move): the head recorded at
+ * `work.ready`, whose changed paths there were not empty, is inside the base branch, the item's
+ * branch ref is that head or also inside the base (no commit made after ready is dropped), and
+ * its worker is not running. It becomes `merged` (`work.merged`, `detectedBy: ancestry`), which
+ * releases its exclusive lock and drops it from the overlaps; `merged` is permanent, even if the
+ * base is rewound later. An item in any other state is never merged this way, whatever its
+ * worktree's HEAD points at. LIMITS: a squash or rebase merge (the head itself never reaches the
+ * base) and a base that moved only on the remote (the local base branch of this repository is
+ * what is read) are not detected; such an item stays open until it is cancelled, and a person can
+ * release its lock.
  *
  * OVERLAPS. Per project, the stored paths of at most {@link TEAM_OVERLAP_PROJECT_ITEMS} active
  * items of active teams are compared: an item with at most {@link TEAM_OVERLAP_COMPARE_PATHS}
@@ -111,6 +116,8 @@ export const NOTICE_MAX_BYTES = 4 * 1024;
 const LOCKS_LISTED = 10;
 /** A pass stops looking at more items after this long and resumes there next time. */
 export const PASS_DEADLINE_MS = 60_000;
+/** Passes an item a pass timed out on is skipped for. */
+export const HUNG_BACKOFF_PASSES = 5;
 /** Pair visits between two yields while pairing overlap entries. */
 const PAIR_VISITS_PER_YIELD = 5000;
 
@@ -130,6 +137,12 @@ const samplePath = (path: string) =>
 export function normalizeExclusivePath(pattern: string): string {
 	const trimmed = pattern.trim().replace(/^(\.\/)+/, "");
 	return trimmed.endsWith("/") ? `${trimmed.replace(/\/+$/, "")}/**` : trimmed;
+}
+
+/** Whether a pattern is made of `*` and `**` segments only (it matches everything): too broad. */
+export function exclusivePathMatchesEverything(pattern: string): boolean {
+	const segments = normalizeExclusivePath(pattern).split("/").filter(Boolean);
+	return segments.every((segment) => /^\*+$/.test(segment));
 }
 
 /** The exclusive path globs of a project setting value (`chapter_settings`), sanitized. */
@@ -153,7 +166,7 @@ export function exclusivePathsOf(chapterSettings: unknown): string[] {
 				glob.length <= TEAM_EXCLUSIVE_PATH_MAX_LENGTH,
 		)
 		.map(normalizeExclusivePath)
-		.filter((glob) => glob.length > 0 && glob !== "**")
+		.filter((glob) => glob.length > 0 && !exclusivePathMatchesEverything(glob))
 		.slice(0, TEAM_EXCLUSIVE_PATHS_MAX);
 }
 
@@ -605,23 +618,61 @@ const activeWithWorktree = () =>
 
 export type RefreshOutcome = "updated" | "unchanged" | "merged" | "failed";
 
-/** Whether an item did real work: stored changed paths, or a head other than its first one. */
-function hadRealWork(itemId: string, head: string): boolean {
-	const stored = db
-		.select({ paths: teamWorkItems.changedPathsJson })
+/**
+ * Whether a `ready` item landed: all of
+ *  1. it is `ready` (never queued, in progress or in review);
+ *  2. the evidence recorded at `work.ready`: its head there is the item's recorded head, and the
+ *     changed paths computed there were not empty (never derived again later);
+ *  3. its worker is not running;
+ *  4. that head is an ancestor of the base, and the item's BRANCH (`refs/heads/<branch>`, never
+ *     the worktree's HEAD) is that head or also inside the base — commits made after ready are
+ *     never dropped.
+ * Then it is merged, if it is still exactly what was read (checked in the transaction).
+ */
+async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promise<boolean> {
+	const item = db
+		.select({
+			state: teamWorkItems.state,
+			headSha: teamWorkItems.headSha,
+			updatedAt: teamWorkItems.updatedAt,
+			branch: teamWorkItems.branchName,
+			worker: teamWorkItems.workerNarratorId,
+		})
 		.from(teamWorkItems)
-		.where(eq(teamWorkItems.id, itemId))
+		.where(eq(teamWorkItems.id, target.id))
 		.limit(1)
 		.get();
-	if (Array.isArray(stored?.paths) && stored.paths.length > 0) return true;
-	const created = db
+	if (!item || item.state !== "ready" || !item.headSha || !item.branch) return false;
+	const ready = db
 		.select({ detail: teamWorkEvents.detailJson })
 		.from(teamWorkEvents)
-		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.created")))
+		.where(and(eq(teamWorkEvents.workItemId, target.id), eq(teamWorkEvents.kind, "work.ready")))
+		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
 		.limit(1)
-		.get();
-	const first = created?.detail?.head;
-	return typeof first === "string" && first !== head;
+		.get()?.detail;
+	const count = ready?.changedPathCount;
+	if (ready?.head !== item.headSha || typeof count !== "number" || count <= 0) return false;
+	if (item.worker) {
+		const worker = db
+			.select({ status: narrators.status })
+			.from(narrators)
+			.where(eq(narrators.id, item.worker))
+			.limit(1)
+			.get();
+		if (worker && worker.status !== "idle" && worker.status !== "archived") return false;
+	}
+	const base = await git.resolve(target.baseRef);
+	if (!base || !(await git.isAncestor(item.headSha, base))) return false;
+	const tip = await git.resolve(`refs/heads/${item.branch}`);
+	if (!tip) return false;
+	if (tip !== item.headSha && !(await git.isAncestor(tip, base))) return false;
+	return markMergedByAncestry({
+		itemId: target.id,
+		head: item.headSha,
+		base,
+		expectedHeadSha: item.headSha,
+		expectedUpdatedAt: item.updatedAt,
+	});
 }
 
 async function refreshTarget(target: RefreshTarget): Promise<RefreshOutcome> {
@@ -636,10 +687,7 @@ async function refreshTarget(target: RefreshTarget): Promise<RefreshOutcome> {
 			if (storeChangedPaths(db, target.id, changed)) outcome = "updated";
 		}
 		// Landed? Checked every pass: the base moves without the item's head moving.
-		if (!hadRealWork(target.id, head)) return outcome;
-		const base = await git.resolve(target.baseRef);
-		if (!base || !(await git.isAncestor(head, base))) return outcome;
-		return markMergedByAncestry({ itemId: target.id, head, base }) ? "merged" : outcome;
+		return (await mergeIfLanded(target, git)) ? "merged" : outcome;
 	} catch (error) {
 		logger.debug("Team changed paths could not be read", {
 			workItemId: target.id,
@@ -715,6 +763,12 @@ const job = hotSafe("narrafork.teams.overlap", () => ({
 	/** Items to look at first (their worker's run just ended). */
 	pending: new Set<string>(),
 	running: null as Promise<BatchResult> | null,
+	/** Whether the running pass is a sweep, and whether a sweep was asked for during another. */
+	runningSweep: false,
+	sweepAfter: false,
+	/** Passes so far, and item id → the pass number until which a hung item is skipped. */
+	passNumber: 0,
+	backoff: new Map<string, number>(),
 	stop: null as (() => void) | null,
 	indexes: new Map<string, OverlapIndex>(),
 	computing: new Map<string, Promise<OverlapIndex>>(),
@@ -747,6 +801,8 @@ export function resetOverlapStateForTests(): void {
 	job.pairBacklog.clear();
 	job.lastNoticeAt.clear();
 	job.queuedNotices.clear();
+	job.backoff.clear();
+	job.sweepAfter = false;
 }
 
 /** The sweep's resume point (tests). */
@@ -783,13 +839,24 @@ export interface BatchResult {
  * one runs shares its result; items queued meanwhile get one more pending-only pass.
  */
 export function runChangedPathsPass(options: { sweep?: boolean } = {}): Promise<BatchResult> {
-	if (job.running) return job.running;
+	const sweep = options.sweep !== false;
+	if (job.running) {
+		// A sweep asked for during a pending-only pass is not answered by it: one follows.
+		if (sweep && !job.runningSweep) job.sweepAfter = true;
+		return job.running;
+	}
+	job.runningSweep = sweep;
 	const run = (async () => {
 		try {
-			return await passOnce(options.sweep !== false);
+			return await passOnce(sweep);
 		} finally {
 			job.running = null;
-			if (job.pending.size > 0) {
+			if (job.sweepAfter) {
+				job.sweepAfter = false;
+				void runChangedPathsPass().catch((error) =>
+					logger.warn("Team changed paths pass failed", { error: String(error) }),
+				);
+			} else if (job.pending.size > 0) {
 				void runChangedPathsPass({ sweep: false }).catch((error) =>
 					logger.warn("Team changed paths pass failed", { error: String(error) }),
 				);
@@ -826,6 +893,8 @@ async function passOnce(sweep: boolean): Promise<BatchResult> {
 	};
 	if (activeDatabaseBackend !== "sqlite") return result;
 	const deadlineAt = job.clock.now() + job.deadlineMs;
+	const passNumber = ++job.passNumber;
+	if (job.backoff.size > 1000) job.backoff.clear();
 	if (sweep) {
 		try {
 			releaseLocksOfArchivedTeams();
@@ -854,16 +923,30 @@ async function passOnce(sweep: boolean): Promise<BatchResult> {
 	const targets = [...first, ...next];
 	let lastSwept: string | null = null;
 	for (const [index, target] of targets.entries()) {
+		const swept = index >= first.length;
+		const skipUntil = job.backoff.get(target.id);
+		if (skipUntil !== undefined) {
+			if (passNumber < skipUntil) {
+				if (swept) lastSwept = target.id;
+				continue;
+			}
+			job.backoff.delete(target.id);
+		}
 		const remaining = deadlineAt - job.clock.now();
 		const outcome = await withinDeadline(refreshTarget(target), remaining);
-		// Out of time: the sweep resumes at the first item not looked at; pending items not
-		// looked at are left to the sweep (re-queueing them would retry a hung git at once).
+		// Out of time on this item: it counts as failed, the sweep resumes after it, and it is
+		// skipped for a few passes. Pending items not looked at are left to the sweep
+		// (re-queueing them would start another pass at once).
 		if (outcome === "deadline") {
 			result.deadline = true;
+			result.looked++;
+			result.failed++;
+			if (swept) lastSwept = target.id;
+			job.backoff.set(target.id, passNumber + 1 + HUNG_BACKOFF_PASSES);
 			break;
 		}
 		result.looked++;
-		if (index >= first.length) lastSwept = target.id;
+		if (swept) lastSwept = target.id;
 		if (outcome === "updated" || outcome === "merged") projectsTouched.add(target.projectId);
 		if (outcome === "updated") result.updated++;
 		else if (outcome === "merged") result.merged++;

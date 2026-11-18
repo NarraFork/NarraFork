@@ -49,9 +49,10 @@ const exclusivePathGlobSchema = z
 		const relative = glob.replace(/^(\.\/)+/, "");
 		return relative.endsWith("/") ? `${relative.replace(/\/+$/, "")}/**` : relative;
 	})
+	// Only `*` / `**` segments (`*`, `**`, `**` then `*`, …) would lock every change of the project.
 	.refine(
-		(glob) => glob.length > 0 && glob !== "/**" && glob !== "**",
-		"Too broad an exclusive path",
+		(glob) => glob.split("/").some((segment) => segment.length > 0 && !/^\*+$/.test(segment)),
+		"Too broad an exclusive path: it matches everything",
 	);
 
 export const teamProjectSettingsSchema = z

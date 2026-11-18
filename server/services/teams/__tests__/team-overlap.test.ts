@@ -897,7 +897,7 @@ describe("review round 1", () => {
 		expect(index.entries).toHaveLength(500);
 		// 2,500 cross-team pairs: 50 recorded, the rest on later passes.
 		expect(first).toEqual({ recorded: overlap.NEW_PAIRS_PER_PASS, more: true });
-		expect(longest).toBeLessThan(150);
+		expect(longest).toBeLessThan(50);
 	});
 
 	test("pairs beyond the per-pass cap are recorded by the next pass", async () => {
@@ -1094,9 +1094,277 @@ describe("review round 1", () => {
 		overlap.setOverlapSeamsForTests({ deadlineMs: 100 });
 		try {
 			const hung = await overlap.runChangedPathsPass();
-			expect(hung).toMatchObject({ looked: 0, deadline: true });
+			expect(hung).toMatchObject({ looked: 1, failed: 1, deadline: true });
 		} finally {
 			overlap.setOverlapSeamsForTests({ deadlineMs: null });
 		}
+	});
+});
+
+describe("review round 2: merge detection without false positives", () => {
+	const ready = async (lead: string, itemId: string) => {
+		await clearReview(lead, itemId);
+		return items.markReady({ coordinatorId: lead, itemId, actor: { kind: "agent", id: lead } });
+	};
+
+	test("reviewer probe: fast-forward, reset to base, detached checkout, mid-work landing stay open", async () => {
+		const ff = await create(LEAD_A, "FF only", USER_A);
+		const reset = await create(LEAD_A, "Reset", USER_A);
+		const detached = await create(LEAD_A, "Detached", USER_A);
+		const busy = await create(LEAD_A, "Busy", USER_A);
+		await commitFiles(items.worktreePathOf(reset) ?? "", { "r.txt": "r\n" }, "r");
+		await commitFiles(items.worktreePathOf(busy) ?? "", { "busy.txt": "b\n" }, "b");
+		sqlite.run("UPDATE team_work_items SET exclusive_key = ? WHERE id = ?", [
+			shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			busy.id,
+		]);
+		await overlap.runChangedPathsPass();
+		// The base moves on.
+		await commitFiles(source, { "base-moved.txt": "m\n" }, "base moves");
+		await git(["merge", "-q", "--ff-only", "main"], items.worktreePathOf(ff) ?? "");
+		await git(["reset", "-q", "--hard", "main"], items.worktreePathOf(reset) ?? "");
+		await git(["checkout", "-q", "--detach", "main"], items.worktreePathOf(detached) ?? "");
+		// busy: its in-progress head lands on the base while the worker continues.
+		await git(["merge", "-q", "--no-ff", "-m", "land busy", busy.branchName ?? ""]);
+		sqlite.run("UPDATE team_work_items SET state = 'in_progress' WHERE id = ?", [busy.id]);
+		const pass = await overlap.runChangedPathsPass();
+		expect(pass.merged).toBe(0);
+		expect([ff, reset, detached, busy].map((it) => itemRow(it.id)?.state)).toEqual([
+			"queued",
+			"queued",
+			"queued",
+			"in_progress",
+		]);
+		expect(itemRow(busy.id)?.exclusiveKey).toBe(shared.TEAM_EXCLUSIVE_LOCK_KEY);
+	});
+
+	test("a ready item whose worktree was reset or detached later stays ready", async () => {
+		const reset = await create(LEAD_A, "Reset after ready", USER_A);
+		const detached = await create(LEAD_A, "Detached after ready", USER_A);
+		for (const item of [reset, detached]) {
+			await commitFiles(items.worktreePathOf(item) ?? "", { [`${item.id}.txt`]: "x\n" }, "x");
+			await ready(LEAD_A, item.id);
+		}
+		await commitFiles(source, { "base-moved.txt": "m\n" }, "base moves");
+		await git(["reset", "-q", "--hard", "main"], items.worktreePathOf(reset) ?? "");
+		await git(["checkout", "-q", "--detach", "main"], items.worktreePathOf(detached) ?? "");
+		expect((await overlap.runChangedPathsPass()).merged).toBe(0);
+		expect(itemRow(reset.id)?.state).toBe("ready");
+		expect(itemRow(detached.id)?.state).toBe("ready");
+	});
+
+	test("a ready item with no changes at ready is never auto-merged", async () => {
+		const empty = await create(LEAD_A, "No changes", USER_A);
+		const marked = await ready(LEAD_A, empty.id);
+		expect(marked.item.state).toBe("ready");
+		// Its head is the base's own commit: an ancestor, but nothing landed.
+		expect((await overlap.runChangedPathsPass()).merged).toBe(0);
+		expect(itemRow(empty.id)?.state).toBe("ready");
+	});
+
+	test("a genuinely landed ready item is merged; a commit after ready keeps it ready", async () => {
+		setExclusivePaths(["drizzle/**"]);
+		const landed = await create(LEAD_A, "Landed", USER_A);
+		const later = await create(LEAD_B, "More after ready", USER_B);
+		await commitFiles(items.worktreePathOf(landed) ?? "", { "drizzle/1.sql": "--\n" }, "a");
+		await commitFiles(items.worktreePathOf(later) ?? "", { "later.txt": "1\n" }, "b");
+		const landedReady = await ready(LEAD_A, landed.id);
+		expect(landedReady.item.exclusiveKey).toBe(shared.TEAM_EXCLUSIVE_LOCK_KEY);
+		const laterReady = await ready(LEAD_B, later.id);
+		// The ready facts are kept with the event, never derived again.
+		expect(eventsOf(landed.id).at(-1)).toMatchObject({
+			kind: "work.ready",
+			detail: { head: landedReady.item.headSha, changedPathCount: 1 },
+		});
+		// Both ready heads land on the base; the second item's worker commits once more.
+		await git(["merge", "-q", "--no-ff", "-m", "land", landed.branchName ?? ""]);
+		await git(["merge", "-q", "--no-ff", "-m", "land 2", later.branchName ?? ""]);
+		await commitFiles(items.worktreePathOf(later) ?? "", { "later.txt": "2\n" }, "after ready");
+		const pass = await overlap.runChangedPathsPass();
+		expect(pass.merged).toBe(1);
+		expect(itemRow(landed.id)?.state).toBe("merged");
+		expect(itemRow(landed.id)?.exclusiveKey).toBeNull();
+		expect(eventsOf(landed.id).at(-1)).toMatchObject({
+			kind: "work.merged",
+			detail: { head: landedReady.item.headSha, detectedBy: "ancestry" },
+		});
+		expect(itemRow(later.id)?.state).toBe("ready");
+		expect(laterReady.item.headSha).not.toBeNull();
+	});
+
+	test("not while the worker runs, and not when the item changed in between", async () => {
+		const item = await create(LEAD_A, "Worker busy", USER_A);
+		await commitFiles(items.worktreePathOf(item) ?? "", { "w.txt": "w\n" }, "w");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, status, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('x-runner', 'subagent', 'w', 'working', ?, ?, ?, ?)`,
+			[LEAD_A, LEAD_A, NOW, NOW],
+		);
+		const marked = await ready(LEAD_A, item.id);
+		sqlite.run("UPDATE team_work_items SET worker_narrator_id = 'x-runner' WHERE id = ?", [
+			item.id,
+		]);
+		await git(["merge", "-q", "--no-ff", "-m", "land", item.branchName ?? ""]);
+		expect((await overlap.runChangedPathsPass()).merged).toBe(0);
+		expect(itemRow(item.id)?.state).toBe("ready");
+		const row = itemRow(item.id) as NonNullable<ReturnType<typeof itemRow>>;
+		expect(
+			items.markMergedByAncestry({
+				itemId: item.id,
+				head: marked.item.headSha ?? "",
+				base: "b".repeat(40),
+				expectedHeadSha: row.headSha,
+				expectedUpdatedAt: "2000-01-01T00:00:00.000Z",
+			}),
+		).toBe(false);
+		sqlite.run("UPDATE narrators SET status = 'idle' WHERE id = 'x-runner'");
+		expect((await overlap.runChangedPathsPass()).merged).toBe(1);
+	});
+
+	test("a hung item is skipped past and backed off; the sweep progresses", async () => {
+		const ids: string[] = [];
+		for (let i = 0; i < 4; i++) {
+			const resource = generateId();
+			db.insert(narratorWorktreeResources)
+				.values({
+					id: resource,
+					ownerNarratorId: LEAD_A,
+					deviceId: "local",
+					repositoryKey: "repository",
+					worktreePath: join(temporary, `wt-h-${i}`),
+					state: "ready",
+					createRequestId: `req-h-${i}`,
+				})
+				.run();
+			ids.push(insertItem(LEAD_A, `Item ${i}`, null, { worktreeResourceId: resource }));
+		}
+		ids.sort();
+		const hungPath = items.worktreePathOf({
+			worktreeResourceId: itemRow(ids[0] ?? "")?.worktreeResourceId ?? null,
+		});
+		const heads: string[] = [];
+		overlap.setChangedPathsSourceForTests((worktree) => ({
+			head: () => {
+				heads.push(worktree);
+				return worktree === hungPath
+					? new Promise<string | null>(() => {})
+					: Promise.resolve("b".repeat(40));
+			},
+			resolve: async () => "f".repeat(40),
+			isAncestor: async () => false,
+			changed: async () => ({
+				head: "b".repeat(40),
+				mergeBase: "0".repeat(40),
+				paths: ["x.ts"],
+				collapsed: false,
+			}),
+		}));
+		overlap.setOverlapSeamsForTests({ deadlineMs: 100 });
+		try {
+			const first = await overlap.runChangedPathsPass();
+			expect(first).toMatchObject({ looked: 1, failed: 1, deadline: true });
+			// The cursor is past the hung item, so the next sweep goes on.
+			expect(overlap.overlapCursor()).toBe(ids[0] ?? null);
+			const second = await overlap.runChangedPathsPass();
+			expect(second).toMatchObject({ looked: 3, updated: 3, wrapped: true });
+			// Starting over, the hung item is backed off instead of hanging the pass again.
+			const third = await overlap.runChangedPathsPass();
+			expect(third).toMatchObject({ deadline: false, failed: 0 });
+			expect(heads.filter((path) => path === hungPath)).toHaveLength(1);
+		} finally {
+			overlap.setOverlapSeamsForTests({ deadlineMs: null });
+		}
+	});
+
+	test("a timer tick during a pending-only pass still gets a sweep", async () => {
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const looked: string[] = [];
+		overlap.setChangedPathsSourceForTests((worktree) => ({
+			head: async () => {
+				looked.push(worktree);
+				if (worktree.endsWith("wt-p-0")) await gate;
+				return "b".repeat(40);
+			},
+			resolve: async () => "f".repeat(40),
+			isAncestor: async () => false,
+			changed: async () => null,
+		}));
+		for (let i = 0; i < 3; i++) {
+			const resource = generateId();
+			db.insert(narratorWorktreeResources)
+				.values({
+					id: resource,
+					ownerNarratorId: LEAD_A,
+					deviceId: "local",
+					repositoryKey: "repository",
+					worktreePath: join(temporary, `wt-p-${i}`),
+					state: "ready",
+					createRequestId: `req-p-${i}`,
+				})
+				.run();
+			insertItem(LEAD_A, `Item ${i}`, null, {
+				worktreeResourceId: resource,
+				workerNarratorId: i === 0 ? null : null,
+			});
+		}
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('x-pending-worker', 'subagent', 'w', ?, ?, ?, ?)`,
+			[LEAD_A, LEAD_A, NOW, NOW],
+		);
+		sqlite.run(
+			`UPDATE team_work_items SET worker_narrator_id = 'x-pending-worker'
+			WHERE worktree_resource_id = (SELECT id FROM narrator_worktree_resources WHERE worktree_path LIKE '%wt-p-0')`,
+		);
+		overlap.refreshItemsOfWorker("x-pending-worker");
+		const tick = overlap.runChangedPathsPass();
+		release();
+		const shared1 = await tick;
+		expect(shared1.looked).toBe(1);
+		// The sweep the tick asked for runs right after.
+		for (let i = 0; i < 50 && looked.length < 4; i++) await new Promise((r) => setTimeout(r, 10));
+		expect(looked.length).toBe(4);
+	});
+
+	test("markReady refuses when the team was archived meanwhile", async () => {
+		const item = await create(LEAD_A, "Archive race", USER_A);
+		await commitFiles(items.worktreePathOf(item) ?? "", { "a.txt": "a\n" }, "a");
+		await clearReview(LEAD_A, item.id);
+		overlap.setChangedPathsSourceForTests(() => ({
+			head: async () => null,
+			resolve: async () => null,
+			isAncestor: async () => false,
+			changed: async () => {
+				sqlite.run("UPDATE project_teams SET status = 'archived' WHERE narrator_id = ?", [LEAD_A]);
+				return {
+					head: "b".repeat(40),
+					mergeBase: "0".repeat(40),
+					paths: ["a.txt"],
+					collapsed: false,
+				};
+			},
+		}));
+		await expect(
+			items.markReady({
+				coordinatorId: LEAD_A,
+				itemId: item.id,
+				actor: { kind: "agent", id: LEAD_A },
+			}),
+		).rejects.toMatchObject({ code: "TEAM_ARCHIVED" });
+		expect(itemRow(item.id)?.state).toBe("in_review");
+	});
+
+	test("exclusive paths that match everything are refused", async () => {
+		const { projectChapterSettingsSchema } = await import("../../../lib/validators");
+		for (const broad of ["**", "**/", "*", "**/*", "*/**", "./**", "**/**", "*/"])
+			expect(
+				projectChapterSettingsSchema.safeParse({ teams: { exclusivePaths: [broad] } }).success,
+			).toBe(false);
+		expect(overlap.exclusivePathsOf({ teams: { exclusivePaths: ["*", "**/*", "a/**"] } })).toEqual([
+			"a/**",
+		]);
 	});
 });

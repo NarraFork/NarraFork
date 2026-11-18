@@ -273,6 +273,18 @@ function requireWorktree(item: WorkItemRow): string {
 	return path;
 }
 
+/** Whether a team is active and its coordinator not archived, read inside a transaction. */
+function teamStillActive(executor: Pick<typeof db, "select">, teamId: string): boolean {
+	const row = executor
+		.select({ status: projectTeams.status, coordinator: narrators.status })
+		.from(projectTeams)
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(eq(projectTeams.narratorId, teamId))
+		.limit(1)
+		.get();
+	return row?.status === "active" && row.coordinator !== "archived";
+}
+
 /**
  * Move an item's state only if it is still what was read: concurrent changes lose cleanly. An
  * item that finishes (merged or cancelled) gives up the project's exclusive lock, recorded as
@@ -675,6 +687,9 @@ export async function markReady(input: {
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
+			// Archived while the paths were read: nothing changes on an archived team.
+			if (!teamStillActive(tx, team.teamId))
+				throw new AppError("This team is archived; nothing can change", 409, "TEAM_ARCHIVED");
 			if (changed) storeChangedPaths(tx, item.id, changed);
 			updateItem(
 				tx,
@@ -700,7 +715,15 @@ export async function markReady(input: {
 				workItemId: item.id,
 				kind: "work.ready",
 				actor: input.actor,
-				detail: { head, reviewedHead: reviewed, commitsSinceReview, from: item.state },
+				// `head` and `changedPathCount` are the evidence a later automatic merge relies on
+				// (X): what was ready, and that it changed something. Never derived again.
+				detail: {
+					head,
+					reviewedHead: reviewed,
+					commitsSinceReview,
+					from: item.state,
+					changedPathCount: changed ? changed.paths.length : null,
+				},
 				at: now,
 			});
 		});
@@ -767,26 +790,39 @@ export function cancelWorkItem(input: {
 /**
  * The background pass found an item's head inside its base branch (X): the work landed, so the
  * item is merged — its exclusive lock is released (in `updateItem`), its stored changed paths
- * cleared, and `work.merged` recorded as the system's with `detectedBy: "ancestry"`. Only a merge
- * that keeps the head reachable from the local base branch is noticed (not a squash or rebase
- * merge, nor a base that moved only on the remote). False when the item changed meanwhile or is
- * already finished; the next pass looks again.
+ * cleared, and `work.merged` recorded as the system's with `detectedBy: "ancestry"`. The caller
+ * (`team-overlap.ts`) decides that only for a `ready` item from the head recorded at ready; here
+ * the item must still be exactly what it read (`ready`, same head, same `updated_at`), checked
+ * inside the transaction, or nothing happens (false) and the next pass looks again. `merged` is
+ * permanent: a base rewound later does not reopen the item.
  */
 export function markMergedByAncestry(input: {
 	itemId: string;
 	head: string;
 	base: string;
+	expectedHeadSha: string | null;
+	expectedUpdatedAt: string;
 }): boolean {
-	const item = db
-		.select()
-		.from(teamWorkItems)
-		.where(eq(teamWorkItems.id, input.itemId))
-		.limit(1)
-		.get();
-	if (!item || isFinished(item.state)) return false;
 	const now = new Date().toISOString();
+	let merged = false;
 	try {
 		db.transaction((tx) => {
+			const item = tx
+				.select()
+				.from(teamWorkItems)
+				.where(eq(teamWorkItems.id, input.itemId))
+				.limit(1)
+				.get();
+			if (
+				!item ||
+				item.state !== "ready" ||
+				item.headSha !== input.expectedHeadSha ||
+				item.headSha !== input.head ||
+				item.updatedAt !== input.expectedUpdatedAt ||
+				!teamStillActive(tx, item.teamId)
+			)
+				return;
+			merged = true;
 			updateItem(
 				tx,
 				item,
@@ -811,8 +847,9 @@ export function markMergedByAncestry(input: {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
 		throw error;
 	}
-	logger.info("Team work item merged (its head is in the base)", { workItemId: item.id });
-	return true;
+	if (merged)
+		logger.info("Team work item merged (its head is in the base)", { workItemId: input.itemId });
+	return merged;
 }
 
 // ── Base sync ───────────────────────────────────────────────────────────────
