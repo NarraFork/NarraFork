@@ -557,7 +557,8 @@ export const TEAM_STATUS_MEMBERS_LIMIT = 12;
 
 /**
  * Team events of a person's decision on a call of the team tree: who approved, denied, answered,
- * dismissed, ignored or followed up (plan §二.12 "记下是谁批的"). `actor_id` is the person; the
+ * deferred, dismissed, ignored or followed up (plan §二.12 "记下是谁批的"); an outline plan's
+ * decision is `approval.allowed` (draft / lock) or `approval.denied` (return). `actor_id` is the person; the
  * detail names the call. Best-effort: written after the decision, outside its transaction.
  */
 export const TEAM_PERSON_DECISION_EVENT_KINDS = [
@@ -570,6 +571,8 @@ export const TEAM_PERSON_DECISION_EVENT_KINDS = [
 	"question.ignored",
 	/** An answered asynchronous question got a follow-up from a person. */
 	"question.supplemented",
+	/** A blocking question was turned into an asynchronous one, to answer later. */
+	"question.deferred",
 ] as const;
 export type TeamPersonDecisionEventKind = (typeof TEAM_PERSON_DECISION_EVENT_KINDS)[number];
 

@@ -1,13 +1,18 @@
 /**
  * Who decided a call of a team tree (docs/PROJECT_TEAMS-PLAN.md §二.12, decision T6; M1).
  *
- * Any member may approve, deny or answer a pending call of the team's tree, through the
- * ordinary permission routes and WebSocket frames (those check write access on the call's
- * session; a subagent's access is the coordinator's). The tool call row records only THAT a
- * person decided (`permission_decided_by = 'user'`, which later gates rely on), not which
- * person, so the person is recorded here as a team event (`approval.allowed`,
- * `approval.denied`, `question.answered`) with `actor_id` = the user. The team page shows it in
- * the activity log and in the approvals drawer.
+ * Any member may decide a pending call of the team's tree — approve or deny it, answer an
+ * AskUserQuestion, decide an outline plan, defer a question, and answer, dismiss, ignore or
+ * follow up an asynchronous question — through the ordinary HTTP routes and WebSocket frames,
+ * which check write access on the call's session (a subagent's access is the coordinator's)
+ * again right before deciding. The IM gateway never decides a team call (its sender has no
+ * proven NarraFork identity).
+ *
+ * The tool call row records only THAT a person decided (`permission_decided_by = 'user'`, which
+ * later gates rely on), not which person, so the person is recorded here as a team event (one of
+ * `TEAM_PERSON_DECISION_EVENT_KINDS`) with `actor_id` = the user. The team page shows it in the
+ * activity log and in the approvals drawer. Best-effort: written after the decision, outside its
+ * transaction; a failure is logged and the decision stands.
  *
  * Calls outside a team are left alone: one primary-key probe answers "no team". SQLite only,
  * like the team surface; on another backend nothing is recorded.

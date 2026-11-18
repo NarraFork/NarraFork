@@ -28,7 +28,10 @@
  * When a member last spoke is an absolute UTC minute. It moves with every message, so it alone
  * never makes a new row: two statuses that differ only in those times count as the same (see
  * {@link statusKey}), and the times shown are those of the latest row written for another
- * reason.
+ * reason. The names are stable too: speakers are taken as the most recent 40 distinct authors of
+ * the latest 500 messages, but listed in a fixed order (members before onlookers, the owner
+ * first, then by name), so a message changes the listed names only when the set of people
+ * changes (someone speaks for the first time in the window, leaves it, or gains or loses access).
  *
  * READS, all bounded: the team and coordinator rows by primary key; open work items
  * (`team_id, state` index, 31 rows) and capped state/finished counts (1,001 ids each); this

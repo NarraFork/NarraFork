@@ -6450,13 +6450,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 	const userId = c.get("user").sub;
-	// The gate ran before the body arrived: access revoked meanwhile must not act.
+	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
 	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
 		userId,
-		locale: (await getUserLanguage(userId)) as Locale,
+		locale,
 	});
 	if (!result.ok) {
 		return c.json(
@@ -6489,9 +6490,9 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
-	// The gate ran before the body arrived: access revoked meanwhile must not answer.
-	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await answerAsyncQuestion(questionId, {
 		answers: parsed.data.answers,
 		annotations: parsed.data.annotations ?? null,
@@ -6523,8 +6524,9 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
-	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await dismissAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6553,8 +6555,9 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
-	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6642,11 +6645,20 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	// Read the call, then check write access again: the gate ran before the body arrived.
+	const { target } = await prepareDecision(c, requestId);
 	const result = await decideOutlinePlanRequest({
 		requestId,
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		body: parsed.data,
 	});
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: user.sub,
+			decision: parsed.data.action === "return" ? "deny" : "allow",
+		});
 	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
 	return c.json(response);
 });
@@ -6663,7 +6675,16 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 	const requestId = c.req.param("requestId");
 	const userId = c.get("user").sub;
+	const { target } = await prepareDecision(c, requestId);
 	const result = await deferPendingQuestion(requestId, { userId });
+	if (result.ok && target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			kind: "question.deferred",
+		});
 	if (!result.ok) {
 		return c.json(
 			{
