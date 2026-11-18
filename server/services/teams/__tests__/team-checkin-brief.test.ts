@@ -142,6 +142,63 @@ describe("check-in", () => {
 		expect(rearmCheckins()).toBe(0);
 	});
 
+	test("after a restart, events written in the same millisecond still say what is pending", async () => {
+		const schedule = (minutes: number, note: string) =>
+			scheduleCheckin({
+				coordinatorId: LEAD,
+				minutes,
+				note,
+				locale: "en",
+				actor: agent,
+				userId: "p3c-person",
+			});
+		// Same timestamp everywhere; ids ordered so a timestamp-then-id pick lands on the wrong row.
+		const sameInstant = (renameToSmallest: string, name: string) => {
+			sqlite.run("UPDATE team_work_events SET created_at = ? WHERE team_id = ?", [NOW, LEAD]);
+			sqlite.run("UPDATE team_work_events SET id = ? WHERE id = ?", [name, renameToSmallest]);
+		};
+		const ids = () =>
+			sqlite
+				.query<{ id: string }, [string]>(
+					"SELECT id FROM team_work_events WHERE team_id = ? ORDER BY rowid",
+				)
+				.all(LEAD)
+				.map((row) => row.id);
+		now = Date.parse(NOW);
+
+		// A replaced by B: only B is pending.
+		schedule(20, "A");
+		schedule(30, "B");
+		sameInstant(ids()[1] ?? "", "0-b");
+		resetCheckinsForTests();
+		expect(rearmCheckins()).toBe(1);
+		advance(30 * 60_000);
+		await Promise.resolve();
+		expect(wakes.map((wake) => wake.note)).toEqual(["B"]);
+	});
+
+	test("after a restart, a check-in fired in the same millisecond it was scheduled stays fired", async () => {
+		now = Date.parse(NOW);
+		scheduleCheckin({
+			coordinatorId: LEAD,
+			minutes: 5,
+			locale: "en",
+			actor: agent,
+			userId: "p3c-person",
+		});
+		advance(5 * 60_000);
+		await Promise.resolve();
+		expect(wakes).toHaveLength(1);
+		// The firing row sorts first on (created_at, id), as on a fast machine with the wrong ids.
+		sqlite.run("UPDATE team_work_events SET created_at = ? WHERE team_id = ?", [NOW, LEAD]);
+		sqlite.run(
+			`UPDATE team_work_events SET id = '0-fired' WHERE team_id = ? AND json_extract(detail_json, '$.fired') IS NOT NULL`,
+			[LEAD],
+		);
+		resetCheckinsForTests();
+		expect(rearmCheckins()).toBe(0);
+	});
+
 	test("bounded minutes; a restart re-arms the pending one", async () => {
 		for (const minutes of [0, 4, 1441, 7.5])
 			expect(() =>

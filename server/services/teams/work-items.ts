@@ -1336,13 +1336,22 @@ export function scheduleCheckin(input: {
 	const note = input.note?.trim().slice(0, 500) || null;
 	const dueAtMs = checkins.clock.now() + input.minutes * 60_000;
 	const dueAt = new Date(dueAtMs).toISOString();
-	const replaced = checkins.pending.has(team.teamId);
+	const previous = checkins.pending.get(team.teamId);
+	const replaced = Boolean(previous);
 	const eventId = recordWorkEvent(db, {
 		teamId: team.teamId,
 		workItemId: null,
 		kind: "team.checkin",
 		actor: input.actor,
-		detail: { dueAt, minutes: input.minutes, note, locale: input.locale, userId: input.userId },
+		detail: {
+			dueAt,
+			minutes: input.minutes,
+			note,
+			locale: input.locale,
+			userId: input.userId,
+			// The check-in this one replaces: a restart must not take that one up again.
+			...(previous ? { replaces: previous.eventId } : {}),
+		},
 	});
 	arm(eventId, dueAtMs, {
 		teamId: team.teamId,
@@ -1354,12 +1363,22 @@ export function scheduleCheckin(input: {
 	return { dueAt, replaced };
 }
 
-/** Re-arm one team's newest unfired check-in of the last day; true when one was armed. */
+/** Check-in events of one team a restart looks at (newest first, within the last day). */
+const CHECKIN_REARM_SCAN = 200;
+
+/**
+ * Re-arm one team's pending check-in of the last day; true when one was armed.
+ *
+ * Pending is decided by references, never by which row sorts last: events written in the same
+ * millisecond have no order. A scheduling event (`dueAt`) is pending unless a firing names it
+ * (`fired`) or a later scheduling event replaced it (`replaces`). Should more than one remain,
+ * the latest due time wins (then the larger id, only to be deterministic).
+ */
 export function rearmCheckin(teamId: string): boolean {
 	if (activeDatabaseBackend !== "sqlite" || checkins.pending.has(teamId)) return false;
 	if (!teamIsActive(teamId)) return false;
 	const since = new Date(checkins.clock.now() - CHECKIN_LOOKBACK_MS).toISOString();
-	const newest = db
+	const rows = db
 		.select({ id: teamWorkEvents.id, detail: teamWorkEvents.detailJson })
 		.from(teamWorkEvents)
 		.where(
@@ -1370,13 +1389,26 @@ export function rearmCheckin(teamId: string): boolean {
 			),
 		)
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(1)
-		.get();
-	const detail = newest?.detail;
-	if (!newest || !detail || typeof detail.dueAt !== "string" || detail.fired) return false;
-	const dueAt = Date.parse(detail.dueAt);
-	if (Number.isNaN(dueAt)) return false;
-	arm(newest.id, dueAt, {
+		.limit(CHECKIN_REARM_SCAN)
+		.all();
+	const consumed = new Set<string>();
+	for (const row of rows) {
+		for (const key of ["fired", "replaces"] as const) {
+			const ref = row.detail?.[key];
+			if (typeof ref === "string") consumed.add(ref);
+		}
+	}
+	const pending = rows
+		.flatMap((row) => {
+			const detail = row.detail;
+			if (!detail || typeof detail.dueAt !== "string" || consumed.has(row.id)) return [];
+			const dueAt = Date.parse(detail.dueAt);
+			return Number.isNaN(dueAt) ? [] : [{ id: row.id, detail, dueAt }];
+		})
+		.sort((a, b) => b.dueAt - a.dueAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))[0];
+	if (!pending) return false;
+	const { detail } = pending;
+	arm(pending.id, pending.dueAt, {
 		teamId,
 		minutes: typeof detail.minutes === "number" ? detail.minutes : 0,
 		note: typeof detail.note === "string" ? detail.note : null,
