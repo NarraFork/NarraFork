@@ -2068,6 +2068,12 @@ export const handleNarratorWS = {
 							msg.requestId,
 							msg.decision,
 							{
+								// Checked again inside the decision (after any restart-recovery wait):
+								// access revoked since the frame was authorized refuses it.
+								assertStillAllowed: async () => {
+									if (!(await authorizeNarratorFrame(ws, msg)))
+										throw new Error("Permission request not found");
+								},
 								denyMessage: msg.message,
 								answers: msg.answers,
 								feedbackText: msg.feedbackText,

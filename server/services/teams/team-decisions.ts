@@ -73,7 +73,8 @@ export function personDecisionKind(
 
 /**
  * Record a person's decision on a call of a team tree as a team event. A no-op outside a team.
- * Never throws: the decision itself already happened.
+ * Best-effort and outside the decision's own transaction: written after the decision succeeded,
+ * never throws (the decision itself already happened), logged when it cannot be written.
  */
 export function recordTeamPersonDecision(input: {
 	requestId: string;
@@ -84,6 +85,8 @@ export function recordTeamPersonDecision(input: {
 	answered?: boolean;
 	/** An asynchronous question (answered later from the inbox), not a pending call. */
 	questionId?: string;
+	/** The event kind when it is not an approve / deny / answer (async question actions). */
+	kind?: TeamPersonDecisionEventKind;
 }): boolean {
 	if (activeDatabaseBackend !== "sqlite" || !input.userId) return false;
 	try {
@@ -115,7 +118,9 @@ export function recordTeamPersonDecision(input: {
 				id: generateId(),
 				teamId,
 				workItemId: null,
-				kind: personDecisionKind(input.target.toolName, input.decision, input.answered === true),
+				kind:
+					input.kind ??
+					personDecisionKind(input.target.toolName, input.decision, input.answered === true),
 				actorKind: "person",
 				actorId: input.userId,
 				detailJson:

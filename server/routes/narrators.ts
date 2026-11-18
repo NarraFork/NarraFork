@@ -19,6 +19,7 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
 import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
+import type { TeamPersonDecisionEventKind } from "@shared/project-teams";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -6418,6 +6419,23 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 	});
 });
 
+/** A person's action on an asynchronous question of a team tree, recorded with them (M1). */
+function recordAsyncQuestionAction(
+	narratorId: string,
+	questionId: string,
+	userId: string,
+	kind: TeamPersonDecisionEventKind,
+) {
+	recordTeamPersonDecision({
+		requestId: questionId,
+		target: { narratorId, toolName: "AskUserQuestion" },
+		userId,
+		decision: kind === "question.answered" ? "allow" : "deny",
+		kind,
+		questionId,
+	});
+}
+
 narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const narratorId = c.req.param("id");
 	const questionId = c.req.param("questionId");
@@ -6432,6 +6450,8 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 	const userId = c.get("user").sub;
+	// The gate ran before the body arrived: access revoked meanwhile must not act.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
@@ -6444,6 +6464,7 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 			result.reason === "not_found" ? 404 : 409,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.supplemented");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6483,14 +6504,7 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
-	recordTeamPersonDecision({
-		requestId: questionId,
-		target: { narratorId, toolName: "AskUserQuestion" },
-		userId,
-		decision: "allow",
-		answered: true,
-		questionId,
-	});
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.answered");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6509,6 +6523,7 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
+	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const result = await dismissAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
@@ -6517,6 +6532,7 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.dismissed");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6537,6 +6553,7 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 
+	await requireNarratorAccess(c, narratorId, "write");
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
@@ -6545,18 +6562,24 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.ignored");
 	return c.json({ ok: true, question: result.record });
 });
 
 /**
- * Re-check write access on a decision's session right before deciding. The gate above ran
- * before the body arrived; access revoked while the request was in flight (a member removed
- * from a team, say) must not let the decision through. Also reads the call for the team's
- * record of who decided (M1), before deciding takes it out of the live registries.
+ * A person's decision on a pending call: read the call first (the team's record of who decided,
+ * M1, needs it, and deciding takes it out of the live registries), then check write access on
+ * its session again, then decide. The gate above ran before the body arrived; `assertStillAllowed`
+ * runs once more inside the decision, after any wait to resume a paused restart recovery, so
+ * access revoked while the request was in flight (a member removed from a team) never lets it
+ * through.
  */
-async function recheckDecisionAccess(c: Context, requestId: string) {
-	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
-	return await readDecisionTarget(requestId);
+async function prepareDecision(c: Context, requestId: string) {
+	const target = await readDecisionTarget(requestId);
+	const assertStillAllowed = () =>
+		requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	await assertStillAllowed();
+	return { target, assertStillAllowed };
 }
 
 // Approve permission
@@ -6565,8 +6588,9 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "allow", ...body });
-	const target = await recheckDecisionAccess(c, requestId);
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "allow", {
+		assertStillAllowed,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		compactAfter: parsed.success ? parsed.data.compactAfter : undefined,
@@ -6592,8 +6616,9 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
-	const target = await recheckDecisionAccess(c, requestId);
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "deny", {
+		assertStillAllowed,
 		denyMessage: parsed.success ? parsed.data.message : undefined,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,

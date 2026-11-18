@@ -479,6 +479,11 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		en: "⚠️ Permission required\nTool: {toolName}\n{summary}\n\nReply /approve or /deny [reason]",
 		"zh-CN": "⚠️ 需要权限批准\n工具：{toolName}\n{summary}\n\n回复 /approve 或 /deny [理由]",
 	},
+	"gateway.teamApprovalRefused": {
+		en: "This request belongs to a team: only team members can decide it, and this chat is not linked to a NarraFork account that is a member. Approve or deny it in NarraFork.",
+		"zh-CN":
+			"这个请求属于一个团队：只有团队成员可以决定，而这个聊天没有绑定到一个是团队成员的 NarraFork 账号。请在 NarraFork 里批准或拒绝。",
+	},
 	"gateway.permissionApproved": {
 		en: "✅ Permission approved.",
 		"zh-CN": "✅ 权限已批准。",

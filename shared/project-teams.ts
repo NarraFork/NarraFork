@@ -556,13 +556,20 @@ export const TEAM_SPOKE_WINDOW = 500;
 export const TEAM_STATUS_MEMBERS_LIMIT = 12;
 
 /**
- * Team events of a person's decision on a call of the team tree: who approved, denied or
- * answered (plan §二.12 "记下是谁批的"). `actor_id` is the person; the detail names the call.
+ * Team events of a person's decision on a call of the team tree: who approved, denied, answered,
+ * dismissed, ignored or followed up (plan §二.12 "记下是谁批的"). `actor_id` is the person; the
+ * detail names the call. Best-effort: written after the decision, outside its transaction.
  */
 export const TEAM_PERSON_DECISION_EVENT_KINDS = [
 	"approval.allowed",
 	"approval.denied",
 	"question.answered",
+	/** An asynchronous question closed with the agent told it was dismissed. */
+	"question.dismissed",
+	/** An asynchronous question closed without telling the agent. */
+	"question.ignored",
+	/** An answered asynchronous question got a follow-up from a person. */
+	"question.supplemented",
 ] as const;
 export type TeamPersonDecisionEventKind = (typeof TEAM_PERSON_DECISION_EVENT_KINDS)[number];
 
