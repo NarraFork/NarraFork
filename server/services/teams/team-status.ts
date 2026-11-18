@@ -432,7 +432,11 @@ export function renderTeamStatus(
 	const o = getTeamOverlapLabels(locale);
 	const overlap = state.overlap ?? null;
 	const overlapShown =
-		overlap !== null && (overlap.total > 0 || overlap.lock !== null || overlap.unlocked.length > 0);
+		overlap !== null &&
+		(overlap.total > 0 ||
+			overlap.lock !== null ||
+			overlap.unlocked.length > 0 ||
+			overlap.rewound.length > 0);
 	const overlapFixed: string[] = [];
 	if (overlap && overlapShown) {
 		overlapFixed.push(overlap.total > 0 ? o.heading(countText(overlap.total)) : o.none);
@@ -444,6 +448,7 @@ export function renderTeamStatus(
 			);
 		if (overlap.unlocked.length > 0)
 			overlapFixed.push(o.unlocked(overlap.unlocked.join(o.separator)));
+		if (overlap.rewound.length > 0) overlapFixed.push(o.rewound(overlap.rewound.join(o.separator)));
 	}
 
 	const lists = {

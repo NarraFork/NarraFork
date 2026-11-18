@@ -264,6 +264,8 @@ export interface TeamOverlapLabels {
 	lockMine: (title: string) => string;
 	lockOther: (team: string | null, title: string | null) => string;
 	unlocked: (titles: string) => string;
+	/** Ready items whose branch no longer contains the head recorded at ready (reset). */
+	rewound: (titles: string) => string;
 	noticeHeading: string;
 	noticeLine: (mine: string, team: string | null, title: string | null, paths: string) => string;
 	noticeAdvice: string;
@@ -289,6 +291,8 @@ const overlapLabels: LocalizedValue<TeamOverlapLabels> = {
 				: `Exclusive paths lock: held by team "${team}"'s work item "${title ?? ""}"; an item of yours that changes the exclusive paths cannot be marked ready until it is released.`,
 		unlocked: (titles) =>
 			`Your work items changing the project's exclusive paths without the lock: ${titles}. work.ready takes it, or refuses while another item holds it.`,
+		rewound: (titles) =>
+			`Ready work items whose branch no longer contains the commit recorded when they were marked ready (reset or rewritten): ${titles}. They keep that recorded commit and any lock until cancelled or a person releases the lock; have the worker restore the branch, or cancel the item.`,
 		noticeHeading:
 			"[Team overlap] New overlaps with another team's work (written by the system, not by a person):",
 		noticeLine: (mine, team, title, paths) =>
@@ -314,6 +318,8 @@ const overlapLabels: LocalizedValue<TeamOverlapLabels> = {
 				: `独占路径锁：由 team「${team}」的工作项「${title ?? ""}」持有；在它释放前，你改到独占路径的工作项不能标记就绪。`,
 		unlocked: (titles) =>
 			`你的这些工作项改到了项目的独占路径但还没拿锁：${titles}。work.ready 时会拿锁，别人持有时会被拒绝。`,
+		rewound: (titles) =>
+			`这些已就绪的工作项，分支里已经没有标记就绪时记下的提交（被重置或改写过）：${titles}。它们仍按那个提交记账、锁也还在，直到取消或有人放行；请让 worker 把分支恢复，或者取消它。`,
 		noticeHeading: "[团队重叠] 和另一个 team 的工作出现了新的重叠（由系统写入，不是人发的消息）：",
 		noticeLine: (mine, team, title, paths) =>
 			`- 你的工作项「${mine}」和${team === null ? "另一个 team 的工作项" : ` team「${team}」的「${title ?? ""}」`}都改了：${paths}`,

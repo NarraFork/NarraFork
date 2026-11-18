@@ -9,9 +9,11 @@
  * current: every two minutes a sweep of at most {@link TEAM_CHANGED_PATHS_BATCH} items resuming
  * after the last item it looked at, and when a worker's run ends a pass over that worker's items
  * only. An item whose head did not move is not listed again. Each pass stops at
- * {@link PASS_DEADLINE_MS}; the item it timed out on counts as failed, the sweep goes on after
+ * {@link PASS_DEADLINE_MS}. An item whose own attempt had a real share of that time (more than
+ * 10 s of it left when it started) and still timed out counts as failed, the sweep goes on after
  * it, and it is skipped for the next {@link HUNG_BACKOFF_PASSES} passes, so a hung git never
- * stalls the refreshes. Git runs
+ * stalls the refreshes; an item that merely started late ends the pass and is looked at first
+ * by the next one. Git runs
  * only through the hardened, read-only `team-git.ts` (one `teamGit` per item per pass; a diff of
  * two commits reads no working tree, index or filter); never on a request path. The pass writes
  * only the two path columns, never `updated_at`, so it never makes a coordinator's own change
@@ -27,7 +29,9 @@
  * worktree's HEAD points at. LIMITS: a squash or rebase merge (the head itself never reaches the
  * base) and a base that moved only on the remote (the local base branch of this repository is
  * what is read) are not detected; such an item stays open until it is cancelled, and a person can
- * release its lock.
+ * release its lock. A ready item whose branch was reset or rewritten (it no longer contains the
+ * head recorded at ready) keeps that recorded head and any lock it holds until it is cancelled
+ * or a person releases the lock; the team status flags it.
  *
  * OVERLAPS. Per project, the stored paths of at most {@link TEAM_OVERLAP_PROJECT_ITEMS} active
  * items of active teams are compared: an item with at most {@link TEAM_OVERLAP_COMPARE_PATHS}
@@ -118,6 +122,11 @@ const LOCKS_LISTED = 10;
 export const PASS_DEADLINE_MS = 60_000;
 /** Passes an item a pass timed out on is skipped for. */
 export const HUNG_BACKOFF_PASSES = 5;
+/**
+ * An item is treated as hung only when its own attempt started with more than this share of the
+ * pass's time left (10 s of 60 s); one that started late just ends the pass.
+ */
+const HUNG_SHARE_OF_DEADLINE = 1 / 6;
 /** Pair visits between two yields while pairing overlap entries. */
 const PAIR_VISITS_PER_YIELD = 5000;
 
@@ -642,7 +651,18 @@ async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promi
 		.where(eq(teamWorkItems.id, target.id))
 		.limit(1)
 		.get();
-	if (!item || item.state !== "ready" || !item.headSha || !item.branch) return false;
+	if (!item || item.state !== "ready" || !item.headSha || !item.branch) {
+		job.readyRewound.delete(target.id);
+		return false;
+	}
+	const tip = await git.resolve(`refs/heads/${item.branch}`);
+	// The branch no longer holds the head recorded at ready (reset or rewritten): flagged in the
+	// team status; the item keeps that head and its lock until cancelled or force-released.
+	const rewound =
+		tip !== null && tip !== item.headSha && !(await git.isAncestor(item.headSha, tip));
+	if (rewound) job.readyRewound.add(target.id);
+	else job.readyRewound.delete(target.id);
+	if (!tip || rewound) return false;
 	const ready = db
 		.select({ detail: teamWorkEvents.detailJson })
 		.from(teamWorkEvents)
@@ -663,8 +683,6 @@ async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promi
 	}
 	const base = await git.resolve(target.baseRef);
 	if (!base || !(await git.isAncestor(item.headSha, base))) return false;
-	const tip = await git.resolve(`refs/heads/${item.branch}`);
-	if (!tip) return false;
 	if (tip !== item.headSha && !(await git.isAncestor(tip, base))) return false;
 	return markMergedByAncestry({
 		itemId: target.id,
@@ -769,6 +787,8 @@ const job = hotSafe("narrafork.teams.overlap", () => ({
 	/** Passes so far, and item id → the pass number until which a hung item is skipped. */
 	passNumber: 0,
 	backoff: new Map<string, number>(),
+	/** Ready items whose branch no longer contains the head recorded at ready. */
+	readyRewound: new Set<string>(),
 	stop: null as (() => void) | null,
 	indexes: new Map<string, OverlapIndex>(),
 	computing: new Map<string, Promise<OverlapIndex>>(),
@@ -802,6 +822,7 @@ export function resetOverlapStateForTests(): void {
 	job.lastNoticeAt.clear();
 	job.queuedNotices.clear();
 	job.backoff.clear();
+	job.readyRewound.clear();
 	job.sweepAfter = false;
 }
 
@@ -934,11 +955,14 @@ async function passOnce(sweep: boolean): Promise<BatchResult> {
 		}
 		const remaining = deadlineAt - job.clock.now();
 		const outcome = await withinDeadline(refreshTarget(target), remaining);
-		// Out of time on this item: it counts as failed, the sweep resumes after it, and it is
-		// skipped for a few passes. Pending items not looked at are left to the sweep
-		// (re-queueing them would start another pass at once).
+		// Out of time. Pending items not looked at are left to the sweep (re-queueing them would
+		// start another pass at once).
 		if (outcome === "deadline") {
 			result.deadline = true;
+			// Started with little time left: not this item's fault. The next pass starts with it.
+			if (remaining <= job.deadlineMs * HUNG_SHARE_OF_DEADLINE) break;
+			// It had a real share of the time: it counts as failed, the sweep resumes after it,
+			// and it is skipped for a few passes.
 			result.looked++;
 			result.failed++;
 			if (swept) lastSwept = target.id;
@@ -1612,6 +1636,8 @@ export interface TeamOverlapStatus {
 	lock: { mine: boolean; title: string | null; team: string | null } | null;
 	/** This team's items touching exclusive paths without holding the lock (titles). */
 	unlocked: string[];
+	/** This team's ready items whose branch no longer contains the head recorded at ready. */
+	rewound: string[];
 }
 
 /** The status section of one team: its overlaps (at most `limit`), the lock. */
@@ -1668,5 +1694,12 @@ export async function teamOverlapStatus(
 		.map((item) => oneLine(item.title))
 		.sort()
 		.slice(0, limit);
-	return { lines, total: entries.length, lock, unlocked };
+	const rewound = [...live.values()]
+		.filter(
+			(item) => item.teamId === teamId && item.state === "ready" && job.readyRewound.has(item.id),
+		)
+		.map((item) => oneLine(item.title))
+		.sort()
+		.slice(0, limit);
+	return { lines, total: entries.length, lock, unlocked, rewound };
 }

@@ -1151,6 +1151,13 @@ describe("review round 2: merge detection without false positives", () => {
 		expect((await overlap.runChangedPathsPass()).merged).toBe(0);
 		expect(itemRow(reset.id)?.state).toBe("ready");
 		expect(itemRow(detached.id)?.state).toBe("ready");
+		// The reset branch no longer holds the ready head: flagged in the team status (the item
+		// keeps that head until cancelled); a detached worktree leaves the branch as it was.
+		const status = (await readTeamStatus(LEAD_A, "en", { now: clockNow }))?.text ?? "";
+		expect(status).toContain(
+			"Ready work items whose branch no longer contains the commit recorded when they were marked ready (reset or rewritten): Reset after ready.",
+		);
+		expect(itemRow(reset.id)?.headSha).not.toBe(await git(["rev-parse", "main"]));
 	});
 
 	test("a ready item with no changes at ready is never auto-merged", async () => {
@@ -1366,5 +1373,70 @@ describe("review round 2: merge detection without false positives", () => {
 		expect(overlap.exclusivePathsOf({ teams: { exclusivePaths: ["*", "**/*", "a/**"] } })).toEqual([
 			"a/**",
 		]);
+	});
+
+	test("an item that merely started late ends the pass; the next pass starts with it", async () => {
+		const ids: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const resource = generateId();
+			db.insert(narratorWorktreeResources)
+				.values({
+					id: resource,
+					ownerNarratorId: LEAD_A,
+					deviceId: "local",
+					repositoryKey: "repository",
+					worktreePath: join(temporary, `wt-l-${i}`),
+					state: "ready",
+					createRequestId: `req-l-${i}`,
+				})
+				.run();
+			ids.push(insertItem(LEAD_A, `Item ${i}`, null, { worktreeResourceId: resource }));
+		}
+		ids.sort();
+		const pathOf = (id: string) =>
+			items.worktreePathOf({ worktreeResourceId: itemRow(id)?.worktreeResourceId ?? null });
+		const slow = pathOf(ids[0] ?? "");
+		const hung = pathOf(ids[1] ?? "");
+		let slowCalls = 0;
+		const hungCalls: number[] = [];
+		overlap.setChangedPathsSourceForTests((worktree) => ({
+			head: () => {
+				if (worktree === slow && slowCalls++ === 0) clockNow += 900;
+				if (worktree === hung) {
+					hungCalls.push(clockNow);
+					return new Promise<string | null>(() => {});
+				}
+				return Promise.resolve("b".repeat(40));
+			},
+			resolve: async () => "f".repeat(40),
+			isAncestor: async () => false,
+			changed: async () => ({
+				head: "b".repeat(40),
+				mergeBase: "0".repeat(40),
+				paths: ["x.ts"],
+				collapsed: false,
+			}),
+		}));
+		overlap.setOverlapSeamsForTests({ deadlineMs: 1000 });
+		try {
+			// The first item used 900 of 1,000 ms; the second starts with 100 ms left and times
+			// out: not counted, not backed off, and the cursor stays before it.
+			const first = await overlap.runChangedPathsPass();
+			expect(first).toMatchObject({ looked: 1, failed: 0, deadline: true });
+			expect(overlap.overlapCursor()).toBe(ids[0] ?? null);
+			// The next pass starts with it and gives it the whole budget: now it is hung.
+			const second = await overlap.runChangedPathsPass();
+			expect(second).toMatchObject({ looked: 1, failed: 1, deadline: true });
+			expect(overlap.overlapCursor()).toBe(ids[1] ?? null);
+			expect(hungCalls).toHaveLength(2);
+			// Backed off: the sweep goes on without it.
+			const third = await overlap.runChangedPathsPass();
+			expect(third).toMatchObject({ looked: 1, failed: 0, deadline: false, wrapped: true });
+			const fourth = await overlap.runChangedPathsPass();
+			expect(fourth).toMatchObject({ deadline: false });
+			expect(hungCalls).toHaveLength(2);
+		} finally {
+			overlap.setOverlapSeamsForTests({ deadlineMs: null });
+		}
 	});
 });
