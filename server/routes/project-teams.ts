@@ -3,7 +3,9 @@
  *
  * Access: listing and creating need the project (read / write); everything about one team
  * follows its coordinator narrator's ACL — readers see it, writers (members) change it, others
- * get 404. The whole surface is refused on PostgreSQL with 503 before any access check, like the
+ * get 404. The team page's reads (P4: summary, board, activity) follow the same ACL; pending
+ * approvals and the running list for "pause all" are for members only (403 for an onlooker).
+ * The whole surface is refused on PostgreSQL with 503 before any access check, like the
  * narrator surface the team rides on and the project mutations.
  */
 
@@ -16,9 +18,18 @@ import {
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
 	releaseTeamLockSchema,
+	teamActivityQuerySchema,
+	teamBoardQuerySchema,
 	updateProjectTeamSchema,
 } from "../lib/validators";
 import { hasProjectAccess } from "../services/project-acl";
+import {
+	readTeamActivity,
+	readTeamApprovals,
+	readTeamBoardColumn,
+	readTeamPageSummary,
+	readTeamRunning,
+} from "../services/teams/team-board";
 import { forceReleaseExclusiveLock, readProjectOverlaps } from "../services/teams/team-overlap";
 import {
 	archiveTeam,
@@ -120,6 +131,73 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/unarchive", async (c) => {
 		c.req.param("projectId"),
 	);
 	return c.json(team);
+});
+
+// ── P4: the team page (read-only, bounded, cursor-paged) ─────────────────────
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/summary", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamPageSummary(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/board", async (c) => {
+	const parsed = teamBoardQuerySchema.safeParse({
+		column: c.req.query("column") ?? undefined,
+		limit: c.req.query("limit") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamBoardColumn(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+			parsed.data,
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/events", async (c) => {
+	const parsed = teamActivityQuerySchema.safeParse({
+		limit: c.req.query("limit") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamActivity(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+			parsed.data,
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/approvals", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamApprovals(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+		),
+	);
+});
+
+/** The tree's running sessions for "pause all" (members only; at most 500, with `more`). */
+projectTeamRoutes.get("/:projectId/teams/:teamId/running", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamRunning(c.req.param("teamId"), narratorPrincipalOf(c), c.req.param("projectId")),
+	);
 });
 
 /**

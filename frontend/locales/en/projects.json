@@ -140,5 +140,154 @@
 		"noUsersFound": "No matching users",
 		"readOnlyNotice": "Only the owner, a manager or an admin can change project access.",
 		"unavailable": "Access information is unavailable."
+	},
+	"teams": {
+		"title": "Teams",
+		"newTeam": "New team",
+		"noTeams": "No teams yet.",
+		"loadFailed": "Could not load the teams.",
+		"loadMore": "Load more",
+		"open": "Open",
+		"onlooker": "Read only",
+		"archived": "Archived",
+		"pageTitle": "Team",
+		"notFound": "This team does not exist or you cannot see it.",
+		"create": {
+			"title": "New team",
+			"name": "Team name",
+			"namePlaceholder": "e.g. Release crew",
+			"nameDescription": "The name of the coordinator's session; renaming the session renames the team.",
+			"nameRequired": "A team needs a name",
+			"baseBranch": "Base branch",
+			"baseBranchDescription": "Where work merges back. Empty uses the project's default branch.",
+			"brief": "Brief",
+			"briefDescription": "Shared rules for the coordinator and every agent it sends (up to 4 KB).",
+			"submit": "Create team",
+			"cancel": "Cancel",
+			"failed": "Could not create the team"
+		},
+		"tabs": {
+			"conversation": "Conversation",
+			"board": "Board",
+			"activity": "Activity"
+		},
+		"columns": {
+			"queued": "Queued",
+			"in_progress": "In progress",
+			"review": "In review",
+			"done": "Done",
+			"cancelled": "Cancelled"
+		},
+		"states": {
+			"queued": "Queued",
+			"in_progress": "In progress",
+			"in_review": "In review",
+			"ready": "Ready to merge",
+			"merged": "Merged",
+			"cancelled": "Cancelled"
+		},
+		"board": {
+			"empty": "Nothing here",
+			"loadFailed": "Could not load this column.",
+			"noWorker": "No worker yet",
+			"noBranch": "No branch yet",
+			"worker": "Worker",
+			"reviewRounds_one": "{{count}} review round",
+			"reviewRounds_other": "{{count}} review rounds",
+			"verdict": {
+				"clear": "Last review: clear",
+				"blocker": "Last review: blocker"
+			},
+			"marks": {
+				"exclusive": "Exclusive: {{key}}",
+				"cleanable": "Worktree can be cleaned up"
+			},
+			"expand": "Show {{column}}",
+			"collapse": "Hide {{column}}"
+		},
+		"activity": {
+			"empty": "No activity yet.",
+			"loadFailed": "Could not load the activity.",
+			"system": "System",
+			"unknownPerson": "Someone",
+			"unknownAgent": "An agent",
+			"detailOmitted": "Details too long to list"
+		},
+		"event": {
+			"team_created": "Team created",
+			"team_brief": "Brief updated",
+			"team_settings": "Settings changed",
+			"team_archived": "Team archived",
+			"team_unarchived": "Team restored",
+			"team_decision": "Decided on people's behalf",
+			"team_checkin": "Check-in",
+			"work_created": "Work item created",
+			"work_started": "Work started",
+			"work_start_failed": "Work could not start",
+			"work_review": "Review recorded",
+			"work_ready": "Marked ready to merge",
+			"work_sync": "Base sync",
+			"work_cancelled": "Work cancelled",
+			"work_cleanup": "Worktree cleanup",
+			"overrun": "Coordinator went over a suggested limit",
+			"other": "{{kind}}"
+		},
+		"eventNote": {
+			"text": "{{text}}",
+			"reviewClear": "Round {{round}}: clear, {{findings}} findings",
+			"reviewBlocker": "Round {{round}}: blocker, {{findings}} findings",
+			"cancelledNoChanges": "No changes were made",
+			"syncUpToDate": "Already up to date",
+			"syncHandedOff": "Handed to the worker",
+			"syncNotDelivered": "The worker did not get the instruction",
+			"checkin": "In {{minutes}} min",
+			"branch": "Branch {{branch}}",
+			"overrun": "{{tool}}: {{size}} over {{limit}}"
+		},
+		"top": {
+			"approvals_one": "{{shown}} approval",
+			"approvals_other": "{{shown}} approvals",
+			"running_one": "{{shown}} running",
+			"running_other": "{{shown}} running",
+			"noneRunning": "Nothing running",
+			"pauseAll": "Pause all",
+			"pauseConfirmTitle": "Pause the whole team?",
+			"pauseConfirm": "This stops the current turn of every running session in this team: the coordinator and its agents. They keep their history and can be resumed by sending a message.",
+			"pauseConfirmButton": "Pause all",
+			"membersOnly": "Only team members can approve",
+			"paused_one": "Stopped {{count}} session",
+			"paused_other": "Stopped {{count}} sessions",
+			"pausePartial": "Stopped {{stopped}}; {{failed}} could not be stopped",
+			"pauseNothing": "Nothing was running; nothing was stopped",
+			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
+			"pauseError": "Could not read the running sessions; nothing was stopped",
+			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped"
+		},
+		"approvals": {
+			"title": "Pending approvals",
+			"empty": "Nothing is waiting for approval.",
+			"loadFailed": "Could not load the approvals.",
+			"more": "More are waiting; the oldest {{count}} are shown.",
+			"approve": "Approve",
+			"deny": "Deny",
+			"coordinator": "Coordinator",
+			"worker": "Worker",
+			"helper": "Helper",
+			"decided": "Decision sent",
+			"failed": "Could not send the decision",
+			"openSession": "Open session",
+			"answerInSession": "Answered in the session",
+			"kinds": {
+				"question": "Question",
+				"plan": "Plan to approve",
+				"rule": "Permission rule request"
+			},
+			"unscanned": "Many calls are waiting on a check of their own; some sessions may have more waiting. Open them to see."
+		},
+		"agents": {
+			"title": "Running sessions"
+		},
+		"back": "Back to project",
+		"unavailable": "Teams are not available on this deployment."
 	}
 }

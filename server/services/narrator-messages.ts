@@ -139,6 +139,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
@@ -1375,29 +1376,6 @@ export interface ContextAskHistorySnapshot {
 
 function contextAskUtf8Length(value: unknown): number {
 	return contextAskTextEncoder.encode(JSON.stringify(value)).byteLength;
-}
-
-function getReflectionStatus(suggestions: unknown): string | null {
-	if (!Array.isArray(suggestions)) return null;
-	for (const suggestion of suggestions) {
-		if (!suggestion || typeof suggestion !== "object") continue;
-		const record = suggestion as { type?: unknown; status?: unknown };
-		const type = String(record.type ?? "");
-		if (
-			type === "danger_reflection" ||
-			type === "plan_reflection" ||
-			type === "task_reflection" ||
-			type === "question_reflection"
-		) {
-			return typeof record.status === "string" ? record.status : "running";
-		}
-	}
-	return null;
-}
-
-function shouldHidePendingPermission(suggestions: unknown): boolean {
-	const status = getReflectionStatus(suggestions);
-	return status !== null && status !== "awaiting_user";
 }
 
 /**

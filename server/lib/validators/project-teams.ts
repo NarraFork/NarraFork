@@ -1,6 +1,9 @@
 import {
+	TEAM_BOARD_COLUMNS,
+	TEAM_BOARD_PAGE_LIMIT,
 	TEAM_BRANCH_MAX_LENGTH,
 	TEAM_BRIEF_MAX_BYTES,
+	TEAM_EVENTS_PAGE_LIMIT,
 	TEAM_NAME_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
 } from "@shared/project-teams";
@@ -86,6 +89,21 @@ export const listProjectTeamsQuerySchema = z.object({
 	status: z.enum(["active", "archived", "all"]).default("active"),
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 	cursor: z.string().max(200).optional(),
+});
+
+// ── P4: the team page ────────────────────────────────────────────────────────
+
+const pageCursor = z.string().min(1).max(600).optional();
+
+export const teamBoardQuerySchema = z.object({
+	column: z.enum(TEAM_BOARD_COLUMNS),
+	limit: z.coerce.number().int().min(1).max(TEAM_BOARD_PAGE_LIMIT).default(TEAM_BOARD_PAGE_LIMIT),
+	cursor: pageCursor,
+});
+
+export const teamActivityQuerySchema = z.object({
+	limit: z.coerce.number().int().min(1).max(TEAM_EVENTS_PAGE_LIMIT).default(TEAM_EVENTS_PAGE_LIMIT),
+	cursor: pageCursor,
 });
 
 /** `POST /api/projects/:projectId/team-locks/release`: a person releases the exclusive lock. */
