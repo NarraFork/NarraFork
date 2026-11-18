@@ -13,7 +13,9 @@ import i18next from "i18next";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import narratorEn from "../../locales/en/narrator.json";
 import projectsEn from "../../locales/en/projects.json";
+import narratorZh from "../../locales/zh-CN/narrator.json";
 import projectsZh from "../../locales/zh-CN/projects.json";
 import { ProjectTeamsList } from "./ProjectTeamsList";
 import { TeamPageView } from "./TeamPageView";
@@ -21,7 +23,11 @@ import { TeamPageView } from "./TeamPageView";
 const instance = i18next.createInstance();
 await instance.use(initReactI18next).init({
 	lng: "en",
-	resources: { en: { projects: projectsEn }, "zh-CN": { projects: projectsZh } },
+	// `narrator`: the coordinator's sharing panel in the members drawer (M1).
+	resources: {
+		en: { projects: projectsEn, narrator: narratorEn },
+		"zh-CN": { projects: projectsZh, narrator: narratorZh },
+	},
 	interpolation: { escapeValue: false },
 	react: { useSuspense: false },
 });

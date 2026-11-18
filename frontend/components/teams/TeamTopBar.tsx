@@ -335,7 +335,7 @@ export function TeamTopBar({
 					{title}
 				</Text>
 			</Group>
-			<Group gap={6} wrap="nowrap">
+			<Group gap={6} wrap="wrap" justify="flex-end" style={{ rowGap: 6 }}>
 				{member && (
 					<Button
 						size="xs"

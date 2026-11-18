@@ -698,6 +698,11 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 		await until(page, "title", (f) => f.text("[data-testid=team-title]") === "Release crew");
 		for (const selector of [
 			"[data-testid=team-top-bar]",
+			// Every control of the bar stays on screen (it wraps rather than running off).
+			"[data-testid=team-approvals-button]",
+			"[data-testid=team-members-button]",
+			"[data-testid=team-running-button]",
+			"[data-testid=team-pause-all]",
 			"[data-testid=team-tab-board]",
 			"[data-testid=conversation-stand-in]",
 		]) {
@@ -734,6 +739,31 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 		await shot(page, "phone-dark-approvals");
 		await page.keyboard.press("Escape");
 		await until(page, "drawer closed", (f) => f.gone(".mantine-Drawer-content"));
+
+		// M1: the people drawer (members, onlookers; the owner's sharing panel) fits too.
+		await call(page, (f) => f.click("[data-testid=team-members-button]"));
+		await until(page, "members drawer", (f) => f.count("[data-testid=team-member]") >= 2);
+		await until(page, "members in place", (f) => {
+			const fit = f.fitsWidth("[data-testid=team-members]");
+			return fit.found && fit.inside && !fit.scrolls;
+		});
+		// The owner gets the coordinator's ordinary sharing panel below the list.
+		await until(
+			page,
+			"sharing panel",
+			(f) => f.count("[data-testid=team-members-manage] [role=region]") === 1,
+		);
+		for (const selector of [
+			"[data-testid=team-member]",
+			"[data-testid=team-members-manage]",
+			"[data-testid=team-members-manage] .mantine-SegmentedControl-root",
+		]) {
+			const fit = await call(page, (f, s: string) => f.fitsWidth(s), selector);
+			expect({ selector, ...fit }).toEqual({ selector, found: true, inside: true, scrolls: false });
+		}
+		await shot(page, "phone-dark-members");
+		await page.keyboard.press("Escape");
+		await until(page, "members closed", (f) => f.gone(".mantine-Drawer-content"));
 
 		// Chinese wording (no width checks: CI has no CJK fonts).
 		await call(page, (f) => f.setLanguage("zh-CN"));
