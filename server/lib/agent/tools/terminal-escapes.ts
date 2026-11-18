@@ -1,7 +1,6 @@
 /**
  * The Terminal tool's input escapes. The model writes Enter as a literal `\n` and control
- * keys as `\x03`; this turns them into the bytes sent to the PTY. A leaf module, so the
- * permission layer judges exactly the bytes the tool will write without importing the tool.
+ * keys as `\x03`; this turns them into the bytes sent to the PTY.
  */
 export function processTerminalEscapes(input: string): string {
 	return input

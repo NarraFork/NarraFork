@@ -282,9 +282,10 @@ function NarratorDetailPage() {
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
 	const { mutate: createTerminal } = useCreateNarratorTerminal(narratorId);
 	const terminalCapability = useTerminalCapability();
-	// A read-only viewer gets no auto-created terminal (the server would refuse it).
+	// Only a viewer known to have write access gets an auto-created terminal: not a read-only
+	// one (the server would refuse it), and not before the answer has arrived.
 	const canOpenTerminals = useCanOpenTerminals(narratorId);
-	const terminalSupported = terminalCapability.supported && canOpenTerminals !== false;
+	const terminalSupported = terminalCapability.supported && canOpenTerminals === true;
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);

@@ -9,7 +9,6 @@ import {
 	rememberStandaloneTerminalCreator,
 	terminalAccessAllowed,
 } from "../services/terminal-access";
-import { commitPersonTerminalInput } from "../services/terminal-input-judge";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -100,6 +99,8 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 			return terminalService.getScrollback(terminalId);
 		})
 		.then((scrollback) => {
+			// Dropped meanwhile (access re-check): no scrollback for it.
+			if (!ws.data.subscribedTerminals.has(terminalId)) return;
 			if (scrollback) {
 				try {
 					ws.send(
@@ -296,6 +297,9 @@ export const handleTerminalWS = {
 				for (const id of msg.terminalIds) {
 					if (!(await mayOpenTerminal(ws, id))) continue;
 					subscribeToTerminal(ws, id);
+					// An access sweep that ran between the check and the subscription missed it:
+					// check once more now that it is in place.
+					await mayOpenTerminal(ws, id);
 				}
 				logger.debug("Terminal WS subscribed", { count: msg.terminalIds.length });
 				break;
@@ -326,7 +330,6 @@ export const handleTerminalWS = {
 						}
 					}
 					terminalService.write(terminalId, data);
-					commitPersonTerminalInput(terminalId, data);
 				});
 				break;
 			}

@@ -1,5 +1,5 @@
 import type { IMarker } from "@xterm/headless";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
 import { terminals } from "../../../db/schema";
@@ -158,6 +158,9 @@ async function assertTerminalAccess(
 	};
 }
 
+/** Terminals of each status a name lookup looks through. */
+const TERMINAL_NAME_LOOKUP_LIMIT = 200;
+
 /**
  * Resolve a terminal identifier (ID or name) to a real terminal ID.
  * First tries an exact ID lookup, then falls back to matching by name
@@ -174,18 +177,19 @@ async function resolveTerminalId(
 	});
 	if (byId) return { id: byId.id };
 
-	// 2. Fallback: search by name among accessible terminals
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true },
-	});
-
-	const all = narratorTerminals;
-
-	// Exact name match (case-insensitive)
+	// 2. Fallback: by name (case-insensitive) among this narrator's terminals, running ones
+	// first (only they take input; an exited one may share the name), then the newest exited.
 	const nameLower = idOrName.toLowerCase();
-	const match = all.find((t) => t.name.toLowerCase() === nameLower);
-	if (match) return { id: match.id };
+	for (const status of ["running", "exited"] as const) {
+		const candidates = await db.query.terminals.findMany({
+			where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
+			columns: { id: true, name: true },
+			orderBy: (t, { desc }) => [desc(t.createdAt)],
+			limit: TERMINAL_NAME_LOOKUP_LIMIT,
+		});
+		const match = candidates.find((t) => t.name.toLowerCase() === nameLower);
+		if (match) return { id: match.id };
+	}
 
 	return {
 		error: `Terminal not found: "${idOrName}". Use action 'list' to see available terminals.`,
@@ -212,12 +216,9 @@ export const terminalTool: ToolDefinition = {
 		"terminal exits. Stop({ type: 'bash', id }) cancels a watch. " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"The 'terminal_id' parameter accepts either a terminal ID or a terminal name. " +
-		"Each line you send with Enter is checked like the same Bash command, from the shell's " +
-		"current directory as tracked by NarraFork. Input it cannot judge asks a person, in every " +
-		"permission mode: lines edited with history, completion or cursor keys, input to a running " +
-		"program, here-documents or scripts piped into an interpreter, and any line after the " +
-		"directory became unknown. Send Ctrl-C ('\\x03') to start a clean line and " +
-		"`cd /absolute/path` to set the directory again. " +
+		"A terminal is an unfenced shell: what you type is not checked line by line. Using the " +
+		"tool is permitted as a whole by the session's permission mode, so never type into a " +
+		"terminal what you would not be allowed to run with Bash. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
 		"NOT for running one-off commands — use Bash for that: it returns when the command exits, " +
 		"with its exit code, and needs no completion marker.",
@@ -734,21 +735,7 @@ async function writeInput(
 			};
 		}
 		const processed = processTerminalEscapes(input);
-		// Who receives it, read before sending, so the permission layer's line tracking
-		// (`terminal-input-judge.ts`) follows what the shell actually got.
-		const judge = await import("../../../services/terminal-input-judge");
-		const foreground = await judge.probeTerminalForeground(terminalId);
-		if (signal.aborted) return makeAbortedResult(terminal.name ?? terminalId);
 		terminalService.write(terminalId, processed);
-		const row = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-			columns: { cwd: true, deviceId: true },
-		});
-		judge.commitTerminalInput(terminalId, processed, {
-			initialCwd: row?.cwd ?? null,
-			foreground,
-			home: judge.terminalHome(row?.deviceId ?? null),
-		});
 		const deadline = Date.now() + WRITE_SETTLE_TIMEOUT_MS;
 		let lastChangeTime = Date.now();
 		let lastLen = beforeLen;

@@ -49,10 +49,12 @@ import {
 	resolveRuntimePolicy,
 	withDelegationDepth,
 } from "../agent-runtime/policy";
+import { resolvePermissionDecision } from "../narrator-permission";
 import { narratorService } from "../narrator-service";
 import { interruptAndArchiveSubagent } from "../subagent-lifecycle";
 import { closeSubagentResources, releaseSubagentBrowsersAtRunEnd } from "../subagent-resources";
 import { listTreeTerminals } from "../subagent-terminals";
+import * as terminalAccessModule from "../terminal-access";
 import { resetTerminalAccessForTest } from "../terminal-access";
 import { terminalService } from "../terminal-service";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
@@ -370,6 +372,45 @@ describe("terminals", () => {
 		}
 		const parentRead = await terminalTool.execute({ action: "read", terminal_id: id }, ctx(root));
 		expect(parentRead.isError).toBe(true);
+	});
+
+	test("a terminal named like an exited one resolves to the running one", async () => {
+		const root = await primary();
+		const worker = await subagent(root, "worker");
+		const running = await terminalRow(worker.id);
+		await db.update(terminals).set({ name: "dev" }).where(eq(terminals.id, running));
+		const exited = await terminalRow(worker.id, "exited");
+		await db
+			.update(terminals)
+			.set({ name: "dev", createdAt: new Date(Date.now() + 60_000).toISOString() })
+			.where(eq(terminals.id, exited));
+		const renamed = await terminalTool.execute(
+			{ action: "rename", terminal_id: "DEV", name: "dev-server" },
+			ctx(worker.id),
+		);
+		expect(renamed.isError).not.toBe(true);
+		const name = async (id: string) =>
+			(await db.query.terminals.findFirst({ where: eq(terminals.id, id) }))?.name;
+		expect(await name(running)).toBe("dev-server");
+		expect(await name(exited)).toBe("dev");
+	});
+
+	test("a terminal is an unfenced shell: its input is not judged line by line", () => {
+		// Owner decision (2026-11-18): the Terminal tool is permitted as a whole by mode.
+		expect(terminalTool.description).toContain("unfenced shell");
+		const write = { action: "write", terminal_id: "t", input: "cat ~/.narrafork/settings.json\n" };
+		const decide = (permMode: string) =>
+			resolvePermissionDecision({
+				toolName: "Terminal",
+				input: write,
+				permMode,
+				cwd: process.cwd(),
+			});
+		expect(decide("bypassPermissions")).toBe("allow");
+		expect(decide("default")).toBe("ask");
+		expect(decide("acceptEdits")).toBe("ask");
+		expect(decide("dontAsk")).toBe("deny");
+		expect(decide("readOnly")).toBe("deny");
 	});
 
 	test("a subagent's fourth running terminal is refused; exited ones do not count", async () => {
@@ -859,6 +900,26 @@ describe("terminal access for every narrator", () => {
 			(await app("someone", "admin").request(`/api/terminals/${t.shell}`, { method: "DELETE" }))
 				.status,
 		).toBe(200);
+	});
+
+	test("a subscription whose access is revoked while it is being added is dropped", async () => {
+		const t = await ownedShell();
+		const owner = socket(t.owner);
+		let calls = 0;
+		// Allowed at the first check, revoked before the check after the subscription.
+		const spy = spyOn(terminalAccessModule, "terminalAccessAllowed").mockImplementation(
+			async () => ++calls === 1,
+		);
+		try {
+			await owner.send({ type: "subscribe", terminalIds: [t.shell] });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(calls).toBe(2);
+		expect(owner.ws.data.subscribedTerminals.has(t.shell)).toBe(false);
+		expect(owner.sent).toContainEqual(
+			expect.objectContaining({ type: "error", code: "TERMINAL_NOT_FOUND" }),
+		);
 	});
 
 	test("a standalone terminal is its creator's and admins'", async () => {

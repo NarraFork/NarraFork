@@ -30,7 +30,6 @@ import {
 	deviceHasFeature,
 	requireAuthorizedDeviceForProject,
 } from "./device-service";
-import { forgetTerminalLineState } from "./terminal-input-judge";
 import {
 	endWatchesForBuffer,
 	notifyTerminalOutput,
@@ -169,7 +168,6 @@ async function markTerminalExited(
 	exitCode: number | null,
 	narratorId?: string | null,
 ) {
-	forgetTerminalLineState(terminalId);
 	await db
 		.update(terminals)
 		.set({ status: "exited", exitCode: exitCode ?? 0 })

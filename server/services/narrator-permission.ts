@@ -17,7 +17,6 @@ import {
 	narratorToolCalls,
 	oauthClients,
 	remoteDevices,
-	terminals,
 } from "../db/schema";
 import type {
 	DangerInfo,
@@ -71,7 +70,6 @@ import {
 	readDeclaredExitPlanMode,
 } from "../lib/agent/tools/plan-mode";
 import { isScheduledTaskReadAction } from "../lib/agent/tools/scheduled-task-actions";
-import { processTerminalEscapes } from "../lib/agent/tools/terminal-escapes";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import type {
 	ToolCallBinding,
@@ -787,15 +785,6 @@ function resolveReviewBoundaryDeny(
 	}
 }
 
-/** Terminal's own decision for a write, as before any line was judged. */
-function terminalOwnDecision(opts: PermissionDecisionOpts): "allow" | "deny" | "ask" | "fatal" {
-	return resolvePermissionDecision({
-		...opts,
-		terminalJudgement: undefined,
-		terminalLinesJudged: true,
-	});
-}
-
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -846,35 +835,6 @@ export function resolvePermissionDecision(
 	if (reviewReadOnlyBash && toolName === "Browser" && !isBrowserReadAction(input)) {
 		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
 		return "deny";
-	}
-	// Typing into a terminal (`terminal-input-judge.ts`): every line it runs meets the fences
-	// the same command meets in Bash, and a Bash deny denies the write. Input that cannot be
-	// judged asks a person in every mode (bypassPermissions included); anything else keeps
-	// Terminal's own decision, so a terminal never becomes easier to drive than before.
-	if (isTerminalWrite(toolName, input) && !opts.terminalLinesJudged) {
-		const judged = opts.terminalJudgement;
-		if (!judged) {
-			if (meta) meta.terminalAskReason = "The terminal input could not be judged.";
-			return terminalOwnDecision(opts) === "deny" ? "deny" : "ask";
-		}
-		for (const line of judged.lines) {
-			const shell = resolvePermissionDecision({
-				...opts,
-				toolName: SHELL_TOOL_NAME,
-				input: { command: line.command },
-				cwd: line.cwd,
-				bashAnalysis: line.analysis,
-				executionContext: line.context,
-				terminalJudgement: undefined,
-			});
-			if (shell === "deny" || shell === "fatal") return shell;
-		}
-		const own = terminalOwnDecision(opts);
-		if (judged.askReason && own !== "deny" && own !== "fatal") {
-			if (meta) meta.terminalAskReason = judged.askReason;
-			return "ask";
-		}
-		return own;
 	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
@@ -1418,152 +1378,6 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	return toolName === "StructSed" && input.dry_run !== false;
 }
 
-/** A Terminal `write` call: typing into a terminal, judged as the lines it runs. */
-export function isTerminalWrite(toolName: string, input: Record<string, unknown>): boolean {
-	return toolName === "Terminal" && input.action === "write" && typeof input.input === "string";
-}
-
-/** One line a Terminal write runs, judged like the same command in Bash. */
-interface TerminalJudgedLine {
-	command: string;
-	cwd: string;
-	analysis: BashAnalysis;
-	context: ExecutionTargetContext | null;
-}
-
-/**
- * What a Terminal write will run (`terminal-input-judge.ts`): the complete lines it sends
- * with Enter, each with the directory it runs in, and why a person must be asked when any
- * part cannot be judged. `context` is the terminal's own execution target (device and
- * starting directory), the one its policy is compiled for.
- */
-export interface TerminalJudgement {
-	lines: TerminalJudgedLine[];
-	askReason?: string;
-	context: ExecutionTargetContext | null;
-}
-
-/**
- * Judge a Terminal write against the terminal's tracked line, directory and foreground
- * program. Null for any other call. Never throws for unjudgeable input: it reports why a
- * person must be asked.
- */
-export async function judgeTerminalWrite(
-	narratorId: string,
-	toolName: string,
-	input: Record<string, unknown>,
-	fallbackCwd: string,
-	signal?: AbortSignal,
-): Promise<TerminalJudgement | null> {
-	if (!isTerminalWrite(toolName, input) || typeof input.input !== "string") return null;
-	const judge = await import("./terminal-input-judge");
-	const data = processTerminalEscapes(input.input);
-	const terminalId = typeof input.terminal_id === "string" ? input.terminal_id : "";
-	const columns = { id: true, name: true, narratorId: true, cwd: true, deviceId: true } as const;
-	const terminal =
-		(await db.query.terminals.findFirst({
-			where: and(eq(terminals.id, terminalId), eq(terminals.narratorId, narratorId)),
-			columns,
-		})) ??
-		(
-			await db.query.terminals.findMany({
-				where: eq(terminals.narratorId, narratorId),
-				columns,
-				limit: 50,
-			})
-		).find((row) => row.name.toLowerCase() === terminalId.toLowerCase());
-	if (!terminal)
-		return { lines: [], context: null, askReason: "The terminal could not be found to judge." };
-	const deviceId = terminal.deviceId ?? LOCAL_DEVICE_ID;
-	const backend = resolveBackend({ requested: deviceId });
-	const startCwd = terminal.cwd ?? fallbackCwd;
-	const contextFor = (cwd: string) =>
-		freezePermissionExecutionContext({
-			toolName: SHELL_TOOL_NAME,
-			toolInput: { command: "true" },
-			backend,
-			target: {
-				deviceId,
-				backendKind: backend.kind,
-				cwd,
-				runtimeGeneration: backend.runtimeGeneration ?? 0,
-				selectionSource: "session_default",
-			},
-		});
-	const context = await contextFor(startCwd);
-	if (judge.isInterruptOnly(data)) return { lines: [], context };
-	const foreground = await judge.probeTerminalForeground(terminal.id);
-	if (foreground !== "shell") {
-		if (judge.isPlainTypedText(data)) return { lines: [], context };
-		return {
-			lines: [],
-			context,
-			askReason:
-				foreground === "program"
-					? "A program is running in this terminal; NarraFork cannot judge what this input does in it."
-					: "NarraFork cannot tell which program receives input in this terminal.",
-		};
-	}
-	const state = judge.readTerminalLineState(terminal.id, startCwd);
-	const { executed } = judge.simulateTerminalInput(state, data);
-	const home = judge.terminalHome(terminal.deviceId);
-	const lines: TerminalJudgedLine[] = [];
-	const reasons: string[] = [];
-	let cwd = state.cwd;
-	for (const line of executed) {
-		const runIn = cwd;
-		cwd = judge.directoryAfter(cwd, line, home);
-		// Unknown first: an empty-looking line edited with history keys may run anything.
-		if (line.unknown) {
-			reasons.push(
-				"A line was edited with history, completion, cursor or other control keys, so the command it runs is not known.",
-			);
-			continue;
-		}
-		if (!line.text.trim()) continue;
-		if (!runIn) {
-			reasons.push(
-				"The terminal's working directory is not known (type `cd /absolute/path` to set it), so relative paths cannot be judged.",
-			);
-			continue;
-		}
-		let analysis: BashAnalysis;
-		let lineContext: ExecutionTargetContext;
-		try {
-			lineContext = runIn === startCwd ? context : await contextFor(runIn);
-			analysis = await analyzeShellCommand(
-				line.text,
-				runIn,
-				resolvePermissionShellType(backend),
-				lineContext.paths,
-			);
-			analysis = await canonicalizeShellAnalysisPaths(analysis, lineContext, signal);
-			if (analysis.commands.length === 0) throw new Error("no executable command");
-			if (analysis.hasSyntaxError) throw new Error("the shell parser could not read all of it");
-		} catch (error) {
-			signal?.throwIfAborted();
-			const failure = buildShellAnalysisFailureDanger(
-				SHELL_TOOL_NAME,
-				{ command: line.text },
-				error instanceof Error ? error.message : String(error),
-			);
-			reasons.push([failure.summary, ...(failure.details ?? [])].join(" "));
-			continue;
-		}
-		if (judge.readsProgramFromStdin(line.text, analysis.commands)) {
-			reasons.push(
-				"A line feeds a program through stdin (a here-document, or input piped or typed into a shell or language interpreter), which NarraFork cannot judge.",
-			);
-		}
-		lines.push({ command: line.text, cwd: runIn, analysis, context: lineContext });
-	}
-	return {
-		lines,
-		context,
-		...(reasons.length > 0 ? { askReason: [...new Set(reasons)].join(" ") } : {}),
-	};
-}
-
 /** Why a reviewer's Browser call that does more than read a page is refused. */
 export const REVIEW_BROWSER_READ_ONLY_REASON =
 	"Review mode: Browser may only read pages (launch headless, navigate, screenshot without " +
@@ -1598,8 +1412,6 @@ export interface CommandBlacklistEntry extends LegacyCommandBlacklistEntry {
 /** Metadata collected during permission decision (side-channel output). */
 export interface PermissionDecisionMeta {
 	blacklistReason?: string;
-	/** Why a Terminal write is put to a person: its input could not be fully judged. */
-	terminalAskReason?: string;
 	commandBlacklistReason?: string;
 	commandBlacklistDenyPrompt?: string;
 	planModeSoftDeny?: boolean;
@@ -1686,10 +1498,6 @@ export interface PermissionDecisionOpts {
 	permMode: string;
 	cwd: string;
 	bashAnalysis?: BashAnalysis;
-	/** What a Terminal write will run (`judgeTerminalWrite`); required for Terminal writes. */
-	terminalJudgement?: TerminalJudgement;
-	/** Internal: the lines were judged; decide the rest as a plain Terminal call. */
-	terminalLinesJudged?: boolean;
 	planFileId?: string;
 	/**
 	 * Resolved relative path of the designated plan file. Supplied by the caller
@@ -5159,23 +4967,6 @@ export async function recheckFinalToolExecutionPermission(
 		assertStillCurrent();
 		return { assertStillCurrent };
 	}
-	let finalTerminalJudgement: TerminalJudgement | null = null;
-	if (!routed && isTerminalWrite(check.toolName, check.input)) {
-		const fallback = check.cwd ?? before.narrator.cwd;
-		if (!fallback) finalPermissionDeny("missing execution directory");
-		finalTerminalJudgement = await judgeTerminalWrite(
-			check.narratorId,
-			check.toolName,
-			check.input,
-			fallback,
-			check.signal,
-		).catch((error: unknown) =>
-			finalPermissionDeny(
-				`terminal target unavailable: ${error instanceof Error ? error.message : String(error)}`,
-			),
-		);
-		context = finalTerminalJudgement?.context ?? null;
-	}
 	const cwd = context?.target.cwd ?? check.cwd ?? before.narrator.cwd;
 	if (!cwd) finalPermissionDeny("missing execution directory");
 	const constraint = check.runtimeConstraint;
@@ -5266,16 +5057,11 @@ export async function recheckFinalToolExecutionPermission(
 	);
 	if (reviewBoundaryReason) finalPermissionDeny(reviewBoundaryReason);
 	// Run deny layers before ALL shortcuts (including designated plan-file allowance).
-	// Each line a Terminal write runs meets the latest command blacklist too, like Bash.
-	for (const commands of [
-		analysis?.commands,
-		...(finalTerminalJudgement?.lines ?? []).map((line) => line.analysis.commands),
-	]) {
-		if (
-			commands &&
-			policy.evaluateCommands(commands.map((command) => command.tokens)).decision === "deny"
-		)
-			finalPermissionDeny("latest command blacklist matches this call");
+	if (
+		analysis &&
+		policy.evaluateCommands(analysis.commands.map((command) => command.tokens)).decision === "deny"
+	) {
+		finalPermissionDeny("latest command blacklist matches this call");
 	}
 	const pathDeny = resolveBlacklistDecision(
 		decisionTool,
@@ -5354,7 +5140,6 @@ export async function recheckFinalToolExecutionPermission(
 					planFileId: before.narrator.planFileId ?? undefined,
 					planFilePath: activeNarrators.get(check.narratorId)?._planFilePath,
 					reviewReadOnlyBash: readOnlyGitShell,
-					terminalJudgement: finalTerminalJudgement ?? undefined,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
@@ -5587,30 +5372,12 @@ export async function handlePermission(
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 	}
-	let terminalJudgement: TerminalJudgement | null = null;
-	if (isTerminalWrite(toolName, input)) {
-		try {
-			terminalJudgement = await judgeTerminalWrite(narratorId, toolName, input, cwd, signal);
-		} catch (error) {
-			if (signal?.aborted) return { behavior: "deny", message: "Permission check aborted" };
-			return {
-				behavior: "deny",
-				message: `Terminal target validation failed: ${error instanceof Error ? error.message : String(error)}`,
-			};
-		}
-		if (!executionContext && terminalJudgement?.context) {
-			executionContext = terminalJudgement.context;
-			initialExecutionTarget = executionContext.target;
-		}
-	}
-	const shellCommand =
-		isBashToolName(toolName) && typeof input.command === "string" ? input.command : null;
-	if (shellCommand !== null) {
+	if (isBashToolName(toolName) && typeof input.command === "string") {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
 			const shellCwd = executionContext?.target.cwd ?? resolveToolCwd(cwd, effectiveInput);
 			bashAnalysis = await analyzeShellCommand(
-				shellCommand,
+				input.command,
 				shellCwd,
 				shellType,
 				executionContext?.paths ?? localPathSemantics,
@@ -5904,7 +5671,6 @@ export async function handlePermission(
 					permMode: decisionPermMode,
 					cwd,
 					bashAnalysis,
-					terminalJudgement: terminalJudgement ?? undefined,
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
@@ -6402,7 +6168,6 @@ export async function handlePermission(
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
-	if (permMeta.terminalAskReason) decisionReason = `Terminal input: ${permMeta.terminalAskReason}`;
 
 	if (permMeta.gitInternalReviewReason) {
 		decisionReason = decisionReason
