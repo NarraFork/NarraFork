@@ -217,3 +217,143 @@ export type TeamWorkEventKind =
 	| "work.cleanup"
 	| "team.checkin"
 	| typeof TEAM_DECISION_EVENT_KIND;
+
+// ── P4: the team page ────────────────────────────────────────────────────────
+
+/**
+ * The board's five columns (plan §二.4) and the work item states each shows. "Review" holds
+ * both items under review and items ready to merge; "done" is merged back.
+ */
+export const TEAM_BOARD_COLUMNS = ["queued", "in_progress", "review", "done", "cancelled"] as const;
+export type TeamBoardColumn = (typeof TEAM_BOARD_COLUMNS)[number];
+
+export const TEAM_BOARD_COLUMN_STATES: Readonly<
+	Record<TeamBoardColumn, readonly TeamWorkItemState[]>
+> = Object.freeze({
+	queued: ["queued"],
+	in_progress: ["in_progress"],
+	review: ["in_review", "ready"],
+	done: ["merged"],
+	cancelled: ["cancelled"],
+});
+
+/** The board column a work item state belongs to. */
+export function boardColumnOf(state: TeamWorkItemState): TeamBoardColumn {
+	for (const column of TEAM_BOARD_COLUMNS)
+		if (TEAM_BOARD_COLUMN_STATES[column].includes(state)) return column;
+	return "queued";
+}
+
+/** Columns of finished items, newest change first; the others oldest first (their queue order). */
+export function boardColumnIsFinished(column: TeamBoardColumn): boolean {
+	return column === "done" || column === "cancelled";
+}
+
+/** Most work items one board column page returns. */
+export const TEAM_BOARD_PAGE_LIMIT = 50;
+/** Most team events one activity page returns. */
+export const TEAM_EVENTS_PAGE_LIMIT = 50;
+/** Most pending approvals the team page lists (plan §二.12). */
+export const TEAM_APPROVALS_LIMIT = 50;
+/** Most running agents the summary names (the count is capped one higher). */
+export const TEAM_RUNNING_AGENTS_LIMIT = 20;
+/** Most sessions of one team tree the page looks at (coordinator + both subagent levels). */
+export const TEAM_TREE_LIMIT = 500;
+/** Characters of a tool call's input the approvals list shows. */
+export const TEAM_APPROVAL_PREVIEW_CHARS = 300;
+/** An event's detail is sent only when its JSON text is at most this many characters. */
+export const TEAM_EVENT_DETAIL_PREVIEW_CHARS = 2304;
+
+/** A session of the team tree, as the page names it. */
+export interface TeamAgentRef {
+	id: string;
+	title: string | null;
+	/** Narrator run status: idle / working / waiting / archived. */
+	status: string;
+}
+
+/** One card on the board. Never carries the changed paths or other large columns. */
+export interface TeamBoardItem {
+	id: string;
+	title: string;
+	kind: string;
+	state: TeamWorkItemState;
+	branch: string | null;
+	baseRef: string | null;
+	/** The recorded head commit, abbreviated to 12 characters. */
+	headSha: string | null;
+	worker: TeamAgentRef | null;
+	reviewRounds: number;
+	lastReview: TeamReviewVerdict | null;
+	/** Whether a worktree is still recorded (finished items with one can be cleaned). */
+	hasWorktree: boolean;
+	/** Project-level exclusive lock key, when the item holds one. */
+	exclusiveKey: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface TeamBoardColumnPage {
+	column: TeamBoardColumn;
+	items: TeamBoardItem[];
+	nextCursor: string | null;
+}
+
+/** One entry of the team's activity log. */
+export interface TeamActivityEvent {
+	id: string;
+	kind: string;
+	workItemId: string | null;
+	workItemTitle: string | null;
+	actorKind: TeamEventActorKind;
+	actorId: string | null;
+	/** The person's username or the agent's session title, when still known. */
+	actorName: string | null;
+	/** The event detail when small enough (see {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS}). */
+	detail: Record<string, unknown> | null;
+	detailOmitted: boolean;
+	createdAt: string;
+}
+
+export interface TeamActivityPage {
+	events: TeamActivityEvent[];
+	nextCursor: string | null;
+}
+
+/** A tool call of the team tree waiting for a person. */
+export interface TeamPendingApproval {
+	/** The permission request id (the tool call id) the approve / deny routes take. */
+	id: string;
+	agent: TeamAgentRef;
+	/** 0 = the coordinator, 1 = a worker, 2 = a worker's helper. */
+	depth: number;
+	toolName: string;
+	/** A short, bounded view of the input (command, path, URL, …). */
+	preview: string;
+	decisionReason: string | null;
+	createdAt: string;
+}
+
+export interface TeamApprovalsResponse {
+	approvals: TeamPendingApproval[];
+	/** More are pending than {@link TEAM_APPROVALS_LIMIT}. */
+	more: boolean;
+}
+
+/** The team page's top bar; small and cheap so the page can poll it. */
+export interface TeamPageSummary {
+	teamId: string;
+	access: TeamAccess;
+	coordinatorStatus: string;
+	/** Working or waiting sessions of the tree, coordinator first, at most the limit. */
+	runningAgents: TeamAgentRef[];
+	/** Running sessions counted up to the limit + 1 (a count past the limit means "more"). */
+	runningCount: number;
+	/** Pending approvals counted up to the limit + 1; null for onlookers (members only). */
+	pendingApprovalCount: number | null;
+	/** Work items per board column. */
+	columnCounts: Record<TeamBoardColumn, number>;
+	/** The newest team event: the page refetches the board and activity when it changes. */
+	lastEventId: string | null;
+	lastEventAt: string | null;
+}

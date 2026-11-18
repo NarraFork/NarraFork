@@ -3,7 +3,8 @@
  *
  * Access: listing and creating need the project (read / write); everything about one team
  * follows its coordinator narrator's ACL — readers see it, writers (members) change it, others
- * get 404. The whole surface is refused on PostgreSQL with 503 before any access check, like the
+ * get 404. The team page's reads (P4: summary, board, activity) follow the same ACL; pending
+ * approvals are for members only (403 for an onlooker). The whole surface is refused on PostgreSQL with 503 before any access check, like the
  * narrator surface the team rides on and the project mutations.
  */
 
@@ -15,8 +16,16 @@ import { requireProjectAccess } from "../lib/project-access";
 import {
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
+	teamActivityQuerySchema,
+	teamBoardQuerySchema,
 	updateProjectTeamSchema,
 } from "../lib/validators";
+import {
+	readTeamActivity,
+	readTeamApprovals,
+	readTeamBoardColumn,
+	readTeamPageSummary,
+} from "../services/teams/team-board";
 import {
 	archiveTeam,
 	createTeam,
@@ -109,4 +118,63 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/unarchive", async (c) => {
 		c.req.param("projectId"),
 	);
 	return c.json(team);
+});
+
+// ── P4: the team page (read-only, bounded, cursor-paged) ─────────────────────
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/summary", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamPageSummary(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/board", async (c) => {
+	const parsed = teamBoardQuerySchema.safeParse({
+		column: c.req.query("column") ?? undefined,
+		limit: c.req.query("limit") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamBoardColumn(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+			parsed.data,
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/events", async (c) => {
+	const parsed = teamActivityQuerySchema.safeParse({
+		limit: c.req.query("limit") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamActivity(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+			parsed.data,
+		),
+	);
+});
+
+projectTeamRoutes.get("/:projectId/teams/:teamId/approvals", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readTeamApprovals(
+			c.req.param("teamId"),
+			narratorPrincipalOf(c),
+			c.req.param("projectId"),
+		),
+	);
 });
