@@ -1742,6 +1742,26 @@ export async function getRecentTabUserIdsForTeamTrees(
 	return rows.map((row) => row.userId);
 }
 
+/**
+ * Who has this narrator in their recent tabs, most recently visited first, at most `limit`
+ * (`idx_user_recent_tabs_narrator`, grouped per user). For bounded fan-outs that should prefer
+ * the people who looked most recently over an arbitrary id order (M1).
+ */
+export async function getRecentTabUserIdsForNarratorByRecency(
+	narratorId: string,
+	limit: number,
+): Promise<string[]> {
+	await ensureAllRecentTabsMigrated();
+	const rows = await db.all<{ userId: string }>(sql`
+		select urt.user_id as userId, max(urt.last_visited_at) as lastVisited
+		from user_recent_tabs urt
+		where urt.represented_narrator_id = ${narratorId}
+		group by urt.user_id
+		order by lastVisited desc, urt.user_id
+		limit ${limit}`);
+	return rows.map((row) => row.userId);
+}
+
 /** Update only users indexed as members of this narrator tab. */
 export async function syncNarratorTitleToRecentTabs(
 	narratorId: string,

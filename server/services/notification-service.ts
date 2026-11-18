@@ -16,7 +16,10 @@ import {
 	type NotificationChannel,
 	type NotificationDeliveryResult,
 } from "./notification-delivery";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorByRecency,
+} from "./recent-tabs-service";
 import { readTeamMemberIds } from "./teams/team-members";
 import { teamIdOfNarrator } from "./teams/team-membership";
 
@@ -301,10 +304,12 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 
 	const narratorTitle = narrator.title || narratorId;
 	const displayStatus = reason === "done" ? "done" : "waiting";
-	const teamId = reason === "waiting_permission" ? teamIdOfNarrator(narrator.id) : null;
+	// Team sessions (M1): the members-only "waiting" alert is the one IM signal a team session
+	// sends. No "done" (or any other) alert for a coordinator or its subagents, whoever can read
+	// them; the IM gateway sends nothing of team sessions either.
+	const teamId = teamIdOfNarrator(narrator.id);
+	if (teamId && reason !== "waiting_permission") return;
 	const teamWaiting = !!teamId;
-	// A team call is decided only in NarraFork (M1): the alert says so, and is the only IM alert
-	// a team session sends (the IM gateway sends nothing of team sessions).
 	const markdownText = teamWaiting
 		? `**${narratorTitle}** status: **waiting** for a team member. Decide in NarraFork.`
 		: `**${narratorTitle}** status: **${displayStatus}**`;
@@ -314,14 +319,17 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// webhook carrying the narrator's title and status would otherwise keep
 	// delivering to them — a notification must never outlive the permission.
 	// A call waiting in a team tree waits for a member: onlookers (read only) are not told. As in
-	// the notification center: the team's members (`readTeamMemberIds`, bounded per source) and a
-	// bounded page of recent-tab holders (admins, role-grant and public-audience writers, members
-	// past the per-source cut), then one batch write judgement. Other sessions are unchanged.
+	// the notification center: the team's members (`readTeamMemberIds`, bounded per source) and the
+	// most recent recent-tab holders (at most 200: admins, role-grant and public-audience writers,
+	// members past the per-source cut), then one batch write judgement.
 	const recentTabUserIds = teamId
 		? [
 				...new Set([
 					...(await readTeamMemberIds(teamId, TEAM_ATTENTION_MEMBERS)),
-					...(await getRecentTabUserIdsForNarrator(narratorId, TEAM_ATTENTION_TAB_HOLDERS)),
+					...(await getRecentTabUserIdsForNarratorByRecency(
+						narratorId,
+						TEAM_ATTENTION_TAB_HOLDERS,
+					)),
 				]),
 			]
 		: await getRecentTabUserIdsForNarrator(narratorId);
