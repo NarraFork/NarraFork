@@ -143,7 +143,7 @@ projectTeamRoutes.post("/:projectId/team-locks/release", async (c) => {
 	await requireProjectAccess(c, projectId, "manage");
 	const parsed = releaseTeamLockSchema.safeParse(await jsonBody(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result = forceReleaseExclusiveLock({
+	const result = await forceReleaseExclusiveLock({
 		projectId,
 		workItemId: parsed.data.workItemId,
 		userId: projectPrincipalOf(c).userId,

@@ -671,7 +671,7 @@ export async function markReady(input: {
 		);
 	const hits = changed ? exclusiveHits(changed.paths, globs) : [];
 	const takeLock = hits.length > 0 && item.exclusiveKey === null;
-	if (takeLock) refuseWhileHeld(team, item, hits, input.actor);
+	if (takeLock) await refuseWhileHeld(team, item, hits, input.actor);
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
@@ -706,7 +706,8 @@ export async function markReady(input: {
 		});
 	} catch (error) {
 		// Another item took the lock between the check and the write: the unique index refused.
-		if (takeLock && isExclusiveConflict(error)) refuseWhileHeld(team, item, hits, input.actor);
+		if (takeLock && isExclusiveConflict(error))
+			await refuseWhileHeld(team, item, hits, input.actor);
 		throw error;
 	}
 	return { item: requireWorkItem(team.teamId, item.id), commitsSinceReview };
@@ -716,12 +717,12 @@ export async function markReady(input: {
  * Refuse readiness while another item holds the project's exclusive lock, naming the holder as
  * this coordinator may read it. Recorded as `work.exclusive_refused`.
  */
-function refuseWhileHeld(
+async function refuseWhileHeld(
 	team: TeamRecord,
 	item: WorkItemRow,
 	hits: string[],
 	actor: WorkActor,
-): void {
+): Promise<void> {
 	const holder = exclusiveHolder(team.projectId, TEAM_EXCLUSIVE_LOCK_KEY);
 	if (!holder || holder.id === item.id) return;
 	recordWorkEvent(db, {
@@ -732,7 +733,7 @@ function refuseWhileHeld(
 		detail: { key: TEAM_EXCLUSIVE_LOCK_KEY, holder: holder.id, paths: hits },
 	});
 	throw new AppError(
-		`Work item ${item.id} changes the project's exclusive paths (${hits.join(", ")}), and only one work item at a time may: the lock is held by ${describeHolderFor(team.teamId, holder)}. It is released when that item is merged or cancelled, or a person with project manage access releases it.`,
+		`Work item ${item.id} changes the project's exclusive paths (${hits.join(", ")}), and only one work item at a time may: the lock is held by ${await describeHolderFor(team.teamId, holder)}. It is released when that item is cancelled, or merged back (noticed when the base branch in this repository contains its head; a squash or rebase merge, or a base updated only on the remote, is not noticed), or when a person with project manage access releases it.`,
 		409,
 		"TEAM_EXCLUSIVE_LOCK_HELD",
 	);
@@ -761,6 +762,57 @@ export function cancelWorkItem(input: {
 		});
 	});
 	return requireWorkItem(team.teamId, item.id);
+}
+
+/**
+ * The background pass found an item's head inside its base branch (X): the work landed, so the
+ * item is merged — its exclusive lock is released (in `updateItem`), its stored changed paths
+ * cleared, and `work.merged` recorded as the system's with `detectedBy: "ancestry"`. Only a merge
+ * that keeps the head reachable from the local base branch is noticed (not a squash or rebase
+ * merge, nor a base that moved only on the remote). False when the item changed meanwhile or is
+ * already finished; the next pass looks again.
+ */
+export function markMergedByAncestry(input: {
+	itemId: string;
+	head: string;
+	base: string;
+}): boolean {
+	const item = db
+		.select()
+		.from(teamWorkItems)
+		.where(eq(teamWorkItems.id, input.itemId))
+		.limit(1)
+		.get();
+	if (!item || isFinished(item.state)) return false;
+	const now = new Date().toISOString();
+	try {
+		db.transaction((tx) => {
+			updateItem(
+				tx,
+				item,
+				{
+					state: "merged",
+					headSha: input.head,
+					changedPathsJson: null,
+					changedPathsAtSha: null,
+				},
+				now,
+			);
+			recordWorkEvent(tx, {
+				teamId: item.teamId,
+				workItemId: item.id,
+				kind: "work.merged",
+				actor: { kind: "system", id: null },
+				detail: { head: input.head, base: input.base, detectedBy: "ancestry", from: item.state },
+				at: now,
+			});
+		});
+	} catch (error) {
+		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
+		throw error;
+	}
+	logger.info("Team work item merged (its head is in the base)", { workItemId: item.id });
+	return true;
 }
 
 // ── Base sync ───────────────────────────────────────────────────────────────

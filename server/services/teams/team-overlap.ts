@@ -2,37 +2,54 @@
  * Who is changing what across a project's teams, and the project's exclusive paths
  * (docs/PROJECT_TEAMS-PLAN.md §二.5 "独占路径", §二.10; X).
  *
- * CHANGED PATHS. Every active work item (not merged or cancelled, worktree recorded) carries the
- * paths its branch changed since its merge base with the base (`changed_paths_json`, at most
- * 2,000 paths and 128 KiB; past that only its top-level entries, directories ending in `/`) and
- * the head they were computed at (`changed_paths_at_sha`). A background pass keeps them current:
- * when a worker's run ends (its items first) and every two minutes, at most
- * {@link TEAM_CHANGED_PATHS_BATCH} items per pass, resuming after the last item it looked at.
- * An item whose head did not move is not listed again. Git runs only through the hardened,
- * read-only `team-git.ts` (a diff of two commits: no working tree, index or filter is read);
- * never on a request path. The pass writes only the two path columns, never `updated_at`, so it
- * never makes a coordinator's own change look concurrent.
+ * CHANGED PATHS. Every active work item (not merged or cancelled, worktree recorded, team active)
+ * carries the paths its branch changed since its merge base with the base (`changed_paths_json`,
+ * at most 2,000 paths and 128 KiB; past that only its top-level entries, directories ending in
+ * `/`) and the head they were computed at (`changed_paths_at_sha`). A background pass keeps them
+ * current: every two minutes a sweep of at most {@link TEAM_CHANGED_PATHS_BATCH} items resuming
+ * after the last item it looked at, and when a worker's run ends a pass over that worker's items
+ * only. An item whose head did not move is not listed again. Each pass stops at
+ * {@link PASS_DEADLINE_MS} (keeping its place), so a hung git never stalls the refreshes. Git runs
+ * only through the hardened, read-only `team-git.ts` (one `teamGit` per item per pass; a diff of
+ * two commits reads no working tree, index or filter); never on a request path. The pass writes
+ * only the two path columns, never `updated_at`, so it never makes a coordinator's own change
+ * look concurrent.
+ *
+ * LANDED ITEMS. There is no merge action yet, so the pass also notices an item that landed: one
+ * with real work (stored changed paths, or a head other than the one it was created at) whose
+ * head the base branch now contains (`merge-base --is-ancestor head base`, checked every pass
+ * even when the head did not move). It becomes `merged` (`work.merged`, `detectedBy: ancestry`),
+ * which releases its exclusive lock and drops it from the overlaps. LIMITS: a squash or rebase
+ * merge (the head itself never reaches the base) and a base that moved only on the remote (the
+ * local base branch of this repository is what is read) are not detected; such an item stays
+ * open until it is cancelled, and a person can release its lock.
  *
  * OVERLAPS. Per project, the stored paths of at most {@link TEAM_OVERLAP_PROJECT_ITEMS} active
- * items are compared: an item with at most {@link TEAM_OVERLAP_COMPARE_PATHS} paths path by path,
- * a larger (or collapsed) one by top-level entry. The result is an in-memory index per project
- * (item ids and paths only): rebuilt by the pass when stored paths change, otherwise on demand,
- * one item read at a time with a yield in between. Titles, states and team names are read when
- * the index is shown, so a finished item drops out at once. A NEW overlap between two teams is
- * recorded once per pair as `work.overlap` on both items and told to both coordinators, each at
- * most once per {@link TEAM_OVERLAP_NOTICE_INTERVAL_MS} (what waits is told with the next one).
+ * items of active teams are compared: an item with at most {@link TEAM_OVERLAP_COMPARE_PATHS}
+ * paths path by path, a larger (or collapsed) one by top-level entry. The result is an in-memory
+ * index per project (item ids and paths only), built off the request path, one item at a time
+ * with a yield in between: by the pass when stored paths change, by the team status, or in the
+ * background when a person's request finds it stale (the request is answered from the last index,
+ * marked stale). Titles, states and team names are read when the index is shown, so a finished
+ * item drops out at once. A NEW overlap between two teams is recorded once per pair as
+ * `work.overlap` on both items (at most {@link NEW_PAIRS_PER_PASS} pairs a pass, the rest on the
+ * next one) and told to both coordinators, each at most once per
+ * {@link TEAM_OVERLAP_NOTICE_INTERVAL_MS}; a coordinator a person stopped is not woken for it.
  *
  * WHO SEES WHAT. A person sees a team's items whole when they are a member (may write to its
  * coordinator), the team name and item title when they may read the coordinator, and only
- * "another team" otherwise; an overlap no involved team of which they can read is not listed.
- * In a coordinator's conversation (team status, notices, a refused `work.ready`) another team's
- * name and titles appear only when everyone who can read this coordinator can read that one.
+ * "another team" otherwise; an overlap no involved team of which they can read is not listed,
+ * and items they cannot see are not counted. In a coordinator's conversation (team status,
+ * notices, a refused `work.ready`) another team's name and titles appear only when everyone who
+ * can read this coordinator can read that one.
  *
  * EXCLUSIVE PATHS. A project lists path globs in `chapter_settings.teams.exclusivePaths` (nothing
- * by default). An item whose changes touch one takes the project's exclusive lock at `work.ready`
+ * by default; `dir/` and a bare name without glob characters cover everything under them). An
+ * item whose changes touch one takes the project's exclusive lock at `work.ready`
  * (`exclusive_key`, unique per project: the unique index makes the take atomic); a second item is
- * refused readiness naming the holder. The lock goes with the holder's merge or cancellation, or
- * a person with project manage access releases it (recorded).
+ * refused readiness naming the holder. The lock goes with the holder's merge (as detected above)
+ * or cancellation, with its team's archiving, or when a person with project manage access
+ * releases it (recorded, and the holder's coordinator is told).
  *
  * SQLite only, like the rest of the team surface.
  */
@@ -56,7 +73,7 @@ import {
 	type TeamOverlapResponse,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gt, inArray, isNotNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, ne, notInArray, or } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../../db";
 import {
 	narrators,
@@ -65,6 +82,7 @@ import {
 	projectTeams,
 	teamWorkEvents,
 	teamWorkItems,
+	users,
 } from "../../db/schema";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
@@ -72,28 +90,47 @@ import type { Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import { getTeamOverlapLabels } from "../../lib/prompts/team-coordinator-notes";
 import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../narrator-acl";
+import { canReadProject } from "../project-acl";
 import { type ChangedPaths, teamGit } from "./team-git";
-import { recordWorkEvent, type WorkActor } from "./work-items";
+import { markMergedByAncestry, recordWorkEvent, type WorkActor } from "./work-items";
 
 const FINISHED = [...TEAM_WORK_ITEM_FINISHED_STATES];
 /** Overlap entries one index keeps (the count of all is kept beside them). */
 const INDEX_ENTRIES_MAX = 1000;
 /** `work.overlap` events of one item read to tell whether a pair was already recorded. */
 const PAIR_EVENT_SCAN = 200;
-/** New cross-team pairs recorded per pass; the rest wait for the next pass. */
-const NEW_PAIRS_PER_PASS = 50;
-/** Paths named per pair in an event or a notice. */
+/** New cross-team pairs recorded per pass; the rest are recorded by the next pass. */
+export const NEW_PAIRS_PER_PASS = 50;
+/** Paths named per pair in an event or a notice, each cut to {@link PATH_SAMPLE_CHARS}. */
 const PAIR_PATH_SAMPLE = 5;
-/** Lines one pending notice keeps per team. */
+const PATH_SAMPLE_CHARS = 300;
+/** Lines one pending notice keeps per team, and the notice's UTF-8 budget. */
 const NOTICE_LINES_MAX = 20;
+export const NOTICE_MAX_BYTES = 4 * 1024;
 /** Locks one project lists (one key today). */
 const LOCKS_LISTED = 10;
+/** A pass stops looking at more items after this long and resumes there next time. */
+export const PASS_DEADLINE_MS = 60_000;
+/** Pair visits between two yields while pairing overlap entries. */
+const PAIR_VISITS_PER_YIELD = 5000;
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
+const samplePath = (path: string) =>
+	path.length > PATH_SAMPLE_CHARS ? `${path.slice(0, PATH_SAMPLE_CHARS - 1)}…` : path;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Exclusive paths: the project setting and matching
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One exclusive path as stored: `./` dropped, and a trailing `/` (a directory) made `dir/**`.
+ * A bare name without glob characters (`drizzle`) is matched as itself and everything under it.
+ */
+export function normalizeExclusivePath(pattern: string): string {
+	const trimmed = pattern.trim().replace(/^(\.\/)+/, "");
+	return trimmed.endsWith("/") ? `${trimmed.replace(/\/+$/, "")}/**` : trimmed;
+}
 
 /** The exclusive path globs of a project setting value (`chapter_settings`), sanitized. */
 export function exclusivePathsOf(chapterSettings: unknown): string[] {
@@ -115,7 +152,8 @@ export function exclusivePathsOf(chapterSettings: unknown): string[] {
 				glob.trim().length > 0 &&
 				glob.length <= TEAM_EXCLUSIVE_PATH_MAX_LENGTH,
 		)
-		.map((glob) => glob.trim())
+		.map(normalizeExclusivePath)
+		.filter((glob) => glob.length > 0 && glob !== "**")
 		.slice(0, TEAM_EXCLUSIVE_PATHS_MAX);
 }
 
@@ -141,18 +179,28 @@ function glob(pattern: string) {
 	return compiled;
 }
 
+const GLOB_MAGIC = /[*?[\]{}!]/;
+
 /**
- * Whether one stored changed path touches one glob. A collapsed top-level directory (`dir/`)
- * counts when the glob could match anything under it — its first segment matches the directory
- * or starts with `**` — so a collapsed item errs toward taking the lock.
+ * Whether one stored changed path touches one exclusive path. A pattern without glob characters
+ * names a file or a directory: it touches itself and everything under it. A collapsed top-level
+ * directory (`dir/`) counts when the pattern could match anything under it — its first segment
+ * matches the directory or starts with `**` — so a collapsed item errs toward taking the lock.
  */
 export function pathTouchesGlob(path: string, pattern: string): boolean {
-	const normalized = pattern.replace(/^\.\//, "");
-	if (!path.endsWith(TEAM_CHANGED_DIR_SUFFIX)) return glob(normalized).match(path);
-	const dir = path.slice(0, -TEAM_CHANGED_DIR_SUFFIX.length);
+	const normalized = normalizeExclusivePath(pattern);
+	if (!normalized) return false;
+	const collapsed = path.endsWith(TEAM_CHANGED_DIR_SUFFIX);
+	const plain = collapsed ? path.slice(0, -TEAM_CHANGED_DIR_SUFFIX.length) : path;
+	if (!GLOB_MAGIC.test(normalized)) {
+		if (plain === normalized || plain.startsWith(`${normalized}/`)) return true;
+		// `drizzle/meta/x.json` collapsed to `drizzle/` may hold it.
+		return collapsed && normalized.startsWith(`${plain}/`);
+	}
+	if (!collapsed) return glob(normalized).match(path);
 	const first = normalized.split("/")[0] ?? "";
 	if (first.startsWith("**")) return true;
-	return normalized.includes("/") && glob(first).match(dir);
+	return normalized.includes("/") && glob(first).match(plain);
 }
 
 /** The changed paths that touch an exclusive glob (at most `limit`, in order). */
@@ -177,21 +225,27 @@ export function exclusiveHits(
 /**
  * Whether another team's name and item titles may appear in a coordinator's conversation:
  * everyone who can read the viewer's coordinator can read the other's. `public` is readable by
- * every signed-in user; `project` by everyone inside the project gate, which every reader of a
- * non-public coordinator has passed. A private coordinator is never named to another team.
+ * every signed-in user; `project` by everyone inside the project gate. Every reader of a
+ * non-public coordinator has passed that gate except its owner, who reads it by ownership alone:
+ * so the owner must still read the project (`ownerReadsProject`). A private coordinator is never
+ * named to another team.
  */
 export function teamDetailsVisibleAcross(
-	viewer: { visibility: string },
+	viewer: { visibility: string; ownerReadsProject: boolean },
 	other: { visibility: string },
 ): boolean {
 	if (other.visibility === "public") return true;
-	return other.visibility === "project" && viewer.visibility !== "public";
+	return (
+		other.visibility === "project" && viewer.visibility !== "public" && viewer.ownerReadsProject
+	);
 }
 
 interface CoordinatorFacts {
 	id: string;
 	title: string;
 	visibility: string;
+	ownerUserId: string | null;
+	projectId: string | null;
 }
 
 function coordinatorsOf(teamIds: readonly string[]): Map<string, CoordinatorFacts> {
@@ -199,12 +253,63 @@ function coordinatorsOf(teamIds: readonly string[]): Map<string, CoordinatorFact
 	if (ids.length === 0) return new Map();
 	return new Map(
 		db
-			.select({ id: narrators.id, title: narrators.title, visibility: narrators.visibility })
+			.select({
+				id: narrators.id,
+				title: narrators.title,
+				visibility: narrators.visibility,
+				ownerUserId: narrators.ownerUserId,
+				projectId: projectTeams.projectId,
+			})
 			.from(narrators)
+			.leftJoin(projectTeams, eq(projectTeams.narratorId, narrators.id))
 			.where(inArray(narrators.id, ids))
 			.all()
-			.map((row) => [row.id, { id: row.id, title: row.title ?? "", visibility: row.visibility }]),
+			.map((row) => [row.id, { ...row, title: row.title ?? "" }]),
 	);
+}
+
+/** Whether a coordinator's owner may still read its project (no owner: admin-managed, yes). */
+async function ownerReadsProject(coordinator: CoordinatorFacts): Promise<boolean> {
+	if (!coordinator.ownerUserId) return true;
+	if (!coordinator.projectId) return false;
+	const project = db
+		.select({ id: projects.id, ownerUserId: projects.ownerUserId, visibility: projects.visibility })
+		.from(projects)
+		.where(eq(projects.id, coordinator.projectId))
+		.limit(1)
+		.get();
+	if (!project) return false;
+	const user = db
+		.select({ role: users.role })
+		.from(users)
+		.where(eq(users.id, coordinator.ownerUserId))
+		.limit(1)
+		.get();
+	return canReadProject(project, {
+		userId: coordinator.ownerUserId,
+		isAdmin: user?.role === "admin",
+	});
+}
+
+/** The other teams (of these) whose name and titles may appear in `viewerTeamId`'s conversation. */
+async function namedTeamsFor(
+	viewerTeamId: string,
+	otherTeamIds: readonly string[],
+): Promise<Map<string, CoordinatorFacts>> {
+	const coordinators = coordinatorsOf([viewerTeamId, ...otherTeamIds]);
+	const viewer = coordinators.get(viewerTeamId);
+	const named = new Map<string, CoordinatorFacts>();
+	if (!viewer) return named;
+	const facts = {
+		visibility: viewer.visibility,
+		ownerReadsProject: await ownerReadsProject(viewer),
+	};
+	for (const id of new Set(otherTeamIds)) {
+		const other = coordinators.get(id);
+		if (other && id !== viewerTeamId && teamDetailsVisibleAcross(facts, other))
+			named.set(id, other);
+	}
+	return named;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,13 +344,13 @@ export function exclusiveHolder(
 }
 
 /** The holder as a coordinator of `viewerTeamId` may read it (agent-facing, English). */
-export function describeHolderFor(viewerTeamId: string, holder: ExclusiveHolder): string {
+export async function describeHolderFor(
+	viewerTeamId: string,
+	holder: ExclusiveHolder,
+): Promise<string> {
 	if (holder.teamId === viewerTeamId) return `your work item "${holder.title}" (${holder.id})`;
-	const coordinators = coordinatorsOf([viewerTeamId, holder.teamId]);
-	const viewer = coordinators.get(viewerTeamId);
-	const other = coordinators.get(holder.teamId);
-	if (viewer && other && teamDetailsVisibleAcross(viewer, other))
-		return `team "${other.title}"'s work item "${holder.title}" (${holder.state})`;
+	const other = (await namedTeamsFor(viewerTeamId, [holder.teamId])).get(holder.teamId);
+	if (other) return `team "${other.title}"'s work item "${holder.title}" (${holder.state})`;
 	return `a work item of another team (${holder.state})`;
 }
 
@@ -260,21 +365,47 @@ export function isExclusiveConflict(error: unknown): boolean {
 	return false;
 }
 
+/** Clear one item's lock and record why. Synchronous: shares the caller's transaction. */
+function releaseLock(
+	executor: Pick<typeof db, "insert" | "update">,
+	item: { id: string; teamId: string; exclusiveKey: string },
+	actor: WorkActor,
+	detail: Record<string, unknown>,
+): boolean {
+	const rows = executor
+		.update(teamWorkItems)
+		.set({ exclusiveKey: null })
+		.where(and(eq(teamWorkItems.id, item.id), eq(teamWorkItems.exclusiveKey, item.exclusiveKey)))
+		.returning({ id: teamWorkItems.id })
+		.all();
+	if (rows.length !== 1) return false;
+	recordWorkEvent(executor, {
+		teamId: item.teamId,
+		workItemId: item.id,
+		kind: "work.exclusive_released",
+		actor,
+		detail: { key: item.exclusiveKey, ...detail },
+	});
+	return true;
+}
+
 /**
- * A person with project manage access releases the project's lock from its holder (recorded on
- * the holder's team as `work.exclusive_released`, forced). The holder keeps its state.
+ * A person with project manage access releases the project's lock from its holder: recorded on
+ * the holder's team as `work.exclusive_released` (forced) and told to the holder's coordinator
+ * (a row without a wake). The holder keeps its state.
  */
-export function forceReleaseExclusiveLock(input: {
+export async function forceReleaseExclusiveLock(input: {
 	projectId: string;
 	workItemId: string;
 	userId: string;
 	reason?: string;
-}): { released: boolean; key: string | null } {
+}): Promise<{ released: boolean; key: string | null }> {
 	assertSqlite();
 	const item = db
 		.select({
 			id: teamWorkItems.id,
 			teamId: teamWorkItems.teamId,
+			title: teamWorkItems.title,
 			exclusiveKey: teamWorkItems.exclusiveKey,
 		})
 		.from(teamWorkItems)
@@ -286,26 +417,79 @@ export function forceReleaseExclusiveLock(input: {
 	if (!item) throw new NotFoundError("Work item", input.workItemId);
 	if (!item.exclusiveKey) return { released: false, key: null };
 	const key = item.exclusiveKey;
-	const actor: WorkActor = { kind: "person", id: input.userId };
-	const released = db.transaction((tx) => {
-		const rows = tx
-			.update(teamWorkItems)
-			.set({ exclusiveKey: null })
-			.where(and(eq(teamWorkItems.id, item.id), eq(teamWorkItems.exclusiveKey, key)))
-			.returning({ id: teamWorkItems.id })
-			.all();
-		if (rows.length !== 1) return false;
-		recordWorkEvent(tx, {
-			teamId: item.teamId,
-			workItemId: item.id,
-			kind: "work.exclusive_released",
-			actor,
-			detail: { key, forced: true, reason: input.reason?.trim().slice(0, 500) || null },
-		});
-		return true;
-	});
-	if (released) logger.info("Team exclusive lock force-released", { workItemId: item.id, key });
-	return { released, key: released ? key : null };
+	const reason = input.reason?.trim().slice(0, 500) || null;
+	const released = db.transaction((tx) =>
+		releaseLock(
+			tx,
+			{ id: item.id, teamId: item.teamId, exclusiveKey: key },
+			{ kind: "person", id: input.userId },
+			{ forced: true, reason },
+		),
+	);
+	if (!released) return { released: false, key: null };
+	logger.info("Team exclusive lock force-released", { workItemId: item.id, key });
+	invalidateProjectOverlaps(input.projectId);
+	try {
+		const locale = await coordinatorLocale(item.teamId);
+		const text = getTeamOverlapLabels(locale).releasedNotice(oneLine(item.title), reason);
+		await (job.notify ?? defaultNotify)({ teamId: item.teamId, text, locale, wake: false });
+	} catch (error) {
+		logger.warn("Team lock release notice failed", { teamId: item.teamId, error: String(error) });
+	}
+	return { released: true, key };
+}
+
+/** Release the locks a team's items hold (its coordinator was archived). Returns how many. */
+export function releaseLocksOfTeam(teamId: string, reason: string): number {
+	if (activeDatabaseBackend !== "sqlite") return 0;
+	const held = db
+		.select({
+			id: teamWorkItems.id,
+			teamId: teamWorkItems.teamId,
+			projectId: teamWorkItems.projectId,
+			exclusiveKey: teamWorkItems.exclusiveKey,
+		})
+		.from(teamWorkItems)
+		.where(and(eq(teamWorkItems.teamId, teamId), isNotNull(teamWorkItems.exclusiveKey)))
+		.limit(LOCKS_LISTED)
+		.all();
+	let released = 0;
+	for (const row of held) {
+		const ok = db.transaction((tx) =>
+			releaseLock(
+				tx,
+				{ id: row.id, teamId: row.teamId, exclusiveKey: row.exclusiveKey as string },
+				{ kind: "system", id: null },
+				{ forced: false, reason },
+			),
+		);
+		if (ok) {
+			released++;
+			invalidateProjectOverlaps(row.projectId);
+		}
+	}
+	return released;
+}
+
+/** Backstop of the sweep: locks still held by items of archived teams (at most 10 a pass). */
+function releaseLocksOfArchivedTeams(): number {
+	const rows = db
+		.select({ teamId: teamWorkItems.teamId })
+		.from(teamWorkItems)
+		.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(
+			and(
+				isNotNull(teamWorkItems.exclusiveKey),
+				or(eq(projectTeams.status, "archived"), eq(narrators.status, "archived")),
+			),
+		)
+		.limit(LOCKS_LISTED)
+		.all();
+	let released = 0;
+	for (const teamId of new Set(rows.map((row) => row.teamId)))
+		released += releaseLocksOfTeam(teamId, "team_archived");
+	return released;
 }
 
 function assertSqlite(): void {
@@ -313,19 +497,32 @@ function assertSqlite(): void {
 		throw new AppError("Teams are available on SQLite only", 503, "TEAMS_BACKEND_UNAVAILABLE");
 }
 
+/** Items of active teams only: the team row is active and its coordinator not archived. */
+const teamIsLive = () => and(eq(projectTeams.status, "active"), ne(narrators.status, "archived"));
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Changed paths: reading git, storing the columns
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Where changed paths come from: the hardened git of `team-git.ts` (tests replace it). */
-export interface ChangedPathsSource {
-	head(worktree: string): Promise<string | null>;
-	changed(worktree: string, baseRef: string): Promise<ChangedPaths | null>;
+/** One worktree's git as the pass needs it (one per item per pass). */
+export interface ChangedPathsGit {
+	head(): Promise<string | null>;
+	resolve(ref: string): Promise<string | null>;
+	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+	changed(baseRef: string): Promise<ChangedPaths | null>;
 }
 
-const hardenedSource: ChangedPathsSource = {
-	head: (worktree) => teamGit(worktree).resolveCommit("HEAD"),
-	changed: (worktree, baseRef) => teamGit(worktree).changedPaths(baseRef),
+/** Where changed paths come from: the hardened git of `team-git.ts` (tests replace it). */
+export type ChangedPathsSource = (worktree: string) => ChangedPathsGit;
+
+const hardenedSource: ChangedPathsSource = (worktree) => {
+	const git = teamGit(worktree);
+	return {
+		head: () => git.resolveCommit("HEAD"),
+		resolve: (ref) => git.resolveCommit(ref),
+		isAncestor: (ancestor, descendant) => git.isAncestor(ancestor, descendant),
+		changed: (baseRef) => git.changedPaths(baseRef),
+	};
 };
 
 let sourceOverride: ChangedPathsSource | null = null;
@@ -342,7 +539,7 @@ export async function readChangedPaths(
 	worktree: string,
 	baseRef: string,
 ): Promise<ChangedPaths | null> {
-	return source().changed(worktree, baseRef);
+	return source()(worktree).changed(baseRef);
 }
 
 /**
@@ -381,20 +578,19 @@ function refreshTargets(where: ReturnType<typeof and>, limit: number): RefreshTa
 			itemBase: teamWorkItems.baseRef,
 			teamBase: projectTeams.baseBranch,
 			worktree: narratorWorktreeResources.worktreePath,
-			deviceId: narratorWorktreeResources.deviceId,
 			atSha: teamWorkItems.changedPathsAtSha,
 		})
 		.from(teamWorkItems)
 		.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
 		.innerJoin(
 			narratorWorktreeResources,
 			eq(narratorWorktreeResources.id, teamWorkItems.worktreeResourceId),
 		)
-		.where(where)
+		.where(and(where, teamIsLive(), eq(narratorWorktreeResources.deviceId, "local")))
 		.orderBy(asc(teamWorkItems.id))
 		.limit(limit)
 		.all()
-		.filter((row) => row.deviceId === "local")
 		.map((row) => ({
 			id: row.id,
 			projectId: row.projectId,
@@ -407,16 +603,43 @@ function refreshTargets(where: ReturnType<typeof and>, limit: number): RefreshTa
 const activeWithWorktree = () =>
 	and(notInArray(teamWorkItems.state, FINISHED), isNotNull(teamWorkItems.worktreeResourceId));
 
-export type RefreshOutcome = "updated" | "unchanged" | "failed";
+export type RefreshOutcome = "updated" | "unchanged" | "merged" | "failed";
+
+/** Whether an item did real work: stored changed paths, or a head other than its first one. */
+function hadRealWork(itemId: string, head: string): boolean {
+	const stored = db
+		.select({ paths: teamWorkItems.changedPathsJson })
+		.from(teamWorkItems)
+		.where(eq(teamWorkItems.id, itemId))
+		.limit(1)
+		.get();
+	if (Array.isArray(stored?.paths) && stored.paths.length > 0) return true;
+	const created = db
+		.select({ detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.created")))
+		.limit(1)
+		.get();
+	const first = created?.detail?.head;
+	return typeof first === "string" && first !== head;
+}
 
 async function refreshTarget(target: RefreshTarget): Promise<RefreshOutcome> {
 	try {
-		const head = await source().head(target.worktree);
+		const git = source()(target.worktree);
+		const head = await git.head();
 		if (!head) return "failed";
-		if (head === target.atSha) return "unchanged";
-		const changed = await source().changed(target.worktree, target.baseRef);
-		if (!changed) return "failed";
-		return storeChangedPaths(db, target.id, changed) ? "updated" : "unchanged";
+		let outcome: RefreshOutcome = "unchanged";
+		if (head !== target.atSha) {
+			const changed = await git.changed(target.baseRef);
+			if (!changed) return "failed";
+			if (storeChangedPaths(db, target.id, changed)) outcome = "updated";
+		}
+		// Landed? Checked every pass: the base moves without the item's head moving.
+		if (!hadRealWork(target.id, head)) return outcome;
+		const base = await git.resolve(target.baseRef);
+		if (!base || !(await git.isAncestor(head, base))) return outcome;
+		return markMergedByAncestry({ itemId: target.id, head, base }) ? "merged" : outcome;
 	} catch (error) {
 		logger.debug("Team changed paths could not be read", {
 			workItemId: target.id,
@@ -477,6 +700,8 @@ export interface OverlapNoticeInput {
 	teamId: string;
 	text: string;
 	locale: Locale;
+	/** Start a turn when the coordinator is idle (never for one a person stopped). */
+	wake: boolean;
 }
 type NoticeDelivery = (input: OverlapNoticeInput) => Promise<void>;
 
@@ -484,7 +709,8 @@ type NoticeDelivery = (input: OverlapNoticeInput) => Promise<void>;
 const job = hotSafe("narrafork.teams.overlap", () => ({
 	clock: realClock as OverlapClock,
 	notify: null as NoticeDelivery | null,
-	/** The pass resumes after this item id (null: from the start). */
+	deadlineMs: PASS_DEADLINE_MS,
+	/** The sweep resumes after this item id (null: from the start). */
 	cursor: null as string | null,
 	/** Items to look at first (their worker's run just ended). */
 	pending: new Set<string>(),
@@ -494,6 +720,8 @@ const job = hotSafe("narrafork.teams.overlap", () => ({
 	computing: new Map<string, Promise<OverlapIndex>>(),
 	/** Projects whose stored paths changed since their index was built. */
 	stale: new Set<string>(),
+	/** Projects with new cross-team pairs not recorded yet (over the per-pass cap). */
+	pairBacklog: new Set<string>(),
 	lastNoticeAt: new Map<string, number>(),
 	queuedNotices: new Map<string, NoticeLine[]>(),
 }));
@@ -502,9 +730,11 @@ const job = hotSafe("narrafork.teams.overlap", () => ({
 export function setOverlapSeamsForTests(seams: {
 	clock?: OverlapClock | null;
 	notify?: NoticeDelivery | null;
+	deadlineMs?: number | null;
 }): void {
 	if (seams.clock !== undefined) job.clock = seams.clock ?? realClock;
 	if (seams.notify !== undefined) job.notify = seams.notify;
+	if (seams.deadlineMs !== undefined) job.deadlineMs = seams.deadlineMs ?? PASS_DEADLINE_MS;
 }
 
 /** Forget every cursor, index and notice (tests). */
@@ -514,16 +744,17 @@ export function resetOverlapStateForTests(): void {
 	job.indexes.clear();
 	job.computing.clear();
 	job.stale.clear();
+	job.pairBacklog.clear();
 	job.lastNoticeAt.clear();
 	job.queuedNotices.clear();
 }
 
-/** The pass's resume point (tests). */
+/** The sweep's resume point (tests). */
 export function overlapCursor(): string | null {
 	return job.cursor;
 }
 
-/** Drop a project's index: the next reader rebuilds it from the stored paths. */
+/** Mark a project's index stale: the next builder rebuilds it from the stored paths. */
 export function invalidateProjectOverlaps(projectId: string): void {
 	job.stale.add(projectId);
 }
@@ -532,28 +763,34 @@ export interface BatchResult {
 	/** Items looked at (at most {@link TEAM_CHANGED_PATHS_BATCH}). */
 	looked: number;
 	updated: number;
+	/** Items found landed in the base and marked merged. */
+	merged: number;
 	failed: number;
-	/** The pass reached the last active item and starts over next time. */
+	/** The sweep reached the last active item and starts over next time. */
 	wrapped: boolean;
+	/** The pass hit {@link PASS_DEADLINE_MS} and stopped early (its place is kept). */
+	deadline: boolean;
 	/** Cross-team pairs newly recorded. */
 	newPairs: number;
 }
 
 /**
- * One background pass: the items whose worker just ended a run, then the next items after the
- * cursor, together at most {@link TEAM_CHANGED_PATHS_BATCH}; then the overlaps of the projects
- * whose stored paths changed, their new cross-team pairs, and the notices due. One pass at a
- * time: a call while one runs shares its result; items queued meanwhile get one more pass.
+ * One background pass. A sweep (the timer, and the default) looks at the items whose worker just
+ * ended a run and then the next items after the cursor, together at most
+ * {@link TEAM_CHANGED_PATHS_BATCH}; a pending-only pass (a worker's run ended) looks at the queued
+ * items only. Then the overlaps of the projects whose stored paths changed (or that have pairs
+ * left over), their new cross-team pairs, and the notices due. One pass at a time: a call while
+ * one runs shares its result; items queued meanwhile get one more pending-only pass.
  */
-export function runChangedPathsPass(): Promise<BatchResult> {
+export function runChangedPathsPass(options: { sweep?: boolean } = {}): Promise<BatchResult> {
 	if (job.running) return job.running;
 	const run = (async () => {
 		try {
-			return await passOnce();
+			return await passOnce(options.sweep !== false);
 		} finally {
 			job.running = null;
 			if (job.pending.size > 0) {
-				void runChangedPathsPass().catch((error) =>
+				void runChangedPathsPass({ sweep: false }).catch((error) =>
 					logger.warn("Team changed paths pass failed", { error: String(error) }),
 				);
 			}
@@ -563,15 +800,45 @@ export function runChangedPathsPass(): Promise<BatchResult> {
 	return run;
 }
 
-async function passOnce(): Promise<BatchResult> {
-	const result: BatchResult = { looked: 0, updated: 0, failed: 0, wrapped: false, newPairs: 0 };
+/** Settle within the time left, or report that the deadline passed first. */
+async function withinDeadline<T>(work: Promise<T>, remainingMs: number): Promise<T | "deadline"> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<"deadline">((resolve) => {
+		timer = setTimeout(() => resolve("deadline"), remainingMs);
+		timer.unref?.();
+	});
+	try {
+		return await Promise.race([work, deadline]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+async function passOnce(sweep: boolean): Promise<BatchResult> {
+	const result: BatchResult = {
+		looked: 0,
+		updated: 0,
+		merged: 0,
+		failed: 0,
+		wrapped: false,
+		deadline: false,
+		newPairs: 0,
+	};
 	if (activeDatabaseBackend !== "sqlite") return result;
+	const deadlineAt = job.clock.now() + job.deadlineMs;
+	if (sweep) {
+		try {
+			releaseLocksOfArchivedTeams();
+		} catch (error) {
+			logger.warn("Archived teams' locks could not be released", { error: String(error) });
+		}
+	}
 	const pending = [...job.pending].slice(0, TEAM_CHANGED_PATHS_BATCH);
 	for (const id of pending) job.pending.delete(id);
 	const first = pending.length
 		? refreshTargets(and(inArray(teamWorkItems.id, pending), activeWithWorktree()), pending.length)
 		: [];
-	const room = TEAM_CHANGED_PATHS_BATCH - first.length;
+	const room = sweep ? TEAM_CHANGED_PATHS_BATCH - first.length : 0;
 	const next =
 		room > 0
 			? refreshTargets(
@@ -583,24 +850,42 @@ async function passOnce(): Promise<BatchResult> {
 					room,
 				)
 			: [];
-	if (room > 0) {
-		result.wrapped = next.length < room;
-		job.cursor = result.wrapped ? null : (next.at(-1)?.id ?? null);
-	}
 	const projectsTouched = new Set<string>();
-	for (const target of [...first, ...next]) {
+	const targets = [...first, ...next];
+	let lastSwept: string | null = null;
+	for (const [index, target] of targets.entries()) {
+		const remaining = deadlineAt - job.clock.now();
+		const outcome = await withinDeadline(refreshTarget(target), remaining);
+		// Out of time: the sweep resumes at the first item not looked at; pending items not
+		// looked at are left to the sweep (re-queueing them would retry a hung git at once).
+		if (outcome === "deadline") {
+			result.deadline = true;
+			break;
+		}
 		result.looked++;
-		const outcome = await refreshTarget(target);
-		if (outcome === "updated") {
-			result.updated++;
-			projectsTouched.add(target.projectId);
-		} else if (outcome === "failed") result.failed++;
+		if (index >= first.length) lastSwept = target.id;
+		if (outcome === "updated" || outcome === "merged") projectsTouched.add(target.projectId);
+		if (outcome === "updated") result.updated++;
+		else if (outcome === "merged") result.merged++;
+		else if (outcome === "failed") result.failed++;
 		await yieldToEventLoop();
+		if (job.clock.now() >= deadlineAt && index < targets.length - 1) {
+			result.deadline = true;
+			break;
+		}
 	}
-	for (const projectId of [...projectsTouched].sort()) {
+	if (room > 0) {
+		if (result.deadline) job.cursor = lastSwept ?? job.cursor;
+		else {
+			result.wrapped = next.length < room;
+			job.cursor = result.wrapped ? null : (next.at(-1)?.id ?? null);
+		}
+	}
+	for (const projectId of [...new Set([...projectsTouched, ...job.pairBacklog])].sort()) {
+		job.pairBacklog.delete(projectId);
 		try {
 			const index = await ensureProjectOverlaps(projectId);
-			result.newPairs += recordNewCrossTeamPairs(index);
+			result.newPairs += (await recordNewCrossTeamPairs(index)).recorded;
 		} catch (error) {
 			logger.warn("Team overlaps could not be computed", { projectId, error: String(error) });
 		}
@@ -609,7 +894,7 @@ async function passOnce(): Promise<BatchResult> {
 	return result;
 }
 
-/** Look at a worker's items first on the next pass, and start one. */
+/** Look at a worker's items on a pending-only pass, and start one. */
 export function refreshItemsOfWorker(workerNarratorId: string): void {
 	if (activeDatabaseBackend !== "sqlite") return;
 	const rows = db
@@ -625,14 +910,15 @@ export function refreshItemsOfWorker(workerNarratorId: string): void {
 		.all();
 	if (rows.length === 0) return;
 	for (const row of rows) job.pending.add(row.id);
-	void runChangedPathsPass().catch((error) =>
+	void runChangedPathsPass({ sweep: false }).catch((error) =>
 		logger.warn("Team changed paths pass failed", { error: String(error) }),
 	);
 }
 
 /**
- * Start the background pass: every {@link TEAM_CHANGED_PATHS_INTERVAL_MS}, and after a team
- * subagent's run ends (its items first). Idempotent across `--hot` reloads. Returns the stop.
+ * Start the background pass: a sweep every {@link TEAM_CHANGED_PATHS_INTERVAL_MS}, a pass over a
+ * worker's items after its run ends, and a coordinator's archiving releases its team's lock.
+ * Idempotent across `--hot` reloads. Returns the stop function.
  */
 export function startTeamOverlapJob(): () => void {
 	job.stop?.();
@@ -652,11 +938,23 @@ export function startTeamOverlapJob(): () => void {
 			logger.warn("Team changed paths refresh failed", { error: String(error) });
 		}
 	};
+	const onStatus = (event: { narratorId: string; status: string }) => {
+		if (stopped || activeDatabaseBackend !== "sqlite" || event.status !== "archived") return;
+		try {
+			releaseLocksOfTeam(event.narratorId, "team_archived");
+		} catch (error) {
+			logger.warn("Archived team's lock could not be released", { error: String(error) });
+		}
+	};
 	let off = () => {};
 	void import("../../lib/event-bus").then(({ eventBus }) => {
 		if (stopped) return;
 		eventBus.on("narrator:subagent_completed", onCompleted);
-		off = () => eventBus.off("narrator:subagent_completed", onCompleted);
+		eventBus.on("narrator:status_changed", onStatus);
+		off = () => {
+			eventBus.off("narrator:subagent_completed", onCompleted);
+			eventBus.off("narrator:status_changed", onStatus);
+		};
 	});
 	const stop = () => {
 		stopped = true;
@@ -677,16 +975,10 @@ const topLevel = (path: string) => {
 	return slash < 0 ? path : path.slice(0, slash + 1);
 };
 
-/** Pure: the overlap entries of these items' stored paths. */
-export function computeOverlapEntries(
+/** The overlap entries of these items' stored paths; yields after every item. */
+export async function computeOverlapEntries(
 	items: ReadonlyArray<{ id: string; paths: readonly string[] }>,
-): IndexEntry[] {
-	const byPath = new Map<string, { kind: "file" | "dir"; items: Set<string> }>();
-	const add = (path: string, kind: "file" | "dir", ids: Iterable<string>) => {
-		const entry = byPath.get(path) ?? { kind, items: new Set<string>() };
-		for (const id of ids) entry.items.add(id);
-		byPath.set(path, entry);
-	};
+): Promise<IndexEntry[]> {
 	const files = new Map<string, Set<string>>();
 	const tops = new Map<string, { items: Set<string>; coarse: boolean }>();
 	for (const item of items) {
@@ -705,22 +997,45 @@ export function computeOverlapEntries(
 			if (coarse) entry.coarse = true;
 			tops.set(top, entry);
 		}
+		await yieldToEventLoop();
 	}
-	for (const [path, ids] of files) if (ids.size >= 2) add(path, "file", ids);
+	const byPath = new Map<string, { kind: "file" | "dir"; items: Set<string> }>();
+	const add = (path: string, kind: "file" | "dir", ids: Iterable<string>) => {
+		const entry = byPath.get(path) ?? { kind, items: new Set<string>() };
+		for (const id of ids) entry.items.add(id);
+		byPath.set(path, entry);
+	};
+	let visited = 0;
+	for (const [path, ids] of files) {
+		if (ids.size >= 2) add(path, "file", ids);
+		if (++visited % PAIR_VISITS_PER_YIELD === 0) await yieldToEventLoop();
+	}
 	// A coarse item compares by top-level entry with every other item.
 	for (const [top, entry] of tops)
 		if (entry.coarse && entry.items.size >= 2)
 			add(top, top.endsWith(TEAM_CHANGED_DIR_SUFFIX) ? "dir" : "file", entry.items);
-	return [...byPath.entries()]
-		.map(([path, entry]) => ({ path, kind: entry.kind, items: [...entry.items].sort() }))
-		.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	const entries = [...byPath.entries()].map(([path, entry]) => ({
+		path,
+		kind: entry.kind,
+		items: [...entry.items].sort(),
+	}));
+	await yieldToEventLoop();
+	return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 async function computeProjectOverlaps(projectId: string): Promise<OverlapIndex> {
 	const rows = db
 		.select({ id: teamWorkItems.id, teamId: teamWorkItems.teamId })
 		.from(teamWorkItems)
-		.where(and(eq(teamWorkItems.projectId, projectId), notInArray(teamWorkItems.state, FINISHED)))
+		.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(
+			and(
+				eq(teamWorkItems.projectId, projectId),
+				notInArray(teamWorkItems.state, FINISHED),
+				teamIsLive(),
+			),
+		)
 		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
 		.limit(TEAM_OVERLAP_PROJECT_ITEMS + 1)
 		.all();
@@ -743,7 +1058,7 @@ async function computeProjectOverlaps(projectId: string): Promise<OverlapIndex> 
 		if (exclusiveHits(paths, globs, 1).length) exclusive.add(row.id);
 		await yieldToEventLoop();
 	}
-	const entries = computeOverlapEntries(items);
+	const entries = await computeOverlapEntries(items);
 	return {
 		projectId,
 		computedAt: new Date(job.clock.now()).toISOString(),
@@ -756,17 +1071,22 @@ async function computeProjectOverlaps(projectId: string): Promise<OverlapIndex> 
 	};
 }
 
+function isFresh(projectId: string, index: OverlapIndex | undefined): index is OverlapIndex {
+	return (
+		index !== undefined &&
+		!job.stale.has(projectId) &&
+		job.clock.now() - Date.parse(index.computedAt) < TEAM_CHANGED_PATHS_INTERVAL_MS
+	);
+}
+
 /**
  * The project's overlap index: the cached one unless the stored paths changed since or it is
- * older than one pass interval; otherwise rebuilt (one build at a time per project).
+ * older than one pass interval; otherwise rebuilt (one build at a time per project). Background
+ * callers only (the pass, the team status): a person's request uses {@link peekProjectOverlaps}.
  */
 export async function ensureProjectOverlaps(projectId: string): Promise<OverlapIndex> {
 	const cached = job.indexes.get(projectId);
-	const fresh =
-		cached &&
-		!job.stale.has(projectId) &&
-		job.clock.now() - Date.parse(cached.computedAt) < TEAM_CHANGED_PATHS_INTERVAL_MS;
-	if (cached && fresh) return cached;
+	if (isFresh(projectId, cached)) return cached;
 	const inFlight = job.computing.get(projectId);
 	if (inFlight) return inFlight;
 	job.stale.delete(projectId);
@@ -780,6 +1100,22 @@ export async function ensureProjectOverlaps(projectId: string): Promise<OverlapI
 	return build;
 }
 
+/**
+ * The last index of a project without building on the caller's path: when it is missing or stale
+ * a rebuild is started in the background and the last one (or none) is returned, marked stale.
+ */
+export function peekProjectOverlaps(projectId: string): {
+	index: OverlapIndex | null;
+	stale: boolean;
+} {
+	const cached = job.indexes.get(projectId);
+	if (isFresh(projectId, cached)) return { index: cached, stale: false };
+	void ensureProjectOverlaps(projectId).catch((error) =>
+		logger.warn("Team overlaps could not be computed", { projectId, error: String(error) }),
+	);
+	return { index: cached ?? null, stale: true };
+}
+
 interface LiveItem {
 	id: string;
 	teamId: string;
@@ -789,7 +1125,7 @@ interface LiveItem {
 	exclusiveKey: string | null;
 }
 
-/** The index's items as they are now; finished ones are left out. */
+/** The index's items as they are now; finished ones and archived teams' are left out. */
 function liveItemsOf(index: OverlapIndex): Map<string, LiveItem> {
 	const ids = [...index.teams.keys()];
 	if (ids.length === 0) return new Map();
@@ -804,7 +1140,15 @@ function liveItemsOf(index: OverlapIndex): Map<string, LiveItem> {
 				exclusiveKey: teamWorkItems.exclusiveKey,
 			})
 			.from(teamWorkItems)
-			.where(and(inArray(teamWorkItems.id, ids), notInArray(teamWorkItems.state, FINISHED)))
+			.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+			.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+			.where(
+				and(
+					inArray(teamWorkItems.id, ids),
+					notInArray(teamWorkItems.state, FINISHED),
+					teamIsLive(),
+				),
+			)
 			.all()
 			.map((row) => [row.id, row]),
 	);
@@ -840,42 +1184,57 @@ function toldPairs(itemId: string): Set<string> {
 
 /**
  * Record each cross-team pair of the index not recorded before: one `work.overlap` event on
- * each item (`with`, `withTeam`, a few paths), and a notice line queued for each coordinator.
- * At most {@link NEW_PAIRS_PER_PASS} pairs per call. Returns how many were recorded.
+ * each item (`with`, `withTeam`, a few paths cut short), and a notice line queued for each
+ * coordinator. At most {@link NEW_PAIRS_PER_PASS} pairs per call; when more are left the project
+ * is kept for the next pass. Pairing yields every {@link PAIR_VISITS_PER_YIELD} pair visits and
+ * stops collecting a pair's paths once it has {@link PAIR_PATH_SAMPLE}.
  */
-export function recordNewCrossTeamPairs(index: OverlapIndex): number {
+export async function recordNewCrossTeamPairs(
+	index: OverlapIndex,
+): Promise<{ recorded: number; more: boolean }> {
 	const live = liveItemsOf(index);
-	const pairs = new Map<string, { a: string; b: string; paths: string[] }>();
-	for (const entry of liveEntries(index, live)) {
-		for (let i = 0; i < entry.items.length; i++)
-			for (let j = i + 1; j < entry.items.length; j++) {
-				const a = entry.items[i] as string;
-				const b = entry.items[j] as string;
-				if (live.get(a)?.teamId === live.get(b)?.teamId) continue;
-				const key = `${a}\u0000${b}`;
-				const pair = pairs.get(key) ?? { a, b, paths: [] };
-				if (pair.paths.length < PAIR_PATH_SAMPLE) pair.paths.push(entry.path);
-				pairs.set(key, pair);
-			}
-	}
-	const told = new Map<string, Set<string>>();
-	const toldOf = (id: string) => {
-		let set = told.get(id);
-		if (!set) {
-			set = toldPairs(id);
-			told.set(id, set);
+	const entries = liveEntries(index, live);
+	// Numbered items: a pair is one number, not a string built per visit.
+	const ids = [...live.keys()].sort();
+	const number = new Map(ids.map((id, i) => [id, i]));
+	const width = ids.length + 1;
+	const teamOf = ids.map((id) => live.get(id)?.teamId ?? "");
+	const told = new Set<number>();
+	for (const [i, id] of ids.entries()) {
+		for (const other of toldPairs(id)) {
+			const j = number.get(other);
+			if (j !== undefined) told.add(Math.min(i, j) * width + Math.max(i, j));
 		}
-		return set;
-	};
+		if (i % 10 === 9) await yieldToEventLoop();
+	}
+	const found = new Map<number, string[]>();
+	let visits = 0;
+	for (const entry of entries) {
+		const nums = entry.items
+			.map((id) => number.get(id))
+			.filter((n): n is number => n !== undefined)
+			.sort((a, b) => a - b);
+		for (let x = 0; x < nums.length; x++) {
+			const a = nums[x] as number;
+			for (let y = x + 1; y < nums.length; y++) {
+				const b = nums[y] as number;
+				if (++visits % PAIR_VISITS_PER_YIELD === 0) await yieldToEventLoop();
+				if (teamOf[a] === teamOf[b]) continue;
+				const key = a * width + b;
+				if (told.has(key)) continue;
+				const paths = found.get(key);
+				if (!paths) found.set(key, [samplePath(entry.path)]);
+				else if (paths.length < PAIR_PATH_SAMPLE) paths.push(samplePath(entry.path));
+			}
+		}
+	}
+	const keys = [...found.keys()].sort((x, y) => x - y);
 	let recorded = 0;
 	const system: WorkActor = { kind: "system", id: null };
-	for (const pair of [...pairs.values()].sort((x, y) =>
-		x.a === y.a ? (x.b < y.b ? -1 : 1) : x.a < y.a ? -1 : 1,
-	)) {
-		if (recorded >= NEW_PAIRS_PER_PASS) break;
-		if (toldOf(pair.a).has(pair.b) || toldOf(pair.b).has(pair.a)) continue;
-		const a = live.get(pair.a) as LiveItem;
-		const b = live.get(pair.b) as LiveItem;
+	for (const key of keys.slice(0, NEW_PAIRS_PER_PASS)) {
+		const a = live.get(ids[Math.floor(key / width)] as string) as LiveItem;
+		const b = live.get(ids[key % width] as string) as LiveItem;
+		const paths = found.get(key) ?? [];
 		const at = new Date(job.clock.now()).toISOString();
 		db.transaction((tx) => {
 			recordWorkEvent(tx, {
@@ -883,7 +1242,7 @@ export function recordNewCrossTeamPairs(index: OverlapIndex): number {
 				workItemId: a.id,
 				kind: "work.overlap",
 				actor: system,
-				detail: { with: b.id, withTeam: b.teamId, paths: pair.paths },
+				detail: { with: b.id, withTeam: b.teamId, paths },
 				at,
 			});
 			recordWorkEvent(tx, {
@@ -891,27 +1250,17 @@ export function recordNewCrossTeamPairs(index: OverlapIndex): number {
 				workItemId: b.id,
 				kind: "work.overlap",
 				actor: system,
-				detail: { with: a.id, withTeam: a.teamId, paths: pair.paths },
+				detail: { with: a.id, withTeam: a.teamId, paths },
 				at,
 			});
 		});
-		toldOf(pair.a).add(pair.b);
-		toldOf(pair.b).add(pair.a);
-		queueNotice(a.teamId, {
-			itemId: a.id,
-			otherItemId: b.id,
-			otherTeamId: b.teamId,
-			paths: pair.paths,
-		});
-		queueNotice(b.teamId, {
-			itemId: b.id,
-			otherItemId: a.id,
-			otherTeamId: a.teamId,
-			paths: pair.paths,
-		});
+		queueNotice(a.teamId, { itemId: a.id, otherItemId: b.id, otherTeamId: b.teamId, paths });
+		queueNotice(b.teamId, { itemId: b.id, otherItemId: a.id, otherTeamId: a.teamId, paths });
 		recorded++;
 	}
-	return recorded;
+	const more = keys.length > NEW_PAIRS_PER_PASS;
+	if (more) job.pairBacklog.add(index.projectId);
+	return { recorded, more };
 }
 
 function queueNotice(teamId: string, line: NoticeLine): void {
@@ -920,16 +1269,22 @@ function queueNotice(teamId: string, line: NoticeLine): void {
 	job.queuedNotices.set(teamId, lines);
 }
 
-/** Whether the team is active and its coordinator not archived. */
-function teamIsActive(teamId: string): boolean {
+/** The coordinator's state as a notice needs it: active, and whether it may be woken. */
+function coordinatorNoticeState(teamId: string): { active: boolean; wake: boolean } {
 	const row = db
-		.select({ status: projectTeams.status, coordinator: narrators.status })
+		.select({
+			status: projectTeams.status,
+			coordinator: narrators.status,
+			lastStop: narrators.lastStopReason,
+		})
 		.from(projectTeams)
 		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
 		.where(eq(projectTeams.narratorId, teamId))
 		.limit(1)
 		.get();
-	return row?.status === "active" && row.coordinator !== "archived";
+	const active = row?.status === "active" && row.coordinator !== "archived";
+	// A coordinator a person stopped (or that failed) stays stopped: the row waits for its next run.
+	return { active, wake: active && row?.lastStop === "normal" };
 }
 
 async function coordinatorLocale(teamId: string): Promise<Locale> {
@@ -942,41 +1297,55 @@ async function coordinatorLocale(teamId: string): Promise<Locale> {
 	}
 }
 
-/** The notice text for one coordinator. Pure given the rows it reads. */
-export function renderOverlapNotice(teamId: string, lines: NoticeLine[], locale: Locale): string {
-	const t = getTeamOverlapLabels(locale);
-	const titles = new Map(
-		db
-			.select({ id: teamWorkItems.id, title: teamWorkItems.title })
-			.from(teamWorkItems)
-			.where(
-				inArray(
-					teamWorkItems.id,
-					lines.flatMap((line) => [line.itemId, line.otherItemId]),
-				),
-			)
-			.all()
-			.map((row) => [row.id, row.title]),
-	);
-	const coordinators = coordinatorsOf([teamId, ...lines.map((line) => line.otherTeamId)]);
-	const viewer = coordinators.get(teamId);
-	const body = lines.map((line) => {
-		const other = coordinators.get(line.otherTeamId);
-		const visible = viewer && other && teamDetailsVisibleAcross(viewer, other);
-		return t.noticeLine(
-			oneLine(titles.get(line.itemId) ?? line.itemId),
-			visible ? oneLine(other.title) : null,
-			visible ? oneLine(titles.get(line.otherItemId) ?? "") : null,
-			line.paths.join(t.separator),
-		);
-	});
-	return [t.noticeHeading, ...body, t.noticeAdvice].join("\n");
-}
-
 const oneLine = (value: string, max = 80) => {
 	const flat = value.replace(/\s+/g, " ").trim();
 	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 };
+
+/** The notice text for one coordinator, at most {@link NOTICE_MAX_BYTES}. */
+export async function renderOverlapNotice(
+	teamId: string,
+	lines: NoticeLine[],
+	locale: Locale,
+): Promise<string> {
+	const t = getTeamOverlapLabels(locale);
+	const ids = lines.flatMap((line) => [line.itemId, line.otherItemId]);
+	const titles = new Map(
+		ids.length
+			? db
+					.select({ id: teamWorkItems.id, title: teamWorkItems.title })
+					.from(teamWorkItems)
+					.where(inArray(teamWorkItems.id, ids))
+					.all()
+					.map((row) => [row.id, row.title])
+			: [],
+	);
+	const named = await namedTeamsFor(
+		teamId,
+		lines.map((line) => line.otherTeamId),
+	);
+	const head = t.noticeHeading;
+	const tail = t.noticeAdvice;
+	let used = utf8Bytes(head) + utf8Bytes(tail) + 2;
+	const body: string[] = [];
+	for (const [index, line] of lines.entries()) {
+		const other = named.get(line.otherTeamId);
+		const text = t.noticeLine(
+			oneLine(titles.get(line.itemId) ?? line.itemId),
+			other ? oneLine(other.title) : null,
+			other ? oneLine(titles.get(line.otherItemId) ?? "") : null,
+			line.paths.map(samplePath).join(t.separator),
+		);
+		const more = t.more(lines.length - index);
+		if (used + utf8Bytes(text) + 1 + utf8Bytes(more) + 1 > NOTICE_MAX_BYTES) {
+			body.push(more);
+			break;
+		}
+		body.push(text);
+		used += utf8Bytes(text) + 1;
+	}
+	return [head, ...body, tail].join("\n");
+}
 
 async function defaultNotify(input: OverlapNoticeInput): Promise<void> {
 	const { deliverInjection } = await import("../narrator-injection");
@@ -985,7 +1354,7 @@ async function defaultNotify(input: OverlapNoticeInput): Promise<void> {
 		source: "team_overlap",
 		body: { kind: "prose", text: input.text },
 		role: "sys",
-		schedule: "wakeIfIdle",
+		schedule: input.wake ? "wakeIfIdle" : "none",
 		locale: input.locale,
 	});
 }
@@ -999,14 +1368,16 @@ export async function flushNotices(): Promise<number> {
 		if (last !== undefined && now - last < TEAM_OVERLAP_NOTICE_INTERVAL_MS) continue;
 		const lines = job.queuedNotices.get(teamId) ?? [];
 		job.queuedNotices.delete(teamId);
-		if (lines.length === 0 || !teamIsActive(teamId)) continue;
+		const state = coordinatorNoticeState(teamId);
+		if (lines.length === 0 || !state.active) continue;
 		job.lastNoticeAt.set(teamId, now);
 		try {
 			const locale = await coordinatorLocale(teamId);
 			await (job.notify ?? defaultNotify)({
 				teamId,
-				text: renderOverlapNotice(teamId, lines, locale),
+				text: await renderOverlapNotice(teamId, lines, locale),
 				locale,
+				wake: state.wake,
 			});
 			sent++;
 		} catch (error) {
@@ -1076,7 +1447,9 @@ const refOrder = (ref: TeamOverlapItemRef) =>
 
 /**
  * "Who is changing what" in a project, as this person may see it, plus the exclusive paths and
- * the lock. Bounded: one index (≤ 100 items), one `IN` read of those items, one of their teams.
+ * the lock. Never builds on the request: the last index is shown (marked stale while a rebuild
+ * runs in the background). Bounded: one `IN` read of the index's items (≤ 100), one of their
+ * teams. Items of teams the person cannot read are neither shown nor counted.
  */
 export async function readProjectOverlaps(
 	projectId: string,
@@ -1084,8 +1457,8 @@ export async function readProjectOverlaps(
 	options: { canManageProject: boolean },
 ): Promise<TeamOverlapResponse> {
 	assertSqlite();
-	const index = await ensureProjectOverlaps(projectId);
-	const live = liveItemsOf(index);
+	const { index, stale } = peekProjectOverlaps(projectId);
+	const live = index ? liveItemsOf(index) : new Map<string, LiveItem>();
 	const holderRows = db
 		.select({
 			id: teamWorkItems.id,
@@ -1105,7 +1478,7 @@ export async function readProjectOverlaps(
 		principal,
 	);
 	const visible: TeamOverlapEntry[] = [];
-	for (const entry of liveEntries(index, live)) {
+	for (const entry of index ? liveEntries(index, live) : []) {
 		const refs = entry.items.map((id) => {
 			const item = live.get(id) as LiveItem;
 			return itemRef(item, teams.get(item.teamId));
@@ -1118,16 +1491,18 @@ export async function readProjectOverlaps(
 		key: row.exclusiveKey as string,
 		holder: itemRef(row, teams.get(row.teamId)),
 		canRelease: options.canManageProject,
+		// For the release call only; a client never shows it for a holder it cannot see.
 		...(options.canManageProject ? { holderId: row.id } : {}),
 	}));
 	return {
-		computedAt: index.computedAt,
-		activeItems: index.activeItems,
-		activeItemsCapped: index.capped,
+		computedAt: index?.computedAt ?? null,
+		stale,
+		activeItems: [...live.values()].filter(
+			(item) => (teams.get(item.teamId)?.access ?? "hidden") !== "hidden",
+		).length,
+		activeItemsCapped: index?.capped ?? false,
 		entries: visible.slice(0, TEAM_OVERLAP_LIST_LIMIT),
-		moreEntries:
-			Math.max(0, visible.length - TEAM_OVERLAP_LIST_LIMIT) +
-			Math.max(0, index.entriesTotal - index.entries.length),
+		moreEntries: Math.max(0, visible.length - TEAM_OVERLAP_LIST_LIMIT),
 		exclusivePaths: projectExclusivePaths(projectId),
 		locks,
 	};
@@ -1168,16 +1543,10 @@ export async function teamOverlapStatus(
 		entry.items.some((id) => live.get(id)?.teamId === teamId),
 	);
 	const holder = exclusiveHolder(projectId);
-	const coordinators = coordinatorsOf([
-		teamId,
+	const named = await namedTeamsFor(teamId, [
 		...[...live.values()].map((item) => item.teamId),
 		...(holder ? [holder.teamId] : []),
 	]);
-	const viewer = coordinators.get(teamId);
-	const shown = (otherTeamId: string) => {
-		const other = coordinators.get(otherTeamId);
-		return viewer && other && teamDetailsVisibleAcross(viewer, other) ? other : null;
-	};
 	const lines = entries.slice(0, limit).map((entry) => {
 		const mine: string[] = [];
 		const others: Array<{ team: string | null; title: string | null }> = [];
@@ -1185,7 +1554,7 @@ export async function teamOverlapStatus(
 			const item = live.get(id) as LiveItem;
 			if (item.teamId === teamId) mine.push(oneLine(item.title));
 			else {
-				const other = shown(item.teamId);
+				const other = named.get(item.teamId);
 				others.push(
 					other
 						? { team: oneLine(other.title, 60), title: oneLine(item.title) }
@@ -1199,13 +1568,13 @@ export async function teamOverlapStatus(
 			const kb = `${b.team === null ? 1 : 0}${b.team ?? ""}\u0000${b.title ?? ""}`;
 			return ka < kb ? -1 : ka > kb ? 1 : 0;
 		});
-		return { path: entry.path, kind: entry.kind, mine, others };
+		return { path: samplePath(entry.path), kind: entry.kind, mine, others };
 	});
 	let lock: TeamOverlapStatus["lock"] = null;
 	if (holder) {
 		if (holder.teamId === teamId) lock = { mine: true, title: oneLine(holder.title), team: null };
 		else {
-			const other = shown(holder.teamId);
+			const other = named.get(holder.teamId);
 			lock = other
 				? { mine: false, title: oneLine(holder.title), team: oneLine(other.title, 60) }
 				: { mine: false, title: null, team: null };

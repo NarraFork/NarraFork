@@ -267,6 +267,8 @@ export interface TeamOverlapLabels {
 	noticeHeading: string;
 	noticeLine: (mine: string, team: string | null, title: string | null, paths: string) => string;
 	noticeAdvice: string;
+	/** A person released the exclusive paths lock one of this team's items held. */
+	releasedNotice: (title: string, reason: string | null) => string;
 	separator: string;
 }
 
@@ -293,6 +295,8 @@ const overlapLabels: LocalizedValue<TeamOverlapLabels> = {
 			`- your work item "${mine}" and ${team === null ? "another team's work item" : `team "${team}"'s work item "${title ?? ""}"`} both change: ${paths}`,
 		noticeAdvice:
 			'Decide whether this matters (e.g. who merges first, or split the change) and record what you decide with Team({ action: "decision" }). The team status lists every overlap.',
+		releasedNotice: (title, reason) =>
+			`[Team lock] A person released the exclusive paths lock your work item "${title}" held${reason ? ` (${reason})` : ""}. Another item may take it now; if this item still has to change the exclusive paths, mark it ready again later. Written by the system, not by a person.`,
 		separator: ", ",
 	},
 	"zh-CN": {
@@ -315,6 +319,8 @@ const overlapLabels: LocalizedValue<TeamOverlapLabels> = {
 			`- 你的工作项「${mine}」和${team === null ? "另一个 team 的工作项" : ` team「${team}」的「${title ?? ""}」`}都改了：${paths}`,
 		noticeAdvice:
 			'判断这是否要紧（比如谁先合、要不要拆开改），决定后用 Team({ action: "decision" }) 记下来。团队状态里列着全部重叠。',
+		releasedNotice: (title, reason) =>
+			`[团队锁] 有人放行了你的工作项「${title}」持有的独占路径锁${reason ? `（${reason}）` : ""}。别的工作项现在可以拿锁；这个工作项如果还要改独占路径，之后再标记一次就绪。由系统写入，不是人发的消息。`,
 		separator: "，",
 	},
 };

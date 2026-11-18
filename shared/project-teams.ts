@@ -260,12 +260,17 @@ export const TEAM_EXCLUSIVE_LOCK_KEY = "paths";
  * Nothing is filled in automatically.
  */
 export interface TeamProjectSettings {
-	/** Path globs (relative to the repository root, `**` for any depth) only one item may change at a time. */
+	/**
+	 * Path globs (relative to the repository root, `**` for any depth) only one item may change at
+	 * a time. `dir/` is stored as `dir/**`; a bare name without glob characters (`drizzle`) covers
+	 * that file or directory and everything under it.
+	 */
 	exclusivePaths?: string[];
 }
 
 /** Events written by X. */
 export type TeamOverlapEventKind =
+	| "work.merged"
 	| "work.overlap"
 	| "work.exclusive_taken"
 	| "work.exclusive_refused"
@@ -313,6 +318,8 @@ export interface TeamExclusiveLockView {
 export interface TeamOverlapResponse {
 	/** When the overlaps were computed from the stored changed paths (null: none yet). */
 	computedAt: string | null;
+	/** The overlaps shown are older than the stored paths; a rebuild is running (poll again). */
+	stale: boolean;
 	/** Active work items looked at (at most {@link TEAM_OVERLAP_PROJECT_ITEMS}). */
 	activeItems: number;
 	/** More active items exist than were looked at. */

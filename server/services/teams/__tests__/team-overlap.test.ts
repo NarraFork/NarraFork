@@ -51,7 +51,7 @@ const NOW = "2026-11-18T00:00:00.000Z";
 let temporary: string;
 let source: string;
 let clockNow = Date.UTC(2026, 10, 18, 12);
-const notices: Array<{ teamId: string; text: string }> = [];
+const notices: Array<{ teamId: string; text: string; wake: boolean }> = [];
 
 afterAll(() => {
 	setGitHardeningProbeForTests(null);
@@ -251,7 +251,7 @@ beforeAll(() => {
 	overlap.setOverlapSeamsForTests({
 		clock: { now: () => clockNow, every: () => () => {} },
 		notify: async (input) => {
-			notices.push({ teamId: input.teamId, text: input.text });
+			notices.push({ teamId: input.teamId, text: input.text, wake: input.wake });
 		},
 	});
 });
@@ -372,7 +372,10 @@ describe("two teams changing the same file", () => {
 			activeItems: 2,
 			activeItemsCapped: false,
 			moreEntries: 0,
+			stale: false,
 		});
+		// USER_A cannot see Lead B's item: it is not counted either.
+		expect(seenByA.body.activeItems).toBe(1);
 
 		// A second pass without new commits records nothing new and tells nobody again.
 		clockNow += shared.TEAM_OVERLAP_NOTICE_INTERVAL_MS;
@@ -393,12 +396,18 @@ describe("two teams changing the same file", () => {
 	test("a new overlap within the notice interval waits for the next notice", async () => {
 		const a1 = insertItem(LEAD_A, "A one", ["x.ts"]);
 		insertItem(LEAD_B, "B one", ["x.ts"]);
-		expect(overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT))).toBe(1);
+		expect(
+			(await overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT)))
+				.recorded,
+		).toBe(1);
 		expect(await overlap.flushNotices()).toBe(2);
 		insertItem(LEAD_C, "C one", ["x.ts"]);
 		overlap.invalidateProjectOverlaps(PROJECT);
 		// Two new pairs: A–C and B–C; Lead A and Lead B were told less than ten minutes ago.
-		expect(overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT))).toBe(2);
+		expect(
+			(await overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT)))
+				.recorded,
+		).toBe(2);
 		expect(await overlap.flushNotices()).toBe(1);
 		expect(notices.map((notice) => notice.teamId)).toEqual([LEAD_A, LEAD_B, LEAD_C]);
 		clockNow += shared.TEAM_OVERLAP_NOTICE_INTERVAL_MS;
@@ -410,6 +419,10 @@ describe("two teams changing the same file", () => {
 	test("an overlap none of whose teams the reader can read is not listed", async () => {
 		insertItem(LEAD_B, "B secret", ["secret.ts"]);
 		insertItem(LEAD_C, "C secret", ["secret.ts"]);
+		// A request never builds the index: the first one starts a build and says it is stale.
+		const first = await call(USER_B, `/projects/${PROJECT}/team-overlaps`);
+		expect(first.body).toMatchObject({ stale: true, computedAt: null, entries: [] });
+		await overlap.ensureProjectOverlaps(PROJECT);
 		const outsider = await call(OUTSIDER, `/projects/${PROJECT}/team-overlaps`);
 		expect(outsider.status).toBe(200);
 		expect(outsider.body.entries).toEqual([]);
@@ -555,11 +568,14 @@ describe("exclusive paths", () => {
 		});
 		const holderRow = overlap.exclusiveHolder(PROJECT);
 		expect(holderRow?.id).toBe(holder);
-		const text = overlap.describeHolderFor(LEAD_A, holderRow as NonNullable<typeof holderRow>);
-		expect(text).toBe("a work item of another team (ready)");
-		expect(overlap.describeHolderFor(LEAD_B, holderRow as NonNullable<typeof holderRow>)).toContain(
-			`your work item "Private migration"`,
+		const text = await overlap.describeHolderFor(
+			LEAD_A,
+			holderRow as NonNullable<typeof holderRow>,
 		);
+		expect(text).toBe("a work item of another team (ready)");
+		expect(
+			await overlap.describeHolderFor(LEAD_B, holderRow as NonNullable<typeof holderRow>),
+		).toContain(`your work item "Private migration"`);
 	});
 
 	test("globs match files and collapsed directories", () => {
@@ -593,9 +609,9 @@ describe("exclusive paths", () => {
 });
 
 describe("comparing large changes by directory", () => {
-	test("past 500 paths an item compares by top-level directory", () => {
+	test("past 500 paths an item compares by top-level directory", async () => {
 		const big = Array.from({ length: 600 }, (_, i) => `server/lib/f${i}.ts`);
-		const entries = overlap.computeOverlapEntries([
+		const entries = await overlap.computeOverlapEntries([
 			{ id: "big", paths: big },
 			{ id: "small", paths: ["server/routes/x.ts", "docs/a.md"] },
 			{ id: "docs", paths: ["docs/a.md"] },
@@ -611,7 +627,7 @@ describe("comparing large changes by directory", () => {
 		// At 500 paths an item is still compared path by path.
 		const exact = Array.from({ length: 500 }, (_, i) => `server/lib/f${i}.ts`);
 		expect(
-			overlap.computeOverlapEntries([
+			await overlap.computeOverlapEntries([
 				{ id: "exact", paths: exact },
 				{ id: "small", paths: ["server/routes/x.ts"] },
 			]),
@@ -634,21 +650,22 @@ describe("comparing large changes by directory", () => {
 
 describe("the background pass", () => {
 	test("bounded to 50 items, resumes after the last one, skips unmoved heads", async () => {
-		const calls = { head: 0, changed: 0 };
-		overlap.setChangedPathsSourceForTests({
-			head: async (worktree) => {
-				calls.head++;
-				return worktree.endsWith("moved") ? "c".repeat(40) : "b".repeat(40);
-			},
-			changed: async (worktree) => {
-				calls.changed++;
-				return {
-					head: worktree.endsWith("moved") ? "c".repeat(40) : "b".repeat(40),
-					mergeBase: "0".repeat(40),
-					paths: ["common.ts"],
-					collapsed: false,
-				};
-			},
+		const calls = { opened: 0, head: 0, changed: 0 };
+		overlap.setChangedPathsSourceForTests((worktree) => {
+			calls.opened++;
+			const head = worktree.endsWith("moved") ? "c".repeat(40) : "b".repeat(40);
+			return {
+				head: async () => {
+					calls.head++;
+					return head;
+				},
+				resolve: async () => "f".repeat(40),
+				isAncestor: async () => false,
+				changed: async () => {
+					calls.changed++;
+					return { head, mergeBase: "0".repeat(40), paths: ["common.ts"], collapsed: false };
+				},
+			};
 		});
 		const ids: string[] = [];
 		for (let i = 0; i < 120; i++) {
@@ -681,7 +698,8 @@ describe("the background pass", () => {
 		const third = await overlap.runChangedPathsPass();
 		expect(third).toMatchObject({ looked: 20, updated: 20, wrapped: true });
 		expect(overlap.overlapCursor()).toBeNull();
-		expect(calls).toEqual({ head: 120, changed: 120 });
+		// One git per item per pass.
+		expect(calls).toEqual({ opened: 120, head: 120, changed: 120 });
 
 		// Unmoved heads are looked at (one rev-parse) but not listed again.
 		const fourth = await overlap.runChangedPathsPass();
@@ -703,8 +721,10 @@ describe("the background pass", () => {
 			resource,
 		]);
 		overlap.refreshItemsOfWorker(worker);
-		const fifth = await overlap.runChangedPathsPass();
-		expect(fifth.looked).toBe(50);
+		// A worker's run ending looks at its items only, not at 50 more of the sweep.
+		const fifth = await overlap.runChangedPathsPass({ sweep: false });
+		expect(fifth.looked).toBe(1);
+		expect(overlap.overlapCursor()).toBe(ids[49] ?? null);
 		expect(itemRow(late)?.changedPathsAtSha).toBe("c".repeat(40));
 		// The overlap check looks at 100 of the 120 active items.
 		const index = await overlap.ensureProjectOverlaps(PROJECT);
@@ -729,7 +749,8 @@ describe("the background pass", () => {
 		const text = readFileSync(join(import.meta.dir, "..", "team-overlap.ts"), "utf8");
 		for (const forbidden of ["safeSpawn", "Bun.spawn", "child_process", "gitService", "execRead"])
 			expect(text).not.toContain(forbidden);
-		expect(text).toContain("teamGit(worktree).changedPaths(baseRef)");
+		expect(text).toContain("const git = teamGit(worktree);");
+		expect(text).toContain("changed: (baseRef) => git.changedPaths(baseRef)");
 		const gitText = readFileSync(join(import.meta.dir, "..", "team-git.ts"), "utf8");
 		expect(gitText).toContain('["diff", "--name-only", "--no-renames", "-z", fork, head]');
 	});
@@ -768,5 +789,314 @@ describe("team status section", () => {
 		const quiet = (await readTeamStatus(LEAD_A, "en", { now: clockNow }))?.text ?? "";
 		expect(quiet).not.toContain("Files your open work items share");
 		expect(quiet).not.toContain("Exclusive paths lock");
+	});
+});
+
+describe("review round 1", () => {
+	test("a landed item becomes merged: lock released, overlaps gone; squash merges are not noticed", async () => {
+		setExclusivePaths(["drizzle/**"]);
+		const landed = await create(LEAD_A, "Add a column", USER_A);
+		const squashed = await create(LEAD_A, "Squash me", USER_A);
+		const untouched = await create(LEAD_A, "Nothing yet", USER_A);
+		const other = await create(LEAD_B, "Also the schema", USER_B);
+		const landedPath = items.worktreePathOf(landed) ?? "";
+		await commitFiles(landedPath, { "drizzle/0260.sql": "--\n", "shared.ts": "a\n" }, "a");
+		await commitFiles(items.worktreePathOf(squashed) ?? "", { "squash.txt": "s\n" }, "s");
+		await commitFiles(items.worktreePathOf(other) ?? "", { "shared.ts": "b\n" }, "b");
+		await clearReview(LEAD_A, landed.id);
+		await items.markReady({
+			coordinatorId: LEAD_A,
+			itemId: landed.id,
+			actor: { kind: "agent", id: LEAD_A },
+		});
+		await overlap.runChangedPathsPass();
+		expect(itemRow(landed.id)?.exclusiveKey).toBe(shared.TEAM_EXCLUSIVE_LOCK_KEY);
+		expect((await call(USER_A, `/projects/${PROJECT}/team-overlaps`)).body.entries).toHaveLength(1);
+
+		// The base takes the head (a merge that keeps it), and the squashed branch's content.
+		const head = await git(["rev-parse", "HEAD"], landedPath);
+		await git(["merge", "-q", "--ff-only", landed.branchName ?? ""]);
+		await git(["merge", "-q", "--squash", squashed.branchName ?? ""]);
+		await git(["-c", "user.name=T", "-c", "user.email=t@e.test", "commit", "-qm", "squash"]);
+		const base = await git(["rev-parse", "main"]);
+
+		// The landed item's head did not move: it is still noticed.
+		const pass = await overlap.runChangedPathsPass();
+		expect(pass.merged).toBe(1);
+		const row = itemRow(landed.id);
+		expect(row?.state).toBe("merged");
+		expect(row?.exclusiveKey).toBeNull();
+		expect(row?.changedPathsJson).toBeNull();
+		expect(row?.updatedAt).not.toBe(landed.updatedAt);
+		const kinds = eventsOf(landed.id).map((event) => event.kind);
+		expect(kinds.slice(-2)).toEqual(["work.exclusive_released", "work.merged"]);
+		expect(eventsOf(landed.id).at(-1)).toMatchObject({
+			actorKind: "system",
+			detail: { head, base, detectedBy: "ancestry" },
+		});
+		expect(overlap.exclusiveHolder(PROJECT)).toBeNull();
+		clockNow += shared.TEAM_CHANGED_PATHS_INTERVAL_MS;
+		await overlap.ensureProjectOverlaps(PROJECT);
+		expect((await call(USER_A, `/projects/${PROJECT}/team-overlaps`)).body.entries).toEqual([]);
+		// Documented limits: a squash merge never puts the head in the base; an item without
+		// work is never "landed" although its head is the base's ancestor.
+		expect(itemRow(squashed.id)?.state).toBe("queued");
+		expect(itemRow(untouched.id)?.state).toBe("queued");
+		expect(itemRow(other.id)?.state).toBe("queued");
+	});
+
+	test("the refusal names the limits of merge detection", async () => {
+		setExclusivePaths(["drizzle/**"]);
+		insertItem(LEAD_A, "Holder", ["drizzle/1.sql"], {
+			exclusiveKey: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			state: "ready",
+		});
+		const b = await create(LEAD_B, "Second", USER_B);
+		await commitFiles(items.worktreePathOf(b) ?? "", { "drizzle/2.sql": "--\n" }, "b");
+		await clearReview(LEAD_B, b.id);
+		await expect(
+			items.markReady({
+				coordinatorId: LEAD_B,
+				itemId: b.id,
+				actor: { kind: "agent", id: LEAD_B },
+			}),
+		).rejects.toThrow(
+			"a squash or rebase merge, or a base updated only on the remote, is not noticed",
+		);
+	});
+
+	test("a coordinator a person stopped is told without being woken", async () => {
+		sqlite.run("UPDATE narrators SET last_stop_reason = 'user_interrupt' WHERE id = ?", [LEAD_A]);
+		sqlite.run("UPDATE narrators SET last_stop_reason = 'normal' WHERE id = ?", [LEAD_B]);
+		insertItem(LEAD_A, "A one", ["x.ts"]);
+		insertItem(LEAD_B, "B one", ["x.ts"]);
+		await overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT));
+		await overlap.flushNotices();
+		expect(notices.map(({ teamId, wake }) => ({ teamId, wake }))).toEqual([
+			{ teamId: LEAD_A, wake: false },
+			{ teamId: LEAD_B, wake: true },
+		]);
+	});
+
+	test("pairing 100 items × 500 shared paths never blocks the event loop for long", async () => {
+		const paths = Array.from({ length: 500 }, (_, j) => `src/d${j % 40}/f${j}.ts`);
+		for (let i = 0; i < 100; i++) insertItem(i % 2 ? LEAD_A : LEAD_B, `Item ${i}`, paths);
+		let last = performance.now();
+		let longest = 0;
+		let done = false;
+		const tick = () => {
+			const now = performance.now();
+			longest = Math.max(longest, now - last);
+			last = now;
+			if (!done) setImmediate(tick);
+		};
+		setImmediate(tick);
+		const index = await overlap.ensureProjectOverlaps(PROJECT);
+		const first = await overlap.recordNewCrossTeamPairs(index);
+		done = true;
+		expect(index.entries).toHaveLength(500);
+		// 2,500 cross-team pairs: 50 recorded, the rest on later passes.
+		expect(first).toEqual({ recorded: overlap.NEW_PAIRS_PER_PASS, more: true });
+		expect(longest).toBeLessThan(150);
+	});
+
+	test("pairs beyond the per-pass cap are recorded by the next pass", async () => {
+		for (let i = 0; i < 8; i++) insertItem(LEAD_A, `A ${i}`, ["x.ts"]);
+		for (let i = 0; i < 8; i++) insertItem(LEAD_B, `B ${i}`, ["x.ts"]);
+		// 64 cross-team pairs.
+		expect(
+			await overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT)),
+		).toEqual({ recorded: 50, more: true });
+		expect((await overlap.runChangedPathsPass()).newPairs).toBe(14);
+		expect((await overlap.runChangedPathsPass()).newPairs).toBe(0);
+	});
+
+	test("a long path keeps the overlap event's `with`; the notice stays within its budget", async () => {
+		const long = `${"deep/".repeat(600)}file.ts`;
+		const a = insertItem(LEAD_A, "A long", [long]);
+		for (let i = 0; i < 20; i++) insertItem(LEAD_B, `B ${i} ${"x".repeat(100)}`, [long]);
+		await overlap.recordNewCrossTeamPairs(await overlap.ensureProjectOverlaps(PROJECT));
+		const events = eventsOf(a).filter((event) => event.kind === "work.overlap");
+		expect(events).toHaveLength(20);
+		for (const event of events) {
+			expect(typeof event.detail?.with).toBe("string");
+			expect(String((event.detail?.paths as string[])[0]).length).toBeLessThanOrEqual(300);
+		}
+		await overlap.flushNotices();
+		const toA = notices.find((notice) => notice.teamId === LEAD_A)?.text ?? "";
+		expect(Buffer.byteLength(toA, "utf8")).toBeLessThanOrEqual(overlap.NOTICE_MAX_BYTES);
+		expect(toA).toMatch(/… and \d+ more/);
+	});
+
+	test("an archived team leaves the overlaps and gives up its lock", async () => {
+		insertItem(LEAD_A, "A one", ["x.ts"]);
+		const held = insertItem(LEAD_B, "B one", ["x.ts"], {
+			exclusiveKey: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			state: "ready",
+		});
+		const before = await overlap.ensureProjectOverlaps(PROJECT);
+		expect(before.entries).toHaveLength(1);
+		sqlite.run("UPDATE narrators SET status = 'archived' WHERE id = ?", [LEAD_B]);
+		sqlite.run("UPDATE project_teams SET status = 'archived' WHERE narrator_id = ?", [LEAD_B]);
+		// The listener releases at once; the sweep is the backstop.
+		expect(overlap.releaseLocksOfTeam(LEAD_B, "team_archived")).toBe(1);
+		expect(itemRow(held)?.exclusiveKey).toBeNull();
+		expect(eventsOf(held).at(-1)).toMatchObject({
+			kind: "work.exclusive_released",
+			actorKind: "system",
+			detail: { key: shared.TEAM_EXCLUSIVE_LOCK_KEY, forced: false, reason: "team_archived" },
+		});
+		expect((await overlap.recordNewCrossTeamPairs(before)).recorded).toBe(0);
+		clockNow += shared.TEAM_CHANGED_PATHS_INTERVAL_MS;
+		expect((await overlap.ensureProjectOverlaps(PROJECT)).entries).toEqual([]);
+
+		sqlite.run("UPDATE team_work_items SET exclusive_key = ? WHERE id = ?", [
+			shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			held,
+		]);
+		await overlap.runChangedPathsPass();
+		expect(itemRow(held)?.exclusiveKey).toBeNull();
+	});
+
+	test("the job's archive listener releases the lock", async () => {
+		const { eventBus } = await import("../../../lib/event-bus");
+		const held = insertItem(LEAD_B, "B one", ["x.ts"], {
+			exclusiveKey: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			state: "ready",
+		});
+		const stop = overlap.startTeamOverlapJob();
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			eventBus.emit({ type: "narrator:status_changed", narratorId: LEAD_B, status: "archived" });
+			expect(itemRow(held)?.exclusiveKey).toBeNull();
+		} finally {
+			stop();
+		}
+	});
+
+	test("a coordinator whose owner left the project is not told other teams' names", async () => {
+		const holder = insertItem(LEAD_A, "Project-visible work", ["drizzle/1.sql"], {
+			exclusiveKey: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			state: "ready",
+		});
+		sqlite.run("UPDATE narrators SET owner_user_id = ? WHERE id = ?", [OUTSIDER, LEAD_C]);
+		const row = overlap.exclusiveHolder(PROJECT) as NonNullable<
+			ReturnType<typeof overlap.exclusiveHolder>
+		>;
+		expect(row.id).toBe(holder);
+		expect(await overlap.describeHolderFor(LEAD_C, row)).toContain(`team "Lead A"`);
+		sqlite.run("DELETE FROM acl_grants WHERE principal_id = ?", [OUTSIDER]);
+		expect(await overlap.describeHolderFor(LEAD_C, row)).toBe(
+			"a work item of another team (ready)",
+		);
+	});
+
+	test("a forced release tells the holder's coordinator without waking it", async () => {
+		const held = insertItem(LEAD_A, "Holder", ["drizzle/1.sql"], {
+			exclusiveKey: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+			state: "ready",
+		});
+		const released = await overlap.forceReleaseExclusiveLock({
+			projectId: PROJECT,
+			workItemId: held,
+			userId: MANAGER,
+			reason: "unblock B",
+		});
+		expect(released).toEqual({ released: true, key: shared.TEAM_EXCLUSIVE_LOCK_KEY });
+		expect(notices).toEqual([
+			{
+				teamId: LEAD_A,
+				wake: false,
+				text: expect.stringContaining(
+					`released the exclusive paths lock your work item "Holder" held (unblock B)`,
+				),
+			},
+		]);
+	});
+
+	test("directory and bare-name exclusive paths", async () => {
+		for (const pattern of ["drizzle/", "drizzle", "./drizzle/"]) {
+			expect(overlap.pathTouchesGlob("drizzle/0001.sql", pattern)).toBe(true);
+			expect(overlap.pathTouchesGlob("drizzle/meta/_journal.json", pattern)).toBe(true);
+			expect(overlap.pathTouchesGlob("drizzle-postgres/0001.sql", pattern)).toBe(false);
+			expect(overlap.pathTouchesGlob("drizzle/", pattern)).toBe(true);
+			expect(overlap.pathTouchesGlob("docs/", pattern)).toBe(false);
+		}
+		expect(overlap.pathTouchesGlob("server/db/schema.ts", "server/db/schema.ts")).toBe(true);
+		expect(overlap.pathTouchesGlob("server/", "server/db/schema.ts")).toBe(true);
+		expect(overlap.pathTouchesGlob("server/db/schema.ts.bak", "server/db/schema.ts")).toBe(false);
+		expect(overlap.exclusivePathsOf({ teams: { exclusivePaths: ["drizzle/", "./x.ts"] } })).toEqual(
+			["drizzle/**", "x.ts"],
+		);
+		const { projectChapterSettingsSchema } = await import("../../../lib/validators");
+		const parsed = projectChapterSettingsSchema.parse({
+			teams: { exclusivePaths: ["drizzle/", "drizzle-postgres/**", "server/db/schema.ts"] },
+		});
+		expect(parsed.teams?.exclusivePaths).toEqual([
+			"drizzle/**",
+			"drizzle-postgres/**",
+			"server/db/schema.ts",
+		]);
+		expect(
+			projectChapterSettingsSchema.safeParse({ teams: { exclusivePaths: ["/"] } }).success,
+		).toBe(false);
+	});
+
+	test("a pass stops at its deadline and resumes where it stopped", async () => {
+		const looked: string[] = [];
+		overlap.setChangedPathsSourceForTests((worktree) => ({
+			head: async () => {
+				looked.push(worktree);
+				clockNow += 25_000;
+				return "b".repeat(40);
+			},
+			resolve: async () => "f".repeat(40),
+			isAncestor: async () => false,
+			changed: async () => ({
+				head: "b".repeat(40),
+				mergeBase: "0".repeat(40),
+				paths: ["x.ts"],
+				collapsed: false,
+			}),
+		}));
+		const ids: string[] = [];
+		for (let i = 0; i < 6; i++) {
+			const resource = generateId();
+			db.insert(narratorWorktreeResources)
+				.values({
+					id: resource,
+					ownerNarratorId: LEAD_A,
+					deviceId: "local",
+					repositoryKey: "repository",
+					worktreePath: join(temporary, `wt-${i}`),
+					state: "ready",
+					createRequestId: `req-d-${i}`,
+				})
+				.run();
+			ids.push(insertItem(LEAD_A, `Item ${i}`, null, { worktreeResourceId: resource }));
+		}
+		ids.sort();
+		const first = await overlap.runChangedPathsPass();
+		expect(first).toMatchObject({ looked: 3, deadline: true, wrapped: false });
+		expect(overlap.overlapCursor()).toBe(ids[2] ?? null);
+		const second = await overlap.runChangedPathsPass();
+		expect(second).toMatchObject({ looked: 3, deadline: false, wrapped: true });
+		expect(new Set(looked).size).toBe(6);
+
+		// A git call that never answers: the pass gives up at the deadline instead of waiting.
+		overlap.resetOverlapStateForTests();
+		overlap.setChangedPathsSourceForTests(() => ({
+			head: () => new Promise<string | null>(() => {}),
+			resolve: async () => null,
+			isAncestor: async () => false,
+			changed: async () => null,
+		}));
+		overlap.setOverlapSeamsForTests({ deadlineMs: 100 });
+		try {
+			const hung = await overlap.runChangedPathsPass();
+			expect(hung).toMatchObject({ looked: 0, deadline: true });
+		} finally {
+			overlap.setOverlapSeamsForTests({ deadlineMs: null });
+		}
 	});
 });

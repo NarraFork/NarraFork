@@ -43,6 +43,15 @@ const exclusivePathGlobSchema = z
 			// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are refused.
 			!/[\u0000-\u001f\u007f]/.test(glob),
 		"An exclusive path is a glob relative to the repository root",
+	)
+	// A directory written `dir/` covers everything under it.
+	.transform((glob) => {
+		const relative = glob.replace(/^(\.\/)+/, "");
+		return relative.endsWith("/") ? `${relative.replace(/\/+$/, "")}/**` : relative;
+	})
+	.refine(
+		(glob) => glob.length > 0 && glob !== "/**" && glob !== "**",
+		"Too broad an exclusive path",
 	);
 
 export const teamProjectSettingsSchema = z
