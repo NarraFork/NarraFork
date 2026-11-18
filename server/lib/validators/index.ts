@@ -201,6 +201,7 @@ export {
 	coordinatorLimitsSchema,
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
+	releaseTeamLockSchema,
 	teamBaseBranchSchema,
 	teamBriefSchema,
 	teamSettingsSchema,

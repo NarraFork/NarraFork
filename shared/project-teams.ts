@@ -217,3 +217,109 @@ export type TeamWorkEventKind =
 	| "work.cleanup"
 	| "team.checkin"
 	| typeof TEAM_DECISION_EVENT_KIND;
+
+// ── X: who is changing what across teams, exclusive paths ────────────────────
+
+/** Most changed paths stored per work item; past it the item's top-level entries are stored. */
+export const TEAM_CHANGED_PATHS_MAX = 2000;
+/** Most paths of one item compared path by path; past it the item compares by top-level entry. */
+export const TEAM_OVERLAP_COMPARE_PATHS = 500;
+/** Most active work items of one project the overlap check looks at. */
+export const TEAM_OVERLAP_PROJECT_ITEMS = 100;
+/** Work items whose changed paths one background pass refreshes. */
+export const TEAM_CHANGED_PATHS_BATCH = 50;
+/** How often the background pass runs. */
+export const TEAM_CHANGED_PATHS_INTERVAL_MS = 2 * 60_000;
+/** Most overlap entries the "who is changing what" response lists. */
+export const TEAM_OVERLAP_LIST_LIMIT = 200;
+/** A coordinator hears about new cross-team overlaps at most this often. */
+export const TEAM_OVERLAP_NOTICE_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * A stored changed path ending in `/` is a top-level directory: the item changed more than
+ * {@link TEAM_CHANGED_PATHS_MAX} paths, so only its top-level entries were kept.
+ */
+export const TEAM_CHANGED_DIR_SUFFIX = "/";
+
+/** Most exclusive path globs one project lists, and their UTF-8 budget serialized. */
+export const TEAM_EXCLUSIVE_PATHS_MAX = 50;
+export const TEAM_EXCLUSIVE_PATHS_MAX_BYTES = 4 * 1024;
+export const TEAM_EXCLUSIVE_PATH_MAX_LENGTH = 200;
+
+/**
+ * The lock key a work item holds while its changes touch the project's exclusive paths: one lock
+ * per project (`team_work_items (project_id, exclusive_key)` is unique), taken at `work.ready`,
+ * released when the holder is merged or cancelled, or by a person with project manage access.
+ */
+export const TEAM_EXCLUSIVE_LOCK_KEY = "paths";
+
+/**
+ * Teams settings of a project (`projects.chapter_settings.teams`). Example for NarraFork itself,
+ * where only one in-flight branch may add a migration:
+ * `{ "exclusivePaths": ["drizzle/**", "drizzle-postgres/**", "server/db/schema.ts"] }`.
+ * Nothing is filled in automatically.
+ */
+export interface TeamProjectSettings {
+	/** Path globs (relative to the repository root, `**` for any depth) only one item may change at a time. */
+	exclusivePaths?: string[];
+}
+
+/** Events written by X. */
+export type TeamOverlapEventKind =
+	| "work.overlap"
+	| "work.exclusive_taken"
+	| "work.exclusive_refused"
+	| "work.exclusive_released";
+
+/** How much of a work item the reader may see. */
+export type TeamOverlapAccess = "member" | "reader" | "hidden";
+
+/**
+ * A work item in an overlap, as one reader may see it: a member of its team sees it whole; a
+ * reader of the team's coordinator sees the team name and the item title; anyone else sees only
+ * that it is another team's.
+ */
+export interface TeamOverlapItemRef {
+	access: TeamOverlapAccess;
+	/** Reader and member. */
+	teamId?: string;
+	teamName?: string;
+	title?: string;
+	/** Member only. */
+	id?: string;
+	state?: TeamWorkItemState;
+	branch?: string | null;
+	exclusiveKey?: string | null;
+}
+
+export interface TeamOverlapEntry {
+	/** A file path, or a top-level directory ending in `/` when compared by directory. */
+	path: string;
+	kind: "file" | "dir";
+	/** The items touching it (at least two), in a stable order. */
+	items: TeamOverlapItemRef[];
+}
+
+export interface TeamExclusiveLockView {
+	key: string;
+	holder: TeamOverlapItemRef;
+	/** The reader may force-release it (project manage access). */
+	canRelease: boolean;
+	/** The holder's id, for the release call (only when the reader may release it). */
+	holderId?: string;
+}
+
+/** `GET /api/projects/:projectId/team-overlaps`. */
+export interface TeamOverlapResponse {
+	/** When the overlaps were computed from the stored changed paths (null: none yet). */
+	computedAt: string | null;
+	/** Active work items looked at (at most {@link TEAM_OVERLAP_PROJECT_ITEMS}). */
+	activeItems: number;
+	/** More active items exist than were looked at. */
+	activeItemsCapped: boolean;
+	entries: TeamOverlapEntry[];
+	/** Entries not listed (over {@link TEAM_OVERLAP_LIST_LIMIT}). */
+	moreEntries: number;
+	exclusivePaths: string[];
+	locks: TeamExclusiveLockView[];
+}

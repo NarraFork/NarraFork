@@ -18,16 +18,19 @@
  * (P1, ≤ 4 KB; written whole once per compaction cycle — again when it changes or the row that
  * carried it left the history — and named in one line in the rows after that), a context note when the last measured use is above the team's suggested share,
  * this week's limit overruns by kind, approvals waiting in the team tree, work items (open ones
- * listed, finished ones counted), and the latest decisions recorded on people's behalf. Lists are
- * filled by priority (approvals, work items, decisions) into what the budget leaves, and what
- * does not fit is counted.
+ * listed, finished ones counted), the files this team's open items share with other open items
+ * and the project's exclusive paths lock (X; only when there is one of them), and the latest
+ * decisions recorded on people's behalf. Lists are filled by priority (approvals, work items,
+ * overlaps, decisions) into what the budget leaves, and what does not fit is counted.
  *
  * READS, all bounded: the team and coordinator rows by primary key; open work items
  * (`team_id, state` index, 31 rows) and capped state/finished counts (1,001 ids each); this
  * week's overrun kinds (`team_id, created_at` index, 1,001 rows); the latest 200 event kinds
  * and up to 5 decision details by primary key; the live permission registry in memory (at most
- * 1,000 entries looked at) with one `IN` lookup of their narrators. SQLite only, like the
- * session runtime it serves.
+ * 1,000 entries looked at) with one `IN` lookup of their narrators; the project's overlap index
+ * (`team-overlap.ts`: built from stored paths at most once per pass interval, ≤ 100 items) with
+ * one `IN` read of its items and their coordinators. SQLite only, like the session runtime it
+ * serves.
  */
 
 import { hotSafe } from "@server/lib/hot-safe";
@@ -56,10 +59,12 @@ import {
 import type { Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import {
+	getTeamOverlapLabels,
 	getTeamStatusLabels,
 	type TeamStatusLabels,
 } from "../../lib/prompts/team-coordinator-notes";
 import { beginCoordinatorRun } from "./coordinator-limits";
+import type { TeamOverlapStatus } from "./team-overlap";
 
 export const TEAM_STATUS_SOURCE = "team_status";
 
@@ -70,6 +75,7 @@ export const TEAM_STATUS_LIMITS = {
 	approvals: 10,
 	recentEvents: 200,
 	decisions: 5,
+	overlaps: 10,
 	titleChars: 80,
 	summaryChars: 120,
 } as const;
@@ -122,6 +128,8 @@ interface StatusState {
 	overruns: Partial<Record<CoordinatorOverrunKind, number>>;
 	overrunTotal: number;
 	decisions: Array<{ date: string; summary: string }>;
+	/** X: overlaps with other open items and the exclusive lock (null when unavailable). */
+	overlap: TeamOverlapStatus | null;
 }
 
 const SUMMARY_KEYS = ["command", "file_path", "path", "url", "pattern", "description"] as const;
@@ -180,6 +188,7 @@ async function readTeamApprovals(teamId: string): Promise<StatusApproval[]> {
 async function readStatusState(teamId: string, now: number): Promise<StatusState | null> {
 	const team = db
 		.select({
+			projectId: projectTeams.projectId,
 			brief: projectTeams.brief,
 			baseBranch: projectTeams.baseBranch,
 			settings: projectTeams.settingsJson,
@@ -309,7 +318,21 @@ async function readStatusState(teamId: string, now: number): Promise<StatusState
 		overruns,
 		overrunTotal: overrunRows.length,
 		decisions,
+		overlap: await readOverlapStatus(teamId, team.projectId),
 	};
+}
+
+async function readOverlapStatus(
+	teamId: string,
+	projectId: string,
+): Promise<TeamOverlapStatus | null> {
+	try {
+		const { teamOverlapStatus } = await import("./team-overlap");
+		return await teamOverlapStatus(teamId, projectId, TEAM_STATUS_LIMITS.overlaps);
+	} catch (error) {
+		logger.warn("Team status could not read the overlaps", { teamId, error: String(error) });
+		return null;
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -406,6 +429,22 @@ export function renderTeamStatus(
 	const itemsHead =
 		stateCounts.length > 0 ? t.workItems(stateCounts.join(t.separator)) : t.noWorkItems;
 	const decisionsHead = state.decisions.length > 0 ? t.decisions : null;
+	const o = getTeamOverlapLabels(locale);
+	const overlap = state.overlap ?? null;
+	const overlapShown =
+		overlap !== null && (overlap.total > 0 || overlap.lock !== null || overlap.unlocked.length > 0);
+	const overlapFixed: string[] = [];
+	if (overlap && overlapShown) {
+		overlapFixed.push(overlap.total > 0 ? o.heading(countText(overlap.total)) : o.none);
+		if (overlap.lock)
+			overlapFixed.push(
+				overlap.lock.mine
+					? o.lockMine(overlap.lock.title ?? "")
+					: o.lockOther(overlap.lock.team, overlap.lock.title),
+			);
+		if (overlap.unlocked.length > 0)
+			overlapFixed.push(o.unlocked(overlap.unlocked.join(o.separator)));
+	}
 
 	const lists = {
 		approvals: {
@@ -422,6 +461,18 @@ export function renderTeamStatus(
 			total: state.openTotal,
 			more: t.moreItems,
 		},
+		overlaps: {
+			lines: (overlapShown && overlap ? overlap.lines : []).map((line) =>
+				o.line(
+					line.path,
+					line.kind === "dir",
+					line.mine.map((title) => `"${title}"`).join(o.separator),
+					line.others.map((other) => o.other(other.team, other.title)).join(o.separator),
+				),
+			),
+			total: overlapShown && overlap ? overlap.total : 0,
+			more: o.more,
+		},
 		decisions: {
 			lines: state.decisions.map((d) => t.decision(d.date, d.summary)),
 			total: state.decisions.length,
@@ -436,9 +487,10 @@ export function renderTeamStatus(
 		...notes,
 		approvalsHead,
 		itemsHead,
+		...overlapFixed,
 		...(decisionsHead ? [decisionsHead] : []),
 	];
-	const sectionCount = 6;
+	const sectionCount = 7;
 	let used = utf8Bytes(fixed.join("\n")) + sectionCount * 2;
 	let briefLines: string[];
 	if (state.brief && !statusIncludesBrief(state, input.briefShown))
@@ -453,8 +505,13 @@ export function renderTeamStatus(
 		}
 	} else briefLines = [t.noBrief];
 	used += utf8Bytes(briefLines.join("\n")) + 1;
-	const fitted: Record<keyof typeof lists, string[]> = { approvals: [], items: [], decisions: [] };
-	for (const key of ["approvals", "items", "decisions"] as const) {
+	const fitted: Record<keyof typeof lists, string[]> = {
+		approvals: [],
+		items: [],
+		overlaps: [],
+		decisions: [],
+	};
+	for (const key of ["approvals", "items", "overlaps", "decisions"] as const) {
 		const { lines, bytes } = fitList(lists[key], Math.max(0, max - used));
 		fitted[key] = lines;
 		used += bytes;
@@ -466,6 +523,7 @@ export function renderTeamStatus(
 		notes,
 		[approvalsHead, ...fitted.approvals],
 		[itemsHead, ...fitted.items],
+		...(overlapShown ? [[...overlapFixed, ...fitted.overlaps]] : []),
 		...(decisionsHead ? [[decisionsHead, ...fitted.decisions]] : []),
 	];
 	const text = sections.map((lines) => lines.join("\n")).join("\n\n");

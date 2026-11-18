@@ -249,3 +249,76 @@ const statusLabels: LocalizedValue<TeamStatusLabels> = {
 export function getTeamStatusLabels(locale: Locale): TeamStatusLabels {
 	return pickLocalizedValue(statusLabels, locale);
 }
+
+// ─── Team overlaps and the exclusive lock (Project Teams X) ───
+
+export interface TeamOverlapLabels {
+	/** Status section heading: overlaps of this team's open items with other open items. */
+	heading: (total: string) => string;
+	none: string;
+	/** One overlap: the path (a top-level directory ends in `/`), this team's items, the others. */
+	line: (path: string, dir: boolean, mine: string, others: string) => string;
+	/** Another team's item: its team and title, or `null`s when this conversation may not name it. */
+	other: (team: string | null, title: string | null) => string;
+	more: (count: number) => string;
+	lockMine: (title: string) => string;
+	lockOther: (team: string | null, title: string | null) => string;
+	unlocked: (titles: string) => string;
+	noticeHeading: string;
+	noticeLine: (mine: string, team: string | null, title: string | null, paths: string) => string;
+	noticeAdvice: string;
+	separator: string;
+}
+
+const overlapLabels: LocalizedValue<TeamOverlapLabels> = {
+	en: {
+		heading: (total) => `Files your open work items share with other open work items: ${total}.`,
+		none: "Files your open work items share with other open work items: none.",
+		line: (path, dir, mine, others) =>
+			`- ${path}${dir ? " (compared by top-level directory)" : ""}: ${mine}${mine && others ? "; " : ""}${others}`,
+		other: (team, title) =>
+			team === null ? "another team's work item" : `team "${team}": "${title ?? ""}"`,
+		more: (count) => `- … and ${count} more`,
+		lockMine: (title) =>
+			`Exclusive paths lock: held by your work item "${title}" until it is merged or cancelled.`,
+		lockOther: (team, title) =>
+			team === null
+				? "Exclusive paths lock: held by another team's work item; an item of yours that changes the exclusive paths cannot be marked ready until it is released."
+				: `Exclusive paths lock: held by team "${team}"'s work item "${title ?? ""}"; an item of yours that changes the exclusive paths cannot be marked ready until it is released.`,
+		unlocked: (titles) =>
+			`Your work items changing the project's exclusive paths without the lock: ${titles}. work.ready takes it, or refuses while another item holds it.`,
+		noticeHeading:
+			"[Team overlap] New overlaps with another team's work (written by the system, not by a person):",
+		noticeLine: (mine, team, title, paths) =>
+			`- your work item "${mine}" and ${team === null ? "another team's work item" : `team "${team}"'s work item "${title ?? ""}"`} both change: ${paths}`,
+		noticeAdvice:
+			'Decide whether this matters (e.g. who merges first, or split the change) and record what you decide with Team({ action: "decision" }). The team status lists every overlap.',
+		separator: ", ",
+	},
+	"zh-CN": {
+		heading: (total) => `你的未结束工作项和其他未结束工作项同时改动的文件：${total} 处。`,
+		none: "你的未结束工作项和其他未结束工作项同时改动的文件：没有。",
+		line: (path, dir, mine, others) =>
+			`- ${path}${dir ? "（按顶层目录比较）" : ""}：${mine}${mine && others ? "；" : ""}${others}`,
+		other: (team, title) =>
+			team === null ? "另一个 team 的工作项" : `team「${team}」的「${title ?? ""}」`,
+		more: (count) => `- … 另有 ${count} 处`,
+		lockMine: (title) => `独占路径锁：由你的工作项「${title}」持有，合回或取消时释放。`,
+		lockOther: (team, title) =>
+			team === null
+				? "独占路径锁：由另一个 team 的工作项持有；在它释放前，你改到独占路径的工作项不能标记就绪。"
+				: `独占路径锁：由 team「${team}」的工作项「${title ?? ""}」持有；在它释放前，你改到独占路径的工作项不能标记就绪。`,
+		unlocked: (titles) =>
+			`你的这些工作项改到了项目的独占路径但还没拿锁：${titles}。work.ready 时会拿锁，别人持有时会被拒绝。`,
+		noticeHeading: "[团队重叠] 和另一个 team 的工作出现了新的重叠（由系统写入，不是人发的消息）：",
+		noticeLine: (mine, team, title, paths) =>
+			`- 你的工作项「${mine}」和${team === null ? "另一个 team 的工作项" : ` team「${team}」的「${title ?? ""}」`}都改了：${paths}`,
+		noticeAdvice:
+			'判断这是否要紧（比如谁先合、要不要拆开改），决定后用 Team({ action: "decision" }) 记下来。团队状态里列着全部重叠。',
+		separator: "，",
+	},
+};
+
+export function getTeamOverlapLabels(locale: Locale): TeamOverlapLabels {
+	return pickLocalizedValue(overlapLabels, locale);
+}

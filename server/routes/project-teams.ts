@@ -7,16 +7,19 @@
  * narrator surface the team rides on and the project mutations.
  */
 
-import type { TeamListResponse } from "@shared/project-teams";
+import type { TeamListResponse, TeamOverlapResponse } from "@shared/project-teams";
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import { narratorPrincipalOf } from "../lib/narrator-access";
-import { requireProjectAccess } from "../lib/project-access";
+import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
 import {
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
+	releaseTeamLockSchema,
 	updateProjectTeamSchema,
 } from "../lib/validators";
+import { hasProjectAccess } from "../services/project-acl";
+import { forceReleaseExclusiveLock, readProjectOverlaps } from "../services/teams/team-overlap";
 import {
 	archiveTeam,
 	createTeam,
@@ -34,6 +37,14 @@ projectTeamRoutes.use("/:projectId/teams/*", async (_c, next) => {
 	return next();
 });
 projectTeamRoutes.use("/:projectId/teams", async (_c, next) => {
+	requireSqliteProjectMutation("Project teams");
+	return next();
+});
+projectTeamRoutes.use("/:projectId/team-overlaps", async (_c, next) => {
+	requireSqliteProjectMutation("Project teams");
+	return next();
+});
+projectTeamRoutes.use("/:projectId/team-locks/*", async (_c, next) => {
 	requireSqliteProjectMutation("Project teams");
 	return next();
 });
@@ -109,4 +120,34 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/unarchive", async (c) => {
 		c.req.param("projectId"),
 	);
 	return c.json(team);
+});
+
+/**
+ * Who is changing what across the project's teams (X): files touched by two or more active work
+ * items, the exclusive paths and the lock. Project read; each team's items are shown as far as
+ * the caller may read that team's coordinator. Reads stored paths only (no git).
+ */
+projectTeamRoutes.get("/:projectId/team-overlaps", async (c) => {
+	const projectId = c.req.param("projectId");
+	const project = await requireProjectAccess(c, projectId, "read");
+	const canManageProject = await hasProjectAccess(project, projectPrincipalOf(c), "manage");
+	const result: TeamOverlapResponse = await readProjectOverlaps(projectId, narratorPrincipalOf(c), {
+		canManageProject,
+	});
+	return c.json(result);
+});
+
+/** A person with project manage access releases the exclusive lock from its holder (recorded). */
+projectTeamRoutes.post("/:projectId/team-locks/release", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "manage");
+	const parsed = releaseTeamLockSchema.safeParse(await jsonBody(c));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const result = forceReleaseExclusiveLock({
+		projectId,
+		workItemId: parsed.data.workItemId,
+		userId: projectPrincipalOf(c).userId,
+		reason: parsed.data.reason,
+	});
+	return c.json(result);
 });

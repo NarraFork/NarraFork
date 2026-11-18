@@ -26,11 +26,13 @@ import {
 	TEAM_DECISION_MAX_BYTES,
 	TEAM_DEFAULT_WORK_KIND,
 	TEAM_EVENT_DETAIL_MAX_BYTES,
+	TEAM_EXCLUSIVE_LOCK_KEY,
 	TEAM_ISOLATED_WORK_KIND,
 	TEAM_WORK_ITEM_FINISHED_STATES,
 	TEAM_WORK_LIST_LIMIT,
 	TEAM_WORK_TITLE_MAX_LENGTH,
 	type TeamEventKind,
+	type TeamOverlapEventKind,
 	type TeamReviewVerdict,
 	type TeamWorkEventKind,
 	type TeamWorkItemState,
@@ -50,6 +52,15 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { teamGit } from "./team-git";
+import {
+	describeHolderFor,
+	exclusiveHits,
+	exclusiveHolder,
+	isExclusiveConflict,
+	projectExclusivePaths,
+	readChangedPaths,
+	storeChangedPaths,
+} from "./team-overlap";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
 type Executor = Pick<typeof db, "insert" | "select" | "update">;
@@ -145,7 +156,7 @@ export function recordWorkEvent(
 	event: {
 		teamId: string;
 		workItemId: string | null;
-		kind: TeamWorkEventKind | TeamEventKind;
+		kind: TeamWorkEventKind | TeamEventKind | TeamOverlapEventKind;
 		actor: WorkActor;
 		detail?: Record<string, unknown> | null;
 		at?: string;
@@ -262,16 +273,22 @@ function requireWorktree(item: WorkItemRow): string {
 	return path;
 }
 
-/** Move an item's state only if it is still what was read: concurrent changes lose cleanly. */
+/**
+ * Move an item's state only if it is still what was read: concurrent changes lose cleanly. An
+ * item that finishes (merged or cancelled) gives up the project's exclusive lock, recorded as
+ * `work.exclusive_released`.
+ */
 function updateItem(
 	executor: Executor,
 	item: WorkItemRow,
 	patch: Partial<typeof teamWorkItems.$inferInsert>,
 	at: string,
 ): void {
+	const finishing = patch.state !== undefined && isFinished(patch.state);
+	const releasing = finishing && item.exclusiveKey !== null;
 	const updated = executor
 		.update(teamWorkItems)
-		.set({ ...patch, updatedAt: at })
+		.set({ ...patch, ...(finishing ? { exclusiveKey: null } : {}), updatedAt: at })
 		.where(
 			and(
 				eq(teamWorkItems.id, item.id),
@@ -287,6 +304,15 @@ function updateItem(
 			409,
 			"TEAM_WORK_ITEM_CHANGED",
 		);
+	if (releasing)
+		recordWorkEvent(executor, {
+			teamId: item.teamId,
+			workItemId: item.id,
+			kind: "work.exclusive_released",
+			actor: { kind: "system", id: null },
+			detail: { key: item.exclusiveKey, forced: false, reason: patch.state },
+			at,
+		});
 }
 
 // ── The item as the tool returns it ─────────────────────────────────────────
@@ -634,19 +660,82 @@ export async function markReady(input: {
 			.countCommitsNotIn(head, baseSha ? [reviewed, baseSha] : [reviewed])
 			.catch(() => null);
 	else if (head && reviewed) commitsSinceReview = 0;
+	// X: the paths this item changed, and the project's exclusive lock when they touch it.
+	const globs = projectExclusivePaths(team.projectId);
+	const changed = await readChangedPaths(path, item.baseRef ?? team.baseBranch).catch(() => null);
+	if (!changed && globs.length > 0)
+		throw new AppError(
+			`The changed paths of work item ${item.id} could not be read, so it is not known whether it touches the project's exclusive paths; try work.ready again`,
+			409,
+			"TEAM_CHANGED_PATHS_UNAVAILABLE",
+		);
+	const hits = changed ? exclusiveHits(changed.paths, globs) : [];
+	const takeLock = hits.length > 0 && item.exclusiveKey === null;
+	if (takeLock) refuseWhileHeld(team, item, hits, input.actor);
 	const now = new Date().toISOString();
-	db.transaction((tx) => {
-		updateItem(tx, item, { state: "ready", ...(head ? { headSha: head } : {}) }, now);
-		recordWorkEvent(tx, {
-			teamId: team.teamId,
-			workItemId: item.id,
-			kind: "work.ready",
-			actor: input.actor,
-			detail: { head, reviewedHead: reviewed, commitsSinceReview, from: item.state },
-			at: now,
+	try {
+		db.transaction((tx) => {
+			if (changed) storeChangedPaths(tx, item.id, changed);
+			updateItem(
+				tx,
+				item,
+				{
+					state: "ready",
+					...(head ? { headSha: head } : {}),
+					...(takeLock ? { exclusiveKey: TEAM_EXCLUSIVE_LOCK_KEY } : {}),
+				},
+				now,
+			);
+			if (takeLock)
+				recordWorkEvent(tx, {
+					teamId: team.teamId,
+					workItemId: item.id,
+					kind: "work.exclusive_taken",
+					actor: input.actor,
+					detail: { key: TEAM_EXCLUSIVE_LOCK_KEY, paths: hits },
+					at: now,
+				});
+			recordWorkEvent(tx, {
+				teamId: team.teamId,
+				workItemId: item.id,
+				kind: "work.ready",
+				actor: input.actor,
+				detail: { head, reviewedHead: reviewed, commitsSinceReview, from: item.state },
+				at: now,
+			});
 		});
-	});
+	} catch (error) {
+		// Another item took the lock between the check and the write: the unique index refused.
+		if (takeLock && isExclusiveConflict(error)) refuseWhileHeld(team, item, hits, input.actor);
+		throw error;
+	}
 	return { item: requireWorkItem(team.teamId, item.id), commitsSinceReview };
+}
+
+/**
+ * Refuse readiness while another item holds the project's exclusive lock, naming the holder as
+ * this coordinator may read it. Recorded as `work.exclusive_refused`.
+ */
+function refuseWhileHeld(
+	team: TeamRecord,
+	item: WorkItemRow,
+	hits: string[],
+	actor: WorkActor,
+): void {
+	const holder = exclusiveHolder(team.projectId, TEAM_EXCLUSIVE_LOCK_KEY);
+	if (!holder || holder.id === item.id) return;
+	recordWorkEvent(db, {
+		teamId: team.teamId,
+		workItemId: item.id,
+		kind: "work.exclusive_refused",
+		actor,
+		detail: { key: TEAM_EXCLUSIVE_LOCK_KEY, holder: holder.id, paths: hits },
+	});
+	throw new AppError(
+		`Work item ${item.id} changes the project's exclusive paths (${hits.join(", ")}), and only one work item at a time may: the lock is held by ${describeHolderFor(team.teamId, holder)}. It is released when that item is merged or cancelled, or a person with project manage access releases it.`,
+		409,
+		"TEAM_EXCLUSIVE_LOCK_HELD",
+	);
 }
 
 /** Cancel an item. Its worktree stays recorded until `cleanup` removes it. */
