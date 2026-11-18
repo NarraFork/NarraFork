@@ -509,7 +509,10 @@ describe("exclusive paths", () => {
 			reason: "B's migration goes first",
 		});
 		expect(released.status).toBe(200);
-		expect(released.body).toEqual({ released: true, key: shared.TEAM_EXCLUSIVE_LOCK_KEY });
+		expect(released.body as unknown).toEqual({
+			released: true,
+			key: shared.TEAM_EXCLUSIVE_LOCK_KEY,
+		});
 		expect(itemRow(a.id)?.exclusiveKey).toBeNull();
 		expect(itemRow(a.id)?.state).toBe("ready");
 		expect(eventsOf(a.id).at(-1)).toEqual({
