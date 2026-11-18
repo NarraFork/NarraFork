@@ -18,6 +18,7 @@ import {
 	type TeamBoardColumn,
 	type TeamBoardItem,
 	type TeamPageSummary,
+	type TeamPersonDecisionEventKind,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 
@@ -136,6 +137,9 @@ const KNOWN_EVENT_KINDS = new Set([
 	"work.sync",
 	"work.cancelled",
 	"work.cleanup",
+	"approval.allowed",
+	"approval.denied",
+	"question.answered",
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -193,6 +197,18 @@ export function eventNote(
 		case "work.created": {
 			const branch = text(detail.branch, 200);
 			return branch ? { key: "branch", values: { branch } } : null;
+		}
+		case "approval.allowed":
+		case "approval.denied":
+		case "question.answered": {
+			const tool = text(detail.tool, 120) ?? "";
+			const agent = text(detail.agentTitle, 120);
+			const depth = num(detail.depth) ?? 1;
+			// The coordinator's own call is named as such; a subagent's by its session title.
+			if (depth === 0) return { key: "decisionCoordinator", values: { tool } };
+			return agent
+				? { key: "decision", values: { tool, agent } }
+				: { key: "decisionAgent", values: { tool } };
 		}
 		default:
 			if (event.kind.startsWith("coordinator.overrun.")) {
@@ -299,3 +315,25 @@ export function teamWorkspaceLayout(width: number): TeamWorkspaceLayout {
 /** The page's narrow-screen tabs. */
 export const TEAM_PAGE_TABS = ["conversation", "board", "activity"] as const;
 export type TeamPageTab = (typeof TEAM_PAGE_TABS)[number];
+
+// ── People (M1) ─────────────────────────────────────────────────────────────
+
+/** The i18n key (under `teams.approvals.recent.`) of a recent decision's line. */
+export function recentDecisionKey(kind: TeamPersonDecisionEventKind): string {
+	if (kind === "approval.denied") return "denied";
+	if (kind === "question.answered") return "answered";
+	return "allowed";
+}
+
+/**
+ * What the members drawer says about the coordinator's broad audiences (keys under
+ * `teams.members.audience.`): who is a member or an onlooker without being listed by name.
+ */
+export function audienceNotes(visibility: string, writeAudience: string): string[] {
+	const notes: string[] = [];
+	if (writeAudience === "project") notes.push("projectWrite");
+	if (writeAudience === "public") notes.push("publicWrite");
+	if (visibility === "project" && writeAudience !== "public") notes.push("projectRead");
+	if (visibility === "public") notes.push("publicRead");
+	return notes;
+}

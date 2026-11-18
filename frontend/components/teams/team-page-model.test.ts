@@ -11,6 +11,7 @@ import {
 	type TeamPageSummary,
 } from "@shared/project-teams";
 import {
+	audienceNotes,
 	BOARD_COLUMN_STATUS_ICON,
 	boardColumnOf,
 	boardSignature,
@@ -24,6 +25,7 @@ import {
 	nudgeDelay,
 	pauseNotice,
 	pauseOrder,
+	recentDecisionKey,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
 	summarySignature,
@@ -258,5 +260,36 @@ describe("live updates", () => {
 		});
 		expect(liveWorkerStatus(worker, capped)).toBe("working");
 		expect(liveWorkerStatus({ id: "w", status: "archived" }, summary())).toBe("archived");
+	});
+});
+
+describe("people (M1)", () => {
+	test("a decision's line and its activity note", () => {
+		expect(recentDecisionKey("approval.allowed")).toBe("allowed");
+		expect(recentDecisionKey("approval.denied")).toBe("denied");
+		expect(recentDecisionKey("question.answered")).toBe("answered");
+		for (const kind of ["approval.allowed", "approval.denied", "question.answered"])
+			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
+		expect(
+			eventNote({
+				kind: "approval.allowed",
+				detail: { tool: "Bash", agentTitle: "Parser worker", depth: 1 },
+			}),
+		).toEqual({ key: "decision", values: { tool: "Bash", agent: "Parser worker" } });
+		expect(eventNote({ kind: "approval.denied", detail: { tool: "Edit", depth: 0 } })).toEqual({
+			key: "decisionCoordinator",
+			values: { tool: "Edit" },
+		});
+		expect(eventNote({ kind: "question.answered", detail: { tool: "AskUserQuestion" } })).toEqual({
+			key: "decisionAgent",
+			values: { tool: "AskUserQuestion" },
+		});
+	});
+
+	test("broad audiences named in the members list", () => {
+		expect(audienceNotes("project", "project")).toEqual(["projectWrite", "projectRead"]);
+		expect(audienceNotes("project", "owner")).toEqual(["projectRead"]);
+		expect(audienceNotes("public", "public")).toEqual(["publicWrite", "publicRead"]);
+		expect(audienceNotes("private", "owner")).toEqual([]);
 	});
 });

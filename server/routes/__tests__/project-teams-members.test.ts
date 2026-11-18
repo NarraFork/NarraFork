@@ -514,8 +514,8 @@ describe("revoking access takes effect at once", () => {
 			expect(onlooker.data.subscribedNarrators.has(teamId)).toBe(true);
 			expect(onlooker.data.subscribedNarrators.has(workerId)).toBe(true);
 		} finally {
-			handleNarratorWS.close(ws, 1000, "");
-			handleNarratorWS.close(onlooker, 1000, "");
+			handleNarratorWS.close(ws);
+			handleNarratorWS.close(onlooker);
 			await db.insert(aclGrants).values({
 				id: generateId(),
 				scopeType: "project",

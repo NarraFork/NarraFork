@@ -5,6 +5,7 @@ import type {
 	TeamBoardColumnPage,
 	TeamDetail,
 	TeamListResponse,
+	TeamMembersResponse,
 	TeamPageSummary,
 	TeamRunningResponse,
 } from "@shared/project-teams";
@@ -62,6 +63,9 @@ export const teamsApi = {
 		request<TeamActivityPage>(`${teamBase(projectId, teamId)}/events${query({ cursor })}`),
 	getTeamApprovals: (projectId: string, teamId: string) =>
 		request<TeamApprovalsResponse>(`${teamBase(projectId, teamId)}/approvals`),
+	/** The team's people: members and onlookers, with when each last spoke (M1). */
+	getTeamMembers: (projectId: string, teamId: string) =>
+		request<TeamMembersResponse>(`${teamBase(projectId, teamId)}/members`),
 	/** The tree's running sessions now, for "pause all" (members only, at most 500). */
 	getTeamRunning: (projectId: string, teamId: string) =>
 		request<TeamRunningResponse>(`${teamBase(projectId, teamId)}/running`),
