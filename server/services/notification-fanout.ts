@@ -38,7 +38,10 @@ import {
 	recordNotifications as recordNotificationsImpl,
 	syncChatNotificationReads,
 } from "./notification-center-service";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorByRecency,
+} from "./recent-tabs-service";
 import { readTeamMemberIds } from "./teams/team-members";
 import { teamIdOfNarrator } from "./teams/team-membership";
 
@@ -292,8 +295,9 @@ const TEAM_NOTIFY_CANDIDATES = 50;
  */
 async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promise<string[]> {
 	const allowed = new Set(await readTeamMemberIds(teamId, TEAM_NOTIFY_CANDIDATES));
+	// The most recently visited holders: a crowd of onlooker tabs cannot push a writer out by id.
 	const tabs = (
-		await getRecentTabUserIdsForNarrator(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS)
+		await getRecentTabUserIdsForNarratorByRecency(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS)
 	).filter((id) => !allowed.has(id));
 	if (tabs.length > 0) {
 		const admins = new Set(

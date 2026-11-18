@@ -593,6 +593,65 @@ describe("revoking access takes effect at once", () => {
 });
 
 describe("notifications", () => {
+	test("tab holders are read most recent first: 205 onlooker tabs do not push out a recent admin (M1)", async () => {
+		const now = new Date().toISOString();
+		const holderTab = async (userId: string, lastVisitedAt: number) => {
+			await db
+				.insert(userRecentTabsMeta)
+				.values({ userId, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+				.onConflictDoNothing();
+			await db.insert(userRecentTabs).values({
+				id: `fanout-tab-${userId}`,
+				userId,
+				tabKey: `subagent:${workerId}`,
+				section: "work",
+				type: "subagent",
+				entityId: workerId,
+				representedNarratorId: workerId,
+				title: "worker one",
+				lastVisitedAt,
+				sortOrder: 0,
+				createdAt: now,
+				updatedAt: now,
+			});
+		};
+		const onlookers: string[] = [];
+		for (let i = 0; i < 205; i++) {
+			const userId = `a-fanout-onlooker-${String(i).padStart(3, "0")}`;
+			onlookers.push(userId);
+			await db
+				.insert(users)
+				.values({ id: userId, username: userId, passwordHash: "x", role: "user", createdAt: now });
+			await holderTab(userId, 1);
+		}
+		await db.insert(users).values({
+			id: "zz-fanout-admin",
+			username: "zz-fanout-admin",
+			passwordHash: "x",
+			role: "admin",
+			createdAt: now,
+		});
+		await holderTab("zz-fanout-admin", 99);
+		const recorded: string[] = [];
+		setRecordNotifications(async (inputs) => {
+			for (const input of inputs) recorded.push(input.userId);
+		});
+		try {
+			const pending = await pendingCall(workerId, "AskUserQuestion", { questions: [] });
+			await notificationFanoutTesting.fanoutPermissionRequestNotifications({
+				narratorId: workerId,
+				requestId: pending.id,
+			});
+			expect(recorded).toContain("zz-fanout-admin");
+			expect(recorded).toContain(OWNER);
+			expect(recorded.some((id) => onlookers.includes(id))).toBe(false);
+			pendingPermissions.delete(pending.id);
+		} finally {
+			setRecordNotifications(null);
+			await db.delete(userRecentTabs).where(eq(userRecentTabs.representedNarratorId, workerId));
+		}
+	});
+
 	test("a call waiting in the tree notifies the members, not the onlookers", async () => {
 		const recorded: Array<{ userId: string; kind: string; sourceKey: string | null }> = [];
 		setRecordNotifications(async (inputs) => {
@@ -1123,6 +1182,51 @@ describe("IM gateway and team sessions (M1)", () => {
 			expect(lookups).not.toHaveBeenCalled();
 		} finally {
 			lookups.mockRestore();
+		}
+	});
+
+	test("/list names team sessions without their status; others keep theirs", async () => {
+		const { im, sent, msg, mapping, cleanup } = await imSetup("chat-list");
+		const holder = mapping.appUserId as string;
+		const plain = await narratorService.create({ title: "plain listed", cwd: repo });
+		const now = new Date().toISOString();
+		await db
+			.insert(userRecentTabsMeta)
+			.values({ userId: holder, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+			.onConflictDoNothing();
+		const tabRows = [
+			[teamId, "narrator", "Members team"],
+			[workerId, "subagent", "worker one"],
+			[plain.id, "narrator", "plain listed"],
+		] as const;
+		for (const [index, [narratorId, type, title]] of tabRows.entries())
+			await db.insert(userRecentTabs).values({
+				id: `list-${narratorId}`,
+				userId: holder,
+				tabKey: `${type}:${narratorId}`,
+				section: "work",
+				type,
+				entityId: narratorId,
+				representedNarratorId: narratorId,
+				...(type === "subagent" ? { narratorId } : {}),
+				title,
+				lastVisitedAt: index,
+				sortOrder: index,
+				createdAt: now,
+				updatedAt: now,
+			} as never);
+		try {
+			await im.handleCommand({ cmd: "/list", args: "" }, { ...msg, text: "/list" });
+			const listing = sent.at(-1) ?? "";
+			const line = (title: string) => listing.split("\n").find((l) => l.includes(title)) ?? "";
+			expect(line("Members team")).not.toBe("");
+			expect(line("Members team")).not.toContain("(");
+			expect(line("plain listed")).toMatch(/\((idle|working|waiting)\)/);
+			expect(line("worker one")).not.toBe("");
+			expect(line("worker one")).not.toContain("(");
+		} finally {
+			await db.delete(userRecentTabs).where(eq(userRecentTabs.userId, holder));
+			await cleanup();
 		}
 	});
 

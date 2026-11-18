@@ -22,6 +22,8 @@ process.env.NARRAFORK_HOME = testHome;
 const { sqlite } = await import("../../db");
 const { SNAPSHOT_TABLES } = await import("../../db/snapshot-protocol");
 const { applyImport, clearData, exportData, previewImport } = await import("../data-portability");
+const { isTeamSessionCached, teamSessionMemoSize } = await import("../teams/team-session-memo");
+const { eventBus } = await import("../../lib/event-bus");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -162,5 +164,25 @@ describe("data portability · project teams", () => {
 			expect(count(table)).toBe(0);
 		// The project itself is not session data.
 		expect(count("projects")).toBe(1);
+	});
+
+	test("IM 网关记住的「是不是 team 会话」：导入、清空和删除会话后都忘掉 (M1)", async () => {
+		insertNarrator("n-memo", ["team"]);
+		insertTeam("n-memo");
+		expect(isTeamSessionCached("n-memo")).toBe(true);
+		const zip = await exportZip();
+		// Cleared: the id is gone, so is what was remembered about it.
+		await clearData("sessions");
+		expect(teamSessionMemoSize()).toBe(0);
+		// Imported back without a local team row: no longer a team session.
+		expect(isTeamSessionCached("n-memo")).toBe(false);
+		const preview = await previewImport(zip, "export.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect(teamSessionMemoSize()).toBe(0);
+		expect(isTeamSessionCached("n-memo")).toBe(false);
+		// Made a coordinator here, and its memo dropped when the narrator is deleted.
+		insertTeam("n-memo");
+		eventBus.emit({ type: "narrator:deleted", narratorId: "n-memo", title: null });
+		expect(isTeamSessionCached("n-memo")).toBe(true);
 	});
 });

@@ -1715,7 +1715,8 @@ export async function getRecentTabUserIdsForNarrator(
 /**
  * Who has a session of a team tree in their recent tabs (M1): the coordinator or any of its
  * subagents (`scope.coordinatorId`), or of every team of a project (`scope.projectId`). Most
- * recently visited first, at most `limit`. One statement: the tree's narrator ids come from
+ * recently visited first, at most `limit`. Only the output is bounded: the statement reads every tab row of
+ * those sessions to order them, so its cost grows with the number of holders. One statement: the tree's narrator ids come from
  * `project_teams` and `narrators (acl_root_narrator_id)` in a subquery, the tabs from
  * `idx_user_recent_tabs_narrator`, grouped per user.
  */
@@ -1746,6 +1747,10 @@ export async function getRecentTabUserIdsForTeamTrees(
  * Who has this narrator in their recent tabs, most recently visited first, at most `limit`
  * (`idx_user_recent_tabs_narrator`, grouped per user). For bounded fan-outs that should prefer
  * the people who looked most recently over an arbitrary id order (M1).
+ *
+ * Only the OUTPUT is bounded: to order by recency the statement reads every tab row of this
+ * narrator (one per holder, through the index) and groups them, so its cost grows with the
+ * number of people who have the narrator in their recent tabs.
  */
 export async function getRecentTabUserIdsForNarratorByRecency(
 	narratorId: string,
