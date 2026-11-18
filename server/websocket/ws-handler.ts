@@ -35,7 +35,12 @@ import {
 	sendExternalNarratorFrame,
 } from "./oauth-connection-registry";
 import { drainOutlineLive, handleOutlineLiveBinary } from "./outline-live-ws";
-import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
+import {
+	dropUnauthorizedTerminalSubscriptions,
+	getTerminalConnections,
+	handleTerminalWS,
+	type TerminalWSData,
+} from "./terminal-ws";
 import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 // === Unified WS data type ===
@@ -178,6 +183,8 @@ export function resolveWSData(
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
+			userId: userInfo?.userId,
+			userRole: userInfo?.role,
 			sessionExp: sessionAuth?.sessionExp,
 			sessionId: sessionAuth?.sessionId,
 			sessionUserId: sessionAuth?.sessionUserId,
@@ -283,8 +290,16 @@ export async function revalidateSessionSockets(sockets: readonly SessionSocket[]
 			continue;
 		}
 		ws.data.sessionExp = session.exp;
-		if (ws.data.channel === "narrator") ws.data.userRole = session.role;
+		// Both channels authorize with the live role (a demoted admin loses its shortcut).
+		if (ws.data.channel === "narrator" || ws.data.channel === "terminal")
+			ws.data.userRole = session.role;
 	}
+	// Terminal subscriptions were authorized under the old role: re-check them now.
+	const terminalSockets = sockets.filter(
+		(ws): ws is ServerWebSocket<WSData & { channel: "terminal" }> =>
+			ws.readyState === 1 && ws.data.channel === "terminal",
+	);
+	if (terminalSockets.length > 0) await dropUnauthorizedTerminalSubscriptions(terminalSockets);
 }
 
 /** Re-check a user's session sockets whenever their authorization changes. */

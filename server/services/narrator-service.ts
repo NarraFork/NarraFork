@@ -130,8 +130,11 @@ import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
 import {
 	BOT_RUNTIME_CEILING,
+	delegationPreloadTools,
+	isRuntimeToolAllowed,
 	MAX_DELEGATION_DEPTH,
 	type RuntimePolicy,
+	resolveRuntimePolicy,
 	withDelegationDepth,
 } from "./agent-runtime/policy";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
@@ -147,7 +150,7 @@ import type {
 	UnloadToolResult,
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
-import { compileDelegationCeiling } from "./custom-subagent-service";
+import { canonicalTemplateName, compileDelegationCeiling } from "./custom-subagent-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { newEnvelopeColumns } from "./narrator-block-sync";
@@ -574,6 +577,23 @@ function nestedCeiling(
 		...(parent.readOnlyGitShell ? { readOnlyGitShell: true } : {}),
 		...(parent.searchOnly ? { searchOnly: true } : {}),
 	};
+}
+
+/**
+ * The optional tools a subagent starts with loaded (a worker's Terminal and Browser, a
+ * reviewer's Browser), written to `enabledTools` the way a knowledge steward's tools are.
+ * Only what both its own ceiling and its delegator's allow: a helper never starts with a
+ * tool its parent could not use.
+ */
+function subagentPreloadTools(
+	subagentType: string,
+	ceiling: RuntimePolicyTrait,
+	delegator: RuntimePolicy,
+): string[] {
+	const own = resolveRuntimePolicy([ceiling]);
+	return delegationPreloadTools(canonicalTemplateName(subagentType)).filter(
+		(name) => isRuntimeToolAllowed(own, name) && isRuntimeToolAllowed(delegator, name),
+	);
 }
 
 function formatAvailableOptionalToolIds(): string {
@@ -1989,6 +2009,7 @@ export const narratorService = {
 				parentDepth > 0 ? parentPolicy : null,
 			);
 			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
+			const preloadTools = subagentPreloadTools(input.subagentType, runtimePolicy, parentPolicy);
 			// The delegator is the policy/model source and the controller; the model pool
 			// the child follows the source within is fixed now, from the template.
 			const runtimeRegistration = delegationRegistration(
@@ -2014,6 +2035,7 @@ export const narratorService = {
 						subagentType: input.subagentType,
 						variant: subagentVariant(input.subagentType),
 						traits: subTraits,
+						enabledTools: preloadTools.length > 0 ? preloadTools : undefined,
 						title: input.title ?? null,
 						model: storedModel,
 						systemPrompt: input.systemPrompt ?? null,
@@ -2514,6 +2536,10 @@ export const narratorService = {
 			if (!survivingForks.some((fork) => fork.id === child.id)) await this.remove(child.id);
 		}
 		await freezePolicyDependents(narratorId);
+		// The rows below go with the narrator; a subagent's running shells and browser tabs
+		// must not outlive them (a no-op for primaries and for subagents archived first).
+		const { closeSubagentResources } = await import("./subagent-resources");
+		await closeSubagentResources(narratorId);
 
 		// Any surviving narrator that still borrows pre-compact refs from this one must
 		// materialize what it can keep and drop the link first: the self-FK would abort

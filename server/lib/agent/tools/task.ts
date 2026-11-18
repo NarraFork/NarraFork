@@ -126,7 +126,7 @@ function buildParameters() {
 				.string()
 				.optional()
 				.describe(
-					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access), "worker" (general plus its own helper agents, which cannot launch further agents). You can also use any custom subagent type name defined by the user.',
+					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access), "worker" (general plus Terminal, Browser and its own helper agents, which cannot launch further agents). You can also use any custom subagent type name defined by the user.',
 				),
 			run_in_background: z
 				.boolean()

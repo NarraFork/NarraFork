@@ -1,4 +1,5 @@
 {
+	"readOnlyNotice": "Terminals open only for people who can write to this session.",
 	"noTerminals": "No terminals",
 	"newTerminal": "New terminal",
 	"terminal": "Terminal",
