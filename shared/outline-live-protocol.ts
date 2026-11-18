@@ -398,6 +398,12 @@ export interface LiveJoinedHead {
 	 * them, unsent and not replayed, until a batch acknowledges them.
 	 */
 	dur?: number;
+	/**
+	 * Entries of the join's watch set not taken (pageless L4): past the person's watch budget
+	 * ({@link OUTLINE_LIVE_LIMITS.watchBudget}), `watch_cap`. The rest of the set is joined; the
+	 * client drops these from its set (asked again once there is room).
+	 */
+	refused?: Array<[LiveWatchWire, LiveCloseCode]>;
 }
 
 export interface LiveTxHead {
@@ -541,7 +547,13 @@ export type LiveRejectCode =
 	 * moved into a watched subtree: one watch's bound, the space's, the process's, or the
 	 * person's share). Nothing was written; the editor says why.
 	 */
-	| "too_large";
+	| "too_large"
+	/**
+	 * It deletes a block under which there is a live block it does not delete too (someone
+	 * added under it meanwhile, or the client did not have all of it: pageless L4). Nothing was
+	 * deleted; the editor says so.
+	 */
+	| "children_changed";
 
 /**
  * Why a change to a task was refused: someone else is doing it (setting it in progress claims

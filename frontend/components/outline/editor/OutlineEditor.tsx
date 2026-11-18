@@ -341,8 +341,12 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	useEffect(
 		() =>
 			client.on((event) => {
-				if (event !== "rejected" || client.lastReject?.code !== "too_large") return;
-				notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+				if (event !== "rejected") return;
+				const code = client.lastReject?.code;
+				if (code === "too_large")
+					notifications.show({ color: "yellow", message: t("editor.moveTooLarge") });
+				else if (code === "children_changed")
+					notifications.show({ color: "yellow", message: t("editor.childrenChanged") });
 			}),
 		[client, t],
 	);

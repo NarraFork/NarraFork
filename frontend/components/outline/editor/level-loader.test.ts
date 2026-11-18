@@ -56,6 +56,7 @@ function setup(options: {
 		textOf: () => "",
 		on: () => () => {},
 		watch: () => {},
+		forgetMadeHere: () => {},
 	} as unknown as LiveClient;
 	const tree = buildFoldTree(
 		liveFoldSource(client, { marks: new Map(), questionsKnown: true }),
@@ -153,7 +154,7 @@ describe("what the views need watched", () => {
 
 describe("wide levels", () => {
 	/** A real client (not connected) watching `page` and `big` by levels, `big` open. */
-	function wide(n: number, watchedWhole: number) {
+	function wide(n: number, watchedWhole: number, view?: FoldView) {
 		const transport = {
 			connected: false,
 			send: () => true,
@@ -172,9 +173,11 @@ describe("wide levels", () => {
 		for (let i = 0; i < n; i++) put(`k${i}`, "big", `b${String(i).padStart(5, "0")}`);
 		client.watchRefused.set("s:page", "too_large");
 		client.watchRefused.set("s:big", "too_large");
-		const tree = buildFoldTree(liveFoldSource(client, { marks: new Map(), questionsKnown: true }), {
-			rootId: "page",
-		});
+		const tree = buildFoldTree(
+			liveFoldSource(client, { marks: new Map(), questionsKnown: true }),
+			{ rootId: "page" },
+			view,
+		);
 		const loader = new LevelLoader(client);
 		loader.add({ foldTrees: () => [tree] });
 		return { loader, client };
@@ -189,6 +192,33 @@ describe("wide levels", () => {
 		console.log(`wanted() over 1,900 children: ${ms.toFixed(2)} ms`);
 		// (Was ~68 ms with a scan of the set per block; a generous bound for slow machines.)
 		expect(ms).toBeLessThan(25);
+	});
+
+	test("a block made here and folded away before its watch was asked is no longer known-empty", () => {
+		const made = (c: LiveClient) => (c as unknown as { madeHere: Set<string> }).madeHere;
+		const live = (c: LiveClient) => {
+			(c as unknown as { ready: boolean }).ready = true;
+			(c as unknown as { status: string }).status = "live";
+			(c as unknown as { watch: () => void }).watch = () => {};
+		};
+		// Shown: kept (its watch is about to be asked).
+		const shown = wide(3, 0);
+		live(shown.client);
+		made(shown.client).add("k1");
+		shown.loader.run();
+		expect(shown.client.childrenKnown("k1")).toBe(true);
+		// Folded away (its parent closed) with no watch asked: unknown.
+		const hidden = wide(3, 0, { expanded: new Set(), collapsed: new Set(["big"]) });
+		live(hidden.client);
+		made(hidden.client).add("k1");
+		hidden.loader.run();
+		expect(hidden.client.childrenKnown("k1")).toBe(false);
+		// Not in any tree yet (a view not projected since): kept.
+		const fresh = wide(3, 0);
+		live(fresh.client);
+		made(fresh.client).add("new");
+		fresh.loader.run();
+		expect(fresh.client.childrenKnown("new")).toBe(true);
 	});
 
 	test("new watches are asked for a batch at a time", () => {

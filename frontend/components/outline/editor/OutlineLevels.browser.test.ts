@@ -647,3 +647,104 @@ test("by levels, what was refused for room loads once the reader closes somethin
 		bounds.maxUserBlocks = saved;
 	}
 }, 180_000);
+
+test("a block someone adds under while it is deleted is never deleted with it (levels, whole watch, undo)", async () => {
+	const addUnder = async (x: string) =>
+		(
+			await writeOutline({
+				spaceId: h.space.id,
+				ops: [{ op: "insert", parent: { id: x }, content: "Bob's child" }],
+				actor: { kind: "human", id: h.writer },
+				responsibleUserId: h.writer,
+			})
+		).results[0]?.blockId as string;
+	const lastReject = (e: Editor) => e.call((f) => f.client().lastReject?.code ?? null);
+	// By levels: a block made here, deleted while Bob adds under it (this editor has not seen it).
+	{
+		const { pageId, big } = await bigPage("Made, deleted");
+		const a = await openEditor(h, h.owner, pageId);
+		await waitFor(
+			() => a.call((f) => f.client().watchSet.length),
+			(n) => n >= 7,
+			"parts",
+		);
+
+		await waitFor(
+			() => watches(a),
+			(w) => w.includes(`l:${big}`),
+			"big by levels",
+		);
+		await a.call((f, id) => f.caret(id as never, -1), big);
+		await a.page.keyboard.press("Enter");
+		const x = (await a.call((f) => f.where()?.blockId ?? null)) as string;
+		await waitFor(
+			async () => !!liveSpaceOf(h.space.id)?.mirror.alive(x),
+			(v) => v,
+			"x there",
+		);
+		await a.call((f) => f.net().hold(true));
+		const bob = await addUnder(x);
+		await a.page.keyboard.press("Backspace");
+		await a.call((f) => f.net().hold(false));
+		await settle(a);
+		await waitFor(
+			() => lastReject(a),
+			(c) => c === "children_changed",
+			"refused",
+		);
+		expect((await outlineStore.getBlock(bob))?.deleted).toBe(false);
+		expect((await outlineStore.getBlock(x))?.deleted).toBe(false);
+		await waitFor(
+			() => loaded(a, x),
+			(v) => v,
+			"x back in the editor",
+		);
+		expect(errorsOf(a)).toEqual([]);
+	}
+	// Watched whole: an empty block, deleted while Bob adds under it.
+	{
+		const { pageId, ids } = await seedPage(h, "Whole, deleted", ["Intro", "", "Tail"]);
+		const x = ids[1] as string;
+		const a = await openEditor(h, h.owner, pageId);
+		await a.call((f, id) => f.caret(id as never, 0), x);
+		await a.call((f) => f.net().hold(true));
+		const bob = await addUnder(x);
+		await a.page.keyboard.press("Backspace");
+		await a.call((f) => f.net().hold(false));
+		await settle(a);
+		await waitFor(
+			() => lastReject(a),
+			(c) => c === "children_changed",
+			"refused",
+		);
+		expect((await outlineStore.getBlock(bob))?.deleted).toBe(false);
+		expect((await outlineStore.getBlock(x))?.deleted).toBe(false);
+		await same(a, pageId);
+		expect(errorsOf(a)).toEqual([]);
+	}
+	// Undoing an insert after someone added under it (seen here): refused, both stay.
+	{
+		const { pageId, ids } = await seedPage(h, "Undo insert", ["Intro", "Tail"]);
+		const a = await openEditor(h, h.owner, pageId);
+		await a.call((f, id) => f.caret(id as never, -1), ids[0]);
+		await a.page.keyboard.press("Enter");
+		await settle(a);
+		const x = (await a.call((f) => f.where()?.blockId ?? null)) as string;
+		const bob = await addUnder(x);
+		await waitFor(
+			() => loaded(a, bob),
+			(v) => v,
+			"bob's child seen",
+		);
+		await undo(a);
+		await waitFor(
+			() => lastReject(a),
+			(c) => c === "children_changed",
+			"refused",
+		);
+		expect((await outlineStore.getBlock(bob))?.deleted).toBe(false);
+		expect((await outlineStore.getBlock(x))?.deleted).toBe(false);
+		await same(a, pageId);
+		expect(errorsOf(a)).toEqual([]);
+	}
+}, 240_000);

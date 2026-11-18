@@ -1726,6 +1726,19 @@ export class LiveClient {
 		return v.open(id) || this.madeHere.has(id);
 	}
 
+	/**
+	 * Blocks made here that went out of view before any watch of them was asked for (hidden in
+	 * the moment the loader waits to batch): no longer counted as known-empty (unknown, as any
+	 * block whose watch was never answered). `hidden`: whether the block is folded away now.
+	 */
+	forgetMadeHere(hidden: (id: string) => boolean): void {
+		for (const id of this.madeHere) {
+			if (!hidden(id)) continue;
+			const asked = (w: LiveWatchWire) => this.watching(liveWatchKey(w)) !== null;
+			if (!asked({ s: id }) && !asked({ l: id })) this.madeHere.delete(id);
+		}
+	}
+
 	/** Whether an operation still fits the visible structure. */
 	private validLocally(op: ClientOp | LiveOp, v: Store = this.visible): boolean {
 		switch (op.t) {
@@ -1942,6 +1955,13 @@ export class LiveClient {
 	}
 
 	private onJoined(head: LiveJoinedHead, body: Uint8Array): void {
+		// Entries of its set the join did not take (the person's watch budget): out of the set.
+		if (head.refused && head.refused.length > 0) {
+			const keys = new Set(head.refused.map(([w]) => liveWatchKey(w)));
+			this.watches = this.watches.filter((w) => !keys.has(liveWatchKey(w)));
+			for (const [w, code] of head.refused) this.watchRefused.set(liveWatchKey(w), code);
+			this.rescope();
+		}
 		this.retries = 0;
 		this.roomAsked = false;
 		this.me = head.me;

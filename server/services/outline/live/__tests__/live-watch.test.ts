@@ -1278,28 +1278,157 @@ describe("pageless L4: a participant's watch budget", () => {
 		for (const id of capped) expect(a.watchRefused.has(`s:${id}`)).toBe(false);
 	}, 120_000);
 
-	test("two wide views cannot take the process's watches: another space still joins", async () => {
+	test("the budget is the person's: four wide views of one person, and another space still joins", async () => {
 		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
-		const one = await widePage(budget + 100, "Wide one");
-		const two = await widePage(budget + 100, "Wide two");
-		const a = open(link(owner), "", [{ l: one.pageId }]);
-		const b = open(link(writer), "", [{ l: two.pageId }]);
-		await clock.until(() => a.ready && b.ready, 5000, "joined");
-		a.watch({ add: one.ids.map((s) => ({ s })) });
-		b.watch({ add: two.ids.map((s) => ({ s })) });
-		await clock.settle(100, 60_000);
-		expect(a.watchSet.length).toBe(budget);
-		expect(b.watchSet.length).toBe(budget);
-		expect(liveSpaceOf(space.id)?.watchesHeld ?? 0).toBeLessThanOrEqual(2 * budget);
-		expect(2 * budget).toBeLessThan(OUTLINE_LIVE_LIMITS.liveWatches);
-		// Someone in another space joins.
+		const held: number[] = [];
+		for (let k = 0; k < 4; k++) {
+			const wide = await widePage(530, `Wide ${k}`);
+			const a = open(link(owner), "", [{ l: null }, { l: wide.pageId }]);
+			await clock.until(() => a.ready, 5000, `joined ${k}`);
+			a.watch({ add: wide.ids.map((s) => ({ s })) });
+			await clock.settle(100, 60_000);
+			expect(a.status).toBe("live");
+			held.push(a.watchSet.length);
+		}
+		// The first takes the budget; the others keep only what their joins named.
+		expect(held[0]).toBe(budget);
+		expect(held.slice(1)).toEqual([2, 2, 2]);
+		expect(liveSpaceOf(space.id)?.watchesHeld ?? 0).toBeLessThanOrEqual(budget + 3 * 2);
+		// The same person in another space: their join keeps its root.
 		const foreign = await page(["f"], "Foreign wide", otherSpace);
-		const c = client(link(third), foreign.pageId, "edit", {
+		const c = client(link(owner), foreign.pageId, "edit", {
 			space: otherSpace.id,
 			watch: [{ s: foreign.pageId }],
 		});
 		clients.push(c);
 		await clock.until(() => c.ready, 5000, "the other space joined");
 		expect(c.status).toBe("live");
+		// Someone else is not limited by this person's budget.
+		const other = await widePage(20, "Another person's");
+		const b = open(link(writer), "", [{ l: other.pageId }]);
+		await clock.until(() => b.ready, 5000, "joined");
+		b.watch({ add: other.ids.map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		expect(b.watchSet.length).toBe(21);
+	}, 180_000);
+
+	test("a join past the person's budget keeps its first entries; the rest are refused watch_cap", async () => {
+		const budget = OUTLINE_LIVE_LIMITS.watchBudget;
+		const wide = await widePage(budget + 10, "Full");
+		const a = open(link(owner), "", [{ l: wide.pageId }]);
+		await clock.until(() => a.ready, 5000, "joined");
+		a.watch({ add: wide.ids.map((s) => ({ s })) });
+		await clock.settle(100, 60_000);
+		expect(a.watchSet.length).toBe(budget);
+		const small = await widePage(8, "Small");
+		const set: LiveWatchWire[] = [{ l: small.pageId }, ...small.ids.map((s) => ({ s }))];
+		const b = open(link(owner), "", set);
+		await clock.until(() => b.ready, 5000, "joined");
+		expect(b.status).toBe("live");
+		expect(b.watchSet.length).toBe(4);
+		expect([...b.watchRefused.values()]).toEqual(Array(set.length - 4).fill("watch_cap"));
+		// It shows what it kept, and takes typing there.
+		expect(b.visible.alive(small.ids[0] as string)).toBeDefined();
 	}, 120_000);
+
+	test("a frame whose reads run out asks again in a later frame (not the person's share)", async () => {
+		const limits = OUTLINE_LIVE_LIMITS as { maxWatchBlocks: number };
+		const savedMax = limits.maxWatchBlocks;
+		try {
+			limits.maxWatchBlocks = 10;
+			OUTLINE_LIVE_BOUNDS.maxUserBlocks = 40;
+			// Four subtrees too large for a watch (each read to one past the bound), then a small one.
+			const big = await page(["b0", "b1", "b2", "b3", "small"], "Reads");
+			for (const [k, id] of big.ids.entries())
+				await writeOutline({
+					spaceId: space.id,
+					// (The small one has eight children: more than the frame has left to read.)
+					ops: Array.from({ length: k < 4 ? 12 : 8 }, (_, i) => ({
+						op: "insert" as const,
+						parent: { id },
+						content: `x${i}`,
+					})),
+					actor: { kind: "human", id: owner },
+					responsibleUserId: owner,
+				});
+			const a = open(link(owner), "", [{ l: big.pageId }]);
+			await clock.until(() => a.ready, 5000, "joined");
+			a.watch({ add: big.ids.map((s) => ({ s })) });
+			await clock.settle(100, 60_000);
+			await clock.advance(10_000);
+			await clock.settle(100, 60_000);
+			const small = big.ids[4] as string;
+			expect(a.watchSet.some((w) => "s" in w && w.s === small)).toBe(true);
+			expect(a.watchRefused.get(`s:${small}`)).toBeUndefined();
+			for (const id of big.ids.slice(0, 4)) expect(a.watchRefused.get(`s:${id}`)).toBe("too_large");
+		} finally {
+			limits.maxWatchBlocks = savedMax;
+		}
+	}, 120_000);
+});
+
+describe("pageless L4: a delete never takes what the transaction does not delete", () => {
+	test("deleting a block with a child the client does not have is refused children_changed", async () => {
+		const one = await page(["x", "y"], "Deletes");
+		const [x] = one.ids as [string];
+		const c = (
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "insert", parent: { id: x }, content: "someone's child" }],
+				actor: { kind: "human", id: writer },
+				responsibleUserId: writer,
+			})
+		).results[0]?.blockId as string;
+		// Watching the page's level only: x's child is not here.
+		const f = open(link(owner), "", [{ l: one.pageId }]);
+		await clock.until(() => f.ready, 5000, "joined");
+		expect(f.visible.children(x)).toEqual([]);
+		struct(f, [{ t: "d", id: x }]);
+		await clock.settle(100, 20_000);
+		expect(f.lastReject?.code).toBe("children_changed");
+		expect((await block(x))?.deleted).toBe(false);
+		expect((await block(c))?.deleted).toBe(false);
+		expect(f.visible.alive(x)).toBeDefined();
+		// With its child (watched whole), the same delete goes through and takes both.
+		const g = open(link(owner), "", [{ s: one.pageId }]);
+		await clock.until(() => g.ready, 5000, "joined whole");
+		struct(g, [{ t: "d", id: x }]);
+		await clock.settle(100, 20_000);
+		expect((await block(x))?.deleted).toBe(true);
+		expect((await block(c))?.deleted).toBe(true);
+	});
+
+	test("someone adds under a block while it is deleted: refused, nothing lost; agents unaffected", async () => {
+		const one = await page(["x", "z"], "Race");
+		const [x, z] = one.ids as [string, string];
+		const lf = link(owner);
+		const f = open(lf, one.pageId);
+		await clock.until(() => f.ready, 5000, "joined");
+		// Someone adds under x; the person has not seen it yet (their answers are late) and
+		// deletes x as they see it.
+		lf.holdDown(true);
+		const child = (
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "insert", parent: { id: x }, content: "late child" }],
+				actor: { kind: "human", id: writer },
+				responsibleUserId: writer,
+			})
+		).results[0]?.blockId as string;
+		await clock.settle(100, 20_000);
+		expect(f.visible.children(x)).toEqual([]);
+		struct(f, [{ t: "d", id: x }]);
+		await clock.settle(100, 20_000);
+		lf.holdDown(false);
+		await clock.settle(100, 20_000);
+		expect((await block(child))?.deleted).toBe(false);
+		expect((await block(x))?.deleted).toBe(false);
+		expect(f.lastReject?.code).toBe("children_changed");
+		// An agent deleting a block still takes everything under it (the write path's rule).
+		await agent([{ op: "delete", block: { id: x } }]);
+		await clock.settle(100, 20_000);
+		expect((await block(x))?.deleted).toBe(true);
+		expect((await block(child))?.deleted).toBe(true);
+		expect((await block(z))?.deleted).toBe(false);
+	});
 });

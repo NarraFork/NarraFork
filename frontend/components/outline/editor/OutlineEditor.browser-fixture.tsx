@@ -32,6 +32,7 @@ import {
 	toggleTask,
 } from "./commands";
 import { serializePM } from "./convert";
+import { type LevelLoader, levelLoaderOf } from "./level-loader";
 import type { LiveClient, LiveTransport } from "./live-client";
 import { OutlineEditor } from "./OutlineEditor";
 import { keyBetweenLoose } from "./store";
@@ -275,6 +276,11 @@ export function secondView(): OutlineView {
 export function client(): LiveClient {
 	if (!current) throw new Error("editor not open");
 	return current.client;
+}
+
+/** The client's level loader (`level-loader.ts`). */
+export function loader(): LevelLoader {
+	return levelLoaderOf(client());
 }
 
 export function view(): OutlineView {

@@ -2342,14 +2342,22 @@ export class OutlineView implements CmdHost, ClientView {
 		const pos = tr.mapping.map(insertPos);
 		const isNode = s.openStart === 0 && s.openEnd === 0 && s.content.childCount === 1;
 		const before = tr.doc;
-		if (isNode) tr.replaceRangeWith(pos, pos, s.content.firstChild as PMNode);
+		const first = s.content.firstChild as PMNode;
+		if (isNode) tr.replaceRangeWith(pos, pos, first);
 		else tr.replaceRange(pos, pos, s);
-		if (tr.doc.eq(before)) return true;
-		let end = tr.mapping.map(insertPos);
-		tr.mapping.maps[tr.mapping.maps.length - 1]?.forEach((_f, _t, _nf, newTo) => {
-			end = newTo;
-		});
-		tr.setSelection(TextSelection.between(tr.doc.resolve(pos), tr.doc.resolve(end)));
+		// Nothing changed: not handled (as ProseMirror's own drop does nothing then).
+		if (tr.doc.eq(before)) return false;
+		const $pos = tr.doc.resolve(pos);
+		if (isNode && NodeSelection.isSelectable(first) && $pos.nodeAfter?.sameMarkup(first)) {
+			// A node dropped whole (an embed) is selected, as ProseMirror does.
+			tr.setSelection(new NodeSelection($pos));
+		} else {
+			let end = tr.mapping.map(insertPos);
+			tr.mapping.maps[tr.mapping.maps.length - 1]?.forEach((_f, _t, _nf, newTo) => {
+				end = newTo;
+			});
+			tr.setSelection(TextSelection.between($pos, tr.doc.resolve(end)));
+		}
 		this.pm.focus();
 		this.pm.dispatch(tr.setMeta("uiEvent", "drop"));
 		return true;

@@ -477,7 +477,18 @@ interface WatchTaking {
 	userId: string;
 	views: LiveView[];
 	rowsLeft: number;
+	/**
+	 * Refusal when this join's or frame's reads are spent (not the person's share): a `watch`
+	 * frame says `too_fast` (the client asks again in a later frame); a join `user_limit`.
+	 */
+	spentCode?: LiveCloseCode;
 }
+
+/**
+ * Entries a join keeps whatever the person's watch budget says: its root (the client names it
+ * first). Past the budget, a join holds at most this many.
+ */
+const JOIN_KEEPS = 4;
 
 /** Rows one join or `watch` frame may read in all: one share and one more watch. */
 function frameReads(): number {
@@ -1255,6 +1266,15 @@ export class LiveSpace {
 		private readonly room: () => number = () => Number.POSITIVE_INFINITY,
 		/** Watches the process may still load (`OUTLINE_LIVE_LIMITS.liveWatches`). */
 		private readonly watchRoom: () => number = () => Number.POSITIVE_INFINITY,
+		/**
+		 * Watches a person holds in every session of the process (all sockets, all spaces):
+		 * the budget `OUTLINE_LIVE_LIMITS.watchBudget` is the person's (the registry counts).
+		 */
+		private readonly userWatches: (userId: string) => number = (userId) => {
+			let n = 0;
+			for (const q of this.participants.values()) if (q.userId === userId) n += q.views.length;
+			return n;
+		},
 	) {}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1542,7 +1562,8 @@ export class LiveSpace {
 		const own = userId !== undefined ? this.ownBlocks(userId, taking) : 0;
 		const shareLeft = own > 0 ? OUTLINE_LIVE_BOUNDS.maxUserBlocks - own : Number.POSITIVE_INFINITY;
 		if (shareLeft <= 0) return { refused: "user_limit" };
-		if (taking && taking.rowsLeft <= 0) return { refused: "user_limit" };
+		const spent = taking?.spentCode ?? "user_limit";
+		if (taking && taking.rowsLeft <= 0) return { refused: spent };
 		// A mirror full of what people are connected to: nothing to read for.
 		if (
 			(this.mirror.size >= OUTLINE_LIVE_BOUNDS.maxLoadedBlocks ||
@@ -1550,9 +1571,11 @@ export class LiveSpace {
 			this.idleViews(taking).length === 0
 		)
 			return { refused: "space_full" };
+		const rowsLeft = taking?.rowsLeft ?? Number.POSITIVE_INFINITY;
 		const read = await this.readWatch(watch, {
-			rows: Math.min(shareLeft, taking?.rowsLeft ?? Number.POSITIVE_INFINITY),
-			code: "user_limit",
+			rows: Math.min(shareLeft, rowsLeft),
+			// Past the share: `user_limit`; past what this frame may still read: its own code.
+			code: rowsLeft < shareLeft ? spent : "user_limit",
 		});
 		if (taking) taking.rowsLeft -= read.read ?? 0;
 		if ("refused" in read) return { refused: read.refused };
@@ -1662,6 +1685,32 @@ export class LiveSpace {
 			if (into.length > 0) out.push({ id: op.id, into });
 		}
 		return out;
+	}
+
+	/**
+	 * Whether a transaction deletes a block with a live child it does not delete or move away
+	 * too (a join moves the children along). The mirror
+	 * says for a block whose children it holds whole (`isLoaded`); otherwise one indexed, bounded
+	 * read of its children (as many as the transaction deletes of them, and one more).
+	 */
+	private async deletesLeaveChildren(ops: readonly LiveOp[]): Promise<boolean> {
+		const deleted = new Set<string>();
+		// Children the transaction takes out from under a deleted block (a join moves them).
+		const goes = new Set<string>();
+		for (const op of ops) {
+			if (op.t === "d") deleted.add(op.id);
+			else if (op.t === "m") goes.add(op.id);
+		}
+		if (deleted.size === 0) return false;
+		for (const id of deleted) goes.add(id);
+		for (const id of deleted) {
+			const known = this.mirror.children(id);
+			if (known.some((k) => !goes.has(k))) return true;
+			if (this.isLoaded(id)) continue;
+			const rows = await outlineStore.listChildBlocks(this.spaceId, [id], known.length + 1);
+			if (rows.some((r) => !goes.has(r.id))) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -2390,7 +2439,16 @@ export class LiveSpace {
 			for (const v of views) if (v.participants.size === 0 && !v.gone) v.armIdle();
 		};
 		const taking: WatchTaking = { userId: socket.userId, views, rowsLeft: frameReads() };
-		for (const w of head.watch) {
+		// The person's watch budget across the process: entries past it are refused `watch_cap`
+		// (the join keeps its first few: its root).
+		const room = Math.max(
+			JOIN_KEEPS,
+			OUTLINE_LIVE_LIMITS.watchBudget - this.userWatches(socket.userId),
+		);
+		const capped: Array<[LiveWatchWire, LiveCloseCode]> = head.watch
+			.slice(room)
+			.map((w) => [w, "watch_cap"]);
+		for (const w of head.watch.slice(0, room)) {
 			const v = await this.ensureView(w, taking);
 			if ("refused" in v) {
 				idleUnless();
@@ -2432,6 +2490,7 @@ export class LiveSpace {
 			peers: presence.peers,
 			cur: presence.cur,
 			...(presence.am > 0 ? { am: presence.am } : {}),
+			...(capped.length > 0 ? { refused: capped } : {}),
 		};
 		// Which of the client's transactions of its previous session the space has: this session's
 		// own bookkeeping when it is that session (a resume, or a snapshot after a refusal), else
@@ -2661,9 +2720,11 @@ export class LiveSpace {
 			p,
 			p.views.filter((v) => !kept.includes(v)),
 		);
-		// The participant's budget: taken up to it, the rest refused `watch_cap` (read nothing).
+		// The person's budget (all their sessions in the process): taken up to it, the rest
+		// refused `watch_cap` (read nothing).
+		const others = this.userWatches(p.userId) - p.views.length;
 		const capped: Array<[LiveWatchWire, LiveCloseCode]> = adding
-			.splice(Math.max(0, OUTLINE_LIVE_LIMITS.watchBudget - kept.length))
+			.splice(Math.max(0, OUTLINE_LIVE_LIMITS.watchBudget - others - kept.length))
 			.map((x) => [x, "watch_cap"]);
 		const answerRefusing = (code: LiveCloseCode) =>
 			this.notify(p, {
@@ -2693,7 +2754,12 @@ export class LiveSpace {
 		const added: LiveView[] = [];
 		const ok: LiveWatchWire[] = [];
 		const refused: Array<[LiveWatchWire, LiveCloseCode]> = [...capped];
-		const taking: WatchTaking = { userId: p.userId, views: added, rowsLeft: frameReads() };
+		const taking: WatchTaking = {
+			userId: p.userId,
+			views: added,
+			rowsLeft: frameReads(),
+			spentCode: "too_fast",
+		};
 		const idleUnless = () => {
 			for (const view of added) if (view.participants.size === 0 && !view.gone) view.armIdle();
 		};
@@ -3651,6 +3717,14 @@ export class LiveSpace {
 		const plan = this.planTx(ops);
 		if (!plan) {
 			this.reject(p, n, "conflict");
+			return;
+		}
+		// A deleted block takes everything under it: never something this transaction does not
+		// delete too (someone added under it meanwhile, or the person did not have all of it).
+		const keeps = await this.deletesLeaveChildren(plan.ops);
+		if (this.participants.get(p.pno) !== p || p.blocked || this.closed) return;
+		if (keeps) {
+			this.reject(p, n, "children_changed");
 			return;
 		}
 		// Blocks moved into a watched subtree bring what is under them (read before the write:

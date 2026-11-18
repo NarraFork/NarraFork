@@ -113,6 +113,7 @@ export class LevelLoader {
 		const c = this.client;
 		const trees: FoldTree[] = [];
 		for (const s of this.sources) for (const t of s.foldTrees()) if (t) trees.push(t);
+		this.lastTrees = trees;
 		if (trees.length === 0) return null;
 		const want = new Map<string, LiveWatchWire>();
 		const v = c.visible;
@@ -212,6 +213,9 @@ export class LevelLoader {
 		return want;
 	}
 
+	/** The trees the last {@link wanted} read. */
+	private lastTrees: FoldTree[] = [];
+
 	/** Refusals the last {@link wanted} came across (still needed). */
 	private refusedSeen = new Set<string>();
 
@@ -222,6 +226,14 @@ export class LevelLoader {
 		const notLoaded = new Map<string, NotLoaded>();
 		const want = this.wanted(notLoaded);
 		if (!want) return;
+		// A block made here that went out of view before its watch was asked: unknown now. (One
+		// no tree has yet, a view not projected since it was made, is not out of view.)
+		const trees = this.lastTrees;
+		c.forgetMadeHere(
+			(id) =>
+				trees.some((t) => t.nodes.get(id)?.visible === false) &&
+				!trees.some((t) => t.nodes.get(id)?.visible === true),
+		);
 		if (!sameMap(notLoaded, this.notLoaded)) {
 			this.notLoaded = notLoaded;
 			for (const l of this.listeners) l();
