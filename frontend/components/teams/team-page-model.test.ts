@@ -268,7 +268,17 @@ describe("people (M1)", () => {
 		expect(recentDecisionKey("approval.allowed")).toBe("allowed");
 		expect(recentDecisionKey("approval.denied")).toBe("denied");
 		expect(recentDecisionKey("question.answered")).toBe("answered");
-		for (const kind of ["approval.allowed", "approval.denied", "question.answered"])
+		expect(recentDecisionKey("question.dismissed")).toBe("dismissed");
+		expect(recentDecisionKey("question.ignored")).toBe("ignored");
+		expect(recentDecisionKey("question.supplemented")).toBe("supplemented");
+		for (const kind of [
+			"approval.allowed",
+			"approval.denied",
+			"question.answered",
+			"question.dismissed",
+			"question.ignored",
+			"question.supplemented",
+		])
 			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
 		expect(
 			eventNote({

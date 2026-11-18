@@ -29,6 +29,7 @@ const { db } = await import("../../db");
 const { and, eq } = await import("drizzle-orm");
 const {
 	aclGrants,
+	gatewaySessionMappings,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
@@ -40,7 +41,13 @@ const { generateId } = await import("../../lib/id");
 const { narratorService } = await import("../../services/narrator-service");
 const { pendingPermissions } = await import("../../services/narrator-session-state");
 const { handleNarratorWS } = await import("../../websocket/narrator-ws");
-const { permissionDecisionSchema } = await import("../../lib/validators");
+const { asyncQuestionAnswerSchema, permissionDecisionSchema } = await import(
+	"../../lib/validators"
+);
+const { createAsyncQuestion, setQuestionServiceSeam } = await import(
+	"../../services/narrator-question-service"
+);
+const { resolvePermissionOrDangerReflection } = await import("../../services/narrator-permission");
 const { notificationFanoutTesting, setRecordNotifications } = await import(
 	"../../services/notification-fanout"
 );
@@ -59,6 +66,7 @@ let grantId: string;
 
 afterAll(() => {
 	setRecordNotifications(null);
+	setQuestionServiceSeam(null);
 	for (const [id, pending] of pendingPermissions)
 		if ([teamId, workerId].includes(pending.narratorId)) pendingPermissions.delete(id);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -601,6 +609,293 @@ describe("notifications", () => {
 			pendingPermissions.delete(pending.id);
 		} finally {
 			setRecordNotifications(null);
+		}
+	});
+});
+
+describe("asynchronous questions (M1)", () => {
+	/** An open asynchronous question of `narratorId`, delivered without a running loop. */
+	async function openQuestion(narratorId: string) {
+		const call = await pendingCall(narratorId, "AskUserQuestion", { questions: [] });
+		pendingPermissions.delete(call.id);
+		const toolUseId = `use-${call.id}`;
+		const { record } = await createAsyncQuestion({
+			narratorId,
+			toolCallId: call.id,
+			toolUseId,
+			context: "Which part first? Work on the parser meanwhile.",
+			questions: [{ id: "q1", header: "Which first?", options: [{ header: "Parser" }] }],
+		});
+		return record.id;
+	}
+	const questionPath = (narratorId: string, id: string, action: string) =>
+		`/narrators/${narratorId}/questions/${id}/${action}`;
+
+	beforeAll(() => {
+		setQuestionServiceSeam({
+			isLoopRunning: () => false,
+			scheduleQuestionAnswerDelivery: async () => ({ ready: true, started: false }),
+			broadcastToNarrator: () => {},
+			emitAttention: () => {},
+			emitAttentionResolved: () => {},
+		});
+	});
+
+	test("members answer, dismiss, ignore and follow up, recorded with the person", async () => {
+		const answered = await openQuestion(workerId);
+		const response = await call(GRANTED, questionPath(workerId, answered, "answer"), {
+			method: "POST",
+			body: { answers: { q1: "Parser" } },
+		});
+		expect(response.status).toBe(200);
+		const followUp = await call(MEMBER, questionPath(workerId, answered, "supplement"), {
+			method: "POST",
+			body: { text: "And keep the old API." },
+		});
+		expect(followUp.status).toBe(200);
+		const dismissed = await openQuestion(teamId);
+		expect(
+			(await call(MEMBER, questionPath(teamId, dismissed, "dismiss"), { method: "POST" })).status,
+		).toBe(200);
+		const ignored = await openQuestion(teamId);
+		expect(
+			(await call(OWNER, questionPath(teamId, ignored, "ignore"), { method: "POST" })).status,
+		).toBe(200);
+
+		const events = await personEvents();
+		const of = (questionId: string, kind: string) =>
+			events.find((event) => event.detail?.questionId === questionId && event.kind === kind);
+		expect(of(answered, "question.answered")).toMatchObject({
+			actorId: GRANTED,
+			detail: { narratorId: workerId, depth: 1, tool: "AskUserQuestion" },
+		});
+		expect(of(answered, "question.supplemented")).toMatchObject({ actorId: MEMBER });
+		expect(of(dismissed, "question.dismissed")).toMatchObject({
+			actorId: MEMBER,
+			detail: { depth: 0 },
+		});
+		expect(of(ignored, "question.ignored")).toMatchObject({ actorId: OWNER });
+		const recent = (await call(MEMBER, teamPath("approvals"))).body.recent.map(
+			(d: { kind: string }) => d.kind,
+		);
+		for (const kind of [
+			"question.answered",
+			"question.supplemented",
+			"question.dismissed",
+			"question.ignored",
+		])
+			expect(recent).toContain(kind);
+	});
+
+	test("an onlooker or a stranger cannot answer, dismiss or ignore", async () => {
+		const before = (await personEvents()).length;
+		const question = await openQuestion(workerId);
+		for (const user of [READER, OUTSIDER])
+			for (const [action, body] of [
+				["answer", { answers: { q1: "Parser" } }],
+				["dismiss", undefined],
+				["ignore", undefined],
+			] as const) {
+				const response = await call(user, questionPath(workerId, question, action), {
+					method: "POST",
+					body,
+				});
+				expect([403, 404]).toContain(response.status);
+			}
+		expect((await personEvents()).length).toBe(before);
+	});
+
+	test("an answer in flight when access is revoked is refused", async () => {
+		const question = await openQuestion(workerId);
+		let revokedInFlight = false;
+		const parse = spyOn(asyncQuestionAnswerSchema, "safeParse").mockImplementation(((
+			value: unknown,
+		) => {
+			db.delete(aclGrants).where(eq(aclGrants.id, grantId)).run();
+			revokedInFlight = true;
+			parse.mockRestore();
+			return asyncQuestionAnswerSchema.safeParse(value);
+		}) as typeof asyncQuestionAnswerSchema.safeParse);
+		try {
+			const response = await call(GRANTED, questionPath(workerId, question, "answer"), {
+				method: "POST",
+				body: { answers: { q1: "Parser" } },
+			});
+			expect(revokedInFlight).toBe(true);
+			expect([403, 404]).toContain(response.status);
+			expect((await personEvents()).some((event) => event.detail?.questionId === question)).toBe(
+				false,
+			);
+		} finally {
+			parse.mockRestore();
+			grantId = await grantWrite(GRANTED);
+		}
+	});
+});
+
+describe("revocation reaches every way of deciding (M1)", () => {
+	test("a WebSocket decision from a member whose grant was revoked is dropped", async () => {
+		const ws = {
+			data: {
+				channel: "narrator",
+				connectedAt: Date.now(),
+				lastPongAt: Date.now(),
+				userId: GRANTED,
+				userRole: "user",
+				subscribedNarrators: new Set<string>(),
+				catchingUpNarrators: new Map(),
+				catchUpBuffers: new Map(),
+			},
+			getBufferedAmount: () => 0,
+			close: () => {},
+			send: (payload: string) => payload.length,
+		} as unknown as Parameters<typeof handleNarratorWS.open>[0];
+		handleNarratorWS.open(ws);
+		const pending = await pendingCall(workerId);
+		try {
+			await revoke(grantId);
+			await handleNarratorWS.message(ws, {
+				type: "permission_decision",
+				requestId: pending.id,
+				decision: "allow",
+			});
+			await Bun.sleep(0);
+			expect(pending.decisions).toEqual([]);
+			expect(pendingPermissions.has(pending.id)).toBe(true);
+		} finally {
+			handleNarratorWS.close(ws);
+			pendingPermissions.delete(pending.id);
+			grantId = await grantWrite(GRANTED);
+		}
+	});
+
+	test("the last check runs inside the decision, after any restart-recovery wait", async () => {
+		const pending = await pendingCall(workerId);
+		const refused = new Error("access revoked");
+		await expect(
+			resolvePermissionOrDangerReflection(pending.id, "allow", {
+				decidedBy: "user",
+				assertStillAllowed: async () => {
+					throw refused;
+				},
+			}),
+		).rejects.toBe(refused);
+		expect(pending.decisions).toEqual([]);
+		expect(pendingPermissions.has(pending.id)).toBe(true);
+		pendingPermissions.delete(pending.id);
+	});
+});
+
+describe("members outside the project's door (M1)", () => {
+	test("a reader outside the project sees no one found only through the project", async () => {
+		await db
+			.update(narrators)
+			.set({ visibility: "public", writeAudience: "project" })
+			.where(eq(narrators.id, teamId));
+		try {
+			// OUTSIDER reads the coordinator only because it is public.
+			const outside = await call(OUTSIDER, teamPath("members"));
+			expect(outside.status).toBe(200);
+			const listed = outside.body.members.map((m: { userId: string }) => m.userId);
+			expect(listed).toContain(OWNER); // the coordinator's owner
+			expect(listed).toContain(GRANTED); // an explicit grant on the coordinator
+			// READER holds only a project grant and never spoke here. (MEMBER spoke in the
+			// conversation earlier, dismissing a question, so anyone who reads it knows them.)
+			expect(listed).not.toContain(READER);
+			// A project member sees them all.
+			const inside = (await call(MEMBER, teamPath("members"))).body.members.map(
+				(m: { userId: string }) => m.userId,
+			);
+			expect(inside).toContain(READER);
+		} finally {
+			await db
+				.update(narrators)
+				.set({ visibility: "project", writeAudience: "project" })
+				.where(eq(narrators.id, teamId));
+		}
+	});
+});
+
+describe("onlookers are not alerted (M1)", () => {
+	test("the attention list leaves out team calls an onlooker cannot act on", async () => {
+		const pending = await pendingCall(workerId);
+		try {
+			const ids = async (userId: string) =>
+				(await call(userId, "/narrators/human-attention")).body.items
+					.filter((item: unknown) => JSON.stringify(item).includes(pending.id))
+					.map((item: { canAct: boolean }) => item.canAct);
+			expect(await ids(MEMBER)).toEqual([true]);
+			expect(await ids(READER)).toEqual([]);
+		} finally {
+			pendingPermissions.delete(pending.id);
+		}
+	});
+
+	test("recent tabs of a team session mark the onlooker, so the client stays silent", async () => {
+		const { enrichTabs } = await import("../../services/user-preferences-service");
+		const other = await narratorService.create({ title: "not a team", cwd: repo });
+		const tabs = () => [
+			{ type: "narrator", id: teamId },
+			{ type: "subagent", id: workerId },
+			{ type: "narrator", id: other.id },
+		];
+		const marks = async (userId: string) =>
+			(await enrichTabs(tabs(), userId)).map((tab) => tab.teamOnlooker === true);
+		expect(await marks(READER)).toEqual([true, true, false]);
+		expect(await marks(MEMBER)).toEqual([false, false, false]);
+	});
+});
+
+describe("IM gateway approvals of a team call (M1)", () => {
+	test("only a chat bound to a member's account decides it, recorded with that member", async () => {
+		const { gateway } = await import("../../gateway/gateway");
+		const sent: string[] = [];
+		// biome-ignore lint/suspicious/noExplicitAny: driving the gateway's private command path
+		const im = gateway as any;
+		im.adapters.set("telegram", {
+			send: async (_chatId: string, text: string) => {
+				sent.push(text);
+			},
+		});
+		const now = new Date().toISOString();
+		const bind = async (chat: string, appUserId: string | null) => {
+			await db.insert(gatewaySessionMappings).values({
+				id: generateId(),
+				platform: "telegram",
+				chatId: chat,
+				userId: `im-${chat}`,
+				narratorId: teamId,
+				appUserId,
+				createdAt: now,
+				updatedAt: now,
+			});
+			return {
+				platform: "telegram" as const,
+				chatId: chat,
+				userId: `im-${chat}`,
+				username: chat,
+				text: "/approve",
+			};
+		};
+		try {
+			const pending = await pendingCall(teamId);
+			for (const [chat, appUserId] of [
+				["chat-unbound", null],
+				["chat-onlooker", READER],
+			] as const) {
+				await im.handleCommand({ cmd: "/approve", args: "" }, await bind(chat, appUserId));
+				expect(sent.at(-1)).toContain("only team members can decide it");
+				expect(pending.decisions).toEqual([]);
+			}
+			await im.handleCommand({ cmd: "/deny", args: "not now" }, await bind("chat-member", GRANTED));
+			expect(pending.decisions).toEqual(["deny"]);
+			const recorded = (await personEvents()).find(
+				(event) => event.detail?.requestId === pending.id,
+			);
+			expect(recorded).toMatchObject({ kind: "approval.denied", actorId: GRANTED });
+		} finally {
+			im.adapters.delete("telegram");
+			await db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.narratorId, teamId));
 		}
 	});
 });

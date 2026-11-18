@@ -34,7 +34,10 @@ import {
 } from "@shared/project-teams";
 import {
 	IconCheck,
+	IconEyeOff,
 	IconMessageCircle,
+	IconMessageOff,
+	IconMessagePlus,
 	IconPlayerPause,
 	IconShieldQuestion,
 	IconUsers,
@@ -43,7 +46,12 @@ import {
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TeamMembersPanel } from "./TeamMembers";
-import { cappedCount, pauseNotice, recentDecisionKey } from "./team-page-model";
+import {
+	cappedCount,
+	pauseNotice,
+	type RecentDecisionKey,
+	recentDecisionKey,
+} from "./team-page-model";
 
 const DEPTH_ROLE = ["coordinator", "worker", "helper"] as const;
 
@@ -181,13 +189,27 @@ function ApprovalRow({
 	);
 }
 
-const DECISION_ICON = { allowed: IconCheck, denied: IconX, answered: IconMessageCircle } as const;
-const DECISION_COLOR = { allowed: "green", denied: "red", answered: "indigo" } as const;
+const DECISION_ICON = {
+	allowed: IconCheck,
+	denied: IconX,
+	answered: IconMessageCircle,
+	dismissed: IconMessageOff,
+	ignored: IconEyeOff,
+	supplemented: IconMessagePlus,
+} as const satisfies Record<RecentDecisionKey, unknown>;
+const DECISION_COLOR = {
+	allowed: "green",
+	denied: "red",
+	answered: "indigo",
+	dismissed: "gray",
+	ignored: "gray",
+	supplemented: "indigo",
+} as const satisfies Record<RecentDecisionKey, string>;
 
 /** One decision a person took on a call of the tree: who, what, where, when. */
 export function RecentDecisionRow({ decision }: { decision: TeamRecentDecision }) {
 	const { t } = useTranslation("projects");
-	const key = recentDecisionKey(decision.kind) as keyof typeof DECISION_ICON;
+	const key = recentDecisionKey(decision.kind);
 	const Icon = DECISION_ICON[key];
 	const role = DEPTH_ROLE[Math.min(Math.max(decision.depth, 0), 2)];
 	const who = decision.actorName ?? t("teams.activity.unknownPerson");

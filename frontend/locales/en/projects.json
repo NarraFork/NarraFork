@@ -233,7 +233,10 @@
 			"other": "{{kind}}",
 			"approval_allowed": "Approved",
 			"approval_denied": "Denied",
-			"question_answered": "Answered a question"
+			"question_answered": "Answered a question",
+			"question_dismissed": "Dismissed a question",
+			"question_ignored": "Closed a question silently",
+			"question_supplemented": "Followed up on an answer"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -297,7 +300,13 @@
 				"answered": "{{who}} answered a question",
 				"allowedLabel": "Approved",
 				"deniedLabel": "Denied",
-				"answeredLabel": "Answered"
+				"answeredLabel": "Answered",
+				"dismissed": "{{who}} dismissed a question",
+				"ignored": "{{who}} closed a question without telling the agent",
+				"supplemented": "{{who}} followed up on an answer",
+				"dismissedLabel": "Dismissed",
+				"ignoredLabel": "Closed silently",
+				"supplementedLabel": "Followed up"
 			}
 		},
 		"agents": {

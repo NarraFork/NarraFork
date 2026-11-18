@@ -233,7 +233,10 @@
 			"other": "{{kind}}",
 			"approval_allowed": "批准",
 			"approval_denied": "拒绝",
-			"question_answered": "回答了提问"
+			"question_answered": "回答了提问",
+			"question_dismissed": "驳回了提问",
+			"question_ignored": "静默关闭了提问",
+			"question_supplemented": "补充了回答"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -297,7 +300,13 @@
 				"answered": "{{who}} 回答了提问",
 				"allowedLabel": "已批准",
 				"deniedLabel": "已拒绝",
-				"answeredLabel": "已回答"
+				"answeredLabel": "已回答",
+				"dismissed": "{{who}} 驳回了提问",
+				"ignored": "{{who}} 关闭了提问（没有告诉代理）",
+				"supplemented": "{{who}} 补充了回答",
+				"dismissedLabel": "已驳回",
+				"ignoredLabel": "已静默关闭",
+				"supplementedLabel": "已补充"
 			}
 		},
 		"agents": {

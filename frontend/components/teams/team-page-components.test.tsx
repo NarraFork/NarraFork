@@ -14,6 +14,7 @@ import type {
 	TeamBoardItem,
 	TeamMembersResponse,
 	TeamPageSummary,
+	TeamPersonDecisionEventKind,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
@@ -210,7 +211,7 @@ describe("ready items and approvals answered in their session", () => {
 		const client = new QueryClient();
 		const decision = (
 			id: string,
-			kind: "approval.allowed" | "approval.denied" | "question.answered",
+			kind: TeamPersonDecisionEventKind,
 			patch: Record<string, unknown>,
 		) => ({
 			id,
@@ -240,6 +241,11 @@ describe("ready items and approvals answered in their session", () => {
 				}),
 				decision("d2", "approval.denied", { actorName: "bob", toolName: "Edit", depth: 2 }),
 				decision("d1", "approval.allowed", {}),
+				decision("d0", "question.ignored", {
+					actorName: "dave",
+					toolName: "AskUserQuestion",
+					approvalKind: "question",
+				}),
 			],
 		};
 		client.setQueryData(teamKeys.approvals("lead"), approvals);
@@ -256,13 +262,18 @@ describe("ready items and approvals answered in their session", () => {
 					'aria-label="Approved"',
 					'aria-label="Denied"',
 					'aria-label="Answered"',
+					"dave closed a question without telling the agent",
+					'aria-label="Closed silently"',
 				],
 			],
-			["zh-CN", ["carol 回答了提问", "bob 拒绝了 Edit", "alice 批准了 Bash", "协调者"]],
+			[
+				"zh-CN",
+				["carol 回答了提问", "bob 拒绝了 Edit", "alice 批准了 Bash", "协调者", "dave 关闭了提问"],
+			],
 		] as const) {
 			const html = await render(<TeamApprovalsList projectId="p" teamId="lead" />, client, lng);
 			expect(html).toContain("team-recent-decisions");
-			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(3);
+			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(4);
 			for (const text of expected) expect(html).toContain(text);
 		}
 	});

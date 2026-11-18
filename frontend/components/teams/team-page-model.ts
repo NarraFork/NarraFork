@@ -140,6 +140,9 @@ const KNOWN_EVENT_KINDS = new Set([
 	"approval.allowed",
 	"approval.denied",
 	"question.answered",
+	"question.dismissed",
+	"question.ignored",
+	"question.supplemented",
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -200,7 +203,10 @@ export function eventNote(
 		}
 		case "approval.allowed":
 		case "approval.denied":
-		case "question.answered": {
+		case "question.answered":
+		case "question.dismissed":
+		case "question.ignored":
+		case "question.supplemented": {
 			const tool = text(detail.tool, 120) ?? "";
 			const agent = text(detail.agentTitle, 120);
 			const depth = num(detail.depth) ?? 1;
@@ -319,11 +325,19 @@ export type TeamPageTab = (typeof TEAM_PAGE_TABS)[number];
 // ── People (M1) ─────────────────────────────────────────────────────────────
 
 /** The i18n key (under `teams.approvals.recent.`) of a recent decision's line. */
-export function recentDecisionKey(kind: TeamPersonDecisionEventKind): string {
-	if (kind === "approval.denied") return "denied";
-	if (kind === "question.answered") return "answered";
-	return "allowed";
+export function recentDecisionKey(kind: TeamPersonDecisionEventKind): RecentDecisionKey {
+	return RECENT_DECISION_KEYS[kind] ?? "allowed";
 }
+
+const RECENT_DECISION_KEYS = {
+	"approval.allowed": "allowed",
+	"approval.denied": "denied",
+	"question.answered": "answered",
+	"question.dismissed": "dismissed",
+	"question.ignored": "ignored",
+	"question.supplemented": "supplemented",
+} as const satisfies Record<TeamPersonDecisionEventKind, string>;
+export type RecentDecisionKey = (typeof RECENT_DECISION_KEYS)[TeamPersonDecisionEventKind];
 
 /**
  * What the members drawer says about the coordinator's broad audiences (keys under

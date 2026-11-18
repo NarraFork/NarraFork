@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	aclGrants,
 	narrators,
+	projects,
+	projectTeams,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
@@ -58,7 +61,9 @@ function seedUser(userId: string, notifyEnabled: boolean): void {
 			userId,
 			recentTabs: "[]",
 			notifyDingtalkEnabled: notifyEnabled,
-			notifyDingtalkWebhook: notifyEnabled ? "https://example.test/hook?access=1" : "",
+			notifyDingtalkWebhook: notifyEnabled
+				? `https://example.test/hook?access=1&user=${userId}`
+				: "",
 			createdAt: NOW,
 			updatedAt: NOW,
 		})
@@ -168,5 +173,88 @@ describe("notification recent-tabs consumer", () => {
 		await handleAttention("narrator-private", "done");
 
 		expect(requests).toHaveLength(0);
+	});
+
+	it("a team session waiting for a person alerts its members, not its onlookers (M1)", async () => {
+		seedUser("team-owner", true);
+		seedUser("team-member", true);
+		seedUser("team-onlooker", true);
+		db.insert(projects)
+			.values({
+				id: "team-project",
+				name: "Team project",
+				gitPath: "/tmp/team-project",
+				ownerUserId: "team-owner",
+				visibility: "public",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(narrators)
+			.values({
+				id: "team-lead",
+				title: "Team lead",
+				status: "waiting",
+				ownerUserId: "team-owner",
+				// Anyone may look on; only the owner and explicit writers drive it.
+				visibility: "public",
+				writeAudience: "owner",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(projectTeams)
+			.values({
+				narratorId: "team-lead",
+				projectId: "team-project",
+				baseBranch: "main",
+				brief: "",
+				settingsJson: {},
+				status: "active",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(aclGrants)
+			.values({
+				id: "team-member-write",
+				scopeType: "narrator",
+				scopeId: "team-lead",
+				principalType: "user",
+				principalId: "team-member",
+				capability: "write",
+				createdAt: NOW,
+			})
+			.run();
+		for (const userId of ["team-member", "team-onlooker"]) {
+			db.insert(userRecentTabsMeta)
+				.values({ userId, revision: 1, migratedAt: NOW, createdAt: NOW, updatedAt: NOW })
+				.run();
+			db.insert(userRecentTabs)
+				.values({
+					id: `recent-${userId}`,
+					userId,
+					tabKey: "narrator:team-lead",
+					section: "work",
+					type: "narrator",
+					entityId: "team-lead",
+					representedNarratorId: "team-lead",
+					title: "Team lead",
+					lastVisitedAt: 1,
+					sortOrder: 0,
+					createdAt: NOW,
+					updatedAt: NOW,
+				})
+				.run();
+		}
+
+		await handleAttention("team-lead", "waiting_permission");
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.url).toContain("user=team-member");
+
+		// "Done" is not a call waiting for a member: readers still hear about it, as before.
+		requests.length = 0;
+		await handleAttention("team-lead", "done");
+		expect(requests).toHaveLength(2);
 	});
 });
