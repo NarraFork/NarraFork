@@ -49,10 +49,23 @@ describe("team onlooker alerts", () => {
 		expect(accessChangeNeedsRuntimeRefresh([tab({ id: "w", teamOnlooker: true })], "lead")).toBe(
 			true,
 		);
-		// A subagent's root is not known on the client.
+		// A subagent's root is not known on the client: a team subagent's tab re-reads, and so does
+		// one whose runtime patch (team or not) has not been read yet; a non-team one does not.
+		expect(
+			accessChangeNeedsRuntimeRefresh(
+				[tab({ id: "w", type: "subagent", teamSession: true })],
+				"lead",
+			),
+		).toBe(true);
 		expect(accessChangeNeedsRuntimeRefresh([tab({ id: "w", type: "subagent" })], "lead")).toBe(
 			true,
 		);
+		expect(
+			accessChangeNeedsRuntimeRefresh(
+				[tab({ id: "w", type: "subagent", teamSession: false })],
+				"lead",
+			),
+		).toBe(false);
 		expect(accessChangeNeedsRuntimeRefresh([], "lead")).toBe(false);
 	});
 });

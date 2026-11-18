@@ -611,15 +611,15 @@ async function announceAccessChange(
 		const recipients = new Set(affectedUserIds);
 		// A team coordinator's audiences decide who is a member (M1), and a member's browser
 		// silences "waiting" alerts of team sessions it may only read. An audience change names
-		// nobody, so the people who have the coordinator in their recent tabs (at most
-		// TEAM_AUDIENCE_NOTICE_LIMIT) are told too, to re-read.
+		// nobody, so the people who have the coordinator or one of its subagents in their recent
+		// tabs (most recent first, at most TEAM_AUDIENCE_NOTICE_LIMIT) are told too, to re-read.
 		if (
 			(reason === "visibility_changed" || reason === "write_audience_changed") &&
 			coordinatedTeamId(narratorId)
 		) {
-			const { getRecentTabUserIdsForNarrator } = await import("./recent-tabs-service");
-			for (const userId of await getRecentTabUserIdsForNarrator(
-				narratorId,
+			const { getRecentTabUserIdsForTeamTrees } = await import("./recent-tabs-service");
+			for (const userId of await getRecentTabUserIdsForTeamTrees(
+				{ coordinatorId: narratorId },
 				TEAM_AUDIENCE_NOTICE_LIMIT,
 			))
 				recipients.add(userId);

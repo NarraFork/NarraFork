@@ -987,23 +987,35 @@ describe("IM gateway and team sessions (M1)", () => {
 			expect(pending.decisions).toEqual([]);
 			expect((await personEvents()).length).toBe(before);
 
-			// The permission request pushed to the chat invites no /approve and carries no
-			// [perm:id] tag a quote reply could act on.
+			// Nothing of a team session goes out to IM: no permission request, no tool messages, no
+			// reply when it goes idle, no error, no recent-tab status ping.
 			im.subscribeToEvents();
-			const pushed = sent.length;
-			eventBus.emit({
-				type: "narrator:message_broadcast",
-				narratorId: teamId,
-				message: {
+			const before2 = sent.length;
+			for (const message of [
+				{
 					type: "permission_request",
 					request: { id: pending.id, toolName: "Bash", inputJson: { command: "ls" } },
 				},
+				{ type: "tool_started", toolName: "Bash", toolUseId: "tu-1", input: { command: "ls" } },
+				{ type: "tool_completed", toolName: "Bash", toolUseId: "tu-1", status: "success" },
+				{ type: "message", message: { role: "assistant", contentText: "done" } },
+			])
+				eventBus.emit({ type: "narrator:message_broadcast", narratorId: teamId, message } as never);
+			eventBus.emit({
+				type: "narrator:status_changed",
+				narratorId: teamId,
+				status: "idle",
 			} as never);
-			for (let i = 0; i < 100 && sent.length === pushed; i++) await Bun.sleep(5);
-			const push = sent.at(-1) ?? "";
-			expect(push).toContain("decided in NarraFork");
-			expect(push).not.toContain("[perm:");
-			expect(push).not.toContain("/approve");
+			eventBus.emit({ type: "narrator:error", narratorId: teamId, error: "boom" } as never);
+			eventBus.emit({
+				type: "narrator:attention",
+				narratorId: teamId,
+				reason: "waiting_permission",
+			} as never);
+			await im.notifyRecentTabStatusChange(teamId, "waiting_permission");
+			await im.deliverToIM(teamId);
+			await Bun.sleep(50);
+			expect(sent.slice(before2)).toEqual([]);
 			pendingPermissions.delete(pending.id);
 		} finally {
 			send.mockRestore();
@@ -1036,6 +1048,47 @@ describe("IM gateway and team sessions (M1)", () => {
 				pendingPermissions.delete(pending.id);
 			}
 		} finally {
+			await cleanup();
+		}
+	});
+
+	test("recent-tab status pings: none for a team session (even to someone without access); others as before", async () => {
+		const { im, sent, mapping, cleanup } = await imSetup("chat-ping");
+		const holder = mapping.appUserId as string;
+		const plain = await narratorService.create({ title: "plain session", cwd: repo });
+		const now = new Date().toISOString();
+		await db
+			.insert(userRecentTabsMeta)
+			.values({ userId: holder, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+			.onConflictDoNothing();
+		for (const narratorId of [teamId, plain.id])
+			await db.insert(userRecentTabs).values({
+				id: `ping-${narratorId}`,
+				userId: holder,
+				tabKey: `narrator:${narratorId}`,
+				section: "work",
+				type: "narrator",
+				entityId: narratorId,
+				representedNarratorId: narratorId,
+				title: "tab",
+				lastVisitedAt: 1,
+				sortOrder: 0,
+				createdAt: now,
+				updatedAt: now,
+			});
+		const teamCall = await pendingCall(teamId);
+		const plainCall = await pendingCall(plain.id);
+		try {
+			const before = sent.length;
+			await im.notifyRecentTabStatusChange(teamId, "waiting_permission");
+			await im.notifyRecentTabStatusChange(teamId, "done");
+			expect(sent.slice(before)).toEqual([]);
+			await im.notifyRecentTabStatusChange(plain.id, "waiting_permission");
+			expect(sent.at(-1)).toContain(`[perm:${plainCall.id}]`);
+		} finally {
+			pendingPermissions.delete(teamCall.id);
+			pendingPermissions.delete(plainCall.id);
+			await db.delete(userRecentTabs).where(eq(userRecentTabs.userId, holder));
 			await cleanup();
 		}
 	});
@@ -1176,6 +1229,25 @@ describe("audience changes reach the coordinator's tab holders (M1)", () => {
 	test("a visibility or write-audience change tells the people who have the coordinator open", async () => {
 		const narratorWs = await import("../../websocket/narrator-ws");
 		const now = new Date().toISOString();
+		// MEMBER has only the worker (a subagent of the coordinator) open.
+		await db
+			.insert(userRecentTabsMeta)
+			.values({ userId: MEMBER, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+			.onConflictDoNothing();
+		await db.insert(userRecentTabs).values({
+			id: `audience-tab-${MEMBER}`,
+			userId: MEMBER,
+			tabKey: `subagent:${workerId}`,
+			section: "work",
+			type: "subagent",
+			entityId: workerId,
+			representedNarratorId: workerId,
+			title: "worker one",
+			lastVisitedAt: 2,
+			sortOrder: 0,
+			createdAt: now,
+			updatedAt: now,
+		});
 		for (const userId of [READER, OUTSIDER]) {
 			await db
 				.insert(userRecentTabsMeta)
@@ -1210,7 +1282,7 @@ describe("audience changes reach the coordinator's tab holders (M1)", () => {
 					})
 				).status,
 			).toBe(200);
-			expect(told().sort()).toEqual([OUTSIDER, READER].sort());
+			expect(told().sort()).toEqual([MEMBER, OUTSIDER, READER].sort());
 			sent.mockClear();
 			expect(
 				(
@@ -1220,7 +1292,7 @@ describe("audience changes reach the coordinator's tab holders (M1)", () => {
 					})
 				).status,
 			).toBe(200);
-			expect(told().sort()).toEqual([OUTSIDER, READER].sort());
+			expect(told().sort()).toEqual([MEMBER, OUTSIDER, READER].sort());
 			// A narrator that is not a team coordinator: nobody named, nobody told (as before).
 			sent.mockClear();
 			const plain = await narratorService.create({ title: "plain", cwd: repo });
@@ -1277,6 +1349,46 @@ describe("asking the AI to answer (M1)", () => {
 			pendingPermissions.delete(asked.id);
 		} finally {
 			reflect.mockRestore();
+		}
+	});
+});
+
+describe("project visibility changes reach team tab holders (M1)", () => {
+	test("the people with a team session of the project open are told to re-read", async () => {
+		const narratorWs = await import("../../websocket/narrator-ws");
+		const { setProjectVisibility } = await import("../../services/project-membership");
+		const now = new Date().toISOString();
+		await db
+			.insert(userRecentTabsMeta)
+			.values({ userId: READER, revision: 1, migratedAt: now, createdAt: now, updatedAt: now })
+			.onConflictDoNothing();
+		await db
+			.insert(userRecentTabs)
+			.values({
+				id: `project-tab-${READER}`,
+				userId: READER,
+				tabKey: `subagent:${workerId}`,
+				section: "work",
+				type: "subagent",
+				entityId: workerId,
+				representedNarratorId: workerId,
+				title: "worker one",
+				lastVisitedAt: 3,
+				sortOrder: 0,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.onConflictDoNothing();
+		const sent = spyOn(narratorWs, "broadcastToUser");
+		try {
+			await setProjectVisibility(projectId, "public", { userId: OWNER, isAdmin: false });
+			const told = sent.mock.calls
+				.filter(([, frame]) => (frame as { type: string }).type === "project_access_changed")
+				.map(([userId]) => userId);
+			expect(told).toContain(READER);
+		} finally {
+			sent.mockRestore();
+			await setProjectVisibility(projectId, "private", { userId: OWNER, isAdmin: false });
 		}
 	});
 });

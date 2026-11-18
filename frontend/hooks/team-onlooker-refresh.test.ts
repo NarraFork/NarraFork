@@ -77,9 +77,14 @@ describe("installTeamOnlookerRefresh", () => {
 		// Other frames never reach it.
 		source.emit({ type: "status_change", narratorId: "plain", status: "waiting" });
 		expect(refreshes).toBe(2);
-		// A subagent tab: its root is unknown here, so any narrator change re-reads.
-		tabs = [tab({ id: "worker", type: "subagent" })];
+		// A team subagent tab: its root is unknown here, so any narrator change re-reads.
+		tabs = [tab({ id: "worker", type: "subagent", teamSession: true })];
 		source.emit({ type: "narrator_access_changed", narratorId: "lead", reason: "unshared" });
+		expect(refreshes).toBe(3);
+		// A subagent tab known not to be a team session: nothing to re-read.
+		tabs = [tab({ id: "plain-worker", type: "subagent", teamSession: false })];
+		source.emit({ type: "narrator_access_changed", narratorId: "lead", reason: "unshared" });
+		source.emit({ type: "project_access_changed", projectId: "p", reason: "visibility_changed" });
 		expect(refreshes).toBe(3);
 		remove();
 		expect(source.listeners.size).toBe(0);

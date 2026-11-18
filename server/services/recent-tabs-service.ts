@@ -37,7 +37,7 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
@@ -1713,30 +1713,33 @@ export async function getRecentTabUserIdsForNarrator(
 }
 
 /**
- * Which of `userIds` have this narrator in their recent tabs: one indexed read per 500 ids.
- * For a fixed candidate set (a team's members, M1), so other holders cannot crowd them out.
+ * Who has a session of a team tree in their recent tabs (M1): the coordinator or any of its
+ * subagents (`scope.coordinatorId`), or of every team of a project (`scope.projectId`). Most
+ * recently visited first, at most `limit`. One statement: the tree's narrator ids come from
+ * `project_teams` and `narrators (acl_root_narrator_id)` in a subquery, the tabs from
+ * `idx_user_recent_tabs_narrator`, grouped per user.
  */
-export async function getRecentTabUserIdsForNarratorAmong(
-	narratorId: string,
-	userIds: readonly string[],
+export async function getRecentTabUserIdsForTeamTrees(
+	scope: { coordinatorId: string } | { projectId: string },
+	limit: number,
 ): Promise<string[]> {
-	if (userIds.length === 0) return [];
 	await ensureAllRecentTabsMigrated();
-	const found = new Set<string>();
-	const unique = [...new Set(userIds)];
-	for (let start = 0; start < unique.length; start += 500) {
-		const rows = await db
-			.selectDistinct({ userId: userRecentTabs.userId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.representedNarratorId, narratorId),
-					inArray(userRecentTabs.userId, unique.slice(start, start + 500)),
-				),
-			);
-		for (const row of rows) found.add(row.userId);
-	}
-	return unique.filter((id) => found.has(id));
+	const coordinators =
+		"coordinatorId" in scope
+			? sql`select ${scope.coordinatorId}`
+			: sql`select pt.narrator_id from project_teams pt where pt.project_id = ${scope.projectId}`;
+	const rows = await db.all<{ userId: string }>(sql`
+		select urt.user_id as userId, max(urt.last_visited_at) as lastVisited
+		from user_recent_tabs urt
+		where urt.represented_narrator_id in (${coordinators})
+			or urt.represented_narrator_id in (
+				select n.id from narrators n
+				where n.type = 'subagent' and n.acl_root_narrator_id in (${coordinators})
+			)
+		group by urt.user_id
+		order by lastVisited desc, urt.user_id
+		limit ${limit}`);
+	return rows.map((row) => row.userId);
 }
 
 /** Update only users indexed as members of this narrator tab. */

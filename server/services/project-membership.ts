@@ -22,7 +22,14 @@ import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
 import { recordAclEvent } from "./acl/acl-audit";
 import { canManageProject, canWriteProject, type ProjectPrincipal } from "./project-acl";
-import { getRecentTabUserIds, pruneUnreadableProjectTabs } from "./recent-tabs-service";
+import {
+	getRecentTabUserIds,
+	getRecentTabUserIdsForTeamTrees,
+	pruneUnreadableProjectTabs,
+} from "./recent-tabs-service";
+
+/** Holders of a project's team-session tabs told about a project visibility change (M1). */
+const TEAM_VISIBILITY_NOTICE_LIMIT = 200;
 
 /** The three membership tiers, mirroring the generic capabilities. */
 export type ProjectRole = "read" | "write" | "manage";
@@ -184,7 +191,15 @@ export async function setProjectVisibility(
 		if (visibility === "private") {
 			await pruneProjectTabsFor(await usersWithTabsInProject(projectId), projectId);
 		}
-		await announceProjectAccessChange(projectId, "visibility_changed");
+		// Project visibility is part of who passes a team coordinator's project-wide audiences
+		// (M1): the people with one of the project's team sessions in their recent tabs (most
+		// recent first, at most TEAM_VISIBILITY_NOTICE_LIMIT) are told, so their browsers
+		// re-read which team sessions they may only read.
+		await announceProjectAccessChange(
+			projectId,
+			"visibility_changed",
+			await getRecentTabUserIdsForTeamTrees({ projectId }, TEAM_VISIBILITY_NOTICE_LIMIT),
+		);
 	}
 	return await getProjectAccess(projectId, principal);
 }
