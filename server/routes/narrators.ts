@@ -6646,11 +6646,12 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
 	// Read the call, then check write access again: the gate ran before the body arrived.
-	const { target } = await prepareDecision(c, requestId);
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const result = await decideOutlinePlanRequest({
 		requestId,
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		body: parsed.data,
+		assertStillAllowed,
 	});
 	if (target)
 		recordTeamPersonDecision({
@@ -6702,10 +6703,20 @@ narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 // Run AskUserQuestion reflection immediately and submit the generated answers
 narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 	const requestId = c.req.param("requestId");
+	const { target } = await prepareDecision(c, requestId);
 	const result = await reflectPendingAskUserQuestion(requestId);
 	if (!result.ok) {
 		return c.json({ error: result.reason ?? "Question reflection request not found" }, 404);
 	}
+	// A person had the AI answer: recorded with them (M1), as its own kind.
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: c.get("user").sub,
+			decision: "allow",
+			kind: "question.answered_by_ai",
+		});
 	return c.json({ ok: true, answers: result.answers ?? {} });
 });
 
