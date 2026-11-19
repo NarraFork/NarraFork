@@ -1905,6 +1905,7 @@ narratorRoutes.get("/:id", async (c) => {
 		logger.warn("Slow narrator detail hydration", { narratorId: id, elapsedMs, messageCount });
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
+		...fastMode,
 		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
 		gitSummary: null,
 		navigationSummary,

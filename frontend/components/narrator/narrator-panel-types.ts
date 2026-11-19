@@ -128,6 +128,11 @@ export interface NarratorPanelSnapshot {
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
 	fastModeOverride?: "inherit" | "on" | "off";
+	effectiveFastMode?: boolean;
+	fastModeSource?: import("../../lib/api/narrators").FastModeSource;
+	fastModeSourceNarratorId?: string | null;
+	variant?: string | null;
+	type?: string | null;
 	turnStartedAt?: string | null;
 }
 
