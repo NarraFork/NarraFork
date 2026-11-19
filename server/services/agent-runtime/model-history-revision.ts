@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
+import { ModelHistoryTimeoutError } from "../../lib/model-history-preparation";
 import {
 	MODEL_HISTORY_PG_TRIGGERS,
 	MODEL_HISTORY_REVISION_CONTRACT,
@@ -38,6 +39,16 @@ export interface ModelHistorySignature {
 // other connections. A warm read still fetches the persisted narrator revision every time.
 const sqliteContracts = new WeakMap<Database, { catalogIdentity: number; trusted: boolean }>();
 
+export function readModelHistorySignatureTask(
+	sqlite: Database,
+	input: { narratorId: string },
+	signal: AbortSignal,
+): ModelHistorySignature {
+	signal.throwIfAborted();
+	return readSqliteModelHistorySignature(sqlite, input.narratorId);
+}
+
+/** A tiny, persisted signature on EVERY hit; never use a process-local epoch or WS version. */
 export function readSqliteModelHistorySignature(
 	sqlite: Database,
 	narratorId: string,
@@ -81,9 +92,12 @@ export function readSqliteModelHistorySignature(
 export async function readPostgresModelHistorySignature(
 	sql: Pick<SQL, "unsafe">,
 	narratorId: string,
-	options: { signal?: AbortSignal } = {},
+	options: { signal?: AbortSignal; deadline?: number } = {},
 ): Promise<ModelHistorySignature> {
+	// Only a source probe's explicit deadline is bounded here, never the complete hydration.
+	const deadline = options.deadline ?? Infinity;
 	options.signal?.throwIfAborted();
+	if (Date.now() >= deadline) throw new ModelHistoryTimeoutError();
 	try {
 		const pending = sql.unsafe(
 			`SELECT n.model_history_revision AS revision,
@@ -95,11 +109,23 @@ export async function readPostgresModelHistorySignature(
 			[narratorId],
 		);
 		let abort: () => void = () => {};
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		const stopped = new Promise<never>((_, reject) => {
 			abort = () => {
 				pending.cancel();
-				reject(new Error("Model history preparation cancelled"));
+				reject(
+					options.signal?.reason ??
+						new DOMException("Model history preparation cancelled", "AbortError"),
+				);
 			};
+			if (Number.isFinite(deadline))
+				timer = setTimeout(
+					() => {
+						pending.cancel();
+						reject(new ModelHistoryTimeoutError());
+					},
+					Math.max(1, deadline - Date.now()),
+				);
 			options.signal?.addEventListener("abort", abort, { once: true });
 			if (options.signal?.aborted) abort();
 		});
@@ -107,8 +133,11 @@ export async function readPostgresModelHistorySignature(
 		try {
 			rows = await Promise.race([pending, stopped]);
 		} finally {
+			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", abort);
 		}
+		options.signal?.throwIfAborted();
+		if (Date.now() >= deadline) throw new ModelHistoryTimeoutError();
 		const row = rows[0];
 		return {
 			revision: String(row?.revision ?? -1),
@@ -118,6 +147,9 @@ export async function readPostgresModelHistorySignature(
 				Number(row.triggers) === MODEL_HISTORY_PG_TRIGGERS.length,
 		};
 	} catch (error) {
+		options.signal?.throwIfAborted();
+		if (Date.now() >= deadline || error instanceof ModelHistoryTimeoutError)
+			throw new ModelHistoryTimeoutError();
 		if (error instanceof Error && error.message.startsWith("Model history preparation"))
 			throw error;
 		if (!["42703", "42P01"].includes(String((error as { code?: string }).code)))

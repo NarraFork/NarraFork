@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
+import { narrators } from "../../db/schema";
 import {
 	isInternalTrait,
 	NARRATOR_DRAFT_TRAIT_PREFIX,
@@ -10,7 +11,15 @@ import type {
 	RecoverySubagentInput,
 	RecoveryToolCallInput,
 } from "../narrator-subagent-recovery";
-import {
+import { TURN_PAUSE_STARTED_MS_PREFIX } from "../narrator-turn-timing";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
+
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db: fixture.db, sqlite: fixture.sqlite }));
+const {
+	markRecoveryOffered,
 	buildRecoveryNotifyPrompt,
 	buildRecoveryOfferedTrait,
 	buildRecoveryOfferedUpdate,
@@ -23,8 +32,42 @@ import {
 	TOOL_CALL_RESET_FIELDS,
 	toolOutputText,
 	withRecoveryOfferedTrait,
-} from "../narrator-subagent-recovery";
-import { TURN_PAUSE_STARTED_MS_PREFIX } from "../narrator-turn-timing";
+} = await import("../narrator-subagent-recovery");
+
+afterAll(async () => {
+	await (await import("../background-occupancy-store")).stopBackgroundOccupancy();
+	await (await import("../agent-runtime/async-work")).drainCommunicationWork();
+	await fixture.close();
+	mock.module("../../db", () => realDbModule);
+});
+
+test("recovery watermark preserves committed alias traits and failure timing", async () => {
+	const id = "worker-recovery-mark";
+	const updatedAt = "2026-01-02T03:04:05.000Z";
+	fixture.db
+		.insert(narrators)
+		.values({
+			id,
+			type: "subagent",
+			variant: "subagent:general",
+			traits: ["subagent-alias:worker-recovery", "custom-trait"],
+			createdAt: updatedAt,
+			updatedAt,
+		})
+		.run();
+	await markRecoveryOffered([{ id, failedAtMs: 1234 }]);
+	const row = fixture.sqlite
+		.query<{ traits: string; updated_at: string }, [string]>(
+			"SELECT traits, updated_at FROM narrators WHERE id = ?",
+		)
+		.get(id);
+	expect(JSON.parse(row?.traits ?? "[]")).toEqual([
+		"subagent-alias:worker-recovery",
+		"custom-trait",
+		buildRecoveryOfferedTrait(1234),
+	]);
+	expect(row?.updated_at).toBe(updatedAt);
+});
 
 const MSG = "assistant-msg-1";
 

@@ -15,7 +15,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -23,6 +23,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // The shared migrated test database, not a hand-rolled subset.
 //
@@ -30,7 +31,9 @@ import {
 // mock is process-wide, so those four tables became `db` for all 190 sibling files and
 // broke 139 unrelated assertions. `getTestDb()` runs the real migrations, so a leak
 // costs nothing structural — and the `afterAll` below re-points the module anyway.
-const { db: testDb, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db: testDb, sqlite } = fixture;
+await fixture.ready;
 
 // Snapshot the real module first so `afterAll` can restore it: `mock.restore()` does
 // NOT undo `mock.module`, and an FTS-less test db leaking into later real-db suites is
@@ -219,17 +222,19 @@ describe("question lifecycle closure", () => {
 	});
 	test("new async requires context, user-deferred remains compatible, and UTF-8 budgets apply", async () => {
 		const call = await seedToolCall();
-		await expect(
+		const missingContext = await captureWorkerRejectionThrower(
 			createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
-		).rejects.toThrow("context");
-		await expect(
+		);
+		expect(missingContext).toThrow("context");
+		const oversizedContext = await captureWorkerRejectionThrower(
 			createQuestionRecord({
 				narratorId: NARRATOR_ID,
 				...call,
 				questions: QUESTIONS,
 				context: "中".repeat(700),
 			}),
-		).rejects.toThrow("2048");
+		);
+		expect(oversizedContext).toThrow("2048");
 		const result = await createQuestionRecord({
 			narratorId: NARRATOR_ID,
 			...call,
@@ -421,7 +426,7 @@ describe("question lifecycle closure", () => {
 	});
 	test("oversized snapshots and answers reject before changing state; legacy detail stays bounded", async () => {
 		const call = await seedToolCall();
-		await expect(
+		const oversizedSnapshot = await captureWorkerRejectionThrower(
 			createAsyncQuestion({
 				narratorId: NARRATOR_ID,
 				...call,
@@ -433,15 +438,17 @@ describe("question lifecycle closure", () => {
 					},
 				],
 			}),
-		).rejects.toThrow("snapshot");
+		);
+		expect(oversizedSnapshot).toThrow("snapshot");
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,
 			...call,
 			questions: QUESTIONS,
 		});
-		await expect(
+		const oversizedAnswers = await captureWorkerRejectionThrower(
 			answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
-		).rejects.toThrow("answers");
+		);
+		expect(oversizedAnswers).toThrow("answers");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		sqlite
 			.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?")
@@ -459,9 +466,10 @@ describe("question lifecycle closure", () => {
 			]),
 			record.id,
 		);
-		await expect(
+		const ambiguousAnswers = await captureWorkerRejectionThrower(
 			answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
-		).rejects.toThrow("ambiguous");
+		);
+		expect(ambiguousAnswers).toThrow("ambiguous");
 		sqlite.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?").run(
 			JSON.stringify([
 				{
@@ -575,7 +583,7 @@ beforeEach(async () => {
 	await seedParents();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	setQuestionServiceSeam(null);
 	setInjectionScheduler(previousScheduler);
 	// Re-point the module at the real database. `mock.restore()` does not undo
@@ -584,6 +592,7 @@ afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("own question query capability", () => {
@@ -838,9 +847,10 @@ describe("answerAsyncQuestion", () => {
 		});
 		broadcasts = [];
 		deliveryError = new Error("injected persistence failure");
-		await expect(
+		const failedDelivery = await captureWorkerRejectionThrower(
 			answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-		).rejects.toThrow("injected persistence failure");
+		);
+		expect(failedDelivery).toThrow("injected persistence failure");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		expect((await getAsyncQuestion(record.id))?.answers).toBeNull();
 		expect(broadcasts).toEqual([]);
@@ -871,9 +881,10 @@ describe("answerAsyncQuestion", () => {
 		sqlite.run(`CREATE TEMP TRIGGER reject_question_message BEFORE INSERT ON narrator_messages
 			WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'injected message insert failure'); END`);
 		try {
-			await expect(
+			const failedInsert = await captureWorkerRejectionThrower(
 				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected message insert failure");
+			);
+			expect(failedInsert).toThrow("injected message insert failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect((await getAsyncQuestion(record.id))?.answerMessageId).toBeNull();
 		} finally {
@@ -895,9 +906,10 @@ describe("answerAsyncQuestion", () => {
 		sqlite.run(`CREATE TEMP TRIGGER reject_question_update BEFORE UPDATE OF status ON narrator_questions
 			BEGIN SELECT RAISE(ABORT, 'injected question update failure'); END`);
 		try {
-			await expect(
+			const failedUpdate = await captureWorkerRejectionThrower(
 				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected question update failure");
+			);
+			expect(failedUpdate).toThrow("injected question update failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect(
 				sqlite.query("SELECT count(*) AS n FROM narrator_messages WHERE role = 'user'").get(),
@@ -974,7 +986,8 @@ describe("dismissAsyncQuestion", () => {
 			questions: QUESTIONS,
 		});
 		deliveryError = new Error("injected dismissal failure");
-		await expect(dismissAsyncQuestion(record.id)).rejects.toThrow("injected dismissal failure");
+		const failedDismissal = await captureWorkerRejectionThrower(dismissAsyncQuestion(record.id));
+		expect(failedDismissal).toThrow("injected dismissal failure");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		deliveryError = null;
 		const result = await dismissAsyncQuestion(record.id);
@@ -1552,5 +1565,9 @@ describe("receipt supplements with block reads", () => {
 		sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?").run(receipt);
 		expect((await read(false)).events.at(-1)?.text).toBe("changed");
 		expect((await read(true)).events.at(-1)?.text).toBe("Actually memory");
+		sqlite.query("UPDATE narrator_messages SET content_json = '[]' WHERE id = ?").run(receipt);
+		sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?").run(receipt);
+		expect((await read(true)).events.at(-1)?.text).toBe("Actually memory");
+		expect(await getBoundedQuestionReceipt(receipt, NARRATOR_ID)).toContain("Actually memory");
 	});
 });

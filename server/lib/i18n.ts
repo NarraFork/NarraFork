@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Unified backend i18n module.
  *
@@ -795,10 +796,13 @@ function loadUserPreferenceQueryDependencies() {
  */
 export async function getUserLanguage(userId: string): Promise<Locale> {
 	const { db, eq, userPreferences } = await loadUserPreferenceQueryDependencies();
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { language: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { language: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return normalizeLocale(pref?.language);
 }
 
@@ -807,10 +811,13 @@ export async function getUserLanguage(userId: string): Promise<Locale> {
  */
 export async function getUserReplyInLanguage(userId: string): Promise<boolean> {
 	const { db, eq, userPreferences } = await loadUserPreferenceQueryDependencies();
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { replyInUserLanguage: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { replyInUserLanguage: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return pref?.replyInUserLanguage ?? true;
 }
 

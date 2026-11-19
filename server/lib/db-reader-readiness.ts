@@ -3,26 +3,23 @@
  *
  * Authentication reads run only on the short-read Worker pool and never fall back to the main
  * thread, so a process whose Workers cannot start would answer every request with an opaque
- * failure. Instead, startup probes the pool once (bounded), `/api/*` and `/ws/*` wait for that
- * verdict, and an unavailable pool is a clear 503 with `Retry-After`. A failed verdict is
- * re-probed at most once per retry interval, so a transient spawn failure heals on its own.
+ * failure. Instead, startup probes the pool once (bounded), API/WS requests wait for that verdict,
+ * and an unavailable pool is a clear 503 with `Retry-After`.
  */
 import { catalogError } from "./errors";
 
 export const DATABASE_READ_RETRY_AFTER_SECONDS = 5;
 
 export type DatabaseReaderFailureCode = "DB_READERS_UNAVAILABLE" | "DB_READERS_TIMEOUT";
-
 export type DatabaseReaderState =
-	| { status: "waiting" }
-	| { status: "ready" }
-	| { status: "not-required" }
-	| { status: "failed"; code: DatabaseReaderFailureCode; reason: string };
+	| { status: "waiting" | "ready" | "not-required" }
+	| { status: "failed"; code: DatabaseReaderFailureCode; reason?: string };
+export type DatabaseReaderResult = { ok: true } | { ok: false; code: DatabaseReaderFailureCode };
 
 export interface DatabaseReaderReadiness {
 	readonly state: DatabaseReaderState;
-	/** Resolves to the current verdict, probing first when none is usable yet. Never rejects. */
-	wait(): Promise<DatabaseReaderState>;
+	/** Bounded startup probe, followed by a fresh, non-spawning availability check. */
+	wait(): Promise<DatabaseReaderResult>;
 }
 
 const DB_READ_UNAVAILABLE_ERROR_NAMES = new Set([
@@ -30,20 +27,50 @@ const DB_READ_UNAVAILABLE_ERROR_NAMES = new Set([
 	"DbReadTaskTimeoutError",
 	"WorkersUnavailableError",
 ]);
+const DB_READ_UNAVAILABLE_CODES = new Set([
+	"DB_READ_UNAVAILABLE",
+	"DB_READ_OVERLOADED",
+	"DB_READ_BUSY",
+	"DB_READ_DATABASE_CLOSED",
+	"DB_READ_WORKER_EXITED",
+	"DB_READ_READER_EXIT_UNCONFIRMED",
+	"DB_READ_TASK_TIMEOUT",
+]);
 
-/** Short-read pool full, timed out or disabled. Names, to survive duplicated module instances. */
+/** Short-read pool full, timed out or disabled. Names and codes survive duplicated module copies. */
 export function isDatabaseReadUnavailable(error: unknown): boolean {
-	return error instanceof Error && DB_READ_UNAVAILABLE_ERROR_NAMES.has(error.name);
+	return (
+		error instanceof Error &&
+		(DB_READ_UNAVAILABLE_ERROR_NAMES.has(error.name) ||
+			("code" in error &&
+				typeof error.code === "string" &&
+				DB_READ_UNAVAILABLE_CODES.has(error.code)))
+	);
 }
 
 export function databaseReadersAvailable(state: DatabaseReaderState): boolean {
 	return state.status === "ready" || state.status === "not-required";
 }
 
-/** Everything that reaches the backend except liveness needs the readers to authenticate. */
-export function requiresDatabaseReaders(pathname: string): boolean {
-	if (pathname === "/api/health") return false;
-	return pathname.startsWith("/api/") || pathname.startsWith("/ws/");
+const PUBLIC_READ_ONLY_PATHS = new Set([
+	"/api/branding",
+	"/api/branding/favicon.svg",
+	"/api/branding/icon-192.png",
+	"/api/branding/icon-512.png",
+	"/api/branding/apple-touch-icon.png",
+	"/api/licenses",
+	"/api/changelog",
+]);
+
+/** Preserve verified build/settings-only GET surfaces, not arbitrary API prefixes. */
+export function requiresDatabaseReaders(pathname: string, method = "GET"): boolean {
+	if (pathname === "/api/health" || pathname === "/api/gracefully_shutdown") return false;
+	if (
+		(method === "GET" || method === "HEAD") &&
+		(PUBLIC_READ_ONLY_PATHS.has(pathname) || /^\/api\/licenses\/text\/[^/]+$/.test(pathname))
+	)
+		return false;
+	return pathname === "/api" || pathname.startsWith("/api/") || pathname.startsWith("/ws");
 }
 
 export function databaseReaderUnavailableResponse(state: DatabaseReaderState): Response {
@@ -54,58 +81,99 @@ export function databaseReaderUnavailableResponse(state: DatabaseReaderState): R
 			code: error.code,
 			messageCode: error.messageCode,
 			details: { databaseReaders: state },
+			databaseReaders: state,
 		},
 		{ status: 503, headers: { "Retry-After": String(DATABASE_READ_RETRY_AFTER_SECONDS) } },
 	);
 }
 
+/** Dependencies are injected so readiness can be tested without bootstrapping a database. */
 export function createDatabaseReaderReadiness(options: {
 	backend: "sqlite" | "postgres";
 	probe: (options: { signal: AbortSignal; timeoutMs: number }) => Promise<unknown>;
 	/** Live check after a successful probe, e.g. the pool being disabled later on. */
-	availability?: () => { available: boolean; reason: string | null };
+	availability?: () => { available: boolean; reason?: string | null };
+	/** Alias used by the database-identity lifecycle gate. */
+	databaseAvailability?: () => { available: boolean; reason?: string | null };
 	timeoutMs?: number;
 	retryIntervalMs?: number;
 	now?: () => number;
 }): DatabaseReaderReadiness {
-	const timeoutMs = options.timeoutMs ?? 10_000;
+	const timeoutMs = options.timeoutMs ?? 30_000;
 	const retryIntervalMs = options.retryIntervalMs ?? DATABASE_READ_RETRY_AFTER_SECONDS * 1000;
 	const now = options.now ?? Date.now;
 	let state: DatabaseReaderState =
-		options.backend === "sqlite" ? { status: "waiting" } : { status: "not-required" };
-	let inFlight: Promise<DatabaseReaderState> | null = null;
+		options.backend === "postgres" ? { status: "not-required" } : { status: "waiting" };
+	let inFlight: Promise<DatabaseReaderResult> | null = null;
 	let lastProbeAt = Number.NEGATIVE_INFINITY;
 
-	const probe = (): Promise<DatabaseReaderState> => {
+	const liveState = (): DatabaseReaderState => {
+		if (state.status !== "ready" && state.status !== "waiting") return state;
+		try {
+			const pool = options.availability?.();
+			const database = state.status === "ready" ? options.databaseAvailability?.() : undefined;
+			if ((pool && !pool.available) || (database && !database.available)) {
+				return {
+					status: "failed",
+					code: "DB_READERS_UNAVAILABLE",
+					reason: pool?.reason ?? database?.reason ?? "unavailable",
+				};
+			}
+		} catch {
+			return { status: "failed", code: "DB_READERS_UNAVAILABLE", reason: "unavailable" };
+		}
+		return state;
+	};
+
+	const probe = (): Promise<DatabaseReaderResult> => {
 		if (inFlight) return inFlight;
 		lastProbeAt = now();
 		const controller = new AbortController();
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<DatabaseReaderState>((resolve) => {
-			timer = setTimeout(() => {
-				controller.abort();
-				resolve({
-					status: "failed",
-					code: "DB_READERS_TIMEOUT",
-					reason: `probe exceeded ${timeoutMs}ms`,
-				});
-			}, timeoutMs);
-		});
+		let timedOut = false;
 		const attempt = Promise.resolve()
 			.then(() => options.probe({ signal: controller.signal, timeoutMs }))
 			.then(
-				(): DatabaseReaderState => ({ status: "ready" }),
-				(error: unknown): DatabaseReaderState => ({
-					status: "failed",
-					code: "DB_READERS_UNAVAILABLE",
-					reason: error instanceof Error ? error.message : String(error),
-				}),
+				() => ({ ok: true }) as const,
+				(error: unknown) => {
+					const failed: DatabaseReaderState = {
+						status: "failed",
+						code: timedOut ? "DB_READERS_TIMEOUT" : "DB_READERS_UNAVAILABLE",
+						reason: error instanceof Error ? error.message : String(error),
+					};
+					state = failed;
+					return { ok: false, code: failed.code } as const;
+				},
 			);
-		inFlight = Promise.race([attempt, timeout]).then((verdict) => {
+		const timeout = new Promise<DatabaseReaderResult>((resolve) => {
+			timer = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+				state = {
+					status: "failed",
+					code: "DB_READERS_TIMEOUT",
+					reason: `probe exceeded ${timeoutMs}ms`,
+				};
+				resolve({ ok: false, code: "DB_READERS_TIMEOUT" });
+			}, timeoutMs);
+		});
+		inFlight = Promise.race([attempt, timeout]).then((result) => {
 			clearTimeout(timer);
-			state = verdict;
+			if (result.ok) {
+				const live = options.availability?.();
+				const database = options.databaseAvailability?.();
+				if ((live && !live.available) || (database && !database.available)) {
+					state = {
+						status: "failed",
+						code: "DB_READERS_UNAVAILABLE",
+						reason: live?.reason ?? database?.reason ?? "unavailable",
+					};
+					return { ok: false, code: "DB_READERS_UNAVAILABLE" };
+				}
+				state = { status: "ready" };
+			}
 			inFlight = null;
-			return verdict;
+			return result;
 		});
 		return inFlight;
 	};
@@ -114,21 +182,18 @@ export function createDatabaseReaderReadiness(options: {
 
 	return {
 		get state() {
-			return state;
+			const current = liveState();
+			if (current.status === "failed" && state.status !== "failed") state = current;
+			return current;
 		},
 		async wait() {
-			if (state.status === "not-required") return state;
-			if (state.status === "ready") {
-				const live = options.availability?.();
-				if (!live || live.available) return state;
-				state = {
-					status: "failed",
-					code: "DB_READERS_UNAVAILABLE",
-					reason: live.reason ?? "unavailable",
-				};
-			}
+			if (options.backend === "postgres") return { ok: true };
+			const current = liveState();
+			if (current.status === "failed" && state.status !== "failed") state = current;
+			if (state.status === "ready") return { ok: true };
 			if (inFlight) return inFlight;
-			if (state.status === "failed" && now() - lastProbeAt < retryIntervalMs) return state;
+			if (state.status === "failed" && now() - lastProbeAt < retryIntervalMs)
+				return { ok: false, code: state.code };
 			return probe();
 		},
 	};

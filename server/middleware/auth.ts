@@ -151,7 +151,8 @@ async function authenticateRequest(c: Context, forceFresh = false): Promise<Auth
 	// Not a session token — an OAuth access token issued by NarraFork's own authorization
 	// server (third-party API clients), or nothing usable (including session JWTs from
 	// before opaque session tokens, which are simply no longer accepted).
-	const oauthGrant = await validateAccessToken(token).catch(() => null);
+	// Invalid credentials return null; storage and Worker failures must remain 5xx.
+	const oauthGrant = await validateAccessToken(token);
 	if (!oauthGrant) {
 		throw catalogError("TOKEN_INVALID");
 	}

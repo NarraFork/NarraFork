@@ -76,7 +76,7 @@ export async function queryModelHistoryDelta(
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
 	const fromBlocks = options.bodiesFromBlocks === true;
-	const budget = new ModelHistoryBudget(maxBytes, options.signal);
+	const budget = new ModelHistoryBudget(maxBytes, options.signal, options.deadline);
 	const measuredBytes = (sizes: Map<string, number>, id: string): number => {
 		const bytes = sizes.get(id);
 		if (bytes === undefined) throw new Error("Model history snapshot contains unmeasured rows");

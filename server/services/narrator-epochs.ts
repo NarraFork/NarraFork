@@ -242,6 +242,7 @@ export interface ReconcileEpochInput {
 	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
+	/** Borrow request observation; authoritative source reads each get a fresh short budget. */
 	preparation?: ModelHistoryPreparation;
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	/** Compatibility for callers/tests; cache age never opens an epoch. */
@@ -274,7 +275,7 @@ export async function reconcileEpoch(input: ReconcileEpochInput): Promise<Reconc
 				throw new ToolEpochError(error);
 			}
 		},
-		input.signal,
+		input.signal ?? input.preparation?.signal,
 	);
 }
 
@@ -316,18 +317,24 @@ function currentPromptParts(
 	];
 }
 async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEpoch> {
-	const { narratorId, managed, signal } = input;
+	const { narratorId, managed, preparation } = input;
+	const signal = input.signal ?? preparation?.signal;
 	signal?.throwIfAborted();
 	// Production uses the shared incremental history loader. Legacy/test tool-only
 	// callers can still provide their captured history without a prompt baseline.
-	const sourceMessages = input.prompt
-		? await (await import("./narrator-service")).narratorService.getModelHistorySinceLastCompact(
-				narratorId,
-				undefined,
-				{ signal, preparation: input.preparation },
-			)
-		: undefined;
-	input.preparation?.recordPhase("epoch");
+	let sourceMessages: ReconciledEpoch["sourceMessages"];
+	if (input.prompt) {
+		const { narratorService } = await import("./narrator-service");
+		signal?.throwIfAborted();
+		preparation?.phase("source");
+		sourceMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+			signal,
+			deadline: Date.now() + 10_000,
+			preparation,
+		});
+		signal?.throwIfAborted();
+		preparation?.phase("epoch");
+	}
 	const messages = sourceMessages ?? input.messages;
 	const compactMessageId = await currentCompactMessageId(narratorId);
 	if (

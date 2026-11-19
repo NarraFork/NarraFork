@@ -18,9 +18,10 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { getTestDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -134,7 +135,8 @@ beforeEach(() => {
 
 afterEach(resetFixture);
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.module("../../db", () => realDbModule);
 	mock.module("../narrator-session", () => realNarratorSession);
 	mock.restore();
@@ -147,7 +149,7 @@ describe("queue admission during compaction", () => {
 			const result = await pushBufferedMessage(NARRATOR_ID, "typed while compacting");
 
 			expect(result.ok).toBe(true);
-			expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
 				"typed while compacting",
 			]);
 		} finally {
@@ -167,7 +169,7 @@ describe("queue admission during compaction", () => {
 		expect(result.ok).toBe(false);
 		expect(result.full).toBeUndefined();
 		// The message queued while the compact was live is untouched by the refusal.
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["during"]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual(["during"]);
 	});
 
 	test("a compact on ANOTHER narrator does not admit this one", async () => {
@@ -295,7 +297,7 @@ describe("the compact exit rechecks the unified mailbox without user input", () 
 	])("a completed watch notice is eligible after compact %s", async (exit) => {
 		const lock = installCompactLock(NARRATOR_ID);
 		enqueueTaskNotice();
-		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
 		if (exit === "success") lock.settle();
 		else lock.fail(new Error(`compact ${exit}`));
 		compactLocks.delete(NARRATOR_ID);

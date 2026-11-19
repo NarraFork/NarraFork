@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { getClientIp } from "../lib/client-ip";
 import { AppError, RateLimitError } from "../lib/errors";
 import {
@@ -201,10 +202,13 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	});
 	// The service guarantees the page's own revision consistency (see the narrator
 	// route's note); a second version comparison here only produced spurious 409s.
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, auth.narratorId),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, auth.narratorId),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narratorMeta) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	const projected = projectPublicNarratorPayload(auth.narratorId, result);
@@ -216,7 +220,7 @@ publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", 
 	const metadata = await narratorService.getToolCallPreviewMetadata(
 		auth.narratorId,
 		c.req.param("toolUseId"),
-		reference,
+		{ toolCallId: reference.toolCallId, messageId: reference.messageId },
 	);
 	if (isGenUiToolName(metadata.toolName)) throw unavailablePublicShare();
 	const ref = await toolInputStreamSource.ensureWriteDocumentSource(

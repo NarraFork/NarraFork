@@ -1,3 +1,4 @@
+import { readQuery } from "../../db/worker-read";
 /**
  * NarraFork narrator → InterchangeSession → Claude Code / Codex session files.
  *
@@ -49,18 +50,14 @@ import {
 } from "@shared/session-interchange/model";
 import { isClearedToolOutput } from "@shared/storage-retention";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { db, sqlite } from "../../db";
+import { db } from "../../db";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 import { NotFoundError, ValidationError } from "../../lib/errors";
-import { bodySql, readBodies } from "../../lib/narrator-bodies";
 import { getSubagentType, isSubagentVariant } from "../../lib/narrator-utils";
 import { settings } from "../../lib/settings";
 import { getImagePath, imageToBase64 } from "../../lib/uploads";
-import {
-	exportBodiesFromBlocks,
-	iterateNarratorTranscript,
-	resolveTranscriptScope,
-} from "../narrator-export";
+import { iterateNarratorTranscript, resolveTranscriptScope } from "../narrator-export";
+import { readNarratorBodyTexts } from "../narrator-message-reader";
 /**
  * Ceiling on the characters one export may hold in memory, subagents included.
  *
@@ -418,24 +415,27 @@ function assistantMessages(
 async function loadTools(messageIds: string[]): Promise<Map<string, ToolRow[]>> {
 	const byMessage = new Map<string, ToolRow[]>();
 	if (messageIds.length === 0) return byMessage;
-	const rows = await db
-		.select({
-			messageId: narratorToolCalls.messageId,
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson:
-				sql`CASE WHEN ${CLEARED_SESSION_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
-					narratorToolCalls.inputJson,
-				),
-			outputJson: narratorToolCalls.outputJson,
-			status: narratorToolCalls.status,
-			errorMessage: narratorToolCalls.errorMessage,
-			completedAt: narratorToolCalls.completedAt,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.messageId, messageIds))
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id));
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				inputJson:
+					sql`CASE WHEN ${CLEARED_SESSION_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
+						narratorToolCalls.inputJson,
+					),
+				outputJson: narratorToolCalls.outputJson,
+				status: narratorToolCalls.status,
+				errorMessage: narratorToolCalls.errorMessage,
+				completedAt: narratorToolCalls.completedAt,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.messageId, messageIds))
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id)),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	for (const row of rows) {
 		if (!row.messageId) continue;
 		const list = byMessage.get(row.messageId);
@@ -475,23 +475,19 @@ async function rowsToMessages(
 
 /** Message rows by id; a block-format body is assembled from its rows. */
 async function loadMessageRows(ids: string[]): Promise<MessageRow[]> {
-	if (!exportBodiesFromBlocks())
-		return db
-			.select({ ...MESSAGE_COLUMNS, contentJson: narratorMessages.contentJson })
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, ids));
-	const rows = await db
-		.select({
-			...MESSAGE_COLUMNS,
-			body: sql<string | null>`${sql.raw(bodySql("narrator_messages", true))}`,
-		})
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, ids));
-	const bodies = readBodies(
-		sqlite,
-		rows.map((row) => ({ id: row.id, body: row.body })),
+	const rows = await readQuery(
+		db.select(MESSAGE_COLUMNS).from(narratorMessages).where(inArray(narratorMessages.id, ids)),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
 	);
-	return rows.map(({ body: _body, ...row }) => ({ ...row, contentJson: bodies.get(row.id) }));
+	const bodies = await readNarratorBodyTexts(
+		rows.map((row) => ({ id: row.id, maxBytes: 128 * 1024 * 1024 })),
+	);
+	return rows.map((row) => {
+		const body = bodies.get(row.id);
+		if (body == null)
+			throw new ValidationError("Session export source changed or exceeded its body budget");
+		return { ...row, contentJson: JSON.parse(body) };
+	});
 }
 
 /** The narrator's own top-level transcript, full scope, in seq order. */
@@ -522,25 +518,28 @@ async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<Inter
 async function loadSubagents(
 	parentId: string,
 ): Promise<Array<{ id: string; toolUseId: string; variant: string; title: string | null }>> {
-	const rows = await db
-		.select({
-			id: narrators.id,
-			variant: narrators.variant,
-			subagentType: narrators.subagentType,
-			title: narrators.title,
-			toolUseId: narratorToolCalls.toolUseId,
-		})
-		.from(narrators)
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narrators.originToolCallId))
-		.where(
-			and(
-				eq(narrators.parentNarratorId, parentId),
-				eq(narrators.type, "subagent"),
-				eq(narrators.subagentOriginKind, "tool"),
-			),
-		)
-		.orderBy(asc(narrators.createdAt), asc(narrators.id))
-		.limit(SESSION_EXPORT_MAX_SUBAGENTS + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narrators.id,
+				variant: narrators.variant,
+				subagentType: narrators.subagentType,
+				title: narrators.title,
+				toolUseId: narratorToolCalls.toolUseId,
+			})
+			.from(narrators)
+			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narrators.originToolCallId))
+			.where(
+				and(
+					eq(narrators.parentNarratorId, parentId),
+					eq(narrators.type, "subagent"),
+					eq(narrators.subagentOriginKind, "tool"),
+				),
+			)
+			.orderBy(asc(narrators.createdAt), asc(narrators.id))
+			.limit(SESSION_EXPORT_MAX_SUBAGENTS + 1),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	return rows.map((row) => ({
 		id: row.id,
 		toolUseId: row.toolUseId,
@@ -559,7 +558,10 @@ export async function narratorToInterchange(
 	narratorId: string,
 	signal?: AbortSignal,
 ): Promise<InterchangeSession> {
-	const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	const warnings = new WarningCollector();

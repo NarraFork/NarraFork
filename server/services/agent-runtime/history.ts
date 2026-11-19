@@ -26,7 +26,9 @@ import {
 	usesToolLoading,
 } from "../../lib/agent/tool-loading";
 import type { ToolDefinition } from "../../lib/agent/types";
-import type { ModelHistoryPreparation } from "../../lib/model-history-preparation";
+import { stallTimeBetween } from "../../lib/event-loop-monitor";
+import { logger } from "../../lib/logger";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
@@ -65,6 +67,8 @@ export interface RuntimeHistoryOptions {
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
+	/** Optional deadline for source admission/signature reads, not hydration/projection. */
+	deadline?: number;
 	preparation?: ModelHistoryPreparation;
 	/**
 	 * Optional tools whose presence follows session loading, and the currently loaded
@@ -208,20 +212,50 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
-	// Source reads, hydration and projection remain cancellable without a fixed
-	// wall-clock cutoff for otherwise valid large histories.
-	const checkBudget = () => options.attachmentSignal?.throwIfAborted();
-	checkBudget();
+	// Source reads enforce their own short timeout; observation and cancellation
+	// continue through projection without imposing a total wall-clock limit.
+	const preparation =
+		options.preparation ??
+		new ModelHistoryPreparation({
+			narratorId: options.narratorId,
+			kind: "projection",
+			signal: options.attachmentSignal,
+			timeoutMs: null,
+			warn: (message, fields) => logger.warn(message, fields),
+			stallTimeBetween,
+		});
+	try {
+		const result = await projectRuntimeHistory({
+			...options,
+			preparation,
+			attachmentSignal: preparation.signal,
+		});
+		preparation.check();
+		if (!options.preparation) preparation.finish();
+		return result;
+	} catch (error) {
+		if (!options.preparation) preparation.finish(error);
+		throw error;
+	}
+}
+
+async function projectRuntimeHistory(
+	options: RuntimeHistoryOptions & { preparation: ModelHistoryPreparation },
+): Promise<PreparedRuntimeHistory> {
+	const { preparation } = options;
+	const checkBudget = () => preparation.check();
+	preparation.phase("source");
 	const sourceMessages =
 		options.sourceMessages ??
 		(await (
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
 			signal: options.attachmentSignal,
-			preparation: options.preparation,
+			deadline: options.deadline,
+			preparation,
 		}));
 	checkBudget();
-	options.preparation?.recordPhase("placement");
+	preparation.phase("placement");
 	const ownPlacement =
 		options.ownTurnPlacement !== undefined
 			? options.ownTurnPlacement
@@ -229,7 +263,8 @@ export async function buildRuntimeHistory(
 	checkBudget();
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
-	options.preparation?.recordPhase("mapping");
+	preparation.phase("mapping");
+	preparation.count("messages", sourceMessages.length);
 	let modelMessages = sourceMessages
 		.filter((message) => message.role !== "disp")
 		.map((message) => ({
@@ -245,19 +280,21 @@ export async function buildRuntimeHistory(
 		}));
 	let currentInput = options.currentInput;
 	if (options.attachmentCwd) {
-		options.preparation?.recordPhase("attachments");
+		preparation.phase("attachments");
 		const prepared = await projectAttachmentLocations(modelMessages, {
 			cwd: options.attachmentCwd,
 			narratorId: options.narratorId,
 			currentInput,
 			signal: options.attachmentSignal,
-			preparation: options.preparation,
+			preparation,
 		});
 		modelMessages = prepared.messages;
 		currentInput = prepared.currentInput;
 	}
 	checkBudget();
+	preparation.phase("toolState");
 	const loading = options.toolLoading;
+	preparation.count("tools", loading?.candidates?.length ?? 0);
 	let epoch = loading
 		? Object.hasOwn(loading, "epoch")
 			? loading.epoch
@@ -340,9 +377,9 @@ export async function buildRuntimeHistory(
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
-	options.preparation?.recordPhase("projection");
-	options.preparation?.count("messages", modelMessages.length);
-	options.preparation?.count("tools", loading?.candidates?.length ?? 0);
+	preparation.phase("projection");
+	preparation.count("messages", modelMessages.length);
+	preparation.count("tools", loading?.candidates?.length ?? 0);
 	const built = await buildHistory(
 		modelMessages,
 		options.model,
@@ -359,6 +396,7 @@ export async function buildRuntimeHistory(
 	checkBudget();
 	// The WeakMap key MUST stay the builder's actual history array. A copied array loses
 	// the exact sourceHistory/adoption boundary, including edited currentRevision candidates.
+	preparation.phase("delivery");
 	await trackAgentMessageHistory(
 		options.narratorId,
 		built.history,
@@ -368,6 +406,7 @@ export async function buildRuntimeHistory(
 	);
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.
+	checkBudget();
 	const current = projectCurrentInput(modelMessages, currentInput ?? "");
 	const accepted = findCurrentSenderMessage(modelMessages);
 	const acceptedBlocks = Array.isArray(accepted?.contentJson) ? accepted.contentJson : [];

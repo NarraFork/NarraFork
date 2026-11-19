@@ -5,9 +5,17 @@ import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-// The snapshot worker shares the preload-isolated file-backed database.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+// Bind the file-backed fixture before importing services that start database workers.
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
 
@@ -143,7 +151,7 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 			providerCalls.length === expectedCalls &&
 			row?.status === "idle" &&
 			!getExecutionOwner(narratorId) &&
-			!hasPendingBufferedWork(narratorId)
+			!(await hasPendingBufferedWork(narratorId))
 		)
 			return;
 		await Bun.sleep(10);
@@ -1129,14 +1137,22 @@ test.each([
 	}
 });
 
-test("gates the synchronous pending-work probe on PostgreSQL", () => {
-	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
+test("uses the asynchronous PostgreSQL mailbox for the pending-work probe", async () => {
+	const listPending = mock(async () => []);
+	const sqliteRead = spyOn(db, "select").mockImplementation(() => {
+		throw new Error("PostgreSQL probe must not read SQLite");
+	});
+	bindRuntimeQueue({
+		backend: "postgres",
+		queue: { mailbox: { listPending } } as unknown as RuntimeQueuePort,
+	});
 	try {
-		expect(() => hasPendingBufferedWork("mailbox-send-pg-gate")).toThrow(
-			"cannot inspect the PostgreSQL mailbox",
-		);
+		expect(await hasPendingBufferedWork("mailbox-send-pg-gate")).toBe(false);
+		expect(listPending).toHaveBeenCalledTimes(1);
+		expect(sqliteRead).not.toHaveBeenCalled();
 	} finally {
 		bindRuntimeQueue({ backend: "sqlite" });
+		sqliteRead.mockRestore();
 	}
 });
 
@@ -1187,7 +1203,7 @@ test.each([
 		} else {
 			expect(await updateBufferedMessageMode(narratorId, accepted.id, "turn")).toBe(true);
 		}
-		clearBufferedMessageSoftStopIfIdle(narratorId, false);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, false);
 		expect(providerCalls).toEqual([]);
 		releasePreflight.resolve();
 		await waitForIdle(narratorId, operation === "remove" ? 2 : 3);
@@ -1205,9 +1221,8 @@ test.each([
 	}
 });
 afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	backgroundOccupancyStore.resetForTests();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
 	mock.restore();
-	await closePrefixSnapshotStore();
-	cleanDb(sqlite);
 });

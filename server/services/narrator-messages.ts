@@ -125,7 +125,9 @@ import {
 	contentJsonSql,
 	envelopeStoredBytesSql,
 	fillBodies,
+	fillBodiesAsync,
 	fillBody,
+	fillBodyAsync,
 	hasStoredElementSql,
 	storedBodyBytesSql,
 } from "./narrator-body-reads";
@@ -3453,11 +3455,24 @@ const narratorMessageQueriesUnlocked = {
 
 		const messageIds = refRows.map((row) => row.messageId);
 		const messages = fillBodies(
-			await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, messageIds),
-				...bodyColumns(),
-				with: { toolCalls: true },
-			}),
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: inArray(narratorMessages.id, messageIds),
+								...bodyColumns(),
+								with: { toolCalls: true },
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: true, includeCreator: false },
+			),
 		);
 		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -3468,14 +3483,17 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
@@ -3515,11 +3533,24 @@ const narratorMessageQueriesUnlocked = {
 
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = fillBodies(
-			await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, messageIds),
-				...bodyColumns(),
-				with: { toolCalls: true },
-			}),
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: inArray(narratorMessages.id, messageIds),
+								...bodyColumns(),
+								with: { toolCalls: true },
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: true, includeCreator: false },
+			),
 		);
 
 		if (messages.length !== refRows.length) {
@@ -3877,14 +3908,17 @@ const narratorMessageQueriesUnlocked = {
 	async _getPostCompactTopLevelRefs(narratorId: string) {
 		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
@@ -4958,19 +4992,38 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async dismissSpecCarryoverMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!ref) return;
 
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				...bodyColumns({ id: true, role: true, contentJson: true }),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, role: true, contentJson: true }),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
@@ -5020,19 +5073,38 @@ const narratorMessageQueriesUnlocked = {
 	 * stops reading it. Idempotent when the message is already gone.
 	 */
 	async dismissInterruptTaskGuardMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!ref) return;
 
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				...bodyColumns({ id: true, role: true, contentJson: true }),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, role: true, contentJson: true }),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		// Unreachable while foreign keys are on: `narrator_message_refs.message_id` is a
 		// NOT NULL reference to `narrator_messages.id`, so a ref cannot outlive its
@@ -5102,19 +5174,38 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async dismissCwdRecoveryMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!ref) return;
 
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				...bodyColumns({ id: true, role: true, contentJson: true }),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, role: true, contentJson: true }),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
@@ -5162,19 +5253,38 @@ const narratorMessageQueriesUnlocked = {
 	 * Idempotent when the row or the ref is already gone.
 	 */
 	async dismissSubagentRecoveryMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!ref) return;
 
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				...bodyColumns({ id: true, role: true, contentJson: true }),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, role: true, contentJson: true }),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		// Unreachable while foreign keys are on (a ref cannot outlive its message);
 		// treated as "already gone" rather than as an error, like the missing-ref case.
@@ -5217,10 +5327,26 @@ const narratorMessageQueriesUnlocked = {
 
 	async dismissErrorMessage(narratorId: string, messageId: string) {
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				...bodyColumns({ id: true, role: true, contentJson: true }),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, role: true, contentJson: true }),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 
 		// The message may already be gone (e.g. a historical "message without ref"

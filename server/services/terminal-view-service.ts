@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { terminalViewState } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { generateId } from "../lib/id";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
@@ -17,9 +18,12 @@ export const terminalViewService = {
 			return null;
 		}
 
-		return db.query.terminalViewState.findFirst({
-			where: and(...conditions),
-		});
+		return readQuery(
+			db.query.terminalViewState.findFirst({
+				where: and(...conditions),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 	},
 
 	async upsert(

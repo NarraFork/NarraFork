@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -316,6 +316,85 @@ describe("batch recalculation", () => {
 });
 
 describe("single in-memory job", () => {
+	test("accepts synchronous injected resolver factories", async () => {
+		const db = fixture();
+		insert(db, "a");
+		const service = new TokenRecalculationService({
+			createStore: async () => createSqliteTokenRecalculationStore(db),
+			createResolver: () => resolver,
+		});
+		service.start({});
+		await service.wait();
+		expect(service.get()).toMatchObject({ status: "completed", processed: 1, changed: 1 });
+	});
+
+	for (const cancel of [false, true]) {
+		test(`waits for an async resolver before scanning (cancel=${cancel})`, async () => {
+			const db = fixture();
+			insert(db, "a");
+			const store = createSqliteTokenRecalculationStore(db);
+			const scan = mock(store.scan);
+			const close = mock(async () => {});
+			const pending = Promise.withResolvers<typeof resolver>();
+			const entered = Promise.withResolvers<void>();
+			const service = new TokenRecalculationService({
+				createStore: async () => ({ ...store, scan, close }),
+				createResolver: () => {
+					entered.resolve();
+					return pending.promise;
+				},
+			});
+			const started = service.start({});
+			try {
+				await entered.promise;
+				expect(service.get()?.status).toBe("running");
+				expect(scan).not.toHaveBeenCalled();
+				expect(close).not.toHaveBeenCalled();
+				if (cancel) service.cancel(started.id);
+				pending.resolve(resolver);
+				await service.wait();
+				expect(service.get()).toMatchObject({
+					status: cancel ? "cancelled" : "completed",
+					processed: cancel ? 0 : 1,
+					changed: cancel ? 0 : 1,
+				});
+				if (cancel) expect(scan).not.toHaveBeenCalled();
+				expect(close).toHaveBeenCalledTimes(1);
+				expect(
+					db.query("SELECT input_tokens,token_accounting_version FROM api_requests").get(),
+				).toEqual({
+					input_tokens: cancel ? 10000 : 7000,
+					token_accounting_version: cancel ? null : 1,
+				});
+			} finally {
+				pending.resolve(resolver);
+				await service.wait();
+			}
+		});
+	}
+
+	test("async resolver failures close the store and keep credentials private", async () => {
+		const scan = mock(async () => []);
+		const close = mock(async () => {});
+		const service = new TokenRecalculationService({
+			createStore: async () => ({
+				scan,
+				apply: async () => ({ processed: 0, changed: 0, fallback: 0 }),
+				close,
+			}),
+			createResolver: async () => {
+				throw new Error("secret resolver credentials");
+			},
+		});
+		service.start({});
+		await service.wait();
+		expect(service.get()?.status).toBe("failed");
+		expect(service.get()?.error).not.toContain("secret");
+		expect(service.get()?.finishedAt).not.toBeNull();
+		expect(scan).not.toHaveBeenCalled();
+		expect(close).toHaveBeenCalledTimes(1);
+	});
+
 	test("rejects overlapping jobs, cancellation is harmless, status is a snapshot", async () => {
 		const db = fixture();
 		insert(db, "a");

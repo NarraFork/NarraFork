@@ -19,13 +19,29 @@ import {
 	projects,
 } from "../../../server/db/schema";
 import { logger } from "../../../server/lib/logger";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
-
-// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
-const realDbModule = { ...(await import("../../../server/db")) };
-mock.module("../../../server/db", () => ({ db, sqlite }));
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+// Match openDatabase: WAL commits do not fsync every recovery-row transaction.
+sqlite.run("PRAGMA synchronous = NORMAL");
+await fixture.ready;
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../../../server/db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 
 const { narratorService } = await import("../../../server/services/narrator-service");
 await import("../../../server/services/narrator-messages");
@@ -160,6 +176,7 @@ function insertToolCall(params: {
 	inputJson?: unknown;
 	outputJson?: unknown;
 	narratorId?: string;
+	executionAttempt?: number;
 }) {
 	const narratorId = params.narratorId ?? "n1";
 	db.insert(narratorToolCalls)
@@ -171,6 +188,7 @@ function insertToolCall(params: {
 			toolName: params.toolName,
 			// These fixtures represent newly recorded calls, not legacy origin evidence.
 			executionIdentityVersion: 1,
+			executionAttempt: params.executionAttempt,
 			status: params.status ?? "success",
 			inputJson: params.inputJson,
 			outputJson: params.outputJson,
@@ -329,9 +347,10 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
-	mock.module("../../../server/db", () => realDbModule);
+afterAll(async () => {
 	mock.restore();
+	(await import("../../../server/services/narrator-block-sync")).stopBlockSyncSweep();
+	await fixture.close();
 });
 
 describe("narratorService message query regressions", () => {
@@ -739,7 +758,9 @@ describe("narratorService message query regressions", () => {
 			toolName: "Bash",
 		});
 
-		await expect(narratorService.getToolCallDetail("n2", "shared-tool")).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(narratorService.getToolCallDetail("n2", "shared-tool")),
+		).toThrow();
 		shareMessageWithNarrator("shared-tool-message", "n2", 0);
 		const detail = await narratorService.getToolCallDetail("n2", "shared-tool");
 		expect(detail.toolUseId).toBe("shared-tool");
@@ -1046,9 +1067,11 @@ describe("narratorService message query regressions", () => {
 
 		const detail = await narratorService.getCompactSummary("n1", failedMarker.id);
 		expect(detail).toMatchObject({ status: "failed", canRetry: false });
-		await expect(
-			narratorService.prepareFailedCompactRetry("n1", failedMarker.id, "provider:retry-too-late"),
-		).rejects.toMatchObject({ statusCode: 400 });
+		expect(
+			await captureWorkerRejection(
+				narratorService.prepareFailedCompactRetry("n1", failedMarker.id, "provider:retry-too-late"),
+			),
+		).toMatchObject({ statusCode: 400 });
 
 		const unchanged = await narratorService.getCompactSummary("n1", failedMarker.id);
 		expect(unchanged.status).toBe("failed");
@@ -1100,12 +1123,14 @@ describe("narratorService message query regressions", () => {
 			8,
 		);
 
-		await expect(
-			narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "stale retry summary", 9, {
-				mode: "blocking",
-				expectedCompactBoundaryMessageId: prepared.compactBoundaryMessageId,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "COMPACT_BOUNDARY_CHANGED" });
+		expect(
+			await captureWorkerRejection(
+				narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "stale retry summary", 9, {
+					mode: "blocking",
+					expectedCompactBoundaryMessageId: prepared.compactBoundaryMessageId,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "COMPACT_BOUNDARY_CHANGED" });
 
 		await narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "", undefined, {
 			status: "failed",
@@ -1542,7 +1567,7 @@ describe("narratorService message query regressions", () => {
 		const { promise } = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
 		await started;
 		expect(cancelCompact("n1")).toBe(true);
-		await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+		expect(await captureWorkerRejection(promise)).toMatchObject({ name: "AbortError" });
 
 		const detail = await narratorService.getCompactSummary("n1", marker.id);
 		expect(detail).toMatchObject({
@@ -1633,9 +1658,9 @@ describe("narratorService message query regressions", () => {
 
 	it("retry preparation failure releases its compact lock reservation", async () => {
 		seedBase();
-		await expect(retryFailedCompact("n1", "en", "missing-marker")).rejects.toMatchObject({
-			statusCode: 404,
-		});
+		expect(
+			await captureWorkerRejection(retryFailedCompact("n1", "en", "missing-marker")),
+		).toMatchObject({ statusCode: 404 });
 		expect(compactLocks.has("n1")).toBe(false);
 	});
 
@@ -1647,10 +1672,9 @@ describe("narratorService message query regressions", () => {
 			promise: Promise.resolve({ kind: "history", compacted: false, mode: "blocking" }),
 		});
 		try {
-			await expect(retryFailedCompact("n1", "en", "failed-marker")).rejects.toMatchObject({
-				statusCode: 409,
-				code: "COMPACT_IN_PROGRESS",
-			});
+			expect(
+				await captureWorkerRejection(retryFailedCompact("n1", "en", "failed-marker")),
+			).toMatchObject({ statusCode: 409, code: "COMPACT_IN_PROGRESS" });
 		} finally {
 			compactLocks.delete("n1");
 		}
@@ -1743,7 +1767,7 @@ describe("narratorService message query regressions", () => {
 			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
 			expect(result).toMatchObject({ oldMessageId: marker.id, replacedMessageId: marker.id });
 			expect(result.message.id).not.toBe(marker.id);
-			await expect(result.promise).resolves.toBe(true);
+			expect(await result.promise).toBe(true);
 
 			const historyEvents = capture.sent.filter((event) =>
 				["messages_deleted", "message_updated", "compact_done", "compact_failed"].includes(
@@ -1808,7 +1832,7 @@ describe("narratorService message query regressions", () => {
 			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
 			expect(result.message.id).toBe(marker.id);
 			expect(result.replacedMessageId).toBeUndefined();
-			await expect(result.promise).resolves.toBe(true);
+			expect(await result.promise).toBe(true);
 
 			expect(capture.sent.some((event) => event.type === "messages_deleted")).toBe(false);
 			const updatedIds = capture.sent
@@ -1834,7 +1858,7 @@ describe("narratorService message query regressions", () => {
 		try {
 			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
 			expect(result.message.id).not.toBe(marker.id);
-			await expect(result.promise).rejects.toThrow("retry summary failed");
+			expect(await captureWorkerRejectionThrower(result.promise)).toThrow("retry summary failed");
 			const failed = capture.sent.find((event) => event.type === "compact_failed");
 			expect(failed).toMatchObject({
 				messageId: result.message.id,
@@ -1945,16 +1969,16 @@ describe("narratorService message query regressions", () => {
 			});
 			expect(marker).toBeDefined();
 			if (!marker) throw new Error("Expected compact marker");
-			await expect(narratorService.deleteCompactMessage("n1", marker.id)).rejects.toMatchObject({
-				statusCode: 409,
-			});
+			expect(
+				await captureWorkerRejection(narratorService.deleteCompactMessage("n1", marker.id)),
+			).toMatchObject({ statusCode: 409 });
 			expect(
 				await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
 			).toBeDefined();
 
 			expect(cancelCompact("n1")).toBe(true);
 			resolveSummary({ summary: "late summary", contextPercent: 4 });
-			await expect(compactPromise).rejects.toMatchObject({ name: "AbortError" });
+			expect(await captureWorkerRejection(compactPromise)).toMatchObject({ name: "AbortError" });
 			expect(
 				await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
 			).toBeUndefined();
@@ -2043,7 +2067,7 @@ describe("narratorService message query regressions", () => {
 		resolveSummary({ summary: "must not apply", contextPercent: 9 });
 
 		try {
-			await expect(compactPromise).rejects.toBeTruthy();
+			expect(await captureWorkerRejection(compactPromise)).toBeTruthy();
 		} finally {
 			connections.delete(fakeWs);
 		}
@@ -2142,7 +2166,7 @@ describe("narratorService message query regressions", () => {
 		resolveSummary({ summary: "must not apply", contextPercent: 9 });
 
 		try {
-			await expect(compactPromise).rejects.toBeTruthy();
+			expect(await captureWorkerRejection(compactPromise)).toBeTruthy();
 		} finally {
 			connections.delete(fakeWs);
 		}
@@ -3030,6 +3054,7 @@ describe("subagent activity input summary projection", () => {
 			toolName: string;
 			inputJson?: unknown;
 			rawInputJson?: string;
+			executionAttempt?: number;
 		}>,
 	) {
 		seedBase();
@@ -3073,6 +3098,7 @@ describe("subagent activity input summary projection", () => {
 					toolUseId: call.toolUseId,
 					toolName: call.toolName,
 					inputJson: call.inputJson,
+					executionAttempt: call.executionAttempt,
 					narratorId: "sa-1",
 				});
 			}
@@ -3083,12 +3109,63 @@ describe("subagent activity input summary projection", () => {
 			?.contentJson?.find(
 				(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-agent",
 			);
-		return (block?._subagentActivity?.latestToolCalls ?? []) as Array<{
-			toolUseId: string;
-			toolName: string;
-			inputSummary?: Record<string, string>;
-		}>;
+		return (block?._subagentActivity?.latestToolCalls ?? []) as Array<
+			import("../../../server/services/narrator-messages").SubagentActivityToolCall
+		>;
 	}
+
+	it("cold 与 catch-up 保留数据库真实 attempt，刷新时不拼接不同 attempt 的摘要", async () => {
+		const calls = await activityFor([
+			{ toolUseId: "tu-outside-window", toolName: "Read", executionAttempt: 2 },
+			{
+				toolUseId: "tu-read-attempt",
+				toolName: "Read",
+				executionAttempt: 3,
+				inputJson: { file_path: "/repo/attempt-three.ts" },
+			},
+			{
+				toolUseId: "tu-bash-attempt",
+				toolName: "Bash",
+				executionAttempt: 7,
+				inputJson: { description: "latest command", command: "pwd" },
+			},
+			{ toolUseId: "tu-empty-attempt", toolName: "Await", executionAttempt: 9 },
+		]);
+		expect(
+			calls.map(({ toolCallId, executionAttempt }) => ({ toolCallId, executionAttempt })),
+		).toEqual([
+			{ toolCallId: "tc-tu-read-attempt", executionAttempt: 3 },
+			{ toolCallId: "tc-tu-bash-attempt", executionAttempt: 7 },
+			{ toolCallId: "tc-tu-empty-attempt", executionAttempt: 9 },
+		]);
+		const cursor = {
+			parentLastMessageId: "m-agent",
+			childAnchors: [{ parentToolUseId: "tu-agent", narratorId: "sa-1", lastMessageId: "c-1" }],
+		};
+		const catchUp = await narratorService.getMessagesAfter("n1", cursor);
+		const activity = catchUp.subagentActivities.find(
+			(item) => item.parentToolUseId === "tu-agent",
+		)?.activity;
+		expect(activity?.subagentNarratorId).toBe("sa-1");
+		expect(JSON.parse(JSON.stringify(activity?.latestToolCalls))).toEqual(calls);
+
+		await db
+			.update(narratorToolCalls)
+			.set({ executionAttempt: 4, inputJson: {} })
+			.where(eq(narratorToolCalls.id, "tc-tu-read-attempt"));
+		const next = await narratorService.getMessagesAfter("n1", cursor);
+		const nextCalls = next.subagentActivities.find((item) => item.parentToolUseId === "tu-agent")
+			?.activity.latestToolCalls;
+		expect(nextCalls).toHaveLength(3);
+		expect(nextCalls?.[0]).toMatchObject({
+			toolCallId: "tc-tu-read-attempt",
+			toolUseId: "tu-read-attempt",
+			executionAttempt: 4,
+		});
+		expect(nextCalls?.[0]).not.toHaveProperty("inputSummary");
+		expect(nextCalls?.slice(1)).toEqual(calls.slice(1));
+		expect(calls[0]?.inputSummary).toEqual({ file_path: "/repo/attempt-three.ts" });
+	});
 
 	it("projects the whitelisted key for each tool the row labels", async () => {
 		const calls = await activityFor([
@@ -3320,9 +3397,11 @@ describe("dismissInterruptTaskGuardMessage", () => {
 			contentJson: [{ type: "system_injection", source: "spec_carryover", text: "x" }],
 		});
 
-		await expect(narratorService.dismissInterruptTaskGuardMessage("n1", "other")).rejects.toThrow(
-			/not an interrupt task-guard reminder/,
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				narratorService.dismissInterruptTaskGuardMessage("n1", "other"),
+			),
+		).toThrow(/not an interrupt task-guard reminder/);
 		// And nothing was deleted on the way to the error.
 		expect(
 			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "other") }),
@@ -3334,7 +3413,11 @@ describe("dismissInterruptTaskGuardMessage", () => {
 		// carry a matching block and become deletable.
 		seedBase();
 		insertMessage({ id: "a1", seq: 1, role: "assistant", contentJson: guardBlocks });
-		await expect(narratorService.dismissInterruptTaskGuardMessage("n1", "a1")).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				narratorService.dismissInterruptTaskGuardMessage("n1", "a1"),
+			),
+		).toThrow();
 	});
 
 	it("is idempotent: a second dismissal is a no-op, not an error", async () => {
@@ -3461,9 +3544,11 @@ describe("dismissSubagentRecoveryMessage", () => {
 			contentJson: [{ type: "spec_fork_carryover", openCount: 1 }],
 		});
 
-		await expect(narratorService.dismissSubagentRecoveryMessage("n1", "other")).rejects.toThrow(
-			/not a subagent recovery notice/,
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				narratorService.dismissSubagentRecoveryMessage("n1", "other"),
+			),
+		).toThrow(/not a subagent recovery notice/);
 		expect(
 			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "other") }),
 		).toBeDefined();
@@ -3474,7 +3559,11 @@ describe("dismissSubagentRecoveryMessage", () => {
 		// carry a matching block and become deletable.
 		seedBase();
 		insertMessage({ id: "a1", seq: 1, role: "assistant", contentJson: recoveryBlocks });
-		await expect(narratorService.dismissSubagentRecoveryMessage("n1", "a1")).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				narratorService.dismissSubagentRecoveryMessage("n1", "a1"),
+			),
+		).toThrow();
 	});
 
 	it("is idempotent: a second dismissal is a no-op, not an error", async () => {

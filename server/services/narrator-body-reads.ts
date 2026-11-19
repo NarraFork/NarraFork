@@ -21,6 +21,7 @@ import { narratorMessages } from "../db/schema";
 import { blockBodies, boundedBodyText } from "../lib/narrator-bodies";
 import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { blockReadsEnabled } from "./narrator-block-scans";
+import { readNarratorBodyTexts } from "./narrator-message-reader";
 
 /** The envelope columns the expression reads: `narratorMessages`, or a relational alias of it. */
 interface EnvelopeColumns {
@@ -187,6 +188,39 @@ export function boundedStoredBody(messageId: string, maxBytes: number): string |
 /** One envelope's body assembled from its block rows (for a reader that saw it NULL). */
 export function blockBody(messageId: string): unknown[] {
 	return blockBodies(database.sqlite, [messageId]).get(messageId) ?? [];
+}
+
+/** Async read-side assembly. Synchronous fillBodies remains exclusively for write boundaries. */
+export async function fillBodiesAsync<T extends { id: string; contentJson: unknown }>(
+	rows: T[],
+	signal?: AbortSignal,
+): Promise<T[]> {
+	for (const row of rows) {
+		const record = row as Record<string, unknown>;
+		if (!Object.hasOwn(record, STORED_BODY)) continue;
+		const stored = record[STORED_BODY];
+		delete record[STORED_BODY];
+		row.contentJson = typeof stored === "string" ? JSON.parse(stored) : null;
+	}
+	const missing = rows.filter((row) => row.contentJson === null);
+	if (!missing.length) return rows;
+	const bodies = await readNarratorBodyTexts(
+		missing.map((row) => ({ id: row.id, maxBytes: 128 * 1024 * 1024 })),
+		signal,
+	);
+	for (const row of missing) {
+		const body = bodies.get(row.id);
+		if (body == null) throw new Error("Message body changed or exceeded its read budget");
+		row.contentJson = JSON.parse(body);
+	}
+	return rows;
+}
+export async function fillBodyAsync<T extends { id: string; contentJson: unknown }>(
+	row: T | undefined,
+	signal?: AbortSignal,
+): Promise<T | undefined> {
+	if (row) await fillBodiesAsync([row], signal);
+	return row;
 }
 
 /** `fillBodies` for one row, or none. */

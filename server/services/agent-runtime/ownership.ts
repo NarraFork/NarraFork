@@ -68,6 +68,8 @@ export interface RunControl {
 	/** Set while the run is suspended by a hold. */
 	wake?: (reason: "input" | "release" | "cancel") => void;
 	readonly terminal: Promise<RunResult>;
+	/** Exact process-only release accepted by executeRun after owner identity validation. */
+	checkpointStop?: import("./checkpoint-stop").CheckpointStop;
 }
 
 /** A user control hold on a session's result: survives runs, mirrored as `taken_over`. */

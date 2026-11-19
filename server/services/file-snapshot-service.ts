@@ -13,6 +13,7 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorFileSnapshots } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 
@@ -51,14 +52,17 @@ export async function ensureFileSnapshot(
 	failureMode: SnapshotFailureMode = "best-effort",
 ): Promise<EnsureFileSnapshotResult> {
 	try {
-		const existing = await db.query.narratorFileSnapshots.findFirst({
-			where: and(
-				eq(narratorFileSnapshots.narratorId, narratorId),
-				eq(narratorFileSnapshots.deviceId, deviceId),
-				eq(narratorFileSnapshots.filePath, filePath),
-			),
-			columns: { id: true },
-		});
+		const existing = await readQuery(
+			db.query.narratorFileSnapshots.findFirst({
+				where: and(
+					eq(narratorFileSnapshots.narratorId, narratorId),
+					eq(narratorFileSnapshots.deviceId, deviceId),
+					eq(narratorFileSnapshots.filePath, filePath),
+				),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (existing) return "existing";
 
 		const captured = toSnapshotContent(await readContent());

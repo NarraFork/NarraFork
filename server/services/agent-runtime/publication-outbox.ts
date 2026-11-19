@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
@@ -1042,9 +1043,17 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			.get();
 		if (delivered) return { status: "duplicate" as const, ...delivered };
 		const existing = tx
-			.select()
+			.select({
+				id: outbox.id,
+				state: outbox.state,
+				eventKind: outbox.eventKind,
+				deliveryId: outbox.deliveryId,
+				arrivalSeq: outbox.arrivalSeq,
+				lastError: outbox.lastError,
+			})
 			.from(outbox)
 			.where(and(runWhere(intent), eq(outbox.eventKind, intent.eventKind)))
+			.limit(1)
 			.get();
 		if (existing && existing.state !== "reserved")
 			return {
@@ -1052,6 +1061,32 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 				deliveryId: existing.deliveryId,
 				arrivalSeq: existing.arrivalSeq,
 			};
+		if (intent.eventKind !== "started") {
+			const outcomes = (["completed", "failed", "timed_out", "cancelled"] as const).filter(
+				(event) => event !== intent.eventKind,
+			);
+			const conflict = tx
+				.select({ eventKind: outbox.eventKind, state: outbox.state })
+				.from(outbox)
+				.where(and(runWhere(intent), inArray(outbox.eventKind, outcomes)))
+				.limit(1)
+				.get();
+			if (conflict)
+				throw new PublicationStateError("terminal_conflict", "commit", intent, conflict);
+			// Mailbox dedupe keys retain the same outcome authority after outbox transfer.
+			const keys = outcomes.map((event) => publicationDedupeKey(intent, event));
+			const receipt = tx
+				.select({ dedupeKey: mailbox.dedupeKey, state: mailbox.state })
+				.from(mailbox)
+				.where(and(eq(mailbox.narratorId, intent.recipientId), inArray(mailbox.dedupeKey, keys)))
+				.limit(1)
+				.get();
+			if (receipt)
+				throw new PublicationStateError("terminal_conflict", "commit", intent, {
+					eventKind: outcomes[keys.indexOf(receipt.dedupeKey ?? "")],
+					state: receipt.state,
+				});
+		}
 		// Existing event receipts win over regenerated summaries or result projections on retries.
 		if (intent.logicalRunId.startsWith("legacy:unknown:"))
 			intent = { ...intent, summary: LEGACY_UNKNOWN_BASH_FAILURE_SUMMARY };
@@ -1061,11 +1096,19 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		const slot =
 			existing ??
 			tx
-				.select()
+				.select({
+					id: outbox.id,
+					state: outbox.state,
+					eventKind: outbox.eventKind,
+					deliveryId: outbox.deliveryId,
+					arrivalSeq: outbox.arrivalSeq,
+					lastError: outbox.lastError,
+				})
 				.from(outbox)
 				.where(
 					and(runWhere(intent), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved")),
 				)
+				.limit(1)
 				.get();
 		const recipientExists = tx
 			.select({ id: narrators.id })
@@ -1076,8 +1119,52 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		// consumed slot is gone must still be harmless after that lifetime boundary.
 		if (!slot && !recipientExists && intent.eventKind !== "started")
 			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
-		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
-			throw new Error("Publication requires a startup reservation");
+		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started")) {
+			// The event index leads with producer/task/run. These bounded metadata probes
+			// describe real surviving evidence, not an inference from a missing slot.
+			const sameRun = tx
+				.select({
+					logicalRunId: outbox.logicalRunId,
+					recipientId: outbox.recipientId,
+					eventKind: outbox.eventKind,
+					state: outbox.state,
+				})
+				.from(outbox)
+				.where(
+					and(
+						eq(outbox.producerKind, intent.producerKind),
+						eq(outbox.taskId, intent.taskId),
+						eq(outbox.logicalRunId, intent.logicalRunId),
+						ne(outbox.recipientId, intent.recipientId),
+					),
+				)
+				.limit(1)
+				.get();
+			if (sameRun) throw new PublicationStateError("recipient_mismatch", "commit", intent, sameRun);
+			const otherRun = tx
+				.select({
+					logicalRunId: outbox.logicalRunId,
+					recipientId: outbox.recipientId,
+					eventKind: outbox.eventKind,
+					state: outbox.state,
+				})
+				.from(outbox)
+				.where(
+					and(
+						eq(outbox.producerKind, intent.producerKind),
+						eq(outbox.taskId, intent.taskId),
+						ne(outbox.logicalRunId, intent.logicalRunId),
+					),
+				)
+				.limit(1)
+				.get();
+			throw new PublicationStateError(
+				otherRun ? "run_mismatch" : "missing_reservation",
+				"commit",
+				intent,
+				otherRun,
+			);
+		}
 		// A reserved slot can be marked undeliverable without revoking the running producer's
 		// right to commit its terminal result. lastError on a reservation is only set by failRecipient.
 		const recipientFailure =
@@ -1239,25 +1326,27 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		registerLegacyRunningRunSlots,
 		registerLegacyUnknownBashFailure,
 		registerLegacyCompletedRunSlots,
-		listPending(options: { afterId?: string; limit?: number } = {}, tx: RuntimeStoreDb = db) {
-			return tx
-				.select({
-					id: outbox.id,
-					recipientId: outbox.recipientId,
-					producerKind: outbox.producerKind,
-					logicalRunId: outbox.logicalRunId,
-					arrivalSeq: outbox.arrivalSeq,
-				})
-				.from(outbox)
-				.where(
-					and(
-						eq(outbox.state, "pending"),
-						options.afterId ? gt(outbox.id, options.afterId) : undefined,
-					),
-				)
-				.orderBy(asc(outbox.id))
-				.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1)
-				.all();
+		async listPending(options: { afterId?: string; limit?: number } = {}) {
+			return readQuery(
+				db
+					.select({
+						id: outbox.id,
+						recipientId: outbox.recipientId,
+						producerKind: outbox.producerKind,
+						logicalRunId: outbox.logicalRunId,
+						arrivalSeq: outbox.arrivalSeq,
+					})
+					.from(outbox)
+					.where(
+						and(
+							eq(outbox.state, "pending"),
+							options.afterId ? gt(outbox.id, options.afterId) : undefined,
+						),
+					)
+					.orderBy(asc(outbox.id))
+					.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1),
+				{ executionPolicy: "worker-required", maxRows: L.pageSize + 1 },
+			);
 		},
 		/** Fail actual events, but preserve running tasks' reserved capacity until their result commits. */
 		failRecipient(recipientId: string, reason: string) {

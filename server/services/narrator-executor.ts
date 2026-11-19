@@ -333,6 +333,9 @@ export async function executeAgentLoop(
 			}
 		}
 	} catch (error) {
+		// A consumer failure closes an async generator with return(), not throw(error).
+		// Preserve only a control transfer the generator actually accepted before yielding
+		// a companion result, and expose its failed flush to the shutdown audit.
 		const pause = getAcceptedCheckpointStopDrain(config.signal);
 		if (pause && !config.signal.aborted && pause.identity.narratorId === config.narratorId) {
 			if (error !== pause) pause.cleanupFailure ??= error;

@@ -9,7 +9,7 @@ import {
 import { activeNarrators } from "./narrator-session-state";
 
 /** Indexed single-row operations, shared by SQLite and PostgreSQL. */
-export function createReplyContextStore(query: Pick<ContextQuery, "get">) {
+export function createReplyContextStore(query: Pick<ContextQuery, "get" | "writeReturning">) {
 	return {
 		async ensure(narratorId: string, trustedInitial?: ReplyContext): Promise<ReplyContext> {
 			for (;;) {
@@ -38,7 +38,7 @@ export function createReplyContextStore(query: Pick<ContextQuery, "get">) {
 								replyInUserLanguage: !!preferences.reply,
 							}
 						: { ...DEFAULT_REPLY_CONTEXT, replyInUserLanguage: row.ownerUserId !== null });
-				const written = await query.get<{ id: string }>(
+				const written = await query.writeReturning<{ id: string }>(
 					"UPDATE narrators SET reply_context = ? WHERE id = ? AND reply_context IS NULL RETURNING id",
 					[JSON.stringify(fallback), narratorId],
 				);
@@ -49,7 +49,7 @@ export function createReplyContextStore(query: Pick<ContextQuery, "get">) {
 		async adopt(narratorId: string, pair: ReplyContext): Promise<void> {
 			const context = parseReplyContext(pair);
 			if (!context) throw new Error("Human reply context is required");
-			const row = await query.get<{ id: string }>(
+			const row = await query.writeReturning<{ id: string }>(
 				"UPDATE narrators SET reply_context = ? WHERE id = ? RETURNING id",
 				[JSON.stringify(context), narratorId],
 			);

@@ -6,10 +6,13 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -54,10 +57,10 @@ beforeEach(() => {
 	broadcasts = [];
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await workerFixture.close();
 	mock.restore();
 });
 

@@ -36,7 +36,7 @@ describe("trackFileChange team location forwarding", () => {
 			mock.module("@server/services/narrator-subagent", () => ({
 				recordTeamFileChange(...args) {
 					calls.push(args);
-					team.recordTeamFileChange(...args);
+					return team.recordTeamFileChange(...args);
 				},
 			}));
 			const { trackFileChange } = await import("@server/lib/agent/tools/track-file-change");

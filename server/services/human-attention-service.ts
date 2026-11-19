@@ -9,6 +9,7 @@ import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { and, eq, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
+import { readDbAll, readQueryFirst } from "../db/worker-read";
 import {
 	getTaskReflectionAwaitingUser,
 	iterateTaskReflectionsAwaitingUser,
@@ -127,12 +128,14 @@ const narratorColumns = {
 };
 
 async function loadNarrator(narratorId: string, principal: NarratorPrincipal) {
-	return db
-		.select(narratorColumns)
-		.from(narrators)
-		.where(and(eq(narrators.id, narratorId), narratorReadableWhere(principal)))
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select(narratorColumns)
+			.from(narrators)
+			.where(and(eq(narrators.id, narratorId), narratorReadableWhere(principal)))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 type VisibleNarrator = {
@@ -310,20 +313,22 @@ async function permissionItem(requestId: string, context: RequestContext) {
 	if (!live) return null;
 	const owner = await context.narrator(live.narratorId);
 	if (!owner) return null;
-	const row = await db
-		.select(toolColumns)
-		.from(narratorToolCalls)
-		.where(
-			and(
-				live.toolCallId ? eq(narratorToolCalls.id, live.toolCallId) : undefined,
-				eq(narratorToolCalls.narratorId, live.narratorId),
-				eq(narratorToolCalls.toolUseId, live.toolUseId),
-				eq(narratorToolCalls.toolName, live.toolName),
-				eq(narratorToolCalls.status, "pending"),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select(toolColumns)
+			.from(narratorToolCalls)
+			.where(
+				and(
+					live.toolCallId ? eq(narratorToolCalls.id, live.toolCallId) : undefined,
+					eq(narratorToolCalls.narratorId, live.narratorId),
+					eq(narratorToolCalls.toolUseId, live.toolUseId),
+					eq(narratorToolCalls.toolName, live.toolName),
+					eq(narratorToolCalls.status, "pending"),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row || !stillLive(requestId, live)) return null;
 	// An outline plan (outline P2 PR 8): its title and the version's changes, locale-neutral.
 	const plan = live.kind === "plan_approval" ? outlinePlanSubmissionOf(live.input) : null;
@@ -379,12 +384,14 @@ async function questionItem(
 }
 
 async function readQuestionSummary(id: string) {
-	return db
-		.select(questionColumns)
-		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select(questionColumns)
+			.from(narratorQuestions)
+			.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 /**
@@ -476,8 +483,10 @@ export async function listHumanAttentionForPrincipal(
 			context.check();
 			if (checked >= CANDIDATE_BUDGET || context.expired()) return finish(true);
 			const take = Math.min(CANDIDATE_BUDGET - checked, limit + 1 - entries.length);
-			const rows: QuestionSummary[] = db.all<QuestionSummary>(
+			const rows: QuestionSummary[] = await readDbAll<QuestionSummary>(
+				db,
 				questionPageQuery(principal, cursor, take),
+				{ executionPolicy: "worker-required" },
 			);
 			for (const row of rows) {
 				context.check();
@@ -620,24 +629,28 @@ async function permissionDetail(
 		sql<
 			string | null
 		>`case when ${jsonBytes} <= ${HUMAN_ATTENTION_DETAIL_MAX_BYTES} then ${column} else null end`;
-	const row = await db
-		.select({
-			withinBudget: sql<number>`${jsonBytes} <= ${HUMAN_ATTENTION_DETAIL_MAX_BYTES}`,
-			suggestions: bounded(narratorToolCalls.permissionSuggestions),
-			targets: bounded(narratorToolCalls.executionTargetsJson),
-			decisionReason: bounded(narratorToolCalls.permissionDecisionReason),
-			executionDeviceId: bounded(narratorToolCalls.executionDeviceId),
-			executionCwd: bounded(narratorToolCalls.executionCwd),
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: bounded(narratorToolCalls.resolvedFilePath),
-			canonicalFilePath: bounded(narratorToolCalls.canonicalFilePath),
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
-		})
-		.from(narratorToolCalls)
-		.where(and(eq(narratorToolCalls.id, item.toolCallId), eq(narratorToolCalls.status, "pending")))
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				withinBudget: sql<number>`${jsonBytes} <= ${HUMAN_ATTENTION_DETAIL_MAX_BYTES}`,
+				suggestions: bounded(narratorToolCalls.permissionSuggestions),
+				targets: bounded(narratorToolCalls.executionTargetsJson),
+				decisionReason: bounded(narratorToolCalls.permissionDecisionReason),
+				executionDeviceId: bounded(narratorToolCalls.executionDeviceId),
+				executionCwd: bounded(narratorToolCalls.executionCwd),
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
+				resolvedFilePath: bounded(narratorToolCalls.resolvedFilePath),
+				canonicalFilePath: bounded(narratorToolCalls.canonicalFilePath),
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
+			})
+			.from(narratorToolCalls)
+			.where(
+				and(eq(narratorToolCalls.id, item.toolCallId), eq(narratorToolCalls.status, "pending")),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row || !stillLive(item.requestId, live)) throw new NotFoundError("Human attention", item.id);
 	if (!row.withinBudget) return { item, tooLarge: true };
 	const targets = toolCallWithExecutionTargets({

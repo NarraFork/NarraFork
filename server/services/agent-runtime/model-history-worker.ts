@@ -3,6 +3,8 @@
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
 import { safeSqliteCode, workerFailureDetails } from "../../lib/db-worker/failure";
+import { MODEL_HISTORY_EXECUTION_MS } from "../../lib/model-history-preparation";
+import { hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { type ModelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import {
@@ -61,13 +63,19 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 				const signature = request.versioned
 					? pin(readSqliteModelHistorySignature(connection, request.narratorId))
 					: undefined;
+				// Resolve rows-only within this same read snapshot. The owner's earlier metadata
+				// observation cannot select a body format for rows committed in a later snapshot.
+				const snapshotRequest = {
+					...request,
+					bodiesFromBlocks: request.bodiesFromBlocks || hasRowsOnlyBodies(connection),
+				};
 				const query = sqliteHistoryQuery(connection);
 				completed = {
 					...(request.previous
-						? await queryModelHistoryDelta(query, request, request.previous, sendPage)
+						? await queryModelHistoryDelta(query, snapshotRequest, request.previous, sendPage)
 						: await queryModelHistory(
 								query,
-								request,
+								snapshotRequest,
 								(rows) => sendPage({ type: "page", rows }),
 								(rows) => sendPage({ type: "tools", rows }),
 							)),
@@ -82,6 +90,8 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 			try {
 				completed = await sql.begin(async (tx) => {
 					await tx.unsafe("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+					// Bound each DB statement, not the sum of paging, IPC and hydration work.
+					await tx.unsafe(`SET LOCAL statement_timeout = '${MODEL_HISTORY_EXECUTION_MS}ms'`);
 					const signature = request.versioned
 						? pin(await readPostgresModelHistorySignature(tx, request.narratorId))
 						: undefined;

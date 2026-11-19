@@ -245,16 +245,17 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		policySourceId: policySourceIdOf(parent),
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	const choice = selectSubagentModel({
+	// The same rule a later run re-selects with (subagent-model-switch).
+	const modelChoice = selectSubagentModel({
 		policy: modelPolicy,
-		explicitModel,
 		parentId: parentNarratorId,
 		parentModel: parent.model,
 		typePreference: subagentPref,
+		explicitModel,
 	});
-	const modelSelection = choice?.selection;
+	const modelSelection = modelChoice?.selection;
 	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
-	if (!choice) {
+	if (!modelChoice || (modelPolicy.source !== "none" && !modelChoice.storedModel)) {
 		const allowedModels = expandAllowedPoolForDisplay(
 			modelPolicy.models.map((entry) => entry.model),
 		);
@@ -266,7 +267,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		);
 	}
 
-	const storedModelInput = choice.storedModel;
+	const storedModelInput = modelChoice.storedModel;
 	const updateLease = claimSubagentUpdateExecutionLease(
 		input.updateExecutionLease,
 		"resumable",
@@ -471,12 +472,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		const { getSearchExecutionScope } = await import("../lib/search/execution-scope");
 		const handle = await startNarratorRun({
 			narratorId: subagentId,
-			skipModelReselect: true,
 			locale: locale as Locale,
 			text: "",
 			binding,
 			cancelSignal: input.signal,
 			foreground: true,
+			// The model was just chosen for this run above.
+			skipModelReselect: true,
 		});
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		if (delegatedBeforeRun) await delegationRunStarted(subagentId);

@@ -118,9 +118,15 @@ export interface BackfillBlockRow {
 	assets: Array<[assetId: string, role: string]>;
 }
 
-export interface BackfillEnvelope {
-	id: string;
+/** Ordered candidates include skipped items, so apply can commit only a visited prefix. */
+export interface BlockApplyCandidate {
 	rowid: number;
+	/** UTF-8 source/prepared-write bytes, computed on the read side, never serialized by apply. */
+	sourceBytes: number;
+}
+
+export interface BackfillEnvelope extends BlockApplyCandidate {
+	id: string;
 	createdAt: string;
 	/** What the plan was read at; the apply skips an envelope that changed since. */
 	bodyRevision: number;
@@ -140,7 +146,14 @@ export interface BlockBackfillSliceResult {
 	done: boolean;
 }
 
+export interface VerifyVisit extends BlockApplyCandidate {
+	id: string;
+	mismatched: boolean;
+}
+
 export interface BlockVerifySliceResult {
+	/** Every candidate in rowid order, including matching envelopes. */
+	visited: VerifyVisit[];
 	/** Block-format envelopes whose rows do not assemble to their stored content. */
 	mismatched: string[];
 	checked: number;
@@ -159,7 +172,15 @@ export interface ProjectionEnvelope {
 	rows?: string;
 }
 
+export interface ProjectionVisit extends BlockApplyCandidate {
+	id: string;
+	envelope?: ProjectionEnvelope;
+	mismatched?: string;
+}
+
 export interface BlockProjectionSliceResult {
+	/** Every candidate in rowid order, including queued/marker/changed-row skips. */
+	visited: ProjectionVisit[];
 	/** `clear`: envelopes whose rows assemble to their column. `restore`: their projections. */
 	envelopes: ProjectionEnvelope[];
 	/** `clear`: envelopes whose rows do not assemble to their column. */
@@ -215,7 +236,7 @@ function rowsOnlyCandidates(db: Database, params: BlockSliceLimits): Candidate[]
 function withinBudget<T>(
 	params: BlockSliceLimits,
 	rows: Candidate[],
-	visit: (rowid: number) => T,
+	visit: (rowid: number, sourceBytes: number) => T,
 ): { results: T[]; lastRowid: number; done: boolean } {
 	const started = performance.now();
 	const results: T[] = [];
@@ -227,7 +248,7 @@ function withinBudget<T>(
 			(bytes + row.bytes > params.maxSourceBytes || performance.now() - started > params.budgetMs)
 		)
 			return { results, lastRowid, done: false };
-		results.push(visit(row.rowid));
+		results.push(visit(row.rowid, row.bytes));
 		bytes += row.bytes;
 		lastRowid = row.rowid;
 	}
@@ -268,11 +289,12 @@ export function ledgerFingerprint(db: Database, messageId: string): string {
 	return `${row.n}:${row.revisions}`;
 }
 
-function planBackfill(db: Database, rowid: number): BackfillEnvelope {
+function planBackfill(db: Database, rowid: number, sourceBytes: number): BackfillEnvelope {
 	const source = envelopeAt(db, rowid);
 	const base = {
 		id: source.id,
 		rowid: source.rowid,
+		sourceBytes,
 		createdAt: source.createdAt,
 		bodyRevision: source.bodyRevision,
 		stateRevision: source.stateRevision,
@@ -294,7 +316,7 @@ function planBackfill(db: Database, rowid: number): BackfillEnvelope {
 		},
 		adoptedLedger(ledgerOf(db, source.id)),
 	);
-	return {
+	const envelope: BackfillEnvelope = {
 		...base,
 		bodyBytes: planned.bodyBytes,
 		blocks: planned.blocks.map((block) => ({
@@ -312,14 +334,30 @@ function planBackfill(db: Database, rowid: number): BackfillEnvelope {
 			assets: blockAssets(block.draft, block.output),
 		})),
 	};
+	// Include prepared write text as well: ledger output can exceed the original projection.
+	envelope.sourceBytes = Math.max(
+		sourceBytes,
+		(envelope.blocks ?? []).reduce(
+			(bytes, block) =>
+				bytes +
+				Buffer.byteLength(block.payload) +
+				Buffer.byteLength(block.modelText ?? "") +
+				Buffer.byteLength(block.state ?? "") +
+				Buffer.byteLength(block.indexText ?? ""),
+			0,
+		),
+	);
+	return envelope;
 }
 
 export function runBlockBackfillSlice(
 	db: Database,
 	params: BlockBackfillSliceParams,
 ): BlockBackfillSliceResult {
-	const { results, lastRowid, done } = withinBudget(params, candidates(db, params, 1), (rowid) =>
-		planBackfill(db, rowid),
+	const { results, lastRowid, done } = withinBudget(
+		params,
+		candidates(db, params, 1),
+		(rowid, bytes) => planBackfill(db, rowid, bytes),
 	);
 	return { envelopes: results, lastRowid, done };
 }
@@ -354,24 +392,30 @@ export function runBlockVerifySlice(
 	db: Database,
 	params: BlockVerifySliceParams,
 ): BlockVerifySliceResult {
-	const { results, lastRowid, done } = withinBudget(params, candidates(db, params, 2), (rowid) =>
-		rowsMatch(db, rowid),
+	const { results, lastRowid, done } = withinBudget(
+		params,
+		candidates(db, params, 2),
+		(rowid, sourceBytes) => {
+			const result = rowsMatch(db, rowid);
+			return { rowid, id: result.id, sourceBytes, mismatched: !result.matches };
+		},
 	);
 	return {
-		mismatched: results.filter((result) => !result.matches).map((result) => result.id),
+		visited: results,
+		mismatched: results.filter((result) => result.mismatched).map((result) => result.id),
 		checked: results.length,
 		lastRowid,
 		done,
 	};
 }
 
-type ProjectionVisit = { envelope?: ProjectionEnvelope; mismatched?: string };
+type ProjectionPlan = { id: string; envelope?: ProjectionEnvelope; mismatched?: string };
 
 /**
  * `clear`: an envelope whose projection can go — an array that is not a compact marker,
  * not waiting on its sync, whose rows assemble to it exactly. A mismatch is named instead.
  */
-function clearable(db: Database, rowid: number): ProjectionVisit {
+function clearable(db: Database, rowid: number): ProjectionPlan {
 	const row = db
 		.query(
 			`SELECT m.id, m.content_json AS contentJson, m.body_revision AS bodyRevision,
@@ -387,12 +431,12 @@ function clearable(db: Database, rowid: number): ProjectionVisit {
 		queued: number;
 	};
 	// A queued envelope's rows are about to be rebuilt; a later run sees it settled.
-	if (row.queued) return {};
+	if (row.queued) return { id: row.id };
 	const stored = parseStored(row.contentJson);
-	if (!Array.isArray(stored) || keepsProjection(stored)) return {};
-	if (!assemblesTo(db, row.id, stored)) return { mismatched: row.id };
+	if (!Array.isArray(stored) || keepsProjection(stored)) return { id: row.id };
+	if (!assemblesTo(db, row.id, stored)) return { id: row.id, mismatched: row.id };
 	const { id, bodyRevision, stateRevision } = row;
-	return { envelope: { id, bodyRevision, stateRevision } };
+	return { id, envelope: { id, bodyRevision, stateRevision } };
 }
 
 /**
@@ -415,7 +459,7 @@ export function rowsSignature(db: Database, messageId: string): string {
 }
 
 /** `restore`: a rows-only envelope's projection, assembled from its rows. */
-function restorable(db: Database, rowid: number): ProjectionVisit {
+function restorable(db: Database, rowid: number): ProjectionPlan {
 	const row = db
 		.query(
 			`SELECT id, body_revision AS bodyRevision, state_revision AS stateRevision
@@ -426,19 +470,28 @@ function restorable(db: Database, rowid: number): ProjectionVisit {
 	// (a later run reads them settled), and revisions read before them make a stale apply fail.
 	const rows = rowsSignature(db, row.id);
 	const json = JSON.stringify(assembledRows(db, row.id));
-	if (rowsSignature(db, row.id) !== rows) return {};
-	return { envelope: { ...row, rows, json } };
+	if (rowsSignature(db, row.id) !== rows) return { id: row.id };
+	return { id: row.id, envelope: { ...row, rows, json } };
 }
 
 export function runBlockProjectionSlice(
 	db: Database,
 	params: BlockProjectionSliceParams,
 ): BlockProjectionSliceResult {
-	const { results, lastRowid, done } =
-		params.job === "clear"
-			? withinBudget(params, candidates(db, params, 2), (rowid) => clearable(db, rowid))
-			: withinBudget(params, rowsOnlyCandidates(db, params), (rowid) => restorable(db, rowid));
+	const { results, lastRowid, done } = withinBudget(
+		params,
+		params.job === "clear" ? candidates(db, params, 2) : rowsOnlyCandidates(db, params),
+		(rowid, bytes): ProjectionVisit => {
+			const plan = params.job === "clear" ? clearable(db, rowid) : restorable(db, rowid);
+			return {
+				...plan,
+				rowid,
+				sourceBytes: Math.max(bytes, Buffer.byteLength(plan.envelope?.json ?? "")),
+			};
+		},
+	);
 	return {
+		visited: results,
 		envelopes: results.flatMap((result) => (result.envelope ? [result.envelope] : [])),
 		mismatched: results.flatMap((result) => (result.mismatched ? [result.mismatched] : [])),
 		checked: results.length,

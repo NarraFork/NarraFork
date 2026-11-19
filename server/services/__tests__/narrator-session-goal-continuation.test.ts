@@ -1,13 +1,15 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import { readTestMessageContent } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-// The snapshot worker shares the preload-isolated file-backed database.
-const { db, sqlite } = await import("../../db");
-const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 // The worktree may contain schema work whose generated migration is intentionally
 // deferred. Add only the columns selected by narrator history queries so this
@@ -90,10 +92,10 @@ async function waitFor(
 }
 
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.module("../../lib/agent/provider", () => realProviderModule);
+	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
 });
 
 describe("Dynamic Spec continuation stall classification", () => {

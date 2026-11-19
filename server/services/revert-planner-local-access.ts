@@ -217,7 +217,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		const initialContext = await this.fileContext(input);
 		const { runtime, namespace } = await verifiedNamespace(input.signal);
 		const identity = Object.freeze({ ...input.identity });
-		const scope = runtime.evidence.getScope(identity.scopeId);
+		const scope = await runtime.evidence.getScope(identity.scopeId);
 		if (!scope) throw stale("Recorded scope is unavailable");
 		const assertCurrent = async ({ signal }: { signal: AbortSignal }) => {
 			const context = await this.fileContext({ ...input, identity, signal });
@@ -226,7 +226,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			const liveNamespace = await verifiedNamespace(signal);
 			if (liveNamespace.namespace.sourceInstanceId !== namespace.sourceInstanceId)
 				throw stale("Recorded history source changed");
-			const live = runtime.evidence.getScope(identity.scopeId);
+			const live = await runtime.evidence.getScope(identity.scopeId);
 			if (
 				!live ||
 				live.sourceInstanceId !== namespace.sourceInstanceId ||
@@ -361,7 +361,7 @@ let cached:
 async function services(signal: AbortSignal) {
 	const { runtime, namespace } = await verifiedNamespace(signal);
 	if (!cached || cached.runtime !== runtime || cached.namespace !== namespace) {
-		const namespaceKey = namespace.catalog.getBudget()?.namespaceKey;
+		const namespaceKey = (await namespace.catalog.getBudget({ signal }))?.namespaceKey;
 		if (!namespaceKey) throw stale("Evidence namespace metadata is missing");
 		cached = {
 			runtime,
@@ -513,7 +513,7 @@ export async function getLocalRevertPlan(
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
 	const { plans } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId, { signal });
 	signal.throwIfAborted();
 	return { plan, executable: false as const };
 }
@@ -721,7 +721,7 @@ export async function prepareLocalRevertAction(
 		// advisory: they never widen the refused plan or soften the safety gate.
 		let blockers =
 			unavailable === "pending_operations" || unavailable === "incomplete_coverage"
-				? collectRevertBlockers(narratorId, code)
+				? await collectRevertBlockers(narratorId, code)
 				: undefined;
 		if (unavailable === "pending_operations" && (!blockers || blockers.length === 0)) {
 			// Name live narrator activity without exposing arbitrary error paths.
@@ -767,7 +767,7 @@ export async function applyLocalRevertPlan(
 	const owner = await access.owner(principal, narratorId, signal);
 	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId, { signal });
 	if (plan.planHash !== input.planHash)
 		throw new RevertPlannerError("ACTION_MISMATCH", "Confirmed plan changed");
 	if (plan.status === "prepared" && plan.expired)
@@ -792,7 +792,7 @@ export async function applyLocalRevertPlan(
 			: () => {};
 	let execution: ReturnType<RevertTransactionService["execute"]>;
 	try {
-		const admissionPlan = plans.getSummary(owner, planId);
+		const admissionPlan = await plans.getSummary(owner, planId, { signal });
 		if (admissionPlan.status === "prepared" && admissionPlan.expired)
 			throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
 		execution = transactions.execute({ principal, narratorId, planId, ...input, signal });

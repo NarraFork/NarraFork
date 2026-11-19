@@ -52,7 +52,7 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 		initializeNamespace: async (input) => blobCatalog.initializeNamespace(input),
 
 		reserve: async (input) => {
-			const lease = blobCatalog.reserve(input);
+			const lease = await blobCatalog.reserve(input);
 			return {
 				reservationId: lease.reservationId,
 				ownerEpoch: lease.ownerEpoch,

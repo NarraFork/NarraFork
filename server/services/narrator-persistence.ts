@@ -41,6 +41,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type { EpochRecord } from "../lib/agent/tool-loading";
 import type {
@@ -98,6 +99,7 @@ import {
 	updateEnvelope,
 	writeEnvelopeBody,
 } from "./narrator-body-writes";
+import { readNarratorMessageRows, readNarratorToolRows } from "./narrator-message-reader";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -332,18 +334,21 @@ async function resolveToolCallWriteId(
 	toolUseId: string,
 	options: { toolCallId?: string; messageId?: string; narratorId?: string } = {},
 ): Promise<string | undefined> {
-	const rows = await db
-		.select({ id: narratorToolCalls.id })
-		.from(narratorToolCalls)
-		.where(
-			and(
-				eq(narratorToolCalls.toolUseId, toolUseId),
-				options.toolCallId ? eq(narratorToolCalls.id, options.toolCallId) : undefined,
-				options.messageId ? eq(narratorToolCalls.messageId, options.messageId) : undefined,
-				options.narratorId ? eq(narratorToolCalls.narratorId, options.narratorId) : undefined,
-			),
-		)
-		.limit(2);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					options.toolCallId ? eq(narratorToolCalls.id, options.toolCallId) : undefined,
+					options.messageId ? eq(narratorToolCalls.messageId, options.messageId) : undefined,
+					options.narratorId ? eq(narratorToolCalls.narratorId, options.narratorId) : undefined,
+				),
+			)
+			.limit(2),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	if (rows.length > 1)
 		throw new ValidationError(
 			"An exact tool-call row id is required for repeated toolUseId values",
@@ -1142,10 +1147,13 @@ export async function bumpParentNarratorMessageVersion(
 	parentToolUseId?: string | null,
 ): Promise<void> {
 	if (!parentToolUseId) return;
-	const parentToolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.toolUseId, parentToolUseId),
-		columns: { narratorId: true },
-	});
+	const parentToolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, parentToolUseId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	if (!parentToolCall) return;
 	await bumpNarratorMessageVersions([parentToolCall.narratorId]);
 }
@@ -2031,10 +2039,13 @@ const sqliteNarratorPersistence = {
 		// behaviour decision about the primary path, not part of opening this seam.
 		if (createdBy) {
 			try {
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, createdBy),
-					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-				});
+				const user = await readQuery(
+					db.query.users.findFirst({
+						where: eq(users.id, createdBy),
+						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+					}),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				);
 				return { ...msgWithSeq, creator: user ?? null };
 			} catch (error) {
 				// Display enrichment cannot turn a committed input into a failed write.
@@ -3549,10 +3560,13 @@ const sqliteNarratorPersistence = {
 	},
 
 	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean): Promise<boolean> {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { permissionMode: true },
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { permissionMode: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		const effectiveRelaxedPlan = forcesRelaxedPlan(current?.permissionMode) ? true : relaxedPlan;
 		const now = new Date().toISOString();
 		await db
@@ -3646,10 +3660,13 @@ const sqliteNarratorPersistence = {
 		let broadcastTurnStartedAt: string | undefined = turnStartedAt;
 		const writeStatus = async () => {
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true, updatedAt: true },
-				});
+				const row = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true, turnStartedAt: true, updatedAt: true },
+					}),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				);
 				if (broadcastTurnStartedAt === undefined) {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}
@@ -3886,10 +3903,13 @@ const sqliteNarratorPersistence = {
 		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true },
-				});
+				const row = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true, turnStartedAt: true },
+					}),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				);
 				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
@@ -3986,10 +4006,13 @@ const sqliteNarratorPersistence = {
 		options?: { preserveTiming?: boolean },
 	) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			const actualSubstatus =
 				options?.preserveTiming === false
 					? substatus
@@ -4012,10 +4035,13 @@ const sqliteNarratorPersistence = {
 	 */
 	async addSubstatus(narratorId: string, tag: string): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (current.includes(tag)) return current;
 			const updated = [...current, tag];
@@ -4038,10 +4064,13 @@ const sqliteNarratorPersistence = {
 	 */
 	async removeSubstatus(narratorId: string, tag: string): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (!current.includes(tag)) return current;
 			const updated = current.filter((t) => t !== tag);
@@ -4062,27 +4091,33 @@ const sqliteNarratorPersistence = {
 		toolUseId: string,
 		toolCallId: string,
 	): Promise<ToolCallBinding> {
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.messageId, messageId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: {
-				executionAttempt: true,
-				executionIdentityVersion: true,
-				executionOriginToolCallId: true,
-				executionSegmentId: true,
-			},
-		});
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { messageId: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.messageId, messageId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				columns: {
+					executionAttempt: true,
+					executionIdentityVersion: true,
+					executionOriginToolCallId: true,
+					executionSegmentId: true,
+				},
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { messageId: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (
 			!row ||
 			!ref ||
@@ -4101,15 +4136,18 @@ const sqliteNarratorPersistence = {
 	},
 
 	async validateToolCallBinding(narratorId: string, toolUseId: string, binding: ToolCallBinding) {
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, binding.toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-				eq(narratorToolCalls.executionAttempt, binding.attempt),
-			),
-			columns: { messageId: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, binding.toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					eq(narratorToolCalls.executionAttempt, binding.attempt),
+				),
+				columns: { messageId: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!row)
 			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
 		const receipt = await this.getToolCallBinding(
@@ -4139,10 +4177,13 @@ const sqliteNarratorPersistence = {
 			parentToolUseId,
 			parentBinding,
 		);
-		const parent = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, parentBinding.toolCallId),
-			columns: { toolName: true, status: true },
-		});
+		const parent = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, parentBinding.toolCallId),
+				columns: { toolName: true, status: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (
 			parent?.toolName !== "Eval" ||
 			parent.status !== "running" ||
@@ -4262,10 +4303,13 @@ const sqliteNarratorPersistence = {
 		toolUseId: string,
 		expectedOriginToolCallId?: string,
 	) {
-		const child = await db.query.narrators.findFirst({
-			where: eq(narrators.id, subagentId),
-			columns: { runtimeRegistrationJson: true },
-		});
+		const child = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, subagentId),
+				columns: { runtimeRegistrationJson: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		const deliverTo = child ? runDeliverToOf(child) : undefined;
 		if (
 			!deliverTo ||
@@ -4294,36 +4338,42 @@ const sqliteNarratorPersistence = {
 			throw new ValidationError("A conclusion requires its original tool-call row or message");
 		}
 		const original = reference.toolCallId
-			? await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.id, reference.toolCallId),
-					columns: { toolUseId: true, executionOriginToolCallId: true },
-				})
+			? await readQuery(
+					db.query.narratorToolCalls.findFirst({
+						where: eq(narratorToolCalls.id, reference.toolCallId),
+						columns: { toolUseId: true, executionOriginToolCallId: true },
+					}),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				)
 			: undefined;
 		if (original && original.toolUseId !== toolUseId) {
 			throw new ValidationError("Conclusion tool-use identity does not match its original row");
 		}
 		const originId = original?.executionOriginToolCallId ?? reference.toolCallId;
-		const rows = await db
-			.select({ toolCallId: narratorToolCalls.id, messageId: narratorToolCalls.messageId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-				),
-			)
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-					reference.messageId ? eq(narratorToolCalls.messageId, reference.messageId) : undefined,
-					originId
-						? sql`(${narratorToolCalls.id} = ${reference.toolCallId} OR ${narratorToolCalls.executionOriginToolCallId} = ${originId})`
-						: undefined,
-				),
-			)
-			.limit(2);
+		const rows = await readQuery(
+			db
+				.select({ toolCallId: narratorToolCalls.id, messageId: narratorToolCalls.messageId })
+				.from(narratorToolCalls)
+				.innerJoin(
+					narratorMessageRefs,
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+					),
+				)
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+						reference.messageId ? eq(narratorToolCalls.messageId, reference.messageId) : undefined,
+						originId
+							? sql`(${narratorToolCalls.id} = ${reference.toolCallId} OR ${narratorToolCalls.executionOriginToolCallId} = ${originId})`
+							: undefined,
+					),
+				)
+				.limit(2),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (rows.length !== 1) {
 			throw new ValidationError(
 				"Conclusion reference is missing or ambiguous in the parent's history",
@@ -4335,17 +4385,35 @@ const sqliteNarratorPersistence = {
 	/** Resume an unstarted attempt, or append a new attempt after isolating shared history. */
 	async prepareToolCallAttempt(narratorId: string, sourceToolCallId: string, resume = false) {
 		return toolAttemptCreationLock.acquire(narratorId, async () => {
-			const source = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, sourceToolCallId),
-			});
+			const source = (
+				await readNarratorToolRows(
+					(
+						await readQuery(
+							db.query.narratorToolCalls.findMany({
+								...{
+									where: eq(narratorToolCalls.id, sourceToolCallId),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+				)
+			)[0];
 			if (!source) throw new NotFoundError("Tool call", sourceToolCallId);
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, source.messageId),
-				),
-				columns: { messageId: true },
-			});
+			const ref = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, source.messageId),
+					),
+					columns: { messageId: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			if (!ref) throw new ValidationError("Tool call is not in this narrator's history");
 			const shared = await this.isMessageSharedByMultipleNarrators(source.messageId);
 			if (
@@ -4458,26 +4526,29 @@ const sqliteNarratorPersistence = {
 		const toolCallId =
 			binding?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { narratorId }));
 		if (!toolCallId) throw new NotFoundError("Tool call", toolUseId);
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			// Production callers always supply the receipt; legacy callers remain supported.
-			columns: {
-				id: true,
-				status: true,
-				executionDeviceId: true,
-				executionCwd: true,
-				executionPathFlavor: true,
-				resolvedFilePath: true,
-				canonicalFilePath: true,
-				runtimeGeneration: true,
-				executionTargetsJson: true,
-				deviceSelectionSource: true,
-			},
-		});
+		const existing = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				// Production callers always supply the receipt; legacy callers remain supported.
+				columns: {
+					id: true,
+					status: true,
+					executionDeviceId: true,
+					executionCwd: true,
+					executionPathFlavor: true,
+					resolvedFilePath: true,
+					canonicalFilePath: true,
+					runtimeGeneration: true,
+					executionTargetsJson: true,
+					deviceSelectionSource: true,
+				},
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!existing) {
 			throw new NotFoundError("Tool call", toolUseId);
 		}
@@ -4579,14 +4650,17 @@ const sqliteNarratorPersistence = {
 		// `status` and `id` are taken from this same row rather than re-queried after the
 		// write: neither is touched by the target writer, and the main thread must not run
 		// two queries where one suffices.
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: { id: true, status: true, executionTargetsJson: true },
-		});
+		const existing = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				columns: { id: true, status: true, executionTargetsJson: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!existing) throw new NotFoundError("Tool call", toolUseId);
 		// Compare the ROUTING the column describes, not its raw JSON.
 		//
@@ -4876,18 +4950,27 @@ const sqliteNarratorPersistence = {
 	},
 
 	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
-		const refs = await db
-			.select({ id: narratorMessageRefs.id })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId))
-			.limit(2);
+		const refs = await readQuery(
+			db
+				.select({ id: narratorMessageRefs.id })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.messageId, messageId))
+				.limit(2),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		return refs.length > 1;
 	},
 
 	async getToolCallByToolUseId(toolUseId: string) {
-		return db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-		});
+		const rows = await readQuery(
+			db.query.narratorToolCalls.findMany({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+				columns: { id: true },
+				limit: 1,
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		return (await readNarratorToolRows(rows.map((row) => row.id)))[0];
 	},
 
 	async copyOnWriteMessage(
@@ -4902,12 +4985,15 @@ const sqliteNarratorPersistence = {
 			afterWrite?: (tx: DbTx, messageId: string) => void;
 		} = {},
 	): Promise<string> {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!ref) throw new NotFoundError("Message", messageId);
 		const semanticEdit =
 			overrides != null &&
@@ -5080,13 +5166,16 @@ const sqliteNarratorPersistence = {
 		const executedToolUseIds = new Set<string>();
 		const removableRowIds: string[] = [];
 		if (discardedToolUseIds.length > 0) {
-			const rows = await db.query.narratorToolCalls.findMany({
-				where: and(
-					eq(narratorToolCalls.messageId, partialId),
-					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
-				),
-				columns: { id: true, toolUseId: true, status: true },
-			});
+			const rows = await readQuery(
+				db.query.narratorToolCalls.findMany({
+					where: and(
+						eq(narratorToolCalls.messageId, partialId),
+						inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
+					),
+					columns: { id: true, toolUseId: true, status: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			for (const row of rows) {
 				if (row.status === "initializing" || row.status === "pending") removableRowIds.push(row.id);
 				else executedToolUseIds.add(row.toolUseId);
@@ -5247,10 +5336,15 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getToolCallPlanText(toolUseId: string): Promise<string | null> {
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { inputJson: true },
-		});
+		const ids = await readQuery(
+			db.query.narratorToolCalls.findMany({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+				columns: { id: true },
+				limit: 1,
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		const tc = (await readNarratorToolRows(ids.map((row) => row.id)))[0];
 		const plan = (tc?.inputJson as Record<string, unknown> | null)?.plan;
 		return typeof plan === "string" && plan.trim() ? plan : null;
 	},
@@ -5348,29 +5442,45 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getMessagesForSegmentCompact(narratorId: string, messageIds: string[]) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refs = await readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						inArray(narratorMessageRefs.messageId, messageIds),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
 		const messages = fillBodies(
-			await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, ids),
-				...bodyColumns(),
-				with: { toolCalls: true },
-			}),
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: inArray(narratorMessages.id, ids),
+								...bodyColumns(),
+								with: { toolCalls: true },
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: true, includeCreator: false },
+			),
 		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
@@ -5388,15 +5498,18 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
 
-		const [countRow] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, messageId),
+		const [countRow] = await readQuery(
+			db
+				.select({ cnt: sql<number>`count(*)` })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, messageId),
+					),
 				),
-			);
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		const messageCount = countRow?.cnt ?? 0;
 
 		const block: Record<string, unknown> = {
@@ -5460,29 +5573,45 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getSegmentCompactHiddenMessages(narratorId: string, segmentCompactId: string) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refs = await readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
 		const messages = fillBodies(
-			await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, ids),
-				...bodyColumns(),
-				with: { toolCalls: true },
-			}),
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: inArray(narratorMessages.id, ids),
+								...bodyColumns(),
+								with: { toolCalls: true },
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: true, includeCreator: false },
+			),
 		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
@@ -5492,10 +5621,29 @@ const sqliteNarratorPersistence = {
 
 	async deleteSegmentCompact(narratorId: string, messageId: string) {
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-				...bodyColumns(),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: and(
+										eq(narratorMessages.id, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+									),
+									...bodyColumns(),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
@@ -5544,10 +5692,29 @@ const sqliteNarratorPersistence = {
 
 	async getSegmentCompactSummary(narratorId: string, messageId: string) {
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-				...bodyColumns(),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									where: and(
+										eq(narratorMessages.id, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+									),
+									...bodyColumns(),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
@@ -5562,10 +5729,29 @@ const sqliteNarratorPersistence = {
 
 	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
 		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				...bodyColumns(),
-				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-			}),
+			(
+				await readNarratorMessageRows(
+					(
+						await readQuery(
+							db.query.narratorMessages.findMany({
+								...{
+									...bodyColumns(),
+									where: and(
+										eq(narratorMessages.id, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+									),
+								},
+								columns: { id: true },
+								with: undefined,
+								extras: undefined,
+								limit: 1,
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					).map((row) => row.id),
+					{ includeTools: false, includeCreator: false },
+				)
+			)[0],
 		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 

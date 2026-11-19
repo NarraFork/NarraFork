@@ -14,10 +14,11 @@
  * - `narrator_tool_calls` are intentionally not copied (tool_use blocks remain in contentJson).
  * - `aclRootNarratorId = null` — primary narrators are judged on their own columns.
  */
+import { readQuery } from "@server/db/worker-read";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { narratorMessageRefs, type narratorMessages, narrators } from "../db/schema";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { measureSummaryCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { ValidationError } from "../lib/errors";
@@ -36,8 +37,8 @@ import {
 	newEnvelopeFormat,
 	syncQueueMark,
 } from "./narrator-block-sync";
-import { bodyColumns, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
+import { readNarratorMessageRows } from "./narrator-message-reader";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -74,10 +75,13 @@ async function resolveExtractAudiences(source: {
 	let visibility: Visibility = "private";
 	let writeAudience: WriteAudience = "owner";
 	if (source.parentNarratorId) {
-		const parent = await db.query.narrators.findFirst({
-			where: eq(narrators.id, source.parentNarratorId),
-			columns: { visibility: true, writeAudience: true },
-		});
+		const parent = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, source.parentNarratorId),
+				columns: { visibility: true, writeAudience: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
@@ -100,9 +104,12 @@ export async function extractSubagentToPrimary(
 	sourceId: string,
 	opts?: ExtractSubagentToPrimaryOpts,
 ) {
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, sourceId),
-	});
+	const source = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, sourceId),
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 
 	if (!source) {
 		throw new ValidationError("Subagent not found");
@@ -118,14 +125,17 @@ export async function extractSubagentToPrimary(
 	const subagentType = source.subagentType ?? null;
 	const maxFull = opts?.maxFullMessages ?? EXTRACT_FULL_MAX_MESSAGES;
 
-	const sourceRefs = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-		})
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, sourceId))
-		.orderBy(asc(narratorMessageRefs.seq));
+	const sourceRefs = await readQuery(
+		db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, sourceId))
+			.orderBy(asc(narratorMessageRefs.seq)),
+		{ executionPolicy: "worker-required" },
+	);
 
 	let inheritMode = opts?.inheritMode ?? "full";
 	if (inheritMode === "full" && sourceRefs.length > maxFull) {
@@ -151,12 +161,10 @@ export async function extractSubagentToPrimary(
 		const byId = new Map<string, typeof narratorMessages.$inferSelect>();
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
-			const rows = fillBodies(
-				await db.query.narratorMessages.findMany({
-					...bodyColumns(),
-					where: inArray(narratorMessages.id, chunk),
-				}),
-			);
+			const rows = await readNarratorMessageRows(chunk, {
+				includeTools: false,
+				includeCreator: false,
+			});
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
 		for (const row of sourceRefs) {
@@ -188,6 +196,48 @@ export async function extractSubagentToPrimary(
 			db.transaction(
 				(tx) => {
 					const queueMark = syncQueueMark();
+					const currentSource = tx
+						.select({
+							variant: narrators.variant,
+							status: narrators.status,
+							ownerUserId: narrators.ownerUserId,
+							parentNarratorId: narrators.parentNarratorId,
+							aclRootNarratorId: narrators.aclRootNarratorId,
+							visibility: narrators.visibility,
+							contextProjectId: narrators.contextProjectId,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, sourceId))
+						.get();
+					if (
+						!currentSource ||
+						currentSource.variant !== source.variant ||
+						currentSource.status === "archived" ||
+						currentSource.ownerUserId !== source.ownerUserId ||
+						currentSource.parentNarratorId !== source.parentNarratorId ||
+						currentSource.aclRootNarratorId !== source.aclRootNarratorId ||
+						currentSource.visibility !== source.visibility ||
+						currentSource.contextProjectId !== source.contextProjectId
+					)
+						throw new ValidationError("Subagent identity changed while preparing extraction");
+					const currentParent = currentSource.parentNarratorId
+						? tx
+								.select({
+									visibility: narrators.visibility,
+									writeAudience: narrators.writeAudience,
+								})
+								.from(narrators)
+								.where(eq(narrators.id, currentSource.parentNarratorId))
+								.get()
+						: undefined;
+					const currentVisibility = currentParent?.visibility === "public" ? "public" : "private";
+					const currentWriteAudience =
+						currentParent?.writeAudience === "public" ? "public" : "owner";
+					if (
+						currentVisibility !== audiences.visibility ||
+						currentWriteAudience !== audiences.writeAudience
+					)
+						throw new ValidationError("Subagent audience changed while preparing extraction");
 					const created = tx
 						.insert(narrators)
 						.values({
@@ -227,9 +277,9 @@ export async function extractSubagentToPrimary(
 							subagentOriginKind: null,
 							// Primary convention: judged on its own columns, not a delegation root.
 							aclRootNarratorId: null,
-							ownerUserId: source.ownerUserId,
-							visibility: audiences.visibility,
-							writeAudience: audiences.writeAudience,
+							ownerUserId: currentSource.ownerUserId,
+							visibility: currentVisibility,
+							writeAudience: currentWriteAudience,
 							inheritMode,
 							apiConversationId: null,
 							contextSummary,

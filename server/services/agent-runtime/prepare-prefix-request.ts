@@ -30,6 +30,7 @@ export interface PreparePrefixRequestOptions<
 	getModel: () => string;
 	getProvider: () => string;
 	signal?: AbortSignal;
+	/** Request-wide observation/cancellation; DB source probes retain independent read budgets. */
 	preparation?: ModelHistoryPreparation;
 	getToolLoading?: (identity: RequestModelIdentity) => RuntimeHistoryOptions["toolLoading"];
 	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
@@ -58,7 +59,8 @@ export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = Requ
 export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	options: PreparePrefixRequestOptions<Prompt>,
 ): Promise<PreparedPrefixRequest<Prompt>> {
-	const { narratorId, signal } = options;
+	const { narratorId, preparation } = options;
+	const signal = options.signal ?? preparation?.signal;
 	const replyContext = parseReplyContext(options.getReplyContext?.()) ?? {
 		locale: options.locale,
 		replyInUserLanguage: false,
@@ -72,9 +74,10 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	};
 	const readHistory = () => {
 		signal?.throwIfAborted();
+		preparation?.phase("source");
 		return narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
-			preparation: options.preparation,
+			...(preparation ? { preparation } : {}),
 		});
 	};
 	for (;;) {
@@ -97,8 +100,8 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 				narratorId,
 				messages: sourceMessages ?? [],
 				...capturedLoading,
-				preparation: options.preparation,
 				signal,
+				preparation,
 				...identity,
 				refreshTools: async () => {
 					await options.refreshToolLoading?.(identity);

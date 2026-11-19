@@ -489,6 +489,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the raw-handle access path for its non-search reads.
 	"server/lib/agent/tools/recall.ts": ["handle"],
 	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
+	"server/lib/auth.ts": ["handle"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
 	"server/lib/db-worker/failure.ts": ["errorCode"],
@@ -497,6 +498,35 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/sql-trace.ts": ["driver"],
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
+	"server/db/worker-read-adapter.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/lib/db-worker/database-identity.ts": ["driver"],
+	"server/lib/db-worker/domain-task-registry.ts": ["driver"],
+	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
+	"server/lib/db-worker/select-extended.ts": ["driver"],
+	"server/main.ts": ["connectionModule"],
+	// SQLite streaming receives an explicit read-only client; the route selects PG's async list.
+	"server/services/benchmark-suite-stream.ts": ["driver"],
+	"server/routes/benchmarks.ts": ["handle"],
+	"server/services/database-cleanup-read.ts": ["driver"],
+	"server/services/execution-log-reader.ts": ["driver", "drizzleDialect"],
+	"server/services/execution-policy/facts-reader.ts": ["driver", "drizzleDialect", "json1"],
+	// The fact store is an explicit SQLite snapshot/final-write-transaction capability.
+	"server/services/execution-policy/facts.ts": ["drizzleDialect"],
+	"server/services/file-read-snapshots.ts": ["driver", "drizzleDialect"],
+	"server/services/git-current-diff-reader.ts": ["driver", "drizzleDialect", "rowid"],
+	"server/services/integration-authority-read-task.ts": ["driver", "drizzleDialect"],
+	// The predicate emits JSON1 only for SQLite and jsonb operators for PostgreSQL.
+	"server/services/storage/upload-reference-predicate.ts": ["json1"],
+	"server/services/knowledge/entry-reader.ts": ["driver"],
+	"server/services/narrator-message-snapshot-reader.ts": ["driver"],
+	// Mixed-backend callers choose these explicit Worker handles only on SQLite.
+	"server/services/narrator-message-reader.ts": ["handle"],
+	"server/services/search/recall-store.ts": ["handle"],
+	"server/services/narrator-read-snapshots.ts": ["driver", "drizzleDialect", "json1", "glob"],
+	"server/services/narrator-tool-snapshot-reader.ts": ["driver"],
+	"server/services/search/recall-reader.ts": ["driver"],
+	"server/services/tool-continuation-reader.ts": ["driver", "drizzleDialect"],
+	"server/services/tool-edit-preview-reader.ts": ["driver", "drizzleDialect", "json1"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
@@ -540,6 +570,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/lib/db-worker/compact-summary-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	// The publication backend selector constructs this Worker reader only for SQLite.
 	"server/services/agent-runtime/publication.ts": ["json1", "nativeClient"],
 	"server/services/agent-runtime/publication-reader.ts": ["driver"],
 	// The injected occupancy source currently uses the SQLite builder; the maintained
@@ -554,11 +585,16 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
 	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
 	"server/lib/db-worker/file-revert-selection-body-query.ts": ["driver"],
-	"server/services/execution-log-service.ts": ["json1"],
 	"server/lib/db-worker/execution-policy-query.ts": ["driver", "json1"],
 	"server/services/execution-policy/repository.ts": ["handle"],
+	"server/services/execution-log-service.ts": ["nativeClient", "json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
-	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
+	"server/services/file-change-blob-catalog.ts": [
+		"driver",
+		"nativeClient",
+		"drizzleDialect",
+		"pragma",
+	],
 	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/services/file-change-history-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-physical-audit-worker.ts": [
@@ -588,7 +624,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-messages.ts": ["handle", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Staging lookup is guarded by assertSqliteBufferRead; PG uses the mailbox port.
+	"server/services/narrator-buffer.ts": ["json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "errorCode"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	// The broken-call flag of a tool result is read in SQL so the result itself is not.
 	"server/services/narrator-block-sync.ts": [
@@ -640,11 +678,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/composer-document-query.ts": ["driver"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
-	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
-	// storage): exports, the session interchange, and the body length they measure in SQL.
+	// The shared SQL body-length expression measures block-format rows.
 	"server/lib/narrator-body-length.ts": ["json1"],
-	"server/services/narrator-export.ts": ["handle"],
-	"server/services/session-interchange/export.ts": ["handle"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	// Lazy refs must reject an ambient native transaction before any async page preparation.
 	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
@@ -654,7 +689,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The dependent scan reads a narrator's committed directory out of the JSON context column.
 	"server/services/narrator-worktree-retirement.ts": ["json1"],
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
-	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
@@ -717,8 +751,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/knowledge-entry-query.ts": ["driver"],
 	"server/services/knowledge/sqlite-read-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
-	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1", "handle"],
+	"server/services/tool-continuation-service.ts": ["nativeClient", "json1"],
+	"server/services/tool-edit-preview.ts": ["nativeClient", "json1", "handle"],
 	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
@@ -815,9 +849,8 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
  * modules below explain their SQLite reasoning at length in JSDoc.
  */
 function stripComments(source: string): string {
-	return source
-		.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-		.replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+	// Consume comments in source order: a block opener inside a line comment is prose.
+	return source.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
 }
 
 interface Finding {
@@ -1114,6 +1147,24 @@ describe("SQLite dialect inventory guard", () => {
 			);
 			expect(detect(`// ${usage}`), `${capability.id} must ignore commented-out usage`).toEqual([]);
 		}
+	});
+
+	it("self-check: detects the entry point connection import after a wildcard alias comment", () => {
+		const usage = [
+			"// Relative rather than `@frontend/*`: keep the entry import local.",
+			'import { getDbPath } from "./db/connection";',
+			"/** Later startup documentation. */",
+			"const path = getDbPath();",
+		].join("\n");
+		const findings = scanSource(usage);
+		expect(findings.map((finding) => finding.capability.id)).toEqual(["connectionModule"]);
+		expect(findings[0]).toMatchObject({
+			line: 2,
+			snippet: 'import { getDbPath } from "./db/connection";',
+		});
+		expect(stripComments(usage).length).toBe(usage.length);
+		expect(scanSource(usage.replaceAll("getDbPath", "getDbDir"))).toEqual([]);
+		expect(scanSource('// import { getDbPath } from "./db/connection";')).toEqual([]);
 	});
 
 	it("self-check: removed session counters still require registration when reintroduced", () => {

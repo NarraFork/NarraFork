@@ -4,7 +4,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../lib/logger";
 import {
 	BLOCK_INDEX_MAX_CHARS,
 	blockIndexWriter,
@@ -211,4 +212,90 @@ describe("block FTS index", () => {
 		replaceBlockIndexText(sqlite, "b1", "fresh needle");
 		expect(blockHits(sqlite, "needle")).toEqual(["b1"]);
 	});
+});
+
+describe("FTS block startup diagnostics", () => {
+	for (const mode of [
+		"healthy",
+		"corrupt",
+		"repair_failed",
+		"missing_trigger",
+		"lookup_failed",
+	] as const) {
+		test(`records preliminary ${mode} work with a monotonic clock and fixed metadata`, () => {
+			let now = 0;
+			const records: Array<Record<string, unknown>> = [];
+			const stop = new Error("end of fake startup");
+			const info = spyOn(logger, "info").mockImplementation((message, fields) => {
+				if (message === "FTS block index startup operation") records.push(fields ?? {});
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			const wallClock = spyOn(Date, "now").mockImplementation(() => {
+				throw new Error("preliminary FTS diagnostics must use a monotonic clock");
+			});
+			const fake = {
+				prepare(sql: string) {
+					return {
+						all: () => [],
+						get() {
+							if (sql.includes("name IN ('narrators','narrator_messages')")) return { c: 2 };
+							if (sql.includes("name='narrator_blocks'")) return { c: 1 };
+							if (sql.includes("type = 'table' AND name = 'narrator_blocks_fts'")) return {};
+							if (sql.includes("name = 'narrator_blocks_fts_delete'")) {
+								expect(records.at(-1)).toMatchObject({ operation: "repair", status: "started" });
+								now += 11;
+								if (mode === "lookup_failed") throw stop;
+								return mode === "missing_trigger" ? null : {};
+							}
+							// Stop before later startup SQL: this fixture executes no SQLite maintenance.
+							throw stop;
+						},
+					};
+				},
+				run(sql: string) {
+					expect(sql).not.toContain("integrity-check");
+					now += 17;
+					if (sql === "DROP TABLE narrator_blocks_fts" && mode === "repair_failed") throw stop;
+				},
+			} as unknown as Database;
+			try {
+				expect(() =>
+					ensureFts(fake, {
+						wasClean: false,
+						repairFtsTables:
+							mode === "corrupt" || mode === "repair_failed" ? ["narrator_blocks_fts"] : [],
+					}),
+				).toThrow(stop);
+				const result =
+					mode === "healthy"
+						? "unchanged"
+						: mode === "missing_trigger"
+							? "cleared"
+							: mode === "corrupt"
+								? "recreated"
+								: "failed";
+				expect(records[0]).toEqual({
+					index: "narrator_blocks_fts",
+					operation: "repair",
+					status: "started",
+					elapsedMs: 0,
+				});
+				expect(records.at(-1)).toEqual({
+					index: "narrator_blocks_fts",
+					operation: "repair",
+					status: result === "failed" ? "failed" : "completed",
+					result,
+					elapsedMs: mode === "healthy" || mode === "lookup_failed" ? 11 : 28,
+				});
+				expect(records).toHaveLength(2);
+				expect(JSON.stringify(records)).not.toContain(stop.message);
+			} finally {
+				wallClock.mockRestore();
+				clock.mockRestore();
+				warn.mockRestore();
+				info.mockRestore();
+			}
+		});
+	}
 });

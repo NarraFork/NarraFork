@@ -347,7 +347,12 @@ export const queryEditorOperation: NonNullable<
 	actor.signal?.throwIfAborted();
 	const runtime = await getDefaultLocalFileChangeRuntime();
 	const namespace = await runtime.verifyNamespace(actor.signal);
-	const operation = runtime.evidence.getEditorOperation(namespace.sourceInstanceId, operationId);
+	const snapshot = await runtime.evidence.getEditorSnapshot(
+		namespace.sourceInstanceId,
+		operationId,
+		{ signal: actor.signal },
+	);
+	const operation = snapshot.operation;
 	if (
 		!operation ||
 		operation.ownerUserId !== actor.userId ||
@@ -358,7 +363,7 @@ export const queryEditorOperation: NonNullable<
 			"No owned durable receipt is available; verify before retrying",
 			404,
 		);
-	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
+	const effects = snapshot.effects;
 	const effect = effects.length === 1 ? effects[0] : undefined;
 	const deviceId =
 		operation.executionBindingJson?.deviceId ?? effect?.identityJson.deviceId ?? "local";

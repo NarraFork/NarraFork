@@ -128,6 +128,8 @@ export function createStorageHistoryService(deps: StorageHistoryServiceDependenc
 	let stopping = false;
 	const active = new Map<StorageRetentionTarget, AbortController>();
 	const pending = new Map<string, Promise<void>>();
+	const producers = new Set<Promise<void>>();
+	let backgroundFailure: { error: unknown } | undefined;
 	const stats = new Map<
 		string,
 		{
@@ -326,13 +328,27 @@ export function createStorageHistoryService(deps: StorageHistoryServiceDependenc
 			invalidate();
 		}
 	}
+	function recordBackgroundFailure(message: string, error: unknown): void {
+		backgroundFailure ??= { error };
+		try {
+			logger.warn(message, { error: String(error) });
+		} catch {
+			// Observation must not prevent ownership cleanup or replace the retained failure.
+		}
+	}
 	function enqueue(job: StoredJob) {
 		if (pending.has(job.id)) return;
 		const promise = Promise.resolve().then(() => run(job));
 		pending.set(job.id, promise);
-		promise
-			.catch((error) => logger.warn("History cleanup state save failed", { error: String(error) }))
-			.finally(() => pending.delete(job.id));
+		promise.then(
+			() => {
+				pending.delete(job.id);
+			},
+			(error) => {
+				pending.delete(job.id);
+				recordBackgroundFailure("History cleanup state save failed", error);
+			},
+		);
 	}
 	async function start(
 		target: StorageRetentionTarget,
@@ -469,14 +485,32 @@ export function createStorageHistoryService(deps: StorageHistoryServiceDependenc
 			} else enqueue(job);
 		}
 		await automatic();
-		if (!scheduler) {
+		if (!scheduler && !stopping) {
 			scheduler = setInterval(() => {
-				void automatic().catch((error) =>
-					logger.warn("Automatic history cleanup failed", { error: String(error) }),
+				if (stopping) return;
+				const producer = Promise.resolve().then(() => {
+					if (!stopping) return automatic();
+				});
+				producers.add(producer);
+				producer.then(
+					() => {
+						producers.delete(producer);
+					},
+					(error) => {
+						producers.delete(producer);
+						recordBackgroundFailure("Automatic history cleanup failed", error);
+					},
 				);
 			}, 60 * 60_000);
 			scheduler.unref();
 		}
+	}
+	async function settled(): Promise<void> {
+		// A producer can enqueue jobs while awaiting its journal write. Observe both collections
+		// to a fixed point; one failed task must not release ownership of a live sibling.
+		while (producers.size || pending.size)
+			await Promise.allSettled([...producers, ...pending.values()]);
+		if (backgroundFailure) throw backgroundFailure.error;
 	}
 	function stop() {
 		stopping = true;
@@ -495,7 +529,7 @@ export function createStorageHistoryService(deps: StorageHistoryServiceDependenc
 		automatic,
 		startScheduler,
 		stop,
-		settled: () => Promise.all([...pending.values()]).then(() => undefined),
+		settled,
 		invalidate,
 	};
 }

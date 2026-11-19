@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as workerRead from "@server/db/worker-read";
+import { closeReadDatabase } from "@server/lib/db-worker/pool";
+import { splitEnvelope } from "@shared/narrator-blocks/storage";
 import { logger } from "../../lib/logger";
 import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
@@ -17,7 +20,6 @@ import {
 	queryModelHistory,
 	sqliteHistoryQuery,
 } from "./model-history-query";
-import * as revisionModule from "./model-history-revision";
 import { readSqliteModelHistorySignature } from "./model-history-revision";
 import { renderModelHistoryRevisionSql } from "./model-history-revision-sql";
 import {
@@ -59,22 +61,22 @@ function message(db: Database, id: string, seq: number, extra = "", role = "user
 }
 /** Runs `mutate` right after the main thread's first signature read, before the worker starts. */
 function afterFirstSignature(mutate: () => void) {
-	const realRead = revisionModule.readSqliteModelHistorySignature;
+	const realRead = workerRead.readDomainTask;
 	let reads = 0;
-	const spy = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
-		(connection, id) => {
-			const signature = realRead(connection, id);
-			if (++reads === 1) mutate();
-			return signature;
-		},
-	);
+	const spy = spyOn(workerRead, "readDomainTask").mockImplementation(async (...args) => {
+		const result = await realRead(...args);
+		if (args[1] === "modelHistorySignature" && ++reads === 1) mutate();
+		return result;
+	});
 	return () => spy.mockRestore();
 }
 function revision(db: Database, id = "owner") {
 	return readSqliteModelHistorySignature(db, id).revision;
 }
-afterEach(() => {
+afterEach(async () => {
 	clearModelHistorySourceCacheForTest();
+	for (const path of new Set(connections.map((db) => db.filename)))
+		if (path && path !== ":memory:") await closeReadDatabase(path);
 	for (const db of connections.splice(0)) db.close();
 	for (const directory of directories.splice(0))
 		rmSync(directory, { recursive: true, force: true });
@@ -450,6 +452,204 @@ describe("delta metadata and allocation accounting", () => {
 });
 
 describe("complete bounded model source", () => {
+	test("preparation diagnostics retain request-local counters rather than global lastCounters", async () => {
+		const db = fixture();
+		message(db, "one", 0);
+		message(db, "two", 1);
+		let now = 100_000;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const logs: Array<Record<string, unknown>> = [];
+		const first = new ModelHistoryPreparation({
+			narratorId: "owner",
+			kind: "rebuild",
+			warn: (_message, fields) => logs.push(fields),
+		});
+		const second = new ModelHistoryPreparation({
+			narratorId: "other",
+			kind: "rebuild",
+			warn: (_message, fields) => logs.push(fields),
+		});
+		try {
+			await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner", {
+				preparation: first,
+				signal: first.signal,
+				deadline: first.deadline,
+			});
+			await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "other", {
+				preparation: second,
+				signal: second.signal,
+				deadline: second.deadline,
+			});
+			expect(modelHistorySourceStats().lastCounters?.refs).toBe(0);
+			now += 11_000;
+			first.finish();
+			second.finish();
+			expect(
+				logs.find((entry) => entry.narratorId === "owner" && entry.outcome === "success")?.counts,
+			).toMatchObject({ refs: 2 });
+			expect(
+				logs.find((entry) => entry.narratorId === "other" && entry.outcome === "success")?.counts,
+			).toMatchObject({ refs: 0 });
+		} finally {
+			first.finish();
+			second.finish();
+			clock.mockRestore();
+		}
+	});
+
+	test("slow in-flight worker observations include partial pages without counting them twice", async () => {
+		const db = fixture(true);
+		message(db, "partial", 0);
+		const row = (
+			await queryModelHistory(sqliteHistoryQuery(db), {
+				narratorId: "owner",
+				deadline: Date.now() + 30_000,
+			})
+		).messages[0];
+		let now = 100_000;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const signature = readSqliteModelHistorySignature(db, "owner");
+		const signatureRead = spyOn(workerRead, "readDomainTask").mockImplementation(
+			async () => signature as never,
+		);
+		const ready = Promise.withResolvers<Worker>();
+		const workers = controlledHistoryWorkers((worker) => ready.resolve(worker));
+		const logs: Array<Record<string, unknown>> = [];
+		const controller = new AbortController();
+		const preparation = new ModelHistoryPreparation({
+			narratorId: "owner",
+			kind: "rebuild",
+			signal: controller.signal,
+			warn: (_message, fields) => logs.push(fields),
+		});
+		const loading = loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner", {
+			preparation,
+			signal: preparation.signal,
+			deadline: preparation.deadline,
+		});
+		try {
+			const worker = await ready.promise;
+			await emitHistoryPage(worker, { type: "page", rows: [row] });
+			await emitHistoryPage(worker, {
+				type: "tools",
+				rows: [
+					{
+						messageId: "partial",
+						id: "tool",
+						createdAt: "now",
+						modelRevision: 1,
+						executionAttempt: 1,
+						toolUseId: "use",
+						toolName: "Read",
+						inputJson: {},
+						outputJson: null,
+						status: "success",
+					},
+				],
+			});
+			now += 11_000;
+			preparation.check();
+			expect(logs).toHaveLength(1);
+			expect(logs[0]?.counts).toMatchObject({ refs: 1, toolRows: 1 });
+			worker.postMessage({
+				type: "test_emit",
+				message: {
+					type: "done",
+					counters: {
+						refs: 1,
+						toolRows: 1,
+						sourceBytes: 0,
+						refQueries: 1,
+						bodyQueries: 1,
+						toolQueries: 1,
+						maxRefsPerQuery: 1,
+						maxBodyBatchBytes: 0,
+						maxToolBatchBytes: 0,
+						preparedBytes: 0,
+					},
+				},
+			});
+			await loading;
+			expect(workers.exited).toBe(1);
+			expect(Number.isFinite(modelHistorySourceStats().cacheBytes)).toBe(true);
+			preparation.finish();
+			expect(logs.at(-1)?.counts).toMatchObject({ refs: 1, toolRows: 1 });
+			expect(logs.at(-1)?.outcome).toBe("success");
+		} finally {
+			controller.abort(new Error("test cleanup"));
+			await Promise.allSettled([loading]);
+			preparation.finish();
+			workers.mockRestore();
+			signatureRead.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	for (const outcome of ["cancel", "timeout"] as const)
+		test(`history worker queue shares the preparation deadline and supports ${outcome}`, async () => {
+			const db = fixture(true);
+			let now = 100_000;
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			const signature = readSqliteModelHistorySignature(db, "owner");
+			const signatureRead = spyOn(workerRead, "readDomainTask").mockImplementation(
+				async () => signature as never,
+			);
+			const ready = Promise.withResolvers<void>();
+			let started = 0;
+			const workers = controlledHistoryWorkers(() => {
+				if (++started === 2) ready.resolve();
+			});
+			const first = new AbortController();
+			const second = new AbortController();
+			const third = new AbortController();
+			const preparation = new ModelHistoryPreparation({
+				narratorId: "other",
+				kind: "rebuild",
+				signal: third.signal,
+			});
+			const queuedStage = Promise.withResolvers<void>();
+			const originalPhase = preparation.phase.bind(preparation);
+			const phase = spyOn(preparation, "phase").mockImplementation((name) => {
+				originalPhase(name);
+				if (name === "queue") queuedStage.resolve();
+			});
+			const backend = { backend: "sqlite" as const, sqlite: db };
+			const active = [
+				loadModelHistorySource(backend, "owner", { signal: first.signal }),
+				loadModelHistorySource(backend, "fork", { signal: second.signal }),
+			];
+			const settled = Promise.allSettled(active);
+			try {
+				await ready.promise;
+				const queued = loadModelHistorySource(backend, "other", {
+					preparation,
+					signal: preparation.signal,
+					deadline: preparation.deadline,
+				});
+				await queuedStage.promise;
+				if (outcome === "cancel") third.abort(new Error("queue cancelled"));
+				else {
+					now += 30_000;
+					// Advance the deterministic preparation clock without waiting for a real 30s timer.
+					expect(() => preparation.check()).toThrow("30s budget");
+				}
+				await expect(queued).rejects.toThrow(
+					outcome === "cancel" ? "queue cancelled" : "30s budget",
+				);
+				expect(started).toBe(2);
+			} finally {
+				first.abort(new Error("test cleanup"));
+				second.abort(new Error("test cleanup"));
+				await settled;
+				preparation.finish();
+				workers.mockRestore();
+				signatureRead.mockRestore();
+				phase.mockRestore();
+				clock.mockRestore();
+				expect(workers.exited).toBe(2);
+				expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0 });
+			}
+		});
 	test("keysets >2000 refs without truncation and independently pages >200 tools", async () => {
 		const db = fixture();
 		db.transaction(() => {
@@ -512,6 +712,9 @@ describe("complete bounded model source", () => {
 				signal: AbortSignal.abort(new Error("cancel model query")),
 			}),
 		).rejects.toThrow("cancel model query");
+		await expect(
+			queryModelHistory(sqliteHistoryQuery(db), { narratorId: "owner", deadline: Date.now() - 1 }),
+		).rejects.toThrow("30s budget");
 	});
 	test("real worker completes all pages after the clock crosses the former ten-second cutoff", async () => {
 		const db = fixture(true);
@@ -523,7 +726,7 @@ describe("complete bounded model source", () => {
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const RealWorker = globalThis.Worker;
 		let pages = 0;
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
+		const worker = spyHistoryWorker((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
 			instance.addEventListener("message", (event) => {
 				if (event.data.type === "page") {
@@ -579,9 +782,13 @@ describe("complete bounded model source", () => {
 		for (let index = 0; index < 205; index++) message(db, `cancel:${index}`, index);
 		const controller = new AbortController();
 		const RealWorker = globalThis.Worker;
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
+		const worker = spyHistoryWorker((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
-			instance.addEventListener("message", () => controller.abort(), { once: true });
+			instance.addEventListener(
+				"message",
+				() => controller.abort(new Error("Model history preparation cancelled")),
+				{ once: true },
+			);
 			return instance;
 		});
 		try {
@@ -617,7 +824,7 @@ describe("complete bounded model source", () => {
 		const url = URL.createObjectURL(
 			new Blob(["process.exit(0)"], { type: "application/javascript" }),
 		);
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation(() => new RealWorker(url));
+		const worker = spyHistoryWorker(() => new RealWorker(url));
 		try {
 			await expect(
 				loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner"),
@@ -640,7 +847,7 @@ describe("complete bounded model source", () => {
 		const RealWorker = globalThis.Worker;
 		let terminations = 0;
 		let failedDispatches = 0;
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
+		const worker = spyHistoryWorker((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
 			const send = instance.postMessage.bind(instance);
 			const terminate = instance.terminate.bind(instance);
@@ -679,7 +886,7 @@ describe("complete bounded model source", () => {
 	test("worker message deserialization failure rejects without a timeout", async () => {
 		const db = fixture(true);
 		const RealWorker = globalThis.Worker;
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
+		const worker = spyHistoryWorker((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
 			const dispatch = instance.postMessage.bind(instance);
 			spyOn(instance, "postMessage").mockImplementation((message) => {
@@ -858,7 +1065,7 @@ describe("complete bounded model source", () => {
 		).rejects.toThrow();
 		const controller = new AbortController();
 		const pending = loadModelHistorySource(backend, "owner", { signal: controller.signal });
-		const cancel = setTimeout(() => controller.abort(), 0);
+		const cancel = setTimeout(() => controller.abort(new Error("source cancelled")), 0);
 		await expect(pending).rejects.toThrow("cancelled");
 		clearTimeout(cancel);
 		db.run("DROP TRIGGER model_history_v3_tool_update");
@@ -930,7 +1137,64 @@ describe("hot source signature lifecycle", () => {
 			reloaded.loadModelHistorySource(backend, "owner", { signal: AbortSignal.abort() }),
 		).rejects.toThrow();
 		expect((await reloaded.loadModelHistorySource(backend, "owner")).messages).toHaveLength(1);
+		await expect(
+			reloaded.loadModelHistorySource(backend, "owner", { deadline: Date.now() - 1 }),
+		).rejects.toThrow("30s budget");
 	});
+});
+
+test("file-backed cold and cached signatures read only independent Worker connections", async () => {
+	const db = fixture(true);
+	message(db, "worker-only", 0);
+	const backend = { backend: "sqlite" as const, sqlite: db };
+	const query = spyOn(db, "query").mockImplementation(() => {
+		throw new Error("Owner connection SELECT is forbidden");
+	});
+	const prepare = spyOn(db, "prepare").mockImplementation(() => {
+		throw new Error("Owner connection SELECT preparation is forbidden");
+	});
+	try {
+		const first = await loadModelHistorySource(backend, "owner");
+		expect(first.messages[0].id).toBe("worker-only");
+		const before = modelHistorySourceStats();
+		expect(await loadModelHistorySource(backend, "owner")).toBe(first);
+		expect(modelHistorySourceStats().signatureReads).toBe(before.signatureReads + 1);
+		expect(query).not.toHaveBeenCalled();
+		expect(prepare).not.toHaveBeenCalled();
+	} finally {
+		query.mockRestore();
+		prepare.mockRestore();
+	}
+});
+
+test("rows-only source is selected inside the history Worker snapshot", async () => {
+	const db = fixture(true);
+	message(db, "rows-only", 0);
+	const [block] = splitEnvelope({
+		id: "rows-only",
+		narratorId: "owner",
+		role: "user",
+		contentJson: [{ type: "text", text: "WORKER BODY" }],
+		contentText: "WORKER BODY",
+		parentToolUseId: null,
+	}).blocks;
+	if (!block) throw new Error("Rows-only fixture requires a stored block");
+	db.run(
+		"UPDATE narrator_messages SET body_format=2,body_rows_only=1,content_json='[]' WHERE id='rows-only'",
+	);
+	db.run(
+		"INSERT INTO narrator_blocks(id,message_id,ordinal,kind,subtype,phase,model_text,payload,state) VALUES ('body','rows-only',0,?,?,?,?,?,?)",
+		[
+			block.kind,
+			block.subtype,
+			block.phase,
+			block.modelText,
+			JSON.stringify(block.payload),
+			block.state ? JSON.stringify(block.state) : null,
+		],
+	);
+	const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
+	expect(source.messages[0].contentJson).toEqual([{ type: "text", text: "WORKER BODY" }]);
 });
 
 test("source LRU has only a 64MiB budget, accounts for empty entries and retains one revision", () => {
@@ -1146,6 +1410,9 @@ describe("slow history diagnostics and worker admission", () => {
 	])("a warning while reading never rejects the request (sink throws: %s)", async (sinkThrows) => {
 		const db = fixture(true);
 		message(db, "only", 0);
+		const signatureRead = spyOn(workerRead, "readDomainTask").mockResolvedValue(
+			readSqliteModelHistorySignature(db, "owner") as never,
+		);
 		let now = Date.now();
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const warn = spyOn(logger, "warn").mockImplementation(() => {
@@ -1163,6 +1430,7 @@ describe("slow history diagnostics and worker admission", () => {
 			expect(timers.timers).toHaveLength(1);
 			expect(clear).toHaveBeenCalledWith(timers.timers[0]);
 		} finally {
+			signatureRead.mockRestore();
 			clear.mockRestore();
 			timers.restore();
 			warn.mockRestore();
@@ -1177,6 +1445,11 @@ describe("slow history diagnostics and worker admission", () => {
 		const db = fixture(true);
 		message(db, "only", 0);
 		if (mode === "failure") db.run("DROP TABLE narrator_message_refs");
+		// Only the history warning timer is under test; signature Worker readiness owns
+		// a separate 10s watchdog that this delay-based timer observer would also capture.
+		const signatureRead = spyOn(workerRead, "readDomainTask").mockResolvedValue(
+			readSqliteModelHistorySignature(db, "owner") as never,
+		);
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		const timers = observeSlowTimers();
 		const clear = spyOn(globalThis, "clearTimeout");
@@ -1194,6 +1467,7 @@ describe("slow history diagnostics and worker admission", () => {
 			expect(clear).toHaveBeenCalledWith(timers.timers[0]);
 			expect(modelHistorySourceStats().workers).toBe(0);
 		} finally {
+			signatureRead.mockRestore();
 			clear.mockRestore();
 			timers.restore();
 			warn.mockRestore();
@@ -1203,6 +1477,9 @@ describe("slow history diagnostics and worker admission", () => {
 		const db = fixture(true);
 		message(db, "only", 0);
 		const backend = { backend: "sqlite" as const, sqlite: db };
+		const signatureRead = spyOn(workerRead, "readDomainTask").mockResolvedValue(
+			readSqliteModelHistorySignature(db, "owner") as never,
+		);
 		const all = new AbortController();
 		const cancelled = new AbortController();
 		let now = Date.now();
@@ -1214,7 +1491,7 @@ describe("slow history diagnostics and worker admission", () => {
 		const releaseRequests: Array<() => void> = [];
 		const second = Promise.withResolvers<void>();
 		const third = Promise.withResolvers<void>();
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
+		const worker = spyHistoryWorker((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
 			const dispatch = instance.postMessage.bind(instance);
 			spyOn(instance, "postMessage").mockImplementation((message) => {
@@ -1239,7 +1516,7 @@ describe("slow history diagnostics and worker admission", () => {
 			await second.promise;
 			const dropped = load("other", cancelled.signal);
 			const next = load("owner");
-			await Promise.resolve();
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(modelHistorySourceStats()).toMatchObject({ workers: 2, queued: 2 });
 			now += 10_001;
 			timers.fire[2]();
@@ -1252,7 +1529,7 @@ describe("slow history diagnostics and worker admission", () => {
 			releaseRequests[1]();
 			releaseRequests[2]();
 			await Promise.all([first, other, next]);
-			expect(worker).toHaveBeenCalledTimes(3);
+			expect(worker.spy).toHaveBeenCalledTimes(3);
 			expect(sleep).not.toHaveBeenCalledWith(1);
 			expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0 });
 			const queuedWarnings = warn.mock.calls.filter(([, data]) => data?.narratorId === "other");
@@ -1262,6 +1539,7 @@ describe("slow history diagnostics and worker admission", () => {
 			all.abort();
 			cancelled.abort();
 			await Promise.allSettled(pending);
+			signatureRead.mockRestore();
 			worker.mockRestore();
 			sleep.mockRestore();
 			timers.restore();

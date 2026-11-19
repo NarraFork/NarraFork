@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { narratorMessages, narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
@@ -3376,28 +3377,31 @@ export function createCorePluginPublicApiAdapters(options: {
 				}
 				// The narrator's primary project, resolved the one way every caller must.
 				if (input.projectId) predicates.push(eq(narratorProjectIdColumn, input.projectId));
-				const rows = await db
-					.select({
-						id: narrators.id,
-						projectId: narratorProjectIdColumn,
-						title: narrators.title,
-						handle: narrators.handle,
-						variant: narrators.variant,
-						type: narrators.type,
-						status: narrators.status,
-						substatus: narrators.substatus,
-						model: narrators.model,
-						permissionMode: narrators.permissionMode,
-						reasoningEffort: narrators.reasoningEffort,
-						messageCount: narrators.messageCount,
-						lastMessageAt: narrators.lastMessageAt,
-						createdAt: narrators.createdAt,
-						updatedAt: narrators.updatedAt,
-					})
-					.from(narrators)
-					.where(predicates.length ? and(...predicates) : undefined)
-					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
-					.limit(input.limit);
+				const rows = await readQuery(
+					db
+						.select({
+							id: narrators.id,
+							projectId: narratorProjectIdColumn,
+							title: narrators.title,
+							handle: narrators.handle,
+							variant: narrators.variant,
+							type: narrators.type,
+							status: narrators.status,
+							substatus: narrators.substatus,
+							model: narrators.model,
+							permissionMode: narrators.permissionMode,
+							reasoningEffort: narrators.reasoningEffort,
+							messageCount: narrators.messageCount,
+							lastMessageAt: narrators.lastMessageAt,
+							createdAt: narrators.createdAt,
+							updatedAt: narrators.updatedAt,
+						})
+						.from(narrators)
+						.where(predicates.length ? and(...predicates) : undefined)
+						.orderBy(desc(narrators.updatedAt), desc(narrators.id))
+						.limit(input.limit),
+					{ executionPolicy: "worker-required" },
+				);
 				return rows.map((row) => ({
 					id: row.id,
 					projectId: row.projectId ?? null,
@@ -3419,17 +3423,20 @@ export function createCorePluginPublicApiAdapters(options: {
 			async listMessages(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
-				const rows = await db
-					.select({
-						id: narratorMessages.id,
-						role: narratorMessages.role,
-						contentText: narratorMessages.contentText,
-						createdAt: narratorMessages.createdAt,
-					})
-					.from(narratorMessages)
-					.where(eq(narratorMessages.narratorId, input.narratorId))
-					.orderBy(desc(narratorMessages.createdAt))
-					.limit(input.limit);
+				const rows = await readQuery(
+					db
+						.select({
+							id: narratorMessages.id,
+							role: narratorMessages.role,
+							contentText: narratorMessages.contentText,
+							createdAt: narratorMessages.createdAt,
+						})
+						.from(narratorMessages)
+						.where(eq(narratorMessages.narratorId, input.narratorId))
+						.orderBy(desc(narratorMessages.createdAt))
+						.limit(input.limit),
+					{ executionPolicy: "worker-required" },
+				);
 				return rows.map((row) => ({
 					id: row.id,
 					role: row.role,

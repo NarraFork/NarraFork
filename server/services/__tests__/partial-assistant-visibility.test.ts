@@ -18,13 +18,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { decodeLegacyContent } from "@shared/narrator-blocks/decode";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { OutputContentAccumulator } from "../../lib/agent/output-content";
 import { toTurns } from "../../lib/agent/projection/turns";
 import type { AgentConfig, AgentEvent, ContentBlock } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -134,11 +137,12 @@ afterEach(() => {
 	for (const id of ["n1", "parent", "child"]) clearStreamingSnapshot(id);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.restore();
 	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("partial assistant visibility", () => {
@@ -448,14 +452,26 @@ describe("identified content checkpoints through the real event consumer", () =>
 			});
 
 			const version = messageVersionOf(ctx.narratorId);
+			const checkpointBlocks = storedBlocks(messageId);
 			const frameCount = broadcasts.length;
 			await processEvent({ type: "block_complete", block: completeReasoning }, ctx);
 			await processEvent({ type: "block_complete", block: completeText }, ctx);
 			await processEvent({ type: "block_complete", block: { ...reasoning, text: "stale" } }, ctx);
 			await processEvent({ type: "block_complete", block: { ...text, text: "stale" } }, ctx);
 			expect(messageVersionOf(ctx.narratorId)).toBe(version);
-			expect(broadcasts).toHaveLength(frameCount);
-			expect(storedBlocks(messageId)).toHaveLength(3);
+			// Replayed checkpoints may clear translation activity, but never republish content.
+			expect(broadcasts.slice(frameCount)).toEqual(
+				(subagent ? ["parent", "child"] : [ctx.narratorId]).map((narratorId) => ({
+					narratorId,
+					message: expect.objectContaining({
+						type: "streaming_snapshot",
+						narratorId,
+						reasoningTranslationActivity: null,
+						streamingBlocks: [],
+					}),
+				})),
+			);
+			expect(storedBlocks(messageId)).toEqual(checkpointBlocks);
 			await processEvent(
 				{ type: "assistant_message", messageId: "final-uuid", text: text.text, toolUses: [tool] },
 				ctx,

@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -13,6 +14,7 @@ import type { ToolCallBinding } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { AgentMessageSender } from "./agent-message-origin";
+import { markCommunicationWorkFailed, trackCommunicationWork } from "./agent-runtime/async-work";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getRuntimeQueuePort } from "./agent-runtime/runtime-queue-port";
@@ -89,8 +91,8 @@ export function markMailboxDeliveryConsumed(
 		consumedAt,
 	);
 }
-export function consumeMailboxDelivery(delivery: MailboxDeliveryConsumption): void {
-	void markMailboxDeliveryConsumed(delivery);
+export function consumeMailboxDelivery(delivery: MailboxDeliveryConsumption): Promise<void> {
+	return markMailboxDeliveryConsumed(delivery);
 }
 
 const MAX_CONSUMED_CACHE_ENTRIES = 4096;
@@ -163,8 +165,42 @@ export function markAgentMessageConsumed(
 		consumedAt: new Date(consumedAt),
 		resolve,
 	});
-	void drainConsumptionWrites();
+	void trackCommunicationWork(drainConsumptionWrites());
 	return promise;
+}
+
+/** A bounded Worker preflight may skip absent refs; it never authorizes consumption. */
+async function missingConsumptionRefs(batch: typeof consumptionQueue): Promise<Set<number>> {
+	if (getRuntimeQueuePort()) return new Set();
+	const { db } = await import("../db");
+	const probes = batch.flatMap((entry, index) => {
+		if (entry.delivery.deliveryId) return [];
+		const delivery = entry.delivery;
+		const exact = and(
+			eq(narratorMessageRefs.narratorId, delivery.recipientNarratorId),
+			delivery.recipientRefId
+				? eq(narratorMessageRefs.id, delivery.recipientRefId)
+				: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
+		);
+		return [
+			db
+				.select({
+					index: sql<number>`${index}`,
+					candidateRefId: sql<
+						string | null
+					>`(SELECT ${narratorMessageRefs.id} FROM ${narratorMessageRefs} WHERE ${exact} LIMIT 1)`,
+				})
+				.from(sql`(SELECT 1) AS receipt_probe`),
+		];
+	});
+	if (!probes.length) return new Set();
+	let query = probes[0].$dynamic();
+	for (const probe of probes.slice(1)) query = query.unionAll(probe);
+	const rows = await readQuery(query, {
+		executionPolicy: "worker-required",
+		maxRows: probes.length,
+	});
+	return new Set(rows.filter((row) => row.candidateRefId === null).map((row) => row.index));
 }
 
 async function drainConsumptionWrites(): Promise<void> {
@@ -174,9 +210,21 @@ async function drainConsumptionWrites(): Promise<void> {
 		while (consumptionQueue.length) {
 			const batch = consumptionQueue.splice(0, CONSUMPTION_WRITE_BATCH_SIZE);
 			const startedAt = Date.now();
-			for (const entry of batch) {
+			let missing = new Set<number>();
+			try {
+				missing = await missingConsumptionRefs(batch);
+			} catch (error) {
+				markCommunicationWorkFailed();
+				logger.warn("Agent receipt batch preflight failed; checking entries individually", {
+					error: String(error),
+				});
+			}
+			for (const [index, entry] of batch.entries()) {
 				try {
-					if (await persistAgentMessageConsumption(entry.delivery, entry.consumedAt)) {
+					if (
+						!missing.has(index) &&
+						(await persistAgentMessageConsumption(entry.delivery, entry.consumedAt))
+					) {
 						consumedCache.add(entry.key);
 						if (consumedCache.size > MAX_CONSUMED_CACHE_ENTRIES) {
 							const oldest = consumedCache.values().next().value;
@@ -184,6 +232,7 @@ async function drainConsumptionWrites(): Promise<void> {
 						}
 					}
 				} catch (error) {
+					markCommunicationWorkFailed();
 					logger.warn("Agent consumption bookkeeping failed", { error: String(error) });
 				} finally {
 					pendingConsumptions.delete(entry.key);
@@ -213,45 +262,51 @@ async function persistAgentMessageConsumption(
 			const queuePort = getRuntimeQueuePort();
 			if (queuePort) return await persistConsumptionPostgres(queuePort, delivery, consumedAt);
 			const { db } = await import("../db");
-			const candidateRef = db
-				.select({ id: narratorMessageRefs.id })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, delivery.recipientNarratorId),
-						delivery.recipientRefId
-							? eq(narratorMessageRefs.id, delivery.recipientRefId)
-							: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
-					),
-				)
-				.get();
+			const candidateRef = await readQueryFirst(
+				db
+					.select({ id: narratorMessageRefs.id })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, delivery.recipientNarratorId),
+							delivery.recipientRefId
+								? eq(narratorMessageRefs.id, delivery.recipientRefId)
+								: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
+						),
+					)
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			if (!candidateRef && !delivery.deliveryId) return false;
 			const stable =
 				delivery.deliveryId || candidateRef
-					? db
-							.select({
-								deliveryId: narratorBufferedMessages.deliveryId,
-								kind: narratorBufferedMessages.kind,
-								narratorId: narratorBufferedMessages.narratorId,
-								refId: narratorBufferedMessages.recipientRefId,
-								messageId: narratorBufferedMessages.currentMessageId,
-								revision: narratorBufferedMessages.contentRevision,
-								currentRevision: narratorBufferedMessages.currentRevision,
-								disposition: narratorBufferedMessages.receiptDisposition,
-								sourceNarratorId: narratorBufferedMessages.sourceNarratorId,
-								sourceToolCallId: narratorBufferedMessages.sourceToolCallId,
-								sourceAttempt: narratorBufferedMessages.sourceAttempt,
-							})
-							.from(narratorBufferedMessages)
-							.where(
-								delivery.deliveryId
-									? eq(narratorBufferedMessages.deliveryId, delivery.deliveryId)
-									: and(
-											eq(narratorBufferedMessages.narratorId, delivery.recipientNarratorId),
-											eq(narratorBufferedMessages.recipientRefId, candidateRef?.id ?? ""),
-										),
-							)
-							.get()
+					? await readQueryFirst(
+							db
+								.select({
+									deliveryId: narratorBufferedMessages.deliveryId,
+									kind: narratorBufferedMessages.kind,
+									narratorId: narratorBufferedMessages.narratorId,
+									refId: narratorBufferedMessages.recipientRefId,
+									messageId: narratorBufferedMessages.currentMessageId,
+									revision: narratorBufferedMessages.contentRevision,
+									currentRevision: narratorBufferedMessages.currentRevision,
+									disposition: narratorBufferedMessages.receiptDisposition,
+									sourceNarratorId: narratorBufferedMessages.sourceNarratorId,
+									sourceToolCallId: narratorBufferedMessages.sourceToolCallId,
+									sourceAttempt: narratorBufferedMessages.sourceAttempt,
+								})
+								.from(narratorBufferedMessages)
+								.where(
+									delivery.deliveryId
+										? eq(narratorBufferedMessages.deliveryId, delivery.deliveryId)
+										: and(
+												eq(narratorBufferedMessages.narratorId, delivery.recipientNarratorId),
+												eq(narratorBufferedMessages.recipientRefId, candidateRef?.id ?? ""),
+											),
+								)
+								.limit(1),
+							{ executionPolicy: "worker-required", maxRows: 1 },
+						)
 					: undefined;
 			if (delivery.deliveryId && !stable) return false;
 			if (delivery.currentRevisionOnly) {
@@ -295,12 +350,15 @@ async function persistAgentMessageConsumption(
 					: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
 			);
 			const readReceipt = () =>
-				db
-					.select({ consumedAt: narratorMessageRefs.injectionConsumedAt })
-					.from(narratorMessageRefs)
-					.where(exactRef)
-					.get();
-			const existing = readReceipt();
+				readQueryFirst(
+					db
+						.select({ consumedAt: narratorMessageRefs.injectionConsumedAt })
+						.from(narratorMessageRefs)
+						.where(exactRef)
+						.limit(1),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
+			const existing = await readReceipt();
 			if (!existing) return false;
 			if (existing.consumedAt != null) {
 				// Upgrade pre-mailbox acknowledgement without changing its timestamp or re-invalidating pages.
@@ -336,16 +394,21 @@ async function persistAgentMessageConsumption(
 			const senderToolUseId =
 				delivery.fromToolUseId ||
 				(senderBinding
-					? db
-							.select({ id: narratorToolCalls.toolUseId })
-							.from(narratorToolCalls)
-							.where(
-								and(
-									eq(narratorToolCalls.id, senderBinding.toolCallId),
-									eq(narratorToolCalls.executionAttempt, senderBinding.attempt),
-								),
+					? (
+							await readQueryFirst(
+								db
+									.select({ id: narratorToolCalls.toolUseId })
+									.from(narratorToolCalls)
+									.where(
+										and(
+											eq(narratorToolCalls.id, senderBinding.toolCallId),
+											eq(narratorToolCalls.executionAttempt, senderBinding.attempt),
+										),
+									)
+									.limit(1),
+								{ executionPolicy: "worker-required", maxRows: 1 },
 							)
-							.get()?.id
+						)?.id
 					: undefined);
 			const changed = db.transaction((tx) => {
 				const receipt =
@@ -415,9 +478,10 @@ async function persistAgentMessageConsumption(
 					senderBinding,
 				);
 			}
-			return changed || readReceipt()?.consumedAt != null;
+			return changed || (await readReceipt())?.consumedAt != null;
 		} catch (error) {
 			if (attempt === 2) {
+				markCommunicationWorkFailed();
 				logger.warn("Failed to record adopted agent injection; delivery will not be repeated", {
 					...delivery,
 					error: String(error),
@@ -593,37 +657,39 @@ export async function trackAgentMessageHistory(
 						narratorId,
 						page.map((message) => message.id),
 					)
-				: historyReceiptDb
-						.select({
-							messageId: narratorMessageRefs.messageId,
-							refId: narratorMessageRefs.id,
-							deliveryId: narratorBufferedMessages.deliveryId,
-							revision: narratorBufferedMessages.contentRevision,
-							currentRevision: narratorBufferedMessages.currentRevision,
-							disposition: narratorBufferedMessages.receiptDisposition,
-							kind: narratorBufferedMessages.kind,
-						})
-						.from(narratorMessageRefs)
-						.innerJoin(
-							narratorBufferedMessages,
-							and(
-								eq(narratorBufferedMessages.narratorId, narratorId),
-								eq(narratorBufferedMessages.recipientRefId, narratorMessageRefs.id),
-							),
-						)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, narratorId),
-								inArray(
-									narratorMessageRefs.messageId,
-									page.map((message) => message.id),
+				: await readQuery(
+						historyReceiptDb
+							.select({
+								messageId: narratorMessageRefs.messageId,
+								refId: narratorMessageRefs.id,
+								deliveryId: narratorBufferedMessages.deliveryId,
+								revision: narratorBufferedMessages.contentRevision,
+								currentRevision: narratorBufferedMessages.currentRevision,
+								disposition: narratorBufferedMessages.receiptDisposition,
+								kind: narratorBufferedMessages.kind,
+							})
+							.from(narratorMessageRefs)
+							.innerJoin(
+								narratorBufferedMessages,
+								and(
+									eq(narratorBufferedMessages.narratorId, narratorId),
+									eq(narratorBufferedMessages.recipientRefId, narratorMessageRefs.id),
 								),
-								eq(narratorBufferedMessages.state, "materialized"),
-								inArray(narratorBufferedMessages.receiptDisposition, ["active", "superseded"]),
-							),
-						)
-						.limit(100)
-						.all();
+							)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									inArray(
+										narratorMessageRefs.messageId,
+										page.map((message) => message.id),
+									),
+									eq(narratorBufferedMessages.state, "materialized"),
+									inArray(narratorBufferedMessages.receiptDisposition, ["active", "superseded"]),
+								),
+							)
+							.limit(100),
+						{ executionPolicy: "worker-required", maxRows: 100 },
+					);
 			for (const row of rows) {
 				// Agent-message envelopes above retain their exact sender/attempt and WS receipt protocol.
 				if (
@@ -661,15 +727,15 @@ export async function trackAgentMessageHistory(
 }
 
 /** Called exclusively by the execution loop after adopting this history as model input. */
-export function consumeAgentMessageHistory(history: unknown[]): void {
+export async function consumeAgentMessageHistory(history: unknown[]): Promise<void> {
 	const deliveries = historyConsumptions.get(history);
 	historyConsumptions.delete(history);
 	// Identity comes from the exact structured envelope, never from matching words.
-	for (const delivery of deliveries ?? []) void markAgentMessageConsumed(delivery);
+	await Promise.all((deliveries ?? []).map((delivery) => markAgentMessageConsumed(delivery)));
 }
 
-export function consumeAgentMessageDelivery(delivery: AgentMessageDelivery): void {
-	void markAgentMessageConsumed({ ...delivery, senderNarratorId: delivery.sender.id });
+export function consumeAgentMessageDelivery(delivery: AgentMessageDelivery): Promise<void> {
+	return markAgentMessageConsumed({ ...delivery, senderNarratorId: delivery.sender.id });
 }
 
 export function agentMessageDeliveryBody(delivery: AgentMessageDelivery): SideCarBody {

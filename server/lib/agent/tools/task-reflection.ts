@@ -214,15 +214,19 @@ async function resolveTaskReflectionToolCallId(
 	if (pending.toolCallId) return pending.toolCallId;
 	try {
 		const { and, eq } = await import("drizzle-orm");
+		const { readQuery } = await import("@server/db/worker-read");
 		const { db } = await import("@server/db");
 		const { narratorToolCalls } = await import("@server/db/schema");
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, pending.narratorId),
-				eq(narratorToolCalls.toolUseId, pending.toolUseId),
-			),
-			columns: { id: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.narratorId, pending.narratorId),
+					eq(narratorToolCalls.toolUseId, pending.toolUseId),
+				),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
 		if (row?.id) {
 			pending.toolCallId = row.id;
 			return row.id;

@@ -9,17 +9,21 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { extractSubagentToPrimary } = await import("../subagent-extract");
 const { narratorService } = await import("../narrator-service");
+const { stopBlockSyncSweep } = await import("../narrator-block-sync");
 
 const now = "2026-08-01T10:00:00.000Z";
 
@@ -100,12 +104,16 @@ function seedSourceMessage(id: string, narratorId: string, seq: number, text: st
 		.run(`ref-${id}`, narratorId, id, seq);
 }
 
-beforeEach(() => cleanDb(sqlite));
+beforeEach(() => {
+	stopBlockSyncSweep();
+	cleanDb(sqlite);
+});
 
-afterAll(() => {
+afterAll(async () => {
+	stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("extractSubagentToPrimary", () => {

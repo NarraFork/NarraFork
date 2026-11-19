@@ -62,7 +62,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
@@ -1100,31 +1100,43 @@ async function resolveRuleNarratorId(
 ): Promise<string | null> {
 	switch (segment) {
 		case "whitelist-dirs": {
-			const row = await db.query.narratorWhitelistDirs.findFirst({
-				where: eq(narratorWhitelistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorWhitelistDirs.findFirst({
+					where: eq(narratorWhitelistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			return row?.narratorId ?? null;
 		}
 		case "blacklist-dirs": {
-			const row = await db.query.narratorBlacklistDirs.findFirst({
-				where: eq(narratorBlacklistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorBlacklistDirs.findFirst({
+					where: eq(narratorBlacklistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-whitelist": {
-			const row = await db.query.narratorWhitelistCmds.findFirst({
-				where: eq(narratorWhitelistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorWhitelistCmds.findFirst({
+					where: eq(narratorWhitelistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-blacklist": {
-			const row = await db.query.narratorBlacklistCmds.findFirst({
-				where: eq(narratorBlacklistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorBlacklistCmds.findFirst({
+					where: eq(narratorBlacklistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			return row?.narratorId ?? null;
 		}
 	}
@@ -1309,7 +1321,10 @@ async function askInPassingChildrenByParent(
 
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
-	const readOptions = { signal: c.req.raw.signal };
+	const readOptions = {
+		signal: c.req.raw.signal,
+		executionPolicy: "worker-required" as const,
+	};
 	const userId = c.get("user").sub;
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
@@ -1811,10 +1826,13 @@ narratorRoutes.post("/", async (c) => {
 	let projectDir: string | undefined;
 	if (input.contextProjectId) {
 		await requireProjectAccess(c, input.contextProjectId, "write");
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, input.contextProjectId),
+				columns: { gitPath: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		projectDir = project?.gitPath ?? undefined;
 	}
 	// The device comes first: it decides what the directory even means.
@@ -2115,7 +2133,13 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 		narratorPrincipalOf(c),
 		c.req.raw.signal,
 	).catch((error: unknown) => {
-		if (c.req.raw.signal.aborted) throw catalogError("GIT_REQUEST_CANCELLED");
+		// Classify here before Hono serializes the downstream handler's error.
+		if (
+			c.req.raw.signal.aborted &&
+			(error === c.req.raw.signal.reason ||
+				(error instanceof Error && "code" in error && error.code === "DB_READ_ABORTED"))
+		)
+			throw catalogError("GIT_REQUEST_CANCELLED");
 		throw error;
 	});
 	await requireNarratorAccess(c, id, "read");
@@ -2368,9 +2392,12 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const userId = c.get("user").sub;
 
 	// ACL: narrator must exist and user must have access
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	await requireAccessToNarratorRow(c, narrator, "read");
 
@@ -3075,10 +3102,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Every session takes the same admission: a running one (including a run the
 		// user holds) queues the input for its next safe boundary, an idle one starts.
 		// Model overrides belong to the accepted input, not to the running turn.
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const creator: BufferCreator | null = user
 			? {
 					id: user.id,
@@ -3393,19 +3423,25 @@ async function resolveEditedFileReferences(
 	signal: AbortSignal,
 ): Promise<FileReferenceSnapshot[] | undefined> {
 	if (requested === undefined) return undefined;
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { messageId: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { messageId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!ref) throw new NotFoundError("Message", messageId);
 	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, ref.messageId),
-			...bodyColumns({ id: true, role: true, contentJson: true }),
-		}),
+		await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, ref.messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 	if (!message) throw new NotFoundError("Message", messageId);
 	if (message.role !== "user") throw new ValidationError("Can only edit user messages");
@@ -4000,7 +4036,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		if (!committed) {
 			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
-			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
+			for (const file of createdSavedFiles) await deleteBufferedTextFile(file);
 		}
 	}
 
@@ -4011,7 +4047,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	}
 	// A source-owned media reference may also be used by a fork. Removing a ref
 	// never deletes shared bytes; only newly-created uncommitted uploads are rolled back.
-	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
+	for (const file of droppedSavedFiles) await deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
@@ -4144,7 +4180,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4221,7 +4257,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const { clearBufferedMessages } = await import("../services/narrator-buffer");
 	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4266,10 +4302,13 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// window in which any unrelated write on a live narrator turned a good page into
 	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
 	return c.json(toBlockPage(result));
@@ -5054,7 +5093,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 	const msg = beforeMessageId
 		? await narratorService.clearContextBefore(narratorId, beforeMessageId)
 		: await narratorService.clearContext(narratorId);
-	resetActiveUpstreamSession(narratorId);
+	resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	// On a full context clear (no anchor), the Dynamic Spec tasks.json is left
@@ -5663,14 +5702,17 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			],
 		},
 	});
-	const manualToolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.messageId, msg.id),
-			eq(narratorToolCalls.narratorId, id),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true },
-	});
+	const manualToolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.messageId, msg.id),
+				eq(narratorToolCalls.narratorId, id),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
 	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
 	// now, and the result names it instead of a plan file.
@@ -5705,11 +5747,14 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		manualToolCall.id,
 	);
 	const fullMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, msg.id),
-			...bodyColumns(),
-			with: { toolCalls: true },
-		}),
+		await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, msg.id),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 	if (fullMsg) {
 		broadcastToNarrator(id, {
@@ -6209,13 +6254,16 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	const { sourceMessageId, sourceMessageUuid } = parsed.data;
 
 	// Verify the source message belongs to this narrator and capture its position.
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, id),
-			eq(narratorMessageRefs.messageId, sourceMessageId),
-		),
-		columns: { seq: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, id),
+				eq(narratorMessageRefs.messageId, sourceMessageId),
+			),
+			columns: { seq: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!ref) throw new ValidationError("Source message not found in this narrator");
 
 	const now = new Date().toISOString();
@@ -6301,10 +6349,13 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 
 	// Verify the pending message exists, belongs to this narrator, and is still pending
 	const pendingMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
-		}),
+		await readQuery(
+			db.query.narratorMessages.findFirst({
+				...bodyColumns(),
+				where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 	const pendingBlock = getAskInPassingPendingBlock(pendingMsg);
 	if (!pendingMsg || !pendingBlock) {
@@ -6413,10 +6464,13 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 
 	// Verify the message exists and is a pending ask-in-passing
 	const msg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-			...bodyColumns(),
-		}),
+		await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+				...bodyColumns(),
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 	if (!msg || !getAskInPassingPendingBlock(msg)) {
 		throw new ValidationError("Pending ask-in-passing message not found");
@@ -6502,15 +6556,27 @@ narratorRoutes.post("/:id/promote", async (c) => {
 // Get pending permissions
 narratorRoutes.get("/:id/permissions", async (c) => {
 	const id = c.req.param("id");
-	const permissions = await narratorService.getPendingPermissions(id);
-	// Attach the live AskUserQuestion reflection deadline (in-memory only) so the
-	// frontend can restore its countdown after a reconnect / refetch.
-	return c.json(
-		permissions.map((p) => {
-			const reflectionDeadline = getQuestionReflectionDeadline(p.id);
-			return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
-		}),
-	);
+	try {
+		const permissions = await narratorService.getPendingPermissions(id, c.req.raw.signal);
+		// Attach the live AskUserQuestion reflection deadline (in-memory only) so the
+		// frontend can restore its countdown after a reconnect / refetch.
+		return c.json(
+			permissions.map((p) => {
+				const reflectionDeadline = getQuestionReflectionDeadline(p.id);
+				return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			}),
+		);
+	} catch (error) {
+		// Only the original HTTP request's cancellation qualifies, not an independent read failure.
+		if (
+			c.req.raw.signal.aborted &&
+			error instanceof Error &&
+			"code" in error &&
+			error.code === "DB_READ_ABORTED"
+		)
+			return new Response(null, { status: 499 });
+		throw error;
+	}
 });
 
 /**
@@ -6563,10 +6629,13 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 		return c.json({ error: "Question detail exceeds the byte limit", tooLarge: true }, 413);
 	}
 	if (!detail.record) return c.json({ error: "Question not found" }, 404);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const canAct = !!narrator && (await canWriteNarrator(narrator, narratorPrincipalOf(c)));
 	return c.json({
 		question: detail.record,
@@ -6598,11 +6667,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const questionId = c.req.param("questionId");
 	const parsed = asyncQuestionSupplementSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const [existing] = await db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1);
+	const [existing] = await readQuery(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6637,12 +6709,14 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Ownership is checked against the question's own narrator rather than trusting the
 	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
 	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6671,12 +6745,14 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6702,12 +6778,14 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -7136,26 +7214,35 @@ async function rollbackPreviewResponse(
 	requestedBlockIndex: number | null,
 ) {
 	// Verify narrator exists
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) return c.json({ error: "Narrator not found" }, 404);
 
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
 
 	const targetMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			...bodyColumns({ id: true, role: true, contentJson: true }),
-		}),
+		await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 	if (!targetMsg) return c.json({ error: "Message not found" }, 404);
 
@@ -7259,25 +7346,28 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 	const toolUseId = c.req.query("toolUseId");
 	if (!toolUseId) return c.json({ error: "toolUseId query param is required" }, 400);
 
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: {
-			toolUseId: true,
-			toolName: true,
-			inputJson: true,
-			executionDeviceId: true,
-			executionCwd: true,
-			executionPathFlavor: true,
-			resolvedFilePath: true,
-			canonicalFilePath: true,
-			runtimeGeneration: true,
-			executionTargetsJson: true,
-			deviceSelectionSource: true,
-		},
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				toolUseId: true,
+				toolName: true,
+				inputJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				executionPathFlavor: true,
+				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
+				deviceSelectionSource: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
 
 	// StructSed records no replayable file identity until it has written, and its pending
@@ -7592,9 +7682,12 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistDirs.findFirst({
+			where: eq(narratorWhitelistDirs.id, dirId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "directoryWhitelist",
@@ -7605,10 +7698,13 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistDirs.findFirst({
+			where: eq(narratorWhitelistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryWhitelist", dirId);
 	return c.json({ ok: true });
@@ -7641,9 +7737,12 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistDirs.findFirst({
+			where: eq(narratorBlacklistDirs.id, dirId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "directoryBlacklist",
@@ -7654,10 +7753,13 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistDirs.findFirst({
+			where: eq(narratorBlacklistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryBlacklist", dirId);
 	return c.json({ ok: true });
@@ -7690,9 +7792,12 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistCmds.findFirst({
+			where: eq(narratorWhitelistCmds.id, entryId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "commandWhitelist",
@@ -7703,10 +7808,13 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 
 narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistCmds.findFirst({
+			where: eq(narratorWhitelistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandWhitelist", entryId);
 	return c.json({ ok: true });
@@ -7739,9 +7847,12 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistCmds.findFirst({
+			where: eq(narratorBlacklistCmds.id, entryId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "commandBlacklist",
@@ -7752,10 +7863,13 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 
 narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistCmds.findFirst({
+			where: eq(narratorBlacklistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandBlacklist", entryId);
 	return c.json({ ok: true });

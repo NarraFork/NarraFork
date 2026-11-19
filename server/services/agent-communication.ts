@@ -1,3 +1,4 @@
+import { readQueryFirst } from "@server/db/worker-read";
 import { NotFoundError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
@@ -170,14 +171,14 @@ export interface SendSubagentResult {
 }
 
 /** Stable coordinates survive COW and can be recovered by reserved address. */
-function stableSendCoordinates(
+async function stableSendCoordinates(
 	id: string,
 	messageId?: string,
 	delivery?: Pick<
 		import("./agent-message-delivery").AgentMessageDelivery,
 		"deliveryId" | "recipientRefId" | "revision"
 	>,
-): Partial<SendDeliveryTarget> {
+): Promise<Partial<SendDeliveryTarget>> {
 	if (delivery?.deliveryId)
 		return {
 			deliveryId: delivery.deliveryId,
@@ -185,22 +186,24 @@ function stableSendCoordinates(
 			revision: delivery.revision,
 		};
 	if (!messageId) return {};
-	const row = db
-		.select({
-			deliveryId: narratorBufferedMessages.deliveryId,
-			recipientRefId: narratorBufferedMessages.recipientRefId,
-			revision: narratorBufferedMessages.contentRevision,
-			receiptDisposition: narratorBufferedMessages.receiptDisposition,
-		})
-		.from(narratorBufferedMessages)
-		.where(
-			and(
-				eq(narratorBufferedMessages.narratorId, id),
-				eq(narratorBufferedMessages.recipientMessageId, messageId),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				deliveryId: narratorBufferedMessages.deliveryId,
+				recipientRefId: narratorBufferedMessages.recipientRefId,
+				revision: narratorBufferedMessages.contentRevision,
+				receiptDisposition: narratorBufferedMessages.receiptDisposition,
+			})
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, id),
+					eq(narratorBufferedMessages.recipientMessageId, messageId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!row?.deliveryId) return {};
 	return {
 		deliveryId: row.deliveryId,
@@ -209,18 +212,18 @@ function stableSendCoordinates(
 		receiptDisposition: row.receiptDisposition,
 	};
 }
-function notifyDeliveryResolved(
+async function notifyDeliveryResolved(
 	input: SendSubagentInput,
 	id: string,
 	deliveryMessageId: string,
 	title?: string | null,
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery,
-): void {
+): Promise<void> {
 	try {
 		input.onDeliveryResolved?.({
 			id,
 			deliveryMessageId,
-			...stableSendCoordinates(id, deliveryMessageId, delivery),
+			...(await stableSendCoordinates(id, deliveryMessageId, delivery)),
 			...(title !== undefined ? { title } : {}),
 		});
 	} catch (error) {
@@ -1098,7 +1101,13 @@ async function deliverSubagentMessageToParent(
 	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
 
-	notifyDeliveryResolved(input, parentId, delivery.recipientMessageId, parent.title, delivery);
+	await notifyDeliveryResolved(
+		input,
+		parentId,
+		delivery.recipientMessageId,
+		parent.title,
+		delivery,
+	);
 
 	// Wake the parent only when idle; a working/waiting parent drains the queue
 	// at its next after_tools sidecar boundary.
@@ -1112,7 +1121,7 @@ async function deliverSubagentMessageToParent(
 		title: parent.title,
 		status: started ? "started" : "queued",
 		deliveryMessageId: delivery.recipientMessageId,
-		...stableSendCoordinates(parentId, delivery.recipientMessageId, delivery),
+		...(await stableSendCoordinates(parentId, delivery.recipientMessageId, delivery)),
 	};
 }
 
@@ -1244,7 +1253,6 @@ export async function sendSubagentMessageDetailed(
 				: "";
 			const interruptTarget = input.doInterrupt && !takenOver;
 			const running = fresh.status === "working" || fresh.status === "waiting";
-
 			// Prefix sibling/child-bound messages with a sender label so the recipient
 			// can tell who sent it (user-typed page messages bypass this path entirely).
 			const deliveredMessage = withSenderPrefix(
@@ -1327,11 +1335,11 @@ export async function sendSubagentMessageDetailed(
 					title: fresh.title,
 					status: "queued",
 					deliveryMessageId,
-					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+					...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),
 					...(appliedModel && { model: appliedModel }),
 					interrupted,
 				});
-				notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
+				await notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 				continue;
 			}
 
@@ -1380,9 +1388,9 @@ export async function sendSubagentMessageDetailed(
 				...(appliedModel && { model: appliedModel }),
 				...(resumeRequested && !wakeFailed && { resumed: true }),
 				deliveryMessageId,
-				...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+				...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),
 			});
-			notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
+			await notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 		} catch (err) {
 			const error = err instanceof Error ? err.message : String(err);
 			sections.push(`Failed to send to ${label}: ${error}`);

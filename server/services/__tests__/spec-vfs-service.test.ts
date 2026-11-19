@@ -477,8 +477,14 @@ describe("spec fork carryover helpers", () => {
 		expect(index.builtin).toBe(true);
 		expect(index.content).toContain("tasks.json");
 
-		// The custom note file is gone.
-		expect(readSpecFile(narratorId, "spec://notes.md")).rejects.toThrow(/not found/);
+		// The custom note file is gone. Settle the worker read before the sync throw matcher.
+		const missingNotesError = await readSpecFile(narratorId, "spec://notes.md").then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(() => {
+			throw missingNotesError;
+		}).toThrow(/not found/);
 		const files = await listSpecFiles(narratorId);
 		expect(files.map((f) => f.uri)).not.toContain("spec://notes.md");
 
@@ -513,6 +519,12 @@ describe("spec fork carryover helpers", () => {
 		// Child is reset.
 		const childTasks = await readTasksFileForNarrator(childId);
 		expect(JSON.parse(childTasks.content).tasks).toEqual([]);
-		expect(readSpecFile(childId, "spec://notes.md")).rejects.toThrow(/not found/);
+		const missingNotesError = await readSpecFile(childId, "spec://notes.md").then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(() => {
+			throw missingNotesError;
+		}).toThrow(/not found/);
 	});
 });

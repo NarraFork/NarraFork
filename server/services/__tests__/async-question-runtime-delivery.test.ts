@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -10,10 +10,18 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const fixture = getRuntimeTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+const session = await import("../narrator-session");
 const {
 	scheduleQuestionAnswerDelivery,
 	drainInjectionsIntoHistory,
@@ -22,14 +30,25 @@ const {
 	isQuestionAnswerDeliveryReady,
 	interruptNarrator,
 	consumeQuestionAnswerModelReceipts,
-} = await import("../narrator-session");
+} = session;
 const { activeNarrators } = await import("../narrator-session-state");
 const { MAILBOX_LIMITS } = await import("../agent-runtime/limits");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const time = "2026-10-05T00:00:00.000Z";
 const narratorId = "question-runtime";
 
-async function captureQuestionRequests(
+const captureWork = new Map<Promise<unknown>, AbortController>();
+function captureQuestionRequests(
+	...args: Parameters<typeof captureQuestionRequestsImpl>
+): ReturnType<typeof captureQuestionRequestsImpl> {
+	const work = captureQuestionRequestsImpl(...args);
+	captureWork.set(work, args[0].abortController);
+	const release = () => captureWork.delete(work);
+	void work.then(release, release);
+	return work;
+}
+
+async function captureQuestionRequestsImpl(
 	running: ActiveNarrator,
 	questionId: string,
 	groups: number[] | ((turn: number) => number),
@@ -131,10 +150,13 @@ async function captureQuestionRequests(
 					injected.push(...input.parts);
 					return input;
 				},
-				onModelInputConsumed: (_history, _content, ids) => {
+				onModelInputConsumed: async (_history, _content, ids) => {
 					adopted.push(Array.from(ids ?? []));
 					running._questionAnswerAdoptedMessageIds = new Set(ids);
-					consumeQuestionAnswerModelReceipts(narratorId, running._questionAnswerAdoptedMessageIds);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						running._questionAnswerAdoptedMessageIds,
+					);
 				},
 			},
 			currentText,
@@ -169,23 +191,28 @@ async function captureQuestionRequests(
 
 async function fillNoticeInbox(prefix: string) {
 	const { runtimeInbox } = await import("../agent-runtime/inbox");
-	for (let i = 0; i < MAILBOX_LIMITS.noticePending; i++) {
-		const result = runtimeInbox.enqueue({
-			kind: "task_notice",
-			noticeKind: "agent",
-			narratorId,
-			sourceKey: `${prefix}-${i}`,
-			text: "older notice",
-			projectedByteSize: 100,
-			metadata: {
-				producerKind: "agent",
-				eventKind: "completed",
-				taskId: `${prefix}-task-${i}`,
-				logicalRunId: `${prefix}-run-${i}`,
-			},
-		});
-		expect(result.status).toBe("accepted");
-	}
+	db.transaction((tx) => {
+		for (let i = 0; i < MAILBOX_LIMITS.noticePending; i++) {
+			const result = runtimeInbox.enqueue(
+				{
+					kind: "task_notice",
+					noticeKind: "agent",
+					narratorId,
+					sourceKey: `${prefix}-${i}`,
+					text: "older notice",
+					projectedByteSize: 100,
+					metadata: {
+						producerKind: "agent",
+						eventKind: "completed",
+						taskId: `${prefix}-task-${i}`,
+						logicalRunId: `${prefix}-run-${i}`,
+					},
+				},
+				tx,
+			);
+			expect(result.status).toBe("accepted");
+		}
+	});
 }
 
 async function waitForAnswerAdoption(answerId: string) {
@@ -319,13 +346,19 @@ beforeEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
 afterEach(async () => {
+	for (const controller of captureWork.values()) controller.abort("test cleanup");
+	activeNarrators.get(narratorId)?.abortController?.abort("test cleanup");
+	await Promise.allSettled([...captureWork.keys()]);
+	await session.drainNarratorSessionTails({ deadlineAt: Date.now() + 30_000 });
+	await drainRuntimeTestWork();
 	activeNarrators.delete(narratorId);
 	backgroundOccupancyStore.setRuntimeLive(narratorId, false);
 	await backgroundOccupancyStore.flush();
+	await drainRuntimeTestWork();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	backgroundOccupancyStore.resetForTests();
-	sqlite.close();
 });
 
 describe("async question receipt runtime adoption", () => {
@@ -412,12 +445,12 @@ describe("async question receipt runtime adoption", () => {
 			answers: { choice: "sensitive answer" },
 			answerMessageId: "answer",
 		};
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"sensitive answer",
 		);
 		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"Question action=get",
 		);
@@ -432,7 +465,7 @@ describe("async question receipt runtime adoption", () => {
 			.set({ state: "materialized", adoptedAt: time, currentAdoptedAt: time })
 			.where(eq(narratorBufferedMessages.recipientMessageId, "answer"))
 			.run();
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 	});
 	test("deleting an answer through ordinary history mutation reopens its question and cancels delivery", async () => {
 		const question = await seedQuestion();
@@ -450,7 +483,9 @@ describe("async question receipt runtime adoption", () => {
 			.get();
 		expect(restored?.status).toBe("open");
 		expect(restored?.answerMessageId).toBeNull();
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(
+			false,
+		);
 	});
 	test("unlinking the original shared request withdraws it while a fork retains its background row", async () => {
 		const question = await seedQuestion();
@@ -517,7 +552,7 @@ describe("async question receipt runtime adoption", () => {
 			locale: "en",
 		} as import("../../lib/agent/types").ToolContext;
 		const query = () => questionTool.execute({ action: "get", id: question.id }, context);
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
 		expect(delivery()).toEqual([]);
 		const [first, parallel] = await Promise.all([query(), query()]);
 		expect(first.isError).not.toBe(true);
@@ -541,7 +576,7 @@ describe("async question receipt runtime adoption", () => {
 		const freed = await drainInjectionsIntoHistory(running, "en");
 		expect(freed.text).not.toContain("All except Redis");
 		freed.onConsumed();
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
 		const accepted = delivery();
 		expect(accepted).toHaveLength(1);
 		expect(accepted[0]).toMatchObject({ state: "queued", currentAdoptedAt: null });
@@ -597,7 +632,7 @@ describe("async question receipt runtime adoption", () => {
 		});
 		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
 		const answerId = answer.record.answerMessageId;
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
 		let queriedAfterAdoption = false;
 		const evidence = await captureQuestionRequests(running, question.id, (turn) => {
 			if (turn > MAILBOX_LIMITS.noticePending + 2)

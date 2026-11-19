@@ -63,6 +63,7 @@ import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -282,18 +283,21 @@ async function deliverInjectionUnlocked(
 	// blank card for the reader plus a wasted turn for the model.
 	if (!content) return EMPTY_RESULT;
 
-	const locale = options.locale ?? "en";
 	const existingRole = options.messageId
-		? db
-				.select({ role: narratorMessages.role })
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.id, options.messageId),
-						eq(narratorMessages.narratorId, narratorId),
-					),
+		? (
+				await readQueryFirst(
+					db
+						.select({ role: narratorMessages.role })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, options.messageId),
+								eq(narratorMessages.narratorId, narratorId),
+							),
+						),
+					{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
 				)
-				.get()?.role
+			)?.role
 		: undefined;
 	const role =
 		options.role ?? (existingRole === "user" || existingRole === "sys" ? existingRole : "sys");
@@ -393,7 +397,7 @@ async function deliverInjectionUnlocked(
 		// subagent, and what may start one" in a module that reaches the session layer only
 		// through a lazy import — and would leave the route-level caller of the same
 		// scheduler entry unprotected.
-		result.started = await wakeIfIdle(narratorId, locale, options.executionPrincipal);
+		result.started = await wakeIfIdle(narratorId, options.locale, options.executionPrincipal);
 	}
 
 	return result;
@@ -420,7 +424,7 @@ export interface InjectionScheduler {
 	requestSoftStop: (narratorId: string) => boolean;
 	wakeIfIdle: (
 		narratorId: string,
-		locale: Locale,
+		locale?: Locale,
 		executionPrincipal?: QuestionExecutionPrincipal,
 	) => Promise<{ started: boolean }>;
 }
@@ -490,7 +494,7 @@ async function requestSoftStop(narratorId: string): Promise<boolean> {
  */
 async function wakeIfIdle(
 	narratorId: string,
-	locale: Locale,
+	locale?: Locale,
 	executionPrincipal?: QuestionExecutionPrincipal,
 ): Promise<boolean> {
 	try {

@@ -32,12 +32,20 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import * as workerPool from "../../lib/db-worker/pool";
 import { readRuntimeRegistrationColumn } from "../../lib/validators/runtime-registration";
-
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
-// The snapshot worker shares the preload-isolated file-backed database.
-const { db, sqlite } = await import("../../db");
+const fixture = getRuntimeTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
@@ -114,14 +122,16 @@ afterEach(async () => {
 	getExecutionOwner(RUN)?.release();
 	activeNarrators.delete(RUN);
 	setRunHold(RUN, undefined);
+	await drainRuntimeTestWork();
 	mock.restore();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	unregisterProvider();
+	mock.module("../../db", () => realDb);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 });
 
@@ -366,7 +376,12 @@ describe("A. detach and the finalizer", () => {
 			foreground: true,
 		});
 		await settle(() => !!getRunControl(RUN)?.logicalRunId);
-		await expect(controlRun(RUN, { kind: "detach" })).rejects.toThrow("task row unavailable");
+		const failure = await controlRun(RUN, { kind: "detach" }).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("task row unavailable");
 		expect(getRunControl(RUN)?.waiter).toBeDefined();
 		gate.resolve();
 		const result = await handle.foreground;
@@ -467,7 +482,18 @@ describe("background and detached terminal source transactions", () => {
 				text: "work",
 				...(detached ? { binding: binding(), foreground: true } : { resumeRunId }),
 			});
-			await entered.promise;
+			try {
+				await Promise.race([
+					entered.promise,
+					handle.completion.then(() => {
+						throw new Error("Run settled before the scripted model gate");
+					}),
+				]);
+			} catch (error) {
+				gate.resolve();
+				await handle.completion.catch(() => {});
+				throw error;
+			}
 			if (detached) {
 				expect(await controlRun(RUN, { kind: "detach" })).toBe(true);
 				expect((await handle.foreground).handoff).toBe(true);
@@ -510,6 +536,73 @@ describe("background and detached terminal source transactions", () => {
 				await handle.completion;
 				expect(sessionRow()?.status).toBe("idle");
 			});
+		if (!detached) {
+			test("a task relink after the finalizer read rejects the old run inside its terminal transaction", async () => {
+				const { handle, gate, calls, runId } = await launch();
+				const commit = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+				let newerRunId: string | undefined;
+				spyOn(backgroundTaskService, "markCompleted").mockImplementation(async (...args) => {
+					// deliverDetachedResult already read the old task; a new start commits
+					// before its terminal transaction reaches the task CAS.
+					newerRunId = runtimePublication.startRun({
+						narratorId: RUN,
+						binding: backgroundBinding(),
+					}).publication?.logicalRunId;
+					return commit(...args);
+				});
+				gate.resolve();
+				const failure = await handle.completion.then(
+					() => null,
+					(error: unknown) => error,
+				);
+				expect(failure).toBeInstanceOf(Error);
+				expect(failure).toMatchObject({
+					code: "PUBLICATION_IDENTITY_MISMATCH",
+					reason: "identity_mismatch",
+				});
+				expect(newerRunId).not.toBe(runId);
+				expect(taskRow()).toMatchObject({
+					status: "running",
+					logicalRunId: newerRunId,
+					parentNarratorId: CALLER,
+					output: null,
+				});
+				expect(sessionRow()?.logicalRunId).toBe(newerRunId);
+				expect(sessionRow()?.backgroundResult).toBeNull();
+				expect(delivered(runId)).toHaveLength(0);
+				expect(delivered(newerRunId)).toHaveLength(0);
+				expect(calls).toHaveLength(1);
+				expect(toolOutput()).toBe("PENDING");
+				expect(
+					db
+						.select()
+						.from(narratorMessages)
+						.where(eq(narratorMessages.id, `publication-result:${newerRunId}`))
+						.get(),
+				).toBeUndefined();
+			});
+
+			test("same-run recipient drift is rejected before task completion or tool fallback", async () => {
+				const { handle, gate, runId } = await launch();
+				db.update(backgroundTasks)
+					.set({ parentNarratorId: RUN })
+					.where(eq(backgroundTasks.id, RUN))
+					.run();
+				gate.resolve();
+				const failure = await handle.completion.then(
+					() => null,
+					(error: unknown) => error,
+				);
+				expect(failure).toBeInstanceOf(Error);
+				expect(failure).toMatchObject({
+					code: "PUBLICATION_IDENTITY_MISMATCH",
+					reason: "identity_mismatch",
+				});
+				expect(taskRow()).toMatchObject({ status: "running", logicalRunId: runId, output: null });
+				expect(delivered(runId)).toHaveLength(0);
+				expect(toolOutput()).toBe("PENDING");
+			});
+		}
 		test(`${detached ? "detached" : "background"} retries one failed source commit without a second terminal or model pass`, async () => {
 			const { handle, gate, calls, runId } = await launch();
 			const commit = backgroundTaskService.markCompleted.bind(backgroundTaskService);
@@ -542,7 +635,12 @@ describe("background and detached terminal source transactions", () => {
 				throw new Error("SQLITE_BUSY exhausted source transaction");
 			});
 			gate.resolve();
-			await expect(handle.completion).rejects.toThrow("exhausted source transaction");
+			const failure = await handle.completion.then(
+				() => null,
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(Error);
+			expect((failure as Error).message).toContain("exhausted source transaction");
 			expect(writes).toHaveBeenCalledTimes(3);
 			expect(taskRow()?.status).toBe("running");
 			expect(sessionRow()?.backgroundResult).toBe("same immutable terminal answer");
@@ -612,7 +710,7 @@ describe("C. a new run of an ended background task", () => {
 			logicalRunId: firstRunId,
 			recipientId: CALLER,
 		});
-		runtimePublication.flushRecipient(CALLER);
+		await runtimePublication.flushRecipient(CALLER);
 		const noticesBefore = notices().length;
 		const gate = Promise.withResolvers<void>();
 		mock.restore();
@@ -642,7 +740,7 @@ describe("C. a new run of an ended background task", () => {
 		// delivered once, as a notice of the new run.
 		expect(consumed(secondRunId)).toHaveLength(0);
 		expect(delivered(secondRunId)).toHaveLength(1);
-		runtimePublication.flushRecipient(CALLER);
+		await runtimePublication.flushRecipient(CALLER);
 		const fresh = notices().slice(noticesBefore);
 		expect(fresh).toHaveLength(1);
 		expect(fresh[0].dedupeKey).toContain(secondRunId as string);
@@ -957,7 +1055,7 @@ describe("C. a new run of an ended background task", () => {
 				createdAt: NOW,
 			})
 			.run();
-		runtimePublication.flushRecipient(CALLER);
+		await runtimePublication.flushRecipient(CALLER);
 		expect(notices().map((row) => row.dedupeKey)).toEqual([expect.stringContaining(firstRunId)]);
 		const noticesBefore = notices().length;
 		mock.restore();
@@ -980,7 +1078,7 @@ describe("C. a new run of an ended background task", () => {
 		await settle(() => !getExecutionOwner(RUN));
 		expect(taskRow()).toMatchObject({ status: "completed", logicalRunId: retryRunId });
 		expect(taskRow()?.output).toContain("after the retried tool");
-		runtimePublication.flushRecipient(CALLER);
+		await runtimePublication.flushRecipient(CALLER);
 		const fresh = notices().slice(noticesBefore);
 		expect(fresh).toHaveLength(1);
 		expect(fresh[0].dedupeKey).toContain(retryRunId as string);
@@ -1211,13 +1309,22 @@ describe("hold protocol regressions", () => {
 		expect(config?.disabledTools).toContain("Write");
 		const finalGate = config?.onToolExecutionFinalAuthorization;
 		if (!finalGate) throw new Error("Missing final-start gate");
-		await expect(
-			finalGate({
-				toolUse: { name: "Write", toolUseId: "blocked-write", input: {} },
-				effectiveInput: {},
-				binding: { toolCallId: "blocked-write", attempt: 1 },
-			} as Parameters<typeof finalGate>[0]),
-		).rejects.toThrow("Tool disabled by the current effective traits: Write");
+		const authorizationFailure = await Promise.resolve()
+			.then(() =>
+				finalGate({
+					toolUse: { name: "Write", toolUseId: "blocked-write", input: {} },
+					effectiveInput: {},
+					binding: { toolCallId: "blocked-write", attempt: 1 },
+				} as Parameters<typeof finalGate>[0]),
+			)
+			.then(
+				() => null,
+				(error: unknown) => error,
+			);
+		expect(authorizationFailure).toBeInstanceOf(Error);
+		expect((authorizationFailure as Error).message).toContain(
+			"Tool disabled by the current effective traits: Write",
+		);
 		await controlRun(RUN, { kind: "release" });
 		await handle.completion;
 		expect(calls).toHaveLength(2);
@@ -1270,7 +1377,12 @@ describe("hold protocol regressions", () => {
 		const pub = getRuntimePublicationService();
 		spyOn(pub, "commitAgentTerminal").mockRejectedValueOnce(new Error("injected terminal failure"));
 		await controlRun(RUN, { kind: "release" });
-		await expect(handle.completion).rejects.toThrow("injected terminal failure");
+		const failure = await handle.completion.then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("injected terminal failure");
 		expect(getRunHold(RUN)?.result?.finalText).toBe("immutable held answer");
 		expect(sessionRow()?.substatus).toContain("taken_over");
 		expect(
@@ -1474,7 +1586,12 @@ describe("hold protocol regressions", () => {
 		expect((await buffer.enqueueBufferedMessage(RUN, "accepted during release")).ok).toBe(true);
 		expect(await inbox.wakeInboxIfEligible(RUN, "en")).toBe(false);
 		gate.resolve();
-		await expect(release).rejects.toThrow("cold release commit failed");
+		const failure = await release.then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("cold release commit failed");
 		await settle(() => calls.length === 1 && !!getRunControl(RUN)?.wake);
 		expect(getRunHold(RUN)).toBe(hold);
 		expect(getRunHold(RUN)?.released).toBe(false);
@@ -1563,21 +1680,27 @@ describe("hold protocol regressions", () => {
 	test("M8 labels are parsed exactly and each hydration query scans one bounded primary-key page", async () => {
 		seed();
 		db.update(narrators).set({ substatus: '["taken-over"]' }).where(eq(narrators.id, RUN)).run();
-		const selects: string[] = [];
-		const prepare = sqlite.prepare.bind(sqlite);
-		spyOn(sqlite, "prepare").mockImplementation((query, ...rest) => {
-			selects.push(query);
-			return prepare(query, ...rest);
-		});
-		expect((await hydrateRunHolds()).has(RUN)).toBe(false);
-		const scans = selects.filter(
-			(q) => q.includes('"substatus"') && q.includes('from "narrators"'),
-		);
-		expect(scans.length).toBeGreaterThan(0);
-		for (const query of scans) {
-			expect(query.toLowerCase()).not.toContain("like");
-			expect(query.toLowerCase()).toContain("limit");
-			expect(query).toContain('"narrators"."id" >');
+		const requests = spyOn(workerPool, "runReadTask");
+		try {
+			expect((await hydrateRunHolds()).has(RUN)).toBe(false);
+			const scans = requests.mock.calls.flatMap(([path, params]) =>
+				params.kind === "selectRows" &&
+				params.sql.includes('"substatus"') &&
+				params.sql.includes('from "narrators"')
+					? [{ path, ...params }]
+					: [],
+			);
+			expect(scans.length).toBeGreaterThan(0);
+			for (const scan of scans) {
+				expect(scan.path).toBe(sqlite.filename);
+				expect(scan.sql.toLowerCase()).not.toContain("like");
+				expect(scan.sql.toLowerCase()).toContain("limit");
+				expect(scan.sql).toContain('"narrators"."id" >');
+				expect(scan.maxRows).toBe(500);
+				expect(scan.params).toEqual(["", 500]);
+			}
+		} finally {
+			requests.mockRestore();
 		}
 	});
 });

@@ -7,15 +7,15 @@ import {
 	STORAGE_CATEGORY_PROGRESS_MESSAGE,
 	type StorageCategoryKey,
 } from "@shared/storage-categories";
-import { and, asc, eq, gt, isNotNull, sql } from "drizzle-orm";
-import { db } from "../db";
+import { and, asc, eq, gt, isNotNull, or, sql } from "drizzle-orm";
+import { activeDatabaseBackend, db } from "../db";
 import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
 	getChatAttachmentsDir,
-	listStoredChatAttachmentNames,
+	withChatAttachmentPublicationLock,
 } from "../lib/chat-attachments";
 import { coordinatorOutputsRoot } from "../lib/coordinator-outputs-path";
 import { DbReadTaskTimeoutError } from "../lib/db-worker/pool";
@@ -26,14 +26,16 @@ import {
 import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
+import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir, isWithinDir } from "../lib/uploads";
-import { blockReadsEnabled, imageEnvelopeOwners } from "./narrator-block-scans";
+import { collectKeysetRows } from "./read/read-collect";
 import {
 	DatabaseStorageScanCancelledError,
 	DatabaseStorageUnsupportedError,
 } from "./storage/database-storage-port";
 import { databaseStoragePort } from "./storage/store";
+import { uploadReferencePredicate } from "./storage/upload-reference-predicate";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -192,21 +194,60 @@ export function buildReferencedUploadOwnerIds(
  * `input_image` asset rows (the same `{type: "image", imageId}` elements
  * `contentJsonHasImageBlocks` looks for) instead of a substring scan of every message.
  */
-export function referencedUploadOwnerIds(narratorIds: Iterable<string>): Set<string> {
-	if (blockReadsEnabled()) {
-		const { owners, unindexed } = imageEnvelopeOwners();
-		return buildReferencedUploadOwnerIds([...narratorIds, ...owners], unindexed);
+export async function referencedUploadOwnerIds(
+	narratorIds: Iterable<string>,
+): Promise<Set<string>> {
+	const owners = new Set(narratorIds);
+	const fromBlocks =
+		activeDatabaseBackend === "sqlite" &&
+		(settings.narratorBlocks.read ||
+			!!(await readQueryFirst(
+				db
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(eq(narratorMessages.bodyRowsOnly, 1))
+					.limit(1),
+				{ executionPolicy: "worker-required" },
+			)));
+	const literalImage = uploadReferencePredicate(
+		narratorMessages.contentJson,
+		activeDatabaseBackend,
+	);
+	const current = sql`(${narratorMessages.bodyFormat} = 2 AND (${narratorMessages.bodyRowsOnly} = 1 OR NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${narratorMessages.id})))`;
+	const predicate = fromBlocks
+		? or(
+				and(
+					current,
+					sql`EXISTS (SELECT 1 FROM narrator_block_assets a JOIN narrator_blocks b ON b.id = a.block_id WHERE b.message_id = ${narratorMessages.id} AND a.role = 'input_image')`,
+				),
+				and(
+					sql`(${narratorMessages.bodyFormat} = 1 OR (${narratorMessages.bodyRowsOnly} = 0 AND EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = ${narratorMessages.id})))`,
+					literalImage,
+				),
+			)
+		: literalImage;
+	let after = "";
+	while (true) {
+		const rows = await readQuery(
+			db
+				.selectDistinct({ narratorId: narratorMessages.narratorId })
+				.from(narratorMessages)
+				.where(
+					and(
+						isNotNull(narratorMessages.narratorId),
+						gt(narratorMessages.narratorId, after),
+						predicate,
+					),
+				)
+				.orderBy(asc(narratorMessages.narratorId))
+				.limit(256),
+			{ executionPolicy: "worker-required" },
+		);
+		for (const row of rows) if (row.narratorId) owners.add(row.narratorId);
+		if (rows.length < 256) break;
+		after = rows[rows.length - 1].narratorId as string;
 	}
-	// Only messages that contain an image block can pin an upload dir. Pre-filter
-	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
-	// which requires the literal `"type":"image"`) so we avoid loading every
-	// message's content_json into memory. The exact check below stays authoritative.
-	const uploadMessageOwners = db
-		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
-		.all();
-	return buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
+	return owners;
 }
 
 // ── Scan functions (each returns one category) ─────────────────────────────
@@ -493,7 +534,7 @@ async function readWorktreeProjects(signal?: AbortSignal) {
 				)
 				.orderBy(asc(projects.id))
 				.limit(pageSize),
-			{ signal, maxRows: pageSize, timeoutMs },
+			{ executionPolicy: "worker-required", signal, maxRows: pageSize, timeoutMs },
 		).catch((error) => {
 			throwIfAborted(signal);
 			throw error;
@@ -510,6 +551,7 @@ async function scanWorktrees(options: CategoryScanOptions = {}): Promise<Storage
 	let truncated = false;
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
+	throwIfAborted(options.signal);
 	const allProjects = await readWorktreeProjects(options.signal);
 
 	for (const proj of allProjects) {
@@ -935,12 +977,22 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, freedBytes: 0 };
 		throw err;
 	}
-	const narratorIds = db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.all()
-		.map((n) => n.id);
-	const preservedOwnerIds = referencedUploadOwnerIds(narratorIds);
+	const narratorIds = (
+		await collectKeysetRows(
+			(after) =>
+				readQuery(
+					db
+						.select({ id: narrators.id })
+						.from(narrators)
+						.where(after === null ? undefined : gt(narrators.id, after))
+						.orderBy(asc(narrators.id))
+						.limit(200),
+					{ executionPolicy: "worker-required" },
+				),
+			(row) => row.id,
+		)
+	).map((row) => row.id);
+	const preservedOwnerIds = await referencedUploadOwnerIds(narratorIds);
 
 	let removed = 0;
 	let freedBytes = 0;
@@ -1000,40 +1052,44 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 	// whatever is left over is collected by the next run.
 	const DRAFT_SWEEP_LIMIT = 500;
 	const cutoff = new Date(Date.now() - CHAT_DRAFT_ATTACHMENT_TTL_MS).toISOString();
-	const staleDrafts = db
-		.select({
-			id: chatAttachments.id,
-			roomId: chatAttachments.roomId,
-			storedName: chatAttachments.storedName,
-			sizeBytes: chatAttachments.sizeBytes,
-		})
-		.from(chatAttachments)
-		.where(sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`)
-		.limit(DRAFT_SWEEP_LIMIT)
-		.all();
+	const staleDrafts = await readQuery(
+		db
+			.select({
+				id: chatAttachments.id,
+				roomId: chatAttachments.roomId,
+				storedName: chatAttachments.storedName,
+				sizeBytes: chatAttachments.sizeBytes,
+			})
+			.from(chatAttachments)
+			.where(sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`)
+			.limit(DRAFT_SWEEP_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 	if (staleDrafts.length > 0) {
-		db.delete(chatAttachments)
+		const deletedDrafts = await db
+			.delete(chatAttachments)
 			.where(
-				sql`${chatAttachments.id} IN (${sql.join(
-					staleDrafts.map((row) => sql`${row.id}`),
-					sql`, `,
-				)})`,
+				and(
+					sql`${chatAttachments.id} IN (${sql.join(
+						staleDrafts.map((row) => sql`${row.id}`),
+						sql`, `,
+					)})`,
+					sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`,
+				),
 			)
-			.run();
-		deleteChatAttachmentFiles(staleDrafts);
-		removed += staleDrafts.length;
-		freedBytes += staleDrafts.reduce((total, row) => total + row.sizeBytes, 0);
-		logger.info("Removed abandoned chat attachment drafts", { count: staleDrafts.length });
+			.returning({
+				id: chatAttachments.id,
+				roomId: chatAttachments.roomId,
+				storedName: chatAttachments.storedName,
+				sizeBytes: chatAttachments.sizeBytes,
+			});
+		deleteChatAttachmentFiles(deletedDrafts);
+		removed += deletedDrafts.length;
+		freedBytes += deletedDrafts.reduce((total, row) => total + row.sizeBytes, 0);
+		logger.info("Removed abandoned chat attachment drafts", { count: deletedDrafts.length });
 	}
 
-	// (2) + (3) Reconcile the directories on disk against the rooms and rows.
-	const liveRoomIds = new Set(
-		db
-			.select({ id: chatRooms.id })
-			.from(chatRooms)
-			.all()
-			.map((r) => r.id),
-	);
+	// Directory enumeration supplies candidates; publication ownership decides reclamation.
 	let entries: Dirent[];
 	try {
 		entries = await readdir(root, { withFileTypes: true });
@@ -1047,37 +1103,63 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 		const roomId = entry.name;
 		const dirPath = resolve(root, roomId);
 
-		if (!liveRoomIds.has(roomId)) {
-			const size = await dirSize(dirPath);
-			await rm(dirPath, { recursive: true, force: true });
-			removed++;
-			freedBytes += size;
-			logger.info("Removed chat attachments for a deleted room", { roomId, size });
+		let files: Dirent[];
+		try {
+			files = (await readdir(dirPath, { withFileTypes: true })).filter((file) => file.isFile());
+		} catch {
 			continue;
 		}
-
-		// One room's rows: bounded by that room's attachment count and served by the
-		// `(room_id, claimed_at)` index.
-		const known = new Set(
-			db
-				.select({ storedName: chatAttachments.storedName })
-				.from(chatAttachments)
-				.where(eq(chatAttachments.roomId, roomId))
-				.all()
-				.map((row) => row.storedName),
-		);
-		for (const storedName of listStoredChatAttachmentNames(roomId)) {
-			if (known.has(storedName)) continue;
-			const filePath = resolve(dirPath, storedName);
-			try {
-				const size = (await stat(filePath)).size;
-				await rm(filePath, { force: true });
-				removed++;
-				freedBytes += size;
-				logger.info("Removed unreferenced chat attachment file", { roomId, storedName, size });
-			} catch {
-				// Already gone, or unreadable — nothing to reclaim either way.
-			}
+		const batchSize = 50;
+		for (let offset = 0; offset < Math.max(1, files.length); offset += batchSize) {
+			const candidates = files.slice(offset, offset + batchSize).map((file) => file.name);
+			const directoryRemoved = await withChatAttachmentPublicationLock(roomId, async () => {
+				const room = await readQueryFirst(
+					db.select({ id: chatRooms.id }).from(chatRooms).where(eq(chatRooms.id, roomId)).limit(1),
+					{ executionPolicy: "worker-required" },
+				);
+				if (!room) {
+					const size = await dirSize(dirPath);
+					await rm(dirPath, { recursive: true, force: true });
+					removed++;
+					freedBytes += size;
+					logger.info("Removed chat attachments for a deleted room", { roomId, size });
+					return true;
+				}
+				if (!candidates.length) return false;
+				const rows = await readQuery(
+					db
+						.select({ storedName: chatAttachments.storedName })
+						.from(chatAttachments)
+						.where(
+							and(
+								eq(chatAttachments.roomId, roomId),
+								sql`${chatAttachments.storedName} IN (${sql.join(
+									candidates.map((name) => sql`${name}`),
+									sql`, `,
+								)})`,
+							),
+						)
+						.groupBy(chatAttachments.storedName)
+						.limit(batchSize),
+					{ executionPolicy: "worker-required" },
+				);
+				const known = new Set(rows.map((row) => row.storedName));
+				for (const storedName of candidates) {
+					if (known.has(storedName)) continue;
+					const filePath = resolve(dirPath, storedName);
+					try {
+						const size = (await stat(filePath)).size;
+						await rm(filePath, { force: true });
+						removed++;
+						freedBytes += size;
+						logger.info("Removed unreferenced chat attachment file", { roomId, storedName, size });
+					} catch {
+						/* Concurrent filesystem removal is already reclaimed. */
+					}
+				}
+				return false;
+			});
+			if (directoryRemoved) break;
 		}
 	}
 

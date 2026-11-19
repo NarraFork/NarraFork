@@ -17,28 +17,40 @@
  *   - `clearFactors` removes the enrollment and the backup codes together;
  *   - the MFA flag and the passkey existence read round-trip.
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on an isolated file/WAL database, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { userMfaBackupCodes, userPasskeys, users, userTotp } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 import type { BackupCodeDraft } from "../mfa-store";
 
-const { db, sqlite } = getTestDb();
+const previousWorker = process.env.NARRAFORK_DB_WORKER;
+const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+process.env.NARRAFORK_DB_WORKER = "on";
+process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
 const { sqliteAuthMfaStore: store } = await import("../sqlite-mfa-store");
 const { authMfaStore } = await import("../store");
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
+	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+	else process.env.NARRAFORK_DB_WORKER = previousWorker;
+	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 });
 
 const NOW = "2026-08-12T00:00:00.000Z";
@@ -69,6 +81,25 @@ async function backupCodeRows(): Promise<Array<{ id: string; usedAt: string | nu
 }
 
 describe("AuthMfaStore — SQLite", () => {
+	test("factor reads never execute SELECT on the owning connection", async () => {
+		const forbid = () => {
+			throw new Error("MFA SELECT ran on the owning connection");
+		};
+		const prepare = spyOn(sqlite, "prepare").mockImplementation(forbid);
+		const query = spyOn(sqlite, "query").mockImplementation(forbid);
+		try {
+			expect(await store.findTotp(userId, "active")).toBeNull();
+			expect(await store.findMfaEnabled(userId)).toBe(false);
+			expect(await store.hasAnyPasskey(userId)).toBe(false);
+			expect(await store.countUnusedBackupCodes(userId)).toBe(0);
+			expect(await store.findUnusedBackupCodes(userId)).toEqual([]);
+			expect(prepare).not.toHaveBeenCalled();
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+	});
 	test("enrollment: pending is saved, replaced while pending, never over an active one", async () => {
 		expect(
 			await store.savePendingTotp({ id: generateId(), userId, secret: "S1", nowIso: NOW }),

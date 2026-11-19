@@ -168,26 +168,41 @@ async function expectParity(narratorId: string, label: string) {
 }
 
 describe("judgeNarratorAccessBatch agrees with canReadNarrator / canWriteNarrator", () => {
-	test("every audience pair, both project visibilities, every grant combination", async () => {
-		let compared = 0;
-		let anyWrite = 0;
-		let anyReadOnly = 0;
-		for (const project of [projectId, privateProjectId, null])
-			for (const visibility of VISIBILITIES)
-				for (const writeAudience of WRITE_AUDIENCES) {
-					const id = await narrator(project, visibility, writeAudience);
-					await grantAll("narrator", id);
-					const batch = await expectParity(
-						id,
-						`${project === null ? "standalone" : project === projectId ? "public project" : "private project"} ${visibility}/${writeAudience}`,
-					);
-					compared += principals.length;
-					for (const verdict of batch.values()) {
-						if (verdict.write) anyWrite++;
-						else if (verdict.read) anyReadOnly++;
-					}
-				}
-		// The matrix really exercises both outcomes, not a sea of "no".
+	let compared = 0;
+	let anyWrite = 0;
+	let anyReadOnly = 0;
+	const matrix = (["public project", "private project", "standalone"] as const).flatMap(
+		(projectKind) =>
+			VISIBILITIES.flatMap((visibility) =>
+				WRITE_AUDIENCES.map((writeAudience) => [projectKind, visibility, writeAudience] as const),
+			),
+	);
+	test.each(
+		matrix,
+	)("%s %s/%s agrees for every grant combination", async (projectKind, visibility, writeAudience) => {
+		const project =
+			projectKind === "standalone"
+				? null
+				: projectKind === "public project"
+					? projectId
+					: privateProjectId;
+		const id = await narrator(project, visibility, writeAudience);
+		try {
+			await grantAll("narrator", id);
+			const batch = await expectParity(id, `${projectKind} ${visibility}/${writeAudience}`);
+			expect(batch.size).toBe(principals.length);
+			compared += principals.length;
+			for (const verdict of batch.values()) {
+				if (verdict.write) anyWrite++;
+				else if (verdict.read) anyReadOnly++;
+			}
+		} finally {
+			await db.delete(aclGrants).where(eq(aclGrants.scopeId, id));
+			await db.delete(narrators).where(eq(narrators.id, id));
+		}
+	});
+
+	test("the complete audience matrix exercises write and read-only outcomes", () => {
 		expect(compared).toBe(3 * 3 * 3 * principals.length);
 		expect(anyWrite).toBeGreaterThan(50);
 		expect(anyReadOnly).toBeGreaterThan(50);

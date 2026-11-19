@@ -4,15 +4,17 @@ import {
 	isOpaqueSessionToken,
 	SESSION_TOKEN_TTL_SECONDS,
 } from "@shared/session-auth";
+import * as database from "../db";
 import { trackCommunicationWork } from "../services/agent-runtime/async-work";
 import type { AuthSessionRecord } from "../services/auth/session-store";
 import { authMfaStore, authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
+import { type AuthReadOptions, authReadAdmission } from "./auth-read-admission";
 import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
 import { eventBus } from "./event-bus";
-import { hotTimer, hotTimerClear } from "./hot-safe";
+import { hotSafe, hotTimer, hotTimerClear } from "./hot-safe";
 import { generateId } from "./id";
 import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
@@ -149,12 +151,18 @@ function livePayload(session: AuthSessionRecord): SessionPayload {
  */
 export async function verifyToken(
 	token: string,
-	options: { signal?: AbortSignal } = {},
+	options: AuthReadOptions = {},
 ): Promise<SessionPayload> {
 	if (!isOpaqueSessionToken(token)) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
-	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token), options);
+	const tokenHash = hashSessionToken(token);
+	const read = (context: AuthReadOptions) =>
+		authSessionStore.findSessionByTokenHash(tokenHash, context);
+	// Admission fixes the SQLite budget at entry and passes that same deadline to the read.
+	const session = await (database.activeDatabaseBackend === "sqlite"
+		? authReadAdmission.run(read, options)
+		: read(options));
 	if (!session) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
@@ -167,7 +175,7 @@ export async function verifyToken(
  */
 export async function resolveLiveSession(
 	sessionId: string,
-	options: { signal?: AbortSignal } = {},
+	options: AuthReadOptions = {},
 ): Promise<SessionPayload | null> {
 	const session = await authSessionStore.findSessionById(sessionId, options);
 	if (!session) return null;
@@ -187,6 +195,10 @@ const STALE_SESSION_BATCH = 500;
 const STALE_SESSION_MAX_BATCHES = 20;
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const SESSION_CLEANUP_TIMER_KEY = "narrafork.authSessionCleanupTimer";
+const sessionCleanup = hotSafe("narrafork.authSessionCleanup", () => ({
+	stopped: false,
+	work: new Set<Promise<number>>(),
+}));
 
 /** Delete stale sessions in bounded batches, yielding between them. */
 export async function pruneStaleSessions(): Promise<number> {
@@ -194,6 +206,7 @@ export async function pruneStaleSessions(): Promise<number> {
 	let total = 0;
 	try {
 		for (let batch = 0; batch < STALE_SESSION_MAX_BATCHES; batch++) {
+			if (sessionCleanup.stopped) break;
 			const deleted = await authSessionStore.deleteStaleSessions(before, STALE_SESSION_BATCH);
 			total += deleted;
 			if (deleted < STALE_SESSION_BATCH) break;
@@ -209,16 +222,25 @@ export async function pruneStaleSessions(): Promise<number> {
 
 /** Sweep on startup, then hourly. `hotTimer` keeps --hot reloads from stacking intervals. */
 export function startSessionCleanupTimer(): ReturnType<typeof setInterval> {
-	void trackCommunicationWork(pruneStaleSessions());
-	return hotTimer(SESSION_CLEANUP_TIMER_KEY, () =>
-		setInterval(() => {
-			void trackCommunicationWork(pruneStaleSessions());
-		}, SESSION_CLEANUP_INTERVAL_MS),
-	);
+	sessionCleanup.stopped = false;
+	const sweep = () => {
+		if (sessionCleanup.stopped) return;
+		const work = trackCommunicationWork(pruneStaleSessions());
+		sessionCleanup.work.add(work);
+		void work.then(
+			() => sessionCleanup.work.delete(work),
+			() => sessionCleanup.work.delete(work),
+		);
+	};
+	sweep();
+	return hotTimer(SESSION_CLEANUP_TIMER_KEY, () => setInterval(sweep, SESSION_CLEANUP_INTERVAL_MS));
 }
 
-export function stopSessionCleanupTimer(): void {
+/** Stop admission before awaiting existing cleanup statements; no persistent setting changes. */
+export async function stopSessionCleanupTimer(): Promise<void> {
+	sessionCleanup.stopped = true;
 	hotTimerClear(SESSION_CLEANUP_TIMER_KEY);
+	while (sessionCleanup.work.size) await Promise.allSettled([...sessionCleanup.work]);
 }
 
 export interface RegisterUserInput {

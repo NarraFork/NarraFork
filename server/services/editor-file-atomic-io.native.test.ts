@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -8,6 +8,11 @@ import { EditorSaveCodec } from "../../frontend/components/narrator/file-editor/
 import type { EditorRawDocumentDescriptor } from "../../shared/editor-document";
 import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
+import { assertDbReadersReady, closeReadDatabase } from "../lib/db-worker/pool";
+
+beforeAll(() => assertDbReadersReady(db.$client.filename));
+afterAll(() => closeReadDatabase(db.$client.filename));
+
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { safeSpawn } from "../lib/spawn";
@@ -304,7 +309,7 @@ test("lost apply reply stays unknown until original executor proof; no second ap
 	fixture.forceQueryOutcome();
 	const runtime = await getDefaultLocalFileChangeRuntime(),
 		source = await runtime.verifyNamespace();
-	const operation = runtime.evidence.getEditorOperation(
+	const operation = await runtime.evidence.getEditorOperation(
 		source.sourceInstanceId,
 		saved.upload.operationId,
 	);

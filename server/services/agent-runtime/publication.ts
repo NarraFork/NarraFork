@@ -1,3 +1,4 @@
+import { readDbAll, readDomainTask, readQueryFirst } from "@server/db/worker-read";
 import { and, desc, eq, gt, inArray, isNull, like, ne, notExists, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { resolveDatabaseBackendConfig } from "../../db/postgres-runtime";
@@ -51,7 +52,6 @@ export interface StartedRun {
 	publication?: PublicationRun;
 }
 
-import { blockReadsEnabled } from "../narrator-block-scans";
 import { newEnvelopeColumns } from "../narrator-block-sync";
 import { insertEnvelopeIfAbsent } from "../narrator-body-writes";
 import {
@@ -92,9 +92,9 @@ import {
 	type PublicationRun,
 	PublicationStateError,
 	publicationDedupeKey,
+	publicationEventFromDedupeKey,
 	type RunPublicationStatus,
 } from "./publication-outbox";
-import { readPublicationTerminalResult } from "./publication-reader";
 import {
 	type AgentTerminalResult,
 	type AgentTerminalResultReadOptions,
@@ -357,8 +357,36 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		});
 	}
 
-	function getAgentRun(narratorId: string, recipientId: string, tx?: RuntimeTx): PublicationRun {
-		const row = (tx ?? database)
+	function getAgentRun(narratorId: string, recipientId: string, tx: RuntimeTx): PublicationRun;
+	function getAgentRun(narratorId: string, recipientId: string): Promise<PublicationRun>;
+	function getAgentRun(
+		narratorId: string,
+		recipientId: string,
+		tx?: RuntimeTx,
+	): PublicationRun | Promise<PublicationRun> {
+		if (!tx)
+			return readQueryFirst(
+				database
+					.select({ logicalRunId: narrators.logicalRunId })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			).then((row) => {
+				if (!row) throw new ValidationError("Agent has no registered publication source");
+				if (row.logicalRunId)
+					return {
+						producerKind: "agent" as const,
+						taskId: narratorId,
+						recipientId,
+						logicalRunId: row.logicalRunId,
+					};
+				// Legacy admission can write. Its authoritative source is re-read atomically.
+				return runAtomicWrite(database, "publication.getAgentRun", (inner) =>
+					getAgentRun(narratorId, recipientId, inner),
+				);
+			});
+		const row = tx
 			.select({ logicalRunId: narrators.logicalRunId })
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
@@ -503,11 +531,71 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return `message-original:${messageId}`;
 	}
 
-	function readAgentTerminalResult(
+	/** State evidence shares one bounded read snapshot; result readability is not admission. */
+	async function readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus> {
+		if (run.producerKind !== "agent" && run.producerKind !== "bash")
+			throw new Error("Invalid publication producer identity");
+		for (const pointer of [run.taskId, run.logicalRunId, run.recipientId])
+			if (typeof pointer !== "string" || !pointer || Buffer.byteLength(pointer) > 256)
+				throw new Error("Invalid publication pointer");
+		const where = and(
+			eq(runtimePublicationOutbox.producerKind, run.producerKind),
+			eq(runtimePublicationOutbox.taskId, run.taskId),
+			eq(runtimePublicationOutbox.logicalRunId, run.logicalRunId),
+			eq(runtimePublicationOutbox.recipientId, run.recipientId),
+		);
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		const [row] = await readDbAll<{
+			reserved: number;
+			eventKind: Exclude<PublicationEvent, "started"> | null;
+			deliveredKey: string | null;
+			consumed: number;
+		}>(
+			database,
+			sql`SELECT
+			EXISTS (SELECT 1 FROM ${runtimePublicationOutbox} WHERE ${where}
+				AND ${runtimePublicationOutbox.eventKind} = 'terminal'
+				AND ${runtimePublicationOutbox.state} = 'reserved') AS reserved,
+			(SELECT ${runtimePublicationOutbox.eventKind} FROM ${runtimePublicationOutbox} WHERE ${where}
+				AND ${runtimePublicationOutbox.eventKind} NOT IN ('started', 'terminal')
+				AND ${runtimePublicationOutbox.state} <> 'reserved' LIMIT 1) AS eventKind,
+			(SELECT ${narratorBufferedMessages.dedupeKey} FROM ${narratorBufferedMessages}
+				WHERE ${narratorBufferedMessages.narratorId} = ${run.recipientId}
+				AND ${inArray(narratorBufferedMessages.dedupeKey, keys)} LIMIT 1) AS deliveredKey,
+			EXISTS (SELECT 1 FROM ${runtimeAwaitedTerminalConsumptions} WHERE ${and(
+				eq(runtimeAwaitedTerminalConsumptions.producerKind, run.producerKind),
+				eq(runtimeAwaitedTerminalConsumptions.taskId, run.taskId),
+				eq(runtimeAwaitedTerminalConsumptions.logicalRunId, run.logicalRunId),
+				eq(runtimeAwaitedTerminalConsumptions.recipientId, run.recipientId),
+			)}) AS consumed`,
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
+		if (!row) throw new Error("Publication state snapshot unavailable");
+		if (row.reserved) return { state: "reserved" };
+		if (row.eventKind) return { state: "settled", eventKind: row.eventKind };
+		if (row.deliveredKey) {
+			const eventKind = publicationEventFromDedupeKey(row.deliveredKey);
+			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
+		}
+		return { state: row.consumed ? "settled" : "none" };
+	}
+
+	/** Read one bounded, body-aware snapshot; this observation never authorizes a write. */
+	async function readAgentTerminalResult(
 		run: PublicationRun,
 		options: AgentTerminalResultReadOptions = {},
-	): AgentTerminalResult | null {
-		return readPublicationTerminalResult(database.$client, run, options, blockReadsEnabled());
+	): Promise<AgentTerminalResult | null> {
+		return readDomainTask(
+			database.$client,
+			"publicationTerminalResult",
+			{ run, options },
+			{
+				executionPolicy: "worker-required",
+				timeoutMs: 30_000,
+			},
+		);
 	}
 
 	/** Source result mutation and intent are committed by the caller's SAME synchronous transaction. */
@@ -515,13 +603,23 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return store.commitIntent({ ...intent, summary: publicationSummary(intent.summary) }, tx);
 	}
 
-	function notifyTransfer(recipientId: string, deliveryId?: string) {
+	function pendingSourceQuery(run: PublicationRun) {
+		const keys = (
+			["started", "completed", "failed", "timed_out", "cancelled", "terminal"] as const
+		).map((event) => publicationDedupeKey(run, event));
+		return sql`SELECT EXISTS (SELECT 1 FROM ${runtimePublicationOutbox} WHERE ${inArray(runtimePublicationOutbox.dedupeKey, keys)}) OR EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${and(eq(narratorBufferedMessages.narratorId, run.recipientId), inArray(narratorBufferedMessages.dedupeKey, keys), ne(narratorBufferedMessages.state, "cancelled"), or(ne(narratorBufferedMessages.state, "materialized"), isNull(narratorBufferedMessages.adoptedAt)))}) AS pending`;
+	}
+
+	async function notifyTransfer(recipientId: string, deliveryId?: string) {
 		if (!wake || !deliveryId) return;
-		const row = database
-			.select({ metadataJson: narratorBufferedMessages.metadataJson })
-			.from(narratorBufferedMessages)
-			.where(eq(narratorBufferedMessages.deliveryId, deliveryId))
-			.get();
+		const row = await readQueryFirst(
+			database
+				.select({ metadataJson: narratorBufferedMessages.metadataJson })
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.deliveryId, deliveryId))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		const event = row?.metadataJson
 			? (JSON.parse(row.metadataJson) as { eventKind?: string }).eventKind
 			: undefined;
@@ -539,22 +637,22 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	}
 
 	/** All fast and retry paths grant the next vacancy to the earliest durable intent. */
-	function flushRecipient(recipientId: string): number {
+	async function flushRecipient(recipientId: string): Promise<number> {
 		let transferred = 0;
 		for (const kind of ["agent", "bash"] as const) {
 			for (let i = 0; i < L.pageSize / 2; i++) {
 				const result = store.transferNext(recipientId, kind);
 				if (result.status !== "transferred") break;
 				transferred++;
-				notifyTransfer(recipientId, result.deliveryId);
+				await notifyTransfer(recipientId, result.deliveryId);
 			}
 		}
 		return transferred;
 	}
 
 	/** One bounded page per turn. Full mailboxes release the worker immediately. */
-	function flushPage(): boolean {
-		const page = store.listPending({ afterId: cursor, limit: L.pageSize });
+	async function flushPage(): Promise<boolean> {
+		const page = await store.listPending({ afterId: cursor, limit: L.pageSize });
 		const rows = page.slice(0, L.pageSize);
 		// At most one transfer per listed row: a page never expands to pageSize² work.
 		const full = new Set<string>();
@@ -562,7 +660,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			const key = `${row.recipientId}:${row.producerKind}`;
 			if (full.has(key)) continue;
 			const result = store.transferNext(row.recipientId, row.producerKind);
-			if (result.status === "transferred") notifyTransfer(row.recipientId, result.deliveryId);
+			if (result.status === "transferred") await notifyTransfer(row.recipientId, result.deliveryId);
 			else full.add(key);
 		}
 		cursor = page.length > L.pageSize ? rows.at(-1)?.id : undefined;
@@ -599,42 +697,22 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		getAgentRun,
 		persistResult,
 		readAgentTerminalResult,
-		readRunPublicationState: store.readRunPublicationState,
+		readRunPublicationState,
 		commit,
 		flushRecipient,
 		flushPage,
 		schedule,
 		consumeAwaitedTerminal: (run: PublicationRun, options?: AwaitedTerminalConsumeOptions) =>
 			store.consumeAwaitedTerminal(run, undefined, options),
-		hasPendingSource(run: PublicationRun) {
-			const keys = (
-				["started", "completed", "failed", "timed_out", "cancelled", "terminal"] as const
-			).map((event) => publicationDedupeKey(run, event));
-			if (
-				database
-					.select({ id: runtimePublicationOutbox.id })
-					.from(runtimePublicationOutbox)
-					.where(inArray(runtimePublicationOutbox.dedupeKey, keys))
-					.limit(1)
-					.get()
-			)
-				return true;
-			return !!database
-				.select({ id: narratorBufferedMessages.id })
-				.from(narratorBufferedMessages)
-				.where(
-					and(
-						eq(narratorBufferedMessages.narratorId, run.recipientId),
-						inArray(narratorBufferedMessages.dedupeKey, keys),
-						ne(narratorBufferedMessages.state, "cancelled"),
-						or(
-							ne(narratorBufferedMessages.state, "materialized"),
-							isNull(narratorBufferedMessages.adoptedAt),
-						),
-					),
-				)
-				.limit(1)
-				.get();
+		async hasPendingSource(run: PublicationRun): Promise<boolean> {
+			const [row] = await readDbAll<{ pending: number }>(database, pendingSourceQuery(run), {
+				executionPolicy: "worker-required",
+				maxRows: 1,
+			});
+			return !!row?.pending;
+		},
+		hasPendingSourceInTransaction(run: PublicationRun, tx: RuntimeTx): boolean {
+			return !!tx.all<{ pending: number }>(pendingSourceQuery(run))[0]?.pending;
 		},
 		newBashRun(taskId: string, recipientId: string): PublicationRun {
 			return { producerKind: "bash", taskId, recipientId, logicalRunId: generateId() };
@@ -793,6 +871,7 @@ export function createUnwiredPublicationFacade(
 		flushPage: () => unavailable("flushPage"),
 		schedule: () => unavailable("schedule"),
 		hasPendingSource: () => unavailable("hasPendingSource"),
+		hasPendingSourceInTransaction: () => unavailable("hasPendingSourceInTransaction"),
 		consumeAwaitedTerminal: () => unavailable("consumeAwaitedTerminal"),
 		newBashRun: () => unavailable("newBashRun"),
 		migrateLegacyTaskNotice: () => unavailable("migrateLegacyTaskNotice"),
@@ -977,7 +1056,7 @@ export interface AsyncRuntimePublicationService {
 	/**
 	 * Named bounded read: full detail of a background task row by id.
 	 * Returns the complete BackgroundTaskRecord (including output) or null.
-	 * On PG this is a LIMIT-1 async query; on SQLite it wraps the sync `.get()`.
+	 * On PG this is a LIMIT-1 async query; SQLite dispatches the bounded read to its Worker.
 	 */
 	readTaskDetail(taskId: string): Promise<BackgroundTaskRecord | null>;
 	/**
@@ -1062,10 +1141,9 @@ export interface AsyncRuntimePublicationService {
 const pgPublicationRegistrations: PgPublicationRegistrations = { legacyReaders: new Map() };
 
 /**
- * The SQLite branch: wrap the legacy synchronous service. Each method body runs
- * the synchronous section to completion at CALL time and the Promise wraps the
- * already-committed result — no Promise ever enters a `bun:sqlite` transaction,
- * and the observable timing for legacy fire-and-forget callers is unchanged.
+ * SQLite writes complete their small synchronous transactions before resolving;
+ * read-only observations run on the Worker. No Promise enters a bun:sqlite write
+ * section, and every final identity/CAS check stays in the committing transaction.
  */
 function createSqliteAsyncPublicationService(
 	legacy: RuntimePublicationService,
@@ -1288,11 +1366,14 @@ function createSqliteAsyncPublicationService(
 		releaseUnusedRunSlots: async (run) => Promise.resolve(legacy.store.releaseUnusedRunSlots(run)),
 		restartAgentTask: async (input) => {
 			const now = input.now;
-			const existing = db
-				.select({ logicalRunId: backgroundTasks.logicalRunId })
-				.from(backgroundTasks)
-				.where(eq(backgroundTasks.id, input.taskId))
-				.get();
+			const existing = await readQueryFirst(
+				db
+					.select({ logicalRunId: backgroundTasks.logicalRunId })
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, input.taskId))
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			if (!existing) return undefined;
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
@@ -1646,11 +1727,17 @@ function createSqliteAsyncPublicationService(
 			});
 		},
 		readBackgroundTask: async (taskId) => {
-			const row = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+			const row = await readQueryFirst(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			return row ?? null;
 		},
 		readTaskDetail: async (taskId) => {
-			const row = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+			const row = await readQueryFirst(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			return (row as BackgroundTaskRecord) ?? null;
 		},
 		cancelTask: async (input) => {

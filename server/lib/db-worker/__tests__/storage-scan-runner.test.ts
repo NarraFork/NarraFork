@@ -23,7 +23,7 @@ import {
 	measureTable,
 } from "../../../services/storage-scan-queries";
 import * as pool from "../pool";
-import { resetDbWorkerPoolForTest, shutdownDbWorkerPool } from "../pool";
+import { drainDbWorkerPool, resetDbWorkerPoolForTest } from "../pool";
 import type { StorageScanContextResult } from "../protocol";
 import { runParallelObjectStorageScan } from "../storage-scan-runner";
 
@@ -59,7 +59,7 @@ function createFixtureDatabase(dbPath: string): void {
 		}
 	});
 	seed();
-	db.close();
+	db.close(true);
 }
 
 /** Strip the orchestration metadata so the two paths can be compared field for field. */
@@ -90,7 +90,7 @@ describe("runParallelObjectStorageScan", () => {
 
 	afterEach(async () => {
 		mock.restore();
-		await shutdownDbWorkerPool();
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		rmSync(home, { recursive: true, force: true });
@@ -101,6 +101,22 @@ describe("runParallelObjectStorageScan", () => {
 	 * test that actually establishes it: both runs go through `runParallelObjectStorageScan`, one with
 	 * workers enabled and one with them disabled so the `WorkersUnavailableError` fallback fires.
 	 */
+	test("strict worker scans reject disabled execution rather than returning an empty report", async () => {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		const sqlite = new Database(dbPath, { readonly: true });
+		try {
+			await expect(
+				runParallelObjectStorageScan({
+					sqlite,
+					dbPath,
+					mainBytes: MAIN_BYTES,
+					executionPolicy: "worker-required",
+				}),
+			).rejects.toMatchObject({ code: "DB_READ_UNAVAILABLE" });
+		} finally {
+			sqlite.close(true);
+		}
+	});
 	test("worker path and fallback path produce identical results", async () => {
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "3";
 		const sqlite = new Database(dbPath, { readonly: true });

@@ -4,6 +4,7 @@ import {
 } from "@shared/notification-center";
 import { sql } from "drizzle-orm";
 import { db } from "../db";
+import { readDbAll } from "../db/worker-read";
 import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { notifyNotificationCenterChanged } from "./notification-center-service";
@@ -74,9 +75,15 @@ export async function runNotificationCenterMaintenanceTick(): Promise<{
 			result.deleted < NOTIFICATION_MAINTENANCE_DELETE_PER_TICK &&
 			performance.now() - started < NOTIFICATION_MAINTENANCE_BUDGET_MS
 		) {
-			const user = db.all<{ id: string }>(sql`
+			const user = (
+				await readDbAll<{ id: string }>(
+					db,
+					sql`
 				SELECT id FROM users WHERE id > ${state.cursor} ORDER BY id ASC LIMIT 1
-			`)[0];
+			`,
+					{ executionPolicy: "worker-required" },
+				)
+			)[0];
 			if (!user) {
 				state.cursor = "";
 				break;

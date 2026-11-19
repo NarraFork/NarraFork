@@ -32,7 +32,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
-import { type ReadQueryOptions, readQuery } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 
 const exactRefCounts = new Map<string, { version: number; count: number }>();
 const EXACT_COUNT_CACHE_LIMIT = 256;
@@ -50,15 +50,17 @@ export async function countNarratorMessageRefs(
 	}
 	// Count and version are observed in one statement; never seed a cache under
 	// a pre-await version or use the insert-only messageCount high-water mark.
-	const row = await db
-		.select({
-			version: narrators.messageVersion,
-			count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
+	const row = await readQueryFirst(
+		db
+			.select({
+				version: narrators.messageVersion,
+				count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
 			WHERE exact_refs.narrator_id = ${narratorId})`,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get();
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId)),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	if (row && messageVersion !== undefined && row.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
 		exactRefCounts.set(narratorId, { version: row.version, count: row.count });
@@ -88,8 +90,10 @@ export async function countNarratorMessageRefsBatch(
 			.where(inArray(narratorMessageRefs.narratorId, [...narratorIds]))
 			.groupBy(narratorMessageRefs.narratorId),
 		{
+			executionPolicy: "worker-required",
 			diagnosticSource: "narrators.message-count.batch",
 			...options,
+			timeoutMs: 30_000,
 			maxRows: narratorIds.length,
 		},
 	);
@@ -117,17 +121,20 @@ export async function countNarratorMessageRefsBatch(
  * than 79ms on a 31k-ref narrator).
  */
 export async function isFirstUserTurn(narratorId: string): Promise<boolean> {
-	const rows = await db
-		.select({ id: narratorMessageRefs.id })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessages.role, "user"),
-				eq(narratorMessages.narratorId, narratorId),
-			),
-		)
-		.limit(2);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorMessageRefs.id })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessages.role, "user"),
+					eq(narratorMessages.narratorId, narratorId),
+				),
+			)
+			.limit(2),
+		{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+	);
 	return rows.length <= 1;
 }

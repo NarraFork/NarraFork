@@ -24,6 +24,32 @@ function row(provider: string | null, model: string | null, credential_id: strin
 }
 
 describe("historical token recalculation protocol", () => {
+	test("ESM boundaries do not synchronously require async-capable runtime modules", async () => {
+		for (const file of ["token-recalculation-protocol.ts", "token-recalculation-service.ts"]) {
+			const source = await Bun.file(`${import.meta.dir}/${file}`).text();
+			expect(source).not.toMatch(/\brequire\s*\(/);
+		}
+	});
+
+	test("injected resolvers stay synchronous and read current settings once per job", () => {
+		let settings: ReturnType<TokenRecalculationProtocolDependencies["getSettings"]> = {
+			customApiProviders: [{ id: "a", prefix: "proxy", protocol: "anthropic-messages" }],
+		};
+		const getSettings = mock(() => settings);
+		const deps = dependencies({ getSettings });
+		const first = createTokenRecalculationProtocolResolver(deps);
+		expect(typeof first).toBe("function");
+		expect(first(row("proxy", "first"))).toEqual({ protocol: "anthropic", fallback: false });
+		expect(getSettings).toHaveBeenCalledTimes(1);
+		settings = {
+			customApiProviders: [{ id: "a", prefix: "proxy", protocol: "gemini-compatible" }],
+		};
+		expect(first(row("proxy", "second"))).toEqual({ protocol: "anthropic", fallback: false });
+		const second = createTokenRecalculationProtocolResolver(deps);
+		expect(second(row("proxy", "first"))).toEqual({ protocol: "gemini", fallback: false });
+		expect(getSettings).toHaveBeenCalledTimes(2);
+	});
+
 	test("credential wins over prefix across connection families, including disabled history", () => {
 		const resolve = createTokenRecalculationProtocolResolver(
 			dependencies({

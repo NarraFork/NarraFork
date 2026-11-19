@@ -1,4 +1,5 @@
 /** Revert results. Legacy history stays read-only; file writes use fixed per-file plans. */
+import { readQuery } from "@server/db/worker-read";
 import type {
 	FileChangeEvidenceUncertaintyWarning,
 	FileChangeRevertApplyResponse,
@@ -110,18 +111,24 @@ export function snapshotHistoryFailure(result: RevertResult, error: unknown): Sn
 
 /** Same explicit workspace precedence as the session; never falls back to the user's home. */
 export async function resolveNarratorCwd(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: (row, { eq }) => eq(row.id, narratorId),
-		columns: { cwd: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: (row, { eq }) => eq(row.id, narratorId),
+			columns: { cwd: true, contextProjectId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!narrator) return null;
 	if (narrator.cwd) return narrator.cwd;
 	const projectId = narrator.contextProjectId;
 	if (projectId) {
-		const project = await db.query.projects.findFirst({
-			where: (row, { eq }) => eq(row.id, projectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: (row, { eq }) => eq(row.id, projectId),
+				columns: { gitPath: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (project?.gitPath) return project.gitPath;
 	}
 	return null;

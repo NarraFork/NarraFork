@@ -1,23 +1,29 @@
-import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { contextUpdateOf } from "@shared/prefix-context";
 import { z } from "zod/v4";
-import { db } from "../../db";
 import { narrators } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
+import { ToolEpochError } from "../../lib/agent/tool-loading";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import {
 	historyPreparationFailure,
 	ModelHistoryPreparation,
+	ModelHistoryTimeoutError,
 } from "../../lib/model-history-preparation";
 import { settings } from "../../lib/settings";
-import { currentCompactMessageId } from "../narrator-epochs";
-import * as snapshots from "../narrator-prefix-snapshots";
-import { narratorService } from "../narrator-service";
-import { buildContextManagementHooks } from "../narrator-session";
-import { buildRuntimeHistory } from "./history";
-import * as historyRevision from "./model-history-revision";
-import * as preparation from "./prepare-prefix-request";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "../__tests__/agent-runtime-test-database";
 
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+const { currentCompactMessageId } = await import("../narrator-epochs");
+const snapshots = await import("../narrator-prefix-snapshots");
+const { narratorService } = await import("../narrator-service");
+const { buildContextManagementHooks } = await import("../narrator-session");
+const { buildRuntimeHistory } = await import("./history");
+const preparation = await import("./prepare-prefix-request");
 const { narratorPersistence } = await import("../narrator-persistence");
 const originalProviders = settings.anthropicProviders;
 const provider = "prefix-request-tests";
@@ -35,8 +41,9 @@ beforeEach(() => {
 		},
 	];
 });
-afterAll(() => {
+afterAll(async () => {
 	settings.anthropicProviders = originalProviders;
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 });
 
 const tool = {
@@ -148,14 +155,12 @@ describe("shared prefix request preparation", () => {
 		const startedAt = Date.now();
 		let now = startedAt;
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
-		const realSignature = historyRevision.readSqliteModelHistorySignature;
-		const signature = spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation(
-			(...args) => {
-				const result = realSignature(...args);
-				now += 11_000;
-				return result;
-			},
-		);
+		const realSignature = workerRead.readDomainTask;
+		const signature = spyOn(workerRead, "readDomainTask").mockImplementation(async (...args) => {
+			const result = await realSignature(...args);
+			if (args[1] === "modelHistorySignature") now += 11_000;
+			return result;
+		});
 		const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
 		try {
 			const prepared = await preparation.preparePrefixRequest({
@@ -174,6 +179,163 @@ describe("shared prefix request preparation", () => {
 			clock.mockRestore();
 		}
 	});
+	test("source reads share observation and cancellation without a total hydration deadline", async () => {
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const controller = new AbortController();
+		const observation = new ModelHistoryPreparation({
+			narratorId: "prefix-source-budget",
+			kind: "rebuild",
+			signal: controller.signal,
+			timeoutMs: null,
+		});
+		const phase = spyOn(observation, "phase");
+		const readTimes: number[] = [];
+		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+			async (_narratorId, _limit, options) => {
+				expect(options?.preparation).toBe(observation);
+				expect(options?.signal).toBe(observation.signal);
+				expect(options?.deadline).toBeUndefined();
+				readTimes.push(now);
+				return [];
+			},
+		);
+		try {
+			const options = {
+				narratorId: "prefix-source-budget",
+				locale: "en" as const,
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+				preparation: observation,
+			};
+			await preparation.preparePrefixRequest(options);
+			now += 45_000;
+			await preparation.preparePrefixRequest(options);
+			expect(readTimes[1] - readTimes[0]).toBe(45_000);
+			expect(phase.mock.calls).toEqual([["source"], ["source"]]);
+			expect(observation.signal.aborted).toBe(false);
+			expect(observation.deadline).toBe(Infinity);
+			const cancellation = new Error("cancel source preparation");
+			controller.abort(cancellation);
+			await expect(preparation.preparePrefixRequest(options)).rejects.toThrow(cancellation);
+			expect(load).toHaveBeenCalledTimes(2);
+		} finally {
+			load.mockRestore();
+			phase.mockRestore();
+			observation.finish();
+			clock.mockRestore();
+		}
+	});
+
+	for (const outcome of ["success", "cancelled", "timeout"] as const) {
+		test(`unchanged production prefix source forwards budget, phases and ${outcome} metrics`, async () => {
+			const narratorId = await narrator();
+			const options = {
+				narratorId,
+				locale: "en" as const,
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+				getToolLoading: () => ({
+					managed: new Set<string>(),
+					current: new Set<string>(),
+					candidates: [tool],
+				}),
+				buildPrefixPrompt: async () => ({
+					contract: "Production source budget contract",
+					parts: [{ key: "workspace", text: "/source-budget" }],
+				}),
+			};
+			const initial = await preparation.preparePrefixRequest(options);
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			const controller = new AbortController();
+			const logs: Record<string, unknown>[] = [];
+			const observation = new ModelHistoryPreparation({
+				narratorId,
+				kind: "rebuild",
+				signal: controller.signal,
+				timeoutMs: null,
+				warn: (_message, fields) => logs.push(fields),
+			});
+			const phase = spyOn(observation, "phase");
+			const count = spyOn(observation, "count");
+			const cancellation = new Error("cancel authoritative prefix source");
+			const sourceTimeout = new ModelHistoryTimeoutError();
+			const readHistory = narratorService.getModelHistorySinceLastCompact.bind(narratorService);
+			let authoritativeRows: Awaited<ReturnType<typeof readHistory>> | undefined;
+			const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+				async (id, limit, readOptions) => {
+					expect(readOptions?.preparation).toBe(observation);
+					expect(readOptions?.signal).toBe(observation.signal);
+					expect(readOptions?.deadline).toBe(now + 10_000);
+					expect(phase.mock.calls.at(-1)).toEqual(["source"]);
+					if (outcome === "cancelled") {
+						controller.abort(cancellation);
+						expect(readOptions?.signal?.reason).toBe(cancellation);
+					}
+					if (outcome === "timeout") throw sourceTimeout;
+					authoritativeRows = await readHistory(id, limit, readOptions);
+					return authoritativeRows;
+				},
+			);
+			try {
+				const work = preparation.preparePrefixRequest({
+					...options,
+					preparation: observation,
+					buildPrefixPrompt: async () => {
+						// Prompt work is outside the source read's freshly allocated query budget.
+						now += 45_000;
+						return options.buildPrefixPrompt();
+					},
+				});
+				if (outcome === "success") {
+					const result = await work;
+					if (authoritativeRows === undefined) {
+						throw new Error("Authoritative prefix source was not loaded");
+					}
+					expect(result.reconciled?.changed).toBe(false);
+					expect(result.sourceMessages).toBe(authoritativeRows);
+					expect(result.toolLoading?.epoch?.markerId).toBe(initial.toolLoading?.epoch?.markerId);
+					expect(count.mock.calls.length).toBeGreaterThan(0);
+					expect(observation.signal.aborted).toBe(false);
+					observation.finish();
+				} else {
+					let failure: unknown;
+					try {
+						await work;
+					} catch (error) {
+						failure = error;
+						observation.finish(error);
+					}
+					expect(failure).toBeInstanceOf(Error);
+					expect(historyPreparationFailure(failure)?.outcome).toBe(outcome);
+					if (outcome === "timeout") {
+						expect(failure).toBeInstanceOf(ToolEpochError);
+						expect(failure).toMatchObject({ cause: sourceTimeout });
+						expect(observation.signal.aborted).toBe(false);
+					} else {
+						expect(observation.signal.reason).toBe(cancellation);
+					}
+				}
+				expect(load).toHaveBeenCalledTimes(1);
+				expect(observation.deadline).toBe(Infinity);
+				expect(logs.at(-1)).toMatchObject({
+					preparationId: observation.preparationId,
+					outcome,
+				});
+				expect((await readHistory(narratorId)).map((row) => row.id)).toEqual(
+					initial.sourceMessages.map((row) => row.id),
+				);
+			} finally {
+				load.mockRestore();
+				count.mockRestore();
+				phase.mockRestore();
+				observation.finish();
+				clock.mockRestore();
+			}
+		});
+	}
+
 	test("real snapshot work exceeding ten seconds prepares first and later requests without losing summary metadata", async () => {
 		const narratorId = await narrator();
 		const controller = new AbortController();
@@ -184,14 +346,15 @@ describe("shared prefix request preparation", () => {
 		let summary = "The prior conversation summary.";
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const writeText = snapshots.putPrefixText;
+		const prepare = spyOn(preparation, "preparePrefixRequest");
 		const snapshot = spyOn(snapshots, "putPrefixText").mockImplementation(async (text, signal) => {
-			expect(signal).toBe(controller.signal);
+			expect(signal).toBe(prepare.mock.calls.at(-1)?.[0].signal);
+			expect(signal?.aborted).toBe(false);
 			const hash = await writeText(text, signal);
 			// Real writes still run; only elapsed wall time is simulated. No ten-second sleep.
 			now += 6_000;
 			return hash;
 		});
-		const prepare = spyOn(preparation, "preparePrefixRequest");
 		const loading = () => ({
 			managed: new Set<string>(),
 			current: new Set<string>(),
@@ -244,6 +407,10 @@ describe("shared prefix request preparation", () => {
 			expect(later.systemPrompt).toBe(systemPrompt);
 			expect(later.toolLoading?.epochMarkerId).toBe(projected.toolLoading?.epochMarkerId);
 			expect(prepare).toHaveBeenCalledTimes(2);
+			const laterOptions = prepare.mock.calls[1]?.[0];
+			expect(laterOptions?.signal).toBe(laterOptions?.preparation?.signal);
+			expect(laterOptions?.signal).not.toBe(controller.signal);
+			expect(laterOptions?.preparation?.deadline).toBe(Infinity);
 			expect(refreshes).toBe(2);
 			const updates = later.rows.flatMap((row) =>
 				Array.isArray(row.contentJson) ? row.contentJson.map(contextUpdateOf).filter(Boolean) : [],
@@ -371,36 +538,55 @@ describe("shared prefix request preparation", () => {
 		}
 	});
 
-	test("cancellation after progressing snapshot work prevents projection", async () => {
-		const narratorId = await narrator();
-		const controller = new AbortController();
-		const writeText = snapshots.putPrefixText;
-		const snapshot = spyOn(snapshots, "putPrefixText").mockImplementation(async (text, signal) => {
-			const hash = await writeText(text, signal);
-			controller.abort(new Error("cancel progressing prefix"));
-			return hash;
-		});
-		try {
-			await expect(
-				preparation.preparePrefixRequest({
+	for (const entryPoint of ["direct", "rebuild"] as const) {
+		test(`${entryPoint} cancellation after progressing snapshot work prevents projection`, async () => {
+			const narratorId = await narrator();
+			const controller = new AbortController();
+			const cancellation = new Error("cancel progressing prefix");
+			const writeText = snapshots.putPrefixText;
+			const snapshot = spyOn(snapshots, "putPrefixText").mockImplementation(
+				async (text, signal) => {
+					const hash = await writeText(text, signal);
+					expect(signal).toBeDefined();
+					if (entryPoint === "direct") expect(signal).toBe(controller.signal);
+					else expect(signal).not.toBe(controller.signal);
+					controller.abort(cancellation);
+					expect(signal?.aborted).toBe(true);
+					expect(signal?.reason).toBe(cancellation);
+					return hash;
+				},
+			);
+			try {
+				const options = {
 					narratorId,
-					locale: "en",
+					locale: "en" as const,
 					getModel: () => "claude-sonnet-4",
 					getProvider: () => provider,
-					signal: controller.signal,
-					getToolLoading: () => ({ managed: new Set(), current: new Set(), candidates: [tool] }),
+					getToolLoading: () => ({
+						managed: new Set<string>(),
+						current: new Set<string>(),
+						candidates: [tool],
+					}),
 					buildPrefixPrompt: async () => ({
 						contract: "cancel contract",
 						parts: [{ key: "workspace", text: "/cancel" }],
 					}),
-				}),
-			).rejects.toThrow();
-			expect(controller.signal.aborted).toBe(true);
-			expect(await narratorService.getModelHistorySinceLastCompact(narratorId)).toHaveLength(0);
-		} finally {
-			snapshot.mockRestore();
-		}
-	});
+				};
+				const work =
+					entryPoint === "direct"
+						? preparation.preparePrefixRequest({ ...options, signal: controller.signal })
+						: buildContextManagementHooks({
+								...options,
+								attachmentSignal: controller.signal,
+							}).rebuildRequestHistory();
+				await expect(work).rejects.toThrow();
+				expect(controller.signal.aborted).toBe(true);
+				expect(await narratorService.getModelHistorySinceLastCompact(narratorId)).toHaveLength(0);
+			} finally {
+				snapshot.mockRestore();
+			}
+		});
+	}
 
 	test("first and later request entry points delegate reconciliation to the same preparer", async () => {
 		const initial = await Bun.file(new URL("./orchestrator.ts", import.meta.url)).text();

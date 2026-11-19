@@ -169,9 +169,9 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	);
 
 	// Lifetime totals are independent of the date-filtered, removable history.
-	routes.get("/user-totals", (c) => {
+	routes.get("/user-totals", async (c) => {
 		const { limit, cursor } = userTotalsQuerySchema.parse(c.req.query());
-		return c.json((options.listUserUsageTotals ?? listUserUsageTotals)(limit, cursor));
+		return c.json(await (options.listUserUsageTotals ?? listUserUsageTotals)(limit, cursor));
 	});
 
 	/**
@@ -263,12 +263,12 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	 * route these come from `credential_usage_totals`, not `api_requests`, so they
 	 * survive narrator deletion. Registered before `/:id` so the literal path wins.
 	 */
-	routes.get("/credential-totals", (c) => {
+	routes.get("/credential-totals", async (c) => {
 		const query = credentialTotalsQuerySchema.parse(c.req.query());
 		return c.json({
 			provider: query.provider,
 			entries: serializeCredentialUsageTotalsList(
-				listProviderCredentialTotals(query.provider, query.limit),
+				await listProviderCredentialTotals(query.provider, query.limit),
 			),
 		});
 	});

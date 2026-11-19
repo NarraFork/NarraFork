@@ -79,7 +79,7 @@ type HistoricalProtocolRow = {
 type ResolvedConnection = Connection & { protocol?: string; nug?: boolean };
 const MAX_CACHE_ENTRIES = 4096;
 
-/** One resolver/cache per recalculation job; never creates providers or requests model catalogs. */
+/** One synchronous resolver/cache per job; never creates providers or requests model catalogs. */
 export function createTokenRecalculationProtocolResolver(
 	deps: TokenRecalculationProtocolDependencies,
 ): (row: HistoricalProtocolRow) => TokenProtocolResolution {

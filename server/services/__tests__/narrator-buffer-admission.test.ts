@@ -24,14 +24,15 @@
 
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import { users as pgUsers } from "../../db/postgres-schema";
 import { narratorBufferedMessages, narrators, users } from "../../db/schema";
 import { MAILBOX_LIMITS } from "../agent-runtime/limits";
 import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
 import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready, close: closeWorkerTestDb } = getNarratorWorkerTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -43,6 +44,7 @@ const {
 	updateBufferedMessageMode,
 	reorderBufferedMessages,
 	toBufferSummary,
+	readBufferedMessageDeliveryReceipt,
 } = await import("../narrator-buffer");
 const { activeNarrators, claimNarratorRuntime, pendingDangerReflections, pendingPermissions } =
 	await import("../narrator-session-state");
@@ -79,9 +81,56 @@ afterEach(() => {
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeWorkerTestDb();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+});
+
+describe("Worker-backed buffered reads", () => {
+	test("reads committed queue envelopes without preparing SELECTs on the caller", async () => {
+		const accepted = await enqueueBufferedMessage(NARRATOR_ID, "committed worker input");
+		const prepare = spyOn(sqlite, "prepare").mockImplementation(() => {
+			throw new Error("Buffered reads must not prepare SQL on the caller");
+		});
+		const query = spyOn(sqlite, "query").mockImplementation(() => {
+			throw new Error("Buffered reads must not query SQLite on the caller");
+		});
+		try {
+			const messages = await getBufferedMessages(NARRATOR_ID);
+			expect(messages.map((message) => [message.id, message.text])).toEqual([
+				[accepted.id, "committed worker input"],
+			]);
+			expect(await readBufferedMessageDeliveryReceipt(NARRATOR_ID, accepted.id)).toMatchObject({
+				id: accepted.id,
+				state: "queued",
+			});
+			expect(prepare).not.toHaveBeenCalled();
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+	});
+
+	test("retains every legal inline envelope beyond the observational result threshold", async () => {
+		const text = "x".repeat(180 * 1024);
+		for (let index = 0; index < 32; index++) {
+			expect((await enqueueBufferedMessage(NARRATOR_ID, `${index}:${text}`)).ok).toBe(true);
+		}
+		const messages = await getBufferedMessages(NARRATOR_ID);
+		expect(messages.map((message) => message.text)).toEqual(
+			Array.from({ length: 32 }, (_, index) => `${index}:${text}`),
+		);
+	});
+
+	test("passes an already-cancelled delivery read to the Worker boundary", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			readBufferedMessageDeliveryReceipt(NARRATOR_ID, "cancelled", controller.signal),
+		).rejects.toMatchObject({ code: "DB_READ_ABORTED" });
+	});
 });
 
 describe("queued user identity", () => {
@@ -361,7 +410,7 @@ describe("durable queue modes", () => {
 		await enqueue("ordinary", "turn");
 		await enqueue("first guide", "tool");
 		await enqueue("second guide", "interrupt");
-		const messages = getBufferedMessages(NARRATOR_ID);
+		const messages = await getBufferedMessages(NARRATOR_ID);
 		expect(messages.map((m) => m.text)).toEqual(["second guide", "first guide", "ordinary"]);
 		expect(toBufferSummary(messages).map((m) => m.queueMode)).toEqual([
 			"interrupt",
@@ -378,16 +427,16 @@ describe("durable queue modes", () => {
 			.where(eq(narratorBufferedMessages.id, first.id))
 			.run();
 		expect(await updateBufferedMessageMode(NARRATOR_ID, first.id, "interrupt")).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
 			"first",
 			"second",
 			"third",
 		]);
-		const failed = getBufferedMessages(NARRATOR_ID).find((m) => m.id === first.id);
+		const failed = (await getBufferedMessages(NARRATOR_ID)).find((m) => m.id === first.id);
 		expect(failed?.state).toBe("failed");
 		expect(failed?.error).toBe("test failure");
 		expect(await updateBufferedMessageMode(NARRATOR_ID, second.id, "turn")).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
 			"first",
 			"third",
 			"second",
@@ -399,7 +448,11 @@ describe("durable queue modes", () => {
 		const b = await enqueue("b", "turn");
 		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, guide.id, a.id])).toBe(false);
 		expect(await reorderBufferedMessages(NARRATOR_ID, [guide.id, b.id, a.id])).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["guide", "b", "a"]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
+			"guide",
+			"b",
+			"a",
+		]);
 		expect(await reorderBufferedMessages(NARRATOR_ID, [a.id, b.id])).toBe(true);
 		db.update(narratorBufferedMessages)
 			.set({ state: "claimed" })
@@ -420,7 +473,7 @@ describe("pushBufferedMessage — loop-less runtime owners can hold a queue", ()
 			const result = await pushBufferedMessage(NARRATOR_ID, "queued during recovery");
 
 			expect(result.ok).toBe(true);
-			expect(getBufferedMessages(NARRATOR_ID).map((msg) => msg.text)).toEqual([
+			expect((await getBufferedMessages(NARRATOR_ID)).map((msg) => msg.text)).toEqual([
 				"queued during recovery",
 			]);
 			// Persisted too, so the queue survives another restart mid-recovery.
@@ -469,7 +522,7 @@ describe("pushBufferedMessage — loop-less runtime owners can hold a queue", ()
 				"front",
 			);
 
-			expect(getBufferedMessages(NARRATOR_ID).map((msg) => msg.text)).toEqual([
+			expect((await getBufferedMessages(NARRATOR_ID)).map((msg) => msg.text)).toEqual([
 				"cut in",
 				"first",
 				"second",
@@ -491,7 +544,7 @@ describe("pushBufferedMessage — an ownerless narrator is refused", () => {
 
 		expect(result.ok).toBe(false);
 		expect(result.full).toBeUndefined();
-		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
 		expect(await readPersistedTexts(NARRATOR_ID)).toEqual([]);
 	});
 
@@ -513,6 +566,6 @@ describe("pushBufferedMessage — an ownerless narrator is refused", () => {
 
 		expect((await pushBufferedMessage(NARRATOR_ID, "after")).ok).toBe(false);
 		// The message queued while the claim was live is untouched by the refusal.
-		expect(getBufferedMessages(NARRATOR_ID).map((msg) => msg.text)).toEqual(["during"]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((msg) => msg.text)).toEqual(["during"]);
 	});
 });

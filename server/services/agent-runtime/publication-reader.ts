@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { boundedBodyText, hasRowsOnlyBodies } from "../../lib/narrator-bodies";
+import { boundedBodyText, hasBlockStorage, hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { MAILBOX_LIMITS as L } from "./limits";
 import { publicationDedupeKey } from "./publication-key";
 import type { PublicationRun } from "./publication-outbox";
@@ -26,7 +26,7 @@ export function readPublicationTerminalSnapshot(
 			sqlite,
 			run,
 			options,
-			fromBlocks || hasRowsOnlyBodies(sqlite),
+			fromBlocks || hasRowsOnlyBodies(sqlite) || hasBlockStorage(sqlite),
 			signal,
 		),
 	)();
@@ -42,6 +42,7 @@ export function readPublicationTerminalResult(
 ): AgentTerminalResult | null {
 	signal?.throwIfAborted();
 	if (run.producerKind !== "agent") return null;
+
 	function projection(messageId: string, role: string) {
 		const row = sqlite
 			.query<
@@ -164,4 +165,17 @@ export function readPublicationTerminalResult(
 	const result = assistantSource(assistant.id);
 	signal?.throwIfAborted();
 	return settledActor() ? result : null;
+}
+
+/** Receipt, source boundary and actual block body belong to one readonly snapshot. */
+export function readPublicationTerminalResultTask(
+	sqlite: Database,
+	input: { run: PublicationRun; options?: AgentTerminalResultReadOptions },
+	signal: AbortSignal,
+): AgentTerminalResult | null {
+	signal.throwIfAborted();
+	const options = input.options ?? {};
+	return sqlite.transaction(() =>
+		readPublicationTerminalResult(sqlite, input.run, options, hasBlockStorage(sqlite), signal),
+	)();
 }

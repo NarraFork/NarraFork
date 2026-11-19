@@ -13,12 +13,14 @@ import {
 	sql,
 } from "drizzle-orm";
 import { db } from "../db";
+import { resolveDatabaseBackendConfig } from "../db/postgres-runtime";
 import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { readDomainTask, readQuery, readQueryFirst } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { getInstanceMaintenanceAuthority } from "../lib/instance-lock";
@@ -127,18 +129,21 @@ export async function beginOrdinaryColdAdoptionPass(input: {
 	toolCallId: string;
 }) {
 	ordinaryColdSource(input.rootEpoch);
-	const receipt = await db
-		.select({
-			recordId: narratorToolContinuations.id,
-			sourceEpoch: narratorToolContinuations.updateEpoch,
-			narratorId: narratorToolContinuations.narratorId,
-			executionAttempt: narratorToolCalls.executionAttempt,
-			updatedAt: narratorToolContinuations.updatedAt,
-		})
-		.from(narratorToolContinuations)
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narratorToolContinuations.toolCallId))
-		.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
-		.get();
+	const receipt = await readQueryFirst(
+		db
+			.select({
+				recordId: narratorToolContinuations.id,
+				sourceEpoch: narratorToolContinuations.updateEpoch,
+				narratorId: narratorToolContinuations.narratorId,
+				executionAttempt: narratorToolCalls.executionAttempt,
+				updatedAt: narratorToolContinuations.updatedAt,
+			})
+			.from(narratorToolContinuations)
+			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narratorToolContinuations.toolCallId))
+			.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!receipt || hasReservedRecoverySourceEpoch(receipt.sourceEpoch))
 		throw new ValidationError(
 			"Ordinary cold adoption requires an actual non-reserved execution receipt",
@@ -271,7 +276,8 @@ export interface CancelInterruptibleContinuationsInput {
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_ROWS_PER_EPOCH = 10_000;
 const MAX_RECOVERY_BYTES = 16 * 1024 * 1024;
-const METADATA_PAGE_SIZE = 100;
+// Keep epoch and guarded-row binds below the Worker's 256-bind request budget.
+const METADATA_PAGE_SIZE = 40;
 const MAX_BOUNDED_READ_ATTEMPTS = 3;
 const payloadBytes = sql<number>`coalesce(length(cast(${narratorToolContinuations.payloadJson} as blob)), 0)`;
 const toolInputBytes = sql<number>`coalesce(length(cast(${narratorToolCalls.inputJson} as blob)), 0)`;
@@ -355,14 +361,22 @@ function normalizePayload(
 	return payloadJson;
 }
 
-async function withExecutionReceipt(
+function withExecutionReceipt(
+	tx: Pick<typeof db, "select">,
 	input: PutToolContinuationInput,
-): Promise<PutToolContinuationInput> {
-	const tool = await db
-		.select({ executionAttempt: narratorToolCalls.executionAttempt })
+): PutToolContinuationInput {
+	// This receipt is written in the same transaction as its continuation; a Worker
+	// snapshot must not stamp a previous execution attempt onto a new checkpoint.
+	const tool = tx
+		.select({
+			narratorId: narratorToolCalls.narratorId,
+			executionAttempt: narratorToolCalls.executionAttempt,
+		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, input.toolCallId))
 		.get();
+	if (tool && tool.narratorId !== input.narratorId)
+		throw new ValidationError("Continuation tool call does not belong to this narrator");
 	return tool
 		? { ...input, payloadJson: { ...input.payloadJson, executionAttempt: tool.executionAttempt } }
 		: input;
@@ -485,18 +499,21 @@ async function readBoundedContinuations(
 		let cursor: string | undefined;
 		let totalBytes = 0;
 		while (true) {
-			const page = await db
-				.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
-				.from(narratorToolContinuations)
-				.where(
-					and(
-						epochCondition(scope),
-						filter,
-						cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-					),
-				)
-				.orderBy(asc(narratorToolContinuations.id))
-				.limit(METADATA_PAGE_SIZE + 1);
+			const page = await readQuery(
+				db
+					.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							epochCondition(scope),
+							filter,
+							cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+						),
+					)
+					.orderBy(asc(narratorToolContinuations.id))
+					.limit(METADATA_PAGE_SIZE + 1),
+				{ executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE + 1 },
+			);
 			assertEpochRowLimit([...metadata, ...page], scope);
 			for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
 				totalBytes += row.bytes;
@@ -511,20 +528,23 @@ async function readBoundedContinuations(
 		const records: ToolContinuationRecord[] = [];
 		for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
 			const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
-			const rows = await db
-				.select()
-				.from(narratorToolContinuations)
-				.where(
-					and(
-						epochCondition(scope),
-						filter,
-						or(
-							...page.map((row) =>
-								and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+			const rows = await readQuery(
+				db
+					.select()
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							epochCondition(scope),
+							filter,
+							or(
+								...page.map((row) =>
+									and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+								),
 							),
 						),
 					),
-				);
+				{ executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
 			if (rows.length !== page.length) throw new ContinuationScopeChangedError();
 			records.push(...rows);
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -757,71 +777,81 @@ export const toolContinuationService = {
 		});
 	},
 	async getByToolCallId(toolCallId: string): Promise<ToolContinuationRecord | null> {
-		const row = await db
-			.select()
-			.from(narratorToolContinuations)
-			.where(eq(narratorToolContinuations.toolCallId, toolCallId))
-			.get();
+		const row = await readQueryFirst(
+			db
+				.select()
+				.from(narratorToolContinuations)
+				.where(eq(narratorToolContinuations.toolCallId, toolCallId))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return row ?? null;
 	},
 
 	async getToolCallResult(toolCallId: string): Promise<ToolContinuationToolCallResult | null> {
-		const row = await db
-			.select({
-				id: narratorToolCalls.id,
-				toolUseId: narratorToolCalls.toolUseId,
-				messageId: narratorToolCalls.messageId,
-				status: narratorToolCalls.status,
-				outputJson: narratorToolCalls.outputJson,
-			})
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, toolCallId))
-			.get();
+		const row = await readQueryFirst(
+			db
+				.select({
+					id: narratorToolCalls.id,
+					toolUseId: narratorToolCalls.toolUseId,
+					messageId: narratorToolCalls.messageId,
+					status: narratorToolCalls.status,
+					outputJson: narratorToolCalls.outputJson,
+				})
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, toolCallId))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return row ?? null;
 	},
 
 	async create(input: PutToolContinuationInput): Promise<ToolContinuationRecord> {
-		input = await withExecutionReceipt(input);
-		const timestamp = isoNow();
-		const [created] = await db
-			.insert(narratorToolContinuations)
-			.values(normalizePutInput(input, timestamp))
-			.returning();
-		if (!created) throw new Error("Failed to create tool continuation");
-		return created;
+		return runAtomicWrite(db, "continuation.create", (tx) => {
+			const stamped = withExecutionReceipt(tx, input);
+			const created = tx
+				.insert(narratorToolContinuations)
+				.values(normalizePutInput(stamped, isoNow()))
+				.returning()
+				.get();
+			if (!created) throw new Error("Failed to create tool continuation");
+			return created;
+		});
 	},
 
 	async upsert(input: PutToolContinuationInput): Promise<ToolContinuationRecord> {
-		input = await withExecutionReceipt(input);
 		const timestamp = isoNow();
-		const row = normalizePutInput(input, timestamp);
-		const [upserted] = await db
-			.insert(narratorToolContinuations)
-			.values(row)
-			.onConflictDoUpdate({
-				target: narratorToolContinuations.toolCallId,
-				set: {
-					narratorId: row.narratorId,
-					updateEpoch: row.updateEpoch,
-					kind: row.kind,
-					state: row.state,
-					payloadJson: row.payloadJson,
-					deadlineAt: row.deadlineAt,
-					claimToken: null,
-					claimedAt: null,
-					errorMessage: row.errorMessage,
-					completedAt: row.completedAt,
-					updatedAt: timestamp,
-				},
-				setWhere: and(
-					eq(narratorToolContinuations.updateEpoch, input.updateEpoch),
-					eq(narratorToolContinuations.narratorId, input.narratorId),
-					isNull(narratorToolContinuations.claimToken),
-					inArray(narratorToolContinuations.state, CLAIMABLE_STATES),
-					sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') IS NULL`,
-				),
-			})
-			.returning();
+		const upserted = runAtomicWrite(db, "continuation.upsert", (tx) => {
+			const row = normalizePutInput(withExecutionReceipt(tx, input), timestamp);
+			return tx
+				.insert(narratorToolContinuations)
+				.values(row)
+				.onConflictDoUpdate({
+					target: narratorToolContinuations.toolCallId,
+					set: {
+						narratorId: row.narratorId,
+						updateEpoch: row.updateEpoch,
+						kind: row.kind,
+						state: row.state,
+						payloadJson: row.payloadJson,
+						deadlineAt: row.deadlineAt,
+						claimToken: null,
+						claimedAt: null,
+						errorMessage: row.errorMessage,
+						completedAt: row.completedAt,
+						updatedAt: timestamp,
+					},
+					setWhere: and(
+						eq(narratorToolContinuations.updateEpoch, input.updateEpoch),
+						eq(narratorToolContinuations.narratorId, input.narratorId),
+						isNull(narratorToolContinuations.claimToken),
+						inArray(narratorToolContinuations.state, CLAIMABLE_STATES),
+						sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') IS NULL`,
+					),
+				})
+				.returning()
+				.get();
+		});
 		if (upserted) return upserted;
 
 		const existing = await this.getByToolCallId(input.toolCallId);
@@ -1277,27 +1307,30 @@ export const toolContinuationService = {
 			let cursor: string | undefined;
 			let totalBytes = 0;
 			while (true) {
-				const page = await db
-					.select({
-						id: narratorToolContinuations.id,
-						bytes: payloadBytes,
-						inputBytes: toolInputBytes,
-						contentBytes: messageContentBytes(),
-					})
-					.from(narratorToolContinuations)
-					.innerJoin(
-						narratorToolCalls,
-						eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
-					)
-					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-					.where(
-						and(
-							epochCondition(updateEpoch),
-							cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-						),
-					)
-					.orderBy(asc(narratorToolContinuations.id))
-					.limit(METADATA_PAGE_SIZE + 1);
+				const page = await readQuery(
+					db
+						.select({
+							id: narratorToolContinuations.id,
+							bytes: payloadBytes,
+							inputBytes: toolInputBytes,
+							contentBytes: messageContentBytes(),
+						})
+						.from(narratorToolContinuations)
+						.innerJoin(
+							narratorToolCalls,
+							eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+						)
+						.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+						.where(
+							and(
+								epochCondition(updateEpoch),
+								cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+							),
+						)
+						.orderBy(asc(narratorToolContinuations.id))
+						.limit(METADATA_PAGE_SIZE + 1),
+					{ executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE + 1 },
+				);
 				assertEpochRowLimit([...metadata, ...page], updateEpoch);
 				for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
 					totalBytes += row.bytes + row.inputBytes + row.contentBytes;
@@ -1312,41 +1345,55 @@ export const toolContinuationService = {
 			const result: ToolContinuationRecoveryItem[] = [];
 			for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
 				const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
-				const rows = await db
-					.select({
-						record: getTableColumns(narratorToolContinuations),
-						messageId: narratorToolCalls.messageId,
-						messageCreatedAt: narratorMessages.createdAt,
-						toolCallCreatedAt: narratorToolCalls.createdAt,
-						toolUseId: narratorToolCalls.toolUseId,
-						toolName: narratorToolCalls.toolName,
-						inputJson: narratorToolCalls.inputJson,
-						// Only to place the call among its message's calls: from the tool block's
-						// ordinal when block rows hold the body, so the body is not read.
-						contentJson: contentJsonSql(),
-						blockOrder: toolBlockOrdinalSql(narratorMessages, narratorToolCalls.toolUseId),
-					})
-					.from(narratorToolContinuations)
-					.innerJoin(
-						narratorToolCalls,
-						eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
-					)
-					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-					.where(
-						and(
-							epochCondition(updateEpoch),
-							or(
-								...page.map((row) =>
-									and(
-										eq(narratorToolContinuations.id, row.id),
-										lte(payloadBytes, row.bytes),
-										lte(toolInputBytes, row.inputBytes),
-										lte(messageContentBytes(), row.contentBytes),
+				const rows =
+					resolveDatabaseBackendConfig().backend === "postgres"
+						? await readQuery(
+								db
+									.select({
+										record: getTableColumns(narratorToolContinuations),
+										messageId: narratorToolCalls.messageId,
+										messageCreatedAt: narratorMessages.createdAt,
+										toolCallCreatedAt: narratorToolCalls.createdAt,
+										toolUseId: narratorToolCalls.toolUseId,
+										toolName: narratorToolCalls.toolName,
+										inputJson: narratorToolCalls.inputJson,
+										// Only to place the call among its message's calls: from the tool block's
+										// ordinal when block rows hold the body, so the body is not read.
+										contentJson: contentJsonSql(),
+										blockOrder: toolBlockOrdinalSql(narratorMessages, narratorToolCalls.toolUseId),
+									})
+									.from(narratorToolContinuations)
+									.innerJoin(
+										narratorToolCalls,
+										eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+									)
+									.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+									.where(
+										and(
+											epochCondition(updateEpoch),
+											or(
+												...page.map((row) =>
+													and(
+														eq(narratorToolContinuations.id, row.id),
+														lte(payloadBytes, row.bytes),
+														lte(toolInputBytes, row.inputBytes),
+														lte(messageContentBytes(), row.contentBytes),
+													),
+												),
+											),
+										),
 									),
-								),
-							),
-						),
-					);
+								{ executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+							)
+						: await readDomainTask(
+								db.$client,
+								"continuationRecoveryPage",
+								{
+									epochs: normalizeEpochScope(updateEpoch),
+									rows: page,
+								},
+								{ executionPolicy: "worker-required" },
+							);
 				if (rows.length !== page.length) throw new ContinuationScopeChangedError();
 				result.push(
 					...rows.map(({ toolUseId, inputJson, contentJson, blockOrder, ...row }) => ({
@@ -1782,18 +1829,24 @@ export const toolContinuationService = {
 		updateEpoch: EpochScope,
 	): Promise<boolean> {
 		normalizeEpochScope(updateEpoch);
-		const rows = await db
-			.select({ messageId: narratorToolCalls.messageId })
-			.from(narratorToolContinuations)
-			.innerJoin(narratorToolCalls, eq(narratorToolContinuations.toolCallId, narratorToolCalls.id))
-			.where(
-				and(
-					eq(narratorToolContinuations.narratorId, narratorId),
-					epochCondition(updateEpoch),
-					notInArray(narratorToolContinuations.state, ["cancelled"]),
-				),
-			)
-			.limit(MAX_ROWS_PER_EPOCH + 1);
+		const rows = await readQuery(
+			db
+				.select({ messageId: narratorToolCalls.messageId })
+				.from(narratorToolContinuations)
+				.innerJoin(
+					narratorToolCalls,
+					eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+				)
+				.where(
+					and(
+						eq(narratorToolContinuations.narratorId, narratorId),
+						epochCondition(updateEpoch),
+						notInArray(narratorToolContinuations.state, ["cancelled"]),
+					),
+				)
+				.limit(MAX_ROWS_PER_EPOCH + 1),
+			{ executionPolicy: "worker-required", maxRows: MAX_ROWS_PER_EPOCH + 1 },
+		);
 		assertEpochRowLimit(rows, updateEpoch);
 		for (const messageId of new Set(rows.map((row) => row.messageId))) {
 			const pending = await this.markOwnerContinuationPendingForMessage(messageId, updateEpoch);

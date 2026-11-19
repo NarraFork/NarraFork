@@ -1,5 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import type { z } from "zod";
@@ -103,10 +104,13 @@ export function editorActorForSubject(
 	signal?: AbortSignal,
 ): EditorActor & Required<Pick<EditorActor, "authorizeOperation">> {
 	const requireAccess = async (need: "read" | "write") => {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, subject.userId),
-			columns: { role: true, tokenVersion: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, subject.userId),
+				columns: { role: true, tokenVersion: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!user) throw new NotFoundError("User", subject.userId);
 		const auth = subject.auth;
 		if (
@@ -252,10 +256,13 @@ export function editorActorForSubject(
 				);
 			const projectId = narrator.contextProjectId ?? null;
 			const project = projectId
-				? await db.query.projects.findFirst({
-						where: eq(projects.id, projectId),
-						columns: { gitPath: true },
-					})
+				? await readQuery(
+						db.query.projects.findFirst({
+							where: eq(projects.id, projectId),
+							columns: { gitPath: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1, signal },
+					)
 				: undefined;
 			if (projectId && !project) throw new NotFoundError("Project", projectId);
 			const cwd = resolveNarratorSessionCwd(narrator.cwd, project?.gitPath, getHome());

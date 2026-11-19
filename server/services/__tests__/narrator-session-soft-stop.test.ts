@@ -1,15 +1,19 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import * as workerReads from "../../db/worker-read";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready, close: closeWorkerTestDb } = getNarratorWorkerTestDb();
+await ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const {
 	applyBufferedQueueModeControl,
 	clearBufferedMessageSoftStopIfIdle,
 	evaluateSoftStopRequest,
+	getBufferedGuidanceRequestVersion,
 	hasPendingBufferedGuidance,
 	hasPendingBufferedWork,
 	rearmCutInSoftStopBeforeContinuing,
@@ -25,6 +29,7 @@ function registerActiveNarrator(): ActiveNarrator {
 	const active = {
 		narratorId: NARRATOR_ID,
 		alive: true,
+		abortController: new AbortController(),
 	} as unknown as ActiveNarrator;
 	activeNarrators.set(NARRATOR_ID, active);
 	return active;
@@ -60,7 +65,9 @@ async function queueMessage(text = "cut in"): Promise<string> {
 		"front",
 	);
 	expect(entry.ok).toBe(true);
-	expect(getBufferedMessages(NARRATOR_ID).some((message) => message.id === entry.id)).toBe(true);
+	expect((await getBufferedMessages(NARRATOR_ID)).some((message) => message.id === entry.id)).toBe(
+		true,
+	);
 	return entry.id;
 }
 
@@ -77,11 +84,14 @@ beforeEach(() => {
 		})
 		.run();
 });
-afterEach(() => {
-	clearBufferedMessages(NARRATOR_ID);
+afterEach(async () => {
+	await clearBufferedMessages(NARRATOR_ID);
 	activeNarrators.delete(NARRATOR_ID);
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(async () => {
+	await closeWorkerTestDb();
+	mock.module("../../db", () => realDb);
+});
 
 describe("evaluateSoftStopRequest", () => {
 	test("permission feedback always stops and consumes its flag", () => {
@@ -170,7 +180,7 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferSoftStopTaken).toBe(true);
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBe(true);
 		// Consumed: the re-armed request now stands on its own, so the "queue emptied
@@ -180,7 +190,7 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 
 	test("the re-armed request stops the very next tool boundary", async () => {
 		const active = await grantedCutInStop();
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(
 			evaluateSoftStopRequest({
@@ -194,9 +204,9 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		// Re-arming a stop with nothing left to deliver would end the next pass at its
 		// first tool call for no reason.
 		const active = await grantedCutInStop();
-		clearBufferedMessages(NARRATOR_ID);
+		await clearBufferedMessages(NARRATOR_ID);
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferSoftStopTaken).toBe(true);
@@ -206,21 +216,59 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		const active = registerActiveNarrator();
 		await queueMessage();
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBeUndefined();
 	});
 });
 
 describe("clearBufferedMessageSoftStopIfIdle", () => {
+	test("a completed empty read does not clear guidance admitted while that read is awaiting", async () => {
+		const active = registerActiveNarrator();
+		active._guidanceAbortController = new AbortController();
+		requestBufferedMessageSoftStop(NARRATOR_ID);
+		const observed = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const original = workerReads.readQuery;
+		let first = true;
+		const pausedRead = async (...args: Parameters<typeof workerReads.readQuery>) => {
+			const pause = first;
+			first = false;
+			const result = await original(...args);
+			if (pause) {
+				observed.resolve();
+				await release.promise;
+			}
+			return result;
+		};
+		const read = spyOn(workerReads, "readQuery").mockImplementation(
+			pausedRead as typeof workerReads.readQuery,
+		);
+		const clearing = clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		try {
+			await observed.promise;
+			await queueMessage("guidance admitted after the empty snapshot");
+			expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
+			release.resolve();
+			await clearing;
+			expect(getBufferedGuidanceRequestVersion(active)).toBe(2);
+			expect(active._bufferSoftStop).toBe(true);
+			expect(active._bufferGuidancePending).toBe(true);
+		} finally {
+			release.resolve();
+			await clearing.catch(() => {});
+			read.mockRestore();
+		}
+	});
+
 	test("clears the pending soft stop once the queue is empty", async () => {
 		const active = registerActiveNarrator();
 		await queueMessage();
 		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
 		expect(active._bufferSoftStop).toBe(true);
 
-		clearBufferedMessages(NARRATOR_ID);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		await clearBufferedMessages(NARRATOR_ID);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(false);
 	});
@@ -233,26 +281,44 @@ describe("clearBufferedMessageSoftStopIfIdle", () => {
 		// One of several queued messages was cancelled; the rest still need the boundary.
 		await queueMessage("queued-b");
 		expect(await removeBufferedMessage(NARRATOR_ID, first)).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((message) => message.text)).toEqual(["queued-b"]);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((message) => message.text)).toEqual([
+			"queued-b",
+		]);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(true);
 	});
 
-	test("is a no-op when no soft stop is pending", () => {
+	test("is a no-op when no soft stop is pending", async () => {
 		const active = registerActiveNarrator();
 
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBeUndefined();
 	});
 
-	test("does not throw for an unknown narrator", () => {
-		expect(() => clearBufferedMessageSoftStopIfIdle("no-such-narrator")).not.toThrow();
+	test("does not throw for an unknown narrator", async () => {
+		await expect(clearBufferedMessageSoftStopIfIdle("no-such-narrator")).resolves.toBeUndefined();
 	});
 });
 
 describe("immediate guidance controls", () => {
+	test("each live guidance request advances its version while a previous request stays armed", () => {
+		const active = registerActiveNarrator();
+		active._guidanceAbortController = new AbortController();
+		expect(getBufferedGuidanceRequestVersion(active)).toBe(0);
+		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
+		expect(getBufferedGuidanceRequestVersion(active)).toBe(1);
+		expect(active._guidanceAbortController.signal.aborted).toBe(true);
+		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
+		expect(getBufferedGuidanceRequestVersion(active)).toBe(2);
+		expect(active._bufferSoftStop).toBe(true);
+		expect(active.abortController.signal.aborted).toBe(false);
+		active.alive = false;
+		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(false);
+		expect(getBufferedGuidanceRequestVersion(active)).toBe(2);
+	});
+
 	test("cancels the request without aborting the narrator/tool owner", async () => {
 		const active = registerActiveNarrator();
 		active.abortController = new AbortController();
@@ -270,9 +336,9 @@ describe("immediate guidance controls", () => {
 		await pushBufferedMessage(NARRATOR_ID, "next task");
 		requestBufferedMessageSoftStop(NARRATOR_ID);
 		await removeBufferedMessage(NARRATOR_ID, guide);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
-		expect(hasPendingBufferedWork(NARRATOR_ID)).toBe(true);
-		expect(hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		expect(await hasPendingBufferedWork(NARRATOR_ID)).toBe(true);
+		expect(await hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferGuidancePending).toBe(false);
 	});

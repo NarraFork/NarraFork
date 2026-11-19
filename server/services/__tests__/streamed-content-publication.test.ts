@@ -1,13 +1,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import { cleanDb, getFileTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, AgentEvent } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // Only the upstream provider and the network sink are replaced. The actual loop,
 // execution receipt, event consumer, append/publication and SQLite paths all run.
-const { db, sqlite, dispose } = getFileTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
@@ -155,10 +158,13 @@ const { handlePermission } = await import("../narrator-permission");
 const {
 	processEvent,
 	clearStreamingSnapshot,
+	finishReasoningTranslationActivity,
 	getStreamingSnapshot,
 	CriticalEventPersistenceError,
 } = await import("../narrator-event-handler");
 const { executeAgentLoop } = await import("../narrator-executor");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+const { resolveReasoningTranslationTarget } = await import("../reasoning-translation-store");
 toolRegistry.register({
 	name: "PublicationHold",
 	description: "Hold the first actual execution while the second tool is streamed",
@@ -267,7 +273,8 @@ function readMessage(messageId: string) {
 	return { blocks: readTestMessageContent(sqlite, messageId), seq: row.seq };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	frames.length = 0;
 	executions.length = 0;
@@ -282,15 +289,21 @@ afterEach(() => {
 	releaseProvider.resolve();
 	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint_insert");
 	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint_update");
-	for (const id of ["main", "child", "parent"]) clearStreamingSnapshot(id);
+	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint");
+	for (const id of ["main", "child", "parent"]) {
+		finishReasoningTranslationActivity(id, id, true);
+		clearStreamingSnapshot(id);
+	}
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	toolRegistry.unregister("PublicationHold");
 	mock.module("../../lib/agent/provider", () => realProvider);
 	mock.module("../../db", () => realDb);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.restore();
-	dispose();
+	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("real loop content publication before tools", () => {
@@ -340,6 +353,19 @@ describe("real loop content publication before tools", () => {
 						{ type: "reasoning", text: thought },
 						{ type: "text", text },
 					]);
+					expect(sqlite.filename).not.toBe(":memory:");
+					// Exercise the same worker-backed identity lookup used by live completion.
+					expect(
+						await resolveReasoningTranslationTarget(
+							ctx.narratorId,
+							messageId as string,
+							committed.blocks[0].id as string,
+						),
+					).toMatchObject({
+						ownerNarratorId: ctx.narratorId,
+						messageId,
+						elementId: committed.blocks[0].id,
+					});
 					for (const block of committed.blocks.slice(0, 2)) {
 						expect(block.id).toBeString();
 						expect(block.revision).toBeNumber();

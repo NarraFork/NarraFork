@@ -1,3 +1,5 @@
+import { ModelHistoryTimeoutError } from "../../lib/model-history-preparation";
+
 export const MODEL_JSON_CONTAINER_BYTES = 256;
 export const MODEL_JSON_SLOT_BYTES = 32;
 
@@ -11,10 +13,14 @@ export class ModelHistoryBudget {
 	constructor(
 		readonly maxBytes: number,
 		private readonly signal?: AbortSignal,
+		/** Explicit caller budget only; production hydration does not set a total deadline. */
+		private readonly deadline?: number,
 	) {}
 
 	check = (): void => {
 		this.signal?.throwIfAborted();
+		if (this.deadline !== undefined && Date.now() >= this.deadline)
+			throw new ModelHistoryTimeoutError();
 	};
 
 	/** Reserve wire/UTF-16/projection overhead before fetching a body, or known reused costs. */

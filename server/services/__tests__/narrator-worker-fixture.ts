@@ -6,7 +6,7 @@ import { testEnvironment } from "../../../tests/preload";
 import { getTestDb } from "../../../tests/setup";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
-import { runReadTask, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
+import { assertDbReadersReady, closeReadDatabase } from "../../lib/db-worker/pool";
 
 /** Per-file isolated schema; strict Worker reads observe committed WAL pages. */
 export function getNarratorWorkerTestDb() {
@@ -23,17 +23,13 @@ export function getNarratorWorkerTestDb() {
 	sqlite.run("PRAGMA foreign_keys = ON");
 	sqlite.run("PRAGMA busy_timeout = 50");
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
-	const ready = runReadTask(
-		path,
-		{ kind: "selectRows", sql: "SELECT 1", params: [], maxRows: 1 },
-		{ timeoutMs: 30_000 },
-	);
+	const ready = assertDbReadersReady(path, { timeoutMs: 30_000 });
 	let closing: Promise<void> | undefined;
 	function close(): Promise<void> {
 		closing ??= (async () => {
 			// A failed probe still needs the same acknowledged handle cleanup.
 			await ready.catch(() => {});
-			await shutdownDbWorkerPool();
+			await closeReadDatabase(path, { timeoutMs: 30_000 });
 			sqlite.close();
 			rmSync(directory, { recursive: true, force: true });
 		})();

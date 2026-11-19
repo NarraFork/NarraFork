@@ -21,6 +21,16 @@ import {
 	withNarratorMutationAdmission,
 } from "../narrator-session-state";
 
+// Settle worker I/O before Bun's synchronous throw matcher evaluates the rejection.
+async function settledThrow(work: Promise<unknown>): Promise<() => never> {
+	const [result] = await Promise.allSettled([work]);
+	expect(result.status).toBe("rejected");
+	if (result.status !== "rejected") throw new Error("Expected operation to reject");
+	return () => {
+		throw result.reason;
+	};
+}
+
 function deferred() {
 	let resolve = () => {};
 	const promise = new Promise<void>((done) => {
@@ -121,7 +131,7 @@ async function identityContract(query: ContextQuery, other: ContextQuery) {
 				return store.claim(...args);
 			},
 		};
-		await expect(send(id, stale, raced)).rejects.toThrow("Conversation identity changed");
+		expect(await settledThrow(send(id, stale, raced))).toThrow("Conversation identity changed");
 		expect(outbound).toBe(3);
 		expect(stale._persistedConversationId).toBe(old);
 		expect((await store.read(id)).conversationId).toBeNull();
@@ -133,10 +143,10 @@ async function identityContract(query: ContextQuery, other: ContextQuery) {
 
 	await seed(query, "lost-id", "other-owner");
 	const lost = { conversationId: "candidate", _persistedConversationId: null };
-	await expect(send("lost-id", lost)).rejects.toThrow("Conversation identity changed");
+	expect(await settledThrow(send("lost-id", lost))).toThrow("Conversation identity changed");
 	expect(lost._persistedConversationId).toBeNull();
 	expect((await store.read("lost-id")).conversationId).toBe("other-owner");
-	await expect(send("missing-row", lost)).rejects.toThrow();
+	expect(await settledThrow(send("missing-row", lost))).toThrow();
 	expect(outbound).toBe(3);
 
 	for (const failAt of ["read", "claim"] as const) {
@@ -145,12 +155,23 @@ async function identityContract(query: ContextQuery, other: ContextQuery) {
 		const failed = { conversationId: "not-sent", _persistedConversationId: null };
 		const broken = createConversationIdentityStore({
 			async get<T>(statement: string, bindings: Parameters<ContextQuery["get"]>[1]) {
-				if ((failAt === "read") === statement.startsWith("SELECT"))
+				if (failAt === "read")
 					return query.get<T>("SELECT id FROM missing_conversation_identity_table", []);
 				return query.get<T>(statement, bindings);
 			},
+			async writeReturning<T>(
+				statement: string,
+				bindings: Parameters<ContextQuery["writeReturning"]>[1],
+			) {
+				if (failAt === "claim")
+					return query.writeReturning<T>(
+						"UPDATE missing_conversation_identity_table SET id = ? RETURNING id",
+						[id],
+					);
+				return query.writeReturning<T>(statement, bindings);
+			},
 		});
-		await expect(send(id, failed, broken)).rejects.toThrow();
+		expect(await settledThrow(send(id, failed, broken))).toThrow();
 		expect(failed._persistedConversationId).toBeNull();
 		expect((await store.read(id)).conversationId).toBeNull();
 		expect(outbound).toBe(3);
@@ -188,6 +209,32 @@ test("SQLite: identity is durable before send; delayed/failed/ABA claims fail cl
 	await identityContract(sqliteContextQuery(sqlite), sqliteContextQuery(sqlite));
 });
 
+test("SQLite identity claims use the writer while read and queued transaction boundaries stay strict", async () => {
+	const query = sqliteContextQuery(sqlite);
+	const id = "identity-explicit-writer";
+	await seed(query, id);
+	const store = createConversationIdentityStore(query);
+	const expected = await store.read(id);
+	const update = "UPDATE narrators SET api_conversation_id = ? WHERE id = ? RETURNING id";
+	const readWriteError = await query.get(update, ["read-path-write", id]).then(
+		() => null,
+		(error: unknown) => error,
+	);
+	expect(readWriteError).toMatchObject({ code: "DB_READ_INVALID" });
+	expect((await store.read(id)).conversationId).toBeNull();
+	expect(await store.claim(id, "writer-claimed", expected)).toBe(true);
+	expect((await store.read(id)).conversationId).toBe("writer-claimed");
+	expect(
+		await settledThrow(
+			query.transaction(async (tx) => {
+				await tx.run("UPDATE narrators SET api_conversation_id = ? WHERE id = ?", ["queued", id]);
+				await tx.writeReturning(update, ["escaped", id]);
+			}),
+		),
+	).toThrow("Returning mutations are not supported in queued context transactions");
+	expect((await store.read(id)).conversationId).toBe("writer-claimed");
+});
+
 test("production admission rejects a displaced or aborted session before touching identity", async () => {
 	await seed(sqliteContextQuery(sqlite), "not-current");
 	const active = {
@@ -196,13 +243,13 @@ test("production admission rejects a displaced or aborted session before touchin
 		_persistedConversationId: null,
 		abortController: new AbortController(),
 	} as ActiveNarrator;
-	await expect(ensureConversationIdentityPersisted("not-current", active)).rejects.toThrow(
+	expect(await settledThrow(ensureConversationIdentityPersisted("not-current", active))).toThrow(
 		"Conversation identity changed",
 	);
 	activeNarrators.set("not-current", active);
 	try {
 		active.abortController.abort(new Error("stopped"));
-		await expect(ensureConversationIdentityPersisted("not-current", active)).rejects.toThrow(
+		expect(await settledThrow(ensureConversationIdentityPersisted("not-current", active))).toThrow(
 			"stopped",
 		);
 		expect(active._persistedConversationId).toBeNull();

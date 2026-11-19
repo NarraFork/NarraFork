@@ -17,28 +17,40 @@
  *   - a bump for an unknown account answers 0 and changes nothing (the pre-port
  *     `?? 0` behaviour, preserved verbatim).
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on an isolated file/WAL database, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Locale } from "@shared/i18n-locales";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const previousWorker = process.env.NARRAFORK_DB_WORKER;
+const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+process.env.NARRAFORK_DB_WORKER = "on";
+process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
 const { sqliteAuthSessionStore: store } = await import("../sqlite-session-store");
 const { authSessionStore } = await import("../store");
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
+	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+	else process.env.NARRAFORK_DB_WORKER = previousWorker;
+	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 });
 
 beforeEach(() => {
@@ -69,6 +81,109 @@ async function makeAccount(
 }
 
 describe("AuthSessionStore — SQLite", () => {
+	test("only the two fixed session lookups use short scheduling and forward the caller budget", async () => {
+		const bridge = await import("../../../db/worker-read");
+		const { createToken, verifyToken } = await import("../../../lib/auth");
+		const { hashSessionToken } = await import("../../../lib/session-token-hash");
+		const userId = await makeAccount();
+		const token = await createToken(userId);
+		const session = await verifyToken(token);
+		const controller = new AbortController();
+		const deadlineAt = Date.now() + 10_000;
+		const read = spyOn(bridge, "readQuery");
+		try {
+			await store.findSessionByTokenHash(hashSessionToken(token), {
+				signal: controller.signal,
+				deadlineAt,
+			});
+			await store.findSessionById(session.sid as string, { signal: controller.signal, deadlineAt });
+			await store.findSessionState(userId);
+			expect(read).toHaveBeenCalledTimes(3);
+			for (const call of read.mock.calls.slice(0, 2)) {
+				expect(call[1]).toMatchObject({
+					schedulingHint: "auth-session",
+					signal: controller.signal,
+					deadlineAt,
+				});
+			}
+			expect(read.mock.calls[2]?.[1]?.schedulingHint).toBeUndefined();
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("opaque session reads use the Worker and unavailable readers stay 503", async () => {
+		const { Hono } = await import("hono");
+		const { createToken, verifyToken } = await import("../../../lib/auth");
+		const { buildAppErrorResponse } = await import("../../../lib/app-error-response");
+		const { requireAuth } = await import("../../../middleware/auth");
+		const id = await makeAccount({ username: "worker-session", role: "admin" });
+		const token = await createToken(id);
+		const payload = await verifyToken(token);
+		const forbid = () => {
+			throw new Error("Session SELECT ran on the owning connection");
+		};
+		const prepare = spyOn(sqlite, "prepare").mockImplementation(forbid);
+		const query = spyOn(sqlite, "query").mockImplementation(forbid);
+		const app = new Hono();
+		app.onError(
+			(error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: "Internal error" }, 500),
+		);
+		app.get("/", requireAuth, (c) => c.text("authorized"));
+		try {
+			expect(await store.findSessionById(payload.sid as string)).toMatchObject({
+				userId: id,
+				role: "admin",
+				userTokenVersion: 0,
+				sessionTokenVersion: 0,
+			});
+			expect((await verifyToken(token)).sub).toBe(id);
+			expect((await store.findSessionProfile(id))?.username).toBe("worker-session");
+			const authorized = await app.request("/", {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			expect(authorized.status).toBe(200);
+			expect(await authorized.text()).toBe("authorized");
+			process.env.NARRAFORK_DB_WORKER = "off";
+			const response = await app.request("/", { headers: { Authorization: `Bearer ${token}` } });
+			expect(response.status).toBe(503);
+			expect(await response.json()).toMatchObject({
+				code: "DB_READ_UNAVAILABLE",
+				messageCode: "DATABASE_READ_UNAVAILABLE",
+			});
+			expect(prepare).not.toHaveBeenCalled();
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			process.env.NARRAFORK_DB_WORKER = "on";
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+	});
+
+	test("OAuth native storage failures propagate instead of invalidating credentials", async () => {
+		const { Hono } = await import("hono");
+		const { DrizzleQueryError } = await import("drizzle-orm/errors");
+		const oauth = await import("../../../lib/oauth-provider");
+		const { requireAuth } = await import("../../../middleware/auth");
+		const failure = new DrizzleQueryError("SELECT session", [], new Error("storage unavailable"));
+		const lookup = spyOn(oauth, "validateAccessToken").mockRejectedValue(failure);
+		let observed: unknown;
+		const app = new Hono();
+		app.onError((error, c) => {
+			observed = error;
+			return c.json({ error: "Internal error" }, 500);
+		});
+		app.get("/", requireAuth, (c) => c.text("authorized"));
+		try {
+			const response = await app.request("/", {
+				headers: { Authorization: "Bearer oauth-storage-failure" },
+			});
+			expect(response.status).toBe(500);
+			expect(observed).toBe(failure);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
 	test("a login lookup returns the verification facts; an unknown username is null", async () => {
 		const id = await makeAccount({ username: "alice" });
 		expect(await store.findLoginCredential("alice")).toEqual({

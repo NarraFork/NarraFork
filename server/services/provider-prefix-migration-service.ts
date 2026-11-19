@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { and, eq, gt, isNull } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { logger } from "../lib/logger";
 import {
 	getProviderPrefixChanges,
@@ -14,7 +15,7 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
-import { allRows, applyUpdates, firstRow, type PlannedUpdate, selectFrom } from "./migration-db";
+import { applyUpdates, firstRow, type PlannedUpdate, selectFrom } from "./migration-db";
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_PATH = `${narraforkDir}/provider-prefix-migration.json`;
@@ -53,20 +54,20 @@ export async function planProviderPrefixNarratorMigration(
 	let lastId: string | null = null;
 	let scanned = 0;
 	for (;;) {
-		const rows: Array<{
-			id: string;
-			model: string | null;
-			pendingModelRestore: string | null;
-		}> = await allRows(
-			selectFrom(narrators, {
-				id: narrators.id,
-				model: narrators.model,
-				pendingModelRestore: narrators.pendingModelRestore,
-			})
-				.where(lastId ? gt(narrators.id, lastId) : undefined)
-				.orderBy(narrators.id)
-				.limit(SCAN_BATCH_SIZE),
-		);
+		const rows: Pick<typeof narrators.$inferSelect, "id" | "model" | "pendingModelRestore">[] =
+			await readQuery<
+				Pick<typeof narrators.$inferSelect, "id" | "model" | "pendingModelRestore">[]
+			>(
+				selectFrom(narrators, {
+					id: narrators.id,
+					model: narrators.model,
+					pendingModelRestore: narrators.pendingModelRestore,
+				})
+					.where(lastId ? gt(narrators.id, lastId) : undefined)
+					.orderBy(narrators.id)
+					.limit(SCAN_BATCH_SIZE),
+				{ executionPolicy: "worker-required" },
+			);
 		if (rows.length === 0) break;
 		scanned += rows.length;
 		if (scanned > MAX_SCANNED_NARRATORS) {

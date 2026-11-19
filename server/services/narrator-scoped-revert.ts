@@ -8,6 +8,7 @@ import {
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narrators, narratorToolCalls, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { AppError, NotFoundError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -77,11 +78,10 @@ export async function revertPrincipalForUser(userId: string | null | undefined) 
 			401,
 			"REVERT_AUTHENTICATION_REQUIRED",
 		);
-	const user = db
-		.select({ id: users.id, role: users.role })
-		.from(users)
-		.where(eq(users.id, userId))
-		.get();
+	const user = await readQueryFirst(
+		db.select({ id: users.id, role: users.role }).from(users).where(eq(users.id, userId)).limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!user || !["user", "admin"].includes(user.role))
 		throw new AppError("Restore requester is unavailable", 401, "REVERT_AUTHENTICATION_REQUIRED");
 	return { userId: user.id, isAdmin: user.role === "admin" };
@@ -118,26 +118,32 @@ async function select(
 		scope.toolUses.map((item) => JSON.stringify([item.messageId, item.toolUseId])),
 	);
 	if (!wanted.size) return { kind: "tool_calls", toolCallIds: [] };
-	const rows = await db
-		.select({
-			id: narratorToolCalls.id,
-			messageId: narratorToolCalls.messageId,
-			toolUseId: narratorToolCalls.toolUseId,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			inArray(narratorToolCalls.messageId, [
-				...new Set(scope.toolUses.map((item) => item.messageId)),
-			]),
-		)
-		.limit(FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(
+				inArray(narratorToolCalls.messageId, [
+					...new Set(scope.toolUses.map((item) => item.messageId)),
+				]),
+			)
+			.limit(FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1),
+		{
+			executionPolicy: "worker-required",
+			maxRows: FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1,
+		},
+	);
 	if (rows.length > FILE_CHANGE_LIMITS.historyToolRelatedChanges)
 		throw new RevertPlannerError("BUDGET_EXCEEDED", "Tool selection exceeds its bound");
 	const matched = rows.filter((item) =>
@@ -164,11 +170,14 @@ export async function planNarratorScopedRevert(
 		narratorId,
 		options?.signal ?? AbortSignal.timeout(60_000),
 	);
-	const narrator = db
-		.select({ messageVersion: narrators.messageVersion })
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get();
+	const narrator = await readQueryFirst(
+		db
+			.select({ messageVersion: narrators.messageVersion })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, signal: options?.signal },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	return prepareLocalRevertPlan({
 		principal,

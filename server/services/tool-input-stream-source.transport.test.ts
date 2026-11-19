@@ -1,13 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+
+import { dirname, join } from "node:path";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { TEXT_DOCUMENT_PACKET_BYTES } from "@shared/pretext-layout/text-document";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { getTestDb } from "../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -18,11 +16,16 @@ import {
 import { resetDbWorkerPoolForTest } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { getNarratorWorkerTestDb } from "./__tests__/narrator-worker-fixture";
 
-// The detail route's real Worker must see the same committed, isolated fixture as auth.
-const directory = await mkdtemp(join(tmpdir(), "nf-tool-source-transport-"));
-const { db, sqlite } = getTestDb(join(directory, "isolated-route-fixture.sqlite"));
+// Strict metadata reads use real Worker connections to this file-backed, committed WAL fixture.
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
+const directory = dirname(sqlite.filename);
+const realDbModule = { ...(await import("../db")) };
 const dbStub = {
+	...realDbModule,
 	db,
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
@@ -33,6 +36,10 @@ const dbStub = {
 };
 mock.module("../db", () => dbStub);
 mock.module("@server/db", () => dbStub);
+const workerReads = await import("../db/worker-read");
+const previewReads = spyOn(workerReads, "readDomainTask");
+// Initialize the service before the route/WebSocket graph reaches its persistence module.
+await import("./narrator-service");
 const sourceModule = await import("./tool-input-stream-source");
 const historyPath = join(directory, "isolated-history-fixture.sqlite");
 const historyDatabase = new Database(historyPath);
@@ -71,6 +78,19 @@ const { narratorRoutes } = await import("../routes/narrators");
 const { publicNarratorShareRoutes } = await import("../routes/public-narrator-shares");
 const { createPublicShare, revokePublicShare } = await import("./public-narrator-share-service");
 const { rememberPublicToolIdentity } = await import("./public-narrator-share-gen-ui");
+const { stopBlockSyncSweep } = await import("./narrator-block-sync");
+
+// Authorization metadata and tool bodies must use Workers; retain the public range gate's
+// existing capped tool-name-only classification query, which does not grant visibility.
+const prepare = sqlite.prepare.bind(sqlite);
+const callerReads = spyOn(sqlite, "prepare").mockImplementation(
+	(...args: Parameters<typeof sqlite.prepare>) => {
+		const classification = /^select "tool_name" from "narrator_tool_calls" where .+ limit \?$/i;
+		if (/\bselect\b[\s\S]*\bnarrator_tool_calls\b/i.test(args[0]) && !classification.test(args[0]))
+			throw new Error("Historical tool metadata must be read in the Worker");
+		return prepare(...args);
+	},
+);
 
 const owner = generateId();
 const outsider = generateId();
@@ -114,13 +134,34 @@ app.onError((error, c) =>
 );
 const refs: string[] = [];
 afterAll(async () => {
+	stopBlockSyncSweep();
 	for (const ref of refs) await service.discard(ref);
 	await resetDbWorkerPoolForTest();
-	sqlite.close();
 	historyDatabase.close();
-	await rm(directory, { recursive: true, force: true });
+	callerReads.mockRestore();
+	previewReads.mockRestore();
+	mock.module("../db", () => realDbModule);
+	mock.module("@server/db", () => realDbModule);
+	await workerFixture.close();
 	mock.restore();
 });
+
+function expectPreviewReads(
+	toolUseId: string,
+	toolCallId: string,
+	messageId: string,
+	count: number,
+) {
+	expect(previewReads).toHaveBeenCalledTimes(count);
+	for (const call of previewReads.mock.calls) {
+		expect(call).toEqual([
+			sqlite,
+			"narratorToolPreview",
+			{ narratorId, toolUseId, reference: { toolCallId, messageId } },
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		]);
+	}
+}
 
 async function source(ownerId = narratorId, text = "raw\r\n\ud800") {
 	// The share gate fail-closes an unclassified tool. This fixture is an ordinary
@@ -179,8 +220,10 @@ describe("historical ensure source routes", () => {
 		const query = new URLSearchParams({ toolCallId, messageId, executionAttempt: "0" });
 		const root = `/api/narrators/${narratorId}/tool-calls/${toolUseId}`;
 		expect((await app.request(`${root}?${query}`)).status).toBe(413);
+		previewReads.mockClear();
 		const response = await app.request(`${root}/input-document?${query}`);
 		expect(response.status).toBe(200);
+		expectPreviewReads(toolUseId, toolCallId, messageId, 2);
 		const ref = (await response.json()) as { id: string; source: { executionAttempt: number } };
 		refs.push(ref.id);
 		expect(ref.source.executionAttempt).toBe(0);
@@ -208,16 +251,16 @@ describe("historical ensure source routes", () => {
 			{ userId: owner, isAdmin: false },
 			{ guestName: "different scope" },
 		);
-		expect(
-			(
-				await app.request(
-					`/api/public/narrator-shares/${wrongShare.share.id}/tool-calls/${toolUseId}/input-document?${query}`,
-					{
-						headers: { Authorization: `Share ${wrongShare.token}` },
-					},
-				)
-			).status,
-		).toBe(404);
+		const beforeDenied = historyWorkers;
+		const invisible = await app.request(
+			`/api/public/narrator-shares/${wrongShare.share.id}/tool-calls/${toolUseId}/input-document?${query}`,
+			{
+				headers: { Authorization: `Share ${wrongShare.token}` },
+			},
+		);
+		expect(invisible.status).toBe(404);
+		expect(await invisible.json()).toMatchObject({ code: "PUBLIC_SHARE_UNAVAILABLE" });
+		expect(historyWorkers).toBe(beforeDenied);
 	});
 
 	test("detail 413 and TTL expiry do not limit canonical content; metadata ACL precedes readonly extraction", async () => {
@@ -325,13 +368,10 @@ describe("historical ensure source routes", () => {
 				})
 			).status,
 		).toBe(404);
-		expect(
-			(
-				await app.request(
-					`${root}/input-document?${new URLSearchParams({ toolCallId, messageId, executionAttempt: "1" })}`,
-				)
-			).status,
-		).toBe(404);
+		const wrongAttempt = new URLSearchParams({ toolCallId, messageId, executionAttempt: "1" });
+		const stale = await app.request(`${root}/input-document?${wrongAttempt}`);
+		expect(stale.status).toBe(404);
+		expect(await stale.json()).toMatchObject({ code: "TEXT_DOCUMENT_IDENTITY_CHANGED" });
 		expect(historyWorkers).toBe(beforeDenied);
 		await service.cleanupExpired(Date.now() + 25 * 60 * 60 * 1000);
 		expect(
@@ -343,6 +383,14 @@ describe("historical ensure source routes", () => {
 			{ guestName: "historical reader" },
 		);
 		const publicRoot = `/api/public/narrator-shares/${share.share.id}`;
+		const publicStale = await app.request(
+			`${publicRoot}/tool-calls/${encodeURIComponent(toolUseId)}/input-document?${wrongAttempt}`,
+			{ headers: { Authorization: `Share ${share.token}` } },
+		);
+		expect(publicStale.status).toBe(404);
+		expect(await publicStale.json()).toMatchObject({ code: "PUBLIC_SHARE_UNAVAILABLE" });
+		expect(historyWorkers).toBe(beforeDenied);
+		previewReads.mockClear();
 		const rebuiltResponse = await app.request(
 			`${publicRoot}/tool-calls/${encodeURIComponent(toolUseId)}/input-document?${query}`,
 			{
@@ -350,6 +398,7 @@ describe("historical ensure source routes", () => {
 			},
 		);
 		expect(rebuiltResponse.status).toBe(200);
+		expectPreviewReads(toolUseId, toolCallId, messageId, 3);
 		const rebuilt = (await rebuiltResponse.json()) as { id: string; epoch: string; length: number };
 		refs.push(rebuilt.id);
 		expect(rebuilt.epoch).not.toBe(first.epoch);
@@ -360,6 +409,7 @@ describe("historical ensure source routes", () => {
 				headers: { Authorization: `Share ${share.token}` },
 			},
 		);
+		expect(publicRange.status).toBe(200);
 		expect(((await publicRange.json()) as { text: string }).text).toBe(raw.slice(-16));
 		await revokePublicShare(narratorId, share.share.id, { userId: owner, isAdmin: false });
 		expect(

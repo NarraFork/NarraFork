@@ -488,9 +488,9 @@ codexRoutes.delete("/credentials/:id", (c) => {
  *
  * Registered before the `:id` variant so the literal path wins the match.
  */
-codexRoutes.get("/credentials/usage-stats", (c) => {
+codexRoutes.get("/credentials/usage-stats", async (c) => {
 	return c.json({
-		entries: serializeCredentialUsageTotalsList(listProviderCredentialTotals("codex")),
+		entries: serializeCredentialUsageTotalsList(await listProviderCredentialTotals("codex")),
 	});
 });
 
@@ -506,9 +506,9 @@ codexRoutes.get("/credentials/usage-stats", (c) => {
  * The top-level figures always cover every model; `byModel` is capped and sets
  * `byModelTruncated` when the credential has used more models than it returns.
  */
-codexRoutes.get("/credentials/:id/usage-stats", (c) => {
+codexRoutes.get("/credentials/:id/usage-stats", async (c) => {
 	const id = c.req.param("id");
-	return c.json(serializeCredentialUsageSummary(getCredentialUsageTotals("codex", id)));
+	return c.json(serializeCredentialUsageSummary(await getCredentialUsageTotals("codex", id)));
 });
 
 /**

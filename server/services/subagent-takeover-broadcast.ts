@@ -23,6 +23,7 @@
  * Its only dependencies are the DB and the socket.
  */
 
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
@@ -37,15 +38,18 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
  */
 export async function resolveSpawningToolUseId(subagentId: string): Promise<string | undefined> {
 	try {
-		const first = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, subagentId),
-				eq(narratorMessages.role, "user"),
-				isNotNull(narratorMessages.parentToolUseId),
-			),
-			columns: { parentToolUseId: true },
-			orderBy: narratorMessages.createdAt,
-		});
+		const first = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: and(
+					eq(narratorMessages.narratorId, subagentId),
+					eq(narratorMessages.role, "user"),
+					isNotNull(narratorMessages.parentToolUseId),
+				),
+				columns: { parentToolUseId: true },
+				orderBy: narratorMessages.createdAt,
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return first?.parentToolUseId ?? undefined;
 	} catch {
 		return undefined;

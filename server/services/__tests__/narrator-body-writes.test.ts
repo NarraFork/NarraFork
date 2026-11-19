@@ -8,9 +8,12 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -36,10 +39,10 @@ beforeEach(() => {
 			NOW,
 		]);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await workerFixture.close();
 });
 
 /** What the envelope's rows assemble to. */

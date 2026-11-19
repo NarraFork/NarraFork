@@ -70,6 +70,7 @@ describe("maintained background occupancy graph", () => {
 		index.getNarratorIds = () => {
 			throw new Error("batch removal must not copy narrator keys");
 		};
+		expect(index.sourceRowCounts).toEqual({ narrators: 200, tasks: 2000 });
 		const removed = new Set(Array.from({ length: 5000 }, (_, i) => `cold-${i}`));
 		const result = index.deleteNarrators(removed);
 		expect(parentReads).toBe(2000);

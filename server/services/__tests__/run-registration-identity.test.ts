@@ -340,9 +340,10 @@ for (const cancellation of ["deadline", "caller"] as const) {
 		});
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
 			sawPass();
-			await new Promise<void>((resolve) =>
-				config.signal.addEventListener("abort", () => resolve(), { once: true }),
-			);
+			if (!config.signal.aborted)
+				await new Promise<void>((resolve) =>
+					config.signal.addEventListener("abort", () => resolve(), { once: true }),
+				);
 			return { ...done, aborted: true };
 		});
 		try {
@@ -352,15 +353,27 @@ for (const cancellation of ["deadline", "caller"] as const) {
 				text: "work",
 				binding: { principal: { userId: A }, deadlineAt, cancelWith },
 			});
-			await passStarted;
+			// The absolute deadline also covers cold history preparation: a terminal
+			// can legitimately arrive without ever entering the model executor.
+			const control = getRunControl(TARGET);
+			expect(control).toBeDefined();
+			const first = await Promise.race([
+				passStarted.then(() => "pass" as const),
+				handle.terminal.then(() => "terminal" as const),
+			]);
 			expect(stored().registration?.run).toMatchObject({
 				principal: { userId: A },
 				deadlineAt,
 				cancelWith,
 			});
 			expect(stored().logicalRunId).toBeTruthy();
-			expect(getRunControl(TARGET)?.binding).toEqual(stored().registration?.run);
-			if (cancellation === "caller") expect(cancelRunsBoundTo(CALLER, "cancel caller")).toBe(1);
+			// Keep the same registered control even if terminal cleanup removed its map entry.
+			expect(control?.binding).toEqual(stored().registration?.run);
+			expect(control?.binding?.deliverTo).toBeUndefined();
+			if (cancellation === "caller") {
+				expect(first).toBe("pass");
+				expect(cancelRunsBoundTo(CALLER, "cancel caller")).toBe(1);
+			}
 			expect((await handle.terminal).timedOut).toBe(cancellation === "deadline");
 			expect(db.select().from(runtimePublicationOutbox).all()).toEqual([]);
 		} finally {

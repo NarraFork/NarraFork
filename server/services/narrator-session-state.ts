@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
+import { readQuery } from "../db/worker-read";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError } from "../lib/errors";
@@ -824,12 +825,12 @@ export function listRuntimeBusyNarratorIds(): string[] {
 
 /** Deprecated read-only view; the mailbox is the sole queue authority. */
 export const bufferedMessages = {
-	get(narratorId: string): BufferedMessage[] | undefined {
-		const messages = getBufferedMessages(narratorId);
+	async get(narratorId: string): Promise<BufferedMessage[] | undefined> {
+		const messages = await getBufferedMessages(narratorId);
 		return messages.length ? messages : undefined;
 	},
-	has(narratorId: string): boolean {
-		return getBufferedMessages(narratorId).length > 0;
+	async has(narratorId: string): Promise<boolean> {
+		return (await getBufferedMessages(narratorId)).length > 0;
 	},
 };
 
@@ -911,10 +912,13 @@ export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<
 					 FROM narrators WHERE id = ?`,
 					[id],
 				)
-			: await db.query.narrators.findFirst({
-					where: eq(narrators.id, id),
-					columns: { id: true, variant: true, parentNarratorId: true },
-				});
+			: await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, id),
+						columns: { id: true, variant: true, parentNarratorId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;

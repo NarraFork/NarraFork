@@ -59,7 +59,7 @@ test("PG signature cancellation cancels the pending SQL even if the driver never
 	const signature = readPostgresModelHistorySignature(query.sql, "owner", {
 		signal: controller.signal,
 	});
-	controller.abort();
+	controller.abort(new Error("Model history preparation cancelled"));
 	await expect(signature).rejects.toThrow("Model history preparation cancelled");
 	expect(query.cancel).toHaveBeenCalledTimes(1);
 	query.reject(new Error("late driver cancellation"));
@@ -78,6 +78,55 @@ test("PG signature pre-cancellation skips SQL and driver failures stay sanitized
 	const signature = readPostgresModelHistorySignature(failed.sql, "owner");
 	failed.reject(new Error("postgres://private:secret@host"));
 	await expect(signature).rejects.toThrow("Model history PostgreSQL signature failed");
+});
+
+test("PG signature uses an explicit 30s source budget and accepts a read after 10s", async () => {
+	let now = 100_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const timer = spyOn(globalThis, "setTimeout");
+	const pending = Object.assign(
+		Promise.resolve().then(() => {
+			now += 11_000;
+			return [{ revision: 4, catalogIdentity: "fixture", contract: null, triggers: 0 }];
+		}),
+		{ cancel: () => {} },
+	);
+	const sql = { unsafe: () => pending } as unknown as Pick<SQL, "unsafe">;
+	try {
+		expect(
+			(await readPostgresModelHistorySignature(sql, "owner", { deadline: now + 30_000 })).revision,
+		).toBe("4");
+		expect(timer.mock.calls.some(([, delay]) => delay === 30_000)).toBe(true);
+	} finally {
+		clock.mockRestore();
+		timer.mockRestore();
+	}
+});
+
+test("PG signature preserves a shorter external deadline and active cancellation", async () => {
+	const clock = spyOn(Date, "now").mockReturnValue(100_000);
+	const timer = spyOn(globalThis, "setTimeout");
+	const controller = new AbortController();
+	let cancels = 0;
+	const pending = Object.assign(new Promise<never>(() => {}), {
+		cancel: () => {
+			cancels++;
+		},
+	});
+	const sql = { unsafe: () => pending } as unknown as Pick<SQL, "unsafe">;
+	try {
+		const read = readPostgresModelHistorySignature(sql, "owner", {
+			signal: controller.signal,
+			deadline: 102_000,
+		});
+		expect(timer.mock.calls.some(([, delay]) => delay === 2000)).toBe(true);
+		controller.abort(new Error("signature cancelled"));
+		await expect(read).rejects.toThrow("signature cancelled");
+		expect(cancels).toBe(1);
+	} finally {
+		clock.mockRestore();
+		timer.mockRestore();
+	}
 });
 
 (process.env.PG_INTEGRATION === "1" ? test : test.skip)(

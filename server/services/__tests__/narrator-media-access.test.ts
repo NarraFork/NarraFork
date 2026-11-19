@@ -3,11 +3,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { type MediaRef, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -21,10 +22,21 @@ import * as fsScanClient from "../../lib/fs-scan-worker/client";
 import { generateId } from "../../lib/id";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
 import { setUploadsDirForTests } from "../../lib/uploads";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+mock.module("../../db", () => ({
+	...realDbModule,
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+	postgresRuntime: null,
+	activePostgresReadUrl: null,
+}));
 const { narratorService } = await import("../narrator-service");
 const { cleanupOrphanedUploads } = await import("../storage-service");
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -32,6 +44,7 @@ const { narratorReferencesMedia } = await import("../narrator-media-access");
 const { uploadRoutes } = await import("../../routes/uploads");
 const { insertEnvelope } = await import("../narrator-body-writes");
 const { noteRowsOnlyEnvelopes } = await import("../narrator-block-scans");
+const { stopBlockSyncSweep } = await import("../narrator-block-sync");
 const home = mkdtempSync(join(tmpdir(), "nf-media-fork-"));
 setUploadsDirForTests(home);
 const now = new Date().toISOString();
@@ -46,11 +59,13 @@ beforeEach(() => {
 		db.insert(users).values({ id, username: id, passwordHash: "x", createdAt: now }).run();
 	}
 });
-afterAll(() => {
+afterAll(async () => {
+	stopBlockSyncSweep();
 	setUploadsDirForTests(null);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await workerFixture.close();
 	rmSync(home, { recursive: true, force: true });
 });
 

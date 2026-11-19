@@ -15,7 +15,6 @@
  */
 import { db } from "@server/db";
 import { authSessions, userPreferences, users } from "@server/db/schema";
-import type { AuthReadOptions } from "@server/lib/auth-read-admission";
 import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
@@ -25,6 +24,7 @@ import type {
 	LoginCredential,
 	NewAuthSession,
 	SessionProfile,
+	SessionReadOptions,
 	SessionState,
 } from "./session-store";
 import { authRead } from "./sqlite-auth-read";
@@ -37,7 +37,7 @@ function asRole(role: string): AccountRole {
 /** One session row joined with its account, by a unique key. */
 async function findSession(
 	where: SQL,
-	options?: AuthReadOptions,
+	options?: SessionReadOptions,
 ): Promise<AuthSessionRecord | null> {
 	const query = db
 		.select({
@@ -56,6 +56,7 @@ async function findSession(
 		.where(where)
 		.limit(1);
 	const [row] = await authRead(query, options);
+
 	if (!row) return null;
 	return { ...row, role: asRole(row.role) };
 }
@@ -148,14 +149,14 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 
 	async findSessionByTokenHash(
 		tokenHash: string,
-		options?: AuthReadOptions,
+		options?: SessionReadOptions,
 	): Promise<AuthSessionRecord | null> {
 		return findSession(eq(authSessions.tokenHash, tokenHash), options);
 	},
 
 	async findSessionById(
 		sessionId: string,
-		options?: AuthReadOptions,
+		options?: SessionReadOptions,
 	): Promise<AuthSessionRecord | null> {
 		return findSession(eq(authSessions.id, sessionId), options);
 	},

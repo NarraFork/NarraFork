@@ -27,8 +27,6 @@ import {
 } from "../../services/storage-scan-queries";
 import { logger } from "../logger";
 import {
-	DbReadTaskExecutionError,
-	DbReadTaskTimeoutError,
 	getConfiguredConcurrency,
 	runEphemeralReadTask,
 	runReadTask,
@@ -43,8 +41,9 @@ export interface ParallelScanOptions {
 	mainBytes: number;
 	onProgress?: (progress: { done: number; total: number; tableName: string }) => void;
 	signal?: AbortSignal;
-	/** One deadline for context, shards and worker-unavailable fallbacks, including queueing. */
+	/** One deadline for context, shards and isolated retries, including queueing. */
 	budgetMs?: number;
+	executionPolicy?: "compatible" | "worker-required";
 }
 
 export interface ParallelScanOutcome extends DatabaseObjectStorageResult {
@@ -236,7 +235,7 @@ async function runObjectStorageScan(
 			durationMs: Date.now() - startedAt,
 		};
 	} catch (err) {
-		if (signal?.aborted) throw err;
+		if (signal?.aborted || options.executionPolicy === "worker-required") throw err;
 		if (!(err instanceof WorkersUnavailableError)) {
 			logger.warn("Storage scan read failed; not restarting the scan", {
 				phase,
@@ -300,11 +299,9 @@ async function runObjectStorageScan(
 					durationMs: Date.now() - startedAt,
 				};
 			} catch (ephemeralErr) {
-				if (
-					signal?.aborted ||
-					ephemeralErr instanceof DbReadTaskTimeoutError ||
-					ephemeralErr instanceof DbReadTaskExecutionError
-				)
+				// Only unavailable isolation may produce an explicitly unavailable breakdown.
+				// Query/protocol failures, cancellation and watchdogs remain visible to the caller.
+				if (signal?.aborted || !(ephemeralErr instanceof WorkersUnavailableError))
 					throw ephemeralErr;
 				logger.warn("Storage scan could not run off-thread; per-table breakdown is unavailable", {
 					reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),

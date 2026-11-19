@@ -113,20 +113,30 @@ function languageUpdates(request: CapturedRequest) {
 		.map(([text]) => text)
 		.filter((text) => text.includes("[language]\n"));
 }
-async function waitUntil(check: () => boolean, label: string) {
+async function waitUntil(check: () => boolean | Promise<boolean>, label: string) {
 	const deadline = Date.now() + 8_000;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() >= deadline) throw new Error(`Timed out: ${label}; requests=${requests.length}`);
 		await Bun.sleep(10);
 	}
 }
+async function expectRejectedMessage(work: Promise<unknown>, message: string) {
+	// Settle asynchronous work before the synchronous throw matcher.
+	const error = await work.then(
+		() => null,
+		(error: unknown) => error,
+	);
+	expect(() => {
+		throw error;
+	}).toThrow(message);
+}
 async function idle(count: number) {
 	await waitUntil(
-		() =>
+		async () =>
 			requests.length === count &&
 			recipientRow().status === "idle" &&
 			!getExecutionOwner(recipient) &&
-			!hasPendingBufferedWork(recipient),
+			!(await hasPendingBufferedWork(recipient)),
 		"recipient idle",
 	);
 }

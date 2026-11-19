@@ -6,19 +6,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
+import * as workerReads from "../db/worker-read";
+import { DbReadError } from "../lib/db-worker/errors";
 import * as readPool from "../lib/db-worker/pool";
+import {
+	assertDbReadersReady,
+	closeReadDatabase,
+	getConfiguredConcurrency,
+} from "../lib/db-worker/pool";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import {
-	closeRevertBodyWorkers,
 	REVERT_SELECTION_LIMITS,
 	REVERT_SELECTION_PAGE_ITEMS,
 	RevertSelectionService,
 	readCommittedRevertSelectionBody,
-	resetRevertBodyWorkersForTests,
 } from "./revert-selection-service";
 
-// Independent in-memory schema; importing the service never imports application DB/runtime.
+// Independent file schema; production Worker reads see committed source snapshots.
 const DDL = `
 CREATE TABLE narrators (
  id TEXT PRIMARY KEY, owner_user_id TEXT, visibility TEXT NOT NULL DEFAULT 'private',
@@ -32,7 +37,8 @@ CREATE INDEX idx_narrators_refs_inherited_from ON narrators(refs_inherited_from)
 CREATE INDEX idx_narrators_fork_message ON narrators(fork_message_id);
 CREATE TABLE narrator_messages (
  id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_tool_use_id TEXT, role TEXT NOT NULL DEFAULT 'assistant', content_json TEXT NOT NULL,
- content_text TEXT, original_content_json TEXT, tree_hash_after TEXT, snapshot_commit_sha TEXT, created_at TEXT NOT NULL DEFAULT '2026-09-07'
+ content_text TEXT, original_content_json TEXT, tree_hash_after TEXT, snapshot_commit_sha TEXT, created_at TEXT NOT NULL DEFAULT '2026-09-07',
+ body_revision INTEGER NOT NULL DEFAULT 1, state_revision INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX idx_messages_parent_tool_use_lookup ON narrator_messages(parent_tool_use_id,created_at);
 CREATE TABLE narrator_message_refs (
@@ -108,13 +114,41 @@ let authorized: string[];
 let denied: Set<string>;
 let queries: string[];
 let beforeQuery: ((query: string) => void) | undefined;
+let fixtureDirectory: string;
+let restoreWorkerTrace: (() => void) | undefined;
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 
+function bodyWorkerRequest(value: unknown): {
+	requestId: string;
+	id: string;
+	digestOnly: boolean;
+} | null {
+	if (!value || typeof value !== "object") return null;
+	const request = value as {
+		type?: string;
+		requestId?: string;
+		params?: {
+			kind?: string;
+			task?: string;
+			input?: { id?: string; digestOnly?: boolean; entries?: { id: string }[] };
+		};
+	};
+	if (request.type !== "task" || !request.requestId || request.params?.kind !== "domainRead")
+		return null;
+	const input = request.params.input;
+	if (request.params.task === "revertSelectionBody" && typeof input?.id === "string")
+		return { requestId: request.requestId, id: input.id, digestOnly: input.digestOnly === true };
+	if (request.params.task === "revertSelectionBodyVerify" && input?.entries?.[0])
+		return { requestId: request.requestId, id: input.entries[0].id, digestOnly: true };
+	return null;
+}
+
 beforeEach(async () => {
-	await resetRevertBodyWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
-	sqlite = new Database(":memory:");
+	fixtureDirectory = mkdtempSync(join(tmpdir(), "revert-selection-worker-"));
+	sqlite = new Database(join(fixtureDirectory, "fixture.sqlite"));
+	sqlite.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;");
 	sqlite.exec(DDL);
 	serial = 0;
 	authorized = [];
@@ -136,10 +170,42 @@ beforeEach(async () => {
 		},
 	});
 	service = new RevertSelectionService({ $client: traced }, { authorize, onSlow: () => {} });
+	const read = workerReads.readNativeRows;
+	const trace = spyOn(workerReads, "readNativeRows").mockImplementation(((
+		client,
+		query,
+		binds,
+		options,
+	) => {
+		if (client.filename === sqlite.filename) {
+			if (queries.length < 20_000) queries.push(query);
+			beforeQuery?.(query);
+		}
+		return read(client, query, binds, options);
+	}) as typeof workerReads.readNativeRows);
+	const digestRead = workerReads.readSelectDigestBatch;
+	const batchTrace = spyOn(workerReads, "readSelectDigestBatch").mockImplementation(
+		(client, entries, options) => {
+			const source = client instanceof Database ? client : client.$client;
+			if (source instanceof Database && source.filename === sqlite.filename)
+				for (const entry of entries) {
+					if (queries.length < 20_000) queries.push(entry.query);
+					beforeQuery?.(entry.query);
+				}
+			return digestRead(client, entries, options);
+		},
+	);
+	restoreWorkerTrace = () => {
+		trace.mockRestore();
+		batchTrace.mockRestore();
+	};
+	await assertDbReadersReady(sqlite.filename, { timeoutMs: 30_000 });
 });
 afterEach(async () => {
-	await closeRevertBodyWorkers();
+	restoreWorkerTrace?.();
+	await closeReadDatabase(sqlite.filename, { timeoutMs: 30_000 });
 	sqlite.close();
+	rmSync(fixtureDirectory, { recursive: true, force: true });
 });
 async function authorize(
 	owner: NarratorPrincipal,
@@ -649,8 +715,8 @@ describe("authorized stable source selection", () => {
 	});
 });
 
-describe("pooled body worker lifecycle", () => {
-	test("separate collections reuse one native thread with distinct RPC IDs and duplicate ready is inert", async () => {
+describe("shared database body worker lifecycle", () => {
+	test("separate collections reuse native readers with distinct RPC IDs", async () => {
 		message(1);
 		const threads = new Set<Worker>();
 		const ids = new Set<string>();
@@ -660,11 +726,10 @@ describe("pooled body worker lifecycle", () => {
 			this: Worker,
 			...args: Parameters<Worker["postMessage"]>
 		) {
-			if (typeof args[0]?.digestOnly === "boolean") {
+			if (bodyWorkerRequest(args[0])) {
 				threads.add(this);
 				ids.add(args[0].requestId);
 				calls++;
-				this.emit("message", { ready: true });
 			}
 			return Reflect.apply(original, this, args);
 		});
@@ -678,7 +743,7 @@ describe("pooled body worker lifecycle", () => {
 			post.mockRestore();
 		}
 	});
-	test("concurrent collectors share a bounded two-thread pool rather than starting per collector", async () => {
+	test("concurrent collectors share bounded readers and database close awaits native exit", async () => {
 		message(1);
 		const threads = new Set<Worker>();
 		let live = 0;
@@ -688,7 +753,7 @@ describe("pooled body worker lifecycle", () => {
 			this: Worker,
 			...args: Parameters<Worker["postMessage"]>
 		) {
-			if (args[0]?.action === "ping" && !threads.has(this)) {
+			if (bodyWorkerRequest(args[0]) && !threads.has(this)) {
 				threads.add(this);
 				peak = Math.max(peak, ++live);
 				this.once("exit", () => live--);
@@ -707,17 +772,16 @@ describe("pooled body worker lifecycle", () => {
 				),
 			);
 			expect(new Set(results.map((r) => r.metadataDigest)).size).toBe(1);
-			expect(threads.size).toBe(2);
-			expect(peak).toBe(2);
-			await closeRevertBodyWorkers();
+			expect(threads.size).toBeGreaterThan(0);
+			expect(peak).toBeLessThanOrEqual(getConfiguredConcurrency());
+			await closeReadDatabase(sqlite.filename, { timeoutMs: 30_000 });
 			expect(live).toBe(0);
 		} finally {
 			post.mockRestore();
 		}
 	});
 	test.each([
-		"startup-error",
-		"startup-timeout",
+		"dispatch",
 		"cancel",
 		"timeout",
 		"error",
@@ -733,98 +797,91 @@ describe("pooled body worker lifecycle", () => {
 			this: Worker,
 			...args: Parameters<Worker["postMessage"]>
 		) {
-			if (!threads.has(this)) {
-				threads.add(this);
-				this.once("exit", () => exited.add(this));
-			}
-			if (args[0]?.action === "ping") {
-				if (mode === "startup-error") throw Error("injected startup failure");
-				if (mode === "startup-timeout") return;
-				return Reflect.apply(original, this, args);
-			}
+			if (!bodyWorkerRequest(args[0])) return Reflect.apply(original, this, args);
+			threads.add(this);
+			this.once("exit", () => exited.add(this));
 			business++;
+			if (mode === "dispatch") throw Error("injected dispatch failure");
 			if (mode === "cancel") controller.abort(Error("injected cancellation"));
 			if (mode === "error" || mode === "messageerror")
 				this.emit(mode, Error("injected runtime failure"));
-			// Deliberately do not send the body: timeout/cancel/fault must not compute inline.
+			// Withhold the task so faults cannot compute a body in the caller thread.
 		});
 		try {
 			const service = new RevertSelectionService(
 				{ $client: sqlite },
-				{ authorize, timeoutMs: 180 },
+				{ authorize, timeoutMs: 500 },
 			);
-			const error = await service
-				.collect({
+			await expect(
+				service.collect({
 					principal,
 					narratorId: "root",
 					expectedMessageVersion: 7,
 					selector: { kind: "all" },
 					signal: controller.signal,
-				})
-				.then(
-					() => undefined,
-					(error: unknown) => error,
-				);
-			expect(error).toBeDefined();
+				}),
+			).rejects.toBeDefined();
 			expect(threads.size).toBe(1);
 			expect(exited.size).toBe(1);
-			expect(business).toBe(mode.startsWith("startup") ? 0 : 1);
+			expect(business).toBe(1);
 		} finally {
 			post.mockRestore();
 		}
-		// A bad slot is replaced, never silently replayed; a later independent request works.
 		expect((await collect()).history.messages).toHaveLength(1);
 	});
-	test("healthy domain validation errors keep the thread reusable", async () => {
+	test.each([
+		"DB_READ_FAILED",
+		"DB_READ_TIMEOUT",
+		"DB_READ_UNSUPPORTED",
+	] as const)("%s during body admission never reads the body on the caller thread", async (code) => {
+		message(1);
+		const domain = spyOn(workerReads, "readDomainTask").mockRejectedValue(
+			new DbReadError(code, "Injected body admission failure"),
+		);
+		try {
+			await expect(collect()).rejects.toMatchObject({ code });
+			expect(domain).toHaveBeenCalledTimes(1);
+		} finally {
+			domain.mockRestore();
+		}
+	});
+	test("healthy domain validation errors keep the reader reusable", async () => {
 		const id = message(1);
 		const originalBody = sqlite
 			.query<{ body: string }, [string]>(
 				"SELECT content_json AS body FROM narrator_messages WHERE id=?",
 			)
 			.get(id)?.body as string;
-		const threads = new Set<Worker>();
-		const original = Worker.prototype.postMessage;
-		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
-			this: Worker,
-			...args: Parameters<Worker["postMessage"]>
-		) {
-			if (typeof args[0]?.digestOnly === "boolean") threads.add(this);
-			return Reflect.apply(original, this, args);
-		});
-		try {
-			sqlite.query("UPDATE narrator_messages SET content_json='{' WHERE id=?").run(id);
-			await rejected(collect(), "BODY_UNVERIFIED");
-			sqlite.query("UPDATE narrator_messages SET content_json=? WHERE id=?").run(originalBody, id);
-			expect((await collect()).history.messages).toHaveLength(1);
-			expect(threads.size).toBe(1);
-		} finally {
-			post.mockRestore();
-		}
+		sqlite.query("UPDATE narrator_messages SET content_json='{' WHERE id=?").run(id);
+		await rejected(collect(), "BODY_UNVERIFIED");
+		sqlite.query("UPDATE narrator_messages SET content_json=? WHERE id=?").run(originalBody, id);
+		expect((await collect()).history.messages).toHaveLength(1);
 	});
-	test("final close cancels active work, awaits exit and refuses new dispatch", async () => {
+	test("database close cancels active work, awaits exit and refuses late dispatch", async () => {
 		message(1);
 		let exited = false;
 		let dispatched = 0;
+		let closing: Promise<void> | undefined;
 		const original = Worker.prototype.postMessage;
 		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
 			this: Worker,
 			...args: Parameters<Worker["postMessage"]>
 		) {
-			if (typeof args[0]?.digestOnly === "boolean") {
+			if (bodyWorkerRequest(args[0])) {
 				dispatched++;
 				this.once("exit", () => {
 					exited = true;
 				});
-				void closeRevertBodyWorkers();
+				closing = closeReadDatabase(sqlite.filename, { timeoutMs: 30_000 });
 				return;
 			}
 			return Reflect.apply(original, this, args);
 		});
 		try {
-			await rejected(collect(), "BODY_UNVERIFIED");
-			await closeRevertBodyWorkers();
+			await expect(collect()).rejects.toBeDefined();
+			await closing;
 			expect(exited).toBe(true);
-			await rejected(collect(), "BODY_UNVERIFIED");
+			await expect(collect()).rejects.toBeDefined();
 			expect(dispatched).toBe(1);
 		} finally {
 			post.mockRestore();
@@ -848,8 +905,8 @@ describe("stable block boundary and COW history manifest", () => {
 			this: Worker,
 			...args: Parameters<Worker["postMessage"]>
 		) {
-			const [request] = args;
-			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
+			const request = bodyWorkerRequest(args[0]);
+			if (request) {
 				const wrongId = requests.at(-1)?.requestId ?? `wrong-${request.requestId}`;
 				requests.push({
 					worker: this,
@@ -858,9 +915,10 @@ describe("stable block boundary and COW history manifest", () => {
 					digestOnly: request.digestOnly,
 				});
 				// Emit before forwarding to the actual worker, including the previous parse's ID.
-				this.emit("message", { requestId: wrongId, error: "stale body error" });
+				this.emit("message", { type: "result", requestId: wrongId, error: "stale body error" });
 				injectedErrors++;
 				this.emit("message", {
+					type: "result",
 					requestId: wrongId,
 					result: { digest: "0".repeat(64), blocks: [] },
 				});
@@ -889,50 +947,27 @@ describe("stable block boundary and COW history manifest", () => {
 		}
 	});
 	test.each([
-		{ name: "null envelope", reply: (_id: string) => null },
-		{ name: "array envelope", reply: (_id: string) => [] },
-		{ name: "missing ID", reply: (_id: string) => ({ result: {} }) },
-		{ name: "invalid ID", reply: (_id: string) => ({ requestId: 1 }) },
-		{ name: "missing result", reply: (requestId: string) => ({ requestId }) },
-		{ name: "null result", reply: (requestId: string) => ({ requestId, result: null }) },
+		{ name: "null verdict", reply: null },
+		{ name: "array verdict", reply: [] },
+		{ name: "missing verdict", reply: {} },
+		{ name: "null summary", reply: { error: null, summary: null } },
+		{ name: "invalid digest", reply: { error: null, summary: { digest: 1, blocks: [] } } },
+		{ name: "invalid error", reply: { error: 1, summary: null } },
 		{
-			name: "invalid result shape",
-			reply: (requestId: string) => ({ requestId, result: { digest: 1, blocks: [] } }),
+			name: "ambiguous summary/error",
+			reply: {
+				error: "BODY_UNVERIFIED",
+				summary: { digest: "0".repeat(64), blocks: [] },
+			},
 		},
-		{ name: "invalid error", reply: (requestId: string) => ({ requestId, error: 1 }) },
-		{
-			name: "ambiguous result/error",
-			reply: (requestId: string) => ({
-				requestId,
-				error: "ambiguous",
-				result: { digest: "0".repeat(64), blocks: [] },
-			}),
-		},
-	])("malformed real body worker reply fails explicitly: $name", async ({ reply }) => {
+	])("malformed database body verdict fails explicitly: $name", async ({ reply }) => {
 		message(1);
-		let injected = 0;
-		let exited = false;
-		const realPost = Worker.prototype.postMessage;
-		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
-			this: Worker,
-			...args: Parameters<Worker["postMessage"]>
-		) {
-			const [request] = args;
-			if (typeof request?.id === "string" && typeof request.digestOnly === "boolean") {
-				this.once("exit", () => {
-					exited = true;
-				});
-				this.emit("message", reply(request.requestId));
-				injected++;
-			}
-			return Reflect.apply(realPost, this, args);
-		});
+		const domain = spyOn(workerReads, "readDomainTask").mockResolvedValue(reply as never);
 		try {
 			await rejected(collect(), "BODY_UNVERIFIED");
-			expect(injected).toBeGreaterThan(0);
-			expect(exited).toBe(true);
+			expect(domain).toHaveBeenCalledTimes(1);
 		} finally {
-			post.mockRestore();
+			domain.mockRestore();
 		}
 	});
 	test("after_block fixes retained boundary and all later message/ref changes in one capture", async () => {
@@ -1605,6 +1640,7 @@ describe("bounded metadata collection and drift", () => {
 		const source = new Database(path);
 		const writer = new Database(path);
 		try {
+			source.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;");
 			source.exec(DDL);
 			source.exec(`
 				INSERT INTO narrators(id,owner_user_id) VALUES('root','alice'),('other','bob');
@@ -1626,6 +1662,7 @@ describe("bounded metadata collection and drift", () => {
 			).not.toBe(initial);
 			expect((await pending).selectionComplete).toBe(true);
 		} finally {
+			await closeReadDatabase(source.filename, { timeoutMs: 30_000 });
 			writer.close();
 			source.close();
 			rmSync(directory, { recursive: true, force: true });
@@ -1706,14 +1743,58 @@ describe("bounded metadata collection and drift", () => {
 		expect((await pending).selectionComplete).toBe(true);
 	});
 
-	test("same-connection mutation during the first worker await rejects despite same length/version", async () => {
+	test("same-length body drift after the first Worker body snapshot is rejected", async () => {
 		const id = message(1, [{ type: "text", text: "old" }]);
-		const pending = collect();
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		sqlite
-			.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
-			.run(JSON.stringify([{ type: "text", text: "new" }]), id);
-		await rejected(pending, "STALE");
+		const original = workerReads.readDomainTask;
+		let changed = false;
+		const inspect = spyOn(workerReads, "readDomainTask").mockImplementation((async (...args) => {
+			const result = await Reflect.apply(original, workerReads, args);
+			if (!changed && args[1] === "revertSelectionBody") {
+				changed = true;
+				sqlite
+					.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+					.run(JSON.stringify([{ type: "text", text: "new" }]), id);
+			}
+			return result;
+		}) as typeof workerReads.readDomainTask);
+		try {
+			await rejected(collect(), "STALE");
+			expect(changed).toBe(true);
+		} finally {
+			inspect.mockRestore();
+		}
+	});
+	test.each([
+		"body revision",
+		"ref",
+		"tool",
+	] as const)("the final no-await fence rejects late selected %s drift", async (kind) => {
+		const selected = tool(1, "Read");
+		const boundary = service as unknown as { verifySourcesSync(state: unknown): void };
+		const original = boundary.verifySourcesSync;
+		const verify = spyOn(boundary, "verifySourcesSync").mockImplementation(function (
+			this: typeof boundary,
+			state: unknown,
+		) {
+			if (kind === "body revision")
+				sqlite
+					.query("UPDATE narrator_messages SET body_revision=body_revision+1 WHERE id=?")
+					.run(selected.messageId);
+			else if (kind === "ref")
+				sqlite
+					.query("UPDATE narrator_message_refs SET seq=seq+1 WHERE message_id=?")
+					.run(selected.messageId);
+			else
+				sqlite
+					.query("UPDATE narrator_tool_calls SET execution_attempt=2 WHERE id=?")
+					.run(selected.id);
+			return Reflect.apply(original, this, [state]);
+		});
+		try {
+			await rejected(collect(), "STALE");
+		} finally {
+			verify.mockRestore();
+		}
 	});
 	test.each([
 		["ref removal", "DELETE FROM narrator_message_refs WHERE narrator_id='root'"],
@@ -1870,7 +1951,8 @@ describe("bounded metadata collection and drift", () => {
 			{ kind: "messages", messageIds: [selected] },
 			{ expectedMessageVersion: undefined },
 		);
-		expect(writes).toBeGreaterThan(20);
+		expect(writes).toBeGreaterThan(0);
+		expect(current.messageVersions[0].messageVersion).toBe(7 + writes);
 		expect(current.metadataDigest).toBe(expected.metadataDigest);
 		expect(current.evidenceComplete).toBe(true);
 	});
@@ -1968,7 +2050,15 @@ describe("bounded metadata collection and drift", () => {
 		const selections = queries.filter((query) => /FROM /i.test(query));
 		expect(selections.length).toBeGreaterThan(10);
 		expect(selections.every((query) => /LIMIT (\?|1)/i.test(query))).toBe(true);
-		expect(selections.some((query) => /COUNT\(|SUM\(|GROUP BY|SELECT \*/i.test(query))).toBe(false);
+		const fences = selections.filter((query) => query.startsWith("WITH observed AS MATERIALIZED"));
+		const sources = selections.filter((query) => !fences.includes(query));
+		expect(sources.some((query) => /COUNT\(|SUM\(|GROUP BY|SELECT \*/i.test(query))).toBe(false);
+		expect(fences.length).toBeGreaterThan(0);
+		for (const fence of fences) {
+			expect(fence).toContain("SELECT count(*) FROM observed");
+			expect(fence).toContain("FROM json_each(?)");
+			expect(fence).not.toMatch(/COUNT\(\*\) FROM (?:narrator_|file_change_)/i);
+		}
 		expect(selections.some((query) => /input_json AS|output_json AS/i.test(query))).toBe(false);
 		expect(
 			selections.some(

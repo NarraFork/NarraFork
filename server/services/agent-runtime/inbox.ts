@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { AgentInboxBlockedReason, PendingAgentMessageSummary } from "@shared/agent-inbox";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
@@ -37,6 +38,7 @@ import {
 	type RuntimeMailboxRow,
 	requireRuntimeQueuePort,
 } from "./runtime-queue-port";
+import { runAtomicWrite } from "./runtime-write";
 
 // Resolve the current DB binding per operation (hot reload and isolated test repositories).
 export const inboxProcessTokenPrefix = hotSafe(
@@ -69,14 +71,17 @@ export async function resolveInboxExecutionBinding(
 ): Promise<InboxExecutionBinding | null> {
 	if (!row.sourceNarratorId || !row.sourceToolCallId || row.sourceAttempt == null) return null;
 	try {
-		const source = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, row.sourceToolCallId),
-				eq(narratorToolCalls.narratorId, row.sourceNarratorId),
-				eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
-			),
-			columns: { messageId: true, toolUseId: true },
-		});
+		const source = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, row.sourceToolCallId),
+					eq(narratorToolCalls.narratorId, row.sourceNarratorId),
+					eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
+				),
+				columns: { messageId: true, toolUseId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!source) return null;
 		const { narratorPersistence } = await import("../narrator-persistence");
 		const binding = await narratorPersistence.getToolCallBinding(
@@ -216,69 +221,68 @@ function enqueueInboxAgentSqlite(
 		sourceAttempt: binding.attempt,
 		sourceKey: "send",
 	});
-	const existing = db
-		.select()
-		.from(mailbox)
-		.where(
-			and(eq(mailbox.narratorId, delivery.recipientNarratorId), eq(mailbox.dedupeKey, dedupeKey)),
+	const result = runAtomicWrite(db, "inbox.enqueueAgent", (tx) => {
+		const existing = tx
+			.select()
+			.from(mailbox)
+			.where(
+				and(eq(mailbox.narratorId, delivery.recipientNarratorId), eq(mailbox.dedupeKey, dedupeKey)),
+			)
+			.get();
+		if (existing) return { status: "duplicate" as const, delivery: existing };
+		const source = tx
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				attempt: narratorToolCalls.executionAttempt,
+				toolUseId: narratorToolCalls.toolUseId,
+				identityVersion: narratorToolCalls.executionIdentityVersion,
+				originToolCallId: narratorToolCalls.executionOriginToolCallId,
+			})
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
+		if (
+			!source ||
+			source.narratorId !== delivery.sender.id ||
+			source.attempt !== binding.attempt ||
+			source.toolUseId !== delivery.fromToolUseId ||
+			source.identityVersion !== 1 ||
+			source.originToolCallId !== null
 		)
-		.get();
-	if (existing) {
-		delivery.recipientMessageId =
-			existing.currentMessageId ?? existing.recipientMessageId ?? delivery.recipientMessageId;
-		delivery.deliveryId = existing.deliveryId ?? undefined;
-		delivery.recipientRefId = existing.recipientRefId ?? undefined;
-		delivery.revision = existing.contentRevision;
-		return { status: "duplicate" as const, delivery: existing };
-	}
-	const source = db
-		.select({
-			id: narratorToolCalls.id,
-			narratorId: narratorToolCalls.narratorId,
-			attempt: narratorToolCalls.executionAttempt,
-			toolUseId: narratorToolCalls.toolUseId,
-			identityVersion: narratorToolCalls.executionIdentityVersion,
-			originToolCallId: narratorToolCalls.executionOriginToolCallId,
-		})
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.id, binding.toolCallId))
-		.get();
-	if (
-		!source ||
-		source.narratorId !== delivery.sender.id ||
-		source.attempt !== binding.attempt ||
-		source.toolUseId !== delivery.fromToolUseId ||
-		source.identityVersion !== 1 ||
-		source.originToolCallId !== null
-	)
-		throw new Error("Agent message execution receipt is stale or missing");
-	const index = modelText.indexOf(delivery.text);
-	if (index < 0) throw new Error("Agent model projection must contain its reader-facing body");
-	const { text, ...coordinates } = delivery;
-	const result = runtimeInbox.enqueue({
-		kind: "agent_message",
-		narratorId: delivery.recipientNarratorId,
-		text,
-		projectedByteSize: Math.max(Buffer.byteLength(modelText), Buffer.byteLength(text)) + 4096,
-		sourceNarratorId: delivery.sender.id,
-		sourceToolCallId: binding.toolCallId,
-		sourceAttempt: binding.attempt,
-		sourceKey: "send",
-		recipientMessageId: delivery.recipientMessageId,
-		createdBy: options.createdBy,
-		metadata: {
-			delivery: coordinates,
-			projection: {
-				prefix: modelText.slice(0, index),
-				suffix: modelText.slice(index + text.length),
+			throw new Error("Agent message execution receipt is stale or missing");
+		const index = modelText.indexOf(delivery.text);
+		if (index < 0) throw new Error("Agent model projection must contain its reader-facing body");
+		const { text, ...coordinates } = delivery;
+		const result = runtimeInbox.enqueue(
+			{
+				kind: "agent_message",
+				narratorId: delivery.recipientNarratorId,
+				text,
+				projectedByteSize: Math.max(Buffer.byteLength(modelText), Buffer.byteLength(text)) + 4096,
+				sourceNarratorId: delivery.sender.id,
+				sourceToolCallId: binding.toolCallId,
+				sourceAttempt: binding.attempt,
+				sourceKey: "send",
+				recipientMessageId: delivery.recipientMessageId,
+				createdBy: options.createdBy,
+				metadata: {
+					delivery: coordinates,
+					projection: {
+						prefix: modelText.slice(0, index),
+						suffix: modelText.slice(index + text.length),
+					},
+					channel: options.channel ?? "buffer",
+					isBroadcast: options.isBroadcast,
+					fromMessageId: options.fromMessageId,
+					userId: options.userId ?? options.createdBy ?? null,
+				},
 			},
-			channel: options.channel ?? "buffer",
-			isBroadcast: options.isBroadcast,
-			fromMessageId: options.fromMessageId,
-			userId: options.userId ?? options.createdBy ?? null,
-		},
+			tx,
+		);
+		if (!("delivery" in result)) throw new Error("Target message queue is full");
+		return result;
 	});
-	if (!("delivery" in result)) throw new Error("Target message queue is full");
 	// Retries navigate to the original delivery, including its negative tombstone.
 	delivery.recipientMessageId =
 		result.delivery.currentMessageId ??
@@ -357,23 +361,25 @@ export async function listInboxRows(
 ): Promise<RuntimeMailboxRow[]> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.listPending(narratorId, { kinds, includeFailed, limit: 100 });
-	return db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				inArray(mailbox.state, includeFailed ? ["queued", "failed"] : ["queued"]),
-				kinds ? inArray(mailbox.kind, kinds) : undefined,
-			),
-		)
-		.orderBy(
-			desc(mailbox.priority),
-			sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-			asc(mailbox.arrivalSeq),
-		)
-		.limit(100)
-		.all();
+	return readQuery(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					inArray(mailbox.state, includeFailed ? ["queued", "failed"] : ["queued"]),
+					kinds ? inArray(mailbox.kind, kinds) : undefined,
+				),
+			)
+			.orderBy(
+				desc(mailbox.priority),
+				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+				asc(mailbox.arrivalSeq),
+			)
+			.limit(100),
+		{ executionPolicy: "worker-required", maxRows: 100 },
+	);
 }
 export const PENDING_AGENT_MESSAGE_PAGE = 20;
 const PENDING_AGENT_MESSAGE_PREVIEW_CHARS = 500;
@@ -413,24 +419,26 @@ export async function listPendingAgentMessages(
 					limit: PENDING_AGENT_MESSAGE_PAGE + 1,
 				})
 			).map((row) => ({ ...row, text: row.text ?? "" }))
-		: db
-				.select({
-					id: mailbox.id,
-					bufferedAt: mailbox.bufferedAt,
-					metadataJson: mailbox.metadataJson,
-					text: sql<string>`substr(${mailbox.text}, 1, ${PENDING_AGENT_MESSAGE_PREVIEW_CHARS + 1})`,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						eq(mailbox.state, "queued"),
-						eq(mailbox.kind, "agent_message"),
-					),
-				)
-				.orderBy(asc(mailbox.arrivalSeq))
-				.limit(PENDING_AGENT_MESSAGE_PAGE + 1)
-				.all();
+		: await readQuery(
+				db
+					.select({
+						id: mailbox.id,
+						bufferedAt: mailbox.bufferedAt,
+						metadataJson: mailbox.metadataJson,
+						text: sql<string>`substr(${mailbox.text}, 1, ${PENDING_AGENT_MESSAGE_PREVIEW_CHARS + 1})`,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.state, "queued"),
+							eq(mailbox.kind, "agent_message"),
+						),
+					)
+					.orderBy(asc(mailbox.arrivalSeq))
+					.limit(PENDING_AGENT_MESSAGE_PAGE + 1),
+				{ executionPolicy: "worker-required", maxRows: PENDING_AGENT_MESSAGE_PAGE + 1 },
+			);
 	return {
 		messages: rows.slice(0, PENDING_AGENT_MESSAGE_PAGE).map(summarizePendingAgentMessage),
 		hasMore: rows.length > PENDING_AGENT_MESSAGE_PAGE,
@@ -446,16 +454,19 @@ export async function discardPendingAgentMessage(
 	const port = getRuntimeQueuePort();
 	const row = port
 		? await port.mailbox.getById(messageId)
-		: db
-				.select({
-					narratorId: mailbox.narratorId,
-					kind: mailbox.kind,
-					state: mailbox.state,
-					deliveryId: mailbox.deliveryId,
-				})
-				.from(mailbox)
-				.where(eq(mailbox.id, messageId))
-				.get();
+		: await readQueryFirst(
+				db
+					.select({
+						narratorId: mailbox.narratorId,
+						kind: mailbox.kind,
+						state: mailbox.state,
+						deliveryId: mailbox.deliveryId,
+					})
+					.from(mailbox)
+					.where(eq(mailbox.id, messageId))
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 	if (
 		!row ||
 		row.narratorId !== narratorId ||
@@ -469,54 +480,75 @@ export async function discardPendingAgentMessage(
 		: runtimeInbox.cancel(row.deliveryId, reason);
 }
 
-export async function peekInbox(narratorId: string): Promise<RuntimeMailboxRow | undefined> {
+type InboxReadOptions = { signal?: AbortSignal; timeoutMs?: number };
+
+export async function peekInbox(
+	narratorId: string,
+	options: InboxReadOptions = {},
+): Promise<RuntimeMailboxRow | undefined> {
+	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.peekQueued(narratorId);
 	runtimeInbox.initializeLegacy(narratorId);
-	return db
-		.select()
-		.from(mailbox)
-		.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-		.orderBy(
-			desc(mailbox.priority),
-			sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-			asc(mailbox.arrivalSeq),
-		)
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select()
+			.from(mailbox)
+			.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+			.orderBy(
+				desc(mailbox.priority),
+				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+				asc(mailbox.arrivalSeq),
+			)
+			.limit(1),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 }
-export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Promise<boolean> {
+export async function hasInboxKind(
+	narratorId: string,
+	kinds: MailboxKind[],
+	options: InboxReadOptions = {},
+): Promise<boolean> {
+	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasQueuedKind(narratorId, kinds);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.state, "queued"),
-				inArray(mailbox.kind, kinds),
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: mailbox.id })
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.state, "queued"),
+					inArray(mailbox.kind, kinds),
+				),
+			)
+			.limit(1),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	));
 }
 /** Wake authority is separate from consumption: broadcasts remain visible to live runners. */
-export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
+export async function hasWakeEligibleInboxInput(
+	narratorId: string,
+	options: InboxReadOptions = {},
+): Promise<boolean> {
+	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.state, "queued"),
-				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: mailbox.id })
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.state, "queued"),
+					sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+				),
+			)
+			.limit(1),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	));
 }
 /**
  * The eligible-head projection the claim predicate sees, widened to the dialect-neutral
@@ -536,25 +568,12 @@ export type InboxEligibleHead = Pick<
 	| "createdBy"
 	| "deliveryId"
 >;
-/**
- * Synchronous queue-presence re-check for loop-boundary callbacks (the agent loop's
- * `shouldStop` cannot await). SQLite-only by construction: the subagent loop is not
- * wired on PostgreSQL yet, and a sync callback could never perform the network read —
- * callers on the PG backend must answer from their in-memory flags instead.
- */
-export function hasQueuedInboxRowSync(narratorId: string): boolean {
-	if (getRuntimeQueuePort())
-		throw new Error(
-			"Synchronous inbox probes are SQLite-only; the PostgreSQL queue is honestly async",
-		);
-	runtimeInbox.initializeLegacy(narratorId);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-		.limit(1)
-		.get();
+/** Queue presence is an asynchronous read on both database backends. */
+export async function hasQueuedInboxRow(narratorId: string): Promise<boolean> {
+	if (!getRuntimeQueuePort()) runtimeInbox.initializeLegacy(narratorId);
+	return hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]);
 }
+
 /**
  * The predicate is checked against the global head, never used to skip a principal barrier.
  *
@@ -647,7 +666,7 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
 			await port.mailbox.failClaim(inboxClaim(row), String(error));
 		return;
 	}
-	const current = runtimeInbox.getByDelivery(row.deliveryId);
+	const current = await runtimeInbox.getByDelivery(row.deliveryId);
 	if (current?.state === "claimed" && current.claimToken === row.claimToken)
 		runtimeInbox.failClaim(inboxClaim(row), String(error));
 }
@@ -665,16 +684,19 @@ async function readClaimCommittedState(
 > {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.getStateById(claim.id, claim.narratorId);
-	return db
-		.select({
-			state: mailbox.state,
-			currentMessageId: mailbox.currentMessageId,
-			kind: mailbox.kind,
-			lastError: mailbox.lastError,
-		})
-		.from(mailbox)
-		.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId)))
-		.get();
+	return readQueryFirst(
+		db
+			.select({
+				state: mailbox.state,
+				currentMessageId: mailbox.currentMessageId,
+				kind: mailbox.kind,
+				lastError: mailbox.lastError,
+			})
+			.from(mailbox)
+			.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId)))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 }
 
 async function inboxInjectionText(
@@ -690,10 +712,13 @@ async function inboxInjectionText(
 			const refs = getNarratorMessageRefsPort();
 			creator = refs
 				? await refs.creator(options.createdBy)
-				: ((await db.query.users.findFirst({
-						where: eq(users.id, options.createdBy),
-						columns: { username: true },
-					})) ?? null);
+				: ((await readQuery(
+						db.query.users.findFirst({
+							where: eq(users.id, options.createdBy),
+							columns: { username: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					)) ?? null);
 		} catch (error) {
 			logger.warn("Injection sender name unavailable", { narratorId, error: String(error) });
 		}
@@ -948,11 +973,11 @@ async function deliverClaimedInboxInjectionPg(
 						await (options.executionPrincipal
 							? session.startInjectionContinuationIfPossible(
 									narratorId,
-									options.locale ?? "en",
+									options.locale,
 									undefined,
 									options.executionPrincipal,
 								)
-							: session.startInjectionContinuationIfPossible(narratorId, options.locale ?? "en"))
+							: session.startInjectionContinuationIfPossible(narratorId, options.locale))
 					).started;
 				} catch (error) {
 					logger.warn("Injection delivered but waking the narrator failed", {
@@ -1241,49 +1266,71 @@ export interface InboxWakeOptions {
 	resumeStopped?: readonly ResumableStopReason[];
 }
 
-/** Coalesced control-plane wake; the only payload authority remains the mailbox table. */
-const wakeControl = hotSafe("narrafork:inbox:wake-control", () => ({ stopped: false }));
+const wakeControl = hotSafe("narrafork.runtime-inbox-wake-control", () => ({
+	stopped: false,
+	generation: new Map<string, number>(),
+}));
 
+/** Stop admission and re-probes; an already-started continuation keeps its own lifecycle. */
 export function stopInboxWakes(): void {
 	wakeControl.stopped = true;
 }
 
 export function wakeInboxIfEligible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	options: InboxWakeOptions = {},
 ): Promise<boolean> {
 	if (wakeControl.stopped) return Promise.resolve(false);
 	const pending = pendingWakes.get(narratorId);
+	if (wakeControl.stopped) return pending ?? Promise.resolve(false);
+	wakeControl.generation.set(narratorId, (wakeControl.generation.get(narratorId) ?? 0) + 1);
 	if (pending) {
 		if (!options.resumeStopped?.length) return pending;
-		// A coalesced ordinary wake may have been refused by the stop guard.
-		return pending.then((started) => started || wakeInboxIfEligible(narratorId, locale, options));
+		// Retry explicit resume after a coalesced ordinary wake has settled its stop guard.
+		return trackCommunicationWork(
+			pending.then((started) => started || wakeInboxIfEligible(narratorId, locale, options)),
+		);
 	}
-	const wake = Promise.resolve()
-		.then(async () => {
-			if (wakeControl.stopped) return false;
-			await flushInboxPublicationBarrier(narratorId);
-			if (wakeControl.stopped) return false;
-			// A held run keeps its owner while parked: queued input wakes that same run.
-			const { wakeHeldRun } = await import("./run");
-			if (wakeHeldRun(narratorId)) return true;
-			if (getExecutionOwner(narratorId)) return false;
-			const { isNarratorRuntimeBusy, compactLocks, isNarratorRevertAdmissionBlocked } =
-				await import("../narrator-session-state");
-			if (
-				isNarratorRuntimeBusy(narratorId) ||
-				compactLocks.has(narratorId) ||
-				isNarratorRevertAdmissionBlocked(narratorId)
-			)
-				return false;
-			// Named backend reads on PostgreSQL; SQLite keeps its own store. The task-notice
-			// probe is dialect-specific by construction (json_extract vs jsonb extraction) and
-			// lives behind `hasActionableTaskNotice` on the PG side — never a shared fallback.
-			const port = getRuntimeQueuePort();
-			const row = port
-				? await port.mailbox.readRecipientRoute(narratorId)
-				: db
+	const deadlineAt = Date.now() + 30_000;
+	const signal = AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()));
+	const canProbe = () => !wakeControl.stopped && !signal.aborted && Date.now() < deadlineAt;
+	const readOptions = (): InboxReadOptions => ({
+		signal,
+		timeoutMs: Math.max(1, deadlineAt - Date.now()),
+	});
+	const release = (): void => {
+		if (pendingWakes.get(narratorId) !== wake) return;
+		pendingWakes.delete(narratorId);
+		wakeControl.generation.delete(narratorId);
+	};
+	const attempt = async (): Promise<boolean> => {
+		if (!canProbe()) return false;
+		await flushInboxPublicationBarrier(narratorId);
+		if (!canProbe()) return false;
+		// A held run keeps its owner while parked: queued input wakes that same run.
+		const { wakeHeldRun } = await import("./run");
+		if (!canProbe()) return false;
+		if (wakeHeldRun(narratorId)) return true;
+		if (getExecutionOwner(narratorId)) return false;
+		const { isNarratorRuntimeBusy, compactLocks, isNarratorRevertAdmissionBlocked } = await import(
+			"../narrator-session-state"
+		);
+		if (!canProbe()) return false;
+		if (
+			isNarratorRuntimeBusy(narratorId) ||
+			compactLocks.has(narratorId) ||
+			isNarratorRevertAdmissionBlocked(narratorId)
+		)
+			return false;
+		// Named backend reads on PostgreSQL; SQLite keeps its own store. The task-notice
+		// probe is dialect-specific by construction (json_extract vs jsonb extraction) and
+		// lives behind `hasActionableTaskNotice` on the PG side — never a shared fallback.
+		const port = getRuntimeQueuePort();
+		const row = port
+			? await port.mailbox.readRecipientRoute(narratorId)
+			: await readQueryFirst(
+					db
 						.select({
 							variant: narrators.variant,
 							status: narrators.status,
@@ -1291,43 +1338,50 @@ export function wakeInboxIfEligible(
 						})
 						.from(narrators)
 						.where(eq(narrators.id, narratorId))
-						.get();
-			if (!row || row.status === "archived") return false;
-			const pendingHead = await peekInbox(narratorId);
-			const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"]);
-			const stopped =
-				"lastStopReason" in row ? blockingStopReason(row.lastStopReason as string | null) : null;
-			if (!hasExplicitUserInput && stopped && !options.resumeStopped?.includes(stopped))
-				return false;
-			if (
-				!hasExplicitUserInput &&
-				pendingHead &&
-				inboxMetadata<{
-					questionAnswer?: {
-						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
-					};
-				}>(pendingHead).questionAnswer
-			) {
-				const answer = inboxMetadata<{
-					questionAnswer: {
-						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
-					};
-				}>(pendingHead).questionAnswer;
-				if (!answer.executionPrincipal) return false;
-				const { startInjectionContinuationIfPossible } = await import("../narrator-session");
-				return (
-					await startInjectionContinuationIfPossible(
-						narratorId,
-						locale,
-						false,
-						answer.executionPrincipal,
-					)
-				).started;
-			}
-			if (!(await hasWakeEligibleInboxInput(narratorId))) {
-				const notice = port
-					? await port.mailbox.hasActionableTaskNotice(narratorId)
-					: !!db
+						.limit(1),
+					{ ...readOptions(), executionPolicy: "worker-required", maxRows: 1 },
+				);
+		if (!canProbe() || !row || row.status === "archived") return false;
+		const pendingHead = await peekInbox(narratorId, readOptions());
+		if (!canProbe()) return false;
+		const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"], readOptions());
+		if (!canProbe()) return false;
+		const stopped =
+			"lastStopReason" in row ? blockingStopReason(row.lastStopReason as string | null) : null;
+		if (!hasExplicitUserInput && stopped && !options.resumeStopped?.includes(stopped)) return false;
+		if (
+			!hasExplicitUserInput &&
+			pendingHead &&
+			inboxMetadata<{
+				questionAnswer?: {
+					executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+				};
+			}>(pendingHead).questionAnswer
+		) {
+			const answer = inboxMetadata<{
+				questionAnswer: {
+					executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+				};
+			}>(pendingHead).questionAnswer;
+			if (!answer.executionPrincipal) return false;
+			const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+			if (!canProbe()) return false;
+			return (
+				await startInjectionContinuationIfPossible(
+					narratorId,
+					locale,
+					false,
+					answer.executionPrincipal,
+				)
+			).started;
+		}
+		const hasWakeInput = await hasWakeEligibleInboxInput(narratorId, readOptions());
+		if (!canProbe()) return false;
+		if (!hasWakeInput) {
+			const notice = port
+				? await port.mailbox.hasActionableTaskNotice(narratorId)
+				: !!(await readQueryFirst(
+						db
 							.select({ id: mailbox.id })
 							.from(mailbox)
 							.where(
@@ -1338,34 +1392,56 @@ export function wakeInboxIfEligible(
 									sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
 								),
 							)
-							.limit(1)
-							.get();
-				if (!notice) return false;
+							.limit(1),
+						{ ...readOptions(), executionPolicy: "worker-required", maxRows: 1 },
+					));
+			if (!canProbe() || !notice) return false;
+		}
+		const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } = await import(
+			"../narrator-session"
+		);
+		if (!canProbe()) return false;
+		const first = await peekInbox(narratorId, readOptions());
+		if (!canProbe()) return false;
+		// A user behind a bounded batch of notices is still explicit work.
+		// The user consumer drains those preceding notices without skipping them;
+		// delegated reports alone use the notification continuation, also in plan mode.
+		const hasUserInput =
+			first?.kind === "user_input" ||
+			(await hasInboxKind(narratorId, ["user_input"], readOptions()));
+		if (!canProbe()) return false;
+		if (hasUserInput) return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
+		return (
+			await startParentInboundContinuationIfPossible(narratorId, locale, false, {
+				resumeStopped: options.resumeStopped,
+			})
+		).started;
+	};
+	const wake: Promise<boolean> = Promise.resolve()
+		.then(async () => {
+			while (canProbe()) {
+				const observed = wakeControl.generation.get(narratorId);
+				let started = false;
+				try {
+					started = await attempt();
+				} catch (error) {
+					logger.warn("Mailbox wake deferred", { narratorId, error: String(error) });
+				}
+				if (started || !canProbe() || wakeControl.generation.get(narratorId) === observed) {
+					// Release in this same synchronous decision: a later request must not join
+					// a settled empty probe while its Promise finalizer is still queued.
+					release();
+					return started;
+				}
 			}
-			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
-				await import("../narrator-session");
-			const first = await peekInbox(narratorId);
-			// A user behind a bounded batch of notices is still explicit work.
-			// The user consumer drains those preceding notices without skipping them;
-			// delegated reports alone use the notification continuation, also in plan mode.
-			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
-				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
-			return (
-				await startParentInboundContinuationIfPossible(narratorId, "en", false, {
-					resumeStopped: options.resumeStopped,
-				})
-			).started;
-		})
-		.catch((error) => {
-			logger.warn("Mailbox wake deferred", { narratorId, error: String(error) });
+			release();
 			return false;
 		})
-		.finally(() => {
-			if (pendingWakes.get(narratorId) === wake) pendingWakes.delete(narratorId);
-		});
-	pendingWakes.set(narratorId, wake);
-	return trackCommunicationWork(wake);
+		.finally(release);
+	pendingWakes.set(narratorId, trackCommunicationWork(wake));
+	return wake;
 }
+
 setRuntimePublicationWake(async (narratorId) => {
 	await wakeInboxIfEligible(narratorId);
 });

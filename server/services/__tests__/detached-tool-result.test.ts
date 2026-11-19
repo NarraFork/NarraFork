@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -9,14 +9,27 @@ import {
 } from "../../db/schema";
 import type { AgentEvent } from "../../lib/agent/types";
 import { eventBus } from "../../lib/event-bus";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../../db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 const { clearStreamingSnapshot, getStreamingSnapshot, persistDetachedToolResult, processEvent } =
 	await import("../narrator-event-handler");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { markInterruptedToolCallsForMessage } = await import("../narrator-session");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 type ResultEvent = Extract<AgentEvent, { type: "tool_result" }>;
 
@@ -116,7 +129,8 @@ function context(narratorId = "owner"): EventHandlerContext {
 	};
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	frames.length = 0;
 	toolChanges.length = 0;
@@ -125,12 +139,13 @@ afterEach(() => {
 	clearStreamingSnapshot("owner");
 	clearStreamingSnapshot("child");
 });
-afterAll(() => {
+afterAll(async () => {
 	eventBus.off("narrator:message_broadcast", onFrame);
 	eventBus.off("narrator:tool_changed", onToolChange);
-	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	(await import("../narrator-block-sync")).stopBlockSyncSweep();
+	await closePrefixSnapshotStore();
+	await fixture.close();
 });
 
 describe("detached tool result durable settlement", () => {
@@ -197,6 +212,7 @@ describe("detached tool result durable settlement", () => {
 			});
 			expect(getImagePath("owner", stored._images[0]?.imageId ?? "")).not.toBeNull();
 
+			await closePrefixSnapshotStore();
 			cleanDb(sqlite);
 			await seed();
 			await persistDetachedToolResult(

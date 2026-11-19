@@ -14,6 +14,7 @@ import * as schema from "../../db/schema";
 import { localBackend } from "../../lib/agent/execution/local-backend";
 import type { GenUiInput } from "../../lib/agent/tools/gen-ui";
 import type { ToolContext } from "../../lib/agent/types";
+import { assertDbReadersReady, closeReadDatabase } from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { fileChangeLocalIo } from "../file-change-local-io";
 import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "../file-change-runtime";
@@ -52,6 +53,7 @@ beforeEach(async () => {
 		.all();
 	expect(definitions.length).toBeLessThan(2048);
 	for (const { sql } of definitions) sqlite.exec(sql);
+	await assertDbReadersReady(sqlite.filename);
 	db = database(sqlite);
 	db.insert(schema.users)
 		.values({
@@ -80,6 +82,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	for (const restore of restores.splice(0).reverse()) restore();
+	await closeReadDatabase(sqlite.filename);
 	sqlite.close();
 	// Windows releases the journal databases' file handles asynchronously, so removing
 	// the temporary root can still see them as busy. Leaking a temp directory there is
@@ -313,7 +316,7 @@ describe("GenUI ordinary file history", () => {
 		expect(selected.effects[0].before).toEqual({ kind: "absent" });
 		const namespace = await runtime.initialize();
 		const authorized = access();
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.getBudget();
 		if (!budget) throw new Error("Missing file-history namespace budget");
 		const planOptions = { namespaceKey: budget.namespaceKey };
 		const planner = new RevertPlannerService(db, {
