@@ -1,3 +1,4 @@
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import type { ProxyOverride } from "../../lib/proxy";
 
 export type CustomApiProtocol =
@@ -48,6 +49,8 @@ export interface CustomApiProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	/** Chat Completions：工具返回的图片放哪，缺省 `"off"`。 */
+	toolResultImages?: ToolResultImagesMode;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;

@@ -164,6 +164,9 @@ const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom
 const customUserAgentSchema = z.string().max(500).optional();
 const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional();
 
+/** 工具结果图片的去处（Chat Completions 通道），见 shared/tool-result-images.ts。 */
+const toolResultImagesSchema = z.enum(["off", "inline", "separate"]).optional();
+
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -185,6 +188,7 @@ const customApiProviderSchema = z.object({
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
+	toolResultImages: toolResultImagesSchema,
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
@@ -207,6 +211,7 @@ const openaiProviderSchema = z.object({
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
+	toolResultImages: toolResultImagesSchema,
 	defaultContextWindow: z.number().int().min(1).optional(),
 	proxy: proxyOverrideSchema,
 	userAgentMode: userAgentModeSchema,
@@ -727,6 +732,7 @@ export const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
+				toolResultImages: toolResultImagesSchema,
 			})
 			.partial()
 			.optional(),
