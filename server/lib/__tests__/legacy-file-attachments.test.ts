@@ -241,6 +241,20 @@ describe("legacy worktree file copies", () => {
 		}
 	});
 
+	test("explicit history budget permits legacy copying after 10 seconds", async () => {
+		source();
+		const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(11_000);
+		const wall = spyOn(Date, "now").mockReturnValue(100_000);
+		try {
+			const budget = { remainingCopies: 1, remainingBytes: 14, deadlineAt: 130_000 };
+			expect((await ensureLegacyFileWorktreeCopy(cwd, file, undefined, budget))?.size).toBe(14);
+			expect(budget.remainingCopies).toBe(0);
+		} finally {
+			clock.mockRestore();
+			wall.mockRestore();
+		}
+	});
+
 	test("image and legacy copies share one count and byte budget", async () => {
 		source();
 		const imageBytes = Buffer.alloc(24);

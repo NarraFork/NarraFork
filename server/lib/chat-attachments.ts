@@ -40,10 +40,13 @@
  * rather than executed in the app's origin. Size is still bounded.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { extname, resolve } from "node:path";
 import { MAX_BUFFERED_TEXT_FILE_BYTES } from "@shared/text-file-types";
+import { FileWriteQueueError, withFileWrite } from "../services/file-write-queue";
 import { ValidationError } from "./errors";
+import { hotSafe } from "./hot-safe";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
@@ -147,6 +150,56 @@ function resolveRoomDir(roomId: string): string {
 		throw new ValidationError("Invalid room ID");
 	}
 	return dir;
+}
+
+export interface ChatAttachmentPublicationLockOptions {
+	signal?: AbortSignal;
+	deadlineAt?: number;
+}
+const chatPublicationScope = hotSafe(
+	"narrafork.chat-attachment-publication-lock.v1",
+	() => new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>(),
+);
+
+/** Keep a file publication and its row admission exclusive with reclamation. */
+export async function withChatAttachmentPublicationLock<T>(
+	roomId: string,
+	fn: () => Promise<T>,
+	options: ChatAttachmentPublicationLockOptions = {},
+): Promise<T> {
+	options.signal?.throwIfAborted();
+	if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt))
+		throw new TypeError("Chat attachment publication deadline must be finite");
+	const dir = resolveRoomDir(roomId);
+	const key = process.platform === "win32" ? dir.toLowerCase() : dir;
+	const inherited = chatPublicationScope.getStore();
+	if (inherited?.get(key)?.active)
+		throw new TypeError("Chat attachment publication locks are non-reentrant");
+	const now = Date.now();
+	const deadlineAt = Math.min(options.deadlineAt ?? now + 30_000, now + 30_000);
+	if (deadlineAt <= now) throw new FileWriteQueueError("file_busy");
+	return withFileWrite(
+		{
+			deviceId: "host",
+			pathFlavor: process.platform === "win32" ? "windows" : "posix",
+			canonicalPath: dir,
+		},
+		async () => {
+			if (Date.now() >= deadlineAt) throw new FileWriteQueueError("file_busy");
+			const lease = { active: true };
+			const scope = new Map(inherited);
+			scope.set(key, lease);
+			try {
+				return await chatPublicationScope.run(scope, fn);
+			} finally {
+				lease.active = false;
+			}
+		},
+		{
+			signal: options.signal,
+			waitTimeoutMs: Math.min(30_000, Math.max(0, Math.floor(deadlineAt - Date.now()))),
+		},
+	);
 }
 
 /**

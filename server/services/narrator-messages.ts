@@ -55,6 +55,7 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { readDomainTask, readQuery } from "../db/worker-read";
 import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
@@ -117,9 +118,11 @@ import {
 import { insertEnvelope, readEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	createPostgresNarratorDisplayPagePort,
+	mapNarratorDisplayReadError,
 	readDisplayFixtureMessages,
 	readNarratorDisplayMessages,
 } from "./narrator-display-page-reader";
+import { readNarratorMessageRows } from "./narrator-message-reader";
 import {
 	cowEnvelopeTx,
 	deleteRecipientMessageRefs,
@@ -127,6 +130,7 @@ import {
 } from "./narrator-persistence";
 import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
+import type { NarratorAggregateScope } from "./narrator-read-snapshots";
 import {
 	assertNoLazyChildrenForHistoryRewriteTx,
 	ensureRefsCoverMessage,
@@ -2561,32 +2565,36 @@ async function loadLatestSubagentToolCalls(
 
 	const rowsByNarrator = await Promise.all(
 		uniqueNarratorIds.map(async (narratorId) => {
-			const rows = await db
-				.select({
-					toolCallId: narratorToolCalls.id,
-					toolUseId: narratorToolCalls.toolUseId,
-					toolName: narratorToolCalls.toolName,
-					status: narratorToolCalls.status,
-					createdAt: narratorToolCalls.createdAt,
-					streamStartedAt: narratorToolCalls.streamStartedAt,
-					streamCompletedAt: narratorToolCalls.streamCompletedAt,
-					permissionStartedAt: narratorToolCalls.permissionStartedAt,
-					executionStartedAt: narratorToolCalls.executionStartedAt,
-					completedAt: narratorToolCalls.completedAt,
-					durationMs: narratorToolCalls.durationMs,
-					// Short whitelisted input keys only — never the `input_json` blob.
-					inputSummary: subagentSummarySql(),
-				})
-				.from(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.narratorId, narratorId),
-						eq(narratorToolCalls.isFileHistoryCheckpoint, false),
-						toolMessageRefExists(narratorId),
-					),
-				)
-				.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
-				.limit(limit);
+			const rows = await readQuery(
+				db
+					.select({
+						toolCallId: narratorToolCalls.id,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						toolUseId: narratorToolCalls.toolUseId,
+						toolName: narratorToolCalls.toolName,
+						status: narratorToolCalls.status,
+						createdAt: narratorToolCalls.createdAt,
+						streamStartedAt: narratorToolCalls.streamStartedAt,
+						streamCompletedAt: narratorToolCalls.streamCompletedAt,
+						permissionStartedAt: narratorToolCalls.permissionStartedAt,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						completedAt: narratorToolCalls.completedAt,
+						durationMs: narratorToolCalls.durationMs,
+						// Short whitelisted input keys only — never the `input_json` blob.
+						inputSummary: subagentSummarySql(),
+					})
+					.from(narratorToolCalls)
+					.where(
+						and(
+							eq(narratorToolCalls.narratorId, narratorId),
+							eq(narratorToolCalls.isFileHistoryCheckpoint, false),
+							toolMessageRefExists(narratorId),
+						),
+					)
+					.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
+					.limit(limit),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			return { narratorId, rows: rows.reverse() };
 		}),
 	);
@@ -2605,6 +2613,7 @@ async function loadLatestSubagentToolCalls(
 				const inputSummary = parseSubagentSummary(row.inputSummary);
 				return {
 					toolCallId: row.toolCallId ?? null,
+					executionAttempt: row.executionAttempt,
 					toolUseId: row.toolUseId,
 					toolName: row.toolName,
 					status: row.status,
@@ -2983,6 +2992,43 @@ async function waitForPretextDriftRetry(
 	assertDisplayReadActive(signal, deadlineAt);
 }
 
+async function readAggregateScope(
+	narratorId: string,
+	toolUseIds: string[],
+): Promise<NarratorAggregateScope> {
+	if (modelHistoryDatabase.activeDatabaseBackend === "postgres")
+		return db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+	const snapshot = await readDomainTask(
+		modelHistoryDatabase.sqlite,
+		"narratorAggregateScope",
+		{ narratorId, toolUseIds },
+		{
+			executionPolicy: "worker-required",
+			timeoutMs: 30_000,
+		},
+	);
+	return { ...snapshot, parents: new Map(snapshot.parents) };
+}
+async function readAggregateRefs(
+	narratorId: string,
+	messageIds: string[],
+	signal?: AbortSignal,
+	deadlineAt?: number,
+) {
+	if (modelHistoryDatabase.activeDatabaseBackend === "postgres")
+		return db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	return readDomainTask(
+		modelHistoryDatabase.sqlite,
+		"narratorAggregateRefs",
+		{ narratorId, messageIds },
+		{
+			executionPolicy: "worker-required",
+			signal,
+			timeoutMs: deadlineAt === undefined ? 30_000 : Math.max(1, deadlineAt - Date.now()),
+		},
+	);
+}
+
 async function loadAggregateRefMessages(
 	narratorId: string,
 	messageIds: string[],
@@ -2992,7 +3038,7 @@ async function loadAggregateRefMessages(
 	maxRawBytes = AGGREGATE_BODY_BYTE_LIMIT,
 ) {
 	assertDisplayReadActive(signal, deadlineAt);
-	const refs = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	const refs = await readAggregateRefs(narratorId, messageIds, signal, deadlineAt);
 	const options = {
 		ioBudget,
 		signal,
@@ -3029,7 +3075,7 @@ async function loadAggregateRefMessages(
 		throw error;
 	});
 	assertDisplayReadActive(signal, deadlineAt);
-	const current = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	const current = await readAggregateRefs(narratorId, messageIds, signal, deadlineAt);
 	if (!sameAggregateRows(refs, current))
 		throw new AppError(
 			"History aggregation references changed; reload the history window.",
@@ -3040,15 +3086,12 @@ async function loadAggregateRefMessages(
 }
 
 async function loadAggregateInlineMessages(narratorId: string, toolUseIds: string[]) {
-	const scope = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+	const scope = await readAggregateScope(narratorId, toolUseIds);
 	const messages = await loadAggregateRefMessages(
 		narratorId,
 		scope.inlineRows.map((row) => row.id),
 	);
-	assertAggregateScopeUnchanged(
-		scope,
-		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds)),
-	);
+	assertAggregateScopeUnchanged(scope, await readAggregateScope(narratorId, toolUseIds));
 	return messages;
 }
 
@@ -3092,13 +3135,11 @@ async function loadSubagentActivitiesForToolUseIds(
 	scopeToolUseIds = toolUseIds,
 ): Promise<Map<string, SubagentActivity>> {
 	if (toolUseIds.length === 0 && !initialScope) return new Map();
-	const scope =
-		initialScope ??
-		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	const scope = initialScope ?? (await readAggregateScope(narratorId, scopeToolUseIds));
 	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
 	// Summary/file aggregation can await other services. A removed caller/child
 	// ref must revoke this response too, rather than publishing a stale owner.
-	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	const current = await readAggregateScope(narratorId, scopeToolUseIds);
 	assertAggregateScopeUnchanged(scope, current);
 	return activities;
 }
@@ -3314,7 +3355,23 @@ const TOOL_DETAIL_CANDIDATE_LIMIT = 200;
 const TOOL_DETAIL_METADATA_ROW_LIMIT = 1_000;
 const TOOL_DETAIL_PAYLOAD_BYTE_LIMIT = 32 * 1024 * 1024;
 
-type ToolDetailReference = { toolCallId?: string; messageId?: string };
+type ToolDetailReference = {
+	toolCallId?: string;
+	messageId?: string;
+	executionAttempt?: number;
+};
+
+function toolDetailReferenceForWorker(reference?: ToolDetailReference): ToolDetailReference | null {
+	if (!reference || typeof reference !== "object" || Array.isArray(reference))
+		return reference ?? null;
+	// Optional service arguments become omitted fields on the strict Worker wire.
+	// Preserve every other key/value so domain validation still rejects invalid input.
+	const normalized = { ...reference };
+	if (normalized.toolCallId === undefined) delete normalized.toolCallId;
+	if (normalized.messageId === undefined) delete normalized.messageId;
+	if (normalized.executionAttempt === undefined) delete normalized.executionAttempt;
+	return normalized;
+}
 
 function toolDetailSelectionRequired(): AppError {
 	return new AppError(
@@ -3352,6 +3409,11 @@ function selectVisibleToolCallTx(
 			);
 		}
 	}
+	if (
+		reference?.executionAttempt !== undefined &&
+		(!Number.isSafeInteger(reference.executionAttempt) || reference.executionAttempt < 0)
+	)
+		throw new ValidationError("Tool detail execution attempt must be a non-negative safe integer");
 	let metadataRows = 0;
 	const admit = (length: number) => {
 		metadataRows += length;
@@ -3386,6 +3448,9 @@ function selectVisibleToolCallTx(
 					: undefined,
 				reference?.messageId !== undefined
 					? eq(narratorToolCalls.messageId, reference.messageId)
+					: undefined,
+				reference?.executionAttempt !== undefined
+					? eq(narratorToolCalls.executionAttempt, reference.executionAttempt)
 					: undefined,
 			),
 		)
@@ -3509,13 +3574,16 @@ function getToolCallDetailTx(
 
 const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(narratorMessageRefs.seq)
-			.limit(limit)
-			.offset(offset);
+		const refRows = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(narratorMessageRefs.seq)
+				.limit(limit)
+				.offset(offset),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((row) => row.messageId);
@@ -3582,17 +3650,20 @@ const narratorMessageQueriesUnlocked = {
 	async getMessagesSinceLastCompact(narratorId: string) {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
 
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refRows = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		if (refRows.length === 0) return [];
 
@@ -3653,21 +3724,24 @@ const narratorMessageQueriesUnlocked = {
 			CONTEXT_ASK_HISTORY_MESSAGE_LIMIT,
 		);
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
-		const rawRefRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					ne(narratorMessages.role, "disp"),
-					isNull(narratorMessageRefs.segmentCompactId),
-					sql`NOT ${hasStoredElementSql("compact")}`,
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(boundedLimit + 1);
+		const rawRefRows = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+						ne(narratorMessages.role, "disp"),
+						isNull(narratorMessageRefs.segmentCompactId),
+						sql`NOT ${hasStoredElementSql("compact")}`,
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(boundedLimit + 1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		const hasMore = rawRefRows.length > boundedLimit;
 		const refRows = rawRefRows.slice(0, boundedLimit).reverse();
@@ -3682,21 +3756,24 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		const messageIds = refRows.map((row) => row.messageId);
-		const messageRows = await db
-			.select({
-				id: narratorMessages.id,
-				role: narratorMessages.role,
-				contentText: sql<string | null>`CASE
+		const messageRows = await readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					role: narratorMessages.role,
+					contentText: sql<string | null>`CASE
 					WHEN ${narratorMessages.contentText} IS NULL THEN NULL
 					ELSE substr(${narratorMessages.contentText}, 1, ${CONTEXT_ASK_MESSAGE_TEXT_LIMIT})
 				END`,
-				contentTruncated: sql<number>`CASE
+					contentTruncated: sql<number>`CASE
 					WHEN length(COALESCE(${narratorMessages.contentText}, '')) > ${CONTEXT_ASK_MESSAGE_TEXT_LIMIT}
 					THEN 1 ELSE 0
 				END`,
-			})
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, messageIds));
+				})
+				.from(narratorMessages)
+				.where(inArray(narratorMessages.id, messageIds)),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		const missingMessages = messageRows.length !== refRows.length;
 		if (missingMessages) {
@@ -3709,36 +3786,39 @@ const narratorMessageQueriesUnlocked = {
 			});
 		}
 
-		const rawToolRows = await db
-			.select({
-				messageId: narratorToolCalls.messageId,
-				toolUseId: narratorToolCalls.toolUseId,
-				toolName: narratorToolCalls.toolName,
-				status: narratorToolCalls.status,
-				inputText: sql<string | null>`CASE
+		const rawToolRows = await readQuery(
+			db
+				.select({
+					messageId: narratorToolCalls.messageId,
+					toolUseId: narratorToolCalls.toolUseId,
+					toolName: narratorToolCalls.toolName,
+					status: narratorToolCalls.status,
+					inputText: sql<string | null>`CASE
 					WHEN ${narratorToolCalls.inputJson} IS NULL OR ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN NULL
 					ELSE substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_INPUT_LIMIT})
 				END`,
-				outputText: sql<string | null>`CASE
+					outputText: sql<string | null>`CASE
 					WHEN ${narratorToolCalls.outputJson} IS NULL THEN NULL
 					ELSE substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT})
 				END`,
-				inputTruncated: sql<number>`CASE
+					inputTruncated: sql<number>`CASE
 					WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN 0
 					WHEN ${narratorToolCalls.inputJson} IS NOT NULL
 						AND length(CAST(${narratorToolCalls.inputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_INPUT_LIMIT}
 					THEN 1 ELSE 0
 				END`,
-				outputTruncated: sql<number>`CASE
+					outputTruncated: sql<number>`CASE
 					WHEN ${narratorToolCalls.outputJson} IS NOT NULL
 						AND length(CAST(${narratorToolCalls.outputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT}
 					THEN 1 ELSE 0
 				END`,
-			})
-			.from(narratorToolCalls)
-			.where(inArray(narratorToolCalls.messageId, messageIds))
-			.orderBy(sql`${narratorToolCalls.createdAt} DESC`)
-			.limit(CONTEXT_ASK_TOOL_CALL_LIMIT + 1);
+				})
+				.from(narratorToolCalls)
+				.where(inArray(narratorToolCalls.messageId, messageIds))
+				.orderBy(sql`${narratorToolCalls.createdAt} DESC`)
+				.limit(CONTEXT_ASK_TOOL_CALL_LIMIT + 1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		const toolCallsTruncated = rawToolRows.length > CONTEXT_ASK_TOOL_CALL_LIMIT;
 		const toolCallsByMessage = new Map<string, ContextAskToolCallSnapshot[]>();
@@ -3859,56 +3939,78 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, beforeMessageId),
-			),
-		});
+		const targetRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, beforeMessageId),
+				),
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
 
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.isCompact, 1),
-					lt(narratorMessageRefs.seq, targetRef.seq),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.isCompact, 1),
+						lt(narratorMessageRefs.seq, targetRef.seq),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 		const lowerBound = compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : sql`1=1`;
 
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					lowerBound,
-					lt(narratorMessageRefs.seq, targetRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refRows = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						lowerBound,
+						lt(narratorMessageRefs.seq, targetRef.seq),
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = fillBodies(
-			await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, messageIds),
-				...bodyColumns(),
-				with: {
-					toolCalls: true,
-					creator: { columns: { username: true } },
-					narrator: { columns: { title: true } },
-				},
-			}),
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: inArray(narratorMessages.id, messageIds),
+								...bodyColumns(),
+								with: {
+									toolCalls: true,
+									creator: { columns: { username: true } },
+									narrator: { columns: { title: true } },
+								},
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: true, includeCreator: true },
+			),
 		);
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
@@ -3929,10 +4031,13 @@ const narratorMessageQueriesUnlocked = {
 		const authorTitles = new Map(
 			authorIds.length
 				? (
-						await db
-							.select({ id: narrators.id, title: narrators.title })
-							.from(narrators)
-							.where(inArray(narrators.id, authorIds))
+						await readQuery(
+							db
+								.select({ id: narrators.id, title: narrators.title })
+								.from(narrators)
+								.where(inArray(narrators.id, authorIds)),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
 					).map((row) => [row.id, row.title])
 				: [],
 		);
@@ -3946,27 +4051,30 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getEarliestMessages(narratorId: string, limit = 2) {
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				role: narratorMessages.role,
-				contentJson: contentJsonSql(),
-				contentText: narratorMessages.contentText,
-				createdAt: narratorMessages.createdAt,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNotNull(narratorMessages.contentText),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq)
-			.limit(limit);
-		return fillBodies(rows);
+		const rows = await readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					narratorId: narratorMessages.narratorId,
+					role: narratorMessages.role,
+					contentJson: contentJsonSql(),
+					contentText: narratorMessages.contentText,
+					createdAt: narratorMessages.createdAt,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						inArray(narratorMessages.role, ["user", "assistant"]),
+						isNotNull(narratorMessages.contentText),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq)
+				.limit(limit),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		return fillBodiesAsync(rows);
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
@@ -3987,23 +4095,26 @@ const narratorMessageQueriesUnlocked = {
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
-		return db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNull(narratorMessageRefs.segmentCompactId),
-					ownTurn,
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		return readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+						inArray(narratorMessages.role, ["user", "assistant"]),
+						isNull(narratorMessageRefs.segmentCompactId),
+						ownTurn,
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 	},
 
 	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
@@ -4035,27 +4146,30 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getRecentMessages(narratorId: string, limit = 4) {
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				role: narratorMessages.role,
-				contentJson: contentJsonSql(),
-				contentText: narratorMessages.contentText,
-				createdAt: narratorMessages.createdAt,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNotNull(narratorMessages.contentText),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(limit);
-		return fillBodies(rows).reverse();
+		const rows = await readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					narratorId: narratorMessages.narratorId,
+					role: narratorMessages.role,
+					contentJson: contentJsonSql(),
+					contentText: narratorMessages.contentText,
+					createdAt: narratorMessages.createdAt,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						inArray(narratorMessages.role, ["user", "assistant"]),
+						isNotNull(narratorMessages.contentText),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(limit),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		return (await fillBodiesAsync(rows)).reverse();
 	},
 
 	/**
@@ -4077,25 +4191,28 @@ const narratorMessageQueriesUnlocked = {
 		narratorId: string,
 		scanLimit = 10,
 	): Promise<{ id: string; text: string } | null> {
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				contentJson: contentJsonSql(),
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessages.role, "assistant"),
-					isNotNull(narratorMessages.contentText),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(Math.max(1, Math.floor(scanLimit)));
+		const rows = await readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessages.role, "assistant"),
+						isNotNull(narratorMessages.contentText),
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(Math.max(1, Math.floor(scanLimit))),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
-		for (const row of fillBodies(rows)) {
+		for (const row of await fillBodiesAsync(rows)) {
 			const blocks = Array.isArray(row.contentJson)
 				? (row.contentJson as Array<{ type: string; text?: string }>)
 				: [];
@@ -4117,20 +4234,23 @@ const narratorMessageQueriesUnlocked = {
 	async getLatestSuccessfulCompactSummary(
 		narratorId: string,
 	): Promise<{ id: string; summary: string } | null> {
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				contentJson: contentJsonSql(),
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 
-		const row = fillBody(rows[0]);
+		const row = await fillBodyAsync(rows[0]);
 		if (!row) return null;
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -4164,42 +4284,50 @@ const narratorMessageQueriesUnlocked = {
 				AND narrator_tool_calls.is_file_history_checkpoint = 0
 		)`;
 		const byteSize = storedBodyBytesSql();
-		const rows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				role: narratorMessages.role,
-				createdAt: narratorMessages.createdAt,
-				toolCount,
-				byteSize,
-				preview: sql<string | null>`substr(COALESCE(${narratorMessages.contentText}, ''), 1, 160)`,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					isNull(narratorMessageRefs.segmentCompactId),
-					sql`(
+		const rows = await readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+					role: narratorMessages.role,
+					createdAt: narratorMessages.createdAt,
+					toolCount,
+					byteSize,
+					preview: sql<
+						string | null
+					>`substr(COALESCE(${narratorMessages.contentText}, ''), 1, 160)`,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						isNull(narratorMessageRefs.segmentCompactId),
+						sql`(
 						(SELECT COUNT(*) FROM narrator_tool_calls
 						 WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 						   AND narrator_tool_calls.is_file_history_checkpoint = 0)
 						> ${HISTORY_RECOVERY_TOOL_COUNT}
 						OR ${byteSize} > ${HISTORY_RECOVERY_BYTE_SIZE}
 					)`,
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(HISTORY_RECOVERY_CANDIDATES),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
+		const maxSeqRow = await readQuery(
+			db
+				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
 				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(HISTORY_RECOVERY_CANDIDATES);
-		const maxSeqRow = await db
-			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			);
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		const maxSeq = maxSeqRow[0]?.maxSeq ?? null;
 		return {
 			candidates: rows.map((row) => ({
@@ -4218,10 +4346,13 @@ const narratorMessageQueriesUnlocked = {
 	 * run delivers to, `null` for none.
 	 */
 	async ownTurnPlacement(narratorId: string): Promise<OwnTurnPlacement> {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: RUNTIME_SOURCE_COLUMNS,
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: RUNTIME_SOURCE_COLUMNS,
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		return narrator ? ownTurnPlacementOf(narrator) : null;
 	},
 
@@ -4240,10 +4371,13 @@ const narratorMessageQueriesUnlocked = {
 	 * "bump version ⟺ broadcast" pairing intact.
 	 */
 	async getMessageVersion(narratorId: string): Promise<number> {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { messageVersion: true },
-		});
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { messageVersion: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		return row?.messageVersion ?? 0;
 	},
 
@@ -4267,10 +4401,13 @@ const narratorMessageQueriesUnlocked = {
 	}> {
 		const [placement, target] = await Promise.all([
 			this.ownTurnPlacement(narratorId),
-			db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { id: true, parentToolUseId: true },
-			}),
+			readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					columns: { id: true, parentToolUseId: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			),
 		]);
 		if (!target) throw new NotFoundError("Message", messageId);
 
@@ -4281,14 +4418,17 @@ const narratorMessageQueriesUnlocked = {
 		await ensureRefsCoverMessage(narratorId, messageId);
 
 		const findVisibleRef = async (candidateMessageId: string) =>
-			db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, candidateMessageId),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-				columns: { seq: true },
-			});
+			readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, candidateMessageId),
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
+					columns: { seq: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 
 		const directRef = await findVisibleRef(target.id);
 		if (directRef && isTopLevelMessage(target, placement)) {
@@ -4297,25 +4437,28 @@ const narratorMessageQueriesUnlocked = {
 
 		let parentToolUseId = target.parentToolUseId;
 		for (let depth = 0; parentToolUseId && depth < 32; depth++) {
-			const candidates = await db
-				.select({
-					messageId: narratorToolCalls.messageId,
-					parentToolUseId: narratorMessages.parentToolUseId,
-					seq: narratorMessageRefs.seq,
-				})
-				.from(narratorToolCalls)
-				.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-				.innerJoin(
-					narratorMessageRefs,
-					and(
-						eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-						isNull(narratorMessageRefs.segmentCompactId),
-					),
-				)
-				.where(eq(narratorToolCalls.toolUseId, parentToolUseId))
-				.orderBy(narratorMessageRefs.seq)
-				.limit(10);
+			const candidates = await readQuery(
+				db
+					.select({
+						messageId: narratorToolCalls.messageId,
+						parentToolUseId: narratorMessages.parentToolUseId,
+						seq: narratorMessageRefs.seq,
+					})
+					.from(narratorToolCalls)
+					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+					.innerJoin(
+						narratorMessageRefs,
+						and(
+							eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+						),
+					)
+					.where(eq(narratorToolCalls.toolUseId, parentToolUseId))
+					.orderBy(narratorMessageRefs.seq)
+					.limit(10),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			if (candidates.length === 0) break;
 
 			let nextParentToolUseId: string | null = null;
@@ -4380,10 +4523,13 @@ const narratorMessageQueriesUnlocked = {
 		};
 		const maxAttempts = opts.messageVersion == null ? PRETEXT_PAGE_DRIFT_ATTEMPTS : 1;
 		const buildPage = async () => {
-			const narratorMeta = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { ...RUNTIME_SOURCE_COLUMNS, messageVersion: true },
-			});
+			const narratorMeta = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { ...RUNTIME_SOURCE_COLUMNS, messageVersion: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			const placement = narratorMeta ? ownTurnPlacementOf(narratorMeta) : null;
 			const messageVersion = narratorMeta?.messageVersion ?? 0;
 			if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
@@ -4436,12 +4582,15 @@ const narratorMessageQueriesUnlocked = {
 			}
 
 			const loadWindow = async () => {
-				const refRows = await db
-					.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(and(...conditions))
-					.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
-					.limit(limit + 1);
+				const refRows = await readQuery(
+					db
+						.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(and(...conditions))
+						.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
+						.limit(limit + 1),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				);
 				const hasMoreInDirection = refRows.length > limit;
 				const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
 				// Descending queries return newest-first; flip to the ascending order the
@@ -4538,12 +4687,18 @@ const narratorMessageQueriesUnlocked = {
 				hasPrev =
 					(minSeq != null &&
 						(
-							await db
-								.select({ seq: narratorMessageRefs.seq })
-								.from(narratorMessageRefs)
-								.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-								.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
-								.limit(1)
+							await readQuery(
+								db
+									.select({ seq: narratorMessageRefs.seq })
+									.from(narratorMessageRefs)
+									.innerJoin(
+										narratorMessages,
+										eq(narratorMessageRefs.messageId, narratorMessages.id),
+									)
+									.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
+									.limit(1),
+								{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+							)
 						).length > 0) ||
 					(await probeUnmaterializedBelow());
 			} else {
@@ -4561,6 +4716,9 @@ const narratorMessageQueriesUnlocked = {
 			try {
 				return await buildPage();
 			} catch (error) {
+				// Reference snapshots run outside the display reader, but share its cancellation contract.
+				if (error instanceof Error && "code" in error && error.code === "DB_READ_ABORTED")
+					throw mapNarratorDisplayReadError(error);
 				if (!(error instanceof AppError) || !driftErrors.has(error) || attempt >= maxAttempts)
 					throw error;
 			}
@@ -4578,11 +4736,14 @@ const narratorMessageQueriesUnlocked = {
 		const baseChildAnchors = new Map<string, CatchUpChildAnchor>();
 
 		async function addOpenAnchorsForMessage(messageId: string) {
-			const rows = await db.query.narratorToolCalls.findMany({
-				where: eq(narratorToolCalls.messageId, messageId),
-				columns: { toolUseId: true },
-				limit: AGGREGATE_METADATA_LIMIT + 1,
-			});
+			const rows = await readQuery(
+				db.query.narratorToolCalls.findMany({
+					where: eq(narratorToolCalls.messageId, messageId),
+					columns: { toolUseId: true },
+					limit: AGGREGATE_METADATA_LIMIT + 1,
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			assertAggregateBudget(rows.length);
 			for (const row of rows) {
 				upsertCursorChildAnchor(baseChildAnchors, { parentToolUseId: row.toolUseId });
@@ -4590,17 +4751,23 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		if (parentLastMessageId) {
-			const parentRef = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, parentLastMessageId),
-				),
-				columns: { seq: true },
-			});
-			const parentMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, parentLastMessageId),
-				columns: { narratorId: true, parentToolUseId: true },
-			});
+			const parentRef = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, parentLastMessageId),
+					),
+					columns: { seq: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+			const parentMessage = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, parentLastMessageId),
+					columns: { narratorId: true, parentToolUseId: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			if (parentMessage?.parentToolUseId && !isTopLevelMessage(parentMessage, placement)) {
 				const childAnchorMessageId = parentLastMessageId;
 				const scope = db.transaction((tx) =>
@@ -4682,29 +4849,35 @@ const narratorMessageQueriesUnlocked = {
 				isNull(narratorMessageRefs.segmentCompactId),
 			];
 			if (ownTurn) rowConditions.push(ownTurn);
-			refRows = await db
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-				})
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(and(...rowConditions))
-				.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-				.limit(limit + 1);
-		}
-
-		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
-			? await db
+			refRows = await readQuery(
+				db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 					})
 					.from(narratorMessageRefs)
 					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(childWhere)
+					.where(and(...rowConditions))
 					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-					.limit(limit + 1)
+					.limit(limit + 1),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+		}
+
+		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
+			? await readQuery(
+					db
+						.select({
+							messageId: narratorMessageRefs.messageId,
+							seq: narratorMessageRefs.seq,
+						})
+						.from(narratorMessageRefs)
+						.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+						.where(childWhere)
+						.orderBy(sql`${narratorMessageRefs.seq} ASC`)
+						.limit(limit + 1),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				)
 			: [];
 
 		if (refRows.length === 0 && childRefRows.length === 0) {
@@ -4808,7 +4981,24 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getToolCallDetail(narratorId: string, toolUseId: string, reference?: ToolDetailReference) {
-		return db.transaction((tx) => getToolCallDetailTx(tx, narratorId, toolUseId, reference));
+		if (modelHistoryDatabase.activeDatabaseBackend === "postgres")
+			return db.transaction((tx) => getToolCallDetailTx(tx, narratorId, toolUseId, reference));
+		const raw = await readDomainTask(
+			modelHistoryDatabase.sqlite,
+			"narratorToolDetail",
+			{ narratorId, toolUseId, reference: toolDetailReferenceForWorker(reference) },
+			{
+				executionPolicy: "worker-required",
+				timeoutMs: 30_000,
+			},
+		);
+		const row = Object.fromEntries(
+			Object.entries(getTableColumns(narratorToolCalls)).map(([key, column]) => {
+				const value = raw[column.name];
+				return [key, value === null ? null : column.mapFromDriverValue(value)];
+			}),
+		) as typeof narratorToolCalls.$inferSelect;
+		return toolCallWithExecutionTargets(row);
 	},
 
 	async getToolCallPreviewMetadata(
@@ -4816,12 +5006,19 @@ const narratorMessageQueriesUnlocked = {
 		toolUseId: string,
 		reference?: ToolDetailReference,
 	) {
+		if (modelHistoryDatabase.activeDatabaseBackend !== "postgres")
+			return readDomainTask(
+				modelHistoryDatabase.sqlite,
+				"narratorToolPreview",
+				{ narratorId, toolUseId, reference: toolDetailReferenceForWorker(reference) },
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 		return db.transaction((tx) => {
 			const selected = selectVisibleToolCallTx(tx, narratorId, toolUseId, reference);
 			const row = tx
 				.select({
 					...toolEditPreviewColumns,
-					payloadCleared: sql<boolean>`(${sql.raw(CLEARED_TOOL_OUTPUT_SQL)})`,
+					payloadCleared: sql<boolean>`(${sql.raw(CLEARED_TOOL_OUTPUT_SQL)})`.mapWith(Boolean),
 				})
 				.from(narratorToolCalls)
 				.where(eq(narratorToolCalls.id, selected.id))
@@ -4832,82 +5029,82 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getCompactSummary(narratorId: string, messageId: string) {
-		return db.transaction((tx) => {
-			const msg = fillBody(
-				tx.query.narratorMessages
-					.findFirst({
-						...bodyColumns({
-							id: true,
-							contentJson: true,
-							tokensIn: true,
-							contextPercent: true,
-						}),
-						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-					})
-					.sync(),
-			);
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-					columns: { seq: true, isCompact: true },
-				})
-				.sync();
-			if (!msg || !ref) throw new NotFoundError("Message", messageId);
-
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) throw new NotFoundError("CompactSummary", messageId);
-			const latestCompactRows = tx
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(
-					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(1)
-				.all();
-			const latestCompactSeq = latestCompactRows[0]?.seq ?? null;
-			const canRetry =
-				compactBlock.status === "failed" &&
-				ref.isCompact === 0 &&
-				(latestCompactSeq == null || ref.seq > latestCompactSeq);
-			const latestAttempt = compactBlock.attempts?.at(-1);
-			const live =
-				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
-
-			// Display fallbacks for markers written before both ends of the occupancy pair
-			// were recorded. A marker without `before` inherits the last real occupancy its
-			// history carried; a marker without `after` inherits its own row only when that
-			// row came from the post-compact estimate — the summary model's own request
-			// occupancy also lands in this column, and that is a percentage of a different
-			// window, so it must not be shown as the narrator's occupancy.
-			// The search stops at the previous compact boundary: anything older belongs to a
-			// different context, and compact markers themselves (system rows) may carry the
-			// summary model's own occupancy. Bounding it also keeps this read small.
-			const previousCompactSeq = (() => {
-				if (compactBlock.contextPercentBefore != null) return null;
-				return (
-					tx
-						.select({ seq: narratorMessageRefs.seq })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, narratorId),
-								eq(narratorMessageRefs.isCompact, 1),
-								lt(narratorMessageRefs.seq, ref.seq),
-							),
+		const snapshot =
+			modelHistoryDatabase.activeDatabaseBackend === "postgres"
+				? (
+						await readQuery(
+							db
+								.select({
+									contentJsonText: sql<string>`CAST(${contentJsonSql()} AS TEXT)`,
+									seq: narratorMessageRefs.seq,
+									isCompact: narratorMessageRefs.isCompact,
+									latestCompactSeq: sql<
+										number | null
+									>`(SELECT MAX(latest.seq) FROM narrator_message_refs latest WHERE latest.narrator_id = ${narratorId} AND latest.is_compact = 1)`,
+								})
+								.from(narratorMessages)
+								.innerJoin(
+									narratorMessageRefs,
+									and(
+										eq(narratorMessageRefs.messageId, narratorMessages.id),
+										eq(narratorMessageRefs.narratorId, narratorId),
+									),
+								)
+								.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")))
+								.limit(1),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
 						)
-						.orderBy(desc(narratorMessageRefs.seq))
-						.limit(1)
-						.get()?.seq ?? null
-				);
-			})();
-			const contextPercentBefore =
-				compactBlock.contextPercentBefore ??
-				tx
+					)[0]
+				: await readDomainTask(
+						modelHistoryDatabase.sqlite,
+						"narratorCompactSummary",
+						{ narratorId, messageId },
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					);
+		if (!snapshot) throw new NotFoundError("Message", messageId);
+		const content: unknown = JSON.parse(snapshot.contentJsonText);
+		const blocks = Array.isArray(content) ? content : [];
+		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+		if (!compactBlock) throw new NotFoundError("CompactSummary", messageId);
+		const ref = snapshot;
+		const latestCompactSeq = snapshot.latestCompactSeq;
+		const canRetry =
+			compactBlock.status === "failed" &&
+			ref.isCompact === 0 &&
+			(latestCompactSeq == null || ref.seq > latestCompactSeq);
+		const latestAttempt = compactBlock.attempts?.at(-1);
+		const live =
+			compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+
+		// Display fallbacks for markers written before both ends of the occupancy pair
+		// were recorded. A marker without `before` inherits the last real occupancy its
+		// history carried; a marker without `after` inherits its own row only when that
+		// row came from the post-compact estimate — the summary model's own request
+		// occupancy also lands in this column, and that is a percentage of a different
+		// window, so it must not be shown as the narrator's occupancy.
+		// The search stops at the previous compact boundary: anything older belongs to a
+		// different context, and compact markers themselves (system rows) may carry the
+		// summary model's own occupancy. Bounding it also keeps this read small.
+		let contextPercentBefore = compactBlock.contextPercentBefore;
+		if (contextPercentBefore == null) {
+			const previousCompactRows = await readQuery(
+				db
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							lt(narratorMessageRefs.seq, ref.seq),
+						),
+					)
+					.orderBy(desc(narratorMessageRefs.seq))
+					.limit(1),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+			const previousCompactSeq = previousCompactRows[0]?.seq ?? null;
+			const occupancyRows = await readQuery(
+				db
 					.select({ contextPercent: narratorMessages.contextPercent })
 					.from(narratorMessageRefs)
 					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
@@ -4923,47 +5120,56 @@ const narratorMessageQueriesUnlocked = {
 						),
 					)
 					.orderBy(desc(narratorMessageRefs.seq))
-					.limit(1)
-					.get()?.contextPercent ??
-				undefined;
-			const contextPercentAfter =
-				compactBlock.contextPercentAfter ??
-				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
+					.limit(1),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+			contextPercentBefore = occupancyRows[0]?.contextPercent ?? undefined;
+		}
+		let contextPercentAfter = compactBlock.contextPercentAfter;
+		if (contextPercentAfter == null) {
+			const msg = await readQuery(
+				db.query.narratorMessages.findFirst({
+					columns: { tokensIn: true, contextPercent: true },
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+			contextPercentAfter = msg?.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined;
+		}
 
-			return {
-				status: compactBlock.status,
-				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
-				...(live
-					? {
-							model: live.model || latestAttempt?.model,
-							reasoningEffort: live.reasoningEffort,
-							startedAt: live.startedAt,
-							output: live.output,
-							thinking: live.thinking,
-							outputChars: live.outputChars,
-							thinkingChars: live.thinkingChars,
-							outputTruncated: live.outputTruncated,
-							thinkingTruncated: live.thinkingTruncated,
-						}
-					: {
-							model: latestAttempt?.model,
-							startedAt: latestAttempt?.startedAt,
-							finishedAt: latestAttempt?.finishedAt,
-						}),
-				error:
-					typeof compactBlock.error === "string"
-						? compactBlock.error
-						: latestAttempt?.status === "failed"
-							? latestAttempt.error
-							: undefined,
-				mode: compactBlock.mode,
-				trigger: compactBlock.trigger,
-				contextPercentBefore,
-				contextPercentAfter,
-				attempts: compactBlock.attempts ?? [],
-				canRetry,
-			};
-		});
+		return {
+			status: compactBlock.status,
+			summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
+			...(live
+				? {
+						model: live.model || latestAttempt?.model,
+						reasoningEffort: live.reasoningEffort,
+						startedAt: live.startedAt,
+						output: live.output,
+						thinking: live.thinking,
+						outputChars: live.outputChars,
+						thinkingChars: live.thinkingChars,
+						outputTruncated: live.outputTruncated,
+						thinkingTruncated: live.thinkingTruncated,
+					}
+				: {
+						model: latestAttempt?.model,
+						startedAt: latestAttempt?.startedAt,
+						finishedAt: latestAttempt?.finishedAt,
+					}),
+			error:
+				typeof compactBlock.error === "string"
+					? compactBlock.error
+					: latestAttempt?.status === "failed"
+						? latestAttempt.error
+						: undefined,
+			mode: compactBlock.mode,
+			trigger: compactBlock.trigger,
+			contextPercentBefore,
+			contextPercentAfter,
+			attempts: compactBlock.attempts ?? [],
+			canRetry,
+		};
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
@@ -5435,10 +5641,13 @@ const narratorMessageQueriesUnlocked = {
 					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId));
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { status: true },
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { status: true },
+				}),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
 			broadcastToNarrator(narratorId, {
 				type: "status_change",
 				narratorId,
@@ -5486,10 +5695,13 @@ const narratorMessageQueriesUnlocked = {
 				.run();
 		});
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { status: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		broadcastToNarrator(narratorId, {
 			type: "status_change",
 			narratorId,
@@ -5678,18 +5890,21 @@ const narratorMessageQueriesUnlocked = {
 		return result;
 	},
 
-	async getPendingPermissions(narratorId: string) {
-		const visibleSubagentToolRows = await db
-			.select({ toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-					eq(narratorMessageRefs.narratorId, narratorId),
-				),
-			)
-			.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES]));
+	async getPendingPermissions(narratorId: string, signal?: AbortSignal) {
+		const visibleSubagentToolRows = await readQuery(
+			db
+				.select({ toolUseId: narratorToolCalls.toolUseId })
+				.from(narratorToolCalls)
+				.innerJoin(
+					narratorMessageRefs,
+					and(
+						eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+					),
+				)
+				.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES])),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000, signal },
+		);
 		const visibleSubagentToolUseIds = visibleSubagentToolRows.map((row) => row.toolUseId);
 		const childVisibility =
 			visibleSubagentToolUseIds.length > 0
@@ -5698,36 +5913,39 @@ const narratorMessageQueriesUnlocked = {
 						inArray(narratorMessages.parentToolUseId, visibleSubagentToolUseIds),
 					)
 				: sql`0`;
-		const tcs = await db
-			.select({
-				id: narratorToolCalls.id,
-				ownerNarratorId: narratorToolCalls.narratorId,
-				parentToolUseId: narratorMessages.parentToolUseId,
-				toolName: narratorToolCalls.toolName,
-				toolUseId: narratorToolCalls.toolUseId,
-				inputJson: narratorToolCalls.inputJson,
-				permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
-				permissionSuggestions: narratorToolCalls.permissionSuggestions,
-				executionDeviceId: narratorToolCalls.executionDeviceId,
-				executionCwd: narratorToolCalls.executionCwd,
-				executionPathFlavor: narratorToolCalls.executionPathFlavor,
-				resolvedFilePath: narratorToolCalls.resolvedFilePath,
-				canonicalFilePath: narratorToolCalls.canonicalFilePath,
-				runtimeGeneration: narratorToolCalls.runtimeGeneration,
-				executionTargetsJson: narratorToolCalls.executionTargetsJson,
-				deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
-				createdAt: narratorToolCalls.createdAt,
-			})
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
-			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-			.where(
-				and(
-					eq(narratorToolCalls.status, "pending"),
-					or(eq(narratorToolCalls.narratorId, narratorId), childVisibility),
-				),
-			)
-			.orderBy(narratorToolCalls.createdAt);
+		const tcs = await readQuery(
+			db
+				.select({
+					id: narratorToolCalls.id,
+					ownerNarratorId: narratorToolCalls.narratorId,
+					parentToolUseId: narratorMessages.parentToolUseId,
+					toolName: narratorToolCalls.toolName,
+					toolUseId: narratorToolCalls.toolUseId,
+					inputJson: narratorToolCalls.inputJson,
+					permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
+					permissionSuggestions: narratorToolCalls.permissionSuggestions,
+					executionDeviceId: narratorToolCalls.executionDeviceId,
+					executionCwd: narratorToolCalls.executionCwd,
+					executionPathFlavor: narratorToolCalls.executionPathFlavor,
+					resolvedFilePath: narratorToolCalls.resolvedFilePath,
+					canonicalFilePath: narratorToolCalls.canonicalFilePath,
+					runtimeGeneration: narratorToolCalls.runtimeGeneration,
+					executionTargetsJson: narratorToolCalls.executionTargetsJson,
+					deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
+					createdAt: narratorToolCalls.createdAt,
+				})
+				.from(narratorToolCalls)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+				.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+				.where(
+					and(
+						eq(narratorToolCalls.status, "pending"),
+						or(eq(narratorToolCalls.narratorId, narratorId), childVisibility),
+					),
+				)
+				.orderBy(narratorToolCalls.createdAt),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000, signal },
+		);
 		return tcs
 			.filter((tc) => !shouldHidePendingPermission(tc.permissionSuggestions))
 			.map((tc) =>

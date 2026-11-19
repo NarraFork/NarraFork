@@ -4,8 +4,8 @@
  * slice with the event loop free in between, and can be paused from the storage page.
  *
  *   - `convert` gives every legacy (`body_format = 1`) envelope its block rows. A read-only
- *     db-worker decodes a slice; the main thread inserts it in one short transaction and
- *     flips the envelope to `body_format = 2` last. The rows go in while the envelope is
+ *     db-worker decodes a slice; the main thread inserts ordered prefixes in short transactions
+ *     and flips each envelope to `body_format = 2` last. The rows go in while the envelope is
  *     still legacy, so no revision trigger fires: the model's history, its caches and the
  *     envelope search index are untouched. An envelope that changed after the worker read
  *     it is flipped without rows instead, and the store's sync builds them.
@@ -39,6 +39,7 @@ import { getDbPath } from "../db/connection";
 import { replaceBlockIndexRow, replaceBlockIndexText } from "../db/fts";
 import {
 	type BackfillEnvelope,
+	type BlockApplyCandidate,
 	type BlockBackfillSliceParams,
 	type BlockBackfillSliceResult,
 	type BlockProjectionSliceParams,
@@ -58,6 +59,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { saveSettings, settings } from "../lib/settings";
+import { stopBlockIndexBackgroundJobs } from "./narrator-block-index";
 import { noteRowsOnlyEnvelopes, rowsOnlyEnvelopesExist } from "./narrator-block-scans";
 import {
 	reindexEnvelope,
@@ -76,11 +78,10 @@ const MAX_SLICE_ENVELOPES = 100;
 const MIN_SLICE_ENVELOPES = 1;
 const MAX_SLICE_SOURCE_BYTES = 4 * 1024 * 1024;
 const SLICE_BUDGET_MS = 1_000;
-/**
- * A write transaction should stay under this, commit included. Past it, a slice written in
- * one transaction halves the next slice, and `reindex` halves its index text per transaction.
- */
+/** Checked between items; a single SQLite statement/envelope and commit cannot be preempted. */
 const APPLY_TARGET_MS = 50;
+const APPLY_MAX_VISITED = 8;
+const APPLY_MAX_SOURCE_BYTES = 128 * 1024;
 /**
  * The jobs' share of the main thread: after a write transaction of T ms, the next one waits
  * this many times T (at most a quarter of the time is theirs), up to `MAX_PACE_MS`. The next
@@ -113,7 +114,10 @@ async function readInWorker<T>(
 		| BlockReindexSliceParams
 		| BlockProjectionSliceParams,
 ): Promise<T> {
-	return await runReadTask<T>(getDbPath(), params, { timeoutMs: WORKER_TIMEOUT_MS });
+	return await runReadTask<T>(getDbPath(), params, {
+		timeoutMs: WORKER_TIMEOUT_MS,
+		signal: backgroundJobs.controller.signal,
+	});
 }
 
 const workerReader: SliceReader = {
@@ -136,6 +140,16 @@ const state = hotSafe("narrator-block-backfill:state", () => ({
 
 /** When the jobs' next write transaction may start. */
 const pace = hotSafe("narrator-block-backfill:pace", () => ({ notBefore: 0 }));
+/** Serialize wait → final gates → transaction → pacing, including projection/reindex callers. */
+const applyQueue = hotSafe("narrator-block-backfill:apply-queue", () => ({
+	tail: Promise.resolve(),
+}));
+const applyBudget = hotSafe("narrator-block-backfill:apply-budget", () => ({
+	visited: APPLY_MAX_VISITED,
+	bytes: APPLY_MAX_SOURCE_BYTES,
+}));
+/** A bounded pass over queue metadata, never ownership of the durable repair debt. */
+const repairScan = hotSafe("narrator-block-backfill:repair-scan", () => ({ afterRowid: 0 }));
 const reindexBudget = hotSafe("narrator-block-backfill:reindex-budget", () => ({
 	chars: REINDEX_TX_CHARS.initial,
 }));
@@ -143,14 +157,88 @@ const reindexBudget = hotSafe("narrator-block-backfill:reindex-budget", () => ({
 /** Back to how a fresh process paces and sizes the jobs. */
 export function resetBlockJobPacingForTests(): void {
 	pace.notBefore = 0;
+	applyBudget.visited = APPLY_MAX_VISITED;
+	applyBudget.bytes = APPLY_MAX_SOURCE_BYTES;
+	repairScan.afterRowid = 0;
 	reindexBudget.chars = REINDEX_TX_CHARS.initial;
 	state.sliceEnvelopes = MAX_SLICE_ENVELOPES;
+	projection.pass = { fromStart: false, restored: 0 };
+	slowLog.at = 0;
+	slowLog.suppressed = 0;
 }
 
 /** Wait until the jobs may take the main thread again (`APPLY_PACE_FACTOR`). */
+function assertBackgroundJobsActive(): void {
+	backgroundJobs.controller.signal.throwIfAborted();
+	if (backgroundJobs.stopping)
+		throw new DOMException("Block background jobs are stopping", "AbortError");
+}
 async function applyTurn(): Promise<void> {
-	const wait = pace.notBefore - performance.now();
-	if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+	assertBackgroundJobsActive();
+	const signal = backgroundJobs.controller.signal;
+	// Even a zero-cost batch releases the event loop, not just the microtask queue.
+	await new Promise<void>((resolve, reject) => {
+		const finish = (error?: unknown) => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", abort);
+			if (error) reject(error);
+			else resolve();
+		};
+		const abort = () => finish(signal.reason);
+		const timer = setTimeout(() => finish(), Math.max(0, pace.notBefore - performance.now()));
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+	});
+	assertBackgroundJobsActive();
+}
+
+/** One shared main-thread turn; metadata reads and the full commit cost are paced together. */
+async function applyScheduled<T>(
+	job: BlockJob,
+	work: (started: number) => T,
+	committed?: (result: T, elapsedMs: number) => void,
+): Promise<T> {
+	const previous = applyQueue.tail;
+	let release = () => {};
+	applyQueue.tail = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	try {
+		await previous;
+		await applyTurn();
+		assertBackgroundJobsActive();
+		const started = performance.now();
+		try {
+			const result = work(started);
+			const elapsedMs = performance.now() - started;
+			paceAfter(elapsedMs);
+			committed?.(result, elapsedMs);
+			return result;
+		} catch (error) {
+			const elapsedMs = performance.now() - started;
+			paceAfter(elapsedMs);
+			if (elapsedMs > APPLY_TARGET_MS) noteSlow(job, elapsedMs, { failed: 1 });
+			throw error;
+		}
+	} finally {
+		release();
+	}
+}
+
+function applyTransaction<T>(
+	job: BlockJob,
+	write: (started: number) => T,
+	committed?: (result: T, elapsedMs: number) => void,
+): Promise<T> {
+	return applyScheduled(
+		job,
+		(started) =>
+			database.sqlite.transaction(() => {
+				assertBackgroundJobsActive();
+				return write(started);
+			})(),
+		committed,
+	);
 }
 
 const projection = hotSafe("narrator-block-backfill:projection", () => ({
@@ -311,7 +399,7 @@ function paceAfter(elapsedMs: number): void {
 }
 
 /** At most one line a minute: a run of large envelopes would otherwise log every slice. */
-function noteSlow(job: BlockJob, elapsedMs: number, detail: Record<string, number>): void {
+function noteSlow(job: BlockJob, elapsedMs: number, detail: Record<string, number | string>): void {
 	const now = Date.now();
 	if (now - slowLog.at < SLOW_LOG_INTERVAL_MS) {
 		slowLog.suppressed++;
@@ -327,15 +415,247 @@ function noteSlow(job: BlockJob, elapsedMs: number, detail: Record<string, numbe
 	slowLog.suppressed = 0;
 }
 
-/** After a slice's one write transaction: pace, and size the next slice by how long it took. */
-function adapt(job: BlockJob, elapsedMs: number, envelopes: number): void {
-	paceAfter(elapsedMs);
+interface AppliedPrefix {
+	next: number;
+	visited: number;
+	handled: number;
+	sourceBytes: number;
+	maxItemMs: number;
+	/** Recovery has only metadata: reserve one full byte budget per eligible target. */
+	estimatedBytes?: boolean;
+	stopReason: "complete" | "items" | "bytes" | "time";
+}
+
+/** No in-memory position changes until the enclosing transaction has committed. */
+function writePrefix<T extends BlockApplyCandidate>(
+	items: readonly T[],
+	at: number,
+	started: number,
+	apply: (item: T) => number,
+): AppliedPrefix {
+	const result: AppliedPrefix = {
+		next: at,
+		visited: 0,
+		handled: 0,
+		sourceBytes: 0,
+		maxItemMs: 0,
+		stopReason: "complete",
+	};
+	while (result.next < items.length) {
+		const item = items[result.next];
+		if (result.visited > 0) {
+			if (result.visited >= applyBudget.visited) result.stopReason = "items";
+			else if (result.sourceBytes + item.sourceBytes > applyBudget.bytes)
+				result.stopReason = "bytes";
+			else if (performance.now() - started >= APPLY_TARGET_MS) result.stopReason = "time";
+			if (result.stopReason !== "complete") break;
+		}
+		assertBackgroundJobsActive();
+		const itemStarted = performance.now();
+		result.handled += apply(item);
+		result.maxItemMs = Math.max(result.maxItemMs, performance.now() - itemStarted);
+		result.sourceBytes += item.sourceBytes;
+		result.visited++;
+		result.next++;
+	}
+	return result;
+}
+
+/** Include commit cost; a slow indivisible item/commit reduces the following batches too. */
+function adapt(job: BlockJob, elapsedMs: number, batch: AppliedPrefix): void {
 	if (elapsedMs > APPLY_TARGET_MS) {
+		applyBudget.visited = Math.max(1, Math.floor(applyBudget.visited / 2));
+		applyBudget.bytes = Math.max(1024, Math.floor(applyBudget.bytes / 2));
 		state.sliceEnvelopes = Math.max(MIN_SLICE_ENVELOPES, Math.floor(state.sliceEnvelopes / 2));
-		noteSlow(job, elapsedMs, { envelopes, nextSlice: state.sliceEnvelopes });
+		noteSlow(job, elapsedMs, {
+			visited: batch.visited,
+			sourceBytes: batch.sourceBytes,
+			maxItemMs: batch.maxItemMs,
+			sourceBytesEstimate: batch.estimatedBytes ? 1 : 0,
+			overshootMs: elapsedMs - APPLY_TARGET_MS,
+			stopReason: batch.stopReason,
+			nextVisited: applyBudget.visited,
+			nextBytes: applyBudget.bytes,
+		});
 	} else {
 		state.sliceEnvelopes = Math.min(MAX_SLICE_ENVELOPES, state.sliceEnvelopes * 2);
 	}
+}
+
+interface PrefixProgress extends AppliedPrefix {
+	cursor: number;
+	complete: boolean;
+}
+interface PrefixTransition {
+	cursor: number;
+	complete: boolean;
+	stuck?: boolean;
+}
+
+/** Reject incomplete read protocols rather than advancing past candidates not described by them. */
+function assertCandidates<T extends BlockApplyCandidate>(
+	items: readonly T[],
+	after: number,
+	last: number,
+): void {
+	if (!Array.isArray(items)) throw new Error("Block slice is missing ordered candidates");
+	let cursor = after;
+	for (const item of items) {
+		if (
+			!Number.isSafeInteger(item.rowid) ||
+			item.rowid <= cursor ||
+			!Number.isSafeInteger(item.sourceBytes) ||
+			item.sourceBytes < 0
+		)
+			throw new Error("Invalid block slice candidate position or source bytes");
+		cursor = item.rowid;
+	}
+	if (cursor !== last) throw new Error("Block slice cursor does not match its candidate prefix");
+}
+
+async function applyPrefixes<T extends BlockApplyCandidate>(
+	job: BlockJob,
+	cursor: number,
+	slice: { items: readonly T[]; lastRowid: number; done: boolean },
+	options: {
+		enabled: () => boolean;
+		apply: (item: T) => number;
+		/** Pure in-memory reads plus transactional checks only; mutations belong in committed. */
+		finish?: (progress: PrefixProgress) => PrefixTransition;
+		committed?: (progress: PrefixProgress, transition: PrefixTransition) => void;
+	},
+): Promise<void> {
+	assertCandidates(slice.items, cursor, slice.lastRowid);
+	let at = 0;
+	do {
+		const committed = await applyTransaction(
+			job,
+			(started) => {
+				const current = jobState(job);
+				if (current.paused || current.complete || current.cursor !== cursor || !options.enabled())
+					return null;
+				const batch = writePrefix(slice.items, at, started, options.apply);
+				const progress: PrefixProgress = {
+					...batch,
+					cursor: batch.visited ? slice.items[batch.next - 1].rowid : cursor,
+					complete: slice.done && batch.next === slice.items.length,
+				};
+				const transition = options.finish?.(progress) ?? progress;
+				advance(job, transition.cursor, batch.handled, transition.complete);
+				return { progress, transition };
+			},
+			(result, elapsedMs) => {
+				if (!result) return;
+				adapt(job, elapsedMs, result.progress);
+				options.committed?.(result.progress, result.transition);
+			},
+		);
+		if (!committed) return;
+		at = committed.progress.next;
+		cursor = committed.transition.cursor;
+	} while (at < slice.items.length);
+}
+
+interface RepairCandidate {
+	rowid: number;
+	id: string;
+	messageRowid: number | null;
+	bodyFormat: number | null;
+	rowsOnly: number | null;
+	bodyBytes: number | null;
+}
+
+/**
+ * Repair ownership stays in the sync queue, including across a crash after a format flip.
+ * Each call scans at most 100 queue entries; each paced turn reads at most eight metadata
+ * rows BEFORE joining/filtering. A skipped entry stays queued and is reconsidered next pass.
+ */
+async function repairConvertedQueue(): Promise<boolean> {
+	let scanned = 0;
+	let repaired = 0;
+	let expectedCursor: number | undefined;
+	while (scanned < MAX_SLICE_ENVELOPES) {
+		const result = await applyScheduled(
+			"convert",
+			(started) => {
+				const convert = jobState("convert");
+				if (
+					convert.paused ||
+					!settings.narratorBlocks.write ||
+					convert.cursor === 0 ||
+					(expectedCursor !== undefined && convert.cursor !== expectedCursor)
+				)
+					return null;
+				const limit = Math.min(applyBudget.visited, MAX_SLICE_ENVELOPES - scanned);
+				const candidates = database.sqlite
+					.prepare(
+						`WITH pending AS MATERIALIZED (
+					SELECT rowid, message_id FROM narrator_block_sync_queue
+					WHERE rowid > ? ORDER BY rowid LIMIT ?
+				 ) SELECT q.rowid, q.message_id AS id, m.rowid AS messageRowid,
+					m.body_format AS bodyFormat, m.body_rows_only AS rowsOnly, m.body_bytes AS bodyBytes
+				 FROM pending q LEFT JOIN narrator_messages m ON m.id = q.message_id ORDER BY q.rowid`,
+					)
+					.all(repairScan.afterRowid, limit) as RepairCandidate[];
+				assertBackgroundJobsActive();
+				const scanGate = jobState("convert");
+				if (scanGate.paused || scanGate.cursor !== convert.cursor || !settings.narratorBlocks.write)
+					return null;
+				const eligible = (item: RepairCandidate) =>
+					item.messageRowid !== null &&
+					item.messageRowid <= convert.cursor &&
+					item.bodyFormat === 2 &&
+					item.rowsOnly === 0;
+				// body_bytes may predate a queued rewrite. A full-budget estimate forces every
+				// eligible repair to be its turn's only target, without reading or sizing its body.
+				const items = candidates.map((item) => ({
+					...item,
+					sourceBytes: eligible(item) ? Math.max(APPLY_MAX_SOURCE_BYTES, item.bodyBytes ?? 0) : 0,
+				}));
+				// Metadata-only skips owe no write lock; retain their durable queue debt.
+				const batch = items.some(eligible)
+					? database.sqlite.transaction(() => {
+							assertBackgroundJobsActive();
+							const current = jobState("convert");
+							if (
+								current.paused ||
+								current.cursor !== convert.cursor ||
+								!settings.narratorBlocks.write
+							)
+								return null;
+							return writePrefix(items, 0, started, (item) => {
+								if (!eligible(item)) return 0;
+								// Sync and queue deletion share this transaction; rollback retains the debt.
+								syncEnvelopeNow(item.id);
+								return 1;
+							});
+						})()
+					: writePrefix(items, 0, started, () => 0);
+				if (!batch) return null;
+				batch.estimatedBytes = true;
+				const end = batch.next === items.length && candidates.length < limit;
+				return {
+					batch,
+					end,
+					cursor: convert.cursor,
+					afterRowid: end ? 0 : items[batch.next - 1].rowid,
+				};
+			},
+			(committed, elapsedMs) => {
+				if (!committed) return;
+				// Only a successful metadata scan/transaction moves the process-local pass.
+				repairScan.afterRowid = committed.afterRowid;
+				adapt("convert", elapsedMs, committed.batch);
+			},
+		);
+		if (!result) return false;
+		expectedCursor = result.cursor;
+		scanned += result.batch.visited;
+		repaired += result.batch.handled;
+		if (result.end) return repaired > 0;
+	}
+	// The next slice continues this finite pass, even if this page held only skips.
+	return true;
 }
 
 async function convertSlice(reader: SliceReader): Promise<void> {
@@ -347,20 +667,29 @@ async function convertSlice(reader: SliceReader): Promise<void> {
 		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
 		budgetMs: SLICE_BUDGET_MS,
 	});
-	await applyTurn();
-	const started = performance.now();
-	const outcomes = database.sqlite.transaction(() => {
-		const applied = slice.envelopes.map(applyEnvelope);
-		advance("convert", slice.lastRowid, slice.envelopes.length, slice.done);
-		return applied;
-	})();
-	adapt("convert", performance.now() - started, slice.envelopes.length);
-	// Stale plans were flipped for the store to build; let it do so now, a few at a time.
-	if (outcomes.includes("changed"))
-		database.sqlite.transaction(() => {
-			for (const [index, envelope] of slice.envelopes.entries())
-				if (outcomes[index] === "changed") syncEnvelopeNow(envelope.id);
-		})();
+	await applyPrefixes(
+		"convert",
+		job.cursor,
+		{ ...slice, items: slice.envelopes },
+		{
+			enabled: () => settings.narratorBlocks.write,
+			apply: (envelope) => {
+				applyEnvelope(envelope);
+				return 1;
+			},
+		},
+	);
+	await repairConvertedQueue();
+}
+
+function repairMismatch(id: string): void {
+	// Queued envelopes are about to be synced; they are not a dual-write failure.
+	if (
+		database.sqlite.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?").get(id)
+	)
+		return;
+	recordDiagnostic(id, "mismatch", "block rows did not assemble to content_json");
+	resyncFromColumn(id);
 }
 
 async function verifySlice(reader: SliceReader): Promise<void> {
@@ -372,25 +701,18 @@ async function verifySlice(reader: SliceReader): Promise<void> {
 		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
 		budgetMs: SLICE_BUDGET_MS,
 	});
-	await applyTurn();
-	const started = performance.now();
-	database.sqlite.transaction(() => {
-		const pending = database.sqlite.prepare(
-			"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
-		);
-		for (const id of slice.mismatched) {
-			// Queued envelopes are about to be synced; they are not a dual-write failure.
-			if (pending.get(id)) continue;
-			recordDiagnostic(id, "mismatch", "block rows did not assemble to content_json");
-			resyncFromColumn(id);
-		}
-		advance("verify", slice.lastRowid, slice.checked, slice.done);
-	})();
-	adapt("verify", performance.now() - started, slice.checked);
-	if (slice.mismatched.length)
-		logger.warn("Block rows differed from their envelope; recorded and re-synced", {
-			messageIds: slice.mismatched,
-		});
+	await applyPrefixes(
+		"verify",
+		job.cursor,
+		{ ...slice, items: slice.visited },
+		{
+			enabled: () => true,
+			apply: (item) => {
+				if (item.mismatched) repairMismatch(item.id);
+				return 1;
+			},
+		},
+	);
 }
 
 /** How far a reindex slice's writes have got: an envelope, and a block of it. */
@@ -423,33 +745,36 @@ async function reindexSlice(reader: SliceReader): Promise<void> {
 		const at: ReindexPosition = { envelope: 0, block: 0 };
 		let cursor = job.cursor;
 		do {
-			await applyTurn();
-			const budget = reindexBudget.chars;
-			const started = performance.now();
-			const written = database.sqlite.transaction(() => {
-				// Paused, or sent back to the start, while this slice was being written.
-				const current = jobState("reindex");
-				if (current.paused || current.complete || current.cursor !== cursor) return null;
-				const done = writeReindexed(slice.envelopes, at, watch.synced, started, budget);
-				if (done.envelopes > 0) cursor = slice.envelopes[at.envelope - 1].rowid;
-				const complete = slice.done && at.envelope === slice.envelopes.length;
-				if (complete) cursor = slice.lastRowid;
-				advance("reindex", cursor, done.envelopes, complete);
-				return done;
-			})();
+			const written = await applyTransaction(
+				"reindex",
+				(started) => {
+					const budget = reindexBudget.chars;
+					// Paused, or sent back to the start, while this slice was being written.
+					const current = jobState("reindex");
+					if (current.paused || current.complete || current.cursor !== cursor) return null;
+					const next = { ...at };
+					const done = writeReindexed(slice.envelopes, next, watch.synced, started, budget);
+					let nextCursor = done.envelopes > 0 ? slice.envelopes[next.envelope - 1].rowid : cursor;
+					const complete = slice.done && next.envelope === slice.envelopes.length;
+					if (complete) nextCursor = slice.lastRowid;
+					advance("reindex", nextCursor, done.envelopes, complete);
+					return { done, next, nextCursor, budget };
+				},
+				(result, elapsedMs) => {
+					if (!result) return;
+					const { done, budget } = result;
+					// Include commit cost; grow only a transaction that used its text budget.
+					if (elapsedMs > APPLY_TARGET_MS)
+						reindexBudget.chars = Math.max(REINDEX_TX_CHARS.min, Math.floor(budget / 2));
+					else if (elapsedMs < APPLY_TARGET_MS / 2 && done.indexChars >= budget)
+						reindexBudget.chars = Math.min(REINDEX_TX_CHARS.max, Math.ceil(budget * 1.25));
+					if (elapsedMs > 2 * APPLY_TARGET_MS)
+						noteSlow("reindex", elapsedMs, { ...done, nextChars: reindexBudget.chars });
+				},
+			);
 			if (!written) return;
-			const elapsedMs = performance.now() - started;
-			paceAfter(elapsedMs);
-			// Sized by the whole transaction, its commit included; grown only by one that used
-			// its budget.
-			if (elapsedMs > APPLY_TARGET_MS)
-				reindexBudget.chars = Math.max(REINDEX_TX_CHARS.min, Math.floor(budget / 2));
-			else if (elapsedMs < APPLY_TARGET_MS / 2 && written.indexChars >= budget)
-				reindexBudget.chars = Math.min(REINDEX_TX_CHARS.max, Math.ceil(budget * 1.25));
-			// One well past the target: a merge fell due at its commit, or one block or one
-			// envelope's sync took that long.
-			if (elapsedMs > 2 * APPLY_TARGET_MS)
-				noteSlow("reindex", elapsedMs, { ...written, nextChars: reindexBudget.chars });
+			Object.assign(at, written.next);
+			cursor = written.nextCursor;
 		} while (at.envelope < slice.envelopes.length);
 	} finally {
 		watch.stop();
@@ -526,8 +851,11 @@ function writeReindexed(
  * Run one slice of whichever job has work: convert first, then verify, then reindex.
  * Returns whether a slice ran (false when all are complete or paused).
  */
-export async function runBlockJobSlice(reader: SliceReader = workerReader): Promise<boolean> {
-	if (!hasSchema()) return false;
+export function runBlockJobSlice(reader: SliceReader = workerReader): Promise<boolean> {
+	return trackBlockSlice(() => runBlockJobSliceNow(reader));
+}
+async function runBlockJobSliceNow(reader: SliceReader): Promise<boolean> {
+	if (backgroundJobs.stopping || !hasSchema()) return false;
 	const convert = jobState("convert");
 	if (!convert.complete) {
 		// Block writes off is the rollback switch: no envelope becomes block-format.
@@ -535,6 +863,8 @@ export async function runBlockJobSlice(reader: SliceReader = workerReader): Prom
 		await convertSlice(reader);
 		return true;
 	}
+	// A previous process may have committed a stale-plan flip but not its repair.
+	if (await repairConvertedQueue()) return true;
 	const verify = jobState("verify");
 	if (!verify.complete) {
 		if (verify.paused) return false;
@@ -806,39 +1136,32 @@ async function clearSlice(read: ProjectionReader): Promise<void> {
 		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
 		budgetMs: SLICE_BUDGET_MS,
 	});
-	await applyTurn();
-	if (!stillRunning("clear")) return;
-	const started = performance.now();
-	const cleared = database.sqlite.transaction(() => {
-		// Only as read: not rewritten, not waiting on its sync, still with its projection.
-		const clear = database.sqlite.prepare(
-			`UPDATE narrator_messages SET content_json = '[]', body_rows_only = 1,
-				state_revision = state_revision + 1
-			 WHERE id = ? AND body_format = 2 AND body_rows_only = 0 AND body_revision = ?
-				AND state_revision = ?
-				AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?)`,
-		);
-		let count = 0;
-		for (const envelope of slice.envelopes)
-			count += clear.run(
-				envelope.id,
-				envelope.bodyRevision,
-				envelope.stateRevision,
-				envelope.id,
-			).changes;
-		const pending = database.sqlite.prepare(
-			"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
-		);
-		for (const id of slice.mismatched) {
-			if (pending.get(id)) continue;
-			recordDiagnostic(id, "mismatch", "block rows did not assemble to content_json");
-			resyncFromColumn(id);
-		}
-		advance("clear", slice.lastRowid, count, slice.done);
-		return count;
-	})();
-	if (cleared) noteRowsOnlyEnvelopes(true);
-	adapt("clear", performance.now() - started, slice.envelopes.length);
+	await applyPrefixes(
+		"clear",
+		job.cursor,
+		{ ...slice, items: slice.visited },
+		{
+			enabled: () => stillRunning("clear"),
+			apply: (item) => {
+				if (item.mismatched) repairMismatch(item.id);
+				const envelope = item.envelope;
+				if (!envelope) return 0;
+				// Only as read: not rewritten, queued, or already without its projection.
+				return database.sqlite
+					.prepare(
+						`UPDATE narrator_messages SET content_json = '[]', body_rows_only = 1,
+					state_revision = state_revision + 1
+				 WHERE id = ? AND body_format = 2 AND body_rows_only = 0 AND body_revision = ?
+					AND state_revision = ?
+					AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?)`,
+					)
+					.run(envelope.id, envelope.bodyRevision, envelope.stateRevision, envelope.id).changes;
+			},
+			committed: (progress) => {
+				if (progress.handled) noteRowsOnlyEnvelopes(true);
+			},
+		},
+	);
 }
 
 async function restoreSlice(read: ProjectionReader): Promise<void> {
@@ -852,57 +1175,54 @@ async function restoreSlice(read: ProjectionReader): Promise<void> {
 		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
 		budgetMs: SLICE_BUDGET_MS,
 	});
-	await applyTurn();
-	if (!stillRunning("restore")) return;
-	const started = performance.now();
-	const outcome = database.sqlite.transaction(() => {
-		// Only as read: the same revisions and the same rows (a state rewrite by the sync
-		// moves neither revision), and still rows-only (a write since stored its own).
-		const write = database.sqlite.prepare(
-			`UPDATE narrator_messages SET content_json = ?, body_rows_only = 0,
-				state_revision = state_revision + 1
-			 WHERE id = ? AND body_rows_only = 1 AND body_revision = ? AND state_revision = ?`,
-		);
-		let count = 0;
-		for (const envelope of slice.envelopes)
-			if (rowsSignature(database.sqlite, envelope.id) === envelope.rows)
-				count += write.run(
-					envelope.json ?? "[]",
-					envelope.id,
-					envelope.bodyRevision,
-					envelope.stateRevision,
-				).changes;
-		projection.pass.restored += count;
-		if (!slice.done) {
-			advance("restore", slice.lastRowid, count, false);
-			return "more";
-		}
-		// The end of a pass: done once none is left. Ones that changed under it are taken by
-		// another pass, as long as passes make progress.
-		if (!hasRowsOnlyBodies(database.sqlite)) {
-			advance("restore", slice.lastRowid, count, true);
-			return "complete";
-		}
-		const { fromStart, restored } = projection.pass;
-		advance("restore", 0, count, false);
-		return fromStart && restored === 0 ? "stuck" : "more";
-	})();
-	adapt("restore", performance.now() - started, slice.envelopes.length);
-	if (outcome === "complete") noteRowsOnlyEnvelopes(undefined);
-	if (outcome === "stuck") {
-		pauseProjection("restore");
-		logger.warn("Projection restore made no progress in a full pass; stopped", {});
-	}
+	await applyPrefixes(
+		"restore",
+		job.cursor,
+		{ ...slice, items: slice.visited },
+		{
+			enabled: () => stillRunning("restore"),
+			apply: (item) => {
+				const envelope = item.envelope;
+				// A sync can rewrite rows without moving either envelope revision.
+				if (!envelope || rowsSignature(database.sqlite, item.id) !== envelope.rows) return 0;
+				return database.sqlite
+					.prepare(
+						`UPDATE narrator_messages SET content_json = ?, body_rows_only = 0,
+					state_revision = state_revision + 1
+				 WHERE id = ? AND body_rows_only = 1 AND body_revision = ? AND state_revision = ?`,
+					)
+					.run(envelope.json ?? "[]", item.id, envelope.bodyRevision, envelope.stateRevision)
+					.changes;
+			},
+			finish: (progress) => {
+				// Only the final committed prefix ends a pass. A stale candidate can need another.
+				if (!progress.complete || !hasRowsOnlyBodies(database.sqlite)) return progress;
+				const stuck =
+					projection.pass.fromStart && projection.pass.restored + progress.handled === 0;
+				if (stuck) pauseProjection("restore");
+				return { cursor: 0, complete: false, stuck };
+			},
+			committed: (progress, transition) => {
+				projection.pass.restored += progress.handled;
+				if (transition.complete) noteRowsOnlyEnvelopes(undefined);
+				if (transition.stuck)
+					logger.warn("Projection restore made no progress in a full pass; stopped", {});
+			},
+		},
+	);
 }
 
 /**
  * Run one slice of the started projection job. Returns whether one ran (false when none is
  * started, or what it needs went away — then it stops where it is).
  */
-export async function runProjectionSlice(
+export function runProjectionSlice(
 	read: ProjectionReader = workerProjectionReader,
 ): Promise<boolean> {
-	if (!hasSchema()) return false;
+	return trackBlockSlice(() => runProjectionSliceNow(read));
+}
+async function runProjectionSliceNow(read: ProjectionReader): Promise<boolean> {
+	if (backgroundJobs.stopping || !hasSchema()) return false;
 	const job = activeProjection();
 	if (!job) return false;
 	const blocked = projectionBlocked(job);

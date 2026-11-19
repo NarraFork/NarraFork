@@ -1,11 +1,16 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
+const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({
+	...realDbModule,
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
@@ -25,9 +30,11 @@ beforeEach(async () => {
 	cleanDb(sqlite);
 	await db.insert(schema.narrators).values({ id: "n", createdAt: now, updatedAt: now });
 });
-afterAll(() => {
+afterAll(async () => {
+	mock.module("../../db", () => realDbModule);
+	mock.module("../../lib/context-characters", () => realCharacters);
 	mock.restore();
-	sqlite.close();
+	await workerFixture.close();
 });
 async function persist(narratorId = "n", parentToolUseId?: string) {
 	return narratorPersistence.persistAssistantMessage(narratorId, {
@@ -207,12 +214,15 @@ describe("persisted execution segment identities", () => {
 			calls[0].toolUseId,
 			calls[0].id,
 		);
-		await expect(
-			narratorPersistence.validateToolCallBinding("n", calls[0].toolUseId, {
-				...binding,
-				executionSegmentId: calls[1].executionSegmentId ?? "missing",
-			}),
-		).rejects.toThrow("does not match");
+		// Settle the real Worker I/O before entering Bun's native error matcher.
+		expect(
+			await captureWorkerRejectionThrower(
+				narratorPersistence.validateToolCallBinding("n", calls[0].toolUseId, {
+					...binding,
+					executionSegmentId: calls[1].executionSegmentId ?? "missing",
+				}),
+			),
+		).toThrow("does not match");
 	});
 
 	test("a missing historical segment stays unavailable, not a fake tool-call ID", async () => {

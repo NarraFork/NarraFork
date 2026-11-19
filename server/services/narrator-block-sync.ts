@@ -51,6 +51,13 @@ import {
 	splitEnvelope,
 } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
+import {
+	getValidReasoningTranslationParts,
+	isReasoningTranslationId,
+	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
+	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
 import * as database from "../db";
 import { removeBlockIndexText } from "../db/fts";
 import { hotSafe } from "../lib/hot-safe";
@@ -160,7 +167,7 @@ export function syncQueueMark(): number {
 	if (!hasBlockSchema()) return 0;
 	return (
 		database.sqlite
-			.prepare("SELECT coalesce(max(rowid), 0) AS mark FROM narrator_block_sync_queue")
+			.query("SELECT coalesce(max(rowid), 0) AS mark FROM narrator_block_sync_queue")
 			.get() as { mark: number }
 	).mark;
 }
@@ -176,14 +183,12 @@ export function flushQueuedSince(mark: number, limit = FLUSH_LIMIT): number {
 	if (!hasBlockSchema()) return 0;
 	const ids = (
 		database.sqlite
-			.prepare(
+			.query(
 				"SELECT message_id AS id FROM narrator_block_sync_queue WHERE rowid > ? ORDER BY rowid LIMIT ?",
 			)
 			.all(mark, limit) as Array<{ id: string }>
 	).map((row) => row.id);
-	const done = database.sqlite.prepare(
-		"DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
-	);
+	const done = database.sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?");
 	for (const id of ids) {
 		syncQueuedEnvelope(id);
 		done.run(id);
@@ -201,14 +206,94 @@ export function syncQueuedEnvelopeNow(messageId: string): void {
 	if (!hasBlockSchema()) return;
 	if (
 		!database.sqlite
-			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.query("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
 			.get(messageId)
 	)
 		return;
 	syncQueuedEnvelope(messageId);
 	database.sqlite
-		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
 		.run(messageId);
+}
+
+/** Sync explicit settlement targets that are still dirty; unrelated work stays for the sweep. */
+export function flushChangedEnvelopeTargets(messageIds: Iterable<string>): number {
+	if (!hasBlockSchema()) return 0;
+	const dirty = database.sqlite.query(
+		"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
+	);
+	const done = database.sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?");
+	let count = 0;
+	for (const id of new Set(messageIds)) {
+		if (!dirty.get(id)) continue;
+		syncQueuedEnvelope(id);
+		done.run(id);
+		count++;
+	}
+	return count;
+}
+
+/** Optional, transaction-local work counters; ordinary sync callers collect nothing. */
+export interface BlockSyncStats {
+	messages: number;
+	messageSyncMs: number;
+	maxMessageSyncMs: number;
+	/** Ledger identities inspected; a moved attempt's details do not count its identity twice. */
+	ledgerRows: number;
+	/** Stored plus planned rows visited; blockWrites counts attempted row DML, including parking. */
+	blockVisits: number;
+	blockWrites: number;
+	plannedBodyBytes: number;
+	/** Index text work stays zero in the writer; the background index job owns it. */
+	indexTextCount: number;
+	indexTextMs: number;
+	/** Logical index queue operations, including attempts rolled back with the transaction. */
+	indexQueued: number;
+	indexQueueMs: number;
+	/** Logical index replace/remove calls, including attempts rolled back with the transaction. */
+	ftsWrites: number;
+	ftsDeletes: number;
+	ftsMs: number;
+}
+
+export function createBlockSyncStats(): BlockSyncStats {
+	return {
+		messages: 0,
+		messageSyncMs: 0,
+		maxMessageSyncMs: 0,
+		ledgerRows: 0,
+		blockVisits: 0,
+		blockWrites: 0,
+		plannedBodyBytes: 0,
+		indexTextCount: 0,
+		indexTextMs: 0,
+		indexQueued: 0,
+		indexQueueMs: 0,
+		ftsWrites: 0,
+		ftsDeletes: 0,
+		ftsMs: 0,
+	};
+}
+
+let observedSync: BlockSyncStats | undefined;
+
+/** Includes nested input/body writes, and restores the caller's scope on rollback too. */
+export function withBlockSyncStats<T>(stats: BlockSyncStats, write: () => T): T {
+	const previous = observedSync;
+	observedSync = stats;
+	try {
+		return write();
+	} finally {
+		observedSync = previous;
+	}
+}
+
+function diagnosticNow(): number {
+	try {
+		return performance.now();
+	} catch {
+		return 0;
+	}
 }
 
 /** The envelopes synced since each open `watchSyncs` began. */
@@ -239,7 +324,7 @@ export function syncEnvelopeNow(
 	if (!hasBlockSchema()) return;
 	syncEnvelope(messageId, mode, stamp, content);
 	database.sqlite
-		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
 		.run(messageId);
 }
 
@@ -253,7 +338,7 @@ export function reindexEnvelope(messageId: string): void {
 	if (!hasBlockSchema()) return;
 	syncEnvelope(messageId, "keep", {}, undefined, { reindex: true });
 	database.sqlite
-		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
 		.run(messageId);
 }
 
@@ -294,14 +379,12 @@ const slowSyncLog = hotSafe("narrator-block-sync:slow", () => ({ at: 0, suppress
 function drainQueue(budgetMs: number): { synced: number; more: boolean } {
 	const started = performance.now();
 	let synced = 0;
-	const done = database.sqlite.prepare(
-		"DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
-	);
+	const done = database.sqlite.query("DELETE FROM narrator_block_sync_queue WHERE message_id = ?");
 	for (;;) {
 		const batch = database.sqlite.transaction(() => {
 			const ids = (
 				database.sqlite
-					.prepare("SELECT message_id AS id FROM narrator_block_sync_queue ORDER BY rowid LIMIT ?")
+					.query("SELECT message_id AS id FROM narrator_block_sync_queue ORDER BY rowid LIMIT ?")
 					.all(SWEEP_BATCH) as Array<{ id: string }>
 			).map((row) => row.id);
 			let count = 0;
@@ -581,6 +664,10 @@ export function contentHash(text: string): string {
 const ENVELOPE_COLUMNS = `id, narrator_id AS narratorId, role, content_text AS contentText,
 	parent_tool_use_id AS parentToolUseId, sdk_message_uuid AS messageUuid, origin, provider,
 	body_format AS bodyFormat, body_rows_only AS rowsOnly`;
+const ENVELOPE_READ_BYTES_SQL = ENVELOPE_COLUMNS.split(",")
+	.map((column) => column.trim().split(/\s+/)[0])
+	.map((column) => `coalesce(octet_length(m.${column}), 0)`)
+	.join(" + ");
 
 function envelopeRow(messageId: string): EnvelopeRow | null {
 	return database.sqlite
@@ -620,7 +707,38 @@ export function syncEnvelope(
 	given?: unknown,
 	options: { reindex?: boolean; contentHash?: string | null } = {},
 ): void {
-	const started = performance.now();
+	observeEnvelopeSync((stats) =>
+		syncEnvelopeContent(messageId, mode, stamp, given, options, stats),
+	);
+}
+
+/** One message observation includes the queued fast path and any full-sync fallback. */
+function observeEnvelopeSync(write: (stats?: BlockSyncStats) => void): void {
+	const stats = observedSync;
+	if (!stats) {
+		write();
+		return;
+	}
+	const started = diagnosticNow();
+	stats.messages++;
+	try {
+		write(stats);
+	} finally {
+		const elapsed = Math.max(0, diagnosticNow() - started);
+		stats.messageSyncMs += elapsed;
+		stats.maxMessageSyncMs = Math.max(stats.maxMessageSyncMs, elapsed);
+	}
+}
+
+function syncEnvelopeContent(
+	messageId: string,
+	mode: SyncMode,
+	stamp: BlockStamp,
+	given: unknown,
+	options: { reindex?: boolean; contentHash?: string | null },
+	stats?: BlockSyncStats,
+): void {
+	const started = diagnosticNow();
 	for (const watch of syncWatches) watch.add(messageId);
 	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
@@ -650,11 +768,14 @@ export function syncEnvelope(
 		origin: row.origin,
 		provider: row.provider,
 	};
-	const adopted = isHistoryProtectedContent(content) ? [] : adoptedLedger(ledgerRows(messageId));
+	const ledger = isHistoryProtectedContent(content) ? [] : ledgerRows(messageId);
+	if (stats) stats.ledgerRows += ledger.length;
+	const adopted = adoptedLedger(ledger);
 	const attempts = new Map(adopted.map((attempt) => [attempt.toolUseId, attempt]));
 	const planned = planEnvelopeBlocks({ ...message, contentJson: content }, adopted, {
 		streaming: mode === "streaming",
 	});
+	if (stats) stats.plannedBodyBytes += planned.bodyBytes;
 
 	const existing = database.sqlite
 		.prepare(
@@ -663,6 +784,8 @@ export function syncEnvelope(
 			 FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(messageId) as BlockRow[];
+	// Both the stored and planned rows are visited; no diagnostic-only reads are needed.
+	if (stats) stats.blockVisits += existing.length + planned.blocks.length;
 	const live = existing.filter((block) => !retiredRows.has(block.id));
 	const continued = matchBlocks(
 		keyed(message, live),
@@ -697,13 +820,18 @@ export function syncEnvelope(
 	const removed = existing.filter((block) => !kept.has(block.id));
 	const deleteBlock = database.sqlite.prepare("DELETE FROM narrator_blocks WHERE id = ?");
 	for (const block of removed) {
-		dropBlockIndex(block.id);
+		dropBlockIndex(block.id, stats);
+		if (stats) stats.blockWrites++;
 		deleteBlock.run(block.id);
 	}
 	// Ordinals are unique per envelope: park every moving row before placing any.
 	const park = database.sqlite.prepare("UPDATE narrator_blocks SET ordinal = ? WHERE id = ?");
-	for (const plan of plans)
-		if (plan.current && plan.current.ordinal !== plan.ordinal) park.run(-1 - plan.ordinal, plan.id);
+	for (const plan of plans) {
+		if (plan.current && plan.current.ordinal !== plan.ordinal) {
+			if (stats) stats.blockWrites++;
+			park.run(-1 - plan.ordinal, plan.id);
+		}
+	}
 
 	const insert = database.sqlite.prepare(
 		`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, subtype, phase, revision, wire_id,
@@ -750,6 +878,7 @@ export function syncEnvelope(
 			current.ordinal !== plan.ordinal ||
 			current.modelChars !== chars;
 		if (!current) {
+			if (stats) stats.blockWrites++;
 			insert.run(
 				plan.id,
 				messageId,
@@ -769,6 +898,7 @@ export function syncEnvelope(
 				ledgerRevision,
 			);
 		} else if (changed) {
+			if (stats) stats.blockWrites++;
 			const revision =
 				current.revision +
 				(bodyChanged || (current.phase === "open" && plan.phase !== "open") ? 1 : 0);
@@ -789,7 +919,10 @@ export function syncEnvelope(
 				ledgerRevision,
 				plan.id,
 			);
-		} else if (ledgerMoved) setLedgerRevision.run(ledgerRevision, plan.id);
+		} else if (ledgerMoved) {
+			if (stats) stats.blockWrites++;
+			setLedgerRevision.run(ledgerRevision, plan.id);
+		}
 		// What follows from the block and its attempt: only for a block that changed, or whose
 		// attempt moved. Only then is the attempt's result read.
 		const derive = !current || changed || ledgerMoved || !!options.reindex;
@@ -805,8 +938,8 @@ export function syncEnvelope(
 		if (draft.kind === "tool" && draft.wireId)
 			bindLedger.run(plan.id, messageId, draft.wireId, plan.id);
 		// Searchable once it stops streaming (§4.6): a step's open items are not indexed yet.
-		if (plan.phase === "open") dropBlockIndex(plan.id);
-		else if (derive) queueBlockIndex(plan.id);
+		if (plan.phase === "open") dropBlockIndex(plan.id, stats);
+		else if (derive) enqueueBlockIndex(plan.id, stats);
 	}
 	database.sqlite
 		.prepare("UPDATE narrator_messages SET body_bytes = ? WHERE id = ? AND body_bytes <> ?")
@@ -816,7 +949,7 @@ export function syncEnvelope(
 			"UPDATE narrator_messages SET blocks_content_hash = ? WHERE id = ? AND blocks_content_hash IS NOT ?",
 		)
 		.run(hash, messageId, hash);
-	noteSlowSync(messageId, "envelope", performance.now() - started, plans.length);
+	noteSlowSync(messageId, "envelope", diagnosticNow() - started, plans.length);
 }
 
 /** At most one line a minute, for a single envelope's sync past `SLOW_SYNC_MS`. */
@@ -845,6 +978,10 @@ function noteSlowSync(messageId: string, kind: string, elapsedMs: number, blocks
  * moved (`syncLedger`). Anything else is a full sync, from the column it was hashed from.
  */
 function syncQueuedEnvelope(messageId: string): void {
+	observeEnvelopeSync((stats) => syncQueuedEnvelopeContent(messageId, stats));
+}
+
+function syncQueuedEnvelopeContent(messageId: string, stats?: BlockSyncStats): void {
 	const row = database.sqlite
 		.prepare(
 			`SELECT ${ENVELOPE_COLUMNS}, blocks_content_hash AS syncedHash,
@@ -855,16 +992,16 @@ function syncQueuedEnvelope(messageId: string): void {
 		| (EnvelopeRow & { syncedHash: string | null; contentJson: string | null })
 		| null;
 	if (!row || row.bodyFormat !== 2) {
-		syncEnvelope(messageId);
+		syncEnvelopeContent(messageId, "keep", {}, undefined, {}, stats);
 		return;
 	}
 	if (row.rowsOnly || row.contentJson === null) {
-		if (!syncLedger(row)) syncEnvelope(messageId);
+		if (!syncLedger(row, stats)) syncEnvelopeContent(messageId, "keep", {}, undefined, {}, stats);
 		return;
 	}
 	const hash = contentHash(row.contentJson);
-	if (hash === row.syncedHash && syncLedger(row)) return;
-	syncEnvelope(messageId, "keep", {}, parse(row.contentJson), { contentHash: hash });
+	if (hash === row.syncedHash && syncLedger(row, stats)) return;
+	syncEnvelopeContent(messageId, "keep", {}, parse(row.contentJson), { contentHash: hash }, stats);
 }
 
 /**
@@ -875,8 +1012,8 @@ function syncQueuedEnvelope(messageId: string): void {
  * block does not decode on its own as a tool block of the same call: the caller then syncs
  * the whole envelope, which rewrites whatever this wrote.
  */
-function syncLedger(row: EnvelopeRow): boolean {
-	const started = performance.now();
+function syncLedger(row: EnvelopeRow, stats?: BlockSyncStats): boolean {
+	const started = diagnosticNow();
 	for (const watch of syncWatches) watch.add(row.id);
 	const blocks = database.sqlite
 		.prepare(
@@ -893,19 +1030,18 @@ function syncLedger(row: EnvelopeRow): boolean {
 		revision: number;
 		ledgerRevision: string | null;
 	}>;
+	if (stats) stats.blockVisits += blocks.length;
 	if (!blocks.length) return true;
 	// The attempt identities first: no input or result is read for a block that did not move.
-	const attempts = new Map(
-		adoptedLedger(
-			database.sqlite
-				.prepare(
-					`SELECT id, tool_use_id AS toolUseId, model_revision AS modelRevision
-					 FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
-					 ORDER BY tool_use_id, execution_attempt, created_at, id`,
-				)
-				.all(row.id) as Array<{ id: string; toolUseId: string; modelRevision: number }>,
-		).map((attempt) => [attempt.toolUseId, attempt]),
-	);
+	const ledger = database.sqlite
+		.prepare(
+			`SELECT id, tool_use_id AS toolUseId, model_revision AS modelRevision
+			 FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
+			 ORDER BY tool_use_id, execution_attempt, created_at, id`,
+		)
+		.all(row.id) as Array<{ id: string; toolUseId: string; modelRevision: number }>;
+	if (stats) stats.ledgerRows += ledger.length;
+	const attempts = new Map(adoptedLedger(ledger).map((attempt) => [attempt.toolUseId, attempt]));
 	const moved = blocks.filter(
 		(block) =>
 			block.ledgerRevision !==
@@ -947,13 +1083,18 @@ function syncLedger(row: EnvelopeRow): boolean {
 		const known = block.wireId ? attempts.get(block.wireId) : undefined;
 		const attempt = known ? (attemptOf.get(known.id) as LedgerRow | null) : null;
 		const body = bodyOf.get(block.id) as { payload: string; state: string | null };
-		const [plan, ...rest] = planEnvelopeBlocks(
+		const planned = planEnvelopeBlocks(
 			{
 				...message,
 				contentJson: assembleContent([{ payload: parse(body.payload), state: parse(body.state) }]),
 			},
 			attempt ? [attempt] : [],
-		).blocks;
+		);
+		if (stats) {
+			stats.blockVisits += planned.blocks.length;
+			stats.plannedBodyBytes += planned.bodyBytes;
+		}
+		const [plan, ...rest] = planned.blocks;
 		if (
 			!plan ||
 			rest.length ||
@@ -965,6 +1106,7 @@ function syncLedger(row: EnvelopeRow): boolean {
 			return false;
 		const phase = plan.draft.phase;
 		const revision = block.revision + (block.phase === "open" && phase !== "open" ? 1 : 0);
+		if (stats) stats.blockWrites++;
 		update.run(
 			plan.draft.subtype,
 			phase,
@@ -980,10 +1122,10 @@ function syncLedger(row: EnvelopeRow): boolean {
 		for (const [assetId, role] of blockAssets(plan.draft, output))
 			addAsset.run(block.id, assetId, role);
 		if (block.wireId) bindLedger.run(block.id, row.id, block.wireId, block.id);
-		if (phase === "open") dropBlockIndex(block.id);
-		else queueBlockIndex(block.id);
+		if (phase === "open") dropBlockIndex(block.id, stats);
+		else enqueueBlockIndex(block.id, stats);
 	}
-	noteSlowSync(row.id, "ledger", performance.now() - started, moved.length);
+	noteSlowSync(row.id, "ledger", diagnosticNow() - started, moved.length);
 	return true;
 }
 
@@ -1019,7 +1161,7 @@ function writeBlockStates(messageId: string, drafts: BlockDraft[], wasRowsOnly: 
 	if (
 		!wasRowsOnly &&
 		database.sqlite
-			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.query("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
 			.get(messageId)
 	)
 		return;
@@ -1054,6 +1196,293 @@ function writeBlockStates(messageId: string, drafts: BlockDraft[], wasRowsOnly: 
 		database.sqlite
 			.prepare("UPDATE narrator_messages SET body_bytes = body_bytes + ? WHERE id = ?")
 			.run(delta, messageId);
+}
+
+export const REASONING_TRANSLATION_WRITE_MAX_BYTES = 1024 * 1024;
+const REASONING_TRANSLATION_WRITE_MAX_BLOCKS = 1000;
+
+interface ReasoningPartStateInput {
+	messageId: string;
+	elementId: string;
+	expected: { sourceText: string; generation: string };
+	part: ReasoningTranslationPart;
+	signal?: AbortSignal;
+}
+function normalizeReasoningPartInput(
+	candidate: ReasoningPartStateInput,
+): ReasoningPartStateInput | null {
+	if (
+		!isReasoningTranslationId(candidate.messageId) ||
+		!isReasoningTranslationId(candidate.elementId) ||
+		!candidate.expected ||
+		!isReasoningTranslationId(candidate.expected.generation) ||
+		typeof candidate.expected.sourceText !== "string" ||
+		candidate.expected.sourceText.length > 256 * 1024 ||
+		!candidate.part ||
+		!isReasoningTranslationId(candidate.part.id) ||
+		!isReasoningTranslationId(candidate.part.generation)
+	)
+		return null;
+	const { id, generation, start, end, sourceText, translatedText } = candidate.part;
+	if (
+		!Number.isSafeInteger(start) ||
+		!Number.isSafeInteger(end) ||
+		start < 0 ||
+		start >= end ||
+		typeof sourceText !== "string" ||
+		sourceText.length > MAX_REASONING_TRANSLATION_SOURCE_BYTES ||
+		typeof translatedText !== "string" ||
+		translatedText.length > MAX_REASONING_TRANSLATION_OUTPUT_BYTES ||
+		Buffer.byteLength(candidate.expected.sourceText) > 256 * 1024
+	)
+		return null;
+	// Keep exactly the protocol fields; extra properties never enter a state serializer or clone.
+	const part: ReasoningTranslationPart = { id, generation, start, end, sourceText, translatedText };
+	if (
+		getValidReasoningTranslationParts(
+			candidate.expected.sourceText,
+			candidate.expected.generation,
+			[part],
+		).length !== 1
+	)
+		return null;
+	return {
+		messageId: candidate.messageId,
+		elementId: candidate.elementId,
+		expected: {
+			sourceText: candidate.expected.sourceText,
+			generation: candidate.expected.generation,
+		},
+		part,
+		signal: candidate.signal,
+	};
+}
+
+function translatedParts(
+	element: Record<string, unknown>,
+	input: ReasoningPartStateInput,
+): ReasoningTranslationPart[] | null {
+	if (
+		element.type !== "reasoning" ||
+		element.id !== input.elementId ||
+		typeof element.text !== "string" ||
+		!element.text.startsWith(input.expected.sourceText) ||
+		!input.expected.generation ||
+		element.translationGeneration !== input.expected.generation ||
+		input.part.generation !== input.expected.generation ||
+		input.part.end > input.expected.sourceText.length
+	)
+		return null;
+	const previous = getValidReasoningTranslationParts(
+		element.text,
+		input.expected.generation,
+		element.translationParts as ReasoningTranslationPart[] | undefined,
+	);
+	if (
+		previous.some(
+			(part) =>
+				part.id === input.part.id || (part.start < input.part.end && input.part.start < part.end),
+		)
+	)
+		return null;
+	const next = getValidReasoningTranslationParts(element.text, input.expected.generation, [
+		...previous,
+		input.part,
+	]);
+	return next.length === previous.length + 1 && next.includes(input.part) ? next : null;
+}
+
+/**
+ * Bounded translation write: rows-only envelopes touch just the matching block state.
+ * Compatibility projections retain patchEnvelopeState semantics within a 1MiB write budget.
+ * Larger sources retain their original text; this budget does not constrain history reads.
+ */
+export function patchReasoningPartState(candidate: ReasoningPartStateInput): null | {
+	messageId: string;
+	blockId: string;
+	elementId: string;
+	blockRevision: number;
+	stateRevision: number;
+	translationGeneration: string;
+	part: ReasoningTranslationPart;
+} {
+	candidate.signal?.throwIfAborted();
+	const input = normalizeReasoningPartInput(candidate);
+	if (!input) return null;
+	return database.sqlite.transaction(() => {
+		input.signal?.throwIfAborted();
+		const envelope = database.sqlite
+			.query<
+				{
+					bodyFormat: number;
+					rowsOnly: number;
+					bodyRevision: number;
+					stateRevision: number;
+					projectionBytes: number;
+					envelopeBytes: number;
+					pending: number;
+				},
+				[string]
+			>(`SELECT body_format AS bodyFormat, body_rows_only AS rowsOnly,
+			body_revision AS bodyRevision, state_revision AS stateRevision,
+			octet_length(content_json) AS projectionBytes,
+			(${ENVELOPE_READ_BYTES_SQL}) AS envelopeBytes,
+			EXISTS(SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = m.id) AS pending
+			FROM narrator_messages m WHERE id = ? LIMIT 1`)
+			.get(input.messageId);
+		if (
+			!envelope ||
+			envelope.bodyFormat !== 2 ||
+			(!envelope.rowsOnly && envelope.pending) ||
+			(!envelope.rowsOnly && envelope.projectionBytes > REASONING_TRANSLATION_WRITE_MAX_BYTES)
+		)
+			return null;
+		const rows = database.sqlite
+			.query<
+				{
+					id: string;
+					kind: string;
+					revision: number;
+					payloadBytes: number;
+					stateBytes: number;
+				},
+				[string, number]
+			>(`SELECT id, kind, revision, octet_length(payload) AS payloadBytes,
+			coalesce(octet_length(state),0) AS stateBytes FROM narrator_blocks
+			WHERE message_id = ? ORDER BY ordinal LIMIT ?`)
+			.all(input.messageId, REASONING_TRANSLATION_WRITE_MAX_BLOCKS + 1);
+		if (rows.length > REASONING_TRANSLATION_WRITE_MAX_BLOCKS) return null;
+		// One aggregate parsing allowance, including both candidate lookup and compatibility assembly.
+		// Rows-only storage never decodes the unrelated kinds.
+		const reasoningBytes = rows
+			.filter((row) => row.kind === "reasoning")
+			.reduce((sum, row) => sum + row.payloadBytes + row.stateBytes, 0);
+		const assemblyBytes = envelope.rowsOnly
+			? 0
+			: envelope.envelopeBytes +
+				Math.max(
+					envelope.projectionBytes,
+					rows.reduce((sum, row) => sum + row.payloadBytes + row.stateBytes, 0),
+				);
+		if (reasoningBytes + assemblyBytes > REASONING_TRANSLATION_WRITE_MAX_BYTES) return null;
+		const matches: Array<{
+			id: string;
+			revision: number;
+			state: string | null;
+			raw: unknown[];
+			index: number;
+			stateRaw: Array<Record<string, unknown> | null>;
+			next: ReasoningTranslationPart[];
+		}> = [];
+		for (const row of rows) {
+			if (row.kind !== "reasoning") continue;
+			input.signal?.throwIfAborted();
+			const stored = database.sqlite
+				.query<{ payload: string; state: string | null }, [string, string, number]>(
+					"SELECT payload, state FROM narrator_blocks WHERE id = ? AND message_id = ? AND revision = ? LIMIT 1",
+				)
+				.get(row.id, input.messageId, row.revision);
+			if (!stored) return null;
+			const payload = parse(stored.payload) as { raw?: unknown[] } | null;
+			const state = parse(stored.state) as { raw?: Array<Record<string, unknown> | null> } | null;
+			if (!Array.isArray(payload?.raw)) continue;
+			const stateRaw = Array.isArray(state?.raw) ? state.raw : [];
+			if (
+				stateRaw.some(
+					(fields) => fields !== null && (typeof fields !== "object" || Array.isArray(fields)),
+				)
+			)
+				return null;
+			for (let index = 0; index < payload.raw.length; index++) {
+				const raw = payload.raw[index];
+				if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+				const element = { ...raw, ...stateRaw[index] } as Record<string, unknown>;
+				if (element.type !== "reasoning" || element.id !== input.elementId) continue;
+				const next = translatedParts(element, input);
+				if (!next) return null;
+				matches.push({
+					id: row.id,
+					revision: row.revision,
+					state: stored.state,
+					raw: payload.raw,
+					index,
+					stateRaw,
+					next,
+				});
+			}
+		}
+		if (matches.length !== 1) return null;
+		const target = matches[0];
+		let stateRevision: number;
+		if (envelope.rowsOnly) {
+			const stateRaw = Array.from(
+				{ length: target.raw.length },
+				(_, index) => target.stateRaw[index] ?? null,
+			);
+			stateRaw[target.index] = {
+				...stateRaw[target.index],
+				translationGeneration: input.expected.generation,
+				translationParts: target.next,
+			};
+			const state = JSON.stringify({ raw: stateRaw });
+			const bytes = Buffer.byteLength(state);
+			if (bytes > REASONING_TRANSLATION_WRITE_MAX_BYTES) return null;
+			const delta = bytes - (target.state === null ? 0 : Buffer.byteLength(target.state));
+			input.signal?.throwIfAborted();
+			const written = database.sqlite
+				.query<{ stateRevision: number }, [number, string, number, number]>(
+					`UPDATE narrator_messages SET state_revision = state_revision + 1, body_bytes = body_bytes + ?
+				 WHERE id = ? AND body_format = 2 AND body_rows_only = 1 AND body_revision = ? AND state_revision = ?
+				 RETURNING state_revision AS stateRevision`,
+				)
+				.get(delta, input.messageId, envelope.bodyRevision, envelope.stateRevision);
+			if (!written) return null;
+			const block = database.sqlite
+				.query<{ revision: number }, [string, number, string, string, number, string | null]>(
+					`UPDATE narrator_blocks SET state = ?, byte_size = byte_size + ?
+				 WHERE id = ? AND message_id = ? AND revision = ? AND state IS ? RETURNING revision`,
+				)
+				.get(state, delta, target.id, input.messageId, target.revision, target.state);
+			if (!block) throw new Error("Reasoning translation state identity changed");
+			stateRevision = written.stateRevision;
+		} else {
+			const changed = patchEnvelopeState(input.messageId, (content) => {
+				const candidates = content.filter(
+					(entry) =>
+						(entry as { type?: unknown } | null)?.type === "reasoning" &&
+						(entry as { id?: unknown }).id === input.elementId,
+				);
+				if (candidates.length !== 1) return null;
+				const element = candidates[0] as Record<string, unknown>;
+				const next = translatedParts(element, input);
+				if (!next) return null;
+				element.translationParts = next;
+				return Buffer.byteLength(JSON.stringify(content)) <= REASONING_TRANSLATION_WRITE_MAX_BYTES
+					? content
+					: null;
+			});
+			if (!changed) return null;
+			const written = database.sqlite
+				.query<{ revision: number; stateRevision: number }, [string, string]>(
+					`SELECT b.revision, m.state_revision AS stateRevision FROM narrator_blocks b
+				 INNER JOIN narrator_messages m ON m.id = b.message_id WHERE b.id = ? AND m.id = ? LIMIT 1`,
+				)
+				.get(target.id, input.messageId);
+			if (!written || written.revision !== target.revision)
+				throw new Error("Reasoning translation changed its body identity");
+			stateRevision = written.stateRevision;
+		}
+		input.signal?.throwIfAborted();
+		return {
+			messageId: input.messageId,
+			blockId: target.id,
+			elementId: input.elementId,
+			blockRevision: target.revision,
+			stateRevision,
+			translationGeneration: input.expected.generation,
+			part: structuredClone(input.part),
+		};
+	})();
 }
 
 /**
@@ -1259,8 +1688,28 @@ function lineageRows(messageId: string): Array<{
 
 // === Block search index (§4.6) ===
 
+function enqueueBlockIndex(blockId: string, stats?: BlockSyncStats): void {
+	const started = stats ? diagnosticNow() : 0;
+	try {
+		queueBlockIndex(blockId);
+	} finally {
+		if (stats) {
+			stats.indexQueued++;
+			stats.indexQueueMs += Math.max(0, diagnosticNow() - started);
+		}
+	}
+}
+
 /** A block that is streaming again has no search text, and owes none. */
-function dropBlockIndex(blockId: string): void {
-	removeBlockIndexText(database.sqlite, blockId);
-	unqueueBlockIndex(blockId);
+function dropBlockIndex(blockId: string, stats?: BlockSyncStats): void {
+	const started = stats ? diagnosticNow() : 0;
+	try {
+		removeBlockIndexText(database.sqlite, blockId);
+		unqueueBlockIndex(blockId);
+	} finally {
+		if (stats) {
+			stats.ftsDeletes++;
+			stats.ftsMs += Math.max(0, diagnosticNow() - started);
+		}
+	}
 }

@@ -473,9 +473,10 @@ export type NarratorServerMessage =
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Only sent on the
 			 * parent copy of a subagent event, where the raw `input` is deliberately
-			 * withheld. See {@link SubagentToolInputSummary}.
+			 * withheld. Omission preserves an earlier label; null clears it.
+			 * See {@link SubagentToolInputSummary}.
 			 */
-			inputSummary?: SubagentToolInputSummary;
+			inputSummary?: SubagentToolInputSummary | null;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| {
@@ -1061,6 +1062,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseIds: string[];
 			parentToolUseId?: string;
+			subagentNarratorId?: string;
 	  }
 	| {
 			type: "model_switched";

@@ -1,13 +1,17 @@
+import type { SQLQueryBindings } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ContextCharStats } from "@shared/context-composition";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	hasPendingContextCharacterRefresh,
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../../lib/context-characters";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 // Schema changes intentionally precede generated migrations in this worktree.
 for (const [table, column, definition] of [
 	["narrator_messages", "context_chars_json", "text"],
@@ -28,7 +32,10 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const refreshes: string[] = [];
 const messageRefreshes: Array<{ narratorId: string; messageId?: string }> = [];
-const { createContextCharacterService } = await import("../narrator-context-composition");
+const { createContextCharacterService, createContextCharacterServiceFromQuery } = await import(
+	"../narrator-context-composition"
+);
+const { sqliteContextQuery } = await import("../context-composition-history");
 let integrationService: ReturnType<typeof createContextCharacterService> | undefined;
 mock.module("../narrator-context-composition", () => ({
 	storeNarratorContextUsage: async () => {},
@@ -91,6 +98,7 @@ afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("character statistics at actual persistence boundaries", () => {
@@ -602,7 +610,22 @@ test("an unrelated narrator's queued write cannot force a fresh request to fixed
 });
 
 test("fork waits for owner-only shared-message notifications and rejects a later shared write", async () => {
-	integrationService = createContextCharacterService(sqlite);
+	const query = sqliteContextQuery(sqlite);
+	const readStarted = Promise.withResolvers<void>();
+	const releaseRead = Promise.withResolvers<void>();
+	let pauseNextHistoryRead = false;
+	integrationService = createContextCharacterServiceFromQuery({
+		...query,
+		async all<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T[]> {
+			if (pauseNextHistoryRead) {
+				pauseNextHistoryRead = false;
+				// freezeForRequest registers its write observer before starting history reads.
+				readStarted.resolve();
+				await releaseRead.promise;
+			}
+			return query.all<T>(sql, bindings);
+		},
+	});
 	const assistant = await narratorPersistence.createPartialAssistantMessage("n1", {
 		uuid: "shared-boundary",
 		session_id: "session",
@@ -652,13 +675,24 @@ test("fork waits for owner-only shared-message notifications and rejects a later
 		assistant.id,
 		toolId,
 	);
+	pauseNextHistoryRead = true;
 	const preparing = integrationService.freezeForRequest("fork", counts, "fork-late-write", NOW);
-	await narratorPersistence.updateToolCallResult(
-		"shared-boundary-call",
-		{ output: "later shared output", status: "success" },
-		assistant.id,
-		toolId,
-	);
+	try {
+		await Promise.race([
+			readStarted.promise,
+			preparing.then(() => {
+				throw new Error("Request preparation settled before its history-read barrier");
+			}),
+		]);
+		await narratorPersistence.updateToolCallResult(
+			"shared-boundary-call",
+			{ output: "later shared output", status: "success" },
+			assistant.id,
+			toolId,
+		);
+	} finally {
+		releaseRead.resolve();
+	}
 	expect(await preparing).toBeNull();
 	expect((await integrationService.get("fork")).usage?.composition).toBeNull();
 	await flushRefreshes();

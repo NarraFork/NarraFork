@@ -46,7 +46,11 @@ import {
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
-import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
+import {
+	withNarratorMutationAdmission,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} from "../narrator-session-state";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
 import {
 	type ExecutionOwner,
@@ -63,7 +67,11 @@ import {
 	tryClaimExecution,
 } from "./ownership";
 import { getRuntimePublicationService, publicationEvent, runtimePublication } from "./publication";
-import type { PublicationRun } from "./publication-outbox";
+import {
+	assertPublicationTaskIdentity,
+	type PublicationRun,
+	PublicationStateError,
+} from "./publication-outbox";
 
 export type { RunResult } from "./ownership";
 
@@ -91,6 +99,8 @@ export interface StartNarratorRunRequest {
 	binding?: RunBindingInput;
 	/** Run an already registered logical run (adopted task run, or recovery); facts are kept. */
 	resumeRunId?: string;
+	/** Successful task registration, retained until normal preparation owns finalization. */
+	registeredStart?: RegisteredAgentStart;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
 	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
@@ -369,13 +379,102 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 	};
 }
 
+/** Settle only this successful registration; a later execution or source attempt wins. */
+export async function settleRegisteredAgentStartFailure(
+	registered: RegisteredAgentStart,
+	error: unknown,
+	existingOwner?: ExecutionOwner,
+	eventKind: "failed" | "cancelled" = "failed",
+): Promise<boolean> {
+	try {
+		return await withNarratorMutationAdmission(registered.narratorId, async () => {
+			const owner = existingOwner ?? tryClaimExecution(registered.narratorId, "run");
+			if (!owner || owner.narratorId !== registered.narratorId || !owner.isCurrent()) return false;
+			const hold = getRunHold(registered.narratorId);
+			try {
+				const live = getRunControl(registered.narratorId);
+				if (live?.checkpointStop) return false;
+				// Release either runs before this claim and is honored by terminal delivery,
+				// or is refused until this failing execution has released its owner.
+				if (existingOwner && hold && live) live.finalizing = true;
+				// Retained answers belong to normal finish/release, not startup failure.
+				if (hold?.result) return false;
+				const retainHeldResult = !!hold && !hold.released;
+				const assertOwner = () => {
+					if (!owner.isCurrent()) throw new Error("Agent startup cleanup owner changed");
+					if (retainHeldResult && (getRunHold(registered.narratorId) !== hold || hold.released))
+						throw new Error("Agent startup cleanup hold changed");
+				};
+				const finalText = error instanceof Error ? error.message : String(error);
+				const pub = getRuntimePublicationService();
+				await withDbRetry(
+					() =>
+						pub.commitAgentTerminal({
+							run: {
+								producerKind: "agent",
+								taskId: registered.narratorId,
+								recipientId: registered.deliverTo.narratorId,
+								logicalRunId: registered.logicalRunId,
+							},
+							eventKind,
+							// Before handoff the Agent call receives the original exception itself.
+							delivery: existingOwner ? "background" : "foreground",
+							text: finalText,
+							summary: `[System] Background agent (ID: ${registered.narratorId}) failed to start.`,
+							startupFailure: { deliverTo: registered.deliverTo, retainHeldResult, assertOwner },
+						}),
+					{ label: "run.failRegisteredAgentStart", maxRetries: 3 },
+				);
+				assertOwner();
+				if (retainHeldResult) {
+					hold.result = {
+						...notStarted,
+						started: true,
+						logicalRunId: registered.logicalRunId,
+						output: finalText,
+						finalText,
+						hasError: eventKind === "failed",
+						interrupted: eventKind === "cancelled",
+					};
+				} else if (getRunHold(registered.narratorId) === hold)
+					setRunHold(registered.narratorId, undefined);
+				const { backgroundTaskService } = await import("../background-task-service");
+				backgroundTaskService.notifyDerivedStatusChanged(
+					registered.deliverTo.narratorId,
+					registered.narratorId,
+				);
+				if (retainHeldResult && existingOwner) return true;
+				await backgroundTaskService.announcePersistedAgentTerminal(
+					registered.narratorId,
+					registered.logicalRunId,
+				);
+				pub.schedule();
+				return true;
+			} finally {
+				if (!existingOwner) owner.release();
+			}
+		});
+	} catch (cleanupError) {
+		try {
+			logger.warn("Registered agent startup cleanup failed", {
+				narratorId: registered.narratorId,
+				logicalRunId: registered.logicalRunId,
+				error: String(error),
+				cleanupError: String(cleanupError),
+			});
+		} catch {
+			// Diagnostics must not replace the caller's original startup exception.
+		}
+		return false;
+	}
+}
+
 async function executeRun(
 	req: StartNarratorRunRequest,
 	owner: ExecutionOwner,
 	run: RunControl,
 ): Promise<RunResult> {
 	const id = req.narratorId;
-	const sessionModule = await session();
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	let removeCallerListener: (() => void) | undefined;
 	let removeCancelListener: (() => void) | undefined;
@@ -389,6 +488,7 @@ async function executeRun(
 	let delegated: DelegatedTaskRegistration | undefined;
 	let finished = false;
 	try {
+		const sessionModule = await session();
 		// Notification locale is display-only. A trusted recovery snapshot may seed a legacy row.
 		const replyContext = await ensureReplyContext(
 			id,
@@ -404,7 +504,7 @@ async function executeRun(
 			req.active ??
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
 		syncActiveReplyContext(id, replyContext);
-		const session = active;
+		const preparedSession = active;
 		const source = await readRunSource(id);
 		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
@@ -414,7 +514,7 @@ async function executeRun(
 				? req.principal
 				: req.binding?.principal
 					? req.binding.principal.userId
-					: (session._currentUserId ?? registeredPrincipalOf(source));
+					: (preparedSession._currentUserId ?? registeredPrincipalOf(source));
 		if (principal === undefined) {
 			logger.warn("Run not started: execution principal is unknown", {
 				narratorId: id,
@@ -440,7 +540,7 @@ async function executeRun(
 		run.logicalRunId = binding.logicalRunId;
 		if (!binding.principal) throw new Error("Run registration requires an execution principal");
 		run.principal = binding.principal.userId;
-		session._currentUserId = run.principal;
+		preparedSession._currentUserId = run.principal;
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
@@ -506,8 +606,7 @@ async function executeRun(
 				backgroundTaskService.registerAbortController(id, run.cancel);
 		}
 		if (req.recovered && publicationRun) {
-			// The publication slots, not the readability of the result, decide whether this
-			// run may execute again. A settled run NEVER runs the model a second time.
+			// Publication state, never result readability, decides whether a run may execute again.
 			const publicationState =
 				await getRuntimePublicationService().readRunPublicationState(publicationRun);
 			const settled = publicationState.state === "settled";
@@ -730,9 +829,9 @@ function afterRunRelease(id: string, active: ActiveNarrator | undefined, allowIn
 	void (async () => {
 		const [{ retryDeferredQuestionAnswerDeliveries }, { hasInboxKind, wakeInboxIfEligible }] =
 			await Promise.all([session(), import("./inbox")]);
-		if (allowInboxWake) await retryDeferredQuestionAnswerDeliveries(id, active?.locale ?? "en");
+		if (allowInboxWake) await retryDeferredQuestionAnswerDeliveries(id, active?.locale);
 		if (resumeBuffered || (await hasInboxKind(id, ["user_input", "agent_message", "task_notice"])))
-			await wakeInboxIfEligible(id, active?.locale ?? "en");
+			await wakeInboxIfEligible(id, active?.locale);
 	})().catch((error) =>
 		logger.warn("Inbox wake deferred after run release", { id, error: String(error) }),
 	);
@@ -1165,28 +1264,62 @@ async function deliverDetachedResult(
 	onlyIfActive = false,
 ): Promise<void> {
 	const { eventKind, finalText, hasError } = terminal;
+	if (
+		publicationRun.producerKind !== "agent" ||
+		publicationRun.taskId !== id ||
+		publicationRun.recipientId !== deliverTo.narratorId
+	)
+		throw new PublicationStateError("identity_mismatch", "finish", publicationRun, {
+			taskId: id,
+			recipientId: deliverTo.narratorId,
+		});
 	const { recordTaskNoticeUser } = await import("../parent-injection-queue");
 	recordTaskNoticeUser(id, terminal.principal);
 	const { backgroundTaskService } = await import("../background-task-service");
 	const task = await backgroundTaskService.getById(id).catch(() => null);
-	if (task?.status === "running" && task.logicalRunId === publicationRun.logicalRunId) {
+	if (task && (task.status === "running" || task.logicalRunId === publicationRun.logicalRunId))
+		assertPublicationTaskIdentity(publicationRun, task);
+	if (task?.status === "running") {
+		const publicationOptions = { expectedRun: publicationRun };
 		const transitioned =
 			eventKind === "timed_out"
-				? await backgroundTaskService.markTimedOut(id, finalText)
+				? await backgroundTaskService.markTimedOut(
+						id,
+						finalText,
+						undefined,
+						undefined,
+						publicationOptions,
+					)
 				: eventKind === "completed"
-					? await backgroundTaskService.markCompleted(id, finalText)
+					? await backgroundTaskService.markCompleted(
+							id,
+							finalText,
+							undefined,
+							undefined,
+							publicationOptions,
+						)
 					: eventKind === "cancelled"
-						? await backgroundTaskService.markCancelled(id)
-						: await backgroundTaskService.markFailed(id, finalText);
+						? await backgroundTaskService.markCancelled(id, undefined, publicationOptions)
+						: await backgroundTaskService.markFailed(
+								id,
+								finalText,
+								undefined,
+								undefined,
+								publicationOptions,
+							);
 		if (transitioned) {
 			await backgroundTaskService.markNarratorTerminal(
 				id,
 				backgroundStatusOf(eventKind),
 				finalText,
+				{ logicalRunId: publicationRun.logicalRunId },
 			);
 			getRuntimePublicationService().schedule();
 			return;
 		}
+		// A pre-transaction runtime admission can also refuse the transition. Do not
+		// turn a task relink into a tool-call fallback for the stale finalizer.
+		assertPublicationTaskIdentity(publicationRun, await backgroundTaskService.getById(id));
 	}
 	try {
 		const { getSubagentResultMessageId, updateToolCallConclusion } = await session();
@@ -1281,23 +1414,24 @@ export type RunControlAction =
 export async function controlRun(narratorId: string, action: RunControlAction): Promise<boolean> {
 	const run = getRunControl(narratorId);
 	switch (action.kind) {
-		case "hold": {
-			// Claim synchronously, before imports or mirror writes. Either the hold or
-			// the terminal owns this result, never a successful but ineffective takeover.
-			if (run?.finalizing) return false;
-			const previous = getRunHold(narratorId);
-			if (previous && !previous.released) return true;
-			const hold: RunHold = { released: false };
-			setRunHold(narratorId, hold);
-			try {
-				const { narratorService } = await import("../narrator-service");
-				await narratorService.addSubstatus(narratorId, "taken_over");
-			} catch (error) {
-				if (getRunHold(narratorId) === hold) setRunHold(narratorId, previous);
-				throw error;
-			}
-			return true;
-		}
+		case "hold":
+			return withNarratorMutationAdmission(narratorId, async () => {
+				// Read again after admission: a finalizer or archive may have won while queued.
+				if (getRunControl(narratorId)?.finalizing) return false;
+				const previous = getRunHold(narratorId);
+				if (previous && !previous.released) return true;
+				// Claim before imports or mirror writes; the hold owns the next result.
+				const hold: RunHold = { released: false };
+				setRunHold(narratorId, hold);
+				try {
+					const { narratorService } = await import("../narrator-service");
+					await narratorService.addSubstatus(narratorId, "taken_over");
+				} catch (error) {
+					if (getRunHold(narratorId) === hold) setRunHold(narratorId, previous);
+					throw error;
+				}
+				return true;
+			});
 		case "release": {
 			const claim = await withNarratorStartAdmission(narratorId, async () => {
 				const hold = getRunHold(narratorId);
@@ -1639,44 +1773,75 @@ async function deliverHeldResult(
 			);
 	run.binding = prepared.binding;
 	run.logicalRunId = prepared.binding.logicalRunId;
+	const checkpoint =
+		current?.logicalRunId === prepared.binding.logicalRunId &&
+		current.backgroundCompletedAt &&
+		current.backgroundResult != null &&
+		parseSubstatus(current.substatus).includes(`terminal_run:${prepared.binding.logicalRunId}`)
+			? {
+					finalText: current.backgroundResult,
+					hasError: current.backgroundStatus === "failed",
+					interrupted: current.backgroundStatus === "cancelled",
+					timedOut: parseSubstatus(current.substatus).includes("timeout"),
+				}
+			: undefined;
+	const heldResult =
+		!hold.result?.logicalRunId || hold.result.logicalRunId === prepared.binding.logicalRunId
+			? hold.result
+			: undefined;
+	const saved = heldResult ?? checkpoint;
 	const { getSubagentFinalText } = await session();
-	const finalText = hold.result?.finalText ?? (await getSubagentFinalText(narratorId));
-	const hasError = hold.result?.hasError ?? parseSubstatus(current?.substatus).includes("error");
+	const finalText = saved?.finalText ?? (await getSubagentFinalText(narratorId));
+	const hasError = saved?.hasError ?? parseSubstatus(current?.substatus).includes("error");
 	const deliverTo = prepared.binding.deliverTo;
 	if (deliverTo && prepared.publicationRun) {
-		const eventKind: TerminalEvent = hold.result?.timedOut
-			? "timed_out"
-			: hold.result?.interrupted
-				? "cancelled"
-				: hasError
-					? "failed"
-					: "completed";
-		const principal = prepared.binding.principal?.userId ?? null;
-		const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
-		await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
-			eventKind,
-			finalText: delegated
-				? (
-						await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
-							delivered: finalText,
-							report: finalText,
-							ending: eventKind,
-							principal,
-						})
-					).text
-				: finalText,
-			hasError,
-			principal,
-		});
+		const state = await getRuntimePublicationService().readRunPublicationState(
+			prepared.publicationRun,
+		);
+		let alreadyDelivered = false;
+		if (state.state === "settled") {
+			const { backgroundTaskService } = await import("../background-task-service");
+			const task = await backgroundTaskService.getById(narratorId);
+			if (task) assertPublicationTaskIdentity(prepared.publicationRun, task);
+			alreadyDelivered = !task || task.status !== "running";
+		}
+		// A synchronous Agent failure already reached its caller. Releasing user
+		// control must not rewrite that tool conclusion or publish the result again.
+		if (!alreadyDelivered) {
+			const eventKind: TerminalEvent = saved?.timedOut
+				? "timed_out"
+				: saved?.interrupted
+					? "cancelled"
+					: hasError
+						? "failed"
+						: "completed";
+			const principal = prepared.binding.principal?.userId ?? null;
+			const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
+			await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
+				eventKind,
+				finalText: delegated
+					? (
+							await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
+								delivered: finalText,
+								report: finalText,
+								ending: eventKind,
+								principal,
+							})
+						).text
+					: finalText,
+				hasError,
+				principal,
+			});
+		}
 		await getRuntimePublicationService().releaseUnusedRunSlots(prepared.publicationRun);
 	}
 	await clearDeliveredHold(narratorId, hold);
 	await settleStatus(narratorId, deliverTo, {
 		hasError,
-		interrupted: hold.result?.interrupted ?? false,
-		timedOut: hold.result?.timedOut ?? false,
+		interrupted: saved?.interrupted ?? false,
+		timedOut: saved?.timedOut ?? false,
 		finalText,
-		terminalStatus: hold.result?.terminalStatus,
+		terminalStatus: heldResult?.terminalStatus,
 	});
 }
 

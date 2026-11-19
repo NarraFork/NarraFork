@@ -4,12 +4,21 @@
  * and search text is written by the index job, not the writer.
  */
 
+import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
+const realConnectionModule = { ...(await import("../../db/connection")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+mock.module("../../db/connection", () => ({
+	...realConnectionModule,
+	getDbPath: () => sqlite.filename,
+}));
 
 // narrator-service must be imported before narrator-persistence (pre-existing cycle).
 await import("../narrator-service");
@@ -28,6 +37,7 @@ ensureFts(sqlite, { wasClean: true });
 
 beforeEach(() => {
 	settings.narratorBlocks.compactJson = false;
+	blockSync.stopBlockSyncSweep();
 	cleanDb(sqlite);
 	sqlite.run("DELETE FROM narrator_blocks_fts");
 	blockIndex.resetBlockIndexForTests();
@@ -39,11 +49,13 @@ beforeEach(() => {
 			NOW,
 		]);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
+	blockIndex.stopBlockIndex();
 	settings.narratorBlocks.compactJson = false;
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	mock.module("../../db/connection", () => realConnectionModule);
+	await workerFixture.close();
 });
 
 /** Every column the sync writes, of every block, assets and ledger bindings included. */
@@ -309,6 +321,149 @@ describe("a write syncs only what it queued", () => {
 	});
 });
 
+const QUEUE_SQL = {
+	mark: "SELECT coalesce(max(rowid), 0) AS mark FROM narrator_block_sync_queue",
+	since:
+		"SELECT message_id AS id FROM narrator_block_sync_queue WHERE rowid > ? ORDER BY rowid LIMIT ?",
+	dirty: "SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
+	done: "DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
+	sweep: "SELECT message_id AS id FROM narrator_block_sync_queue ORDER BY rowid LIMIT ?",
+};
+
+/** Warm the native connection cache, then count work and compare returned statement identities. */
+function observeQueueStatements(connection: Database, statements: string[]) {
+	const cached = new Map(statements.map((sql) => [sql, connection.query(sql)]));
+	const prepare = spyOn(connection, "prepare");
+	const query = spyOn(connection, "query");
+	return {
+		cached,
+		assertReused() {
+			expect(prepare.mock.calls.filter(([sql]) => cached.has(sql))).toEqual([]);
+			for (const sql of statements) {
+				const results = query.mock.calls.flatMap(([text], index) =>
+					text === sql ? [query.mock.results[index]] : [],
+				);
+				expect(results.length).toBeGreaterThan(1);
+				for (const result of results) {
+					expect(result.type).toBe("return");
+					expect(result.value).toBe(cached.get(sql));
+				}
+			}
+		},
+		stop() {
+			query.mockRestore();
+			prepare.mockRestore();
+		},
+	};
+}
+
+function queueEnvelope(messageId: string, connection = sqlite) {
+	connection.run("INSERT OR IGNORE INTO narrator_block_sync_queue (message_id) VALUES (?)", [
+		messageId,
+	]);
+}
+
+describe("queue SQL uses the current connection's statement cache", () => {
+	test("repeated foreground syncs preserve rows and leave another narrator's backlog alone", async () => {
+		const { stepId: target } = await parallelTools(1);
+		const { stepId: backlog } = await parallelTools(1, "n2");
+		const beforeTarget = snapshot(target);
+		const beforeBacklog = snapshot(backlog);
+		queueEnvelope(backlog);
+		const observed = observeQueueStatements(sqlite, [
+			QUEUE_SQL.mark,
+			QUEUE_SQL.since,
+			QUEUE_SQL.dirty,
+			QUEUE_SQL.done,
+		]);
+		const watch = blockSync.watchSyncs();
+		try {
+			for (let round = 0; round < 3; round++) {
+				const mark = blockSync.syncQueueMark();
+				queueEnvelope(target);
+				expect(sqlite.transaction(() => blockSync.flushQueuedSince(mark, 1))()).toBe(1);
+				queueEnvelope(target);
+				blockSync.syncQueuedEnvelopeNow(target);
+				blockSync.syncQueuedEnvelopeNow(target);
+				queueEnvelope(target);
+				expect(blockSync.flushChangedEnvelopeTargets([target, target, "missing-envelope"])).toBe(1);
+				expect(blockSync.flushChangedEnvelopeTargets([target])).toBe(0);
+				queueEnvelope(target);
+				sqlite.transaction(() => blockSync.syncEnvelopeNow(target))();
+				queueEnvelope(target);
+				sqlite.transaction(() => blockSync.reindexEnvelope(target))();
+				expect(queued()).toEqual([backlog]);
+				expect(snapshot(target)).toEqual(beforeTarget);
+				expect(snapshot(backlog)).toEqual(beforeBacklog);
+			}
+			expect([...watch.synced]).toEqual([target]);
+			observed.assertReused();
+		} finally {
+			watch.stop();
+			observed.stop();
+		}
+	});
+
+	test("repeated sweeps reuse cached selection and deletion without changing queue order", async () => {
+		const { stepId: first } = await parallelTools(1, "n2");
+		const { stepId: second } = await parallelTools(1);
+		const before = [snapshot(first), snapshot(second)];
+		const observed = observeQueueStatements(sqlite, [QUEUE_SQL.sweep, QUEUE_SQL.done]);
+		try {
+			for (let round = 0; round < 2; round++) {
+				queueEnvelope(first);
+				queueEnvelope(second);
+				const watch = blockSync.watchSyncs();
+				try {
+					// A budget-limited pass always processes at least its first envelope.
+					for (let pass = 0; pass < 2 && queued().length; pass++) blockSync.recoverBlockStorage();
+					expect(queued()).toEqual([]);
+					expect([...watch.synced]).toEqual([first, second]);
+					expect([snapshot(first), snapshot(second)]).toEqual(before);
+				} finally {
+					watch.stop();
+				}
+			}
+			observed.assertReused();
+		} finally {
+			blockSync.stopBlockSyncSweep();
+			observed.stop();
+		}
+	});
+
+	test("switching the database connection never reuses the previous connection's statements", async () => {
+		const { stepId } = await parallelTools(1);
+		queueEnvelope(stepId);
+		const statements = Object.values(QUEUE_SQL);
+		const previous = new Map(statements.map((sql) => [sql, sqlite.query(sql)]));
+		const replacement = new Database(sqlite.filename);
+		const observed = observeQueueStatements(replacement, statements);
+		try {
+			mock.module("../../db", () => ({ ...realDbModule, db, sqlite: replacement }));
+			for (let round = 0; round < 2; round++) {
+				expect(blockSync.syncQueueMark()).toBeGreaterThan(0);
+				blockSync.syncQueuedEnvelopeNow(stepId);
+				queueEnvelope(stepId, replacement);
+				expect(blockSync.flushQueuedSince(0)).toBe(1);
+				queueEnvelope(stepId, replacement);
+				expect(blockSync.flushChangedEnvelopeTargets([stepId])).toBe(1);
+				queueEnvelope(stepId, replacement);
+				blockSync.recoverBlockStorage();
+				expect(replacement.query(QUEUE_SQL.dirty).get(stepId)).toBeNull();
+				expect(previous.get(QUEUE_SQL.dirty)?.get(stepId)).toBeNull();
+				queueEnvelope(stepId, replacement);
+			}
+			observed.assertReused();
+			for (const sql of statements) expect(observed.cached.get(sql)).not.toBe(previous.get(sql));
+		} finally {
+			blockSync.stopBlockSyncSweep();
+			mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+			observed.stop();
+			replacement.close();
+		}
+	});
+});
+
 describe("the index job", () => {
 	test("text read before a re-queue is not written over it", async () => {
 		const { stepId, calls } = await parallelTools(1);
@@ -340,12 +495,14 @@ describe("the index job", () => {
 
 	test("started by a write, it writes what is owed in paced slices", async () => {
 		const { stepId, calls } = await parallelTools(3);
-		// Explicit unit fixture: the real scheduler still dispatches to the worker interface;
-		// only this test substitutes a reader for its private in-memory database.
-		const read = spyOn(workerPool, "runReadTask").mockImplementation(async (_path, params) => {
-			if (params.kind !== "blockIndexQueueSlice") throw new Error("unexpected worker task");
-			return (await readIndex(params)) as never;
-		});
+		// Substitute only the index task; foreground persistence keeps its real Worker reads.
+		const runReadTask = workerPool.runReadTask;
+		const read = spyOn(workerPool, "runReadTask").mockImplementation(
+			async (path, params, options) => {
+				if (params.kind === "blockIndexQueueSlice") return (await readIndex(params)) as never;
+				return (await runReadTask(path, params, options)) as never;
+			},
+		);
 		blockIndex.setBlockIndexAutoRunForTests(true);
 		try {
 			for (const [i, call] of calls.entries())
@@ -358,7 +515,9 @@ describe("the index job", () => {
 			const deadline = Date.now() + 5_000;
 			while (owed().length && Date.now() < deadline)
 				await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(read).toHaveBeenCalled();
+			expect(read.mock.calls.some(([, params]) => params.kind === "blockIndexQueueSlice")).toBe(
+				true,
+			);
 		} finally {
 			blockIndex.setBlockIndexAutoRunForTests(false);
 			read.mockRestore();

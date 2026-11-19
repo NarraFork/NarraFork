@@ -161,7 +161,9 @@ chatRoutes.post(
 		const file = formData.get("file");
 		if (!(file instanceof File)) throw new ValidationError("A file is required");
 		const userId = c.get("user").sub;
-		const attachment = await createChatAttachment(c.req.param("roomId"), userId, file);
+		const attachment = await createChatAttachment(c.req.param("roomId"), userId, file, {
+			signal: c.req.raw.signal,
+		});
 		return c.json(attachment, 201);
 	},
 );

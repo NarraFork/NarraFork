@@ -191,6 +191,7 @@ import {
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
+	getBufferedGuidanceRequestVersion,
 	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
@@ -2183,13 +2184,13 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
 							? afterToolsInput.mailbox
 							: isLastModelInputMailbox(history, content);
-					consumeAgentMessageHistory(history);
+					await consumeAgentMessageHistory(history);
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
@@ -2204,8 +2205,8 @@ export async function runAgentLoopUnlocked(
 					const input = await drainInjectionsIntoHistory(active, locale, placement);
 					return {
 						...input,
-						onConsumed: () => {
-							input.onConsumed();
+						onConsumed: async () => {
+							await input.onConsumed();
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can
@@ -2352,10 +2353,10 @@ export async function runAgentLoopUnlocked(
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
+						hasPendingBufferedWork: hasPendingGuidance,
 					});
 					active._feedbackSoftStop = decision.feedbackSoftStop;
-					active._bufferSoftStop = decision.bufferSoftStop;
+					active._bufferSoftStop = preserveBufferedRequest ? true : decision.bufferSoftStop;
 					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
 					return decision.stop;
 				},

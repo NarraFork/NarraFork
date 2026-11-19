@@ -7,9 +7,12 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -69,10 +72,10 @@ afterEach(async () => {
 	settings.narratorBlocks.read = true;
 	scans.noteRowsOnlyEnvelopes(undefined);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await workerFixture.close();
 });
 
 async function conversation() {
@@ -377,6 +380,374 @@ describe("automatic single-copy upgrade", () => {
 	});
 });
 
+/** Start a manual slice without the timer producer; persisted gates are still exercised. */
+function armProjection(job: "clear" | "restore") {
+	backfill.blockBackfillStatus();
+	sqlite.run(
+		"UPDATE narrator_block_backfill SET complete = 1 WHERE job IN ('convert','verify','reindex')",
+	);
+	sqlite.run("UPDATE narrator_block_backfill SET paused = 1 WHERE job IN ('clear','restore')");
+	sqlite.run(
+		"UPDATE narrator_block_backfill SET cursor = 0,processed = 0,complete = 0,paused = 0 WHERE job = ?",
+		[job],
+	);
+	settings.narratorBlocks.compactJson = job === "clear";
+}
+
+function projectionProbe(
+	job: "clear" | "restore",
+	options: {
+		failTransaction?: number;
+		commitCost?: number;
+		onCommit?: (count: number) => void;
+	} = {},
+) {
+	let now = 10_000;
+	let calls = 0;
+	let turns = 0;
+	const states: Array<{
+		cursor: number;
+		processed: number;
+		complete: number;
+		paused: number;
+		turns: number;
+		started: number;
+		ended: number;
+	}> = [];
+	const clock = spyOn(performance, "now").mockImplementation(() => now);
+	const originalTimeout = globalThis.setTimeout;
+	const timers = spyOn(globalThis, "setTimeout").mockImplementation(
+		new Proxy(originalTimeout, {
+			apply(target, receiver, args) {
+				const [handler, delay = 0, ...handlerArgs] = args;
+				return Reflect.apply(target, receiver, [
+					() => {
+						now += Number(delay);
+						if (typeof handler === "function") Reflect.apply(handler, undefined, handlerArgs);
+					},
+					0,
+				]);
+			},
+		}),
+	);
+	const transaction = sqlite.transaction.bind(sqlite);
+	const transactions = spyOn(sqlite, "transaction").mockImplementation((write) => {
+		const call = ++calls;
+		return new Proxy(
+			transaction(
+				new Proxy(write, {
+					apply(target, receiver, args) {
+						const result = Reflect.apply(target, receiver, args);
+						if (call === options.failTransaction) throw new Error("projection apply rollback");
+						return result;
+					},
+				}),
+			),
+			{
+				apply(target, receiver, args) {
+					const started = now;
+					const result = Reflect.apply(target, receiver, args);
+					now += options.commitCost ?? 0;
+					const state = sqlite
+						.prepare(
+							"SELECT cursor,processed,complete,paused FROM narrator_block_backfill WHERE job = ?",
+						)
+						.get(job) as { cursor: number; processed: number; complete: number; paused: number };
+					states.push({ ...state, turns, started, ended: now });
+					originalTimeout(() => {
+						turns++;
+					}, 0);
+					options.onCommit?.(states.length);
+					return result;
+				},
+			},
+		);
+	});
+	return {
+		states,
+		restore() {
+			transactions.mockRestore();
+			timers.mockRestore();
+			clock.mockRestore();
+		},
+	};
+}
+
+async function manyProjections(count = 17) {
+	const ids: string[] = [];
+	for (let index = 0; index < count; index++)
+		ids.push((await narratorStore.appendInput("n1", `projection-${index}`)).id);
+	blockSync.stopBlockSyncSweep();
+	return ids;
+}
+
+async function rowsOnlyProjections(count = 17) {
+	const ids = await manyProjections(count);
+	armProjection("clear");
+	const probe = projectionProbe("clear");
+	try {
+		await backfill.runProjectionSlice(read);
+	} finally {
+		probe.restore();
+	}
+	backfill.resetBlockJobPacingForTests();
+	armProjection("restore");
+	return ids;
+}
+
+describe("bounded projection apply", () => {
+	test("clear advances ordered match, marker, queued, gone and mismatch prefixes without inflating processed", async () => {
+		const first = await conversation();
+		const extra = await manyProjections(14);
+		const ids = [first.inputId, first.stepId, first.markerId, ...extra];
+		for (const index of [0, 9, 16])
+			sqlite.run("UPDATE narrator_blocks SET payload = ? WHERE message_id = ?", [
+				JSON.stringify({ raw: [{ type: "text", text: "drifted" }] }),
+				ids[index],
+			]);
+		sqlite.run("INSERT INTO narrator_block_sync_queue (message_id) VALUES (?)", [ids[5]]);
+		armProjection("clear");
+		const slice = await read({
+			kind: "blockProjectionSlice",
+			job: "clear",
+			afterRowid: 0,
+			maxEnvelopes: 100,
+			maxSourceBytes: 4 * 1024 * 1024,
+			budgetMs: 1000,
+		});
+		expect(slice.visited.map((item) => item.id)).toEqual(ids);
+		expect(slice.visited[2].envelope).toBeUndefined();
+		expect(slice.visited[5].envelope).toBeUndefined();
+		expect(slice.mismatched).toEqual([ids[0], ids[9], ids[16]]);
+		sqlite.transaction(() => {
+			// This input's refs restrict deletion; its block rows and queues cascade.
+			sqlite.run("DELETE FROM narrator_message_refs WHERE message_id = ?", [ids[7]]);
+			sqlite.run("DELETE FROM narrator_messages WHERE id = ?", [ids[7]]);
+		})();
+		expect(sqlite.prepare("SELECT id FROM narrator_messages WHERE id = ?").get(ids[7])).toBeNull();
+		const probe = projectionProbe("clear");
+		try {
+			await backfill.runProjectionSlice(async () => slice);
+		} finally {
+			probe.restore();
+		}
+		expect(probe.states.map((state) => state.cursor)).toEqual(
+			[7, 15, 16].map((index) => slice.visited[index].rowid),
+		);
+		expect(probe.states.map((state) => state.processed)).toEqual([4, 11, 11]);
+		expect(probe.states.map((state) => state.complete)).toEqual([0, 0, 1]);
+		expect(probe.states.map((state) => state.turns)).toEqual([0, 1, 2]);
+		for (const index of [0, 9, 16]) {
+			expect(column(ids[index]).r).toBe(0);
+			expect(assembled(ids[index])).toEqual(JSON.parse(column(ids[index]).c));
+			expect(
+				sqlite
+					.prepare("SELECT kind FROM narrator_block_diagnostics WHERE message_id = ?")
+					.get(ids[index]),
+			).toEqual({ kind: "mismatch" });
+		}
+	});
+
+	test("clear mismatch repair and its cursor roll back together before retry", async () => {
+		const ids = await manyProjections();
+		sqlite.run("UPDATE narrator_blocks SET payload = ? WHERE message_id = ?", [
+			JSON.stringify({ raw: [{ type: "text", text: "drifted" }] }),
+			ids[9],
+		]);
+		armProjection("clear");
+		const probe = projectionProbe("clear", { failTransaction: 2 });
+		try {
+			await expect(backfill.runProjectionSlice(read)).rejects.toThrow("projection apply rollback");
+		} finally {
+			probe.restore();
+		}
+		expect(backfill.blockBackfillStatus().clear).toMatchObject({ complete: false, processed: 8 });
+		expect(column(ids[8]).r).toBe(0);
+		expect(
+			sqlite
+				.prepare("SELECT kind FROM narrator_block_diagnostics WHERE message_id = ?")
+				.get(ids[9]),
+		).toBeNull();
+		const retry = projectionProbe("clear");
+		try {
+			await backfill.runProjectionSlice(read);
+		} finally {
+			retry.restore();
+		}
+		expect(backfill.blockBackfillStatus().clear).toMatchObject({ complete: true, processed: 16 });
+		expect(assembled(ids[9])).toEqual(JSON.parse(column(ids[9]).c));
+	});
+
+	test("restore completes only after the final prefix and keeps its successful-write count", async () => {
+		const ids = await rowsOnlyProjections();
+		const probe = projectionProbe("restore");
+		try {
+			await backfill.runProjectionSlice(read);
+		} finally {
+			probe.restore();
+		}
+		expect(probe.states.map((state) => state.processed)).toEqual([8, 16, 17]);
+		expect(probe.states.map((state) => state.complete)).toEqual([0, 0, 1]);
+		expect(probe.states.map((state) => state.turns)).toEqual([0, 1, 2]);
+		for (const id of ids) expect(column(id)).toEqual({ c: JSON.stringify(assembled(id)), r: 0 });
+	});
+
+	test("restore pass progress excludes a rolled-back final prefix before its no-progress decision", async () => {
+		const ids = await rowsOnlyProjections();
+		const source = await read({
+			kind: "blockProjectionSlice",
+			job: "restore",
+			afterRowid: 0,
+			maxEnvelopes: 100,
+			maxSourceBytes: 4 * 1024 * 1024,
+			budgetMs: 1000,
+		});
+		const skipped = {
+			...source,
+			visited: source.visited.map((item, index) =>
+				index === 16 ? item : { ...item, envelope: undefined },
+			),
+		};
+		const probe = projectionProbe("restore", { failTransaction: 3 });
+		try {
+			await expect(backfill.runProjectionSlice(async () => skipped)).rejects.toThrow(
+				"projection apply rollback",
+			);
+		} finally {
+			probe.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({
+			cursor: source.visited[15].rowid,
+			complete: false,
+			processed: 0,
+			paused: false,
+		});
+		expect(column(ids[16]).r).toBe(1);
+		const retry = projectionProbe("restore");
+		try {
+			await backfill.runProjectionSlice(async (params) => {
+				const slice = await read(params);
+				return {
+					...slice,
+					visited: slice.visited.map((item) => ({ ...item, envelope: undefined })),
+				};
+			});
+		} finally {
+			retry.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({
+			cursor: 0,
+			complete: false,
+			processed: 0,
+			paused: true,
+		});
+		sqlite.run("UPDATE narrator_block_backfill SET paused = 0 WHERE job = 'restore'");
+		const finish = projectionProbe("restore");
+		try {
+			await backfill.runProjectionSlice(read);
+		} finally {
+			finish.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({ complete: true, processed: 17 });
+	});
+
+	test("restore shutdown preserves the rows-only tail and resumes after a fresh lifecycle", async () => {
+		const ids = await rowsOnlyProjections();
+		let stopping: Promise<void> | undefined;
+		const probe = projectionProbe("restore", {
+			onCommit: (count) => {
+				if (count === 1)
+					stopping = backfill.stopBlockBackgroundJobs({ deadlineAt: Date.now() + 1000 });
+			},
+		});
+		try {
+			await expect(backfill.runProjectionSlice(read)).rejects.toThrow();
+			await stopping;
+		} finally {
+			probe.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({
+			complete: false,
+			paused: false,
+			processed: 8,
+		});
+		expect(column(ids[8]).r).toBe(1);
+		backfill.resetBlockJobPacingForTests();
+		const retry = projectionProbe("restore");
+		try {
+			await backfill.runProjectionSlice(read);
+		} finally {
+			retry.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({ complete: true, processed: 17 });
+	});
+
+	test("restore prepared byte costs use UTF-8 even if stored body sizes understate them", async () => {
+		for (let index = 0; index < 3; index++)
+			await narratorStore.appendInput("n1", "界".repeat(25_000));
+		blockSync.stopBlockSyncSweep();
+		armProjection("clear");
+		const clear = projectionProbe("clear");
+		try {
+			await backfill.runProjectionSlice(read);
+		} finally {
+			clear.restore();
+		}
+		backfill.resetBlockJobPacingForTests();
+		sqlite.run("UPDATE narrator_messages SET body_bytes = 0");
+		armProjection("restore");
+		const slice = await read({
+			kind: "blockProjectionSlice",
+			job: "restore",
+			afterRowid: 0,
+			maxEnvelopes: 100,
+			maxSourceBytes: 4 * 1024 * 1024,
+			budgetMs: 1000,
+		});
+		for (const item of slice.visited)
+			expect(item.sourceBytes).toBe(Buffer.byteLength(item.envelope?.json ?? ""));
+		const restore = projectionProbe("restore");
+		try {
+			await backfill.runProjectionSlice(async () => slice);
+		} finally {
+			restore.restore();
+		}
+		expect(restore.states.map((state) => state.processed)).toEqual([1, 2, 3]);
+	});
+
+	test("projection and conversion callers serialize their shared pacing turns", async () => {
+		await rowsOnlyProjections();
+		sqlite.run("UPDATE narrator_block_backfill SET complete = 0,cursor = 0 WHERE job = 'convert'");
+		const probe = projectionProbe("restore", { commitCost: 10 });
+		try {
+			await Promise.all([backfill.runProjectionSlice(read), backfill.runBlockJobSlice(inline)]);
+		} finally {
+			probe.restore();
+		}
+		expect(backfill.blockBackfillStatus().restore).toMatchObject({ complete: true, processed: 17 });
+		for (let index = 1; index < probe.states.length; index++)
+			expect(probe.states[index].started - probe.states[index - 1].ended).toBeGreaterThanOrEqual(
+				30,
+			);
+	});
+
+	test("projection readers must describe skipped candidates before a cursor can advance", async () => {
+		await manyProjections(1);
+		armProjection("clear");
+		await expect(
+			backfill.runProjectionSlice(async (params) => {
+				const source = await read(params);
+				return { ...source, visited: undefined } as unknown as typeof source;
+			}),
+		).rejects.toThrow("missing ordered candidates");
+		expect(backfill.blockBackfillStatus().clear).toMatchObject({
+			cursor: 0,
+			complete: false,
+			processed: 0,
+		});
+	});
+});
+
 describe("clear", () => {
 	test("drops verified projections; compact markers keep theirs; nothing reads differently", async () => {
 		const { inputId, stepId, markerId } = await conversation();
@@ -537,6 +908,7 @@ describe("restore", () => {
 
 	test("a write since the read stored its own projection, which the job leaves alone", async () => {
 		const { stepId } = await cleared();
+		let writerProjection: string | undefined;
 		settings.narratorBlocks.compactJson = false;
 		backfill.startProjectionJob("restore", async (params) => {
 			const slice = await read(params);
@@ -544,11 +916,18 @@ describe("restore", () => {
 				id: "r1",
 				text: "thinking",
 			});
+			writerProjection = column(stepId).c;
 			return slice;
 		});
 		await settled();
-		expect(column(stepId)).toEqual({ c: JSON.stringify(assembled(stepId)), r: 0 });
-		expect(JSON.parse(column(stepId).c)[0]).toMatchObject({ translatedText: "pensando" });
+		const stored = column(stepId);
+		const projectedBody = JSON.parse(stored.c);
+		if (typeof writerProjection !== "string")
+			throw new Error("Writer projection was not captured after translation");
+		expect(stored.c).toBe(writerProjection);
+		expect(stored.r).toBe(0);
+		expect(projectedBody).toEqual(assembled(stepId));
+		expect(projectedBody[0]).toMatchObject({ translatedText: "pensando" });
 	});
 
 	test("starting one job stops the other where it is", async () => {

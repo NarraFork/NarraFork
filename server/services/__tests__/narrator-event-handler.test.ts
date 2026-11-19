@@ -4,7 +4,7 @@ import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
-import { getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { readTestMessageContent } from "../../../tests/setup";
 import {
 	apiRequests,
 	narratorMessageRefs,
@@ -12,18 +12,21 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import type { ExecutionOwner, RunControl } from "../agent-runtime/ownership";
 import type { TokenUsageSnapshot } from "../narrator-event-handler";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-// Functional in-memory test db (not empty stubs): Bun's mock.module is global
-// and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
-// Do NOT import the real `../../db` first: that opens the runtime database and runs
-// drizzle migrations (journal may reference SQL files that are gitignored / absent).
-const { db, sqlite } = getTestDb();
+// Functional file-backed test DB lets worker reads observe the same committed rows.
+// Bind it before importing modules that open the runtime database singleton.
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const dbStub = {
 	db,
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
 	releaseDatabaseInstanceLockOnly: () => {},
@@ -32,6 +35,9 @@ const dbStub = {
 // (narrator-ws → services → @server/db opens sqlite and runs drizzle migrations).
 mock.module("../../db", () => dbStub);
 mock.module("@server/db", () => dbStub);
+const { getRunControl, setRunControl, tryClaimExecution } = await import(
+	"../agent-runtime/ownership"
+);
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 
 const broadcastMessages: unknown[] = [];
@@ -48,12 +54,18 @@ const {
 	clearStreamingSnapshot,
 	CriticalEventPersistenceError,
 	getStreamingSnapshot,
+	getSubagentOutputCounts,
 	isSameReasoningBlock,
 	processEvent,
 	retireSubagentOutputCharCount,
+	startSubagentOutputCharCount,
 } = await import("../narrator-event-handler");
+const { reasoningTranslationActivities } = await import("../reasoning-translation-activity");
 
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
+type CountEventContext = EventHandlerContext & {
+	subagentOutputIdentity: NonNullable<EventHandlerContext["subagentOutputIdentity"]>;
+};
 
 const PARENT_NARRATOR_ID = "parent-narrator";
 const SUBAGENT_NARRATOR_ID = "subagent-narrator";
@@ -194,134 +206,1149 @@ describe("Write complete input source routing", () => {
 	});
 });
 
-describe("reasoning translation output boundary", () => {
-	for (const boundary of [
-		"stream_text",
-		"tool_use_chunk",
-		"tool_call",
-		"block_complete",
-	] as const) {
-		test(`${boundary} translates the latest reasoning once, never intermediate prefixes`, async () => {
-			const { settings } = await import("../../lib/settings");
-			const agent = await import("../../lib/agent");
-			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "" });
-			const original = settings.agent.translateReasoning;
-			settings.agent.translateReasoning = true;
-			const id = `translation-boundary-${boundary}`;
-			const createdAt = new Date().toISOString();
-			await db
-				.insert(narrators)
-				.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
-			let partialId: string | undefined;
-			const ctx: EventHandlerContext = {
-				...makeMainContext(),
-				narratorId: id,
-				broadcastTargetId: id,
-				locale: "zh-CN",
-				getPartialMessageId: () => partialId,
-				setPartialMessageId: (value) => {
-					partialId = value;
-				},
-			};
-			const checkpoint = (text: string, revision: number) =>
-				processEvent(
-					{
-						type: "block_complete",
-						block: { type: "reasoning", id: "reason", text, revision },
-					},
-					ctx,
+describe("reasoning translation durable boundaries", () => {
+	const seal = (sourceText = "source", blockId = "reason") => ({
+		type: "reasoning_summary_sealed" as const,
+		blockId,
+		blockRevision: 1,
+		nativePartId: "summary-0",
+		nativePartIndex: 0,
+		start: 0,
+		end: sourceText.length,
+		sourceText,
+	});
+	const context = (locale?: string): EventHandlerContext => ({
+		...makeMainContext(),
+		locale,
+		getPartialMessageId: () => "translation-pending",
+	});
+	const checkpoint = (ctx: EventHandlerContext, text: string, revision = 1, id = "reason") =>
+		processEvent({ type: "block_complete", block: { type: "reasoning", id, text, revision } }, ctx);
+
+	type ReasoningSnapshot = {
+		type: "reasoning";
+		id: string;
+		text: string;
+		translationGeneration: string;
+		translationLocale?: string;
+		translationParts?: import("@shared/reasoning-translation").ReasoningTranslationPart[];
+		translatedText?: string;
+	};
+	async function openTranslationFixture(id: string, locale = "zh-CN") {
+		const now = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const messageIds = new Set<string>();
+		const ctx: EventHandlerContext = {
+			...context(locale),
+			narratorId: id,
+			broadcastTargetId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+				if (value) messageIds.add(value);
+			},
+		};
+		return {
+			ctx,
+			read: async () => {
+				const messageId = [...messageIds].at(-1);
+				expect(messageId).toBeString();
+				const { readNarratorMessageRow } = await import("../narrator-message-reader");
+				const message = await readNarratorMessageRow(messageId as string);
+				const block = (message?.contentJson as ReasoningSnapshot[] | undefined)?.find(
+					(entry) => entry.type === "reasoning" && entry.id === "reason",
 				);
+				expect(block).toBeDefined();
+				return block as ReasoningSnapshot;
+			},
+			cleanup: async () => {
+				await processEvent({ type: "stream_reset" }, ctx);
+				clearStreamingSnapshot(id);
+				sqlite.run("PRAGMA foreign_keys = OFF");
+				try {
+					for (const messageId of messageIds)
+						await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId));
+				} finally {
+					sqlite.run("PRAGMA foreign_keys = ON");
+				}
+				await cleanupFileContextNarrator(id);
+			},
+		};
+	}
+
+	test("summary handoffs and item completion translate while the display lane stays active", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { reasoningTranslationActivities: activity } = await import(
+			"../reasoning-translation-activity"
+		);
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const store = await import("../reasoning-translation-store");
+		const { REASONING_TRANSLATION_LIMITS, reasoningTranslationScheduler: scheduler } = await import(
+			"../reasoning-translation-scheduler"
+		);
+		const { eventBus } = await import("../../lib/event-bus");
+		const calls: string[] = [];
+		const started = new Map(["A", "B+", "C"].map((text) => [text, Promise.withResolvers<void>()]));
+		const generate = spyOn(agent, "summaryGenerate").mockImplementation(async (input) => {
+			const text = String(input);
+			if (text.startsWith('{"parts":')) {
+				const payload = JSON.parse(text) as { parts: Array<{ id: string; text: string }> };
+				for (const part of payload.parts) {
+					calls.push(part.text);
+					started.get(part.text.trim())?.resolve();
+				}
+				return {
+					text: JSON.stringify({
+						parts: payload.parts.map((part) => ({ id: part.id, translatedText: "译" })),
+					}),
+				};
+			}
+			calls.push(text);
+			started.get(text.trim())?.resolve();
+			return { text: "译" };
+		});
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const f = await openTranslationFixture("translation-pending-summary");
+		const connection = {};
+		let subscribed = true;
+		const fullTranslationPublished = Promise.withResolvers<void>();
+		const onTranslation = (
+			event: Extract<
+				import("../../lib/event-bus").NarraForkEvent,
+				{ type: "narrator:ws_broadcast" }
+			>,
+		) => {
+			if (
+				event.narratorId === f.ctx.narratorId &&
+				event.message.type === "reasoning_translation_patch" &&
+				event.message.part.sourceText.trim() === "C"
+			)
+				fullTranslationPublished.resolve();
+		};
+		eventBus.on("narrator:ws_broadcast", onTranslation);
+		const waitForPart = async (part: string, ready = started.get(part)?.promise) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
-				await checkpoint("A", 1);
-				await checkpoint("A+B", 2);
-				await checkpoint("A+B+C", 3);
-				expect(generate).not.toHaveBeenCalled();
-				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
-				const event =
-					boundary === "stream_text"
-						? {
-								type: "stream_text" as const,
-								blockRevision: 1,
-								blockTextOffset: 0,
-								blockId: "text",
-								text: "Answer",
-							}
-						: boundary === "tool_use_chunk"
-							? {
-									type: "tool_use_chunk" as const,
-									toolUseId: "tool",
-									toolName: "Read",
-									inputCharsTotal: 1,
-								}
-							: boundary === "tool_call"
-								? { type: "tool_call" as const, toolUseId: "tool", toolName: "Read", input: {} }
-								: {
-										type: "block_complete" as const,
-										block: { type: "text" as const, text: "Answer" },
-									};
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(1);
-				expect(generate.mock.calls[0]?.[0]).toBe("A+B+C");
-				await checkpoint("A+B+C", 4);
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(1);
-				expect(ctx.pendingReasoningTranslations?.size).toBe(0);
-				// A later, distinct reasoning phase in the same response is independent.
-				await processEvent(
-					{
-						type: "block_complete",
-						block: { type: "reasoning", id: "next-reason", text: "Next thought", revision: 1 },
-					},
-					ctx,
-				);
-				expect(generate).toHaveBeenCalledTimes(1);
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(2);
-				expect(generate.mock.calls[1]?.[0]).toBe("Next thought");
+				await Promise.race([
+					ready,
+					new Promise<never>((_resolve, reject) => {
+						timer = setTimeout(
+							() =>
+								reject(new Error(`Waiting for ${part}; model sources: ${JSON.stringify(calls)}`)),
+							3000,
+						);
+					}),
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		const passCoalescingWindow = async (part: string, action: () => Promise<unknown>) => {
+			const release = scheduler.hold();
+			const queued = Promise.withResolvers<void>();
+			const originalFreeze = scheduler.freeze.bind(scheduler);
+			let deadlineAt = 0;
+			const freeze = spyOn(scheduler, "freeze").mockImplementation((response, input) => {
+				originalFreeze(response, input);
+				if (input.text.slice(input.start ?? 0, input.end ?? input.text.length).trim() === part) {
+					const queuedAt = response.queuedAt;
+					if (queuedAt === undefined) throw new Error(`Missing queue clock for ${part}`);
+					deadlineAt = queuedAt + REASONING_TRANSLATION_LIMITS.deadlineMs;
+					queued.resolve();
+				}
+			});
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await action();
+				await Promise.race([
+					queued.promise,
+					new Promise<never>((_resolve, reject) => {
+						timer = setTimeout(() => reject(new Error(`Waiting for queued ${part}`)), 3000);
+					}),
+				]);
+				expect(calls.some((text) => text.trim() === part)).toBe(false);
+				expect(scheduler.stats().queued).toBeGreaterThan(0);
+				const dispatchAt = Date.now() + 10_000;
+				expect(REASONING_TRANSLATION_LIMITS.coalesceMs).toBe(10_000);
+				expect(dispatchAt).toBeLessThan(deadlineAt);
+				const clock = spyOn(Date, "now").mockReturnValue(dispatchAt);
+				try {
+					release();
+					// Visibility owns a nested hold until its asynchronous refresh settles.
+					// Keep this window mature through that release and live authorization.
+					await waitForPart(part);
+				} finally {
+					clock.mockRestore();
+				}
+			} finally {
+				clearTimeout(timer);
+				freeze.mockRestore();
+				release();
+			}
+		};
+		const delta = (text: string, revision: number, offset: number, index: number) =>
+			processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "r",
+					text,
+					blockRevision: revision,
+					blockTextOffset: offset,
+					reasoningSummaryPart: { id: `native:summary:${index}`, index },
+				} as import("../../lib/agent/types").AgentEvent,
+				f.ctx,
+			);
+		const commit = (text: string, revision: number, completed = false) =>
+			processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "r", text, revision, completed },
+				},
+				f.ctx,
+			);
+		const sealPart = (text: string, revision: number, start: number, index: number) =>
+			processEvent(
+				{
+					...seal(text, "r"),
+					blockRevision: revision,
+					start,
+					end: start + text.length,
+					nativePartId: `native:summary:${index}`,
+					nativePartIndex: index,
+				},
+				f.ctx,
+			);
+		try {
+			await delta("A", 1, 0, 0);
+			await commit("A", 1);
+			const target = await store.resolveReasoningTranslationTarget(
+				f.ctx.narratorId,
+				f.ctx.getPartialMessageId() as string,
+				"r",
+			);
+			if (!target) throw new Error("Missing persisted target");
+			visibility.replace(
+				connection,
+				"body",
+				{
+					narratorId: f.ctx.narratorId,
+					userId: "viewer",
+					isCurrent: () => subscribed,
+					authorize: async () => subscribed,
+				},
+				[target],
+			);
+			await sealPart("A", 1, 0, 0);
+			expect(activity.get(f.ctx.narratorId)?.completedRanges).toEqual([]);
+			expect(calls).toEqual([]);
+			await passCoalescingWindow("A", () => delta("\n\nB", 2, 1, 1));
+			await commit("A\n\nB", 2);
+			await sealPart("B", 2, 3, 1);
+			expect(calls).toEqual(["A"]);
+			expect(activity.allows(target, 3, 4)).toBe(false);
+			await delta("", 3, 4, 2);
+			await delta("+", 3, 4, 1);
+			await commit("A\n\nB+", 3);
+			await sealPart("B+", 3, 3, 1);
+			await sealPart("B+", 3, 3, 1);
+			expect(calls).toEqual(["A"]);
+			expect(activity.allows(target, 3, 5)).toBe(false);
+			await passCoalescingWindow("B+", () => delta("\n\nC", 4, 5, 2));
+			expect(calls).toEqual(["A", "B+"]);
+			expect(activity.allows(target, 7, 8)).toBe(false);
+			await passCoalescingWindow("C", async () => {
+				await commit("A\n\nB+\n\nC", 4, true);
+				expect(activity.allows(target, 7, 8)).toBe(true);
+				expect(activity.get(f.ctx.narratorId)).toMatchObject({
+					elementId: "r",
+					completedRanges: [{ start: 0, end: 8 }],
+					displayTailStart: 5,
+				});
+			});
+			await waitForPart("published C", fullTranslationPublished.promise);
+			expect(calls.map((text) => text.trim())).toEqual(["A", "B+", "C"]);
+			expect(activity.get(f.ctx.narratorId)).toMatchObject({
+				elementId: "r",
+				completedRanges: [{ start: 0, end: 8 }],
+				displayTailStart: 5,
+			});
+			const translated = await store.loadVisibleTranslationSource(
+				target,
+				{
+					narratorId: f.ctx.narratorId,
+					userId: "viewer",
+					isCurrent: () => subscribed,
+					authorize: async () => subscribed,
+				},
+				new AbortController().signal,
+			);
+			expect(
+				translated?.parts?.some(
+					(part) => part.sourceText.trim() === "C" && part.translatedText.trim() === "译",
+				),
+			).toBe(true);
+			const snapshot = (broadcastMessages as Array<Record<string, unknown>>).findLast(
+				(message) =>
+					message.type === "streaming_snapshot" && message.narratorId === f.ctx.narratorId,
+			);
+			expect(snapshot?.reasoningTranslationActivity).toMatchObject({
+				elementId: "r",
+				displayTailStart: 5,
+			});
+			await processEvent({ type: "reasoning_response_complete" }, f.ctx);
+			expect(activity.get(f.ctx.narratorId)).toBeNull();
+		} finally {
+			eventBus.off("narrator:ws_broadcast", onTranslation);
+			subscribed = false;
+			visibility.release(connection);
+			try {
+				await f.cleanup();
 			} finally {
 				generate.mockRestore();
 				settings.agent.translateReasoning = original;
-				clearStreamingSnapshot(id);
-				await cleanupFileContextNarrator(id);
 			}
-		});
-	}
+		}
+	}, 15_000);
 
-	for (const reset of ["stream_reset", "attempt_discarded", "api_request_start"] as const) {
-		test(`${reset} drops reasoning-only attempts without translation`, async () => {
-			const ctx = makeMainContext();
-			ctx.pendingReasoningTranslations = new Map([
-				[
-					"old",
-					{
-						messageId: "discarded",
-						block: { type: "reasoning", id: "old", text: "unused" },
-					},
-				],
-			]);
+	test.each([
+		false,
+		undefined,
+	])("completed=%s persists without releasing the current item", async (completed) => {
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const complete = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture(`translation-incomplete-${String(completed)}`);
+		try {
 			await processEvent(
-				reset === "stream_reset"
-					? { type: reset }
-					: reset === "attempt_discarded"
-						? { type: reset, requestId: "old" }
-						: { type: reset, requestId: "new", model: "test", provider: "test" },
-				ctx,
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "source",
+					blockRevision: 1,
+					blockTextOffset: 0,
+				},
+				f.ctx,
 			);
-			expect(ctx.pendingReasoningTranslations.size).toBe(0);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: {
+						type: "reasoning",
+						id: "reason",
+						text: "source",
+						revision: 1,
+						...(completed !== undefined ? { completed } : {}),
+					},
+				},
+				f.ctx,
+			);
+			expect(await f.read()).toMatchObject({ text: "source" });
+			expect(complete).not.toHaveBeenCalled();
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toMatchObject({
+				elementId: "reason",
+				completedRanges: [],
+				displayTailStart: 0,
+			});
+		} finally {
+			complete.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("an acknowledged write without matching durable completion cannot release an item", async () => {
+		const { narratorStore } = await import("../narrator-store");
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const complete = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-unpersisted-completion");
+		const write = spyOn(narratorStore, "writeStepItem");
+		try {
+			await checkpoint(f.ctx, "source");
+			write.mockResolvedValue(undefined);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "source", revision: 2, completed: true },
+				},
+				f.ctx,
+			);
+			expect(await f.read()).toMatchObject({ text: "source", revision: 1 });
+			expect(complete).not.toHaveBeenCalled();
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toMatchObject({
+				revision: 1,
+				completedRanges: [],
+				displayTailStart: 0,
+			});
+		} finally {
+			write.mockRestore();
+			complete.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test.each([
+		false,
+		true,
+	])("completion waits for persistence and respects terminal cleanup=%s", async (terminate) => {
+		const { narratorStore } = await import("../narrator-store");
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const complete = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture(`translation-completion-write-${String(terminate)}`);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let pending: Promise<unknown> | undefined;
+		await checkpoint(f.ctx, "source");
+		const originalWrite = narratorStore.writeStepItem.bind(narratorStore);
+		const write = spyOn(narratorStore, "writeStepItem").mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return originalWrite(...args);
+		});
+		try {
+			pending = processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "source", revision: 2, completed: true },
+				},
+				f.ctx,
+			);
+			await Promise.race([entered.promise, pending]);
+			expect(complete).not.toHaveBeenCalled();
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)?.completedRanges).toEqual([]);
+			if (terminate) await processEvent({ type: "reasoning_response_complete" }, f.ctx);
+			release.resolve();
+			await pending;
+			expect(await f.read()).toMatchObject({ text: "source", revision: 2, completed: true });
+			expect(complete).toHaveBeenCalledTimes(1);
+			if (terminate) expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toBeNull();
+			else
+				expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toMatchObject({
+					elementId: "reason",
+					completedRanges: [{ start: 0, end: 6 }],
+					displayTailStart: 0,
+				});
+		} finally {
+			release.resolve();
+			await pending?.catch(() => {});
+			write.mockRestore();
+			complete.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("old completed checkpoints and summary seals cannot reclose a rewritten live tail", async () => {
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const complete = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-complete-rewrite-race");
+		const done = () =>
+			processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "AB", revision: 2, completed: true },
+				},
+				f.ctx,
+			);
+		try {
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "AB",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					reasoningSummaryPart: { id: "A", index: 0 },
+				},
+				f.ctx,
+			);
+			await done();
+			expect(complete).toHaveBeenCalledTimes(1);
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "ZZ",
+					blockRevision: 3,
+					blockTextOffset: 0,
+					reasoningSummaryPart: { id: "B", index: 1 },
+				},
+				f.ctx,
+			);
+			await processEvent(
+				{
+					...seal("AB"),
+					blockRevision: 2,
+					nativePartId: "A",
+					nativePartIndex: 0,
+				},
+				f.ctx,
+			);
+			await done();
+			expect(complete).toHaveBeenCalledTimes(1);
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toMatchObject({
+				revision: 3,
+				completedRanges: [],
+				displayTailStart: 0,
+			});
+			await checkpoint(f.ctx, "ZZ", 4);
+			await done();
+			expect(await f.read()).toMatchObject({ text: "ZZ", revision: 4 });
+			expect(complete).toHaveBeenCalledTimes(1);
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toMatchObject({
+				revision: 4,
+				completedRanges: [],
+				displayTailStart: 0,
+			});
+		} finally {
+			complete.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("full completion preserves the summary handoff boundary in the broadcast activity", async () => {
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const complete = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-full-after-summary");
+		try {
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "A",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					reasoningSummaryPart: { id: "A", index: 0 },
+				},
+				f.ctx,
+			);
+			await checkpoint(f.ctx, "A");
+			await processEvent({ ...seal("A"), nativePartId: "A", nativePartIndex: 0 }, f.ctx);
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "\n\nB",
+					blockRevision: 2,
+					blockTextOffset: 1,
+					reasoningSummaryPart: { id: "B", index: 1 },
+				},
+				f.ctx,
+			);
+			await checkpoint(f.ctx, "A\n\nB", 2);
+			const done = {
+				type: "block_complete" as const,
+				block: {
+					type: "reasoning" as const,
+					id: "reason",
+					text: "A\n\nB",
+					revision: 3,
+					completed: true,
+				},
+			};
+			await processEvent(done, f.ctx);
+			expect(complete).toHaveBeenCalledTimes(2);
+			await processEvent(done, f.ctx);
+			expect(complete).toHaveBeenCalledTimes(2);
+			const expected = {
+				elementId: "reason",
+				revision: 3,
+				completedRanges: [{ start: 0, end: 4 }],
+				displayTailStart: 1,
+			};
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toEqual(expected);
+			const snapshot = (broadcastMessages as Array<Record<string, unknown>>).findLast(
+				(message) =>
+					message.type === "streaming_snapshot" && message.narratorId === f.ctx.narratorId,
+			);
+			expect(snapshot?.reasoningTranslationActivity).toEqual(expected);
+			expect(snapshot?.streamingBlocks).toEqual([]);
 			await processEvent(
 				{
 					type: "stream_text",
+					blockId: "text",
+					text: "body",
 					blockRevision: 1,
 					blockTextOffset: 0,
-					blockId: "text-6",
-					text: "new answer",
 				},
-				ctx,
+				f.ctx,
 			);
-			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
+			expect(reasoningTranslationActivities.get(f.ctx.narratorId)).toBeNull();
+			const handedOff = (broadcastMessages as Array<Record<string, unknown>>).findLast(
+				(message) =>
+					message.type === "streaming_snapshot" && message.narratorId === f.ctx.narratorId,
+			);
+			expect(handedOff?.reasoningTranslationActivity).toBeNull();
+		} finally {
+			complete.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("item done keeps authoritative activity until nonempty successor output", async () => {
+		const { reasoningTranslationActivities: activity } = await import(
+			"../reasoning-translation-activity"
+		);
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const completed = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-pending-item");
+		try {
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "B",
+					blockRevision: 1,
+					blockTextOffset: 0,
+				},
+				f.ctx,
+			);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "B", revision: 2, completed: true },
+				},
+				f.ctx,
+			);
+			expect(await f.read()).toMatchObject({ text: "B", completed: true });
+			expect(activity.get(f.ctx.narratorId)).toMatchObject({
+				elementId: "reason",
+				revision: 2,
+				completedRanges: [{ start: 0, end: 1 }],
+				displayTailStart: 0,
+			});
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["reason"]);
+			const snapshot = (broadcastMessages as Array<Record<string, unknown>>).findLast(
+				(message) =>
+					message.type === "streaming_snapshot" && message.narratorId === f.ctx.narratorId,
+			);
+			expect(snapshot?.reasoningTranslationActivity).toMatchObject({
+				elementId: "reason",
+				displayTailStart: 0,
+				completedRanges: [{ start: 0, end: 1 }],
+			});
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "next",
+					text: "",
+					blockRevision: 1,
+					blockTextOffset: 0,
+				},
+				f.ctx,
+			);
+			await processEvent(
+				{ type: "stream_text", blockId: "text", text: "", blockRevision: 1, blockTextOffset: 0 },
+				f.ctx,
+			);
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["reason"]);
+			expect(activity.get(f.ctx.narratorId)?.elementId).toBe("reason");
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "next",
+					text: "C",
+					blockRevision: 1,
+					blockTextOffset: 0,
+				},
+				f.ctx,
+			);
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual([
+				"reason",
+				"reason",
+			]);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "next", text: "C", revision: 2, completed: true },
+				},
+				f.ctx,
+			);
+			expect(activity.get(f.ctx.narratorId)?.elementId).toBe("next");
+			await processEvent({ type: "reasoning_response_complete" }, f.ctx);
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual([
+				"reason",
+				"reason",
+				"next",
+				"next",
+			]);
+			expect(activity.get(f.ctx.narratorId)).toBeNull();
+		} finally {
+			completed.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("an error releases the last durable pending item even without a successor", async () => {
+		const { reasoningTranslationActivities: activity } = await import(
+			"../reasoning-translation-activity"
+		);
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const completed = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-pending-error");
+		try {
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reason",
+					text: "B",
+					blockRevision: 1,
+					blockTextOffset: 0,
+				},
+				f.ctx,
+			);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "B", revision: 2, completed: false },
+				},
+				f.ctx,
+			);
+			expect(completed).not.toHaveBeenCalled();
+			await processEvent({ type: "error", message: "upstream ended" }, f.ctx);
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["reason"]);
+			expect(activity.get(f.ctx.narratorId)).toBeNull();
+		} finally {
+			completed.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("persisted lane switches and pending summary seals release before the request ends", async () => {
+		const { reasoningTranslationActivities: activity } = await import(
+			"../reasoning-translation-activity"
+		);
+		const { reasoningTranslationVisibility: visibility } = await import(
+			"../reasoning-translation-runtime"
+		);
+		const completed = spyOn(visibility, "complete").mockImplementation(() => {});
+		const f = await openTranslationFixture("translation-live-lanes");
+		const delta = (id: string, text: string, revision = 1, offset = 0) =>
+			processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: id,
+					blockRevision: revision,
+					blockTextOffset: offset,
+					text,
+				},
+				f.ctx,
+			);
+		const commit = (id: string, text: string, revision = 1, done = false) =>
+			processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id, text, revision, completed: done },
+				},
+				f.ctx,
+			);
+		try {
+			await delta("A", "Alpha");
+			await commit("A", "Alpha");
+			expect(completed).not.toHaveBeenCalled();
+			expect(getStreamingSnapshot(f.ctx.narratorId)?.streamingBlocks).toEqual([]);
+			expect(activity.get(f.ctx.narratorId)?.elementId).toBe("A");
+			await delta("B", "Beta");
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["A"]);
+			await commit("B", "Beta");
+			await delta("C", "😀AB tail");
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["A", "B"]);
+			await commit("C", "😀AB tail");
+			await processEvent({ ...seal("😀AB", "C"), end: 4 }, f.ctx);
+			expect(completed.mock.calls.map(([target]) => target.elementId)).toEqual(["A", "B"]);
+			expect(activity.get(f.ctx.narratorId)?.completedRanges).toEqual([]);
+			await delta("C", "+", 3, 9);
+			await commit("C", "😀AB tail", 2, true);
+			expect(activity.get(f.ctx.narratorId)?.revision).toBe(3);
+			expect(completed).toHaveBeenCalledTimes(2);
+			await processEvent(
+				{ type: "tool_use_chunk", toolUseId: "t", toolName: "Read", inputCharsTotal: 1 },
+				f.ctx,
+			);
+			expect(activity.get(f.ctx.narratorId)).toBeNull();
+			expect(completed).toHaveBeenCalledTimes(3);
+		} finally {
+			completed.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("durable checkpoints notify without creating unsubscribed translation work", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const patch = spyOn(narratorPersistence, "patchReasoningTranslationPart");
+		const notify = spyOn(reasoningTranslationVisibility, "notify");
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const f = await openTranslationFixture("translation-durable-boundaries");
+		try {
+			await checkpoint(f.ctx, "A");
+			const messageId = f.ctx.getPartialMessageId();
+			expect(notify.mock.calls.map(([id]) => id)).toEqual([messageId]);
+			await processEvent(
+				{ type: "tool_use_chunk", toolUseId: "await", toolName: "Await", inputCharsTotal: 1 },
+				f.ctx,
+			);
+			expect(notify).toHaveBeenCalledTimes(2);
+			await processEvent(seal("A"), f.ctx);
+			expect(notify).toHaveBeenCalledTimes(2);
+			await checkpoint(f.ctx, "A+B", 2);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "tool_use", toolUseId: "await", name: "Await", input: {} },
+				},
+				f.ctx,
+			);
+			expect(notify).toHaveBeenCalledTimes(4);
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: "",
+					toolUses: [{ toolUseId: "await", name: "Await", input: {} }],
+				},
+				f.ctx,
+			);
+			expect(notify.mock.calls.map(([id]) => id)).toEqual(Array(5).fill(messageId));
+			expect((await f.read()).text).toBe("A+B");
+			expect(generate).not.toHaveBeenCalled();
+			expect(patch).not.toHaveBeenCalled();
+			expect(
+				broadcastMessages.some(
+					(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+				),
+			).toBe(false);
+		} finally {
+			await f.cleanup();
+			generate.mockRestore();
+			patch.mockRestore();
+			notify.mockRestore();
+			settings.agent.translateReasoning = original;
+		}
+	});
+
+	test("a terminal partial response preserves translation identity and releases its pending lane", async () => {
+		const agent = await import("../../lib/agent");
+		const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const notify = spyOn(reasoningTranslationVisibility, "notify");
+		const f = await openTranslationFixture("translation-incomplete-boundary");
+		try {
+			await checkpoint(f.ctx, "A");
+			const generation = (await f.read()).translationGeneration;
+			notify.mockClear();
+			const messageId = f.ctx.getPartialMessageId();
+			await processEvent(
+				{ type: "assistant_message", text: "", toolUses: [], outputCompleted: false },
+				f.ctx,
+			);
+			expect(notify.mock.calls.map(([id]) => id)).toEqual([messageId]);
+			expect(generate).not.toHaveBeenCalled();
+			expect(await f.read()).toMatchObject({
+				text: "A",
+				translationGeneration: generation,
+				translationLocale: "zh-CN",
+			});
+		} finally {
+			await f.cleanup();
+			generate.mockRestore();
+			notify.mockRestore();
+		}
+	});
+
+	test("append retains the generation, locale and parts while rewrite starts a new lineage", async () => {
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const f = await openTranslationFixture("translation-checkpoint-lineage");
+		try {
+			await checkpoint(f.ctx, "A");
+			const first = await f.read();
+			expect(first.translationGeneration).toBeString();
+			expect(first.translationLocale).toBe("zh-CN");
+			const part = {
+				id: "translated-prefix",
+				generation: first.translationGeneration,
+				start: 0,
+				end: 1,
+				sourceText: "A",
+				translatedText: "甲",
+			};
+			const messageId = f.ctx.getPartialMessageId() as string;
+			expect(
+				await narratorPersistence.patchReasoningTranslationPart({
+					messageId,
+					elementId: "reason",
+					expected: { sourceText: "A", generation: first.translationGeneration },
+					part,
+				}),
+			).not.toBeNull();
+			f.ctx.locale = "fr";
+			await checkpoint(f.ctx, "AB", 2);
+			expect(await f.read()).toMatchObject({
+				text: "AB",
+				translationGeneration: first.translationGeneration,
+				translationLocale: "zh-CN",
+				translationParts: [part],
+			});
+			await narratorPersistence.patchReasoningTranslation(messageId, 0, "旧译", {
+				id: "reason",
+				text: "AB",
+			});
+			await checkpoint(f.ctx, "Z", 3);
+			const rewritten = await f.read();
+			expect(rewritten.translationGeneration).not.toBe(first.translationGeneration);
+			expect(rewritten).toMatchObject({ text: "Z", translationLocale: "fr", translationParts: [] });
+			expect(rewritten.translatedText).toBeUndefined();
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each([
+		undefined,
+		"",
+		"en",
+		"zh-CN",
+	])("checkpoints persist locale %s for future demand while translation is disabled", async (locale) => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = false;
+		const f = await openTranslationFixture(`translation-disabled-locale-${locale ?? "default"}`);
+		f.ctx.locale = locale;
+		try {
+			await checkpoint(f.ctx, "source");
+			const stored = await f.read();
+			expect(stored.translationGeneration).toBeString();
+			expect(stored).toMatchObject({ text: "source", translationLocale: locale || "en" });
+			expect(generate).not.toHaveBeenCalled();
+		} finally {
+			await f.cleanup();
+			settings.agent.translateReasoning = original;
+			generate.mockRestore();
+		}
+	});
+
+	test("summary seals require a matching persisted source and active lane", async () => {
+		const agent = await import("../../lib/agent");
+		const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const notify = spyOn(reasoningTranslationVisibility, "notify");
+		const ctx = context("zh-CN");
+		try {
+			await processEvent(seal("summary", "missing-source"), ctx);
+			expect(notify).not.toHaveBeenCalled();
+			ctx.getPartialMessageId = () => undefined;
+			await processEvent(seal("summary"), ctx);
+			expect(notify).not.toHaveBeenCalled();
+			expect(generate).not.toHaveBeenCalled();
+		} finally {
+			notify.mockRestore();
+			generate.mockRestore();
+		}
+	});
+
+	test("stale checkpoints cannot replace a rewritten generation, locale or valid parts", async () => {
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const f = await openTranslationFixture("translation-stale-checkpoint");
+		try {
+			await checkpoint(f.ctx, "A", 2);
+			const first = await f.read();
+			f.ctx.locale = "fr";
+			await checkpoint(f.ctx, "Z", 4);
+			const rewritten = await f.read();
+			expect(rewritten.translationGeneration).not.toBe(first.translationGeneration);
+			expect(rewritten.translationLocale).toBe("fr");
+			const part = {
+				id: "rewritten-prefix",
+				generation: rewritten.translationGeneration,
+				start: 0,
+				end: 1,
+				sourceText: "Z",
+				translatedText: "nouveau",
+			};
+			expect(
+				await narratorPersistence.patchReasoningTranslationPart({
+					messageId: f.ctx.getPartialMessageId() as string,
+					elementId: "reason",
+					expected: { sourceText: "Z", generation: rewritten.translationGeneration },
+					part,
+				}),
+			).not.toBeNull();
+			const latest = await f.read();
+			expect(latest.translationParts).toEqual([part]);
+			f.ctx.locale = "de";
+			await checkpoint(f.ctx, "old source", 3);
+			expect(await f.read()).toEqual(latest);
+			await processEvent(
+				{ type: "block_complete", block: { type: "reasoning", id: "reason", text: "unversioned" } },
+				f.ctx,
+			);
+			expect(await f.read()).toEqual(latest);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("a replacement event context reuses the persisted translation lineage", async () => {
+		const f = await openTranslationFixture("translation-replacement-context");
+		try {
+			await checkpoint(f.ctx, "A");
+			const first = await f.read();
+			const replacement: EventHandlerContext = { ...f.ctx, locale: "fr" };
+			await checkpoint(replacement, "AB", 2);
+			expect(await f.read()).toMatchObject({
+				text: "AB",
+				translationGeneration: first.translationGeneration,
+				translationLocale: "zh-CN",
+			});
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("reasoning checkpoints notify visible demand only after the write settles", async () => {
+		const { narratorStore } = await import("../narrator-store");
+		const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const write = spyOn(narratorStore, "writeStepItem").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return undefined;
+		});
+		const notify = spyOn(reasoningTranslationVisibility, "notify").mockImplementation(() => {});
+		const ctx = context("zh-CN");
+		const pending = checkpoint(ctx, "source");
+		try {
+			await Promise.race([entered.promise, pending]);
+			expect(notify).not.toHaveBeenCalled();
+			expect(write.mock.calls[0]?.[2]).toMatchObject({
+				text: "source",
+				translationGeneration: expect.any(String),
+				translationLocale: "zh-CN",
+			});
+			release.resolve();
+			await pending;
+			expect(notify.mock.calls.map(([id]) => id)).toEqual(["translation-pending"]);
+		} finally {
+			release.resolve();
+			await pending.catch(() => {});
+			await processEvent({ type: "stream_reset" }, ctx);
+			write.mockRestore();
+			notify.mockRestore();
+		}
+	});
+
+	test("a failed checkpoint preserves persisted translation identity and does not notify demand", async () => {
+		const { narratorStore } = await import("../narrator-store");
+		const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+		const f = await openTranslationFixture("translation-failed-checkpoint");
+		const write = spyOn(narratorStore, "writeStepItem");
+		const notify = spyOn(reasoningTranslationVisibility, "notify").mockImplementation(() => {});
+		try {
+			await checkpoint(f.ctx, "source");
+			const previous = await f.read();
+			notify.mockClear();
+			write.mockRejectedValue(new Error("checkpoint write failed"));
+			f.ctx.locale = "fr";
+			await expect(checkpoint(f.ctx, "source+", 2)).rejects.toThrow("checkpoint write failed");
+			expect(await f.read()).toEqual(previous);
+			expect(f.ctx.unpublishedContentBlockIds?.has("reason")).toBe(true);
+			expect(notify).not.toHaveBeenCalled();
+		} finally {
+			write.mockRestore();
+			notify.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	for (const reset of ["stream_reset", "attempt_discarded", "error", "done"] as const) {
+		test(`${reset} preserves committed translation lineage for the next append`, async () => {
+			const { settings } = await import("../../lib/settings");
+			const agent = await import("../../lib/agent");
+			const { narratorPersistence } = await import("../narrator-persistence");
+			const { reasoningTranslationVisibility } = await import("../reasoning-translation-runtime");
+			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+			const notify = spyOn(reasoningTranslationVisibility, "notify");
+			const original = settings.agent.translateReasoning;
+			settings.agent.translateReasoning = true;
+			const f = await openTranslationFixture(`translation-reset-${reset}`);
+			try {
+				await checkpoint(f.ctx, "A");
+				const previous = await f.read();
+				const part = {
+					id: "committed-prefix",
+					generation: previous.translationGeneration,
+					start: 0,
+					end: 1,
+					sourceText: "A",
+					translatedText: "甲",
+				};
+				expect(
+					await narratorPersistence.patchReasoningTranslationPart({
+						messageId: f.ctx.getPartialMessageId() as string,
+						elementId: "reason",
+						expected: { sourceText: "A", generation: previous.translationGeneration },
+						part,
+					}),
+				).not.toBeNull();
+				await processEvent(seal("A"), f.ctx);
+				await processEvent(
+					reset === "stream_reset" || reset === "done"
+						? { type: reset }
+						: reset === "attempt_discarded"
+							? { type: reset, requestId: "old" }
+							: { type: reset, message: "Aborted" },
+					f.ctx,
+				);
+				expect(notify).toHaveBeenCalledTimes(reset === "attempt_discarded" ? 1 : 2);
+				expect(await f.read()).toMatchObject({
+					text: "A",
+					translationGeneration: previous.translationGeneration,
+					translationLocale: "zh-CN",
+					translationParts: [part],
+				});
+				f.ctx.locale = "fr";
+				await checkpoint(f.ctx, "AB", 2);
+				expect(await f.read()).toMatchObject({
+					text: "AB",
+					translationGeneration: previous.translationGeneration,
+					translationLocale: "zh-CN",
+					translationParts: [part],
+				});
+				expect(generate).not.toHaveBeenCalled();
+				expect(
+					broadcastMessages.some(
+						(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+					),
+				).toBe(false);
+			} finally {
+				generate.mockRestore();
+				notify.mockRestore();
+				settings.agent.translateReasoning = original;
+				await f.cleanup();
+			}
 		});
 	}
 });
@@ -525,29 +1552,38 @@ test("sealing a streamed assistant retains final duration, TTFT and metering wit
 		await cleanupFileContextNarrator(id);
 	}
 });
+const outputCountOwners = new Map<string, ExecutionOwner>();
 
 afterEach(() => {
+	reasoningTranslationActivities.finish(PARENT_NARRATOR_ID, true);
+	reasoningTranslationActivities.finish(SUBAGENT_NARRATOR_ID, true);
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
 	clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
-	// The counters are run-scoped, not snapshot-scoped: clearStreamingSnapshot no
-	// longer retires them, so tests retire them explicitly to stay isolated.
-	retireSubagentOutputCharCount(PARENT_NARRATOR_ID);
-	retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
+	for (const [id, owner] of outputCountOwners) {
+		const runId = getRunControl(id)?.logicalRunId;
+		if (runId) retireSubagentOutputCharCount(id, runId);
+		clearStreamingSnapshot(id);
+		setRunControl(owner, undefined);
+		owner.release();
+	}
+	outputCountOwners.clear();
 	broadcastMessages.length = 0;
 	broadcastTargets.length = 0;
 });
 
-afterAll(() => {
-	// Leave the in-memory stub in place. Bun's mock.module is process-global and
+afterAll(async () => {
+	// Leave the isolated DB stub in place. Bun's mock.module is process-global and
 	// mock.restore() does not undo module mocks; re-pointing at a lazily imported
 	// real `../../db` would open the runtime database mid-suite.
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+	(await import("../narrator-block-sync")).stopBlockSyncSweep();
+	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
+	await fixture.close();
 });
 
 async function cleanupFileContextNarrator(id: string) {
-	// These tests use the functional in-memory DB, whose historical FK edges
-	// intentionally mirror migrations beyond the minimal narrator fixture.
+	// The worker fixture retains historical FK edges beyond the minimal narrator rows.
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	try {
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
@@ -1442,6 +2478,8 @@ describe("narrator event handler streaming snapshot", () => {
 		});
 		expect(parent).not.toHaveProperty("output");
 		expect(parent).not.toHaveProperty("metadata");
+		expect(parent).not.toHaveProperty("executionAttempt");
+		expect(self).not.toHaveProperty("executionAttempt");
 		expect(self?.output).toBe("sensitive output");
 		expect(self?.metadata).toEqual({ secret: true });
 	});
@@ -1656,6 +2694,42 @@ describe("native image generation persistence", () => {
 });
 
 describe("完成工具输入传递", () => {
+	test("onGitTrack 的异步意图判断在完成边界内结束，失败工具仍会检查", async () => {
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release!: () => void;
+		const classified = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let completed = false;
+		const pending = processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "partial-write",
+				toolName: "Bash",
+				input: { command: "touch changed; false" },
+				output: "failed after write",
+				isError: true,
+			},
+			makeSubagentContext(),
+			{
+				onGitTrack: async () => {
+					entered();
+					await classified;
+				},
+			},
+		).then(() => {
+			completed = true;
+		});
+		await started;
+		expect(completed).toBe(false);
+		release();
+		await pending;
+		expect(completed).toBe(true);
+	});
+
 	test("onGitTrack 收到 tool_result 携带的实际完成输入", async () => {
 		const ctx = makeSubagentContext();
 		const calls: Array<[string, string, Record<string, unknown> | undefined]> = [];
@@ -2028,6 +3102,10 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 			ctx,
 		);
 		const { parent } = subagentBroadcasts("tool_use_chunk");
+		expect(parent).not.toHaveProperty("executionAttempt");
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("summary-chunk"),
+		).not.toHaveProperty("executionAttempt");
 		// `content` is in extractedFields but not in the whitelist, so it is dropped —
 		// the projection is a whitelist, not a passthrough of whatever was extracted.
 		expect(parent?.inputSummary).toEqual({ file_path: "/repo/streamed.ts" });
@@ -2052,37 +3130,408 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 		expect(parent).not.toHaveProperty("inputSummary");
 	});
 
-	test("tool_completed 只在权限改写过输入时才带摘要", async () => {
+	test("子代理 started/completed 保留真实 receipt attempt，旧结果不影响新 attempt", async () => {
+		const ctx = makeSubagentContext();
+		const toolUseId = "receipt-summary";
+		const toolCallId = "tc-receipt-summary";
+		const messageId = "receipt-summary-message";
+		const createdAt = new Date().toISOString();
+		const binding = { toolCallId, attempt: 3 };
+		const updatedInput = {
+			description: "d".repeat(5_000),
+			command: "ls /repo",
+			content: "SECRET-BODY".repeat(5_000),
+		};
+		await db.insert(narrators).values({
+			id: ctx.narratorId,
+			type: "subagent",
+			variant: "subagent:general",
+			inheritMode: "fresh",
+			createdAt,
+			updatedAt: createdAt,
+		});
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId: ctx.narratorId,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: toolUseId, name: "Bash", input: {} }],
+			parentToolUseId: ctx.parentToolUseId,
+			createdAt,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: "ref-receipt-summary",
+			narratorId: ctx.narratorId,
+			messageId,
+			seq: 0,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: toolCallId,
+			narratorId: ctx.narratorId,
+			messageId,
+			toolUseId,
+			toolName: "Bash",
+			status: "running",
+			executionIdentityVersion: 1,
+			executionAttempt: binding.attempt,
+			createdAt,
+		});
+		ctx.toolCallIdsMap?.set(toolUseId, toolCallId);
+		ctx.toolExecutionReceipts = new Map([[toolUseId, { messageId, binding }]]);
+		try {
+			await processEvent(
+				{ type: "tool_call", toolUseId, toolName: "Bash", input: { description: "original" } },
+				ctx,
+			);
+			expect(subagentBroadcasts("tool_started").parent).toMatchObject({
+				toolCallId,
+				executionAttempt: 3,
+				inputSummary: { description: "original" },
+			});
+			expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(toolUseId)).toMatchObject({
+				toolCallId,
+				executionAttempt: 3,
+			});
+			await processEvent(
+				{
+					type: "tool_result",
+					toolUseId,
+					toolName: "Bash",
+					output: "sensitive output",
+					isError: false,
+					durationMs: 17,
+					updatedInput,
+					metadata: { secret: true },
+				},
+				ctx,
+			);
+			const { parent, self } = subagentBroadcasts("tool_completed");
+			expect(parent).toMatchObject({
+				toolCallId,
+				executionAttempt: 3,
+				status: "success",
+				durationMs: 17,
+				inputSummary: { description: "d".repeat(200), command: "ls /repo" },
+			});
+			expect(self).toMatchObject({ toolCallId, executionAttempt: 3, updatedInput });
+			for (const field of ["input", "output", "updatedInput", "metadata"])
+				expect(parent).not.toHaveProperty(field);
+			expect(JSON.stringify(parent)).not.toContain("SECRET-BODY");
+			expect(JSON.stringify(parent).length).toBeLessThan(1_000);
+			expect(
+				await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, toolCallId) }),
+			).toMatchObject({ executionAttempt: 3, status: "success", inputJson: updatedInput });
+
+			await db
+				.update(narratorToolCalls)
+				.set({ executionAttempt: 4, status: "running" })
+				.where(eq(narratorToolCalls.id, toolCallId));
+			ctx.toolExecutionReceipts.set(toolUseId, {
+				messageId,
+				binding: { toolCallId, attempt: 4 },
+			});
+			await processEvent(
+				{ type: "tool_call", toolUseId, toolName: "Bash", input: { description: "new attempt" } },
+				ctx,
+			);
+			broadcastMessages.length = 0;
+			const throwStaleResult = await captureWorkerRejectionThrower(
+				processEvent(
+					{
+						type: "tool_result",
+						toolUseId,
+						toolName: "Bash",
+						toolCallBinding: binding,
+						output: "late old output",
+						isError: false,
+						updatedInput: { description: "old attempt" },
+					},
+					ctx,
+				),
+			);
+			expect(throwStaleResult).toThrow("stale");
+			expect(broadcastMessages).toHaveLength(0);
+			expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(toolUseId)).toMatchObject({
+				toolCallId,
+				executionAttempt: 4,
+				inputSummary: { description: "new attempt" },
+			});
+			expect(
+				await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, toolCallId) }),
+			).toMatchObject({ executionAttempt: 4, status: "running", inputJson: updatedInput });
+		} finally {
+			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, toolCallId));
+			await cleanupFileContextNarrator(ctx.narratorId);
+		}
+	});
+
+	test("子代理 discard 帧传递明确 child 身份并移除 pre-start 重连快照", async () => {
+		const ctx = makeSubagentContext();
+		const toolUseId = "discarded-child-input";
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId,
+				toolName: "Read",
+				inputCharsTotal: 32,
+				extractedFilePath: "/repo/unstarted.ts",
+			},
+			ctx,
+		);
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(toolUseId)).toMatchObject({
+			toolCallId: null,
+			subagentNarratorId: ctx.narratorId,
+		});
+		await processEvent({ type: "tool_use_discarded", toolUseIds: [toolUseId] }, ctx);
+		const expected: Extract<
+			import("../../websocket/narrator-ws-types").NarratorServerMessage,
+			{ type: "tool_use_discarded" }
+		> = {
+			type: "tool_use_discarded",
+			narratorId: PARENT_NARRATOR_ID,
+			toolUseIds: [toolUseId],
+			parentToolUseId: PARENT_TOOL_USE_ID,
+			subagentNarratorId: SUBAGENT_NARRATOR_ID,
+		};
+		expect(subagentBroadcasts("tool_use_discarded").parent).toEqual(expected);
+		expect(subagentBroadcasts("tool_use_discarded").self).toEqual({
+			type: "tool_use_discarded",
+			narratorId: SUBAGENT_NARRATOR_ID,
+			toolUseIds: [toolUseId],
+			subagentNarratorId: SUBAGENT_NARRATOR_ID,
+		});
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.has(toolUseId)).toBe(false);
+	});
+
+	const ordinaryCompletionInputs: Array<[string, Record<string, unknown>, Record<string, string>]> =
+		[
+			["Read", { file_path: "/repo/read.ts" }, { file_path: "/repo/read.ts" }],
+			["Glob", { pattern: "**/*.ts", path: "/repo" }, { pattern: "**/*.ts" }],
+			["Grep", { pattern: "summary", path: "/repo" }, { pattern: "summary" }],
+			[
+				"Bash",
+				{ description: "检查工作区", command: "git status" },
+				{ description: "检查工作区", command: "git status" },
+			],
+		];
+	test.each(
+		ordinaryCompletionInputs,
+	)("tool_completed 普通 %s 最终输入独立提供父级摘要", async (toolName, input, inputSummary) => {
 		const ctx = makeSubagentContext();
 		await processEvent(
 			{
 				type: "tool_result",
 				toolUseId: "summary-plain",
+				toolName,
+				input,
+				output: "ok",
+				isError: false,
+				durationMs: 17,
+			},
+			ctx,
+		);
+		const { parent, self } = subagentBroadcasts("tool_completed");
+		expect(parent).toEqual({
+			type: "tool_completed",
+			narratorId: PARENT_NARRATOR_ID,
+			toolCallId: null,
+			toolUseId: "summary-plain",
+			toolName,
+			status: "success",
+			durationMs: 17,
+			parentToolUseId: PARENT_TOOL_USE_ID,
+			subagentNarratorId: SUBAGENT_NARRATOR_ID,
+			inputSummary,
+		});
+		expect(self).toEqual({
+			type: "tool_completed",
+			narratorId: SUBAGENT_NARRATOR_ID,
+			toolCallId: null,
+			toolUseId: "summary-plain",
+			toolName,
+			status: "success",
+			output: "ok",
+			durationMs: 17,
+			subagentNarratorId: SUBAGENT_NARRATOR_ID,
+		});
+		for (const field of ["input", "updatedInput", "brokenInputOverride", "output", "metadata"])
+			expect(parent).not.toHaveProperty(field);
+		expect(self).not.toHaveProperty("input");
+		expect(self).not.toHaveProperty("inputSummary");
+	});
+
+	test("tool_completed 没有最终输入证据时省略摘要", async () => {
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "summary-no-input",
 				toolName: "Read",
 				output: "ok",
 				isError: false,
 			},
-			ctx,
+			makeSubagentContext(),
 		);
-		// No `updatedInput` → nothing to relabel; the row keeps what tool_started sent.
-		expect(subagentBroadcasts("tool_completed").parent).not.toHaveProperty("inputSummary");
+		const { parent, self } = subagentBroadcasts("tool_completed");
+		expect(parent).toBeDefined();
+		expect(parent).not.toHaveProperty("inputSummary");
+		expect(self).not.toHaveProperty("inputSummary");
+	});
 
-		broadcastMessages.length = 0;
+	test("tool_completed 权限改写输入优先于原始输入且仅父级摘要更新", async () => {
+		const ctx = makeSubagentContext();
+		const updatedInput = { file_path: "/repo/redirected.ts", content: "y".repeat(50_000) };
 		await processEvent(
 			{
 				type: "tool_result",
 				toolUseId: "summary-redirected",
 				toolName: "Write",
+				input: { file_path: "/repo/original.ts", content: "original body" },
 				output: "ok",
 				isError: false,
-				updatedInput: { file_path: "/repo/redirected.ts", content: "y".repeat(50_000) },
+				updatedInput,
 			},
 			ctx,
 		);
-		const { parent } = subagentBroadcasts("tool_completed");
-		// A permission redirect changed the path, so the row must follow it.
+		const { parent, self } = subagentBroadcasts("tool_completed");
 		expect(parent?.inputSummary).toEqual({ file_path: "/repo/redirected.ts" });
 		expect(parent).not.toHaveProperty("updatedInput");
+		expect(parent).not.toHaveProperty("input");
+		expect(JSON.stringify(parent)).not.toContain(updatedInput.content);
+		expect(self?.updatedInput).toBe(updatedInput);
+		expect(self).not.toHaveProperty("input");
+		expect(self).not.toHaveProperty("inputSummary");
+	});
+
+	test("tool_completed broken 覆盖优先于权限改写和原始输入", async () => {
+		const updatedInput = { file_path: "/repo/redirected.ts", content: "redirected body" };
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "summary-broken",
+				toolName: "Write",
+				input: { file_path: "/repo/original.ts", content: "original body" },
+				updatedInput,
+				brokenInputOverride: { file_path: "/repo/sanitized.ts", _broken: true },
+				output: "invalid input",
+				isError: true,
+			},
+			makeSubagentContext(),
+		);
+		const { parent, self } = subagentBroadcasts("tool_completed");
+		expect(parent).toMatchObject({
+			status: "fail",
+			inputSummary: { file_path: "/repo/sanitized.ts" },
+		});
+		for (const field of ["input", "updatedInput", "brokenInputOverride", "output", "metadata"])
+			expect(parent).not.toHaveProperty(field);
+		expect(self?.updatedInput).toBe(updatedInput);
+		expect(self).not.toHaveProperty("input");
+		expect(self).not.toHaveProperty("brokenInputOverride");
+		expect(self).not.toHaveProperty("inputSummary");
+	});
+
+	const clearingCompletionInputs: Array<
+		[
+			string,
+			Pick<
+				Extract<Parameters<typeof processEvent>[0], { type: "tool_result" }>,
+				"input" | "updatedInput" | "brokenInputOverride"
+			>,
+		]
+	> = [
+		["普通空输入", { input: {} }],
+		["普通无白名单输入", { input: { questions: [{ header: "选择" }] } }],
+		["权限空覆盖", { input: { file_path: "/repo/original.ts" }, updatedInput: {} }],
+		[
+			"权限非法摘要覆盖",
+			{ input: { file_path: "/repo/original.ts" }, updatedInput: { file_path: { invalid: true } } },
+		],
+		[
+			"broken 空覆盖",
+			{
+				input: { file_path: "/repo/original.ts" },
+				updatedInput: { file_path: "/repo/redirected.ts" },
+				brokenInputOverride: {},
+			},
+		],
+		[
+			"broken 非法输入覆盖",
+			{
+				input: { file_path: "/repo/original.ts" },
+				updatedInput: { file_path: "/repo/redirected.ts" },
+				brokenInputOverride: [] as unknown as Record<string, unknown>,
+			},
+		],
+	];
+	test.each(
+		clearingCompletionInputs,
+	)("tool_completed %s 显式清除而不回退旧路径", async (_label, inputs) => {
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "summary-cleared",
+				toolName: "Read",
+				...inputs,
+				output: "done",
+				isError: false,
+			},
+			makeSubagentContext(),
+		);
+		const { parent, self } = subagentBroadcasts("tool_completed");
+		expect(parent).toHaveProperty("inputSummary", null);
+		expect(self).not.toHaveProperty("input");
+		expect(self).not.toHaveProperty("inputSummary");
+	});
+
+	test("tool_completed 摘要只读取十个白名单键且不查询数据库或传递大字段", async () => {
+		const { SUBAGENT_SUMMARY_INPUT_KEYS } = await import("@shared/subagent-tool-summary");
+		const readKeys: PropertyKey[] = [];
+		const hugeContent = "SECRET-BODY".repeat(20_000);
+		const input = new Proxy(
+			{ file_path: "/repo/big.ts", description: "d".repeat(5_000), content: hugeContent },
+			{
+				ownKeys() {
+					throw new Error("Input enumeration is forbidden");
+				},
+				get(target, key, receiver) {
+					readKeys.push(key);
+					if (key === "content") throw new Error("Body access is forbidden");
+					return Reflect.get(target, key, receiver);
+				},
+			},
+		);
+		const query = spyOn(sqlite, "query");
+		const prepare = spyOn(sqlite, "prepare");
+		try {
+			await processEvent(
+				{
+					type: "tool_result",
+					toolUseId: "summary-bounded-completion",
+					toolName: "Read",
+					input,
+					output: hugeContent,
+					isError: false,
+					metadata: { content: hugeContent },
+				},
+				makeSubagentContext(),
+			);
+			const { parent, self } = subagentBroadcasts("tool_completed");
+			expect(parent?.inputSummary).toEqual({
+				file_path: "/repo/big.ts",
+				description: "d".repeat(200),
+			});
+			expect(readKeys).toEqual([...SUBAGENT_SUMMARY_INPUT_KEYS]);
+			expect(query).not.toHaveBeenCalled();
+			expect(prepare).not.toHaveBeenCalled();
+			for (const field of ["input", "updatedInput", "brokenInputOverride", "output", "metadata"])
+				expect(parent).not.toHaveProperty(field);
+			expect(JSON.stringify(parent)).not.toContain("SECRET-BODY");
+			expect(JSON.stringify(parent).length).toBeLessThan(1_000);
+			expect(self).not.toHaveProperty("input");
+			expect(self).not.toHaveProperty("inputSummary");
+		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+		}
 	});
 
 	test("主叙述者不带摘要（它本来就收到完整 input）", async () => {
@@ -2109,6 +3558,272 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 		);
 		expect(started?.input).toEqual({ description: "构建", command: "bun run build" });
 		expect(started).not.toHaveProperty("inputSummary");
+	});
+});
+
+describe("ordinary tool result commit boundary", () => {
+	async function seedResult(suffix: string) {
+		const narratorId = `ordinary-result-${suffix}`;
+		const messageId = `${narratorId}-message`;
+		const toolUseId = `${narratorId}-call`;
+		const binding = { toolCallId: `${narratorId}-tool`, attempt: 1 };
+		const now = new Date().toISOString();
+		const input = { file_path: "before.txt", content: "before" };
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: toolUseId, name: "Write", input }],
+			createdAt: now,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: `${narratorId}-ref`,
+			narratorId,
+			messageId,
+			seq: 1,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: binding.toolCallId,
+			narratorId,
+			messageId,
+			toolUseId,
+			toolName: "Write",
+			inputJson: input,
+			status: "running",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			executionStartedAt: now,
+			createdAt: now,
+		});
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId,
+			broadcastTargetId: narratorId,
+			conversationId: narratorId,
+			requireToolCallBinding: true,
+			toolExecutionReceipts: new Map([[toolUseId, { messageId, binding }]]),
+		};
+		return {
+			ctx,
+			binding,
+			event: {
+				type: "tool_result" as const,
+				toolUseId,
+				toolName: "Write",
+				toolCallBinding: binding,
+				input,
+				updatedInput: { file_path: "after.txt", content: "after" },
+				output: "saved",
+				isError: false,
+			},
+			row: () =>
+				db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, binding.toolCallId),
+				}),
+			owner: () => db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }),
+			cleanup: async () => {
+				clearStreamingSnapshot(narratorId);
+				await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
+				await cleanupFileContextNarrator(narratorId);
+			},
+		};
+	}
+
+	test("non-lock persistence failure is attempted once and retains its cause with bounded diagnostics", async () => {
+		const f = await seedResult("non-lock");
+		const { narratorStore } = await import("../narrator-store");
+		const { logger } = await import("../../lib/logger");
+		const driver = Object.assign(new Error("constraint failed"), {
+			code: "SQLITE_CONSTRAINT",
+			errno: 19,
+		});
+		const failure = new Error("Failed query: update private_sql_secret params: private_input", {
+			cause: driver,
+		});
+		const settle = spyOn(narratorStore, "settleTool").mockRejectedValue(failure);
+		const log = spyOn(logger, "error").mockImplementation(() => {});
+		const onToolResult = mock(() => {});
+		const onGitTrack = mock(() => {});
+		try {
+			const caught = await processEvent(f.event, f.ctx, { onToolResult, onGitTrack }).catch(
+				(error: unknown) => error,
+			);
+			expect(caught).toBeInstanceOf(CriticalEventPersistenceError);
+			expect(caught).toMatchObject({
+				cause: failure,
+				message: "Tool result could not be persisted: constraint failed",
+			});
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(log).toHaveBeenCalledWith("Failed to persist tool result", {
+				narratorId: f.ctx.narratorId,
+				toolUseId: f.event.toolUseId,
+				phase: "settle-tool",
+				code: "SQLITE_CONSTRAINT",
+				errno: 19,
+			});
+			expect(JSON.stringify(log.mock.calls)).not.toContain("private_");
+			expect(onToolResult).not.toHaveBeenCalled();
+			expect(onGitTrack).not.toHaveBeenCalled();
+			expect(broadcastMessages).toEqual([]);
+		} finally {
+			settle.mockRestore();
+			log.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("exhausted transaction locks do not publish completion, hand off Write input or run hooks", async () => {
+		const f = await seedResult("locked");
+		const { narratorStore } = await import("../narrator-store");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		const failure = Object.assign(new Error("SQLITE_BUSY: database is locked"), {
+			code: "SQLITE_BUSY",
+			errno: 5,
+		});
+		const transaction = spyOn(db, "transaction").mockImplementation(() => {
+			throw failure;
+		});
+		const settle = spyOn(narratorStore, "settleTool");
+		const handoff = spyOn(toolInputStreamSource, "handoff");
+		const onToolResult = mock(() => {});
+		const onGitTrack = mock(() => {});
+		try {
+			const caught = await processEvent(f.event, f.ctx, { onToolResult, onGitTrack }).catch(
+				(error: unknown) => error,
+			);
+			expect(caught).toBeInstanceOf(CriticalEventPersistenceError);
+			expect(caught).toMatchObject({ cause: failure });
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(5);
+			expect(await f.row()).toMatchObject({
+				status: "running",
+				outputJson: null,
+				inputJson: f.event.input,
+			});
+			expect((await f.owner())?.messageVersion).toBe(0);
+			expect(handoff).not.toHaveBeenCalled();
+			expect(onToolResult).not.toHaveBeenCalled();
+			expect(onGitTrack).not.toHaveBeenCalled();
+			expect(broadcastMessages).toEqual([]);
+		} finally {
+			transaction.mockRestore();
+			settle.mockRestore();
+			handoff.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("a committed retry hands off Write input, completes and runs each hook in order once", async () => {
+		const f = await seedResult("retry-success");
+		const { narratorStore } = await import("../narrator-store");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		const order: string[] = [];
+		const original = toolInputStreamSource.handoff.bind(toolInputStreamSource);
+		const handoff = spyOn(toolInputStreamSource, "handoff").mockImplementation(async (...args) => {
+			order.push("handoff");
+			return original(...args);
+		});
+		const settle = spyOn(narratorStore, "settleTool");
+		const originalTransaction = db.transaction.bind(db);
+		let attempt = 0;
+		const transaction = spyOn(db, "transaction").mockImplementation((write, config) => {
+			if (++attempt < 5) throw new Error("SQLITE_BUSY: database is locked");
+			return originalTransaction(write, config);
+		});
+		const onToolResult = mock(() => {
+			expect(broadcastMessages).toContainEqual(
+				expect.objectContaining({ type: "tool_completed", toolUseId: f.event.toolUseId }),
+			);
+			order.push("onToolResult");
+		});
+		const onGitTrack = mock(() => {
+			order.push("onGitTrack");
+		});
+		try {
+			await processEvent(f.event, f.ctx, { onToolResult, onGitTrack });
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(5);
+			expect(settle.mock.calls[0]?.[1]).toMatchObject({
+				expectedBinding: { ...f.binding, narratorId: f.ctx.narratorId },
+				includeLegacyParentVersions: true,
+			});
+			expect(await f.row()).toMatchObject({
+				status: "success",
+				outputJson: "saved",
+				inputJson: f.event.updatedInput,
+			});
+			expect((await f.owner())?.messageVersion).toBe(1);
+			expect(handoff).toHaveBeenCalledTimes(1);
+			expect(handoff.mock.calls[0]?.[3]).toBe(true);
+			expect(onToolResult).toHaveBeenCalledTimes(1);
+			expect(onGitTrack).toHaveBeenCalledTimes(1);
+			expect(order).toEqual(["handoff", "onToolResult", "onGitTrack"]);
+			expect(
+				(broadcastMessages as Array<{ type: string }>).filter(
+					(message) => message.type === "tool_completed",
+				),
+			).toHaveLength(1);
+		} finally {
+			transaction.mockRestore();
+			settle.mockRestore();
+			handoff.mockRestore();
+			await f.cleanup();
+		}
+	});
+
+	test("a binding retired during backoff cannot overwrite the next execution attempt", async () => {
+		const f = await seedResult("stale-backoff");
+		const { narratorStore } = await import("../narrator-store");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		let release: (() => void) | undefined;
+		const failed = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const originalTransaction = db.transaction.bind(db);
+		const transaction = spyOn(db, "transaction")
+			.mockImplementation(originalTransaction)
+			.mockImplementationOnce(() => {
+				release?.();
+				throw new Error("SQLITE_BUSY: database is locked");
+			});
+		const settle = spyOn(narratorStore, "settleTool");
+		const handoff = spyOn(toolInputStreamSource, "handoff");
+		const onToolResult = mock(() => {});
+		const onGitTrack = mock(() => {});
+		const pending = processEvent(f.event, f.ctx, { onToolResult, onGitTrack }).catch(
+			(error: unknown) => error,
+		);
+		try {
+			await failed;
+			expect(sqlite.inTransaction).toBe(false);
+			const nextInput = { file_path: "next.txt", content: "next attempt" };
+			await db
+				.update(narratorToolCalls)
+				.set({ executionAttempt: 2, inputJson: nextInput })
+				.where(eq(narratorToolCalls.id, f.binding.toolCallId));
+			const caught = await pending;
+			expect(caught).toBeInstanceOf(CriticalEventPersistenceError);
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(2);
+			expect(await f.row()).toMatchObject({
+				executionAttempt: 2,
+				status: "running",
+				outputJson: null,
+				inputJson: nextInput,
+			});
+			expect((await f.owner())?.messageVersion).toBe(0);
+			expect(handoff).not.toHaveBeenCalled();
+			expect(onToolResult).not.toHaveBeenCalled();
+			expect(onGitTrack).not.toHaveBeenCalled();
+			expect(broadcastMessages).toEqual([]);
+		} finally {
+			await pending;
+			transaction.mockRestore();
+			settle.mockRestore();
+			handoff.mockRestore();
+			await f.cleanup();
+		}
 	});
 });
 
@@ -2381,6 +4096,9 @@ describe("narrator event handler persistence", () => {
 					type: "tool_result",
 					toolUseId: "missing-prepared-state",
 					toolName: "EnterPlanMode",
+					input: { description: "original plan" },
+					updatedInput: { description: "uncommitted redirect" },
+					brokenInputOverride: { description: "uncommitted repair" },
 					output: "entered",
 					isError: false,
 				},
@@ -2394,6 +4112,16 @@ describe("narrator event handler persistence", () => {
 		).rejects.toBeInstanceOf(CriticalEventPersistenceError);
 
 		expect(committed).toBe(false);
+		const completed = broadcastMessages.filter(
+			(message) => (message as { type?: string }).type === "tool_completed",
+		) as Array<Record<string, unknown>>;
+		expect(completed).toHaveLength(2);
+		for (const message of completed) {
+			expect(message.status).toBe("fail");
+			expect(message).not.toHaveProperty("input");
+			expect(message).not.toHaveProperty("updatedInput");
+			expect(message).not.toHaveProperty("inputSummary");
+		}
 	});
 
 	test("EnterPlanMode 原子提交连续失败时终止事件处理", async () => {
@@ -2408,6 +4136,9 @@ describe("narrator event handler persistence", () => {
 					type: "tool_result",
 					toolUseId: "atomic-failure",
 					toolName: "EnterPlanMode",
+					input: { description: "original plan" },
+					updatedInput: { description: "uncommitted redirect" },
+					brokenInputOverride: { description: "uncommitted repair" },
 					output: "entered",
 					isError: false,
 				},
@@ -2427,6 +4158,16 @@ describe("narrator event handler persistence", () => {
 		expect(attempts).toBe(2);
 		expect(discards).toEqual(["tool-row-atomic-failure"]);
 		expect(ctx.preparedPlanModeToolCalls.size).toBe(0);
+		const completed = broadcastMessages.filter(
+			(message) => (message as { type?: string }).type === "tool_completed",
+		) as Array<Record<string, unknown>>;
+		expect(completed).toHaveLength(2);
+		for (const message of completed) {
+			expect(message.status).toBe("fail");
+			expect(message).not.toHaveProperty("input");
+			expect(message).not.toHaveProperty("updatedInput");
+			expect(message).not.toHaveProperty("inputSummary");
+		}
 	});
 });
 
@@ -2548,6 +4289,64 @@ describe("isSameReasoningBlock — the translation write-back guard", () => {
 });
 
 describe("subagent live output char count", () => {
+	function startOutputContext(
+		ctx = makeSubagentContext(),
+		logicalRunId = "count-run",
+		toolCallId = "agent-tool-pk",
+		attempt = 0,
+		keepAnnouncements = false,
+	): CountEventContext {
+		// A newly admitted child run owns a fresh stream; its parent's card state survives.
+		clearStreamingSnapshot(ctx.narratorId);
+		let owner = outputCountOwners.get(ctx.narratorId);
+		if (!owner) {
+			owner = tryClaimExecution(ctx.narratorId, "run") ?? undefined;
+			if (!owner) throw new Error("Expected a fresh count run owner");
+			outputCountOwners.set(ctx.narratorId, owner);
+		}
+		const run: RunControl = {
+			logicalRunId,
+			deliverTo: {
+				narratorId: ctx.broadcastTargetId,
+				toolUseId: ctx.parentToolUseId ?? PARENT_TOOL_USE_ID,
+				toolCallId,
+				attempt,
+			},
+			startedAt: Date.now(),
+			cancel: new AbortController(),
+			timedOut: false,
+			terminal: new Promise(() => {}),
+		};
+		setRunControl(owner, run);
+		const identity = {
+			childNarratorId: ctx.narratorId,
+			logicalRunId,
+			toolUseId: run.deliverTo?.toolUseId ?? PARENT_TOOL_USE_ID,
+			toolCallId,
+			attempt,
+		};
+		startSubagentOutputCharCount(ctx.narratorId, logicalRunId);
+		if (!keepAnnouncements) {
+			broadcastMessages.length = 0;
+			broadcastTargets.length = 0;
+		}
+		return { ...ctx, subagentOutputIdentity: identity };
+	}
+
+	function startRequest(ctx: EventHandlerContext, requestId: string) {
+		return processEvent(
+			{ type: "api_request_start", requestId, provider: "test", model: "test" },
+			ctx,
+		);
+	}
+
+	function body(ctx: EventHandlerContext, text: string, offset = 0, blockId = "body") {
+		return processEvent(
+			{ type: "stream_text", blockRevision: offset + 1, blockTextOffset: offset, text, blockId },
+			ctx,
+		);
+	}
+
 	/** The parent's own Agent call owns a snapshot chunk once `tool_call` ran. */
 	async function parentAgentChunk(toolUseId = PARENT_TOOL_USE_ID) {
 		await processEvent(
@@ -2579,7 +4378,7 @@ describe("subagent live output char count", () => {
 
 	test("counts a subagent's streamed text and ticks the parent's Agent card", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2599,15 +4398,23 @@ describe("subagent live output char count", () => {
 		});
 		// Not a child-tool frame: the parent page must fold this into its OWN card.
 		expect(frames.at(-1)).not.toHaveProperty("parentToolUseId");
-		// The snapshot carries the same count so a reconnecting client restores it.
+		expect(frames.at(-1)?.subagentOutputCount).toMatchObject({
+			...sub.subagentOutputIdentity,
+			count: 5,
+			active: true,
+		});
+		// Run projections restore the count independently of transient tool chunks.
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...sub.subagentOutputIdentity, count: 5, active: true },
+		]);
 		expect(
 			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(PARENT_TOOL_USE_ID)?.streamingOutput,
-		).toBe("5");
+		).toBeUndefined();
 	});
 
 	test("throttled frames keep only the latest cumulative total", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2637,7 +4444,7 @@ describe("subagent live output char count", () => {
 
 	test("an overlapping replay does not double-count", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2677,9 +4484,9 @@ describe("subagent live output char count", () => {
 		expect(toolOutputFrames()).toHaveLength(0);
 	});
 
-	test("skips the broadcast while no card tracks the tool, resuming with the full total", async () => {
-		const sub = makeSubagentContext();
-		// No Agent chunk yet: nothing to show the count on, so nothing is sent…
+	test("broadcasts the accumulated total while the parent has no transient tool chunk", async () => {
+		const sub = startOutputContext();
+		// The durable Agent card remains a destination even when its stream chunk is gone.
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2690,9 +4497,8 @@ describe("subagent live output char count", () => {
 			},
 			sub,
 		);
-		expect(toolOutputFrames()).toHaveLength(0);
-		// …but the counter keeps accumulating, so a card appearing later resumes
-		// from the true total rather than zero.
+		expect(toolOutputFrames().at(-1)?.output).toBe("5");
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)).toBeUndefined();
 		await parentAgentChunk();
 		await processEvent(
 			{ type: "stream_text", blockRevision: 8, blockTextOffset: 43, text: "!", blockId: "blk-1" },
@@ -2703,7 +4509,7 @@ describe("subagent live output char count", () => {
 
 	test("iteration-level snapshot resets do NOT retire the counter (run-scoped total)", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2733,7 +4539,8 @@ describe("subagent live output char count", () => {
 
 	test("a discarded attempt restarts the count with the replayed stream", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
+		await startRequest(sub, "discarded-body-request");
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2745,8 +4552,9 @@ describe("subagent live output char count", () => {
 			sub,
 		);
 		await untilOutput("5");
-		// The dead-turn reset retracts the streamed text; the count starts over.
+		// The dead-turn reset retracts this provider request's body.
 		await processEvent({ type: "stream_reset" }, sub);
+		await startRequest(sub, "retried-body-request");
 		await processEvent(
 			{ type: "stream_text", blockRevision: 11, blockTextOffset: 54, text: "Hi", blockId: "blk-1" },
 			sub,
@@ -2754,9 +4562,81 @@ describe("subagent live output char count", () => {
 		await untilOutput("2");
 	});
 
+	test("a successful response survives a later reasoning-only request's stream reset", async () => {
+		const sub = startOutputContext();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: sub.narratorId, createdAt: now, updatedAt: now });
+		try {
+			await startRequest(sub, "completed-response-request");
+			await body(sub, "successful reply");
+			await processEvent({ type: "api_request_end", requestId: "completed-response-request" }, sub);
+			await processEvent(
+				{ type: "assistant_message", text: "successful reply", toolUses: [] },
+				sub,
+			);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(16);
+			await startRequest(sub, "reasoning-only-request");
+			await processEvent(
+				{
+					type: "stream_reasoning",
+					blockId: "reasoning",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					text: "thinking only",
+				},
+				sub,
+			);
+			await processEvent({ type: "api_request_end", requestId: "reasoning-only-request" }, sub);
+			await processEvent({ type: "stream_reset" }, sub);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+				{ ...sub.subagentOutputIdentity, count: 16, active: true },
+			]);
+		} finally {
+			await cleanupFileContextNarrator(sub.narratorId);
+		}
+	});
+
+	test("discard retracts only its real provider request while completed and newer requests survive", async () => {
+		const sub = startOutputContext();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: sub.narratorId, createdAt: now, updatedAt: now });
+		try {
+			await startRequest(sub, "retained-response-request");
+			await body(sub, "kept");
+			await processEvent({ type: "api_request_end", requestId: "retained-response-request" }, sub);
+			await processEvent({ type: "assistant_message", text: "kept", toolUses: [] }, sub);
+			await startRequest(sub, "retracted-response-request");
+			await body(sub, "temporary", 0, "reused-body-id");
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(13);
+			await processEvent(
+				{ type: "attempt_discarded", requestId: "retracted-response-request" },
+				sub,
+			);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(4);
+			expect(toolOutputFrames().at(-1)?.subagentOutputCount).toMatchObject({
+				count: 4,
+				active: true,
+			});
+			await processEvent({ type: "api_request_end", requestId: "retracted-response-request" }, sub);
+			await startRequest(sub, "retry-response-request");
+			await body(sub, "retry", 0, "reused-body-id");
+			await processEvent(
+				{ type: "attempt_discarded", requestId: "retracted-response-request" },
+				sub,
+			);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(9);
+			await processEvent({ type: "api_request_end", requestId: "retry-response-request" }, sub);
+			await processEvent({ type: "assistant_message", text: "retry", toolUses: [] }, sub);
+			await processEvent({ type: "stream_reset" }, sub);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(9);
+		} finally {
+			await cleanupFileContextNarrator(sub.narratorId);
+		}
+	});
+
 	test("a replay fully inside the streamed span never shrinks the count", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2788,7 +4668,7 @@ describe("subagent live output char count", () => {
 
 	test("run end flushes the final count and retires the counter", async () => {
 		await parentAgentChunk();
-		const sub = makeSubagentContext();
+		const sub = startOutputContext();
 		await processEvent(
 			{
 				type: "stream_text",
@@ -2805,8 +4685,12 @@ describe("subagent live output char count", () => {
 			sub,
 		);
 		expect(toolOutputFrames()).toHaveLength(1);
-		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
-		expect(toolOutputFrames().at(-1)?.output).toBe("7");
+		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID, "count-run");
+		expect(toolOutputFrames().at(-1)).toMatchObject({
+			output: "7",
+			subagentOutputCount: { ...sub.subagentOutputIdentity, count: 7, active: false },
+		});
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([]);
 	});
 });
 

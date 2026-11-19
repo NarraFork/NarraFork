@@ -56,6 +56,7 @@ import {
 	runtimePublication,
 	taskPublicationRun,
 } from "./agent-runtime/publication";
+import { assertPublicationTaskIdentity } from "./agent-runtime/publication-outbox";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
@@ -940,6 +941,8 @@ class BackgroundTaskService {
 			subagentNarratorId: opts.subagentNarratorId,
 			subagentType: opts.subagentType,
 			toolUseId: opts.toolUseId ?? null,
+			toolCallId: opts.binding.deliverTo.toolCallId ?? null,
+			executionAttempt: opts.binding.deliverTo.attempt ?? null,
 			alias: opts.alias ?? null,
 			title: opts.title ?? null,
 			output: null,
@@ -950,11 +953,16 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		const { binding } = await pub.startRun({
-			narratorId: opts.subagentNarratorId,
-			binding: opts.binding,
-			taskRow,
-		});
+		// Lock order: admission (when present), traits, then the registration transaction.
+		// The publication transaction reads the latest traits instead of merging a snapshot.
+		const { binding } = await narratorTraitsLock.acquire(opts.subagentNarratorId, () =>
+			pub.startRun({
+				narratorId: opts.subagentNarratorId,
+				binding: opts.binding,
+				taskRow,
+			}),
+		);
+		backgroundOccupancyStore.refreshNarrator(opts.subagentNarratorId);
 		const publicationRun = { logicalRunId: binding.logicalRunId };
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 		this.queueTaskUpsert(opts.parentNarratorId, opts.id);
@@ -1193,6 +1201,7 @@ class BackgroundTaskService {
 		setFields: Record<string, unknown>,
 		fullOutput?: string | null,
 		deferPublication = false,
+		expectedRun?: PublicationRun,
 	): Promise<BackgroundTaskRecord | undefined> {
 		const prepared = await this.prepareTerminalBashOutput(
 			taskId,
@@ -1210,6 +1219,7 @@ class BackgroundTaskService {
 				fields,
 				fullOutput,
 				deferPublication,
+				expectedRun,
 			);
 			if (!task) await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
 			return task;
@@ -1223,6 +1233,7 @@ class BackgroundTaskService {
 		setFields: Record<string, unknown>,
 		fullOutput?: string | null,
 		deferPublication = false,
+		expectedRun?: PublicationRun,
 	): Promise<BackgroundTaskRecord | undefined> {
 		if (resolveRuntimeQueueBackend() === "postgres") {
 			// B4 fix: use the named PG composite — CAS update + publication commit
@@ -1243,6 +1254,7 @@ class BackgroundTaskService {
 				summary,
 				eventKind: eventKind as Exclude<PublicationEvent, "started">,
 				deferPublication,
+				expectedRun,
 			});
 			if (task) pub.schedule();
 			// The composite returns partial fields; cast to BackgroundTaskRecord
@@ -1260,6 +1272,7 @@ class BackgroundTaskService {
 					.get(),
 			fullOutput,
 			deferPublication,
+			expectedRun,
 		);
 	}
 
@@ -1272,6 +1285,7 @@ class BackgroundTaskService {
 		write: (tx: RuntimeTx) => BackgroundTaskRecord | undefined,
 		fullOutput?: string | null,
 		deferPublication = false,
+		expectedRun?: PublicationRun,
 	) {
 		const task = runAtomicWrite(db, "background-task.commitTerminalTask", (tx) => {
 			const before = tx
@@ -1280,10 +1294,12 @@ class BackgroundTaskService {
 					type: backgroundTasks.type,
 					parentNarratorId: backgroundTasks.parentNarratorId,
 					logicalRunId: backgroundTasks.logicalRunId,
+					status: backgroundTasks.status,
 				})
 				.from(backgroundTasks)
 				.where(eq(backgroundTasks.id, taskId))
 				.get();
+			if (expectedRun) assertPublicationTaskIdentity(expectedRun, before);
 			if (before && before.type !== "transfer" && !before.logicalRunId) {
 				runtimePublication.store.registerLegacyRunningRunSlots(
 					{

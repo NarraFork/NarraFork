@@ -12,8 +12,23 @@ import {
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import {
+	getValidReasoningTranslationParts,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
+import {
+	and,
+	desc,
+	eq,
+	getTableColumns,
+	inArray,
+	isNull,
+	ne,
+	or,
+	type SQL,
+	sql,
+} from "drizzle-orm";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
 	narratorBlocks,
@@ -67,6 +82,8 @@ import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
 	contentByAttempt,
+	createBlockSyncStats,
+	flushChangedEnvelopeTargets,
 	flushQueuedSince,
 	newEnvelopeColumns,
 	patchEnvelopeState,
@@ -103,6 +120,228 @@ import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./na
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+type ToolResultSyncMode = "targeted" | "callback" | "fallback";
+const TOOL_RESULT_SLOW_MS = 25;
+const TOOL_RESULT_LOG_INTERVAL_MS = 60_000;
+const toolResultLogWindow = { lastAt: -Infinity, suppressed: 0, maxTransactionMs: 0 };
+
+function toolResultDiagnosticNow(): number {
+	try {
+		return performance.now();
+	} catch {
+		return 0;
+	}
+}
+
+/** The boundary includes SQLite commit/rollback; diagnostics never replace a write's outcome. */
+function observeToolResultTransaction<T>(
+	observation: { mode: ToolResultSyncMode },
+	write: () => T,
+): T {
+	const stats = createBlockSyncStats();
+	const started = toolResultDiagnosticNow();
+	let committed = false;
+	try {
+		const value = withBlockSyncStats(stats, write);
+		committed = true;
+		return value;
+	} finally {
+		try {
+			const transactionMs = Math.max(0, toolResultDiagnosticNow() - started);
+			if (transactionMs >= TOOL_RESULT_SLOW_MS) {
+				const now = Date.now();
+				toolResultLogWindow.maxTransactionMs = Math.max(
+					toolResultLogWindow.maxTransactionMs,
+					transactionMs,
+				);
+				if (now - toolResultLogWindow.lastAt < TOOL_RESULT_LOG_INTERVAL_MS) {
+					toolResultLogWindow.suppressed++;
+				} else {
+					const { suppressed, maxTransactionMs } = toolResultLogWindow;
+					toolResultLogWindow.lastAt = now;
+					toolResultLogWindow.suppressed = 0;
+					toolResultLogWindow.maxTransactionMs = 0;
+					logger.warn("Slow tool result transaction", {
+						operation: "updateToolCallResult",
+						syncMode: observation.mode,
+						outcome: committed ? "committed" : "rolled_back",
+						transactionMs,
+						suppressed,
+						maxTransactionMs,
+						...stats,
+					});
+				}
+			}
+		} catch {
+			// Logging and clocks are best effort, including while an original error unwinds.
+		}
+	}
+}
+
+function toolResultFailureMetadata(error: unknown): { code: string | null; errno: number | null } {
+	let code: string | null = null;
+	let errno: number | null = null;
+	try {
+		for (let depth = 0; error && typeof error === "object" && depth < 4; depth++) {
+			const value = error as { code?: unknown; errno?: unknown; cause?: unknown };
+			if (typeof value.code === "string" && /^[A-Z0-9_]{1,64}$/.test(value.code)) code = value.code;
+			if (typeof value.errno === "number" && Number.isFinite(value.errno)) errno = value.errno;
+			error = value.cause;
+		}
+	} catch {
+		// Error metadata may itself be supplied by an external callback.
+	}
+	return { code, errno };
+}
+
+/** Driver metadata outranks messages, which may contain SQL, parameters or callback text. */
+function isToolResultLockError(error: unknown): boolean {
+	let driverDecision: boolean | undefined;
+	let message: string | undefined;
+	try {
+		for (let depth = 0; error && typeof error === "object" && depth < 4; depth++) {
+			const value = error as {
+				code?: unknown;
+				errno?: unknown;
+				message?: unknown;
+				cause?: unknown;
+			};
+			message = typeof value.message === "string" ? value.message : undefined;
+			if (typeof value.code === "string" && value.code.startsWith("SQLITE_")) {
+				driverDecision = /^SQLITE_(?:BUSY|LOCKED)(?:_|$)/.test(value.code);
+			} else if (typeof value.errno === "number" && Number.isSafeInteger(value.errno)) {
+				// Extended codes retain their primary SQLite result code in the low byte.
+				const primaryCode = value.errno & 0xff;
+				driverDecision = primaryCode === 5 || primaryCode === 6;
+			}
+			error = value.cause;
+		}
+	} catch {
+		return false;
+	}
+	return (
+		driverDecision ??
+		/^(?:database(?: table)? is locked|SQLITE_(?:BUSY|LOCKED)(?:_[A-Z_]+)?(?:: database(?: table)? is locked)?)$/.test(
+			message ?? "",
+		)
+	);
+}
+
+type AssistantContentPhase =
+	| "transaction"
+	| "notification"
+	| "version-write"
+	| "publication-read"
+	| "broadcast";
+
+interface AssistantContentObservation {
+	phase: AssistantContentPhase;
+	attempt: number;
+	committed: boolean;
+}
+
+const ASSISTANT_CONTENT_FAILURE_CODES = new Set([
+	"SQLITE_ERROR",
+	"SQLITE_BUSY",
+	"SQLITE_BUSY_RECOVERY",
+	"SQLITE_BUSY_SNAPSHOT",
+	"SQLITE_BUSY_TIMEOUT",
+	"SQLITE_LOCKED",
+	"SQLITE_LOCKED_SHAREDCACHE",
+	"SQLITE_LOCKED_VTAB",
+	"SQLITE_CONSTRAINT",
+	"SQLITE_CONSTRAINT_CHECK",
+	"SQLITE_CONSTRAINT_FOREIGNKEY",
+	"SQLITE_CONSTRAINT_NOTNULL",
+	"SQLITE_CONSTRAINT_PRIMARYKEY",
+	"SQLITE_CONSTRAINT_TRIGGER",
+	"SQLITE_CONSTRAINT_UNIQUE",
+	"SQLITE_READONLY",
+	"SQLITE_IOERR",
+	"SQLITE_CORRUPT",
+	"SQLITE_FULL",
+	"SQLITE_MISUSE",
+	"DB_READ_FAILED",
+]);
+
+/** Callback-supplied fields may contain secrets even when shaped like driver metadata. */
+function assistantContentFailureMetadata(error: unknown): {
+	code: string | null;
+	errno: number | null;
+} {
+	let code: string | null = null;
+	let errno: number | null = null;
+	try {
+		for (let depth = 0; error && typeof error === "object" && depth < 4; depth++) {
+			const value = error as { code?: unknown; errno?: unknown; cause?: unknown };
+			if (typeof value.code === "string" && ASSISTANT_CONTENT_FAILURE_CODES.has(value.code))
+				code = value.code;
+			if (
+				typeof value.errno === "number" &&
+				Number.isSafeInteger(value.errno) &&
+				value.errno >= 0 &&
+				value.errno <= 0xffff
+			)
+				errno = value.errno;
+			error = value.cause;
+		}
+	} catch {
+		// Metadata getters are untrusted too; diagnostics remain best effort.
+	}
+	return { code, errno };
+}
+
+function reportAssistantContentFailure(
+	error: unknown,
+	observation: AssistantContentObservation,
+	retrying = false,
+): void {
+	try {
+		logger[retrying ? "warn" : "error"]("Assistant content persistence failed", {
+			operation: "appendBlockToMessage",
+			...observation,
+			...assistantContentFailureMetadata(error),
+		});
+	} catch {
+		// Diagnostics must not expose payloads or replace the original barrier failure.
+	}
+}
+
+/** Retry only a synchronous transaction or its independent publication-version SQL. */
+async function retryAssistantContentWrite<T>(
+	observation: AssistantContentObservation,
+	phase: "transaction" | "version-write",
+	write: () => T | Promise<T>,
+): Promise<T> {
+	observation.phase = phase;
+	for (let attempt = 1; ; attempt++) {
+		observation.attempt = attempt;
+		try {
+			return await write();
+		} catch (error) {
+			if (attempt >= 3 || !isToolResultLockError(error)) throw error;
+			reportAssistantContentFailure(error, observation, true);
+			await new Promise<void>((resolve) => setTimeout(resolve, 200 * 2 ** (attempt - 1)));
+		}
+	}
+}
+
+function notifyToolResult(phase: "context-characters" | "tool-changed", notify: () => void): void {
+	try {
+		notify();
+	} catch (error) {
+		try {
+			logger.warn("Tool result notification failed", {
+				operation: "updateToolCallResult",
+				phase,
+				...toolResultFailureMetadata(error),
+			});
+		} catch {
+			// The result is committed; even a failed diagnostic must not invite replay.
+		}
+	}
+}
 
 /** Use the durable current-run receipt; provider IDs and creation origins are not execution authority. */
 async function findExecutionSegmentParent(
@@ -3032,27 +3271,31 @@ const sqliteNarratorPersistence = {
 			  },
 		options?: {
 			republishUnchanged?: boolean;
+			/** Caller-owned, current-message evidence for retrying only a failed notification. */
+			contextCharacterRefreshState?: { pending: boolean };
 			/** The provider request writing this item; its blocks are discarded by it. */
 			attemptId?: string;
 		},
 	) {
-		// The segment parent is read up front; the block and its ledger row are then one
-		// transaction, so a tool_use never commits without the row that pairs its result.
-		const toolParentSegmentId =
-			block.type === "tool_use"
-				? ((await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null)
-				: null;
-		const toolCreatedAt = new Date().toISOString();
-		let toolCallId: string | undefined;
-		// No await between reading and replacing the JSON body: a concurrent checkpoint
-		// or translation must not overwrite a newer revision read by another consumer.
-		// A transient BUSY here aborts the whole assistant-content checkpoint, and the
-		// loop treats that as a critical persistence failure. Other writers in this file
-		// already retry the same way; this path must not be the one that gives up first.
-		const persisted = await withDbRetry(
-			async () =>
+		const observation: AssistantContentObservation = {
+			phase: "publication-read",
+			attempt: 1,
+			committed: false,
+		};
+		try {
+			// The segment parent is read up front; the block and its ledger row are then one
+			// transaction, so a tool_use never commits without the row that pairs its result.
+			const toolParentSegmentId =
+				block.type === "tool_use"
+					? ((await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null)
+					: null;
+			const toolCreatedAt = new Date().toISOString();
+			// Each synchronous attempt takes the writer lock before reading the current body.
+			// Its receipt is adopted only after commit, never from a rolled-back attempt.
+			const persisted = await retryAssistantContentWrite(observation, "transaction", () =>
 				db.transaction(
 					(tx) => {
+						let toolCallId: string | undefined;
 						const queueMark = syncQueueMark();
 						const existing = fillBody(
 							tx.query.narratorMessages
@@ -3175,7 +3418,12 @@ const sqliteNarratorPersistence = {
 							// pull later reasoning in front of text/tools that were actually seen first.
 							content = [...current, block];
 						}
-						if (content === current && !options?.republishUnchanged) return undefined;
+						if (
+							content === current &&
+							!options?.republishUnchanged &&
+							!options?.contextCharacterRefreshState?.pending
+						)
+							return undefined;
 						const writeLedgerRow = () => {
 							if (block.type === "tool_use")
 								toolCallId = insertToolCallRowTx(tx, {
@@ -3203,74 +3451,114 @@ const sqliteNarratorPersistence = {
 								stamp,
 								rows: writeLedgerRow,
 							});
-							queueContextCharacterRefresh(narratorId, messageId);
 						} else {
 							writeLedgerRow();
 							syncEnvelopeNow(messageId, "streaming", stamp);
 						}
 						flushQueuedSince(queueMark);
-						return existing;
+						return { existing, toolCallId, changed: content !== current };
 					},
 					{ behavior: "immediate" },
 				),
-			{ label: "appendBlockToMessage", maxRetries: 5 },
-		);
-		if (!persisted) return undefined;
-		const existing = persisted;
-
-		/**
-		 * Publish the partial now that it holds real content.
-		 *
-		 * Completed blocks are removed from the reconnect streaming snapshot at
-		 * `block_complete`, so without this announce a reconnecting client would see
-		 * neither the live row nor the committed copy — reasoning and assistant text
-		 * vanish until some later reload. Matches the `messageVersion` contract: a
-		 * bump always ships with a broadcast of the current message body.
-		 */
-		const publishPartial = async () => {
-			const owner = existing.parentToolUseId
-				? await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { parentNarratorId: true },
-					})
-				: undefined;
-			const broadcastTargetId = owner?.parentNarratorId ?? narratorId;
-			// The parent embeds this child's messages, so its reconnect version must
-			// change at the same boundary as the child's (never for the empty shell).
-			await bumpNarratorMessageVersions([narratorId, broadcastTargetId]);
-			const published = fillBody(
-				await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, messageId),
-					...bodyColumns(),
-					with: { toolCalls: true },
-				}),
 			);
-			if (!published) throw new NotFoundError("Assistant message", messageId);
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-				columns: { seq: true },
-			});
-			const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
-			if (!projected) throw new Error(`Cannot publish assistant message ${messageId}`);
-			dualBroadcastToNarrator(
-				{
-					narratorId,
-					broadcastTargetId,
-					parentToolUseId: existing.parentToolUseId,
-				},
-				{
-					type: "message_updated",
-					narratorId,
-					message: projected,
-				},
-			);
-		};
+			observation.committed = true;
+			if (!persisted) return undefined;
+			const { existing, toolCallId, changed } = persisted;
+			observation.phase = "notification";
+			observation.attempt = 1;
+			const refreshState = options?.contextCharacterRefreshState;
+			if (changed && refreshState) refreshState.pending = true;
+			if (changed || refreshState?.pending) {
+				queueContextCharacterRefresh(narratorId, messageId);
+				if (refreshState) refreshState.pending = false;
+			}
 
-		await publishPartial();
-		return toolCallId;
+			/**
+			 * Publish the partial now that it holds real content.
+			 *
+			 * Completed blocks are removed from the reconnect streaming snapshot at
+			 * `block_complete`, so without this announce a reconnecting client would see
+			 * neither the live row nor the committed copy — reasoning and assistant text
+			 * vanish until some later reload. Matches the `messageVersion` contract: a
+			 * bump always ships with a broadcast of the current message body.
+			 */
+			const publishPartial = async () => {
+				observation.phase = "publication-read";
+				observation.attempt = 1;
+				const owner = existing.parentToolUseId
+					? await readQuery(
+							db.query.narrators.findFirst({
+								where: eq(narrators.id, narratorId),
+								columns: { parentNarratorId: true },
+							}),
+							{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+						)
+					: undefined;
+				const broadcastTargetId = owner?.parentNarratorId ?? narratorId;
+				// The parent embeds this child's messages, so its reconnect version must
+				// change at the same boundary as the child's (never for the empty shell).
+				await retryAssistantContentWrite(observation, "version-write", () =>
+					bumpNarratorMessageVersions([narratorId, broadcastTargetId]),
+				);
+				observation.phase = "publication-read";
+				observation.attempt = 1;
+				const published = fillBody(
+					(
+						await readNarratorMessageRows(
+							(
+								await readQuery(
+									db.query.narratorMessages.findMany({
+										...{
+											where: eq(narratorMessages.id, messageId),
+											...bodyColumns(),
+											with: { toolCalls: true },
+										},
+										columns: { id: true },
+										with: undefined,
+										extras: undefined,
+										limit: 1,
+									}),
+									{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+								)
+							).map((row) => row.id),
+							{ includeTools: true, includeCreator: false },
+						)
+					)[0],
+				);
+				if (!published) throw new NotFoundError("Assistant message", messageId);
+				const ref = await readQuery(
+					db.query.narratorMessageRefs.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+						columns: { seq: true },
+					}),
+					{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+				);
+				const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
+				if (!projected) throw new Error(`Cannot publish assistant message ${messageId}`);
+				observation.phase = "broadcast";
+				dualBroadcastToNarrator(
+					{
+						narratorId,
+						broadcastTargetId,
+						parentToolUseId: existing.parentToolUseId,
+					},
+					{
+						type: "message_updated",
+						narratorId,
+						message: projected,
+					},
+				);
+			};
+
+			await publishPartial();
+			return toolCallId;
+		} catch (error) {
+			reportAssistantContentFailure(error, observation);
+			throw error;
+		}
 	},
 
 	async patchReasoningTranslation(
@@ -4610,8 +4898,10 @@ const sqliteNarratorPersistence = {
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
 			preserveTiming?: boolean;
-			/** Detached completions must atomically match their original execution authority. */
+			/** Completions must atomically match their original execution authority. */
 			expectedBinding?: ToolCallBinding & { narratorId: string };
+			/** Ordinary results retain provider-local parent version fan-out alongside their CAS. */
+			includeLegacyParentVersions?: boolean;
 			/** Persist a permission redirect/sanitized input in the same CAS as the result. */
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
@@ -4654,121 +4944,177 @@ const sqliteNarratorPersistence = {
 				ne(narratorToolCalls.status, "success"),
 				ne(narratorToolCalls.status, "fail"),
 			);
-		const affectedToolCalls = db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				if (
-					sqlite
-						.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
-						.get(exactId)
-				)
-					return [];
-				const updated = tx
-					.update(narratorToolCalls)
-					.set({
-						outputJson: result.output ?? null,
-						outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-						status: result.status,
-						errorMessage: result.errorMessage ?? null,
-						permissionStartedAt:
-							typeof result.permissionStartedAt === "number"
-								? new Date(result.permissionStartedAt).toISOString()
-								: undefined,
-						executionStartedAt:
-							typeof result.executionStartedAt === "number"
-								? new Date(result.executionStartedAt).toISOString()
-								: undefined,
-						...(result.preserveTiming
-							? {}
-							: {
-									durationMs: result.durationMs ?? null,
-									completedAt:
-										typeof result.completedAt === "number"
-											? new Date(result.completedAt).toISOString()
-											: new Date().toISOString(),
-								}),
-						...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-					})
-					.where(and(...conditions))
-					.returning({
-						id: narratorToolCalls.id,
-						narratorId: narratorToolCalls.narratorId,
-						messageId: narratorToolCalls.messageId,
-						toolUseId: narratorToolCalls.toolUseId,
-						toolName: narratorToolCalls.toolName,
-						executionDeviceId: narratorToolCalls.executionDeviceId,
-					})
-					.all();
-				// Another writer already settled or retired this receipt. A recovery
-				// explanation must not replace it or trigger another publication commit.
-				if (result.onlyIfActive && updated.length === 0) return [];
-				if (expected && updated.length !== 1) {
-					throw new ValidationError(
-						"Tool execution binding is stale or belongs to another narrator",
+		// Pure payload work stays outside the write lock and is shared by all attempts.
+		const completedAt = new Date().toISOString();
+		const payload = {
+			outputJson: result.output ?? null,
+			outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
+			status: result.status,
+			errorMessage: result.errorMessage ?? null,
+			permissionStartedAt:
+				typeof result.permissionStartedAt === "number"
+					? new Date(result.permissionStartedAt).toISOString()
+					: undefined,
+			executionStartedAt:
+				typeof result.executionStartedAt === "number"
+					? new Date(result.executionStartedAt).toISOString()
+					: undefined,
+			...(result.preserveTiming
+				? {}
+				: {
+						durationMs: result.durationMs ?? null,
+						completedAt:
+							typeof result.completedAt === "number"
+								? new Date(result.completedAt).toISOString()
+								: completedAt,
+					}),
+			...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+		};
+		let attempt = 0;
+		let failedAttempt: { error: unknown } | undefined;
+		const transactionResult = await withDbRetry(
+			async () => {
+				attempt++;
+				try {
+					const observation: { mode: ToolResultSyncMode } = {
+						mode: result.onPersist ? "callback" : "targeted",
+					};
+					const toolCalls = observeToolResultTransaction(observation, () =>
+						db.transaction(
+							(tx) => {
+								const queueMark = syncQueueMark();
+								if (
+									sqlite
+										.query(
+											`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`,
+										)
+										.get(exactId)
+								)
+									return [];
+								const updated = tx
+									.update(narratorToolCalls)
+									.set(payload)
+									.where(and(...conditions))
+									.returning({
+										id: narratorToolCalls.id,
+										narratorId: narratorToolCalls.narratorId,
+										messageId: narratorToolCalls.messageId,
+										toolUseId: narratorToolCalls.toolUseId,
+										toolName: narratorToolCalls.toolName,
+										executionDeviceId: narratorToolCalls.executionDeviceId,
+									})
+									.all();
+								// A settled recovery receipt cannot trigger another publication callback.
+								if (result.onlyIfActive && updated.length === 0) return [];
+								if (expected && updated.length !== 1) {
+									throw new ValidationError(
+										"Tool execution binding is stale or belongs to another narrator",
+									);
+								}
+								// A redirected or sanitized input is stored with the result it produced.
+								if (result.input !== undefined)
+									for (const row of updated)
+										overwriteToolInputTx(tx, row.id, toolUseId, result.input);
+								result.onPersist?.(tx);
+								// Exact settlement targets commit with their block state even if already queued;
+								// input rewrites synced above are no longer dirty and are not derived twice.
+								const targets = updated
+									.map((row) => row.messageId)
+									.filter((id): id is string => typeof id === "string" && !!id);
+								flushChangedEnvelopeTargets(targets);
+								// Callback writes can queue other envelopes. Only this transaction's new work
+								// is ours to flush; unrelated earlier entries remain for the sweep.
+								if (result.onPersist) flushQueuedSince(queueMark);
+								else if (targets.length !== updated.length) {
+									observation.mode = "fallback";
+									flushQueuedSince(queueMark);
+								}
+								if (result.bumpMessageVersion !== false && updated.length > 0) {
+									const ownerIds = [
+										...new Set(updated.map((row) => row.narratorId).filter(Boolean)),
+									];
+									const parentCondition =
+										expected && !result.includeLegacyParentVersions
+											? sql`${narrators.id} in (
+							select ${narrators.parentNarratorId} from ${narrators}
+							where ${narrators.id} = ${expected.narratorId} and ${narrators.type} = 'subagent'
+						)`
+											: targets.length > 0
+												? sql`${narrators.id} in (
+								select ${narratorToolCalls.narratorId} from ${narratorToolCalls}
+								where ${narratorToolCalls.toolUseId} in (
+									select ${narratorMessages.parentToolUseId} from ${narratorMessages}
+									where ${inArray(narratorMessages.id, targets)} and ${narratorMessages.parentToolUseId} <> ''
+								)
+							)`
+												: undefined;
+									// SQL IN deduplicates all legacy parent owners without materializing them.
+									tx.update(narrators)
+										.set({
+											messageVersion: sql`${narrators.messageVersion} + 1`,
+											updatedAt: new Date().toISOString(),
+										})
+										.where(or(inArray(narrators.id, ownerIds), parentCondition))
+										.run();
+								}
+								return updated;
+							},
+							{ behavior: "immediate" },
+						),
+					);
+					return { committed: true as const, toolCalls };
+				} catch (error) {
+					failedAttempt = { error };
+					const { code, errno } = toolResultFailureMetadata(error);
+					if (!isToolResultLockError(error)) {
+						try {
+							logger.error("Tool result transaction failed", {
+								operation: "updateToolCallResult",
+								phase: "transaction",
+								code,
+								errno,
+								attempt,
+							});
+						} catch {
+							// Preserve the original failure even if the diagnostic sink fails.
+						}
+						// A fulfilled failure result bypasses withDbRetry's message classifier.
+						return { committed: false as const, error };
+					}
+					// Only classified lock errors reach the helper; its bounded diagnostic
+					// must never expose query/parameter text from the original failure.
+					throw new Error(
+						`Tool result transaction failed (phase=transaction, code=${code}, errno=${errno}): database is locked`,
 					);
 				}
-				// A redirected or sanitized input is stored with the result it produced.
-				if (result.input !== undefined)
-					for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
-				result.onPersist?.(tx);
-				// The settled tool block (phase, binding, searchable result) commits with it.
-				flushQueuedSince(queueMark);
-				return updated;
 			},
-			{ behavior: "immediate" },
-		);
+			{ label: "updateToolCallResult", maxRetries: 5 },
+		).catch((error) => {
+			throw failedAttempt ? failedAttempt.error : error;
+		});
+		if (!transactionResult.committed) throw transactionResult.error;
+		const affectedToolCalls = transactionResult.toolCalls;
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
 		// "which tool ran on which device, how long it took, did it fail" to follow along; without
 		// this they cannot distinguish "the model is thinking" from "a tool has been running for
 		// two minutes". Input/output payloads are deliberately excluded.
 		for (const toolCall of affectedToolCalls) {
-			queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined);
-			eventBus.emit({
-				type: "narrator:tool_changed",
-				narratorId: toolCall.narratorId,
-				toolUseId: toolCall.toolUseId,
-				toolName: toolCall.toolName,
-				status: result.status,
-				...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
-				executionDeviceId: toolCall.executionDeviceId,
-				...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-			});
-		}
-
-		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
-		const affectedMessageIds = [
-			...new Set(affectedToolCalls.map((tc) => tc.messageId).filter((id): id is string => !!id)),
-		];
-		if (expected) {
-			// Detached results must not infer a parent from a provider-local tool-use id.
-			const owner = await db.query.narrators.findFirst({
-				where: eq(narrators.id, expected.narratorId),
-				columns: { type: true, parentNarratorId: true },
-			});
-			if (owner?.type === "subagent" && owner.parentNarratorId) {
-				affectedNarratorIds.push(owner.parentNarratorId);
-			}
-		} else if (affectedMessageIds.length > 0) {
-			const affectedMessages = await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, affectedMessageIds),
-				columns: { parentToolUseId: true },
-			});
-			const parentToolUseIds = [
-				...new Set(
-					affectedMessages.map((msg) => msg.parentToolUseId).filter((id): id is string => !!id),
-				),
-			];
-			if (parentToolUseIds.length > 0) {
-				const parentToolCalls = await db.query.narratorToolCalls.findMany({
-					where: inArray(narratorToolCalls.toolUseId, parentToolUseIds),
-					columns: { narratorId: true },
-				});
-				affectedNarratorIds.push(...parentToolCalls.map((tc) => tc.narratorId));
-			}
-		}
-		if (result.bumpMessageVersion !== false) {
-			await bumpNarratorMessageVersions(affectedNarratorIds);
+			notifyToolResult("context-characters", () =>
+				queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined),
+			);
+			notifyToolResult("tool-changed", () =>
+				eventBus.emit({
+					type: "narrator:tool_changed",
+					narratorId: toolCall.narratorId,
+					toolUseId: toolCall.toolUseId,
+					toolName: toolCall.toolName,
+					status: result.status,
+					...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
+					executionDeviceId: toolCall.executionDeviceId,
+					...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+				}),
+			);
 		}
 		return affectedToolCalls[0];
 	},
@@ -4870,6 +5216,17 @@ const sqliteNarratorPersistence = {
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
 		options: {
 			preserveExecutionOwner?: boolean;
+			/** Derive a body edit from the current envelope inside the COW write transaction. */
+			mutateBody?: (
+				content: unknown,
+				tx: DbTx,
+				messageId: string,
+			) =>
+				| (Partial<typeof narratorMessages.$inferInsert> & {
+						contentJson: unknown[];
+						contentText: string | null;
+				  })
+				| null;
 			/** Writes that belong to the edit, run first in its transaction. */
 			beforeWrite?: (tx: DbTx) => void;
 			/** Writes that follow the edit once its block rows are rebuilt, in its transaction. */
@@ -4886,7 +5243,7 @@ const sqliteNarratorPersistence = {
 			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
 		);
 		if (!ref) throw new NotFoundError("Message", messageId);
-		const semanticEdit =
+		let semanticEdit =
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (semanticEdit && overrides) {
@@ -4914,9 +5271,31 @@ const sqliteNarratorPersistence = {
 			{ behavior: "immediate" },
 		);
 		function rewrite(tx: DbTx): string {
-			const original = readEnvelope(tx, messageId);
-			if (!original) throw new NotFoundError("Message", messageId);
+			const before = readEnvelope(tx, messageId);
+			if (!before) throw new NotFoundError("Message", messageId);
 			options.beforeWrite?.(tx);
+			const original =
+				options.mutateBody && options.beforeWrite ? readEnvelope(tx, messageId) : before;
+			if (!original) throw new NotFoundError("Message", messageId);
+			let mutationNoop = false;
+			if (options.mutateBody) {
+				// A state patch may have settled during the ref read above. Mutate the latest body,
+				// including any synchronous beforeWrite changes, never the caller's earlier snapshot.
+				const mutation = options.mutateBody(original.contentJson, tx, messageId);
+				mutationNoop = !mutation && !overrides;
+				if (mutation) {
+					overrides = {
+						...overrides,
+						...mutation,
+						contextCharsJson: measureMessageCharacters(
+							mutation.role ?? overrides?.role ?? original.role,
+							mutation.contentJson,
+							mutation.contentText,
+						),
+					};
+					semanticEdit = true;
+				}
+			}
 			// Read ref membership atomically with the rewrite, including forks made while the
 			// caller awaited context accounting. Never mutate a newly-shared row in place.
 			const recipients = tx
@@ -4929,6 +5308,7 @@ const sqliteNarratorPersistence = {
 				throw new ValidationError("Message COW exceeds the 1000-recipient limit");
 			const currentRef = recipients.find((recipient) => recipient.narratorId === narratorId);
 			if (!currentRef) throw new NotFoundError("Message", messageId);
+			if (mutationNoop) return messageId;
 			const bumpVersion = (recipientId: string, replacementId: string) => {
 				const narrator = tx.query.narrators
 					.findFirst({ where: eq(narrators.id, recipientId), columns: { forkMessageId: true } })

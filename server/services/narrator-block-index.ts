@@ -81,12 +81,38 @@ export function unqueueBlockIndex(blockId: string): void {
 /** Production slices use a db-worker; unit tests may explicitly inject a reader. */
 export type IndexQueueReader = (
 	params: BlockIndexQueueSliceParams,
+	signal?: AbortSignal,
 ) => Promise<BlockIndexQueueSliceResult>;
 
-const workerReader: IndexQueueReader = (params) =>
+const workerReader: IndexQueueReader = (params, signal) =>
 	runReadTask<BlockIndexQueueSliceResult>(getDbPath(), params, {
 		timeoutMs: WORKER_TIMEOUT_MS,
+		signal,
 	});
+
+const backgroundJobs = hotSafe("narrator-block-index:lifecycle", () => ({
+	stopping: false,
+	controller: new AbortController(),
+	active: new Set<Promise<void>>(),
+}));
+
+function assertIndexJobsActive(): void {
+	backgroundJobs.controller.signal.throwIfAborted();
+	if (backgroundJobs.stopping)
+		throw new DOMException("Block index jobs are stopping", "AbortError");
+}
+
+async function trackIndexJob<T>(run: () => Promise<T>): Promise<T> {
+	assertIndexJobsActive();
+	const { promise: settled, resolve: finish } = Promise.withResolvers<void>();
+	backgroundJobs.active.add(settled);
+	try {
+		return await run();
+	} finally {
+		backgroundJobs.active.delete(settled);
+		finish();
+	}
+}
 
 const runner = hotSafe("narrator-block-index:runner", () => ({
 	/** Tests write the queue themselves (`drainBlockIndexQueue`), when they choose. */
@@ -101,7 +127,7 @@ const runner = hotSafe("narrator-block-index:runner", () => ({
 
 /** Start the job after `delayMs`, unless it runs or is due already. */
 export function scheduleBlockIndex(delayMs = START_DELAY_MS): void {
-	if (!runner.autoRun || runner.running || runner.timer) return;
+	if (backgroundJobs.stopping || !runner.autoRun || runner.running || runner.timer) return;
 	runner.timer = setTimeout(() => {
 		runner.timer = undefined;
 		void runBlockIndex();
@@ -109,58 +135,75 @@ export function scheduleBlockIndex(delayMs = START_DELAY_MS): void {
 	runner.timer.unref?.();
 }
 
-/** Stop the job (process shutdown, tests); queued entries stay for the next start. */
+/** Stop automatic scheduling; explicit drains remain available. */
 export function stopBlockIndex(): void {
 	if (runner.timer) clearTimeout(runner.timer);
 	runner.timer = undefined;
 }
 
+/** The block-jobs shutdown barrier owns the deadline while these active jobs settle. */
+export function stopBlockIndexBackgroundJobs(): Promise<void> {
+	backgroundJobs.stopping = true;
+	backgroundJobs.controller.abort();
+	stopBlockIndex();
+	return Promise.all([...backgroundJobs.active]).then(() => {});
+}
+
 /** Startup: write what an earlier process left owed. */
 export function recoverBlockIndex(): void {
-	if (!hasIndexQueue()) return;
+	if (backgroundJobs.stopping || !hasIndexQueue()) return;
 	if (database.sqlite.query("SELECT 1 FROM narrator_block_index_queue LIMIT 1").get())
 		scheduleBlockIndex();
 }
 
 /** Run slices until the queue is empty; a failure retries later. Exported for tests. */
 export async function runBlockIndex(reader: IndexQueueReader = workerReader): Promise<void> {
-	if (runner.running || !hasIndexQueue()) return;
+	if (backgroundJobs.stopping || runner.running || !hasIndexQueue()) return;
 	runner.running = true;
-	let last = { more: false, written: 0 };
-	try {
-		do last = await indexSlice(reader);
-		while (last.more && last.written > 0);
-	} catch (error) {
-		const closed = /closed/i.test(String(error));
-		if (!closed) {
-			logger.warn("Block index job failed; it retries", { error: String(error) });
+	await trackIndexJob(async () => {
+		let last = { more: false, written: 0 };
+		try {
+			do last = await indexSlice(reader);
+			while (last.more && last.written > 0);
+		} catch (error) {
+			const closed = /closed/i.test(String(error));
+			if (!backgroundJobs.stopping && !closed) {
+				logger.warn("Block index job failed; it retries", { error: String(error) });
+				runner.running = false;
+				scheduleBlockIndex(RETRY_DELAY_MS);
+			}
+			return;
+		} finally {
 			runner.running = false;
-			scheduleBlockIndex(RETRY_DELAY_MS);
 		}
-		return;
-	} finally {
-		runner.running = false;
-	}
-	// Entries queued while the last slice was being written, or ones it could not write yet
-	// (their envelope queued for its sync): those wait a little, not a busy loop.
-	if (database.sqlite.query("SELECT 1 FROM narrator_block_index_queue LIMIT 1").get())
-		scheduleBlockIndex(last.written > 0 ? START_DELAY_MS : BLOCKED_DELAY_MS);
+		if (backgroundJobs.stopping) return;
+		// Entries queued while the last slice was being written, or ones it could not write yet
+		// (their envelope queued for its sync): those wait a little, not a busy loop.
+		if (database.sqlite.query("SELECT 1 FROM narrator_block_index_queue LIMIT 1").get())
+			scheduleBlockIndex(last.written > 0 ? START_DELAY_MS : BLOCKED_DELAY_MS);
+	});
 }
 
 /** One slice: read the next queued blocks' text, write it in paced transactions. */
 async function indexSlice(reader: IndexQueueReader): Promise<{ more: boolean; written: number }> {
-	const slice = await reader({
-		kind: "blockIndexQueueSlice",
-		maxBlocks: SLICE_BLOCKS,
-		maxIndexChars: SLICE_INDEX_CHARS,
-		budgetMs: SLICE_BUDGET_MS,
-	});
+	assertIndexJobsActive();
+	const slice = await reader(
+		{
+			kind: "blockIndexQueueSlice",
+			maxBlocks: SLICE_BLOCKS,
+			maxIndexChars: SLICE_INDEX_CHARS,
+			budgetMs: SLICE_BUDGET_MS,
+		},
+		backgroundJobs.controller.signal,
+	);
+	assertIndexJobsActive();
 	// FTS5 flushes its pending terms whenever a write goes back to a lower rowid.
 	const entries = [...slice.entries].sort((a, b) => a.rowid - b.rowid);
 	let at = 0;
 	let written = 0;
 	while (at < entries.length) {
 		await applyTurn();
+		assertIndexJobsActive();
 		const budget = runner.txChars;
 		const started = performance.now();
 		const done = database.sqlite.transaction(() => writeEntries(entries, at, started, budget))();
@@ -178,8 +221,24 @@ async function indexSlice(reader: IndexQueueReader): Promise<{ more: boolean; wr
 }
 
 async function applyTurn(): Promise<void> {
+	assertIndexJobsActive();
 	const wait = runner.notBefore - performance.now();
-	if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+	if (wait > 0) {
+		const signal = backgroundJobs.controller.signal;
+		await new Promise<void>((resolve, reject) => {
+			const finish = (error?: unknown) => {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", abort);
+				if (error) reject(error);
+				else resolve();
+			};
+			const abort = () => finish(signal.reason);
+			const timer = setTimeout(() => finish(), wait);
+			signal.addEventListener("abort", abort, { once: true });
+			if (signal.aborted) abort();
+		});
+	}
+	assertIndexJobsActive();
 }
 
 /**
@@ -193,6 +252,7 @@ function writeEntries(
 	started: number,
 	maxChars: number,
 ): { next: number; written: number; chars: number } {
+	assertIndexJobsActive();
 	const version = database.sqlite.prepare(
 		"SELECT version FROM narrator_block_index_queue WHERE block_id = ?",
 	);
@@ -242,26 +302,35 @@ function noteSlow(elapsedMs: number, chars: number): void {
  * There is deliberately no default main-thread reader in the production client.
  */
 export async function drainBlockIndexQueue(reader: IndexQueueReader): Promise<number> {
+	assertIndexJobsActive();
 	if (!hasIndexQueue()) return 0;
-	let total = 0;
-	for (;;) {
-		const before = total;
-		const slice = await reader({
-			kind: "blockIndexQueueSlice",
-			maxBlocks: SLICE_BLOCKS,
-			maxIndexChars: SLICE_INDEX_CHARS,
-			budgetMs: SLICE_BUDGET_MS,
-		});
-		const entries = [...slice.entries].sort((a, b) => a.rowid - b.rowid);
-		for (let at = 0; at < entries.length; ) {
-			const done = database.sqlite.transaction(() =>
-				writeEntries(entries, at, performance.now(), Number.POSITIVE_INFINITY),
-			)();
-			at = done.next;
-			total += done.written;
+	return trackIndexJob(async () => {
+		let total = 0;
+		for (;;) {
+			assertIndexJobsActive();
+			const before = total;
+			const slice = await reader(
+				{
+					kind: "blockIndexQueueSlice",
+					maxBlocks: SLICE_BLOCKS,
+					maxIndexChars: SLICE_INDEX_CHARS,
+					budgetMs: SLICE_BUDGET_MS,
+				},
+				backgroundJobs.controller.signal,
+			);
+			assertIndexJobsActive();
+			const entries = [...slice.entries].sort((a, b) => a.rowid - b.rowid);
+			for (let at = 0; at < entries.length; ) {
+				assertIndexJobsActive();
+				const done = database.sqlite.transaction(() =>
+					writeEntries(entries, at, performance.now(), Number.POSITIVE_INFINITY),
+				)();
+				at = done.next;
+				total += done.written;
+			}
+			if (!slice.more || total === before) return total;
 		}
-		if (!slice.more || total === before) return total;
-	}
+	});
 }
 
 /** Let the job start itself after writes, in a test that exercises that. */
@@ -272,7 +341,10 @@ export function setBlockIndexAutoRunForTests(enabled: boolean): void {
 
 /** Reset the job's pacing and sizing, for tests. */
 export function resetBlockIndexForTests(): void {
+	if (backgroundJobs.active.size) throw new Error("Cannot reset active block index jobs");
 	stopBlockIndex();
+	backgroundJobs.controller = new AbortController();
+	backgroundJobs.stopping = false;
 	runner.running = false;
 	runner.notBefore = 0;
 	runner.txChars = TX_CHARS.initial;

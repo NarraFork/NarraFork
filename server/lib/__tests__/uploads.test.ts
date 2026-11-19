@@ -195,6 +195,39 @@ describe("image worktree copies", () => {
 		expect(await ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget)).toEqual(first);
 	});
 
+	test("explicit history deadline permits a copy after 10 seconds without a new local cap", async () => {
+		setup();
+		const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(11_000);
+		const wall = spyOn(Date, "now").mockReturnValue(100_000);
+		try {
+			const budget = { remainingCopies: 1, remainingBytes: 24, deadlineAt: 130_000 };
+			expect((await ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget))?.size).toBe(
+				24,
+			);
+			expect(budget.remainingCopies).toBe(0);
+		} finally {
+			clock.mockRestore();
+			wall.mockRestore();
+		}
+	});
+
+	test("explicit shorter deadline cleans an interrupted copy", async () => {
+		setup();
+		const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(2000);
+		const wall = spyOn(Date, "now").mockReturnValue(100_000);
+		const budget = { remainingCopies: 1, remainingBytes: 24, deadlineAt: 101_000 };
+		try {
+			await expect(
+				ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget),
+			).rejects.toThrow("timed out");
+			expect(budget.remainingCopies).toBe(1);
+			expect(readdirSync(resolve(cwd, ".narrafork/attached"))).toEqual([]);
+		} finally {
+			clock.mockRestore();
+			wall.mockRestore();
+		}
+	});
+
 	test("uses fallback owner for legacy images", async () => {
 		setup();
 		const copy = await ensureImageWorktreeCopy(

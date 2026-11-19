@@ -4,11 +4,14 @@
  * still legacy and decoded on read.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -20,6 +23,7 @@ const compactJson = settings.narratorBlocks.compactJson;
 const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const session = await import("../narrator-session");
+const { readEnvelopeBody, writeEnvelopeBody } = await import("../narrator-body-writes");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -37,10 +41,10 @@ afterEach(() => {
 	settings.narratorBlocks.write = true;
 	settings.narratorBlocks.compactJson = compactJson;
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await workerFixture.close();
 });
 
 interface Row {
@@ -340,9 +344,14 @@ describe("operations by block id", () => {
 
 	test("only output blocks are edited, and a block's detail carries its full body", async () => {
 		const stepId = await step();
-		await expect(session.editOutputBlock("n1", blockOf(stepId, "tool"), "x", null)).rejects.toThrow(
-			"Only an output block",
-		);
+		let error: unknown;
+		try {
+			await session.editOutputBlock("n1", blockOf(stepId, "tool"), "x", null);
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ message: expect.stringContaining("Only an output block") });
 		const [target] = targets.resolveBlockTargets("n1", [blockOf(stepId, "reasoning", 1)]);
 		expect(targets.blockDetail(target)).toMatchObject({
 			kind: "reasoning",
@@ -351,6 +360,103 @@ describe("operations by block id", () => {
 			originalElements: null,
 		});
 	});
+});
+
+describe("output mutations revalidate the persistent target after Worker reads", () => {
+	for (const action of ["edit", "restore"] as const) {
+		test.each([
+			"delete-a",
+			"delete-b",
+			"rewrite-b",
+		] as const)(`${action} targets B after %s before the COW transaction`, async (change) => {
+			const opened = await narratorStore.openStep("n1", { uuid: "interleave", session_id: "s" });
+			for (const [index, id, text] of [
+				[0, "a", "Alpha"],
+				[1, "b", "Beta"],
+				[2, "c", "Gamma"],
+			] as const) {
+				await narratorStore.writeStepItem(opened.id, "n1", {
+					type: "text",
+					id,
+					text,
+					completed: true,
+					outputIndex: index,
+				});
+			}
+			const [a, b, c] = rows(opened.id);
+			// A neighbouring edited block pins both its payload and pre-edit snapshot.
+			await session.editOutputBlock("n1", c.id, "Gamma edited", null);
+			if (action === "restore") await session.editOutputBlock("n1", b.id, "Beta edited", null);
+			const bBefore = rows(opened.id).find((row) => row.id === b.id);
+			const cBefore = rows(opened.id).find((row) => row.id === c.id);
+			expect(cBefore?.originalPayload).not.toBeNull();
+			const cow = narratorService.copyOnWriteMessage;
+			let interleaved = false;
+			const barrier = spyOn(narratorService, "copyOnWriteMessage").mockImplementation((...args) => {
+				if (!interleaved && args[0] === "n1" && args[1] === opened.id) {
+					interleaved = true;
+					const current = readEnvelopeBody(db, opened.id) as Array<Record<string, unknown>>;
+					const next =
+						change === "rewrite-b"
+							? current.map((element) =>
+									element.id === "b" ? { ...element, text: "Beta concurrent" } : element,
+								)
+							: current.filter((element) => element.id !== (change === "delete-a" ? "a" : "b"));
+					db.transaction((tx) =>
+						writeEnvelopeBody(tx, opened.id, next, {
+							set: { contentText: next.map((element) => String(element.text ?? "")).join("\n") },
+						}),
+					);
+				}
+				return cow(...args);
+			});
+			try {
+				const pending =
+					action === "edit"
+						? session.editOutputBlock("n1", b.id, "Beta rewritten", null)
+						: session.restoreOutputBlock("n1", b.id);
+				if (change === "delete-a") {
+					const result = await pending;
+					expect(result.messageId).toBe(opened.id);
+					expect(result.blockId).toBe(b.id);
+				} else {
+					let error: unknown;
+					try {
+						await pending;
+					} catch (caught) {
+						error = caught;
+					}
+					expect(error).toBeInstanceOf(Error);
+					expect(error).toMatchObject({ statusCode: 409 });
+				}
+			} finally {
+				barrier.mockRestore();
+			}
+			expect(interleaved).toBe(true);
+			const after = readEnvelopeBody(db, opened.id) as Array<Record<string, unknown>>;
+			expect(after.map((element) => element.id)).toEqual(
+				change === "delete-a" ? ["b", "c"] : change === "delete-b" ? ["a", "c"] : ["a", "b", "c"],
+			);
+			expect(rows(opened.id).find((row) => row.id === c.id)).toEqual(cBefore);
+			if (change === "delete-a") {
+				expect(rows(opened.id).some((row) => row.id === a.id)).toBe(false);
+				const changed = rows(opened.id).find((row) => row.id === b.id);
+				expect(after[0].text).toBe(action === "edit" ? "Beta rewritten" : "Beta");
+				if (action === "edit")
+					expect(JSON.parse(changed?.originalPayload ?? "null")).toEqual(
+						JSON.parse(bBefore?.payload ?? "null"),
+					);
+				else expect(changed?.originalPayload).toBeNull();
+			} else if (change === "delete-b")
+				expect(rows(opened.id).some((row) => row.id === b.id)).toBe(false);
+			else {
+				expect(after[1].text).toBe("Beta concurrent");
+				expect(rows(opened.id).find((row) => row.id === b.id)?.originalPayload).toBe(
+					bBefore?.originalPayload,
+				);
+			}
+		});
+	}
 });
 
 /** A step of id-less texts around a tool call: blocks keyed only by type and position. */
@@ -382,9 +488,13 @@ describe("block ids survive deletes and edits of their neighbours", () => {
 		await narratorService.deleteBlocks("n1", [alpha], { skipRevert: true });
 		expect(texts(stepId)).toEqual(["Beta"]);
 		expect(blockOf(stepId, "output")).toBe(beta);
-		await expect(
-			narratorService.deleteBlocks("n1", [alpha], { skipRevert: true }),
-		).rejects.toThrow();
+		let error: unknown;
+		try {
+			await narratorService.deleteBlocks("n1", [alpha], { skipRevert: true });
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(Error);
 		expect(texts(stepId)).toEqual(["Beta"]);
 	});
 
@@ -452,9 +562,14 @@ describe("block ids survive deletes and edits of their neighbours", () => {
 		await narratorService.deleteBlocks("n1", [decoded], { skipRevert: true });
 		expect(texts(stepId)).toEqual(["Beta"]);
 		expect(assembled(stepId)).toEqual(content(stepId));
-		await expect(
-			narratorService.deleteBlocks("n1", [decoded], { skipRevert: true }),
-		).rejects.toThrow("Message history changed");
+		let error: unknown;
+		try {
+			await narratorService.deleteBlocks("n1", [decoded], { skipRevert: true });
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ message: expect.stringContaining("Message history changed") });
 		expect(texts(stepId)).toEqual(["Beta"]);
 	});
 });

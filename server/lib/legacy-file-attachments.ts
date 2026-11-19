@@ -54,7 +54,7 @@ async function checkedFileSize(root: string, path: string): Promise<number | nul
 /**
  * Copy a canonical legacy uploads-relative reference into the active worktree.
  * Existing copies retain user edits. Copies use a 64 KiB buffer and a 100 MiB cap.
- * Cancellation and the 10 second deadline are cooperative between filesystem calls;
+ * Cancellation and the caller deadline (10 seconds by default) are cooperative between calls;
  * portable Node APIs cannot stop an in-flight call or hostile directory rename races.
  */
 export async function ensureLegacyFileWorktreeCopy(
@@ -63,11 +63,16 @@ export async function ensureLegacyFileWorktreeCopy(
 	signal?: AbortSignal,
 	budget?: ImageWorktreeCopyBudget,
 ): Promise<TextFileRef | null> {
-	const deadline = performance.now() + 10_000;
+	const deadline =
+		performance.now() + (budget ? Math.max(0, budget.deadlineAt - Date.now()) : 10_000);
 	let copying = false;
 	const checkBudget = () => {
 		signal?.throwIfAborted();
-		if (performance.now() > deadline || (copying && budget && Date.now() >= budget.deadlineAt)) {
+		const timedOut = performance.now() > deadline;
+		if (
+			((!budget || copying) && timedOut) ||
+			(copying && budget && Date.now() >= budget.deadlineAt)
+		) {
 			throw new ValidationError("Legacy attachment copy timed out");
 		}
 	};

@@ -12,11 +12,14 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import type { NarraForkEvent } from "../../lib/event-bus";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -154,13 +157,14 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	eventBus.off("narrator:attention", attentionHandler);
 	backgroundOccupancyStore.resetForTests();
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.restore();
 	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("done-transition backgroundWorkActive flag", () => {

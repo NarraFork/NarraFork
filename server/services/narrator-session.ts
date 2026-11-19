@@ -35,6 +35,7 @@ import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspa
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
+	narratorBlocks,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -422,7 +423,6 @@ import {
 	cleanupBufferedTextFilesAsync,
 	dropBufferedMessage,
 	enqueueBufferedMessage,
-	getBufferedMessages,
 	getBufferedMessagesAsync,
 	projectMailboxUserMessage,
 	removeBufferedMessage,
@@ -4015,7 +4015,7 @@ async function feedMessageUnlocked(
 			if (!internalOptions?.bufferedDelivery) throw error;
 			logger.error("Buffered message committed but could not start", {
 				narratorId,
-				message: fileReferenceMessageForDisplay(userMsg),
+				error: String(error),
 			});
 			await narratorService
 				.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(error) })
@@ -5351,7 +5351,7 @@ async function resolveBackgroundContinuationLocale(
 
 export async function startBackgroundCompletionContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return withTrackedNarratorSessionWork(async () => {
@@ -5754,7 +5754,7 @@ export function registerQuestionAnswerFallback(narratorId: string, messageId: st
 /** Retry only receipts whose earlier inbox acceptance failed; existing delivery identities never repeat. */
 export async function retryDeferredQuestionAnswerDeliveries(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 ): Promise<number> {
 	if (getNarratorMessageRefsPort()) return 0;
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
@@ -5871,7 +5871,7 @@ export async function scheduleQuestionAnswerDelivery(
 	messageId: string,
 	text: string,
 	executionPrincipal: QuestionExecutionPrincipal | undefined,
-	locale: Locale = "en",
+	locale?: Locale,
 ): Promise<{ ready: boolean; started: boolean }> {
 	return withTrackedNarratorSessionWork(async () => {
 		// Questions still use the SQLite business service. Fail closed rather than enqueue
@@ -5954,7 +5954,7 @@ export async function scheduleQuestionAnswerDelivery(
 
 export async function startInjectionContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 	executionPrincipal?: QuestionExecutionPrincipal,
 ): Promise<{ started: boolean }> {
@@ -6066,7 +6066,7 @@ export async function startInjectionContinuationIfPossible(
  */
 export async function resumeBufferedMessagesIfIdle(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 ): Promise<{ resumed: boolean }> {
 	return withTrackedNarratorSessionWork(async () => {
@@ -6117,7 +6117,7 @@ export async function resumeBufferedMessagesIfIdle(
  */
 export async function startParentInboundContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 	options: InboxWakeOptions = {},
 ): Promise<{ started: boolean }> {
@@ -6636,13 +6636,12 @@ async function continueNarratorUnlocked(
 				},
 			);
 			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
+				type: "user_message",
 				narratorId,
-				deletedMessageIds,
+				message: fileReferenceMessageForDisplay(userMsg),
 			});
 			return { ok: true, terminal };
 		}
-	}
 
 		recoveryStart?.check();
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
@@ -9821,6 +9820,7 @@ export function getBufferedGuidanceRequestVersion(active: ActiveNarrator): numbe
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
+	bufferedGuidanceRequestVersions.set(active, getBufferedGuidanceRequestVersion(active) + 1);
 	active._bufferSoftStop = true;
 	active._bufferGuidancePending = true;
 	active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
@@ -9897,6 +9897,7 @@ export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator)
 	if (!(await hasPendingBufferedGuidance(active.narratorId, active.abortController.signal))) return;
 	if (!active._bufferSoftStopTaken || getBufferedGuidanceRequestVersion(active) !== version) return;
 	active._bufferSoftStopTaken = false;
+	bufferedGuidanceRequestVersions.set(active, getBufferedGuidanceRequestVersion(active) + 1);
 	active._bufferSoftStop = true;
 }
 
