@@ -14,9 +14,11 @@ import {
 	type TokenRecalculationStore,
 } from "./token-recalculation";
 
+type RecalculationResolver = (row: TokenRecalculationRow) => TokenProtocolResolution;
+
 interface RecalculationDependencies {
 	createStore(signal: AbortSignal): Promise<TokenRecalculationStore>;
-	createResolver(): Promise<(row: TokenRecalculationRow) => TokenProtocolResolution>;
+	createResolver(): RecalculationResolver | Promise<RecalculationResolver>;
 }
 
 export class TokenRecalculationService {

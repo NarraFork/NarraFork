@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { and, asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -11,9 +11,12 @@ import {
 } from "../../db/schema";
 import { MAILBOX_LIMITS as L } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher, createRuntimePublicationService } = await import(
 	"../agent-runtime/publication"
@@ -65,10 +68,11 @@ beforeEach(() => {
 		])
 		.run();
 });
-afterAll(() => {
+afterAll(async () => {
 	publisher.stop();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.restore();
+	mock.module("../../db", () => realDb);
 });
 
 describe("real task producers use publication outbox", () => {
@@ -130,6 +134,127 @@ describe("real task producers use publication outbox", () => {
 		);
 		expect((await tasks.getById("child"))?.logicalRunId).toBe(second.logicalRunId);
 	});
+	test("new task projection identity conflicts roll back run registration and reservation", () => {
+		const before = db.select().from(narrators).where(eq(narrators.id, "child")).get();
+		expect(() =>
+			publisher.startRun({
+				narratorId: "child",
+				binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+				taskRow: {
+					id: "child",
+					type: "agent",
+					parentNarratorId: "different-recipient",
+					subagentNarratorId: "child",
+					status: "running",
+					startedAt: time,
+					createdAt: time,
+					updatedAt: time,
+				},
+			}),
+		).toThrow("Publication identity mismatch");
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()).toEqual(before);
+		expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(0);
+	});
+
+	test.each([
+		false,
+		true,
+	])("running task recipient mismatch rolls back start (resume=%s)", async (resume) => {
+		db.insert(narrators)
+			.values({ id: "different-recipient", createdAt: time, updatedAt: time })
+			.run();
+		const task = await tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		});
+		db.update(backgroundTasks)
+			.set({ parentNarratorId: "different-recipient" })
+			.where(eq(backgroundTasks.id, "child"))
+			.run();
+		const actor = db.select().from(narrators).where(eq(narrators.id, "child")).get();
+		const slots = db.select().from(runtimePublicationOutbox).all();
+		const before = db.select().from(backgroundTasks).all();
+		expect(() =>
+			publisher.startRun({
+				narratorId: "child",
+				...(resume ? { resumeRunId: task.logicalRunId! } : {}),
+				binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+			}),
+		).toThrow("Publication identity mismatch");
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()).toEqual(actor);
+		expect(db.select().from(backgroundTasks).all()).toEqual(before);
+		expect(db.select().from(runtimePublicationOutbox).all()).toEqual(slots);
+	});
+
+	test("terminal producer rejects a same-run task whose parent differs from its binding", async () => {
+		await tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		});
+		db.update(backgroundTasks)
+			.set({ parentNarratorId: "child" })
+			.where(eq(backgroundTasks.id, "child"))
+			.run();
+		const before = db.select().from(backgroundTasks).all();
+		const slots = db.select().from(runtimePublicationOutbox).all();
+		const failure = await tasks.markCompleted("child", "must not be stored").then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).toMatchObject({
+			code: "PUBLICATION_IDENTITY_MISMATCH",
+			reason: "identity_mismatch",
+		});
+		expect(db.select().from(backgroundTasks).all()).toEqual(before);
+		expect(db.select().from(runtimePublicationOutbox).all()).toEqual(slots);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+	});
+
+	test("recovery cannot change its registered recipient even without a task projection", () => {
+		const first = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		}).publication!;
+		const before = db.select().from(narrators).where(eq(narrators.id, "child")).get();
+		const slots = db.select().from(runtimePublicationOutbox).all();
+		expect(() =>
+			publisher.startRun({
+				narratorId: "child",
+				resumeRunId: first.logicalRunId,
+				binding: { deliverTo: { narratorId: "child", toolUseId: "test-tool-use" } },
+			}),
+		).toThrow("Publication identity mismatch");
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()).toEqual(before);
+		expect(db.select().from(runtimePublicationOutbox).all()).toEqual(slots);
+	});
+
+	test("an ended task from another recipient is not a live projection of a new run", async () => {
+		await tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+		});
+		await tasks.markCompleted("child", "old answer");
+		const ended = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "child")).get();
+		const next = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "child", toolUseId: "another-tool" } },
+		}).publication!;
+		expect(next.logicalRunId).not.toBe(ended?.logicalRunId);
+		expect(next.recipientId).toBe("child");
+		expect(db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "child")).get()).toEqual(
+			ended,
+		);
+	});
+
 	test("new task admission does not adopt the actor's old terminal or consumed run", async () => {
 		const old = publisher.startRun({
 			narratorId: "child",
@@ -162,7 +287,7 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(runtimePublicationOutbox).all()[0].logicalRunId).toBe(
 			task.logicalRunId,
 		);
-		expect(publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
+		expect(await publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
 	});
 
 	test("101st Bash completion is terminal while full mailbox retains its intent and immutable source", async () => {
@@ -170,7 +295,7 @@ describe("real task producers use publication outbox", () => {
 		await startBash("last");
 		expect(await tasks.markCompleted("last", "complete result")).toBe(true);
 		expect((await tasks.getById("last"))?.status).toBe("completed");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(100);
 		const [intent] = db.select().from(runtimePublicationOutbox).all();
 		expect(intent.state).toBe("pending");
@@ -186,11 +311,11 @@ describe("real task producers use publication outbox", () => {
 		fill("bash");
 		await startBash("early");
 		await tasks.markCompleted("early", "earlier");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		mailbox.cancel(pending("bash")[0].deliveryId ?? "", "free one slot");
 		await startBash("late");
 		await tasks.markCompleted("late", "later");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		const fresh = pending("bash").filter((row) => row.metadataJson);
 		expect(fresh).toHaveLength(1);
 		expect(JSON.parse(fresh[0].metadataJson ?? "{}").taskId).toBe("early");
@@ -217,8 +342,8 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 		expect(await tasks.markCompleted("atomic", "output")).toBe(true);
 		expect(await tasks.markCompleted("atomic", "MUST NOT REPLACE")).toBe(false);
-		publisher.flushRecipient("parent");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(1);
 		expect((await tasks.getById("atomic"))?.output).toBe("output");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
@@ -233,7 +358,7 @@ describe("real task producers use publication outbox", () => {
 		if (status === "failed") await tasks.markFailed(status, "failure");
 		if (status === "timeout") await tasks.markTimedOut(status, "deadline");
 		if (status === "cancelled") await tasks.markCancelled(status);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(JSON.parse(pending("bash")[0].metadataJson ?? "{}").eventKind).toBe(
 			status === "timeout" ? "timed_out" : status,
 		);
@@ -284,7 +409,7 @@ describe("real task producers use publication outbox", () => {
 		}).publication!;
 		expect(restored).toEqual(second);
 		await tasks.markCompleted("child", "second result");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("agent").map((row) => JSON.parse(row.metadataJson ?? "{}").eventKind)).toEqual([
 			"completed",
 			"started",
@@ -303,8 +428,8 @@ describe("real task producers use publication outbox", () => {
 		await startBash("recovered");
 		await tasks.markCompleted("recovered", "durable");
 		const restartedWorker = createRuntimePublicationService(db);
-		expect(restartedWorker.flushPage()).toBe(true);
-		expect(restartedWorker.flushPage()).toBe(false);
+		expect(await restartedWorker.flushPage()).toBe(true);
+		expect(await restartedWorker.flushPage()).toBe(false);
 		expect(pending("bash")).toHaveLength(1);
 		expect(db.select().from(backgroundTasks).all()).toHaveLength(1);
 		restartedWorker.stop();
@@ -392,7 +517,7 @@ describe("real task producers use publication outbox", () => {
 			.where(eq(backgroundTasks.id, "retained"))
 			.run();
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
 		db.update(narratorBufferedMessages)
 			.set({ state: "materialized", adoptedAt: new Date().toISOString() })

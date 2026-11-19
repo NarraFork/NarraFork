@@ -102,6 +102,12 @@ export interface AuthSessionRecord {
 	revokedAt: number | null;
 }
 
+export interface SessionReadOptions {
+	signal?: AbortSignal;
+	/** Absolute deadline in epoch milliseconds. */
+	deadlineAt?: number;
+}
+
 export interface AuthSessionStore {
 	/** Look up an account by username for password verification. Unknown → null. */
 	findLoginCredential(username: string): Promise<LoginCredential | null>;
@@ -126,9 +132,15 @@ export interface AuthSessionStore {
 	/** Persist a freshly issued session. */
 	createSession(session: NewAuthSession): Promise<void>;
 	/** Resolve a session by token hash, joined with its account. Unknown → null. */
-	findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null>;
+	findSessionByTokenHash(
+		tokenHash: string,
+		options?: SessionReadOptions,
+	): Promise<AuthSessionRecord | null>;
 	/** Resolve a session by id, joined with its account (long-lived sockets). Unknown → null. */
-	findSessionById(sessionId: string): Promise<AuthSessionRecord | null>;
+	findSessionById(
+		sessionId: string,
+		options?: SessionReadOptions,
+	): Promise<AuthSessionRecord | null>;
 	/**
 	 * Slide a live session's expiry forward. Never revives a revoked session and never
 	 * shortens one (a concurrent renewal that already went further wins).

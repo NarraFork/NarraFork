@@ -41,8 +41,8 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
 	"server/services/narrator-body-writes.ts": { count: 6, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
-		count: 7,
-		why: "dual-write audit, resync, queued column hash and three bounded retention-marker probes",
+		count: 8,
+		why: "dual-write audit, resync, queued column hash, bounded translation sizing and three bounded retention-marker probes",
 	},
 	"server/services/storage-history-mutations.ts": {
 		count: 1,
@@ -57,11 +57,23 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 		why: "body reads and final synchronous equality for an already-budgeted legacy body",
 	},
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
+	"server/services/narrator-message-reader.ts": {
+		count: 2,
+		why: "PG body reads and envelope decoding",
+	},
+	"server/services/narrator-message-snapshot-reader.ts": {
+		count: 3,
+		why: "bounded explicit-connection body snapshots",
+	},
 	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
 	"server/services/narrator-block-backfill.ts": {
-		count: 5,
-		why: "legacy envelope conversion, projection clear/restore",
+		count: 4,
+		why: "two conversion/verification diagnostic strings and projection clear/restore writes",
+	},
+	"server/services/reasoning-translation-store.ts": {
+		count: 2,
+		why: "pre-read and revalidation projection-length budgets; no body materialization",
 	},
 	"server/lib/db-worker/block-backfill-query.ts": {
 		count: 4,
@@ -76,14 +88,12 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
-	"server/services/storage-service.ts": { count: 2, why: "read switch off" },
+	"server/services/storage-service.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },
-	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-epochs.ts": {
 		count: 2,
-		why: "PG compact epoch-only projection, whose column is the body",
+		why: "read switch off and PG compact epoch-only projection",
 	},
-	"server/services/agent-runtime/publication.ts": { count: 1, why: "column fallback" },
 	// Writes whose rows the sync queue builds from the column (`insertEnvelopeQueued`'s
 	// contract): a legacy-format import, and the revert program's prepared statements, which
 	// apply without reads or JSON work and so cannot sync inline.

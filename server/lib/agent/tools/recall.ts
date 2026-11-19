@@ -1,8 +1,7 @@
-import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
-import { sqlite } from "../../../db";
 import { searchStore } from "../../../services/search/backend";
 import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
+import { recallConversation, recallToolCallDetail } from "../../../services/search/recall-store";
 import type { RecallMessageRow } from "../../../services/search/types";
 import { isBashToolName } from "../tool-name";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -14,7 +13,7 @@ import type { ToolDefinition, ToolResult } from "../types";
  * The message SEARCH runs through the search port (`services/search/`), so its FTS5
  * expression, snippet markup and time filtering live with the other search statements rather
  * than in a second copy here. The conversation and tool-call READS below are ordinary
- * indexed lookups by id — no full-text involved — so they stay as direct queries.
+ * indexed lookups by id, assembled under bounded Worker read snapshots.
  */
 
 const MAX_SEARCH_LIMIT = 50;
@@ -24,82 +23,6 @@ const MAX_READ_LIMIT = 50;
 const DEFAULT_READ_LIMIT = 20;
 const SNIPPET_CHARS = 300;
 const MAX_TOOL_CALL_OUTPUT = 4000;
-
-// --- Cached prepared statements (lazy-initialized) ---
-// Avoids creating a new Statement object on every Recall tool invocation.
-
-let _getNarrator: Statement | null = null;
-let _getRefSeq: Statement | null = null;
-let _msgsAround: Statement | null = null;
-let _msgsLatest: Statement | null = null;
-let _getToolCall: Statement | null = null;
-let _getToolCallAny: Statement | null = null;
-
-function getNarratorStmt() {
-	if (!_getNarrator) {
-		_getNarrator = sqlite.prepare("SELECT id, title, model FROM narrators WHERE id = ?");
-	}
-	return _getNarrator;
-}
-function getRefSeqStmt() {
-	if (!_getRefSeq) {
-		_getRefSeq = sqlite.prepare(
-			"SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?",
-		);
-	}
-	return _getRefSeq;
-}
-function msgsAroundStmt() {
-	if (!_msgsAround) {
-		_msgsAround = sqlite.prepare(
-			`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
-			 FROM narrator_message_refs r
-			 JOIN narrator_messages m ON m.id = r.message_id
-			 WHERE r.narrator_id = ? AND r.seq >= ? AND r.seq <= ?
-			 ORDER BY r.seq ASC`,
-		);
-	}
-	return _msgsAround;
-}
-function msgsLatestStmt() {
-	if (!_msgsLatest) {
-		_msgsLatest = sqlite.prepare(
-			`SELECT m.id, m.role, m.content_text, m.created_at, r.seq
-			 FROM narrator_message_refs r
-			 JOIN narrator_messages m ON m.id = r.message_id
-			 WHERE r.narrator_id = ?
-			 ORDER BY r.seq DESC
-			 LIMIT ?`,
-		);
-	}
-	return _msgsLatest;
-}
-function getToolCallStmt() {
-	if (!_getToolCall) {
-		_getToolCall = sqlite.prepare(
-			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
-			        tc.duration_ms, tc.error_message, tc.created_at,
-			        tc.narrator_id, n.title AS narrator_title
-			 FROM narrator_tool_calls tc
-			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ? AND tc.narrator_id = ?`,
-		);
-	}
-	return _getToolCall;
-}
-function getToolCallAnyStmt() {
-	if (!_getToolCallAny) {
-		_getToolCallAny = sqlite.prepare(
-			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
-			        tc.duration_ms, tc.error_message, tc.created_at,
-			        tc.narrator_id, n.title AS narrator_title
-			 FROM narrator_tool_calls tc
-			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ?`,
-		);
-	}
-	return _getToolCallAny;
-}
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
@@ -251,9 +174,16 @@ export const recallTool: ToolDefinition = {
 			};
 		}
 		if (action === "read_tool_call") {
-			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators);
+			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators, ctx.signal);
 		}
-		return handleReadConversation(narrator_id, message_id, limit, currentNarratorId, allNarrators);
+		return handleReadConversation(
+			narrator_id,
+			message_id,
+			limit,
+			currentNarratorId,
+			allNarrators,
+			ctx.signal,
+		);
 	},
 };
 
@@ -557,13 +487,14 @@ async function handleSearch(
 // read_conversation
 // ---------------------------------------------------------------------------
 
-function handleReadConversation(
+async function handleReadConversation(
 	narratorId: string | undefined,
 	messageId: string | undefined,
 	limit: number | undefined,
 	currentNarratorId: string,
 	allNarrators: boolean,
-): ToolResult {
+	signal?: AbortSignal,
+): Promise<ToolResult> {
 	const targetNarratorId = narratorId ?? currentNarratorId;
 	if (!allNarrators && targetNarratorId !== currentNarratorId) {
 		return {
@@ -576,73 +507,42 @@ function handleReadConversation(
 
 	const cap = Math.min(Math.max(limit ?? DEFAULT_READ_LIMIT, 1), MAX_READ_LIMIT);
 
-	// Verify narrator exists
-	const narrator = getNarratorStmt().get(targetNarratorId) as
-		| { id: string; title: string | null; model: string | null }
-		| undefined;
+	const {
+		narrator,
+		messageMissing,
+		rows,
+		tools: tcRows,
+	} = await recallConversation(
+		{
+			narratorId: targetNarratorId,
+			messageId: messageId ?? null,
+			limit: cap,
+		},
+		signal,
+	);
 
 	if (!narrator) {
 		return { output: `Narrator "${targetNarratorId}" not found.`, isError: true };
 	}
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic SQL rows
-	let rows: any[];
-
-	if (messageId) {
-		// Find the seq of the target message in this narrator's refs
-		const ref = getRefSeqStmt().get(targetNarratorId, messageId) as { seq: number } | undefined;
-
-		if (!ref) {
-			return {
-				output: `Message "${messageId}" not found in the current narrator.`,
-				isError: true,
-			};
-		}
-
-		const half = Math.floor(cap / 2);
-		rows = msgsAroundStmt().all(targetNarratorId, ref.seq - half, ref.seq + (cap - half));
-	} else {
-		// Latest messages
-		rows = msgsLatestStmt().all(targetNarratorId, cap);
-		rows.reverse();
-	}
+	if (messageMissing)
+		return {
+			output: `Message "${messageId}" not found in the current narrator.`,
+			isError: true,
+		};
 
 	if (rows.length === 0) {
 		return { output: `No messages found for the current narrator (${targetNarratorId}).` };
 	}
 
-	// Batch-load tool calls for all message IDs
-	const messageIds = rows.map((r) => r.id as string);
-	const tcRows = sqlite
-		.prepare(
-			`SELECT tool_use_id, tool_name, status, input_json, message_id
-			 FROM narrator_tool_calls
-			 WHERE message_id IN (${messageIds.map(() => "?").join(",")}) AND narrator_id = ?
-			 ORDER BY created_at ASC`,
-		)
-		.all(...messageIds, targetNarratorId) as Array<{
-		tool_use_id: string;
-		tool_name: string;
-		status: string;
-		input_json: string | null;
-		message_id: string;
-	}>;
-
 	// Group tool calls by message ID
 	const tcByMessage = new Map<string, ConversationToolCall[]>();
 	for (const tc of tcRows) {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-		let parsed: any = null;
-		try {
-			parsed = tc.input_json ? JSON.parse(tc.input_json) : null;
-		} catch {
-			// ignore parse errors
-		}
 		const entry: ConversationToolCall = {
 			toolUseId: tc.tool_use_id,
 			toolName: tc.tool_name,
 			status: tc.status,
-			summary: getToolCallSummary(tc.tool_name, parsed),
+			summary: tc.summary,
 		};
 		const list = tcByMessage.get(tc.message_id);
 		if (list) list.push(entry);
@@ -695,11 +595,12 @@ function handleReadConversation(
 // read_tool_call
 // ---------------------------------------------------------------------------
 
-function handleReadToolCall(
+async function handleReadToolCall(
 	toolCallId: string | undefined,
 	currentNarratorId: string,
 	allNarrators: boolean,
-): ToolResult {
+	signal?: AbortSignal,
+): Promise<ToolResult> {
 	if (!toolCallId) {
 		return {
 			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
@@ -707,24 +608,13 @@ function handleReadToolCall(
 		};
 	}
 
-	const tc = (
-		allNarrators
-			? getToolCallAnyStmt().get(toolCallId)
-			: getToolCallStmt().get(toolCallId, currentNarratorId)
-	) as
-		| {
-				tool_use_id: string;
-				tool_name: string;
-				status: string;
-				input_json: string | null;
-				output_json: string | null;
-				duration_ms: number | null;
-				error_message: string | null;
-				created_at: string;
-				narrator_id: string;
-				narrator_title: string | null;
-		  }
-		| undefined;
+	const tc = await recallToolCallDetail(
+		{
+			toolCallId,
+			narratorId: allNarrators ? null : currentNarratorId,
+		},
+		signal,
+	);
 
 	if (!tc) {
 		return {

@@ -19,10 +19,14 @@ import { TURN_RANGE_MAX_TURNS } from "@shared/export-turn-range";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "@shared/gen-ui-public";
 import { clearedToolOutput } from "@shared/storage-retention";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
+import type { ReadQueryOptions } from "../../db/worker-read";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -41,6 +45,7 @@ const {
 	NARRATOR_EXPORT_DEFAULTS,
 	streamNarratorExport,
 } = await import("../narrator-export");
+const workerReads = await import("../../db/worker-read");
 
 const now = "2026-08-03T10:00:00.000Z";
 
@@ -129,8 +134,55 @@ async function collect(
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
+	await workerFixture.close();
+});
+
+test("tool IO export dispatches only its admitted primary keys and SQL row limit", async () => {
+	seedNarrator("n1");
+	seedNarrator("n2");
+	await seedMessage({ id: "allowed-message", narratorId: "n1", seq: 1 });
+	await seedMessage({ id: "unrelated-message", narratorId: "n2", seq: 1 });
+	await seedToolCall({
+		id: "allowed-tool",
+		narratorId: "n1",
+		messageId: "allowed-message",
+		toolUseId: "allowed-use",
+		output: "allowed-output",
+	});
+	await seedToolCall({
+		id: "unrelated-tool",
+		narratorId: "n2",
+		messageId: "unrelated-message",
+		toolUseId: "unrelated-use",
+		output: "unrelated-output",
+	});
+	const dispatched: Array<{ sql: string; params: unknown[] }> = [];
+	const read = workerReads.readQuery;
+	const trace = spyOn(workerReads, "readQuery").mockImplementation(
+		<T>(
+			query: PromiseLike<T> & { toSQL(): { sql: string; params: unknown[] } },
+			options?: ReadQueryOptions,
+		): Promise<T> => {
+			const compiled = query.toSQL();
+			if (/substr\(CAST\([^)]*input_json[^)]*AS TEXT\)/i.test(compiled.sql))
+				dispatched.push(compiled);
+			return read<T>(query, options);
+		},
+	);
+	let output: string;
+	try {
+		output = await collect("n1", { format: "json", scope: "full", includeToolIO: true });
+	} finally {
+		trace.mockRestore();
+	}
+	expect(output).toContain("allowed-output");
+	expect(output).not.toContain("unrelated-output");
+	expect(dispatched).toHaveLength(1);
+	expect(dispatched[0].sql).toMatch(/where[\s\S]*\bid"?\s+in\s*\(/i);
+	expect(dispatched[0].sql).toMatch(/limit\s+\?/i);
+	expect(dispatched[0].params.slice(-2)).toEqual(["allowed-tool", 1]);
 });
 
 test("ordinary export excludes retained legacy reconstruction input after tool details are cleared", async () => {

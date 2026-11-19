@@ -509,15 +509,18 @@ async function syncIndexRow(
 	initial: ProjectIndexNarratorRow,
 	context: RebuildContext,
 	prefetched?: { links: CurrentLink[]; revision: string },
+	stopOnShutdown = false,
 ): Promise<"changed" | "skipped"> {
 	let row: ProjectIndexNarratorRow | undefined = initial;
 	for (let attempt = 0; attempt < DERIVATION_MAX_ATTEMPTS; attempt++) {
+		if (stopOnShutdown && rebuildStopped) return "skipped";
 		const revision = refreshResolutionCache(context);
 		// Page rows and links are a snapshot, not authority after an async mutation.
 		if (attempt > 0 || (prefetched && prefetched.revision !== revision))
 			row = readNarrator(initial.id);
 		if (!row) return "skipped";
 		const derived = await deriveLinks(row, context);
+		if (stopOnShutdown && rebuildStopped) return "skipped";
 		const afterDerivation = databaseRevision();
 		if (afterDerivation !== revision) {
 			const latest = readNarrator(row.id);
@@ -619,6 +622,7 @@ export async function assignProjectRootKey(projectId: string): Promise<void> {
 async function backfillProjectRootKeys(): Promise<void> {
 	let cursor: { createdAt: string; id: string } | null = null;
 	for (;;) {
+		if (rebuildStopped) return;
 		const page: Array<{ id: string; createdAt: string }> = await db
 			.select({ id: projects.id, createdAt: projects.createdAt })
 			.from(projects)
@@ -637,7 +641,10 @@ async function backfillProjectRootKeys(): Promise<void> {
 			.orderBy(asc(projects.createdAt), asc(projects.id))
 			.limit(ROOT_KEY_BATCH_SIZE);
 		if (page.length === 0) return;
-		for (const project of page) await assignProjectRootKey(project.id);
+		for (const project of page) {
+			if (rebuildStopped) return;
+			await assignProjectRootKey(project.id);
+		}
 		const last = page[page.length - 1];
 		cursor = { createdAt: last.createdAt, id: last.id };
 		await yieldToEventLoop();
@@ -651,7 +658,7 @@ let rootKeysReady: Promise<void> | null = null;
  * are filled in once per process, oldest first, before anything is matched or created.
  */
 export function ensureProjectRootKeys(): Promise<void> {
-	if (activeDatabaseBackend !== "sqlite") return Promise.resolve();
+	if (rebuildStopped || activeDatabaseBackend !== "sqlite") return Promise.resolve();
 	rootKeysReady ??= backfillProjectRootKeys().catch((error) => {
 		rootKeysReady = null;
 		throw error;
@@ -675,6 +682,7 @@ async function rebuildProjectIndex() {
 	let failed = 0;
 	let sliceStarted = performance.now();
 	for (;;) {
+		if (rebuildStopped) break;
 		const revision = databaseRevision();
 		const page = db
 			.select(NARRATOR_INDEX_COLUMNS)
@@ -708,15 +716,19 @@ async function rebuildProjectIndex() {
 			current.set(link.narratorId, rows);
 		}
 		for (const row of page) {
+			if (rebuildStopped) break;
 			try {
-				const outcome = await syncIndexRow(row, context, {
-					links: current.get(row.id) ?? [],
-					revision,
-				});
+				const outcome = await syncIndexRow(
+					row,
+					context,
+					{ links: current.get(row.id) ?? [], revision },
+					true,
+				);
 				if (outcome === "changed") {
 					changed++;
 					await invalidateProjectDerivedState(row.id);
 				} else skipped++;
+				if (rebuildStopped) break;
 			} catch (error) {
 				failed++;
 				// Do not let a failed resolution poison a later narrator with the same cwd.
@@ -749,6 +761,7 @@ async function rebuildProjectIndex() {
 
 let rebuildRunning: Promise<void> | null = null;
 let rebuildRequested = false;
+let rebuildStopped = false;
 
 /**
  * Rebuild every narrator's links in the background: paged by id, yielding between
@@ -756,7 +769,7 @@ let rebuildRequested = false;
  * pass instead of starting a second concurrent one.
  */
 export function scheduleProjectIndexRebuild(): Promise<void> {
-	if (activeDatabaseBackend !== "sqlite") return Promise.resolve();
+	if (rebuildStopped || activeDatabaseBackend !== "sqlite") return Promise.resolve();
 	if (rebuildRunning) {
 		rebuildRequested = true;
 		return rebuildRunning;
@@ -771,11 +784,43 @@ export function scheduleProjectIndexRebuild(): Promise<void> {
 			} catch (error) {
 				logger.warn("Project index rebuild failed", { error: String(error) });
 			}
-		} while (rebuildRequested);
+		} while (rebuildRequested && !rebuildStopped);
 	})().finally(() => {
 		rebuildRunning = null;
 	});
 	return rebuildRunning;
+}
+
+/** Stop new rebuilds and await the current producer within the caller's shutdown deadline. */
+export async function stopProjectIndexRebuild(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	rebuildStopped = true;
+	rebuildRequested = false;
+	options.signal?.throwIfAborted();
+	if (!Number.isFinite(options.deadlineAt))
+		throw new TypeError("Project index shutdown deadline must be finite");
+	const active = Promise.all([rebuildRunning, rootKeysReady]);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+	try {
+		await Promise.race([
+			active,
+			new Promise<never>((_resolve, reject) => {
+				onAbort = () =>
+					reject(options.signal?.reason ?? new Error("Project index shutdown cancelled"));
+				options.signal?.addEventListener("abort", onAbort, { once: true });
+				timer = setTimeout(
+					() => reject(new Error("Project index shutdown deadline expired")),
+					Math.max(0, options.deadlineAt - Date.now()),
+				);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+		if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+	}
 }
 
 /** Test hook: forget cached probes and the per-process root-key pass. */
@@ -783,4 +828,5 @@ export function resetProjectIndexStateForTests(): void {
 	gitProbeCache.clear();
 	creationsInFlight.clear();
 	rootKeysReady = null;
+	rebuildStopped = false;
 }

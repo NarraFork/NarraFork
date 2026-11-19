@@ -1,16 +1,17 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
 import { fileChangeExecutionSegments } from "../db/schema";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 
 const databases: Database[] = [];
-afterEach(() => {
-	for (const db of databases.splice(0)) db.close();
+afterEach(async () => {
+	for (const db of databases.splice(0)) await closeFileWorkerDatabase(db);
 });
 function setup() {
-	const sqlite = new Database(":memory:");
+	const sqlite = openFileWorkerDatabase();
 	databases.push(sqlite);
 	sqlite.run(`CREATE TABLE file_change_execution_segments (
 		id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_segment_id TEXT,
@@ -22,7 +23,7 @@ function setup() {
 
 describe("file change execution segments", () => {
 	test("logical-run receipt lookup uses the schema's compound input index with long history", () => {
-		const sqlite = new Database(":memory:");
+		const sqlite = openFileWorkerDatabase();
 		databases.push(sqlite);
 		const config = getTableConfig(fileChangeExecutionSegments);
 		const inputIndex = config.indexes.find((index) => index.config.name === "idx_fc_segment_input");

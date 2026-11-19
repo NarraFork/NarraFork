@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { specFileRevisions, specNamespaceFiles, specNamespaces } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AsyncMutex } from "../lib/async-mutex";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -147,14 +148,23 @@ export async function ensureNamespace(
 }
 
 async function getCurrentFile(namespaceId: string, path: string) {
-	return db.query.specNamespaceFiles.findFirst({
-		where: and(eq(specNamespaceFiles.namespaceId, namespaceId), eq(specNamespaceFiles.path, path)),
-	});
+	return readQuery(
+		db.query.specNamespaceFiles.findFirst({
+			where: and(
+				eq(specNamespaceFiles.namespaceId, namespaceId),
+				eq(specNamespaceFiles.path, path),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 async function getRevision(revisionId: string | null | undefined) {
 	if (!revisionId) return null;
-	return db.query.specFileRevisions.findFirst({ where: eq(specFileRevisions.id, revisionId) });
+	return readQuery(
+		db.query.specFileRevisions.findFirst({ where: eq(specFileRevisions.id, revisionId) }),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 /** Whether the assistant's Write/Edit tools are blocked for this path. */
@@ -213,9 +223,12 @@ export async function readSpecFileContentIfExists(
 	uri: string,
 ): Promise<string | null> {
 	const path = normalizeSpecPath(uri);
-	const namespace = await db.query.specNamespaces.findFirst({
-		where: eq(specNamespaces.narratorId, narratorId),
-	});
+	const namespace = await readQuery(
+		db.query.specNamespaces.findFirst({
+			where: eq(specNamespaces.narratorId, narratorId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!namespace) return null;
 	const current = await getCurrentFile(namespace.id, path);
 	if (current?.deleted) return null;
@@ -341,12 +354,15 @@ export async function deleteSpecFile(narratorId: string, uri: string): Promise<v
 
 export async function listSpecFiles(narratorId: string): Promise<SpecResolvedFile[]> {
 	const namespace = await ensureNamespace(narratorId);
-	const rows = await db.query.specNamespaceFiles.findMany({
-		where: and(
-			eq(specNamespaceFiles.namespaceId, namespace.id),
-			eq(specNamespaceFiles.deleted, false),
-		),
-	});
+	const rows = await readQuery(
+		db.query.specNamespaceFiles.findMany({
+			where: and(
+				eq(specNamespaceFiles.namespaceId, namespace.id),
+				eq(specNamespaceFiles.deleted, false),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const files: SpecResolvedFile[] = [];
 	const seen = new Set<string>();
 	for (const row of rows) {

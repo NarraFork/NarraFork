@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -10,8 +10,15 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const fixture = getRuntimeTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const session = await import("../narrator-session");
@@ -115,10 +122,12 @@ afterEach(async () => {
 	state.activeNarrators.clear();
 	for (const owner of runOwners.splice(0)) owner.release();
 	drainPendingInjections(ROOT);
+	await drainRuntimeTestWork();
 	mock.restore();
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.module("../../db", () => realDb);
 });
 
@@ -234,7 +243,7 @@ describe("exclusive revert blocks every service entry before writes", () => {
 			expect(sqlite.query("SELECT * FROM narrators ORDER BY id").all()).toEqual(before);
 			expect(sqlite.query("SELECT * FROM narrator_messages").all()).toEqual(messages);
 			expect(sqlite.query("SELECT * FROM narrator_buffered_messages").all()).toEqual(queue);
-			expect(state.bufferedMessages.get(ROOT)?.map((entry) => entry.text)).toEqual([
+			expect((await state.bufferedMessages.get(ROOT))?.map((entry) => entry.text)).toEqual([
 				"preserved queued input",
 			]);
 		});
@@ -305,7 +314,7 @@ test("release drains preserved buffered input exactly once", async () => {
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
 
-	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+	expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 	expectMaterializedUserInput();
 	expect(
 		(await db.select().from(narratorMessages)).filter(
@@ -690,7 +699,7 @@ test("cancellation retries the real loop finalizer's consumed waiting-gate wakeu
 	cleanup.resolve();
 	await running;
 	expect(active._resumeBufferedAfterLoop).toBe(false);
-	expect(state.bufferedMessages.get(ROOT)).toHaveLength(1);
+	expect(await state.bufferedMessages.get(ROOT)).toHaveLength(1);
 	const committed = deferred();
 	const persist = narratorService.persistUserMessage;
 	spyOn(narratorService, "persistUserMessage").mockImplementation(async (...args) => {
@@ -703,7 +712,7 @@ test("cancellation retries the real loop finalizer's consumed waiting-gate wakeu
 	expect(await requested).toBeInstanceOf(Error);
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
-	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+	expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 	expect(
 		(await db.select().from(narratorMessages)).filter((message) => message.role === "user"),
 	).toHaveLength(1);
@@ -758,13 +767,13 @@ for (const timeout of [false, true]) {
 			expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(false);
 			if (settlesLate) {
 				expect(await session.resumeBufferedMessagesIfIdle(ROOT)).toEqual({ resumed: false });
-				expect(state.bufferedMessages.get(ROOT)).toHaveLength(1);
+				expect(await state.bufferedMessages.get(ROOT)).toHaveLength(1);
 				finish.resolve();
 				await work;
 			}
 			await committed.promise;
 			await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
-			expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+			expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 			expectMaterializedUserInput();
 			expect(
 				(await db.select().from(narratorMessages)).filter(

@@ -1,7 +1,9 @@
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages } from "../db/schema";
-import { bodyColumns, contentJsonSql, fillBodies, fillBody } from "./narrator-body-reads";
+import { readQuery } from "../db/worker-read";
+import { bodyColumns, fillBody } from "./narrator-body-reads";
+import { readNarratorMessageRows } from "./narrator-message-reader";
 import { narratorPersistence } from "./narrator-persistence";
 
 function isTextualBlock(block: unknown): block is Record<string, unknown> {
@@ -49,20 +51,37 @@ export async function completeAssistantOutput(
 	messageId: string,
 ): Promise<string> {
 	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			...bodyColumns({ id: true, contentJson: true }),
-		}),
+		(
+			await readNarratorMessageRows(
+				(
+					await readQuery(
+						db.query.narratorMessages.findMany({
+							...{
+								where: eq(narratorMessages.id, messageId),
+								...bodyColumns({ id: true, contentJson: true }),
+							},
+							columns: { id: true },
+							with: undefined,
+							extras: undefined,
+							limit: 1,
+						}),
+						{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+					)
+				).map((row) => row.id),
+				{ includeTools: false, includeCreator: false },
+			)
+		)[0],
 	);
 	const completed = completeOutputBlocks(message?.contentJson);
 	if (!completed) return messageId;
 	// The persistence method updates recipient refs, versions and character accounting too.
-	return narratorPersistence.copyOnWriteMessage(
-		narratorId,
-		messageId,
-		{ contentJson: completed, contentText: contentText(completed) },
-		{ preserveExecutionOwner: true },
-	);
+	return narratorPersistence.copyOnWriteMessage(narratorId, messageId, undefined, {
+		preserveExecutionOwner: true,
+		mutateBody: (current) => {
+			const completed = completeOutputBlocks(current);
+			return completed ? { contentJson: completed, contentText: contentText(completed) } : null;
+		},
+	});
 }
 
 /**
@@ -75,28 +94,43 @@ export async function completeAssistantOutput(
 export async function cleanupIncompleteNarratorOutput(
 	narratorId: string,
 ): Promise<{ messageId?: string; removedBlocks: number }> {
-	const [message] = fillBodies(
-		await db
-			.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "assistant")),
+	const [message] = await readNarratorMessageRows(
+		(
+			await readQuery(
+				db
+					.select({ id: narratorMessages.id })
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessages.role, "assistant"),
+						),
+					)
+					.orderBy(desc(narratorMessageRefs.seq))
+					.limit(1),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
 			)
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1),
+		).map((row) => row.id),
+		{ includeTools: false, includeCreator: false },
 	);
 	if (!message) return { removedBlocks: 0 };
 	const retained = removeIncompleteOutputBlocks(message.contentJson);
 	if (!retained) return { messageId: message.id, removedBlocks: 0 };
+	let removedBlocks = 0;
 	const messageId = await narratorPersistence.copyOnWriteMessage(
 		narratorId,
 		message.id,
-		{ contentJson: retained, contentText: contentText(retained) },
-		{ preserveExecutionOwner: true },
+		undefined,
+		{
+			preserveExecutionOwner: true,
+			mutateBody: (current) => {
+				const retained = removeIncompleteOutputBlocks(current);
+				if (!retained) return null;
+				removedBlocks = (current as unknown[]).length - retained.length;
+				return { contentJson: retained, contentText: contentText(retained) };
+			},
+		},
 	);
-	return {
-		messageId,
-		removedBlocks: (message.contentJson as unknown[]).length - retained.length,
-	};
+	return { messageId, removedBlocks };
 }

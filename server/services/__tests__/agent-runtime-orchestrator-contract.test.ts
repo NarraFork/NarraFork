@@ -24,6 +24,12 @@ import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 /**
  * Exercises the real shared orchestrator and its control/persistence hooks. Only the
@@ -34,9 +40,11 @@ import type { ActiveNarrator } from "../narrator-session-state";
  * Those remain separate integration contracts; custom fallback below checks visibility,
  * not permission enforcement. Each file is intended to run in its own Bun process.
  */
-// Prefix/history workers must share the same file-backed DB as the real orchestrator.
-// Test preload supplies an isolated temporary database; do not replace it with :memory:.
-const { db, sqlite } = await import("../../db");
+// Prefix/history workers share this isolated file-backed fixture and its real triggers.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
 const orchestrator = await import("../agent-runtime/orchestrator");
@@ -144,9 +152,12 @@ afterEach(async () => {
 	mock.restore();
 });
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	(await import("../agent-runtime/publication")).stopRuntimePublications();
+	await drainRuntimeTestWork();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	backgroundOccupancyStore.resetForTests();
 	unregister();
+	mock.module("../../db", () => realDb);
 });
 
 const finished: ExecuteLoopResult = {
@@ -1664,7 +1675,7 @@ describe("real shared orchestrator profile contract", () => {
 					const before = db.select().from(narratorBufferedMessages).get();
 					expect(before).toMatchObject({ state: "materialized", adoptedAt: null });
 					expect(injection.onConsumed).toBeFunction();
-					injection.onConsumed?.();
+					await injection.onConsumed?.();
 					await new Promise<void>((resolve) => setImmediate(resolve));
 					expect(db.select().from(narratorBufferedMessages).get()?.adoptedAt).toBeString();
 					return finished;
@@ -1673,6 +1684,161 @@ describe("real shared orchestrator profile contract", () => {
 			expect((await h.run()).hasError).toBe(false);
 			expect(h.calls).toHaveLength(1);
 		});
+
+		test(`${profile.kind}: feedback arriving during the Worker predicate stops the current boundary`, async () => {
+			const runtimeSession = await import("../narrator-session");
+			const original = runtimeSession.hasPendingBufferedGuidance;
+			const observed = Promise.withResolvers<boolean>();
+			const release = Promise.withResolvers<void>();
+			const probe = spyOn(runtimeSession, "hasPendingBufferedGuidance").mockImplementationOnce(
+				async (...args) => {
+					const pending = await original(...args);
+					observed.resolve(pending);
+					await release.promise;
+					return pending;
+				},
+			);
+			const h = fixture(profile, [
+				async (options) => {
+					const boundary = options.config.shouldYieldToInput?.();
+					expect(await observed.promise).toBe(false);
+					h.session._feedbackSoftStop = true;
+					release.resolve();
+					expect(await boundary).toBe(true);
+					expect(h.session._feedbackSoftStop).toBe(false);
+					return finished;
+				},
+			]);
+			try {
+				expect((await h.run()).hasError).toBe(false);
+			} finally {
+				release.resolve();
+				probe.mockRestore();
+			}
+		});
+
+		test(`${profile.kind}: an old empty Worker predicate keeps a repeated buffer request armed`, async () => {
+			const runtimeSession = await import("../narrator-session");
+			const original = runtimeSession.hasPendingBufferedGuidance;
+			const observed = Promise.withResolvers<boolean>();
+			const release = Promise.withResolvers<void>();
+			const probe = spyOn(runtimeSession, "hasPendingBufferedGuidance").mockImplementationOnce(
+				async (...args) => {
+					const pending = await original(...args);
+					observed.resolve(pending);
+					await release.promise;
+					return pending;
+				},
+			);
+			const h = fixture(profile, [
+				async (options) => {
+					runtimeSession.requestBufferedMessageSoftStop(h.session.narratorId);
+					const boundary = options.config.shouldYieldToInput?.();
+					expect(await observed.promise).toBe(false);
+					const { createMailboxStore } = await import("../agent-runtime/mailbox");
+					expect(
+						createMailboxStore(db).enqueue({
+							kind: "user_input",
+							narratorId: h.session.narratorId,
+							text: "new buffered request",
+							projectedByteSize: 4096,
+							metadata: { queueMode: "tool" },
+						}).status,
+					).toBe("accepted");
+					runtimeSession.requestBufferedMessageSoftStop(h.session.narratorId);
+					release.resolve();
+					expect(await boundary).toBe(false);
+					expect(h.session._bufferSoftStop).toBe(true);
+					expect(await options.config.shouldYieldToInput?.()).toBe(true);
+					return { ...finished, completedNaturally: false, hadToolUses: true };
+				},
+				async (options) => {
+					expect(modelInputText(options)).toContain("new buffered request");
+					return finished;
+				},
+			]);
+			try {
+				expect((await h.run()).hasError).toBe(false);
+				expect(h.calls).toHaveLength(2);
+			} finally {
+				release.resolve();
+				probe.mockRestore();
+			}
+		});
+
+		for (const settlement of ["complete", "reject"] as const) {
+			test(`${profile.kind}: after-tools consumption awaits receipt ${settlement} before updating provenance`, async () => {
+				const receipt = Promise.withResolvers<void>();
+				const failure = new Error("receipt callback failed");
+				const order: string[] = [];
+				const runtimeSession = await import("../narrator-session");
+				const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory").mockResolvedValue({
+					text: "mailbox packet",
+					parts: [{ text: "mailbox packet" }],
+					lastInputWasMailbox: true,
+					onConsumed: () => {
+						order.push("receipt-started");
+						const pending = receipt.promise.then(() => {
+							order.push("receipt-finished");
+						});
+						// Observe the injected fault independently while returning its original promise.
+						void pending.catch(() => {});
+						return pending;
+					},
+				});
+				const h = fixture(profile, [
+					async (options) => {
+						const history = options.history.built ?? [];
+						await options.config.onModelInputConsumed?.(history, options.userText);
+						expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+						const packet = await options.config.getAfterToolsInjections?.();
+						if (!packet || typeof packet === "string" || !packet.onConsumed)
+							throw new Error("Missing consumption callback");
+						let settled = false;
+						const outcome = Promise.resolve(packet.onConsumed()).then(
+							() => {
+								settled = true;
+								order.push("consumer-finished");
+								return null;
+							},
+							(error: unknown) => {
+								settled = true;
+								order.push("consumer-rejected");
+								return error;
+							},
+						);
+						await Promise.resolve();
+						expect(settled).toBe(false);
+						expect(order).toEqual(["receipt-started"]);
+						expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+						if (settlement === "complete") receipt.resolve();
+						else receipt.reject(failure);
+						expect(await outcome).toBe(settlement === "complete" ? null : failure);
+						expect(order).toEqual(
+							settlement === "complete"
+								? ["receipt-started", "receipt-finished", "consumer-finished"]
+								: ["receipt-started", "consumer-rejected"],
+						);
+						expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(
+							settlement === "complete",
+						);
+						// A retry adopts the identical request; only a successful receipt retained provenance.
+						await options.config.onModelInputConsumed?.(history, options.userText);
+						expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(
+							settlement === "complete",
+						);
+						return finished;
+					},
+				]);
+				try {
+					expect((await h.run()).hasError).toBe(false);
+					expect(h.calls).toHaveLength(1);
+				} finally {
+					receipt.resolve();
+					drain.mockRestore();
+				}
+			});
+		}
 	}
 
 	for (const scenario of [
@@ -1692,7 +1858,7 @@ describe("real shared orchestrator profile contract", () => {
 					});
 					if (!accepted.buffered) throw new Error("expected queued input");
 					order.push("queued");
-					if (scenario.softStop) expect(options.config.shouldYieldToInput?.()).toBe(true);
+					if (scenario.softStop) expect(await options.config.shouldYieldToInput?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
 					const text = typeof injection === "string" ? injection : injection?.text;
 					expect(text ?? "").not.toContain(feedback);
@@ -1775,7 +1941,7 @@ describe("real shared orchestrator profile contract", () => {
 				);
 				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
 					.delivery;
-				expect(options.config.shouldYieldToInput?.()).toBe(false);
+				expect(await options.config.shouldYieldToInput?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);
@@ -1804,7 +1970,7 @@ describe("real shared orchestrator profile contract", () => {
 						event.message.id === message?.id,
 				);
 				expect(projected.map(([id]) => id)).toEqual(["contract-parent", "contract-child"]);
-				packet.onConsumed?.();
+				await packet.onConsumed?.();
 				await new Promise<void>((resolve) => setImmediate(resolve));
 				expect(
 					db
@@ -2154,7 +2320,9 @@ describe("real shared orchestrator profile contract", () => {
 
 for (const profile of profiles) {
 	test(`${profile.kind}: real keyword knowledge hit has the same system sender live and in history`, async () => {
-		const { knowledgeService } = await import("../knowledge-service");
+		const { knowledgeService, knowledgeInjectionReads } = await import("../knowledge-service");
+		const { knowledgeInjection } = await import("../knowledge-injection");
+		const { narratorService } = await import("../narrator-service");
 		const { narratorPersistence } = await import("../narrator-persistence");
 		const { buildRuntimeHistory } = await import("../agent-runtime/history");
 		const { projectMessageSenderText } = await import("../../lib/agent/sender-projection");
@@ -2176,6 +2344,15 @@ for (const profile of profiles) {
 			const h = fixture(profile, [finished]);
 			h.session._currentUserId = "principal-a";
 			const request = `Please recall ${keyword}`;
+			expect(
+				await knowledgeInjectionReads.keywordInjectionCandidatesSignature({
+					userId: "principal-a",
+				}),
+			).toBe(`1:${entry.updatedAt}|0:`);
+			// An empty personal library must not prevent the global hit from reaching the matcher.
+			expect(
+				await knowledgeInjectionReads.listKeywordInjectionCandidates({ userId: "principal-a" }),
+			).toContainEqual(expect.objectContaining({ id: entry.id, scope: "global" }));
 			await narratorPersistence.persistUserMessage(
 				h.session.narratorId,
 				request,
@@ -2187,9 +2364,13 @@ for (const profile of profiles) {
 			);
 			expect((await h.run(request)).hasError).toBe(false);
 			expect(h.calls).toHaveLength(1);
-			const rawMessages = await (
-				await import("../narrator-service")
-			).narratorService.getModelHistorySinceLastCompact(h.session.narratorId);
+			// Probe the resolver after the run so the live matcher still takes its own cold path.
+			expect(await knowledgeInjection.resolveInjections("principal-a", request)).toContainEqual(
+				expect.objectContaining({ entryId: entry.id, scope: "global" }),
+			);
+			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
+				h.session.narratorId,
+			);
 			const knowledge = rawMessages.find(
 				(message) => message.role === "sys" && message.contentText?.includes(entry.id),
 			);
@@ -2242,7 +2423,7 @@ describe("foreground run failure status", () => {
 			principal: null,
 			active: active("contract-primary"),
 		});
-		await expect(handle.completion).rejects.toThrow("model exploded");
+		expect(await captureWorkerRejectionThrower(handle.completion)).toThrow("model exploded");
 		expect(
 			db.select().from(narrators).where(eq(narrators.id, "contract-primary")).get()?.status,
 		).toBe("idle");
@@ -2263,7 +2444,9 @@ describe("foreground run failure status", () => {
 			principal: null,
 			active: active("contract-child"),
 		});
-		await expect(handle.completion).rejects.toThrow("registration unavailable");
+		expect(await captureWorkerRejectionThrower(handle.completion)).toThrow(
+			"registration unavailable",
+		);
 		expect(
 			db.select().from(narrators).where(eq(narrators.id, "contract-child")).get()?.status,
 		).toBe("working");
@@ -2289,7 +2472,7 @@ describe("foreground run failure status", () => {
 			principal: null,
 			active: active("contract-primary"),
 		});
-		await expect(handle.completion).rejects.toThrow("deadline blew up");
+		expect(await captureWorkerRejectionThrower(handle.completion)).toThrow("deadline blew up");
 		expect(tags("contract-primary")).toContain("timeout");
 		expect(tags("contract-primary")).not.toContain("interrupted");
 		expect(tags("contract-primary")).not.toContain("error");

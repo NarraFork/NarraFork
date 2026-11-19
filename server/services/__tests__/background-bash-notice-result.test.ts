@@ -7,6 +7,7 @@ import { backgroundTasks, narratorBufferedMessages, narrators } from "../../db/s
 import { wakeInboxIfEligible } from "../agent-runtime/inbox";
 import { flushRuntimePublications, runtimePublication } from "../agent-runtime/publication";
 import { discardBackgroundBashResult } from "../background-bash-result";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { backgroundTaskService } from "../background-task-service";
 import { projectPendingInjection } from "../parent-injection-queue";
 
@@ -150,6 +151,104 @@ describe("real Bash terminal publication result", () => {
 			expect(Buffer.byteLength(content)).toBeLessThan(5120);
 		} finally {
 			mock.mockRestore();
+		}
+	});
+
+	test("killAll and collector cancellation share preparation and publish once", async () => {
+		const task = await create();
+		const output = "x".repeat(5120);
+		backgroundTaskService.appendOutput(task.id, output);
+		const writing = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const killed = Promise.withResolvers<void>();
+		const exit = Promise.withResolvers<void>();
+		backgroundTaskService.registerKillHandler(task.id, () => killed.resolve());
+		const original = fs.writeFile;
+		const write = spyOn(fs, "writeFile").mockImplementation(async (path, data, options) => {
+			paths.add(String(path));
+			writing.resolve();
+			await releaseWrite.promise;
+			await original(path, data, options);
+		});
+		const preparation = spyOn(
+			backgroundTaskService as unknown as {
+				prepareTerminalBashOutput(id: string, output?: string | null): Promise<unknown>;
+			},
+			"prepareTerminalBashOutput",
+		);
+		const collector = backgroundTaskService.trackBashCollector(
+			task.id,
+			task.controller,
+			exit.promise.then(() => backgroundTaskService.markCancelled(task.id, task.controller)),
+		);
+		const first = backgroundTaskService.markCancelled(task.id, task.controller);
+		let killAll: Promise<void> | undefined;
+		let duplicate: Promise<boolean> | undefined;
+		try {
+			await writing.promise;
+			killAll = backgroundTaskService.killAll();
+			await killed.promise;
+			duplicate = backgroundTaskService.markCancelled(task.id, task.controller);
+			expect(write).toHaveBeenCalledTimes(1);
+			expect(preparation).toHaveBeenCalledTimes(1);
+			expect(backgroundTaskService.getOutputBuffer(task.id)).toBe(output);
+			releaseWrite.resolve();
+			expect(await first).toBe(true);
+			expect(await duplicate).toBe(false);
+			await killAll;
+			expect((await backgroundTaskService.getById(task.id))?.status).toBe("cancelled");
+			expect(await notices()).toHaveLength(1);
+			exit.resolve();
+			expect(await collector).toBe(false);
+			expect(preparation).toHaveBeenCalledTimes(1);
+			expect(write).toHaveBeenCalledTimes(1);
+			await backgroundTaskService.drainBashCollectors();
+		} finally {
+			releaseWrite.resolve();
+			exit.resolve();
+			await Promise.allSettled([first, killAll, duplicate, collector].filter(Boolean));
+			write.mockRestore();
+			preparation.mockRestore();
+		}
+	});
+
+	test("terminal settlement retains the detached list upsert through its Worker reads", async () => {
+		const task = await create();
+		await backgroundOccupancyStore.start();
+		await backgroundTaskService.drainBashCollectors();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const reader = backgroundTaskService as unknown as {
+			listItemsByIds(parentId: string, ids: string[]): Promise<unknown[]>;
+		};
+		const read = reader.listItemsByIds.bind(reader);
+		const blocked = spyOn(reader, "listItemsByIds").mockImplementation(async (parentId, ids) => {
+			entered.resolve();
+			await release.promise;
+			return read(parentId, ids);
+		});
+		let drain: Promise<void> | undefined;
+		try {
+			expect(
+				await backgroundTaskService.markCompleted(task.id, "completed", 0, task.controller),
+			).toBe(true);
+			await entered.promise;
+			expect(backgroundTaskService.getBashShutdownSnapshot().pending).toBeGreaterThan(0);
+			let drained = false;
+			drain = backgroundTaskService.drainBashCollectors().then(() => {
+				drained = true;
+			});
+			await Promise.resolve();
+			expect(drained).toBe(false);
+			release.resolve();
+			await drain;
+			expect(backgroundTaskService.getBashShutdownSnapshot().pending).toBe(0);
+		} finally {
+			release.resolve();
+			await drain?.catch(() => {});
+			blocked.mockRestore();
+			await backgroundOccupancyStore.stop();
+			backgroundOccupancyStore.resetForTests();
 		}
 	});
 

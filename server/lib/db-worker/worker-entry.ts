@@ -37,7 +37,10 @@ import {
 } from "./block-backfill-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
-import { workerFailureDetails } from "./failure";
+import { isDomainReadStreamTask } from "./domain-protocol";
+import { runDomainRead, runDomainReadStream } from "./domain-task-registry";
+import { DbReadError, readAborted, workerFailure } from "./errors";
+import { isSqliteLockError, safeSqliteCode, workerFailureDetails } from "./failure";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -51,6 +54,9 @@ import type {
 	StorageScanTablesResult,
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
+import { ReadBudgetMeter } from "./read-budget";
+import { runSelectDigestBatch } from "./select-digest-batch";
+import { runSelectChunks, runSelectValues } from "./select-extended";
 import { runSelectRows } from "./select-rows";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
@@ -60,10 +66,14 @@ const port = parentPort;
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
 const connections = new Map<string, Database>();
 
-function getConnection(dbPath: string): Database {
-	const existing = connections.get(dbPath);
-	if (existing) return existing;
-	const db = instrumentSqliteConnection(new Database(dbPath, { readonly: true }));
+function getConnection(identity: string, dbPath: string = identity): Database {
+	const existing = connections.get(identity);
+	if (existing) return sqlDiagnostics.instrument(existing);
+	// Keep the existing trace wrapper inside this instance wrapper, unchanged.
+	const db = sqlDiagnostics.instrument(
+		instrumentSqliteConnection(new Database(dbPath, { readonly: true })),
+	);
+	db.run("PRAGMA query_only = ON");
 	// Match the main connection's read tuning. No write pragmas: this handle is read-only.
 	try {
 		db.run("PRAGMA cache_size = -16000");
@@ -74,7 +84,7 @@ function getConnection(dbPath: string): Database {
 	} catch {
 		// Tuning is best-effort; a working connection matters more.
 	}
-	connections.set(dbPath, db);
+	connections.set(identity, db);
 	return db;
 }
 
@@ -181,29 +191,79 @@ function runStorageScanSessionPreview(
 }
 
 const activeTasks = new Map<string, AbortController>();
+const acknowledgements = new Map<string, { sequence: number; resolve: () => void }>();
+function emitChunk(
+	requestId: string,
+	chunk: import("./protocol").SelectChunk,
+	signal: AbortSignal,
+	deadlineAt: number,
+	meter: ReadBudgetMeter,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", abort);
+			acknowledgements.delete(requestId);
+		};
+		const abort = () => {
+			cleanup();
+			reject(readAborted());
+		};
+		const timer = setTimeout(
+			() => {
+				cleanup();
+				reject(new DbReadError("DB_READ_TASK_TIMEOUT", "database read consumer deadline expired"));
+			},
+			Math.max(0, deadlineAt - Date.now()),
+		);
+		acknowledgements.set(requestId, {
+			sequence: chunk.sequence,
+			resolve: () => {
+				cleanup();
+				resolve();
+			},
+		});
+		if (signal.aborted) return abort();
+		signal.addEventListener("abort", abort, { once: true });
+		post({ type: "chunk", requestId, chunk, diagnostics: meter.snapshot() });
+	});
+}
 port.on("message", async (message: DbWorkerInbound) => {
 	if (!message || typeof message !== "object") return;
-
+	if (message.type === "chunkAck") {
+		const waiting = acknowledgements.get(message.requestId);
+		if (waiting?.sequence === message.sequence) waiting.resolve();
+		return;
+	}
 	if (message.type === "cancel") {
 		activeTasks.get(message.requestId)?.abort();
 		return;
 	}
 	if (message.type === "shutdown") {
+		for (const task of activeTasks.values()) task.abort();
 		for (const db of connections.values()) {
 			try {
 				db.close();
 			} catch {
-				// best effort
+				/* Native exit remains the release confirmation. */
 			}
 		}
 		connections.clear();
 		process.exit(0);
 	}
-
 	if (message.type !== "task") return;
-
 	const startedAt = Date.now();
 	const controller = new AbortController();
+	const meter = new ReadBudgetMeter();
+	const deadlineAt = message.deadlineAt ?? startedAt + 30_000;
+	const connection = () => getConnection(message.databaseId ?? message.dbPath, message.dbPath);
+	const check = () => {
+		if (controller.signal.aborted) throw readAborted();
+		if (message.params.kind !== "displayPageMessagesPostgres" && Date.now() >= deadlineAt)
+			throw new DbReadError("DB_READ_TASK_TIMEOUT", "database read task timed out");
+	};
+	const emit = (chunk: import("./protocol").SelectChunk) =>
+		emitChunk(message.requestId, chunk, controller.signal, deadlineAt, meter);
 	activeTasks.set(message.requestId, controller);
 	const sqlSpan = startSqlTraceSpan(
 		"worker",
@@ -212,80 +272,165 @@ port.on("message", async (message: DbWorkerInbound) => {
 		message.traceParent,
 	);
 	try {
+		check();
 		const params = message.params;
-		const result = await runInSqlTraceSpan(sqlSpan, async () =>
-			params.kind === "storageHistoryRead"
-				? runStorageHistoryRead(getConnection(message.dbPath), params)
-				: params.kind === "storageHistoryBody"
-					? runStorageHistoryBody(getConnection(message.dbPath), params)
-					: params.kind === "displayPageMessagesPostgres"
-						? await runPostgresDisplayPageQuery(
+		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
+			runInSqlTraceSpan(sqlSpan, async () => {
+				let result: unknown;
+				if (isDomainReadStreamTask(params)) {
+					let sequence = 0;
+					result = await runDomainReadStream(
+						connection(),
+						params,
+						{
+							signal: controller.signal,
+							deadlineAt,
+							emit: (bytes) => emit({ columns: ["bytes"], rows: [[bytes]], sequence: sequence++ }),
+						},
+						meter,
+					);
+				} else {
+					switch (params.kind) {
+						case "storageHistoryRead":
+							result = runStorageHistoryRead(connection(), params);
+							break;
+						case "storageHistoryBody":
+							result = runStorageHistoryBody(connection(), params);
+							break;
+						case "displayPageMessagesPostgres":
+							result = await runPostgresDisplayPageQuery(
 								message.dbPath,
 								{ ...params, kind: "displayPageMessages" },
 								controller.signal,
-							)
-						: params.kind === "blockBackfillSlice"
-							? runBlockBackfillSlice(getConnection(message.dbPath), params)
-							: params.kind === "blockVerifySlice"
-								? runBlockVerifySlice(getConnection(message.dbPath), params)
-								: params.kind === "blockReindexSlice"
-									? runBlockReindexSlice(getConnection(message.dbPath), params)
-									: params.kind === "blockIndexQueueSlice"
-										? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
-										: params.kind === "blockProjectionSlice"
-											? runBlockProjectionSlice(getConnection(message.dbPath), params)
-											: params.kind === "displayPageMessages"
-												? runDisplayPageQuery(getConnection(message.dbPath), params)
-												: params.kind === "selectRows"
-													? runSelectRows(getConnection(message.dbPath), params)
-													: params.kind === "storageScanContext"
-														? runStorageScanContext(message.dbPath)
-														: params.kind === "storageScanSerial"
-															? runStorageScanSerial(
-																	message.dbPath,
-																	message.requestId,
-																	params.mainBytes,
-																	controller.signal,
-																)
-															: params.kind === "storageScanCleanupSummaries"
-																? runStorageScanCleanupSummaries(message.dbPath, params)
-																: params.kind === "storageScanSessionPreview"
-																	? runStorageScanSessionPreview(
-																			message.dbPath,
-																			params,
-																			controller.signal,
-																		)
-																	: runStorageScanTables(
-																			message.dbPath,
-																			message.requestId,
-																			params,
-																			controller.signal,
-																		),
+							);
+							break;
+						case "blockBackfillSlice":
+							result = runBlockBackfillSlice(connection(), params);
+							break;
+						case "blockVerifySlice":
+							result = runBlockVerifySlice(connection(), params);
+							break;
+						case "blockReindexSlice":
+							result = runBlockReindexSlice(connection(), params);
+							break;
+						case "blockIndexQueueSlice":
+							result = runBlockIndexQueueSlice(connection(), params);
+							break;
+						case "blockProjectionSlice":
+							result = runBlockProjectionSlice(connection(), params);
+							break;
+						case "displayPageMessages":
+							result = runDisplayPageQuery(connection(), params);
+							break;
+						case "selectRows":
+							result = runSelectRows(connection(), params, meter);
+							break;
+						case "selectValues":
+							result = runSelectValues(connection(), params, meter);
+							break;
+						case "selectChunks":
+							result = await runSelectChunks(
+								connection(),
+								params,
+								controller.signal,
+								deadlineAt,
+								emit,
+								meter,
+							);
+							break;
+						case "selectDigestBatch":
+							result = runSelectDigestBatch(
+								connection(),
+								params,
+								controller.signal,
+								deadlineAt,
+								meter,
+							);
+							break;
+						case "domainRead":
+							result = await runDomainRead(
+								connection(),
+								params,
+								controller.signal,
+								deadlineAt,
+								meter,
+							);
+							break;
+						case "storageScanContext":
+							result = runStorageScanContext(message.dbPath);
+							break;
+						case "storageScanTables":
+							result = runStorageScanTables(
+								message.dbPath,
+								message.requestId,
+								params,
+								controller.signal,
+							);
+							break;
+						case "storageScanSerial":
+							result = runStorageScanSerial(
+								message.dbPath,
+								message.requestId,
+								params.mainBytes,
+								controller.signal,
+							);
+							break;
+						case "storageScanCleanupSummaries":
+							result = runStorageScanCleanupSummaries(message.dbPath, params);
+							break;
+						case "storageScanSessionPreview":
+							result = runStorageScanSessionPreview(message.dbPath, params, controller.signal);
+							break;
+						default:
+							throw new DbReadError("DB_READ_UNSUPPORTED", "Unregistered database read task");
+					}
+				}
+				return result;
+			}),
 		);
+		check();
 		post({
 			type: "result",
 			requestId: message.requestId,
 			result,
 			durationMs: Date.now() - startedAt,
+			diagnostics: meter.snapshot(),
 		});
 	} catch (err) {
 		const unknownPgError =
 			message.params.kind === "displayPageMessagesPostgres" &&
 			!(err instanceof DisplayPageReadError);
+		const sqliteRead = [
+			"selectRows",
+			"selectValues",
+			"selectChunks",
+			"selectDigestBatch",
+			"domainRead",
+		].includes(message.params.kind);
 		post({
 			type: "error",
 			requestId: message.requestId,
 			diagnostic: workerFailureDetails(err, false),
-			message: unknownPgError
-				? "PostgreSQL read-only display worker failed"
-				: err instanceof Error
-					? err.message
-					: String(err),
 			...(unknownPgError
-				? { code: "DISPLAY_PAGE_READER_UNAVAILABLE" }
-				: err && typeof err === "object" && "code" in err && typeof err.code === "string"
-					? { code: err.code }
-					: {}),
+				? {
+						message: "PostgreSQL read-only display worker failed",
+						code: "DISPLAY_PAGE_READER_UNAVAILABLE",
+					}
+				: sqliteRead
+					? workerFailure(err)
+					: {
+							message: err instanceof Error ? err.message : String(err),
+							...(err && typeof err === "object" && "code" in err && typeof err.code === "string"
+								? { code: err.code }
+								: {}),
+						}),
+			// The history owner retries the entire source read on these content-free lock codes.
+			...(message.params.kind === "domainRead" &&
+			message.params.task === "modelHistorySignature" &&
+			isSqliteLockError(err)
+				? { code: safeSqliteCode(err) }
+				: {}),
+			diagnostics: meter.snapshot(),
 		});
 	} finally {
 		sqlSpan?.end();

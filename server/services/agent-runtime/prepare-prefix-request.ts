@@ -1,4 +1,5 @@
 import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
+import type { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import {
 	currentCompactMessageId,
@@ -29,6 +30,8 @@ export interface PreparePrefixRequestOptions<
 	getModel: () => string;
 	getProvider: () => string;
 	signal?: AbortSignal;
+	/** Request-wide observation/cancellation; DB source probes retain independent read budgets. */
+	preparation?: ModelHistoryPreparation;
 	getToolLoading?: (identity: RequestModelIdentity) => RuntimeHistoryOptions["toolLoading"];
 	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
 	/** Runs after tool refresh under the existing /load serialization queue. */
@@ -55,7 +58,8 @@ export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = Requ
 export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	options: PreparePrefixRequestOptions<Prompt>,
 ): Promise<PreparedPrefixRequest<Prompt>> {
-	const { narratorId, signal } = options;
+	const { narratorId, preparation } = options;
+	const signal = options.signal ?? preparation?.signal;
 	const replyContext = parseReplyContext(options.getReplyContext?.()) ?? {
 		locale: options.locale,
 		replyInUserLanguage: false,
@@ -69,8 +73,10 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	};
 	const readHistory = () => {
 		signal?.throwIfAborted();
+		preparation?.phase("source");
 		return narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
+			...(preparation ? { preparation } : {}),
 		});
 	};
 	for (;;) {
@@ -94,6 +100,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 				messages: sourceMessages ?? [],
 				...capturedLoading,
 				signal,
+				preparation,
 				...identity,
 				refreshTools: async () => {
 					await options.refreshToolLoading?.(identity);

@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { assembleContent } from "@shared/narrator-blocks/storage";
+import { MODEL_HISTORY_EXECUTION_MS } from "../../lib/model-history-preparation";
 import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
 import { ModelHistoryBudget } from "./model-history-json";
 
@@ -12,11 +13,14 @@ export const MODEL_HISTORY_TOOL_INPUT_SQL = `CASE WHEN ${MODEL_HISTORY_TOOL_CLEA
 export const MODEL_HISTORY_REF_BATCH = 200;
 export const MODEL_HISTORY_BATCH_BYTES = 4 * 1024 * 1024;
 export const MODEL_HISTORY_MAX_BYTES = 128 * 1024 * 1024;
+export const MODEL_HISTORY_TIMEOUT_MS = MODEL_HISTORY_EXECUTION_MS;
 
 export interface ModelHistoryQueryOptions {
 	narratorId: string;
 	limit?: number;
 	signal?: AbortSignal;
+	/** Optional explicit caller budget, never a default total hydration limit. */
+	deadline?: number;
 	maxBytes?: number;
 	/** In-memory unit fixtures have no worker identity; reject large inline JSON before decoding. */
 	inlineRowBytes?: number;
@@ -159,7 +163,7 @@ export async function queryModelHistory(
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
 	const fromBlocks = options.bodiesFromBlocks === true;
-	const budget = new ModelHistoryBudget(maxBytes, options.signal);
+	const budget = new ModelHistoryBudget(maxBytes, options.signal, options.deadline);
 	const check = budget.check;
 	check();
 	const boundary = await query<{ seq: number }>(

@@ -9,7 +9,7 @@
  *  - the promise that a list page never carries `input_json`/`output_json`, which
  *    is a main-thread performance constraint rather than a cosmetic one.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
 	narratorMessages,
 	narratorProjectLinks,
@@ -19,10 +19,14 @@ import {
 } from "@server/db/schema";
 import { decodeExecutionLogCursor } from "@server/lib/execution-log-cursor";
 import { clearedToolOutput } from "@shared/storage-retention";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
+import { getNarratorWorkerTestDb } from "./__tests__/narrator-worker-fixture";
 import { ExecutionLogService } from "./execution-log-service";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+beforeAll(() => workerFixture.ready);
+afterAll(() => workerFixture.close());
 const service = new ExecutionLogService(db);
 
 afterEach(() => cleanDb(sqlite));

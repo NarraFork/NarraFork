@@ -4,10 +4,10 @@ import { createHash } from "node:crypto";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
 import { generateId } from "../lib/id";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import {
 	type BeginFileChangeOperation,
@@ -36,7 +36,7 @@ const target = {
 
 beforeEach(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
-	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	sqlite = openFileWorkerDatabase(isolatedTemplate);
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = wrap(sqlite);
 	service = new FileChangeEvidenceService(db, () => timestamp);
@@ -48,7 +48,7 @@ beforeEach(() => {
 		canonicalRoot: "/repo",
 	});
 });
-afterEach(() => sqlite.close());
+afterEach(async () => await closeFileWorkerDatabase(sqlite));
 function hash(value: string) {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -76,7 +76,7 @@ function operationInput(
 	};
 }
 
-test("editor operation persists the full safe-integer snapshot revision and never a lease", () => {
+test("editor operation persists the full safe-integer snapshot revision and never a lease", async () => {
 	const input = operationInput({
 		executionBinding: {
 			deviceId: "remote-fixture",
@@ -87,7 +87,7 @@ test("editor operation persists the full safe-integer snapshot revision and neve
 		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
 	});
 	const recorded = service.beginOperation(input);
-	expect(service.getEditorOperation("source", input.sourceId)).toMatchObject({
+	expect(await service.getEditorOperation("source", input.sourceId)).toMatchObject({
 		id: recorded.id,
 		workspaceLeaseId: null,
 		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
@@ -193,7 +193,7 @@ const preview: FileChangeNoDispatchProof = {
 };
 
 describe("version 3 final historical facts", () => {
-	test("scope is metadata and old barriers remain untouched", () => {
+	test("scope is metadata and old barriers remain untouched", async () => {
 		db.update(schema.fileChangeScopes)
 			.set({
 				status: "needs_verification",
@@ -205,7 +205,7 @@ describe("version 3 final historical facts", () => {
 			})
 			.where(eq(schema.fileChangeScopes.id, scope.id))
 			.run();
-		const old = service.getScope(scope.id);
+		const old = await service.getScope(scope.id);
 		if (!old) throw new Error("Missing scope fixture");
 		expect(service.prepareScope({ ...scope, canonicalRoot: "/repo" })).toEqual(old);
 		const operation = service.beginOperation(operationInput());
@@ -229,9 +229,9 @@ describe("version 3 final historical facts", () => {
 			coverage: "complete",
 			settlement: "settled",
 		});
-		expect(service.getScope(scope.id)).toEqual(old);
+		expect(await service.getScope(scope.id)).toEqual(old);
 	});
-	test("retired scopes and global blob states do not gate independent history", () => {
+	test("retired scopes and global blob states do not gate independent history", async () => {
 		db.update(schema.fileChangeScopes)
 			.set({ status: "retired" })
 			.where(eq(schema.fileChangeScopes.id, scope.id))
@@ -249,7 +249,7 @@ describe("version 3 final historical facts", () => {
 		const operation = service.beginOperation(operationInput());
 		expect(service.recordEffect(effectInput(operation.id)).diskOutcome).toBe("applied");
 	});
-	test("request/attempt replay returns the original sequence, including unknown attempts", () => {
+	test("request/attempt replay returns the original sequence, including unknown attempts", async () => {
 		const input = operationInput();
 		const first = service.beginOperation(input);
 		expect(service.beginOperation(input)).toEqual({ ...first, replayed: true });
@@ -272,12 +272,12 @@ describe("version 3 final historical facts", () => {
 		expect(next.journalSeq).toBe((first.journalSeq ?? 0) + 1);
 		expect(service.recordEffect(effectInput(next.id)).diskOutcome).toBe("applied");
 	});
-	test("effect replay is immutable and only increments counters once", () => {
+	test("effect replay is immutable and only increments counters once", async () => {
 		const operation = service.beginOperation(operationInput());
 		const input = effectInput(operation.id);
 		const effect = service.recordEffect(input);
 		expect(service.recordEffect(input)).toEqual(effect);
-		expect(service.getOperation(operation.id)).toMatchObject({
+		expect(await service.getOperation(operation.id)).toMatchObject({
 			preparedEffectCount: 1,
 			settledEffectCount: 1,
 			evidenceBytes: 6,
@@ -287,7 +287,7 @@ describe("version 3 final historical facts", () => {
 			"expected file results",
 		);
 	});
-	test("unknown content preserves an applied result without inventing measured history", () => {
+	test("unknown content preserves an applied result without inventing measured history", async () => {
 		const operation = service.beginOperation(operationInput());
 		const effect = service.recordEffect(
 			effectInput(operation.id, {
@@ -308,7 +308,7 @@ describe("version 3 final historical facts", () => {
 			reason: "result_unknown",
 		});
 	});
-	test("known unchanged, not-applied, mode-only and deletion results remain distinct", () => {
+	test("known unchanged, not-applied, mode-only and deletion results remain distinct", async () => {
 		const before = known();
 		for (const outcome of ["applied", "not_applied", "unknown"] as const) {
 			const op = service.beginOperation(operationInput());
@@ -332,26 +332,26 @@ describe("version 3 final historical facts", () => {
 			).outcome,
 		).toBe("changed");
 	});
-	test("failed metadata transaction rolls back only this record and later requests succeed", () => {
+	test("failed metadata transaction rolls back only this record and later requests succeed", async () => {
 		const operation = service.beginOperation(operationInput());
 		const input = effectInput(operation.id);
 		sqlite.exec(
 			"CREATE TRIGGER fail_history BEFORE UPDATE ON file_change_operations BEGIN SELECT RAISE(ABORT, 'accounting-fault'); END;",
 		);
 		expect(() => service.recordEffect(input)).toThrow("accounting-fault");
-		expect(service.listEffects(operation.id).items).toHaveLength(0);
-		expect(service.getOperation(operation.id)?.preparedEffectCount).toBe(0);
+		expect((await service.listEffects(operation.id)).items).toHaveLength(0);
+		expect((await service.getOperation(operation.id))?.preparedEffectCount).toBe(0);
 		sqlite.exec("DROP TRIGGER fail_history;");
 		expect(service.recordEffect(input).diskOutcome).toBe("applied");
 		const next = service.beginOperation(operationInput());
 		expect(service.recordEffect(effectInput(next.id)).diskOutcome).toBe("applied");
 	});
-	test("a missing blob affects only its result, leaves old content metadata intact", () => {
+	test("a missing blob affects only its result, leaves old content metadata intact", async () => {
 		const missing = known(0o644, "missing");
 		const op = service.beginOperation(operationInput());
 		const input = effectInput(op.id, { before: missing });
 		expect(() => service.recordEffect(input)).toThrow("verified catalog object");
-		expect(service.listEffects(op.id).items).toEqual([]);
+		expect((await service.listEffects(op.id)).items).toEqual([]);
 		const independent = service.beginOperation(operationInput());
 		expect(service.recordEffect(effectInput(independent.id)).diskOutcome).toBe("applied");
 		if (missing.kind !== "regular") throw new Error("Invalid fixture");
@@ -363,25 +363,25 @@ describe("version 3 final historical facts", () => {
 				.get()?.status,
 		).toBe("missing");
 	});
-	test("version 2 history stays byte-for-byte readable and rejects new mutations", () => {
+	test("version 2 history stays byte-for-byte readable and rejects new mutations", async () => {
 		const op = service.beginOperation(operationInput());
 		const effect = service.recordEffect(effectInput(op.id));
 		db.update(schema.fileChangeOperations)
 			.set({ evidenceVersion: 2, settlement: "reconcile_required", executionOutcome: "running" })
 			.where(eq(schema.fileChangeOperations.id, op.id))
 			.run();
-		const before = service.getOperation(op.id);
-		expect(service.getEffect(op.id, effect.mutationId)).toEqual(effect);
+		const before = await service.getOperation(op.id);
+		expect(await service.getEffect(op.id, effect.mutationId)).toEqual(effect);
 		expect(() => service.finishOperation(op.id, "failed")).toThrow("read-only");
 		expect(() => service.recordEffect(effectInput(op.id))).toThrow("read-only");
-		expect(service.getOperation(op.id)).toEqual(before);
+		expect(await service.getOperation(op.id)).toEqual(before);
 		expect(
-			service
-				.listPendingOperations({ settlement: "reconcile_required" })
-				.items.map((row) => row.id),
+			(await service.listPendingOperations({ settlement: "reconcile_required" })).items.map(
+				(row) => row.id,
+			),
 		).toContain(op.id);
 	});
-	test("terminal history gap needs no recovery process and can receive a late fact", () => {
+	test("terminal history gap needs no recovery process and can receive a late fact", async () => {
 		const op = service.beginOperation(operationInput());
 		expect(service.finishOperation(op.id, "succeeded")).toMatchObject({
 			reason: "history_unavailable",
@@ -389,14 +389,14 @@ describe("version 3 final historical facts", () => {
 			settlement: "settled",
 		});
 		service.recordEffect(effectInput(op.id));
-		expect(service.getOperation(op.id)).toMatchObject({
+		expect(await service.getOperation(op.id)).toMatchObject({
 			reason: null,
 			coverage: "complete",
 			settlement: "settled",
 		});
 		expect(() => service.finishOperation(op.id, "failed")).toThrow("immutable");
 	});
-	test("source, target metadata, bounded input and transaction boundaries remain enforced", () => {
+	test("source, target metadata, bounded input and transaction boundaries remain enforced", async () => {
 		const op = service.beginOperation(operationInput());
 		const input = effectInput(op.id);
 		expect(() =>
@@ -417,14 +417,14 @@ describe("version 3 final historical facts", () => {
 			service.recordEffect({ ...input, scopeRevision: 0 } as RecordFileChangeEffect),
 		).toThrow("Unexpected fields");
 	});
-	test("bounded keyset pages include every recorded file exactly once", () => {
+	test("bounded keyset pages include every recorded file exactly once", async () => {
 		const op = service.beginOperation(operationInput({ expectedEffectCount: 7 }));
 		for (let index = 0; index < 7; index++)
 			service.recordEffect(effectInput(op.id, {}, `file-${index}`));
 		const keys: string[] = [];
 		let cursor: FileChangeEffectCursor | undefined;
 		do {
-			const page = service.listEffects(op.id, { limit: 2, cursor });
+			const page = await service.listEffects(op.id, { limit: 2, cursor });
 			keys.push(...page.items.map((row) => row.fileKey));
 			cursor = page.nextCursor ?? undefined;
 		} while (cursor);
@@ -435,7 +435,7 @@ describe("version 3 final historical facts", () => {
 });
 
 describe("trusted no-dispatch records", () => {
-	test("binding-null preview records a real attempt with zero effects and sequence", () => {
+	test("binding-null preview records a real attempt with zero effects and sequence", async () => {
 		const input = noDispatchInput();
 		const op = service.beginNoDispatchOperation(input, preview);
 		expect(op).toMatchObject({
@@ -447,7 +447,7 @@ describe("trusted no-dispatch records", () => {
 		});
 		expect(op.journalSeq).toBeGreaterThan(0);
 		expect(service.beginNoDispatchOperation(input, preview)).toEqual(op);
-		expect(service.listEffects(op.id).items).toEqual([]);
+		expect((await service.listEffects(op.id)).items).toEqual([]);
 		expect(
 			db
 				.select()
@@ -472,7 +472,7 @@ describe("trusted no-dispatch records", () => {
 		expect(() => service.beginNoDispatchOperation(input, preview)).toThrow("frozen file-tool");
 		expect(db.select().from(schema.fileChangeOperations).all()).toEqual([]);
 	});
-	test("unstarted host rejection requires its actual observed status and frozen target", () => {
+	test("unstarted host rejection requires its actual observed status and frozen target", async () => {
 		const input = noDispatchInput();
 		db.update(schema.narratorToolCalls)
 			.set({ status: "fail", executionStartedAt: null })
@@ -490,7 +490,7 @@ describe("trusted no-dispatch records", () => {
 		});
 		expect(op).toMatchObject({ executionOutcome: "failed", effectOutcome: "no_change" });
 	});
-	test("linking failure rolls back the entire no-dispatch record and clock tick", () => {
+	test("linking failure rolls back the entire no-dispatch record and clock tick", async () => {
 		const input = noDispatchInput();
 		sqlite.exec(
 			"CREATE TRIGGER fail_tool_link BEFORE UPDATE ON narrator_tool_calls BEGIN SELECT RAISE(ABORT, 'link-fault'); END;",
@@ -500,7 +500,7 @@ describe("trusted no-dispatch records", () => {
 		sqlite.exec("DROP TRIGGER fail_tool_link;");
 		expect(service.beginNoDispatchOperation(input, preview).journalSeq).toBe(1);
 	});
-	test("a dispatched operation cannot be relabeled no-dispatch", () => {
+	test("a dispatched operation cannot be relabeled no-dispatch", async () => {
 		const input = noDispatchInput();
 		service.beginOperation(input);
 		expect(() => service.beginNoDispatchOperation(input, preview)).toThrow("cannot change");

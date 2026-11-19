@@ -1,15 +1,18 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
+import { openSchemaCopyAt } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
+import * as workerReads from "../db/worker-read";
 import { measureMessageCharacters } from "../lib/context-characters";
+import { assertDbReadersReady, closeReadDatabase } from "../lib/db-worker/pool";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { RuntimeDb } from "./agent-runtime/mailbox-types";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
@@ -22,11 +25,7 @@ import {
 	RevertHistoryCommitService,
 	resetRevertRewriteWorkersForTests,
 } from "./revert-history-commit";
-import {
-	closeRevertBodyWorkers,
-	RevertSelectionService,
-	resetRevertBodyWorkersForTests,
-} from "./revert-selection-service";
+import { RevertSelectionService } from "./revert-selection-service";
 import { loadSendTargetDetails } from "./send-delivery-resolution";
 
 // Actual schema/FKs/generated columns, with a real independent root and actual collector.
@@ -43,6 +42,7 @@ let serial: number;
 let authorized: string[];
 let onAuthorize: (() => void) | undefined;
 let connections: Database[];
+let fixtureDirectory: string;
 function database(client: Database) {
 	return drizzle({ client, schema });
 }
@@ -88,13 +88,14 @@ function seedSchema(client: Database, options: { schemaAlreadyCopied?: boolean }
 	);
 }
 beforeEach(async () => {
-	await resetRevertBodyWorkersForTests();
 	await resetRevertRewriteWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	// Byte copy of the same schema, built once per process (see tests/sqlite-schema-image.ts);
 	// replaying ~550 DDL statements per case dominated this file's runtime.
-	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	fixtureDirectory = mkdtempSync(join(process.env.HOME as string, "history-worker-"));
+	sqlite = openSchemaCopyAt(isolatedTemplate, join(fixtureDirectory, "fixture.sqlite"));
+	sqlite.exec("PRAGMA journal_mode=WAL;");
 	connections = [sqlite];
 	seedSchema(sqlite, { schemaAlreadyCopied: true });
 	db = database(sqlite);
@@ -110,11 +111,15 @@ beforeEach(async () => {
 	narrator("other", "bob");
 	service = new RevertHistoryCommitService(db, { authorize, onSlow: () => {} });
 	collector = new RevertSelectionService(db, { authorize, onSlow: () => {} });
+	await assertDbReadersReady(sqlite.filename, { timeoutMs: 30_000 });
 });
 afterEach(async () => {
-	await closeRevertBodyWorkers();
 	await closeRevertRewriteWorkers();
+	for (const filename of new Set(connections.map((connection) => connection.filename)))
+		if (filename && filename !== ":memory:")
+			await closeReadDatabase(filename, { timeoutMs: 30_000 });
 	for (const connection of connections) connection.close();
+	rmSync(fixtureDirectory, { recursive: true, force: true });
 });
 async function authorize(
 	user: NarratorPrincipal,
@@ -263,21 +268,27 @@ async function prepare(selector: FileChangeRevertSelector = { kind: "all" }, nar
 function apply(token: PreparedRevertHistory) {
 	return db.transaction((tx) => service.applyToTransaction(tx, token));
 }
-/** Mutate on the next await after a real synchronous read has returned its original row. */
+/** Mutate after the real Worker snapshot returned its original committed row. */
 function mutateAfterRead(matches: (text: string) => boolean, mutation: () => void) {
 	let scheduled = false;
 	const state = { mutated: false };
-	const realQuery = sqlite.query.bind(sqlite);
-	const trace = spyOn(sqlite, "query").mockImplementation(((text: string) => {
-		if (!scheduled && matches(text)) {
+	const realRead = workerReads.readNativeRows;
+	const trace = spyOn(workerReads, "readNativeRows").mockImplementation((async (
+		client,
+		text,
+		binds,
+		options,
+	) => {
+		const rows = await realRead(client, text, binds, options);
+		if (!scheduled && client.filename === sqlite.filename && matches(text)) {
 			scheduled = true;
 			queueMicrotask(() => {
 				mutation();
 				state.mutated = true;
 			});
 		}
-		return realQuery(text);
-	}) as typeof sqlite.query);
+		return rows;
+	}) as typeof workerReads.readNativeRows);
 	return { state, restore: () => trace.mockRestore() };
 }
 function operation(toolId: string, mode: "effect" | "no_dispatch" = "effect") {
@@ -542,6 +553,25 @@ for (const role of ["assistant", "user", "sys", "system", "disp", "other"]) {
 		}
 	});
 }
+
+test("Worker COW projections preserve native stored-column and length positions", async () => {
+	const target = withTools();
+	const columns = sqlite
+		.query<{ name: string; hidden: number }, []>("PRAGMA table_xinfo(narrator_tool_calls)")
+		.all()
+		.filter((column) => column.hidden === 0)
+		.map((column) => column.name);
+	const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+	const size = columns.map((name) => `coalesce(octet_length(${quote(name)}),0)`).join("+");
+	const query = `SELECT ${columns.map(quote).join(",")},octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,${size} AS rowBytes FROM narrator_tool_calls WHERE id=? LIMIT 1`;
+	const expected = sqlite.query<Record<string, unknown>, [string]>(query).get(target.tools[1]);
+	expect(expected).not.toBeNull();
+	if (expected === null) throw new Error("COW tool fixture is missing its native stored row");
+	const rows = await workerReads.readNativeRows(sqlite, query, [target.tools[1]], {
+		executionPolicy: "worker-required",
+	});
+	expect(rows).toEqual([expected]);
+});
 
 describe("pooled rewrite worker lifecycle", () => {
 	test("separate preparations reuse one native rewrite thread without changing shared originals", async () => {

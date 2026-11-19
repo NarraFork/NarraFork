@@ -1,6 +1,7 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
+import { logger } from "@server/lib/logger";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import {
 	BackgroundOccupancyIndex,
 	type OccupancyNarrator,
@@ -121,6 +122,178 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+describe("background occupancy diagnostics", () => {
+	test("reports one bounded maintenance record with awaited reads separate from synchronous graph work", async () => {
+		const { source, store } = fixture();
+		source.tasks.set("work", task("work", "leaf"));
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const originalRebuild = BackgroundOccupancyIndex.prototype.rebuild;
+		const originalPrune = BackgroundOccupancyIndex.prototype.prune;
+		const originalAncestors = BackgroundOccupancyIndex.prototype.getAncestorIdsForBatch;
+		const rebuild = spyOn(BackgroundOccupancyIndex.prototype, "rebuild").mockImplementation(
+			function (this: BackgroundOccupancyIndex) {
+				clock += 7;
+				return originalRebuild.call(this);
+			},
+		);
+		const prune = spyOn(BackgroundOccupancyIndex.prototype, "prune").mockImplementation(function (
+			this: BackgroundOccupancyIndex,
+		) {
+			clock += 11;
+			return originalPrune.call(this);
+		});
+		const ancestors = spyOn(
+			BackgroundOccupancyIndex.prototype,
+			"getAncestorIdsForBatch",
+		).mockImplementation(function (this: BackgroundOccupancyIndex, ids) {
+			clock += 3;
+			return originalAncestors.call(this, ids);
+		});
+		source.onRead = async () => {
+			await Promise.resolve();
+			clock += 100;
+		};
+		try {
+			await store.start();
+			await store.flush();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[0]).toBe("Slow background occupancy maintenance");
+			const record = warn.mock.calls[0]?.[1];
+			expect(record).toMatchObject({
+				initial: true,
+				completed: true,
+				cancelled: false,
+				workerReadCount: source.calls.length,
+				workerReadElapsedMs: source.calls.length * 100,
+				validationSyncMs: 0,
+				yieldWaitMs: 0,
+				ancestorSyncMs: 6,
+				rebuildSyncMs: 7,
+				pruneSyncMs: 11,
+				rebuildSourceNarratorRows: 3,
+				rebuildSourceTaskRows: 1,
+				sourceNarratorRows: 3,
+				sourceTaskRows: 1,
+			});
+			expect(record?.rows).toBeGreaterThan(0);
+			expect(record?.bytes).toBeGreaterThan(0);
+			expect(record?.elapsedMs).toBe(source.calls.length * 100 + 24);
+			expect(record).not.toHaveProperty("label");
+			expect(store.snapshot(["root"]).counts.get("root")?.activeWorkCount).toBe(1);
+			for (let i = 0; i < 3; i++) {
+				store.refreshTask("work");
+				await store.flush();
+			}
+			expect(warn).toHaveBeenCalledTimes(1);
+			clock += 30_000;
+			store.refreshTask("work");
+			await store.flush();
+			expect(warn).toHaveBeenCalledTimes(2);
+		} finally {
+			ancestors.mockRestore();
+			prune.mockRestore();
+			rebuild.mockRestore();
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+
+	test("fast maintenance emits nothing and multiple slow pages share the same log record", async () => {
+		const { source, store } = fixture();
+		for (let i = 0; i < 260; i++)
+			source.tasks.set(`service-${i}`, task(`service-${i}`, "root", { backgroundKind: "service" }));
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await store.start();
+			await store.flush();
+			expect(warn).not.toHaveBeenCalled();
+			store.resetForTests();
+			source.onRead = async () => {
+				clock += 100;
+			};
+			await store.start();
+			await store.flush();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[1]).toMatchObject({
+				workerReadCount: 4,
+				rows: 263,
+				sourceTaskRows: 260,
+				rebuildSyncMs: 0,
+				pruneSyncMs: 0,
+			});
+		} finally {
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+
+	test("a failed diagnostic sink preserves the source rejection", async () => {
+		const { source, store } = fixture();
+		const failure = new Error("source unavailable");
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("diagnostic sink failed");
+		});
+		const error = spyOn(logger, "error").mockImplementation(() => {});
+		source.onRead = async () => {
+			clock += 100;
+			throw failure;
+		};
+		try {
+			await expect(store.start()).rejects.toBe(failure);
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[1]).toMatchObject({
+				completed: false,
+				cancelled: false,
+				workerReadElapsedMs: 100,
+				ancestorSyncMs: 0,
+				rebuildSyncMs: 0,
+				pruneSyncMs: 0,
+			});
+		} finally {
+			error.mockRestore();
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+
+	test("a slow cancelled generation still rejects startup and lets shutdown settle", async () => {
+		const { source, store } = fixture();
+		const gate = deferred();
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		source.onRead = async () => {
+			await gate.promise;
+			clock += 100;
+		};
+		try {
+			const starting = store.start();
+			const stopping = store.stop();
+			gate.resolve();
+			const results = await Promise.allSettled([starting, stopping]);
+			expect(results.map((result) => result.status)).toEqual(["rejected", "fulfilled"]);
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[1]).toMatchObject({
+				completed: false,
+				cancelled: true,
+				workerReadElapsedMs: 100,
+				rebuildSyncMs: 0,
+				pruneSyncMs: 0,
+			});
+		} finally {
+			gate.resolve();
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+});
+
 describe("background occupancy coordinator", () => {
 	test("cold flush and reads never trigger the explicitly scheduled initial scan", async () => {
 		const { source, store } = fixture();
@@ -134,8 +307,32 @@ describe("background occupancy coordinator", () => {
 		expect(store.isReady).toBe(true);
 	});
 
+	test("shutdown waits for the current read and prevents another maintenance launch", async () => {
+		const { source, store } = fixture();
+		const gate = deferred();
+		source.onRead = () => gate.promise;
+		const startup = store.start();
+		let settled = false;
+		const stopping = store.stop().then(() => {
+			settled = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(settled).toBe(false);
+		} finally {
+			gate.resolve();
+		}
+		const results = await Promise.allSettled([startup, stopping]);
+		expect(results.map((result) => result.status)).toEqual(["rejected", "fulfilled"]);
+		const count = source.calls.length;
+		store.refreshNarrator("child");
+		await Promise.resolve();
+		expect(source.calls).toHaveLength(count);
+		await expect(store.ensureReady()).rejects.toThrow("stopped");
+	});
+
 	test("real SQL correlates projection existence to the outer narrator, not background task itself", async () => {
-		const client = new Database(":memory:");
+		const client = openFileWorkerDatabase();
 		client.exec(`
 			CREATE TABLE narrators (
 				id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT, status TEXT,
@@ -179,7 +376,7 @@ describe("background occupancy coordinator", () => {
 				activeServiceCount: 1,
 			});
 		} finally {
-			client.close();
+			await closeFileWorkerDatabase(client);
 		}
 	});
 	test("explicit startup scans paged metadata only once; all steady reads are SQL-free", async () => {

@@ -2,6 +2,7 @@ import type { NarratorNavigationSummary } from "@shared/narrator-panel-state";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { isSubagentVariant, parseTraits } from "../lib/narrator-utils";
 import { canReadNarrator, NARRATOR_ACL_COLUMNS, type NarratorPrincipal } from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
@@ -24,10 +25,13 @@ export async function getNarratorNavigationSummary(
 	let context = row;
 	if (isSubagentVariant(row.variant) || parseTraits(row.traits).includes("modeltrace")) {
 		if (!row.parentNarratorId) return result;
-		const parent = await db.query.narrators.findFirst({
-			where: eq(narrators.id, row.parentNarratorId),
-			columns: { ...NARRATOR_ACL_COLUMNS, title: true, variant: true, parentNarratorId: true },
-		});
+		const parent = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, row.parentNarratorId),
+				columns: { ...NARRATOR_ACL_COLUMNS, title: true, variant: true, parentNarratorId: true },
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!parent || !(await canReadNarrator(parent, principal))) return result;
 		result.parentNarratorId = parent.id;
 		result.parentNarratorTitle = parent.title;
@@ -35,23 +39,28 @@ export async function getNarratorNavigationSummary(
 	}
 	const contextProjectId = await resolveNarratorProjectId(context);
 	if (contextProjectId) {
-		const project = await db
-			.select({ id: projects.id })
-			.from(projects)
-			.where(
-				and(
-					eq(projects.id, contextProjectId),
-					projectReadableWhereForColumn(principal, sql`projects.id`),
+		const project = await readQueryFirst(
+			db
+				.select({ id: projects.id })
+				.from(projects)
+				.where(
+					and(
+						eq(projects.id, contextProjectId),
+						projectReadableWhereForColumn(principal, sql`projects.id`),
+					),
 				),
-			)
-			.get();
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		result.projectId = project?.id ?? null;
 	}
 	if (result.parentNarratorId) {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, result.parentNarratorId),
-			columns: NARRATOR_ACL_COLUMNS,
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, result.parentNarratorId),
+				columns: NARRATOR_ACL_COLUMNS,
+			}),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		if (!current || !(await canReadNarrator(current, principal)))
 			return {
 				parentNarratorId: null,

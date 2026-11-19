@@ -11,6 +11,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { LOCAL_DEVICE_ID, type PathFlavor } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
 import {
@@ -160,18 +161,24 @@ export class ReplayDivergedError extends FileHistoryError {
  * wrong files.
  */
 async function resolveLegacyLocalCwd(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { cwd: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { cwd: true, contextProjectId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!narrator) return null;
 	if (narrator.cwd) return narrator.cwd;
 
 	if (narrator.contextProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narrator.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, narrator.contextProjectId),
+				columns: { gitPath: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (project?.gitPath) return project.gitPath;
 	}
 	return null;
@@ -424,34 +431,37 @@ export async function queryOrderedToolCalls(
 	];
 	if (maxSeq !== undefined) conditions.push(lte(narratorMessageRefs.seq, maxSeq));
 
-	const rows = (await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-			isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
-			status: narratorToolCalls.status,
-			messageId: narratorToolCalls.messageId,
-			seq: narratorMessageRefs.seq,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(and(...conditions))
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))) as OrderedToolCall[];
+	const rows = (await readQuery(
+		db
+			.select({
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				inputJson: narratorToolCalls.inputJson,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
+				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				canonicalFilePath: narratorToolCalls.canonicalFilePath,
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				executionTargetsJson: narratorToolCalls.executionTargetsJson,
+				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
+				status: narratorToolCalls.status,
+				messageId: narratorToolCalls.messageId,
+				seq: narratorMessageRefs.seq,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(and(...conditions))
+			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt)),
+		{ executionPolicy: "worker-required", maxRows: TOOL_CALL_WARN_THRESHOLD },
+	)) as OrderedToolCall[];
 
 	if (rows.length >= TOOL_CALL_WARN_THRESHOLD) {
 		logger.warn("queryOrderedToolCalls returned large result set", {
@@ -949,17 +959,20 @@ async function loadSnapshotMap(
 	legacyLocalCwd: string | null,
 	canonicalAliases: Map<string, DeviceFileIdentity>,
 ): Promise<Map<string, SnapshotBaseline>> {
-	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		orderBy: narratorFileSnapshots.createdAt,
-		columns: {
-			deviceId: true,
-			filePath: true,
-			originalContent: true,
-			originalEncoding: true,
-			isBinary: true,
-		},
-	});
+	const snapshots = await readQuery(
+		db.query.narratorFileSnapshots.findMany({
+			where: eq(narratorFileSnapshots.narratorId, narratorId),
+			orderBy: narratorFileSnapshots.createdAt,
+			columns: {
+				deviceId: true,
+				filePath: true,
+				originalContent: true,
+				originalEncoding: true,
+				isBinary: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: TOOL_CALL_WARN_THRESHOLD },
+	);
 	if (snapshots.length >= TOOL_CALL_WARN_THRESHOLD) {
 		logger.warn("loadSnapshotMap returned large result set", {
 			narratorId,
@@ -1092,13 +1105,16 @@ export async function rebuildFileStatesAtMessage(
 	narratorId: string,
 	messageId: string,
 ): Promise<Map<string, string | null>> {
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return ref ? rebuildFileStatesUpToSeq(narratorId, ref.seq) : new Map();
 }
 

@@ -1,7 +1,14 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import type { ReadQueryOptions } from "../../db/worker-read";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+type WorkerQuery<T> = PromiseLike<T> & { toSQL(): { sql: string; params: unknown[] } };
+
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+const workerRead = await import("../../db/worker-read");
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 // Preserve the existing service/persistence import-cycle initialization order.
@@ -51,11 +58,18 @@ function buffer(id: string, seq: number, priority = false, state = "queued", tex
 }
 function driverQueries() {
 	const queries: string[] = [];
-	const prepare = sqlite.prepare.bind(sqlite);
-	spyOn(sqlite, "prepare").mockImplementation((...args: Parameters<typeof sqlite.prepare>) => {
-		queries.push(args[0]);
-		return prepare(...args);
-	});
+	const readQuery = workerRead.readQuery;
+	spyOn(workerRead, "readQuery").mockImplementation(
+		<T>(query: WorkerQuery<T>, options?: ReadQueryOptions) => {
+			queries.push(query.toSQL().sql);
+			return readQuery<T>(query, options);
+		},
+	);
+	const readQueryFirst = workerRead.readQueryFirst;
+	spyOn(workerRead, "readQueryFirst").mockImplementation(((query, options) => {
+		queries.push(query.toSQL().sql);
+		return readQueryFirst(query, options);
+	}) as typeof readQueryFirst);
 	return queries;
 }
 beforeEach(() => {
@@ -63,10 +77,11 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	narrator();
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("bounded narrator panel state", () => {
@@ -140,22 +155,20 @@ describe("bounded narrator panel state", () => {
 		type Bindings = Parameters<ReturnType<typeof sqlite.prepare>["values"]>;
 		let executed: { query: string; bindings: Bindings } | undefined;
 		const prepare = sqlite.prepare.bind(sqlite);
-		// Preserve the driver's generic row signature; the spy only observes bindings.
-		const tracePrepare = ((...args: Parameters<typeof sqlite.prepare>) => {
-			const statement = prepare(...args);
-			const values = statement.values.bind(statement);
-			spyOn(statement, "values").mockImplementation((...bindings: Bindings) => {
+		const readQuery = workerRead.readQuery;
+		// Capture the exact compiled SQL handed to the real Worker execution.
+		spyOn(workerRead, "readQuery").mockImplementation(
+			<T>(query: WorkerQuery<T>, options?: ReadQueryOptions) => {
+				const compiled = query.toSQL();
 				if (
 					!executed &&
-					args[0].includes('from "narrator_tool_calls"') &&
-					args[0].includes("length(CAST(")
+					compiled.sql.includes('from "narrator_tool_calls"') &&
+					compiled.sql.includes("length(CAST(")
 				)
-					executed = { query: args[0], bindings };
-				return values(...bindings);
-			});
-			return statement;
-		}) as typeof sqlite.prepare;
-		spyOn(sqlite, "prepare").mockImplementation(tracePrepare);
+					executed = { query: compiled.sql, bindings: compiled.params as Bindings };
+				return readQuery<T>(query, options);
+			},
+		);
 		await getNarratorPanelState("n1", "viewer");
 		const getExecution = (): { query: string; bindings: Bindings } | undefined => executed;
 		const actual = getExecution();

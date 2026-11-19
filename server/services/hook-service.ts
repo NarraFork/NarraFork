@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { hooks, narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -68,26 +69,36 @@ export interface HookResult {
 export const hookService = {
 	async list(projectId?: string | null) {
 		if (projectId) {
-			return db
-				.select()
-				.from(hooks)
-				.where(eq(hooks.projectId, projectId))
-				.orderBy(hooks.sortOrder, hooks.createdAt);
+			return readQuery(
+				db
+					.select()
+					.from(hooks)
+					.where(eq(hooks.projectId, projectId))
+					.orderBy(hooks.sortOrder, hooks.createdAt),
+				{ executionPolicy: "worker-required" },
+			);
 		}
 		// Global hooks (projectId IS NULL)
-		return db
-			.select()
-			.from(hooks)
-			.where(isNull(hooks.projectId))
-			.orderBy(hooks.sortOrder, hooks.createdAt);
+		return readQuery(
+			db
+				.select()
+				.from(hooks)
+				.where(isNull(hooks.projectId))
+				.orderBy(hooks.sortOrder, hooks.createdAt),
+			{ executionPolicy: "worker-required" },
+		);
 	},
 
 	async listAll() {
-		return db.select().from(hooks).orderBy(hooks.sortOrder, hooks.createdAt);
+		return readQuery(db.select().from(hooks).orderBy(hooks.sortOrder, hooks.createdAt), {
+			executionPolicy: "worker-required",
+		});
 	},
 
 	async get(id: string) {
-		const [row] = await db.select().from(hooks).where(eq(hooks.id, id));
+		const [row] = await readQuery(db.select().from(hooks).where(eq(hooks.id, id)), {
+			executionPolicy: "worker-required",
+		});
 		return row ?? null;
 	},
 
@@ -167,11 +178,14 @@ export const hookService = {
 		const conditions = [eq(hooks.event, event), eq(hooks.enabled, true)];
 
 		// Get global + project hooks
-		const allHooks = await db
-			.select()
-			.from(hooks)
-			.where(and(...conditions))
-			.orderBy(hooks.sortOrder, hooks.createdAt);
+		const allHooks = await readQuery(
+			db
+				.select()
+				.from(hooks)
+				.where(and(...conditions))
+				.orderBy(hooks.sortOrder, hooks.createdAt),
+			{ executionPolicy: "worker-required" },
+		);
 
 		return allHooks.filter((h) => {
 			// Scope: global (null projectId) or matching project
@@ -260,10 +274,13 @@ export const hookService = {
 		// the common no-hook path stays a single indexed lookup with no extra query.
 		if (input.narrator_id && input.narrator_title === undefined) {
 			try {
-				const narrator = await db.query.narrators.findFirst({
-					where: eq(narrators.id, input.narrator_id),
-					columns: { title: true },
-				});
+				const narrator = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, input.narrator_id),
+						columns: { title: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				if (narrator?.title) input.narrator_title = narrator.title;
 			} catch {
 				// Title is informational only — never block hook execution on lookup failure.

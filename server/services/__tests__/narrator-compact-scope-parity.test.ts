@@ -25,9 +25,14 @@ import {
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-// Prefix/history workers need the same file-backed database as the run/compact paths.
-const { db, sqlite } = await import("../../db");
+// Prefix/history workers share the run/compact paths' isolated file-backed database.
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const { settings } = await import("../../lib/settings");
 const executor = await import("../narrator-executor");
@@ -90,8 +95,11 @@ afterEach(async () => {
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
 	unregisterProvider();
+	await closePrefixSnapshotStore();
+	await workerFixture.close();
+	mock.module("../../db", () => realDb);
 });
 
 function message(
@@ -144,10 +152,11 @@ function callerCall() {
 function seed(shape: Shape) {
 	db.insert(narrators)
 		.values([
-			{ id: CALLER, variant: "primary", cwd, createdAt: NOW, updatedAt: NOW },
+			{ id: CALLER, variant: "primary", model: "test:model", cwd, createdAt: NOW, updatedAt: NOW },
 			{
 				id: ID,
 				...shape.row,
+				policySourceNarratorId: CALLER,
 				cwd,
 				status: "idle",
 				model: "test:model",

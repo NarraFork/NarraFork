@@ -85,9 +85,9 @@ function gate() {
 	releases.add(result.resolve);
 	return result;
 }
-async function waitUntil(check: () => boolean, label: string) {
+async function waitUntil(check: () => boolean | Promise<boolean>, label: string) {
 	const deadline = Date.now() + 10_000;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() >= deadline)
 			throw new Error(`Timed out: ${label}; requests=${requests.length}; status=${row().status}`);
 		await Bun.sleep(10);
@@ -95,11 +95,11 @@ async function waitUntil(check: () => boolean, label: string) {
 }
 async function idle(count: number) {
 	await waitUntil(
-		() =>
+		async () =>
 			requests.length === count &&
 			row().status === "idle" &&
 			!getExecutionOwner(narratorId) &&
-			!hasPendingBufferedWork(narratorId),
+			!(await hasPendingBufferedWork(narratorId)),
 		"run fully torn down",
 	);
 }

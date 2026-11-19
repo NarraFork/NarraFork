@@ -162,6 +162,11 @@ export class BackgroundOccupancyIndex {
 		return this.tasks.get(id);
 	}
 
+	/** Counts stored source rows, not derived occupancy buckets or graph edges. */
+	get sourceRowCounts(): { narrators: number; tasks: number } {
+		return { narrators: this.narrators.size, tasks: this.tasks.size };
+	}
+
 	getNarratorIds(): string[] {
 		return [...this.narrators.keys()];
 	}

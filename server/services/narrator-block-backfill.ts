@@ -51,7 +51,7 @@ import {
 	type ReindexEnvelope,
 	rowsSignature,
 } from "../lib/db-worker/block-backfill-query";
-import { runReadTask } from "../lib/db-worker/pool";
+import { getDbReadSchedulingPressure, runReadTask } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";

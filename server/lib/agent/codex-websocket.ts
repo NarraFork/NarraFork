@@ -9,6 +9,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import { generateId } from "../id";
 import { logger } from "../logger";
 import { applyProxyExemptions } from "../net/proxy";
@@ -490,15 +491,21 @@ export function decidePrematureCodexReconnect(
 	};
 }
 
-async function getLatestNarratorMessageCreatedAt(narratorId?: string): Promise<string | null> {
+async function getLatestNarratorMessageCreatedAt(
+	narratorId?: string,
+	signal?: AbortSignal,
+): Promise<string | null> {
 	if (!narratorId) return null;
-	const rows = await db
-		.select({ createdAt: narratorMessages.createdAt })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(eq(narratorMessageRefs.narratorId, narratorId))
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000, signal },
+	);
 	return rows[0]?.createdAt ?? null;
 }
 
@@ -1498,7 +1505,10 @@ export async function* streamCodexResponsesWebSocket(
 				if (!isCodexWebSocketIdleTimeoutError(error)) {
 					throw error;
 				}
-				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(
+					options.narratorId,
+					options.signal,
+				);
 				if (options.signal.aborted) {
 					await resetSession(session, false);
 					yield { silentDisconnect: true };
@@ -1666,7 +1676,10 @@ export async function* streamCodexResponsesWebSocket(
 					return;
 				}
 
-				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
+				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(
+					options.narratorId,
+					options.signal,
+				);
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
 					hasYieldedEvents,

@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
 import { DisplayJsonAllocationBudget } from "../../lib/db-worker/display-page-json-budget";
 import { DISPLAY_PAGE_LIMITS } from "../../lib/db-worker/display-page-protocol";
+import { ModelHistoryTimeoutError } from "../../lib/model-history-preparation";
 import { modelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
 import {
@@ -13,6 +14,19 @@ import { assembleBlockBodies, queryModelHistory, sqliteHistoryQuery } from "./mo
 import { freezeModelHistorySource } from "./model-history-source";
 
 describe("pre-parse graph allocation budget", () => {
+	test("JSON preflight shares the caller deadline beyond 10s and reports execution expiry", () => {
+		const clock = spyOn(Date, "now").mockReturnValue(111_000);
+		const check = () => {
+			if (Date.now() >= 130_000) throw new ModelHistoryTimeoutError();
+		};
+		try {
+			expect(measureModelJsonShape("[1]", { check }).slots).toBe(1);
+			clock.mockReturnValue(130_000);
+			expect(() => measureModelJsonShape("[1]", { check })).toThrow("30s budget");
+		} finally {
+			clock.mockRestore();
+		}
+	});
 	test("counts scalar slots and property slots, not punctuation within escaped strings", () => {
 		const shape = measureModelJsonShape('[0,0,{"a":0,"b":"[,{}:\\"", "c":[1,2]}]', {});
 		expect(shape).toEqual({

@@ -160,7 +160,7 @@ function validatePortResult(
 	// supplies the worker's bounded result plus its byte accounting.
 }
 
-function mapReadError(error: unknown): Error {
+export function mapNarratorDisplayReadError(error: unknown): Error {
 	if (error instanceof AppError) return error;
 	if (error instanceof WorkersUnavailableError) return unavailable(error.reason);
 	const code = error && typeof error === "object" && "code" in error ? error.code : null;
@@ -182,6 +182,8 @@ function mapReadError(error: unknown): Error {
 			return new AppError(message, 500, code);
 		case "DISPLAY_PAGE_DEADLINE":
 			return new AppError(message, 504, code);
+		case "DB_READ_ABORTED":
+			return new AppError("History display read was cancelled", 499, "DISPLAY_PAGE_CANCELLED");
 		case "DISPLAY_PAGE_CANCELLED":
 			return new AppError(message, 499, code);
 		case "DISPLAY_PAGE_READER_UNAVAILABLE":
@@ -231,7 +233,7 @@ export async function readNarratorDisplayMessages(
 	try {
 		validateDisplayPageRequest(request, limits);
 	} catch (error) {
-		throw mapReadError(error);
+		throw mapNarratorDisplayReadError(error);
 	}
 	if (options.signal?.aborted)
 		throw new AppError("History display read was cancelled", 499, "DISPLAY_PAGE_CANCELLED");
@@ -297,7 +299,7 @@ export async function readNarratorDisplayMessages(
 		assertSuccessfulSettlement();
 		return messages;
 	} catch (error) {
-		throw mapReadError(controller.signal.aborted ? controller.signal.reason : error);
+		throw mapNarratorDisplayReadError(controller.signal.aborted ? controller.signal.reason : error);
 	} finally {
 		clearTimeout(timer);
 		options.signal?.removeEventListener("abort", onAbort);

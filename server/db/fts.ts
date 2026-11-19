@@ -77,6 +77,28 @@ export const FTS_INDEX_TABLES = [
 	"outline_blocks_fts",
 ] as const;
 
+type BlockIndexResult = "unchanged" | "cleared" | "recreated" | "failed";
+
+/** Fixed-cardinality diagnostics for block-index schema checks and queued repairs. */
+function beginBlockIndexOperation(operation: "repair"): (result: BlockIndexResult) => void {
+	const startedAt = performance.now();
+	const log = (status: "started" | "completed" | "failed", result?: BlockIndexResult) => {
+		try {
+			logger.info("FTS block index startup operation", {
+				index: "narrator_blocks_fts",
+				operation,
+				status,
+				...(result ? { result } : {}),
+				elapsedMs: performance.now() - startedAt,
+			});
+		} catch {
+			// Observability must not change repair or startup behavior.
+		}
+	};
+	log("started");
+	return (result) => log(result === "failed" ? "failed" : "completed", result);
+}
+
 /**
  * The FTS indexes an integrity report blames, when it blames nothing else.
  *
@@ -286,25 +308,36 @@ function dropRetiredFtsObjects(sqlite: Database): void {
  * store, so it cannot be rebuilt here; see {@link restartReindex}.
  */
 function repairBlockIndex(sqlite: Database, corrupt: boolean): boolean {
-	const deleteTrigger = sqlite
-		.prepare(
-			"SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'narrator_blocks_fts_delete'",
-		)
-		.get();
-	if (!deleteTrigger) {
-		sqlite.run("DELETE FROM narrator_blocks_fts");
-		logger.info("Block FTS index cleared before restoring its missing delete trigger");
-		return true;
-	}
-	if (!corrupt) return false;
+	const finish = beginBlockIndexOperation("repair");
+	let result: BlockIndexResult = "failed";
 	try {
-		sqlite.run("DROP TABLE narrator_blocks_fts");
-		createBlockIndex(sqlite);
-		logger.warn("Corrupt block FTS index recreated empty");
-		return true;
-	} catch (err) {
-		logger.warn("Block FTS index recreation failed on startup", { error: String(err) });
-		return false;
+		const deleteTrigger = sqlite
+			.prepare(
+				"SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'narrator_blocks_fts_delete'",
+			)
+			.get();
+		if (!deleteTrigger) {
+			sqlite.run("DELETE FROM narrator_blocks_fts");
+			logger.info("Block FTS index cleared before restoring its missing delete trigger");
+			result = "cleared";
+			return true;
+		}
+		if (!corrupt) {
+			result = "unchanged";
+			return false;
+		}
+		try {
+			sqlite.run("DROP TABLE narrator_blocks_fts");
+			createBlockIndex(sqlite);
+			logger.warn("Corrupt block FTS index recreated empty");
+			result = "recreated";
+			return true;
+		} catch (err) {
+			logger.warn("Block FTS index recreation failed on startup", { error: String(err) });
+			return false;
+		}
+	} finally {
+		finish(result);
 	}
 }
 

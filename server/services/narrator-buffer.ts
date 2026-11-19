@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	existsSync,
 	mkdirSync,
@@ -19,10 +20,11 @@ import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import type { MediaRef } from "@shared/media-attachments";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { users as pgUsers } from "../db/postgres-schema";
 import { narratorBufferedMessages as mailbox, narrators, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
@@ -88,8 +90,8 @@ function pgQueue(): RuntimeQueuePort | undefined {
 	return getRuntimeQueuePort();
 }
 /**
- * Synchronous staging/ownership reads have no PG read port in this stage. Under
- * PostgreSQL they fail closed with an explicit error — never a silent empty result.
+ * SQLite-specific staging helpers require the SQLite backend. PostgreSQL callers
+ * use the backend-neutral asynchronous cleanup entry and the queue port.
  */
 function assertSqliteBufferRead(operation: string): void {
 	if (getRuntimeQueuePort())
@@ -101,7 +103,7 @@ function assertSqliteBufferRead(operation: string): void {
 async function rowByIdRuntime(id: string): Promise<RuntimeMailboxRow | undefined> {
 	const port = pgQueue();
 	if (port) return port.mailbox.getById(id);
-	return rowById(id);
+	return await rowById(id);
 }
 /** Drop a staging directory that was never accepted into the mailbox (no ownership row exists). */
 function discardUnownedStaging(stagingId: string): void {
@@ -204,7 +206,108 @@ export async function reconcileBufferedStaging(
 // These are unaccepted preparation permits, never a second message authority.
 let activePreparations = 0;
 const preparationWaiters: Array<() => void> = [];
+const pendingBufferedPreparations = new Set<Promise<unknown>>();
+const bufferedPreparationScope = new AsyncLocalStorage<{ pending: number }>();
+const acceptedPreparationScopes = new Set<{ pending: number }>();
+let bufferedPreparationFailures = 0;
+let firstBufferedPreparationFailure: unknown;
+let bufferedPreparationAdmissionClosed = false;
+
+function trackBufferedPreparation<T>(
+	work: Promise<T>,
+	scope = bufferedPreparationScope.getStore(),
+): Promise<T> {
+	if (scope) scope.pending++;
+	pendingBufferedPreparations.add(work);
+	const settled = () => {
+		pendingBufferedPreparations.delete(work);
+		if (scope && --scope.pending === 0) acceptedPreparationScopes.delete(scope);
+	};
+	void work.then(settled, (error) => {
+		if (bufferedPreparationAdmissionClosed) {
+			bufferedPreparationFailures++;
+			firstBufferedPreparationFailure ??= error;
+		}
+		settled();
+	});
+	return work;
+}
+
+function withBufferedPreparationAdmission<T>(work: () => Promise<T>): Promise<T> {
+	const inherited = bufferedPreparationScope.getStore();
+	if (bufferedPreparationAdmissionClosed && !inherited?.pending)
+		return Promise.reject(new Error("Buffered file preparation admission is closed"));
+	if (
+		!inherited?.pending &&
+		acceptedPreparationScopes.size >= MAILBOX_LIMITS.prepareConcurrency + MAILBOX_LIMITS.userPending
+	)
+		return Promise.reject(new Error("Buffered preparation is full"));
+	const scope = inherited?.pending ? inherited : { pending: 0 };
+	acceptedPreparationScopes.add(scope);
+	return trackBufferedPreparation(
+		bufferedPreparationScope.run(scope, () => Promise.resolve().then(work)),
+		scope,
+	);
+}
+
+function trackBufferedCleanup<T>(work: () => Promise<T>): Promise<T> {
+	return trackBufferedPreparation(Promise.resolve().then(work));
+}
+
+export function getBufferedFilePreparationStatus() {
+	return {
+		pending: pendingBufferedPreparations.size,
+		active: activePreparations,
+		waiting: preparationWaiters.length,
+		batches: acceptedPreparationScopes.size,
+		failed: bufferedPreparationFailures,
+	};
+}
+export function stopBufferedFilePreparations(): void {
+	bufferedPreparationAdmissionClosed = true;
+}
+export function hasPendingBufferedFilePreparations(): boolean {
+	return (
+		pendingBufferedPreparations.size > 0 || activePreparations > 0 || preparationWaiters.length > 0
+	);
+}
+export async function drainBufferedFilePreparations(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	options.signal?.throwIfAborted();
+	while (hasPendingBufferedFilePreparations()) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Buffered preparation drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingBufferedPreparations]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Buffered preparation drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(
+						() => reject(new Error("Buffered preparation drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (bufferedPreparationFailures)
+		throw new Error("Buffered preparation failed", { cause: firstBufferedPreparationFailure });
+}
+
 async function acquirePreparation(): Promise<() => void> {
+	if (bufferedPreparationAdmissionClosed && !bufferedPreparationScope.getStore()?.pending)
+		throw new Error("Buffered file preparation admission is closed");
 	if (activePreparations >= MAILBOX_LIMITS.prepareConcurrency) {
 		if (preparationWaiters.length >= MAILBOX_LIMITS.userPending)
 			throw new Error("Buffered preparation is full");
@@ -253,13 +356,14 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const write = Promise.resolve()
 		.then(() => Bun.write(path, value))
-		.finally(() => {
+		.finally(async () => {
 			release();
 			if (expired) {
-				deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
-				cleanupBufferedTextFiles(basename(dirname(path)));
+				await deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
+				await cleanupBufferedTextFiles(basename(dirname(path)));
 			}
 		});
+	trackBufferedPreparation(write);
 	try {
 		await Promise.race([
 			write,
@@ -299,14 +403,25 @@ function ownedPath(path: string): boolean {
 function json<T>(value: string | null, fallback: T): T {
 	return value ? JSON.parse(value) : fallback;
 }
-function rowById(id: string): MailboxRow | undefined {
-	return db.select().from(mailbox).where(eq(mailbox.id, id)).get();
+async function rowById(id: string): Promise<MailboxRow | undefined> {
+	return readQueryFirst(db.select().from(mailbox).where(eq(mailbox.id, id)).limit(1), {
+		executionPolicy: "worker-required",
+	});
 }
-/** SQLite's synchronous ownership probe mirrors the bounded PostgreSQL adapter lookup. */
-function rowByStagingId(stagingId: string): MailboxRow | undefined {
-	const candidates = db.select().from(mailbox).where(eq(mailbox.kind, "user_input")).all();
-	return candidates.find(
-		(candidate) => json<{ stagingId?: string }>(candidate.metadataJson, {}).stagingId === stagingId,
+/** Resolve a staging owner without materializing every narrator's mailbox. */
+async function rowByStagingId(stagingId: string): Promise<MailboxRow | undefined> {
+	return readQueryFirst(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.kind, "user_input"),
+					sql`CASE WHEN json_valid(${mailbox.metadataJson}) THEN json_extract(${mailbox.metadataJson}, ${"$.stagingId"}) END = ${stagingId}`,
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
 	);
 }
 function writeStagingOwnerMarker(stagingId: string, rowId: string | null): void {
@@ -381,125 +496,136 @@ export async function persistBufferedTextFiles(
 	files: File[],
 	reserved: Iterable<string> = [],
 ): Promise<SavedBufferedFile[]> {
-	if (!files.length) return [];
-	if (files.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE)
-		throw new Error("Too many buffered attachments");
-	const dir = ensureStagingDirectory(id);
-	const taken = new Set([STAGING_OWNER_FILE, ...reserved]);
-	const saved: SavedBufferedFile[] = [];
-	try {
-		for (const file of files) {
-			if (file.size > MAX_TEXT_FILE_SIZE) throw new Error("Buffered attachment exceeds size limit");
-			const namePart = basename(file.name);
-			const safe = !namePart || namePart === "." || namePart === ".." ? "unnamed" : namePart;
-			let name = safe;
-			while (taken.has(name) || existsSync(join(dir, name))) {
-				const ext = extname(safe);
-				name = `${ext ? safe.slice(0, -ext.length) : safe}_${generateShortId()}${ext}`;
+	return withBufferedPreparationAdmission(async () => {
+		if (!files.length) return [];
+		if (files.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE)
+			throw new Error("Too many buffered attachments");
+		const dir = ensureStagingDirectory(id);
+		const taken = new Set([STAGING_OWNER_FILE, ...reserved]);
+		const saved: SavedBufferedFile[] = [];
+		try {
+			for (const file of files) {
+				if (file.size > MAX_TEXT_FILE_SIZE)
+					throw new Error("Buffered attachment exceeds size limit");
+				const namePart = basename(file.name);
+				const safe = !namePart || namePart === "." || namePart === ".." ? "unnamed" : namePart;
+				let name = safe;
+				while (taken.has(name) || existsSync(join(dir, name))) {
+					const ext = extname(safe);
+					name = `${ext ? safe.slice(0, -ext.length) : safe}_${generateShortId()}${ext}`;
+				}
+				taken.add(name);
+				const path = join(dir, name);
+				// Register before write so a partial write is cleaned after failure too.
+				saved.push({
+					filename: name,
+					path,
+					size: file.size,
+					originalName: file.name,
+					sourceMimeType: file.type,
+				});
+				await writeBufferedFile(path, file);
+				// Deliberately NOT releasing the staged original here: this copy only
+				// becomes the message's attachment once the mailbox row commits. Callers
+				// release after their commit (see `releaseStagedFiles`), so a full queue
+				// or a DB error still leaves the upload claimable on retry.
 			}
-			taken.add(name);
-			const path = join(dir, name);
-			// Register before write so a partial write is cleaned after failure too.
-			saved.push({
-				filename: name,
-				path,
-				size: file.size,
-				originalName: file.name,
-				sourceMimeType: file.type,
-			});
-			await writeBufferedFile(path, file);
-			// Deliberately NOT releasing the staged original here: this copy only
-			// becomes the message's attachment once the mailbox row commits. Callers
-			// release after their commit (see `releaseStagedFiles`), so a full queue
-			// or a DB error still leaves the upload claimable on retry.
+			return saved;
+		} catch (error) {
+			for (const file of saved) await deleteBufferedTextFile(file);
+			throw error;
 		}
-		return saved;
-	} catch (error) {
-		for (const file of saved) deleteBufferedTextFile(file);
-		throw error;
-	}
+	});
 }
 /** Only clean a known, unreferenced mailbox staging directory, never uploads/history. */
-export function cleanupBufferedTextFiles(id: string): void {
-	assertSqliteBufferRead("cleanupBufferedTextFiles");
-	const row = rowById(id) ?? rowByStagingId(id);
-	const stagingId = row
-		? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
-		: id;
-	if (!stagingId) return;
-	const path = stagingPath(stagingId);
-	if (!ownedPath(path)) return;
-	// A small on-disk ownership pointer avoids scanning every narrator's mailbox.
-	// It is not a message registry: the DB row still decides whether files are leased.
-	const marker = join(path, STAGING_OWNER_FILE);
-	let ownerId: string | null = row?.id ?? stagingId;
-	let stagingPending = false;
-	if (!existsSync(marker) && (!row || row.kind !== "user_input")) return;
-	if (existsSync(marker)) {
-		if (!ownedPath(marker) || statSync(marker).size > 1024) return;
-		try {
-			const markerOwner = JSON.parse(readFileSync(marker, "utf8")).rowId;
-			if (markerOwner === null) stagingPending = true;
-			else ownerId = markerOwner ?? ownerId;
-		} catch {
-			return;
+export async function cleanupBufferedTextFiles(id: string): Promise<void> {
+	return trackBufferedCleanup(async () => {
+		assertSqliteBufferRead("cleanupBufferedTextFiles");
+		const row = (await rowById(id)) ?? (await rowByStagingId(id));
+		const stagingId = row
+			? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
+			: id;
+		if (!stagingId) return;
+		const path = stagingPath(stagingId);
+		if (!ownedPath(path)) return;
+		// A small on-disk ownership pointer avoids scanning every narrator's mailbox.
+		// It is not a message registry: the DB row still decides whether files are leased.
+		const marker = join(path, STAGING_OWNER_FILE);
+		let ownerId: string | null = row?.id ?? stagingId;
+		let stagingPending = false;
+		if (!existsSync(marker) && (!row || row.kind !== "user_input")) return;
+		if (existsSync(marker)) {
+			if (!ownedPath(marker) || statSync(marker).size > 1024) return;
+			try {
+				const markerOwner = JSON.parse(readFileSync(marker, "utf8")).rowId;
+				if (markerOwner === null) stagingPending = true;
+				else ownerId = markerOwner ?? ownerId;
+			} catch {
+				return;
+			}
+			if (ownerId !== null && typeof ownerId !== "string") return;
 		}
-		if (ownerId !== null && typeof ownerId !== "string") return;
-	}
-	if (stagingPending && !row) return;
-	const owner = ownerId ? rowById(ownerId) : undefined;
-	if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
-	rmSync(path, { recursive: true, force: true });
+		if (stagingPending && !row) return;
+		const owner = ownerId ? await rowById(ownerId) : undefined;
+		if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
+		rmSync(path, { recursive: true, force: true });
+	});
 }
 /** Backend-neutral asynchronous cleanup used after mailbox consumption. */
 export async function cleanupBufferedTextFilesAsync(id: string): Promise<void> {
-	const port = pgQueue();
-	if (port) {
-		await cleanupStagingPg(port, id);
-		return;
-	}
-	cleanupBufferedTextFiles(id);
+	return trackBufferedCleanup(async () => {
+		const port = pgQueue();
+		if (port) {
+			await cleanupStagingPg(port, id);
+			return;
+		}
+		await cleanupBufferedTextFiles(id);
+	});
 }
-export function persistAdditionalBufferedTextFiles(
+export async function persistAdditionalBufferedTextFiles(
 	messageId: string,
 	files: File[],
 	reserved: Iterable<string>,
 ): Promise<SavedBufferedFile[]> {
-	assertSqliteBufferRead("persistAdditionalBufferedTextFiles");
-	const row = rowById(messageId);
-	if (!row || row.kind !== "user_input" || !pending.includes(row.state as "queued" | "failed"))
-		throw new Error("Buffered message is no longer editable");
-	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
-	if (files.length) {
-		mkdirSync(stagingPath(id), { recursive: true });
-		writeStagingOwnerMarker(id, row.id);
-	}
-	return persistBufferedTextFiles(id, files, reserved);
-}
-export function deleteBufferedTextFile(saved: SavedBufferedFile): void {
-	assertSqliteBufferRead("deleteBufferedTextFile");
-	if (!ownedPath(saved.path)) return;
-	const marker = join(dirname(saved.path), STAGING_OWNER_FILE);
-	let ownerId: string | null = basename(dirname(saved.path));
-	if (!existsSync(marker) && !rowById(ownerId)) return;
-	if (existsSync(marker)) {
-		if (!ownedPath(marker) || statSync(marker).size > 1024) return;
-		try {
-			ownerId = JSON.parse(readFileSync(marker, "utf8")).rowId ?? ownerId;
-		} catch {
-			return;
+	return withBufferedPreparationAdmission(async () => {
+		assertSqliteBufferRead("persistAdditionalBufferedTextFiles");
+		const row = await rowById(messageId);
+		if (!row || row.kind !== "user_input" || !pending.includes(row.state as "queued" | "failed"))
+			throw new Error("Buffered message is no longer editable");
+		const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
+		if (files.length) {
+			mkdirSync(stagingPath(id), { recursive: true });
+			writeStagingOwnerMarker(id, row.id);
 		}
-		if (ownerId !== null && typeof ownerId !== "string") return;
-	}
-	const owner = ownerId ? rowById(ownerId) : undefined;
-	if (
-		owner &&
-		json<SavedBufferedFile[]>(owner.textFilePathsJson, []).some(
-			(file) => resolve(file.path) === resolve(saved.path),
+		return persistBufferedTextFiles(id, files, reserved);
+	});
+}
+export async function deleteBufferedTextFile(saved: SavedBufferedFile): Promise<void> {
+	return trackBufferedCleanup(async () => {
+		assertSqliteBufferRead("deleteBufferedTextFile");
+		if (!ownedPath(saved.path)) return;
+		const marker = join(dirname(saved.path), STAGING_OWNER_FILE);
+		let ownerId: string | null = basename(dirname(saved.path));
+		if (!existsSync(marker) && !(await rowById(ownerId))) return;
+		if (existsSync(marker)) {
+			if (!ownedPath(marker) || statSync(marker).size > 1024) return;
+			try {
+				ownerId = JSON.parse(readFileSync(marker, "utf8")).rowId ?? ownerId;
+			} catch {
+				return;
+			}
+			if (ownerId !== null && typeof ownerId !== "string") return;
+		}
+		const owner = ownerId ? await rowById(ownerId) : undefined;
+		if (
+			owner &&
+			json<SavedBufferedFile[]>(owner.textFilePathsJson, []).some(
+				(file) => resolve(file.path) === resolve(saved.path),
+			)
 		)
-	)
-		return;
-	rmSync(saved.path, { force: true });
+			return;
+		rmSync(saved.path, { force: true });
+	});
 }
 export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 	return saved.flatMap((s) => {
@@ -584,22 +710,8 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 			: {}),
 	};
 }
-export function getBufferedMessages(narratorId: string): BufferedMessage[] {
-	assertSqliteBufferRead("getBufferedMessages");
-	return db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
-		)
-		.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-		.limit(MAILBOX_LIMITS.userPending)
-		.all()
-		.map(projectMailboxUserMessage);
+export function getBufferedMessages(narratorId: string): Promise<BufferedMessage[]> {
+	return getBufferedMessagesAsync(narratorId);
 }
 
 /** Public user identity only; never read credentials or infer an author from a narrator owner. */
@@ -621,16 +733,19 @@ async function loadBufferCreators(createdBy: readonly string[]): Promise<BufferC
 			.where(inArray(pgUsers.id, ids))
 			.limit(ids.length);
 	}
-	return await db
-		.select({
-			id: users.id,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(users)
-		.where(inArray(users.id, ids))
-		.limit(ids.length);
+	return await readQuery(
+		db
+			.select({
+				id: users.id,
+				username: users.username,
+				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
+			})
+			.from(users)
+			.where(inArray(users.id, ids))
+			.limit(ids.length),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 /** Backend-neutral async projection used by production callers on both SQLite and PG. */
@@ -642,19 +757,21 @@ export async function getBufferedMessagesAsync(narratorId: string): Promise<Buff
 				includeFailed: true,
 				limit: MAILBOX_LIMITS.userPending,
 			})
-		: db
-				.select()
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						eq(mailbox.kind, "user_input"),
-						inArray(mailbox.state, pending),
-					),
-				)
-				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-				.limit(MAILBOX_LIMITS.userPending)
-				.all();
+		: await readQuery(
+				db
+					.select()
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							inArray(mailbox.state, pending),
+						),
+					)
+					.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+					.limit(MAILBOX_LIMITS.userPending),
+				{ executionPolicy: "worker-required" },
+			);
 	const messages = rows.map(projectMailboxUserMessage);
 	const missingAuthors = messages.flatMap((message) =>
 		!message.creator && message.createdBy ? [message.createdBy] : [],
@@ -696,181 +813,188 @@ export async function enqueueBufferedMessage(
 	humanReplyContext?: import("@shared/reply-context").ReplyContext,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	humanReplyContext = humanReplyContext ? { ...humanReplyContext } : undefined;
-	composerDocument = parseOptionalComposerDocument(composerDocument);
-	validateComposerProjection(
-		composerDocument,
-		text,
-		(fileReferences ?? []).map((snapshot) => snapshot.reference),
-	);
-	validateComposerAssets(composerDocument, images ?? [], textFiles ?? [], media ?? []);
-	const stagingId = generateShortId();
-	const refs = freezeFileReferenceSnapshots(fileReferences);
-	images = images?.map((image) => ({ ...image }));
-	media = media?.map((item) => copyMediaRef(item, narratorId));
-	creator = creator ? { ...creator } : creator;
-	textFiles = textFiles ? [...textFiles] : undefined;
-	let saved: SavedBufferedFile[] = [];
-	let admissionStarted = false;
-	let port: RuntimeQueuePort | undefined;
-	let admittedOwnerId: string | undefined;
-	try {
-		if (!creator && createdBy) creator = (await loadBufferCreators([createdBy]))[0] ?? null;
-		saved = await persistBufferedTextFiles(stagingId, textFiles ?? []);
-		const bytes = Buffer.byteLength(text);
-		if (bytes > MAX_BUFFERED_PAYLOAD_BYTES) throw new Error("Buffered input exceeds size limit");
-		let payloadRef:
-			| { storage: "buffered_file"; path: string; byteSize: number; ownership: "mailbox" }
-			| undefined;
-		if (bytes > MAILBOX_LIMITS.inlineBytes) {
-			const path = await writeStagingText(stagingId, "body", text);
-			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
-		}
-		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, humanReplyContext };
-		if (composerDocument)
-			metadata.composerDocumentPath = await writeStagingText(
-				stagingId,
-				"composer",
-				JSON.stringify(composerDocument),
-			);
-		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
-		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
-			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
-			commandText = null;
-		}
-		if (bashCommand && Buffer.byteLength(bashCommand) > MAILBOX_LIMITS.metadataBytes / 8) {
-			metadata.bashCommandPath = await writeStagingText(stagingId, "bash", bashCommand);
-			bashCommand = null;
-		}
-		if (
-			fileReferencesJson &&
-			Buffer.byteLength(fileReferencesJson) > MAILBOX_LIMITS.metadataBytes / 2
-		) {
-			metadata.fileReferencesPath = await writeStagingText(
-				stagingId,
-				"references",
-				fileReferencesJson,
-			);
-			fileReferencesJson = null;
-		}
-		port = pgQueue();
-		const input = {
-			narratorId,
-			kind: "user_input" as const,
-			text: payloadRef ? "" : text,
-			projectedByteSize: bytes,
-			payloadRef,
-			metadata: { ...metadata },
-			createdBy,
-			commandText,
-			bashCommand,
-			imagesJson: images?.length ? JSON.stringify(images) : null,
-			mediaJson: media?.length ? JSON.stringify(media) : null,
-			creatorJson: creator ? JSON.stringify(creator) : null,
-			textFilePathsJson: saved.length ? JSON.stringify(saved) : null,
-			fileReferencesJson,
-		};
-		// PostgreSQL: ONE named admission (seq computation + optional FIFO reorder + insert)
-		// commits atomically in the adapter. SQLite: the original synchronous segment below.
-		admissionStarted = true;
-		const result = port
-			? await port.mailbox.admitUserBuffered(input, { position, frontOrder })
-			: db.transaction((tx) => {
-					const rows = tx
-						.select({ id: mailbox.id, seq: mailbox.seq, priority: mailbox.priority })
-						.from(mailbox)
-						.where(
-							and(
-								eq(mailbox.narratorId, narratorId),
-								eq(mailbox.kind, "user_input"),
-								inArray(mailbox.state, pending),
-							),
-						)
-						.limit(MAILBOX_LIMITS.userPending)
-						.all();
-					rows.sort((a, b) => a.seq - b.seq);
-					const recipient = tx
-						.select({ sequence: narrators.inboxSequence })
-						.from(narrators)
-						.where(eq(narrators.id, narratorId))
-						.get();
-					const fifoPriority = position === "front" && frontOrder === "fifo";
-					const seq =
-						position === "front"
-							? Math.min(0, ...rows.map((r) => r.seq)) - 1
-							: Math.max(recipient?.sequence ?? 0, ...rows.map((r) => r.seq)) + 1;
-					const accepted = store.enqueue(
-						{
-							...input,
-							priority: position === "front",
-							seq,
-						},
-						tx,
-					);
-					if (accepted.status === "accepted" && fifoPriority) {
-						// Subagent priority inputs historically preserve FIFO within the priority
-						// group. Publish their order atomically with acceptance, never afterward.
-						const orderedIds = [
-							...rows.filter((row) => row.priority).map((row) => row.id),
-							accepted.delivery.id,
-						];
-						const priorityBase = Math.min(0, ...rows.map((row) => row.seq)) - orderedIds.length;
-						for (const [order, id] of orderedIds.entries()) {
-							tx.update(mailbox)
-								.set({ seq: priorityBase + order })
-								.where(
-									and(
-										eq(mailbox.id, id),
-										eq(mailbox.narratorId, narratorId),
-										eq(mailbox.kind, "user_input"),
-										inArray(mailbox.state, pending),
-									),
-								)
-								.run();
-						}
-					}
-					if (accepted.status === "accepted" && existsSync(stagingPath(stagingId))) {
-						writeStagingOwnerMarker(stagingId, accepted.delivery.id);
-					}
-					return accepted;
-				});
-		if (port && result.status === "accepted") {
-			admittedOwnerId = result.delivery.id;
-			if (existsSync(stagingPath(stagingId))) {
-				// Post-commit staging ownership marker (the SQLite path writes it inside the tx).
-				writeStagingOwnerMarker(stagingId, result.delivery.id);
+	return withBufferedPreparationAdmission(async () => {
+		composerDocument = parseOptionalComposerDocument(composerDocument);
+		validateComposerProjection(
+			composerDocument,
+			text,
+			(fileReferences ?? []).map((snapshot) => snapshot.reference),
+		);
+		validateComposerAssets(composerDocument, images ?? [], textFiles ?? [], media ?? []);
+		const stagingId = generateShortId();
+		const refs = freezeFileReferenceSnapshots(fileReferences);
+		images = images?.map((image) => ({ ...image }));
+		media = media?.map((item) => copyMediaRef(item, narratorId));
+		creator = creator ? { ...creator } : creator;
+		textFiles = textFiles ? [...textFiles] : undefined;
+		let saved: SavedBufferedFile[] = [];
+		let admissionStarted = false;
+		let port: RuntimeQueuePort | undefined;
+		let admittedOwnerId: string | undefined;
+		try {
+			if (!creator && createdBy) creator = (await loadBufferCreators([createdBy]))[0] ?? null;
+			saved = await persistBufferedTextFiles(stagingId, textFiles ?? []);
+			const bytes = Buffer.byteLength(text);
+			if (bytes > MAX_BUFFERED_PAYLOAD_BYTES) throw new Error("Buffered input exceeds size limit");
+			let payloadRef:
+				| { storage: "buffered_file"; path: string; byteSize: number; ownership: "mailbox" }
+				| undefined;
+			if (bytes > MAILBOX_LIMITS.inlineBytes) {
+				const path = await writeStagingText(stagingId, "body", text);
+				payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 			}
-		}
-		if (result.status !== "accepted" && result.status !== "duplicate") {
-			discardUnownedStaging(stagingId);
-			return { ok: false, bufferedAt: "", id: "", full: true };
-		}
-		// The mailbox row now owns its own copy, so the staged originals can go.
-		releaseStagedFiles(textFiles);
-		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
-	} catch (error) {
-		if (!admissionStarted) {
-			discardUnownedStaging(stagingId);
-		} else if (port) {
-			// The transaction may have rolled back, committed with a lost confirmation, or
-			// committed before the marker write failed. Reconcile against DB authority; an
-			// unknown read keeps the null marker and never guesses that the row is absent.
-			try {
-				await reconcileBufferedStaging(narratorId, stagingId, admittedOwnerId);
-			} catch (reconcileError) {
-				logger.warn("Buffered staging reconciliation deferred", {
-					narratorId,
+			let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
+			const metadata: StagingMetadata = {
+				stagingId,
+				executionIntent,
+				queueMode,
+				humanReplyContext,
+			};
+			if (composerDocument)
+				metadata.composerDocumentPath = await writeStagingText(
 					stagingId,
-					error: String(reconcileError),
-				});
+					"composer",
+					JSON.stringify(composerDocument),
+				);
+			if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
+			if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
+				metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
+				commandText = null;
 			}
-		} else {
-			// SQLite writes the marker inside the same transaction, so an admission error
-			// proves that no mailbox row committed.
-			discardUnownedStaging(stagingId);
+			if (bashCommand && Buffer.byteLength(bashCommand) > MAILBOX_LIMITS.metadataBytes / 8) {
+				metadata.bashCommandPath = await writeStagingText(stagingId, "bash", bashCommand);
+				bashCommand = null;
+			}
+			if (
+				fileReferencesJson &&
+				Buffer.byteLength(fileReferencesJson) > MAILBOX_LIMITS.metadataBytes / 2
+			) {
+				metadata.fileReferencesPath = await writeStagingText(
+					stagingId,
+					"references",
+					fileReferencesJson,
+				);
+				fileReferencesJson = null;
+			}
+			port = pgQueue();
+			const input = {
+				narratorId,
+				kind: "user_input" as const,
+				text: payloadRef ? "" : text,
+				projectedByteSize: bytes,
+				payloadRef,
+				metadata: { ...metadata },
+				createdBy,
+				commandText,
+				bashCommand,
+				imagesJson: images?.length ? JSON.stringify(images) : null,
+				mediaJson: media?.length ? JSON.stringify(media) : null,
+				creatorJson: creator ? JSON.stringify(creator) : null,
+				textFilePathsJson: saved.length ? JSON.stringify(saved) : null,
+				fileReferencesJson,
+			};
+			// PostgreSQL: ONE named admission (seq computation + optional FIFO reorder + insert)
+			// commits atomically in the adapter. SQLite: the original synchronous segment below.
+			admissionStarted = true;
+			const result = port
+				? await port.mailbox.admitUserBuffered(input, { position, frontOrder })
+				: db.transaction((tx) => {
+						const rows = tx
+							.select({ id: mailbox.id, seq: mailbox.seq, priority: mailbox.priority })
+							.from(mailbox)
+							.where(
+								and(
+									eq(mailbox.narratorId, narratorId),
+									eq(mailbox.kind, "user_input"),
+									inArray(mailbox.state, pending),
+								),
+							)
+							.limit(MAILBOX_LIMITS.userPending)
+							.all();
+						rows.sort((a, b) => a.seq - b.seq);
+						const recipient = tx
+							.select({ sequence: narrators.inboxSequence })
+							.from(narrators)
+							.where(eq(narrators.id, narratorId))
+							.get();
+						const fifoPriority = position === "front" && frontOrder === "fifo";
+						const seq =
+							position === "front"
+								? Math.min(0, ...rows.map((r) => r.seq)) - 1
+								: Math.max(recipient?.sequence ?? 0, ...rows.map((r) => r.seq)) + 1;
+						const accepted = store.enqueue(
+							{
+								...input,
+								priority: position === "front",
+								seq,
+							},
+							tx,
+						);
+						if (accepted.status === "accepted" && fifoPriority) {
+							// Subagent priority inputs historically preserve FIFO within the priority
+							// group. Publish their order atomically with acceptance, never afterward.
+							const orderedIds = [
+								...rows.filter((row) => row.priority).map((row) => row.id),
+								accepted.delivery.id,
+							];
+							const priorityBase = Math.min(0, ...rows.map((row) => row.seq)) - orderedIds.length;
+							for (const [order, id] of orderedIds.entries()) {
+								tx.update(mailbox)
+									.set({ seq: priorityBase + order })
+									.where(
+										and(
+											eq(mailbox.id, id),
+											eq(mailbox.narratorId, narratorId),
+											eq(mailbox.kind, "user_input"),
+											inArray(mailbox.state, pending),
+										),
+									)
+									.run();
+							}
+						}
+						if (accepted.status === "accepted" && existsSync(stagingPath(stagingId))) {
+							writeStagingOwnerMarker(stagingId, accepted.delivery.id);
+						}
+						return accepted;
+					});
+			if (port && result.status === "accepted") {
+				admittedOwnerId = result.delivery.id;
+				if (existsSync(stagingPath(stagingId))) {
+					// Post-commit staging ownership marker (the SQLite path writes it inside the tx).
+					writeStagingOwnerMarker(stagingId, result.delivery.id);
+				}
+			}
+			if (result.status !== "accepted" && result.status !== "duplicate") {
+				discardUnownedStaging(stagingId);
+				return { ok: false, bufferedAt: "", id: "", full: true };
+			}
+			// The mailbox row now owns its own copy, so the staged originals can go.
+			releaseStagedFiles(textFiles);
+			return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
+		} catch (error) {
+			if (!admissionStarted) {
+				discardUnownedStaging(stagingId);
+			} else if (port) {
+				// The transaction may have rolled back, committed with a lost confirmation, or
+				// committed before the marker write failed. Reconcile against DB authority; an
+				// unknown read keeps the null marker and never guesses that the row is absent.
+				try {
+					await reconcileBufferedStaging(narratorId, stagingId, admittedOwnerId);
+				} catch (reconcileError) {
+					logger.warn("Buffered staging reconciliation deferred", {
+						narratorId,
+						stagingId,
+						error: String(reconcileError),
+					});
+				}
+			} else {
+				// SQLite writes the marker inside the same transaction, so an admission error
+				// proves that no mailbox row committed.
+				discardUnownedStaging(stagingId);
+			}
+			throw error;
 		}
-		throw error;
-	}
+	});
 }
 export interface BufferedMessageAttachmentUpdate {
 	composerDocument?: ComposerDocument;
@@ -886,188 +1010,190 @@ export async function updateBufferedMessage(
 	text: string,
 	opts: BufferedMessageAttachmentUpdate = {},
 ): Promise<boolean> {
-	const port = pgQueue();
-	const row = port ? await port.mailbox.getById(messageId) : rowById(messageId);
-	if (
-		!row ||
-		row.narratorId !== narratorId ||
-		row.kind !== "user_input" ||
-		!pending.includes(row.state as "queued" | "failed")
-	)
-		return false;
-	const current = projectMailboxUserMessage(row);
-	opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
-	validateComposerProjection(
-		opts.composerDocument,
-		text,
-		(opts.fileReferences ?? current.fileReferences ?? []).map((snapshot) => snapshot.reference),
-	);
-	validateComposerAssets(
-		opts.composerDocument,
-		opts.images ?? current.images ?? [],
-		opts.textFiles ??
-			(opts.savedFiles ? loadBufferedTextFiles(opts.savedFiles) : current.textFiles) ??
-			[],
-		opts.media ?? current.media ?? [],
-	);
-	const bytes = Buffer.byteLength(text);
-	if (bytes > MAX_BUFFERED_PAYLOAD_BYTES)
-		throw new Error("Edited input exceeds mailbox size limit");
-	// Snapshot caller-owned arrays before the first asynchronous file write.
-	opts = {
-		...opts,
-		images: opts.images?.map((image) => ({ ...image })),
-		media: opts.media?.map((item) => copyMediaRef(item, narratorId)),
-		savedFiles: opts.savedFiles?.map((file) => ({ ...file })),
-		fileReferences:
-			opts.fileReferences === undefined
-				? undefined
-				: freezeFileReferenceSnapshots(opts.fileReferences),
-	};
-	const metadata = json<StagingMetadata>(row.metadataJson, {});
-	const stagingId = metadata.stagingId ?? row.id;
-	const prepared: string[] = [];
-	const superseded: string[] = [];
-	try {
-		if (metadata.composerDocumentPath) superseded.push(metadata.composerDocumentPath);
-		delete metadata.composerDocumentPath;
-		if (opts.composerDocument) {
-			metadata.composerDocumentPath = await writeStagingText(
-				stagingId,
-				"composer",
-				JSON.stringify(opts.composerDocument),
-			);
-			prepared.push(metadata.composerDocumentPath);
-		}
-		let payloadRefJson: string | null = null;
-		if (bytes > MAILBOX_LIMITS.inlineBytes) {
-			const path = await writeStagingText(stagingId, "body", text);
-			prepared.push(path);
-			payloadRefJson = JSON.stringify({
-				storage: "buffered_file",
-				ownership: "mailbox",
-				path,
-				byteSize: bytes,
-			});
-		}
-		let fileReferencesJson = row.fileReferencesJson;
-		if (opts.fileReferences !== undefined) {
-			const refs = freezeFileReferenceSnapshots(opts.fileReferences);
-			fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-			if (metadata.fileReferencesPath) superseded.push(metadata.fileReferencesPath);
-			delete metadata.fileReferencesPath;
-			if (
-				fileReferencesJson &&
-				Buffer.byteLength(fileReferencesJson) > MAILBOX_LIMITS.metadataBytes / 2
-			) {
-				metadata.fileReferencesPath = await writeStagingText(
-					stagingId,
-					"references",
-					fileReferencesJson,
-				);
-				prepared.push(metadata.fileReferencesPath);
-				fileReferencesJson = null;
-			}
-		}
-		const imagesJson =
-			opts.images === undefined
-				? row.imagesJson
-				: opts.images.length
-					? JSON.stringify(opts.images)
-					: null;
-		const mediaJson =
-			opts.media === undefined
-				? row.mediaJson
-				: opts.media.length
-					? JSON.stringify(opts.media)
-					: null;
-		const textFilePathsJson =
-			opts.savedFiles === undefined
-				? row.textFilePathsJson
-				: opts.savedFiles.length
-					? JSON.stringify(opts.savedFiles)
-					: null;
-		const metadataJson = JSON.stringify({ ...metadata, stagingId });
+	return withBufferedPreparationAdmission(async () => {
+		const port = pgQueue();
+		const row = port ? await port.mailbox.getById(messageId) : await rowById(messageId);
 		if (
-			[
-				imagesJson,
-				mediaJson,
-				textFilePathsJson,
-				fileReferencesJson,
-				metadataJson,
-				payloadRefJson,
-				row.creatorJson,
-				row.commandText,
-				row.bashCommand,
-			].reduce((size, item) => size + Buffer.byteLength(item ?? ""), 0) >
-			MAILBOX_LIMITS.metadataBytes
+			!row ||
+			row.narratorId !== narratorId ||
+			row.kind !== "user_input" ||
+			!pending.includes(row.state as "queued" | "failed")
 		)
-			throw new Error("Attachment metadata exceeds mailbox budget");
-		const ok = port
-			? await port.mailbox.updateUserBuffered(
-					messageId,
-					narratorId,
-					{
-						text: payloadRefJson ? "" : text,
-						byteSize: bytes,
-						payloadRefJson,
-						imagesJson,
-						mediaJson,
-						textFilePathsJson,
-						fileReferencesJson,
-						metadataJson,
-					},
-					row.contentRevision,
-				)
-			: db.transaction((tx) => {
-					const changed =
-						tx
-							.update(mailbox)
-							.set({
-								text: payloadRefJson ? "" : text,
-								payloadRefJson,
-								byteSize: bytes,
-								projectedByteSize: bytes,
-								bufferedAt: new Date().toISOString(),
-								updatedAt: new Date().toISOString(),
-								imagesJson,
-								mediaJson,
-								textFilePathsJson,
-								fileReferencesJson,
-								metadataJson,
-								contentRevision: row.contentRevision + 1,
-							})
-							.where(
-								and(
-									eq(mailbox.id, messageId),
-									eq(mailbox.narratorId, narratorId),
-									eq(mailbox.kind, "user_input"),
-									inArray(mailbox.state, pending),
-									eq(mailbox.contentRevision, row.contentRevision),
-								),
-							)
-							.returning({ id: mailbox.id })
-							.all().length === 1;
-					if (changed && prepared.length) writeStagingOwnerMarker(stagingId, row.id);
-					return changed;
-				});
-		if (ok && port && prepared.length)
-			writeFileSync(
-				join(stagingPath(stagingId), STAGING_OWNER_FILE),
-				JSON.stringify({ rowId: row.id }),
-			);
-		if (!ok) {
-			for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
 			return false;
+		const current = projectMailboxUserMessage(row);
+		opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
+		validateComposerProjection(
+			opts.composerDocument,
+			text,
+			(opts.fileReferences ?? current.fileReferences ?? []).map((snapshot) => snapshot.reference),
+		);
+		validateComposerAssets(
+			opts.composerDocument,
+			opts.images ?? current.images ?? [],
+			opts.textFiles ??
+				(opts.savedFiles ? loadBufferedTextFiles(opts.savedFiles) : current.textFiles) ??
+				[],
+			opts.media ?? current.media ?? [],
+		);
+		const bytes = Buffer.byteLength(text);
+		if (bytes > MAX_BUFFERED_PAYLOAD_BYTES)
+			throw new Error("Edited input exceeds mailbox size limit");
+		// Snapshot caller-owned arrays before the first asynchronous file write.
+		opts = {
+			...opts,
+			images: opts.images?.map((image) => ({ ...image })),
+			media: opts.media?.map((item) => copyMediaRef(item, narratorId)),
+			savedFiles: opts.savedFiles?.map((file) => ({ ...file })),
+			fileReferences:
+				opts.fileReferences === undefined
+					? undefined
+					: freezeFileReferenceSnapshots(opts.fileReferences),
+		};
+		const metadata = json<StagingMetadata>(row.metadataJson, {});
+		const stagingId = metadata.stagingId ?? row.id;
+		const prepared: string[] = [];
+		const superseded: string[] = [];
+		try {
+			if (metadata.composerDocumentPath) superseded.push(metadata.composerDocumentPath);
+			delete metadata.composerDocumentPath;
+			if (opts.composerDocument) {
+				metadata.composerDocumentPath = await writeStagingText(
+					stagingId,
+					"composer",
+					JSON.stringify(opts.composerDocument),
+				);
+				prepared.push(metadata.composerDocumentPath);
+			}
+			let payloadRefJson: string | null = null;
+			if (bytes > MAILBOX_LIMITS.inlineBytes) {
+				const path = await writeStagingText(stagingId, "body", text);
+				prepared.push(path);
+				payloadRefJson = JSON.stringify({
+					storage: "buffered_file",
+					ownership: "mailbox",
+					path,
+					byteSize: bytes,
+				});
+			}
+			let fileReferencesJson = row.fileReferencesJson;
+			if (opts.fileReferences !== undefined) {
+				const refs = freezeFileReferenceSnapshots(opts.fileReferences);
+				fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
+				if (metadata.fileReferencesPath) superseded.push(metadata.fileReferencesPath);
+				delete metadata.fileReferencesPath;
+				if (
+					fileReferencesJson &&
+					Buffer.byteLength(fileReferencesJson) > MAILBOX_LIMITS.metadataBytes / 2
+				) {
+					metadata.fileReferencesPath = await writeStagingText(
+						stagingId,
+						"references",
+						fileReferencesJson,
+					);
+					prepared.push(metadata.fileReferencesPath);
+					fileReferencesJson = null;
+				}
+			}
+			const imagesJson =
+				opts.images === undefined
+					? row.imagesJson
+					: opts.images.length
+						? JSON.stringify(opts.images)
+						: null;
+			const mediaJson =
+				opts.media === undefined
+					? row.mediaJson
+					: opts.media.length
+						? JSON.stringify(opts.media)
+						: null;
+			const textFilePathsJson =
+				opts.savedFiles === undefined
+					? row.textFilePathsJson
+					: opts.savedFiles.length
+						? JSON.stringify(opts.savedFiles)
+						: null;
+			const metadataJson = JSON.stringify({ ...metadata, stagingId });
+			if (
+				[
+					imagesJson,
+					mediaJson,
+					textFilePathsJson,
+					fileReferencesJson,
+					metadataJson,
+					payloadRefJson,
+					row.creatorJson,
+					row.commandText,
+					row.bashCommand,
+				].reduce((size, item) => size + Buffer.byteLength(item ?? ""), 0) >
+				MAILBOX_LIMITS.metadataBytes
+			)
+				throw new Error("Attachment metadata exceeds mailbox budget");
+			const ok = port
+				? await port.mailbox.updateUserBuffered(
+						messageId,
+						narratorId,
+						{
+							text: payloadRefJson ? "" : text,
+							byteSize: bytes,
+							payloadRefJson,
+							imagesJson,
+							mediaJson,
+							textFilePathsJson,
+							fileReferencesJson,
+							metadataJson,
+						},
+						row.contentRevision,
+					)
+				: db.transaction((tx) => {
+						const changed =
+							tx
+								.update(mailbox)
+								.set({
+									text: payloadRefJson ? "" : text,
+									payloadRefJson,
+									byteSize: bytes,
+									projectedByteSize: bytes,
+									bufferedAt: new Date().toISOString(),
+									updatedAt: new Date().toISOString(),
+									imagesJson,
+									mediaJson,
+									textFilePathsJson,
+									fileReferencesJson,
+									metadataJson,
+									contentRevision: row.contentRevision + 1,
+								})
+								.where(
+									and(
+										eq(mailbox.id, messageId),
+										eq(mailbox.narratorId, narratorId),
+										eq(mailbox.kind, "user_input"),
+										inArray(mailbox.state, pending),
+										eq(mailbox.contentRevision, row.contentRevision),
+									),
+								)
+								.returning({ id: mailbox.id })
+								.all().length === 1;
+						if (changed && prepared.length) writeStagingOwnerMarker(stagingId, row.id);
+						return changed;
+					});
+			if (ok && port && prepared.length)
+				writeFileSync(
+					join(stagingPath(stagingId), STAGING_OWNER_FILE),
+					JSON.stringify({ rowId: row.id }),
+				);
+			if (!ok) {
+				for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
+				return false;
+			}
+			const oldBody = json<{ path: string } | null>(row.payloadRefJson, null);
+			if (oldBody) superseded.push(oldBody.path);
+			for (const path of superseded) if (ownedPath(path)) rmSync(path, { force: true });
+			return true;
+		} catch (error) {
+			for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
+			throw error;
 		}
-		const oldBody = json<{ path: string } | null>(row.payloadRefJson, null);
-		if (oldBody) superseded.push(oldBody.path);
-		for (const path of superseded) if (ownedPath(path)) rmSync(path, { force: true });
-		return true;
-	} catch (error) {
-		for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
-		throw error;
-	}
+	});
 }
 export async function removeBufferedMessage(
 	narratorId: string,
@@ -1087,12 +1213,12 @@ export async function removeBufferedMessage(
 		return true;
 	}
 	store.initializeLegacy(narratorId);
-	const row = rowById(messageId);
+	const row = await rowById(messageId);
 	if (!row || row.narratorId !== narratorId || row.kind !== "user_input" || !row.deliveryId)
 		return false;
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
 	if (!store.cancel(row.deliveryId, "Removed by user")) return false;
-	cleanupBufferedTextFiles(id);
+	await cleanupBufferedTextFiles(id);
 	return true;
 }
 export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
@@ -1100,26 +1226,29 @@ export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
 export async function readBufferedMessageDeliveryReceipt(
 	narratorId: string,
 	messageId: string,
+	signal?: AbortSignal,
 ): Promise<RuntimeBufferedDeliveryReceipt | undefined> {
 	const port = pgQueue();
 	if (port) return port.mailbox.readUserBufferedDeliveryReceipt(narratorId, messageId);
-	return db
-		.select({
-			id: mailbox.id,
-			state: mailbox.state,
-			recipientMessageId: mailbox.recipientMessageId,
-			lastError: mailbox.lastError,
-		})
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.id, messageId),
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-			),
-		)
-		.limit(1)
-		.get();
+	return await readQueryFirst(
+		db
+			.select({
+				id: mailbox.id,
+				state: mailbox.state,
+				recipientMessageId: mailbox.recipientMessageId,
+				lastError: mailbox.lastError,
+			})
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.id, messageId),
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", signal },
+	);
 }
 
 /** Wait OUTSIDE mutation admission. A busy wake is not a delivery acknowledgement. */
@@ -1168,7 +1297,9 @@ export async function waitForBufferedMessageDelivery(
 			});
 		while (true) {
 			if (signal.aborted) throw cancellation();
-			const receipt = await bounded(readBufferedMessageDeliveryReceipt(narratorId, messageId));
+			const receipt = await bounded(
+				readBufferedMessageDeliveryReceipt(narratorId, messageId, signal),
+			);
 			if (!receipt)
 				throw new AppError("Buffered input no longer exists", 409, "BUFFER_DELIVERY_MISSING");
 			if (receipt.state === "materialized" && receipt.recipientMessageId) {
@@ -1282,18 +1413,20 @@ export async function clearBufferedMessages(narratorId: string): Promise<void> {
 		return;
 	}
 	store.initializeLegacy(narratorId);
-	const rows = db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
-		)
-		.limit(MAILBOX_LIMITS.userPending)
-		.all();
+	const rows = await readQuery(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+					inArray(mailbox.state, pending),
+				),
+			)
+			.limit(MAILBOX_LIMITS.userPending),
+		{ executionPolicy: "worker-required" },
+	);
 	for (const row of rows) await removeBufferedMessage(narratorId, row.id);
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */
@@ -1359,26 +1492,30 @@ export async function dropBufferedMessage(
 	msg: BufferedMessage,
 	reason: string,
 ): Promise<boolean> {
-	const claim = msg._mailboxClaim;
-	if (!claim || claim.narratorId !== narratorId) return false;
-	const stagingId = msg._stagingId ?? msg.id;
-	const port = pgQueue();
-	if (port) {
-		if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
-		await cleanupStagingPg(port, stagingId);
+	return trackBufferedCleanup(async () => {
+		const claim = msg._mailboxClaim;
+		if (!claim || claim.narratorId !== narratorId) return false;
+		const stagingId = msg._stagingId ?? msg.id;
+		const port = pgQueue();
+		if (port) {
+			if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
+			await cleanupStagingPg(port, stagingId);
+			return true;
+		}
+		if (!store.cancelClaim(claim, reason)) return false;
+		await cleanupBufferedTextFiles(stagingId);
 		return true;
-	}
-	if (!store.cancelClaim(claim, reason)) return false;
-	cleanupBufferedTextFiles(stagingId);
-	return true;
+	});
 }
 
 export async function restoreBufferedMessage(
 	narratorId: string,
 	msg: BufferedMessage,
 ): Promise<void> {
-	if (msg._mailboxClaim?.narratorId !== narratorId) return;
-	await releaseBufferedMessage(msg);
+	return trackBufferedCleanup(async () => {
+		if (msg._mailboxClaim?.narratorId !== narratorId) return;
+		await releaseBufferedMessage(msg);
+	});
 }
 
 export interface BufferedImageSummary {

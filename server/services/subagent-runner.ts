@@ -12,10 +12,7 @@ import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/typ
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import {
-	resolveEffectiveSubagentModelPolicy,
-	resolveSubagentModelSelectionFromPolicy,
-} from "../lib/narrator-custom-traits";
+import { resolveEffectiveSubagentModelPolicy } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
@@ -37,7 +34,7 @@ import { agentMarkdownReference } from "./subagent-label";
 import {
 	formatSubagentModelFallbackNote,
 	resolveSubagentModelForRun,
-	subagentStoredModelReference,
+	selectSubagentModel,
 } from "./subagent-model";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { buildDelegationBasePrompt } from "./subagent-tools";
@@ -243,29 +240,18 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		policySourceId: policySourceIdOf(parent),
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	const candidateModels =
-		modelPolicy.source === "none" ? [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL] : [];
-	const modelSelection = resolveSubagentModelSelectionFromPolicy({
+	// The same rule a later run re-selects with (subagent-model-switch).
+	const modelChoice = selectSubagentModel({
 		policy: modelPolicy,
+		parentId: parentNarratorId,
+		parentModel: parent.model,
+		typePreference: subagentPref,
 		explicitModel,
-		candidates: candidateModels,
 	});
-	const resolvedModelInput = modelSelection?.model;
-	const preferenceSelection =
-		modelPolicy.source === "none" && !explicitModel && subagentPref
-			? resolveSubagentModelSelectionFromPolicy({
-					policy: modelPolicy,
-					explicitModel: subagentPref,
-					candidates: [],
-				})
-			: undefined;
-	const storedModelInput = subagentStoredModelReference({
-		explicitModel: modelPolicy.source !== "none" ? resolvedModelInput : explicitModel,
-		preferenceSelection,
-		selection: modelSelection,
-	});
+	const modelSelection = modelChoice?.selection;
+	const storedModelInput = modelChoice?.storedModel;
 	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
-	if (modelPolicy.source !== "none" && !resolvedModelInput) {
+	if (modelPolicy.source !== "none" && !storedModelInput) {
 		const allowedModels = expandAllowedPoolForDisplay(
 			modelPolicy.models.map((entry) => entry.model),
 		);
@@ -443,11 +429,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				locale: locale as Locale,
 				text: "",
 				resumeRunId: task.logicalRunId ?? undefined,
+				// The model was just chosen for this run above.
+				skipModelReselect: true,
 			});
 			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 			if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 			delegatedBeforeRun = null;
-			void handle.terminal.finally(() => updateLease.release());
+			void handle.terminal.then(
+				() => updateLease.release(),
+				() => updateLease.release(),
+			);
 			return (
 				(input.takeoverByUser
 					? `<background_task_id>${aliasRegistration.alias}</background_task_id>\n\n` +
@@ -470,11 +461,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			binding,
 			cancelSignal: input.signal,
 			foreground: true,
+			// The model was just chosen for this run above.
+			skipModelReselect: true,
 		});
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 		delegatedBeforeRun = null;
-		void handle.terminal.finally(() => updateLease.release());
+		void handle.terminal.then(
+			() => updateLease.release(),
+			() => updateLease.release(),
+		);
 		if (getSearchExecutionScope()) {
 			// A channel failure must reach the search router so the next channel can run.
 			const terminal = await handle.terminal;

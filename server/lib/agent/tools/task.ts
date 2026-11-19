@@ -1,6 +1,7 @@
 import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning-effort";
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
+import { isCheckpointStop } from "../../../services/agent-runtime/checkpoint-stop";
 import { resolvePath } from "../../platform-path";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
@@ -49,7 +50,7 @@ function filterSubagentModels(models: string[]): string[] {
 }
 
 const MODEL_PARAM_BASE =
-	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool. " +
+	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects the parent narrator's current model when the pool allows it, otherwise the first entry on the parent's current provider, otherwise its first entry, and pins the child. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. When a pinned child is resumed later and its model's provider differs from the parent's current provider, its model is re-selected by the same rule (a model given explicitly for that resume is kept). Explicit models must also be allowed by the pool. " +
 	"`<provider>:<model>` pins that provider; `auto:<model>` lets NarraFork choose any provider that serves the model.";
 
 /** Dynamic prompt context only; never used to construct tool definitions. */
@@ -648,6 +649,7 @@ export const agentTool: ToolDefinition = {
 				},
 			};
 		} catch (err) {
+			if (isCheckpointStop(err)) throw err;
 			// The work item of a call whose agent never ran is settled (see `settleFailedStart`):
 			// an untouched isolated worktree is removed, an attached item goes back to the queue.
 			if (workItem && workItemsModule)

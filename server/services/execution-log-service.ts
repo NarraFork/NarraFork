@@ -14,9 +14,11 @@
  *  3. Never select the payload columns in a list query. They are read only by
  *     `getRecord`, and even there they are byte-capped.
  */
-import { db } from "@server/db";
+import { activeDatabaseBackend, db } from "@server/db";
 import { narrators, narratorToolCalls, projects } from "@server/db/schema";
 import { toolRegistry } from "@server/lib/agent/tool-registry";
+import { NARRATOR_MESSAGE_SOURCE_MAX_BYTES } from "@server/lib/db-worker/domain-limits";
+import { DbReadError } from "@server/lib/db-worker/errors";
 import {
 	type ExecutionLogCursor,
 	encodeExecutionLogCursor,
@@ -32,6 +34,7 @@ import {
 import { narratorProjectIdColumn } from "@server/services/narrator-project";
 import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { and, desc, eq, gte, isNotNull, lte, or, type SQL, sql } from "drizzle-orm";
+import { readDomainTask, readQuery } from "../db/worker-read";
 import { summarizeSubagentToolCall } from "./subagent-activity";
 
 /** Longest free-text / model needle we compare per row. */
@@ -366,14 +369,17 @@ export class ExecutionLogService {
 			);
 		}
 
-		const rows = await this.database
-			.select({ ...LIST_COLUMNS, ...SUMMARY_HINT_COLUMNS })
-			.from(narratorToolCalls)
-			.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
-			.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
-			.where(and(...conditions))
-			.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
-			.limit(boundedLimit + 1);
+		const rows = await readQuery(
+			this.database
+				.select({ ...LIST_COLUMNS, ...SUMMARY_HINT_COLUMNS })
+				.from(narratorToolCalls)
+				.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
+				.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
+				.where(and(...conditions))
+				.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
+				.limit(boundedLimit + 1),
+			{ executionPolicy: "worker-required" },
+		);
 
 		const hasMore = rows.length > boundedLimit;
 		const page = hasMore ? rows.slice(0, boundedLimit) : rows;
@@ -393,37 +399,59 @@ export class ExecutionLogService {
 	}
 
 	async getRecord(id: string): Promise<ExecutionLogDetail | null> {
-		const [row] = await this.database
-			.select({
-				...LIST_COLUMNS,
-				...SUMMARY_HINT_COLUMNS,
-				messageId: narratorToolCalls.messageId,
-				// File replay inputs remain stored internally, never in ordinary details.
-				inputJson:
-					sql`CASE WHEN ${CLEARED_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
-						narratorToolCalls.inputJson,
-					),
-				outputJson: narratorToolCalls.outputJson,
-				permissionDenyMessage: narratorToolCalls.permissionDenyMessage,
-				permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
-				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
-				treeHashBefore: narratorToolCalls.treeHashBefore,
-				treeHashAfter: narratorToolCalls.treeHashAfter,
-				resolvedFilePath: narratorToolCalls.resolvedFilePath,
-				canonicalFilePath: narratorToolCalls.canonicalFilePath,
-				executionPathFlavor: narratorToolCalls.executionPathFlavor,
-				deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
-				executionTargetsJson: narratorToolCalls.executionTargetsJson,
-				runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			})
-			.from(narratorToolCalls)
-			.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
-			.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
-			.where(eq(narratorToolCalls.id, id))
-			.limit(1);
+		// Retained replay input is internal, so it cannot consume the public detail budget.
+		const visibleInput = sql`CASE WHEN ${CLEARED_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`;
+		const inputSourceBytes = sql<number | null>`octet_length(CAST(${visibleInput} AS TEXT))`;
+		const outputSourceBytes = sql<
+			number | null
+		>`octet_length(CAST(${narratorToolCalls.outputJson} AS TEXT))`;
+		const withinSourceBudget = sql`coalesce(${inputSourceBytes}, 0) + coalesce(${outputSourceBytes}, 0) <= ${NARRATOR_MESSAGE_SOURCE_MAX_BYTES}`;
+		const [row] = await readQuery(
+			this.database
+				.select({
+					...LIST_COLUMNS,
+					...SUMMARY_HINT_COLUMNS,
+					messageId: narratorToolCalls.messageId,
+					inputJson:
+						sql`CASE WHEN ${withinSourceBudget} THEN ${visibleInput} ELSE NULL END`.mapWith(
+							narratorToolCalls.inputJson,
+						),
+					outputJson:
+						sql`CASE WHEN ${withinSourceBudget} THEN ${narratorToolCalls.outputJson} ELSE NULL END`.mapWith(
+							narratorToolCalls.outputJson,
+						),
+					inputSourceBytes,
+					outputSourceBytes,
+					permissionDenyMessage: narratorToolCalls.permissionDenyMessage,
+					permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
+					isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
+					treeHashBefore: narratorToolCalls.treeHashBefore,
+					treeHashAfter: narratorToolCalls.treeHashAfter,
+					resolvedFilePath: narratorToolCalls.resolvedFilePath,
+					canonicalFilePath: narratorToolCalls.canonicalFilePath,
+					executionPathFlavor: narratorToolCalls.executionPathFlavor,
+					deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
+					executionTargetsJson: narratorToolCalls.executionTargetsJson,
+					runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				})
+				.from(narratorToolCalls)
+				.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
+				.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
+				.where(eq(narratorToolCalls.id, id))
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 
 		if (!row) return null;
 
+		if (
+			(row.inputSourceBytes ?? 0) + (row.outputSourceBytes ?? 0) >
+			NARRATOR_MESSAGE_SOURCE_MAX_BYTES
+		)
+			throw new DbReadError(
+				"DB_READ_BUDGET",
+				"Execution log detail exceeds its source byte budget",
+			);
 		const input = capPayload(row.inputJson);
 		const output = capPayload(row.outputJson);
 		const withTargets = toolCallWithExecutionTargets({
@@ -474,18 +502,29 @@ export class ExecutionLogService {
 	async listFacets(): Promise<ExecutionLogFacets> {
 		const registered = new Set(toolRegistry.all().map((tool) => tool.name));
 
-		const observed = await this.database
-			.select({
-				toolName: sql<string | null>`tool_name`,
-				provider: sql<string | null>`provider`,
-			})
-			.from(
-				sql`(SELECT ${narratorToolCalls.toolName} AS tool_name, ${narratorToolCalls.provider} AS provider
+		const observed =
+			activeDatabaseBackend === "sqlite"
+				? await readDomainTask(
+						this.database.$client,
+						"executionLogFacets",
+						{},
+						{ executionPolicy: "worker-required" },
+					)
+				: await readQuery(
+						this.database
+							.select({
+								toolName: sql<string | null>`tool_name`,
+								provider: sql<string | null>`provider`,
+							})
+							.from(
+								sql`(SELECT ${narratorToolCalls.toolName} AS tool_name, ${narratorToolCalls.provider} AS provider
 					FROM ${narratorToolCalls}
 					ORDER BY ${narratorToolCalls.startedAt} DESC, ${narratorToolCalls.id} DESC
 					LIMIT ${FACET_WINDOW_ROWS}) AS recent`,
-			)
-			.groupBy(sql`tool_name`, sql`provider`);
+							)
+							.groupBy(sql`tool_name`, sql`provider`),
+						{ executionPolicy: "worker-required" },
+					);
 
 		const providers = new Set<string>();
 		for (const row of observed) {
@@ -506,12 +545,15 @@ export class ExecutionLogService {
 	 * smaller than the window (in which case the search is already exhaustive).
 	 */
 	private async resolvePayloadWindow(): Promise<string | null> {
-		const [boundary] = await this.database
-			.select({ startedAt: narratorToolCalls.startedAt })
-			.from(narratorToolCalls)
-			.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
-			.limit(1)
-			.offset(this.payloadSearchWindowRows);
+		const [boundary] = await readQuery(
+			this.database
+				.select({ startedAt: narratorToolCalls.startedAt })
+				.from(narratorToolCalls)
+				.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
+				.limit(1)
+				.offset(this.payloadSearchWindowRows),
+			{ executionPolicy: "worker-required" },
+		);
 		return boundary?.startedAt ?? null;
 	}
 

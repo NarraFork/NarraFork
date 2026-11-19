@@ -1,8 +1,12 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import * as pool from "../../lib/db-worker/pool";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 await import("../narrator-service");
@@ -36,12 +40,22 @@ function narrator(
 }
 function queryTrace() {
 	const queries: string[] = [];
+	const domainReads: string[] = [];
 	const prepare = sqlite.prepare.bind(sqlite);
 	spyOn(sqlite, "prepare").mockImplementation((...args: Parameters<typeof sqlite.prepare>) => {
 		queries.push(args[0]);
 		return prepare(...args);
 	});
-	return queries;
+	const run = pool.runReadTask;
+	spyOn(pool, "runReadTask").mockImplementation(
+		<T>(...args: Parameters<typeof run>): Promise<T> => {
+			const [, params] = args;
+			if (params.kind === "selectRows" || params.kind === "selectValues") queries.push(params.sql);
+			if (params.kind === "domainRead") domainReads.push(params.task);
+			return run<T>(...args);
+		},
+	);
+	return { queries, domainReads };
 }
 function message(
 	id: string,
@@ -71,10 +85,11 @@ beforeEach(() => {
 			)
 			.run(id, id, time);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("request-local narrator loading", () => {
@@ -172,12 +187,14 @@ describe("request-local narrator loading", () => {
 		await expect(
 			narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
 		).rejects.toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
-		const read = displayReaderModule.readDisplayFixtureMessages;
-		spyOn(displayReaderModule, "readDisplayFixtureMessages").mockImplementation(async (...args) => {
-			const result = await read(...args);
-			sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
-			return result;
-		});
+		const read = displayReaderModule.readNarratorDisplayMessages;
+		spyOn(displayReaderModule, "readNarratorDisplayMessages").mockImplementation(
+			async (...args) => {
+				const result = await read(...args);
+				sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
+				return result;
+			},
+		);
 		await expect(
 			narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
 		).rejects.toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
@@ -202,7 +219,7 @@ describe("request-local narrator loading", () => {
 			await requireNarratorAccess(c, "n1", "read");
 			return c.json({ leaked: true });
 		});
-		const queries = queryTrace();
+		const { queries } = queryTrace();
 		expect(await (await app.request("/read")).json()).toEqual({ id: "n1", write: false });
 		expect(queries.filter((query) => query.includes('from "narrators"'))).toHaveLength(1);
 		expect((await app.request("/fresh")).status).toBe(404);
@@ -215,7 +232,7 @@ describe("request-local narrator loading", () => {
 		sqlite
 			.prepare("UPDATE narrators SET message_count = 99, message_version = 7 WHERE id = 'n1'")
 			.run();
-		const queries = queryTrace();
+		const { queries } = queryTrace();
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
 		const afterFirst = queries.length;
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
@@ -332,19 +349,22 @@ describe("request-local narrator loading", () => {
 					"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, created_at) VALUES (?, 'n1', 'top', ?, ?, '{}', 'completed', ?)",
 				)
 				.run(`tool-${id}`, id as string, name as string, time);
-		const queries = queryTrace();
+		const { queries, domainReads } = queryTrace();
 		const page = await narratorMessageQueries.getPretextDocumentPage("n1", { limit: 32 });
 		expect(page.messages).toHaveLength(1);
 		expect(page.messages[0]?.children).toHaveLength(1);
-		const scopeQueries = queries.filter(
-			(query) =>
-				query.includes("aggregate_ref.seq") && query.includes('from "narrator_tool_calls"'),
-		);
-		// One initial union resolve plus one post-summary withdrawal guard, not two initial resolves.
-		expect(scopeQueries).toHaveLength(2);
-		console.info("Display-page SQLite driver query counts", {
-			total: queries.length,
-			aggregateParentReads: scopeQueries.length,
+		const scopeReads = [
+			...queries.filter(
+				(query) =>
+					query.includes("aggregate_ref.seq") && query.includes('from "narrator_tool_calls"'),
+			),
+			...domainReads.filter((task) => task === "narratorAggregateScope"),
+		];
+		// One initial worker scope snapshot plus one post-summary SQL withdrawal guard.
+		expect(scopeReads).toHaveLength(2);
+		console.info("Display-page SQLite metadata read counts", {
+			total: queries.length + domainReads.length,
+			aggregateParentReads: scopeReads.length,
 		});
 		// One narrow metadata read: the run registration (own-turn placement) and version.
 		expect(
@@ -358,10 +378,13 @@ describe("request-local narrator loading", () => {
 				.filter((query) => query.includes('"creator"'))
 				.every((query) => !query.includes("password_hash")),
 		).toBe(true);
-		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", {
-				messageVersion: page.messageVersion + 1,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
+		// Settle Worker I/O before entering Bun's native error matcher.
+		expect(
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", {
+					messageVersion: page.messageVersion + 1,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
 	});
 });

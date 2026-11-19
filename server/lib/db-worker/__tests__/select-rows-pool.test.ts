@@ -4,10 +4,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	drainDbWorkerPool,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	runReadTask,
-	shutdownDbWorkerPool,
 } from "../pool";
 import {
 	SELECT_ROWS_MAX_BYTES,
@@ -45,7 +45,7 @@ beforeEach(async () => {
 	writer.run("CREATE VIRTUAL TABLE messages_fts USING fts5(content, tokenize='trigram')");
 	writer.run("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages");
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	await resetDbWorkerPoolForTest();
 });
 
@@ -85,17 +85,23 @@ describe("real selectRows read-worker pool", () => {
 		expect(await query("SELECT count(*) AS total FROM messages")).toEqual([{ total: 1 }]);
 	}, 30_000);
 
-	test("input/output rejection does not poison the cached worker", async () => {
-		await expect(
-			query("SELECT ? AS value", ["a".repeat(SELECT_ROWS_MAX_PARAMS_BYTES)]),
-		).rejects.toThrow("oversized");
-		await expect(query("SELECT ? AS value", [Infinity])).rejects.toThrow("oversized");
-		await expect(query("SELECT 1; SELECT 2")).rejects.toThrow("oversized");
-		await expect(query("SELECT 1 UNION ALL SELECT 2", [], 1)).rejects.toThrow("row budget");
-		await expect(
-			query("SELECT printf('%.*c', ?, 'x') AS value", [SELECT_ROWS_MAX_BYTES + 1]),
-		).rejects.toThrow("byte budget");
-		expect(await query("SELECT 42 AS value")).toEqual([{ value: 42 }]);
+	test("large valid reads are complete and malformed inputs do not poison the cached worker", async () => {
+		const text = "a".repeat(SELECT_ROWS_MAX_PARAMS_BYTES + 1);
+		const bound = await query("SELECT ? AS value", [text]);
+		expect(bound).toEqual([{ value: text }]);
+		for (const [sql, params] of [
+			["SELECT ? AS value", [Infinity]],
+			["SELECT 1; SELECT 2", []],
+		] as const) {
+			const failure = await query(sql, [...params]).catch((error) => error);
+			expect(failure).toMatchObject({ code: "DB_READ_INVALID" });
+		}
+		const rows = await query("SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3", [], 1);
+		expect(rows).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
+		const big = await query("SELECT printf('%.*c', ?, 'x') AS value", [SELECT_ROWS_MAX_BYTES + 1]);
+		expect((big[0].value as string).length).toBe(SELECT_ROWS_MAX_BYTES + 1);
+		const ok = await query("SELECT 42 AS value");
+		expect(ok).toEqual([{ value: 42 }]);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 	}, 30_000);
@@ -158,6 +164,10 @@ describe("real selectRows read-worker pool", () => {
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
+		// Shared cancellation settles only after native exit, so replacement needs no reset.
+		expect(getDbWorkerPoolStats()).toMatchObject({ retiring: 0, tracked: 0 });
 		expect(await query("SELECT 42 AS recovered")).toEqual([{ recovered: 42 }]);
+		expect(getDbWorkerPoolStats().retiring).toBe(0);
+		expect(getDbWorkerPoolStats().queued).toBe(0);
 	}, 30_000);
 });

@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, userPreferences } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -180,10 +181,13 @@ function parseCommandInput(prompt: string): { name: string; input: string } | nu
 
 /** Load user-level commands from user_preferences. */
 async function getUserCommands(userId: string): Promise<Command[]> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!pref?.commands) return [];
 	try {
 		const parsed = typeof pref.commands === "string" ? JSON.parse(pref.commands) : pref.commands;
@@ -195,18 +199,24 @@ async function getUserCommands(userId: string): Promise<Command[]> {
 
 /** Load project-level commands from project.chapterSettings. */
 async function getProjectCommandsForNarrator(narratorId: string): Promise<Command[]> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) return [];
 	const projectId = await resolveNarratorProjectId(narrator);
 	if (!projectId) return [];
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { chapterSettings: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!project?.chapterSettings) return [];
 
 	return parseChapterSettingsCommands(project.chapterSettings);
@@ -214,10 +224,13 @@ async function getProjectCommandsForNarrator(narratorId: string): Promise<Comman
 
 /** Load project-level commands directly from a project ID. */
 async function getProjectCommandsById(projectId: string): Promise<Command[]> {
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { chapterSettings: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!project?.chapterSettings) return [];
 	return parseChapterSettingsCommands(project.chapterSettings);
 }
@@ -497,15 +510,18 @@ export async function getSlashMenuItems(
 	const [customCommands, skillContext, narrator] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
 		resolveSkillContextForNarrator(narratorId),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: {
-				id: true,
-				traits: true,
-				contextProjectId: true,
-				...RUNTIME_SOURCE_COLUMNS,
-			},
-		}),
+		readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: {
+					id: true,
+					traits: true,
+					contextProjectId: true,
+					...RUNTIME_SOURCE_COLUMNS,
+				},
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	]);
 	// The slash menu must hide anything the layered traits block, otherwise a
 	// project-enforced block would still be offered and only fail on use.

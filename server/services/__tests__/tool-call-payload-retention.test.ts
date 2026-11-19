@@ -11,18 +11,22 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 // mock.module is process-wide and mock.restore() does not undo it, so the real module is
 // snapshotted first and re-pointed in afterAll to keep this migration-only in-memory db
 // from leaking into later real-db suites.
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await workerFixture.close();
 });
 
 const { databaseCleanupService, DEFAULT_TOOL_CALL_PAYLOAD_DAYS } = await import(

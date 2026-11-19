@@ -1362,7 +1362,7 @@ const realDelivery: OutlineAnswerDelivery = {
 					.limit(1)
 					.get();
 				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
-				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq))
+				if (ref && (await assistantReplyFollowsAnswer(narratorId, ref.seq)))
 					return { written: true, woke: false };
 				const again = await wakeForTeam(
 					narratorId,

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import {
 	FILE_PANEL_PAGE_BYTES,
 	FILE_REFERENCE_READ_CONCURRENCY,
@@ -931,21 +932,27 @@ const productionDependencies: FileReferenceDependencies = {
 			import("./narrator-cwd"),
 			import("./oauth-narrator-runtime-policy"),
 		]);
-		const user = await db.query.users.findFirst({
-			where: eq(schema.users.id, userId),
-			columns: { role: true },
-		});
-		const row = await db.query.narrators.findFirst({
-			where: eq(schema.narrators.id, narratorId),
-			columns: {
-				...acl.NARRATOR_ACL_COLUMNS,
-				cwd: true,
-				defaultDeviceId: true,
-				permissionMode: true,
-				traits: true,
-				relaxedPlan: true,
-			},
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(schema.users.id, userId),
+				columns: { role: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(schema.narrators.id, narratorId),
+				columns: {
+					...acl.NARRATOR_ACL_COLUMNS,
+					cwd: true,
+					defaultDeviceId: true,
+					permissionMode: true,
+					traits: true,
+					relaxedPlan: true,
+				},
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!user || !row) throw new NotFoundError("Narrator", narratorId);
 		await acl.assertNarratorAccess(row, { userId, isAdmin: user.role === "admin" }, need);
 		if (isFormerChapterSessionWithoutDirectory(row))
@@ -956,10 +963,13 @@ const productionDependencies: FileReferenceDependencies = {
 			);
 		const projectId = row.contextProjectId;
 		const project = projectId
-			? await db.query.projects.findFirst({
-					where: eq(schema.projects.id, projectId),
-					columns: { gitPath: true },
-				})
+			? await readQuery(
+					db.query.projects.findFirst({
+						where: eq(schema.projects.id, projectId),
+						columns: { gitPath: true },
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				)
 			: undefined;
 		if (projectId && !project) throw new NotFoundError("Project", projectId);
 		const runtimePolicy = await resolveOAuthNarratorRuntimePolicy(narratorId);

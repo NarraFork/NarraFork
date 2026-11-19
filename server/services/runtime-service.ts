@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { closeBrowser, getBrowserStatus } from "../lib/browser/pool";
 import { closeAllSessions, getAllSessionStats } from "../lib/browser/session";
 import { logger } from "../lib/logger";
@@ -71,7 +72,9 @@ async function scanContainers(): Promise<RuntimeContainerInfo> {
 		// Podman not installed
 	}
 
-	const instances = db.select().from(containerInstances).all();
+	const instances = await readQuery(db.select().from(containerInstances), {
+		executionPolicy: "worker-required",
+	});
 	return {
 		running: instances.filter((c) => c.status === "running").length,
 		stopped: instances.filter((c) => c.status === "stopped" || c.status === "paused").length,
@@ -141,11 +144,10 @@ async function cleanupContainers(): Promise<{ stopped: number }> {
 	let stopped = 0;
 	try {
 		// Get running containers from DB
-		const running = db
-			.select()
-			.from(containerInstances)
-			.where(eq(containerInstances.status, "running"))
-			.all();
+		const running = await readQuery(
+			db.select().from(containerInstances).where(eq(containerInstances.status, "running")),
+			{ executionPolicy: "worker-required" },
+		);
 
 		for (const c of running) {
 			if (!c.containerId) continue;

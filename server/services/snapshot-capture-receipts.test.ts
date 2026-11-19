@@ -20,6 +20,7 @@ import { db as appDb, sqlite as template } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { closeReadDatabase } from "../lib/db-worker/pool";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import * as spawn from "../lib/spawn";
@@ -104,6 +105,7 @@ afterEach(async () => {
 		.where(eq(schema.narratorMessages.narratorId, narratorId))
 		.run();
 	appDb.delete(schema.narrators).where(eq(schema.narrators.id, narratorId)).run();
+	await closeReadDatabase(sqlite.filename, { timeoutMs: 5000 });
 	// Drizzle retains prepare() statements. Default close defers the real SQLite
 	// close until their GC; strict close finalizes them before Windows removes the files.
 	sqlite.close(true);

@@ -6,6 +6,7 @@ import {
 	clearLegacyRequestDumpBatch,
 	hasRetainedLegacyRequestDump,
 } from "@server/db/legacy-request-storage";
+import { readDomainTask } from "@server/db/worker-read";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import {
 	resumeDbWorkerPool,
@@ -384,21 +385,18 @@ function coordinatorIdsOf(rows: NarratorCleanupRecord[]): string[] {
 }
 
 async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
-	const narratorRows = sqlite
-		.prepare(`SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators`)
-		.all() as Record<string, unknown>[];
-	const terminalRows = sqlite
-		.prepare(
-			`SELECT DISTINCT narrator_id AS narratorId
-			 FROM terminals
-			 WHERE status = 'running' AND narrator_id IS NOT NULL`,
-		)
-		.all() as Array<{ narratorId: string }>;
-	const narrators = narratorRows.map(normalizeNarratorCleanupRecord);
+	const context = await readDomainTask(
+		sqlite,
+		"databaseCleanupContext",
+		{},
+		{
+			executionPolicy: "worker-required",
+		},
+	);
 	return {
-		narrators,
-		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
-		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
+		narrators: context.narrators.map(normalizeNarratorCleanupRecord),
+		runningTerminalIds: new Set(context.runningTerminalIds),
+		liveTeamIds: new Set(context.liveTeamIds),
 	};
 }
 

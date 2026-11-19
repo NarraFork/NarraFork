@@ -96,6 +96,38 @@ const HOT_EXIT_HANDLER_KEY = "narrafork.walExitHandler";
 /** Long enough for the server to bind and answer the first page load first. */
 const STARTUP_OPTIMIZE_DELAY_MS = 30_000;
 
+type StartupPhase = "ensureColumns" | "applyDataBackfills" | "ensureFts" | "optimizeDatabase";
+
+/** Timers start before each operation, including FTS schema checks and queued repairs. */
+function beginStartupPhase(phase: StartupPhase): (status: "completed" | "failed") => void {
+	const startedAt = performance.now();
+	const log = (status: "started" | "completed" | "failed") => {
+		try {
+			logger.info("SQLite startup phase", {
+				phase,
+				status,
+				elapsedMs: performance.now() - startedAt,
+			});
+		} catch {
+			// Diagnostics cannot affect startup success or replace the original failure.
+		}
+	};
+	log("started");
+	return log;
+}
+
+function runStartupPhase<T>(phase: StartupPhase, operation: () => T): T {
+	const finish = beginStartupPhase(phase);
+	let status: "completed" | "failed" = "failed";
+	try {
+		const result = operation();
+		status = "completed";
+		return result;
+	} finally {
+		finish(status);
+	}
+}
+
 export interface SqliteLifecycleOptions {
 	/**
 	 * Idempotent data backfills, run between column patching and FTS initialisation.
@@ -280,20 +312,29 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 		reportStartupStep({ key: "database" });
 
 		// Patch missing columns for databases created by older versions.
-		ensureColumns(connection());
+		runStartupPhase("ensureColumns", () => ensureColumns(connection()));
 
-		await options.applyDataBackfills?.(connection());
+		const finishBackfills = beginStartupPhase("applyDataBackfills");
+		let backfillsStatus: "completed" | "failed" = "failed";
+		try {
+			await options.applyDataBackfills?.(connection());
+			backfillsStatus = "completed";
+		} finally {
+			finishBackfills(backfillsStatus);
+		}
 
 		// FTS5 virtual tables and triggers — managed outside Drizzle (which cannot express FTS5).
 		// Indexes the background check found corrupt are rebuilt here; startup reads no index to
 		// find out. The marker goes only once the rebuild has run, so a killed rebuild retries.
 		const ftsRepair = isHotReload ? null : readPendingFtsRepair();
-		ensureFts(connection(), {
-			skipUncleanShutdownRebuild: isHotReload,
-			// consumeCleanShutdownState already cleared the marker, so ensureFts cannot re-read it.
-			wasClean,
-			repairFtsTables: ftsRepair?.tables,
-		});
+		runStartupPhase("ensureFts", () =>
+			ensureFts(connection(), {
+				skipUncleanShutdownRebuild: isHotReload,
+				// consumeCleanShutdownState already cleared the marker, so ensureFts cannot re-read it.
+				wasClean,
+				repairFtsTables: ftsRepair?.tables,
+			}),
+		);
 		if (ftsRepair) clearPendingFtsRepair();
 		state.initialized = true;
 
@@ -304,7 +345,11 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 		// help later queries, so startup should not wait for it.
 		if (!isHotReload) {
 			setTimeout(() => {
-				if (state.sqlite) optimizeDatabase(state.sqlite, { source: "startup" });
+				if (state.sqlite) {
+					runStartupPhase("optimizeDatabase", () =>
+						optimizeDatabase(connection(), { source: "startup" }),
+					);
+				}
 			}, STARTUP_OPTIMIZE_DELAY_MS).unref();
 		}
 

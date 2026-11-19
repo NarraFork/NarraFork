@@ -16,6 +16,7 @@ import {
 } from "../../db/schema";
 import { epochRecordOf } from "../../lib/agent/tool-loading";
 import { generateId } from "../../lib/id";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import { resolveNarratorGitTarget } from "../git-workspace";
@@ -243,6 +244,60 @@ describe("unified prefix epochs with real SQLite history", () => {
 			writer.mockRestore();
 		}
 	}, 15000);
+
+	test("unchanged prefix sources retain request metrics and start their budget after tool refresh", async () => {
+		const { input } = await fixture();
+		const initial = await reconcileEpoch(input);
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const preparation = new ModelHistoryPreparation({
+			narratorId: input.narratorId,
+			kind: "rebuild",
+			timeoutMs: null,
+		});
+		const phase = spyOn(preparation, "phase");
+		const count = spyOn(preparation, "count");
+		const readHistory = narratorService.getModelHistorySinceLastCompact.bind(narratorService);
+		const source = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+			async (narratorId, limit, options) => {
+				expect(options?.preparation).toBe(preparation);
+				expect(options?.signal).toBe(preparation.signal);
+				expect(options?.deadline).toBe(now + 10_000);
+				expect(phase.mock.calls.at(-1)).toEqual(["source"]);
+				return readHistory(narratorId, limit, options);
+			},
+		);
+		try {
+			const result = await reconcileEpoch({
+				...input,
+				preparation,
+				refreshTools: async () => {
+					now += 45_000;
+					return {
+						managed: input.managed,
+						current: input.current,
+						candidates: input.candidates,
+						registryRevision: input.registryRevision,
+						prompt: input.prompt,
+					};
+				},
+			});
+			expect(source).toHaveBeenCalledTimes(1);
+			expect(result.changed).toBe(false);
+			expect(result.sourceMessages).toBeDefined();
+			expect(result.epoch?.markerId).toBe(initial.epoch?.markerId);
+			expect(count.mock.calls.length).toBeGreaterThan(0);
+			expect(phase.mock.calls.at(-1)).toEqual(["epoch"]);
+			expect(preparation.deadline).toBe(Infinity);
+			expect(preparation.signal.aborted).toBe(false);
+		} finally {
+			source.mockRestore();
+			count.mockRestore();
+			phase.mockRestore();
+			preparation.finish();
+			clock.mockRestore();
+		}
+	});
 
 	test("initial baseline is durable; concurrent changes and retries append only once", async () => {
 		const { narratorId, input } = await fixture();

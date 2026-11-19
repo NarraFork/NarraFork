@@ -21,11 +21,18 @@ import type { RunControl } from "../agent-runtime/ownership";
 import { runtimePolicyForContext } from "../agent-runtime/policy";
 import type { ExecuteLoopOptions } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
 // Real configured provider classification, real provider history and the real outer
 // runtime; only model I/O and its bounded delay are replaced. Run in an isolated process.
-// Share the preload-isolated file-backed DB with the real prefix/history workers.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { settings, usesStatefulModel } = await import("../../lib/settings");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
@@ -83,8 +90,11 @@ afterEach(async () => {
 	mock.restore();
 });
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	(await import("../agent-runtime/publication")).stopRuntimePublications();
+	await drainRuntimeTestWork();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	backgroundOccupancyStore.resetForTests();
+	mock.module("../../db", () => realDb);
 });
 
 // Direct SQL fixtures must publish the same entity-specific maintenance as production writes.
@@ -233,7 +243,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			if (expected) await openReasoningIdleTask(id);
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
-				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+				await options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
@@ -297,7 +307,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			if (expected) await openReasoningIdleTask(id);
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
-				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+				await options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
@@ -314,10 +324,10 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 
 	test("busy subagent changes mailbox provenance only when after-tools input is consumed", async () => {
 		const { active, owner, run } = await reasoningIdleFixture("subagent");
-		const consumed = mock(() => {});
+		const consumed = mock(async () => {});
 		const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory");
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-			options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+			await options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			for (const step of [
 				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
@@ -333,14 +343,14 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				const input = await options.config.getAfterToolsInjections?.();
 				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.before);
-				input.onConsumed?.();
+				await input.onConsumed?.();
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
 				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
-				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+				await options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
 			}
 			expect(consumed).toHaveBeenCalledTimes(3);
-			options.config.onModelInputConsumed?.(options.history.built ?? [], "a new user turn");
+			await options.config.onModelInputConsumed?.(options.history.built ?? [], "a new user turn");
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			return { ...reasoningIdleResult, reasoningOnlyIdle: false };
 		});

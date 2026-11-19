@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import {
 	narratorBlacklistDirs,
 	narratorMessages,
@@ -17,8 +16,10 @@ import { localBackend, setRemoteBackendResolver } from "../../lib/agent/executio
 import type { ToolExecutionTarget } from "../../lib/agent/types";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 import type { PendingDangerReflection, PendingExecutionTarget } from "../narrator-session-state";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
+await ready;
 
 // The branch intentionally does not generate a migration while permission schema work is under
 // review. Keep this focused test database aligned with the current typed schema without touching
@@ -53,11 +54,11 @@ for (const statement of [
 }
 
 const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 const events: Array<Record<string, unknown>> = [];
 
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
 	...realNarratorWsModule,
 	broadcastToNarrator: (_narratorId: string, message: Record<string, unknown>) => {
@@ -331,7 +332,8 @@ afterEach(() => {
 	sqlite.run("DELETE FROM narrators");
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await close();
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.module("../narrator-service", () => realNarratorServiceModule);

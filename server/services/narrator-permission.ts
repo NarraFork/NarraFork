@@ -18,6 +18,7 @@ import {
 	oauthClients,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -89,7 +90,7 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { isOwnCoordinatorOutputPath } from "../lib/coordinator-outputs-path";
-import { AppError } from "../lib/errors";
+import { AppError, NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
@@ -214,19 +215,39 @@ const pendingPermissionContexts = new WeakMap<
 
 // === Permission handling ===
 
+function rethrowPermissionReadFailure(error: unknown): void {
+	if (
+		error &&
+		typeof error === "object" &&
+		"code" in error &&
+		typeof error.code === "string" &&
+		error.code.startsWith("DB_READ_")
+	)
+		throw error;
+}
+
+function missingNarrator(error: unknown): null {
+	if (error instanceof NotFoundError) return null;
+	throw error;
+}
+
 async function refreshPermissionContextCharacters(
 	narratorId: string,
 	toolCallId: string,
 ): Promise<void> {
-	const row = await db.query.narratorToolCalls
-		.findFirst({ where: eq(narratorToolCalls.id, toolCallId), columns: { messageId: true } })
-		.catch((error: unknown) => {
-			logger.warn("Character refresh message identity unavailable", {
-				toolCallId,
-				error: String(error),
-			});
-			return undefined;
+	const row = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, toolCallId),
+			columns: { messageId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	).catch((error: unknown) => {
+		logger.warn("Character refresh message identity unavailable", {
+			toolCallId,
+			error: String(error),
 		});
+		return undefined;
+	});
 	queueContextCharacterRefresh(narratorId, row?.messageId);
 }
 
@@ -2367,16 +2388,19 @@ function scheduleQuestionReflection(
 async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	pending: PendingPermission,
 ): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, pending.narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			traits: true,
-			questionReflectionOverride: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, pending.narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				traits: true,
+				questionReflectionOverride: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!narrator) return false;
 	const effectiveMode = getEffectivePermissionMode(
 		narrator.permissionMode ?? "default",
@@ -2427,7 +2451,7 @@ export async function reflectPendingAskUserQuestion(
 			"running",
 			"Question reflection is answering AskUserQuestion",
 		);
-		const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
+		const narrator = await narratorService.getById(pending.narratorId).catch(missingNarrator);
 		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
 			locale: pending.locale,
 			model: narrator?.model,
@@ -3484,7 +3508,7 @@ async function resolveSendTargetsForPermission(
 		// "parent"/"main" are reserved aliases, not narrator primary keys. Resolve the
 		// launching narrator by teamParentId so mixed target lists still work.
 		if (addressesParent) {
-			const parent = await narratorService.getById(parentId).catch(() => null);
+			const parent = await narratorService.getById(parentId).catch(missingNarrator);
 			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
 				return [];
 			}
@@ -3494,7 +3518,7 @@ async function resolveSendTargetsForPermission(
 			}
 			continue;
 		}
-		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
+		const direct = await narratorService.getById(aliasCandidate).catch(missingNarrator);
 		if (direct) {
 			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
 				return [];
@@ -3512,7 +3536,7 @@ async function resolveSendTargetsForPermission(
 			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
-		const target = await narratorService.getById(candidates[0].id).catch(() => null);
+		const target = await narratorService.getById(candidates[0].id).catch(missingNarrator);
 		if (!target?.id || !isTeamMember(target, parentId)) return [];
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
@@ -5338,10 +5362,13 @@ export async function classifyDeviceAccessGroup(
 	ctx: { oauthClientId: string; grantId: string },
 ): Promise<DeviceAccessGroup> {
 	if (deviceId === LOCAL_DEVICE_ID) return "host";
-	const device = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, deviceId),
-		columns: { scope: true },
-	});
+	const device = await readQuery(
+		db.query.remoteDevices.findFirst({
+			where: eq(remoteDevices.id, deviceId),
+			columns: { scope: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!device) return "global"; // fail closed toward the more restrictive default level below
 	const binding = await integrationResourceBindingService.get("device", deviceId);
 	const isSelfRegistered =
@@ -5402,20 +5429,24 @@ export async function handlePermission(
 	if (binding) {
 		try {
 			await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
-		} catch {
+		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: "Invalid persisted tool execution binding" };
 		}
 	}
 	// Legacy callers may omit the binding only when the provider id is unambiguous.
-	const candidates = await db.query.narratorToolCalls.findMany({
-		where: and(
-			binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true, executionAttempt: true },
-		limit: 2,
-	});
+	const candidates = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true, executionAttempt: true },
+			limit: 2,
+		}),
+		{ executionPolicy: "worker-required", maxRows: 2, timeoutMs: 30_000, signal },
+	);
 	if (candidates.length > 1 || (binding && candidates.length !== 1)) {
 		return { behavior: "deny", message: "Ambiguous or missing persisted tool execution record" };
 	}
@@ -5447,23 +5478,26 @@ export async function handlePermission(
 	let initialExecutionTarget = executionContext?.target;
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			planFileId: true,
-			dangerReflectionOverride: true,
-			questionReflectionOverride: true,
-			variant: true,
-			type: true,
-			parentNarratorId: true,
-			aclRootNarratorId: true,
-			runtimeRegistrationJson: true,
-			traits: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				planFileId: true,
+				dangerReflectionOverride: true,
+				questionReflectionOverride: true,
+				variant: true,
+				type: true,
+				parentNarratorId: true,
+				aclRootNarratorId: true,
+				runtimeRegistrationJson: true,
+				traits: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000, signal },
+	);
 	// A nested subagent's requests also reach its ACL root's page (see nested-subagent-routing).
 	if (narrator) rememberNestedSubagentRoot({ id: narratorId, ...narrator });
 	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
@@ -5520,6 +5554,7 @@ export async function handlePermission(
 			// Freeze an alias to the checked task, so approval cannot cancel a retargeted alias.
 			effectiveInput = { type: task.type, id: task.id };
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 	}
@@ -5675,6 +5710,7 @@ export async function handlePermission(
 			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
 			await assertNarratorCanAskQuestion(narratorId);
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 		const askResult = await validateOrRepairAskUserQuestionInput(
@@ -5744,6 +5780,7 @@ export async function handlePermission(
 			signal,
 		);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return {
 			behavior: "deny",
 			message: `Execution policy compilation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -5944,9 +5981,13 @@ export async function handlePermission(
 		if (!opts.skipConfirmationCache && consumeDangerConfirmation(narratorId, fingerprint)) {
 			return null;
 		}
-		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-		});
+		const toolCallRecord = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000, signal },
+		);
 		if (!toolCallRecord) {
 			logger.error("Tool call record not found for danger reflection", {
 				narratorId,
@@ -6309,9 +6350,13 @@ export async function handlePermission(
 		};
 	}
 
-	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-	});
+	const toolCallRecord = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000, signal },
+	);
 
 	if (!toolCallRecord) {
 		logger.error("Tool call record not found for permission request", { narratorId, toolUseId });
@@ -6569,6 +6614,7 @@ async function handlePermissionRuleRequest(args: {
 		}
 		await options.onInputResolved?.(prepared.input);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 	}
 	const id = binding.toolCallId;
@@ -6991,7 +7037,7 @@ export async function resolvePermission(
 	let decidedByNarrator: { id: string; handle: string | null } | undefined;
 	if (decidedBy.startsWith("narrator:")) {
 		const proxyId = decidedBy.slice("narrator:".length);
-		const proxy = await narratorService.getById(proxyId).catch(() => null);
+		const proxy = await narratorService.getById(proxyId).catch(missingNarrator);
 		decidedByNarrator = { id: proxyId, handle: proxy?.handle ?? null };
 	}
 
@@ -7163,10 +7209,13 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 	);
 	const planReflectionNarratorId = getExitPlanReflectionNarratorId(requestId);
 	if (planReflectionNarratorId) return planReflectionNarratorId;
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
+	const row = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, requestId),
+			columns: { narratorId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	return row?.narratorId ?? null;
 }
 
@@ -7210,15 +7259,18 @@ export async function resolvePermissionOrDangerReflection(
 		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
 			"./restart-recovery-service"
 		);
-		const stored = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
-			columns: {
-				narratorId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-			},
-		});
+		const stored = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+				columns: {
+					narratorId: true,
+					status: true,
+					executionStartedAt: true,
+					fileChangeOperationId: true,
+				},
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
 		if (
 			stored?.status === "pending" &&
 			stored.executionStartedAt == null &&
@@ -7458,30 +7510,39 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	requestId: string,
 	reason?: string,
 ): Promise<boolean> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: {
-			id: true,
-			narratorId: true,
-			messageId: true,
-			toolUseId: true,
-			status: true,
-			permissionSuggestions: true,
-		},
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, requestId),
+			columns: {
+				id: true,
+				narratorId: true,
+				messageId: true,
+				toolUseId: true,
+				status: true,
+				permissionSuggestions: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!toolCall) return false;
 
 	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
 	if (!existingReflection) return false;
 	const [narrator, ownerMessage] = await Promise.all([
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, toolCall.narratorId),
-			columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
-		}),
-		db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, toolCall.messageId),
-			columns: { parentToolUseId: true },
-		}),
+		readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, toolCall.narratorId),
+				columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		),
+		readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, toolCall.messageId),
+				columns: { parentToolUseId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		),
 	]);
 	// No runtime pause exists, so the route is rebuilt from persistence: the owner
 	// plus its parent (if it is a subagent) are exactly the pages that can be

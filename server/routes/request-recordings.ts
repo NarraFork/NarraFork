@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import type { RequestRecordingDetail } from "../../shared/request-recording";
 import { db } from "../db";
 import { apiRequests } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import {
 	deleteSavedRecording,
@@ -19,17 +20,20 @@ export async function lookupApiRequestMetadata(
 	apiRequestId: string,
 ): Promise<RequestRecordingDetail["apiRequest"]> {
 	// Primary-key lookup, same-narrator ownership, bounded metadata only. No dump columns.
-	const [row] = await db
-		.select({
-			id: apiRequests.id,
-			createdAt: apiRequests.createdAt,
-			durationMs: apiRequests.durationMs,
-			ttftMs: apiRequests.ttftMs,
-			errorMessage: sql<string | null>`substr(${apiRequests.errorMessage}, 1, 2048)`,
-		})
-		.from(apiRequests)
-		.where(and(eq(apiRequests.id, apiRequestId), eq(apiRequests.narratorId, narratorId)))
-		.limit(1);
+	const [row] = await readQuery(
+		db
+			.select({
+				id: apiRequests.id,
+				createdAt: apiRequests.createdAt,
+				durationMs: apiRequests.durationMs,
+				ttftMs: apiRequests.ttftMs,
+				errorMessage: sql<string | null>`substr(${apiRequests.errorMessage}, 1, 2048)`,
+			})
+			.from(apiRequests)
+			.where(and(eq(apiRequests.id, apiRequestId), eq(apiRequests.narratorId, narratorId)))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) return undefined;
 	return {
 		...row,

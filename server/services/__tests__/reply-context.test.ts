@@ -24,6 +24,16 @@ import { editAndRegenerate } from "../narrator-session";
 const chinese = { locale: "zh-CN" as const, replyInUserLanguage: true };
 const english = { locale: "en" as const, replyInUserLanguage: false };
 
+// Settle worker I/O before Bun's synchronous throw matcher evaluates the rejection.
+async function settledThrow(work: Promise<unknown>): Promise<() => never> {
+	const [result] = await Promise.allSettled([work]);
+	expect(result.status).toBe("rejected");
+	if (result.status !== "rejected") throw new Error("Expected operation to reject");
+	return () => {
+		throw result.reason;
+	};
+}
+
 async function contract(query: ContextQuery) {
 	const store = createReplyContextStore(query);
 	await query.run(
@@ -67,16 +77,20 @@ async function contract(query: ContextQuery) {
 		"bad JSON",
 	]) {
 		await query.run("UPDATE narrators SET reply_context = ? WHERE id = 'reply-broken'", [bad]);
-		await expect(store.ensure("reply-broken", chinese)).rejects.toThrow();
+		expect(await settledThrow(store.ensure("reply-broken", chinese))).toThrow();
 	}
 	let blocked = true;
 	const racing = createReplyContextStore({
-		get: async <T>(statement: string, params: Parameters<ContextQuery["get"]>[1]) => {
+		get: query.get,
+		writeReturning: async <T>(
+			statement: string,
+			params: Parameters<ContextQuery["writeReturning"]>[1],
+		) => {
 			if (blocked && statement.startsWith("UPDATE narrators SET reply_context")) {
 				blocked = false;
 				await store.adopt("reply-race", english);
 			}
-			return query.get<T>(statement, params);
+			return query.writeReturning<T>(statement, params);
 		},
 	});
 	expect(await racing.ensure("reply-race", chinese)).toEqual(english);
@@ -162,9 +176,11 @@ test("explicit human edit adopts atomically with message COW, including rollback
 		"CREATE TRIGGER fail_reply_edit BEFORE UPDATE OF reply_context ON narrators BEGIN SELECT RAISE(ABORT, 'forced reply failure'); END",
 	);
 	try {
-		await expect(
-			editAndRegenerate(narrator.id, message.id, "edited", "en", false, options),
-		).rejects.toThrow("forced reply failure");
+		expect(
+			await settledThrow(
+				editAndRegenerate(narrator.id, message.id, "edited", "en", false, options),
+			),
+		).toThrow("forced reply failure");
 	} finally {
 		sqlite.exec("DROP TRIGGER fail_reply_edit");
 	}
@@ -246,7 +262,7 @@ CREATE TRIGGER fail_reply_flip BEFORE UPDATE OF state ON narrator_buffered_messa
 			await client.sql.unsafe("DROP TRIGGER fail_reply_flip ON narrator_buffered_messages");
 			await queue.mailbox.materialize(claim, persist);
 			expect(await store.ensure("reply-recovery", chinese)).toEqual(english);
-			await expect(queue.mailbox.materialize(claim, persist)).rejects.toThrow(
+			expect(await settledThrow(queue.mailbox.materialize(claim, persist))).toThrow(
 				"Stale mailbox claim",
 			);
 			const forbidden = new Proxy(

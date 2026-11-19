@@ -22,6 +22,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { logger } from "../lib/logger";
 import { normalizeWorkspacePath } from "./git-workspace";
 
@@ -148,26 +149,29 @@ async function loadChildren(ids: string[], parentNarratorId?: string): Promise<C
 	if (!ids.length) return [];
 	const parent = alias(narrators, "file_changes_parent");
 	const contextProject = alias(projects, "file_changes_parent_context_project");
-	const rows = await db
-		.select({
-			id: narrators.id,
-			parentNarratorId: narrators.parentNarratorId,
-			parentId: parent.id,
-			parentCwd: parent.cwd,
-			parentContextGitPath: contextProject.gitPath,
-			parentDeviceId: parent.defaultDeviceId,
-		})
-		.from(narrators)
-		.leftJoin(parent, eq(parent.id, narrators.parentNarratorId))
-		.leftJoin(contextProject, eq(contextProject.id, parent.contextProjectId))
-		.where(
-			and(
-				inArray(narrators.id, ids),
-				subagentPredicate(),
-				parentNarratorId ? eq(narrators.parentNarratorId, parentNarratorId) : undefined,
-			),
-		)
-		.limit(MAX_SUBAGENT_QUERY_IDS);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narrators.id,
+				parentNarratorId: narrators.parentNarratorId,
+				parentId: parent.id,
+				parentCwd: parent.cwd,
+				parentContextGitPath: contextProject.gitPath,
+				parentDeviceId: parent.defaultDeviceId,
+			})
+			.from(narrators)
+			.leftJoin(parent, eq(parent.id, narrators.parentNarratorId))
+			.leftJoin(contextProject, eq(contextProject.id, parent.contextProjectId))
+			.where(
+				and(
+					inArray(narrators.id, ids),
+					subagentPredicate(),
+					parentNarratorId ? eq(narrators.parentNarratorId, parentNarratorId) : undefined,
+				),
+			)
+			.limit(MAX_SUBAGENT_QUERY_IDS),
+		{ executionPolicy: "worker-required", maxRows: MAX_SUBAGENT_QUERY_IDS },
+	);
 	return rows.map((row) => ({
 		id: row.id,
 		parentNarratorId: row.parentNarratorId,
@@ -208,17 +212,20 @@ async function resolveScopes(
 			: [];
 	});
 	const timings = lookups.length
-		? await db
-				.select({
-					parentNarratorId: narratorToolCalls.narratorId,
-					sourceToolUseId: narratorToolCalls.toolUseId,
-					startedAt: narratorToolCalls.executionStartedAt,
-					createdAt: narratorToolCalls.createdAt,
-					completedAt: narratorToolCalls.completedAt,
-				})
-				.from(narratorToolCalls)
-				.where(or(...lookups))
-				.limit(MAX_SUBAGENT_QUERY_IDS * 2 + 1)
+		? await readQuery(
+				db
+					.select({
+						parentNarratorId: narratorToolCalls.narratorId,
+						sourceToolUseId: narratorToolCalls.toolUseId,
+						startedAt: narratorToolCalls.executionStartedAt,
+						createdAt: narratorToolCalls.createdAt,
+						completedAt: narratorToolCalls.completedAt,
+					})
+					.from(narratorToolCalls)
+					.where(or(...lookups))
+					.limit(MAX_SUBAGENT_QUERY_IDS * 2 + 1),
+				{ executionPolicy: "worker-required", maxRows: MAX_SUBAGENT_QUERY_IDS * 2 + 1 },
+			)
 		: [];
 	for (const child of children) {
 		const scope = requested.get(child.id);
@@ -280,11 +287,14 @@ async function collectExecutionSegments(rootSegmentId: string): Promise<{
 		const accepted = frontier.slice(0, MAX_EXACT_SEGMENTS - ids.size);
 		if (accepted.length < frontier.length) truncated = true;
 		for (const id of accepted) ids.add(id);
-		const children = await db
-			.select({ id: fileChangeExecutionSegments.id })
-			.from(fileChangeExecutionSegments)
-			.where(inArray(fileChangeExecutionSegments.parentSegmentId, accepted))
-			.limit(MAX_EXACT_SEGMENTS - ids.size + 1);
+		const children = await readQuery(
+			db
+				.select({ id: fileChangeExecutionSegments.id })
+				.from(fileChangeExecutionSegments)
+				.where(inArray(fileChangeExecutionSegments.parentSegmentId, accepted))
+				.limit(MAX_EXACT_SEGMENTS - ids.size + 1),
+			{ executionPolicy: "worker-required", maxRows: MAX_EXACT_SEGMENTS + 1 },
+		);
 		if (children.length > MAX_EXACT_SEGMENTS - ids.size) truncated = true;
 		queue = children.slice(0, MAX_EXACT_SEGMENTS - ids.size).map((row) => row.id);
 	}
@@ -379,30 +389,33 @@ async function addExactChanges(
 		}
 	}
 	if (!segmentIds.size) return;
-	const operations = await db
-		.select({
-			id: fileChangeOperations.id,
-			narratorId: fileChangeOperations.narratorId,
-			executionSegmentId: fileChangeOperations.executionSegmentId,
-			settlement: fileChangeOperations.settlement,
-			coverage: fileChangeOperations.coverage,
-			attributionGrade: fileChangeOperations.attributionGrade,
-			executionOutcome: fileChangeOperations.executionOutcome,
-		})
-		.from(fileChangeOperations)
-		.where(
-			and(
-				inArray(
-					fileChangeOperations.narratorId,
-					children.map((child) => child.id),
+	const operations = await readQuery(
+		db
+			.select({
+				id: fileChangeOperations.id,
+				narratorId: fileChangeOperations.narratorId,
+				executionSegmentId: fileChangeOperations.executionSegmentId,
+				settlement: fileChangeOperations.settlement,
+				coverage: fileChangeOperations.coverage,
+				attributionGrade: fileChangeOperations.attributionGrade,
+				executionOutcome: fileChangeOperations.executionOutcome,
+			})
+			.from(fileChangeOperations)
+			.where(
+				and(
+					inArray(
+						fileChangeOperations.narratorId,
+						children.map((child) => child.id),
+					),
+					eq(fileChangeOperations.sourceKind, "tool"),
+					// v3 only changed the execution binding check, which this query does not use.
+					inArray(fileChangeOperations.evidenceVersion, [2, FILE_CHANGE_EVIDENCE_VERSION]),
+					inArray(fileChangeOperations.executionSegmentId, [...segmentIds]),
 				),
-				eq(fileChangeOperations.sourceKind, "tool"),
-				// v3 only changed the execution binding check, which this query does not use.
-				inArray(fileChangeOperations.evidenceVersion, [2, FILE_CHANGE_EVIDENCE_VERSION]),
-				inArray(fileChangeOperations.executionSegmentId, [...segmentIds]),
-			),
-		)
-		.limit(MAX_EXACT_OPERATIONS + 1);
+			)
+			.limit(MAX_EXACT_OPERATIONS + 1),
+		{ executionPolicy: "worker-required", maxRows: MAX_EXACT_OPERATIONS + 1 },
+	);
 	if (operations.length > MAX_EXACT_OPERATIONS) {
 		for (const entry of entries.values()) {
 			entry.changes.countsTruncated = true;
@@ -426,34 +439,37 @@ async function addExactChanges(
 	const ownerByOperation = new Map(
 		eligible.map((operation) => [operation.id, operation.narratorId as string]),
 	);
-	const effects = await db
-		.select({
-			effectId: fileChangeEffects.id,
-			operationId: fileChangeEffects.operationId,
-			identityJson: fileChangeEffects.identityJson,
-			linesAdded: fileChangeEffects.linesAdded,
-			linesRemoved: fileChangeEffects.linesRemoved,
-			outcome: fileChangeEffects.outcome,
-			phase: fileChangeEffects.phase,
-			settlement: fileChangeEffects.settlement,
-			attributionGrade: fileChangeEffects.attributionGrade,
-			workspacePath: fileChangeScopes.displayRoot,
-		})
-		.from(fileChangeEffects)
-		.innerJoin(fileChangeScopes, eq(fileChangeScopes.id, fileChangeEffects.scopeId))
-		.where(
-			and(
-				inArray(
-					fileChangeEffects.operationId,
-					eligible.map((operation) => operation.id),
+	const effects = await readQuery(
+		db
+			.select({
+				effectId: fileChangeEffects.id,
+				operationId: fileChangeEffects.operationId,
+				identityJson: fileChangeEffects.identityJson,
+				linesAdded: fileChangeEffects.linesAdded,
+				linesRemoved: fileChangeEffects.linesRemoved,
+				outcome: fileChangeEffects.outcome,
+				phase: fileChangeEffects.phase,
+				settlement: fileChangeEffects.settlement,
+				attributionGrade: fileChangeEffects.attributionGrade,
+				workspacePath: fileChangeScopes.displayRoot,
+			})
+			.from(fileChangeEffects)
+			.innerJoin(fileChangeScopes, eq(fileChangeScopes.id, fileChangeEffects.scopeId))
+			.where(
+				and(
+					inArray(
+						fileChangeEffects.operationId,
+						eligible.map((operation) => operation.id),
+					),
+					eq(fileChangeEffects.phase, "apply"),
+					eq(fileChangeEffects.outcome, "changed"),
+					eq(fileChangeEffects.settlement, "settled"),
+					eq(fileChangeEffects.attributionGrade, "measured"),
 				),
-				eq(fileChangeEffects.phase, "apply"),
-				eq(fileChangeEffects.outcome, "changed"),
-				eq(fileChangeEffects.settlement, "settled"),
-				eq(fileChangeEffects.attributionGrade, "measured"),
-			),
-		)
-		.limit(MAX_EXACT_OPERATIONS + 1);
+			)
+			.limit(MAX_EXACT_OPERATIONS + 1),
+		{ executionPolicy: "worker-required", maxRows: MAX_EXACT_OPERATIONS + 1 },
+	);
 	if (effects.length > MAX_EXACT_OPERATIONS) {
 		for (const entry of entries.values()) {
 			entry.changes.countsTruncated = true;
@@ -526,29 +542,32 @@ async function queryChanges(ids: string[], options: SubagentFileChangeQueryOptio
 	// Use the narrator index and a source-row cap, not unbounded SQL SUM/COUNT.
 	// No timestamp ordering: that would sort a potentially enormous history before
 	// LIMIT. Reaching the cap is explicitly a lower bound, even for a filtered run.
-	const rows = await db
-		.select({
-			subagentNarratorId: fileAttributions.narratorId,
-			deviceId: fileAttributions.deviceId,
-			workspacePath: fileAttributions.workspacePath,
-			filePath: fileAttributions.filePath,
-			action: fileAttributions.action,
-			linesAdded: fileAttributions.linesAdded,
-			linesRemoved: fileAttributions.linesRemoved,
-			changedAt: fileAttributions.changedAt,
-			effectId: fileAttributions.effectId,
-			operationSegmentId: fileChangeOperations.executionSegmentId,
-		})
-		.from(fileAttributions)
-		.leftJoin(fileChangeOperations, eq(fileChangeOperations.id, fileAttributions.operationId))
-		.where(
-			inArray(
-				fileAttributions.narratorId,
-				children.map((child) => child.id),
-			),
-		)
-		.orderBy(asc(fileAttributions.narratorId))
-		.limit(MAX_LEGACY_ATTRIBUTION_ROWS + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				subagentNarratorId: fileAttributions.narratorId,
+				deviceId: fileAttributions.deviceId,
+				workspacePath: fileAttributions.workspacePath,
+				filePath: fileAttributions.filePath,
+				action: fileAttributions.action,
+				linesAdded: fileAttributions.linesAdded,
+				linesRemoved: fileAttributions.linesRemoved,
+				changedAt: fileAttributions.changedAt,
+				effectId: fileAttributions.effectId,
+				operationSegmentId: fileChangeOperations.executionSegmentId,
+			})
+			.from(fileAttributions)
+			.leftJoin(fileChangeOperations, eq(fileChangeOperations.id, fileAttributions.operationId))
+			.where(
+				inArray(
+					fileAttributions.narratorId,
+					children.map((child) => child.id),
+				),
+			)
+			.orderBy(asc(fileAttributions.narratorId))
+			.limit(MAX_LEGACY_ATTRIBUTION_ROWS + 1),
+		{ executionPolicy: "worker-required", maxRows: MAX_LEGACY_ATTRIBUTION_ROWS + 1 },
+	);
 	const firstOmittedOwner = rows[MAX_LEGACY_ATTRIBUTION_ROWS]?.subagentNarratorId;
 	for (const row of rows.slice(0, MAX_LEGACY_ATTRIBUTION_ROWS)) {
 		if (!row.subagentNarratorId) continue;
@@ -656,51 +675,54 @@ export async function getCurrentSubagentFileChangeOptions(
 	const scopesBySubagent = new Map<string, SubagentFileChangeScope>();
 	if (!requested.length) return { executionBoundariesBySubagent, scopesBySubagent };
 	const parentSegment = alias(fileChangeExecutionSegments, "current_subagent_parent_segment");
-	const rows = await db
-		.select({
-			childId: narrators.id,
-			turnStartedAt: narrators.turnStartedAt,
-			runCompletedAt: narrators.backgroundCompletedAt,
-			segmentStartedAt: fileChangeExecutionSegments.createdAt,
-			sourceToolCallId: narratorToolCalls.id,
-			executionAttempt: narratorToolCalls.executionAttempt,
-			executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
-			executionSegmentId: narratorToolCalls.executionSegmentId,
-			sourceToolUseId: narratorToolCalls.toolUseId,
-			startedAt: narratorToolCalls.executionStartedAt,
-			createdAt: narratorToolCalls.createdAt,
-			completedAt: narratorToolCalls.completedAt,
-		})
-		.from(narrators)
-		.leftJoin(
-			fileChangeExecutionSegments,
-			and(
-				eq(fileChangeExecutionSegments.narratorId, narrators.id),
-				eq(
-					fileChangeExecutionSegments.sourceInputId,
-					sql<string>`'subagent-run:' || ${narrators.logicalRunId}`,
+	const rows = await readQuery(
+		db
+			.select({
+				childId: narrators.id,
+				turnStartedAt: narrators.turnStartedAt,
+				runCompletedAt: narrators.backgroundCompletedAt,
+				segmentStartedAt: fileChangeExecutionSegments.createdAt,
+				sourceToolCallId: narratorToolCalls.id,
+				executionAttempt: narratorToolCalls.executionAttempt,
+				executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+				executionSegmentId: narratorToolCalls.executionSegmentId,
+				sourceToolUseId: narratorToolCalls.toolUseId,
+				startedAt: narratorToolCalls.executionStartedAt,
+				createdAt: narratorToolCalls.createdAt,
+				completedAt: narratorToolCalls.completedAt,
+			})
+			.from(narrators)
+			.leftJoin(
+				fileChangeExecutionSegments,
+				and(
+					eq(fileChangeExecutionSegments.narratorId, narrators.id),
+					eq(
+						fileChangeExecutionSegments.sourceInputId,
+						sql<string>`'subagent-run:' || ${narrators.logicalRunId}`,
+					),
 				),
-			),
-		)
-		.leftJoin(parentSegment, eq(parentSegment.id, fileChangeExecutionSegments.parentSegmentId))
-		.leftJoin(
-			narratorToolCalls,
-			and(
-				eq(narratorToolCalls.id, parentSegment.sourceToolCallId),
-				eq(narratorToolCalls.executionAttempt, parentSegment.sourceExecutionAttempt),
-				eq(narratorToolCalls.executionIdentityVersion, 1),
-				eq(narratorToolCalls.executionSegmentId, parentSegment.id),
-				eq(narratorToolCalls.narratorId, parentSegment.narratorId),
-			),
-		)
-		.where(
-			and(
-				inArray(narrators.id, requested),
-				subagentPredicate(),
-				parentNarratorId ? eq(narrators.parentNarratorId, parentNarratorId) : undefined,
-			),
-		)
-		.limit(MAX_SUBAGENT_QUERY_IDS * 2 + 1);
+			)
+			.leftJoin(parentSegment, eq(parentSegment.id, fileChangeExecutionSegments.parentSegmentId))
+			.leftJoin(
+				narratorToolCalls,
+				and(
+					eq(narratorToolCalls.id, parentSegment.sourceToolCallId),
+					eq(narratorToolCalls.executionAttempt, parentSegment.sourceExecutionAttempt),
+					eq(narratorToolCalls.executionIdentityVersion, 1),
+					eq(narratorToolCalls.executionSegmentId, parentSegment.id),
+					eq(narratorToolCalls.narratorId, parentSegment.narratorId),
+				),
+			)
+			.where(
+				and(
+					inArray(narrators.id, requested),
+					subagentPredicate(),
+					parentNarratorId ? eq(narrators.parentNarratorId, parentNarratorId) : undefined,
+				),
+			)
+			.limit(MAX_SUBAGENT_QUERY_IDS * 2 + 1),
+		{ executionPolicy: "worker-required", maxRows: MAX_SUBAGENT_QUERY_IDS * 2 + 1 },
+	);
 	// Duplicate receipts are ambiguous; a truncated sample cannot prove uniqueness.
 	const receiptsComplete = rows.length <= MAX_SUBAGENT_QUERY_IDS * 2;
 	for (const row of rows.slice(0, MAX_SUBAGENT_QUERY_IDS * 2)) {
@@ -755,19 +777,25 @@ export async function getTeamSubagentFileChanges(
 	parentDeviceId?: string | null,
 ): Promise<SubagentFileChanges> {
 	try {
-		const children = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(and(eq(narrators.parentNarratorId, parentNarratorId), subagentPredicate()))
-			.orderBy(asc(narrators.id))
-			.limit(MAX_SUBAGENT_QUERY_IDS + 1);
+		const children = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(and(eq(narrators.parentNarratorId, parentNarratorId), subagentPredicate()))
+				.orderBy(asc(narrators.id))
+				.limit(MAX_SUBAGENT_QUERY_IDS + 1),
+			{ executionPolicy: "worker-required", maxRows: MAX_SUBAGENT_QUERY_IDS + 1 },
+		);
 		const ids = children.slice(0, MAX_SUBAGENT_QUERY_IDS).map((child) => child.id);
 		let workspace: SubagentParentWorkspace | undefined;
 		if (parentWorkspacePath !== undefined || parentDeviceId !== undefined) {
-			const parent = await db.query.narrators.findFirst({
-				where: eq(narrators.id, parentNarratorId),
-				columns: { cwd: true, defaultDeviceId: true },
-			});
+			const parent = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, parentNarratorId),
+					columns: { cwd: true, defaultDeviceId: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			workspace = {
 				deviceId:
 					parentDeviceId === undefined

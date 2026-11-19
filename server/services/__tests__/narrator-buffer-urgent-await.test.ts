@@ -14,10 +14,18 @@ import type { ToolResult } from "../../lib/agent/types";
 import { AppError, ValidationError } from "../../lib/errors";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
-// The snapshot worker shares the preload-isolated file-backed database.
-const { db, sqlite } = await import("../../db");
-const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+// The prefix/history workers share this isolated file-backed fixture.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 for (const [table, column, type] of [
 	["narrator_tool_calls", "execution_device_id", "TEXT"],
 	["narrator_tool_calls", "execution_cwd", "TEXT"],
@@ -174,12 +182,12 @@ toolRegistry.register({
 afterAll(async () => {
 	closeNarrator(parent);
 	await until(() => !getExecutionOwner(parent), "cleanup owner released");
-	await closePrefixSnapshotStore();
 	for (const row of db.select().from(backgroundTasks).all()) {
 		if (row.command?.startsWith("[watch]") && row.status === "running") {
 			await backgroundTaskService.cancel(row.id);
 		}
 	}
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	toolRegistry.register(watchTool);
 	mock.restore();
 });
@@ -319,7 +327,7 @@ beforeAll(async () => {
 					bufferSoftStop: active?._bufferSoftStop,
 					guidancePending: active?._bufferGuidancePending,
 				},
-				pendingHead: getBufferedMessages(parent)[0]?.text ?? null,
+				pendingHead: (await getBufferedMessages(parent))[0]?.text ?? null,
 				queue: rows.map((row) => ({
 					text: row.text,
 					state: row.state,
@@ -340,9 +348,9 @@ beforeAll(async () => {
 			oldOwnerReleased: !owner?.isCurrent(),
 			selectedId: selected.id,
 			selectedState: rows.find((row) => row.id === selected.id)?.state,
-			selectedPending: getBufferedMessages(parent).some((row) => row.id === selected.id),
+			selectedPending: (await getBufferedMessages(parent)).some((row) => row.id === selected.id),
 			users,
-			queueOrder: getBufferedMessages(parent).map((row) => row.text),
+			queueOrder: (await getBufferedMessages(parent)).map((row) => row.text),
 		};
 	} finally {
 		closeNarrator(parent);
@@ -412,7 +420,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 	);
 	const newer = await queued("newer urgent B", narratorId);
 	await updateBufferedMessageMode(narratorId, newer.id, "interrupt");
-	expect(getBufferedMessages(narratorId).map((row) => row.text)).toEqual([
+	expect((await getBufferedMessages(narratorId)).map((row) => row.text)).toEqual([
 		"newer urgent B",
 		"retry selected urgent A",
 	]);
@@ -433,7 +441,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 			"retry A and B dispatched",
 		);
 		expect(calls.slice(callStart)).toEqual(["retry selected urgent A", "newer urgent B"]);
-		expect(getBufferedMessages(narratorId)).toHaveLength(0);
+		expect(await getBufferedMessages(narratorId)).toHaveLength(0);
 	} finally {
 		closeNarrator(narratorId);
 		await until(() => !getExecutionOwner(narratorId), "retry cleanup");
@@ -472,7 +480,7 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 	expect(after?.imagesJson).toBe(before?.imagesJson);
 	expect(after?.textFilePathsJson).toBe(before?.textFilePathsJson);
 	expect(after?.metadataJson).toBe(before?.metadataJson);
-	const projected = getBufferedMessages(parent).find((row) => row.id === input.id);
+	const projected = (await getBufferedMessages(parent)).find((row) => row.id === input.id);
 	expect(projected?.textFiles?.[0] && (await projected.textFiles[0].text())).toBe("keep me");
 });
 
@@ -504,14 +512,15 @@ test("failed or cancelled receipts reject without automatic retry or wake", asyn
 		const input = await queued(`terminal ${state}`);
 		sqlite.run("UPDATE narrator_buffered_messages SET state = ? WHERE id = ?", [state, input.id]);
 		let wakes = 0;
-		await expect(
+		const error = await captureWorkerRejection(
 			waitForBufferedMessageDelivery(parent, input.id, {
 				wake: async () => {
 					wakes++;
 					return false;
 				},
 			}),
-		).rejects.toMatchObject({ statusCode: 409 });
+		);
+		expect(error).toMatchObject({ statusCode: 409 });
 		expect(wakes).toBe(0);
 		expect((await readBufferedMessageDeliveryReceipt(parent, input.id))?.state).toBe(state);
 	}
@@ -619,7 +628,7 @@ test("taken-over child's model turn is interrupted without ending takeover or it
 			"child selected urgent guidance",
 			"child older tool guidance",
 		]);
-		expect(getBufferedMessages(child)).toHaveLength(0);
+		expect(await getBufferedMessages(child)).toHaveLength(0);
 		// Releasing the hold ends the same run normally.
 		expect(await controlRun(child, { kind: "release" })).toBe(true);
 		const result = await handle.terminal;

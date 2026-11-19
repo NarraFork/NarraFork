@@ -32,6 +32,7 @@ import {
 	ensureProjectRootKeys,
 	resetProjectIndexStateForTests,
 	scheduleProjectIndexRebuild,
+	stopProjectIndexRebuild,
 	syncNarratorProjectLinks,
 	syncNarratorProjectLinksSafely,
 } from "../project-index";
@@ -139,6 +140,75 @@ async function makeNarratorsAt(cwd: string, count: number): Promise<string[]> {
 	}
 	return ids;
 }
+
+test("shutdown prevents another project-index read producer from being scheduled", async () => {
+	await stopProjectIndexRebuild({ deadlineAt: Date.now() + 1000 });
+	const select = spyOn(db, "select").mockImplementation(() => {
+		throw new Error("Project index is quiescing");
+	});
+	try {
+		await scheduleProjectIndexRebuild();
+		await ensureProjectRootKeys();
+		expect(select).not.toHaveBeenCalled();
+	} finally {
+		select.mockRestore();
+		resetProjectIndexStateForTests();
+	}
+});
+
+test("shutdown during directory derivation leaves project links unchanged", async () => {
+	const cwd = makeDir("shutdown-during-derivation");
+	const projectId = await makeProject(cwd);
+	await assignProjectRootKey(projectId);
+	const narratorId = await makeNarrator({ cwd });
+	let stopping: Promise<void> | undefined;
+	afterRealpath(async (path) => {
+		if (String(path) === cwd && !stopping) {
+			stopping = stopProjectIndexRebuild({ deadlineAt: Date.now() + 1000 });
+		}
+	});
+
+	await scheduleProjectIndexRebuild();
+	expect(stopping).toBeDefined();
+	await stopping;
+	expect(await linksOf(narratorId)).toEqual([]);
+});
+
+test("shutdown after a committed link change still invalidates its execution policy", async () => {
+	await scheduleProjectIndexRebuild();
+	const cwd = makeDir("shutdown-after-link-commit");
+	const projectId = await makeProject(cwd);
+	await assignProjectRootKey(projectId);
+	const narratorId = await makeNarrator({ cwd });
+	const { executionPolicyEngine } = await import("../execution-policy/engine");
+	const invalidations = spyOn(executionPolicyEngine, "invalidate");
+	const committedLink = sqlite.query<{ projectId: string }, [string]>(
+		"select project_id as projectId from narrator_project_links where narrator_id = ? limit 1",
+	);
+	const transaction = db.transaction.bind(db);
+	let stopQueued = false;
+	let stopping: Promise<void> | undefined;
+	let invalidatedAtStop: boolean | undefined;
+	spyOn(db, "transaction").mockImplementation((write, config) => {
+		const result = transaction(write, config);
+		if (!stopQueued && committedLink.get(narratorId)?.projectId === projectId) {
+			stopQueued = true;
+			// Run after the synchronous commit, before the caller resumes its awaited row sync.
+			queueMicrotask(() => {
+				invalidatedAtStop = invalidations.mock.calls.some(([id]) => id === narratorId);
+				stopping = stopProjectIndexRebuild({ deadlineAt: Date.now() + 1000 });
+			});
+		}
+		return result;
+	});
+
+	await scheduleProjectIndexRebuild();
+	expect(stopping).toBeDefined();
+	await stopping;
+	expect(invalidatedAtStop).toBe(false);
+	expect(await linksOf(narratorId)).toEqual([{ projectId, role: "primary", source: "cwd" }]);
+	expect(invalidations.mock.calls.filter(([id]) => id === narratorId)).toHaveLength(1);
+});
 
 describe("ancestorKeys", () => {
 	test("walks whole path segments up to the root", () => {

@@ -1,7 +1,7 @@
 /**
  * Opaque session tokens, end to end through the SQLite session store.
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on an isolated file/WAL database, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -9,9 +9,16 @@ import { ABSOLUTE_SESSION_MAX_SECONDS, SESSION_TOKEN_TTL_SECONDS } from "@shared
 import { eq } from "drizzle-orm";
 import { authSessions, users } from "../../../server/db/schema";
 import { generateId } from "../../../server/lib/id";
-import { cleanDb, getTestDb } from "../../setup";
+import { getNarratorWorkerTestDb } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const previousWorker = process.env.NARRAFORK_DB_WORKER;
+const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+process.env.NARRAFORK_DB_WORKER = "on";
+process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -25,9 +32,14 @@ const {
 } = await import("../../../server/lib/auth");
 const { hashSessionToken } = await import("../../../server/lib/session-token-hash");
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
+	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+	else process.env.NARRAFORK_DB_WORKER = previousWorker;
+	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 });
 
 beforeEach(() => {

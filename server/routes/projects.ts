@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import { narrators, projects, remoteDevices } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
@@ -346,10 +347,13 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
-	const existingProject = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { chapterSettings: true },
-	});
+	const existingProject = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, id),
+			columns: { chapterSettings: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!existingProject) throw new NotFoundError("Project", id);
 
 	// Merge chapterSettings with existing values instead of overwriting

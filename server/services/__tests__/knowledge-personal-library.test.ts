@@ -92,7 +92,7 @@ describe("standalone personal entries", () => {
 			createdAt: new Date().toISOString(),
 		});
 		const other = { userId: otherId, role: "user" as const };
-		expect(knowledgeBranchService.getMine(other, created.id)).rejects.toThrow();
+		await expect(knowledgeBranchService.getMine(other, created.id)).rejects.toThrow();
 	});
 });
 
@@ -103,7 +103,7 @@ describe("publish a standalone entry → creates a new global entry", () => {
 			content: "body",
 		});
 		// No target collection set → submit refused.
-		expect(knowledgeBranchService.submitForReview(author, noTarget.id, {})).rejects.toThrow();
+		await expect(knowledgeBranchService.submitForReview(author, noTarget.id, {})).rejects.toThrow();
 	});
 
 	test("approve creates a new global entry, archives the personal entry, links it", async () => {

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,7 +8,9 @@ import type {
 	StorageRetentionSettings,
 	StorageRetentionTarget,
 } from "@shared/storage-retention";
+import { DbReadError, readAborted } from "../../lib/db-worker/errors";
 import type { StorageHistoryReadParams } from "../../lib/db-worker/storage-history-query";
+import { logger } from "../../lib/logger";
 import {
 	createStorageHistoryService,
 	normalizeStorageHistoryCutoff,
@@ -81,6 +84,34 @@ async function fixture() {
 }
 function candidate(id: string, rowid: number): StorageHistoryCandidate {
 	return { id, rowid, messageId: "message", revision: 0, approxBytes: 100 };
+}
+
+/** Execute the production shutdown adapter with the real service, without importing the DB runtime. */
+async function shutdownRuntime(service: ReturnType<typeof createStorageHistoryService>) {
+	const source = await readFile(new URL("../storage-history-runtime.ts", import.meta.url), "utf8");
+	const start = source.indexOf("export function stopStorageHistoryRetention(");
+	if (start < 0) throw new Error("Cannot locate production history retention teardown");
+	const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
+		source.slice(start).replace(/^export /gm, ""),
+	);
+	const state = {
+		service,
+		stopping: false,
+		pending: new Set<Promise<unknown>>(),
+		unsubscribe: null,
+		shutdown: null,
+		shutdownSettled: false,
+		shutdownFailed: false,
+	};
+	return new Function(
+		"runtime",
+		"DbReadError",
+		"readAborted",
+		`${compiled}\nreturn {stopStorageHistoryRetention, getStorageHistoryShutdownSnapshot};`,
+	)(state, DbReadError, readAborted) as {
+		stopStorageHistoryRetention(options: { deadlineAt: number }): Promise<void>;
+		getStorageHistoryShutdownSnapshot(): { stopped: boolean; pending: number; failed: boolean };
+	};
 }
 
 describe("history cleanup previews", () => {
@@ -341,4 +372,155 @@ test("a journal write failure leaves no phantom queued job and can be retried", 
 	await service.start("toolCallPayloads", cutoff);
 	await service.settled();
 	expect((await service.jobs()).toolCallPayloads?.status).toBe("completed");
+});
+
+describe("history cleanup shutdown ownership", () => {
+	test("a final journal failure waits for the other target before reporting shutdown failure", async () => {
+		const f = await fixture();
+		f.rows.toolCallPayloads = [candidate("t", 1)];
+		f.rows.messageHistory = [candidate("m", 1)];
+		const enteredTool = Promise.withResolvers<void>();
+		const enteredMessage = Promise.withResolvers<void>();
+		const releaseTool = Promise.withResolvers<void>();
+		const releaseMessage = Promise.withResolvers<void>();
+		const recordedFailure = Promise.withResolvers<void>();
+		const clear = f.deps.clear;
+		f.deps.clear = async (input) => {
+			if (input.target === "toolCallPayloads") {
+				enteredTool.resolve();
+				await releaseTool.promise;
+			} else {
+				enteredMessage.resolve();
+				await releaseMessage.promise;
+			}
+			return clear(input);
+		};
+		const service = f.create();
+		const runtime = await shutdownRuntime(service);
+		const failure = new Error("Injected final history journal write failure");
+		const writeFile = fs.writeFile;
+		let injected = false;
+		const write = spyOn(fs, "writeFile").mockImplementation(async (path, data, options) => {
+			if (!injected && String(path).startsWith(`${f.path}.`) && typeof data === "string") {
+				const tool = JSON.parse(data).jobs.toolCallPayloads;
+				if (tool?.status === "queued" && tool.cleared === 1) {
+					injected = true;
+					throw failure;
+				}
+			}
+			return writeFile(path, data, options);
+		});
+		const warn = spyOn(logger, "warn").mockImplementation((message) => {
+			if (message === "History cleanup state save failed") recordedFailure.resolve();
+		});
+		let shutdown: Promise<void> | undefined;
+		let finished = false;
+		try {
+			await service.start("toolCallPayloads", cutoff);
+			await enteredTool.promise;
+			await service.start("messageHistory", cutoff);
+			await enteredMessage.promise;
+			shutdown = runtime.stopStorageHistoryRetention({ deadlineAt: Date.now() + 5_000 });
+			void shutdown.then(
+				() => {
+					finished = true;
+				},
+				() => {
+					finished = true;
+				},
+			);
+			releaseTool.resolve();
+			await recordedFailure.promise;
+			await Bun.sleep(0);
+			expect(injected).toBe(true);
+			expect(finished).toBe(false);
+			expect(runtime.getStorageHistoryShutdownSnapshot()).toMatchObject({
+				stopped: true,
+				pending: 1,
+				failed: false,
+			});
+			expect(f.cleared.map((item) => item.id)).toEqual(["t"]);
+			releaseMessage.resolve();
+			await expect(shutdown).rejects.toBe(failure);
+			expect(runtime.getStorageHistoryShutdownSnapshot()).toEqual({
+				stopped: true,
+				pending: 0,
+				failed: true,
+			});
+			// Repeated observation must report the retained failure, not spin on a rejected owner.
+			await expect(service.settled()).rejects.toBe(failure);
+		} finally {
+			releaseTool.resolve();
+			releaseMessage.resolve();
+			service.stop();
+			await Promise.allSettled([service.settled(), shutdown]);
+			services.splice(services.indexOf(service), 1);
+			write.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("a scheduled producer retains shutdown ownership while its initial journal rename is blocked", async () => {
+		const f = await fixture();
+		const service = f.create();
+		const runtime = await shutdownRuntime(service);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const setInterval = globalThis.setInterval;
+		let tick: (() => void) | undefined;
+		const interval = spyOn(globalThis, "setInterval").mockImplementation(((
+			callback: () => void,
+			delay: number,
+		) => {
+			if (delay === 60 * 60_000) tick = callback;
+			return setInterval(callback, delay);
+		}) as typeof globalThis.setInterval);
+		const rename = fs.rename;
+		let blocked = false;
+		let published = false;
+		const publish = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (!blocked && String(to) === f.path) {
+				blocked = true;
+				entered.resolve();
+				await release.promise;
+			}
+			await rename(from, to);
+			published = true;
+		});
+		let shutdown: Promise<void> | undefined;
+		try {
+			await service.startScheduler();
+			f.policies.toolCallPayloads = { retentionDays: 7, autoCleanup: true };
+			expect(tick).toBeFunction();
+			tick?.();
+			await entered.promise;
+			shutdown = runtime.stopStorageHistoryRetention({ deadlineAt: Date.now() + 5_000 });
+			// A callback already handed out by the timer cannot admit work after stop.
+			tick?.();
+			await Bun.sleep(0);
+			expect(published).toBe(false);
+			expect(publish).toHaveBeenCalledTimes(1);
+			expect(runtime.getStorageHistoryShutdownSnapshot()).toMatchObject({
+				stopped: true,
+				pending: 1,
+				failed: false,
+			});
+			release.resolve();
+			await shutdown;
+			expect(published).toBe(true);
+			expect(runtime.getStorageHistoryShutdownSnapshot()).toEqual({
+				stopped: true,
+				pending: 0,
+				failed: false,
+			});
+			expect(f.cleared).toHaveLength(0);
+			expect((await service.jobs()).toolCallPayloads?.status).toBe("queued");
+		} finally {
+			release.resolve();
+			service.stop();
+			await Promise.allSettled([service.settled(), shutdown]);
+			publish.mockRestore();
+			interval.mockRestore();
+		}
+	});
 });

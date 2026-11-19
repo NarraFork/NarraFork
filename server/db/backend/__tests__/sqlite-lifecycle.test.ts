@@ -34,7 +34,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -445,4 +445,185 @@ describe("connection access", () => {
 		// where an unhandled throw takes the process down.
 		expect(() => plan.value.tick()).not.toThrow();
 	}, 120_000);
+});
+
+describe("SQLite startup phase diagnostics", () => {
+	const synchronousPhases = ["ensureColumns", "applyDataBackfills", "ensureFts"] as const;
+	const phases = [...synchronousPhases, "optimizeDatabase"] as const;
+	let now = 0;
+	let failurePhase: (typeof phases)[number] | undefined;
+	let failLogging = false;
+	const failure = new Error("private startup failure");
+	let records: Array<Record<string, unknown>> = [];
+	let scheduledOptimizations: Array<{
+		callback: () => void;
+		delay: number | undefined;
+		unreferenced: boolean;
+	}> = [];
+	let restores: Array<{ mockRestore(): void }> = [];
+
+	function runScheduledOptimization(): void {
+		expect(scheduledOptimizations).toHaveLength(1);
+		const scheduled = scheduledOptimizations.shift();
+		if (!scheduled) throw new Error("Missing scheduled optimization");
+		expect(scheduled.delay).toBe(30_000);
+		expect(scheduled.unreferenced).toBe(true);
+		scheduled.callback();
+	}
+
+	beforeEach(async () => {
+		resetHotState();
+		now = 100;
+		failurePhase = undefined;
+		failLogging = false;
+		records = [];
+		scheduledOptimizations = [];
+		const [connection, columns, fts, resilience, migrations, integrity, lock, { logger }] =
+			await Promise.all([
+				import("../../connection"),
+				import("../../ensure-columns"),
+				import("../../fts"),
+				import("../../../lib/db-resilience"),
+				import("../../run-migrations"),
+				import("../../integrity-state"),
+				import("../../../lib/instance-lock"),
+				import("../../../lib/logger"),
+			]);
+		const fake = { close() {} } as unknown as Database;
+		const run = (phase: (typeof phases)[number], elapsedMs: number) => {
+			expect(records.at(-1)).toMatchObject({ phase, status: "started" });
+			now += elapsedMs;
+			if (failurePhase === phase) throw failure;
+		};
+		restores = [
+			// Keep optimization deferred without creating a native timer or waiting for its delay.
+			spyOn(globalThis, "setTimeout").mockImplementation(((
+				callback: () => void,
+				delay?: number,
+			) => {
+				const scheduled = { callback, delay, unreferenced: false };
+				scheduledOptimizations.push(scheduled);
+				return {
+					unref() {
+						scheduled.unreferenced = true;
+						return this;
+					},
+				};
+			}) as unknown as typeof setTimeout),
+			spyOn(performance, "now").mockImplementation(() => now),
+			spyOn(Date, "now").mockImplementation(() => {
+				throw new Error("startup phase diagnostics must use a monotonic clock");
+			}),
+			spyOn(connection, "openDatabase").mockReturnValue(fake),
+			spyOn(lock, "acquireInstanceLock").mockImplementation(() => {}),
+			spyOn(fts, "consumeCleanShutdownState").mockReturnValue({ wasClean: true }),
+			spyOn(integrity, "readPendingDatabaseRepair").mockReturnValue(null),
+			spyOn(migrations, "runMigrations").mockResolvedValue({
+				source: "filesystem",
+				folder: "fake",
+			}),
+			spyOn(columns, "ensureColumns").mockImplementation(() => run("ensureColumns", 10)),
+			spyOn(fts, "ensureFts").mockImplementation(() => {
+				// Preliminary checks and the old summary's measured tail both belong to this phase.
+				run("ensureFts", 830_141);
+				now += 61_980;
+				return { rebuilt: false };
+			}),
+			spyOn(resilience, "optimizeDatabase").mockImplementation(() => run("optimizeDatabase", 30)),
+			spyOn(logger, "info").mockImplementation((message, fields) => {
+				if (message !== "SQLite startup phase") return;
+				records.push(fields ?? {});
+				if (failLogging) throw new Error("logger unavailable");
+			}),
+		];
+		// The helper is attached only to this test fixture, not the production lifecycle API.
+		backfill = async () => {
+			await Promise.resolve();
+			run("applyDataBackfills", 20);
+		};
+	});
+
+	let backfill: () => Promise<void>;
+	afterEach(() => {
+		for (const restore of restores.reverse()) restore.mockRestore();
+		restores = [];
+		scheduledOptimizations = [];
+	});
+
+	test("records synchronous phases before startup completes and measures deferred optimization separately", async () => {
+		const lifecycle = await newLifecycle({ applyDataBackfills: backfill });
+		expect((await lifecycle.start()).backendId).toBe("sqlite");
+		expect(records).toEqual(
+			synchronousPhases.flatMap((phase, index) => [
+				{ phase, status: "started", elapsedMs: 0 },
+				{ phase, status: "completed", elapsedMs: [10, 20, 892_121][index] },
+			]),
+		);
+
+		// Waiting for the timer is not part of the optimizer's measured execution time.
+		now += 30_000;
+		runScheduledOptimization();
+		expect(records).toEqual(
+			phases.flatMap((phase, index) => [
+				{ phase, status: "started", elapsedMs: 0 },
+				{ phase, status: "completed", elapsedMs: [10, 20, 892_121, 30][index] },
+			]),
+		);
+		expect(scheduledOptimizations).toHaveLength(0);
+		expect(JSON.stringify(records)).not.toContain(failure.message);
+	});
+
+	for (const phase of synchronousPhases) {
+		test(`records ${phase} failure without changing its rejection`, async () => {
+			failurePhase = phase;
+			const lifecycle = await newLifecycle({ applyDataBackfills: backfill });
+			expect(await lifecycle.start().catch((error: unknown) => error)).toBe(failure);
+			expect(records.at(-1)).toMatchObject({ phase, status: "failed" });
+			expect(records).toHaveLength((synchronousPhases.indexOf(phase) + 1) * 2);
+			expect(scheduledOptimizations).toHaveLength(0);
+			expect(JSON.stringify(records)).not.toContain(failure.message);
+		});
+	}
+
+	for (const loggingFails of [false, true]) {
+		test(`records deferred optimizer failure with logging failure=${loggingFails}`, async () => {
+			failLogging = loggingFails;
+			failurePhase = "optimizeDatabase";
+			const lifecycle = await newLifecycle({ applyDataBackfills: backfill });
+			expect((await lifecycle.start()).backendId).toBe("sqlite");
+			expect(records).toHaveLength(synchronousPhases.length * 2);
+
+			let observed: unknown;
+			try {
+				runScheduledOptimization();
+			} catch (error) {
+				observed = error;
+			}
+			expect(observed).toBe(failure);
+			expect(records.slice(-2)).toEqual([
+				{ phase: "optimizeDatabase", status: "started", elapsedMs: 0 },
+				{ phase: "optimizeDatabase", status: "failed", elapsedMs: 30 },
+			]);
+			expect(records).toHaveLength(phases.length * 2);
+			expect(scheduledOptimizations).toHaveLength(0);
+			expect(JSON.stringify(records)).not.toContain(failure.message);
+		});
+	}
+
+	test("logger failures cannot change startup success or the original failure", async () => {
+		failLogging = true;
+		const first = await newLifecycle({ applyDataBackfills: backfill });
+		expect((await first.start()).backendId).toBe("sqlite");
+		expect(runScheduledOptimization).not.toThrow();
+		expect(records.at(-1)).toEqual({
+			phase: "optimizeDatabase",
+			status: "completed",
+			elapsedMs: 30,
+		});
+		resetHotState();
+		failurePhase = "applyDataBackfills";
+		const second = await newLifecycle({ applyDataBackfills: backfill });
+		expect(await second.start().catch((error: unknown) => error)).toBe(failure);
+		expect(scheduledOptimizations).toHaveLength(0);
+	});
 });

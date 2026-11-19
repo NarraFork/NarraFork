@@ -29,6 +29,7 @@
 
 import { db } from "@server/db";
 import { narrators } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 
 /**
@@ -56,11 +57,12 @@ async function narratorForkDepth(narratorId: string): Promise<number> {
 	for (let step = 0; step < LINEAGE_WALK_MAX_STEPS && currentId; step++) {
 		if (seen.has(currentId)) break;
 		seen.add(currentId);
-		const row: { parentNarratorId: string | null } | undefined = await db.query.narrators.findFirst(
-			{
+		const row: { parentNarratorId: string | null } | undefined = await readQuery(
+			db.query.narrators.findFirst({
 				where: eq(narrators.id, currentId),
 				columns: { parentNarratorId: true },
-			},
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
 		);
 		currentId = row?.parentNarratorId ?? null;
 		if (currentId) depth++;

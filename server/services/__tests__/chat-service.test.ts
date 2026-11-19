@@ -144,7 +144,7 @@ describe("DM room resolution", () => {
 	});
 
 	test("refuses a DM with yourself", async () => {
-		expect(resolveDmRoom(alice, alice)).rejects.toThrow();
+		await expect(resolveDmRoom(alice, alice)).rejects.toThrow();
 	});
 
 	test("peer resolution returns the other participant, per viewer", async () => {
@@ -213,12 +213,12 @@ describe("assertCanRead", () => {
 
 	test("a non-member is refused a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(assertCanRead(room.id, carol)).rejects.toThrow();
+		await expect(assertCanRead(room.id, carol)).rejects.toThrow();
 	});
 
 	test("a non-member cannot post into a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(
+		await expect(
 			postMessage({ roomId: room.id, senderUserId: carol, text: "intruding" }),
 		).rejects.toThrow();
 	});
@@ -253,7 +253,7 @@ describe("assertCanRead", () => {
 		});
 
 		const room = await resolveNarratorRoom(privateNarratorId, alice);
-		expect(assertCanRead(room.id, carol)).rejects.toThrow();
+		await expect(assertCanRead(room.id, carol)).rejects.toThrow();
 	});
 
 	test("opening a private narrator's room does not create it for an outsider", async () => {
@@ -270,7 +270,7 @@ describe("assertCanRead", () => {
 			updatedAt: new Date().toISOString(),
 		});
 
-		expect(resolveNarratorRoom(privateNarratorId, carol)).rejects.toThrow();
+		await expect(resolveNarratorRoom(privateNarratorId, carol)).rejects.toThrow();
 		const room = await db.query.chatRooms.findFirst({
 			where: eq(chatRooms.narratorId, privateNarratorId),
 		});
@@ -557,7 +557,9 @@ describe("room list and deletion", () => {
 		const row = await postMessage({ roomId: room.id, senderUserId: alice, text: "mine" });
 		// The status matters: a client cannot distinguish "fix your input" from
 		// "this was never yours" if both surface as a validation error.
-		expect(softDeleteMessage(room.id, row.id, bob, false)).rejects.toBeInstanceOf(ForbiddenError);
+		await expect(softDeleteMessage(room.id, row.id, bob, false)).rejects.toBeInstanceOf(
+			ForbiddenError,
+		);
 		try {
 			await softDeleteMessage(room.id, row.id, bob, false);
 			throw new Error("expected a refusal");
@@ -578,7 +580,7 @@ describe("room list and deletion", () => {
 		const roomA = await resolveDmRoom(alice, bob);
 		const roomB = await resolveDmRoom(alice, carol);
 		const inA = await postMessage({ roomId: roomA.id, senderUserId: alice, text: "in A" });
-		expect(
+		await expect(
 			postMessage({
 				roomId: roomB.id,
 				senderUserId: alice,
@@ -590,8 +592,10 @@ describe("room list and deletion", () => {
 
 	test("empty and oversized bodies are refused", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(postMessage({ roomId: room.id, senderUserId: alice, text: "   " })).rejects.toThrow();
-		expect(
+		await expect(
+			postMessage({ roomId: room.id, senderUserId: alice, text: "   " }),
+		).rejects.toThrow();
+		await expect(
 			postMessage({ roomId: room.id, senderUserId: alice, text: "x".repeat(8_001) }),
 		).rejects.toThrow();
 	});
@@ -603,7 +607,9 @@ describe("room list and deletion", () => {
 		// Simulates the room being deleted between the access check and the write
 		// transaction: the `UPDATE ... RETURNING` matches nothing.
 		await db.delete(chatRooms).where(eq(chatRooms.id, room.id));
-		expect(postMessage({ roomId: room.id, senderUserId: a, text: "orphan" })).rejects.toThrow();
+		await expect(
+			postMessage({ roomId: room.id, senderUserId: a, text: "orphan" }),
+		).rejects.toThrow();
 	});
 });
 

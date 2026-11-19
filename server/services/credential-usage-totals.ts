@@ -17,6 +17,7 @@
 
 import { db as defaultDb } from "@server/db";
 import { credentialUsageTotals } from "@server/db/schema";
+import { type ReadQueryOptions, readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -253,47 +254,53 @@ function toRow(row: typeof credentialUsageTotals.$inferSelect): CredentialUsageT
  * prefix, so the scanned row count is bounded by the model count — small enough
  * for the main thread even without a limit.
  */
-export function getCredentialUsageTotals(
+export async function getCredentialUsageTotals(
 	provider: string,
 	credentialId: string,
 	limit = 50,
 	db: Db = defaultDb,
-): CredentialUsageSummary {
+	options: ReadQueryOptions = {},
+): Promise<CredentialUsageSummary> {
 	const credentialScope = and(
 		eq(credentialUsageTotals.provider, provider),
 		eq(credentialUsageTotals.credentialId, credentialId),
 	);
 	const effectiveLimit = Math.max(1, Math.min(limit, 500));
 
-	const [aggregate] = db
-		.select({
-			modelCount: sql<number>`count(*)`,
-			requestCount: sql<number>`sum(${credentialUsageTotals.requestCount})`,
-			inputTokens: sql<number>`sum(${credentialUsageTotals.inputTokens})`,
-			outputTokens: sql<number>`sum(${credentialUsageTotals.outputTokens})`,
-			cachedInputTokens: sql<number>`sum(${credentialUsageTotals.cachedInputTokens})`,
-			cacheCreationTokens: sql<number>`sum(${credentialUsageTotals.cacheCreationTokens})`,
-			reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
-			costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
-			unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
-			partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
-			firstSeenAt: sql<string | null>`min(${credentialUsageTotals.firstSeenAt})`,
-			lastSeenAt: sql<string | null>`max(${credentialUsageTotals.lastSeenAt})`,
-		})
-		.from(credentialUsageTotals)
-		.where(credentialScope)
-		.all();
+	const [aggregate] = await readQuery(
+		db
+			.select({
+				modelCount: sql<number>`count(*)`,
+				requestCount: sql<number>`sum(${credentialUsageTotals.requestCount})`,
+				inputTokens: sql<number>`sum(${credentialUsageTotals.inputTokens})`,
+				outputTokens: sql<number>`sum(${credentialUsageTotals.outputTokens})`,
+				cachedInputTokens: sql<number>`sum(${credentialUsageTotals.cachedInputTokens})`,
+				cacheCreationTokens: sql<number>`sum(${credentialUsageTotals.cacheCreationTokens})`,
+				reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
+				costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
+				unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
+				partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
+				firstSeenAt: sql<string | null>`min(${credentialUsageTotals.firstSeenAt})`,
+				lastSeenAt: sql<string | null>`max(${credentialUsageTotals.lastSeenAt})`,
+			})
+			.from(credentialUsageTotals)
+			.where(credentialScope),
+		{ ...options, executionPolicy: "worker-required" },
+	);
 
 	// `byModel` is ordered by recency: when the list is capped, the models the
 	// credential actually still uses are the ones worth showing.
-	const rows = db
-		.select()
-		.from(credentialUsageTotals)
-		.where(credentialScope)
-		.orderBy(desc(credentialUsageTotals.lastSeenAt))
-		.limit(effectiveLimit)
-		.all()
-		.map(toRow);
+	const rows = (
+		await readQuery(
+			db
+				.select()
+				.from(credentialUsageTotals)
+				.where(credentialScope)
+				.orderBy(desc(credentialUsageTotals.lastSeenAt))
+				.limit(effectiveLimit),
+			{ ...options, executionPolicy: "worker-required" },
+		)
+	).map(toRow);
 
 	const inputTokens = Number(aggregate?.inputTokens ?? 0);
 	const outputTokens = Number(aggregate?.outputTokens ?? 0);
@@ -334,32 +341,35 @@ export function getCredentialUsageTotals(
  * Grouped in SQL over an indexed prefix, with an explicit row cap so a large
  * pool cannot produce an unbounded result set.
  */
-export function listProviderCredentialTotals(
+export async function listProviderCredentialTotals(
 	provider: string,
 	limit = 200,
 	db: Db = defaultDb,
-): Array<Omit<CredentialUsageSummary, "byModel" | "byModelTruncated">> {
-	const rows = db
-		.select({
-			credentialId: credentialUsageTotals.credentialId,
-			requestCount: sql<number>`sum(${credentialUsageTotals.requestCount})`,
-			inputTokens: sql<number>`sum(${credentialUsageTotals.inputTokens})`,
-			outputTokens: sql<number>`sum(${credentialUsageTotals.outputTokens})`,
-			cachedInputTokens: sql<number>`sum(${credentialUsageTotals.cachedInputTokens})`,
-			cacheCreationTokens: sql<number>`sum(${credentialUsageTotals.cacheCreationTokens})`,
-			reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
-			costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
-			unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
-			partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
-			firstSeenAt: sql<string>`min(${credentialUsageTotals.firstSeenAt})`,
-			lastSeenAt: sql<string>`max(${credentialUsageTotals.lastSeenAt})`,
-		})
-		.from(credentialUsageTotals)
-		.where(eq(credentialUsageTotals.provider, provider))
-		.groupBy(credentialUsageTotals.credentialId)
-		.orderBy(sql`max(${credentialUsageTotals.lastSeenAt}) desc`)
-		.limit(Math.max(1, Math.min(limit, 1000)))
-		.all();
+	options: ReadQueryOptions = {},
+): Promise<Array<Omit<CredentialUsageSummary, "byModel" | "byModelTruncated">>> {
+	const rows = await readQuery(
+		db
+			.select({
+				credentialId: credentialUsageTotals.credentialId,
+				requestCount: sql<number>`sum(${credentialUsageTotals.requestCount})`,
+				inputTokens: sql<number>`sum(${credentialUsageTotals.inputTokens})`,
+				outputTokens: sql<number>`sum(${credentialUsageTotals.outputTokens})`,
+				cachedInputTokens: sql<number>`sum(${credentialUsageTotals.cachedInputTokens})`,
+				cacheCreationTokens: sql<number>`sum(${credentialUsageTotals.cacheCreationTokens})`,
+				reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
+				costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
+				unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
+				partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
+				firstSeenAt: sql<string>`min(${credentialUsageTotals.firstSeenAt})`,
+				lastSeenAt: sql<string>`max(${credentialUsageTotals.lastSeenAt})`,
+			})
+			.from(credentialUsageTotals)
+			.where(eq(credentialUsageTotals.provider, provider))
+			.groupBy(credentialUsageTotals.credentialId)
+			.orderBy(sql`max(${credentialUsageTotals.lastSeenAt}) desc`)
+			.limit(Math.max(1, Math.min(limit, 1000))),
+		{ ...options, executionPolicy: "worker-required" },
+	);
 
 	return rows.map((row) => ({
 		provider,

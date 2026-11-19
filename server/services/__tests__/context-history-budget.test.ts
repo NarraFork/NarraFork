@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../../lib/logger";
 import * as runtimeHistory from "../agent-runtime/history";
 import * as epochs from "../narrator-epochs";
 import { narratorService } from "../narrator-service";
@@ -35,6 +36,7 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const current = new Set<string>();
 		let request = 0;
 		let getterCalls = 0;
+		let requestSignal: AbortSignal | undefined;
 		const signal = new AbortController().signal;
 		const candidates = [] as const;
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
@@ -51,7 +53,9 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 				request === 2 ? [] : [`mcp__request_${request}`],
 			);
 			expect(loading?.candidates).toBe(candidates);
-			expect(input.signal).toBe(signal);
+			requestSignal = input.signal;
+			expect(requestSignal).toBeDefined();
+			expect(requestSignal?.aborted).toBe(false);
 			expect(loading?.prompt).toEqual({
 				contract: "fixed contract",
 				parts: [{ key: "workspace", text: `cwd-${request}` }],
@@ -66,6 +70,8 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const build = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
 			async (options) => {
 				calls.push("project");
+				expect(options.attachmentSignal).toBe(requestSignal);
+				expect(options.preparation?.signal).toBe(requestSignal);
 				expect(options.toolLoading?.candidates).toBe(candidates);
 				expect(options.toolLoading?.epoch?.toolNames).toEqual(
 					request === 2 ? [] : [`mcp__request_${request}`],
@@ -205,7 +211,8 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const controller = new AbortController();
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				expect(options).toEqual({ signal: controller.signal });
+				expect(options?.signal).toBe(options?.preparation?.signal);
+				expect(options?.deadline).toBeUndefined();
 				return new Promise((_, reject) =>
 					controller.signal.addEventListener("abort", () => reject(new Error("source cancelled")), {
 						once: true,
@@ -227,13 +234,88 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 			build.mockRestore();
 		}
 	});
+	test("load and projection can exceed 30 seconds and report one slow preparation", async () => {
+		let now = 100_000;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+			async () => {
+				now += 8000;
+				return [];
+			},
+		);
+		const build = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
+			async (options) => {
+				expect(options.deadline).toBeUndefined();
+				expect(options.preparation?.deadline).toBe(Number.POSITIVE_INFINITY);
+				now += 23_000;
+				return prepared();
+			},
+		);
+		try {
+			const result = await hooks(new AbortController().signal).onBeforeTurn(1, { force: true });
+			expect(result?.systemPrompt).toBe("system");
+			expect(now).toBe(131_000);
+			expect(
+				warn.mock.calls.filter(([message]) => message === "Slow model history preparation"),
+			).toHaveLength(1);
+			expect(warn.mock.calls.at(-1)?.[1]).toMatchObject({ outcome: "success", elapsedMs: 31_000 });
+		} finally {
+			load.mockRestore();
+			build.mockRestore();
+			clock.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("cancelled tool refresh does not proceed to source loading or epoch publication", async () => {
+		const controller = new AbortController();
+		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue([]);
+		let epochPublications = 0;
+		const reconcile = spyOn(epochs, "reconcileEpoch").mockImplementation(async (input) => {
+			const loading = await input.refreshTools?.();
+			epochPublications++;
+			return { changed: false, loading, epoch: { toolNames: [] }, sourceMessages: [] };
+		});
+		const build = spyOn(runtimeHistory, "buildRuntimeHistory").mockResolvedValue(prepared());
+		const prompt = async () => ({ contract: "contract", parts: [] });
+		try {
+			const context = buildContextManagementHooks({
+				narratorId: "cancelled-refresh",
+				locale: "en",
+				getModel: () => "model",
+				getProvider: () => "anthropic",
+				attachmentSignal: controller.signal,
+				getToolLoading: () => ({ managed: new Set(), current: new Set() }),
+				buildPrefixPrompt: prompt,
+				refreshToolLoading: async (identity, preparation) => {
+					expect(identity).toEqual({ model: "model", provider: "anthropic" });
+					expect(preparation?.signal.aborted).toBe(false);
+					controller.abort(new Error("refresh cancelled"));
+					expect(preparation?.signal.aborted).toBe(true);
+				},
+			});
+			await expect(context.rebuildRequestHistory()).rejects.toThrow("refresh cancelled");
+			expect(reconcile).toHaveBeenCalledTimes(1);
+			expect(epochPublications).toBe(0);
+			expect(load).not.toHaveBeenCalled();
+			expect(build).not.toHaveBeenCalled();
+		} finally {
+			load.mockRestore();
+			reconcile.mockRestore();
+			build.mockRestore();
+		}
+	});
+
 	test("source reads and total request preparation may both exceed ten seconds", async () => {
 		const controller = new AbortController();
 		let now = 100_000;
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				expect(options).toEqual({ signal: controller.signal });
+				expect(options?.signal).toBe(options?.preparation?.signal);
+				expect(options?.deadline).toBeUndefined();
 				now += 11_000;
 				return [];
 			},
@@ -241,7 +323,8 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const build = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
 			async (options) => {
 				expect(options).not.toHaveProperty("deadline");
-				expect(options.attachmentSignal).toBe(controller.signal);
+				expect(options.attachmentSignal).toBe(options.preparation?.signal);
+				expect(options.preparation?.deadline).toBe(Number.POSITIVE_INFINITY);
 				expect(now).toBe(111_000);
 				now += 3000;
 				return prepared();
@@ -251,10 +334,15 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 			const result = await hooks(controller.signal).onBeforeTurn(1, { force: true });
 			expect(result?.systemPrompt).toBe("system");
 			expect(now).toBe(114_000);
+			expect(
+				warn.mock.calls.filter(([message]) => message === "Slow model history preparation"),
+			).toHaveLength(1);
+			expect(warn.mock.calls.at(-1)?.[1]).toMatchObject({ outcome: "success", elapsedMs: 14_000 });
 		} finally {
 			load.mockRestore();
 			build.mockRestore();
 			clock.mockRestore();
+			warn.mockRestore();
 		}
 	});
 });

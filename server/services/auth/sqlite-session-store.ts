@@ -15,6 +15,7 @@
  */
 import { db } from "@server/db";
 import { authSessions, userPreferences, users } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
@@ -24,6 +25,7 @@ import type {
 	LoginCredential,
 	NewAuthSession,
 	SessionProfile,
+	SessionReadOptions,
 	SessionState,
 } from "./session-store";
 
@@ -33,23 +35,36 @@ function asRole(role: string): AccountRole {
 }
 
 /** One session row joined with its account, by a unique key. */
-async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
-	const rows = await db
-		.select({
-			id: authSessions.id,
-			userId: authSessions.userId,
-			role: users.role,
-			userTokenVersion: users.tokenVersion,
-			sessionTokenVersion: authSessions.tokenVersion,
-			sessionStart: authSessions.sessionStart,
-			createdAt: authSessions.createdAt,
-			expiresAt: authSessions.expiresAt,
-			revokedAt: authSessions.revokedAt,
-		})
-		.from(authSessions)
-		.innerJoin(users, eq(users.id, authSessions.userId))
-		.where(where)
-		.limit(1);
+async function findSession(
+	where: SQL,
+	{ signal, deadlineAt }: SessionReadOptions = {},
+): Promise<AuthSessionRecord | null> {
+	const rows = await readQuery(
+		db
+			.select({
+				id: authSessions.id,
+				userId: authSessions.userId,
+				role: users.role,
+				userTokenVersion: sql<number>`${users.tokenVersion}`.as("user_token_version"),
+				sessionTokenVersion: sql<number>`${authSessions.tokenVersion}`.as("session_token_version"),
+				sessionStart: authSessions.sessionStart,
+				createdAt: authSessions.createdAt,
+				expiresAt: authSessions.expiresAt,
+				revokedAt: authSessions.revokedAt,
+			})
+			.from(authSessions)
+			.innerJoin(users, eq(users.id, authSessions.userId))
+			.where(where)
+			.limit(1),
+		{
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			diagnosticSource: "auth.session",
+			schedulingHint: "auth-session",
+			signal,
+			deadlineAt,
+		},
+	);
 	const row = rows[0];
 	if (!row) return null;
 	return { ...row, role: asRole(row.role) };
@@ -57,10 +72,13 @@ async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
 
 export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findLoginCredential(username: string): Promise<LoginCredential | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.username, username),
-			columns: { id: true, passwordHash: true, mfaEnabled: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.username, username),
+				columns: { id: true, passwordHash: true, mfaEnabled: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return row ?? null;
 	},
 
@@ -76,10 +94,13 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	},
 
 	async findSessionState(userId: string): Promise<SessionState | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, role: true, tokenVersion: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, role: true, tokenVersion: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!row) return null;
 		return { id: row.id, role: asRole(row.role), tokenVersion: row.tokenVersion };
 	},
@@ -87,33 +108,39 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findSessionProfile(userId: string): Promise<SessionProfile | null> {
 		// One LEFT JOIN instead of the pre-port pair of findFirsts: the preferences row
 		// belongs to the account, and reading them together is the same observation.
-		const rows = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				role: users.role,
-				avatarColor: users.avatarColor,
-				avatarImageId: users.avatarImageId,
-				gitUsername: users.gitUsername,
-				gitEmail: users.gitEmail,
-				createdAt: users.createdAt,
-				tokenVersion: users.tokenVersion,
-				language: userPreferences.language,
-			})
-			.from(users)
-			.leftJoin(userPreferences, eq(userPreferences.userId, users.id))
-			.where(eq(users.id, userId))
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select({
+					id: users.id,
+					username: users.username,
+					role: users.role,
+					avatarColor: users.avatarColor,
+					avatarImageId: users.avatarImageId,
+					gitUsername: users.gitUsername,
+					gitEmail: users.gitEmail,
+					createdAt: users.createdAt,
+					tokenVersion: users.tokenVersion,
+					language: userPreferences.language,
+				})
+				.from(users)
+				.leftJoin(userPreferences, eq(userPreferences.userId, users.id))
+				.where(eq(users.id, userId))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		const row = rows[0];
 		if (!row) return null;
 		return { ...row, role: asRole(row.role) };
 	},
 
 	async findPasswordHash(userId: string): Promise<string | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { passwordHash: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { passwordHash: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return row?.passwordHash ?? null;
 	},
 
@@ -132,12 +159,18 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 		await db.insert(authSessions).values(session);
 	},
 
-	async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
-		return findSession(eq(authSessions.tokenHash, tokenHash));
+	async findSessionByTokenHash(
+		tokenHash: string,
+		options?: SessionReadOptions,
+	): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.tokenHash, tokenHash), options);
 	},
 
-	async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
-		return findSession(eq(authSessions.id, sessionId));
+	async findSessionById(
+		sessionId: string,
+		options?: SessionReadOptions,
+	): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.id, sessionId), options);
 	},
 
 	async extendSession(sessionId: string, expiresAt: number): Promise<void> {

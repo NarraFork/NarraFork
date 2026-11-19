@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFile, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { testEnvironment } from "../../../tests/preload";
 import { cleanDb } from "../../../tests/setup";
@@ -18,10 +19,19 @@ import {
 	getRegisteredRecoverySource,
 	resetRecoveryHandoffForTests,
 } from "../recovery-handoff";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+	prepareRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
-// Use preload's isolated file DB and real manifests across simulated cold starts.
+// Use a file-backed DB under preload's isolated home and real manifests across cold starts.
 // Only the boundaries that would launch a tool/model are replaced below.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Initialize the service first to avoid its persistence facade's circular import.
 await import("../narrator-service");
@@ -185,6 +195,7 @@ async function tool(id: string) {
 
 beforeEach(async () => {
 	await closePrefixSnapshotStore();
+	await prepareRuntimeTestDb(sqlite);
 	cleanDb(sqlite);
 	recovery.resetRestartRecoveryForTests();
 	resetRecoveryHandoffForTests();
@@ -230,7 +241,8 @@ beforeEach(async () => {
 	spyOn(session, "resumeBufferedMessagesIfIdle").mockResolvedValue(undefined as never);
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await drainRuntimeTestWork();
 	const { listRunHolds, setRunHold } =
 		require("../agent-runtime/ownership") as typeof import("../agent-runtime/ownership");
 	for (const id of listRunHolds()) setRunHold(id, undefined);
@@ -241,16 +253,15 @@ afterEach(() => {
 });
 
 afterAll(async () => {
-	await closePrefixSnapshotStore();
-	cleanDb(sqlite);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
+	mock.module("../../db", () => realDbModule);
 });
 
 describe("ordinary restart eligibility and tool disposition", () => {
 	test("preload isolates all manifests from the user's data", () => {
 		expect(process.env.NARRAFORK_HOME).toBe(testEnvironment.narraforkHome);
 		expect(process.env.NARRAFORK_HOME).not.toBe(testEnvironment.realNarraforkHome);
-		expect(sqlite.filename).toBe(getNarraforkPath("narrafork.db"));
+		expect(sqlite.filename).toStartWith(join(testEnvironment.narraforkHome, "narrator-worker-"));
 	});
 
 	test("automatic resume is enabled unless the exact opt-out flag is present", () => {

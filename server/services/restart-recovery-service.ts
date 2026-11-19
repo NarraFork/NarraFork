@@ -5,6 +5,7 @@ import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -184,16 +185,19 @@ async function withDeliverTo<T extends { id: string }>(
 }
 
 async function loadActiveRows(includeTerminalCandidates = false) {
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.status, ["working", "waiting"]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			logicalRunId: true,
-		},
-		limit: MAX_TARGETS + 1,
-	});
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(narrators.status, ["working", "waiting"]),
+			columns: {
+				id: true,
+				status: true,
+				substatus: true,
+				logicalRunId: true,
+			},
+			limit: MAX_TARGETS + 1,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length > MAX_TARGETS) throw new Error("Too many active restart recovery targets");
 	return includeTerminalCandidates ? rows : rows.filter(restartEligible);
 }
@@ -214,16 +218,19 @@ async function loadRetainedRestartRows(previous: RestartManifest | null) {
 		records.filter((record) => record.state === "cancelled").flatMap(recordTargets),
 	);
 	const targets = new Map(previous.targets.map((target) => [target.narratorId, target]));
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.id, [...targets.keys()]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			logicalRunId: true,
-		},
-		limit: MAX_TARGETS + 1,
-	});
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(narrators.id, [...targets.keys()]),
+			columns: {
+				id: true,
+				status: true,
+				substatus: true,
+				logicalRunId: true,
+			},
+			limit: MAX_TARGETS + 1,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return rows.filter((row) => {
 		const tags = parseSubstatus(row.substatus);
 		return (
@@ -302,40 +309,46 @@ export async function protectHeldRunFacts(
 	for (const id of held) {
 		protection.narratorIds.add(id);
 		for (let after = ""; ; ) {
-			const calls = await db
-				.select({ id: narratorToolCalls.id })
-				.from(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.narratorId, id),
-						gt(narratorToolCalls.id, after),
-						inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
-					),
-				)
-				.orderBy(asc(narratorToolCalls.id))
-				.limit(100);
+			const calls = await readQuery(
+				db
+					.select({ id: narratorToolCalls.id })
+					.from(narratorToolCalls)
+					.where(
+						and(
+							eq(narratorToolCalls.narratorId, id),
+							gt(narratorToolCalls.id, after),
+							inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+						),
+					)
+					.orderBy(asc(narratorToolCalls.id))
+					.limit(100),
+				{ executionPolicy: "worker-required" },
+			);
 			for (const call of calls) protection.toolCallIds.add(call.id);
 			if (calls.length < 100) break;
 			after = calls[calls.length - 1].id;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 		for (let after = ""; ; ) {
-			const tasks = await db
-				.select({ id: backgroundTasks.id })
-				.from(backgroundTasks)
-				.where(
-					and(
-						gt(backgroundTasks.id, after),
-						eq(backgroundTasks.status, "running"),
-						or(
-							eq(backgroundTasks.subagentNarratorId, id),
-							eq(backgroundTasks.id, id),
-							eq(backgroundTasks.parentNarratorId, id),
+			const tasks = await readQuery(
+				db
+					.select({ id: backgroundTasks.id })
+					.from(backgroundTasks)
+					.where(
+						and(
+							gt(backgroundTasks.id, after),
+							eq(backgroundTasks.status, "running"),
+							or(
+								eq(backgroundTasks.subagentNarratorId, id),
+								eq(backgroundTasks.id, id),
+								eq(backgroundTasks.parentNarratorId, id),
+							),
 						),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(100);
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(100),
+				{ executionPolicy: "worker-required" },
+			);
 			for (const task of tasks) protection.backgroundTaskIds.add(task.id);
 			if (tasks.length < 100) break;
 			after = tasks[tasks.length - 1].id;
@@ -343,15 +356,18 @@ export async function protectHeldRunFacts(
 		}
 		const deliverTo = await deliverToOf(id);
 		if (deliverTo) {
-			const call = await db.query.narratorToolCalls.findFirst({
-				where: deliverTo.toolCallId
-					? eq(narratorToolCalls.id, deliverTo.toolCallId)
-					: and(
-							eq(narratorToolCalls.narratorId, deliverTo.narratorId),
-							eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
-						),
-				columns: { id: true },
-			});
+			const call = await readQuery(
+				db.query.narratorToolCalls.findFirst({
+					where: deliverTo.toolCallId
+						? eq(narratorToolCalls.id, deliverTo.toolCallId)
+						: and(
+								eq(narratorToolCalls.narratorId, deliverTo.narratorId),
+								eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
+							),
+					columns: { id: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			if (call) protection.toolCallIds.add(call.id);
 		}
 	}
@@ -464,10 +480,13 @@ export async function prepareOrdinaryRestartRecovery(
 		// A foreground caller may have crashed before saving its tool result. Preserve
 		// its continuation; run.ts observes this committed snapshot before any model pass.
 		if (row.deliverTo?.toolCallId) {
-			const call = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, row.deliverTo.toolCallId),
-				columns: { status: true },
-			});
+			const call = await readQuery(
+				db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, row.deliverTo.toolCallId),
+					columns: { status: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
 		}
 	}
@@ -557,23 +576,29 @@ export async function prepareOrdinaryRestartRecovery(
 	const representedChildren = new Set<string>();
 	for (const child of delegated) {
 		const deliverTo = child.deliverTo as RunDeliverTo;
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: deliverTo.toolCallId
-				? eq(narratorToolCalls.id, deliverTo.toolCallId)
-				: and(
-						eq(narratorToolCalls.narratorId, deliverTo.narratorId),
-						eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
-					),
-			columns: { id: true, narratorId: true, status: true },
-		});
+		const call = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: deliverTo.toolCallId
+					? eq(narratorToolCalls.id, deliverTo.toolCallId)
+					: and(
+							eq(narratorToolCalls.narratorId, deliverTo.narratorId),
+							eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
+						),
+				columns: { id: true, narratorId: true, status: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!call || plannedProtection.toolCallIds.has(call.id)) continue;
-		const task = await db.query.backgroundTasks.findFirst({
-			where: and(
-				eq(backgroundTasks.type, "agent"),
-				or(eq(backgroundTasks.subagentNarratorId, child.id), eq(backgroundTasks.id, child.id)),
-			),
-			columns: { id: true, alias: true, status: true },
-		});
+		const task = await readQuery(
+			db.query.backgroundTasks.findFirst({
+				where: and(
+					eq(backgroundTasks.type, "agent"),
+					or(eq(backgroundTasks.subagentNarratorId, child.id), eq(backgroundTasks.id, child.id)),
+				),
+				columns: { id: true, alias: true, status: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const background = task?.status === "running";
 		// A historical Agent result is not the owner of a later follow-up run.
 		if (!background && (call.status === "success" || call.status === "fail")) continue;
@@ -601,24 +626,27 @@ export async function prepareOrdinaryRestartRecovery(
 		representedChildren.add(child.id);
 	}
 	for (const row of selected) {
-		const calls = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, row.id),
-				isNull(narratorToolCalls.executionOriginToolCallId),
-				eq(narratorToolCalls.executionIdentityVersion, 1),
-				inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
-			),
-			columns: {
-				id: true,
-				toolUseId: true,
-				messageId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-				permissionSuggestions: true,
-			},
-			limit: 1_001,
-		});
+		const calls = await readQuery(
+			db.query.narratorToolCalls.findMany({
+				where: and(
+					eq(narratorToolCalls.narratorId, row.id),
+					isNull(narratorToolCalls.executionOriginToolCallId),
+					eq(narratorToolCalls.executionIdentityVersion, 1),
+					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+				),
+				columns: {
+					id: true,
+					toolUseId: true,
+					messageId: true,
+					status: true,
+					executionStartedAt: true,
+					fileChangeOperationId: true,
+					permissionSuggestions: true,
+				},
+				limit: 1_001,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (calls.length > 1_000) throw new Error("Too many interrupted tools for one narrator");
 		for (const call of calls) {
 			if (protection.toolCallIds.has(call.id) || plannedProtection.toolCallIds.has(call.id))
@@ -735,10 +763,13 @@ async function putColdContinuation(input: Parameters<typeof toolContinuationServ
 		}
 		return;
 	}
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, input.toolCallId),
-		columns: { executionAttempt: true, executionStartedAt: true },
-	});
+	const call = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, input.toolCallId),
+			columns: { executionAttempt: true, executionStartedAt: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!call) return;
 	const pass = toolContinuationService.beginColdRecoveryPass({
 		rootEpoch: input.updateEpoch,
@@ -801,10 +832,13 @@ export async function restoreCarriedOrdinaryTargets(
 			await withRecoveryAdvance(source.updateEpoch, async () => {
 				const current = getRecoverySource(source.updateEpoch);
 				if (!current?.pendingNarratorIds.includes(target.narratorId)) return;
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, target.narratorId),
-					columns: { id: true, logicalRunId: true, status: true, substatus: true },
-				});
+				const row = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, target.narratorId),
+						columns: { id: true, logicalRunId: true, status: true, substatus: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				const saved = current.narrators.find((entry) => entry.narratorId === target.narratorId);
 				const valid =
 					row &&

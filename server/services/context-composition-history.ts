@@ -1,6 +1,8 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type ContextSegment, safeCharacters } from "@shared/context-composition";
 import type { SQL } from "bun";
+import { readNativeRows } from "../db/worker-read";
+import type { ReadBind } from "../lib/db-worker/protocol";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../lib/runtime-source";
 import { readContextSegments } from "./context-composition-projection";
 
@@ -8,6 +10,8 @@ import { readContextSegments } from "./context-composition-projection";
 export interface ContextQuery {
 	get<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T | null>;
 	all<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T[]>;
+	/** Bounded mutation with RETURNING, executed on the write connection rather than a read worker. */
+	writeReturning<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T | null>;
 	run(sql: string, bindings: readonly SQLQueryBindings[]): Promise<void>;
 	transaction(fn: (tx: ContextQuery) => Promise<void>): Promise<void>;
 }
@@ -15,10 +19,21 @@ export interface ContextQuery {
 export function sqliteContextQuery(database: Database): ContextQuery {
 	const query: ContextQuery = {
 		async get<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
-			return (database.query(sql).get(...bindings) as T | null | undefined) ?? null;
+			return (
+				(
+					await readNativeRows<T>(database, sql, bindings as readonly ReadBind[], {
+						executionPolicy: "worker-required",
+					})
+				)[0] ?? null
+			);
 		},
 		async all<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
-			return database.query(sql).all(...bindings) as T[];
+			return readNativeRows<T>(database, sql, bindings as readonly ReadBind[], {
+				executionPolicy: "worker-required",
+			});
+		},
+		async writeReturning<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
+			return database.query(sql).get(...bindings) as T | null;
 		},
 		async run(sql: string, bindings: readonly SQLQueryBindings[]) {
 			database.query(sql).run(...bindings);
@@ -27,6 +42,9 @@ export function sqliteContextQuery(database: Database): ContextQuery {
 			const queued: Array<{ sql: string; bindings: readonly SQLQueryBindings[] }> = [];
 			const tx: ContextQuery = {
 				...query,
+				async writeReturning() {
+					throw new Error("Returning mutations are not supported in queued context transactions");
+				},
 				async run(sql, bindings) {
 					queued.push({ sql, bindings });
 				},
@@ -88,6 +106,10 @@ export function postgresContextQuery(sql: SQL): ContextQuery {
 		async all<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
 			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
 			return rows.map((row) => normalizeRow<T>(row));
+		},
+		async writeReturning<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
+			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
+			return rows[0] ? normalizeRow<T>(rows[0]) : null;
 		},
 		async run(statement: string, bindings: readonly SQLQueryBindings[]) {
 			await run(statement, bindings);

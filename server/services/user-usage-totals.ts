@@ -3,6 +3,7 @@ import { apiRequests, users, userUsageTotals } from "@server/db/schema";
 import { aggregateCostStatus } from "@server/lib/cost-estimate";
 import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { asc, eq, gt, sql } from "drizzle-orm";
+import { readQuery } from "../db/worker-read";
 import { addUsageDaily, resolveRequestAttribution } from "./usage-daily";
 
 type Db = typeof defaultDb;
@@ -90,30 +91,32 @@ export function insertApiRequestWithUserUsage(
 }
 
 /** One row per user, keyset-paginated by the primary key; no COUNT or SUM at read time. */
-export function listUserUsageTotals(limit = 50, cursor?: string, database: Db = defaultDb) {
+export async function listUserUsageTotals(limit = 50, cursor?: string, database: Db = defaultDb) {
 	const boundedLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.trunc(limit))) : 50;
-	const rows = database
-		.select({
-			userId: userUsageTotals.userId,
-			username: users.username,
-			requestCount: userUsageTotals.requestCount,
-			inputTokens: userUsageTotals.inputTokens,
-			outputTokens: userUsageTotals.outputTokens,
-			cachedInputTokens: userUsageTotals.cachedInputTokens,
-			cacheCreationTokens: userUsageTotals.cacheCreationTokens,
-			reasoningTokens: userUsageTotals.reasoningTokens,
-			costUsd: userUsageTotals.costUsd,
-			unpricedRequestCount: userUsageTotals.unpricedRequestCount,
-			partialRequestCount: userUsageTotals.partialRequestCount,
-			firstUsedAt: userUsageTotals.firstUsedAt,
-			lastUsedAt: userUsageTotals.lastUsedAt,
-		})
-		.from(userUsageTotals)
-		.leftJoin(users, eq(users.id, userUsageTotals.userId))
-		.where(cursor ? gt(userUsageTotals.userId, cursor) : undefined)
-		.orderBy(asc(userUsageTotals.userId))
-		.limit(boundedLimit + 1)
-		.all();
+	const rows = await readQuery(
+		database
+			.select({
+				userId: userUsageTotals.userId,
+				username: users.username,
+				requestCount: userUsageTotals.requestCount,
+				inputTokens: userUsageTotals.inputTokens,
+				outputTokens: userUsageTotals.outputTokens,
+				cachedInputTokens: userUsageTotals.cachedInputTokens,
+				cacheCreationTokens: userUsageTotals.cacheCreationTokens,
+				reasoningTokens: userUsageTotals.reasoningTokens,
+				costUsd: userUsageTotals.costUsd,
+				unpricedRequestCount: userUsageTotals.unpricedRequestCount,
+				partialRequestCount: userUsageTotals.partialRequestCount,
+				firstUsedAt: userUsageTotals.firstUsedAt,
+				lastUsedAt: userUsageTotals.lastUsedAt,
+			})
+			.from(userUsageTotals)
+			.leftJoin(users, eq(users.id, userUsageTotals.userId))
+			.where(cursor ? gt(userUsageTotals.userId, cursor) : undefined)
+			.orderBy(asc(userUsageTotals.userId))
+			.limit(boundedLimit + 1),
+		{ executionPolicy: "worker-required" },
+	);
 	const hasMore = rows.length > boundedLimit;
 	const records = rows.slice(0, boundedLimit).map((row) => ({
 		...row,

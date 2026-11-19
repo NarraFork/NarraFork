@@ -1,14 +1,15 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { getTestDb } from "../../../tests/setup";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import {
 	parseFileReferenceSnapshotsJson,
 	projectFileReferenceText,
 } from "../../lib/agent/file-reference-projection";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // Bun module mocks are process-global. Keep the fixture in a bounded child so a
 // whole-directory test run never inherits this tiny database or its closed handle.
@@ -38,8 +39,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		expect(`${result.stdout}\n${result.stderr}`).toMatch(/\b0 fail\b/);
 	}, 65_000);
 } else {
-	// Isolated in-memory schema includes the durable mailbox identity columns.
-	const { sqlite } = getTestDb();
+	// Independent WAL schema includes the durable mailbox identity columns.
+	const fixture = getNarratorWorkerTestDb();
+	await fixture.ready;
+	const { sqlite } = fixture;
 	const queries: string[] = [];
 	const db = drizzle({
 		client: sqlite,
@@ -117,9 +120,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		state.compactLocks.clear();
 		queries.length = 0;
 	});
-	afterAll(() => {
+	afterAll(async () => {
 		state.compactLocks.clear();
-		sqlite.close();
+		await fixture.close();
 	});
 
 	describe("reference metadata draft sync", () => {
@@ -202,8 +205,28 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		test("presence selects only ids, never materializing large draft columns", async () => {
 			await drafts.updateNarratorDraft("u", "n", "", undefined, [reference()]);
 			queries.length = 0;
-			await drafts.narratorHasDraft("u", "n");
-			await drafts.getNarratorIdsWithDraft("u", ["n"]);
+			const read = workerRead.readQuery;
+			const first = workerRead.readQueryFirst;
+			const readSpy = spyOn(workerRead, "readQuery").mockImplementation(((
+				...args: Parameters<typeof read>
+			) => {
+				queries.push(args[0].toSQL().sql);
+				return read(...args);
+			}) as typeof read);
+			const firstSpy = spyOn(workerRead, "readQueryFirst").mockImplementation(((
+				...args: Parameters<typeof first>
+			) => {
+				queries.push(args[0].toSQL().sql);
+				return first(...args);
+			}) as typeof first);
+			try {
+				await drafts.narratorHasDraft("u", "n");
+				await drafts.getNarratorIdsWithDraft("u", ["n"]);
+			} finally {
+				readSpy.mockRestore();
+				firstSpy.mockRestore();
+			}
+			expect(queries.length).toBeGreaterThan(0);
 			for (const query of queries) {
 				const projection = query.split(/\sfrom\s/i)[0];
 				expect(projection).toContain("narrator_id");
@@ -224,7 +247,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 				await expect(
 					buffer.updateBufferedMessage("n", pushed.id, "changed", { fileReferences: [] }),
 				).rejects.toThrow();
-				expect(buffer.getBufferedMessages("n")[0]).toMatchObject({
+				expect((await buffer.getBufferedMessages("n"))[0]).toMatchObject({
 					text: "original",
 					fileReferences: [snapshot()],
 				});
@@ -236,7 +259,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			);
 			try {
 				await expect(push("not accepted", [snapshot("new")])).rejects.toThrow();
-				expect(buffer.getBufferedMessages("n").map((entry) => entry.id)).toEqual([pushed.id]);
+				expect((await buffer.getBufferedMessages("n")).map((entry) => entry.id)).toEqual([
+					pushed.id,
+				]);
 			} finally {
 				sqlite.exec("DROP TRIGGER fail_queue_insert");
 			}
@@ -249,7 +274,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 				snapshotText: "z".repeat(32 * 1024),
 			}));
 			await push("metadata only", refs);
-			const json = JSON.stringify(buffer.toBufferSummary(buffer.getBufferedMessages("n")));
+			const json = JSON.stringify(buffer.toBufferSummary(await buffer.getBufferedMessages("n")));
 			expect(json.length).toBeLessThan(2048);
 			expect(json).not.toContain("zzzz");
 			expect(json).not.toContain("snapshotText");
@@ -263,7 +288,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			expect(result.ok).toBe(true);
 			input.snapshotText = "changed source";
 			input.reference.path = "/changed-source";
-			const [message] = buffer.getBufferedMessages("n");
+			const [message] = await buffer.getBufferedMessages("n");
 			expect(message.fileReferences).toEqual([expected]);
 			expect(parseFileReferenceSnapshotsJson(queueRow(result.id)?.fileReferencesJson)).toEqual([
 				expected,
@@ -288,17 +313,19 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 				fileReferences: [replacement],
 			});
 			replacement.snapshotText = "mutated caller";
-			expect(buffer.getBufferedMessages("n")[0].fileReferences).toEqual([snapshot("new")]);
+			expect((await buffer.getBufferedMessages("n"))[0].fileReferences).toEqual([snapshot("new")]);
 			await buffer.updateBufferedMessage("n", pushed.id, "no refs", { fileReferences: [] });
 			expect(queueRow(pushed.id)?.fileReferencesJson).toBeNull();
-			expect(buffer.toBufferSummary(buffer.getBufferedMessages("n"))[0].fileReferences).toEqual([]);
+			expect(
+				buffer.toBufferSummary(await buffer.getBufferedMessages("n"))[0].fileReferences,
+			).toEqual([]);
 		});
 
 		test("priority, recovery and failed dispatch preserve the exact accepted snapshot", async () => {
 			makeBusy();
 			const ordinary = await push("later", [snapshot("later")]);
 			const priority = await push("first", [snapshot("first")], "front");
-			expect(buffer.getBufferedMessages("n").map((message) => message.id)).toEqual([
+			expect((await buffer.getBufferedMessages("n")).map((message) => message.id)).toEqual([
 				priority.id,
 				ordinary.id,
 			]);
@@ -321,7 +348,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			expect(projectFileReferenceText(current.text, accepted)).toContain(
 				"accepted original contents",
 			);
-			expect(buffer.getBufferedMessages("n").map((message) => message.id)).toEqual([
+			expect((await buffer.getBufferedMessages("n")).map((message) => message.id)).toEqual([
 				priority.id,
 				ordinary.id,
 			]);

@@ -30,7 +30,8 @@ import {
 	type UpdateSourceIdentity,
 } from "../../shared/update-identity";
 import { db } from "../db";
-import { narratorToolCalls } from "../db/schema";
+import { narrators, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { downloadHelperBinary } from "../lib/helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../lib/helper-binary-platform";
 import {
@@ -85,6 +86,7 @@ import {
 	scheduleUpdate,
 	UpdateCancelledError,
 	type UpdateCoordinationStatus,
+	verifyPreparedCheckpoint,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
 	waitForScheduledRecoveryHandoff,
@@ -1775,11 +1777,14 @@ export interface PlannedUpdateCheckpointHooks {
 async function listActiveToolCallIds(
 	snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
 ): Promise<string[]> {
-	const rows = await db
-		.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
-		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+			.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
 		throw new Error(
 			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
@@ -1840,7 +1845,35 @@ export async function checkpointPreparedUpdateFence(
 				stablePasses,
 				activeToolCallCount: activeToolCallIds.length,
 			});
-			if (stablePasses >= CHECKPOINT_REQUIRED_STABLE_PASSES) return snapshot;
+			if (stablePasses >= CHECKPOINT_REQUIRED_STABLE_PASSES) {
+				// Only the durable active row for this exact run can resume after restart.
+				// Held/legacy/changed rows may remain in the manifest, but gain no process-stop authority.
+				const durableRuns = new Set<string>();
+				const targets = snapshot.narrators.filter((target) => target.logicalRunId);
+				for (let offset = 0; offset < targets.length; offset += 100) {
+					const rows = await readQuery(
+						db
+							.select({
+								id: narrators.id,
+								logicalRunId: narrators.logicalRunId,
+								status: narrators.status,
+							})
+							.from(narrators)
+							.where(
+								inArray(
+									narrators.id,
+									targets.slice(offset, offset + 100).map((target) => target.narratorId),
+								),
+							),
+						{ executionPolicy: "worker-required", maxRows: 100 },
+					);
+					for (const row of rows)
+						if (row.status === "working" || row.status === "waiting")
+							durableRuns.add(JSON.stringify([row.id, row.logicalRunId]));
+				}
+				verifyPreparedCheckpoint(snapshot, durableRuns);
+				return snapshot;
+			}
 		} else {
 			stablePasses = 0;
 			logger.warn("Planned-update checkpoint has not converged; retrying", {

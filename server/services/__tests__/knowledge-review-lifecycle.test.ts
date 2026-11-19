@@ -181,7 +181,9 @@ describe("withdrawSubmission", () => {
 	test("a stranger cannot withdraw someone else's request (NotFound, no existence leak)", async () => {
 		const { submissionId } = await makePendingSubmission("NotYours");
 
-		expect(knowledgeBranchService.withdrawSubmission(stranger, submissionId)).rejects.toThrow();
+		await expect(
+			knowledgeBranchService.withdrawSubmission(stranger, submissionId),
+		).rejects.toThrow();
 		// Still open and untouched.
 		expect((await statusOf(submissionId))?.status).toBe("pending");
 	});
@@ -200,7 +202,7 @@ describe("withdrawSubmission", () => {
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "approve" });
 		expect((await statusOf(submissionId))?.status).toBe("approved");
 
-		expect(knowledgeBranchService.withdrawSubmission(author, submissionId)).rejects.toThrow();
+		await expect(knowledgeBranchService.withdrawSubmission(author, submissionId)).rejects.toThrow();
 		expect((await statusOf(submissionId))?.status).toBe("approved");
 		// The publish archived the personal entry; withdraw must not have resurrected it.
 		const personal = await knowledgeBranchService.getMine(author, entry.id);
@@ -232,7 +234,7 @@ describe("withdrawSubmission", () => {
 
 		// Withdraw is terminal for that row: the way back in is a fresh publish, not a resubmit
 		// chain hanging off a request the author already abandoned.
-		expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
+		await expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
 	});
 });
 
@@ -307,13 +309,13 @@ describe("resubmit after changes_requested", () => {
 	test("only a changes_requested request can be re-submitted", async () => {
 		const { submissionId } = await makePendingSubmission("ResubmitPending");
 		// Still pending → refused (a second open request would be a duplicate anyway).
-		expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
+		await expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
 	});
 
 	test("a stranger cannot re-submit someone else's bounced request", async () => {
 		const { submissionId } = await makePendingSubmission("ResubmitNotYours");
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "request_changes" });
-		expect(knowledgeBranchService.resubmit(stranger, submissionId, {})).rejects.toThrow();
+		await expect(knowledgeBranchService.resubmit(stranger, submissionId, {})).rejects.toThrow();
 	});
 });
 
@@ -498,7 +500,7 @@ describe("rebaseDraft strategy=theirs", () => {
 			title: `TakeMainStandalone ${TAG}`,
 			content: "body\n",
 		});
-		expect(
+		await expect(
 			knowledgeBranchService.rebaseDraft(author, standalone.id, { strategy: "theirs" }),
 		).rejects.toThrow();
 	});
@@ -815,7 +817,7 @@ describe("listSubmissions agrees with countReviewInbox on own submissions", () =
 		const inbox = await knowledgeBranchService.countReviewInbox(author);
 		expect(inbox.count).toBe(0);
 
-		expect(
+		await expect(
 			knowledgeBranchService.review(author, submissionId, { verdict: "approve" }),
 		).rejects.toThrow(/your own/i);
 

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -9,14 +9,27 @@ import {
 } from "../../db/schema";
 import type { AgentEvent } from "../../lib/agent/types";
 import { eventBus } from "../../lib/event-bus";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../../db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 const { clearStreamingSnapshot, getStreamingSnapshot, persistDetachedToolResult, processEvent } =
 	await import("../narrator-event-handler");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { markInterruptedToolCallsForMessage } = await import("../narrator-session");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 type ResultEvent = Extract<AgentEvent, { type: "tool_result" }>;
 
@@ -116,7 +129,8 @@ function context(narratorId = "owner"): EventHandlerContext {
 	};
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	frames.length = 0;
 	toolChanges.length = 0;
@@ -125,30 +139,40 @@ afterEach(() => {
 	clearStreamingSnapshot("owner");
 	clearStreamingSnapshot("child");
 });
-afterAll(() => {
+afterAll(async () => {
 	eventBus.off("narrator:message_broadcast", onFrame);
 	eventBus.off("narrator:tool_changed", onToolChange);
-	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	(await import("../narrator-block-sync")).stopBlockSyncSweep();
+	await closePrefixSnapshotStore();
+	await fixture.close();
 });
 
 describe("detached tool result durable settlement", () => {
 	test("retries a transient database lock without losing the original result", async () => {
 		await seed();
 		await markInterruptedToolCallsForMessage("owner", "message-owner");
-		const original = narratorPersistence.updateToolCallResult.bind(narratorPersistence);
-		const update = spyOn(narratorPersistence, "updateToolCallResult")
-			.mockImplementation(original)
-			.mockImplementationOnce(async () => {
-				throw new Error("SQLITE_BUSY: database is locked");
+		const version = (await owner())?.messageVersion ?? 0;
+		const originalTransaction = db.transaction.bind(db);
+		const transaction = spyOn(db, "transaction")
+			.mockImplementation(originalTransaction)
+			.mockImplementationOnce(() => {
+				throw Object.assign(new Error("SQLITE_BUSY: database is locked"), {
+					code: "SQLITE_BUSY",
+					errno: 5,
+				});
 			});
+		const update = spyOn(narratorPersistence, "updateToolCallResult");
 		try {
 			await persistDetachedToolResult("owner", result());
-			expect(update).toHaveBeenCalledTimes(2);
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(2);
 			expect(await row()).toMatchObject({ status: "success", outputJson: "actual durable result" });
+			expect((await owner())?.messageVersion).toBe(version + 1);
+			expect(toolChanges).toEqual(["owner"]);
 			expect(frames).toHaveLength(1);
 		} finally {
+			transaction.mockRestore();
 			update.mockRestore();
 		}
 	});
@@ -186,6 +210,7 @@ describe("detached tool result durable settlement", () => {
 			});
 			expect(getImagePath("owner", stored._images[0]?.imageId ?? "")).not.toBeNull();
 
+			await closePrefixSnapshotStore();
 			cleanDb(sqlite);
 			await seed();
 			await persistDetachedToolResult(
@@ -205,17 +230,24 @@ describe("detached tool result durable settlement", () => {
 
 	test("database lock retries are bounded and do not invent a successful result", async () => {
 		await seed();
-		const update = spyOn(narratorPersistence, "updateToolCallResult").mockImplementation(
-			async () => {
-				throw new Error("SQLITE_BUSY: database is locked");
-			},
-		);
+		const failure = Object.assign(new Error("SQLITE_BUSY: database is locked"), {
+			code: "SQLITE_BUSY",
+			errno: 5,
+		});
+		const transaction = spyOn(db, "transaction").mockImplementation(() => {
+			throw failure;
+		});
+		const update = spyOn(narratorPersistence, "updateToolCallResult");
 		try {
-			await expect(persistDetachedToolResult("owner", result())).rejects.toThrow("SQLITE_BUSY");
-			expect(update).toHaveBeenCalledTimes(3);
-			expect((await row())?.status).toBe("running");
+			await expect(persistDetachedToolResult("owner", result())).rejects.toBe(failure);
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(5);
+			expect(await row()).toMatchObject({ status: "running", outputJson: null });
+			expect((await owner())?.messageVersion).toBe(0);
+			expect(toolChanges).toEqual([]);
 			expect(frames).toEqual([]);
 		} finally {
+			transaction.mockRestore();
 			update.mockRestore();
 		}
 	});

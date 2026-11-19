@@ -20,6 +20,7 @@
 import { eq, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import { type AclPrincipal, resolveCaps } from "./acl/acl-core";
 
@@ -177,7 +178,9 @@ export async function loadProjectForAccess(
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
 ) {
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	const row = await readQuery(db.query.projects.findFirst({ where: eq(projects.id, projectId) }), {
+		executionPolicy: "worker-required",
+	});
 	if (!row) throw new NotFoundError("Project", projectId);
 	await assertProjectAccess(row, principal, need);
 	return row;
@@ -200,10 +203,13 @@ export async function resolveProjectGate(
 ): Promise<{ read: boolean; write: boolean }> {
 	if (!projectId) return { read: true, write: true };
 	if (principal.isAdmin) return { read: true, write: true };
-	const row = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, ownerUserId: true, visibility: true },
-	});
+	const row = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	// A dangling project reference fails closed: the chain claimed a gate exists, and
 	// we cannot show it was passed.
 	if (!row) return { read: false, write: false };

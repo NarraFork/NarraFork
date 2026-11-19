@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
 import { userPreferences } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -405,9 +406,12 @@ userPreferencesRoutes.get("/", async (c) => {
 		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
 		userId,
 	);
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -432,9 +436,12 @@ userPreferencesRoutes.patch("/", async (c) => {
 	const body = await c.req.json();
 
 	const updated = await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const mergedBody = isRecord(body) ? { ...body } : body;
 		if (isRecord(mergedBody)) {
 			for (const field of TOP_LEVEL_SECRET_FIELDS) {
@@ -657,10 +664,21 @@ userPreferencesRoutes.patch("/", async (c) => {
 				now,
 			],
 		);
+		// Notify synchronously after the upsert commits, before the response read can
+		// yield or fail. An omitted field or a same-value save changes no dependency.
+		if (
+			d.fastModeDefault !== undefined &&
+			d.fastModeDefault !== (existing?.fastModeDefault ?? DEFAULTS.fastModeDefault)
+		) {
+			eventBus.emit({ type: "user:fast_mode_default_changed", userId });
+		}
 
-		return db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		return readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 	});
 	if (updated) eventBus.emit({ type: "user_preferences:changed", userId });
 	return c.json(updated ? serializeUserPreferences(updated) : updated);
@@ -825,10 +843,13 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { graphViewports: true },
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { graphViewports: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 
 		let viewports: Record<string, { x: number; y: number; zoom: number }> = {};
 		try {
@@ -922,10 +943,13 @@ userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { specTabLayout: true },
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { specTabLayout: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const layouts = parseJsonObject(existing?.specTabLayout);
 		layouts[narratorId] = { order, pinned };
 		const specTabLayout = JSON.stringify(layouts);

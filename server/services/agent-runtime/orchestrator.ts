@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
@@ -958,7 +959,7 @@ export async function runAgentLoopUnlocked(
 			active._guidanceAbortController = new AbortController();
 			const passUrgentGuidance = new AbortController();
 			active._urgentGuidanceAbortController = passUrgentGuidance;
-			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
+			if (active._bufferSoftStop && (await hasPendingBufferedGuidance(narratorId))) {
 				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
 			}
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
@@ -1116,11 +1117,19 @@ export async function runAgentLoopUnlocked(
 					)
 						managedOptionalTools.add(tool.name);
 				}
-				const [latestNarrator] = await db
-					.select({ enabledTools: narrators.enabledTools })
-					.from(narrators)
-					.where(eq(narrators.id, narratorId))
-					.limit(1);
+				const [latestNarrator] = await readQuery(
+					db
+						.select({ enabledTools: narrators.enabledTools })
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal: preparation?.signal ?? active.abortController.signal,
+					},
+				);
+				preparation?.check();
 				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
@@ -1652,10 +1661,13 @@ export async function runAgentLoopUnlocked(
 						});
 						return { titleUpdate: false };
 					}
-					const n = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { title: true },
-					});
+					const n = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { title: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					// `messageCount` is the real message count, not a turn count, so it is
 					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
@@ -2219,7 +2231,10 @@ export async function runAgentLoopUnlocked(
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
 				},
@@ -2356,7 +2371,15 @@ export async function runAgentLoopUnlocked(
 					return !!active._planApprovedContinue;
 				},
 				// Queued user input never skips a call: the step's tools all run first.
-				shouldYieldToInput: () => {
+				shouldYieldToInput: async () => {
+					const guidanceRequestVersion = getBufferedGuidanceRequestVersion(active);
+					const hasPendingGuidance = await hasPendingBufferedGuidance(narratorId);
+					// A newer request can follow the Worker's empty snapshot. Keep it armed
+					// until a subsequent boundary observes its own queue generation.
+					const preserveBufferedRequest =
+						!hasPendingGuidance &&
+						active._bufferSoftStop &&
+						getBufferedGuidanceRequestVersion(active) !== guidanceRequestVersion;
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -3431,7 +3454,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3504,7 +3527,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
 				// reached, which would strand a cut-in message for the rest of the loop.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3768,10 +3791,13 @@ export async function runAgentLoopUnlocked(
 				});
 			} else {
 				try {
-					const fresh = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { pendingModelRestore: true },
-					});
+					const fresh = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { pendingModelRestore: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					if (fresh?.pendingModelRestore) {
 						const restoreModel = fresh.pendingModelRestore;
 						await db
@@ -3895,10 +3921,13 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const leftover = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { substatus: true },
-					});
+					const leftover = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { substatus: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					const tags = parseSubstatus(leftover?.substatus);
 					if (tags.includes("reflecting") || tags.includes("reasoning")) {
 						await narratorService.updateSubstatus(

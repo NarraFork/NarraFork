@@ -11,11 +11,28 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb as getTestDb,
+} from "./agent-runtime-test-database";
 
-// Share the preload-isolated file-backed DB with the real prefix/history workers.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../../db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 let failBroadcast = false;
@@ -38,9 +55,8 @@ const { pushParentInboundMessage } = await import("../parent-inbound-queue");
 const { drainPendingInjections, projectPendingInjection } = await import(
 	"../parent-injection-queue"
 );
-const { closeNarrator, deliverPendingInjection, drainInjectionsIntoHistory } = await import(
-	"../narrator-session"
-);
+const session = await import("../narrator-session");
+const { closeNarrator, deliverPendingInjection, drainInjectionsIntoHistory } = session;
 const { deliverTeamMessage, drainTeamInbox, clearTeamInbox } = await import("../subagent-team");
 /** Queue an agent message on the agent lane, the way Send does. */
 async function pushAgentMessage(
@@ -97,6 +113,14 @@ function required<T>(value: T | null | undefined): T {
 	if (value == null) throw new Error("Missing test fixture value");
 	return value;
 }
+async function drainSessionWork() {
+	const deadlineAt = Date.now() + 30_000;
+	do {
+		await session.drainNarratorSessionTails({ deadlineAt });
+		await drainRuntimeTestWork();
+	} while (session.getNarratorSessionTailStatus().pending > 0);
+}
+
 beforeEach(async () => {
 	for (const id of ["parent", "child", "sender"]) {
 		getExecutionOwner(id)?.release();
@@ -104,6 +128,7 @@ beforeEach(async () => {
 		closeNarrator(id);
 		activeNarrators.delete(id);
 	}
+	await drainSessionWork();
 	backgroundOccupancyStore.resetForTests();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
@@ -128,10 +153,11 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	await backgroundOccupancyStore.flush();
+	await drainSessionWork();
 });
 afterAll(async () => {
 	for (const id of ["parent", "child", "sender"]) getExecutionOwner(id)?.release();
-	await closePrefixSnapshotStore();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	backgroundOccupancyStore.resetForTests();
 });
 function delivery(recipient = "child", text = "same words") {
@@ -296,7 +322,7 @@ test("child list and summary never materialize the full staging document", async
 	await Bun.write(path, "must not parse this full document in a summary");
 	try {
 		for (const messages of [
-			getBufferedMessages("child"),
+			await getBufferedMessages("child"),
 			await getBufferedMessagesAsync("child"),
 		]) {
 			expect(toBufferSummary(messages)[0]?.hasComposerDocument).toBe(true);
@@ -571,6 +597,81 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	teamOwner.release();
 });
 
+test("a team Send merged after the last empty Worker snapshot is re-probed and starts its ordinary run", async () => {
+	db.update(narrators)
+		.set({
+			status: "idle",
+			cwd: process.env.HOME,
+			runtimeRegistrationJson: {
+				version: 1,
+				run: { logicalRunId: "late-team-wake", principal: { userId: null } },
+			},
+		})
+		.where(eq(narrators.id, "child"))
+		.run();
+	const value = delivery("child", "team message after empty snapshot");
+	bindDeliverySource(value);
+	const observed = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalRead = workerRead.readQueryFirst;
+	let held = false;
+	async function read<T>(
+		query: PromiseLike<T[]> & { toSQL(): { sql: string; params: unknown[] } },
+		options?: workerRead.ReadQueryOptions,
+	): Promise<T | undefined> {
+		const row = await originalRead(query, options);
+		if (!held && query.toSQL().sql.includes("$.eventKind")) {
+			held = true;
+			expect(row).toBeUndefined();
+			observed.resolve();
+			await release.promise;
+		}
+		return row;
+	}
+	const probe = spyOn(workerRead, "readQueryFirst").mockImplementation(read);
+	const realWake = inbox.wakeInboxIfEligible;
+	const requests: Promise<boolean>[] = [];
+	const wakeCalls = spyOn(inbox, "wakeInboxIfEligible").mockImplementation((...args) => {
+		const pending = realWake(...args);
+		requests.push(pending);
+		return pending;
+	});
+	const runs = await observeRunStarts();
+	const first = inbox.wakeInboxIfEligible("child");
+	try {
+		await observed.promise;
+		await deliverTeamMessage(
+			"child",
+			{
+				delivery: value,
+				fromId: "sender",
+				fromTitle: "Sender",
+				fromType: "general",
+				text: value.text,
+				timestamp: time,
+				isBroadcast: false,
+			},
+			"parent",
+		);
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toBe(first);
+		expect(runs.calls).toHaveLength(0);
+		expect(await inbox.listInboxRows("child", ["agent_message"])).toHaveLength(1);
+		release.resolve();
+		expect(await first).toBe(true);
+		expect(runs.calls).toHaveLength(1);
+		expect(runs.calls[0]).toMatchObject({ narratorId: "child", text: "" });
+		expect(childMessages().some((message) => message.contentText?.includes(value.text))).toBe(true);
+		expect(await inbox.listInboxRows("child", ["agent_message"])).toHaveLength(0);
+	} finally {
+		release.resolve();
+		await first;
+		runs.restore();
+		wakeCalls.mockRestore();
+		probe.mockRestore();
+	}
+});
+
 test("broadcast-only inbox never authorizes a wake, regardless of persisted recipient status", async () => {
 	for (const status of ["idle", "working", "waiting"] as const) {
 		for (const id of ["parent", "child"]) {
@@ -607,9 +708,19 @@ test("explicit Send and user input behind a broadcast still authorize the correc
 		expect(await inbox.hasWakeEligibleInboxInput("parent")).toBe(true);
 		expect(await inbox.wakeInboxIfEligible("parent")).toBe(true);
 		expect(continuation).toHaveBeenCalledTimes(1);
+		expect(continuation).toHaveBeenLastCalledWith("parent", undefined, false, {
+			resumeStopped: undefined,
+		});
+		expect(await inbox.wakeInboxIfEligible("parent", "zh-CN")).toBe(true);
+		expect(continuation).toHaveBeenLastCalledWith("parent", "zh-CN", false, {
+			resumeStopped: undefined,
+		});
 		await enqueueBufferedMessage("parent", "explicit user");
 		expect(await inbox.wakeInboxIfEligible("parent")).toBe(true);
 		expect(buffered).toHaveBeenCalledTimes(1);
+		expect(buffered).toHaveBeenLastCalledWith("parent", undefined);
+		expect(await inbox.wakeInboxIfEligible("parent", "en")).toBe(true);
+		expect(buffered).toHaveBeenLastCalledWith("parent", "en");
 	} finally {
 		continuation.mockRestore();
 		buffered.mockRestore();
@@ -619,7 +730,7 @@ test("explicit Send and user input behind a broadcast still authorize the correc
 test("broadcast arriving during the publication barrier cannot authorize a deferred wake", async () => {
 	const { runtimePublication } = await import("../agent-runtime/publication");
 	let publication: ReturnType<typeof inbox.enqueueInboxAgent> | undefined;
-	const flush = spyOn(runtimePublication, "flushRecipient").mockImplementation((id) => {
+	const flush = spyOn(runtimePublication, "flushRecipient").mockImplementation(async (id) => {
 		const d = delivery(id);
 		// SQLite admission commits synchronously; the facade wraps that result in a Promise.
 		publication = inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
@@ -671,7 +782,7 @@ test("source receipt is mandatory; exact retry returns original navigation and n
 	const retry = { ...d, recipientMessageId: "discarded-new-id", text: "x".repeat(300_000) };
 	expect((await inbox.enqueueInboxAgent(retry, retry.text)).status).toBe("duplicate");
 	expect(retry.recipientMessageId).toBe(d.recipientMessageId);
-	expect(inbox.runtimeInbox.list("child")).toHaveLength(1);
+	expect(await inbox.runtimeInbox.list("child")).toHaveLength(1);
 	await expect(
 		inbox.enqueueInboxAgent({ ...d, senderToolCallBinding: undefined }, d.text),
 	).rejects.toThrow("receipt");
@@ -695,8 +806,8 @@ test("user barrier and editing are shared; agent messages cannot be edited throu
 		await inbox.claimInboxHead("child", (row) => row.kind === "agent_message"),
 	).toBeUndefined();
 	expect(await updateBufferedMessage("child", agentInput.id, "forged user")).toBe(false);
-	expect(getBufferedMessages("child").map((m) => m.id)).toEqual([user.id]);
-	clearBufferedMessages("child");
+	expect((await getBufferedMessages("child")).map((m) => m.id)).toEqual([user.id]);
+	await clearBufferedMessages("child");
 	expect(state(user.id)?.state).toBe("cancelled");
 	expect(state(agentInput.id)?.state).toBe("queued");
 	expect((await inbox.claimInboxHead("child", () => true))?.claimEpoch).toBe(owner?.epoch);
@@ -960,7 +1071,7 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	]);
 	expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
 	expect(state(row.id)).toMatchObject({ state: "materialized", adoptedAt: null });
-	projected.onConsumed();
+	await projected.onConsumed();
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(state(row.id)?.adoptedAt).not.toBeNull();
 	expect(state(row.id)?.adoptedRevision).toBe(1);
@@ -1394,7 +1505,7 @@ for (const shape of ["delegated", "unrelated"] as const) {
 				queuedAfterFailure = (await inbox.listInboxRows("child", ["agent_message"])).length;
 				const prepared = await input.config.getAfterToolsInjections?.();
 				texts.push(text(prepared));
-				if (typeof prepared !== "string") prepared?.onConsumed?.();
+				if (typeof prepared !== "string") await prepared?.onConsumed?.();
 				texts.push(text(await input.config.getAfterToolsInjections?.()));
 				principalDuringPass = input.config.userId;
 				return { finalText: "done", hasError: false, shouldUpdateTitle: false };

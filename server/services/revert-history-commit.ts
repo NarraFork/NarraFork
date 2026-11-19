@@ -15,16 +15,13 @@ import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-
 import { getTableColumns } from "drizzle-orm";
 import { type BunSQLiteDatabase, SQLiteBunTransaction } from "drizzle-orm/bun-sqlite";
 import { narratorBufferedMessages, narratorMessages, narratorToolCalls } from "../db/schema";
+import { readDomainTask, readNativeRows } from "../db/worker-read";
 import { connectCompiledWorker } from "../lib/compiled-worker";
+import type { ReadBind } from "../lib/db-worker/protocol";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
-import {
-	bodyLengthSql,
-	boundedBodyText,
-	hasBlockStorage,
-	hasRowsOnlyBodies,
-} from "../lib/narrator-bodies";
+import { bodyLengthSql, hasBlockStorage, hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import type { WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../lib/worker-runtime/pool";
@@ -466,15 +463,26 @@ export class RevertHistoryCommitService {
 		await yieldToEventLoop(0);
 		this.check(work);
 	}
-	private one<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): T {
-		this.check(work);
-		const row = this.root.query<T, SQLQueryBindings[]>(text).get(...values);
+	private async one<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): Promise<T> {
+		const row = (await this.rows<T>(work, text, values))[0];
 		if (!row) throw fail("STALE", "A fixed row disappeared");
 		return row;
 	}
-	private rows<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): T[] {
+	private async rows<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): Promise<T[]> {
 		this.check(work);
-		return this.root.query<T, SQLQueryBindings[]>(text).all(...values);
+		const binds = values.map((value): ReadBind => {
+			if (value === null || typeof value !== "object") return value;
+			if (ArrayBuffer.isView(value))
+				return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+			throw fail("INVALID_BINDING", "History reads require positional scalar or binary bindings");
+		});
+		const rows = await readNativeRows<T>(this.root, text, binds, {
+			executionPolicy: "worker-required",
+			signal: work.signal,
+			timeoutMs: FILE_CHANGE_LIMITS.planLifetimeMs,
+		});
+		this.check(work);
+		return rows;
 	}
 	private async page<T>(
 		work: Snapshot,
@@ -487,7 +495,7 @@ export class RevertHistoryCommitService {
 		let cursor = 0;
 		for (;;) {
 			this.check(work);
-			const rows = this.rows<T & { cursor: number }>(
+			const rows = await this.rows<T & { cursor: number }>(
 				work,
 				`${select} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
 				[target, cursor, PAGE + 1],
@@ -550,7 +558,7 @@ export class RevertHistoryCommitService {
 			capture(
 				authorizationRows,
 				id,
-				this.one<Row>(
+				await this.one<Row>(
 					work,
 					"SELECT id,owner_user_id,visibility,write_audience,type,acl_root_narrator_id,context_project_id,parent_narrator_id,origin_tool_call_id FROM narrators WHERE id=? LIMIT 1",
 					[id],
@@ -604,12 +612,12 @@ export class RevertHistoryCommitService {
 				);
 			affected.add(id);
 		};
-		const refFor = (id: string) =>
+		const refFor = async (id: string) =>
 			refRows.get(id) ??
 			capture(
 				refRows,
 				id,
-				this.one<Ref>(
+				await this.one<Ref>(
 					work,
 					"SELECT id,narrator_id,message_id,seq,segment_compact_id,is_compact FROM narrator_message_refs WHERE id=? LIMIT 1",
 					[id],
@@ -646,7 +654,7 @@ export class RevertHistoryCommitService {
 			// remain deferred until every full-row admission check has passed.
 			// A removed message's body is fixed by `fixedBody` and its size as readers
 			// measure it.
-			const observed = this.one<Row & { ftsBytes: number; rowBytes: number }>(
+			const observed = await this.one<Row & { ftsBytes: number; rowBytes: number }>(
 				work,
 				`SELECT id,role,tree_hash_after,snapshot_commit_sha,coalesce(octet_length(content_text),0) AS ftsBytes,${whole ? fixedBody.map(quote).join(",") : `${rowLength(stored.message)} AS rowBytes`} FROM narrator_messages m WHERE id=?${whole ? ` AND ${bodyLengthSql("m", bodiesFromBlocks(this.root))}=?` : ""} LIMIT 1`,
 				whole ? [message.id, message.contentBytes] : [message.id],
@@ -656,7 +664,7 @@ export class RevertHistoryCommitService {
 			bound(indexBytes, FILE_CHANGE_LIMITS.blobBytes, "search-index source bytes");
 			if (!whole) messageSizes.set(message.id, reserveRow(observed.rowBytes));
 			addAffected(message.narratorId);
-			const ref = refFor(message.refId);
+			const ref = await refFor(message.refId);
 			if (
 				ref.message_id !== message.id ||
 				ref.narrator_id !== message.narratorId ||
@@ -665,7 +673,7 @@ export class RevertHistoryCommitService {
 			)
 				throw fail("STALE", "The fixed owner ref changed");
 			patchRef(ref).remove = message.action === "delete" || message.action === "unlink";
-			const { shared } = this.one<{ shared: number }>(
+			const { shared } = await this.one<{ shared: number }>(
 				work,
 				"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_message WHERE message_id=? AND narrator_id!=?) AS shared",
 				[message.id, message.narratorId],
@@ -691,7 +699,7 @@ export class RevertHistoryCommitService {
 				if (!action)
 					throw fail("MANIFEST_INVALID", "A message tool is absent from the fixed manifest");
 				if (action === "copy") {
-					const size = this.one<{ id: string; rowBytes: number }>(
+					const size = await this.one<{ id: string; rowBytes: number }>(
 						work,
 						`SELECT id,${rowLength(stored.tool)} AS rowBytes FROM narrator_tool_calls WHERE id=? LIMIT 1`,
 						[tool.id],
@@ -703,7 +711,7 @@ export class RevertHistoryCommitService {
 			if (message.action === "rewrite" || message.action === "copy_on_write") {
 				// Partial compact edits/COW would have to retarget other hidden refs, an action
 				// the current collector does not authorize. Do not guess a larger selection.
-				const { hidden } = this.one<{ hidden: number }>(
+				const { hidden } = await this.one<{ hidden: number }>(
 					work,
 					"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=?) AS hidden",
 					[message.id],
@@ -716,7 +724,7 @@ export class RevertHistoryCommitService {
 					);
 			}
 			if (message.action === "unlink") {
-				const { hidden } = this.one<{ hidden: number }>(
+				const { hidden } = await this.one<{ hidden: number }>(
 					work,
 					"SELECT EXISTS(SELECT 1 FROM narrator_message_refs INDEXED BY idx_narrator_refs_segment_compact WHERE segment_compact_id=? AND narrator_id=?) AS hidden",
 					[message.id, message.narratorId],
@@ -790,7 +798,7 @@ export class RevertHistoryCommitService {
 				for (const e of edges) patch[e.column] = null;
 				narratorPatches.set(edge.id, patch);
 			} else if (edge.table === "narrator_message_refs") {
-				const ref = refFor(edge.id);
+				const ref = await refFor(edge.id);
 				addAffected(ref.narrator_id);
 				patchRef(ref).patch.segment_compact_id = null;
 			} else if (edge.table !== "narrator_question_events") {
@@ -835,7 +843,7 @@ export class RevertHistoryCommitService {
 			inboxIds,
 		);
 		for (const id of affected) {
-			const narrator = this.one<Narrator>(
+			const narrator = await this.one<Narrator>(
 				work,
 				"SELECT id,message_version,fork_message_id FROM narrators WHERE id=? LIMIT 1",
 				[id],
@@ -855,7 +863,7 @@ export class RevertHistoryCommitService {
 				message.action === "copy_on_write"
 					? stored.message
 					: ["id", "role", "tree_hash_after", "snapshot_commit_sha", ...fixedBody];
-			const row = this.one<Row>(
+			const row = await this.one<Row>(
 				work,
 				`SELECT ${columns.map(quote).join(",")},coalesce(octet_length(content_text),0) AS ftsBytes,${rowLength(stored.message)} AS rowBytes FROM narrator_messages WHERE id=? AND ${rowLength(stored.message)}=? LIMIT 1`,
 				[id, bytes],
@@ -863,17 +871,24 @@ export class RevertHistoryCommitService {
 			capture(messageRows, id, row);
 			// The body as readers read it (its rows when they hold it), at the size selected.
 			this.check(work);
-			const text = boundedBodyText(this.root, id, bodiesFromBlocks(this.root), {
-				exactBytes: message.contentBytes,
-				maxBytes: FILE_CHANGE_LIMITS.historyCowBytes,
-			});
+			const bodyRows = await readDomainTask(
+				this.root,
+				"narratorBodyTexts",
+				{
+					entries: [
+						{ id, exactBytes: message.contentBytes, maxBytes: FILE_CHANGE_LIMITS.historyCowBytes },
+					],
+				},
+				{ executionPolicy: "worker-required", signal: work.signal, timeoutMs: this.timeoutMs },
+			);
+			const text = bodyRows.find((body) => body.id === id)?.body ?? undefined;
 			if (text === undefined) throw fail("STALE", "A selected message body changed");
 			bodies.set(id, row);
 			bodyTexts.set(id, text);
 			await this.pause(work);
 		}
 		for (const [id, bytes] of toolSizes) {
-			const copy = this.one<Row>(
+			const copy = await this.one<Row>(
 				work,
 				`SELECT ${stored.tool.map(quote).join(",")},octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,${rowLength(stored.tool)} AS rowBytes FROM narrator_tool_calls WHERE id=? AND ${rowLength(stored.tool)}=? LIMIT 1`,
 				[id, bytes],
@@ -1052,7 +1067,7 @@ export class RevertHistoryCommitService {
 			let minSeq = selector.kind === "from_seq" ? selector.minSeq : -Number.MAX_SAFE_INTEGER;
 			let retainedBoundary = 0;
 			if (selector.kind === "after_block") {
-				const boundary = this.one<Ref>(
+				const boundary = await this.one<Ref>(
 					work,
 					"SELECT id,narrator_id,message_id,seq,segment_compact_id,is_compact FROM narrator_message_refs WHERE narrator_id=? AND message_id=? LIMIT 1",
 					[selection.narratorId, selector.messageId],
@@ -1136,7 +1151,7 @@ export class RevertHistoryCommitService {
 		for (let i = 0; i < changes.length; i++) {
 			const change = changes[i];
 			const { ref } = change;
-			const rows = this.rows<RecipientMailbox>(
+			const rows = await this.rows<RecipientMailbox>(
 				work,
 				"SELECT id,narrator_id,recipient_ref_id,state,source_narrator_id,current_revision,content_revision FROM narrator_buffered_messages INDEXED BY idx_nbm_ref WHERE narrator_id=? AND recipient_ref_id=? AND state='materialized' LIMIT ?",
 				[ref.narrator_id, ref.id, PAGE + 1],
@@ -1161,13 +1176,15 @@ export class RevertHistoryCommitService {
 		// or body. A missing narrator is a fixed empty target, as the helper's inArray skip.
 		const refreshed = new Set<string>();
 		const seen = new Set<string>();
-		const resolve = (id: string) => {
+		const resolve = async (id: string) => {
 			if (seen.has(id)) return sources.get(id);
 			seen.add(id);
-			const row = this.rows<SourceNarrator>(
-				work,
-				"SELECT id,type,parent_narrator_id FROM narrators WHERE id=? LIMIT 1",
-				[id],
+			const row = (
+				await this.rows<SourceNarrator>(
+					work,
+					"SELECT id,type,parent_narrator_id FROM narrators WHERE id=? LIMIT 1",
+					[id],
+				)
 			)[0];
 			sourceTargets.push({ row: { source_id: id }, count: row ? 1 : 0 });
 			if (!row) return undefined;
@@ -1176,9 +1193,9 @@ export class RevertHistoryCommitService {
 			return row;
 		};
 		for (const row of updated) {
-			const source = row.source_narrator_id ? resolve(row.source_narrator_id) : undefined;
+			const source = row.source_narrator_id ? await resolve(row.source_narrator_id) : undefined;
 			if (source?.type === "subagent" && source.parent_narrator_id)
-				resolve(source.parent_narrator_id);
+				await resolve(source.parent_narrator_id);
 			bound(seen.size, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "receipt source narrators");
 		}
 		// Owners already in this program get exactly one CAS increment of their own.
@@ -1259,8 +1276,8 @@ export class RevertHistoryCommitService {
 				cursor: row.eventCursor,
 			});
 		};
-		const read = <T>(text: string, values: SQLQueryBindings[]) => {
-			const rows = this.rows<T>(work, text, values);
+		const read = async <T>(text: string, values: SQLQueryBindings[]) => {
+			const rows = await this.rows<T>(work, text, values);
 			bound(rows.length, QUESTION_HISTORY_LIMIT, "question candidates");
 			return rows;
 		};
@@ -1287,7 +1304,7 @@ export class RevertHistoryCommitService {
 			for (const tool of toolsByMessage.get(message.id) ?? []) {
 				if (!whole && !removedBlocks.get(message.id)?.has(tool.tool_use_id)) continue;
 				const physical = Number(deletedTools.has(tool.id));
-				const rows = read<QuestionHistoryRow>(
+				const rows = await read<QuestionHistoryRow>(
 					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_tool_call WHERE q.tool_call_id=? AND (q.narrator_id=? OR ?=1) LIMIT ?`,
 					[tool.id, message.narratorId, physical, QUESTION_HISTORY_LIMIT + 1],
 				);
@@ -1305,7 +1322,7 @@ export class RevertHistoryCommitService {
 				ids.add(message.id);
 				deletedByOwner.set(message.narratorId, ids);
 				const physical = Number(message.action === "delete");
-				const events = read<EventCandidate>(
+				const events = await read<EventCandidate>(
 					`SELECT ${QUESTION_HISTORY_COLUMNS},e.message_id AS eventMessageId,e.rowid AS eventCursor FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? AND (q.narrator_id=? OR ?=1) LIMIT 1`,
 					[message.id, message.narratorId, physical],
 				);
@@ -1314,7 +1331,7 @@ export class RevertHistoryCommitService {
 					count: events.length,
 				});
 				for (const row of events) addEvent(row);
-				const answers = read<QuestionHistoryRow>(
+				const answers = await read<QuestionHistoryRow>(
 					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_answer_message WHERE q.narrator_id=? AND q.answer_message_id=? LIMIT ?`,
 					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
 				);
@@ -1330,7 +1347,7 @@ export class RevertHistoryCommitService {
 		// explicit manifest path and its ACL check rather than guessing ownership.
 		for (const edge of selection.history.associations) {
 			if (edge.table === "narrator_questions") {
-				const row = this.one<QuestionHistoryRow>(
+				const row = await this.one<QuestionHistoryRow>(
 					work,
 					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q WHERE q.id=? LIMIT 1`,
 					[edge.id],
@@ -1338,7 +1355,7 @@ export class RevertHistoryCommitService {
 				add(row, true);
 				physicallyDeleted.add(row.id);
 			} else if (edge.table === "narrator_question_events") {
-				const row = this.one<EventCandidate>(
+				const row = await this.one<EventCandidate>(
 					work,
 					`SELECT ${QUESTION_HISTORY_COLUMNS},e.message_id AS eventMessageId,e.rowid AS eventCursor FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? LIMIT 1`,
 					[edge.id],
@@ -1377,7 +1394,9 @@ export class RevertHistoryCommitService {
 				// Bind the preflight to this exact PK, insertion order and byte count before
 				// materializing resolution_json. Equal length is admission, not equality:
 				// capture the actual full value for the subsequent commit check.
-				const event = this.one<QuestionHistoryEvent & { cursor: number; resolutionBytes: number }>(
+				const event = await this.one<
+					QuestionHistoryEvent & { cursor: number; resolutionBytes: number }
+				>(
 					work,
 					"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor,coalesce(octet_length(resolution_json),0) AS resolutionBytes FROM narrator_question_events WHERE question_id=? AND message_id=? AND rowid=? AND coalesce(octet_length(resolution_json),0)=? LIMIT 1",
 					[question.id, size.message_id, size.cursor, size.resolutionBytes],
@@ -1403,7 +1422,7 @@ export class RevertHistoryCommitService {
 			])) {
 				const key = JSON.stringify([question.narrator_id, eventId]);
 				if (inboxTargets.has(key)) continue;
-				const rows = this.rows<QuestionHistoryInboxRow>(
+				const rows = await this.rows<QuestionHistoryInboxRow>(
 					work,
 					"SELECT id,narrator_id,recipient_message_id FROM narrator_buffered_messages INDEXED BY idx_nbm_reserved WHERE narrator_id=? AND recipient_message_id=? AND kind='task_notice' AND source_key=? LIMIT ?",
 					[question.narrator_id, eventId, `question-answer:${eventId}`, QUESTION_HISTORY_LIMIT + 1],

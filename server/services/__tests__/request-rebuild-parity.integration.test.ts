@@ -14,16 +14,12 @@
  * the network call is scripted.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drizzle } from "drizzle-orm/bun-sqlite";
 import { z } from "zod";
-import { cleanDb, getTestDb } from "../../../tests/setup";
-import { openSchemaCopyAt } from "../../../tests/sqlite-schema-image";
-import * as relations from "../../db/relations";
-import * as schema from "../../db/schema";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, users } from "../../db/schema";
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import { GeminiInteractionsProvider } from "../../lib/agent/gemini-interactions-provider";
@@ -32,19 +28,16 @@ import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "../../lib/agent/provider";
 import { setUploadsDirForTests } from "../../lib/uploads";
 
-const databaseRoot = mkdtempSync(join(tmpdir(), "nf-parity-database-"));
-const template = getTestDb();
-const sqlite = openSchemaCopyAt(template.sqlite, join(databaseRoot, "parity.sqlite"));
-// Schema images omit triggers; retain the migrated fixture's real history/queue behavior.
-for (const trigger of template.sqlite
-	.query<{ sql: string }, []>(
-		"SELECT sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL",
-	)
-	.all())
-	sqlite.exec(trigger.sql);
-template.sqlite.close();
-sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 100");
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
+
+// Preserve real history/queue triggers while sharing committed WAL pages with workers.
+const fixture = getRuntimeTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
@@ -52,7 +45,7 @@ const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { settings } = await import("../../lib/settings");
 const { startNarratorRun } = await import("../agent-runtime/run");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
-const { activeNarrators } = await import("../narrator-session-state");
+const { activeNarrators, requestPlanModePromptRebuild } = await import("../narrator-session-state");
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const { clearModelHistorySourceCacheForTest } = await import(
 	"../agent-runtime/model-history-source"
@@ -209,6 +202,7 @@ beforeEach(() => {
 		.run();
 });
 afterEach(async () => {
+	await drainRuntimeTestWork();
 	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	getExecutionOwner(NARRATOR)?.release();
 	activeNarrators.delete(NARRATOR);
@@ -216,14 +210,13 @@ afterEach(async () => {
 	rmSync(cwd, { recursive: true, force: true });
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	unregister();
 	toolRegistry.unregister(TOOL);
 	toolRegistry.unregister(IMAGE_TOOL);
 	clearModelHistorySourceCacheForTest();
 	mock.module("../../db", () => realDb);
-	sqlite.close();
-	rmSync(databaseRoot, { recursive: true, force: true });
 });
 
 function call(id: string, value: string): ParsedStreamEvent {
@@ -284,6 +277,27 @@ const IMAGE_RESULT_PROTOCOLS = new Set([
 	"parity-responses",
 	"parity-interactions",
 ]);
+
+test("system-prompt rebuilding receives a fresh budget after a long model turn", async () => {
+	const nativeNow = Date.now.bind(Date);
+	let offset = 0;
+	const clock = spyOn(Date, "now").mockImplementation(() => nativeNow() + offset);
+	script = (index) => {
+		if (index === 0) {
+			offset = 31_000;
+			expect(requestPlanModePromptRebuild(NARRATOR)).toBe(true);
+			return [call("long_call", "long turn")];
+		}
+		return [{ text: "Finished with the refreshed system prompt." }];
+	};
+	try {
+		await run("parity-relay");
+		expect(captured).toHaveLength(2);
+		expect(JSON.stringify(captured[1]?.history)).toContain("probed long turn");
+	} finally {
+		clock.mockRestore();
+	}
+});
 
 describe.each(modes)("$name", ({ prefix }) => {
 	test("each request extends the previous one and a rebuild reproduces it", async () => {

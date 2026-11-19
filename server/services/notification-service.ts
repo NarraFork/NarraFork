@@ -1,11 +1,13 @@
 import { db } from "@server/db";
 import { narrators, userPreferences, users } from "@server/db/schema";
 import { ForbiddenError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { readQuery } from "../db/worker-read";
 import {
 	judgeNarratorAccessBatch,
 	listNarratorAudience,
@@ -31,31 +33,34 @@ async function findNotificationUser(target: NotificationTarget, credentials: boo
 		throw new Error("Specify exactly one of user_id or username");
 	}
 	if (!(target.user_id ?? target.username)?.trim()) throw new Error("User identifier is required");
-	const [user] = await db
-		.select({
-			user_id: users.id,
-			username: users.username,
-			dingtalkEnabled: userPreferences.notifyDingtalkEnabled,
-			dingtalkConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyDingtalkWebhook})), 0) > 0`,
-			feishuEnabled: userPreferences.notifyFeishuEnabled,
-			feishuConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyFeishuWebhook})), 0) > 0`,
-			...(credentials
-				? {
-						dingtalkWebhook: userPreferences.notifyDingtalkWebhook,
-						dingtalkSecret: userPreferences.notifyDingtalkSecret,
-						feishuWebhook: userPreferences.notifyFeishuWebhook,
-						feishuSecret: userPreferences.notifyFeishuSecret,
-					}
-				: {}),
-		})
-		.from(users)
-		.leftJoin(userPreferences, eq(users.id, userPreferences.userId))
-		.where(
-			target.user_id !== undefined
-				? eq(users.id, target.user_id)
-				: eq(users.username, target.username as string),
-		)
-		.limit(1);
+	const [user] = await readQuery(
+		db
+			.select({
+				user_id: users.id,
+				username: users.username,
+				dingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+				dingtalkConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyDingtalkWebhook})), 0) > 0`,
+				feishuEnabled: userPreferences.notifyFeishuEnabled,
+				feishuConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyFeishuWebhook})), 0) > 0`,
+				...(credentials
+					? {
+							dingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+							dingtalkSecret: userPreferences.notifyDingtalkSecret,
+							feishuWebhook: userPreferences.notifyFeishuWebhook,
+							feishuSecret: userPreferences.notifyFeishuSecret,
+						}
+					: {}),
+			})
+			.from(users)
+			.leftJoin(userPreferences, eq(users.id, userPreferences.userId))
+			.where(
+				target.user_id !== undefined
+					? eq(users.id, target.user_id)
+					: eq(users.username, target.username as string),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!user) throw new Error("User not found");
 	return user;
 }
@@ -87,15 +92,18 @@ export class NotificationSendForbiddenError extends ForbiddenError {
 async function assertNotificationSendAllowed(narratorId: string): Promise<void> {
 	// Explicit retry approval can bypass permissionHandler. Re-read the live hard
 	// ceiling here instead of trusting the authorization or mode of the first attempt.
-	const [narrator] = await db
-		.select({
-			permissionMode: narrators.permissionMode,
-			traits: narrators.traits,
-			relaxedPlan: narrators.relaxedPlan,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.limit(1);
+	const [narrator] = await readQuery(
+		db
+			.select({
+				permissionMode: narrators.permissionMode,
+				traits: narrators.traits,
+				relaxedPlan: narrators.relaxedPlan,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (
 		!narrator ||
 		narrator.permissionMode === "readOnly" ||
@@ -258,10 +266,13 @@ async function filterUsersWhoCanRead(
 	const audience = await listNarratorAudience(narrator);
 	if (audience.everyone) return candidateUserIds;
 	const allowed = new Set(audience.userIds);
-	const admins = await db
-		.select({ id: users.id })
-		.from(users)
-		.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)));
+	const admins = await readQuery(
+		db
+			.select({ id: users.id })
+			.from(users)
+			.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds))),
+		{ executionPolicy: "worker-required" },
+	);
 	for (const admin of admins) allowed.add(admin.id);
 	return candidateUserIds.filter((userId) => allowed.has(userId));
 }
@@ -274,10 +285,13 @@ async function filterUsersWhoCanWrite(
 	if (candidateUserIds.length === 0) return [];
 	const admins = new Set(
 		(
-			await db
-				.select({ id: users.id })
-				.from(users)
-				.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)))
+			await readQuery(
+				db
+					.select({ id: users.id })
+					.from(users)
+					.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds))),
+				{ executionPolicy: "worker-required", maxRows: candidateUserIds.length },
+			)
 		).map((admin) => admin.id),
 	);
 	const verdicts = await judgeNarratorAccessBatch(
@@ -297,9 +311,12 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
 	if (reason === "error") return;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) return;
 
 	const narratorTitle = narrator.title || narratorId;
@@ -351,20 +368,23 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	}> = [];
 	for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
 		notificationPrefs.push(
-			...(await db
-				.select({
-					userId: userPreferences.userId,
-					notifyOnDone: userPreferences.notifyOnDone,
-					notifyOnWaiting: userPreferences.notifyOnWaiting,
-					notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
-					notifyDingtalkWebhook: userPreferences.notifyDingtalkWebhook,
-					notifyDingtalkSecret: userPreferences.notifyDingtalkSecret,
-					notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
-					notifyFeishuWebhook: userPreferences.notifyFeishuWebhook,
-					notifyFeishuSecret: userPreferences.notifyFeishuSecret,
-				})
-				.from(userPreferences)
-				.where(inArray(userPreferences.userId, relevantUserIds.slice(offset, offset + 500)))),
+			...(await readQuery(
+				db
+					.select({
+						userId: userPreferences.userId,
+						notifyOnDone: userPreferences.notifyOnDone,
+						notifyOnWaiting: userPreferences.notifyOnWaiting,
+						notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+						notifyDingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+						notifyDingtalkSecret: userPreferences.notifyDingtalkSecret,
+						notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
+						notifyFeishuWebhook: userPreferences.notifyFeishuWebhook,
+						notifyFeishuSecret: userPreferences.notifyFeishuSecret,
+					})
+					.from(userPreferences)
+					.where(inArray(userPreferences.userId, relevantUserIds.slice(offset, offset + 500))),
+				{ executionPolicy: "worker-required" },
+			)),
 		);
 	}
 
@@ -408,17 +428,109 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 // "should I notify?" from raw status/substatus. Reflection mid-states and
 // takeover fallbacks never emit attention, so they can never leak an IM.
 
-eventBus.on("narrator:attention", (event) => {
+type AttentionEvent = Extract<NarraForkEvent, { type: "narrator:attention" }>;
+const backgroundWork = hotSafe("notification.automatic-work.v1", () => ({
+	stopped: false,
+	pending: new Set<Promise<void>>(),
+	failed: 0,
+	listener: undefined as ((event: AttentionEvent) => void) | undefined,
+}));
+const BACKGROUND_WORK_FAILED = "Notification background work failed";
+const BACKGROUND_WORK_TIMEOUT = "Notification background work did not drain before its deadline";
+
+function notificationAttentionListener(event: AttentionEvent): void {
+	if (backgroundWork.stopped) return;
 	// A turn that finished while its background work is still running is not
 	// worth an IM ping — the wake-up turn after the last background task
 	// completes emits a fresh, unflagged "done" which notifies normally. Hooks
 	// still observe the flagged event via the attention-hook-bridge.
 	// The reason check is defensive — the flag is only produced for done.
 	if (event.backgroundWorkActive && event.reason === "done") return;
-	handleAttention(event.narratorId, event.reason).catch((err) => {
-		logger.error("Notification handler error", {
-			narratorId: event.narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	});
-});
+	const work = handleAttention(event.narratorId, event.reason);
+	backgroundWork.pending.add(work);
+	void work.then(
+		() => backgroundWork.pending.delete(work),
+		(error) => {
+			backgroundWork.failed = Math.min(backgroundWork.failed + 1, Number.MAX_SAFE_INTEGER);
+			backgroundWork.pending.delete(work);
+			logger.error("Notification handler error", {
+				narratorId: event.narratorId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		},
+	);
+}
+
+// Replace the closure on hot reload without discarding in-flight handlers or reopening a stop.
+if (backgroundWork.listener) eventBus.off("narrator:attention", backgroundWork.listener);
+backgroundWork.listener = notificationAttentionListener;
+if (!backgroundWork.stopped) eventBus.on("narrator:attention", notificationAttentionListener);
+
+/** Content-free audit; failed handlers remain visible after their promises have settled. */
+export function getNotificationBackgroundWorkSnapshot(): {
+	stopped: boolean;
+	pending: number;
+	failed: number;
+} {
+	return {
+		stopped: backgroundWork.stopped,
+		pending: backgroundWork.pending.size,
+		failed: backgroundWork.failed,
+	};
+}
+
+/** Join whole automatic handlers, including reads or deliveries they start after an await. */
+export async function drainNotificationBackgroundWork(
+	options: { deadlineAt?: number } = {},
+): Promise<void> {
+	const deadlineAt = options.deadlineAt ?? Date.now() + 30_000;
+	if (!Number.isFinite(deadlineAt)) throw new Error("Invalid notification drain deadline");
+	while (backgroundWork.pending.size) {
+		const remaining = deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error(BACKGROUND_WORK_TIMEOUT);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...backgroundWork.pending]),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error(BACKGROUND_WORK_TIMEOUT)), remaining);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	if (backgroundWork.failed) throw new Error(BACKGROUND_WORK_FAILED);
+}
+
+/** Close automatic admission synchronously; manual send APIs remain available. */
+export function stopNotificationBackgroundWork(
+	options: { deadlineAt?: number } = {},
+): Promise<void> {
+	backgroundWork.stopped = true;
+	if (backgroundWork.listener) eventBus.off("narrator:attention", backgroundWork.listener);
+	return drainNotificationBackgroundWork(options);
+}
+
+/** Tests may acknowledge exact injected failures, but must really settle all work before rearming. */
+export async function resetNotificationBackgroundWorkForTests(
+	options: { deadlineAt?: number; expectedFailures?: number } = {},
+): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Notification reset is test-only");
+	const expectedFailures = options.expectedFailures ?? 0;
+	try {
+		await stopNotificationBackgroundWork(options);
+	} catch (error) {
+		if (
+			backgroundWork.pending.size ||
+			backgroundWork.failed !== expectedFailures ||
+			!(error instanceof Error && error.message === BACKGROUND_WORK_FAILED)
+		)
+			throw error;
+	}
+	if (backgroundWork.failed !== expectedFailures)
+		throw new Error("Unexpected notification background failure count");
+	backgroundWork.failed = 0;
+	backgroundWork.stopped = false;
+	eventBus.on("narrator:attention", notificationAttentionListener);
+}

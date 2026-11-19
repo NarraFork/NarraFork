@@ -130,7 +130,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	if (isOpaqueSessionToken(token)) {
 		let payload: SessionPayload;
 		try {
-			payload = await verifyToken(token);
+			payload = await verifyToken(token, { signal: c.req.raw.signal });
 		} catch (err) {
 			// Error names rather than `instanceof`, to survive duplicated module instances.
 			if (hasErrorName(err, "SessionTokenRevoked")) throw catalogError("SESSION_REVOKED");
@@ -151,7 +151,8 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	// Not a session token — an OAuth access token issued by NarraFork's own authorization
 	// server (third-party API clients), or nothing usable (including session JWTs from
 	// before opaque session tokens, which are simply no longer accepted).
-	const oauthGrant = await validateAccessToken(token).catch(() => null);
+	// Invalid credentials return null; storage and Worker failures must remain 5xx.
+	const oauthGrant = await validateAccessToken(token);
 	if (!oauthGrant) {
 		throw catalogError("TOKEN_INVALID");
 	}

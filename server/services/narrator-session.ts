@@ -43,6 +43,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
+import { readNativeRows, readQuery, readQueryFirst } from "../db/worker-read";
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -77,6 +78,7 @@ import {
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
+import { stallTimeBetween } from "../lib/event-loop-monitor";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
@@ -87,6 +89,7 @@ import {
 	saveUploadedMedia,
 	validateUploadedMedia,
 } from "../lib/media-uploads";
+import { ModelHistoryPreparation } from "../lib/model-history-preparation";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -143,6 +146,7 @@ import {
 	consumeMailboxDelivery,
 	type MailboxDeliveryConsumption,
 } from "./agent-message-delivery";
+import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
 	claimInboxHead,
@@ -346,7 +350,9 @@ export function registerPlannedUpdateRecoveryController(
 		if (control.interruptFinalizer) return control.interruptFinalizer;
 		const current = plannedUpdateRecoveryControls.get(narratorId);
 		if (current !== control || current.token !== token) return Promise.resolve();
-		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(token));
+		control.interruptFinalizer = withTrackedNarratorSessionCleanup(async () =>
+			control.onInterrupt?.(token),
+		);
 		return control.interruptFinalizer;
 	};
 	return {
@@ -369,7 +375,9 @@ function interruptPlannedUpdateRecovery(narratorId: string): {
 	if (!control) return { interrupted: false, foregroundSubagentIds: [] };
 	control.controller.abort(new Error("Narrator interrupted by user"));
 	if (!control.interruptFinalizer) {
-		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(control.token));
+		control.interruptFinalizer = withTrackedNarratorSessionCleanup(async () =>
+			control.onInterrupt?.(control.token),
+		);
 	}
 	void control.interruptFinalizer.catch((error) => {
 		logger.warn("Failed to finalize planned-update narrator interrupt", {
@@ -405,7 +413,7 @@ import {
 import {
 	bodyColumns,
 	contentJsonSql,
-	fillBodies,
+	fillBodiesAsync,
 	fillBody,
 	storedBodyBytesSql,
 } from "./narrator-body-reads";
@@ -426,6 +434,12 @@ import {
 	runCustomCompact,
 	triggerMidTurnCompact,
 } from "./narrator-compact";
+import { resolveNarratorFastMode } from "./narrator-fast-mode";
+import {
+	readNarratorMessageRow,
+	readNarratorMessageRows,
+	readNarratorToolRows,
+} from "./narrator-message-reader";
 import { handlePermission, resolvePermissionOrDangerReflection } from "./narrator-permission";
 import {
 	narratorPersistence,
@@ -653,10 +667,13 @@ export async function applySessionDefaultDevice(
  * lives in `narrator-project.ts` (single source of truth).
  */
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	return await resolveSharedNarratorProjectId(narrator);
 }
@@ -671,10 +688,13 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	 */
 	directories: import("@shared/workspace-directories").WorkspaceDirectoryMap;
 }> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { defaultDeviceId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { defaultDeviceId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const projectId = await resolveNarratorProjectId(narratorId);
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
@@ -1051,10 +1071,12 @@ export async function resumeNextBufferedMessage(
 	active: ActiveNarrator,
 	locale: Locale,
 ): Promise<void> {
-	const dispatch = await withNarratorStartAdmission(active.narratorId, () =>
-		resumeNextBufferedMessageUnlocked(active, locale),
-	);
-	await dispatch?.();
+	return withTrackedNarratorSessionWork(async () => {
+		const dispatch = await withNarratorStartAdmission(active.narratorId, () =>
+			resumeNextBufferedMessageUnlocked(active, locale),
+		);
+		await dispatch?.();
+	});
 }
 
 async function resumeNextBufferedMessageUnlocked(
@@ -1152,13 +1174,11 @@ async function resumeNextBufferedMessageUnlocked(
 			if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 				// Let this terminal command release its outer admission and wake promise
 				// before scheduling a later command that may run for minutes.
-				setImmediate(() => {
-					void wakeInboxIfEligible(narratorId, locale).catch((error) => {
-						logger.warn("Terminal command inbox wake failed", {
-							narratorId,
-							error: String(error),
-						});
-					});
+				withTrackedNarratorSessionWork(async () => {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					await wakeInboxIfEligible(narratorId, locale);
+				}).catch((error) => {
+					logger.warn("Terminal command inbox wake failed", { narratorId, error: String(error) });
 				});
 				return;
 			}
@@ -1335,7 +1355,9 @@ const continuationStartLock = { acquire: withNarratorStartAdmission };
 export async function ensureNarrator(
 	...args: Parameters<typeof ensureNarratorUnlocked>
 ): ReturnType<typeof ensureNarratorUnlocked> {
-	return withNarratorStartAdmission(args[0], () => ensureNarratorUnlocked(...args));
+	return withTrackedNarratorSessionWork(async () => {
+		return withNarratorStartAdmission(args[0], () => ensureNarratorUnlocked(...args));
+	});
 }
 
 async function ensureNarratorUnlocked(
@@ -1424,7 +1446,6 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
-		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -1483,9 +1504,12 @@ async function createNarrator(
 	await syncNarratorProjectLinksSafely(narrator.id);
 	const resolvedProjectId = await resolveSharedNarratorProjectId(narrator);
 	if (resolvedProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, resolvedProjectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, resolvedProjectId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!project) throw new NotFoundError("Project", resolvedProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
@@ -1729,22 +1753,22 @@ async function broadcastInterruptedPartialMessage(
 	partialId: string,
 ): Promise<void> {
 	try {
-		const fullMessage = fillBody(
-			await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, partialId),
-				...bodyColumns(),
-				with: { toolCalls: true },
-			}),
-		);
+		const fullMessage = await readNarratorMessageRow(partialId, {
+			includeTools: true,
+			includeCreator: false,
+		});
 		if (!fullMessage) return;
 
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, partialId),
-			),
-			columns: { seq: true },
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, partialId),
+				),
+				columns: { seq: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 
 		const processed = enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0];
 
@@ -1756,10 +1780,13 @@ async function broadcastInterruptedPartialMessage(
 				deliverTo?.toolUseId === fullMessage.parentToolUseId
 					? deliverTo.narratorId
 					: (
-							await db.query.narrators.findFirst({
-								where: eq(narrators.id, narratorId),
-								columns: { parentNarratorId: true },
-							})
+							await readQuery(
+								db.query.narrators.findFirst({
+									where: eq(narrators.id, narratorId),
+									columns: { parentNarratorId: true },
+								}),
+								{ executionPolicy: "worker-required" },
+							)
 						)?.parentNarratorId;
 			if (recipientId && recipientId !== narratorId) {
 				broadcastToNarrator(recipientId, {
@@ -1837,10 +1864,13 @@ export async function finalizeInterruptedRun(
 	}
 
 	try {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true, substatus: true },
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { status: true, substatus: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const currentSubstatus = parseSubstatus(current?.substatus);
 		if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
 			await narratorService.updateStatus(narratorId, "idle", {
@@ -2551,25 +2581,28 @@ async function deliverPendingInjectionsInOrder(
 					// A person's answer: the run that takes it up is theirs too (outline P2 PR 10c-2).
 					if (active) active._runPersonActed = true;
 					// Adopt the already persisted user receipt, never create a second message.
-					const ref = db
-						.select({ id: narratorMessageRefs.id })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, narratorId),
-								eq(narratorMessageRefs.messageId, questionAnswer.messageId),
-							),
-						)
-						.get();
+					const ref = await readQueryFirst(
+						db
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									eq(narratorMessageRefs.messageId, questionAnswer.messageId),
+								),
+							)
+							.limit(1),
+						{ executionPolicy: "worker-required" },
+					);
 					if (!ref) throw new Error("Question answer history reference no longer exists");
-					const adopted = runtimeInbox.materialize(inboxClaim(row), () => ({
+					const adopted = await runtimeInbox.materialize(inboxClaim(row), () => ({
 						messageId: questionAnswer.messageId,
 						refId: ref.id,
 					}));
 					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
 						// It arrived between the pre-pass drain and history read. The model
 						// already saw it; acknowledge the receipt, do not add a second copy.
-						consumeMailboxDelivery(inboxConsumption(adopted));
+						await consumeMailboxDelivery(inboxConsumption(adopted));
 						continue;
 					}
 					adoptedMailbox?.push(inboxConsumption(adopted));
@@ -2873,7 +2906,7 @@ export async function drainInjectionsIntoHistory(
 	text: string;
 	parts: AgentInputPart[];
 	lastInputWasMailbox: boolean;
-	onConsumed: () => void;
+	onConsumed: () => Promise<void>;
 }> {
 	const narratorId = active.narratorId;
 	// Every part is a persisted row. Unresolved questions are listed in the pass's system
@@ -3045,9 +3078,9 @@ export async function drainInjectionsIntoHistory(
 		lastInputWasMailbox: adoptedDeliveries.some(
 			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
 		),
-		onConsumed: () => {
-			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
-			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
+		onConsumed: async () => {
+			for (const delivery of adoptedDeliveries) await consumeAgentMessageDelivery(delivery);
+			for (const delivery of adoptedMailbox) await consumeMailboxDelivery(delivery);
 		},
 	};
 }
@@ -3146,7 +3179,10 @@ export interface ContextManagementOptions {
 		identity: RequestModelIdentity,
 	) => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
 	/** Refresh registry membership and explicit MCP server grants before every request. */
-	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
+	refreshToolLoading?: (
+		identity: RequestModelIdentity,
+		preparation?: ModelHistoryPreparation,
+	) => Promise<void>;
 	attachmentSignal?: AbortSignal;
 	/** Called after compact completes (e.g. mark transport restart without rotating cache identity). */
 	onCompactDone?: () => void;
@@ -3164,7 +3200,7 @@ export interface ContextManagementOptions {
 		compactMessageId?: string | null;
 	}>;
 	/** Compatibility path for callers not yet supplying named prompt parts. */
-	rebuildSystemPrompt?: () => Promise<string | null>;
+	rebuildSystemPrompt?: (preparation?: ModelHistoryPreparation) => Promise<string | null>;
 }
 
 /**
@@ -3221,55 +3257,86 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const signal = opts.attachmentSignal;
-		const preparedPrefix = await preparePrefixRequest({
+		const preparation = new ModelHistoryPreparation({
 			narratorId,
-			locale,
-			getReplyContext: opts.getReplyContext,
-			ensureRequestIdentity: opts.ensureRequestIdentity,
-			getModel,
-			getProvider,
-			signal,
-			getToolLoading: opts.getToolLoading,
-			refreshToolLoading: opts.refreshToolLoading,
-			buildPrefixPrompt: opts.buildPrefixPrompt,
+			kind: "rebuild",
+			signal: opts.attachmentSignal,
+			timeoutMs: null,
+			warn: (message, fields) => logger.warn(message, fields),
+			stallTimeBetween,
 		});
-		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
-		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
-		// The in-memory history is now rebuilt from the latest (post-compact)
-		// messages, so any pending-compact guard can be released.
-		clearActiveHistoryCompactPending(narratorId);
-		const result = await buildRuntimeHistory({
-			narratorId,
-			model: preparedPrefix.model,
-			provider: preparedPrefix.provider,
-			sourceMessages: rawMsgs,
-			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: signal,
-			toolLoading,
-		});
-		if (result.toolLoading && !result.toolCandidates) {
-			throw new Error("A tool-loading history rebuild must include tool candidates");
+		const { signal } = preparation;
+		try {
+			preparation.phase("epoch");
+			const collectPrefixPrompt = opts.buildPrefixPrompt;
+			const preparedPrefix = await preparePrefixRequest({
+				narratorId,
+				locale,
+				getReplyContext: opts.getReplyContext,
+				ensureRequestIdentity: opts.ensureRequestIdentity,
+				getModel,
+				getProvider,
+				signal,
+				preparation,
+				getToolLoading: opts.getToolLoading,
+				refreshToolLoading: async (identity) => {
+					preparation.phase("tools");
+					await opts.refreshToolLoading?.(identity, preparation);
+					preparation.check();
+				},
+				buildPrefixPrompt: collectPrefixPrompt
+					? async (identity, replyContext) => {
+							preparation.phase("systemPrompt");
+							const prompt = await collectPrefixPrompt(identity, replyContext, preparation);
+							preparation.check();
+							return prompt;
+						}
+					: undefined,
+			});
+			preparation.check();
+			const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
+			let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
+			// The in-memory history is now rebuilt from the latest (post-compact)
+			// messages, so any pending-compact guard can be released.
+			clearActiveHistoryCompactPending(narratorId);
+			const result = await buildRuntimeHistory({
+				narratorId,
+				model: preparedPrefix.model,
+				provider: preparedPrefix.provider,
+				sourceMessages: rawMsgs,
+				attachmentCwd: opts.getAttachmentCwd?.(),
+				attachmentSignal: signal,
+				preparation,
+				toolLoading,
+			});
+			if (result.toolLoading && !result.toolCandidates) {
+				throw new Error("A tool-loading history rebuild must include tool candidates");
+			}
+			if (!prefixPrompt && includeSystemPrompt) {
+				preparation.phase("systemPrompt");
+				systemPrompt = (await rebuildSystemPrompt?.(preparation)) ?? undefined;
+			}
+			preparation.check();
+			preparation.finish();
+			return {
+				history: result.history,
+				rows: result.modelMessages,
+				replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+				...(result.mediaFallbackWarnings?.length
+					? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+					: {}),
+				...(result.toolLoading
+					? {
+							toolLoading: result.toolLoading,
+							...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+						}
+					: {}),
+				...(systemPrompt !== undefined ? { systemPrompt } : {}),
+			};
+		} catch (error) {
+			preparation.finish(error);
+			throw error;
 		}
-		if (!prefixPrompt && includeSystemPrompt) {
-			systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
-		}
-		signal?.throwIfAborted();
-		return {
-			history: result.history,
-			rows: result.modelMessages,
-			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			...(result.mediaFallbackWarnings?.length
-				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
-				: {}),
-			...(result.toolLoading
-				? {
-						toolLoading: result.toolLoading,
-						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
-					}
-				: {}),
-			...(systemPrompt !== undefined ? { systemPrompt } : {}),
-		};
 	};
 
 	const onReasoningOnlyHighContext: NonNullable<
@@ -3439,48 +3506,133 @@ export async function runAgentLoop(
 		forTaskId?: string;
 	} = {},
 ): Promise<{ started: boolean }> {
-	const narratorId = active.narratorId;
-	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
-		recoveryStart?.resolveAdmission(false);
-		return { started: false };
-	}
-	const { startNarratorRun } = await import("./agent-runtime/run");
-	// Taken by the run when it starts (`runAgentLoopUnlocked`); a start that does not happen
-	// leaves nothing behind for the next run.
-	active._runInitiatedBy = initiatedBy;
-	active._runForTaskId = forTaskId;
-	const forget = () => {
-		if (active._loopRunning) return;
-		active._runInitiatedBy = undefined;
-		active._runForTaskId = undefined;
-	};
-	try {
-		const handle = await startNarratorRun({
-			narratorId,
-			locale: active.locale,
-			text,
-			images,
-			active,
-			...options,
-			...(recoveryStart ? { admission: recoveryStart } : {}),
-		});
-		if (!handle.started) {
-			forget();
+	return withTrackedNarratorSessionWork(async () => {
+		const narratorId = active.narratorId;
+		if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
+			recoveryStart?.resolveAdmission(false);
 			return { started: false };
 		}
-		await handle.completion;
-		return { started: true };
-	} catch (error) {
-		forget();
-		if (recoveryStart?.cancelled()) return { started: false };
-		if (!narratorLoopAdmissions.has(narratorId)) {
-			active._loopRunning = false;
-			active.alive = false;
+		const { startNarratorRun } = await import("./agent-runtime/run");
+		// Taken by the run when it starts (`runAgentLoopUnlocked`); a start that does not happen
+		// leaves nothing behind for the next run.
+		active._runInitiatedBy = initiatedBy;
+		active._runForTaskId = forTaskId;
+		const forget = () => {
+			if (active._loopRunning) return;
+			active._runInitiatedBy = undefined;
+			active._runForTaskId = undefined;
+		};
+		try {
+			const handle = await startNarratorRun({
+				narratorId,
+				locale: active.locale,
+				text,
+				images,
+				active,
+				...options,
+				...(recoveryStart ? { admission: recoveryStart } : {}),
+			});
+			if (!handle.started) {
+				forget();
+				return { started: false };
+			}
+			await handle.completion;
+			return { started: true };
+		} catch (error) {
+			forget();
+			if (isCheckpointStop(error) && error.identity.narratorId === narratorId)
+				return { started: true };
+			if (recoveryStart?.cancelled()) return { started: false };
+			if (!narratorLoopAdmissions.has(narratorId)) {
+				active._loopRunning = false;
+				active.alive = false;
+			}
+			throw error;
+		} finally {
+			recoveryStart?.resolveAdmission(false);
 		}
-		throw error;
-	} finally {
-		recoveryStart?.resolveAdmission(false);
+	});
+}
+
+const pendingNarratorSessionTails = new Set<Promise<unknown>>();
+let narratorSessionFinalizerFailures = 0;
+let firstNarratorSessionFinalizerFailure: unknown;
+
+function trackNarratorSessionTail<T>(work: Promise<T>): Promise<T> {
+	pendingNarratorSessionTails.add(work);
+	const settled = () => pendingNarratorSessionTails.delete(work);
+	void work.then(settled, settled);
+	return work;
+}
+
+function withTrackedNarratorSessionWork<T>(fn: () => Promise<T>): Promise<T> {
+	let fulfill!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const work = new Promise<T>((resolve, fail) => {
+		fulfill = resolve;
+		reject = fail;
+	});
+	trackNarratorSessionTail(work);
+	try {
+		void fn().then(fulfill, reject);
+	} catch (error) {
+		reject(error);
 	}
+	return work;
+}
+
+function withTrackedNarratorSessionCleanup<T>(fn: () => Promise<T>): Promise<T> {
+	return withTrackedNarratorSessionWork(async () => {
+		try {
+			return await fn();
+		} catch (error) {
+			if (!(error instanceof AppError && error.code === "NARRATOR_REVERT_IN_PROGRESS")) {
+				narratorSessionFinalizerFailures++;
+				firstNarratorSessionFinalizerFailure ??= error;
+			}
+			throw error;
+		}
+	});
+}
+
+export function getNarratorSessionTailStatus(): { pending: number; failed: number } {
+	return { pending: pendingNarratorSessionTails.size, failed: narratorSessionFinalizerFailures };
+}
+
+export async function drainNarratorSessionTails(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	options.signal?.throwIfAborted();
+	while (pendingNarratorSessionTails.size > 0) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator session tail drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingNarratorSessionTails]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Narrator session tail drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(
+						() => reject(new Error("Narrator session tail drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (narratorSessionFinalizerFailures)
+		throw new Error("Narrator session finalization failed", {
+			cause: firstNarratorSessionFinalizerFailure,
+		});
 }
 
 // === Message feeding ===
@@ -3489,10 +3641,13 @@ export async function runAgentLoop(
 export async function readSessionDeliverTo(
 	narratorId: string,
 ): Promise<import("../lib/validators/runtime-registration").RunDeliverTo | undefined> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { runtimeRegistrationJson: true },
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { runtimeRegistrationJson: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return row ? runDeliverToOf(row) : undefined;
 }
 
@@ -3559,304 +3714,315 @@ async function feedMessageUnlocked(
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
-	const recoveryStart = internalOptions?.recoveryStart;
-	recoveryStart?.check();
-	let acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	recoveryStart?.check();
-	// Final guard against a concurrent loop slipping past the route-level admission
-	// check (which should have buffered this message). ensureNarrator reuses the live
-	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
-	// Throw BEFORE persisting the user message so we never leave a half-applied turn.
-	const ownedBufferedInput = internalOptions?.bufferedOwner?.isCurrent() === true;
-	if (
-		(ownedBufferedInput ? active._loopRunning === true : isLoopRunning(narratorId)) ||
-		(!ownedBufferedInput && isNarratorRuntimeBusy(narratorId))
-	) {
-		logger.warn("feedMessage blocked: loop already running", { narratorId });
-		// Correct a stale idle status so the user regains the interrupt button.
-		await reconcileRunningStatus(narratorId);
-		throw new ValidationError("Narrator is already running");
-	}
-	active._continuationSuppressed = false;
-	active._continuationStallCount = 0;
-	active._continuationStallKey = undefined;
-	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
-	if (userId !== undefined) active._currentUserId = userId;
-	// Open the one-shot behavior-fence edit window for this user turn. It is consumed by the
-	// first behavior_fence write and cleared once the first tool call completes, so the agent
-	// can only record a fence on its first tool call and only when the user asked for it.
-	grantBehaviorFenceEdit(narratorId);
-
-	const inputOwner = internalOptions?.bufferedOwner ?? tryClaimExecution(narratorId, "tool-replay");
-	if (!inputOwner?.isCurrent())
-		throw new ValidationError("Narrator input is already being adopted");
-	let claimedInput: RuntimeMailboxRow | undefined;
-	let stagingId: string | undefined;
-	let acceptedInputId: string | undefined;
-	let userMsg: typeof narratorMessages.$inferSelect;
-	let effectivePrompt: string;
-	try {
-		// Materialize publication outbox entries before claiming the mailbox head. A pending
-		// publication is an ordering barrier; without flushing it here, an idle user send can
-		// be rejected even though the blocking task notice is still invisible in history.
-		// The shared barrier honors the facade's sync API and a wired service's Promise
-		// shape alike.
-		await flushInboxPublicationBarrier(narratorId);
+	return withTrackedNarratorSessionWork(async () => {
+		const recoveryStart = internalOptions?.recoveryStart;
 		recoveryStart?.check();
-		// An idle narrator may still have earlier agent/task mailbox work that deliberately
-		// does not auto-wake it (notably cancellation notices). Consume that non-user work
-		// before appending this new user input, otherwise the exact claim below reports that
-		// the user's row is queued behind earlier mailbox work forever. The idle drain reuses
-		// the current tool-replay owner and uses schedule:none, so it persists history only;
-		// it cannot start a second loop or skip an earlier user_input row.
-		if (!internalOptions?.bufferedId && !internalOptions?.bufferedRow)
-			await drainAndPersistPendingInjections(active);
+		let acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		recoveryStart?.check();
-		const acceptedId =
-			internalOptions?.bufferedId ??
-			(
-				await enqueueBufferedMessage(
-					narratorId,
-					prompt,
-					images,
-					commandText,
-					userId,
-					null,
-					rawTextFiles,
-					"back",
-					preBashCommand,
-					acceptedReferences,
-					undefined,
-					undefined,
-					undefined,
-					composerDocument,
-					media,
-					internalOptions?.humanReplyContext,
-				)
-			).id;
-		acceptedInputId = acceptedId;
-		recoveryStart?.check();
-		claimedInput =
-			internalOptions?.bufferedRow ??
-			(await claimInboxHead(
-				narratorId,
-				(candidate) => candidate.id === acceptedId && candidate.kind === "user_input",
-			));
+		// Final guard against a concurrent loop slipping past the route-level admission
+		// check (which should have buffered this message). ensureNarrator reuses the live
+		// `active`, so starting a second runAgentLoop here would corrupt the shared session.
+		// Throw BEFORE persisting the user message so we never leave a half-applied turn.
+		const ownedBufferedInput = internalOptions?.bufferedOwner?.isCurrent() === true;
 		if (
-			claimedInput &&
-			(claimedInput.narratorId !== narratorId ||
-				claimedInput.id !== acceptedId ||
-				claimedInput.claimEpoch !== inputOwner.epoch)
-		)
-			throw new ValidationError("Buffered input claim does not match its owner");
-		if (!claimedInput) throw new ValidationError("Input is queued behind earlier mailbox work");
-		recoveryStart?.check();
-		const accepted = projectMailboxUserMessage(claimedInput);
-		prompt = accepted.text;
-		images = accepted.images;
-		media = accepted.media;
-		commandText = accepted.commandText;
-		// A mailbox null means no known principal, not permission to erase the
-		// session's identity. Preserve an explicit null only on this direct call.
-		userId = accepted.createdBy ?? userId;
-		rawTextFiles = accepted.textFiles;
-		preBashCommand = accepted.bashCommand;
-		acceptedReferences = accepted.fileReferences ?? [];
-		stagingId = accepted._stagingId;
+			(ownedBufferedInput ? active._loopRunning === true : isLoopRunning(narratorId)) ||
+			(!ownedBufferedInput && isNarratorRuntimeBusy(narratorId))
+		) {
+			logger.warn("feedMessage blocked: loop already running", { narratorId });
+			// Correct a stale idle status so the user regains the interrupt button.
+			await reconcileRunningStatus(narratorId);
+			throw new ValidationError("Narrator is already running");
+		}
+		active._continuationSuppressed = false;
+		active._continuationStallCount = 0;
+		active._continuationStallKey = undefined;
+		// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
 		if (userId !== undefined) active._currentUserId = userId;
-		// Save text files to worktree only after the durable claim freezes accepted bytes.
-		const savedTextFiles: TextFileRef[] = [];
-		if (rawTextFiles?.length) {
-			for (const file of rawTextFiles) {
-				recoveryStart?.check();
-				savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
-			}
-		}
+		// Open the one-shot behavior-fence edit window for this user turn. It is consumed by the
+		// first behavior_fence write and cleared once the first tool call completes, so the agent
+		// can only record a fence on its first tool call and only when the user asked for it.
+		grantBehaviorFenceEdit(narratorId);
 
-		const persistBlocks: Array<
-			| { type: "text"; text: string }
-			| PersistedUserImageBlock
-			| MediaContentBlock
-			| FileReferenceSnapshot
-			| { type: "text_file"; filename: string; size: number; filePath: string }
-		> = [];
-		if (images?.length) {
-			for (const img of images) {
-				persistBlocks.push(imageRefToContentBlock(img));
+		const inputOwner =
+			internalOptions?.bufferedOwner ?? tryClaimExecution(narratorId, "tool-replay");
+		if (!inputOwner?.isCurrent())
+			throw new ValidationError("Narrator input is already being adopted");
+		let claimedInput: RuntimeMailboxRow | undefined;
+		let stagingId: string | undefined;
+		let acceptedInputId: string | undefined;
+		let userMsg: typeof narratorMessages.$inferSelect;
+		let effectivePrompt: string;
+		try {
+			// Materialize publication outbox entries before claiming the mailbox head. A pending
+			// publication is an ordering barrier; without flushing it here, an idle user send can
+			// be rejected even though the blocking task notice is still invisible in history.
+			// The shared barrier honors the facade's sync API and a wired service's Promise
+			// shape alike.
+			await flushInboxPublicationBarrier(narratorId);
+			recoveryStart?.check();
+			// An idle narrator may still have earlier agent/task mailbox work that deliberately
+			// does not auto-wake it (notably cancellation notices). Consume that non-user work
+			// before appending this new user input, otherwise the exact claim below reports that
+			// the user's row is queued behind earlier mailbox work forever. The idle drain reuses
+			// the current tool-replay owner and uses schedule:none, so it persists history only;
+			// it cannot start a second loop or skip an earlier user_input row.
+			if (!internalOptions?.bufferedId && !internalOptions?.bufferedRow)
+				await drainAndPersistPendingInjections(active);
+			recoveryStart?.check();
+			const acceptedId =
+				internalOptions?.bufferedId ??
+				(
+					await enqueueBufferedMessage(
+						narratorId,
+						prompt,
+						images,
+						commandText,
+						userId,
+						null,
+						rawTextFiles,
+						"back",
+						preBashCommand,
+						acceptedReferences,
+						undefined,
+						undefined,
+						undefined,
+						composerDocument,
+						media,
+						internalOptions?.humanReplyContext,
+					)
+				).id;
+			acceptedInputId = acceptedId;
+			recoveryStart?.check();
+			claimedInput =
+				internalOptions?.bufferedRow ??
+				(await claimInboxHead(
+					narratorId,
+					(candidate) => candidate.id === acceptedId && candidate.kind === "user_input",
+				));
+			if (
+				claimedInput &&
+				(claimedInput.narratorId !== narratorId ||
+					claimedInput.id !== acceptedId ||
+					claimedInput.claimEpoch !== inputOwner.epoch)
+			)
+				throw new ValidationError("Buffered input claim does not match its owner");
+			if (!claimedInput) throw new ValidationError("Input is queued behind earlier mailbox work");
+			recoveryStart?.check();
+			const accepted = projectMailboxUserMessage(claimedInput);
+			prompt = accepted.text;
+			images = accepted.images;
+			media = accepted.media;
+			commandText = accepted.commandText;
+			// A mailbox null means no known principal, not permission to erase the
+			// session's identity. Preserve an explicit null only on this direct call.
+			userId = accepted.createdBy ?? userId;
+			rawTextFiles = accepted.textFiles;
+			preBashCommand = accepted.bashCommand;
+			acceptedReferences = accepted.fileReferences ?? [];
+			stagingId = accepted._stagingId;
+			if (userId !== undefined) active._currentUserId = userId;
+			// Save text files to worktree only after the durable claim freezes accepted bytes.
+			const savedTextFiles: TextFileRef[] = [];
+			if (rawTextFiles?.length) {
+				for (const file of rawTextFiles) {
+					recoveryStart?.check();
+					savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
+				}
 			}
+
+			const persistBlocks: Array<
+				| { type: "text"; text: string }
+				| PersistedUserImageBlock
+				| MediaContentBlock
+				| FileReferenceSnapshot
+				| { type: "text_file"; filename: string; size: number; filePath: string }
+			> = [];
+			if (images?.length) {
+				for (const img of images) {
+					persistBlocks.push(imageRefToContentBlock(img));
+				}
+			}
+			for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
+			if (savedTextFiles.length > 0) {
+				for (const tf of savedTextFiles) {
+					persistBlocks.push({
+						type: "text_file",
+						filename: tf.filename,
+						size: tf.size,
+						filePath: tf.filePath,
+					});
+				}
+			}
+			// NOTE: persistBlocks stores the raw user text (without attached_files hint) so that
+			// contentJson reflects what the user actually typed. The effectivePrompt (with hint)
+			// is stored in contentText and sent to the AI. This intentional split means:
+			//   - contentJson (blocks) → frontend display, shows original user input
+			//   - contentText → FTS search index + AI prompt, includes file references
+			persistBlocks.push(...acceptedReferences, { type: "text", text: prompt });
+
+			// When the user sends images without text, inject a placeholder so that
+			// providers that gate on non-empty content still include the image blocks.
+			const effectiveText =
+				!prompt.trim() && media?.length
+					? "[user sent media]"
+					: !prompt.trim() && images?.length
+						? "[user sent image(s)]"
+						: prompt;
+
+			// Build the effective prompt with attached file hints
+			effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
+
+			const deliverTo = await readSessionDeliverTo(narratorId);
+			recoveryStart?.check();
+			userMsg = (await persistClaimedUserInput({
+				claim: inboxClaim(claimedInput),
+				reservedMessageId: claimedInput.recipientMessageId,
+				narratorId,
+				text: effectivePrompt,
+				contentBlocks: persistBlocks,
+				commandText,
+				createdBy: userId,
+				origin,
+				// Placed under the tool call the session delivers to (display adapter only).
+				parentToolUseId: deliverTo?.toolUseId,
+				composerDocument: accepted.composerDocument,
+			})) as unknown as typeof narratorMessages.$inferSelect;
+			// Display adapter: the destination's tool card shows the placed turn, exactly as
+			// the in-pass consumer does. The session's own frame is sent by the caller.
+			if (deliverTo)
+				broadcastToNarrator(deliverTo.narratorId, {
+					type: "user_message",
+					narratorId: deliverTo.narratorId,
+					message: fileReferenceMessageForDisplay(userMsg),
+				});
+			if (accepted.executionIntent?.modelOverride) {
+				await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
+			}
+		} catch (error) {
+			if (claimedInput) await releaseInboxClaim(claimedInput, error);
+			if (
+				recoveryStart &&
+				acceptedInputId &&
+				!internalOptions?.bufferedId &&
+				!internalOptions?.bufferedRow
+			)
+				await removeBufferedMessage(narratorId, acceptedInputId);
+			throw error;
+		} finally {
+			if (!internalOptions?.prepareOnly) inputOwner.release();
 		}
-		for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
-		if (savedTextFiles.length > 0) {
-			for (const tf of savedTextFiles) {
-				persistBlocks.push({
-					type: "text_file",
-					filename: tf.filename,
-					size: tf.size,
-					filePath: tf.filePath,
+		if (stagingId) {
+			// The mailbox row is durable at this point. Await backend-neutral cleanup, but do not
+			// turn a cleanup failure into a delivery failure that could make callers restore it.
+			try {
+				await cleanupBufferedTextFilesAsync(stagingId);
+			} catch (error) {
+				logger.warn("Failed to clean buffered text files after persistence", {
+					narratorId,
+					messageId: stagingId,
+					error: String(error),
 				});
 			}
 		}
-		// NOTE: persistBlocks stores the raw user text (without attached_files hint) so that
-		// contentJson reflects what the user actually typed. The effectivePrompt (with hint)
-		// is stored in contentText and sent to the AI. This intentional split means:
-		//   - contentJson (blocks) → frontend display, shows original user input
-		//   - contentText → FTS search index + AI prompt, includes file references
-		persistBlocks.push(...acceptedReferences, { type: "text", text: prompt });
 
-		// When the user sends images without text, inject a placeholder so that
-		// providers that gate on non-empty content still include the image blocks.
-		const effectiveText =
-			!prompt.trim() && media?.length
-				? "[user sent media]"
-				: !prompt.trim() && images?.length
-					? "[user sent image(s)]"
-					: prompt;
-
-		// Build the effective prompt with attached file hints
-		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
-
-		const deliverTo = await readSessionDeliverTo(narratorId);
-		recoveryStart?.check();
-		userMsg = (await persistClaimedUserInput({
-			claim: inboxClaim(claimedInput),
-			reservedMessageId: claimedInput.recipientMessageId,
-			narratorId,
-			text: effectivePrompt,
-			contentBlocks: persistBlocks,
-			commandText,
-			createdBy: userId,
-			origin,
-			// Placed under the tool call the session delivers to (display adapter only).
-			parentToolUseId: deliverTo?.toolUseId,
-			composerDocument: accepted.composerDocument,
-		})) as unknown as typeof narratorMessages.$inferSelect;
-		// Display adapter: the destination's tool card shows the placed turn, exactly as
-		// the in-pass consumer does. The session's own frame is sent by the caller.
-		if (deliverTo)
-			broadcastToNarrator(deliverTo.narratorId, {
-				type: "user_message",
-				narratorId: deliverTo.narratorId,
-				message: fileReferenceMessageForDisplay(userMsg),
-			});
-		if (accepted.executionIntent?.modelOverride) {
-			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
-		}
-	} catch (error) {
-		if (claimedInput) await releaseInboxClaim(claimedInput, error);
-		if (
-			recoveryStart &&
-			acceptedInputId &&
-			!internalOptions?.bufferedId &&
-			!internalOptions?.bufferedRow
-		)
-			await removeBufferedMessage(narratorId, acceptedInputId);
-		throw error;
-	} finally {
-		if (!internalOptions?.prepareOnly) inputOwner.release();
-	}
-	if (stagingId) {
-		// The mailbox row is durable at this point. Await backend-neutral cleanup, but do not
-		// turn a cleanup failure into a delivery failure that could make callers restore it.
 		try {
-			await cleanupBufferedTextFilesAsync(stagingId);
-		} catch (error) {
-			logger.warn("Failed to clean buffered text files after persistence", {
+			active._lastTokenUsage = undefined;
+			active._ttftMs = undefined;
+			active._turnStartedAt = internalOptions?.preserveTurnStart
+				? (internalOptions.turnStartedAt ?? new Date().toISOString())
+				: new Date().toISOString();
+
+			const narrator = await narratorService.getById(narratorId);
+			recoveryStart?.check();
+			await narratorService.updateStatus(
 				narratorId,
-				messageId: stagingId,
-				error: String(error),
+				"working",
+				internalOptions?.preserveTurnStart
+					? {
+							turnStartedAt: active._turnStartedAt,
+							resumeTurn: true,
+						}
+					: { setTurnStart: true },
+			);
+			recoveryStart?.check();
+			// The user message above is already persisted, so "first turn" means exactly one
+			// user message exists. `messageCount` cannot answer this any more — it now counts
+			// every message, not finished turns.
+			if (!narrator.title && (await isFirstUserTurn(narratorId))) {
+				recoveryStart?.check();
+				active._provisionalTitle =
+					(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
+				recoveryStart?.check();
+				withTrackedNarratorSessionWork(() => generateQuickTitle(narratorId, prompt, locale)).catch(
+					() => {},
+				);
+			}
+
+			recoveryStart?.check();
+			// runBashFirst flow: the run executes the accepted Bash command as an assistant
+			// tool card before its first model pass, then starts with empty text. buildHistory
+			// reconstructs the Bash tool_result as the current user turn, so the model sees
+			// the order: user prompt → Bash tool call/result → model reply. The runtime owns
+			// the command (and its cancellation), so no admission waits on a long Bash.
+			const input = {
+				text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
+				images: preBashCommand ? undefined : images,
+				media: preBashCommand ? undefined : media,
+				...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
+			};
+			if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
+			if (preBashCommand) {
+				// Broadcast the persisted user message before Bash starts. In chunk mode the
+				// frontend renders directly from WS events (not the query optimistic cache),
+				// so delaying this until sendMessage() returns would show the Bash card first.
+				broadcastToNarrator(narratorId, {
+					type: "user_message",
+					narratorId,
+					message: fileReferenceMessageForDisplay(userMsg),
+				});
+			}
+			// Start agent loop in background
+			const terminal = runAgentLoop(active, input.text, input.images, {
+				...internalOptions?.run,
+				...(userId !== undefined ? { principal: userId } : {}),
+				prePromptBashCommand: input.prePromptBashCommand,
+				media,
+				recoveryStart,
+				// A person's message, or Continue a person asked for. The system resuming after a
+				// restart or an update (`recovered`, a planned update's token) sends its own "continue"
+				// through here: not a person's, unless it adopts a message a person queued.
+				initiatedBy:
+					(internalOptions?.run?.recovered || recoveryStart) && !internalOptions?.bufferedId
+						? "system"
+						: "person",
 			});
-		}
-	}
+			withTrackedNarratorSessionCleanup(() =>
+				terminal.catch(async (err) => {
+					const diagnostics = diagnosticsFromError(err);
+					logger.error("runAgentLoop unhandled error", {
+						narratorId,
+						error: String(err),
+						diagnostics,
+					});
+					await reportUnsettledRunLoopError(narratorId, err, diagnostics);
+				}),
+			);
 
-	try {
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = internalOptions?.preserveTurnStart
-			? (internalOptions.turnStartedAt ?? new Date().toISOString())
-			: new Date().toISOString();
-
-		const narrator = await narratorService.getById(narratorId);
-		recoveryStart?.check();
-		await narratorService.updateStatus(
-			narratorId,
-			"working",
-			internalOptions?.preserveTurnStart
-				? {
-						turnStartedAt: active._turnStartedAt,
-						resumeTurn: true,
-					}
-				: { setTurnStart: true },
-		);
-		recoveryStart?.check();
-		// The user message above is already persisted, so "first turn" means exactly one
-		// user message exists. `messageCount` cannot answer this any more — it now counts
-		// every message, not finished turns.
-		if (!narrator.title && (await isFirstUserTurn(narratorId))) {
-			recoveryStart?.check();
-			active._provisionalTitle =
-				(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
-			recoveryStart?.check();
-			generateQuickTitle(narratorId, prompt, locale).catch(() => {});
-		}
-
-		recoveryStart?.check();
-		// runBashFirst flow: the run executes the accepted Bash command as an assistant
-		// tool card before its first model pass, then starts with empty text. buildHistory
-		// reconstructs the Bash tool_result as the current user turn, so the model sees
-		// the order: user prompt → Bash tool call/result → model reply. The runtime owns
-		// the command (and its cancellation), so no admission waits on a long Bash.
-		const input = {
-			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
-			images: preBashCommand ? undefined : images,
-			media: preBashCommand ? undefined : media,
-			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
-		};
-		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
-		if (preBashCommand) {
-			// Broadcast the persisted user message before Bash starts. In chunk mode the
-			// frontend renders directly from WS events (not the query optimistic cache),
-			// so delaying this until sendMessage() returns would show the Bash card first.
-			broadcastToNarrator(narratorId, {
-				type: "user_message",
+			return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
+		} catch (error) {
+			if (!internalOptions?.bufferedDelivery) throw error;
+			logger.error("Buffered message committed but could not start", {
 				narratorId,
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
+			await narratorService
+				.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(error) })
+				.catch(() => {});
+			broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(error) });
+			return { active, userMsg, postCommitError: error };
 		}
-		// Start agent loop in background
-		const terminal = runAgentLoop(active, input.text, input.images, {
-			...internalOptions?.run,
-			...(userId !== undefined ? { principal: userId } : {}),
-			prePromptBashCommand: input.prePromptBashCommand,
-			media,
-			recoveryStart,
-			// A person's message, or Continue a person asked for. The system resuming after a
-			// restart or an update (`recovered`, a planned update's token) sends its own "continue"
-			// through here: not a person's, unless it adopts a message a person queued.
-			initiatedBy:
-				(internalOptions?.run?.recovered || recoveryStart) && !internalOptions?.bufferedId
-					? "system"
-					: "person",
-		});
-		terminal.catch(async (err) => {
-			const diagnostics = diagnosticsFromError(err);
-			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
-		});
-
-		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
-	} catch (error) {
-		if (!internalOptions?.bufferedDelivery) throw error;
-		logger.error("Buffered message committed but could not start", {
-			narratorId,
-			error: String(error),
-		});
-		await narratorService
-			.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(error) })
-			.catch(() => {});
-		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(error) });
-		return { active, userMsg, postCommitError: error };
-	}
+	});
 }
 
 /** Adopt queued input after the previous session finalized, without replacing its run. */
@@ -3868,98 +4034,100 @@ export async function prepareQueuedRunInput(
 	| { text: string; images?: ImageRef[]; media?: MediaRef[]; prePromptBashCommand?: string }
 	| undefined
 > {
-	const id = active.narratorId;
-	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
-	// Who starts the pass about to run (`ActiveNarrator._runInitiatedBy`, taken by the pass): a
-	// wake delivered here (an agent's message, a notice, a background result) is the system's,
-	// unless it carries a person's answer to a question; a person's queued message is theirs.
-	active._runInitiatedBy = undefined;
-	active._runForTaskId = undefined;
-	active._runPersonActed = false;
-	const delivered = await drainAndPersistPendingInjections(active);
-	if (delivered) {
-		// A person's answer among what was delivered makes the pass theirs.
-		active._runInitiatedBy = active._runPersonActed ? "person" : "system";
-		return { text: "" };
-	}
-	const row = await claimInboxHead(id, (candidate) => candidate.kind === "user_input");
-	if (!row) return;
-	active._runInitiatedBy = "person";
-	const first = projectMailboxUserMessage(row);
-	try {
-		if (first.executionIntent?.controlCommand) {
-			const message = await persistClaimedUserInput({
-				claim: inboxClaim(row),
-				reservedMessageId: row.recipientMessageId,
-				narratorId: id,
-				text: first.text,
-				contentBlocks: [{ type: "text", text: first.text }],
-				commandText: first.commandText,
-				createdBy: first.createdBy,
-				parentToolUseId: run.binding?.deliverTo?.toolUseId,
-			});
+	return withTrackedNarratorSessionWork(async () => {
+		const id = active.narratorId;
+		if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
+		// Who starts the pass about to run (`ActiveNarrator._runInitiatedBy`, taken by the pass): a
+		// wake delivered here (an agent's message, a notice, a background result) is the system's,
+		// unless it carries a person's answer to a question; a person's queued message is theirs.
+		active._runInitiatedBy = undefined;
+		active._runForTaskId = undefined;
+		active._runPersonActed = false;
+		const delivered = await drainAndPersistPendingInjections(active);
+		if (delivered) {
+			// A person's answer among what was delivered makes the pass theirs.
+			active._runInitiatedBy = active._runPersonActed ? "person" : "system";
+			return { text: "" };
+		}
+		const row = await claimInboxHead(id, (candidate) => candidate.kind === "user_input");
+		if (!row) return;
+		active._runInitiatedBy = "person";
+		const first = projectMailboxUserMessage(row);
+		try {
+			if (first.executionIntent?.controlCommand) {
+				const message = await persistClaimedUserInput({
+					claim: inboxClaim(row),
+					reservedMessageId: row.recipientMessageId,
+					narratorId: id,
+					text: first.text,
+					contentBlocks: [{ type: "text", text: first.text }],
+					commandText: first.commandText,
+					createdBy: first.createdBy,
+					parentToolUseId: run.binding?.deliverTo?.toolUseId,
+				});
+				broadcastToNarrator(id, {
+					type: "user_message",
+					narratorId: id,
+					message: fileReferenceMessageForDisplay(message),
+				});
+				if (first.createdBy && run.logicalRunId) {
+					const { registerRunPrincipal } = await import("./narrator-runtime-registration");
+					await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
+					run.principal = first.createdBy;
+					if (run.binding) run.binding.principal = { userId: first.createdBy };
+				}
+				await executeQueuedControlCommand(id, first, active.locale, run.cancel.signal);
+				await cleanupBufferedTextFilesAsync(first.id);
+				return;
+			}
+			const result = await feedMessageUnlocked(
+				id,
+				first.text,
+				first.images,
+				active.locale,
+				active._replyInUserLanguage ?? false,
+				first.commandText,
+				first.createdBy ?? undefined,
+				first.textFiles,
+				first.bashCommand,
+				{
+					bufferedDelivery: true,
+					bufferedId: first.id,
+					bufferedRow: row,
+					bufferedOwner: owner,
+					prepareOnly: true,
+				},
+				undefined,
+				first.fileReferences,
+				first.composerDocument,
+				first.media,
+			);
+			if (result.postCommitError) throw result.postCommitError;
+			if (first.createdBy != null) {
+				if (run.logicalRunId) {
+					const { registerRunPrincipal } = await import("./narrator-runtime-registration");
+					await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
+				}
+				run.principal = first.createdBy;
+				if (run.binding) run.binding = { ...run.binding, principal: { userId: first.createdBy } };
+			}
 			broadcastToNarrator(id, {
 				type: "user_message",
 				narratorId: id,
-				message: fileReferenceMessageForDisplay(message),
+				message: fileReferenceMessageForDisplay(result.userMsg),
 			});
-			if (first.createdBy && run.logicalRunId) {
-				const { registerRunPrincipal } = await import("./narrator-runtime-registration");
-				await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
-				run.principal = first.createdBy;
-				if (run.binding) run.binding.principal = { userId: first.createdBy };
-			}
-			await executeQueuedControlCommand(id, first, active.locale, run.cancel.signal);
 			await cleanupBufferedTextFilesAsync(first.id);
-			return;
+			return result.preparedInput;
+		} finally {
+			await releaseInboxClaim(row, "Fresh input did not commit");
+			broadcastToNarrator(id, {
+				type: "buffer_consumed",
+				narratorId: id,
+				messageId: first.id,
+				remaining: toBufferSummary(await getBufferedMessagesAsync(id)),
+			});
 		}
-		const result = await feedMessageUnlocked(
-			id,
-			first.text,
-			first.images,
-			active.locale,
-			active._replyInUserLanguage ?? false,
-			first.commandText,
-			first.createdBy ?? undefined,
-			first.textFiles,
-			first.bashCommand,
-			{
-				bufferedDelivery: true,
-				bufferedId: first.id,
-				bufferedRow: row,
-				bufferedOwner: owner,
-				prepareOnly: true,
-			},
-			undefined,
-			first.fileReferences,
-			first.composerDocument,
-			first.media,
-		);
-		if (result.postCommitError) throw result.postCommitError;
-		if (first.createdBy != null) {
-			if (run.logicalRunId) {
-				const { registerRunPrincipal } = await import("./narrator-runtime-registration");
-				await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
-			}
-			run.principal = first.createdBy;
-			if (run.binding) run.binding = { ...run.binding, principal: { userId: first.createdBy } };
-		}
-		broadcastToNarrator(id, {
-			type: "user_message",
-			narratorId: id,
-			message: fileReferenceMessageForDisplay(result.userMsg),
-		});
-		await cleanupBufferedTextFilesAsync(first.id);
-		return result.preparedInput;
-	} finally {
-		await releaseInboxClaim(row, "Fresh input did not commit");
-		broadcastToNarrator(id, {
-			type: "buffer_consumed",
-			narratorId: id,
-			messageId: first.id,
-			remaining: toBufferSummary(await getBufferedMessagesAsync(id)),
-		});
-	}
+	});
 }
 
 // === Subagent conclusion helpers ===
@@ -4117,12 +4285,13 @@ async function updateToolCallConclusionUnlocked(opts: {
 		refreshTiming = false,
 	} = opts;
 	// Scope metadata only: do not load the child's transcript or file-tool payloads.
-	const attributionTurn = await db.query.narrators
-		.findFirst({
+	const attributionTurn = await readQuery(
+		db.query.narrators.findFirst({
 			where: eq(narrators.id, subagentId),
 			columns: { turnStartedAt: true, title: true },
-		})
-		.catch(() => undefined);
+		}),
+		{ executionPolicy: "worker-required" },
+	).catch(() => undefined);
 	const resultPrefix = agentResultTag(
 		await resolveAgentLabel(parentNarratorId, subagentId),
 		subagentId,
@@ -4141,23 +4310,26 @@ async function updateToolCallConclusionUnlocked(opts: {
 		},
 		resultPrefix + (finalText || "(no output)"),
 	);
-	const resultRows = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, parentNarratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-			messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
-			opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
-		),
-		columns: {
-			id: true,
-			createdAt: true,
-			streamStartedAt: true,
-			permissionStartedAt: true,
-			executionStartedAt: true,
-			status: true,
-		},
-		limit: 2,
-	});
+	const resultRows = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, parentNarratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
+				opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
+			),
+			columns: {
+				id: true,
+				createdAt: true,
+				streamStartedAt: true,
+				permissionStartedAt: true,
+				executionStartedAt: true,
+				status: true,
+			},
+			limit: 2,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (resultRows.length !== 1) {
 		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
@@ -5148,19 +5320,32 @@ export async function startSpecContinuationIfPossible(
 		if (!prompt) return { started: false };
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, {
-			principal: userId,
-			initiatedBy: options.initiatedBy ?? (options.explicitStart !== false ? "person" : "system"),
-			...(options.preferTaskId ? { forTaskId: options.preferTaskId } : {}),
-		}).catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (spec continuation)", {
-				narratorId,
-				error: String(err),
-			});
-			await reportUnsettledRunLoopError(narratorId, err);
-		});
+		withTrackedNarratorSessionCleanup(() =>
+			runAgentLoop(active, "", undefined, {
+				principal: userId,
+				initiatedBy: options.initiatedBy ?? (options.explicitStart !== false ? "person" : "system"),
+				...(options.preferTaskId ? { forTaskId: options.preferTaskId } : {}),
+			}).catch(async (err) => {
+				logger.error("runAgentLoop unhandled error (spec continuation)", {
+					narratorId,
+					error: String(err),
+				});
+				await reportUnsettledRunLoopError(narratorId, err);
+			}),
+		);
 		return { started: true };
 	});
+}
+
+async function resolveBackgroundContinuationLocale(
+	narratorId: string,
+	locale: Locale | undefined,
+	userId: string | null | undefined,
+): Promise<Locale> {
+	const existing = activeNarrators.get(narratorId);
+	if (existing?.alive && !existing.abortController.signal.aborted) return existing.locale;
+	if (locale !== undefined) return locale;
+	return userId == null ? "en" : getUserLanguage(userId);
 }
 
 export async function startBackgroundCompletionContinuationIfPossible(
@@ -5168,8 +5353,10 @@ export async function startBackgroundCompletionContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	// Background results and Send(parent) share one mailbox and the same wake policy.
-	return startParentInboundContinuationIfPossible(narratorId, locale, replyInUserLanguage);
+	return withTrackedNarratorSessionWork(async () => {
+		// Background results and Send(parent) share one mailbox and the same wake policy.
+		return startParentInboundContinuationIfPossible(narratorId, locale, replyInUserLanguage);
+	});
 }
 
 /**
@@ -5237,55 +5424,77 @@ export function isQuestionAnswerWakeEligible(recipient: {
  * Exported for the outline's answer delivery, whose retry wakes only a session that has not
  * replied after the message yet.
  */
-export function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
-	const substantive = db
-		.select({ id: narratorMessageRefs.id })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessages.role, "assistant"),
-				gt(narratorMessageRefs.seq, answerSeq),
-				or(
-					sql`length(trim(coalesce(${narratorMessages.contentText}, ''))) > 0`,
-					exists(
-						db
-							.select({ one: sql`1` })
-							.from(narratorToolCalls)
-							.where(eq(narratorToolCalls.messageId, narratorMessages.id)),
+export async function assistantReplyFollowsAnswer(
+	narratorId: string,
+	answerSeq: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const readOptions = { executionPolicy: "worker-required" as const, signal };
+	const substantive = await readQueryFirst(
+		db
+			.select({ id: narratorMessageRefs.id })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessages.role, "assistant"),
+					gt(narratorMessageRefs.seq, answerSeq),
+					or(
+						sql`length(trim(coalesce(${narratorMessages.contentText}, ''))) > 0`,
+						exists(
+							db
+								.select({ one: sql`1` })
+								.from(narratorToolCalls)
+								.where(eq(narratorToolCalls.messageId, narratorMessages.id)),
+						),
 					),
 				),
-			),
-		)
-		.limit(1)
-		.get();
+			)
+			.limit(1),
+		readOptions,
+	);
 	if (substantive) return true;
 
+	const end = await readQueryFirst(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1),
+		readOptions,
+	);
+	if (!end || end.seq <= answerSeq) return false;
 	let cursor = answerSeq;
-	for (;;) {
+	while (cursor < end.seq) {
+		signal?.throwIfAborted();
 		// Body bytes and the body itself go through the block-aware readers. The column
 		// is only a projection once rows are current, and a direct read is refused.
-		const bodies = fillBodies(
-			db
-				.select({
-					id: narratorMessages.id,
-					seq: narratorMessageRefs.seq,
-					contentJson: contentJsonSql(),
-				})
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessages.role, "assistant"),
-						gt(narratorMessageRefs.seq, cursor),
-						sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
-					),
-				)
-				.orderBy(asc(narratorMessageRefs.seq))
-				.limit(8)
-				.all(),
+		const bodies = await fillBodiesAsync(
+			await readQuery(
+				db
+					.select({
+						id: narratorMessages.id,
+						seq: narratorMessageRefs.seq,
+						contentJson: contentJsonSql(),
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessages.role, "assistant"),
+							gt(narratorMessageRefs.seq, cursor),
+							sql`${narratorMessageRefs.seq} <= ${end.seq}`,
+							sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
+						),
+					)
+					.orderBy(asc(narratorMessageRefs.seq))
+					.limit(8),
+				readOptions,
+			),
+			signal,
 		);
 		if (!bodies.length) return false;
 		for (const body of bodies) {
@@ -5302,7 +5511,9 @@ export function assistantReplyFollowsAnswer(narratorId: string, answerSeq: numbe
 		const next = bodies[bodies.length - 1]?.seq;
 		if (next == null || next <= cursor || bodies.length < 8) return false;
 		cursor = next;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	}
+	return false;
 }
 
 async function canWakeQuestionAnswer(
@@ -5315,124 +5526,146 @@ async function canWakeQuestionAnswer(
 }
 
 export async function recoverPendingQuestionAnswerDeliveries(
-	locale: Locale = "en",
+	locale?: Locale,
 	options: { signal?: AbortSignal } = {},
 ): Promise<number> {
-	if (getNarratorMessageRefsPort()) return 0;
-	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
-		"./narrator-question-service"
-	);
-	const narratorRowid = sql<number>`${narrators}.rowid`;
-	const questionRowid = sql<number>`${narratorQuestions}.rowid`;
-	const narratorEnd = db
-		.select({ cursor: narratorRowid })
-		.from(narrators)
-		.orderBy(desc(narratorRowid))
-		.limit(1)
-		.get()?.cursor;
-	const questionEnd = db
-		.select({ cursor: questionRowid })
-		.from(narratorQuestions)
-		.orderBy(desc(questionRowid))
-		.limit(1)
-		.get()?.cursor;
-	if (!narratorEnd || !questionEnd) return 0;
-	let cursor = 0;
-	let scheduled = 0;
-	// Fixed high-water marks make this background traversal finite; each indexed
-	// page is small and yields before continuing, including a single busy narrator.
-	while (cursor < narratorEnd) {
-		options.signal?.throwIfAborted();
-		const recipients = db
-			.select({
-				cursor: narratorRowid,
-				id: narrators.id,
-				status: narrators.status,
-				lastStopReason: narrators.lastStopReason,
-				substatus: narrators.substatus,
-			})
-			.from(narrators)
-			.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
-			.orderBy(asc(narratorRowid))
-			.limit(32)
-			.all();
-		if (!recipients.length) break;
-		for (const recipient of recipients) {
-			options.signal?.throwIfAborted();
-			if (!(await canWakeQuestionAnswer(recipient))) continue;
-			let answerCursor = 0;
-			while (answerCursor < questionEnd) {
-				options.signal?.throwIfAborted();
-				// idx_narrator_questions_narrator_status also carries SQLite rowid,
-				// so equality on its two columns supports ordered cursor pagination.
-				const pending = db
-					.select({
-						cursor: questionRowid,
-						id: narratorQuestions.id,
-						messageId: narratorQuestions.answerMessageId,
-					})
+	options.signal?.throwIfAborted();
+	try {
+		if (getNarratorMessageRefsPort()) return 0;
+		const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
+			"./narrator-question-service"
+		);
+		const narratorRowid = sql<number>`${narrators}.rowid`;
+		const questionRowid = sql<number>`${narratorQuestions}.rowid`;
+		const narratorEnd = (
+			await readQueryFirst(
+				db.select({ cursor: narratorRowid }).from(narrators).orderBy(desc(narratorRowid)).limit(1),
+				{ executionPolicy: "worker-required", signal: options.signal },
+			)
+		)?.cursor;
+		const questionEnd = (
+			await readQueryFirst(
+				db
+					.select({ cursor: questionRowid })
 					.from(narratorQuestions)
-					.where(
-						and(
-							eq(narratorQuestions.narratorId, recipient.id),
-							eq(narratorQuestions.status, "answered"),
-							isNull(narratorQuestions.resolutionJson),
-							gt(questionRowid, answerCursor),
-							sql`${questionRowid} <= ${questionEnd}`,
-						),
-					)
-					.orderBy(asc(questionRowid))
-					.limit(32)
-					.all();
-				if (!pending.length) break;
-				for (const question of pending) {
+					.orderBy(desc(questionRowid))
+					.limit(1),
+				{ executionPolicy: "worker-required", signal: options.signal },
+			)
+		)?.cursor;
+		if (!narratorEnd || !questionEnd) return 0;
+		let cursor = 0;
+		let scheduled = 0;
+		// Fixed high-water marks make this background traversal finite; each indexed
+		// page is small and yields before continuing, including a single busy narrator.
+		while (cursor < narratorEnd) {
+			options.signal?.throwIfAborted();
+			const recipients = await readQuery(
+				db
+					.select({
+						cursor: narratorRowid,
+						id: narrators.id,
+						status: narrators.status,
+						lastStopReason: narrators.lastStopReason,
+						substatus: narrators.substatus,
+					})
+					.from(narrators)
+					.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
+					.orderBy(asc(narratorRowid))
+					.limit(32),
+				{ executionPolicy: "worker-required", signal: options.signal },
+			);
+			if (!recipients.length) break;
+			for (const recipient of recipients) {
+				options.signal?.throwIfAborted();
+				if (!(await canWakeQuestionAnswer(recipient))) continue;
+				let answerCursor = 0;
+				while (answerCursor < questionEnd) {
 					options.signal?.throwIfAborted();
-					if (!question.messageId) continue;
-					try {
-						// `resolution_json` 是模型写的「解决备注」，不是送达凭据。回答已经在
-						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
-						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
-						// "Pending question recovery deferred"，下一次启动再试。
-						const answerRef = db
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
+					// idx_narrator_questions_narrator_status also carries SQLite rowid,
+					// so equality on its two columns supports ordered cursor pagination.
+					const pending = await readQuery(
+						db
+							.select({
+								cursor: questionRowid,
+								id: narratorQuestions.id,
+								messageId: narratorQuestions.answerMessageId,
+							})
+							.from(narratorQuestions)
 							.where(
 								and(
-									eq(narratorMessageRefs.narratorId, recipient.id),
-									eq(narratorMessageRefs.messageId, question.messageId),
+									eq(narratorQuestions.narratorId, recipient.id),
+									eq(narratorQuestions.status, "answered"),
+									isNull(narratorQuestions.resolutionJson),
+									gt(questionRowid, answerCursor),
+									sql`${questionRowid} <= ${questionEnd}`,
 								),
 							)
-							.limit(1)
-							.get();
-						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
-						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
-						if (!principal) continue;
-						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
-						if (!receipt) continue;
-						const delivery = await scheduleQuestionAnswerDelivery(
-							recipient.id,
-							question.messageId,
-							receipt,
-							principal,
-							locale,
-						);
-						if (delivery.ready) scheduled++;
-					} catch (error) {
-						logger.warn("Pending question recovery deferred", {
-							narratorId: recipient.id,
-							questionId: question.id,
-							error: String(error),
-						});
+							.orderBy(asc(questionRowid))
+							.limit(32),
+						{ executionPolicy: "worker-required", signal: options.signal },
+					);
+					if (!pending.length) break;
+					for (const question of pending) {
+						options.signal?.throwIfAborted();
+						if (!question.messageId) continue;
+						try {
+							// `resolution_json` 是模型写的「解决备注」，不是送达凭据。回答已经在
+							// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
+							// 没有 ref 时仍交给下面的 schedule：它会抛出并记
+							// "Pending question recovery deferred"，下一次启动再试。
+							const answerRef = await readQueryFirst(
+								db
+									.select({ seq: narratorMessageRefs.seq })
+									.from(narratorMessageRefs)
+									.where(
+										and(
+											eq(narratorMessageRefs.narratorId, recipient.id),
+											eq(narratorMessageRefs.messageId, question.messageId),
+										),
+									)
+									.limit(1),
+								{ executionPolicy: "worker-required", signal: options.signal },
+							);
+							if (
+								answerRef &&
+								(await assistantReplyFollowsAnswer(recipient.id, answerRef.seq, options.signal))
+							)
+								continue;
+							const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
+							if (!principal) continue;
+							const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
+							if (!receipt) continue;
+							const delivery = await scheduleQuestionAnswerDelivery(
+								recipient.id,
+								question.messageId,
+								receipt,
+								principal,
+								locale,
+							);
+							if (delivery.ready) scheduled++;
+						} catch (error) {
+							options.signal?.throwIfAborted();
+							logger.warn("Pending question recovery deferred", {
+								narratorId: recipient.id,
+								questionId: question.id,
+								error: String(error),
+							});
+						}
 					}
+					answerCursor = pending[pending.length - 1].cursor;
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
 				}
-				answerCursor = pending[pending.length - 1].cursor;
-				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			}
+			cursor = recipients[recipients.length - 1].cursor;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		}
-		cursor = recipients[recipients.length - 1].cursor;
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		options.signal?.throwIfAborted();
+		return scheduled;
+	} catch (error) {
+		options.signal?.throwIfAborted();
+		throw error;
 	}
-	return scheduled;
 }
 
 /** Bounded receipt with its persisted human source, never the execution principal. */
@@ -5443,16 +5676,19 @@ export async function getQuestionAnswerFallbackText(
 	const { getBoundedQuestionReceipt } = await import("./narrator-question-service");
 	const text = await getBoundedQuestionReceipt(messageId, narratorId);
 	if (!text) return null;
-	const source = db
-		.select({
-			id: narratorMessages.id,
-			narratorId: narratorMessages.narratorId,
-			createdBy: narratorMessages.createdBy,
-			origin: narratorMessages.origin,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, messageId))
-		.get();
+	const source = await readQueryFirst(
+		db
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				createdBy: narratorMessages.createdBy,
+				origin: narratorMessages.origin,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, messageId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!source) return null;
 	return projectMessageSenderText(
 		{
@@ -5468,33 +5704,35 @@ export async function getQuestionAnswerFallbackText(
 }
 
 /** A prebuilt history has no WeakMap registration for receipts that arrived later. */
-export function consumeQuestionAnswerModelReceipts(
+export async function consumeQuestionAnswerModelReceipts(
 	narratorId: string,
 	eventIds: ReadonlySet<string>,
-): void {
+): Promise<void> {
 	if (getNarratorMessageRefsPort()) return;
 	for (const messageId of eventIds) {
-		const row = db
-			.select({
-				deliveryId: narratorBufferedMessages.deliveryId,
-				recipientRefId: narratorBufferedMessages.recipientRefId,
-				revision: narratorBufferedMessages.contentRevision,
-			})
-			.from(narratorBufferedMessages)
-			.where(
-				and(
-					eq(narratorBufferedMessages.narratorId, narratorId),
-					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
-					eq(narratorBufferedMessages.recipientMessageId, messageId),
-					eq(narratorBufferedMessages.state, "materialized"),
-					eq(narratorBufferedMessages.receiptDisposition, "active"),
-					isNull(narratorBufferedMessages.currentAdoptedAt),
-				),
-			)
-			.limit(1)
-			.get();
+		const row = await readQueryFirst(
+			db
+				.select({
+					deliveryId: narratorBufferedMessages.deliveryId,
+					recipientRefId: narratorBufferedMessages.recipientRefId,
+					revision: narratorBufferedMessages.contentRevision,
+				})
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, narratorId),
+						eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+						eq(narratorBufferedMessages.recipientMessageId, messageId),
+						eq(narratorBufferedMessages.state, "materialized"),
+						eq(narratorBufferedMessages.receiptDisposition, "active"),
+						isNull(narratorBufferedMessages.currentAdoptedAt),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 		if (row?.deliveryId && row.recipientRefId)
-			consumeMailboxDelivery({
+			await consumeMailboxDelivery({
 				deliveryId: row.deliveryId,
 				recipientNarratorId: narratorId,
 				recipientMessageId: messageId,
@@ -5521,20 +5759,22 @@ export async function retryDeferredQuestionAnswerDeliveries(
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
 		"./narrator-question-service"
 	);
-	const pending = db
-		.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
-		.from(narratorQuestions)
-		.where(
-			and(
-				eq(narratorQuestions.narratorId, narratorId),
-				eq(narratorQuestions.status, "answered"),
-				isNull(narratorQuestions.resolutionJson),
-				isNotNull(narratorQuestions.answerMessageId),
-				sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
-			),
-		)
-		.limit(16)
-		.all();
+	const pending = await readQuery(
+		db
+			.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.narratorId, narratorId),
+					eq(narratorQuestions.status, "answered"),
+					isNull(narratorQuestions.resolutionJson),
+					isNotNull(narratorQuestions.answerMessageId),
+					sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
+				),
+			)
+			.limit(16),
+		{ executionPolicy: "worker-required" },
+	);
 	let accepted = 0;
 	for (const question of pending) {
 		if (!question.messageId) continue;
@@ -5565,24 +5805,29 @@ export async function retryDeferredQuestionAnswerDeliveries(
 	return accepted;
 }
 
-export function isQuestionAnswerDeliveryReady(narratorId: string, messageId: string): boolean {
+export async function isQuestionAnswerDeliveryReady(
+	narratorId: string,
+	messageId: string,
+): Promise<boolean> {
 	if (getNarratorMessageRefsPort()) return false;
-	return !!db
-		.select({ id: narratorBufferedMessages.id })
-		.from(narratorBufferedMessages)
-		.where(
-			and(
-				eq(narratorBufferedMessages.narratorId, narratorId),
-				eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
-				eq(narratorBufferedMessages.recipientMessageId, messageId),
-				inArray(narratorBufferedMessages.state, ["queued", "claimed", "materialized"]),
-				eq(narratorBufferedMessages.receiptDisposition, "active"),
-				isNull(narratorBufferedMessages.adoptedAt),
-				isNull(narratorBufferedMessages.currentAdoptedAt),
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: narratorBufferedMessages.id })
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+					eq(narratorBufferedMessages.recipientMessageId, messageId),
+					inArray(narratorBufferedMessages.state, ["queued", "claimed", "materialized"]),
+					eq(narratorBufferedMessages.receiptDisposition, "active"),
+					isNull(narratorBufferedMessages.adoptedAt),
+					isNull(narratorBufferedMessages.currentAdoptedAt),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	));
 }
 
 /** task_notice 的通知预算里给 metadata 预留的额度。 */
@@ -5627,75 +5872,83 @@ export async function scheduleQuestionAnswerDelivery(
 	executionPrincipal: QuestionExecutionPrincipal | undefined,
 	locale: Locale = "en",
 ): Promise<{ ready: boolean; started: boolean }> {
-	// Questions still use the SQLite business service. Fail closed rather than enqueue
-	// on another backend while reading the receipt from the local database.
-	if (getNarratorMessageRefsPort()) return { ready: false, started: false };
-	const accepted = db.transaction((tx) => {
-		const ref = tx
-			.select({ id: narratorMessageRefs.id })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-			)
-			.get();
-		if (!ref) throw new Error("Question answer must be persisted before scheduling");
-		const message = tx
-			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				role: narratorMessages.role,
-				createdBy: narratorMessages.createdBy,
-				origin: narratorMessages.origin,
-				originLabel: narratorMessages.originLabel,
-			})
-			.from(narratorMessages)
-			.where(eq(narratorMessages.id, messageId))
-			.get();
-		if (!message || message.role !== "user")
-			throw new Error("Question answer must be a user event");
-		const modelText = projectMessageSenderText(
-			{ ...message, contentJson: [], contentText: text, parentToolUseId: null, messageUuid: null },
-			text,
-		);
-		const noticeText = boundQuestionAnswerNotice(modelText, messageId);
-		return runtimeInbox.enqueue(
-			{
-				kind: "task_notice",
-				noticeKind: "agent",
-				narratorId,
-				sourceKey: `question-answer:${messageId}`,
-				recipientMessageId: messageId,
-				text: noticeText,
-				projectedByteSize: Buffer.byteLength(noticeText),
-				metadata: {
-					eventKind: "question_answer",
-					questionAnswer: { messageId, executionPrincipal },
+	return withTrackedNarratorSessionWork(async () => {
+		// Questions still use the SQLite business service. Fail closed rather than enqueue
+		// on another backend while reading the receipt from the local database.
+		if (getNarratorMessageRefsPort()) return { ready: false, started: false };
+		const accepted = db.transaction((tx) => {
+			const ref = tx
+				.select({ id: narratorMessageRefs.id })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.get();
+			if (!ref) throw new Error("Question answer must be persisted before scheduling");
+			const message = tx
+				.select({
+					id: narratorMessages.id,
+					narratorId: narratorMessages.narratorId,
+					role: narratorMessages.role,
+					createdBy: narratorMessages.createdBy,
+					origin: narratorMessages.origin,
+					originLabel: narratorMessages.originLabel,
+				})
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, messageId))
+				.get();
+			if (!message || message.role !== "user")
+				throw new Error("Question answer must be a user event");
+			const modelText = projectMessageSenderText(
+				{
+					...message,
+					contentJson: [],
+					contentText: text,
+					parentToolUseId: null,
+					messageUuid: null,
 				},
-			},
-			tx,
-		);
+				text,
+			);
+			const noticeText = boundQuestionAnswerNotice(modelText, messageId);
+			return runtimeInbox.enqueue(
+				{
+					kind: "task_notice",
+					noticeKind: "agent",
+					narratorId,
+					sourceKey: `question-answer:${messageId}`,
+					recipientMessageId: messageId,
+					text: noticeText,
+					projectedByteSize: Buffer.byteLength(noticeText),
+					metadata: {
+						eventKind: "question_answer",
+						questionAnswer: { messageId, executionPrincipal },
+					},
+				},
+				tx,
+			);
+		});
+		if (accepted.status === "full" || accepted.status === "publication_pending")
+			return { ready: false, started: false };
+		if (!executionPrincipal || isLoopRunning(narratorId) || getExecutionOwner(narratorId))
+			return { ready: true, started: false };
+		try {
+			const result = await startInjectionContinuationIfPossible(
+				narratorId,
+				locale,
+				false,
+				executionPrincipal,
+			);
+			return { ready: true, started: result.started };
+		} catch (error) {
+			// The user event and its inbox receipt are committed. A revoked grant or
+			// unavailable execution environment must not turn a saved answer into failure.
+			logger.warn("Question answer wake deferred", { narratorId, messageId, error: String(error) });
+			return { ready: true, started: false };
+		}
 	});
-	if (accepted.status === "full" || accepted.status === "publication_pending")
-		return { ready: false, started: false };
-	if (!executionPrincipal || isLoopRunning(narratorId) || getExecutionOwner(narratorId))
-		return { ready: true, started: false };
-	try {
-		const result = await startInjectionContinuationIfPossible(
-			narratorId,
-			locale,
-			false,
-			executionPrincipal,
-		);
-		return { ready: true, started: result.started };
-	} catch (error) {
-		// The user event and its inbox receipt are committed. A revoked grant or
-		// unavailable execution environment must not turn a saved answer into failure.
-		logger.warn("Question answer wake deferred", { narratorId, messageId, error: String(error) });
-		return { ready: true, started: false };
-	}
 }
 
 export async function startInjectionContinuationIfPossible(
@@ -5704,50 +5957,66 @@ export async function startInjectionContinuationIfPossible(
 	replyInUserLanguage = false,
 	executionPrincipal?: QuestionExecutionPrincipal,
 ): Promise<{ started: boolean }> {
-	// Read BEFORE taking `continuationStartLock`: the subagent path takes its own
-	// resume lock, and nesting the two in an order nobody else uses invites a deadlock
-	// with a concurrent primary-narrator continuation.
-	const recipient = await narratorService.getById(narratorId);
-	if (executionPrincipal && !(await canWakeQuestionAnswer(recipient))) return { started: false };
-	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
+	return withTrackedNarratorSessionWork(async () => {
+		// Read BEFORE taking `continuationStartLock`: the subagent path takes its own
+		// resume lock, and nesting the two in an order nobody else uses invites a deadlock
+		// with a concurrent primary-narrator continuation.
+		const recipient = await narratorService.getById(narratorId);
+		if (executionPrincipal && !(await canWakeQuestionAnswer(recipient))) return { started: false };
+		return continuationStartLock.acquire(narratorId, async () => {
+			if (isLoopRunning(narratorId)) return { started: false };
 
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { started: false };
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
-		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
+			const narrator = await narratorService.getById(narratorId);
+			if (narrator.status !== "idle") return { started: false };
+			if (isPlanModeTrait(narrator.traits)) return { started: false };
+			if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
-		if (
-			executionPrincipal &&
-			db
-				.select({ reason: narrators.lastStopReason })
-				.from(narrators)
-				.where(eq(narrators.id, narratorId))
-				.get()?.reason !== "normal"
-		)
-			return { started: false };
-
-		if (executionPrincipal) active._currentUserId = executionPrincipal.userId;
-		active._continuationSuppressed = false;
-		active._continuationStallCount = 0;
-		active._continuationStallKey = undefined;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
-
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, {
-			principal: executionPrincipal?.userId,
-			// A person's answer (an asynchronous question) wakes the session on their behalf.
-			initiatedBy: executionPrincipal ? "person" : "system",
-		}).catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (injection)", {
+			const principal = executionPrincipal ?? executionPrincipalOf(narrator);
+			const continuationLocale = await resolveBackgroundContinuationLocale(
 				narratorId,
-				error: String(err),
-			});
-			await reportUnsettledRunLoopError(narratorId, err);
+				locale,
+				principal?.userId,
+			);
+			const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
+			if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
+			if (
+				executionPrincipal &&
+				(
+					await readQueryFirst(
+						db
+							.select({ reason: narrators.lastStopReason })
+							.from(narrators)
+							.where(eq(narrators.id, narratorId))
+							.limit(1),
+						{ executionPolicy: "worker-required" },
+					)
+				)?.reason !== "normal"
+			)
+				return { started: false };
+
+			if (executionPrincipal) active._currentUserId = executionPrincipal.userId;
+			active._continuationSuppressed = false;
+			active._continuationStallCount = 0;
+			active._continuationStallKey = undefined;
+			active._lastTokenUsage = undefined;
+			active._ttftMs = undefined;
+			active._turnStartedAt = new Date().toISOString();
+
+			await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+			withTrackedNarratorSessionCleanup(() =>
+				runAgentLoop(active, "", undefined, {
+					principal: executionPrincipal?.userId,
+					// A person's answer (an asynchronous question) wakes the session on their behalf.
+					initiatedBy: executionPrincipal ? "person" : "system",
+				}).catch(async (err) => {
+					logger.error("runAgentLoop unhandled error (injection)", {
+						narratorId,
+						error: String(err),
+					});
+					await reportUnsettledRunLoopError(narratorId, err);
+				}),
+			);
+			return { started: true };
 		});
 		return { started: true };
 	});
@@ -5799,27 +6068,40 @@ export async function resumeBufferedMessagesIfIdle(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ resumed: boolean }> {
-	if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
-	const result = await continuationStartLock.acquire(narratorId, async () => {
+	return withTrackedNarratorSessionWork(async () => {
 		if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
-		// A live loop (or any other runtime owner) will consume the queue itself.
-		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
+		const result = await continuationStartLock.acquire(narratorId, async () => {
+			const [first] = await getBufferedMessagesAsync(narratorId);
+			if (!first) return { resumed: false };
+			// A live loop (or any other runtime owner) will consume the queue itself.
+			if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
 
-		// Recovery left the row at `working` with nobody behind it; drop it to idle so
-		// the resumed turn transitions honestly instead of stacking onto a zombie.
-		await reconcileRunningStatus(narratorId);
+			// Recovery left the row at `working` with nobody behind it; drop it to idle so
+			// the resumed turn transitions honestly instead of stacking onto a zombie.
+			await reconcileRunningStatus(narratorId);
 
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { resumed: false };
+			const narrator = await narratorService.getById(narratorId);
+			if (narrator.status !== "idle") return { resumed: false };
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { resumed: false };
+			const principal = first.createdBy
+				? { userId: first.createdBy }
+				: executionPrincipalOf(narrator);
+			// This projection contains only user_input, even when notices precede it.
+			// A queued person's preference outranks a hint left by the previous run.
+			const continuationLocale = await resolveBackgroundContinuationLocale(
+				narratorId,
+				first.createdBy ? undefined : locale,
+				principal?.userId,
+			);
+			const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
+			if (active._loopRunning) return { resumed: false };
 
-		const dispatch = await resumeNextBufferedMessageUnlocked(active, locale);
-		return { resumed: true, dispatch };
+			const dispatch = await resumeNextBufferedMessageUnlocked(active, continuationLocale);
+			return { resumed: true, dispatch };
+		});
+		if ("dispatch" in result) await result.dispatch?.();
+		return { resumed: result.resumed };
 	});
-	if ("dispatch" in result) await result.dispatch?.();
-	return { resumed: result.resumed };
 }
 
 /**
@@ -5838,40 +6120,46 @@ export async function startParentInboundContinuationIfPossible(
 	replyInUserLanguage = false,
 	options: InboxWakeOptions = {},
 ): Promise<{ started: boolean }> {
-	return continuationStartLock.acquire(narratorId, async () => {
-		// Recheck inside start admission: publication may have observed an idle
-		// recipient before an approval, compaction, or another owner took over.
-		if (
-			isNarratorRuntimeBusy(narratorId) ||
-			compactLocks.has(narratorId) ||
-			isNarratorRevertAdmissionBlocked(narratorId)
-		)
-			return { started: false };
+	return withTrackedNarratorSessionWork(async () => {
+		return continuationStartLock.acquire(narratorId, async () => {
+			// Recheck inside start admission: publication may have observed an idle
+			// recipient before an approval, compaction, or another owner took over.
+			if (
+				isNarratorRuntimeBusy(narratorId) ||
+				compactLocks.has(narratorId) ||
+				isNarratorRevertAdmissionBlocked(narratorId)
+			)
+				return { started: false };
 
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { started: false };
-		if (
-			(narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error") &&
-			!options.resumeStopped?.includes(narrator.lastStopReason)
-		)
-			return { started: false };
+			const narrator = await narratorService.getById(narratorId);
+			if (narrator.status !== "idle") return { started: false };
+			if (
+				(narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error") &&
+				!options.resumeStopped?.includes(narrator.lastStopReason)
+			)
+				return { started: false };
 
-		// Restore the recipient's own identity before touching its inbox. Unknown is
-		// not anonymous: a later human input can establish it without losing this queue.
-		const principal = executionPrincipalOf(narrator);
-		if (!principal) {
-			logger.warn("Run not started: execution principal is unknown", {
+			// Restore the recipient's own identity before touching its inbox. Unknown is
+			// not anonymous: a later human input can establish it without losing this queue.
+			const principal = executionPrincipalOf(narrator);
+			if (!principal) {
+				logger.warn("Run not started: execution principal is unknown", {
+					narratorId,
+					entrySource: "inbound_wake",
+				});
+				return { started: false };
+			}
+			const continuationLocale = await resolveBackgroundContinuationLocale(
 				narratorId,
-				entrySource: "inbound_wake",
-			});
-			return { started: false };
-		}
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
-		active._currentUserId = principal.userId;
+				locale,
+				principal.userId,
+			);
+			const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
+			if (active._loopRunning) return { started: false };
+			active._currentUserId = principal.userId;
 
-		const delivered = await drainAndPersistPendingInjections(active);
-		if (!delivered) return { started: false };
+			const delivered = await drainAndPersistPendingInjections(active);
+			if (!delivered) return { started: false };
 
 		active._continuationSuppressed = false;
 		active._continuationStallCount = 0;
@@ -5880,16 +6168,20 @@ export async function startParentInboundContinuationIfPossible(
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
 
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, {
-			principal: principal.userId,
-			initiatedBy: "system",
-		}).catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (subagent message)", {
-				narratorId,
-				error: String(err),
-			});
-			await reportUnsettledRunLoopError(narratorId, err);
+			await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+			withTrackedNarratorSessionCleanup(() =>
+				runAgentLoop(active, "", undefined, {
+					principal: principal.userId,
+					initiatedBy: "system",
+				}).catch(async (err) => {
+					logger.error("runAgentLoop unhandled error (subagent message)", {
+						narratorId,
+						error: String(err),
+					});
+					await reportUnsettledRunLoopError(narratorId, err);
+				}),
+			);
+			return { started: true };
 		});
 		return { started: true };
 	});
@@ -6024,21 +6316,24 @@ async function retryLastMessageUnlocked(
 	// placeholders are rare. "Top level" is the session's own turns, including those
 	// placed under the call its run delivers to.
 	const ownTurnPlacement = await readSessionOwnTurnPlacement(narratorId);
-	const tailRefs = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-		})
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				isNull(narratorMessageRefs.segmentCompactId),
-				messageRefExists({ roles: ["user", "assistant"], topLevel: { ownTurnPlacement } }),
-			),
-		)
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(RETRY_TAIL_SCAN_LIMIT);
+	const tailRefs = await readQuery(
+		db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessageRefs.segmentCompactId),
+					messageRefExists({ roles: ["user", "assistant"], topLevel: { ownTurnPlacement } }),
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(RETRY_TAIL_SCAN_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 
 	if (!tailRefs.length) {
 		// A ValidationError, not a NotFoundError: the narrator exists and was found, it
@@ -6048,15 +6343,9 @@ async function retryLastMessageUnlocked(
 		throw new ValidationError("No messages to retry");
 	}
 
-	const tailMessages = fillBodies(
-		await db.query.narratorMessages.findMany({
-			where: inArray(
-				narratorMessages.id,
-				tailRefs.map((ref) => ref.messageId),
-			),
-			...bodyColumns(),
-			with: { toolCalls: { columns: { id: true } } },
-		}),
+	const tailMessages = await readNarratorMessageRows(
+		tailRefs.map((ref) => ref.messageId),
+		{ includeTools: false, includeCreator: false },
 	);
 	const tailById = new Map(tailMessages.map((msg) => [msg.id, msg]));
 	// resolveRetryTarget expects oldest → newest; tailRefs is newest first.
@@ -6123,14 +6412,16 @@ async function retryLastMessageUnlocked(
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
-		principal: userId,
-		media: mediaRefs.length > 0 ? mediaRefs : undefined,
-		initiatedBy: "person",
-	}).catch(async (err) => {
-		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
-		await reportUnsettledRunLoopError(narratorId, err);
-	});
+	withTrackedNarratorSessionCleanup(() =>
+		runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
+			principal: userId,
+			media: mediaRefs.length > 0 ? mediaRefs : undefined,
+			initiatedBy: "person",
+		}).catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
+			await reportUnsettledRunLoopError(narratorId, err);
+		}),
+	);
 
 	return { ok: true };
 }
@@ -6240,150 +6531,161 @@ async function continueNarratorUnlocked(
 		recoveryStart?: RecoveryContinuationStart;
 	} = {},
 ): Promise<{ ok: boolean; terminal?: Promise<unknown> }> {
-	const { run, recoveryStart } = options;
-	recoveryStart?.check();
-	const narrator = await narratorService.getById(narratorId);
-	recoveryStart?.check();
-	// If the last top-level message is a tool-call assistant turn, replay the
-	// tool-result request packet instead of appending a textual "continue".
-	const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
-	recoveryStart?.check();
+	return withTrackedNarratorSessionWork(async () => {
+		const { run, recoveryStart } = options;
+		recoveryStart?.check();
+		const narrator = await narratorService.getById(narratorId);
+		recoveryStart?.check();
+		// If the last top-level message is a tool-call assistant turn, replay the
+		// tool-result request packet instead of appending a textual "continue".
+		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		recoveryStart?.check();
 
-	const continueTiming = resolveContinueTurnTiming({
-		substatus: parseSubstatus(narrator.substatus),
-		turnStartedAt: narrator.turnStartedAt,
-		nowMs: Date.now(),
-	});
-	// Guard: refuse to continue while a loop is already running (authoritative
-	// in-memory check, independent of a possibly-stale DB status).
-	if (isLoopRunning(narratorId)) {
-		logger.warn("continueNarrator blocked: loop already running", { narratorId });
-		// Correct a stale idle status so the user regains the interrupt button.
-		await reconcileRunningStatus(narratorId);
-		return { ok: false };
-	}
-	// A turn that died after streaming thinking leaves a reasoning-only assistant
-	// record as the tail. Look past those first: judging the tail without doing so
-	// misreads a preceding tool-call turn as "nothing to replay" and degrades the
-	// continuation into a plain "continue" message that abandons its tool results.
-	const { tail: lastTopLevelMessage, danglingReasoningIds } = resolveContinuationTail(rawMsgs);
-	const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
+		const continueTiming = resolveContinueTurnTiming({
+			substatus: parseSubstatus(narrator.substatus),
+			turnStartedAt: narrator.turnStartedAt,
+			nowMs: Date.now(),
+		});
+		// Guard: refuse to continue while a loop is already running (authoritative
+		// in-memory check, independent of a possibly-stale DB status).
+		if (isLoopRunning(narratorId)) {
+			logger.warn("continueNarrator blocked: loop already running", { narratorId });
+			// Correct a stale idle status so the user regains the interrupt button.
+			await reconcileRunningStatus(narratorId);
+			return { ok: false };
+		}
+		// A turn that died after streaming thinking leaves a reasoning-only assistant
+		// record as the tail. Look past those first: judging the tail without doing so
+		// misreads a preceding tool-call turn as "nothing to replay" and degrades the
+		// continuation into a plain "continue" message that abandons its tool results.
+		const { tail: lastTopLevelMessage, danglingReasoningIds } = resolveContinuationTail(rawMsgs);
+		const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
 
-	// Drop the dangling records before rebuilding the request. buildHistory reads
-	// the DB again, so leaving them in place would put the reasoning-only turn back
-	// at the end of the provider history — the exact shape that makes an upstream
-	// reject a tool-result-only packet. Deleting is safe: they hold no answer text
-	// and no tool call (see isDanglingReasoningOnlyAssistantMessage), and they carry
-	// no file changes, so the workspace must NOT be rolled back with them.
-	if (shouldReplayToolResults && danglingReasoningIds.length > 0) {
-		const deletedMessageIds: string[] = [];
-		for (const messageId of danglingReasoningIds) {
-			recoveryStart?.check();
-			try {
-				const removed = await narratorService.deleteDanglingReasoningMessage(narratorId, messageId);
-				if (removed) deletedMessageIds.push(messageId);
-			} catch (err) {
-				logger.warn("Failed to drop dangling reasoning message before continue", {
+		// Drop the dangling records before rebuilding the request. buildHistory reads
+		// the DB again, so leaving them in place would put the reasoning-only turn back
+		// at the end of the provider history — the exact shape that makes an upstream
+		// reject a tool-result-only packet. Deleting is safe: they hold no answer text
+		// and no tool call (see isDanglingReasoningOnlyAssistantMessage), and they carry
+		// no file changes, so the workspace must NOT be rolled back with them.
+		if (shouldReplayToolResults && danglingReasoningIds.length > 0) {
+			const deletedMessageIds: string[] = [];
+			for (const messageId of danglingReasoningIds) {
+				recoveryStart?.check();
+				try {
+					const removed = await narratorService.deleteDanglingReasoningMessage(
+						narratorId,
+						messageId,
+					);
+					if (removed) deletedMessageIds.push(messageId);
+				} catch (err) {
+					logger.warn("Failed to drop dangling reasoning message before continue", {
+						narratorId,
+						messageId,
+						error: String(err),
+					});
+				}
+			}
+			if (deletedMessageIds.length > 0) {
+				logger.info("Dropped dangling reasoning tail before continuing tool results", {
 					narratorId,
-					messageId,
-					error: String(err),
+					count: deletedMessageIds.length,
+				});
+				broadcastToNarrator(narratorId, {
+					type: "messages_deleted",
+					narratorId,
+					deletedMessageIds,
 				});
 			}
 		}
-		if (deletedMessageIds.length > 0) {
-			logger.info("Dropped dangling reasoning tail before continuing tool results", {
+
+		// A trailing injection already IS the turn's content (see hasTrailingInjectionRow), so
+		// it is continued by starting a loop with empty text — exactly like a tool-result
+		// replay, and unlike the synthetic "continue" row below, which would push the
+		// injection out of the trailing position the history builders depend on.
+		const trailingInjection = !shouldReplayToolResults && hasTrailingInjectionRow(rawMsgs);
+
+		if (!shouldReplayToolResults && !trailingInjection) {
+			// No pending tool calls and no fresh injection — send a simple "continue" user message.
+			const continueText = getToolMessage("userContinue", locale);
+			// A user queued this input while recovery held the runtime claim. Adopt it
+			// instead of appending a synthetic Continue behind an unclaimable mailbox head.
+			const queuedInput = recoveryStart
+				? (await getBufferedMessagesAsync(narratorId))[0]
+				: undefined;
+			recoveryStart?.check();
+			const { userMsg, terminal } = await feedMessage(
 				narratorId,
-				count: deletedMessageIds.length,
-			});
+				continueText,
+				undefined,
+				locale,
+				replyInUserLanguage,
+				null,
+				userId,
+				undefined,
+				undefined,
+				{
+					recoveryStart,
+					humanReplyContext: options.humanReplyContext,
+					bufferedId: queuedInput?.id,
+
+					...(continueTiming.preserveTurnStart
+						? { preserveTurnStart: true, turnStartedAt: continueTiming.turnStartedAt }
+						: {}),
+					...(run ? { run } : {}),
+				},
+			);
 			broadcastToNarrator(narratorId, {
 				type: "messages_deleted",
 				narratorId,
 				deletedMessageIds,
 			});
+			return { ok: true, terminal };
 		}
 	}
 
-	// A trailing injection already IS the turn's content (see hasTrailingInjectionRow), so
-	// it is continued by starting a loop with empty text — exactly like a tool-result
-	// replay, and unlike the synthetic "continue" row below, which would push the
-	// injection out of the trailing position the history builders depend on.
-	const trailingInjection = !shouldReplayToolResults && hasTrailingInjectionRow(rawMsgs);
-
-	if (!shouldReplayToolResults && !trailingInjection) {
-		// No pending tool calls and no fresh injection — send a simple "continue" user message.
-		const continueText = getToolMessage("userContinue", locale);
-		// A user queued this input while recovery held the runtime claim. Adopt it
-		// instead of appending a synthetic Continue behind an unclaimable mailbox head.
-		const queuedInput = recoveryStart ? (await getBufferedMessagesAsync(narratorId))[0] : undefined;
 		recoveryStart?.check();
-		const { userMsg, terminal } = await feedMessage(
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		recoveryStart?.check();
+		if (options.humanReplyContext)
+			await adoptHumanReplyContext(narratorId, options.humanReplyContext);
+		// Restore the triggering user so knowledge-base ACL works after a rebuild
+		// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
+		active._currentUserId = userId ?? active._currentUserId ?? null;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = continueTiming.preserveTurnStart
+			? continueTiming.turnStartedAt
+			: new Date().toISOString();
+		await narratorService.updateStatus(
 			narratorId,
-			continueText,
-			undefined,
-			locale,
-			replyInUserLanguage,
-			null,
-			userId,
-			undefined,
-			undefined,
-			{
-				recoveryStart,
-				humanReplyContext: options.humanReplyContext,
-				bufferedId: queuedInput?.id,
-				...(continueTiming.preserveTurnStart
-					? { preserveTurnStart: true, turnStartedAt: continueTiming.turnStartedAt }
-					: {}),
-				...(run ? { run } : {}),
-			},
+			"working",
+			continueTiming.preserveTurnStart
+				? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
+				: { setTurnStart: true },
 		);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: fileReferenceMessageForDisplay(userMsg),
+
+		// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
+		// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
+		// the current turn.
+		recoveryStart?.check();
+		const terminal = runAgentLoop(active, "", undefined, {
+			...run,
+			...(userId !== undefined ? { principal: userId } : {}),
+			recoveryStart,
+			// Continue or Resume a person asked for is theirs; the system resuming a run after a
+			// restart, an update or a subagent's recovery (`recovered`, a planned update's token) is
+			// not.
+			initiatedBy: run?.recovered || recoveryStart ? "system" : "person",
 		});
+		withTrackedNarratorSessionCleanup(() =>
+			terminal.catch(async (err) => {
+				logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
+				await reportUnsettledRunLoopError(narratorId, err);
+			}),
+		);
+
 		return { ok: true, terminal };
-	}
-
-	recoveryStart?.check();
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	recoveryStart?.check();
-	if (options.humanReplyContext)
-		await adoptHumanReplyContext(narratorId, options.humanReplyContext);
-	// Restore the triggering user so knowledge-base ACL works after a rebuild
-	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
-	active._currentUserId = userId ?? active._currentUserId ?? null;
-	active._lastTokenUsage = undefined;
-	active._ttftMs = undefined;
-	active._turnStartedAt = continueTiming.preserveTurnStart
-		? continueTiming.turnStartedAt
-		: new Date().toISOString();
-	await narratorService.updateStatus(
-		narratorId,
-		"working",
-		continueTiming.preserveTurnStart
-			? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
-			: { setTurnStart: true },
-	);
-
-	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
-	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
-	// the current turn.
-	recoveryStart?.check();
-	const terminal = runAgentLoop(active, "", undefined, {
-		...run,
-		...(userId !== undefined ? { principal: userId } : {}),
-		recoveryStart,
-		// Continue or Resume a person asked for is theirs; the system resuming a run after a
-		// restart, an update or a subagent's recovery (`recovered`, a planned update's token) is
-		// not.
-		initiatedBy: run?.recovered || recoveryStart ? "system" : "person",
 	});
-	terminal.catch(async (err) => {
-		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
-		await reportUnsettledRunLoopError(narratorId, err);
-	});
-
-	return { ok: true, terminal };
 }
 
 /**
@@ -6597,44 +6899,57 @@ async function reExecuteDeniedToolCallUnlocked(
 	// the session's own turns, including those placed under its run's destination.
 	const deliverTo = await readSessionDeliverTo(narratorId);
 	const ownTurnPlacement = await readSessionOwnTurnPlacement(narratorId);
-	const lastRef = await db
-		.select({ messageId: narratorMessageRefs.messageId })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				messageRefExists({
-					roles: ["user", "assistant"],
-					topLevel: { ownTurnPlacement },
-				}),
-			),
-		)
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
-	const latestAssistantMessageId = lastRef.length ? lastRef[0].messageId : null;
-	let toolCall = await db.query.narratorToolCalls.findFirst({
-		where: options?.persistedToolCallId
-			? and(
-					eq(narratorToolCalls.id, options.persistedToolCallId),
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				)
-			: and(
-					eq(narratorToolCalls.messageId, latestAssistantMessageId ?? ""),
-					eq(narratorToolCalls.toolUseId, toolUseId),
+	const lastRef = await readQuery(
+		db
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					messageRefExists({
+						roles: ["user", "assistant"],
+						topLevel: { ownTurnPlacement },
+					}),
 				),
-		orderBy: [desc(narratorToolCalls.executionAttempt), desc(narratorToolCalls.createdAt)],
-	});
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
+	const latestAssistantMessageId = lastRef.length ? lastRef[0].messageId : null;
+	const toolCallHead = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: options?.persistedToolCallId
+				? and(
+						eq(narratorToolCalls.id, options.persistedToolCallId),
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+					)
+				: and(
+						eq(narratorToolCalls.messageId, latestAssistantMessageId ?? ""),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+					),
+			orderBy: [desc(narratorToolCalls.executionAttempt), desc(narratorToolCalls.createdAt)],
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
+	let toolCall = toolCallHead ? (await readNarratorToolRows([toolCallHead.id]))[0] : undefined;
 
 	// Distinguish an obsolete call from an unknown ID without preparing either.
 	if (!toolCall && !restoringPersistedCall) {
-		toolCall = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			orderBy: [desc(narratorToolCalls.createdAt), desc(narratorToolCalls.executionAttempt)],
-		});
+		const previousHead = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				orderBy: [desc(narratorToolCalls.createdAt), desc(narratorToolCalls.executionAttempt)],
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
+		toolCall = previousHead ? (await readNarratorToolRows([previousHead.id]))[0] : undefined;
 	}
 	const rejectReason = restoringPersistedCall
 		? toolCall
@@ -6726,10 +7041,13 @@ async function reExecuteDeniedToolCallUnlocked(
 					active._currentUserId,
 				);
 				const sessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
-				const rerunMessage = await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, toolCall.messageId),
-					columns: { parentToolUseId: true },
-				});
+				const rerunMessage = await readQuery(
+					db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.id, toolCall.messageId),
+						columns: { parentToolUseId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				// Placement of the replayed transcript: the run's registered destination, when the
 				// call being replayed is one of the session's own turns placed under it.
 				const placed = !!deliverTo && rerunMessage?.parentToolUseId === deliverTo.toolUseId;
@@ -6766,6 +7084,10 @@ async function reExecuteDeniedToolCallUnlocked(
 					},
 					model: active.model,
 					provider: active.provider,
+					resolveServiceTier: async ({ provider, model, signal }) => {
+						const { effectiveFastMode } = await resolveNarratorFastMode(narratorId, { signal });
+						return effectiveFastMode && usesCodexModel(provider, model) ? "priority" : undefined;
+					},
 					cwd: active.cwd,
 					locale,
 					signal: active.abortController.signal,
@@ -7089,13 +7411,16 @@ async function executePersistedToolCallUnlocked(input: {
 	userId?: string | null;
 	permissionMode?: "normal" | "preGranted";
 }): Promise<ToolCallReexecutionLaunch> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, input.toolCallId),
-			eq(narratorToolCalls.narratorId, input.narratorId),
-		),
-		columns: { toolUseId: true },
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, input.toolCallId),
+				eq(narratorToolCalls.narratorId, input.narratorId),
+			),
+			columns: { toolUseId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!toolCall) return { ok: false, reason: "not_found" };
 	// Preserve the short-lock handoff: calling the public wrapper here would
 	// await its completion while this outer recovery transaction still held the lock.
@@ -7145,20 +7470,21 @@ async function rollbackToBlockUnlocked(
 	blockIndex: number,
 	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, messageId),
-		}),
-	);
+	const targetMsg = await readNarratorMessageRow(messageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 
 	const blocks = Array.isArray(targetMsg.contentJson)
@@ -7244,12 +7570,10 @@ async function rollbackToBlockUnlocked(
 			});
 		} else {
 			// Broadcast the updated message
-			const updatedMsg = fillBody(
-				await db.query.narratorMessages.findFirst({
-					...bodyColumns(),
-					where: eq(narratorMessages.id, messageId),
-				}),
-			);
+			const updatedMsg = await readNarratorMessageRow(messageId, {
+				includeTools: false,
+				includeCreator: false,
+			});
 			if (updatedMsg) {
 				broadcastToNarrator(narratorId, {
 					type: "message_updated",
@@ -7586,20 +7910,21 @@ async function editAndRegenerateUnlocked(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, messageId),
-		}),
-	);
+	const targetMsg = await readNarratorMessageRow(messageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
 		// The message was found; the request is what is wrong. As a NotFoundError this
@@ -7995,12 +8320,10 @@ async function editAndRegenerateUnlocked(
 
 	// Broadcast the updated message.  If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, privateMessageId),
-			...bodyColumns(),
-		}),
-	);
+	const updatedMsg = await readNarratorMessageRow(privateMessageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -8035,22 +8358,24 @@ async function editAndRegenerateUnlocked(
 	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
-	runAgentLoop(
-		active,
-		projectFileReferenceText(effectivePrompt, selectedReferences),
-		imageRefs.length > 0 ? imageRefs : undefined,
-		{
-			principal: opts?.userId,
-			media: existingMedia.length > 0 ? existingMedia : undefined,
-			initiatedBy: "person",
-		},
-	).catch(async (err) => {
-		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
-			narratorId,
-			error: String(err),
-		});
-		await reportUnsettledRunLoopError(narratorId, err);
-	});
+	withTrackedNarratorSessionCleanup(() =>
+		runAgentLoop(
+			active,
+			projectFileReferenceText(effectivePrompt, selectedReferences),
+			imageRefs.length > 0 ? imageRefs : undefined,
+			{
+				principal: opts?.userId,
+				media: existingMedia.length > 0 ? existingMedia : undefined,
+				initiatedBy: "person",
+			},
+		).catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
+				narratorId,
+				error: String(err),
+			});
+			await reportUnsettledRunLoopError(narratorId, err);
+		}),
+	);
 
 	return { ok: true, ...warnings };
 }
@@ -8112,20 +8437,21 @@ async function editAssistantMessageUnlocked(
 	newContent: string,
 	editedBy?: string | null,
 ): Promise<{ ok: boolean }> {
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, messageId),
-		}),
-	);
+	const targetMsg = await readNarratorMessageRow(messageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only edit assistant messages");
@@ -8154,12 +8480,10 @@ async function editAssistantMessageUnlocked(
 
 	// Broadcast the updated message. If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, privateMessageId),
-		}),
-	);
+	const updatedMsg = await readNarratorMessageRow(privateMessageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -8193,20 +8517,21 @@ async function restoreAssistantMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<{ ok: boolean }> {
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, messageId),
-		}),
-	);
+	const targetMsg = await readNarratorMessageRow(messageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only restore assistant messages");
@@ -8249,12 +8574,10 @@ async function restoreAssistantMessageUnlocked(
 		},
 	);
 
-	const updatedMsg = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, privateMessageId),
-		}),
-	);
+	const updatedMsg = await readNarratorMessageRow(privateMessageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -8304,16 +8627,105 @@ export function editedOutputElements(
 	return elements.map((element, position) => (position === index ? edited : element));
 }
 
-function broadcastEditedMessage(
+type OutputBlockWriteTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+interface OutputBlockEditIntent {
+	messageId: string;
+	rowId: string;
+	revision: number;
+}
+
+function staleOutputBlock(): never {
+	throw new AppError("Message history changed; reload and retry", 409, "BLOCK_TARGET_STALE");
+}
+
+async function readOutputBlockEditIntent(
+	messageId: string,
+	rowId: string,
+): Promise<OutputBlockEditIntent> {
+	const [row] = await readNativeRows<{ revision: number }>(
+		sqlite,
+		"SELECT revision FROM narrator_blocks WHERE id = ? AND message_id = ? AND kind = 'output' LIMIT 1",
+		[rowId, messageId],
+		{ executionPolicy: "worker-required" },
+	);
+	if (!row) staleOutputBlock();
+	return { messageId, rowId, revision: row.revision };
+}
+
+/** The target's identity and current range are checked inside its actual body write. */
+function currentOutputBlock(
+	tx: OutputBlockWriteTx,
+	narratorId: string,
+	intent: OutputBlockEditIntent,
+) {
+	let target: ReturnType<typeof resolveBlockTargets>[number];
+	try {
+		[target] = resolveBlockTargets(narratorId, [intent.rowId]);
+	} catch (error) {
+		if (error instanceof NotFoundError) staleOutputBlock();
+		throw error;
+	}
+	if (
+		target.rowId !== intent.rowId ||
+		target.messageId !== intent.messageId ||
+		target.kind !== "output"
+	)
+		staleOutputBlock();
+	const row = tx
+		.select({
+			id: narratorBlocks.id,
+			originBlockId: narratorBlocks.originBlockId,
+			payload: sql<string>`${narratorBlocks.payload}`,
+			originalPayload: sql<string | null>`${narratorBlocks.originalPayload}`,
+		})
+		.from(narratorBlocks)
+		.where(
+			and(
+				eq(narratorBlocks.id, intent.rowId),
+				eq(narratorBlocks.messageId, intent.messageId),
+				eq(narratorBlocks.kind, "output"),
+				eq(narratorBlocks.revision, intent.revision),
+			),
+		)
+		.get();
+	if (!row) staleOutputBlock();
+	return { target, row };
+}
+
+/** A COW result is matched by persistent identity/lineage, never an earlier ordinal. */
+function writtenOutputBlockId(
+	tx: OutputBlockWriteTx,
+	messageId: string,
+	source: { id: string; originBlockId: string | null },
+): string {
+	const candidates = tx
+		.select({ id: narratorBlocks.id })
+		.from(narratorBlocks)
+		.where(
+			and(
+				eq(narratorBlocks.messageId, messageId),
+				eq(narratorBlocks.kind, "output"),
+				or(
+					eq(narratorBlocks.id, source.id),
+					eq(narratorBlocks.originBlockId, source.originBlockId ?? source.id),
+				),
+			),
+		)
+		.limit(2)
+		.all();
+	if (candidates.length !== 1) staleOutputBlock();
+	return candidates[0].id;
+}
+
+async function broadcastEditedMessage(
 	narratorId: string,
 	messageId: string,
 	privateMessageId: string,
-): void {
-	const updated = fillBody(
-		db.query.narratorMessages
-			.findFirst({ ...bodyColumns(), where: eq(narratorMessages.id, privateMessageId) })
-			.sync(),
-	);
+): Promise<void> {
+	const updated = await readNarratorMessageRow(privateMessageId, {
+		includeTools: false,
+		includeCreator: false,
+	});
 	if (!updated) return;
 	broadcastToNarrator(narratorId, {
 		type: "message_updated",
@@ -8345,59 +8757,64 @@ async function editOutputBlockUnlocked(
 ): Promise<{ ok: true; messageId: string; blockId: string }> {
 	const [target] = resolveBlockTargets(narratorId, [blockId]);
 	if (target.kind !== "output") throw new ValidationError("Only an output block can be edited");
-	// The original payload lives on the block's row: an unconverted envelope gets its rows.
+	// Legacy conversion and its decoded-to-persistent identity binding are synchronous.
 	if (!target.rowId) materializeEnvelope(target.messageId);
-	const row = rowAt(target.messageId, target.from);
-	if (!row)
-		throw new AppError("Message history changed; reload and retry", 409, "BLOCK_TARGET_STALE");
-	const before = sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?").get(row.id) as {
-		payload: string;
-	};
-	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, target.messageId),
-		}),
-	);
-	if (!message) throw new NotFoundError("Message", target.messageId);
-	const elements = Array.isArray(message.contentJson)
-		? (message.contentJson as Array<Record<string, unknown>>)
-		: [];
-	const contentJson = [
-		...elements.slice(0, target.from),
-		...editedOutputElements(elements.slice(target.from, target.to), text),
-		...elements.slice(target.to),
-	];
-	let editedBlockId = row.id;
-	const privateMessageId = await narratorService.copyOnWriteMessage(
-		narratorId,
-		target.messageId,
-		{
-			contentJson,
-			contentText: modelTextFromContentBlocks(contentJson) || null,
-			editedAt: new Date().toISOString(),
-			editedBy: editedBy ?? null,
-			...(message.editedAt ? {} : { originalContentJson: message.contentJson }),
-		},
-		{
-			afterWrite: (_tx, messageId) => {
-				const edited = rowAt(messageId, target.from);
-				if (!edited)
-					throw new AppError(
-						"Message history changed; reload and retry",
-						409,
-						"BLOCK_TARGET_STALE",
-					);
-				editedBlockId = edited.id;
-				sqlite
-					.prepare(
-						"UPDATE narrator_blocks SET original_payload = coalesce(original_payload, ?) WHERE id = ?",
-					)
-					.run(before.payload, edited.id);
+	const rowId = target.rowId ?? rowAt(target.messageId, target.from)?.id;
+	if (!rowId) staleOutputBlock();
+	const intent = await readOutputBlockEditIntent(target.messageId, rowId);
+	let editedSource: { id: string; originBlockId: string | null; payload: string } | undefined;
+	let editedBlockId = rowId;
+	const privateMessageId = await narratorService
+		.copyOnWriteMessage(narratorId, target.messageId, undefined, {
+			mutateBody: (current, tx, sourceMessageId) => {
+				if (sourceMessageId !== intent.messageId || !Array.isArray(current)) staleOutputBlock();
+				const live = currentOutputBlock(tx, narratorId, intent);
+				if (
+					live.target.from < 0 ||
+					live.target.to > current.length ||
+					live.target.to <= live.target.from
+				)
+					staleOutputBlock();
+				const elements = current as Array<Record<string, unknown>>;
+				const contentJson = [
+					...elements.slice(0, live.target.from),
+					...editedOutputElements(elements.slice(live.target.from, live.target.to), text),
+					...elements.slice(live.target.to),
+				];
+				const message = tx
+					.select({ editedAt: narratorMessages.editedAt })
+					.from(narratorMessages)
+					.where(eq(narratorMessages.id, sourceMessageId))
+					.get();
+				if (!message) staleOutputBlock();
+				editedSource = live.row;
+				return {
+					contentJson,
+					contentText: modelTextFromContentBlocks(contentJson) || null,
+					editedAt: new Date().toISOString(),
+					editedBy: editedBy ?? null,
+					...(message.editedAt ? {} : { originalContentJson: current }),
+				};
 			},
-		},
-	);
-	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+			afterWrite: (tx, messageId) => {
+				if (!editedSource) staleOutputBlock();
+				editedBlockId = writtenOutputBlockId(tx, messageId, editedSource);
+				const changed = tx
+					.update(narratorBlocks)
+					.set({
+						originalPayload: sql`coalesce(${narratorBlocks.originalPayload}, ${editedSource.payload})`,
+					})
+					.where(and(eq(narratorBlocks.id, editedBlockId), eq(narratorBlocks.messageId, messageId)))
+					.returning({ id: narratorBlocks.id })
+					.all();
+				if (changed.length !== 1) staleOutputBlock();
+			},
+		})
+		.catch((error) => {
+			if (error instanceof NotFoundError) staleOutputBlock();
+			throw error;
+		});
+	await broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
 	return { ok: true, messageId: privateMessageId, blockId: editedBlockId };
 }
 
@@ -8418,55 +8835,67 @@ async function restoreOutputBlockUnlocked(
 ): Promise<{ ok: true; messageId: string; blockId: string }> {
 	const [target] = resolveBlockTargets(narratorId, [blockId]);
 	if (target.kind !== "output") throw new ValidationError("Only an output block can be restored");
-	const original = target.rowId
-		? (sqlite
-				.prepare("SELECT original_payload AS originalPayload FROM narrator_blocks WHERE id = ?")
-				.get(target.rowId) as { originalPayload: string | null } | null)
-		: null;
-	const raw = (parseStored(original?.originalPayload ?? null) as { raw?: unknown } | null)?.raw;
-	// Never edited by block: nothing to restore.
-	if (!target.rowId || !Array.isArray(raw))
-		return { ok: true, messageId: target.messageId, blockId: target.blockId };
-	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, target.messageId),
-		}),
-	);
-	if (!message) throw new NotFoundError("Message", target.messageId);
-	const elements = Array.isArray(message.contentJson) ? (message.contentJson as unknown[]) : [];
-	const contentJson = [...elements.slice(0, target.from), ...raw, ...elements.slice(target.to)];
-	const othersEdited = !!sqlite
-		.prepare(
-			"SELECT 1 FROM narrator_blocks WHERE message_id = ? AND id <> ? AND original_payload IS NOT NULL",
-		)
-		.get(target.messageId, target.rowId);
+	// An unconverted envelope has no per-block edit snapshot to restore.
+	if (!target.rowId) return { ok: true, messageId: target.messageId, blockId: target.blockId };
+	const intent = await readOutputBlockEditIntent(target.messageId, target.rowId);
+	let restoredSource: { id: string; originBlockId: string | null } | undefined;
 	let restoredBlockId = target.rowId;
-	const privateMessageId = await narratorService.copyOnWriteMessage(
-		narratorId,
-		target.messageId,
-		{
-			contentJson,
-			contentText: modelTextFromContentBlocks(contentJson) || null,
-			...(othersEdited ? {} : { editedAt: null, editedBy: null, originalContentJson: null }),
-		},
-		{
-			afterWrite: (_tx, messageId) => {
-				const restored = rowAt(messageId, target.from);
-				if (!restored)
-					throw new AppError(
-						"Message history changed; reload and retry",
-						409,
-						"BLOCK_TARGET_STALE",
-					);
-				restoredBlockId = restored.id;
-				sqlite
-					.prepare("UPDATE narrator_blocks SET original_payload = NULL WHERE id = ?")
-					.run(restored.id);
+	const privateMessageId = await narratorService
+		.copyOnWriteMessage(narratorId, target.messageId, undefined, {
+			mutateBody: (current, tx, sourceMessageId) => {
+				if (sourceMessageId !== intent.messageId || !Array.isArray(current)) staleOutputBlock();
+				const live = currentOutputBlock(tx, narratorId, intent);
+				if (
+					live.target.from < 0 ||
+					live.target.to > current.length ||
+					live.target.to <= live.target.from
+				)
+					staleOutputBlock();
+				const raw = (parseStored(live.row.originalPayload) as { raw?: unknown } | null)?.raw;
+				if (!Array.isArray(raw)) return null;
+				const contentJson = [
+					...current.slice(0, live.target.from),
+					...raw,
+					...current.slice(live.target.to),
+				];
+				const othersEdited = tx
+					.select({ id: narratorBlocks.id })
+					.from(narratorBlocks)
+					.where(
+						and(
+							eq(narratorBlocks.messageId, sourceMessageId),
+							sql`${narratorBlocks.id} <> ${intent.rowId}`,
+							isNotNull(narratorBlocks.originalPayload),
+						),
+					)
+					.limit(1)
+					.get();
+				restoredSource = live.row;
+				return {
+					contentJson,
+					contentText: modelTextFromContentBlocks(contentJson) || null,
+					...(othersEdited ? {} : { editedAt: null, editedBy: null, originalContentJson: null }),
+				};
 			},
-		},
-	);
-	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+			afterWrite: (tx, messageId) => {
+				if (!restoredSource) return;
+				restoredBlockId = writtenOutputBlockId(tx, messageId, restoredSource);
+				const changed = tx
+					.update(narratorBlocks)
+					.set({ originalPayload: null })
+					.where(
+						and(eq(narratorBlocks.id, restoredBlockId), eq(narratorBlocks.messageId, messageId)),
+					)
+					.returning({ id: narratorBlocks.id })
+					.all();
+				if (changed.length !== 1) staleOutputBlock();
+			},
+		})
+		.catch((error) => {
+			if (error instanceof NotFoundError) staleOutputBlock();
+			throw error;
+		});
+	if (restoredSource) await broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
 	return { ok: true, messageId: privateMessageId, blockId: restoredBlockId };
 }
 
@@ -8619,10 +9048,13 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 	narratorId: string,
 ): Promise<boolean> {
 	try {
-		const toolCalls = await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.messageId, partialId),
-			columns: { id: true, toolUseId: true, status: true },
-		});
+		const toolCalls = await readQuery(
+			db.query.narratorToolCalls.findMany({
+				where: eq(narratorToolCalls.messageId, partialId),
+				columns: { id: true, toolUseId: true, status: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 
 		// Statuses that indicate the tool was actually executed (side effects occurred)
 		const executedStatuses = new Set(["success", "fail", "running"]);
@@ -8813,9 +9245,11 @@ async function markInterruptedToolCallsForMessageUnlocked(
  * protocol requirement that every tool_use has a matching tool_result.
  */
 async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
-	return withNarratorWorkAdmission(narratorId, () =>
-		cleanupOrphanedToolCallsUnlocked(narratorId, locale),
-	);
+	return withTrackedNarratorSessionCleanup(async () => {
+		return withNarratorWorkAdmission(narratorId, () =>
+			cleanupOrphanedToolCallsUnlocked(narratorId, locale),
+		);
+	});
 }
 
 async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Locale): Promise<void> {
@@ -8892,14 +9326,15 @@ export function interruptNarrator(narratorId: string): boolean {
 	// Nothing is found by walking a parent tree: a session driven from its own page,
 	// a detached run and a mere subscriber registered no such relation.
 	if (active || recovery.interrupted)
-		void import("./agent-runtime/run")
-			.then(({ cancelRunsBoundTo }) => cancelRunsBoundTo(narratorId, "Caller interrupted"))
-			.catch((err) =>
-				logger.warn("Failed to cancel runs bound to the interrupted narrator", {
-					narratorId,
-					error: err instanceof Error ? err.message : String(err),
-				}),
-			);
+		withTrackedNarratorSessionCleanup(async () => {
+			const { cancelRunsBoundTo } = await import("./agent-runtime/run");
+			await cancelRunsBoundTo(narratorId, "Caller interrupted");
+		}).catch((err) =>
+			logger.warn("Failed to cancel runs bound to the interrupted narrator", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			}),
+		);
 	// Cleanup is handled by the agent loop's onErrorCleanup callback
 	// when it detects the "Aborted" error — no need to duplicate here.
 	logger.info("Narrator interrupted", { narratorId });
@@ -8912,11 +9347,13 @@ export function closeNarrator(narratorId: string): void {
 	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
+	// Capture the closing run before abort listeners or asynchronous cleanup run.
+	const closingRunId = getRunControl(narratorId)?.logicalRunId;
 	active.alive = false;
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
+	if (closingRunId) retireSubagentOutputCharCount(narratorId, closingRunId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,
@@ -8924,15 +9361,12 @@ export function closeNarrator(narratorId: string): void {
 		});
 	});
 	// Clean up any browser sessions owned by this narrator
-	import("../lib/browser/session")
-		.then(({ cleanupNarrator }) => {
-			cleanupNarrator(narratorId).catch((err) => {
-				logger.warn("Failed to cleanup browser sessions", { narratorId, error: String(err) });
-			});
-		})
-		.catch((err) => {
-			logger.warn("Failed to load browser session module", { narratorId, error: String(err) });
-		});
+	withTrackedNarratorSessionCleanup(async () => {
+		const { cleanupNarrator } = await import("../lib/browser/session");
+		await cleanupNarrator(narratorId);
+	}).catch((err) => {
+		logger.warn("Failed to cleanup browser sessions", { narratorId, error: String(err) });
+	});
 	logger.info("Narrator closed", { narratorId });
 }
 
@@ -8969,10 +9403,13 @@ export async function acquireNarratorRevertAdmission(
 ): Promise<() => void> {
 	const { signal, interrupt } = options;
 	signal.throwIfAborted();
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, variant: true, parentNarratorId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, variant: true, parentNarratorId: true },
+		}),
+		{ executionPolicy: "worker-required", signal: options.signal },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	signal.throwIfAborted();
 	// Users drive subagents directly, so a subagent is a valid revert root. It
@@ -9185,10 +9622,13 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 
 	if (isNarratorRuntimeBusy(narratorId)) return false;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true, substatus: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true, substatus: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (narrator?.status !== "working" && narrator?.status !== "waiting") return false;
 
 	const changed = await narratorService.compareAndSetStatus(
@@ -9266,25 +9706,65 @@ export async function failUnownedStartupRecovery(
  * the current tool call" messages. If the user cancels the queued message before
  * the boundary is reached, there is nothing left and the loop must keep running.
  */
-export function hasPendingBufferedWork(narratorId: string): boolean {
+export async function hasPendingBufferedWork(
+	narratorId: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
 	if (resolveRuntimeQueueBackend() === "postgres")
-		throw new Error(
-			"hasPendingBufferedWork is synchronous and cannot inspect the PostgreSQL mailbox; use getBufferedMessagesAsync",
-		);
-	return getBufferedMessages(narratorId).length > 0;
+		return (await getBufferedMessagesAsync(narratorId)).length > 0;
+	return !!(await readQueryFirst(
+		db
+			.select({ id: narratorBufferedMessages.id })
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.kind, "user_input"),
+					inArray(narratorBufferedMessages.state, ["queued", "failed"]),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", signal },
+	));
 }
 
 /** A queued next-step or failed input must never keep a guidance stop armed. */
-export function hasPendingBufferedGuidance(narratorId: string): boolean {
+export async function hasPendingBufferedGuidance(
+	narratorId: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
 	if (resolveRuntimeQueueBackend() === "postgres") {
-		// Updated after durable admission, queue mutations and consumption. The
-		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
+		// Updated after durable admission, queue mutations and consumption.
 		return activeNarrators.get(narratorId)?._bufferGuidancePending === true;
 	}
-	return getBufferedMessages(narratorId).some(
-		(message) =>
-			message.state !== "failed" &&
-			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+	const rows = await readQuery(
+		db
+			.select({
+				state: narratorBufferedMessages.state,
+				metadataJson: narratorBufferedMessages.metadataJson,
+				priority: narratorBufferedMessages.priority,
+			})
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.kind, "user_input"),
+					inArray(narratorBufferedMessages.state, ["queued", "failed"]),
+				),
+			)
+			.orderBy(
+				desc(narratorBufferedMessages.priority),
+				asc(narratorBufferedMessages.seq),
+				asc(narratorBufferedMessages.arrivalSeq),
+			)
+			.limit(MAILBOX_LIMITS.userPending),
+		{ executionPolicy: "worker-required", signal },
+	);
+	return rows.some(
+		(row) =>
+			row.state !== "failed" &&
+			resolveBufferQueueMode(JSON.parse(row.metadataJson ?? "{}").queueMode, row.priority) !==
+				"turn",
 	);
 }
 
@@ -9328,6 +9808,13 @@ export function evaluateSoftStopRequest(flags: {
 		};
 	}
 	return { stop: false, feedbackSoftStop: false, bufferSoftStop: false, softStopTaken: false };
+}
+
+const bufferedGuidanceRequestVersions = new WeakMap<ActiveNarrator, number>();
+
+/** Distinguish guidance admitted while an asynchronous boundary is checking older input. */
+export function getBufferedGuidanceRequestVersion(active: ActiveNarrator): number {
+	return bufferedGuidanceRequestVersions.get(active) ?? 0;
 }
 
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
@@ -9379,7 +9866,7 @@ export function applyBufferedQueueModeControl(
 	if (active) active._bufferGuidancePending = hasPendingGuidance;
 	if (!targetQueued) return;
 	if (mode === "turn") {
-		clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
+		if (active && !hasPendingGuidance && active._bufferSoftStop) active._bufferSoftStop = false;
 		return;
 	}
 	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
@@ -9395,7 +9882,7 @@ export function applyBufferedQueueModeControl(
  * Several branches in `runAgentLoop` break that assumption: chained permission
  * feedback, the review git-state guard and the injection drain each start a FRESH
  * pass before the buffer consumer is reached. That new pass has no soft-stop
- * request left, so `shouldStop()` stays false for its entire duration and the
+ * request left, so `shouldYieldToInput()` stays false for its entire duration and the
  * queued message waits through every remaining tool call until the whole loop
  * ends — the "it says it cut in, but it only arrived at the very end" report.
  *
@@ -9403,20 +9890,24 @@ export function applyBufferedQueueModeControl(
  * `hasPendingBufferedWork` holds), and the stepping-in producer keeps its priority:
  * its own text still rides on the turn being started here.
  */
-export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
+export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): Promise<void> {
 	if (!active._bufferSoftStopTaken) return;
-	if (!hasPendingBufferedGuidance(active.narratorId)) return;
+	const version = getBufferedGuidanceRequestVersion(active);
+	if (!(await hasPendingBufferedGuidance(active.narratorId, active.abortController.signal))) return;
+	if (!active._bufferSoftStopTaken || getBufferedGuidanceRequestVersion(active) !== version) return;
 	active._bufferSoftStopTaken = false;
 	active._bufferSoftStop = true;
 }
 
-export function clearBufferedMessageSoftStopIfIdle(
+export async function clearBufferedMessageSoftStopIfIdle(
 	narratorId: string,
 	pendingGuidance?: boolean,
-): void {
+): Promise<void> {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
-	const pending = pendingGuidance ?? hasPendingBufferedGuidance(narratorId);
+	const version = getBufferedGuidanceRequestVersion(active);
+	const pending = pendingGuidance ?? (await hasPendingBufferedGuidance(narratorId));
+	if (!pending && getBufferedGuidanceRequestVersion(active) !== version) return;
 	active._bufferGuidancePending = pending;
 	if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
 }
@@ -9435,10 +9926,13 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 	getActive: (id) => activeNarrators.get(id),
 	activeValues: () => activeNarrators.values(),
 	readNarrator: (id) =>
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
-		}),
+		readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	resolve: async (narrator, actingUserId, stickyProvider) => {
 		const settingsRevision = getSettingsRevision();
 		return {
@@ -9609,10 +10103,13 @@ export async function setTemporaryModelRestore(
  * Called once at server startup to recover from unclean shutdowns.
  */
 export async function restorePendingModelOverrides(): Promise<void> {
-	const pending = await db.query.narrators.findMany({
-		where: isNotNull(narrators.pendingModelRestore),
-		columns: { id: true, pendingModelRestore: true },
-	});
+	const pending = await readQuery(
+		db.query.narrators.findMany({
+			where: isNotNull(narrators.pendingModelRestore),
+			columns: { id: true, pendingModelRestore: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (pending.length === 0) return;
 
 	const now = new Date().toISOString();
@@ -9691,11 +10188,11 @@ function abortActiveReflectionSuggestions(
 	return changed ? next : undefined;
 }
 
-function logNarratorIntegrityDiagnostics(): void {
+async function logNarratorIntegrityDiagnostics(): Promise<void> {
 	try {
-		const fullForkEmptyRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
+		const fullForkEmptyRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
 					(SELECT count(*) FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id) AS parentRefCount
 				 FROM narrators n
 				 WHERE n.inherit_mode = 'full'
@@ -9703,8 +10200,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				   AND NOT EXISTS (SELECT 1 FROM narrator_message_refs r WHERE r.narrator_id = n.id)
 				   AND EXISTS (SELECT 1 FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id)
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			{ executionPolicy: "worker-required" },
+		);
 		if (fullForkEmptyRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: full forks with empty local refs", {
 				count: fullForkEmptyRefs.length,
@@ -9712,9 +10210,9 @@ function logNarratorIntegrityDiagnostics(): void {
 			});
 		}
 
-		const missingForkRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
+		const missingForkRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
 				 FROM narrators n
 				 WHERE n.fork_message_id IS NOT NULL
 				   AND n.parent_narrator_id IS NOT NULL
@@ -9724,8 +10222,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				       AND r.message_id = n.fork_message_id
 				   )
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			{ executionPolicy: "worker-required" },
+		);
 		if (missingForkRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: fork messages missing from parent refs", {
 				count: missingForkRefs.length,
@@ -9749,7 +10248,7 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 	const { recoverPermissionRuleRequests } = await import("./permission-rule-request-service");
 	let after: string | undefined;
 	do {
-		const page = recoverPermissionRuleRequests({
+		const page = await recoverPermissionRuleRequests({
 			after,
 			limit: 100,
 			reason: "Interrupted by server restart",
@@ -9795,25 +10294,44 @@ export async function recoverOnStartup(
 	}
 
 	// Legacy plan permission mode migration: plan is now a narrator trait.
-	const legacyPlanRows = sqlite
-		.prepare(
-			"SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan'",
-		)
-		.all() as Array<{ id: string; traits: string | null; previous_permission_mode: string | null }>;
-	for (const row of legacyPlanRows) {
-		const traits = addTrait(parseTraits(row.traits), "plan");
-		const permissionMode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
-		sqlite
-			.prepare(
-				"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(permissionMode, JSON.stringify(traits), permissionMode, generateWordSlug(), now, row.id);
+	let legacyPlanCursor = "";
+	let legacyPlanCount = 0;
+	for (;;) {
+		const rows = await readNativeRows<{
+			id: string;
+			traits: string | null;
+			previous_permission_mode: string | null;
+		}>(
+			sqlite,
+			"SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan' AND id > ? ORDER BY id LIMIT 128",
+			[legacyPlanCursor],
+			{ executionPolicy: "worker-required" },
+		);
+		for (const row of rows) {
+			const traits = addTrait(parseTraits(row.traits), "plan");
+			const mode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
+			legacyPlanCount += sqlite
+				.query(
+					"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ? AND permission_mode = 'plan' AND traits IS ? AND previous_permission_mode IS ?",
+				)
+				.run(
+					mode,
+					JSON.stringify(traits),
+					mode,
+					generateWordSlug(),
+					now,
+					row.id,
+					row.traits,
+					row.previous_permission_mode,
+				).changes;
+		}
+		if (rows.length < 128) break;
+		legacyPlanCursor = rows[rows.length - 1].id;
 	}
-	if (legacyPlanRows.length > 0) {
+	if (legacyPlanCount)
 		logger.info("Legacy plan permission mode migrated to narrator trait", {
-			count: legacyPlanRows.length,
+			count: legacyPlanCount,
 		});
-	}
 
 	// A user's hold on a run survives the restart: it is restored from its durable
 	// `taken_over` mirror before any status is rewritten, and the mirror is kept.
@@ -9833,10 +10351,13 @@ export async function recoverOnStartup(
 	// Active narrators interrupted by an ordinary restart are marked interrupted. Narrators
 	// covered by the planned-update manifest stay active until their continuations reattach.
 	for (const activeStatus of ["working", "waiting"] as const) {
-		const activeRows = await db.query.narrators.findMany({
-			where: eq(narrators.status, activeStatus),
-			columns: { id: true },
-		});
+		const activeRows = await readQuery(
+			db.query.narrators.findMany({
+				where: eq(narrators.status, activeStatus),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const interruptedIds = activeRows
 			.map((row) => row.id)
 			.filter((id) => !protection.narratorIds?.has(id));
@@ -9872,22 +10393,25 @@ export async function recoverOnStartup(
 	// loop; a swallowed clear (DB lock) or a status-drift CAS no-op could otherwise
 	// pin the sidebar tab icon purple across restarts. The interrupt migration above
 	// already reset working/waiting narrators, so only idle/archived rows remain.
-	const staleTransientRows = sqlite
-		.prepare(
-			"SELECT id, substatus FROM narrators WHERE substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%'",
-		)
-		.all() as Array<{ id: string; substatus: string | null }>;
 	let clearedTransient = 0;
-	const clearTransientStmt = sqlite.prepare(
-		"UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ?",
-	);
-	for (const row of staleTransientRows) {
-		const tags = parseSubstatus(row.substatus);
-		const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
-		if (kept.length !== tags.length) {
-			clearTransientStmt.run(JSON.stringify(kept), now, row.id);
-			clearedTransient++;
+	let transientCursor = "";
+	for (;;) {
+		const rows = await readNativeRows<{ id: string; substatus: string | null }>(
+			sqlite,
+			"SELECT id, substatus FROM narrators WHERE id > ? AND (substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%') ORDER BY id LIMIT 128",
+			[transientCursor],
+			{ executionPolicy: "worker-required" },
+		);
+		for (const row of rows) {
+			const tags = parseSubstatus(row.substatus);
+			const kept = tags.filter((tag) => tag !== "reflecting" && tag !== "reasoning");
+			if (kept.length === tags.length) continue;
+			clearedTransient += sqlite
+				.query("UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ? AND substatus IS ?")
+				.run(JSON.stringify(kept), now, row.id, row.substatus).changes;
 		}
+		if (rows.length < 128) break;
+		transientCursor = rows[rows.length - 1].id;
 	}
 	if (clearedTransient > 0) {
 		logger.info("Cleared stale transient substatus tags on startup", {
@@ -9895,97 +10419,100 @@ export async function recoverOnStartup(
 		});
 	}
 
-	logNarratorIntegrityDiagnostics();
+	await logNarratorIntegrityDiagnostics();
 
-	const stalePermissions = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "pending"),
-	});
-	if (stalePermissions.length > 0) {
+	for (const status of ["pending", "running", "initializing"] as const) {
+		let cursor = "";
+		let count = 0;
 		let staleReflectionCount = 0;
-		const restartMessage = "Interrupted by server restart";
-		for (const toolCall of stalePermissions) {
-			if (protection.toolCallIds?.has(toolCall.id)) continue;
-			const abortedSuggestions = abortActiveReflectionSuggestions(
-				toolCall.permissionSuggestions,
-				restartMessage,
-				now,
+		for (;;) {
+			const rows = await readQuery(
+				db
+					.select({
+						id: narratorToolCalls.id,
+						narratorId: narratorToolCalls.narratorId,
+						messageId: narratorToolCalls.messageId,
+						attempt: narratorToolCalls.executionAttempt,
+					})
+					.from(narratorToolCalls)
+					.where(and(eq(narratorToolCalls.status, status), gt(narratorToolCalls.id, cursor)))
+					.orderBy(narratorToolCalls.id)
+					.limit(128),
+				{ executionPolicy: "worker-required" },
 			);
-			if (abortedSuggestions) staleReflectionCount++;
-			await db
-				.update(narratorToolCalls)
-				.set({
-					status: "fail",
-					errorMessage: restartMessage,
-					permissionDecidedBy: "server_restart",
-					permissionDecidedAt: now,
-					...(abortedSuggestions
-						? {
-								permissionDecisionReason: restartMessage,
-								permissionSuggestions: abortedSuggestions,
-							}
-						: {}),
-				})
-				.where(eq(narratorToolCalls.id, toolCall.id));
+			for (const row of rows) {
+				if (protection.toolCallIds?.has(row.id)) continue;
+				const changed = db.transaction((tx) => {
+					// Revalidate attempt/status and reflection authority in the final write.
+					const current = tx
+						.select({
+							status: narratorToolCalls.status,
+							attempt: narratorToolCalls.executionAttempt,
+							permissionSuggestions:
+								status === "pending" ? narratorToolCalls.permissionSuggestions : sql<unknown>`NULL`,
+						})
+						.from(narratorToolCalls)
+						.where(eq(narratorToolCalls.id, row.id))
+						.get();
+					if (!current || current.status !== status || current.attempt !== row.attempt)
+						return false;
+					const restartMessage = "Interrupted by server restart";
+					const aborted =
+						status === "pending"
+							? abortActiveReflectionSuggestions(current.permissionSuggestions, restartMessage, now)
+							: undefined;
+					const fields =
+						status === "pending"
+							? {
+									status: "fail" as const,
+									errorMessage: restartMessage,
+									permissionDecidedBy: "server_restart",
+									permissionDecidedAt: now,
+									...(aborted
+										? { permissionDecisionReason: restartMessage, permissionSuggestions: aborted }
+										: {}),
+								}
+							: {
+									status: "fail" as const,
+									errorMessage: restartMessage,
+									outputJson: getToolMessage("interruptedByServerRestart"),
+									outputChars: measureSerializedCharacters(
+										getToolMessage("interruptedByServerRestart"),
+									),
+								};
+					const applied =
+						tx
+							.update(narratorToolCalls)
+							.set(fields)
+							.where(
+								and(
+									eq(narratorToolCalls.id, row.id),
+									eq(narratorToolCalls.status, status),
+									eq(narratorToolCalls.executionAttempt, row.attempt),
+								),
+							)
+							.returning({ id: narratorToolCalls.id })
+							.all().length > 0;
+					if (applied && aborted) staleReflectionCount++;
+					return applied;
+				});
+				if (changed) {
+					count++;
+					if (status !== "pending") queueContextCharacterRefresh(row.narratorId, row.messageId);
+				}
+			}
+			if (rows.length < 128) break;
+			cursor = rows[rows.length - 1].id;
 		}
-		logger.info("Stale pending tool calls auto-denied on startup", {
-			count: stalePermissions.length,
-			staleReflectionCount,
-		});
-	}
-
-	const staleToolCalls = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "running"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleToolCalls.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleToolCalls.map((toolCall) => toolCall.id),
-				),
+		if (count)
+			logger.info(
+				status === "pending"
+					? "Stale pending tool calls auto-denied on startup"
+					: status === "running"
+						? "Stale running tool calls marked as failed on startup"
+						: "Stale initializing tool calls marked as failed on startup",
+				{ count, ...(status === "pending" ? { staleReflectionCount } : {}) },
 			);
-		for (const call of staleToolCalls)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale running tool calls marked as failed on startup", {
-			count: staleToolCalls.length,
-		});
-	}
-
-	// Also recover tool calls stuck in "initializing" (permission check never started)
-	const staleInitializing = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "initializing"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleInitializing.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleInitializing.map((toolCall) => toolCall.id),
-				),
-			);
-		for (const call of staleInitializing)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale initializing tool calls marked as failed on startup", {
-			count: staleInitializing.length,
-		});
 	}
 
 	// Preserve modern compact lifecycle records across restarts. Running attempts
@@ -10003,20 +10530,31 @@ export async function recoverOnStartup(
 			count: interruptedTurns,
 		});
 
-	const transientCompactRows = await db.query.narrators.findMany({
-		columns: { id: true, substatus: true },
-	});
-	for (const row of transientCompactRows) {
-		const current = parseSubstatus(row.substatus);
-		const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
-		if (next.length !== current.length) {
-			await narratorService.updateSubstatus(row.id, next).catch((err) => {
-				logger.warn("Failed to clear stale compact substatus on startup", {
-					narratorId: row.id,
-					error: String(err),
+	let compactCursor = "";
+	for (;;) {
+		const transientCompactRows = await readQuery(
+			db.query.narrators.findMany({
+				where: gt(narrators.id, compactCursor),
+				orderBy: asc(narrators.id),
+				limit: 128,
+				columns: { id: true, substatus: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
+		for (const row of transientCompactRows) {
+			const current = parseSubstatus(row.substatus);
+			const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
+			if (next.length !== current.length) {
+				await narratorService.updateSubstatus(row.id, next).catch((err) => {
+					logger.warn("Failed to clear stale compact substatus on startup", {
+						narratorId: row.id,
+						error: String(err),
+					});
 				});
-			});
+			}
 		}
+		if (transientCompactRows.length < 128) break;
+		compactCursor = transientCompactRows[transientCompactRows.length - 1].id;
 	}
 
 	// Mailbox rows are authoritative and loaded per narrator on demand. Startup must not
@@ -10079,16 +10617,19 @@ export async function resolveOptionalToolState(
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			enabledTools: true,
-			traits: true,
-			contextProjectId: true,
-			...RUNTIME_SOURCE_COLUMNS,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				enabledTools: true,
+				traits: true,
+				contextProjectId: true,
+				...RUNTIME_SOURCE_COLUMNS,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	// Layered, so the UI reports a project/user-level deny as disabled_by_trait
@@ -10102,10 +10643,13 @@ export async function resolveOptionalToolState(
 	// next turn would contradict.
 	let projectRoutineConfig: RoutineModeConfig | undefined;
 	if (narratorProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narratorProjectId),
-			columns: { chapterSettings: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, narratorProjectId),
+				columns: { chapterSettings: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 	}
 

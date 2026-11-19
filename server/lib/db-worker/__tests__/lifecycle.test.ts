@@ -12,6 +12,8 @@ import { WorkerHandle } from "../../worker-runtime/lifecycle";
 import * as failures from "../failure";
 import {
 	DB_WORKER_MAX_QUEUE,
+	DbReadTaskOverloadedError,
+	drainDbWorkerPool,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	resumeDbWorkerPool,
@@ -23,7 +25,7 @@ import {
 import { DB_WORKER_READY_TIMEOUT_MS } from "../protocol";
 
 const task = { kind: "storageScanContext" } as const;
-const unusedDb = "/must-not-open-on-main-thread.sqlite";
+let unusedDb: string;
 const failureOf = (promise: Promise<unknown>) => promise.catch((error: unknown) => error);
 function deferred<T = void>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
@@ -52,11 +54,13 @@ const hanging = `parentPort.on("message", () => {});`;
 beforeEach(async () => {
 	await resetDbWorkerPoolForTest();
 	dir = mkdtempSync(join(tmpdir(), "nf-db-lifecycle-"));
+	unusedDb = join(dir, "source.sqlite");
+	new Database(unusedDb).close();
 	handles = [];
 	restores = [];
 	posted = [];
 	nextSpawn = deferred();
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	const create = WorkerHandle.thread;
 	const spawns = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
 		const handle = create(entry, options);
@@ -153,8 +157,18 @@ test("no-ready startup uses the bounded startup budget and a failed owner exits"
 	]);
 });
 
+test("count overload retains the public error class and shared admission code", () => {
+	const error = new DbReadTaskOverloadedError();
+	expect(error).toBeInstanceOf(Error);
+	expect(error).toMatchObject({
+		code: "DB_READ_OVERLOADED",
+		name: "DbReadTaskOverloadedError",
+		message: "Database read worker queue is full",
+	});
+});
+
 test("concurrent cold starts reserve shared permits before awaiting readiness", async () => {
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "3";
 	fixture(`${success}\nawait Bun.sleep(80);`);
 	const jobs = Array.from({ length: 6 }, () => runReadTask(unusedDb, task));
 	await nextSpawn.promise;
@@ -169,12 +183,15 @@ test("concurrent cold starts reserve shared permits before awaiting readiness", 
 test("queue bounds overload and cancellation removes every waiter", async () => {
 	fixture(hanging, false);
 	const controller = new AbortController();
-	const jobs = Array.from({ length: DB_WORKER_MAX_QUEUE + 1 }, () =>
+	const jobs = Array.from({ length: (DB_WORKER_MAX_QUEUE * 3) / 4 + 1 }, () =>
 		failureOf(runReadTask(unusedDb, task, { signal: controller.signal })),
 	);
 	const error = await failureOf(runReadTask(unusedDb, task));
-	expect(error).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
-	expect(getDbWorkerPoolStats().queued).toBe(DB_WORKER_MAX_QUEUE);
+	expect(error).toBeInstanceOf(DbReadTaskOverloadedError);
+	expect(error).toMatchObject({ code: "DB_READ_OVERLOADED" });
+	expect(getDbWorkerPoolStats().queued).toBe((DB_WORKER_MAX_QUEUE * 3) / 4);
+	const repeated = await failureOf(runReadTask(unusedDb, task));
+	expect(repeated).toMatchObject({ code: "DB_READ_OVERLOADED" });
 	controller.abort();
 	await Promise.all(jobs);
 	expect(getDbWorkerPoolStats()).toMatchObject({
@@ -447,12 +464,16 @@ test("legacy HMR owners are observed through real exit before runtime startup", 
 		const reloaded = (await import(
 			`../pool.ts?legacy-runtime=${Date.now()}`
 		)) as typeof import("../pool");
-		const pending = reloaded.runReadTask(unusedDb, task);
+		const pending = failureOf(reloaded.runReadTask(unusedDb, task));
 		await Promise.resolve();
 		expect(handles).toHaveLength(0);
 		expect(exited).toBe(false);
+		expect(await pending.catch((error: unknown) => error)).toMatchObject({
+			reason: "pool_upgrading",
+		});
 		gate.resolve();
-		expect(await pending).toBe(42);
+		await Reflect.get(old, "replacement").upgrade;
+		expect(await reloaded.runReadTask(unusedDb, task)).toBe(42);
 		expect(exited).toBe(true);
 		expect(String(Reflect.get(old, "disabledReason"))).toBe("pool_shutdown"); // Stale pre-runtime closures stay disabled.
 		expect(reloaded.getDbWorkerAvailability()).toEqual({ available: true, reason: null });
@@ -735,7 +756,8 @@ test("runtime worker failures log a stable category without the thrown body or e
 	});`);
 	const error = await failureOf(runReadTask(unusedDb, task));
 	expect(error).toMatchObject({
-		name: "DbReadTaskExecutionError",
+		name: "DbReadError",
+		code: "DB_READ_WORKER_EXITED",
 		message: "database worker died before completion",
 	});
 	const calls = (logger.warn as ReturnType<typeof spyOn>).mock.calls;

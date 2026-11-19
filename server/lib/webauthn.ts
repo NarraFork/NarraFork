@@ -5,6 +5,7 @@
 import { and, eq, lt } from "drizzle-orm";
 import { db } from "../db";
 import { webauthnChallenges } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { hotTimer } from "./hot-safe";
 import { generateId } from "./id";
 import { logger } from "./logger";
@@ -41,9 +42,12 @@ export async function consumeChallenge(
 	challenge: string,
 	type: "registration" | "authentication",
 ): Promise<{ ok: boolean; userId: string | null }> {
-	const row = await db.query.webauthnChallenges.findFirst({
-		where: and(eq(webauthnChallenges.challenge, challenge), eq(webauthnChallenges.type, type)),
-	});
+	const row = await readQuery(
+		db.query.webauthnChallenges.findFirst({
+			where: and(eq(webauthnChallenges.challenge, challenge), eq(webauthnChallenges.type, type)),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) return { ok: false, userId: null };
 	// Always delete — whether valid or expired — so it cannot be reused.
 	await db.delete(webauthnChallenges).where(eq(webauthnChallenges.id, row.id));

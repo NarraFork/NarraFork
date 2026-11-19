@@ -29,7 +29,9 @@ function moved(): AppError {
  * The revision is read as text to preserve PostgreSQL bigint precision. No transaction
  * stays open across awaits, and claiming an identity does not rotate a prefix epoch.
  */
-export function createConversationIdentityStore(query: Pick<ContextQuery, "get">) {
+export function createConversationIdentityStore(
+	query: Pick<ContextQuery, "get" | "writeReturning">,
+) {
 	return {
 		async read(narratorId: string): Promise<ConversationIdentitySnapshot> {
 			const row = await query.get<ConversationIdentitySnapshot>(
@@ -45,7 +47,7 @@ export function createConversationIdentityStore(query: Pick<ContextQuery, "get">
 			next: string,
 			expected: ConversationIdentitySnapshot,
 		): Promise<boolean> {
-			const row = await query.get<{ id: string }>(
+			const row = await query.writeReturning<{ id: string }>(
 				`UPDATE narrators SET api_conversation_id = ?, updated_at = ?
 				 WHERE id = ? AND model_history_revision = ? AND
 				 ${expected.conversationId === null ? "api_conversation_id IS NULL" : "api_conversation_id = ?"}

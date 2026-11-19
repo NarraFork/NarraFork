@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	runtimeAwaitedTerminalConsumptions as consumptions,
@@ -8,8 +8,13 @@ import {
 	narrators,
 	runtimePublicationOutbox as outbox,
 } from "../../db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb as getTestDb,
+} from "../__tests__/agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
@@ -38,13 +43,13 @@ beforeEach(async () => {
 afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
-afterAll(() => {
+afterAll(async () => {
 	backgroundOccupancyStore.resetForTests();
 	publisher.stop();
 	runtimePublication.stop();
 	tasks.setBroadcastFnForTests(null);
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.restore();
 });
 

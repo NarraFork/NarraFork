@@ -9,12 +9,21 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
+import type {
+	BackgroundTaskListDelta,
+	BackgroundTaskListItem,
+	BackgroundTaskListPage,
+} from "@shared/background-task-list";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { logger } from "../../lib/logger";
+import type { BackgroundTaskSummary } from "../background-task-service";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -71,24 +80,31 @@ const {
 	encodeBackgroundTaskListCursor,
 } = await import("../background-task-service");
 
-// Observe completion without replacing the real queries, counts or WebSocket publication.
-const pendingBroadcasts = new Set<Promise<void>>();
-const asyncBroadcasters = backgroundTaskService as unknown as Record<
-	"broadcastTaskUpsert" | "broadcastListDelta",
-	(parentNarratorId: string, payload: unknown) => Promise<void>
->;
-for (const method of ["broadcastTaskUpsert", "broadcastListDelta"] as const) {
-	const original = asyncBroadcasters[method].bind(backgroundTaskService);
-	spyOn(asyncBroadcasters, method).mockImplementation((parentNarratorId, payload) => {
-		const pending = original(parentNarratorId, payload);
-		pendingBroadcasts.add(pending);
-		void pending.then(
-			() => pendingBroadcasts.delete(pending),
-			() => pendingBroadcasts.delete(pending),
-		);
-		return pending;
-	});
+/** Track the actual fire-and-forget work; Worker completion is not tied to timer turns. */
+const pendingListBroadcasts = new Set<Promise<void>>();
+function trackListBroadcast(work: Promise<void>): Promise<void> {
+	pendingListBroadcasts.add(work);
+	void work.then(
+		() => pendingListBroadcasts.delete(work),
+		() => pendingListBroadcasts.delete(work),
+	);
+	return work;
 }
+const listBroadcasts = backgroundTaskService as unknown as {
+	broadcastTaskUpsert(parentId: string, taskId: string): Promise<void>;
+	broadcastListDelta(
+		parentId: string,
+		delta: Omit<BackgroundTaskListDelta, "listEpoch" | "version" | "activeCount">,
+	): Promise<void>;
+};
+const broadcastTaskUpsert = listBroadcasts.broadcastTaskUpsert.bind(backgroundTaskService);
+const broadcastListDelta = listBroadcasts.broadcastListDelta.bind(backgroundTaskService);
+spyOn(listBroadcasts, "broadcastTaskUpsert").mockImplementation((...args) =>
+	trackListBroadcast(broadcastTaskUpsert(...args)),
+);
+spyOn(listBroadcasts, "broadcastListDelta").mockImplementation((...args) =>
+	trackListBroadcast(broadcastListDelta(...args)),
+);
 
 const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS, BACKGROUND_TASK_LIST_PAGE_SIZE } = await import(
 	"@shared/background-task-list"
@@ -131,15 +147,21 @@ app.use("*", async (c, next) => {
 });
 app.route("/api/narrators", narratorRoutes);
 
-afterAll(() => {
+afterAll(async () => {
 	runtimePublication.stop();
-	runtimePublication.setWake(async (narratorId) => {
-		await wakeInboxIfEligible(narratorId);
-	});
-	mock.module("../../db", () => realDbModule);
-	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
-	mock.module("../narrator-session", () => realNarratorSession);
-	mock.restore();
+	try {
+		await flushDeltas();
+		await backgroundOccupancyStore.stop();
+	} finally {
+		runtimePublication.setWake(async (narratorId) => {
+			await wakeInboxIfEligible(narratorId);
+		});
+		mock.module("../../db", () => realDbModule);
+		mock.module("../../websocket/narrator-ws", () => realNarratorWs);
+		mock.module("../narrator-session", () => realNarratorSession);
+		mock.restore();
+		await workerFixture.close();
+	}
 });
 
 beforeEach(() => {
@@ -159,14 +181,15 @@ afterEach(async () => {
 	await flushDeltas();
 	cleanDb(sqlite);
 	// An emptied case cannot leave an outbox page cursor positioned in the next case.
-	runtimePublication.flushPage();
+	await runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
 
-async function seedParent(): Promise<void> {
+async function seedParent(options: { startOccupancy?: boolean } = {}): Promise<void> {
 	const now = new Date().toISOString();
-	await seedNarrators({
+	// Initial fixture rows are discovered by startup, not replayed as live invalidations.
+	await db.insert(narrators).values({
 		id: PARENT,
 		type: "primary",
 		variant: "primary",
@@ -174,7 +197,7 @@ async function seedParent(): Promise<void> {
 		updatedAt: now,
 	});
 	// Bootstrap once before exercising subsequent incremental writes and reads.
-	await backgroundOccupancyStore.start();
+	if (options.startOccupancy !== false) await backgroundOccupancyStore.start();
 }
 
 /** A legacy background subagent: pre-unified-table history, keyed off narrators. */
@@ -234,12 +257,16 @@ function transitions(values: unknown[]): unknown[] {
 	return values.filter((value, index) => index === 0 || value !== values[index - 1]);
 }
 
-/** Drain maintenance and actual publication promises, including broadcasts queued by either. */
+/** Drain maintained state, its deferred subscribers and the actual Worker-backed row broadcasts. */
 async function flushDeltas(): Promise<void> {
-	do {
+	for (let round = 0; round < 100; round++) {
 		if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
-		await Promise.all([...pendingBroadcasts]);
-	} while (pendingBroadcasts.size > 0);
+		// Maintenance publishes subscribers on setImmediate after its promise settles.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		if (pendingListBroadcasts.size === 0) return;
+		await Promise.all([...pendingListBroadcasts]);
+	}
+	throw new Error("Background task list broadcasts did not reach a settled boundary");
 }
 
 describe("background task list cursor paging", () => {
@@ -672,9 +699,12 @@ describe("background task batch active count", () => {
 			spyOn(databaseBackgroundOccupancySource, "getProjections"),
 		];
 		try {
-			await expect(backgroundTaskService.countActiveKindsByParentBatch([PARENT])).rejects.toThrow(
-				"not initialized",
+			const error = await captureWorkerRejection(
+				backgroundTaskService.countActiveKindsByParentBatch([PARENT]),
 			);
+			expect(() => {
+				throw error;
+			}).toThrow("not initialized");
 			for (const read of reads) expect(read).not.toHaveBeenCalled();
 		} finally {
 			for (const read of reads) read.mockRestore();
@@ -868,12 +898,19 @@ describe("derived status notification identity", () => {
 		await seedParent();
 		const narratorId = "derived-narrator";
 		const taskId = "derived-projection";
-		await seedLegacyTask({ id: narratorId, createdAt: new Date().toISOString() });
-		await backgroundTaskService.createAgentTask({
+		const now = new Date().toISOString();
+		await seedLegacyTask({ id: narratorId, createdAt: now });
+		// Older persisted projections can use a task id distinct from their narrator id.
+		await seedTasks({
 			id: taskId,
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: narratorId,
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
 		});
 		const { eq } = await import("drizzle-orm");
 		await db
@@ -914,11 +951,16 @@ describe("derived status notification identity", () => {
 			updatedAt: now,
 		});
 		await seedLegacyTask({ id: "scoped-narrator", createdAt: now });
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: "scoped-projection",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: "scoped-narrator",
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
 		});
 		await seedBashTaskAt("scoped-bash", now);
 		await flushDeltas();
@@ -940,11 +982,16 @@ describe("derived status notification identity", () => {
 		await seedParent();
 		const now = new Date().toISOString();
 		await seedLegacyTask({ id: "direct-id", createdAt: now });
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: "indirect-id",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: "direct-id",
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
 		});
 		await seedBashTaskAt("direct-id", now);
 		await seedLegacyTask({ id: "plain-legacy", createdAt: now });
@@ -966,6 +1013,149 @@ describe("derived status notification identity", () => {
 		expect(listRowDeltas()).toHaveLength(1);
 		expect(listRowDeltas()[0]?.removeIds).toEqual(["missing-id"]);
 		expect(listRowDeltas()[0]?.upsert).toBeUndefined();
+	});
+});
+
+describe("background task list diagnostics", () => {
+	test("keeps page content while separating awaited occupancy from synchronous mapping", async () => {
+		await seedParent();
+		await seedBashTaskAt("observed-history", "2026-01-01T00:00:00.000Z", "private output");
+		await seedBashTaskAt("observed-active", "2026-01-02T00:00:00.000Z");
+		await flushDeltas();
+		await backgroundOccupancyStore.flush();
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const internals = backgroundTaskService as unknown as {
+			toListItem(summary: BackgroundTaskSummary): BackgroundTaskListItem;
+		};
+		const originalMap = internals.toListItem.bind(backgroundTaskService);
+		const originalFlush = backgroundOccupancyStore.flush.bind(backgroundOccupancyStore);
+		let mappings = 0;
+		const map = spyOn(internals, "toListItem");
+		const flush = spyOn(backgroundOccupancyStore, "flush");
+		try {
+			const baseline = await backgroundTaskService.listPageByParent(PARENT, { limit: 1 });
+			expect(warn).not.toHaveBeenCalled();
+			map.mockImplementation((summary) => {
+				mappings++;
+				clock += 7;
+				return originalMap(summary);
+			});
+			flush.mockImplementation(async () => {
+				await originalFlush();
+				clock += 500;
+			});
+			const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 1 });
+			expect(page).toEqual(baseline);
+			const records = warn.mock.calls.filter(
+				([message]) => message === "Slow background task list",
+			);
+			expect(records).toHaveLength(1);
+			const record = records[0]?.[1];
+			expect(mappings).toBeGreaterThan(0);
+			expect(record).toMatchObject({
+				mode: "page",
+				completed: true,
+				mappingSyncMs: mappings * 7,
+				mergeSortSyncMs: 0,
+				unifiedRows: 2,
+				legacyRows: 0,
+				activeRows: 1,
+				returnedRows: 1,
+			});
+			expect(record?.occupancyWaitMs).toBeGreaterThanOrEqual(500);
+			expect(record?.workerReadCount).toBeGreaterThanOrEqual(3);
+			expect(record?.workerRows).toBeGreaterThanOrEqual(3);
+			expect(record?.elapsedMs).toBeGreaterThanOrEqual(500);
+			expect(record).not.toHaveProperty("tasks");
+			expect(record).not.toHaveProperty("output");
+		} finally {
+			flush.mockRestore();
+			map.mockRestore();
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+
+	test("uses one fixed log budget across legacy snapshots, pages and parent IDs", async () => {
+		await seedParent();
+		await seedBashTaskAt("observed-legacy-history", "2026-01-01T00:00:00.000Z", "result");
+		await flushDeltas();
+		await backgroundOccupancyStore.flush();
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const originalFlush = backgroundOccupancyStore.flush.bind(backgroundOccupancyStore);
+		const flush = spyOn(backgroundOccupancyStore, "flush").mockImplementation(async () => {
+			await originalFlush();
+			clock += 500;
+		});
+		const records = () =>
+			warn.mock.calls.filter(([message]) => message === "Slow background task list");
+		try {
+			flush.mockImplementation(originalFlush);
+			const baseline = await backgroundTaskService.listLegacySnapshotByParent(PARENT);
+			flush.mockImplementation(async () => {
+				await originalFlush();
+				clock += 500;
+			});
+			expect(await backgroundTaskService.listLegacySnapshotByParent(PARENT)).toEqual(baseline);
+			expect(records()).toHaveLength(1);
+			expect(records()[0]?.[1]).toMatchObject({
+				mode: "legacy-snapshot",
+				completed: true,
+				returnedRows: 1,
+				mergeSortSyncMs: 0,
+			});
+			for (const parent of [PARENT, "another-parent", "third-parent"])
+				await backgroundTaskService.listPageByParent(parent);
+			expect(records()).toHaveLength(1);
+			clock += 30_000;
+			await backgroundTaskService.listPageByParent(PARENT);
+			expect(records()).toHaveLength(2);
+		} finally {
+			flush.mockRestore();
+			warn.mockRestore();
+			now.mockRestore();
+		}
+	});
+
+	test("diagnostic failures preserve successful lists and original occupancy rejections", async () => {
+		await seedParent();
+		await flushDeltas();
+		await backgroundOccupancyStore.flush();
+		let clock = 0;
+		const now = spyOn(performance, "now").mockImplementation(() => clock);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("diagnostic sink failed");
+		});
+		const originalFlush = backgroundOccupancyStore.flush.bind(backgroundOccupancyStore);
+		const flush = spyOn(backgroundOccupancyStore, "flush").mockImplementation(async () => {
+			await originalFlush();
+			clock += 500;
+		});
+		try {
+			const page = await backgroundTaskService.listPageByParent(PARENT);
+			expect(page.tasks).toEqual([]);
+			clock += 30_000;
+			const failure = new Error("occupancy read cancelled");
+			flush.mockImplementation(async () => {
+				clock += 500;
+				throw failure;
+			});
+			expect(await captureWorkerRejection(backgroundTaskService.listPageByParent(PARENT))).toBe(
+				failure,
+			);
+			expect(
+				warn.mock.calls.filter(([message]) => message === "Slow background task list"),
+			).toHaveLength(2);
+			expect(warn.mock.calls.at(-1)?.[1]).toMatchObject({ completed: false, mergeSortSyncMs: 0 });
+		} finally {
+			flush.mockRestore();
+			warn.mockRestore();
+			now.mockRestore();
+		}
 	});
 });
 
@@ -1280,10 +1470,10 @@ describe("background task count frames", () => {
 	});
 
 	test("thousands of terminal legacy leaves do not block a directly running task", async () => {
-		await seedParent();
+		await seedParent({ startOccupancy: false });
 		const createdAt = "2020-01-01T00:00:00.000Z";
 		for (let offset = 0; offset < 4096; offset += 512) {
-			await seedNarrators(
+			await db.insert(narrators).values(
 				Array.from({ length: 512 }, (_, index) => ({
 					id: `historical-leaf-${offset + index}`,
 					type: "subagent" as const,
@@ -1297,6 +1487,8 @@ describe("background task count frames", () => {
 				})),
 			);
 		}
+		// Historical rows exist before startup; only subsequent mutations send invalidations.
+		await backgroundOccupancyStore.start();
 		await backgroundTaskService.createBashTask({
 			id: "history-live-bash",
 			parentNarratorId: PARENT,
@@ -1320,7 +1512,7 @@ describe("background task count frames", () => {
 	])("%i parents with terminal probe leaves fit the separate row/node budgets", async (parentCount) => {
 		const now = new Date().toISOString();
 		const parentIds = Array.from({ length: parentCount }, (_, index) => `probe-parent-${index}`);
-		await seedNarrators(
+		await db.insert(narrators).values(
 			parentIds.map((id) => ({
 				id,
 				type: "primary" as const,
@@ -1330,7 +1522,7 @@ describe("background task count frames", () => {
 			})),
 		);
 		for (const parentId of parentIds) {
-			await seedNarrators(
+			await db.insert(narrators).values(
 				Array.from({ length: 201 }, (_, index) => ({
 					id: `${parentId}-leaf-${index}`,
 					parentNarratorId: parentId,
@@ -1343,7 +1535,7 @@ describe("background task count frames", () => {
 				})),
 			);
 		}
-		await seedTasks(
+		await db.insert(backgroundTasks).values(
 			parentIds.map((parentNarratorId) => ({
 				id: `${parentNarratorId}-bash`,
 				parentNarratorId,
@@ -1359,7 +1551,7 @@ describe("background task count frames", () => {
 		const counts = await backgroundTaskService.countActiveByParentBatch(parentIds);
 		expect(counts.size).toBe(parentCount);
 		for (const id of parentIds) expect(counts.get(id)).toBe(1);
-	});
+	}, 20_000);
 
 	test("deep descendant work counts through the chain without a read-time depth limit", async () => {
 		await seedParent();

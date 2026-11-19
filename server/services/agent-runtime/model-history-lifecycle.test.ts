@@ -4,7 +4,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as failures from "../../lib/db-worker/failure";
-import { resumeDbWorkerPool, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
+import {
+	assertDbReadersReady,
+	resetDbWorkerPoolForTest,
+	resumeDbWorkerPool,
+	shutdownDbWorkerPool,
+} from "../../lib/db-worker/pool";
 import { logger } from "../../lib/logger";
 import { settings } from "../../lib/settings";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
@@ -97,6 +102,14 @@ beforeEach(() => {
 		const log = spyOn(logger, method).mockImplementation(() => {});
 		restores.push(() => log.mockRestore());
 	}
+	await assertDbReadersReady(db.filename, { timeoutMs: 30_000 });
+	// The short readiness probe leaves the normal metadata reader cold in its own pool cell.
+	await workerRead.readDomainTask(
+		db,
+		"modelHistorySignature",
+		{ narratorId: "owner" },
+		{ executionPolicy: "worker-required" },
+	);
 });
 afterEach(async () => {
 	await resetModelHistoryWorkersForTest();
@@ -520,7 +533,11 @@ test.each([
 ])("disabled worker %s may serve a verified cache hit but never computes a miss inline", async (mode) => {
 	const cached = await load();
 	if (mode === "off") process.env.NARRAFORK_DB_WORKER = "off";
-	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "0";
+	else {
+		// Concurrency is frozen until the main pool closes; keep the history cache intact.
+		await resetDbWorkerPoolForTest();
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "0";
+	}
 	const worker = intercept(() => {
 		throw new Error("must not construct");
 	});

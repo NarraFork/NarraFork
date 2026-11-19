@@ -253,13 +253,15 @@ describe("management", () => {
 		});
 		const redeemerId = await seedRedeemer("alice");
 		redeem(code, "alice", redeemerId);
-		expect(registrationCodeService.revokeCode(summary.id)).rejects.toThrow("already been used");
+		await expect(registrationCodeService.revokeCode(summary.id)).rejects.toThrow(
+			"already been used",
+		);
 	});
 
 	test("deleting removes the row", async () => {
 		const { summary } = await registrationCodeService.createCode({ createdByUserId: adminId });
 		await registrationCodeService.deleteCode(summary.id);
 		expect(await registrationCodeService.listCodes()).toHaveLength(0);
-		expect(registrationCodeService.deleteCode(summary.id)).rejects.toThrow("not found");
+		await expect(registrationCodeService.deleteCode(summary.id)).rejects.toThrow("not found");
 	});
 });

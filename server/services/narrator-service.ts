@@ -45,6 +45,7 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import {
@@ -158,6 +159,7 @@ import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
+import { readNarratorMessageRows } from "./narrator-message-reader";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
@@ -438,20 +440,30 @@ function annotateUploadBlocksWithOwner(contentJson: unknown, narratorId: string)
 }
 
 async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean> {
-	const sharedOwnedMessages = await db
-		.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
-		.from(narratorMessages)
-		.where(
-			and(
-				eq(narratorMessages.narratorId, narratorId),
-				sql`EXISTS (
+	const sharedOwnedMessages = await readQuery(
+		db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(
+				and(
+					eq(narratorMessages.narratorId, narratorId),
+					sql`EXISTS (
 					SELECT 1 FROM narrator_message_refs nmr
 					WHERE nmr.message_id = ${narratorMessages.id}
 					AND nmr.narrator_id != ${narratorId}
 				)`,
+				),
 			),
-		);
-	return fillBodies(sharedOwnedMessages).some((row) => contentJsonHasImageBlocks(row.contentJson));
+		{ executionPolicy: "worker-required" },
+	);
+	const bodies = await readNarratorMessageRows(
+		sharedOwnedMessages.map((row) => row.id),
+		{
+			includeTools: false,
+			includeCreator: false,
+		},
+	);
+	return bodies.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
 /**
@@ -1381,10 +1393,13 @@ async function forkTraits(parent: typeof narrators.$inferSelect): Promise<string
  * clear the source. Delegated children are deleted with the source before this runs.
  */
 async function freezePolicyDependents(sourceId: string): Promise<void> {
-	const dependents = await db.query.narrators.findMany({
-		where: eq(narrators.policySourceNarratorId, sourceId),
-		columns: { id: true },
-	});
+	const dependents = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.policySourceNarratorId, sourceId),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (dependents.length === 0) return;
 	const { resolveNarratorCapabilities } = await import("./trait-layer-service");
 	const ceilings = parseRuntimePolicyTraits(
@@ -1392,10 +1407,13 @@ async function freezePolicyDependents(sourceId: string): Promise<void> {
 	);
 	for (const { id } of dependents) {
 		await narratorTraitsLock.acquire(id, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, id),
-				columns: { traits: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { traits: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row?.traits);
 			await db
 				.update(narrators)
@@ -1777,12 +1795,14 @@ export async function narratorCreationWorkspaceTarget(
 ): Promise<LifecycleTarget[]> {
 	const scopeProjectId = row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
 	const project = scopeProjectId
-		? db
-				.select({ path: projects.gitPath })
-				.from(projects)
-				.where(eq(projects.id, scopeProjectId))
-				.limit(1)
-				.get()
+		? await readQueryFirst(
+				db
+					.select({ path: projects.gitPath })
+					.from(projects)
+					.where(eq(projects.id, scopeProjectId))
+					.limit(1),
+				{ executionPolicy: "worker-required" },
+			)
 		: undefined;
 	// The row's own device decides the path grammar. A remote Windows `C:\…` is not a
 	// relative path, and a remote POSIX `/srv/app` is not this server's directory —
@@ -1927,17 +1947,20 @@ export const narratorService = {
 				);
 			}
 			if (input.originToolCallId != null) {
-				const origin = await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.id, input.originToolCallId),
-					columns: {
-						narratorId: true,
-						toolUseId: true,
-						toolName: true,
-						status: true,
-						executionAttempt: true,
-						executionStartedAt: true,
-					},
-				});
+				const origin = await readQuery(
+					db.query.narratorToolCalls.findFirst({
+						where: eq(narratorToolCalls.id, input.originToolCallId),
+						columns: {
+							narratorId: true,
+							toolUseId: true,
+							toolName: true,
+							status: true,
+							executionAttempt: true,
+							executionStartedAt: true,
+						},
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				if (
 					!origin ||
 					origin.narratorId !== input.parentNarratorId ||
@@ -2118,26 +2141,30 @@ export const narratorService = {
 		const scope = and(teamMembersWhere(parentNarratorId), notInArray(narrators.id, [senderId]));
 		// Match the existing last-activity convention, not incidental title/settings edits.
 		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
-		const targets = await db
-			.select(columns)
-			.from(narrators)
-			.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
-			.limit(TEAM_BROADCAST_MAX_TARGETS + 1)
-			.all();
-		const idle = await db
-			.select({ ...columns, lastActivityAt: lastActivity })
-			.from(narrators)
-			.where(
-				and(
-					scope,
-					eq(narrators.status, "idle"),
-					sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
-					sql`${lastActivity} <= ${new Date(now).toISOString()}`,
-				),
-			)
-			.orderBy(desc(lastActivity), desc(narrators.id))
-			.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1)
-			.all();
+		const targets = await readQuery(
+			db
+				.select(columns)
+				.from(narrators)
+				.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
+				.limit(TEAM_BROADCAST_MAX_TARGETS + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const idle = await readQuery(
+			db
+				.select({ ...columns, lastActivityAt: lastActivity })
+				.from(narrators)
+				.where(
+					and(
+						scope,
+						eq(narrators.status, "idle"),
+						sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
+						sql`${lastActivity} <= ${new Date(now).toISOString()}`,
+					),
+				)
+				.orderBy(desc(lastActivity), desc(narrators.id))
+				.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		return {
 			targets,
 			recentIdle: idle.slice(0, TEAM_BROADCAST_RECENT_IDLE_LIMIT),
@@ -2164,31 +2191,33 @@ export const narratorService = {
 		const members: TeamMemberSelectorRow[] = [];
 		let cursor: { createdAt: string; id: string } | null = null;
 		for (;;) {
-			const page: TeamMemberSelectorRow[] = await db
-				.select({
-					id: narrators.id,
-					title: narrators.title,
-					traits: narrators.traits,
-					createdAt: narrators.createdAt,
-				})
-				.from(narrators)
-				.where(
-					and(
-						teamMembersWhere(rootId),
-						cursor
-							? or(
-									sql`${narrators.createdAt} > ${cursor.createdAt}`,
-									and(
-										eq(narrators.createdAt, cursor.createdAt),
-										sql`${narrators.id} > ${cursor.id}`,
-									),
-								)
-							: undefined,
-					),
-				)
-				.orderBy(narrators.createdAt, narrators.id)
-				.limit(TEAM_MEMBERS_PAGE_SIZE)
-				.all();
+			const page: TeamMemberSelectorRow[] = await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						title: narrators.title,
+						traits: narrators.traits,
+						createdAt: narrators.createdAt,
+					})
+					.from(narrators)
+					.where(
+						and(
+							teamMembersWhere(rootId),
+							cursor
+								? or(
+										sql`${narrators.createdAt} > ${cursor.createdAt}`,
+										and(
+											eq(narrators.createdAt, cursor.createdAt),
+											sql`${narrators.id} > ${cursor.id}`,
+										),
+									)
+								: undefined,
+						),
+					)
+					.orderBy(narrators.createdAt, narrators.id)
+					.limit(TEAM_MEMBERS_PAGE_SIZE),
+				{ executionPolicy: "worker-required" },
+			);
 			members.push(...page);
 			if (page.length < TEAM_MEMBERS_PAGE_SIZE) return members;
 			const last = page[page.length - 1];
@@ -2249,29 +2278,33 @@ export const narratorService = {
 		// reads as the ordinal of the first selected column.
 		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
 
-		const rows = await db
-			.select({
-				id: narrators.id,
-				title: narrators.title,
-				traits: narrators.traits,
-				variant: narrators.variant,
-				status: narrators.status,
-				createdAt: narrators.createdAt,
-			})
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(limit)
-			.all();
+		const rows = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					traits: narrators.traits,
+					variant: narrators.variant,
+					status: narrators.status,
+					createdAt: narrators.createdAt,
+				})
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(limit),
+			{ executionPolicy: "worker-required" },
+		);
 
-		const remainder = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
-			.offset(rows.length)
-			.all();
+		const remainder = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
+				.offset(rows.length),
+			{ executionPolicy: "worker-required" },
+		);
 
 		return {
 			subagents: rows,
@@ -2420,9 +2453,12 @@ export const narratorService = {
 	 * caller can distinguish "exists but not yours" from "does not exist".
 	 */
 	async getById(id: string, acl?: { userId: string; isAdmin: boolean; need?: NarratorAccessNeed }) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (acl) {
 			await assertNarratorAccess(
@@ -2444,9 +2480,12 @@ export const narratorService = {
 	async getByHandle(handle: string) {
 		const folded = foldHandle(handle.trim());
 		if (!folded) return null;
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.handleFold, folded),
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.handleFold, folded),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		return narrator ?? null;
 	},
 
@@ -2464,13 +2503,16 @@ export const narratorService = {
 
 	/** List all named narrators (traits include "named"), most recent first. */
 	async listNamed() {
-		const rows = await db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
-			// IS NOT NULL made SQLite scan every narrator before sorting this small result.
-			where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
-			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
-		});
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				columns: { runtimeRegistrationJson: false },
+				// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
+				// IS NOT NULL made SQLite scan every narrator before sorting this small result.
+				where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
+				orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		// Defensive: only return those actually flagged as named.
 		return rows.filter((n) => parseTraits(n.traits).includes("named"));
 	},
@@ -2518,15 +2560,21 @@ export const narratorService = {
 		// What names it once the row is gone (the `narrator:deleted` event below).
 		const title =
 			(
-				await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { title: true },
-				})
+				await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { title: true },
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				)
 			)?.title ?? null;
-		const children = await db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, narratorId),
-			columns: { id: true, type: true, variant: true },
-		});
+		const children = await readQuery(
+			db.query.narrators.findMany({
+				where: eq(narrators.parentNarratorId, narratorId),
+				columns: { id: true, type: true, variant: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		// A primary fork is an independent history owner, not a disposable subagent.
 		// Preserve its shared history before severing the ancestry FK.
 		const survivingForks = children.filter(
@@ -3367,47 +3415,62 @@ export const narratorService = {
 		narratorId: string,
 		toolCallId: string,
 	): Promise<string | undefined> {
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, toolCallId),
-			columns: { messageId: true },
-		});
+		const call = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, toolCallId),
+				columns: { messageId: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!call) return undefined;
-		const stepRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, call.messageId),
-			),
-			columns: { seq: true },
-		});
-		if (!stepRef) return undefined;
-		const previous = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(
-				and(
+		const stepRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
 					eq(narratorMessageRefs.narratorId, narratorId),
-					sql`${narratorMessageRefs.seq} < ${stepRef.seq}`,
+					eq(narratorMessageRefs.messageId, call.messageId),
 				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+				columns: { seq: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
+		if (!stepRef) return undefined;
+		const previous = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						sql`${narratorMessageRefs.seq} < ${stepRef.seq}`,
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 		return previous[0]?.messageId;
 	},
 
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
-		const latestRef = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const latestRef = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 
 		if (!latestRef.length) return null;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, latestRef[0].messageId),
-			columns: { messageUuid: true },
-		});
+		const msg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, latestRef[0].messageId),
+				columns: { messageUuid: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		return msg?.messageUuid ?? null;
 	},
 

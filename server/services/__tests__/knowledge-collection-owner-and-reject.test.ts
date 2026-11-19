@@ -212,8 +212,8 @@ describe("reject verdict", () => {
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "reject" });
 
 		// This is the whole point of reject vs request_changes.
-		expect(knowledgeBranchService.resubmit(owner, submissionId, {})).rejects.toThrow();
-		expect(knowledgeBranchService.withdrawSubmission(owner, submissionId)).rejects.toThrow();
+		await expect(knowledgeBranchService.resubmit(owner, submissionId, {})).rejects.toThrow();
+		await expect(knowledgeBranchService.withdrawSubmission(owner, submissionId)).rejects.toThrow();
 
 		const row = await db.query.knowledgeSubmissions.findFirst({
 			where: eq(knowledgeSubmissions.id, submissionId),
@@ -224,7 +224,7 @@ describe("reject verdict", () => {
 	test("a rejected request cannot be reviewed a second time", async () => {
 		const { submissionId } = await pendingSubmission("RejectOnce");
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "reject" });
-		expect(
+		await expect(
 			knowledgeBranchService.review(admin, submissionId, { verdict: "approve" }),
 		).rejects.toThrow();
 	});

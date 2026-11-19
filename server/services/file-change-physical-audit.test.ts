@@ -30,6 +30,7 @@ import { join } from "node:path";
 import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTestDb } from "../../tests/setup";
+import { closeReadDatabase } from "../lib/db-worker/pool";
 import { safeSpawn } from "../lib/spawn";
 import { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { FileChangeBlobStore } from "./file-change-blob-store";
@@ -90,6 +91,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const timer of timers) clearInterval(timer);
 	timers.clear();
+	await closeReadDatabase(sqlite.filename, { timeoutMs: 5000 });
 	sqlite.close();
 	await rm(sandbox, { recursive: true, force: true });
 });
@@ -569,7 +571,7 @@ if (process.argv.includes(flag)) {
 		expect(summary.start?.pendingReservations).toBe("present");
 		expect(summary.metrics).toMatchObject({ pendingReservations: 2, pendingReservationBytes: 7 });
 		expect(await readFile(databasePath)).toEqual(original);
-		expect(catalog.getBudget()?.reservedBytes).toBe(7);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(7);
 		assertAuthority(summary);
 	});
 
@@ -911,7 +913,7 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 			mutationObservedAt = await held;
 			changed = true;
 			try {
-				const currentBudget = catalog.getBudget();
+				const currentBudget = await catalog.getBudget();
 				if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
 				generationBeforeMutation = currentBudget.generation;
 				sqlite
@@ -931,7 +933,7 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		expect(summary.full).toBe(false);
 		expect(codes(summary)).toContain("generation_changed");
 		expect(summary.end?.generation).toBe(2);
-		expect(catalog.getBudget()).toMatchObject({ status: "reconciling", generation: 2 });
+		expect(await catalog.getBudget()).toMatchObject({ status: "reconciling", generation: 2 });
 		assertAuthority(summary);
 	});
 
@@ -1142,11 +1144,11 @@ finally:
 		sqlite.exec("PRAGMA journal_mode = WAL");
 		await put("wal-object");
 		for (const suffix of ["-wal", "-shm"]) await chmod(databasePath + suffix, 0o600);
-		const budgetBefore = catalog.getBudget();
+		const budgetBefore = await catalog.getBudget();
 		const summary = await auditFileChangePhysical(await options());
 		expect(summary.full).toBe(true);
 		expect(summary.metrics.verifiedObjects).toBe(1);
-		expect(catalog.getBudget()).toEqual(budgetBefore);
+		expect(await catalog.getBudget()).toEqual(budgetBefore);
 		sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 		// Copy the checkpointed main file only. The copied WAL-mode header has NO sidecars.
 		const absentSidecars = join(sandbox, "wal-copy.sqlite");

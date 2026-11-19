@@ -14,11 +14,26 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../../db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 
 const realNarratorWs = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({
@@ -33,6 +48,7 @@ mock.module("../../websocket/narrator-ws", () => ({
  */
 interface RunCall {
 	narratorId: string;
+	locale: string | undefined;
 	text: string;
 	binding: unknown;
 	principal: unknown;
@@ -52,6 +68,7 @@ const idle = Promise.resolve({
 spyOn(runModule, "startNarratorRun").mockImplementation(async (request) => {
 	runCalls.push({
 		narratorId: request.narratorId,
+		locale: request.locale,
 		text: request.text,
 		binding: request.binding,
 		principal: request.principal,
@@ -62,7 +79,9 @@ spyOn(runModule, "startNarratorRun").mockImplementation(async (request) => {
 });
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
-const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+const session = await import("../narrator-session");
+const { startInjectionContinuationIfPossible } = session;
+const promptI18n = await import("../../lib/prompt-i18n");
 // Preserve collaborator initialization order without unused/shadowed local bindings.
 await import("../parent-inbound-queue");
 await import("../bg-completion-queue");
@@ -79,14 +98,19 @@ beforeEach(() => {
 	runCalls.length = 0;
 	runThrows = null;
 });
-afterEach(() => {
+afterEach(async () => {
+	await session.drainNarratorSessionTails({ deadlineAt: Date.now() + 30_000 });
+	await drainRuntimeTestWork();
 	for (const id of [PARENT_ID, SUB_ID]) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
 	cleanDb(sqlite);
 });
-afterAll(() => mock.restore());
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
+	mock.restore();
+});
 
 async function waitUntil(predicate: () => boolean) {
 	const deadline = Date.now() + 2_000;
@@ -344,6 +368,33 @@ for (const shape of shapes) {
 			expect(runCalls[0].sessionUser).not.toBe("parent-user");
 		});
 
+		for (const locale of [undefined, "zh-CN"] as const) {
+			test(`an unknown principal keeps the original injection admission with ${locale ?? "default"} locale`, async () => {
+				seedNarrator(PARENT_ID);
+				shape.seed();
+				sqlite.run("UPDATE narrators SET runtime_registration_json = NULL WHERE id = ?", [SUB_ID]);
+				activeNarrators.set(PARENT_ID, {
+					_currentUserId: "parent-user",
+					locale: "zh-CN",
+				} as never);
+				const lookup = spyOn(promptI18n, "getUserLanguage");
+				try {
+					expect(await startInjectionContinuationIfPossible(SUB_ID, locale)).toEqual({
+						started: true,
+					});
+					await waitUntil(() => runCalls.length > 0);
+					expect(runCalls[0]).toMatchObject({
+						locale: locale ?? "en",
+						principal: undefined,
+						sessionUser: null,
+					});
+					expect(lookup).not.toHaveBeenCalled();
+				} finally {
+					lookup.mockRestore();
+				}
+			});
+		}
+
 		test("a run already owning the session is left to consume the row", async () => {
 			seedNarrator(PARENT_ID);
 			shape.seed();
@@ -391,6 +442,26 @@ for (const shape of shapes) {
 }
 
 describe("a session with no relationship at all", () => {
+	test("reuses a live active locale without requiring a saved execution principal", async () => {
+		seedNarrator(PARENT_ID);
+		await session.ensureNarrator(PARENT_ID, "zh-CN");
+		const lookup = spyOn(promptI18n, "getUserLanguage");
+		try {
+			expect(await startInjectionContinuationIfPossible(PARENT_ID, "en")).toEqual({
+				started: true,
+			});
+			await waitUntil(() => runCalls.length > 0);
+			expect(runCalls[0]).toMatchObject({
+				locale: "zh-CN",
+				principal: undefined,
+				sessionUser: null,
+			});
+			expect(lookup).not.toHaveBeenCalled();
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
 	test("is woken through the same entry", async () => {
 		seedNarrator(PARENT_ID);
 

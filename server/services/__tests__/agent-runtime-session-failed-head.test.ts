@@ -1,15 +1,18 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+	postgresRuntime: null,
 }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
@@ -27,9 +30,9 @@ beforeEach(() => {
 		.values({ id: "recipient", status: "working", createdAt: time, updatedAt: time })
 		.run();
 });
-afterAll(() => {
+afterAll(async () => {
 	getExecutionOwner("recipient")?.release();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 });
 const active = { narratorId: "recipient", locale: "en", _replyInUserLanguage: false } as Parameters<
 	typeof resumeNextBufferedMessage
@@ -76,9 +79,9 @@ test("real session resume ignores failed UI head and executes the next claimed q
 			.where(eq(narratorBufferedMessages.id, queued.id))
 			.get()?.state,
 	).toBe("materialized");
-	expect(getBufferedMessages("recipient").map((row) => ({ id: row.id, state: row.state }))).toEqual(
-		[{ id: failed.id, state: "failed" }],
-	);
+	expect(
+		(await getBufferedMessages("recipient")).map((row) => ({ id: row.id, state: row.state })),
+	).toEqual([{ id: failed.id, state: "failed" }]);
 	expect(getExecutionOwner("recipient")).toBeUndefined();
 });
 
@@ -116,7 +119,7 @@ test("real ordinary feed reuses the claimed queued input and cannot enqueue it t
 		{ id: expectedId, contentText: "ordinary queued text", createdBy: null },
 	]);
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(2);
-	expect(getBufferedMessages("recipient").map((row) => row.id)).toEqual([failed.id]);
+	expect((await getBufferedMessages("recipient")).map((row) => row.id)).toEqual([failed.id]);
 });
 
 test("real session resume does not cross an earlier agent message to reach a user command", async () => {

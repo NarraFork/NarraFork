@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { readDomainTask } from "@server/db/worker-read";
 import type { SQL } from "bun";
 import {
 	compiledWorkerSpecifiers,
@@ -412,8 +413,12 @@ async function readWorker(
 			{
 				requestId,
 				signal: options.signal,
-				// The existing read budget is caller cancellation, not a new 30-second cap.
+				// Admission is bounded separately; hydrated pages remain caller-cancellable.
 				deadlineAt: Number.MAX_SAFE_INTEGER,
+				waitTimeoutMs:
+					options.deadline !== undefined && Number.isFinite(options.deadline)
+						? Math.max(0, options.deadline - Date.now())
+						: undefined,
 				bytes: 2 * narratorId.length + (previous?.source.counters.sourceBytes ?? 0),
 			},
 		);
@@ -583,7 +588,7 @@ async function streamHistory(
 				limit: options.limit,
 				maxBytes: MODEL_HISTORY_MAX_BYTES,
 				versioned,
-				bodiesFromBlocks: backend.backend === "sqlite" && blockBodies(backend.sqlite),
+				bodiesFromBlocks: backend.backend === "sqlite" && settings.narratorBlocks.read,
 				previous: previous ? modelHistoryManifest(previous.source) : undefined,
 				previousCatalogIdentity: previous?.catalogIdentity,
 				...(backend.backend === "sqlite"
@@ -623,9 +628,36 @@ async function readModelHistorySource(
 	check();
 	const signature = async () => {
 		state.signatureReads++;
-		return backend.backend === "sqlite"
-			? readSqliteModelHistorySignature(backend.sqlite, narratorId)
-			: readPostgresModelHistorySignature(backend.sql, narratorId, { signal: options.signal });
+		const deadline = Math.min(
+			options.deadline ?? Infinity,
+			Date.now() + MODEL_HISTORY_EXECUTION_MS,
+		);
+		if (Date.now() >= deadline) throw new ModelHistoryTimeoutError();
+		if (backend.backend === "postgres")
+			return readPostgresModelHistorySignature(backend.sql, narratorId, {
+				signal: options.signal,
+				deadline,
+			});
+		// Connection-local fixtures have no cross-thread identity. File-backed source probes
+		// use a bounded Worker read, independently from the subsequent hydration.
+		if (!backend.sqlite.filename || backend.sqlite.filename === ":memory:")
+			return readSqliteModelHistorySignature(backend.sqlite, narratorId);
+		try {
+			return await readDomainTask(
+				backend.sqlite,
+				"modelHistorySignature",
+				{ narratorId },
+				{
+					executionPolicy: "worker-required",
+					signal: options.signal,
+					timeoutMs: Math.max(1, deadline - Date.now()),
+				},
+			);
+		} catch (error) {
+			options.signal?.throwIfAborted();
+			if (Date.now() >= deadline) throw new ModelHistoryTimeoutError();
+			throw error;
+		}
 	};
 	const before = await signature();
 	check();
@@ -682,8 +714,15 @@ async function readModelHistorySource(
 			)
 				throw error;
 			// Ref deletion/reorder/COW, compact, segment/lazy range changes: one full rebuild,
-			// preserving cancellation. No partial delta or indefinite retries are accepted.
-			loaded = await readWorker(backend, narratorId, options, before.trusted, progress);
+			// preserving cancellation. The source admission deadline must not become a total
+			// lifetime limit after a valid delta has already spent time hydrating pages.
+			loaded = await readWorker(
+				backend,
+				narratorId,
+				{ ...options, deadline: undefined },
+				before.trusted,
+				progress,
+			);
 		}
 		source = loaded.source;
 		after = loaded.signature ?? before;

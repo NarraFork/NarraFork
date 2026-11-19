@@ -7,6 +7,7 @@ import { FILE_CHANGE_LIMITS, type FileChangeUnavailableReason } from "@shared/fi
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { fileChangeScopes, snapshotCaptures } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -154,26 +155,28 @@ export class SnapshotCaptureReceiptService {
 		});
 		signal.throwIfAborted();
 		this.assertConnection();
-		const row = this.options.db
-			.select({
-				id: sql<string>`substr(${fileChangeScopes.id}, 1, 257)`,
-				root: sql<string>`substr(${fileChangeScopes.canonicalRoot}, 1, 8193)`,
-				flavor: fileChangeScopes.pathFlavor,
-				workspaceInstanceId: fileChangeScopes.workspaceInstanceId,
-			})
-			.from(fileChangeScopes)
-			.where(
-				and(
-					eq(fileChangeScopes.sourceInstanceId, source.id),
-					eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
-					inArray(fileChangeScopes.workspaceInstanceId, keys),
-				),
-			)
-			.orderBy(
-				sql`CASE WHEN ${fileChangeScopes.workspaceInstanceId} = ${keys[0]} THEN 0 ELSE 1 END`,
-			)
-			.limit(1)
-			.get();
+		const row = await readQueryFirst(
+			this.options.db
+				.select({
+					id: sql<string>`substr(${fileChangeScopes.id}, 1, 257)`,
+					root: sql<string>`substr(${fileChangeScopes.canonicalRoot}, 1, 8193)`,
+					flavor: fileChangeScopes.pathFlavor,
+					workspaceInstanceId: fileChangeScopes.workspaceInstanceId,
+				})
+				.from(fileChangeScopes)
+				.where(
+					and(
+						eq(fileChangeScopes.sourceInstanceId, source.id),
+						eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
+						inArray(fileChangeScopes.workspaceInstanceId, keys),
+					),
+				)
+				.orderBy(
+					sql`CASE WHEN ${fileChangeScopes.workspaceInstanceId} = ${keys[0]} THEN 0 ELSE 1 END`,
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!row || row.id.length > 256 || row.root !== root || row.flavor !== PATH_FLAVOR)
 			throw new Error("target_unverified");
 		signal.throwIfAborted();
