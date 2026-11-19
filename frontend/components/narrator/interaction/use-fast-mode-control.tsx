@@ -2,15 +2,17 @@ import type React from "react";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FastModeControl } from "./FastModeControl";
+import { type FastModeOverride, fastModePresentation } from "./fast-mode-state";
 import type { Mutate } from "./mutate";
-
-type FastModeOverride = "inherit" | "on" | "off";
 
 export interface UseFastModeControlOptions {
 	narratorId: string;
-	/** Session-level override from the narrator ("inherit" follows the user default). */
+	/** Session choice: inherit follows the primary for children, execution user's default otherwise. */
 	narratorFastModeOverride: FastModeOverride | null | undefined;
-	/** User-level default fast-mode state (what "inherit" resolves to). */
+	effectiveFastMode: boolean | undefined;
+	fastModeSource: string | undefined;
+	isSubagent: boolean;
+	/** The viewing user's editable preference, never used to resolve this session. */
 	fastModeDefault: boolean;
 	/** Coarse-pointer / mobile viewports open settings by long-press, not hover. */
 	fastModeUsesTapSettings: boolean;
@@ -40,6 +42,9 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 	const {
 		narratorId,
 		narratorFastModeOverride,
+		effectiveFastMode,
+		fastModeSource,
+		isSubagent,
 		fastModeDefault,
 		fastModeUsesTapSettings,
 		fastModeMutation,
@@ -47,11 +52,15 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 		t,
 	} = options;
 
-	// "inherit" follows the default, so the default switch also changes what this
-	// session actually does — matching the server-side per-turn resolution.
-	const fastModeOverride: FastModeOverride = narratorFastModeOverride ?? "inherit";
-	const fastModeEnabled =
-		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
+	const {
+		override: fastModeOverride,
+		enabled: fastModeEnabled,
+		sourceUnavailable,
+	} = fastModePresentation({
+		fastModeOverride: narratorFastModeOverride,
+		effectiveFastMode,
+		fastModeSource,
+	});
 
 	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
 	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
@@ -119,6 +128,8 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 				fastModeOverride={fastModeOverride}
 				fastModeDefault={fastModeDefault}
 				fastModeEnabled={fastModeEnabled}
+				sourceUnavailable={sourceUnavailable}
+				isSubagent={isSubagent}
 				fastModeUsesTapSettings={fastModeUsesTapSettings}
 				settingsOpened={fastModeSettingsOpened}
 				setSettingsOpened={setFastModeSettingsOpened}
@@ -138,6 +149,8 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 			fastModeOverride,
 			fastModeDefault,
 			fastModeEnabled,
+			sourceUnavailable,
+			isSubagent,
 			fastModeUsesTapSettings,
 			fastModeSettingsOpened,
 			openFastModeSettings,

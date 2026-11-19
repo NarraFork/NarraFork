@@ -117,9 +117,18 @@ export type WorkspaceDirectoryEntry = {
 };
 export type WorkspaceDirectoryMap = Record<string, WorkspaceDirectoryEntry>;
 
-export type NarratorDetail = ApiEntity & {
-	navigationSummary?: NarratorNavigationSummary;
-};
+export type FastModeSource = "user-default" | "override" | "primary" | "unavailable";
+
+export interface FastModeResolution {
+	effectiveFastMode: boolean;
+	fastModeSource: FastModeSource;
+	fastModeSourceNarratorId: string | null;
+}
+
+export type NarratorDetail = ApiEntity &
+	Partial<FastModeResolution> & {
+		navigationSummary?: NarratorNavigationSummary;
+	};
 
 const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
 
@@ -1853,13 +1862,17 @@ export const narratorsApi = {
 			body: JSON.stringify({ reasoningEffort }),
 		}),
 	updateNarratorFastMode: (id: string, fastModeOverride: "inherit" | "on" | "off") =>
-		request<{ ok: boolean; fastModeOverride: "inherit" | "on" | "off"; fastMode: boolean }>(
-			`/narrators/${id}/fast-mode`,
-			{
-				method: "PATCH",
-				body: JSON.stringify({ fastModeOverride }),
-			},
-		),
+		request<
+			FastModeResolution & {
+				ok: boolean;
+				fastModeOverride: "inherit" | "on" | "off";
+				/** Compatibility response: the effective value, unlike the detail mirror. */
+				fastMode: boolean;
+			}
+		>(`/narrators/${id}/fast-mode`, {
+			method: "PATCH",
+			body: JSON.stringify({ fastModeOverride }),
+		}),
 	updateNarratorRelaxedPlan: (id: string, relaxedPlan: boolean) =>
 		request<{ ok: boolean; relaxedPlan: boolean }>(`/narrators/${id}/relaxed-plan`, {
 			method: "PATCH",

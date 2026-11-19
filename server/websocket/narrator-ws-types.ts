@@ -103,6 +103,8 @@ type NarratorServerMessageFrame =
 	| { type: "human_attention_changed" }
 	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
 	| { type: "user_preferences_changed" }
+	/** Configuration invalidation only; resolution stays in authorized detail reads. */
+	| { type: "fast_mode_changed"; refreshPreferences?: boolean }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
