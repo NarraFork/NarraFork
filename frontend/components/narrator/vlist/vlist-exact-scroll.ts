@@ -8,9 +8,37 @@
  * a stream. They are pure, so they are also the part of the shell that a unit test can
  * check directly (see `vlist-scroll-pin.test.ts`, which imports them).
  *
- * The shell keeps the STATE (refs, the suppression window, the pin flag); this module
- * only answers questions about numbers.
+ * The shell owns the state and scroll writers. This module also sequences the small
+ * loaded-history navigation action so its effects can be exercised independently.
  */
+
+/** Navigate within the loaded window without carrying a jump or paging intent forward. */
+export function scrollExactListToLoadedTop({
+	jumpTokenRef,
+	detachFromBottom,
+	textReadingDetachedRef,
+	loadedTopNarratorRef,
+	narratorId,
+	olderHistoryIntentAtRef,
+	writeScrollTop,
+}: {
+	jumpTokenRef: { current: number };
+	detachFromBottom: () => void;
+	textReadingDetachedRef: { current: boolean };
+	loadedTopNarratorRef: { current: string | null };
+	narratorId: string;
+	olderHistoryIntentAtRef: { current: number | null };
+	writeScrollTop: (top: number) => void;
+}): void {
+	jumpTokenRef.current++;
+	detachFromBottom();
+	// A short loaded window can be geometrically at both ends. Keep this explicit
+	// reading intent detached until a later downward gesture opts back into following.
+	textReadingDetachedRef.current = true;
+	loadedTopNarratorRef.current = narratorId;
+	olderHistoryIntentAtRef.current = null;
+	writeScrollTop(0);
+}
 
 /** Scroll position at which a container is scrolled fully to the bottom. */
 export function getScrollBottomTarget(

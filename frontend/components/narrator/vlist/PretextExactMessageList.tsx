@@ -23,6 +23,7 @@ import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { subscribeAskInPassingEvents } from "@frontend/lib/ask-in-passing-events";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
@@ -112,6 +113,7 @@ import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextD
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
+import { useVListReasoningExpansion } from "./useVListReasoningExpansion";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
 import {
 	sameToolDetailRequests,
@@ -184,6 +186,7 @@ import {
 	isBottomLostToViewportResize,
 	isSuppressedScrollEcho,
 	isUpwardHistoryScroll,
+	scrollExactListToLoadedTop,
 } from "./vlist-exact-scroll";
 import {
 	type FoldRowGeometry,
@@ -235,10 +238,9 @@ import {
 	toggleVListFileChangesOpen,
 	toggleVListLodUserOverride,
 	toggleVListPromptOpen,
-	toggleVListRow,
+	toggleVListRowExpansion,
 	toggleVListShowEarlier,
 	toggleVListShowOriginal,
-	toggleVListTraceRow,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import {
@@ -321,7 +323,7 @@ import {
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
 import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
-import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
+import { isLiveStreamAnimSpec, nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
 import { useSubagentRecoveryDismiss } from "./vlist-subagent-recovery-dismiss";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
@@ -504,16 +506,6 @@ function setExternalRef<T>(ref: RefObject<T | null> | undefined, value: T | null
  */
 const messageIdFromTarget = jumpTargetMessageId;
 
-/**
- * True for a row belonging to the live streaming message.
- *
- * Its spec keys are derived from the synthetic message id, so the prefix is the
- * reliable test. Used only to scope the append animation to live content.
- */
-function isStreamingRowKey(key: string): boolean {
-	return key.startsWith(STREAMING_PLACEHOLDER_ID);
-}
-
 // Cached document readers outlive the pane. Keeping this transport at module
 // scope prevents its closure from retaining React's shared render Context (and
 // therefore setViewportNode, the old Fiber tree and the whole Dockview surface).
@@ -599,6 +591,8 @@ export const PretextExactMessageList = memo(
 			 * navigating away) and stop scrolling instead of fighting the new target.
 			 */
 			const jumpTokenRef = useRef(0);
+			// An explicit loaded-top destination outlives pages already fetching for an older intent.
+			const loadedTopNarratorRef = useRef<string | null>(null);
 			/**
 			 * Compact-progress keys this panel has written into the module store.
 			 * `compact_done` often carries no marker id (non-retry path), so cleanup
@@ -840,10 +834,16 @@ export const PretextExactMessageList = memo(
 
 			const onScrollTopCorrection = useCallback(
 				(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+					// A correction captured before an explicit history navigation cannot re-pin it.
+					if (anchorKind === "bottom" && !pinnedToBottomRef.current) return;
+					// Native reader movement can precede its coalesced scroll frame.
+					if (viewportRef.current && viewportRef.current.scrollTop !== scrollTopRef.current)
+						loadedTopNarratorRef.current = null;
+					const correctionTop = loadedTopNarratorRef.current === narratorId ? 0 : nextTop;
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) {
 						getSmoothFollower().cancel();
 						visibleViewportRef.current.deferCorrection(
-							applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current),
+							applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
 							anchorKind,
 							readViewportView(),
 						);
@@ -865,9 +865,11 @@ export const PretextExactMessageList = memo(
 					// Every other correction owns geometry (anchored rebuild, fold, LOD,
 					// removal): it must land in the same commit, so a chase in flight dies here.
 					getSmoothFollower().cancel();
-					writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
+					writeScrollTop(
+						applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
+					);
 				},
-				[getSmoothFollower, readViewportView, writeScrollTop],
+				[getSmoothFollower, narratorId, readViewportView, writeScrollTop],
 			);
 			const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 				createVListInteractionState(lod),
@@ -947,6 +949,8 @@ export const PretextExactMessageList = memo(
 			);
 			const activeInteraction =
 				interaction.lod === lod ? interaction : resetVListInteractionStateForLod(interaction, lod);
+			const { expandReasoning, isReasoningRowExpanded } =
+				useVListReasoningExpansion(activeInteraction);
 			// Latest-value refs for the two callbacks that are handed to EVERY mounted row.
 			// The ExactRow memo compares those callbacks identity-wise, so they must not be
 			// rebuilt per render; they read the current interaction / narrator id from here
@@ -1389,6 +1393,7 @@ export const PretextExactMessageList = memo(
 			 * force a synchronous layout for information we already have.
 			 */
 			const captureFoldBefore = useCallback((key: string) => {
+				loadedTopNarratorRef.current = null;
 				// A fold owns its own FLIP geometry, planned (while pinned) against the
 				// PREDICTED bottom scrollTop — a chase still gliding towards it would
 				// move the rows under the running animation. Land the chase first.
@@ -1509,11 +1514,9 @@ export const PretextExactMessageList = memo(
 							// No morph capture here: the drill-down header morph is diff-driven off
 							// the committed rebuild (see the drill-morph layout effect), so this
 							// handler only flips the interaction state — nothing to record.
-							if (rowKey !== undefined) {
-								setInteraction((prev) => toggleVListTraceRow(prev, key, rowKey));
-								return;
-							}
-							setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
+							const spec = renderItemsRef.current.find((item) => item.spec.key === key)?.spec;
+							if (spec)
+								setInteraction((prev) => toggleVListRowExpansion(prev, spec, rowIndex, rowKey));
 						},
 						onToggleTextExpanded: (bodyKey?: string) => {
 							// Stop in place, not snapToTarget: a growing tail must not move the
@@ -2176,6 +2179,8 @@ export const PretextExactMessageList = memo(
 				segmentGap: SEGMENT_GAP,
 				topPadding: PAGE_PADDING + olderHeaderHeight,
 				bottomPadding: PAGE_PADDING,
+				expandReasoning,
+				isReasoningRowExpanded,
 				isExpanded: resolveExpanded,
 				isLodUserOverride: resolveLodUserOverride,
 				showEarlier: resolveShowEarlier,
@@ -2269,6 +2274,7 @@ export const PretextExactMessageList = memo(
 				appliedMessageRevisionRef.current = 0;
 				initialRevisionSyncRef.current = true;
 				textReadingDetachedRef.current = false;
+				loadedTopNarratorRef.current = null;
 				setMessageRevision(0);
 				// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
 				// per-row handler caches keyed by spec.key would otherwise accumulate every
@@ -2597,6 +2603,7 @@ export const PretextExactMessageList = memo(
 				enabled: !!revisionSubscriptionId,
 				isSubagent: !!isSubagent,
 				applyLivePatch: pretextDocument.applyLivePatch,
+				messages: pretextDocument.messages,
 				// A terminal event can race the initial exact-document load: the synthetic
 				// streaming row has the completed output, but the persisted message is not
 				// in the coordinator yet, so an in-place patch necessarily misses. Re-run
@@ -4193,6 +4200,8 @@ export const PretextExactMessageList = memo(
 					// frame and cut every streaming glide short. While a chase is active this
 					// yields to it — the chase re-reads the live bottom every frame, so the
 					// growth this effect is answering is already part of its target.
+					// Reader intent may have changed after this frame was queued.
+					if (!pinnedToBottomRef.current) return;
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					if (smoothFollowerRef.current?.isActive() === true) return;
 					writeScrollTop(getScrollBottomTarget(viewportRef.current));
@@ -4208,7 +4217,7 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				if (pretextDocument.status !== "ready") return;
 				if (!hasPrev || loadingOlder) return;
-				if (!pinnedToBottom) return;
+				if (!pinnedToBottom || !pinnedToBottomRef.current) return;
 				if (viewportHeight <= 0) return;
 				const totalHeight = exactLayout?.totalHeight ?? 0;
 				if (totalHeight > viewportHeight + ITEM_OVERSCAN) return;
@@ -4308,6 +4317,7 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				if (!isEcho && nextTop !== previousTop) loadedTopNarratorRef.current = null;
 				// Classify before React mounts a new band. Only optional cold controllers
 				// subscribe to admission; this never invalidates the body/row element cache.
 				interactionAdmissionRef.current?.observeScroll({
@@ -4433,11 +4443,13 @@ export const PretextExactMessageList = memo(
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
+					loadedTopNarratorRef.current = null;
 					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
 					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
 					const land = () => {
+						if (!pinnedToBottomRef.current) return;
 						const node = viewportRef.current;
 						if (!node || !visibleViewportRef.current.isVisible(node)) {
 							visibleViewportRef.current.deferCorrection(0, "bottom", readViewportView());
@@ -4460,6 +4472,24 @@ export const PretextExactMessageList = memo(
 				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
+			const handleIOSScrollToTop = useCallback(() => {
+				scrollExactListToLoadedTop({
+					jumpTokenRef,
+					detachFromBottom,
+					textReadingDetachedRef,
+					loadedTopNarratorRef,
+					narratorId,
+					olderHistoryIntentAtRef,
+					writeScrollTop,
+				});
+			}, [detachFromBottom, narratorId, writeScrollTop]);
+			useLayoutEffect(() => {
+				if (!viewportNode) return;
+				return registerIOSScrollToTopTarget(viewportNode, () => {
+					if (viewportRef.current !== viewportNode) return;
+					handleIOSScrollToTop();
+				});
+			}, [viewportNode, handleIOSScrollToTop]);
 
 			// Quick index of user turns beside the scrollbar (parity with the chunked
 			// path's ScrollbarUserMarkers). Positions come from the exact layout's real
@@ -4495,6 +4525,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleUserMarkerJump = useCallback(
 				(marker: VListUserMarker) => {
+					loadedTopNarratorRef.current = null;
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
@@ -4508,6 +4539,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
+					loadedTopNarratorRef.current = null;
 					getSmoothFollower().cancel();
 					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
@@ -4546,6 +4578,7 @@ export const PretextExactMessageList = memo(
 				const emit = (dir: 1 | -1, clientY: number | null) => {
 					const now = Date.now();
 					if (!throttle.tryStep(now)) return;
+					loadedTopNarratorRef.current = null;
 					// The LOD morph diffs viewport geometry across the level switch; a chase
 					// still gliding through the rebuild would move rows under the morph.
 					smoothFollowerRef.current?.snapToTarget();
@@ -4559,6 +4592,7 @@ export const PretextExactMessageList = memo(
 				// when it reaches the top. Intent expires (chunk-list parity) so momentum
 				// alone never keeps paging.
 				const markUpwardIntent = () => {
+					loadedTopNarratorRef.current = null;
 					olderHistoryIntentAtRef.current = Date.now();
 				};
 				const onWheel = (event: WheelEvent) => {
@@ -4640,6 +4674,7 @@ export const PretextExactMessageList = memo(
 					// first is still paging through history) invalidates the first, which must
 					// then stop scrolling and stop paging rather than fight the new target.
 					const token = ++jumpTokenRef.current;
+					loadedTopNarratorRef.current = null;
 					const cancelled = () => token !== jumpTokenRef.current;
 					// A jump navigates AWAY from the bottom: any chase still gliding towards
 					// it would fight the reveal's scrollIntoView / layout writes.
@@ -4795,6 +4830,7 @@ export const PretextExactMessageList = memo(
 			// the wheel/pinch handlers, so they publish their focus point here instead —
 			// same field the gesture writes, same TTL, so the rebuild path is identical.
 			const prepareLodChange = useCallback((clientY: number) => {
+				loadedTopNarratorRef.current = null;
 				const node = viewportRef.current;
 				if (!node) return;
 				// Same landing the gesture path does: the morph diffs viewport geometry
@@ -5419,10 +5455,10 @@ export const PretextExactMessageList = memo(
 						askInPassingPending,
 						onOpenAskInPassingTarget: askInPassing.openByKey.get(item.spec.key),
 						viewControls: contentView.controls,
-						animateStreaming: animateStreamingRows && isStreamingRowKey(item.spec.key),
+						animateStreaming: animateStreamingRows && isLiveStreamAnimSpec(item.spec),
 						streamAnimMountEpoch,
 						// Accepted document snapshot, never the potentially newer streamingMsg.
-						streamAnimSnapshotEpoch: isStreamingRowKey(item.spec.key)
+						streamAnimSnapshotEpoch: isLiveStreamAnimSpec(item.spec)
 							? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
 							: undefined,
 						specTaskLive: isSpecTaskLiveItem(item, specTaskLiveGate),
@@ -5430,7 +5466,7 @@ export const PretextExactMessageList = memo(
 					};
 					windowRowProjections.push({
 						props: rowProps,
-						skipReuse: isStreamingRowKey(item.spec.key),
+						skipReuse: isLiveStreamAnimSpec(item.spec),
 					});
 				}
 			}

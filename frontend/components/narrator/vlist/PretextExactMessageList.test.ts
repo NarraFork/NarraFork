@@ -55,6 +55,69 @@ function makeManifest(): PretextLayoutManifest {
 }
 
 describe("PretextExactMessageList", () => {
+	it("registers the actual viewport, follows replacement callbacks and unregisters each target", () => {
+		const source = shellModule("PretextExactMessageList.tsx");
+		const registration = source.indexOf("return registerIOSScrollToTopTarget(");
+		expect(registration).toBeGreaterThan(-1);
+		const effectStart = source.lastIndexOf("useLayoutEffect(", registration);
+		const effect = sliceBracketedRegion(source.slice(effectStart), "useLayoutEffect(");
+		if (!effect) throw new Error("Missing iOS scroll-to-top registration effect");
+		const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${effect};`);
+		const firstNode = {};
+		const secondNode = {};
+		const viewportRef = { current: firstNode as object | null };
+		const targets = new Map<object, () => void>();
+		const calls: string[] = [];
+		const register = (node: object, callback: () => void) => {
+			targets.set(node, callback);
+			return () => targets.delete(node);
+		};
+		const install = (node: object | null, callback: () => void) => {
+			const lifecycle = { cleanup: undefined as (() => void) | undefined };
+			new Function(
+				"useLayoutEffect",
+				"viewportNode",
+				"viewportRef",
+				"handleIOSScrollToTop",
+				"registerIOSScrollToTopTarget",
+				code,
+			)(
+				(setup: () => (() => void) | undefined) => {
+					lifecycle.cleanup = setup();
+				},
+				node,
+				viewportRef,
+				callback,
+				register,
+			);
+			return lifecycle.cleanup;
+		};
+		const firstCleanup = install(firstNode, () => calls.push("first"));
+		const firstCallback = targets.get(firstNode);
+		firstCallback?.();
+		expect(calls).toEqual(["first"]);
+		viewportRef.current = secondNode;
+		firstCallback?.();
+		expect(calls).toEqual(["first"]);
+		firstCleanup?.();
+		expect(targets.size).toBe(0);
+		const secondCleanup = install(secondNode, () => calls.push("second"));
+		targets.get(secondNode)?.();
+		expect(calls).toEqual(["first", "second"]);
+		viewportRef.current = null;
+		secondCleanup?.();
+		expect(targets.size).toBe(0);
+		install(null, () => calls.push("detached"));
+		expect(targets.size).toBe(0);
+		expect(effect).toContain("[viewportNode, handleIOSScrollToTop]");
+		expect(effect).not.toContain("isActive");
+		const action = sliceBracketedRegion(source, "const handleIOSScrollToTop = useCallback(");
+		if (!action) throw new Error("Missing iOS scroll-to-top state action");
+		expect(action).toContain("scrollExactListToLoadedTop({");
+		expect(action).toContain("detachFromBottom,");
+		expect(action).toContain("writeScrollTop,");
+	});
+
 	it("resolves the current body's canonical owner and slot before a full-text toggle", () => {
 		const toggle = sliceBracketedRegion(
 			shellModule("PretextExactMessageList.tsx"),

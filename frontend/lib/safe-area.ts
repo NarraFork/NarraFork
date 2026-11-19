@@ -1,4 +1,5 @@
 import type { CSSProperties } from "react";
+import { installIOSScrollToTopBridge } from "./ios-scroll-to-top";
 
 export const SAFE_AREA_INSET_TOP = "env(safe-area-inset-top, 0px)";
 export const SAFE_AREA_INSET_LEFT = "env(safe-area-inset-left, 0px)";
@@ -462,27 +463,39 @@ function isStandaloneDisplay(targetWindow: Window): boolean {
 	return (targetWindow.navigator as { standalone?: boolean }).standalone === true;
 }
 
-const authenticatedAppShellMounts = new WeakMap<Document, number>();
+const authenticatedAppShellMounts = new WeakMap<
+	Document,
+	{ mounts: number; cleanupBridge: () => void }
+>();
 
 /** Mark the authenticated AppShell lifetime without competing with overlay inline styles. */
 export function installAuthenticatedAppShellRootLock(
 	targetDocument: Document = document,
 ): () => void {
 	const root = targetDocument.documentElement;
-	const nextMounts = (authenticatedAppShellMounts.get(targetDocument) ?? 0) + 1;
-	authenticatedAppShellMounts.set(targetDocument, nextMounts);
-	root.setAttribute(AUTHENTICATED_APP_SHELL_ATTRIBUTE, "true");
+	let lifetime = authenticatedAppShellMounts.get(targetDocument);
+	if (lifetime) lifetime.mounts++;
+	else {
+		root.setAttribute(AUTHENTICATED_APP_SHELL_ATTRIBUTE, "true");
+		const targetWindow = targetDocument.defaultView;
+		lifetime = {
+			mounts: 1,
+			cleanupBridge: targetWindow
+				? installIOSScrollToTopBridge(targetWindow, targetDocument)
+				: () => {},
+		};
+		authenticatedAppShellMounts.set(targetDocument, lifetime);
+	}
 
+	const activeLifetime = lifetime;
 	let disposed = false;
 	return () => {
 		if (disposed) return;
 		disposed = true;
-		const remainingMounts = Math.max(0, (authenticatedAppShellMounts.get(targetDocument) ?? 1) - 1);
-		if (remainingMounts > 0) {
-			authenticatedAppShellMounts.set(targetDocument, remainingMounts);
-			return;
-		}
+		activeLifetime.mounts--;
+		if (activeLifetime.mounts > 0) return;
 		authenticatedAppShellMounts.delete(targetDocument);
+		activeLifetime.cleanupBridge();
 		root.removeAttribute(AUTHENTICATED_APP_SHELL_ATTRIBUTE);
 	};
 }

@@ -10,6 +10,7 @@ import {
 	RouterProvider,
 } from "@tanstack/react-router";
 import { parseHTML } from "linkedom";
+import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { isStandaloneWindowPath } from "../lib/standalone-window";
 
@@ -18,6 +19,9 @@ let cleared = 0;
 let retries = 0;
 let shellMounts = 0;
 let appearanceCalls = 0;
+let fastModeMounts = 0;
+let fastModeCleanups = 0;
+let activeFastModeListeners = 0;
 let namespacePromise: Promise<void> = Promise.resolve();
 let auth = {
 	data: { id: "user" } as { id: string } | undefined,
@@ -50,6 +54,19 @@ mock.module("../lib/i18n", () => ({
 }));
 mock.module("../hooks/useUserPreferences", () => ({
 	useUserPreferences: () => ({ data: undefined }),
+}));
+mock.module("../hooks/useFastModeUpdates", () => ({
+	useFastModeUpdates: (enabled = true) => {
+		useEffect(() => {
+			if (!enabled) return;
+			fastModeMounts++;
+			activeFastModeListeners++;
+			return () => {
+				fastModeCleanups++;
+				activeFastModeListeners--;
+			};
+		}, [enabled]);
+	},
 }));
 mock.module("../hooks/useAuthenticatedAppearance", () => ({
 	useAuthenticatedAppearance: () => {
@@ -113,6 +130,7 @@ beforeEach(() => {
 	token = "test-token";
 	namespacePromise = Promise.resolve();
 	cleared = retries = shellMounts = appearanceCalls = 0;
+	fastModeMounts = fastModeCleanups = activeFastModeListeners = 0;
 	auth = {
 		data: { id: "user" },
 		isLoading: false,
@@ -220,6 +238,47 @@ test("private window renders only target and cleans up viewport ownership", asyn
 	root = createRoot(container);
 });
 
+test("authenticated standalone content owns one fast-mode listener and releases it on unmount", async () => {
+	await render("/windows/target");
+	await waitFor(() => !!container.querySelector("[data-target]"));
+	await waitFor(() => activeFastModeListeners === 1);
+	expect(fastModeMounts).toBe(1);
+	expect(fastModeCleanups).toBe(0);
+	await act(async () => root.unmount());
+	expect(activeFastModeListeners).toBe(0);
+	expect(fastModeCleanups).toBe(1);
+	root = createRoot(container);
+});
+
+for (const state of ["missing-token", "pending-auth", "failed-auth"] as const) {
+	test(`${state} never mounts the standalone fast-mode listener`, async () => {
+		if (state === "missing-token") token = null;
+		else {
+			auth = {
+				...auth,
+				data: undefined,
+				isLoading: state === "pending-auth",
+				isError: state === "failed-auth",
+				fetchStatus: state === "pending-auth" ? "fetching" : "idle",
+				error:
+					state === "failed-auth"
+						? { status: 502, data: { code: "UPSTREAM_FAILED" }, message: "retry" }
+						: null,
+			};
+		}
+		await render("/windows/target");
+		await waitFor(() =>
+			state === "missing-token"
+				? !!container.querySelector("[data-login]")
+				: state === "failed-auth"
+					? !!container.querySelector('[role="alert"]')
+					: !!container.querySelector(".mantine-Loader-root"),
+		);
+		expect(fastModeMounts).toBe(0);
+		expect(activeFastModeListeners).toBe(0);
+	});
+}
+
 test("slow translations keep window chrome mounted without exposing panel content", async () => {
 	let resolveNamespaces!: () => void;
 	namespacePromise = new Promise<void>((resolve) => {
@@ -245,6 +304,8 @@ test("public shares never mount private layout even with a session", async () =>
 	await waitFor(() => !!container.querySelector("[data-public-share]"));
 	expect(shellMounts).toBe(0);
 	expect(appearanceCalls).toBe(0);
+	expect(fastModeMounts).toBe(0);
+	expect(activeFastModeListeners).toBe(0);
 });
 
 test("login preserves complete window URL and restores the target afterwards", async () => {

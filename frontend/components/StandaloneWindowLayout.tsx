@@ -12,6 +12,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
+import { useFastModeUpdates } from "../hooks/useFastModeUpdates";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { clearToken } from "../lib/api";
 import { useBrowserLayoutEffect } from "../lib/app-shell-scroll";
@@ -87,6 +88,8 @@ export function StandaloneWindowLayout() {
 }
 
 function StandaloneWindowContent() {
+	// /windows/* bypasses the main shell, but private panels share its invalidation hints.
+	useFastModeUpdates();
 	const { data: prefs } = useUserPreferences();
 	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	// Read the branded name from the module store instead of useBranding(): the

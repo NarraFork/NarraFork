@@ -11,6 +11,7 @@ import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
 import { useChatUnreadLive } from "../hooks/useChat";
+import { useFastModeUpdates } from "../hooks/useFastModeUpdates";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
@@ -185,6 +186,7 @@ export function AuthenticatedLayout() {
 	// client even for rooms it has not subscribed to, so the count is correct without
 	// polling and without opening the conversation.
 	useChatUnreadLive();
+	useFastModeUpdates(hasToken && !!user);
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
