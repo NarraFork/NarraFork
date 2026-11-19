@@ -6,12 +6,12 @@ import { pluginPlatformServices } from "@server/services/plugin-platform-service
 
 /**
  * A builtin plugin must be a *normal* plugin: same manifest validation, same catalog entry,
- * same runtime lifecycle, same tool registry, same health, same enable/disable. Only its
+ * same runtime lifecycle, same command registry, same health, same enable/disable. Only its
  * distribution differs. These cases pin that equivalence, because the failure mode of a
  * "special" builtin plugin is silent: it keeps answering, just through the other code path.
  */
 const PLUGIN_ID = "com.narrafork.apikey-quota";
-const TOOL_ID = `${PLUGIN_ID}/query-balance`;
+const COMMAND_ID = `${PLUGIN_ID}/query-balance`;
 
 describe("apikey-quota is a first-class plugin", () => {
 	test("the catalog reads it through the installed-package reader", async () => {
@@ -27,7 +27,8 @@ describe("apikey-quota is a first-class plugin", () => {
 		// Identity is derived the same way: a current pointer plus versioned packages.
 		expect(plugin?.current?.version).toBe("1.0.0");
 		expect(plugin?.current?.hash).toMatch(/^[a-f0-9]{64}$/);
-		expect(plugin?.contributions.some((entry) => entry.kind === "tool")).toBe(true);
+		expect(plugin?.contributions.some((entry) => entry.kind === "command")).toBe(true);
+		expect(plugin?.contributions.some((entry) => entry.kind === "tool")).toBe(false);
 	});
 
 	test("a malformed builtin manifest fails the same way as an installed one", async () => {
@@ -64,11 +65,14 @@ describe("builtin plugin lifecycle matches an installed plugin", () => {
 		expect(permissions.grants.map((grant) => grant.capability)).toEqual(["provider.use"]);
 	});
 
-	test("its tool is registered through the shared registry", async () => {
-		const tools = pluginPlatformServices.toolRegistry.list();
-		const entry = tools.find((tool) => tool.fullId === TOOL_ID);
+	test("its command is registered without advertising an Agent tool", () => {
+		const entry = pluginPlatformServices.pluginCommandRegistry.find(COMMAND_ID, PLUGIN_ID);
 		expect(entry).toBeDefined();
-		expect(entry?.status).toBe("available");
+		expect(entry?.handler).toBe("server");
+		expect(pluginPlatformServices.toolRegistry.list(PLUGIN_ID)).toEqual([]);
+		expect(
+			pluginPlatformServices.toolBridge.listBindings().some((tool) => tool.pluginId === PLUGIN_ID),
+		).toBe(false);
 	});
 
 	test("disable persists and enable restores, on the same record external plugins use", async () => {

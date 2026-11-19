@@ -3,7 +3,8 @@
  * 12b review S3): a worker that does not start (its start rejects, never answers, or worker
  * threads are unavailable), one that crashes in the middle of a job, and one that hangs. Each job
  * fails, and the job is never run on the caller's thread instead (`runEditTextJob` is spied).
- * The Dynamic Spec import over a failing background channel fails and moves nothing.
+ * The Dynamic Spec import over a failing background channel fails and moves nothing; the
+ * swallowed-content scan (12c) leaves the session unscanned and attaches nothing.
  *
  * The channels here are made for the test (`createEditTextChannel`) with a fake worker start, so
  * the real channels' workers are not touched.
@@ -11,7 +12,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Worker } from "node:worker_threads";
+import * as specLoss from "@shared/spec-content-loss";
+import { connectCompiledWorker } from "../../../lib/compiled-worker";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
+import { WorkerHandle } from "../../../lib/worker-runtime/lifecycle";
+import { writeSpecFile } from "../../spec-vfs-service";
 import { invalidateTaskBackend } from "../../task-source";
 import type { EditTextJob } from "../edit-text";
 import * as editText from "../edit-text";
@@ -31,6 +37,16 @@ import {
 	writeTasks,
 } from "../spec-import/__tests__/fixtures";
 import { importSpecSession, resetSpecImportRecords } from "../spec-import/importer";
+import { attachSpecLossForSession } from "../spec-import/loss-attach";
+import { decideSpecLossFinding, specLossPage } from "../spec-import/loss-findings";
+import {
+	resetSpecLossScanState,
+	runSpecLossPass,
+	SPEC_LOSS_LIMITS,
+	scanSpecSessionLossById,
+} from "../spec-import/loss-scan";
+import { readSpecLossScan } from "../spec-import/loss-store";
+import { readSpecImportSession } from "../spec-import/read-port";
 
 const LIMITS: EditTextChannelLimits = {
 	inlineBytes: 1024,
@@ -55,14 +71,21 @@ class FakeWorker extends EventEmitter {
 		this.posted++;
 		this.onPost(this);
 	}
+	ref(): void {}
 	unref(): void {}
 	async terminate(): Promise<number> {
 		this.terminated++;
+		queueMicrotask(() => this.emit("exit", 0));
 		return 0;
 	}
 }
 
-const asWorker = (fake: FakeWorker) => ({ worker: fake as unknown as Worker });
+const asWorker = (fake: FakeWorker) => {
+	const worker = fake as unknown as Worker;
+	const exited = new Promise<number>((resolve) => fake.once("exit", resolve));
+	fake.on("error", () => {});
+	return { worker, handle: new WorkerHandle(worker, exited, () => fake.terminate()) };
+};
 
 let inline: ReturnType<typeof spyOn>;
 let channels = 0;
@@ -95,10 +118,30 @@ describe("a worker that does not start", () => {
 	});
 
 	test("its start never answers: the job times out, and is not run here", async () => {
-		const ch = channel(() => new Promise(() => {}));
-		expect((await failure(ch.run(job))).code).toBe("OUTLINE_TEXT_TIMEOUT");
-		expect(inline).not.toHaveBeenCalled();
-		ch.stop();
+		let exited = false;
+		const thread = WorkerHandle.thread.bind(WorkerHandle);
+		const creation = spyOn(WorkerHandle, "thread").mockImplementation((...args) => {
+			const handle = thread(...args);
+			void handle.exited.then(() => {
+				exited = true;
+			});
+			return handle;
+		});
+		const ch = channel((options) =>
+			connectCompiledWorker(
+				[new URL("./edit-text-worker.fixture.ts", import.meta.url).href],
+				options,
+			),
+		);
+		try {
+			expect((await failure(ch.run(job))).code).toBe("OUTLINE_TEXT_TIMEOUT");
+			expect(creation).toHaveBeenCalledTimes(1);
+			expect(exited).toBe(true);
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			await ch.stop();
+			creation.mockRestore();
+		}
 	});
 
 	test("worker threads are unavailable (disabled): the job fails, and is not run here", async () => {
@@ -186,5 +229,174 @@ describe("the Dynamic Spec import over a failing background channel", () => {
 		} finally {
 			background.mockRestore();
 		}
+	});
+});
+
+describe("import outcome diagnostics remain observational", () => {
+	beforeEach(() => {
+		settings.outline.enabled = true;
+		settings.outline.specImport = "manual";
+		invalidateTaskBackend();
+		resetSpecImportRecords();
+	});
+	test("worker failure text is retained for the caller, never logged or replaced by a sink error", async () => {
+		const secret = "PRIVATE_OUTLINE_INPUT /private/notes.md";
+		const background = spyOn(runner, "processBackgroundText").mockRejectedValue(
+			new OutlineEditTextError("OUTLINE_TEXT_FAILED", secret, 500),
+		);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("PRIVATE_LOG_FAILURE");
+		});
+		try {
+			const { id } = await makeSession();
+			await writeTasks(id, [{ text: "a task" }]);
+			await writeNote(id, "notes.md", "# Notes\n\nsome text\n");
+			const result = await importSpecSession(id, { trigger: "manual" });
+			expect(result).toMatchObject({ status: "failed", error: secret, attention: false });
+			expect(await backendOf(id)).toBe("spec");
+			expect(await commitCount(id)).toBe(0);
+			expect(inline).not.toHaveBeenCalled();
+			const calls = warn.mock.calls.filter(
+				([message]) => message === "Dynamic Spec import did not move a session",
+			);
+			expect(calls).toHaveLength(1);
+			expect(calls[0]?.[1]).toMatchObject({ reason: "other", attention: false });
+			const logged = JSON.stringify(calls);
+			for (const value of ["PRIVATE_OUTLINE_INPUT", "/private/", "PRIVATE_LOG_FAILURE"])
+				expect(logged).not.toContain(value);
+		} finally {
+			warn.mockRestore();
+			background.mockRestore();
+		}
+	});
+	test("a success log failure cannot turn an already committed import into a failed import", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "one task" }]);
+		await writeNote(id, "notes.md", "# Notes\n\nsome text\n");
+		const info = spyOn(logger, "info").mockImplementation((message) => {
+			if (message === "Dynamic Spec session imported into the outline")
+				throw new Error("PRIVATE_LOG_FAILURE");
+		});
+		try {
+			const result = await importSpecSession(id, { trigger: "manual" });
+			expect(result).toMatchObject({ status: "imported", tasks: 1 });
+			expect(await backendOf(id)).toBe("outline");
+			expect(await commitCount(id)).toBeGreaterThan(0);
+			expect(
+				info.mock.calls.some(
+					([message]) => message === "Dynamic Spec session imported into the outline",
+				),
+			).toBe(true);
+		} finally {
+			info.mockRestore();
+		}
+	});
+});
+
+describe("the swallowed-content scan over a failing background channel", () => {
+	const TABLE = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+	// Larger than the channel's inline size: the worker's to do, never this thread's.
+	const filler = "some text of the file. ".repeat(100);
+
+	beforeEach(() => {
+		settings.outline.enabled = true;
+		settings.outline.specImport = "manual";
+		invalidateTaskBackend();
+		resetSpecImportRecords();
+		resetSpecLossScanState();
+		// The saves of these cases count as made with the old editor.
+		settings.outline.specLossCutoff = "2999-01-01T00:00:00.000Z";
+	});
+
+	async function swallowedSession(): Promise<string> {
+		const { id } = await makeSession();
+		await writeSpecFile(id, "spec://design.md", `${filler}\n\n${TABLE}\n`, {
+			actor: "agent",
+			createdBy: "assistant",
+		});
+		await writeNote(id, "design.md", `${filler}\n`);
+		return id;
+	}
+
+	test("the session is left unscanned, tried again later; nothing is extracted on the main thread", async () => {
+		const id = await swallowedSession();
+		const extract = spyOn(specLoss, "extractSpecLossItems");
+		const background = spyOn(runner, "processBackgroundText").mockImplementation(async () => {
+			throw new OutlineEditTextError("OUTLINE_TEXT_TIMEOUT", "timed out", 504);
+		});
+		try {
+			await expect(scanSpecSessionLossById(id)).rejects.toThrow("timed out");
+			expect(await readSpecLossScan(id)).toBeNull();
+			// A pass counts it as left while it is tried again (the direct scan above was not a
+			// pass's), and stops trying after a few failures in this process: then it is not work
+			// left, so the job does not come back every few minutes for a session it never scans.
+			for (let n = 1; n < SPEC_LOSS_LIMITS.attempts; n++)
+				expect((await runSpecLossPass({ pauseMs: 0 })).left).toBeGreaterThanOrEqual(1);
+			expect((await runSpecLossPass({ pauseMs: 0 })).left).toBe(0);
+			const calls = background.mock.calls.length;
+			expect((await runSpecLossPass({ pauseMs: 0 })).left).toBe(0);
+			expect(background.mock.calls.length).toBe(calls);
+			expect(await readSpecLossScan(id)).toBeNull();
+			expect(background).toHaveBeenCalled();
+			expect(extract).not.toHaveBeenCalled();
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			background.mockRestore();
+			extract.mockRestore();
+		}
+		// The worker is back: the session is scanned and the loss found.
+		resetSpecLossScanState();
+		expect(await scanSpecSessionLossById(id)).toMatchObject({ findings: 1, added: 1 });
+	});
+
+	test("a real channel whose worker cannot start fails the job; nothing runs inline", async () => {
+		const ch = channel(async () => {
+			throw new Error("worker could not be created");
+		});
+		const job: EditTextJob = { kind: "specLoss", contents: [`${filler}\n\n${TABLE}\n`] };
+		await expect(ch.run(job)).rejects.toBeInstanceOf(OutlineEditTextError);
+		expect(inline).not.toHaveBeenCalled();
+		ch.stop();
+	});
+
+	test("attaching a finding: the conversion fails, nothing is written, the finding stays open", async () => {
+		const id = await swallowedSession();
+		await writeTasks(id, [{ text: "a task" }]);
+		expect(await importSpecSession(id, { trigger: "manual" })).toMatchObject({
+			status: "imported",
+		});
+		await scanSpecSessionLossById(id);
+		const page = await specLossPage({ status: "open", narratorId: id, canAct: true });
+		const findingId = page.items[0]?.id as string;
+		const commits = await commitCount(id);
+		inline.mockClear();
+		const background = spyOn(runner, "processBackgroundText").mockImplementation(async () => {
+			throw new OutlineEditTextError("OUTLINE_TEXT_FAILED", "worker exited (1)", 500);
+		});
+		try {
+			await expect(
+				decideSpecLossFinding({ id: findingId, narratorId: id, action: "attach", userId: "u" }),
+			).rejects.toThrow("worker exited");
+			expect(await commitCount(id)).toBe(commits);
+			expect(
+				(await specLossPage({ status: "open", narratorId: id, canAct: true })).items,
+			).toHaveLength(1);
+			expect(inline).not.toHaveBeenCalled();
+			// The pass's own attach: noted as failed on the finding, nothing written, tried again.
+			const session = await readSpecImportSession(id);
+			if (!session) throw new Error("no session");
+			expect(await attachSpecLossForSession(session)).toEqual({ attached: 0, left: 1 });
+			expect(await commitCount(id)).toBe(commits);
+			const [open] = (await specLossPage({ status: "open", narratorId: id, canAct: true })).items;
+			expect(open).toMatchObject({ status: "open", attachNote: "failed" });
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			background.mockRestore();
+		}
+		// The worker is back: the next pass's attach succeeds.
+		const session = await readSpecImportSession(id);
+		if (!session) throw new Error("no session");
+		expect(await attachSpecLossForSession(session)).toEqual({ attached: 1, left: 0 });
+		expect(await commitCount(id)).toBe(commits + 1);
 	});
 });

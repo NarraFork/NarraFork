@@ -60,7 +60,7 @@ const { OUTLINE_TASK_START_ACTOR } = await import("../task-source/outline");
 const { invalidateTaskBackend } = await import("../task-source");
 const { resetOutlineTaskEditsForTests } = await import("../outline-task-edits");
 
-const { ensureProjectSpace } = await import("../outline/spaces");
+const { ensureProjectSpace, ensureSessionSpace } = await import("../outline/spaces");
 const { projects, narratorMessageRefs, narratorMessages } = await import("../../db/schema");
 const { sqlite } = await import("../../db");
 const { readTestMessageContent } = await import("../../../tests/setup");
@@ -561,5 +561,170 @@ describe("a handed-over task the session does not finish (outline P2 PR 10c-2)",
 			expect(row?.status).toBe("idle");
 		}
 		closeNarrator(target);
+	});
+});
+
+describe("交出去 through the board's route (outline P2 PR 10c-3)", () => {
+	/** A to-do of `narratorId`'s own space, written by that session. */
+	async function sessionTask(narratorId: string, owner: string, title: string) {
+		const space = await ensureSessionSpace(narratorId);
+		const written = await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "insert", parent: null, content: title, task: { status: "todo" } }],
+			actor: { kind: "agent", id: narratorId },
+			narratorId,
+			responsibleUserId: owner,
+		});
+		const task = written.results[0] as { blockId: string; sid: string };
+		return {
+			...task,
+			versionSeq: (await outlineStore.getBlock(task.blockId))?.versionSeq as number,
+		};
+	}
+
+	test("「交给团队」: the copy's address in the answer, the task waits for it, nothing is started; refusals carry their reason", async () => {
+		const { owner, projectId } = await world();
+		const main = await session(owner, projectId, { title: "Main" });
+		const task = await sessionTask(main, owner, "Write the migration");
+		const response = await transfer(owner, task, { assign: { kind: "team" }, start: true });
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			started: boolean;
+			versionSeq: number;
+			handedOut: { copyId: string; address: string };
+		};
+		expect(body.started).toBe(false);
+		expect(body.versionSeq).toBe((await outlineStore.getBlock(task.blockId))?.versionSeq as number);
+		expect((await outlineStore.getBlock(task.blockId))?.taskJson?.depends).toEqual([
+			{ target: body.handedOut.address, label: null },
+		]);
+		expect(await state(body.handedOut.copyId)).toMatchObject({ status: "todo", holder: null });
+		expect(providerInputs).toHaveLength(0);
+
+		// Someone else who may write the session is not its owner: 403.
+		const mate = await person();
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "narrator",
+			scopeId: main,
+			principalType: "user",
+			principalId: mate,
+			capability: "write",
+			createdAt: NOW,
+		});
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "project",
+			scopeId: projectId,
+			principalType: "user",
+			principalId: mate,
+			capability: "write",
+			createdAt: NOW,
+		});
+		const other = await sessionTask(main, owner, "Not theirs to give");
+		const notOwner = await transfer(mate, other, { assign: { kind: "team" } });
+		expect(notOwner.status).toBe(403);
+		expect(await notOwner.text()).toContain("Only the session's owner");
+		// A session of no project: 409, nothing written.
+		const loner = await session(owner, projectId, { title: "Loner" });
+		await db.update(narrators).set({ contextProjectId: null }).where(eq(narrators.id, loner));
+		const lonely = await sessionTask(loner, owner, "Nowhere to go");
+		const noProject = await transfer(owner, lonely, { assign: { kind: "team" } });
+		expect(noProject.status).toBe(409);
+		expect(await noProject.text()).toContain("The session belongs to no project");
+		expect((await outlineStore.getBlock(lonely.blockId))?.taskJson?.depends).toBeUndefined();
+	});
+
+	/** A teammate's session in the project: it cannot write `owner`'s session spaces. */
+	async function teammateSession(owner: string, projectId: string, title: string) {
+		const mate = await person();
+		const target = await session(mate, projectId, { continuation: "off", title });
+		for (const [scopeType, scopeId, principalId] of [
+			["project", projectId, mate],
+			// The owner may start it (a turn on their behalf).
+			["narrator", target, owner],
+		] as const)
+			await db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType,
+				scopeId,
+				principalType: "user",
+				principalId,
+				capability: "write",
+				createdAt: NOW,
+			});
+		return target;
+	}
+
+	test("a session of the same person can work in the space: 「转交并开始」 is in place, no copy", async () => {
+		const { owner, projectId } = await world();
+		const main = await session(owner, projectId, { title: "Main" });
+		const sibling = await session(owner, projectId, { continuation: "off", title: "Sibling" });
+		const task = await sessionTask(main, owner, "Tidy the notes");
+		const response = await transfer(owner, task, {
+			assign: { kind: "narrator", narratorId: sibling },
+			start: true,
+		});
+		const body = (await response.json()) as { started: boolean; handedOut?: unknown };
+		expect(body.handedOut).toBeUndefined();
+		expect(body.started).toBe(true);
+		await waitIdleAfterTurns(sibling, 1);
+		expect(await state(task.blockId)).toMatchObject({ assignee: `agent:${sibling}` });
+		closeNarrator(sibling);
+		await writeOutline({
+			spaceId: (await outlineStore.getBlock(task.blockId))?.spaceId as string,
+			ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+	});
+
+	test("「转交并开始」 to a session that cannot write the space: it starts on the copy, and the original waits; never on a copy that is not its own", async () => {
+		const { owner, projectId } = await world();
+		const main = await session(owner, projectId, { title: "Main" });
+		const target = await teammateSession(owner, projectId, "Target");
+		const task = await sessionTask(main, owner, "Profile the importer");
+		const listed = await call(owner, "GET", `/outline/tasks/${task.blockId}/transfer-sessions`);
+		expect(await listed.json()).toMatchObject({ sessions: [{ narratorId: target }] });
+		const response = await transfer(owner, task, {
+			assign: { kind: "narrator", narratorId: target },
+			start: true,
+		});
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			started: boolean;
+			handedOut: { copyId: string; address: string };
+		};
+		expect(body.started).toBe(true);
+		await waitIdleAfterTurns(target, 1);
+		expect(await state(body.handedOut.copyId)).toMatchObject({
+			assignee: `agent:${target}`,
+			holder: target,
+			epoch: 1,
+		});
+		expect(providerInputs[0]).toContain(body.handedOut.address);
+		expect(await state(task.blockId)).toMatchObject({ status: "todo", holder: null });
+		closeNarrator(target);
+		// Handed again, to another session, while the target is doing it: refused, nothing started.
+		const third = await teammateSession(owner, projectId, "Third");
+		const again = await transfer(
+			owner,
+			{
+				blockId: task.blockId,
+				versionSeq: (await outlineStore.getBlock(task.blockId))?.versionSeq as number,
+			},
+			{ assign: { kind: "narrator", narratorId: third }, start: true },
+		);
+		expect(again.status).toBe(409);
+		expect(await again.text()).toContain("handed out already");
+		expect(providerInputs).toHaveLength(1);
+		// Leave no claim on a lease behind (other files' lease-expiry cases scan them all).
+		const copy = await outlineStore.getBlock(body.handedOut.copyId);
+		await writeOutline({
+			spaceId: copy?.spaceId as string,
+			ops: [{ op: "setTask", block: { id: body.handedOut.copyId }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
 	});
 });

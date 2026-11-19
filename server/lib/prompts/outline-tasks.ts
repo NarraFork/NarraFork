@@ -260,7 +260,7 @@ export function getOutlineViewTaskLine(task: OutlineViewTask, locale: Locale): s
 
 /** The subagent a delegated task was handed to (outline P2 PR 9b), as the view names it. */
 export interface OutlineViewAgent {
-	/** Its narrator id: what Send, Stop and Await take. */
+	/** Its narrator id: what Send, Stop and Watch take. */
 	id: string;
 	/** Its title (the Agent call's description), when it has one. */
 	title: string | null;

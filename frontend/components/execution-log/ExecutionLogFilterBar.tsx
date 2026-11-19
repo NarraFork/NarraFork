@@ -1,3 +1,8 @@
+import { useAllModels } from "@frontend/hooks/useModels";
+import {
+	createProviderPrefixOptionsFilter,
+	providerPrefixDisplay,
+} from "@frontend/lib/model-search";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type {
 	ExecutionLogFacets,
@@ -16,6 +21,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { IconFilter, IconSearch } from "@tabler/icons-react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
 /** Draft state: edited freely, only turned into filters when the user applies. */
@@ -99,6 +105,13 @@ export function ExecutionLogFilterBar({
 		value: status,
 		label: t(`executionLogStatus_${status}`),
 	}));
+	// Facet providers are bare prefixes and the server matches them exactly, so
+	// the display name is only searched and shown, never written into the filter.
+	const { providerLabels } = useAllModels();
+	const providerOptionsFilter = useMemo(
+		() => createProviderPrefixOptionsFilter(providerLabels),
+		[providerLabels],
+	);
 
 	return (
 		<Stack gap={isMobile ? "xs" : "md"}>
@@ -167,6 +180,8 @@ export function ExecutionLogFilterBar({
 					label={t("executionLogProvider")}
 					placeholder={t("executionLogAllProviders")}
 					data={facets?.providers ?? []}
+					filter={providerOptionsFilter}
+					renderOption={({ option }) => providerPrefixDisplay(option.value, providerLabels)}
 					value={draft.provider}
 					onChange={(value) => patch({ provider: value })}
 				/>

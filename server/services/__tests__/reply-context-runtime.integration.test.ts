@@ -451,17 +451,18 @@ test("HTTP Continue adopts at unfinished Await recovery admission, not at a dela
 	const baseline = await initialChineseTurn();
 	await persistUnfinishedAwait();
 	await englishOwnerPreference();
-	const communication = await import("../agent-communication");
+	const { watchTool } = await import("../../lib/agent/tools/watch");
 	const release = Promise.withResolvers<void>();
 	releases.add(release.resolve);
-	const wait = spyOn(communication, "awaitAgentResultDetailed").mockImplementation(async () => {
+	const wait = spyOn(watchTool, "execute").mockImplementation(async () => {
 		await release.promise;
-		throw new Error("Fixture missing agent");
+		return { output: "Observation registered", metadata: { kind: "watch", status: "watching" } };
 	});
 	const app = await ownerRoutes();
 	const response = await app.request(`/${recipient}/continue`, { method: "POST" });
 	expect(response.status).toBe(200);
 	expect(await response.json()).toMatchObject({ recovering: 1 });
+	await waitUntil(() => wait.mock.calls.length === 1, "recovery Watch registration");
 	expect(wait).toHaveBeenCalledTimes(1);
 	expect(recipientRow().replyContext).toEqual(en);
 	expect(requests).toHaveLength(1);
@@ -480,7 +481,7 @@ test("HTTP Continue adopts at unfinished Await recovery admission, not at a dela
 
 test("recovery without candidates or with a live owner never adopts the human pair", async () => {
 	await initialChineseTurn();
-	const { resumeIncompleteAgentWorkForContinue, startRecoveryAwaitBatch } = await import(
+	const { resumeIncompleteAgentWorkForContinue, startRecoveryWatchBatch } = await import(
 		"../narrator-subagent-recovery"
 	);
 	const input = {
@@ -499,7 +500,7 @@ test("recovery without candidates or with a live owner never adopts the human pa
 	const owner = tryClaimExecution(recipient, "run");
 	if (!owner) throw new Error("Could not claim fixture owner");
 	try {
-		await expect(startRecoveryAwaitBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
+		await expect(startRecoveryWatchBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
 			"already running",
 		);
 		expect(recipientRow().replyContext).toEqual(zh);
@@ -512,10 +513,10 @@ test("recovery without candidates or with a live owner never adopts the human pa
 test.each([
 	true,
 	false,
-])("recovery await batch adopts only explicit human policy (human=%s)", async (human) => {
+])("recovery Watch registration adopts only explicit human policy (human=%s)", async (human) => {
 	const baseline = await initialChineseTurn();
-	const { startRecoveryAwaitBatch } = await import("../narrator-subagent-recovery");
-	await startRecoveryAwaitBatch({
+	const { startRecoveryWatchBatch } = await import("../narrator-subagent-recovery");
+	await startRecoveryWatchBatch({
 		narratorId: recipient,
 		aliases: ["fixture-missing-agent"],
 		locale: "en",
@@ -523,6 +524,12 @@ test.each([
 		userId: "user-a",
 		...(human ? { humanReplyContext: en } : {}),
 	});
+	// Recovery only registers Watch and releases the parent. A later explicit
+	// continuation (or a real completion notice) starts the next model request.
+	expect(requests).toHaveLength(1);
+	expect(recipientRow().status).toBe("idle");
+	expect(recipientRow().replyContext).toEqual(human ? en : zh);
+	await continueNarrator(recipient, "en", true);
 	await idle(2);
 	if (human) expectRecoveredEnglish(baseline);
 	else {

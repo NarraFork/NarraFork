@@ -44,14 +44,14 @@
  */
 
 import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narrator-access";
-import { and, eq, type SQL, sql } from "drizzle-orm";
+import { and, eq, inArray, or, type SQL, sql } from "drizzle-orm";
 import { db } from "../db";
-import { aclGrants, narrators } from "../db/schema";
+import { aclGrants, narrators, projects } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
-import type { AclPrincipal } from "./acl/acl-core";
-import { resolveCaps } from "./acl/acl-core";
+import type { AclPrincipal, GrantRow } from "./acl/acl-core";
+import { applyGrant, resolveCaps } from "./acl/acl-core";
 import { resolveProjectIdForNarratorId } from "./narrator-project";
-import { resolveProjectGate } from "./project-acl";
+import { projectReadVerdict, projectWriteVerdict, resolveProjectGate } from "./project-acl";
 import { narratorProjectIdText } from "./read/acl-sql";
 
 /** What an operation needs from the caller. */
@@ -295,10 +295,38 @@ export async function canReadNarrator(
 	// A subagent is judged entirely on its root; an undeterminable root denies.
 	const judged = await resolveJudgedRow(row);
 	if (!judged) return false;
+	return await readVerdict(judged, principal, singleFacts(judged, principal));
+}
+
+/**
+ * What a decision about one principal on one judged narrator may need, each read only when a
+ * rule gets that far. One principal reads them lazily ({@link singleFacts}); a batch
+ * ({@link judgeNarratorAccessBatch}) answers them from bulk queries. The rules themselves are
+ * {@link readVerdict} and {@link writeVerdict}, shared by both.
+ */
+interface NarratorAccessFacts {
+	gateAndProject(): Promise<{ gate: { read: boolean; write: boolean }; projectId: string | null }>;
+	own(): Promise<{ read: boolean; write: boolean }>;
+}
+
+function singleFacts(judged: NarratorAclRow, principal: NarratorPrincipal): NarratorAccessFacts {
+	return {
+		gateAndProject: () => gateAndProjectFor(judged, principal),
+		own: () => ownGrants(judged.id, principal),
+	};
+}
+
+/** The read rule of {@link canReadNarrator} on the judged row (never a subagent's own). */
+async function readVerdict(
+	judged: NarratorAclRow,
+	principal: NarratorPrincipal,
+	facts: NarratorAccessFacts,
+): Promise<boolean> {
+	if (principal.isAdmin) return true;
 	if (isOwner(judged, principal)) return true;
 	if (visibilityGrantsRead(judged.visibility)) return true;
 
-	const { gate, projectId } = await gateAndProjectFor(judged, principal);
+	const { gate, projectId } = await facts.gateAndProject();
 	if (!gate.read) return false;
 
 	// Inside the project door, `project` visibility is what makes a session visible to
@@ -306,7 +334,7 @@ export async function canReadNarrator(
 	// write cannot disagree about which project a session belongs to.
 	if (visibilityGrantsReadInProject(judged.visibility) && projectId !== null) return true;
 
-	const own = await ownGrants(judged.id, principal);
+	const own = await facts.own();
 	// A write grant implies read: someone who may drive the session can obviously
 	// see it, and requiring both rows would make every share a two-row write.
 	return own.read || own.write;
@@ -327,13 +355,145 @@ export async function canWriteNarrator(
 	if (principal.isAdmin) return true;
 	const judged = await resolveJudgedRow(row);
 	if (!judged) return false;
+	return await writeVerdict(judged, principal, singleFacts(judged, principal));
+}
+
+/** The write rule of {@link canWriteNarrator} on the judged row. */
+async function writeVerdict(
+	judged: NarratorAclRow,
+	principal: NarratorPrincipal,
+	facts: NarratorAccessFacts,
+): Promise<boolean> {
+	if (principal.isAdmin) return true;
 	if (isOwner(judged, principal)) return true;
 	// The project gate applies to writes too: someone removed from a project must stop
 	// being able to drive its sessions, even if an old narrator grant survives.
-	const { gate, projectId } = await gateAndProjectFor(judged, principal);
+	const { gate, projectId } = await facts.gateAndProject();
 	if (!gate.read) return false;
 	if (writeAudienceGrantsWrite(judged, gate, projectId !== null)) return true;
-	return (await ownGrants(judged.id, principal)).write;
+	return (await facts.own()).write;
+}
+
+/** Most principals one statement of {@link judgeNarratorAccessBatch} looks grants up for. */
+const BATCH_PRINCIPAL_CHUNK = 400;
+
+/**
+ * Read and write access of many principals on one narrator, in a fixed handful of queries:
+ * the judged row (a subagent's root), its project and the project row once, then every
+ * candidate's user grants and the role grants on the narrator and on the project in one
+ * statement per {@link BATCH_PRINCIPAL_CHUNK} principals (`acl_grants (scope_type, scope_id)`).
+ *
+ * Decides with the SAME rules as {@link canReadNarrator} / {@link canWriteNarrator}
+ * ({@link readVerdict}, {@link writeVerdict}, and the project gate's `projectReadVerdict` /
+ * `projectWriteVerdict`), only with the facts answered from memory; a parity test checks them
+ * against each other. For fan-out and lists (a team's people), not for a single request's gate.
+ * Dialect-neutral: every statement is awaited, as in the single-principal path.
+ */
+export async function judgeNarratorAccessBatch(
+	row: NarratorAclRow,
+	principals: readonly NarratorPrincipal[],
+): Promise<Map<string, { read: boolean; write: boolean }>> {
+	const verdicts = new Map<string, { read: boolean; write: boolean }>();
+	if (principals.length === 0) return verdicts;
+	const judged = await resolveJudgedRow(row);
+	if (!judged) {
+		for (const principal of principals)
+			verdicts.set(principal.userId, { read: principal.isAdmin, write: principal.isAdmin });
+		return verdicts;
+	}
+	const projectId = await resolveProjectIdForNarratorId(judged.id);
+	const project = projectId
+		? ((await db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { id: true, ownerUserId: true, visibility: true },
+			})) ?? null)
+		: null;
+
+	const scopes = [
+		and(eq(aclGrants.scopeType, "narrator"), eq(aclGrants.scopeId, judged.id)),
+		...(projectId
+			? [and(eq(aclGrants.scopeType, "project"), eq(aclGrants.scopeId, projectId))]
+			: []),
+	];
+	const userIds = [...new Set(principals.map((p) => p.userId))];
+	const rows: Array<GrantRow & { principalType: string; principalId: string }> = [];
+	for (let start = 0; start < userIds.length; start += BATCH_PRINCIPAL_CHUNK) {
+		const chunk = userIds.slice(start, start + BATCH_PRINCIPAL_CHUNK);
+		// Awaited, never `.all()`: the same statement runs on either backend (dialect-neutral,
+		// like the single-principal path).
+		const chunkRows = await db
+			.select({
+				principalType: aclGrants.principalType,
+				principalId: aclGrants.principalId,
+				scopeType: aclGrants.scopeType,
+				scopeId: aclGrants.scopeId,
+				capability: aclGrants.capability,
+				domainKind: aclGrants.domainKind,
+				domainValue: aclGrants.domainValue,
+			})
+			.from(aclGrants)
+			.where(
+				and(
+					or(
+						and(eq(aclGrants.principalType, "user"), inArray(aclGrants.principalId, chunk)),
+						// Role grants apply to everyone holding the role; read once per chunk.
+						eq(aclGrants.principalType, "role"),
+					),
+					or(...scopes),
+				),
+			);
+		rows.push(...chunkRows);
+	}
+	// Grants by scope and holder, so each principal's caps are two map lookups.
+	const byHolder = new Map<string, GrantRow[]>();
+	for (const grant of rows) {
+		const key = `${grant.scopeType}:${grant.scopeId}:${grant.principalType}:${grant.principalId}`;
+		const list = byHolder.get(key);
+		if (list) list.push(grant);
+		else byHolder.set(key, [grant]);
+	}
+	const capsOf = (principal: NarratorPrincipal, scopeType: string, scopeId: string) => {
+		const caps = { read: false, write: false, manage: false };
+		const domain = {
+			clearance: new Set<string>(),
+			tags: new Set<string>(),
+			review: new Set<string>(),
+		};
+		const role = principal.isAdmin ? "admin" : "user";
+		for (const key of [`user:${principal.userId}`, `role:${role}`])
+			for (const grant of byHolder.get(`${scopeType}:${scopeId}:${key}`) ?? [])
+				applyGrant(caps, domain, grant);
+		return caps;
+	};
+
+	for (const principal of principals) {
+		// Mirrors `gateAndProjectFor` → `resolveProjectGate`, answered from the loaded rows.
+		const computeGate = async (): Promise<{ read: boolean; write: boolean }> => {
+			if (!projectId || principal.isAdmin) return { read: true, write: true };
+			if (!project) return { read: false, write: false };
+			const own = () => capsOf(principal, "project", project.id);
+			return {
+				read: await projectReadVerdict(project, principal, own),
+				write: await projectWriteVerdict(project, principal, own),
+			};
+		};
+		let gate: Promise<{ read: boolean; write: boolean }> | undefined;
+		const facts: NarratorAccessFacts = {
+			async gateAndProject() {
+				gate ??= computeGate();
+				return { gate: await gate, projectId };
+			},
+			async own() {
+				const caps = capsOf(principal, "narrator", judged.id);
+				return { read: caps.read, write: caps.write };
+			},
+		};
+		verdicts.set(principal.userId, {
+			read: await readVerdict(judged, principal, facts),
+			write: await writeVerdict(judged, principal, facts),
+		});
+	}
+	return verdicts;
 }
 
 /**

@@ -1,3 +1,4 @@
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { getOutboundProxy, resolveOverride } from "@server/lib/net/proxy";
 import type { JsonValue } from "@server/lib/plugins/protocol";
@@ -935,4 +936,14 @@ export function createPluginPlatformServices(
 	};
 }
 
-export const pluginPlatformServices = createPluginPlatformServices();
+// Pin the actual supervisor/scheduler, not merely an empty registry of future processes.
+// The former module-constant generation is not discoverable; deploying this first needs a cold restart.
+export const pluginPlatformServices = hotSafe("narrafork.pluginPlatformServices.owner", () =>
+	createPluginPlatformServices(),
+);
+
+/** Main calls this before manager shutdown: stop schedule producers, without clearing durable state. */
+export function stopPluginPlatformProducers(): void {
+	pluginPlatformServices.scheduler.close();
+	pluginPlatformServices.runtimeSupervisor.stopProducers();
+}

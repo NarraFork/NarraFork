@@ -944,6 +944,122 @@ test("interrupt waits for background child publication without changing parent n
 	owner.release();
 });
 
+test("reverting the primary leaves a background subagent running", async () => {
+	db.update(narrators)
+		.set({ isBackground: true, backgroundStatus: "running" })
+		.where(eq(narrators.id, CHILD))
+		.run();
+	const owner = ownership.tryClaimExecution(CHILD, "run");
+	if (!owner) throw new Error("Missing child run owner");
+	runOwners.push(owner);
+	const runCancel = new AbortController();
+	ownership.setRunControl(owner, {
+		startedAt: Date.now(),
+		cancel: runCancel,
+		timedOut: false,
+		terminal: new Promise(() => {}),
+	});
+	const childActive = makeActive();
+	childActive.narratorId = CHILD;
+	childActive._loopRunning = true;
+	state.activeNarrators.set(CHILD, childActive);
+	const primary = makeActive();
+	primary._loopRunning = true;
+	state.activeNarrators.set(ROOT, primary);
+	primary.abortController.signal.addEventListener(
+		"abort",
+		() => {
+			primary._loopRunning = false;
+			primary.alive = false;
+		},
+		{ once: true },
+	);
+	const entered = deferred();
+	const finish = deferred();
+	const child = state.withNarratorWorkAdmission(CHILD, async () => {
+		entered.resolve();
+		await finish.promise;
+	});
+	await entered.promise;
+	const signal = new AbortController();
+	const exclusive = acquire(true, signal.signal);
+	try {
+		const granted = await Promise.race([
+			exclusive.then((release) => ({ release, timedOut: false as const })),
+			Bun.sleep(1_500).then(() => ({ release: undefined, timedOut: true as const })),
+		]);
+		// The primary turn still stops. The background subagent's run does not, and the
+		// revert does not wait for that run to finish.
+		expect(primary.abortController.signal.aborted).toBe(true);
+		expect(runCancel.signal.aborted).toBe(false);
+		expect(childActive.abortController.signal.aborted).toBe(false);
+		expect(granted.timedOut).toBe(false);
+		if (!granted.release) throw new Error("Revert admission was not granted");
+		expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(true);
+		let continued = false;
+		await state.withNarratorWorkAdmission(CHILD, async () => {
+			continued = true;
+			expect(state.isNarratorRevertAdmissionBlocked(CHILD)).toBe(false);
+		});
+		expect(continued).toBe(true);
+		granted.release();
+	} finally {
+		signal.abort(new Error("test cleanup"));
+		finish.resolve();
+		await Promise.allSettled([child, exclusive]);
+		owner.release();
+	}
+});
+
+test("reverting a background subagent still interrupts that subagent", async () => {
+	db.update(narrators)
+		.set({ isBackground: true, backgroundStatus: "running" })
+		.where(eq(narrators.id, CHILD))
+		.run();
+	const active = makeActive();
+	active.narratorId = CHILD;
+	active._loopRunning = true;
+	state.activeNarrators.set(CHILD, active);
+	const aborted = deferred();
+	active.abortController.signal.addEventListener(
+		"abort",
+		() => {
+			active._loopRunning = false;
+			active.alive = false;
+			aborted.resolve();
+		},
+		{ once: true },
+	);
+	const entered = deferred();
+	const finish = deferred();
+	const work = state.withNarratorWorkAdmission(CHILD, async () => {
+		entered.resolve();
+		await finish.promise;
+	});
+	await entered.promise;
+	const signal = new AbortController();
+	const exclusive = session
+		.acquireNarratorRevertAdmission(CHILD, { interrupt: true, signal: signal.signal })
+		.then((release) => {
+			pendingReleases.push(release);
+			return release;
+		});
+	try {
+		const outcome = await Promise.race([
+			aborted.promise.then(() => "aborted" as const),
+			Bun.sleep(1_500).then(() => "timeout" as const),
+		]);
+		expect(outcome).toBe("aborted");
+		finish.resolve();
+		await work;
+		(await exclusive)();
+	} finally {
+		signal.abort(new Error("test cleanup"));
+		finish.resolve();
+		await Promise.allSettled([work, exclusive]);
+	}
+});
+
 test("cancellation before acquisition releases only the waiting reservation", async () => {
 	const entered = deferred();
 	const leave = deferred();

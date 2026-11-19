@@ -26,7 +26,6 @@ import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls, terminals } from "../db/schema";
-import { updateAwaitTimeout } from "../lib/agent/tools/await";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { eventBus } from "../lib/event-bus";
@@ -84,6 +83,7 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -1541,6 +1541,13 @@ export function broadcastToUser(userId: string, data: NarratorServerMessage): vo
 	}
 }
 
+// Kept separate so hot-loading this bridge into an existing server registers it once.
+if (hotOnce("narrafork.userPreferencesWs.listenersRegistered")) {
+	eventBus.on("user_preferences:changed", ({ userId }) => {
+		broadcastToUser(userId, { type: "user_preferences_changed" });
+	});
+}
+
 let humanAttentionBroadcastTimer: ReturnType<typeof setTimeout> | undefined;
 /** When the pending wake-up fires (epoch ms). */
 let humanAttentionDueAt = 0;
@@ -2052,15 +2059,39 @@ export const handleNarratorWS = {
 					hasFeedback: !!msg.feedbackText,
 					hasAnswers: !!msg.answers,
 				});
-				resolvePermissionOrDangerReflection(msg.requestId, msg.decision, {
-					denyMessage: msg.message,
-					answers: msg.answers,
-					feedbackText: msg.feedbackText,
-					compactAfter: msg.compactAfter,
-					updatedPlan: msg.updatedPlan,
-					userId: ws.data.userId,
-					decidedBy: "user",
-				})
+				// Read before deciding: the team's record of who decided (M1) needs the call,
+				// which deciding takes out of the live registries.
+				readDecisionTarget(msg.requestId)
+					.then(async (target) => {
+						const resolved = await resolvePermissionOrDangerReflection(
+							msg.requestId,
+							msg.decision,
+							{
+								// Checked again inside the decision (after any restart-recovery wait):
+								// access revoked since the frame was authorized refuses it.
+								assertStillAllowed: async () => {
+									if (!(await authorizeNarratorFrame(ws, msg)))
+										throw new Error("Permission request not found");
+								},
+								denyMessage: msg.message,
+								answers: msg.answers,
+								feedbackText: msg.feedbackText,
+								compactAfter: msg.compactAfter,
+								updatedPlan: msg.updatedPlan,
+								userId: ws.data.userId,
+								decidedBy: "user",
+							},
+						);
+						if (resolved && target)
+							recordTeamPersonDecision({
+								requestId: msg.requestId,
+								target,
+								userId: ws.data.userId,
+								decision: msg.decision,
+								answered: !!msg.answers,
+							});
+						return resolved;
+					})
 					.then((resolved) => {
 						if (resolved) return;
 						logger.warn("Permission request not found", {
@@ -2354,11 +2385,8 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_timeout": {
-				// Bash and Await both maintain live-timeout registries keyed by toolUseId;
-				// only one will match a given running tool.
-				const newMs =
-					updateBashTimeout(msg.toolUseId, msg.timeoutMs) ??
-					updateAwaitTimeout(msg.toolUseId, msg.timeoutMs);
+				// Only Bash execution has an editable live timeout. Watch already returned.
+				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
 				if (newMs != null) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "timeout_updated",

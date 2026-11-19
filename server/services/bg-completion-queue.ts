@@ -61,8 +61,8 @@ export function backgroundAgentNoticePreview(
 	return (
 		task.result?.slice(0, MAX_BACKGROUND_RESULT_CHARS) ??
 		(zh
-			? "此通知未能读取结果，请查看子代理或使用 Await 获取已保存的结果。"
-			: "This notice could not load the result. View the agent or use Await to inspect the stored result.")
+			? "此通知未能读取结果，请查看子代理或使用 Watch 获取已保存的结果。"
+			: "This notice could not load the result. View the agent or use Watch to inspect the stored result.")
 	);
 }
 
@@ -91,7 +91,7 @@ export function formatBackgroundCompletionNotifications(
 			: `Result preview: ${task.resultPreview || "(empty)"}`;
 		const supplement =
 			!includeResult || missing || truncated
-				? `\nUse Await({ type: "agent", id: "${ref}" }) to see the stored result.`
+				? `\nUse Watch({ type: "agent", id: "${ref}" }) to see the stored result.`
 				: "";
 		return `${header}\n${resultText}${supplement}\nUse Send({ id: "${ref}", message }) to continue.`;
 	});

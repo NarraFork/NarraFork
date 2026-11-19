@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { PluginDockPanelParams } from "./protocol";
+import { parseHTML } from "linkedom";
+import type { PluginDockPanelParams, UiRpcNotification } from "./protocol";
 import { PluginUiSession } from "./runtime";
 import type { PluginUiContribution } from "./types";
 
@@ -41,6 +42,37 @@ function fakeIframe(
 	} as unknown as HTMLIFrameElement;
 }
 
+/** Execute the generated bridge, connected to the real session through MessageChannel. */
+function shellIframe(session: PluginUiSession) {
+	const { document, window } = parseHTML(session.getSrcdoc());
+	const parent = {};
+	const listeners = new Map<string, (event: unknown) => void>();
+	const shellWindow = {
+		parent,
+		addEventListener: (type: string, listener: (event: unknown) => void) =>
+			listeners.set(type, listener),
+		removeEventListener: (type: string) => listeners.delete(type),
+	};
+	const script = document.querySelector("script[nonce]")?.textContent;
+	if (!script) throw new Error("Shell has no inline bridge");
+	new Function("window", "document", "globalThis", script)(shellWindow, document, {});
+	let pluginPort: MessagePort | undefined;
+	return {
+		document,
+		iframe: fakeIframe((bootstrap, port) => {
+			pluginPort = port;
+			listeners.get("message")?.({ source: parent, data: bootstrap, ports: [port] });
+		}),
+		post: (message: unknown) => pluginPort?.postMessage(message),
+		fire: (src: string, type: "load" | "error") => {
+			const asset = document.querySelector(`script[src="${src}"]`);
+			if (!asset) throw new Error(`Asset was not loaded: ${src}`);
+			asset.dispatchEvent(new window.Event(type));
+		},
+		close: () => pluginPort?.close(),
+	};
+}
+
 function waitFor(predicate: () => boolean): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const started = Date.now();
@@ -55,6 +87,153 @@ function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("PluginUiSession", () => {
+	test.each([
+		{ binding: { kind: "global" }, transparent: false },
+		{ binding: { kind: "host-surface", surface: "settings" }, transparent: false },
+		{ binding: { kind: "host-surface", surface: "overlay" }, transparent: true },
+	] satisfies Array<{
+		binding: PluginDockPanelParams["binding"];
+		transparent: boolean;
+	}>)("derives transparent presentation only from the host binding: %j", ({
+		binding,
+		transparent,
+	}) => {
+		const session = new PluginUiSession({
+			params: { ...params, binding, viewState: { transparent: true, surface: "overlay" } },
+			contribution: { ...contribution, surfaces: ["overlay"] },
+		});
+		try {
+			for (const reload of [false, true]) {
+				if (reload) session.reload();
+				const { document } = parseHTML(session.getSrcdoc());
+				expect(document.getElementById("plugin-shell-splash") === null).toBe(transparent);
+				expect(
+					document.head.querySelector("style")?.textContent?.includes("background:transparent"),
+				).toBe(transparent);
+			}
+		} finally {
+			session.dispose();
+		}
+	});
+
+	for (const overlay of [false, true]) {
+		test.each([
+			false,
+			true,
+		])(`actual shell asset failure crashes and cancels work (overlay=${overlay}, host runtime=%s)`, async (hostRuntime) => {
+			const notifications: UiRpcNotification[] = [];
+			const states: string[] = [];
+			let requestSignal: AbortSignal | undefined;
+			const session = new PluginUiSession({
+				params: overlay
+					? { ...params, binding: { kind: "host-surface", surface: "overlay" } }
+					: params,
+				contribution: {
+					...contribution,
+					...(hostRuntime ? { runtime: "host-react" as const } : {}),
+				},
+				onStateChange: (snapshot) => states.push(snapshot.status),
+				onNotification: (_params, notification) => notifications.push(notification),
+				onRequest: ({ signal }) => {
+					requestSignal = signal;
+					return new Promise((_resolve, reject) =>
+						signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }),
+					);
+				},
+			});
+			const shell = shellIframe(session);
+			try {
+				session.attach(shell.iframe);
+				await waitFor(() => shell.document.querySelector("script[src]") !== null);
+				expect(session.getSnapshot().status).toBe("ready");
+				shell.post({
+					protocol: "narrafork.ui/1",
+					kind: "request",
+					id: "in_flight",
+					method: "context.get",
+				});
+				await waitFor(() => requestSignal !== undefined);
+				const pending = session.request("slow").catch((error: Error) => error.message);
+				const src = shell.document.querySelector("script[src]")?.getAttribute("src");
+				if (!src) throw new Error("Shell did not load an asset");
+				if (hostRuntime) expect(src).not.toBe(contribution.entryUrl);
+				else expect(src).toBe(contribution.entryUrl);
+				shell.fire(src, "error");
+				await waitFor(() => session.getSnapshot().status === "crashed");
+				expect(session.getSnapshot()).toMatchObject({
+					status: "crashed",
+					error: hostRuntime ? "runtime-load-failed" : "asset-load-failed",
+					diagnosticId: expect.stringContaining("pui_"),
+				});
+				expect(states).toEqual(["connecting", "ready", "crashed"]);
+				expect(requestSignal?.aborted).toBe(true);
+				expect(await pending).toBe("Plugin UI session disposed");
+				expect(notifications).toHaveLength(1);
+				expect(notifications[0].method).toBe("plugin.lifecycle");
+				await expect(session.request("context.get")).rejects.toThrow("not ready");
+				if (overlay) expect(shell.document.getElementById("plugin-shell-splash")).toBeNull();
+				if (hostRuntime) {
+					expect(shell.document.querySelector(`script[src="${contribution.entryUrl}"]`)).toBeNull();
+				}
+				session.reload();
+				expect(session.getSnapshot().status).toBe("registered");
+				expect(session.getSnapshot().error).toBeUndefined();
+			} finally {
+				session.dispose();
+				shell.close();
+			}
+		});
+	}
+
+	test("normal dock entry load removes its splash and non-crash notifications stay compatible", async () => {
+		const notifications: UiRpcNotification[] = [];
+		const session = new PluginUiSession({
+			params,
+			contribution,
+			onNotification: (_params, notification) => notifications.push(notification),
+		});
+		const shell = shellIframe(session);
+		try {
+			session.attach(shell.iframe);
+			await waitFor(() => shell.document.querySelector("script[src]") !== null);
+			expect(shell.document.getElementById("plugin-shell-splash")).not.toBeNull();
+			shell.fire(contribution.entryUrl, "load");
+			expect(shell.document.getElementById("plugin-shell-splash")).toBeNull();
+			for (const params of [
+				null,
+				["crashed"],
+				{ state: "ready" },
+				{ reason: "asset-load-failed" },
+			]) {
+				shell.post({
+					protocol: "narrafork.ui/1",
+					kind: "notification",
+					method: "plugin.lifecycle",
+					params,
+				});
+			}
+			shell.post({
+				protocol: "narrafork.ui/1",
+				kind: "notification",
+				method: "other",
+				params: { state: "crashed" },
+			});
+			await waitFor(() => notifications.length === 5);
+			expect(session.getSnapshot().status).toBe("ready");
+			shell.post({
+				protocol: "narrafork.ui/1",
+				kind: "notification",
+				method: "plugin.lifecycle",
+				params: { state: "crashed" },
+			});
+			await waitFor(() => session.getSnapshot().status === "crashed");
+			expect(session.getSnapshot().error).toBe("Plugin UI reported a crash");
+		} finally {
+			session.dispose();
+			shell.close();
+		}
+	});
+
 	test("keeps the latest panel params across reloads", () => {
 		const session = new PluginUiSession({ params, contribution });
 		const updated = {

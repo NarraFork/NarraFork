@@ -41,7 +41,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
-	"Await",
+	"Watch",
 	"Send",
 	"ContextAsk",
 ]);
@@ -61,6 +61,8 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
 	"AttachWorktree",
 	"GetWorktreeOperation",
 	"RequestPermissionRule",
+	// Team work item changes read and write one team's rows and worktrees in order.
+	"Team",
 ]);
 
 /**
@@ -68,18 +70,18 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
  * current parallel batch, these must observe that agent's registered/running state,
  * so they start in a fresh group after the Agent batch settles instead of racing it.
  */
-const AGENT_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await", "Send"]);
+const AGENT_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Watch", "Send"]);
 
 const AGENT_TOOL_NAME = "Agent";
 
 /**
- * Send wakes an idle subagent before it returns. An Await in the same batch would
+ * Send wakes an idle subagent before it returns. An Watch in the same batch would
  * otherwise read the previous run's terminal state and hand back the old report, so
- * Await after Send starts in a fresh group. Unlike the Agent barrier this waits for
+ * Watch after Send starts in a fresh group. Unlike the Agent barrier this waits for
  * the whole Send group, which settles as soon as delivery is accepted.
  */
 const SEND_TOOL_NAME = "Send";
-const SEND_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await"]);
+const SEND_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Watch"]);
 
 function crossesSendBarrier<T extends ToolExecutionGroupItem>(
 	previousGroup: readonly T[] | undefined,
@@ -112,7 +114,7 @@ function getToolName(item: ToolExecutionGroupItem): string {
 }
 
 /**
- * Whether a group containing Await/Send must start only after the preceding Agent
+ * Whether a group containing Watch/Send must start only after the preceding Agent
  * group has registered its spawned work. Live grouping uses this to create the
  * boundary; recovery uses the same predicate to await the Agent's mount rather
  * than its long-running terminal completion.
@@ -163,9 +165,9 @@ export function isParallelSafeToolExecution(item: ToolExecutionGroupItem): boole
  * unless the call sets `parallel: true`.
  *
  * Additionally, an Agent already present in the current parallel batch forms a
- * deterministic barrier for a subsequent Await/Send: those open a new group so the
+ * deterministic barrier for a subsequent Watch/Send: those open a new group so the
  * spawned agent is observable before the wait/message runs. Agent+Agent and Agent+Read
- * stay parallel. Likewise a Send in the current batch splits off a later Await, so the
+ * stay parallel. Likewise a Send in the current batch splits off a later Watch, so the
  * wait observes the run that Send woke. The same grouping drives both the live loop and
  * planned-update recovery.
  */

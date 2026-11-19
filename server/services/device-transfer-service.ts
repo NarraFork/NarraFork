@@ -1514,6 +1514,7 @@ interface TransferTaskOperations {
 	onTransferClaimed?: (input: {
 		parentNarratorId: string;
 		transferTaskId: string;
+		runGeneration: number;
 		title: string;
 		toolUseId?: string;
 		/**
@@ -1526,7 +1527,11 @@ interface TransferTaskOperations {
 		 */
 		alias?: string;
 	}) => Promise<unknown>;
-	onTransferPaused?: (transferTaskId: string, reason: string | null) => Promise<unknown>;
+	onTransferPaused?: (
+		transferTaskId: string,
+		reason: string | null,
+		runGeneration?: number,
+	) => Promise<unknown>;
 	/**
 	 * Live progress for the narrator-facing row.
 	 *
@@ -1540,6 +1545,7 @@ interface TransferTaskOperations {
 			| { status: "completed"; summary: string }
 			| { status: "failed"; error: string }
 			| { status: "cancelled" },
+		runGeneration?: number,
 	) => Promise<unknown>;
 }
 
@@ -1652,6 +1658,7 @@ export function createDeviceTransferTaskManager(
 					operations.onTransferClaimed?.({
 						parentNarratorId,
 						transferTaskId: task.id,
+						runGeneration: run.generation,
 						title: transferTaskTitle(task),
 						...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
 						// Carried onto the projection so `Await` can still resolve the handle the
@@ -1735,10 +1742,14 @@ export function createDeviceTransferTaskManager(
 			if (!task.parentNarratorId) return;
 			if (completed) {
 				await reportProjection(task.id, () =>
-					operations.onTransferFinished?.(task.id, {
-						status: "completed",
-						summary: transferTaskSummary(task, result),
-					}),
+					operations.onTransferFinished?.(
+						task.id,
+						{
+							status: "completed",
+							summary: transferTaskSummary(task, result),
+						},
+						run.generation,
+					),
 				);
 				return;
 			}
@@ -1750,24 +1761,33 @@ export function createDeviceTransferTaskManager(
 			await reportProjection(task.id, () => {
 				// A row that vanished (deleted mid-run) has no state to mirror; leaving the
 				// card as-is beats inventing an outcome for a transfer nobody can inspect.
-				if (!owner) return;
+				if (!owner || owner.runGeneration !== run.generation) return;
 				// No reason: the work did not fail, it finished into a paused row. A fabricated
 				// error string here would show up on the card as if something went wrong.
-				if (owner.status === "paused") return operations.onTransferPaused?.(task.id, null);
+				if (owner.status === "paused")
+					return operations.onTransferPaused?.(task.id, null, run.generation);
 				if (owner.status === "cancelled") {
-					return operations.onTransferFinished?.(task.id, { status: "cancelled" });
+					return operations.onTransferFinished?.(task.id, { status: "cancelled" }, run.generation);
 				}
 				// Any other state (already completed by an earlier generation, or failed)
 				// is reported verbatim rather than reinterpreted.
 				return owner.status === "completed"
-					? operations.onTransferFinished?.(task.id, {
-							status: "completed",
-							summary: transferTaskSummary(task, result),
-						})
-					: operations.onTransferFinished?.(task.id, {
-							status: "failed",
-							error: owner.error ?? "Transfer ended in an unexpected state",
-						});
+					? operations.onTransferFinished?.(
+							task.id,
+							{
+								status: "completed",
+								summary: transferTaskSummary(task, result),
+							},
+							run.generation,
+						)
+					: operations.onTransferFinished?.(
+							task.id,
+							{
+								status: "failed",
+								error: owner.error ?? "Transfer ended in an unexpected state",
+							},
+							run.generation,
+						);
 			});
 		} catch (error) {
 			await progressWriter.flush();
@@ -1786,12 +1806,13 @@ export function createDeviceTransferTaskManager(
 			// transfer dead.
 			await reportProjection(task.id, () =>
 				run.stopIntent === "paused"
-					? operations.onTransferPaused?.(task.id, message)
+					? operations.onTransferPaused?.(task.id, message, run.generation)
 					: operations.onTransferFinished?.(
 							task.id,
 							run.stopIntent === "cancelled"
 								? { status: "cancelled" }
 								: { status: "failed", error: message },
+							run.generation,
 						),
 			);
 		}
@@ -1940,7 +1961,7 @@ export function createDeviceTransferTaskManager(
 			// for a transfer whose checkpoint was just discarded.
 			if (!aborted && task.parentNarratorId) {
 				await reportProjection(task.id, () =>
-					operations.onTransferFinished?.(task.id, { status: "cancelled" }),
+					operations.onTransferFinished?.(task.id, { status: "cancelled" }, task.runGeneration),
 				);
 			}
 			return task;
@@ -1964,9 +1985,9 @@ const transferTaskManager = createDeviceTransferTaskManager(
 			const { backgroundTaskService } = await import("./background-task-service");
 			return backgroundTaskService.createTransferTask(input);
 		},
-		onTransferPaused: async (transferTaskId, reason) => {
+		onTransferPaused: async (transferTaskId, reason, runGeneration) => {
 			const { backgroundTaskService } = await import("./background-task-service");
-			return backgroundTaskService.markTransferPaused(transferTaskId, reason);
+			return backgroundTaskService.markTransferPaused(transferTaskId, reason, runGeneration);
 		},
 		onTransferProgress: (transferTaskId, progress) => {
 			void (async () => {
@@ -1984,9 +2005,9 @@ const transferTaskManager = createDeviceTransferTaskManager(
 				// complete state. Never surfaced as a transfer error.
 			});
 		},
-		onTransferFinished: async (transferTaskId, outcome) => {
+		onTransferFinished: async (transferTaskId, outcome, runGeneration) => {
 			const { backgroundTaskService } = await import("./background-task-service");
-			return backgroundTaskService.finishTransferTask(transferTaskId, outcome);
+			return backgroundTaskService.finishTransferTask(transferTaskId, outcome, runGeneration);
 		},
 	},
 	hotSafe("deviceTransfer.taskRuntime", () => ({

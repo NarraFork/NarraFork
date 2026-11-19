@@ -78,6 +78,28 @@ describe("OpenAI raw usage normalization", () => {
 		expect(usage.inputTokens).toBe(100);
 		expect(usage.cachedInputTokens).toBeUndefined();
 		expect(usage.cacheCreationInputTokens).toBeUndefined();
+		expect(usage.cacheReported).toBe(false);
+		expect(
+			extractOpenAIUsage({ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 0 } })
+				.cacheReported,
+		).toBe(true);
+	});
+
+	test("stream usage marks cache reporting only once input-side counts are known", () => {
+		const reported = parseResponsesAPIEvent(
+			{ usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 0 } } },
+			new Map(),
+			new Map(),
+		);
+		expect(reported[0]?.usage?.cacheReported).toBe(true);
+		const relay = parseResponsesAPIEvent({ usage: { input_tokens: 100 } }, new Map(), new Map());
+		expect(relay[0]?.usage?.cacheReported).toBe(false);
+		const outputOnly = parseResponsesAPIEvent(
+			{ usage: { output_tokens: 3 } },
+			new Map(),
+			new Map(),
+		);
+		expect(outputOnly[0]?.usage?.cacheReported).toBeUndefined();
 	});
 
 	test("nested explicit zero wins; missing individual fields fall through", () => {

@@ -6,13 +6,22 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	judgeNarratorAccessBatch,
+	listNarratorAudience,
+	type NarratorAclRow,
+} from "./narrator-acl";
 import {
 	deliverNotification,
 	type NotificationChannel,
 	type NotificationDeliveryResult,
 } from "./notification-delivery";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorByRecency,
+} from "./recent-tabs-service";
+import { readTeamMemberIds } from "./teams/team-members";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type NotificationTarget = { user_id?: string; username?: string };
 const CHANNELS: readonly NotificationChannel[] = ["dingtalk", "feishu"];
@@ -257,6 +266,32 @@ async function filterUsersWhoCanRead(
 	return candidateUserIds.filter((userId) => allowed.has(userId));
 }
 
+/** The candidates who may drive the narrator (write access; admins always), judged as one batch. */
+async function filterUsersWhoCanWrite(
+	narrator: NarratorAclRow,
+	candidateUserIds: string[],
+): Promise<string[]> {
+	if (candidateUserIds.length === 0) return [];
+	const admins = new Set(
+		(
+			await db
+				.select({ id: users.id })
+				.from(users)
+				.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)))
+		).map((admin) => admin.id),
+	);
+	const verdicts = await judgeNarratorAccessBatch(
+		narrator,
+		candidateUserIds.map((userId) => ({ userId, isAdmin: admins.has(userId) })),
+	);
+	return candidateUserIds.filter((userId) => verdicts.get(userId)?.write === true);
+}
+
+/** Candidates of each source the team's members are read from for a "waiting" alert (M1). */
+const TEAM_ATTENTION_MEMBERS = 50;
+/** Recent-tab holders a team session's "waiting" alert also looks at (M1). */
+const TEAM_ATTENTION_TAB_HOLDERS = 200;
+
 export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
@@ -269,15 +304,38 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 
 	const narratorTitle = narrator.title || narratorId;
 	const displayStatus = reason === "done" ? "done" : "waiting";
-	const markdownText = `**${narratorTitle}** status: **${displayStatus}**`;
+	// Team sessions (M1): the members-only "waiting" alert is the one IM signal a team session
+	// sends. No "done" (or any other) alert for a coordinator or its subagents, whoever can read
+	// them; the IM gateway sends nothing of team sessions either.
+	const teamId = teamIdOfNarrator(narrator.id);
+	if (teamId && reason !== "waiting_permission") return;
+	const teamWaiting = !!teamId;
+	const markdownText = teamWaiting
+		? `**${narratorTitle}** status: **waiting** for a team member. Decide in NarraFork.`
+		: `**${narratorTitle}** status: **${displayStatus}**`;
 
 	// Recipients are everyone with this narrator in a recent tab, minus anyone who
 	// may no longer read it. Access can be revoked after a tab was opened, and a
 	// webhook carrying the narrator's title and status would otherwise keep
 	// delivering to them — a notification must never outlive the permission.
-	const recentTabUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+	// A call waiting in a team tree waits for a member: onlookers (read only) are not told. As in
+	// the notification center: the team's members (`readTeamMemberIds`, bounded per source) and the
+	// most recent recent-tab holders (at most 200: admins, role-grant and public-audience writers,
+	// members past the per-source cut), then one batch write judgement.
+	const recentTabUserIds = teamId
+		? [
+				...new Set([
+					...(await readTeamMemberIds(teamId, TEAM_ATTENTION_MEMBERS)),
+					...(await getRecentTabUserIdsForNarratorByRecency(
+						narratorId,
+						TEAM_ATTENTION_TAB_HOLDERS,
+					)),
+				]),
+			]
+		: await getRecentTabUserIdsForNarrator(narratorId);
 	if (recentTabUserIds.length === 0) return;
-	const relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
+	let relevantUserIds = await filterUsersWhoCanRead(narrator, recentTabUserIds);
+	if (teamWaiting) relevantUserIds = await filterUsersWhoCanWrite(narrator, relevantUserIds);
 	if (relevantUserIds.length === 0) return;
 
 	const notificationPrefs: Array<{

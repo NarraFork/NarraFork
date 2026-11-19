@@ -1,6 +1,8 @@
 import { MarkdownContentListItem } from "@frontend/components/common/MarkdownListMarker";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
+import { parseAgentReference } from "@shared/agent-reference";
+import { isDocumentAssetUrl } from "@shared/document-file-extensions";
 import {
 	prepareMarkdownEmphasis,
 	remarkStripEmphasisSentinel,
@@ -13,6 +15,7 @@ import {
 	createContext,
 	Fragment,
 	memo,
+	type ReactElement,
 	type ReactNode,
 	useContext,
 	useEffect,
@@ -20,8 +23,7 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { Components } from "react-markdown";
-import Markdown from "react-markdown";
+import Markdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { hasUnclosedFence, splitStableAndTail } from "../streaming/streaming-markdown-split";
@@ -98,14 +100,17 @@ function MermaidOrCode({ code }: { code: string }) {
 	return <MermaidDiagram code={code} defaultSizeMode={streamedRef.current ? "actual" : "fit"} />;
 }
 
-/** Recursively extract plain text from React children */
-export function extractText(node: ReactNode): string {
+export function extractText(node: ReactNode, referenceTitle = false): string {
 	if (node == null || typeof node === "boolean") return "";
 	if (typeof node === "string" || typeof node === "number")
 		return stripEmphasisSentinel(String(node));
-	if (Array.isArray(node)) return node.map(extractText).join("");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	if (typeof node === "object" && "props" in node) return extractText((node as any).props.children);
+	if (Array.isArray(node)) return node.map((child) => extractText(child, referenceTitle)).join("");
+	if (typeof node === "object" && "props" in node) {
+		const element = node as ReactElement<{ children?: ReactNode; alt?: string }>;
+		if (referenceTitle && element.type === "br") return " ";
+		if (referenceTitle && typeof element.props.alt === "string") return element.props.alt;
+		return extractText(element.props.children, referenceTitle);
+	}
 	return "";
 }
 
@@ -247,7 +252,7 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 			return (
 				<MarkdownLink
 					href={href}
-					labelText={extractText(children)}
+					labelText={extractText(children, parseAgentReference(href) !== null)}
 					linkClassName={classes.mdLink}
 					title={title}
 				>
@@ -527,6 +532,17 @@ function animateText(children: ReactNode): ReactNode {
 
 const animatedComponents = createMdComponents(animateText);
 
+/**
+ * Let `nf-doc-asset:` through, keep every other URL on the default cleaning path.
+ *
+ * react-markdown's default transform drops any scheme outside its allow-list, which silently
+ * emptied the `src` of pictures embedded in a document preview — the image then rendered as its
+ * alt text with no request made and nothing in the UI explaining why.
+ */
+function markdownUrlTransform(url: string): string {
+	return isDocumentAssetUrl(url) ? url : defaultUrlTransform(url);
+}
+
 function AnimatedMarkdownTree({
 	source,
 	remarkPlugins,
@@ -540,6 +556,7 @@ function AnimatedMarkdownTree({
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
+			urlTransform={markdownUrlTransform}
 			components={animatedComponents}
 		>
 			{prepareMarkdownEmphasis(source)}
@@ -610,6 +627,7 @@ function StaticMarkdownTree({
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
+			urlTransform={markdownUrlTransform}
 			components={sourceLines ? staticSourceLineComponents : staticComponents}
 		>
 			{prepareMarkdownEmphasis(source)}

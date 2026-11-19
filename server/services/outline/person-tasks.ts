@@ -36,6 +36,11 @@
  * is stopped in the same commit (back to to-do, which releases the claim): handing it on means
  * the previous executor no longer does it. Every change is a person's commit, based on the
  * version the board read, so a change made since is refused (409) and the board reads again.
+ *
+ * A task of a SESSION space given to the team (「交给团队」), or by the session's owner to someone
+ * who cannot work in the session space, is handed out instead (outline P2 PR 10c-3, `hand-out.ts`,
+ * owner decision 2026-11-13): a copy goes to the project's task page and the task waits for it.
+ * Anyone who can work there already is assigned in place.
  */
 import { catalogError, ForbiddenError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { type BlockNode, normalizeBlock, serializeBody } from "@shared/outline";
@@ -44,8 +49,15 @@ import {
 	type OutlineBoardAssignTarget,
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
-import { readDisplayNames, readUserByUsername } from "./access-reads";
+import { readDisplayNames, readNarrator, readUserByUsername } from "./access-reads";
 import { sessionAssignee } from "./assignee";
+import {
+	canWorkInSessionSpace,
+	handOutPersonTarget,
+	handOutTask,
+	type OutlineHandOutResult,
+	type OutlineHandOutTarget,
+} from "./hand-out";
 import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
@@ -317,7 +329,12 @@ export async function changePersonTask(args: {
 	assign?: OutlineBoardAssignTarget;
 	store?: OutlineStore;
 	now?: () => Date;
-}): Promise<{ result: OutlineWriteResult | null; space: OutlineSpaceRow }> {
+}): Promise<{
+	result: OutlineWriteResult | null;
+	space: OutlineSpaceRow;
+	/** The task was handed out (a task of a session space given to others). */
+	handedOut?: OutlineHandOutResult;
+}> {
 	const store = args.store ?? outlineStore;
 	const { principal } = args;
 	const block = await store.getBlock(args.blockId);
@@ -326,6 +343,21 @@ export async function changePersonTask(args: {
 		throw new NotFoundError("Outline task", args.blockId);
 	if (!(await canWriteSpace(principal, space)))
 		throw new ForbiddenError("You cannot change this task");
+	const handOut = args.assign ? await handOutTargetOf(principal, space, args.assign, store) : null;
+	if (handOut) {
+		if (args.status) throw new ValidationError("Handing a task out changes nothing else");
+		const handedOut = await handOutTask({
+			taskId: block.id,
+			by: { kind: "person", principal },
+			target: handOut,
+			baseVersionSeq: args.baseVersionSeq,
+			store,
+			...(args.now ? { now: args.now } : {}),
+		});
+		return { result: null, space, handedOut };
+	}
+	if (args.assign?.kind === "team")
+		throw new ValidationError("Only a session's task goes to the team");
 	const task = block.taskJson;
 	const patch: OutlineTaskPatch = {};
 	if (args.status && args.status !== task.status) patch.status = args.status;
@@ -366,6 +398,41 @@ export async function changePersonTask(args: {
 	return { result, space };
 }
 
+/**
+ * Whom a task of a session space is handed out to (owner decision 2026-11-13, 「能写就原地指派」):
+ * the team; or, when the person giving it is the session's owner, someone who cannot work in the
+ * session space (a person who may not write it, a session whose person may not). Null when the
+ * change is made in place: not a session space, back to the session, "me" (the person changing it
+ * may write the space), anyone who can work there already, a name nobody has, and anything someone
+ * other than the owner gives (checked in place, as before: who could not work there is refused).
+ */
+async function handOutTargetOf(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	target: OutlineBoardAssignTarget,
+	store: OutlineStore,
+): Promise<OutlineHandOutTarget | null> {
+	if (space.kind !== "session" || !space.narratorId) return null;
+	if (target.kind === "team") return { kind: "team" };
+	if (target.kind === "session" || target.kind === "me") return null;
+	const owner = (await readNarrator(space.narratorId))?.ownerUserId ?? null;
+	if (owner === null || principal.userId !== owner) return null;
+	let handOut: OutlineHandOutTarget | null;
+	if (target.kind === "narrator") {
+		handOut =
+			target.narratorId === space.narratorId
+				? null
+				: { kind: "session", narratorId: target.narratorId };
+	} else {
+		const username = target.username.trim().replace(/^@/, "");
+		if (!username || username.length > OUTLINE_TASK_BOARD_LIMITS.maxUsernameChars) return null;
+		const person = await handOutPersonTarget(username);
+		handOut = person && person.userId !== owner ? person : null;
+	}
+	if (!handOut || (await canWorkInSessionSpace(handOut, space, { store }))) return null;
+	return handOut;
+}
+
 /** Whether session `narratorId` (or a subagent of it) holds the task, its lease running. */
 async function heldBySession(
 	store: OutlineStore,
@@ -388,7 +455,7 @@ async function assigneeOf(
 	space: OutlineSpaceRow,
 	target: OutlineBoardAssignTarget,
 ): Promise<string | null> {
-	if (target.kind === "session") return null;
+	if (target.kind === "session" || target.kind === "team") return null;
 	if (target.kind === "narrator") {
 		// A session the board's picker would list (`transfer.ts`: a root session of the task's
 		// project that keeps its tasks in the outline, is not archived, that the person may read
@@ -417,7 +484,7 @@ async function assigneeOf(
 }
 
 /** `human:name`, when the name can be written as an assignee. */
-function assigneeLabel(username: string): string {
+export function assigneeLabel(username: string): string {
 	const label = `human:${username}`;
 	if (!/^human:[\p{L}\p{N}_.-]*[\p{L}\p{N}_-]$/u.test(label))
 		throw new ValidationError(`${username} cannot be named as an assignee`);

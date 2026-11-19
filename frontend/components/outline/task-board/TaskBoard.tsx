@@ -60,6 +60,7 @@ import {
 	IconPlayerPlay,
 	IconUser,
 	IconUserShare,
+	IconUsersGroup,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -96,6 +97,29 @@ function statusGroupOf(task: OutlineBoardTask): StatusGroup {
 function errorText(error: unknown): string {
 	if (error instanceof ApiError) return error.message;
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** Why a hand-out was refused (`details.reason` of `OUTLINE_HAND_OUT_*`), when it was one. */
+const HAND_OUT_REFUSALS = new Set([
+	"not_session_task",
+	"not_owner",
+	"no_project",
+	"cannot_write_project",
+	"finished",
+	"planning",
+	"locked",
+	"held",
+	"changed",
+	"already_handed_out",
+	"original_not_updated",
+]);
+
+function handOutRefusal(error: unknown): string | null {
+	if (!(error instanceof ApiError)) return null;
+	const code = error.data?.code;
+	if (typeof code !== "string" || !code.startsWith("OUTLINE_HAND_OUT_")) return null;
+	const reason = (error.data?.details as { reason?: unknown } | undefined)?.reason;
+	return typeof reason === "string" && HAND_OUT_REFUSALS.has(reason) ? reason : null;
 }
 
 function executorKey(executor: OutlineBoardExecutor): string {
@@ -640,6 +664,15 @@ function TaskRow({
 				onSuccess: (result) => {
 					setAssigning(false);
 					setUsername("");
+					// Handed out (a task of a session space given to others): where the copy went.
+					if (result.handedOut)
+						notifications.show({
+							color: "green",
+							message: t(
+								body.assign?.kind === "team" ? "board.handOut.toTeam" : "board.handOut.toOthers",
+								{ address: result.handedOut.address },
+							),
+						});
 					// 「转交并开始」: whether the session was started, and why not.
 					if (body.start && body.assign?.kind === "narrator")
 						notifications.show({
@@ -650,6 +683,16 @@ function TaskRow({
 						});
 				},
 				onError: (error) => {
+					const refusal = handOutRefusal(error);
+					if (refusal) {
+						if (refusal === "changed") invalidateTaskBoards(queryClient);
+						notifications.show({
+							color: refusal === "changed" ? "yellow" : "red",
+							title: t("board.handOut.failed"),
+							message: t(`board.handOut.refused.${refusal}`),
+						});
+						return;
+					}
 					const conflict = error instanceof ApiError && error.status === 409;
 					if (conflict) invalidateTaskBoards(queryClient);
 					notifications.show({
@@ -952,8 +995,21 @@ function TaskRow({
 											>
 												{t("board.action.assignUser")}
 											</Menu.Item>
-											{/* A session space's task goes to others by handing it out (a later PR). */}
-											{!sessionSpace && (
+											{/* A session space's task goes to the team as a copy in the project (handed
+											    out, outline P2 PR 10c-3): only its owner, who may write the project. */}
+											{sessionSpace && section?.handOut && (
+												<Menu.Item
+													leftSection={<IconUsersGroup size={14} />}
+													onClick={() => change({ assign: { kind: "team" } })}
+													data-testid="task-action-team"
+												>
+													{t("board.action.handToTeam")}
+												</Menu.Item>
+											)}
+											{/* In place to a session that can work in the space; to others as a copy,
+											    which the server lists only for the owner. A session of no project has
+											    no sessions to give it to. */}
+											{(!sessionSpace || section?.inProject) && (
 												<Menu.Item
 													leftSection={<IconArrowsExchange size={14} />}
 													onClick={() => setAssigning("session")}

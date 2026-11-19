@@ -25,6 +25,7 @@ import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
+	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 	statusRegistry,
@@ -55,9 +56,11 @@ import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
 import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
 import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
+import type { ProviderHeaderActions } from "../model/use-model-menu-refresh-props";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
+import type { Mutate, PendingMutate } from "./mutate";
 import { PermissionMenuContent } from "./PermissionMenuContent";
 import { createPlanReflectionStatusAction } from "./PlanReflectionStatusControl";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
@@ -153,17 +156,17 @@ export interface NarratorInteractionStatusBarProps {
 
 	model: {
 		allModels: ModelOption[];
-		// biome-ignore lint/suspicious/noExplicitAny: aggregation/provider-label shapes come straight from NarratorPanel.
-		aggregations: any;
-		// biome-ignore lint/suspicious/noExplicitAny: provider label map passthrough.
-		providerLabels: any;
+		aggregations: ModelAggregation[];
+		providerLabels: Record<string, string>;
 		/** Settings projection, for the allowance/balance badges on provider groups. */
 		settingsData?: Parameters<typeof useModelMenuProviderBadges>[0];
 		defaultModelValue: string;
-		// biome-ignore lint/suspicious/noExplicitAny: refresh props are spread verbatim onto ModelMenuItems.
-		refreshProps: any;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateModel.
-		mutation: any;
+		refreshProps: {
+			providerActions?: Record<string, ProviderHeaderActions>;
+			onOpenProviderSettings?: (prefix: string) => void;
+			onPickerOpened?: () => void;
+		};
+		mutation: Mutate<{ id: string; model: string }>;
 		onEditDefaultModel: () => void;
 		onEditSummaryModel: () => void;
 		/** Promote a concrete model from the menu into the instance default/summary slots. */
@@ -178,8 +181,7 @@ export interface NarratorInteractionStatusBarProps {
 		displayed: string;
 		options: readonly ReasoningEffortValue[];
 		followsDefault: boolean;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: PendingMutate<{ id: string; reasoningEffort: string | null }>;
 		onFollowDefault: () => void;
 		onSetAsDefault: () => void;
 	};
@@ -187,8 +189,7 @@ export interface NarratorInteractionStatusBarProps {
 	permission: {
 		availableModes: string[];
 		unavailableReason?: string;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: Mutate<{ id: string; permissionMode: string }>;
 		hasPlanTrait: boolean;
 		togglePlanMode: () => void;
 		planModePending: boolean;
@@ -268,8 +269,7 @@ export interface NarratorInteractionStatusBarProps {
 	relaxedPlan: {
 		enabled: boolean;
 		forced: boolean;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: PendingMutate<{ id: string; relaxedPlan: boolean }>;
 	};
 
 	terminal: {

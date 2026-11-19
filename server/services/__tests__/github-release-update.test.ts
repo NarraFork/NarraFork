@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import {
 	type GithubPatchStep,
+	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_LEGACY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
 } from "../../../shared/release-patch";
@@ -580,9 +581,26 @@ describe("GitHub full binary download", () => {
 		).rejects.toThrow();
 		expect(calls).toBe(0);
 	});
+	test.each([
+		1024 ** 3 + 1,
+		4 * 1024 ** 3,
+	])("full descriptors up to 4 GiB reach streaming transport without allocating payloads: %s", async (size) => {
+		const release = descriptor();
+		release.files[0].size = size;
+		let calls = 0;
+		await expect(
+			downloadGithubBinaryToFile(release, downloadPath(), {
+				fetcher: async () => {
+					calls++;
+					return new Response(null, { status: 404 });
+				},
+			}),
+		).rejects.toThrow();
+		expect(calls).toBe(1);
+	});
 	test("an oversized or malicious descriptor never starts downloading", async () => {
 		const invalid = descriptor();
-		invalid.files[0].size = 1024 * 1024 * 1024 + 1;
+		invalid.files[0].size = MAX_RELEASE_BINARY_BYTES + 1;
 		let calls = 0;
 		await expect(
 			downloadGithubBinaryToFile(invalid, downloadPath(), {

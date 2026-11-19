@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import {
+	backgroundTasks,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -11,6 +12,7 @@ import {
 } from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
 import { runtimePublication } from "../agent-runtime/publication";
+import { backgroundTaskService } from "../background-task-service";
 import {
 	invalidateRecoveryTarget,
 	releaseRecoveryHandoff,
@@ -59,6 +61,7 @@ let executePersistedToolCallImpl: (input?: {
 });
 const resumedAgentCalls: Array<Record<string, unknown>> = [];
 const awaitAgentCalls: Array<Record<string, unknown>> = [];
+const recoveredWatchTargets = new Set<string>();
 let onAwaitMounted: (() => void) | null = null;
 const updatedToolResults: Array<{ args: unknown[] }> = [];
 const toolCallResults = new Map<
@@ -97,16 +100,29 @@ mock.module("../narrator-service", () => ({
 	narratorService: {
 		...realNarratorServiceModule.narratorService,
 		getById: async (id: string) => {
+			if (recoveredWatchTargets.has(id))
+				return realNarratorServiceModule.narratorService.getById(id);
 			if (loadMode === "missing") throw new NotFoundError("Narrator", id);
 			if (loadMode === "transient") throw new Error("temporary database failure");
 			// Real start admission resolves the narrator's DB root even when this test
 			// replaces its service projection. Keep that fixture identity real as well.
 			const now = new Date().toISOString();
 			db.insert(narrators)
-				.values({ id, type: "primary", variant: "primary", createdAt: now, updatedAt: now })
+				.values({
+					id,
+					type: "primary",
+					variant: "primary",
+					runtimeRegistrationJson: {
+						version: 1,
+						run: { logicalRunId: `fixture-${id}`, principal: { userId: null } },
+					},
+					createdAt: now,
+					updatedAt: now,
+				})
 				.onConflictDoNothing()
 				.run();
 			return {
+				...db.select().from(narrators).where(eq(narrators.id, id)).get(),
 				id,
 				variant: "primary",
 				status: loadMode === "working" ? "working" : loadMode === "archived" ? "archived" : "idle",
@@ -398,7 +414,25 @@ mock.module("../agent-communication", () => ({
 	awaitAgentResultDetailed: async (input: Record<string, unknown>) => {
 		awaitAgentCalls.push(input);
 		onAwaitMounted?.();
-		return awaitAgentResult;
+		const result = await awaitAgentResult;
+		if (
+			result.status === "running" &&
+			typeof result.id === "string" &&
+			recoveredWatchTargets.has(result.id)
+		) {
+			const target = await realNarratorServiceModule.narratorService.getById(result.id);
+			return {
+				...result,
+				label: input.id,
+				publicationRun: {
+					producerKind: "agent",
+					taskId: result.id,
+					recipientId: input.callerNarratorId,
+					logicalRunId: target.logicalRunId,
+				},
+			};
+		}
+		return { label: input.id, ...result };
 	},
 }));
 
@@ -418,7 +452,12 @@ beforeAll(() => {
 	updateCoordinator.resetUpdateCoordinationForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	for (const row of db.select().from(backgroundTasks).all()) {
+		if (row.command?.startsWith("[watch]") && row.status === "running")
+			await backgroundTaskService.cancel(row.id);
+	}
+	recoveredWatchTargets.clear();
 	resetRecoveryHandoffForTests();
 	loadMode = "transient";
 	requestedProtectionEpoch = null;
@@ -496,7 +535,7 @@ function recoveryItem(
 	toolName = record.kind === "foreground_agent" || record.kind === "background_agent"
 		? "Agent"
 		: record.kind === "await_agent"
-			? "Await"
+			? "Watch"
 			: record.kind === "send_await"
 				? "Send"
 				: "Write",
@@ -511,6 +550,94 @@ function recoveryItem(
 		toolName,
 		input,
 	};
+}
+
+function seedLegacyAwaitForWatch(record: ToolContinuationRecord, targetId: string) {
+	const now = new Date().toISOString();
+	const messageId = `legacy-message-${record.toolCallId}`;
+	const logicalRunId = `legacy-watch-run-${targetId}`;
+	db.insert(narrators)
+		.values({
+			id: record.narratorId,
+			type: "primary",
+			variant: "primary",
+			runtimeRegistrationJson: {
+				version: 1,
+				run: { logicalRunId: `fixture-${record.narratorId}`, principal: { userId: null } },
+			},
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
+	db.insert(narrators)
+		.values({
+			id: targetId,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: record.narratorId,
+			aclRootNarratorId: record.narratorId,
+			status: "working",
+			logicalRunId,
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
+	db.insert(narratorMessages)
+		.values({
+			id: messageId,
+			narratorId: record.narratorId,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		})
+		.run();
+	db.insert(narratorToolCalls)
+		.values({
+			id: record.toolCallId,
+			narratorId: record.narratorId,
+			messageId,
+			toolUseId: record.toolCallId,
+			toolName: "Await",
+			inputJson: {},
+			status: "running",
+			createdAt: now,
+		})
+		.run();
+	toolCallResults.set(record.toolCallId, {
+		id: record.toolCallId,
+		toolUseId: record.toolCallId,
+		messageId,
+		status: "running",
+		outputJson: null,
+	});
+	recoveredWatchTargets.add(targetId);
+	awaitAgentResult = Promise.resolve({
+		id: targetId,
+		label: targetId,
+		status: "running",
+		publicationRun: {
+			producerKind: "agent",
+			taskId: targetId,
+			recipientId: record.narratorId,
+			logicalRunId,
+		},
+	});
+}
+
+async function runningRecoveredWatch() {
+	const deadline = Date.now() + 1_500;
+	for (;;) {
+		const watch = db
+			.select()
+			.from(backgroundTasks)
+			.all()
+			.find((row) => row.command?.startsWith("[watch]") && row.status === "running");
+		if (watch) return watch;
+		if (Date.now() > deadline) throw new Error("Recovered Watch was not registered");
+		await Bun.sleep(5);
+	}
 }
 
 async function prepareRecovery(
@@ -587,7 +714,8 @@ async function prepareRecovery(
 		const run = runtimePublication.startRun({
 			narratorId: subagentId,
 			binding: { deliverTo: { narratorId: record.narratorId, toolUseId: "test-tool-use" } },
-		}).publication!;
+		}).publication;
+		if (!run) throw new Error("Recovery fixture did not create an agent publication run");
 		record.payloadJson = { ...record.payloadJson, logicalRunId: run.logicalRunId };
 	}
 	updateCoordinator.writePlannedUpdateRecoverySnapshot({
@@ -657,43 +785,22 @@ describe("planned update recovery snapshot", () => {
 			loadMode = "working";
 			const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
 			loadMode = "idle";
-			if (kind === "await_agent") {
-				const now = new Date().toISOString();
-				db.insert(narrators)
-					.values({
-						id: "owner",
-						type: "primary",
-						variant: "primary",
-						createdAt: now,
-						updatedAt: now,
-					})
-					.run();
-				db.insert(narratorMessages)
-					.values({
-						id: "message",
-						narratorId: "owner",
-						role: "assistant",
-						contentJson: [],
-						createdAt: now,
-					})
-					.run();
-				db.insert(narratorToolCalls)
-					.values({
-						id: record.toolCallId,
-						narratorId: "owner",
-						messageId: "message",
-						toolUseId: record.toolCallId,
-						toolName: "Await",
-						inputJson: {},
-						status: "running",
-						createdAt: now,
-					})
-					.run();
-			}
+			if (kind === "await_agent") seedLegacyAwaitForWatch(record, "child");
 			const mounting = restoreNarratorsAfterPlannedUpdate(startup);
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			try {
-				expect(continueNarratorCalls).toBe(1);
+				expect(continueNarratorCalls).toBe(kind === "await_agent" ? 2 : 1);
+				if (kind === "await_agent") {
+					expect(awaitAgentCalls).toHaveLength(1);
+					expect(awaitAgentCalls[0]?.snapshotOnly).toBe(true);
+					expect(
+						db
+							.select()
+							.from(backgroundTasks)
+							.all()
+							.some((row) => row.command?.startsWith("[watch]") && row.status === "running"),
+					).toBe(true);
+				}
 			} finally {
 				gate.resolve();
 				const recovery = await mounting;
@@ -1441,7 +1548,8 @@ describe("planned update continuation scheduling", () => {
 		expect(updatedToolResults).toHaveLength(1);
 		expect(updatedToolResults[0]?.args[1] as Record<string, unknown>).toMatchObject({
 			output:
-				'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "background-worker" })',
+				"<background_task_id>background-worker</background_task_id>\n\n[background\\-worker](nf-agent://open?id=child-background)\n\n" +
+				'Background task started. Completion notifies automatically. Watch({ type: "agent", id: "background-worker" }) registers an observation or retrieves the saved result.',
 			status: "success",
 		});
 		expect(
@@ -2343,7 +2451,7 @@ describe("planned update continuation scheduling", () => {
 		});
 	}
 
-	test("parent interrupt reaches recovered foreground Agent and Await", async () => {
+	test("parent interrupt reaches recovered Agent but leaves the independently registered Watch alive", async () => {
 		loadMode = "idle";
 		const awaitMounted = Promise.withResolvers<void>();
 		onAwaitMounted = awaitMounted.resolve;
@@ -2351,10 +2459,7 @@ describe("planned update continuation scheduling", () => {
 		resumedAgentCompletion = new Promise<string>((resolve) => {
 			finishAgent = resolve;
 		});
-		let finishAwait = (_value: Record<string, unknown>) => {};
-		awaitAgentResult = new Promise<Record<string, unknown>>((resolve) => {
-			finishAwait = resolve;
-		});
+
 		const agent = continuationRecord("tool-interrupt-agent", "owner", {
 			kind: "foreground_agent",
 			state: "waiting",
@@ -2368,6 +2473,7 @@ describe("planned update continuation scheduling", () => {
 				awaitDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
 			},
 		});
+		seedLegacyAwaitForWatch(awaitRecord, "child-interrupt");
 		continuationRows = [agent, awaitRecord];
 		recoveryQueue = [
 			recoveryItem(agent, "message-interrupt", 0),
@@ -2380,20 +2486,31 @@ describe("planned update continuation scheduling", () => {
 			expect(resumedAgentCalls).toHaveLength(1);
 			await awaitMounted.promise;
 			expect(awaitAgentCalls).toHaveLength(1);
+			expect(awaitAgentCalls[0]?.snapshotOnly).toBe(true);
+			const watch = await runningRecoveredWatch();
+			expect(watch?.status).toBe("running");
 			const agentSignal = resumedAgentCalls[0]?.cancelSignal as AbortSignal;
-			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
 			expect(agentSignal.aborted).toBe(false);
-			expect(awaitSignal.aborted).toBe(false);
 			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
 			expect(agentSignal.aborted).toBe(true);
-			expect(awaitSignal.aborted).toBe(true);
+			expect(
+				db
+					.select()
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, watch?.id ?? ""))
+					.get()?.status,
+			).toBe("running");
 		} finally {
 			realNarratorSessionModule.interruptNarrator("owner");
 			finishAgent("<subagent_id>child-interrupt</subagent_id>\n\ninterrupted");
-			finishAwait({ id: "child-interrupt", status: "aborted", formatted: "interrupted" });
 			await recovery?.completion;
 		}
-		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+		expect(continuationRows.find((row) => row.toolCallId === agent.toolCallId)?.state).toBe(
+			"cancelled",
+		);
+		expect(continuationRows.find((row) => row.toolCallId === awaitRecord.toolCallId)?.state).toBe(
+			"cancelled",
+		);
 		expect(continueNarratorCalls).toBe(0);
 	});
 
@@ -2484,10 +2601,7 @@ describe("planned update continuation scheduling", () => {
 			backgroundSettled = true;
 			return value;
 		});
-		let finishAwait = (_value: Record<string, unknown>) => {};
-		awaitAgentResult = new Promise<Record<string, unknown>>((resolve) => {
-			finishAwait = resolve;
-		});
+
 		const background = continuationRecord("tool-interrupt-background-mixed", "owner", {
 			kind: "background_agent",
 			state: "waiting",
@@ -2515,6 +2629,7 @@ describe("planned update continuation scheduling", () => {
 					"<background_task_id>background-mixed</background_task_id>\n\nBackground task started.",
 			},
 		});
+		seedLegacyAwaitForWatch(awaitRecord, "foreground-mixed-child");
 		continuationRows = [background, awaitRecord];
 		recoveryQueue = [
 			recoveryItem(background, "message-interrupt-mixed", 0),
@@ -2552,24 +2667,40 @@ describe("planned update continuation scheduling", () => {
 			expect(awaitAgentCalls).toHaveLength(1);
 			// A background continuation has no caller cancellation to inherit.
 			expect(resumedAgentCalls[0]?.cancelSignal).toBeUndefined();
-			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
+			expect(awaitAgentCalls[0]?.snapshotOnly).toBe(true);
+			const watch = await runningRecoveredWatch();
+			expect(watch?.status).toBe("running");
 			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
 			await cancellationStart;
-			expect(awaitSignal.aborted).toBe(true);
+			expect(
+				db
+					.select()
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, watch?.id ?? ""))
+					.get()?.status,
+			).toBe("running");
 			releaseCancellation();
 			await Bun.sleep(0);
-			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
-			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
+			expect(continuationRows.find((row) => row.toolCallId === background.toolCallId)?.state).toBe(
+				"cancelled",
+			);
+			expect(continuationRows.find((row) => row.toolCallId === awaitRecord.toolCallId)?.state).toBe(
+				"cancelled",
+			);
 			releaseResultWrite();
 			await recovery?.completion;
 
 			expect(backgroundSettled).toBe(false);
-			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+			expect(continuationRows.find((row) => row.toolCallId === background.toolCallId)?.state).toBe(
+				"cancelled",
+			);
+			expect(continuationRows.find((row) => row.toolCallId === awaitRecord.toolCallId)?.state).toBe(
+				"cancelled",
+			);
 			expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
 		} finally {
 			realNarratorSessionModule.interruptNarrator("owner");
 			releaseCancellation();
-			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
 			releaseResultWrite();
 			finishBackground("<subagent_id>background-mixed-child</subagent_id>\n\ndone");
 			await recovery?.completion;
@@ -2764,14 +2895,22 @@ describe("planned update continuation scheduling", () => {
 			leaseMs: 100,
 			intervalMs: 10,
 		});
-		await new Promise((resolve) => setTimeout(resolve, 35));
-		expect(renewCalls).toBeGreaterThanOrEqual(2);
-		expect(abortController.signal.aborted).toBe(false);
+		try {
+			// Scheduling can be delayed by other workers; observe renewal, not wall-clock precision.
+			const deadline = Date.now() + 1_000;
+			while (renewCalls < 2 && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			expect(renewCalls).toBeGreaterThanOrEqual(2);
+			expect(abortController.signal.aborted).toBe(false);
 
-		renewal.stop();
-		const callsAfterStop = renewCalls;
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		expect(renewCalls).toBe(callsAfterStop);
+			renewal.stop();
+			const callsAfterStop = renewCalls;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			expect(renewCalls).toBe(callsAfterStop);
+		} finally {
+			renewal.stop();
+		}
 	});
 
 	test("aborts an in-flight recovery when claim renewal loses CAS ownership", async () => {

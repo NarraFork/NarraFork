@@ -4,11 +4,39 @@
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { NoProxyRule } from "@shared/proxy-settings";
 import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { logger } from "../logger";
-import { getBrowserProxy, getWebFetchProxy } from "../web-fetch/proxy";
+import { getNoProxyRules } from "../net/proxy";
+import { getBrowserProxy, getWebFetchProxyForUrl } from "../web-fetch/proxy";
 import { closeTab } from "./tab-scope";
 import { attachUserBrowser } from "./user-browser";
+
+function safeLog(
+	level: "info" | "warn",
+	message: string,
+	fields: Record<
+		string,
+		| number
+		| boolean
+		| "environment"
+		| "system"
+		| "cache"
+		| "flatpak"
+		| "launch"
+		| "release"
+		| undefined
+	>,
+) {
+	try {
+		const scalars = Object.fromEntries(
+			Object.entries(fields).filter(
+				([, value]) => value !== undefined && (typeof value !== "number" || Number.isFinite(value)),
+			),
+		);
+		logger[level](message, scalars);
+	} catch {}
+}
 
 interface PoolEntry {
 	browser: Browser;
@@ -20,18 +48,45 @@ interface PoolEntry {
 	userTabs: Set<Page>;
 }
 
-/** Browser instances keyed by mode. */
-const browsers: Map<boolean, PoolEntry> = new Map();
-const launching: Map<boolean, Promise<PoolEntry>> = new Map();
+interface PoolOwner {
+	version: 2;
+	mainManagesSignals: boolean;
+	browsers: Map<boolean, PoolEntry>;
+	launching: Map<boolean, Promise<PoolEntry>>;
+	preserveOnClose: boolean;
+	closing: boolean;
+	closingPromise: Promise<void> | null;
+	hooksInstalled: boolean;
+}
+const OWNER = Symbol.for("narrafork.browser.pool");
+const globals = globalThis as typeof globalThis & { [OWNER]?: PoolOwner };
+const previous = globals[OWNER];
+if (
+	previous &&
+	(previous.version !== 2 ||
+		!(previous.browsers instanceof Map) ||
+		!(previous.launching instanceof Map))
+)
+	throw new Error("Browser pool ownership cannot be recovered");
+const owner: PoolOwner = previous ?? {
+	version: 2,
+	mainManagesSignals: false,
+	browsers: new Map(),
+	launching: new Map(),
+	preserveOnClose: false,
+	closing: false,
+	closingPromise: null,
+	hooksInstalled: false,
+};
+globals[OWNER] = owner;
+const { browsers, launching } = owner;
 
 /**
  * When true, closeBrowser() disconnects from Chrome instead of killing it, so the
  * Chrome process survives a seamless-update restart and the replacement process can
  * reconnect via wsEndpoint. Only set during planned-update handoff.
  */
-let preserveOnClose = false;
-/** Shared close operation so signal hooks and main shutdown cannot race the same browser handles. */
-let closingPromise: Promise<void> | null = null;
+// Preservation and the shared in-flight close promise live on the hot owner too.
 
 const PAGE_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 30_000;
@@ -43,6 +98,34 @@ export const USER_AGENT =
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font", "stylesheet"]);
 
 const PROXY_BYPASS_LIST = ["localhost", "*.localhost", "127.0.0.0/8", "[::1]", "0.0.0.0"];
+
+/**
+ * Chromium bypass entries for the configured no_proxy rules.
+ *
+ * The browser fetches through a proxy at the Chromium process/context level, so
+ * it cannot consult the URL-level resolver. Only what Chromium's bypass list can
+ * express is forwarded: wildcard host globs (`*.example.com`, `svc.corp`).
+ * Regex rules and scheme/path patterns are skipped — Chromium has no
+ * regular-expression syntax there — and the URL-resolved channels still honour
+ * them.
+ */
+export function browserProxyBypassEntries(
+	rules: readonly NoProxyRule[] = getNoProxyRules(),
+): string[] {
+	const entries: string[] = [];
+	for (const rule of rules) {
+		if (rule.enabled === false || rule.match !== "wildcard") continue;
+		const pattern = rule.pattern.trim();
+		if (!pattern || pattern.includes("://") || pattern.includes("/")) continue;
+		entries.push(pattern);
+	}
+	return entries;
+}
+
+/** The full Chromium bypass list: built-in loopback entries plus configured rules. */
+function proxyBypassList(): string[] {
+	return [...PROXY_BYPASS_LIST, ...browserProxyBypassEntries()];
+}
 
 /**
  * Windows 上的 Edge 可能经兼容层重启自身，丢掉 Puppeteer 依赖的 stderr（DevTools 地址）与调试管道；
@@ -68,7 +151,7 @@ function buildLaunchArgs(headless: boolean): string[] {
 		...LAUNCH_ARGS,
 		...sandbox,
 		...(proxy
-			? [`--proxy-server=${proxy}`, `--proxy-bypass-list=${PROXY_BYPASS_LIST.join(";")}`]
+			? [`--proxy-server=${proxy}`, `--proxy-bypass-list=${proxyBypassList().join(";")}`]
 			: ["--no-proxy-server"]),
 		...(headless ? ["--disable-gpu"] : HEADED_PROFILE_ARGS),
 	];
@@ -78,7 +161,7 @@ export function browserContextProxyOptions(proxy: string | undefined) {
 	return {
 		// Explicit direct mode also overrides a proxy on a preserved old Chrome.
 		proxyServer: proxy ?? "direct://",
-		proxyBypassList: PROXY_BYPASS_LIST,
+		proxyBypassList: proxyBypassList(),
 	};
 }
 
@@ -96,7 +179,7 @@ export function findChromePath(): string | undefined {
 	for (const envKey of ["PUPPETEER_EXECUTABLE_PATH"]) {
 		const envPath = process.env[envKey];
 		if (envPath && existsSync(envPath)) {
-			logger.info("Using browser from env var", { key: envKey, path: envPath });
+			safeLog("info", "Using browser from env var", { source: "environment" });
 			return envPath;
 		}
 	}
@@ -110,7 +193,7 @@ export function findChromePath(): string | undefined {
 	// 3. System Chrome/Edge on common paths
 	for (const { path } of systemBrowsers()) {
 		if (existsSync(path)) {
-			logger.info("Found system browser", { path });
+			safeLog("info", "Found system browser", { source: "system" });
 			return path;
 		}
 	}
@@ -149,7 +232,7 @@ function scanPuppeteerCache(cacheDir: string): string | undefined {
 					];
 					for (const c of candidates) {
 						if (existsSync(c)) {
-							logger.info("Found Chrome in Puppeteer cache", { path: c });
+							safeLog("info", "Found Chrome in Puppeteer cache", { source: "cache" });
 							return c;
 						}
 					}
@@ -181,7 +264,7 @@ function scanFlatpakChrome(): string | undefined {
 		for (const app of flatpakApps) {
 			const candidate = join(root, app.id, "current", "active", "files", app.binary);
 			if (existsSync(candidate)) {
-				logger.info("Found Flatpak Chrome", { appId: app.id, path: candidate });
+				safeLog("info", "Found Flatpak Chrome", { source: "flatpak" });
 				return candidate;
 			}
 		}
@@ -288,7 +371,7 @@ async function launchBrowser(headless: boolean): Promise<PoolEntry> {
 	if (userDataDir) {
 		const userBrowser = await attachUserBrowser(executablePath, userDataDir);
 		if (userBrowser) {
-			logger.info("Attached to the user's own browser", { chromePath: executablePath });
+			safeLog("info", "Attached to the user's own browser", { headless, owned: false });
 			return { browser: userBrowser, owned: false, userTabs: new Set() };
 		}
 	}
@@ -312,12 +395,8 @@ async function launchBrowser(headless: boolean): Promise<PoolEntry> {
 			handleSIGTERM: false,
 			handleSIGHUP: false,
 		});
-	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		logger.warn("Browser found but launch failed", {
-			chromePath: executablePath,
-			error: msg.slice(0, 500),
-		});
+	} catch {
+		safeLog("warn", "Browser found but launch failed", { headless, stage: "launch" });
 
 		// Flatpak Chrome can't be launched directly — give a specific hint
 		if (executablePath.includes("/flatpak/")) {
@@ -336,15 +415,15 @@ async function launchBrowser(headless: boolean): Promise<PoolEntry> {
 
 	// 有头窗口自带一个空白启动页：让第一个会话直接用它，窗口里就不会多出一个空标签。
 	const [spareTab] = headless ? [] : await browser.pages().catch(() => []);
-	logger.info("Puppeteer browser launched", {
+	safeLog("info", "Puppeteer browser launched", {
 		pid: browser.process()?.pid,
-		chromePath: executablePath,
 		headless,
 	});
 	return { browser, owned: true, spareTab, userTabs: new Set() };
 }
 
 function getEntry(headless: boolean): Promise<PoolEntry> {
+	if (owner.closing) return Promise.reject(new Error("Browser pool is closing"));
 	const existing = browsers.get(headless);
 	if (existing?.browser.connected) return Promise.resolve(existing);
 
@@ -367,7 +446,9 @@ function getEntry(headless: boolean): Promise<PoolEntry> {
  * @param headless - true for headless mode (default), false for headed (GUI) mode.
  */
 export async function getBrowser(headless = true): Promise<Browser> {
-	return (await getEntry(headless)).browser;
+	const entry = await getEntry(headless);
+	if (owner.closing) throw new Error("Browser pool is closing");
+	return entry.browser;
 }
 
 export interface FetchPageOptions {
@@ -385,7 +466,9 @@ export interface FetchPageOptions {
  */
 export async function fetchPage(url: string, options?: FetchPageOptions): Promise<Page> {
 	const b = await getBrowser();
-	const ctx = await b.createBrowserContext(browserContextProxyOptions(getWebFetchProxy()));
+	// Resolve against the navigation target: a fresh context is created per fetch,
+	// so no_proxy rules (wildcard and regex alike) can decide this context's proxy.
+	const ctx = await b.createBrowserContext(browserContextProxyOptions(getWebFetchProxyForUrl(url)));
 	let page: Page;
 	try {
 		page = await ctx.newPage();
@@ -470,7 +553,7 @@ export async function openTab(headless = true): Promise<BrowserTab> {
  * handoff so the replacement process can reconnect to the same Chrome instance.
  */
 export function setBrowserPreserveMode(on: boolean): void {
-	preserveOnClose = on;
+	owner.preserveOnClose = on;
 }
 
 /**
@@ -504,14 +587,25 @@ export async function connectBrowser(
 	headless: boolean,
 	browserWSEndpoint: string,
 ): Promise<Browser> {
-	const puppeteer = await import("puppeteer-core");
-	const browser = await puppeteer.default.connect({
-		browserWSEndpoint,
-		defaultViewport: DEFAULT_VIEWPORT,
-	});
-	browsers.set(headless, { browser, owned: true, userTabs: new Set() });
-	logger.info("Reconnected to preserved Chrome instance", { headless, browserWSEndpoint });
-	return browser;
+	if (owner.closing) throw new Error("Browser pool is closing");
+	let pending = launching.get(headless);
+	if (!pending) {
+		pending = (async () => {
+			const puppeteer = await import("puppeteer-core");
+			const browser = await puppeteer.default.connect({
+				browserWSEndpoint,
+				defaultViewport: DEFAULT_VIEWPORT,
+			});
+			const entry: PoolEntry = { browser, owned: true, userTabs: new Set() };
+			browsers.set(headless, entry);
+			return entry;
+		})().finally(() => launching.delete(headless));
+		launching.set(headless, pending);
+	}
+	const entry = await pending;
+	if (owner.closing) throw new Error("Browser pool is closing");
+	safeLog("info", "Reconnected to preserved Chrome instance", { headless });
+	return entry.browser;
 }
 
 /** Check whether browsers are running and connected. */
@@ -540,18 +634,20 @@ async function releaseEntry(headless: boolean, entry: PoolEntry, preserve: boole
 				[...entry.userTabs].map((page) => closeTab(context, page.target()).catch(() => {})),
 			);
 			await browser.disconnect();
-			logger.info("Disconnected from the user's browser", { headless });
+			safeLog("info", "Disconnected from the user's browser", { headless });
 		} else if (preserve) {
 			await browser.disconnect();
-			logger.info("Puppeteer browser disconnected for update handoff", { headless });
+			safeLog("info", "Puppeteer browser disconnected for update handoff", { headless });
 		} else {
 			await browser.close();
-			logger.info("Puppeteer browser closed", { headless });
+			safeLog("info", "Puppeteer browser closed", { headless });
 		}
-	} catch (err) {
-		logger.warn("Failed to release browser", {
+	} catch {
+		safeLog("warn", "Failed to release browser", {
 			headless,
-			error: err instanceof Error ? err.message : String(err),
+			preserve,
+			owned: entry.owned,
+			stage: "release",
 		});
 	}
 }
@@ -564,24 +660,49 @@ async function releaseEntry(headless: boolean, entry: PoolEntry, preserve: boole
  * reconnect to the same instance. In every other path the browser is fully closed.
  */
 export function closeBrowser(): Promise<void> {
-	if (closingPromise) return closingPromise;
-
+	if (owner.closingPromise) return owner.closingPromise;
+	owner.closing = true;
+	const preserve = owner.preserveOnClose;
 	const entries = [...browsers];
+	const released = new Set(entries.map(([, entry]) => entry));
+	const pending = [...launching.values()];
 	browsers.clear();
-	launching.clear();
-	const preserve = preserveOnClose;
-	closingPromise = Promise.all(
-		entries.map(([headless, entry]) => releaseEntry(headless, entry, preserve)),
-	)
+	const closing = entries.map(([headless, entry]) => releaseEntry(headless, entry, preserve));
+	owner.closingPromise = Promise.all([
+		...closing,
+		(async () => {
+			await Promise.allSettled(pending);
+			const late = [...browsers].filter(([, entry]) => !released.has(entry));
+			browsers.clear();
+			await Promise.all(late.map(([headless, entry]) => releaseEntry(headless, entry, preserve)));
+		})(),
+	])
 		.then(() => {})
 		.finally(() => {
-			closingPromise = null;
+			owner.closing = false;
+			owner.closingPromise = null;
 		});
-	return closingPromise;
+	return owner.closingPromise;
 }
 
-// Auto-cleanup on process exit. These honor preserve-on-close mode so a planned-update
-// handoff keeps Chrome alive; normal exits still close it.
-process.on("beforeExit", () => void closeBrowser());
-process.on("SIGINT", () => void closeBrowser());
-process.on("SIGTERM", () => void closeBrowser());
+/** One-way: main owns signal order so a second pool chain cannot race handoff persistence. */
+export function claimBrowserShutdownOwnership(): void {
+	owner.mainManagesSignals = true;
+}
+
+// Standalone scripts retain signal cleanup. Main claims those signals; beforeExit remains a fallback.
+if (!owner.hooksInstalled) {
+	owner.hooksInstalled = true;
+	const closeOnExit = () => {
+		void import("./memory-job")
+			.then(({ closeMemoryDiagnosticWorkers }) => closeMemoryDiagnosticWorkers())
+			.then(() => closeBrowser())
+			.catch(() => {});
+	};
+	const closeOnSignal = () => {
+		if (!owner.mainManagesSignals) closeOnExit();
+	};
+	process.on("beforeExit", closeOnExit);
+	process.on("SIGINT", closeOnSignal);
+	process.on("SIGTERM", closeOnSignal);
+}

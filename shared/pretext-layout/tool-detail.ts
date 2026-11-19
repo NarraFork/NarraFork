@@ -1316,6 +1316,8 @@ function classifyByCategory(
 		}
 		case "await":
 			return classifyAwait(inputJson, outputJson, metadata, status);
+		case "watch":
+			return classifyWatch(inputJson, outputJson, metadata, input.labels);
 		case "send":
 			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
@@ -2451,6 +2453,43 @@ function classifyTaskOutput(inputJson: unknown, outputJson: unknown): ToolDetail
 		textSection("output.main", outputJson, "output", {
 			contentLines: countLines(output),
 			text: output,
+		}),
+	]);
+}
+
+function classifyWatch(
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+	labels?: Record<string, string>,
+): ToolDetailData | null {
+	const type = extractField(inputJson, "type") || readLeafText(metadata?.type) || "task";
+	const id = extractField(inputJson, "id") || readLeafText(metadata?.targetId) || "";
+	const state = readLeafText(metadata?.status);
+	const stateLabel =
+		state === "watching"
+			? (labels?.watchRegistered ?? "Observation registered")
+			: state
+				? (labels?.watchResult ?? "Observation result")
+				: undefined;
+	const pattern = extractField(inputJson, "pattern");
+	return sections([
+		section(
+			"meta.watch",
+			undefined,
+			metaRows([
+				{
+					text: "",
+					badges: [chip(type, "indigo"), chip(stateLabel, "gray")].filter(
+						(value) => value !== null,
+					),
+				},
+				id ? { text: id, mono: true } : null,
+				pattern ? { text: `pattern: ${pattern}`, mono: true, dimmed: true } : null,
+			]),
+		),
+		textSection("output.main", outputJson, "result", {
+			cap: type === "agent" ? "code" : "term",
 		}),
 	]);
 }

@@ -269,3 +269,56 @@ test("large catalogs reach actual HTTP wire builders concurrently with live sign
 		expect(wire.split("<context_update>")).toHaveLength(2);
 	}
 }, 30000);
+
+test("Completions and plain Responses send the stable conversation prompt cache key", async () => {
+	const originalFetch = globalThis.fetch;
+	const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+	globalThis.fetch = (async (input, init) => {
+		const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+		requests.push({ url: String(input), body });
+		const sse =
+			"input" in body
+				? 'data: {"type":"response.completed","response":{"output":[]}}\n\n'
+				: 'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+		return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+	}) as typeof fetch;
+	const send = async (provider: OpenAIProvider, conversationId: string) => {
+		const { history } = await buildAdapterHistory(provider, ROWS, {
+			provider: "test",
+			model: "gpt-5.5",
+		});
+		provider.injectSystemPrompt(history, "frozen baseline", "gpt-5.5");
+		for await (const _event of provider.chat({
+			conversationId,
+			content: "",
+			model: "gpt-5.5",
+			cwd: ".",
+			history,
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+			onInputCharacters: () => {},
+		})) {
+			/* mock ends the stream */
+		}
+	};
+	try {
+		for (const apiMode of ["completions", "responses"] as const) {
+			const provider = new OpenAIProvider({ ...CONFIG, apiMode });
+			await send(provider, "cache-key-conv");
+			await send(provider, "cache-key-conv");
+			await send(provider, "");
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+	expect(requests).toHaveLength(6);
+	expect(requests[0].url.endsWith("/chat/completions")).toBe(true);
+	expect(requests[3].url.endsWith("/responses")).toBe(true);
+	for (const { body } of [requests[0], requests[1], requests[3], requests[4]]) {
+		expect(body.prompt_cache_key).toBe("cache-key-conv");
+	}
+	for (const { body } of [requests[2], requests[5]]) {
+		expect(body).not.toHaveProperty("prompt_cache_key");
+	}
+});

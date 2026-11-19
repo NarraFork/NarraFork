@@ -31,7 +31,12 @@ import {
 } from "./revert-planner-service";
 import { type RevertSelectionResult, RevertSelectionService } from "./revert-selection-service";
 import type { ValidatedTransactionManifest } from "./revert-transaction-manifest-worker";
-import { runRevertManifestWorker } from "./revert-transaction-worker";
+import * as manifestWorker from "./revert-transaction-worker";
+import {
+	closeRevertManifestWorkers,
+	resetRevertManifestWorkersForTests,
+	runRevertManifestWorker,
+} from "./revert-transaction-worker";
 
 const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
 let root: string;
@@ -60,6 +65,7 @@ const owner = { subjectKey: "human:alice", narratorId: "root", projectId: "proje
 const hash = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 
 beforeEach(async () => {
+	await resetRevertManifestWorkersForTests();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	root = await mkdtemp(join(await realpath(tmpdir()), "revert-planner-test-"));
@@ -202,6 +208,7 @@ beforeEach(async () => {
 	plans = new RevertPlanService(db, options.planOptions);
 });
 afterEach(async () => {
+	await closeRevertManifestWorkers();
 	sqlite.close();
 	await rm(root, { recursive: true, force: true });
 });
@@ -387,6 +394,47 @@ async function rejected(pending: Promise<unknown>) {
 			}).toThrow(expected),
 	};
 }
+
+describe("manifest warmup is preview-only and non-blocking", () => {
+	for (const mode of ["pending", "failed"] as const) {
+		test(`${mode} warmup cannot block or mutate an authorized preview`, async () => {
+			const { path } = await fixture();
+			const disk = await readFile(path);
+			const history = historySnapshot();
+			const warm = spyOn(manifestWorker, "warmRevertManifestWorker").mockImplementation(() =>
+				mode === "pending"
+					? new Promise<void>(() => {})
+					: Promise.reject(new Error("startup refused")),
+			);
+			const run = spyOn(manifestWorker, "runRevertManifestWorker");
+			try {
+				const result = await prepare({ signal: AbortSignal.timeout(2_000) });
+				expect(result.plan.status).toBe("prepared");
+				expect(result.plan.coverageComplete).toBe(true);
+				expect(result.plan.expectedFileCount).toBe(1);
+				expect(warm).toHaveBeenCalledTimes(1);
+				expect(warm.mock.calls[0]).toEqual([]);
+				expect(run).not.toHaveBeenCalled();
+				expect(await readFile(path)).toEqual(disk);
+				expect(historySnapshot()).toBe(history);
+			} finally {
+				run.mockRestore();
+				warm.mockRestore();
+			}
+		});
+	}
+	test("denied narrator authorization never prewarms", async () => {
+		await fixture();
+		const warm = spyOn(manifestWorker, "warmRevertManifestWorker");
+		try {
+			(await rejected(prepare({ principal: { userId: "bob", isAdmin: false } }))).toThrow();
+			expect(warm).not.toHaveBeenCalled();
+			assertUnprepared();
+		} finally {
+			warm.mockRestore();
+		}
+	});
+});
 
 describe("real tool evidence -> complete prepared preview", () => {
 	test("Write A -> human -> Edit B -> late human preserves human raw bytes without workspace/history mutation", async () => {
@@ -921,6 +969,71 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		expect(await readFile(path)).toEqual(disk);
 	});
 
+	test("DB working and unrelated same-narrator changes do not block a stable single-tool preview", async () => {
+		const { path, first } = await fixture();
+		db.update(schema.narrators)
+			.set({ status: "working" })
+			.where(eq(schema.narrators.id, "root"))
+			.run();
+		beforeRead = (_path, count) => {
+			if (count !== 1) return;
+			db.insert(schema.narratorMessages)
+				.values({
+					id: "late-unrelated",
+					narratorId: "root",
+					role: "user",
+					contentJson: [{ type: "text", text: "unrelated" }],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({
+					id: "late-unrelated-ref",
+					narratorId: "root",
+					messageId: "late-unrelated",
+					seq: 999,
+				})
+				.run();
+			sqlite
+				.query(
+					"UPDATE narrators SET status='idle',message_version=message_version+1 WHERE id='root'",
+				)
+				.run();
+		};
+		const result = await prepare({
+			selector: { kind: "tool_calls", toolCallIds: [first.toolCallId] },
+		});
+		expect(result.plan.status).toBe("prepared");
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(await readFile(path)).toBeDefined();
+		const original = await rawManifest<{ request: RevertPlannerRequest }>(
+			result.plan.manifestDigests.selector,
+		);
+		expect(original.request.expectedMessageVersion).toBe(7);
+	});
+	test("a rollback suffix cannot silently exclude a newly appended message", async () => {
+		await fixture();
+		beforeRead = (_path, count) => {
+			if (count !== 1) return;
+			db.insert(schema.narratorMessages)
+				.values({
+					id: "late-suffix",
+					narratorId: "root",
+					role: "user",
+					contentJson: [{ type: "text", text: "new suffix member" }],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({ id: "late-suffix-ref", narratorId: "root", messageId: "late-suffix", seq: 999 })
+				.run();
+			sqlite.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'").run();
+		};
+		(await rejected(prepare({ selector: { kind: "from_seq", minSeq: 0 } }))).toMatchObject({
+			code: "REVERT_PLANNER_STALE",
+		});
+		assertUnprepared();
+	});
 	test("original expected message version is enforced", async () => {
 		await fixture();
 		const before = historySnapshot();

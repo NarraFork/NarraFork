@@ -12,7 +12,7 @@
 
 import WebSocket from "ws";
 import { logger } from "../../lib/logger";
-import { createProxyAgent, type ProxyAgentLike, resolveProxyForUrl } from "../../lib/net/proxy";
+import { createProxyAgent, type GatewayProxyAgent, resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, QQBotConfig, SendResult } from "../types";
 
@@ -69,7 +69,7 @@ export class QQBotAdapter extends BaseAdapter {
 	// WebSocket
 	private ws: WebSocket | null = null;
 	/** Proxy agent for the gateway WS; destroyed in cleanup() to avoid leaking on reconnect. */
-	private wsAgent: ProxyAgentLike | null = null;
+	private wsAgent: GatewayProxyAgent | null = null;
 	private sessionId: string | null = null;
 	private lastSeq: number | null = null;
 	private heartbeatInterval = 30_000;
@@ -264,8 +264,7 @@ export class QQBotAdapter extends BaseAdapter {
 			const ws = new WebSocket(gatewayUrl, {
 				headers: { "User-Agent": "NarraFork-QQBot/1.0" },
 				handshakeTimeout: 20_000,
-				// biome-ignore lint/suspicious/noExplicitAny: ws Agent type differs across proxy agents
-				...(agent ? { agent: agent as any } : {}),
+				...(agent ? { agent } : {}),
 			});
 
 			let resolved = false;

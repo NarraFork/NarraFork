@@ -197,6 +197,19 @@ describe("file reference output contract", () => {
 	});
 });
 
+describe("agent reference output contract", () => {
+	test("teaches copying the real ID reference rather than using a callable alias", async () => {
+		const { contract } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-agent-reference-prompt-${Date.now()}`,
+			locale: "en",
+		});
+		expect(contract).toContain("[task name](nf-agent://open?id=NARRATOR_ID)");
+		expect(contract).toContain("Copy the reference returned by Agent");
+		expect(contract).toContain("callable alias, not a session ID");
+	});
+});
+
 describe("plan mode designated plan file state", () => {
 	function makeWorkdir(): string {
 		return mkdtempSync(join(tmpdir(), "narrafork-plan-state-"));
@@ -374,9 +387,9 @@ describe("subagent communication guidance", () => {
 
 		// Send never waits, so there is no await flag left to forbid.
 		expect(en).not.toContain("await=true");
-		expect(en).toContain("Do not use Await(agent)");
+		expect(en).toContain("Do not use Watch(agent)");
 		expect(en).toContain("caller is waiting");
-		expect(zh).toContain("不得使用 Await(agent)");
+		expect(zh).toContain("不得使用 Watch(agent)");
 		expect(zh).toContain("调用方正在等待");
 	});
 

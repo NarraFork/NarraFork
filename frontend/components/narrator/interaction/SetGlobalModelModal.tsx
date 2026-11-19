@@ -4,11 +4,13 @@ import {
 	type ComboboxItemGroup,
 	Group,
 	Modal,
+	type OptionsFilter,
 	Select,
 	Stack,
 } from "@mantine/core";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { defaultModelOptionsFilter } from "../../../lib/model-search";
 
 type ModelComboboxItem = string | { value: string; label: string };
 type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
@@ -23,6 +25,7 @@ export function SetGlobalModelModal({
 	opened,
 	mode,
 	groupedModels,
+	modelOptionsFilter = defaultModelOptionsFilter,
 	currentValue,
 	saving,
 	onClose,
@@ -31,6 +34,8 @@ export function SetGlobalModelModal({
 	opened: boolean;
 	mode: "default" | "summary" | null;
 	groupedModels: ComboboxData;
+	/** From `useAllModels()`; lets the search match provider display names. */
+	modelOptionsFilter?: OptionsFilter<string>;
 	currentValue: string | null | undefined;
 	saving: boolean;
 	onClose: () => void;
@@ -67,6 +72,7 @@ export function SetGlobalModelModal({
 				<Select
 					data={data}
 					searchable
+					filter={modelOptionsFilter}
 					limit={100}
 					placeholder={t("modelFilterPlaceholder")}
 					value={selected}

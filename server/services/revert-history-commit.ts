@@ -11,12 +11,13 @@
  */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { setTimeout as yieldToEventLoop } from "node:timers/promises";
-import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { getTableColumns } from "drizzle-orm";
 import { type BunSQLiteDatabase, SQLiteBunTransaction } from "drizzle-orm/bun-sqlite";
 import { narratorBufferedMessages, narratorMessages, narratorToolCalls } from "../db/schema";
+import { connectCompiledWorker } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import {
 	bodyLengthSql,
@@ -25,6 +26,8 @@ import {
 	hasRowsOnlyBodies,
 } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
+import type { WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../lib/worker-runtime/pool";
 import {
 	nextCurrentRevision,
 	recipientDeletedReceiptPatch,
@@ -43,6 +46,7 @@ import {
 } from "./narrator-question-history";
 import {
 	isSnapshotSelectionComplete,
+	REVERT_LAZY_CHILD_DEPENDENCY_QUERY,
 	REVERT_SELECTION_PAGE_ITEMS,
 	type RevertSelectionBlock,
 	type RevertSelectionMessage,
@@ -91,7 +95,7 @@ export interface RevertHistoryApplyResult {
 type Value = string | number | null;
 type Row = Record<string, Value>;
 type Statement = { text: string; values: SQLQueryBindings[] };
-type Check = Statement & { count: number };
+type Check = Statement & { count: number; code?: "HISTORY_LAZY_DEPENDENCY_CHANGED" };
 type Target = { row: Row; count: number };
 type StoredColumns = { message: string[]; tool: string[] };
 type Snapshot = {
@@ -304,7 +308,8 @@ export class RevertHistoryCommitService {
 			AbortSignal.timeout(this.timeoutMs),
 		]);
 		const snapshot: Snapshot = {
-			versions: request.fixedSelection.messageVersions.map((row) => ({ ...row })),
+			// Bind only after the final selected-history recheck, not to the old plan version.
+			versions: [],
 			signal,
 			expiresAt: Date.now() + this.timeoutMs,
 			statements: [],
@@ -316,13 +321,11 @@ export class RevertHistoryCommitService {
 				replacements: [],
 			},
 		};
-		const worker = new RewriteWorker(signal);
 		this.active++;
 		try {
 			const current = await this.selection.collect({
 				principal,
 				narratorId: fixed.narratorId,
-				expectedMessageVersion: fixed.rootVersion,
 				selector: fixed.selector,
 				signal,
 			});
@@ -334,21 +337,25 @@ export class RevertHistoryCommitService {
 				throw fail("EVIDENCE_INCOMPLETE", "The complete fixed selection is not settled");
 			await compareSelection(fixed, current, () => this.pause(snapshot));
 			const columns = await this.storedColumns(snapshot);
-			await this.build(snapshot, current, worker, columns);
+			await this.build(snapshot, current, columns);
 			const latest = await this.selection.collect({
 				principal,
 				narratorId: fixed.narratorId,
-				expectedMessageVersion: fixed.rootVersion,
 				selector: fixed.selector,
 				signal,
 			});
 			await compareSelection(fixed, latest, () => this.pause(snapshot));
+			// Current versions are a short prepare→apply CAS only. The complete selected
+			// sources above, not a session-wide old counter, bind the user's consent.
+			snapshot.versions = latest.messageVersions.map((row) => {
+				bound(row.messageVersion, Number.MAX_SAFE_INTEGER - 1, "narrator mutation version");
+				return { ...row };
+			});
 		} finally {
-			await worker.close();
 			this.active--;
 			this.report("prepare", started, snapshot.statements.length);
 		}
-		// Check after the final worker shutdown await and observer callback too.
+		// Check after the final source verification await and observer callback too.
 		this.check(snapshot);
 		const token = Object.freeze(Object.create(null)) as PreparedRevertHistory;
 		this.#prepared.set(token, snapshot);
@@ -389,8 +396,11 @@ export class RevertHistoryCommitService {
 			const actual = this.root
 				.query<{ n: number }, SQLQueryBindings[]>(check.text)
 				.get(...check.values);
-			if (actual?.n !== check.count)
+			if (actual?.n !== check.count) {
+				if (check.code)
+					throw new AppError("Inherited child history changed after preview", 409, check.code);
 				throw fail("STALE", "Selected history changed after preparation");
+			}
 		}
 		this.#prepared.delete(prepared);
 		try {
@@ -514,12 +524,7 @@ export class RevertHistoryCommitService {
 		return result;
 	}
 
-	private async build(
-		work: Snapshot,
-		selection: RevertSelectionResult,
-		worker: RewriteWorker,
-		stored: StoredColumns,
-	) {
+	private async build(work: Snapshot, selection: RevertSelectionResult, stored: StoredColumns) {
 		const messages = selection.history.messages;
 		const messageById = new Map<string, RevertSelectionMessage>();
 		const blocks = new Map<string, RevertSelectionBlock[]>();
@@ -540,6 +545,36 @@ export class RevertHistoryCommitService {
 			selection.messageVersions.map((row) => [row.narratorId, row.messageVersion]),
 		);
 		const narrators = new Map<string, Narrator>();
+		const authorizationRows = new Map<string, Row>();
+		for (const id of versions.keys())
+			capture(
+				authorizationRows,
+				id,
+				this.one<Row>(
+					work,
+					"SELECT id,owner_user_id,visibility,write_audience,type,acl_root_narrator_id,context_project_id,parent_narrator_id,origin_tool_call_id FROM narrators WHERE id=? LIMIT 1",
+					[id],
+				),
+			);
+		for (const id of versions.keys())
+			work.checks.push({
+				text: "SELECT CASE WHEN (refs_inherited_from IS NULL AND refs_backfill_cursor IS NULL) OR (refs_inherited_from IS NOT NULL AND typeof(refs_backfill_cursor)='integer' AND refs_backfill_cursor>=0) THEN 1 ELSE 0 END AS n FROM narrators WHERE id=? LIMIT 1",
+				values: [id],
+				count: 1,
+			});
+		const lazyParents = new Map<string, number>();
+		for (const message of messages)
+			lazyParents.set(
+				message.narratorId,
+				Math.min(lazyParents.get(message.narratorId) ?? message.seq, message.seq),
+			);
+		for (const [id, minSeq] of lazyParents)
+			work.checks.push({
+				text: `SELECT EXISTS(${REVERT_LAZY_CHILD_DEPENDENCY_QUERY}) AS n`,
+				values: [id, minSeq, id, minSeq],
+				count: 0,
+				code: "HISTORY_LAZY_DEPENDENCY_CHANGED",
+			});
 		const affected = new Set<string>();
 		const narratorPatches = new Map<string, Row>();
 		const refPatches = new Map<string, { ref: Ref; patch: Row; remove: boolean }>();
@@ -805,8 +840,6 @@ export class RevertHistoryCommitService {
 				"SELECT id,message_version,fork_message_id FROM narrators WHERE id=? LIMIT 1",
 				[id],
 			);
-			if (narrator.message_version !== versions.get(id))
-				throw fail("STALE", "Authorized narrator version changed");
 			bound(narrator.message_version, Number.MAX_SAFE_INTEGER - 1, "narrator mutation version");
 			narrators.set(id, narrator);
 		}
@@ -857,7 +890,13 @@ export class RevertHistoryCommitService {
 			const text = bodyTexts.get(message.id);
 			if (!original || text === undefined) throw fail("BODY_INVALID", "No raw body");
 			const selectedBlocks = blocks.get(message.id) ?? [];
-			const rewritten = await worker.rewrite(message, selectedBlocks, text, String(original.role));
+			const rewritten = await rewriteBody(
+				work,
+				message,
+				selectedBlocks,
+				text,
+				String(original.role),
+			);
 			this.check(work);
 			producedBytes += rewritten.bytes;
 			bound(producedBytes, FILE_CHANGE_LIMITS.historyCowBytes, "rewritten body bytes");
@@ -950,17 +989,17 @@ export class RevertHistoryCommitService {
 		}
 		const narratorProgram: Statement[] = [];
 		const now = new Date().toISOString();
-		for (const [id, narrator] of narrators)
+		for (const id of narrators.keys())
 			narratorProgram.push(
 				update(
 					"narrators",
 					{
 						...narratorPatches.get(id),
 						api_conversation_id: null,
-						message_version: narrator.message_version + 1,
 						updated_at: now,
 					},
-					{ id, message_version: narrator.message_version },
+					{ id },
+					["message_version"],
 				),
 			);
 		// Count actual unique row mutations too: the collector's conservative budget is a
@@ -1004,6 +1043,40 @@ export class RevertHistoryCommitService {
 				work.statements.push(deletion("narrator_messages", { id: message.id }));
 		work.result.affectedNarratorIds = [...affected];
 		work.result.refreshedNarratorIds = recipient.refreshedIds;
+		const selector = selection.selector;
+		if (
+			selector.kind === "all" ||
+			selector.kind === "from_seq" ||
+			selector.kind === "after_block"
+		) {
+			let minSeq = selector.kind === "from_seq" ? selector.minSeq : -Number.MAX_SAFE_INTEGER;
+			let retainedBoundary = 0;
+			if (selector.kind === "after_block") {
+				const boundary = this.one<Ref>(
+					work,
+					"SELECT id,narrator_id,message_id,seq,segment_compact_id,is_compact FROM narrator_message_refs WHERE narrator_id=? AND message_id=? LIMIT 1",
+					[selection.narratorId, selector.messageId],
+				);
+				capture(refRows, boundary.id, boundary);
+				minSeq = boundary.seq;
+				if (!messageById.has(selector.messageId)) retainedBoundary = 1;
+			}
+			work.checks.push({
+				text: "SELECT CASE WHEN refs_inherited_from IS NULL OR refs_backfill_cursor<=? THEN 1 ELSE 0 END AS n FROM narrators WHERE id=? LIMIT 1",
+				values: [minSeq, selection.narratorId],
+				count: 1,
+			});
+			work.checks.push({
+				// Bounded indexed membership check: even an unversioned suffix insertion
+				// cannot be silently excluded from an already confirmed rollback range.
+				text: "SELECT count(*) AS n FROM (SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_seq WHERE narrator_id=? AND seq>=? LIMIT ?)",
+				values: [selection.narratorId, minSeq, FILE_CHANGE_LIMITS.historyMessageRefChanges + 1],
+				count:
+					messages.filter(
+						(message) => message.narratorId === selection.narratorId && message.seq >= minSeq,
+					).length + retainedBoundary,
+			});
+		}
 		work.checks.push(
 			...rowChecks("narrator_messages", "id", messageRows.values(), {
 				ftsBytes: "coalesce(octet_length(a.content_text),0)",
@@ -1015,7 +1088,12 @@ export class RevertHistoryCommitService {
 				outputBytes: "octet_length(a.output_json)",
 				rowBytes: rowLength(stored.tool, "a."),
 			}),
-			...rowChecks("narrators", "id", narrators.values()),
+			...rowChecks("narrators", "id", authorizationRows.values()),
+			...rowChecks(
+				"narrators",
+				"id",
+				[...narrators.values()].map(({ message_version: _version, ...row }) => row),
+			),
 			...targetChecks(
 				toolTargets,
 				"CROSS JOIN narrator_tool_calls a INDEXED BY idx_toolcalls_message ON a.message_id=t.message_id",
@@ -1490,11 +1568,12 @@ function conditions(where: Row) {
 		.map((name) => `${quote(name)} IS ?`)
 		.join(" AND ");
 }
-function update(table: string, patch: Row, where: Row): Statement {
+function update(table: string, patch: Row, where: Row, increments: string[] = []): Statement {
 	return {
-		text: `UPDATE ${quote(table)} SET ${Object.keys(patch)
-			.map((name) => `${quote(name)}=?`)
-			.join(",")} WHERE ${conditions(where)}`,
+		text: `UPDATE ${quote(table)} SET ${[
+			...Object.keys(patch).map((name) => `${quote(name)}=?`),
+			...increments.map((name) => `${quote(name)}=${quote(name)}+1`),
+		].join(",")} WHERE ${conditions(where)}`,
 		values: [...Object.values(patch), ...Object.values(where)],
 	};
 }
@@ -1643,9 +1722,10 @@ function fixSelection(selection: RevertSelectionResult, snapshotRecovery = false
 		FILE_CHANGE_LIMITS.historyCowBytes,
 		"manifest COW budget",
 	);
-	const versions = selection.messageVersions.map((row) =>
-		smallCommitment([fixedText(row.narratorId), row.messageVersion]),
-	);
+	const narrators = selection.messageVersions.map((row) => {
+		bound(row.messageVersion, Number.MAX_SAFE_INTEGER, "message version");
+		return smallCommitment(fixedText(row.narratorId));
+	});
 	const rootVersion = selection.messageVersions.find(
 		(row) => row.narratorId === selection.narratorId,
 	)?.messageVersion;
@@ -1655,9 +1735,8 @@ function fixSelection(selection: RevertSelectionResult, snapshotRecovery = false
 		narratorId: fixedText(selection.narratorId),
 		userId: fixedText(selection.requestedByUserId),
 		digest: fixedText(selection.metadataDigest),
-		rootVersion,
 		selector: fixSelector(selection.selector),
-		versions,
+		narrators,
 		messages: selection.history.messages.map((row) => smallCommitment(messageKey(row))),
 		blocks: selection.history.blocks.map((row) => smallCommitment(blockKey(row))),
 		toolChanges: selection.history.toolChanges.map((row) => smallCommitment(row)),
@@ -1678,7 +1757,7 @@ async function compareSelection(
 	)
 		throw fail("STALE", "The original plan metadata or boundary changed");
 	for (const [left, right] of [
-		[fixed.versions, current.messageVersions.map((row) => [row.narratorId, row.messageVersion])],
+		[fixed.narrators, current.messageVersions.map((row) => row.narratorId)],
 		[fixed.messages, current.history.messages.map(messageKey)],
 		[fixed.blocks, current.history.blocks.map(blockKey)],
 		[fixed.toolChanges, current.history.toolChanges],
@@ -1703,58 +1782,185 @@ function fail(code: string, message: string) {
 }
 
 type Rewritten = { body: string; text: string | null; bytes: number; contextCharsJson: string };
-class RewriteWorker {
-	private worker: Worker | undefined;
-	private termination: Promise<number> | undefined;
+type RewriteRequest = {
+	message: RevertSelectionMessage;
+	blocks: RevertSelectionBlock[];
+	body: string;
+	role: string;
+};
+class RewritePoolWorker implements PoolWorker<RewriteRequest, Rewritten> {
+	private stopping = false;
 	private pending:
-		| { resolve: (result: Rewritten) => void; reject: (error: unknown) => void }
+		| {
+				requestId: string;
+				resolve: (result: Rewritten) => void;
+				reject: (error: unknown) => void;
+		  }
 		| undefined;
-	constructor(private readonly signal: AbortSignal) {}
-	rewrite(
-		message: RevertSelectionMessage,
-		blocks: RevertSelectionBlock[],
-		body: string,
-		role: string,
-	): Promise<Rewritten> {
-		this.signal.throwIfAborted();
-		if (!this.worker) {
-			this.worker = new Worker(REWRITE_WORKER, { eval: true });
-			this.worker.on("message", (result: Rewritten & { error?: string }) => {
-				const pending = this.pending;
-				this.pending = undefined;
-				if (result.error) pending?.reject(fail("BODY_INVALID", result.error));
-				else pending?.resolve(result);
-			});
-			this.worker.on("error", (error) => {
-				this.pending?.reject(error);
-				this.pending = undefined;
-			});
-			this.worker.on("exit", () => {
-				this.pending?.reject(fail("BODY_INVALID", "Rewrite worker exited"));
-				this.pending = undefined;
-			});
-			this.signal.addEventListener("abort", this.abort, { once: true });
+	constructor(private readonly handle: WorkerHandle<import("node:worker_threads").Worker>) {
+		handle.resource.on("message", this.message);
+		handle.resource.on("error", this.error);
+		handle.resource.on("messageerror", this.error);
+		handle.resource.on("exit", this.exit);
+		handle.resource.unref();
+	}
+	get closed() {
+		return this.stopping || this.handle.closed;
+	}
+	private message = (reply: unknown) => {
+		if (
+			reply &&
+			typeof reply === "object" &&
+			!Array.isArray(reply) &&
+			"ready" in reply &&
+			reply.ready === true &&
+			!("requestId" in reply) &&
+			!("result" in reply) &&
+			!("error" in reply)
+		)
+			return;
+		if (
+			!reply ||
+			typeof reply !== "object" ||
+			Array.isArray(reply) ||
+			!("requestId" in reply) ||
+			typeof reply.requestId !== "string" ||
+			!reply.requestId
+		) {
+			this.error(fail("BODY_INVALID", "Invalid rewrite worker response"));
+			return;
 		}
+		const pending = this.pending;
+		// A late success OR error cannot settle a subsequent rewrite on this worker.
+		if (!pending || reply.requestId !== pending.requestId) return;
+		if ("error" in reply && typeof reply.error === "string" && !("result" in reply)) {
+			this.pending = undefined;
+			this.handle.resource.unref();
+			pending.reject(fail("BODY_INVALID", reply.error));
+			return;
+		}
+		const result = "result" in reply ? reply.result : undefined;
+		// Shape checks stay constant-time; commitments were verified off-thread.
+		if (
+			"error" in reply ||
+			!result ||
+			typeof result !== "object" ||
+			Array.isArray(result) ||
+			!("body" in result) ||
+			typeof result.body !== "string" ||
+			!("text" in result) ||
+			(result.text !== null && typeof result.text !== "string") ||
+			!("bytes" in result) ||
+			typeof result.bytes !== "number" ||
+			!Number.isSafeInteger(result.bytes) ||
+			result.bytes < 0 ||
+			!("contextCharsJson" in result) ||
+			typeof result.contextCharsJson !== "string"
+		) {
+			this.error(fail("BODY_INVALID", "Invalid rewrite worker response"));
+			return;
+		}
+		this.pending = undefined;
+		this.handle.resource.unref();
+		pending.resolve(result as Rewritten);
+	};
+	private error = (error: unknown) => {
+		this.pending?.reject(error);
+		this.pending = undefined;
+		void this.close().catch(() => {});
+	};
+	private exit = () => this.error(fail("BODY_INVALID", "Rewrite worker exited"));
+	run(request: RewriteRequest, context: WorkerTaskContext): Promise<Rewritten> {
+		context.signal.throwIfAborted();
+		if (this.closed) return Promise.reject(fail("BODY_INVALID", "Rewrite worker unavailable"));
+		this.handle.resource.ref();
 		return new Promise((resolve, reject) => {
-			this.pending = { resolve, reject };
-			this.worker?.postMessage({
-				message,
-				blocks,
-				body,
-				role,
-				limit: FILE_CHANGE_LIMITS.historyCowBytes,
-			});
+			this.pending = { requestId: context.requestId, resolve, reject };
+			try {
+				this.handle.resource.postMessage({
+					...request,
+					requestId: context.requestId,
+					limit: FILE_CHANGE_LIMITS.historyCowBytes,
+				});
+			} catch (error) {
+				this.error(error);
+			}
 		});
 	}
-	private abort = () => {
-		this.pending?.reject(this.signal.reason);
+	async close(): Promise<void> {
+		this.stopping = true;
+		this.pending?.reject(fail("BODY_INVALID", "Rewrite worker closed"));
 		this.pending = undefined;
-		this.termination ??= this.worker?.terminate();
-	};
-	async close() {
-		this.signal.removeEventListener("abort", this.abort);
-		this.termination ??= this.worker?.terminate();
-		await this.termination;
+		await this.handle.close();
+		this.handle.resource.off("message", this.message);
+		this.handle.resource.off("error", this.error);
+		this.handle.resource.off("messageerror", this.error);
+		this.handle.resource.off("exit", this.exit);
+	}
+}
+function createRewritePool() {
+	return new WorkerPool<RewriteRequest, Rewritten>({
+		concurrency: 2,
+		maxQueued: 32,
+		maxQueuedBytes: 64 * 1024 * 1024,
+		timeoutMs: 30_000,
+		create: async (context) => {
+			const { handle } = await connectCompiledWorker([REWRITE_WORKER], {
+				signal: context.signal,
+				deadlineAt: context.deadlineAt,
+				workerOptions: { eval: true },
+			});
+			return new RewritePoolWorker(handle);
+		},
+	});
+}
+const rewriteWorkers = hotSafe("revert-rewrite:pool", () => ({ pool: createRewritePool() }));
+/** Final production shutdown: no new admission; resolves only after native exit. */
+export function closeRevertRewriteWorkers(): Promise<void> {
+	return rewriteWorkers.pool.close();
+}
+export async function resetRevertRewriteWorkersForTests(): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only rewrite pool reset");
+	await closeRevertRewriteWorkers();
+	rewriteWorkers.pool = createRewritePool();
+}
+async function rewriteBody(
+	scope: Pick<Snapshot, "signal" | "expiresAt">,
+	message: RevertSelectionMessage,
+	blocks: RevertSelectionBlock[],
+	body: string,
+	role: string,
+): Promise<Rewritten> {
+	try {
+		// UTF-8 upper bound + bounded fixed block metadata, without scanning/encoding a body.
+		return await rewriteWorkers.pool.run(
+			{ message, blocks, body, role },
+			{
+				signal: scope.signal,
+				deadlineAt: scope.expiresAt,
+				requestId: generateId(),
+				bytes:
+					body.length * 3 +
+					blocks.length * (message.id.length * 3 + 2048) +
+					(message.id.length +
+						message.refId.length +
+						message.narratorId.length +
+						(message.segmentCompactId?.length ?? 0) +
+						(message.treeHashAfter?.length ?? 0) +
+						(message.snapshotCommitSha?.length ?? 0) +
+						role.length) *
+						3 +
+					1024,
+			},
+		);
+	} catch (error) {
+		scope.signal.throwIfAborted();
+		if (
+			error instanceof Error &&
+			(error.name === "TaskQueueError" || error.name === "WorkerPoolError")
+		)
+			throw fail("BODY_INVALID", error.message);
+		throw error;
 	}
 }
 /** Parsing and hashing even a single 4MiB message runs off the main thread. Retained JSON
@@ -1820,7 +2026,8 @@ function measureCharacters(role, blocks, contentText) {
  }
  return {segments};
 }
-parentPort.on('message', ({message, blocks, body, role, limit}) => {
+parentPort.on('message', ({action, requestId, message, blocks, body, role, limit}) => {
+ if (action === 'ping') { parentPort.postMessage({ready: true}); return; }
  try {
   if (Buffer.byteLength(body) > limit || hash(body) !== message.contentDigest) throw Error('Raw body commitment changed');
   const parsed = JSON.parse(body);
@@ -1854,7 +2061,7 @@ parentPort.on('message', ({message, blocks, body, role, limit}) => {
   if (bytes > limit) throw Error('Rewritten body exceeds byte budget');
   const retainedBlocks = parsed.filter((_, i) => blocks[i].action === 'retain');
   const contextCharsJson = JSON.stringify(measureCharacters(role, retainedBlocks, text));
-  parentPort.postMessage({body: rewritten, text, bytes, contextCharsJson});
- } catch (error) { parentPort.postMessage({error: error.message}); }
+  parentPort.postMessage({requestId, result: {body: rewritten, text, bytes, contextCharsJson}});
+ } catch (error) { parentPort.postMessage({requestId, error: error.message}); }
 });
 `;

@@ -81,6 +81,45 @@ describe("browser diagnostic admission", () => {
 		const next = reserveDiagnostic("snapshot");
 		next();
 	});
+	test("HMR retains policy: snapshot overlaps multiple GC jobs but no profile can enter", async () => {
+		const snapshot = reserveDiagnostic("snapshot");
+		const gc = reserveDiagnostic("gc");
+		let otherGc = () => {};
+		try {
+			const reloaded = await import(`../diagnostic-admission.ts?reload=${crypto.randomUUID()}`);
+			expect(reloaded.reserveDiagnostic).not.toBe(reserveDiagnostic);
+			otherGc = reloaded.reserveDiagnostic("gc");
+			expect(() => reloaded.reserveDiagnostic("snapshot")).toThrow("diagnostic_busy");
+			expect(() => reloaded.reserveDiagnostic("profile")).toThrow("diagnostic_busy");
+			snapshot();
+			gc();
+			expect(() => reserveDiagnostic("profile")).toThrow("diagnostic_busy");
+			otherGc();
+			const profile = reloaded.reserveDiagnostic("profile");
+			profile();
+		} finally {
+			snapshot();
+			gc();
+			otherGc();
+		}
+	});
+
+	test("trace leases retain uncertain evidence across module reevaluation", async () => {
+		const browser = fakeBrowser(new FakeBrowser());
+		const lease = acquireTraceLease(browser, "before-hmr");
+		try {
+			const reloaded = await import(`../tracing-lease.ts?reload=${crypto.randomUUID()}`);
+			expect(reloaded.acquireTraceLease).not.toBe(acquireTraceLease);
+			expect(() => reloaded.acquireTraceLease(browser, "overlap")).toThrow("trace_busy");
+			lease.markUncertain();
+			expect(() => reloaded.acquireTraceLease(browser, "uncertain")).toThrow("trace_uncertain");
+			lease.confirmStopped();
+			reloaded.acquireTraceLease(browser, "after-confirmation").confirmStopped();
+		} finally {
+			lease.confirmStopped();
+		}
+	});
+
 	test("snapshot and GC block profile until every operation releases", () => {
 		const snapshot = reserveDiagnostic("snapshot"),
 			gc = reserveDiagnostic("gc");

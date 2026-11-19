@@ -1,15 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { browserContextProxyOptions } from "@server/lib/browser/pool";
 import { migrateBrowserProxy, normalizeSettingsProxyUrls, settings } from "@server/lib/settings";
-import {
-	getBrowserProxy,
-	getWebFetchProxy,
-	getWebFetchProxyForUrl,
-} from "@server/lib/web-fetch/proxy";
+import { getBrowserProxy, getWebFetchProxyForUrl } from "@server/lib/web-fetch/proxy";
 
 const savedProxy = settings.proxy;
 const savedPolicy = settings.agent.webFetchPolicy;
 const savedBrowserProxy = settings.agent.browserProxy;
+/** A target no rule matches, so these assertions read the policy, not an exemption. */
+const WEBFETCH_TARGET = "https://example.test/page";
+const webFetchProxy = () => getWebFetchProxyForUrl(WEBFETCH_TARGET);
 // Read after migration through a function: TypeScript does not invalidate the
 // caller's earlier `undefined` narrowing for a mutation inside another function.
 const readBrowserProxy = () => settings.agent.browserProxy;
@@ -61,7 +60,7 @@ describe("independent web tool proxy overrides", () => {
 		settings.proxy = { mode: "custom", url: "http://global:8080" };
 		settings.agent.webFetchPolicy = undefined;
 		settings.agent.browserProxy = undefined;
-		expect(getWebFetchProxy()).toBe("http://global:8080");
+		expect(webFetchProxy()).toBe("http://global:8080");
 		expect(getBrowserProxy()).toBe("http://global:8080");
 	});
 
@@ -69,25 +68,25 @@ describe("independent web tool proxy overrides", () => {
 		settings.proxy = { mode: "custom", url: "http://global:8080" };
 		settings.agent.webFetchPolicy = { proxy: { mode: "custom", url: "http://fetch:8081" } };
 		settings.agent.browserProxy = { mode: "custom", url: "http://browser:8082" };
-		expect(getWebFetchProxy()).toBe("http://fetch:8081");
+		expect(webFetchProxy()).toBe("http://fetch:8081");
 		expect(getBrowserProxy()).toBe("http://browser:8082");
 		settings.agent.browserProxy = { mode: "default" };
 		expect(getBrowserProxy()).toBe("http://global:8080");
-		expect(getWebFetchProxy()).toBe("http://fetch:8081");
+		expect(webFetchProxy()).toBe("http://fetch:8081");
 		settings.agent.webFetchPolicy.proxy = { mode: "default" };
-		expect(getWebFetchProxy()).toBe("http://global:8080");
+		expect(webFetchProxy()).toBe("http://global:8080");
 	});
 
 	test("direct mode does not inherit another tool's proxy", () => {
 		settings.proxy = { mode: "custom", url: "http://global:8080" };
 		settings.agent.webFetchPolicy = { proxy: { mode: "direct" } };
 		settings.agent.browserProxy = { mode: "custom", url: "http://browser:8082" };
-		expect(getWebFetchProxy()).toBeUndefined();
-		expect(browserContextProxyOptions(getWebFetchProxy()).proxyServer).toBe("direct://");
+		expect(webFetchProxy()).toBeUndefined();
+		expect(browserContextProxyOptions(webFetchProxy()).proxyServer).toBe("direct://");
 		settings.agent.webFetchPolicy.proxy = { mode: "custom", url: "http://fetch:8081" };
 		settings.agent.browserProxy = { mode: "direct" };
 		expect(getBrowserProxy()).toBeUndefined();
-		expect(getWebFetchProxy()).toBe("http://fetch:8081");
+		expect(webFetchProxy()).toBe("http://fetch:8081");
 	});
 
 	test("WebFetch loopback stays direct and browser contexts bypass local targets", () => {

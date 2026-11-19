@@ -54,24 +54,24 @@ const { readSubtree } = await import("../read");
 
 let previousWorker: string | undefined;
 let previousConcurrency: string | undefined;
-beforeEach(() => {
+beforeEach(async () => {
 	previousWorker = process.env.NARRAFORK_DB_WORKER;
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	delete process.env.NARRAFORK_DB_WORKER;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	workerPool.resetDbWorkerPoolForTest();
+	await workerPool.resetDbWorkerPoolForTest();
 	bindConnection(file);
 });
-afterEach(() => {
-	workerPool.resetDbWorkerPoolForTest();
+afterEach(async () => {
+	await workerPool.resetDbWorkerPoolForTest();
 	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = previousWorker;
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 	bindConnection(file);
 });
-afterAll(() => {
-	workerPool.shutdownDbWorkerPool();
+afterAll(async () => {
+	await workerPool.shutdownDbWorkerPool();
 	mock.module("../../../db", () => realDbModule);
 	file.close();
 	memory.close();

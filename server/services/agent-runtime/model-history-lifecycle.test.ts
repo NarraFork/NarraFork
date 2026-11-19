@@ -4,15 +4,21 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as failures from "../../lib/db-worker/failure";
+import { resumeDbWorkerPool, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
 import { logger } from "../../lib/logger";
 import { settings } from "../../lib/settings";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
 import { renderModelHistoryRevisionSql } from "./model-history-revision-sql";
 import {
 	clearModelHistorySourceCacheForTest,
+	closeModelHistoryWorkers,
 	loadModelHistorySource,
 	MODEL_HISTORY_MAX_QUEUE,
+	ModelHistorySourceCache,
 	modelHistorySourceStats,
+	pauseModelHistorySourceWorkers,
+	resetModelHistoryWorkersForTest,
+	resumeModelHistorySourceWorkers,
 } from "./model-history-source";
 
 const workerGlobal = globalThis as unknown as {
@@ -51,6 +57,33 @@ function intercept(
 function noSlots() {
 	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0, cacheEntries: 0 });
 }
+function failureDiagnostics() {
+	const calls: Parameters<typeof logger.error>[] = (logger.error as ReturnType<typeof spyOn>).mock
+		.calls;
+	const logs = calls
+		.filter(([message]) => message === "Model history worker failure")
+		.map(([, data]) => data as Record<string, unknown>);
+	expect(logs.length).toBeGreaterThan(0);
+	for (const data of logs) {
+		expect(Object.keys(data).sort()).toEqual(["buildId", "code", "entry", "errorType", "phase"]);
+		expect(data.entry).toBe("model-history-worker");
+		for (const value of Object.values(data))
+			expect(value == null || typeof value === "string").toBe(true);
+	}
+	const serialized = JSON.stringify(calls);
+	expect(serialized.length).toBeLessThan(1024 * logs.length);
+	for (const secret of [
+		root,
+		import.meta.dir,
+		"PRIVATE_BODY_SECRET",
+		"PRIVATE_PATH_SECRET",
+		"PRIVATE_STACK_SECRET",
+		"alice:private",
+		"token=secret",
+	])
+		expect(serialized).not.toContain(secret);
+	return logs;
+}
 beforeEach(() => {
 	root = mkdtempSync(join(tmpdir(), "nf-history-lifecycle-"));
 	db = new Database(join(root, "fixture.db"));
@@ -65,7 +98,9 @@ beforeEach(() => {
 		restores.push(() => log.mockRestore());
 	}
 });
-afterEach(() => {
+afterEach(async () => {
+	await resetModelHistoryWorkersForTest();
+	resumeDbWorkerPool();
 	clearModelHistorySourceCacheForTest();
 	for (const restore of restores.splice(0).reverse()) restore();
 	for (const url of urls.splice(0)) URL.revokeObjectURL(url);
@@ -75,19 +110,31 @@ afterEach(() => {
 	rmSync(root, { recursive: true, force: true });
 });
 
-test("synchronous creation failures keep bounded redacted root diagnostics", async () => {
+test("synchronous creation failures keep bounded scalar root diagnostics without text or paths", async () => {
 	const worker = intercept(() => {
-		throw new TypeError(
-			"Cannot resolve fixture module postgres://alice:private@host/db token=secret",
+		throw Object.assign(
+			new TypeError(
+				`Cannot resolve fixture module postgres://alice:private@host/db token=secret ${root}/PRIVATE_PATH_SECRET ${"PRIVATE_BODY_SECRET".repeat(1024)}`,
+			),
+			{
+				code: "ERR_MODULE_NOT_FOUND",
+				filename: `${root}/PRIVATE_PATH_SECRET.ts`,
+				stack: `TypeError: PRIVATE_BODY_SECRET\n at PRIVATE_STACK_SECRET (${root}/PRIVATE_PATH_SECRET.ts:12:34)`,
+				lineno: 12,
+				colno: 34,
+			},
 		);
 	});
 	await expect(load()).rejects.toThrow("failed to start");
 	expect(worker).toHaveBeenCalledTimes(1);
-	const logs = JSON.stringify((logger.error as ReturnType<typeof spyOn>).mock.calls);
-	expect(logs).toContain("Cannot resolve fixture module");
-	expect(logs).toContain('"phase":"create"');
-	expect(logs).not.toContain("alice:private");
-	expect(logs).not.toContain("token=secret");
+	const logs = failureDiagnostics();
+	expect(logs).toHaveLength(1);
+	expect(logs[0]).toMatchObject({
+		phase: "create",
+		errorType: "TypeError",
+		code: "ERR_MODULE_NOT_FOUND",
+	});
+	expect(JSON.stringify(logs)).not.toContain("Cannot resolve fixture module");
 	noSlots();
 });
 
@@ -120,7 +167,13 @@ test.each([
 	) =>
 		realTimeout(
 			fn,
-			delay === 10_000 && typeof fn === "function" && fn.name !== "warnIfSlow" ? 15 : delay,
+			delay &&
+				delay > 9_000 &&
+				delay <= 10_000 &&
+				typeof fn === "function" &&
+				fn.name !== "warnIfSlow"
+				? 15
+				: delay,
 			...args,
 		)) as typeof setTimeout);
 	restores.push(() => timers.mockRestore());
@@ -129,9 +182,17 @@ test.each([
 	await started.promise;
 	if (mode === "abort") controller.abort();
 	await expect(pending).rejects.toThrow(mode === "timeout" ? "readiness timed out" : "cancelled");
-	expect(timers.mock.calls.some(([, ms]) => ms === 10_000)).toBe(true);
+	expect(
+		timers.mock.calls.some(
+			([fn, ms]) =>
+				ms && ms > 9_000 && ms <= 10_000 && typeof fn === "function" && fn.name !== "warnIfSlow",
+		),
+	).toBe(true);
 	expect(sends).toBe(0);
 	expect(terminations).toBe(1);
+	if (mode === "timeout")
+		expect(failureDiagnostics()[0]).toMatchObject({ phase: "ready", code: "TIMEOUT" });
+	else expect(logger.error).not.toHaveBeenCalled();
 	noSlots();
 });
 
@@ -168,6 +229,9 @@ test.each([
 	await expect(load()).rejects.toThrow("readiness validation failed");
 	expect(check).toHaveBeenCalledWith(buildId);
 	expect(sends).toBe(0);
+	expect(failureDiagnostics()).toContainEqual(
+		expect.objectContaining({ phase: "ready", code: "DB_WORKER_BUILD_MISMATCH" }),
+	);
 	noSlots();
 });
 
@@ -257,9 +321,173 @@ test.each([
 		mode === "close" ? "closed before completion" : "read-only worker failed",
 	);
 	expect(worker).toHaveBeenCalledTimes(1);
-	const logs = JSON.stringify((logger.error as ReturnType<typeof spyOn>).mock.calls);
+	const logs = JSON.stringify(failureDiagnostics());
 	expect(logs).toContain(`"phase":"${mode === "close" ? "close" : "run"}"`);
 	expect(logs).not.toContain("PRIVATE_DRIVER_SECRET");
+	noSlots();
+});
+
+test.each([
+	"dispatch",
+	"error",
+	"messageerror",
+])("runtime %s diagnostics discard arbitrary error names, paths and stacks", async (mode) => {
+	const url = standIn("self.onmessage=()=>{};postMessage({type:'ready'});");
+	const fault = Object.assign(new TypeError("PRIVATE_BODY_SECRET token=secret"), {
+		name: `${root}/PRIVATE_PATH_SECRET`,
+		code: "SQLITE_PRIVATE_BODY_SECRET",
+		stack: `PRIVATE_BODY_SECRET\n at PRIVATE_STACK_SECRET (${root}/PRIVATE_PATH_SECRET.ts:12:34)`,
+	});
+	const worker = intercept((RealWorker) => {
+		const instance = new RealWorker(url);
+		spyOn(instance, "postMessage").mockImplementation(() => {
+			if (mode === "dispatch") throw fault;
+			instance.dispatchEvent(
+				new ErrorEvent(mode, {
+					error: fault,
+					message: "PRIVATE_BODY_SECRET postgres://alice:private@host/db token=secret",
+					filename: `${root}/PRIVATE_PATH_SECRET.ts`,
+					lineno: 12,
+					colno: 34,
+				}),
+			);
+		});
+		return instance;
+	});
+	await expect(load()).rejects.toThrow("Model history read-only worker");
+	expect(worker).toHaveBeenCalledTimes(1);
+	const logs = failureDiagnostics();
+	expect(logs).toHaveLength(1);
+	expect(logs[0]).toMatchObject({
+		phase: mode === "error" ? "run" : mode === "messageerror" ? "message" : "dispatch",
+		errorType: "WorkerError",
+		code: undefined,
+	});
+	noSlots();
+});
+
+test.each([
+	{
+		errorType: "SQLiteError",
+		code: "SQLITE_ERROR",
+		loggedType: "SQLiteError",
+		loggedCode: "SQLITE_ERROR",
+	},
+	{
+		errorType: "PRIVATE_BODY_SECRET",
+		code: "SQLITE_PRIVATE_BODY_SECRET",
+		loggedType: "WorkerError",
+		loggedCode: undefined,
+	},
+	{
+		errorType: { name: "PRIVATE_BODY_SECRET" },
+		code: { code: "SQLITE_BUSY" },
+		loggedType: "WorkerError",
+		loggedCode: undefined,
+	},
+	{
+		errorType: ["TypeError", "PRIVATE_BODY_SECRET"],
+		code: ["SQLITE_BUSY"],
+		loggedType: "WorkerError",
+		loggedCode: undefined,
+	},
+])("received diagnostics reclassify $loggedType and never spread arbitrary fields", async ({
+	errorType,
+	code,
+	loggedType,
+	loggedCode,
+}) => {
+	const diagnostic = {
+		errorType,
+		code,
+		name: "SyntaxError",
+		entry: `${root}/PRIVATE_PATH_SECRET.ts`,
+		phase: "PRIVATE_BODY_SECRET",
+		buildId: "PRIVATE_BODY_SECRET",
+		message: "PRIVATE_BODY_SECRET postgres://alice:private@host/db token=secret",
+		stack: `PRIVATE_BODY_SECRET\n at PRIVATE_STACK_SECRET (${root}/PRIVATE_PATH_SECRET.ts:12:34)`,
+		file: `${root}/PRIVATE_PATH_SECRET.ts`,
+		line: { contentJson: "PRIVATE_BODY_SECRET" },
+		nested: { errorType: "PRIVATE_BODY_SECRET", code: "SQLITE_BUSY" },
+	};
+	const url = standIn(
+		`self.onmessage=()=>{const diagnostic=${JSON.stringify(diagnostic)};diagnostic.error=Object.assign(new TypeError('PRIVATE_BODY_SECRET'),{code:'SQLITE_BUSY'});diagnostic.cause=diagnostic.error;diagnostic.circular=diagnostic;postMessage({type:'error',message:'database is locked',diagnostic});};postMessage({type:'ready'});`,
+	);
+	const worker = intercept((RealWorker) => new RealWorker(url));
+	await expect(load()).rejects.toMatchObject({
+		message: "database is locked",
+		code: "MODEL_HISTORY_READ_FAILED",
+	});
+	expect(worker).toHaveBeenCalledTimes(1);
+	const logs = failureDiagnostics();
+	expect(logs).toHaveLength(1);
+	expect(logs[0]).toMatchObject({ phase: "read", errorType: loggedType, code: loggedCode });
+	noSlots();
+});
+
+test("received diagnostic code cannot replace the actual failure or trigger lock retries", async () => {
+	const url = standIn(
+		"self.onmessage=()=>postMessage({type:'error',message:'database is locked',code:'SQLITE_ERROR',diagnostic:{errorType:'SQLiteError',code:'SQLITE_BUSY',message:'PRIVATE_BODY_SECRET'}});postMessage({type:'ready'});",
+	);
+	const worker = intercept((RealWorker) => new RealWorker(url));
+	await expect(load()).rejects.toMatchObject({ code: "SQLITE_ERROR" });
+	expect(worker).toHaveBeenCalledTimes(1);
+	expect(failureDiagnostics()[0]).toMatchObject({
+		phase: "read",
+		errorType: "SQLiteError",
+		code: "SQLITE_ERROR",
+	});
+	noSlots();
+});
+
+test("business error text is preserved without leaking into either diagnostic logger", async () => {
+	const message = `database is locked PRIVATE_BODY_SECRET ${root}/PRIVATE_PATH_SECRET token=secret`;
+	const url = standIn(
+		`self.onmessage=()=>postMessage(${JSON.stringify({ type: "error", message })});postMessage({type:'ready'});`,
+	);
+	const worker = intercept((RealWorker) => new RealWorker(url));
+	await expect(load()).rejects.toMatchObject({ message, code: "MODEL_HISTORY_READ_FAILED" });
+	expect(worker).toHaveBeenCalledTimes(1);
+	failureDiagnostics();
+	noSlots();
+});
+
+test("real worker errors send only scalar diagnostics without the failed database path", async () => {
+	const received: Array<{ type: string; diagnostic: Record<string, unknown> }> = [];
+	intercept((RealWorker, args) => {
+		const worker = new RealWorker(...args);
+		worker.addEventListener("message", (event) => {
+			if (event.data.type === "error") received.push(event.data);
+		});
+		const send = worker.postMessage.bind(worker);
+		spyOn(worker, "postMessage").mockImplementation((message) =>
+			send({ ...message, path: join(root, "PRIVATE_PATH_SECRET.db") }),
+		);
+		return worker;
+	});
+	await expect(load()).rejects.toThrow("Model history read-only worker failed");
+	expect(received).toHaveLength(1);
+	expect(Object.keys(received[0].diagnostic).sort()).toEqual(["code", "errorType"]);
+	expect(received[0].diagnostic).toMatchObject({
+		errorType: "SQLiteError",
+		code: "SQLITE_CANTOPEN",
+	});
+	const serialized = JSON.stringify(received);
+	expect(serialized).not.toContain(root);
+	expect(serialized).not.toContain("PRIVATE_PATH_SECRET");
+	failureDiagnostics();
+	noSlots();
+});
+
+test("failure logging cannot replace the original startup error or prevent cleanup", async () => {
+	intercept(() => {
+		throw new TypeError("PRIVATE_BODY_SECRET");
+	});
+	const sink = spyOn(logger, "error").mockImplementation(() => {
+		throw new Error("logging sink failed");
+	});
+	restores.push(() => sink.mockRestore());
+	await expect(load()).rejects.toThrow("Model history read-only worker failed to start");
 	noSlots();
 });
 
@@ -317,6 +545,119 @@ test("history admission rejects overload and queued cancellation releases all sl
 	controller.abort();
 	await Promise.all(pending);
 	noSlots();
+});
+
+test("permanent close blocks verified cache hits and only an explicit reset rebuilds", async () => {
+	await load();
+	const worker = intercept(() => {
+		throw new Error("closed runtime must not construct");
+	});
+	await Promise.all([closeModelHistoryWorkers(), closeModelHistoryWorkers()]);
+	const error = await load().catch((error) => error);
+	expect(error.code).toBe("MODEL_HISTORY_WORKER_CLOSED");
+	expect(worker).not.toHaveBeenCalled();
+	worker.mockRestore();
+	await resetModelHistoryWorkersForTest();
+	expect((await load()).messages).toHaveLength(1);
+});
+
+test("close cancels active readers, rejects waiters and observes worker exit before returning", async () => {
+	const url = standIn("self.onmessage=()=>{};postMessage({type:'ready'});");
+	let exited = 0;
+	const started = Promise.withResolvers<void>();
+	const worker = intercept((RealWorker) => {
+		const instance = new RealWorker(url);
+		instance.addEventListener("close", () => {
+			exited++;
+		});
+		if (worker.mock.calls.length === 2) started.resolve();
+		return instance;
+	});
+	const pending = Array.from({ length: 5 }, () => load().catch((error) => error));
+	await started.promise;
+	await closeModelHistoryWorkers();
+	await Promise.all(pending);
+	expect(exited).toBe(2);
+	expect(worker).toHaveBeenCalledTimes(2);
+	noSlots();
+});
+
+test("production pause/resume preserves verified cache and permanent shutdown cannot reopen", async () => {
+	const cached = await load();
+	await pauseModelHistorySourceWorkers();
+	const paused = await load().catch((error) => error);
+	expect(paused.code).toBe("MODEL_HISTORY_WORKER_CLOSED");
+	await resumeModelHistorySourceWorkers();
+	expect(await load()).toBe(cached);
+	await closeModelHistoryWorkers();
+	const closed = await resumeModelHistorySourceWorkers().catch((error) => error);
+	expect(closed.message).toContain("permanently closed");
+});
+
+test("maintenance blocks both cold reads and cache-signature reads without new workers", async () => {
+	await load();
+	const reads = modelHistorySourceStats().signatureReads;
+	const worker = intercept(() => {
+		throw new Error("maintenance must not construct");
+	});
+	await shutdownDbWorkerPool({ pause: true });
+	const error = await load().catch((error) => error);
+	expect(error.code).toBe("MODEL_HISTORY_WORKER_PAUSED");
+	expect(modelHistorySourceStats().signatureReads).toBe(reads);
+	expect(worker).not.toHaveBeenCalled();
+	resumeDbWorkerPool();
+	expect((await load()).messages).toHaveLength(1);
+});
+
+test("normal HMR retains pool ownership and pause gates earlier module exports", async () => {
+	const key = Symbol.for("narrator.modelHistorySource.v2");
+	const current = Reflect.get(globalThis, key);
+	const pool = current.pool;
+	const reloaded = await import(`./model-history-source.ts?current=${crypto.randomUUID()}`);
+	expect(reloaded.loadModelHistorySource).not.toBe(loadModelHistorySource);
+	expect(Reflect.get(globalThis, key)).toBe(current);
+	expect(current.pool).toBe(pool);
+	await reloaded.pauseModelHistorySourceWorkers();
+	const paused = await load().catch((error) => error);
+	expect(paused.code).toBe("MODEL_HISTORY_WORKER_CLOSED");
+	await reloaded.resumeModelHistorySourceWorkers();
+	expect((await load()).messages).toHaveLength(1);
+});
+
+test("legacy HMR owner requires restart even with zero counters, never discarding exit evidence", async () => {
+	const key = Symbol.for("narrator.modelHistorySource.v2");
+	const current = Reflect.get(globalThis, key);
+	const legacy = {
+		cache: new ModelHistorySourceCache(),
+		workers: 0,
+		workerWaiters: [],
+		loads: 0,
+		hits: 0,
+		signatureReads: 0,
+		lastCounters: null,
+		workerSpecifier: null,
+	};
+	const worker = intercept(() => {
+		throw new Error("legacy ownership must not dispatch");
+	});
+	Reflect.set(globalThis, key, legacy);
+	try {
+		const upgraded = await import(`./model-history-source.ts?legacy=${crypto.randomUUID()}`);
+		expect(upgraded.loadModelHistorySource).not.toBe(loadModelHistorySource);
+		const error = await upgraded
+			.loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner")
+			.catch((error: Error & { code: string }) => error);
+		expect(error.code).toBe("MODEL_HISTORY_WORKER_RESTART_REQUIRED");
+		const closed = await upgraded.closeModelHistoryWorkers().catch((error: Error) => error);
+		expect(closed.message).toContain("process restart required");
+		const reset = await upgraded.resetModelHistoryWorkersForTest().catch((error: Error) => error);
+		expect(reset.message).toContain("process restart required");
+		expect(Reflect.get(globalThis, key)).toBe(legacy);
+		expect(legacy).toMatchObject({ workers: 0, workerWaiters: [] });
+		expect(worker).not.toHaveBeenCalled();
+	} finally {
+		Reflect.set(globalThis, key, current);
+	}
 });
 
 test("WAL snapshot survives concurrent writes between ACK pages and is released on completion", async () => {

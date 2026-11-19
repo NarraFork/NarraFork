@@ -953,7 +953,8 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	);
 	failBroadcast = false;
 	expect(projected.text).toContain("This notice could not load the result.");
-	expect(projected.text).toContain("Await(");
+	expect(projected.text).toContain("Watch(");
+	expect(projected.text).not.toContain("Await(");
 	expect(projected.parts).toEqual([
 		{ text: projected.text, messageId: required(state(row.id)?.currentMessageId) },
 	]);
@@ -1209,7 +1210,7 @@ test("immutable bounded notice snapshot ignores later edits and never parses ove
 	for (const mode of ["busy", "idle"] as const) {
 		const text = await deliverPendingInjection("parent", "en", mode, "none", projected);
 		expect(text).toContain("Result:\noriginal result");
-		expect(text).not.toContain("Await(");
+		expect(text).not.toContain("Watch(");
 	}
 
 	db.update(narratorMessages)

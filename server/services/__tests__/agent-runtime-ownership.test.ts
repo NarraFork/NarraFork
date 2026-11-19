@@ -10,6 +10,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	runtimePublicationOutbox,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import {
@@ -411,6 +412,303 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 	}
 });
 
+describe("signal shutdown keeps recoverable runs nonterminal", () => {
+	beforeEach(async () => {
+		const inbox = await import("../agent-runtime/inbox");
+		spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	});
+	test("shell cleanup preserves Agent rows, controllers and cancellation semantics", async () => {
+		const { backgroundTaskService } = await import("../background-task-service");
+		const agentAbort = new AbortController();
+		const shellAbort = new AbortController();
+		const shellKilled = mock(() => {});
+		const agent = await backgroundTaskService.createAgentTask({
+			id: CHILD,
+			subagentNarratorId: CHILD,
+			subagentType: "general",
+			binding: {
+				principal: { userId: null },
+				deliverTo: { narratorId: ROOT, toolUseId: "spawn-tool" },
+			},
+		});
+		await backgroundTaskService.createBashTask({
+			id: "signal-shell",
+			parentNarratorId: ROOT,
+			command: "test shell",
+		});
+		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, CHILD));
+		backgroundTaskService.registerAbortController(CHILD, agentAbort);
+		backgroundTaskService.registerAbortController("signal-shell", shellAbort);
+		backgroundTaskService.registerKillHandler("signal-shell", shellKilled);
+		try {
+			await backgroundTaskService.killAll({ preserveAgents: true });
+			expect(shellAbort.signal.aborted).toBe(true);
+			expect(shellKilled).toHaveBeenCalledTimes(1);
+			expect(agentAbort.signal.aborted).toBe(false);
+			expect(
+				await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
+			).toMatchObject({ status: "running", logicalRunId: agent.logicalRunId, notified: false });
+			expect(await db.query.narrators.findFirst({ where: eq(narrators.id, CHILD) })).toMatchObject({
+				status: "working",
+				errorMessage: null,
+			});
+			expect(
+				await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, "signal-shell") }),
+			).toMatchObject({ status: "cancelled" });
+			// Explicit cancellation still uses the original controller and normal task finalizer.
+			await backgroundTaskService.killAll();
+			expect(agentAbort.signal.aborted).toBe(true);
+			expect(
+				await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
+			).toMatchObject({ status: "cancelled" });
+		} finally {
+			backgroundTaskService.unregisterAbortController(CHILD, agentAbort);
+			backgroundTaskService.unregisterAbortController("signal-shell", shellAbort);
+		}
+	});
+
+	for (const errorPath of ["throw", "event"] as const) {
+		test.each([
+			"preserve",
+			"cancel",
+			"timeout",
+		] as const)(`${errorPath}: Worker teardown while preparing a signal-checkpointed Agent: %s`, async (ending) => {
+			const connector = await import("../../lib/compiled-worker");
+			const connect = connector.connectCompiledWorker;
+			const prefix = await import("../agent-runtime/prepare-prefix-request");
+			const { createPrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+			const { getNarraforkPath } = await import("../../lib/narrafork-home");
+			const coordinator = await import("../update-coordinator");
+			const restart = await import("../restart-recovery-service");
+			const workerEntered = Promise.withResolvers<void>();
+			spyOn(connector, "connectCompiledWorker").mockImplementation(async (...args) => {
+				const connected = await connect(...args);
+				const post = connected.worker.postMessage.bind(connected.worker);
+				spyOn(connected.worker, "postMessage").mockImplementation((request) => {
+					if (request.value === "waiting for the snapshot Worker") workerEntered.resolve();
+					else post(request);
+				});
+				return connected;
+			});
+			const store = createPrefixSnapshotStore({
+				backend: "sqlite",
+				path: getNarraforkPath("narrafork.db"),
+			});
+			if (errorPath === "throw") {
+				spyOn(prefix, "preparePrefixRequest").mockImplementation(async () => {
+					await store.putPrefixText("waiting for the snapshot Worker");
+					throw new Error("the blocked Worker must not complete");
+				});
+			}
+			const execute = passExecutor.executeAgentLoop;
+			const model = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
+				if (errorPath === "throw") throw new Error("must not call a model");
+				return execute(options, {
+					eventSource: (async function* () {
+						yield {
+							type: "stream_text" as const,
+							text: "answer before Worker teardown",
+							blockId: "shutdown-text",
+							blockRevision: 1,
+							blockTextOffset: 0,
+						};
+						yield {
+							type: "block_complete" as const,
+							block: {
+								type: "text" as const,
+								text: "answer before Worker teardown",
+								id: "shutdown-text",
+								revision: 1,
+								completed: true,
+							},
+						};
+						try {
+							await store.putPrefixText("waiting for the snapshot Worker");
+						} catch (error) {
+							yield {
+								type: "error" as const,
+								message: error instanceof Error ? error.message : String(error),
+							};
+						}
+					})(),
+				});
+			});
+			const { backgroundTaskService } = await import("../background-task-service");
+			const agent = await backgroundTaskService.createAgentTask({
+				id: CHILD,
+				subagentNarratorId: CHILD,
+				subagentType: "general",
+				binding: {
+					principal: { userId: null },
+					deliverTo: { narratorId: ROOT, toolUseId: "spawn-tool" },
+				},
+			});
+			await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, CHILD));
+			const handle = await startNarratorRun({
+				narratorId: CHILD,
+				locale: "zh-CN",
+				text: "resume after signal",
+				principal: null,
+				resumeRunId: agent.logicalRunId ?? undefined,
+				recovered: true,
+			});
+			let settled = false;
+			const terminal = handle.terminal.finally(() => {
+				settled = true;
+			});
+			void terminal.catch(() => {});
+			try {
+				await workerEntered.promise;
+				const outboxBefore = await db.query.runtimePublicationOutbox.findMany({
+					where: eq(runtimePublicationOutbox.taskId, CHILD),
+				});
+				await restart.prepareSignalRestartRecovery();
+				coordinator.markUpdateRestarting();
+				await store.close();
+				await waitUntil(() => coordinator.getUpdateCoordinationStatus().pausedToolCount === 1);
+				expect(settled).toBe(false);
+				expect(model).toHaveBeenCalledTimes(errorPath === "throw" ? 0 : 1);
+				if (errorPath === "event") {
+					expect((await narratorService.getLatestAssistantTextAndId(CHILD))?.text).toContain(
+						"answer before Worker teardown",
+					);
+				}
+				expect(
+					await db.query.narrators.findFirst({ where: eq(narrators.id, CHILD) }),
+				).toMatchObject({
+					status: "working",
+					errorMessage: null,
+				});
+				expect(
+					await db.query.runtimePublicationOutbox.findMany({
+						where: eq(runtimePublicationOutbox.taskId, CHILD),
+					}),
+				).toEqual(outboxBefore);
+				expect(
+					await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
+				).toMatchObject({ status: "running", logicalRunId: agent.logicalRunId });
+				const manifest = await Bun.file(getNarraforkPath("restart-recovery.json")).json();
+				expect(manifest.targets).toContainEqual({
+					narratorId: CHILD,
+					logicalRunId: agent.logicalRunId,
+				});
+				if (ending !== "preserve") {
+					const { controlRun } = await import("../agent-runtime/run");
+					if (ending === "timeout") {
+						const { getRunControl } = await import("../agent-runtime/ownership");
+						const run = getRunControl(CHILD);
+						if (!run) throw new Error("Missing live run");
+						run.timedOut = true;
+						run.cancel.abort("Run deadline reached");
+					} else {
+						expect(await controlRun(CHILD, { kind: "cancel" })).toBe(true);
+					}
+					expect(await terminal).toMatchObject({
+						interrupted: ending === "cancel",
+						timedOut: ending === "timeout",
+						hasError: ending === "timeout",
+					});
+					expect(
+						await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
+					).toMatchObject({ status: ending === "timeout" ? "timeout" : "cancelled" });
+					const published = await db.query.runtimePublicationOutbox.findMany({
+						where: eq(runtimePublicationOutbox.taskId, CHILD),
+					});
+					expect(
+						published.filter(
+							(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),
+						),
+					).toHaveLength(1);
+					expect(published.filter((row) => row.eventKind === "failed")).toEqual([]);
+				}
+			} finally {
+				// Reopen only to release the test's live waiter, never the production server.
+				coordinator.failScheduledUpdate("signal shutdown fixture cleanup");
+				await terminal.catch(() => {});
+				await store.close();
+				await import("node:fs/promises")
+					.then(({ unlink }) => unlink(getNarraforkPath("restart-recovery.json")))
+					.catch(() => {});
+				restart.resetRestartRecoveryForTests();
+				coordinator.resetUpdateCoordinationForTests();
+			}
+		});
+	}
+});
+test.each([
+	"cancel",
+	"timeout",
+] as const)("run-level shutdown pause still commits %s", async (ending) => {
+	const { backgroundTaskService } = await import("../background-task-service");
+	const coordinator = await import("../update-coordinator");
+	const orchestrator = await import("../agent-runtime/orchestrator");
+	const { controlRun } = await import("../agent-runtime/run");
+	const entered = Promise.withResolvers<void>();
+	const teardown = Promise.withResolvers<void>();
+	spyOn(orchestrator, "runAgentLoopUnlocked").mockImplementation(async () => {
+		entered.resolve();
+		await teardown.promise;
+		throw new Error("Worker closed during run setup");
+	});
+	const agent = await backgroundTaskService.createAgentTask({
+		id: CHILD,
+		subagentNarratorId: CHILD,
+		subagentType: "general",
+		binding: {
+			principal: { userId: null },
+			deliverTo: { narratorId: ROOT, toolUseId: "spawn-tool" },
+		},
+	});
+	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, CHILD));
+	const handle = await startNarratorRun({
+		narratorId: CHILD,
+		locale: "en",
+		text: "run setup",
+		principal: null,
+		resumeRunId: agent.logicalRunId ?? undefined,
+		recovered: true,
+	});
+	try {
+		await entered.promise;
+		coordinator.scheduleUpdate(undefined, "system_shutdown");
+		coordinator.beginQuiescingTools();
+		coordinator.markUpdateRestarting();
+		teardown.resolve();
+		await waitUntil(() => coordinator.getUpdateCoordinationStatus().pausedToolCount === 1);
+		if (ending === "timeout") {
+			const { getRunControl } = await import("../agent-runtime/ownership");
+			const run = getRunControl(CHILD);
+			if (!run) throw new Error("Missing live run");
+			run.timedOut = true;
+			run.cancel.abort("Run deadline reached");
+		} else expect(await controlRun(CHILD, { kind: "cancel" })).toBe(true);
+		expect(await handle.terminal).toMatchObject({
+			interrupted: ending === "cancel",
+			timedOut: ending === "timeout",
+			hasError: ending === "timeout",
+		});
+		expect(
+			await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
+		).toMatchObject({ status: ending === "timeout" ? "timeout" : "cancelled" });
+		expect(await db.query.narrators.findFirst({ where: eq(narrators.id, CHILD) })).toMatchObject({
+			status: "idle",
+		});
+		const published = await db.query.runtimePublicationOutbox.findMany({
+			where: eq(runtimePublicationOutbox.taskId, CHILD),
+		});
+		expect(
+			published.filter(
+				(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),
+			),
+		).toHaveLength(1);
+		expect(published.filter((row) => row.eventKind === "failed")).toEqual([]);
+	} finally {
+		teardown.resolve();
+		coordinator.failScheduledUpdate("run shutdown fixture cleanup");
+		await handle.terminal;
+		coordinator.resetUpdateCoordinationForTests();
+	}
+});
 async function waitUntil(predicate: () => boolean) {
 	const deadline = Date.now() + 2_000;
 	while (!predicate()) {

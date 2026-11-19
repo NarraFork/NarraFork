@@ -46,6 +46,20 @@ import {
 	parseNameStatusRecords,
 	requireCommitFile,
 } from "./git-commit-preview-parse";
+import {
+	aheadBehind,
+	branchUpstream,
+	countCommitsNotIn,
+	GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+	type GitAheadBehind,
+	type GitQueryRunner,
+	type GitUncommittedChanges,
+	type GitUpstream,
+	isAncestor,
+	mergeBase,
+	resolveCommit,
+	uncommittedChanges,
+} from "./git-ref-queries";
 import { coordinateGitStatusQuery, getLocalGitStatusQueryKey } from "./git-status-query";
 import { GIT_STATUS_TIMEOUT_MS, readGitStatusStream } from "./git-status-stream";
 import { lifecycleCreationPath } from "./worktree-lifecycle-guard";
@@ -526,6 +540,25 @@ function execRead(
 		timeout: options?.timeout ?? READ_TIMEOUT_MS,
 		maxOutputBytes: options?.maxOutputBytes ?? READ_MAX_OUTPUT_BYTES,
 	});
+}
+
+/** Per-call bounds for the ref queries; both default to the read ceilings above. */
+export interface GitQueryBounds {
+	timeout?: number;
+	maxOutputBytes?: number;
+}
+
+/** Bind {@link execRead} to one directory for the shared ref-query helpers. */
+function queryRunner(cwd: string, bounds?: GitQueryBounds): GitQueryRunner {
+	return (args, options) =>
+		execRead(args, cwd, true, {
+			timeout: bounds?.timeout,
+			// The tighter of the query's own cap and the caller's.
+			maxOutputBytes:
+				options?.maxOutputBytes === undefined || bounds?.maxOutputBytes === undefined
+					? (options?.maxOutputBytes ?? bounds?.maxOutputBytes)
+					: Math.min(options.maxOutputBytes, bounds.maxOutputBytes),
+		});
 }
 
 async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
@@ -1600,6 +1633,80 @@ export const gitService = {
 			const result = await exec(args, worktreePath, { network: true, silent: true });
 			if (result.exitCode !== 0) throw gitNetworkFailure("git fetch failed", result);
 		});
+	},
+
+	// === Ref queries (read-only; see git-ref-queries.ts) ===
+
+	/** The commit a ref names in this repository, or null when it names none. */
+	async resolveCommit(
+		repoPath: string,
+		ref: string,
+		bounds?: GitQueryBounds,
+	): Promise<string | null> {
+		return resolveCommit(queryRunner(repoPath, bounds), ref);
+	},
+
+	/** Best common ancestor of two commits (full SHAs), or null for unrelated histories. */
+	async getMergeBase(
+		repoPath: string,
+		a: string,
+		b: string,
+		bounds?: GitQueryBounds,
+	): Promise<string | null> {
+		return mergeBase(queryRunner(repoPath, bounds), a, b);
+	},
+
+	/** Whether `ancestor` is reachable from `descendant` (both full SHAs). */
+	async isAncestor(
+		repoPath: string,
+		ancestor: string,
+		descendant: string,
+		bounds?: GitQueryBounds,
+	): Promise<boolean> {
+		return isAncestor(queryRunner(repoPath, bounds), ancestor, descendant);
+	},
+
+	/** Ahead/behind of `ref` against an arbitrary `base` (both full SHAs), not only upstream. */
+	async getAheadBehind(
+		repoPath: string,
+		ref: string,
+		base: string,
+		bounds?: GitQueryBounds,
+	): Promise<GitAheadBehind> {
+		return aheadBehind(queryRunner(repoPath, bounds), ref, base);
+	},
+
+	/** Uncommitted paths in a worktree; `exact` is false when the listing hit its cap. */
+	async getUncommittedChanges(
+		worktreePath: string,
+		bounds?: GitQueryBounds,
+	): Promise<GitUncommittedChanges> {
+		return uncommittedChanges(
+			queryRunner(worktreePath, bounds),
+			bounds?.maxOutputBytes ?? GIT_UNCOMMITTED_LISTING_MAX_BYTES,
+		);
+	},
+
+	/** A local branch's upstream ref and commit, or null without a resolvable one. */
+	async getBranchUpstream(
+		repoPath: string,
+		branch: string,
+		bounds?: GitQueryBounds,
+	): Promise<GitUpstream | null> {
+		return branchUpstream(queryRunner(repoPath, bounds), branch);
+	},
+
+	/**
+	 * Commits reachable from `tip` and from none of `reachableFrom` (full SHAs): zero
+	 * means the branch is fully contained in its base or upstream.
+	 */
+	async countCommitsNotIn(
+		repoPath: string,
+		tip: string,
+		reachableFrom: readonly string[],
+		bounds?: GitQueryBounds,
+	): Promise<number> {
+		return countCommitsNotIn(queryRunner(repoPath, bounds), tip, reachableFrom);
 	},
 
 	// === Reset ===

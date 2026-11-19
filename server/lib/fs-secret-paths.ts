@@ -51,6 +51,7 @@ const SECRET_HOME_FILES: readonly string[] = [
 	"settings.json", // holds auth.jwtSecret — forging MFA challenges and internal signatures
 	"codex-credentials.json",
 	"provider-keys.json",
+	"search-provider-secrets.json",
 	"secret.key", // decrypts every credential file (secret-store.ts)
 	"update-server.json",
 	"update-server-test.json",

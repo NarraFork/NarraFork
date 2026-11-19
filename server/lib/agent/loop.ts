@@ -204,7 +204,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 		large: ["prompt"],
 	},
 	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
-	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
+	Watch: { short: ["type", "id", "pattern", "timeout", "start_at"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
 		large: ["message"],
@@ -592,7 +592,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
-	"Await",
+	"Watch",
 	"Stop",
 	"ShareFile",
 	"ContextAsk",
@@ -4190,6 +4190,7 @@ async function* agentLoopInMetadataSnapshot(
 						cacheCreationInputTokens?: number;
 						cacheCreation5mTokens?: number;
 						cacheCreation1hTokens?: number;
+						cacheReported?: boolean;
 				  }
 				| undefined;
 			let requestContextPercent: number | undefined;
@@ -5918,6 +5919,11 @@ async function* agentLoopInMetadataSnapshot(
 									parsed.usage.cacheCreation5mTokens ?? previousUsage?.cacheCreation5mTokens,
 								cacheCreation1hTokens:
 									parsed.usage.cacheCreation1hTokens ?? previousUsage?.cacheCreation1hTokens,
+								// Sticky: a later counter-less delta cannot retract cache fields seen earlier.
+								cacheReported:
+									previousUsage?.cacheReported === true || parsed.usage.cacheReported === true
+										? true
+										: (parsed.usage.cacheReported ?? previousUsage?.cacheReported),
 							};
 							const contextWindow =
 								parsed.usage.contextWindow ??

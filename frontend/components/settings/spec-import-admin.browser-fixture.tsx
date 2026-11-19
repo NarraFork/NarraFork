@@ -211,6 +211,14 @@ api.readSpecTasks = async () =>
 		document: { tasks: [{ text: "Old spec task", status: "todo" }] },
 		compiled: null,
 	}) as never;
+// The session has nothing the old editor may have swallowed (12c has its own fixture).
+api.getSpecLossPage = async () => ({
+	items: [],
+	next: null,
+	counts: { open: 0, attached: 0, dismissed: 0 },
+	countCap: 1000,
+	canAct: false,
+});
 api.getUserPreferences = async () => ({}) as never;
 api.getSettings = async () => ({ agent: {}, outline: { enabled: true } }) as never;
 api.getNarrator = async () => ({ id: NARRATOR }) as never;

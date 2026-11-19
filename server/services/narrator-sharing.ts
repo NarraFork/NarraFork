@@ -37,6 +37,7 @@ import {
 	type NarratorPrincipal,
 	resolveAclRootId,
 } from "./narrator-acl";
+import { coordinatedTeamId } from "./teams/team-membership";
 
 export interface NarratorGrantView {
 	id: string;
@@ -607,7 +608,23 @@ async function announceAccessChange(
 	// change that names no affected users below.
 	eventBus.emit({ type: "narrator:access_changed", narratorId, reason });
 	try {
-		for (const userId of new Set(affectedUserIds)) {
+		const recipients = new Set(affectedUserIds);
+		// A team coordinator's audiences decide who is a member (M1), and a member's browser
+		// silences "waiting" alerts of team sessions it may only read. An audience change names
+		// nobody, so the people who have the coordinator or one of its subagents in their recent
+		// tabs (most recent first, at most TEAM_AUDIENCE_NOTICE_LIMIT) are told too, to re-read.
+		if (
+			(reason === "visibility_changed" || reason === "write_audience_changed") &&
+			coordinatedTeamId(narratorId)
+		) {
+			const { getRecentTabUserIdsForTeamTrees } = await import("./recent-tabs-service");
+			for (const userId of await getRecentTabUserIdsForTeamTrees(
+				{ coordinatorId: narratorId },
+				TEAM_AUDIENCE_NOTICE_LIMIT,
+			))
+				recipients.add(userId);
+		}
+		for (const userId of recipients) {
 			broadcastToUser(userId, { type: "narrator_access_changed", narratorId, reason });
 		}
 		await dropNarratorSubscriptionsForUnauthorizedUsers(narratorId);
@@ -639,6 +656,9 @@ async function announceAccessChange(
 		});
 	}
 }
+
+/** Recent-tab holders of a team coordinator told about an audience change (M1). */
+export const TEAM_AUDIENCE_NOTICE_LIMIT = 200;
 
 /**
  * Cap on how many subagents get their subscriptions swept on one ACL change.

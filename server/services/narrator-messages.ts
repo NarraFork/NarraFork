@@ -15,6 +15,7 @@ import {
 	isMetadataOnlyEmptyReasoningAssistantMessage,
 } from "@shared/reasoning-content";
 import { isClearedToolOutput } from "@shared/storage-retention";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -125,9 +126,11 @@ import {
 import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
+	assertNoLazyChildrenForHistoryRewriteTx,
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
+	prepareLazyChildrenForHistoryRewrite,
 } from "./narrator-refs-backfill";
 import {
 	authorizeRevertHistory,
@@ -136,6 +139,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
@@ -154,6 +158,7 @@ import {
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
+import { loadNestedSubagentSummaries } from "./subagent-nested";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -231,6 +236,65 @@ async function revertForDeletedBlocks(
 }
 
 type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+function minimumHistorySeqTx(
+	tx: Pick<MessageTx, "select">,
+	narratorId: string,
+	messageIds: string[],
+): number | null {
+	return (
+		tx
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq)
+			.limit(1)
+			.get()?.seq ?? null
+	);
+}
+
+/** Shared admissions are not mutexes: a fork can appear during any preparation yield. */
+async function withPreparedLazyHistoryRewrite<T>(
+	narratorId: string,
+	minimum: (tx: Pick<MessageTx, "select">) => number | null,
+	mutate: (tx: MessageTx) => T,
+	signal?: AbortSignal,
+): Promise<T> {
+	const deadlineAt = Date.now() + 10_000;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		signal?.throwIfAborted();
+		try {
+			const minSeq = minimum(db);
+			if (minSeq !== null)
+				await prepareLazyChildrenForHistoryRewrite(narratorId, minSeq, { signal, deadlineAt });
+			return db.transaction((tx) => {
+				signal?.throwIfAborted();
+				const currentMin = minimum(tx);
+				if (currentMin !== null)
+					assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, currentMin);
+				return mutate(tx);
+			});
+		} catch (error) {
+			if (
+				!(error instanceof AppError) ||
+				error.code !== "HISTORY_LAZY_DEPENDENCY_CHANGED" ||
+				attempt === 2
+			)
+				throw error;
+		}
+	}
+	throw new AppError(
+		"Derived history readers keep changing; retry the selection",
+		409,
+		"HISTORY_DELETE_STALE",
+	);
+}
+
 type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
 type BlockDeleteOptions = ScopedRevertOptions & {
@@ -633,6 +697,8 @@ function planBlockDeletions(
 			);
 		}
 	};
+	const minSeq = minimumHistorySeqTx(tx, narratorId, [...grouped.keys()]);
+	if (minSeq !== null) assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, minSeq);
 	const plans: BlockDeletionPlan[] = [];
 	for (const [messageId, indices] of grouped) {
 		const ref = tx.query.narratorMessageRefs
@@ -939,8 +1005,23 @@ async function deleteBlockSelection(
 	}
 	for (const indices of grouped.values()) indices.sort((a, b) => b - a);
 	if (grouped.size === 0) return { deleted: 0, failed: 0, results: [] };
-	const planned = db.transaction((tx) => planBlockDeletions(tx, narratorId, grouped, opts));
-	const version = JSON.stringify(planned);
+	for (const id of grouped.keys())
+		await ensureRefsCoverMessage(narratorId, id, { signal: opts?.signal });
+	const minimum = (tx: Pick<MessageTx, "select">) =>
+		minimumHistorySeqTx(tx, narratorId, [...grouped.keys()]);
+	let planned = await withPreparedLazyHistoryRewrite(
+		narratorId,
+		minimum,
+		(tx) => planBlockDeletions(tx, narratorId, grouped, opts),
+		opts?.signal,
+	);
+	let version = JSON.stringify(planned);
+	const selectionIdentity = (plan: typeof planned) =>
+		JSON.stringify({
+			messageVersion: plan.messageVersion,
+			plans: plan.plans.map(({ isShared: _shared, ...selected }) => selected),
+		});
+	const originalSelection = selectionIdentity(planned);
 	const toolUses = planned.plans.flatMap(({ message, removed }) =>
 		removed
 			.filter((block) => block.type === "tool_use")
@@ -970,56 +1051,79 @@ async function deleteBlockSelection(
 		}
 	}
 	const updatedMessageIds: Array<{ id: string; oldId?: string; seq: number }> = [];
-	const removedRefMessageIds = planned.plans
+	let removedRefMessageIds = planned.plans
 		.filter((plan) => plan.remaining.length === 0)
 		.map((plan) => plan.message.id);
 	let affectedQuestionIds: string[] = [];
-	const mutate = () =>
-		db.transaction((tx) => {
-			// Recheck refs, content, tool evidence and narrator version after async rollback.
-			// A drift rejects the whole transaction rather than following a moved index.
-			if (JSON.stringify(planBlockDeletions(tx, narratorId, grouped, opts)) !== version) {
-				throw new AppError(
-					"Message history changed during block deletion; retry the selection.",
-					409,
-					"HISTORY_DELETE_STALE",
-				);
-			}
-			affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
-				deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
-				deletedToolBlocks: toolUses.filter(
-					(block): block is { messageId: string; toolUseId: string } =>
-						typeof block.toolUseId === "string",
-				),
-			}).affectedQuestionIds;
-			insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
-			deleteOrphanedMessages(tx, planned.derived.messageIds);
-			for (const plan of planned.plans) {
-				const updatedId = applyBlockDeletionTx(tx, narratorId, plan, opts);
-				if (updatedId)
-					updatedMessageIds.push({
-						id: updatedId,
-						...(updatedId !== plan.message.id ? { oldId: plan.message.id } : {}),
-						seq: plan.ref.seq,
-					});
-			}
-			if (!opts?.skipNarratorUpdate) {
-				tx.update(narrators)
-					.set({
-						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-						messageVersion: sql`${narrators.messageVersion} + 1`,
-						contextUsageSnapshotJson: null,
-						updatedAt: new Date().toISOString(),
-					})
-					.where(eq(narrators.id, narratorId))
-					.run();
-			}
-		});
+	const mutate = (tx: MessageTx) => {
+		// Recheck refs, content, tool evidence and narrator version after async rollback.
+		// A drift rejects the whole transaction rather than following a moved index.
+		if (JSON.stringify(planBlockDeletions(tx, narratorId, grouped, opts)) !== version) {
+			throw new AppError(
+				"Message history changed during block deletion; retry the selection.",
+				409,
+				"HISTORY_DELETE_STALE",
+			);
+		}
+		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+			deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
+			deletedToolBlocks: toolUses.filter(
+				(block): block is { messageId: string; toolUseId: string } =>
+					typeof block.toolUseId === "string",
+			),
+		}).affectedQuestionIds;
+		insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
+		deleteOrphanedMessages(tx, planned.derived.messageIds);
+		for (const plan of planned.plans) {
+			const updatedId = applyBlockDeletionTx(tx, narratorId, plan, opts);
+			if (updatedId)
+				updatedMessageIds.push({
+					id: updatedId,
+					...(updatedId !== plan.message.id ? { oldId: plan.message.id } : {}),
+					seq: plan.ref.seq,
+				});
+		}
+		if (!opts?.skipNarratorUpdate) {
+			tx.update(narrators)
+				.set({
+					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		}
+	};
 	if (snapshotRevert) assertSnapshotRevertComplete(snapshotRevert);
 	try {
 		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
 		opts?.signal?.throwIfAborted();
-		withRetiredBlocks(byBlock?.retiredRows ?? [], mutate);
+		if (snapshotRevert) {
+			// A fixed file result cannot be silently paired with a newly prepared history plan.
+			withRetiredBlocks(byBlock?.retiredRows ?? [], () => db.transaction(mutate));
+		} else {
+			await withPreparedLazyHistoryRewrite(
+				narratorId,
+				minimum,
+				(tx) => {
+					const current = planBlockDeletions(tx, narratorId, grouped, opts);
+					if (selectionIdentity(current) !== originalSelection)
+						throw new AppError(
+							"Selected blocks changed during history preparation",
+							409,
+							"HISTORY_DELETE_STALE",
+						);
+					planned = current;
+					version = JSON.stringify(planned);
+					removedRefMessageIds = planned.plans
+						.filter((plan) => plan.remaining.length === 0)
+						.map((plan) => plan.message.id);
+					withRetiredBlocks(byBlock?.retiredRows ?? [], () => mutate(tx));
+				},
+				opts?.signal,
+			);
+		}
 	} catch (error) {
 		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
 		throw error;
@@ -1274,29 +1378,6 @@ function contextAskUtf8Length(value: unknown): number {
 	return contextAskTextEncoder.encode(JSON.stringify(value)).byteLength;
 }
 
-function getReflectionStatus(suggestions: unknown): string | null {
-	if (!Array.isArray(suggestions)) return null;
-	for (const suggestion of suggestions) {
-		if (!suggestion || typeof suggestion !== "object") continue;
-		const record = suggestion as { type?: unknown; status?: unknown };
-		const type = String(record.type ?? "");
-		if (
-			type === "danger_reflection" ||
-			type === "plan_reflection" ||
-			type === "task_reflection" ||
-			type === "question_reflection"
-		) {
-			return typeof record.status === "string" ? record.status : "running";
-		}
-	}
-	return null;
-}
-
-function shouldHidePendingPermission(suggestions: unknown): boolean {
-	const status = getReflectionStatus(suggestions);
-	return status !== null && status !== "awaiting_user";
-}
-
 /**
  * Delete genuinely unreferenced messages and their tool calls in the caller's
  * transaction. A retained ref aborts the whole mutation; it is never erased here.
@@ -1445,6 +1526,7 @@ function planMessageRangeDeletion(
 		throw new AppError("Selected history contains a missing message", 409, "HISTORY_DELETE_STALE");
 	const toolBlocks = assertNoRunningCompactMessagesTx(tx, messageIds);
 	reserve(toolBlocks.length);
+	if (refs.length) assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, refs[0].seq);
 	const allRefs =
 		messageIds.length > 0
 			? tx
@@ -1578,16 +1660,42 @@ async function deleteMessageRange(
 					.run(),
 			);
 		};
-		const planned = measureSync("transaction", () =>
-			db.transaction((tx) => {
-				const plan = measureSync("plan", () =>
-					planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
-				);
-				// History-only deletion needs no async gap: plan and mutation share this tx.
-				// A range with no file history needs no restore, so it commits the same way.
-				if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
-				return plan;
-			}),
+		await ensureRefsCoverMessage(narratorId, messageId, { signal: opts?.signal });
+		const minimum = (tx: Pick<MessageTx, "select">) => {
+			const boundary = minimumHistorySeqTx(tx, narratorId, [messageId]);
+			if (boundary === null) return null;
+			return (
+				tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							inclusive
+								? gte(narratorMessageRefs.seq, boundary)
+								: gt(narratorMessageRefs.seq, boundary),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq)
+					.limit(1)
+					.get()?.seq ?? null
+			);
+		};
+		const planned = await measureAsync("transaction", () =>
+			withPreparedLazyHistoryRewrite(
+				narratorId,
+				minimum,
+				(tx) => {
+					const plan = measureSync("plan", () =>
+						planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+					);
+					// History-only deletion needs no async gap: plan and mutation share this tx.
+					// A range with no file history needs no restore, so it commits the same way.
+					if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
+					return plan;
+				},
+				opts?.signal,
+			),
 		);
 		selectedMessageCount = planned.refs.length;
 		const messageIds = planned.refs.map((ref) => ref.messageId);
@@ -2347,6 +2455,12 @@ export interface SubagentActivity {
 	 * the payload does not grow for every card.
 	 */
 	takenOver?: boolean;
+	/**
+	 * The helpers this subagent launched itself (its one nested level), so the card on the
+	 * primary's page shows them and which one waits for a person. Absent when it has none.
+	 * Height-AFFECTING on the client: the card lists these rows.
+	 */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {
@@ -2521,6 +2635,8 @@ async function buildSubagentActivities(
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
+	// Same one-aggregate rule for the nested level: one bounded read for every card.
+	const nestedByNarrator = await loadNestedSubagentSummaries(narratorIds);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2552,6 +2668,9 @@ async function buildSubagentActivities(
 			// takeover set stays populated on purpose. Reading the raw set here re-lit
 			// the badge on every page load in that window.
 			...(isRunHeldForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			...(nestedByNarrator.has(owner.subagentNarratorId)
+				? { nested: nestedByNarrator.get(owner.subagentNarratorId) }
+				: {}),
 		});
 	}
 	return activities;
@@ -4814,84 +4933,89 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
-		const result = db.transaction((tx) => {
-			// Resolve the message through the caller-owned ref. The message owner is
-			// intentionally ignored because forked narrators share immutable history.
-			const currentRef = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				})
-				.sync();
-			const msg = fillBody(
-				tx.query.narratorMessages
+		await ensureRefsCoverMessage(narratorId, messageId);
+		const result = await withPreparedLazyHistoryRewrite(
+			narratorId,
+			(tx) => minimumHistorySeqTx(tx, narratorId, [messageId]),
+			(tx) => {
+				// Resolve the message through the caller-owned ref. The message owner is
+				// intentionally ignored because forked narrators share immutable history.
+				const currentRef = tx.query.narratorMessageRefs
 					.findFirst({
-						...bodyColumns(),
-						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
 					})
-					.sync(),
-			);
-			if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
-
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) throw new ValidationError("Message is not a compact message");
-			if (compactBlock.status === "compacting") {
-				throw new AppError(
-					"A running compact must be cancelled before its marker can be deleted",
-					409,
-					"COMPACT_IN_PROGRESS",
+					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							...bodyColumns(),
+							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						})
+						.sync(),
 				);
-			}
+				if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
 
-			const previousCompact = tx
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.isCompact, 1),
-						lt(narratorMessageRefs.seq, currentRef.seq),
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(1)
-				.all();
+				const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+				const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+				if (!compactBlock) throw new ValidationError("Message is not a compact message");
+				if (compactBlock.status === "compacting") {
+					throw new AppError(
+						"A running compact must be cancelled before its marker can be deleted",
+						409,
+						"COMPACT_IN_PROGRESS",
+					);
+				}
 
-			// Delete only this narrator's ref. A sibling fork keeps its own view of
-			// the shared marker and its message row remains alive while referenced.
-			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, currentRef.id)).run();
-			const remainingRef = tx.query.narratorMessageRefs
-				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
-				.sync();
-			if (!remainingRef) {
-				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
+				const previousCompact = tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							lt(narratorMessageRefs.seq, currentRef.seq),
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(1)
+					.all();
 
-			const now = new Date().toISOString();
-			tx.update(narrators)
-				.set({
-					...(compactBlock.status === "compacted"
-						? {
-								contextSummary: null,
-								contextSummaryChars: 0,
-								apiConversationId: null,
-							}
-						: {}),
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+				// Delete only this narrator's ref. A sibling fork keeps its own view of
+				// the shared marker and its message row remains alive while referenced.
+				deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, currentRef.id)).run();
+				const remainingRef = tx.query.narratorMessageRefs
+					.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+					.sync();
+				if (!remainingRef) {
+					tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+					tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+				}
 
-			return {
-				previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
-			};
-		});
+				const now = new Date().toISOString();
+				tx.update(narrators)
+					.set({
+						...(compactBlock.status === "compacted"
+							? {
+									contextSummary: null,
+									contextSummaryChars: 0,
+									apiConversationId: null,
+								}
+							: {}),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+
+				return {
+					previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
+				};
+			},
+		);
 		queueContextCharacterRefresh(narratorId);
 		return result;
 	},
@@ -5367,58 +5491,63 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const result = db.transaction((tx) => {
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				})
-				.sync();
-			const msg = fillBody(
-				tx.query.narratorMessages
+		await ensureRefsCoverMessage(narratorId, messageId);
+		const result = await withPreparedLazyHistoryRewrite(
+			narratorId,
+			(tx) => minimumHistorySeqTx(tx, narratorId, [messageId]),
+			(tx) => {
+				const ref = tx.query.narratorMessageRefs
 					.findFirst({
-						...bodyColumns(),
-						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
 					})
-					.sync(),
-			);
-			if (!msg || !ref) throw new NotFoundError("Message", messageId);
+					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							...bodyColumns(),
+							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						})
+						.sync(),
+				);
+				if (!msg || !ref) throw new NotFoundError("Message", messageId);
 
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks
-				.map(parseCompactMessageBlock)
-				.find((block) => block?.status === "compacted");
-			if (!compactBlock) throw new ValidationError("Message is not a compacted message");
+				const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+				const compactBlock = blocks
+					.map(parseCompactMessageBlock)
+					.find((block) => block?.status === "compacted");
+				if (!compactBlock) throw new ValidationError("Message is not a compacted message");
 
-			const isPlan = compactBlock.subtype === "plan";
-			const newBlock = { ...compactBlock, summary };
-			const prefix = isPlan ? "[Plan]" : "[Compact]";
-			const now = new Date().toISOString();
-			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
+				const isPlan = compactBlock.subtype === "plan";
+				const newBlock = { ...compactBlock, summary };
+				const prefix = isPlan ? "[Plan]" : "[Compact]";
+				const now = new Date().toISOString();
+				const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
 
-			writeEnvelopeBody(tx, copied.messageId, [newBlock], {
-				allowHistoryRewrite: true,
-				set: {
-					contextCharsJson: { segments: [] },
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-				},
-			});
+				writeEnvelopeBody(tx, copied.messageId, [newBlock], {
+					allowHistoryRewrite: true,
+					set: {
+						contextCharsJson: { segments: [] },
+						contentText: `${prefix} ${summary.slice(0, 200)}...`,
+					},
+				});
 
-			tx.update(narrators)
-				.set({
-					contextSummary: summary,
-					contextSummaryChars: measureSummaryCharacters(summary),
-					apiConversationId: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-			return copied.messageId;
-		});
+				tx.update(narrators)
+					.set({
+						contextSummary: summary,
+						contextSummaryChars: measureSummaryCharacters(summary),
+						apiConversationId: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+				return copied.messageId;
+			},
+		);
 		queueContextCharacterRefresh(narratorId, result);
 		return result;
 	},

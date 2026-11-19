@@ -37,6 +37,7 @@ import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/
 import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
+import { TEAM_TOOL_NAME } from "../../lib/agent/tools/team";
 import type { ToolDefinition } from "../../lib/agent/types";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
@@ -53,6 +54,7 @@ import {
 import {
 	isBotNarrator,
 	isPlanModeTrait,
+	isTeamNarrator,
 	parseSubstatus,
 	redactDraftTraits,
 } from "../../lib/narrator-utils";
@@ -63,6 +65,8 @@ import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
 	getBotModePrompt,
 	getRunDeliveryHint,
+	getTeamBriefSection,
+	getTeamLeadPrompt,
 	getToolMessage,
 	getToolMessageWithParams,
 	type Locale,
@@ -228,6 +232,8 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
+import { coordinatorToolAnnotatorFor, forgetCoordinatorRun } from "../teams/coordinator-limits";
+import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -240,7 +246,7 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop } from "../update-coordinator";
+import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
@@ -251,7 +257,7 @@ import {
 	dropDeferredPlanApproval,
 	runDeferredPlanApproval,
 } from "./plan-approval-restart";
-import { type RuntimePolicy, runtimeAwaitTargets, runtimeInteractionHint } from "./policy";
+import { type RuntimePolicy, runtimeInteractionHint, runtimeWatchTargets } from "./policy";
 import { preparePrefixRequest, type RequestModelIdentity } from "./prepare-prefix-request";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
@@ -349,10 +355,17 @@ export function runtimeBasePrompt(
 	row: RuntimeSourceRow & { systemPrompt: string | null; traits?: unknown },
 	locale: Locale,
 	policy: RuntimePolicy,
+	/** A team subagent's team brief (`teamBriefForSubagent`), read for this request. */
+	teamBrief?: string | null,
 ): string | null {
 	const base = row.systemPrompt ?? settings.agent.defaultSystemPrompt ?? null;
 	const sections: string[] = [];
 	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
+	// A team coordinator's duties are a protocol like the bot's: after its own prompt.
+	if (isTeamNarrator(row.traits)) sections.push(getTeamLeadPrompt(locale));
+	// The team's shared rules follow every team subagent's own prompt (both levels).
+	const brief = getTeamBriefSection(locale, teamBrief ?? null);
+	if (brief) sections.push(brief);
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
@@ -933,6 +946,8 @@ export async function runAgentLoopUnlocked(
 		// An outline session moves its old fence text to its behavior page once, before its first
 		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
 		await prepareOutlineRun(active);
+		// A team coordinator's status (Project Teams P2) is written on the first pass of the run.
+		let teamRunStart = true;
 		while (active.alive && owner.isCurrent()) {
 			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
@@ -1001,6 +1016,23 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			// A nested helper's gates and status reach its root's page too (also after a restart).
+			const { rememberNestedSubagentRoot } = await import("../nested-subagent-routing");
+			rememberNestedSubagentRoot(freshNarrator);
+			// A team coordinator (Project Teams P2): the team status is a history row written
+			// before this pass reads its history, at run start and after a compaction; the
+			// soft-limit reminders ride on its tool results. Never in the system prompt.
+			const teamCoordinator =
+				!placement && freshNarrator.type === "primary" && isTeamNarrator(freshNarrator.traits);
+			if (teamCoordinator && !active.abortController.signal.aborted)
+				await writeTeamStatusAtPass({
+					narratorId,
+					locale,
+					compactSeq: baselineCompactSeq,
+					runStart: teamRunStart,
+					contextPercent: active._contextUsagePct,
+				});
+			teamRunStart = false;
 			// Effective traits and the capability ceiling, resolved strictly once per pass
 			// so a layer or source change applies from the next pass. A layer that cannot
 			// be read fails the pass; it never runs without its restrictions.
@@ -1136,6 +1168,8 @@ export async function runAgentLoopUnlocked(
 				// Reflection decisions must exist in the parent's immutable declaration set.
 				if (tool.reflectionOnly) return true;
 				if (tool.isAvailable && !tool.isAvailable()) return false;
+				// The Team tool is a coordinator's own: offered to team-trait primaries only.
+				if (tool.name === TEAM_TOOL_NAME && !teamCoordinator) return false;
 				if (!profileToolFilter(tool)) return false;
 				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 				if (active._disabledTools.has(tool.name)) return false;
@@ -1304,7 +1338,12 @@ export async function runAgentLoopUnlocked(
 					{
 						systemPrompt: currentOAuth
 							? (currentOAuth.systemPrompt ?? null)
-							: runtimeBasePrompt(current, locale, runtimePolicy),
+							: runtimeBasePrompt(
+									current,
+									locale,
+									runtimePolicy,
+									(await import("../teams/team-membership")).teamBriefForSubagent(current),
+								),
 						contextSummary: current.contextSummary,
 					},
 					active.cwd,
@@ -1360,7 +1399,7 @@ export async function runAgentLoopUnlocked(
 						runtimeHints: [
 							"Tool declarations are retained for history compatibility; only currently available tools may execute.",
 							`Runtime capabilities: ${JSON.stringify(runtimePolicy.capabilities)}`,
-							`Await targets: ${runtimeAwaitTargets(runtimePolicy).join(", ")}. Reflection-only tools may only execute in their matching active reflection gate.`,
+							`Watch targets: ${runtimeWatchTargets(runtimePolicy).join(", ")}. Watch registers immediately; end the turn to receive its notification. Await is retired and cannot execute. Reflection-only tools may only execute in their matching active reflection gate.`,
 							`Send user targets: ${isBotNarrator(current.traits) ? "available (bot)" : "unavailable"}; Send resume model and Stop agent: ${runtimePolicy.capabilities.spawnAgent ? "available" : "unavailable"}.`,
 							shouldUseNativeSearch(model.provider, model.model)
 								? "Use the provider-native web_search capability for web searches."
@@ -1852,6 +1891,8 @@ export async function runAgentLoopUnlocked(
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Providers may surface teardown errors as events rather than throws.
+					await waitForRestartBeforeFailure(active.abortController.signal);
 					// A plan approval still waiting for its response to finish never restarted
 					// the pass: this ending is an ordinary interruption or failure, and the
 					// partial response must be kept, not cleaned up as an approval abort.
@@ -1867,7 +1908,7 @@ export async function runAgentLoopUnlocked(
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
-					if (message === "Aborted") {
+					if (message === "Aborted" || active.abortController.signal.aborted) {
 						if (
 							active._planApprovedContinue === "compact" ||
 							active._planApprovedContinue === "continue"
@@ -1950,6 +1991,9 @@ export async function runAgentLoopUnlocked(
 				taskBackend,
 				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
+				annotateToolResult: teamCoordinator
+					? coordinatorToolAnnotatorFor(narratorId, locale)
+					: undefined,
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,
@@ -2828,6 +2872,11 @@ export async function runAgentLoopUnlocked(
 				if (placement) {
 					const payment = result.paymentRequired;
 					for (const recipient of [narratorId, placement.parentNarratorId]) {
+						// The parent copy is tagged like every other dual-broadcast frame: a
+						// child running out of balance must not make the parent page open its
+						// own recharge dialog.
+						const isParentCopy =
+							recipient === placement.parentNarratorId && recipient !== narratorId;
 						broadcastToNarrator(recipient, {
 							type: "payment_required",
 							narratorId: recipient,
@@ -2836,6 +2885,7 @@ export async function runAgentLoopUnlocked(
 							balance: payment.balance,
 							required: payment.required,
 							resumeAction: payment.resumeAction,
+							...(isParentCopy && { isSubagent: true }),
 						});
 					}
 				}
@@ -3582,6 +3632,9 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
+		// Keep the run active for the next process instead of publishing a false failure.
+		await waitForRestartBeforeFailure(active.abortController.signal);
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
@@ -3593,30 +3646,36 @@ export async function runAgentLoopUnlocked(
 			}
 			pendingBufferedDelivery = undefined;
 		}
-		const errorMsg = serializeCatalogErrorMessage(err);
-		logger.error("Narrator loop error", {
-			narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		try {
-			await withDbRetry(
-				() =>
-					updateTerminalStatus({
-						substatus: ["error"],
-						errorMessage: errorMsg,
-					}),
-				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
-			);
-		} catch (statusErr) {
-			logger.error("Failed to persist narrator error status", {
+		if (active.abortController.signal.aborted) {
+			runState.wasInterrupted = true;
+		} else {
+			const errorMsg = serializeCatalogErrorMessage(err);
+			logger.error("Narrator loop error", {
 				narratorId,
-				error: String(statusErr),
+				error: err instanceof Error ? err.message : String(err),
 			});
+			try {
+				await withDbRetry(
+					() =>
+						updateTerminalStatus({
+							substatus: ["error"],
+							errorMessage: errorMsg,
+						}),
+					{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
+				);
+			} catch (statusErr) {
+				logger.error("Failed to persist narrator error status", {
+					narratorId,
+					error: String(statusErr),
+				});
+			}
+			runState.finalText = errorMsg;
+			runState.hadError = true;
+			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
-		runState.finalText = errorMsg;
-		runState.hadError = true;
-		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
+		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
+		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
 		// started that ended by itself are given back with a handoff (not waited for).

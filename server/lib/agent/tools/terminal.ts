@@ -1,12 +1,12 @@
 import type { IMarker } from "@xterm/headless";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
 import { terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
 import {
+	createWatchFrameMatcher,
 	DEFAULT_WATCH_TIMEOUT_MS,
-	echoEnd,
 	MAX_WATCH_PATTERN_CHARS,
 	MAX_WATCH_TIMEOUT_MS,
 	MIN_WATCH_TIMEOUT_MS,
@@ -14,16 +14,19 @@ import {
 	startTerminalWatch,
 	type WatchStart,
 } from "../../../services/terminal-watch-service";
+import { cancelWatchRegistration } from "../../../services/watch-observation";
 import type { BufferManager, BufferReadCursor } from "../../../terminal/buffer-manager";
 import { truncateOutput } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
+import { processTerminalEscapes } from "./terminal-escapes";
 
 /** Successful tool snapshots are the only authority for the next read/watch frontier. */
 interface ReadCursorState {
 	length?: number;
 	buffer?: BufferManager;
 	sequence?: number;
+	layoutRevision?: number;
 	observation?: BufferReadCursor;
 }
 
@@ -51,17 +54,22 @@ function beginReadObservation(narratorId: string, terminalId: string) {
 		if (oldest !== undefined) discardReadCursor(oldest);
 	}
 	let candidate:
-		| { buffer: BufferManager; cursor: BufferReadCursor | undefined; sequence: number }
+		| {
+				buffer: BufferManager;
+				cursor: BufferReadCursor | undefined;
+				sequence: number;
+				layoutRevision: number;
+		  }
 		| undefined;
 	return {
 		observe(buffer: BufferManager, cursor: BufferReadCursor | undefined, sequence: number) {
 			candidate?.cursor?.dispose();
-			candidate = { buffer, cursor, sequence };
+			candidate = { buffer, cursor, sequence, layoutRevision: buffer.layoutRevision };
 		},
 		previousLength(): number | undefined {
 			if (readCursors.get(key) !== state || state.buffer !== candidate?.buffer) return undefined;
 			if (!!state.observation !== !!candidate?.cursor) return undefined;
-			if (state.observation?.layoutRevision !== candidate?.cursor?.layoutRevision) return undefined;
+			if (state.layoutRevision !== candidate?.layoutRevision) return undefined;
 			return state.length;
 		},
 		commit(length: number) {
@@ -79,6 +87,7 @@ function beginReadObservation(narratorId: string, terminalId: string) {
 			state.length = length;
 			state.buffer = candidate?.buffer;
 			state.sequence = candidate?.sequence;
+			state.layoutRevision = candidate?.layoutRevision;
 			state.observation = candidate?.cursor;
 			candidate = undefined;
 		},
@@ -150,6 +159,9 @@ async function assertTerminalAccess(
 	};
 }
 
+/** Terminals of each status a name lookup looks through. */
+const TERMINAL_NAME_LOOKUP_LIMIT = 200;
+
 /**
  * Resolve a terminal identifier (ID or name) to a real terminal ID.
  * First tries an exact ID lookup, then falls back to matching by name
@@ -166,18 +178,19 @@ async function resolveTerminalId(
 	});
 	if (byId) return { id: byId.id };
 
-	// 2. Fallback: search by name among accessible terminals
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true },
-	});
-
-	const all = narratorTerminals;
-
-	// Exact name match (case-insensitive)
+	// 2. Fallback: by name (case-insensitive) among this narrator's terminals, running ones
+	// first (only they take input; an exited one may share the name), then the newest exited.
 	const nameLower = idOrName.toLowerCase();
-	const match = all.find((t) => t.name.toLowerCase() === nameLower);
-	if (match) return { id: match.id };
+	for (const status of ["running", "exited"] as const) {
+		const candidates = await db.query.terminals.findMany({
+			where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
+			columns: { id: true, name: true },
+			orderBy: (t, { desc }) => [desc(t.createdAt)],
+			limit: TERMINAL_NAME_LOOKUP_LIMIT,
+		});
+		const match = candidates.find((t) => t.name.toLowerCase() === nameLower);
+		if (match) return { id: match.id };
+	}
 
 	return {
 		error: `Terminal not found: "${idOrName}". Use action 'list' to see available terminals.`,
@@ -194,32 +207,31 @@ export const terminalTool: ToolDefinition = {
 		"On the first read (or after a buffer reset), the full buffer is returned. " +
 		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
-		"To wait for something to appear, do not poll with 'read': " +
-		"pass 'notify_on' with 'write' (wait for the command you are sending), or use action 'watch' " +
-		"(watch output since this session's last successful read/write, or from now if no cached observation exists). " +
-		"Use start_at: 'now' for only the next occurrence. A watch matches text, not a command's exit status; " +
-		"unobserved output may include commands typed by a human. Only successful read/write snapshots advance the observation. " +
-		"Both start a background watch and return at once; end your turn and you will be notified " +
+		"To observe output, use the Watch tool with type 'terminal'; do not poll with 'read'. " +
+		"For atomic send-and-observe, pass 'notify_on' with 'write'. This uses the same Watch service, " +
+		"starts before sending input, and excludes the command's echo. " +
+		"It starts a background watch and returns at once; end your turn and you will be notified " +
 		"with the matching output when the text appears, or when the watch times out or the " +
 		"terminal exits. Stop({ type: 'bash', id }) cancels a watch. " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"The 'terminal_id' parameter accepts either a terminal ID or a terminal name. " +
+		"A terminal is an unfenced shell: what you type is not checked line by line. Using the " +
+		"tool is permitted as a whole by the session's permission mode, so never type into a " +
+		"terminal what you would not be allowed to run with Bash. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
 		"NOT for running one-off commands — use Bash for that: it returns when the command exits, " +
 		"with its exit code, and needs no completion marker.",
 	parameters: z.object({
 		action: z
-			.enum(["read", "write", "watch", "list", "create", "rename"])
+			.enum(["read", "write", "list", "create", "rename"])
 			.describe(
-				"The action to perform: 'read' buffer, 'write' input, 'watch' for a pattern, " +
-					"'list' terminals, 'create' a new terminal, or 'rename' an existing terminal",
+				"The action to perform: 'read' buffer, 'write' input, 'list' terminals, " +
+					"'create' a new terminal, or 'rename' an existing terminal. Use Watch to observe output.",
 			),
 		terminal_id: z
 			.string()
 			.optional()
-			.describe(
-				"Terminal ID or name to interact with. Required for 'read', 'write', 'watch' and 'rename'.",
-			),
+			.describe("Terminal ID or name to interact with. Required for 'read', 'write' and 'rename'."),
 		input: z
 			.string()
 			.optional()
@@ -252,51 +264,20 @@ export const terminalTool: ToolDefinition = {
 					"appears within the few seconds 'write' waits for output, the result says so and no " +
 					"watch is started. Case-sensitive substring of the rendered screen text.",
 			),
-		pattern: z
-			.string()
-			.max(MAX_WATCH_PATTERN_CHARS)
-			.optional()
-			.describe(
-				"For 'watch': case-sensitive substring of rendered output since this session's last " +
-					"successful read/write snapshot. Older observed text is excluded, including occurrences merely moving " +
-					"inside its prefix; new appended rows are matched independently. Indistinguishable same-prefix redraws " +
-					"are not proof of a new occurrence. With no cached observation, starts now. A horizontal resize " +
-					"ends an active watch: read and register a new one without resending input.",
-			),
-		start_at: z
-			.enum(["last_observation", "now"])
-			.optional()
-			.describe(
-				"For 'watch': last_observation (default) includes output that arrived after the last " +
-					"successful read/write but before registration. now waits only for the next occurrence. " +
-					"Observations expire on reset, reattach, column resize or cache eviction. This is not a command boundary.",
-			),
 		timeout: looseNumber(
-			`For 'watch', and for 'write' with 'notify_on': seconds before the watch gives up and ` +
+			`For 'write' with 'notify_on': seconds before the watch gives up and ` +
 				`notifies you (default ${DEFAULT_WATCH_TIMEOUT_MS / 1000}, max ${MAX_WATCH_TIMEOUT_MS / 1000}).`,
 		),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const {
-			action,
-			terminal_id,
-			input,
-			name,
-			last_n_lines,
-			notify_on,
-			pattern,
-			timeout,
-			start_at,
-		} = args as {
-			action: "read" | "write" | "watch" | "list" | "create" | "rename";
+		const { action, terminal_id, input, name, last_n_lines, notify_on, timeout } = args as {
+			action: "read" | "write" | "list" | "create" | "rename";
 			terminal_id?: string;
 			input?: string;
 			name?: string;
 			last_n_lines?: number;
 			notify_on?: string;
-			pattern?: string;
 			timeout?: number;
-			start_at?: "last_observation" | "now";
 		};
 		const timeoutMs =
 			(normalizeNumber(timeout, {
@@ -356,26 +337,6 @@ export const terminalTool: ToolDefinition = {
 				}
 				return await writeInput(resolved.id, ctx, input, notify_on, timeoutMs);
 			}
-			case "watch": {
-				if (!terminal_id) {
-					return { output: "terminal_id is required for 'watch' action", isError: true };
-				}
-				if (pattern && pattern.length > MAX_WATCH_PATTERN_CHARS) {
-					return {
-						output: `Watch pattern exceeds ${MAX_WATCH_PATTERN_CHARS} characters.`,
-						isError: true,
-					};
-				}
-				if (!pattern || normalizeWatchPattern(pattern).trim() === "") {
-					return { output: "pattern is required for 'watch' action", isError: true };
-				}
-				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
-				if ("error" in resolved) {
-					return { output: resolved.error, isError: true };
-				}
-				return await watchTerminal(resolved.id, ctx, pattern, timeoutMs, start_at);
-			}
-
 			default:
 				return { output: `Unknown action: ${action}`, isError: true };
 		}
@@ -537,27 +498,20 @@ async function startWatch(
 	terminalId: string,
 	terminalName: string,
 	ctx: ToolContext,
-	pattern: string,
+	pattern: string | undefined,
 	timeoutMs: number,
-	buffer: BufferManager,
-	marker: IMarker,
-	start: WatchStart,
+	buffer?: BufferManager,
+	marker?: IMarker,
+	start?: WatchStart,
 	point?: BufferReadCursor,
+	matchFrame?: ReturnType<typeof createWatchFrameMatcher>,
 ): Promise<ToolResult> {
-	if (terminalService.getActiveBuffer(terminalId) !== buffer) {
+	if (pattern !== undefined && terminalService.getActiveBuffer(terminalId) !== buffer) {
 		if (point) point.dispose();
-		else marker.dispose();
+		else marker?.dispose();
 		return {
 			output:
 				"Terminal connection changed; no watch was registered. Read the terminal before continuing; do not resend input automatically.",
-			isError: true,
-		};
-	}
-	if (point && point.layoutRevision !== buffer.layoutRevision) {
-		point.dispose();
-		return {
-			output:
-				"Terminal layout changed; no watch was registered. Read the terminal and register a new watch; do not resend input automatically.",
 			isError: true,
 		};
 	}
@@ -568,6 +522,26 @@ async function startWatch(
 		pattern,
 		timeoutMs,
 		buffer,
+		readLifecycleState:
+			pattern === undefined
+				? async () => {
+						const current = await db.query.terminals.findFirst({
+							where: eq(terminals.id, terminalId),
+							columns: { status: true },
+						});
+						if (current?.status === "exited") return "exited";
+						if (
+							!current ||
+							!terminalService.isAttached(terminalId) ||
+							(buffer && terminalService.getActiveBuffer(terminalId) !== buffer)
+						) {
+							return "disconnected";
+						}
+						return "running";
+					}
+				: undefined,
+		cursor: point,
+		matchFrame,
 		layoutRevision: point?.layoutRevision,
 		marker,
 		observedEndMarker: point?.observedEndMarker,
@@ -575,46 +549,89 @@ async function startWatch(
 		prefixUnknown: point?.prefixUnknown,
 		start,
 		toolUseId: ctx.currentToolUseId,
+		registrationSignal: ctx.signal,
 	});
+	if (ctx.signal.aborted) {
+		if (started.status === "started") await cancelWatchRegistration(started.observation);
+		return makeAbortedResult(terminalName);
+	}
 	if (started.status === "error") return { output: started.message, isError: true };
 	return {
 		output:
-			`Watching terminal "${terminalName}" for ${JSON.stringify(normalizeWatchPattern(pattern))} ` +
+			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +
 			`(background task "${started.alias}", times out in ${Math.round(timeoutMs / 1000)}s). ` +
-			"End your turn or continue other work; you will be notified with the matching output, or " +
-			`when the watch times out or the terminal exits or changes layout. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
+			"End your turn or continue other work; you will be notified " +
+			(pattern
+				? "with the matching output, or when the watch times out, its observation budget expires or the terminal exits. "
+				: "when the terminal exits/closes, disconnects, or the observation reaches its deadline; no terminal text is read. ") +
+			`Stop({ type: "bash", id: "${started.alias}" }) cancels only the observation.`,
 		title: terminalName,
+		metadata: {
+			kind: "watch",
+			type: "terminal",
+			id: terminalId,
+			targetId: terminalId,
+			watchId: started.taskId,
+			watchAlias: started.alias,
+			status: "watching",
+		},
 	};
 }
 
-async function watchTerminal(
+export async function watchTerminal(
 	terminalId: string,
 	ctx: ToolContext,
-	pattern: string,
+	pattern: string | undefined,
 	timeoutMs: number,
 	startAt: "last_observation" | "now" = "last_observation",
 ): Promise<ToolResult> {
+	const resolved = await resolveTerminalId(terminalId, ctx.narratorId);
+	if ("error" in resolved) return { output: resolved.error, isError: true };
+	terminalId = resolved.id;
 	const access = await assertTerminalAccess(terminalId, ctx.narratorId);
 	if (!access.allowed) return { output: access.error, isError: true };
 	const { terminal } = access;
 	if (ctx.signal.aborted) return makeAbortedResult(terminal.name);
 	if (terminal.status === "exited") {
-		return { output: "Terminal has exited. Cannot watch it.", isError: true };
+		return {
+			output: "Terminal has exited; no observation is needed.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "exited" },
+		};
 	}
-	if (!terminalService.isAttached(terminalId) && !(await terminalService.reattach(terminalId))) {
-		return { output: "Terminal is not attached (no active PTY connection).", isError: true };
+	const attached =
+		terminalService.isAttached(terminalId) || (await terminalService.reattach(terminalId));
+	if (ctx.signal.aborted) return makeAbortedResult(terminal.name);
+	if (!attached) {
+		// The status captured by the access check may predate the exit that made
+		// reattachment fail. Do not mislabel that lifecycle boundary as a detach.
+		const current =
+			pattern === undefined
+				? await db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+						columns: { status: true },
+					})
+				: undefined;
+		if (current?.status === "exited") {
+			return {
+				output: "Terminal has exited; no observation is needed.",
+				metadata: { kind: "watch", type: "terminal", id: terminalId, status: "exited" },
+			};
+		}
+		return {
+			output: "Terminal is disconnected; no live PTY can be observed. Nothing was sent.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "disconnected" },
+		};
 	}
 	const buffer = terminalService.getActiveBuffer(terminalId);
+	if (pattern === undefined) {
+		// Exit/deadline observation must also work in vim/top or when text reads
+		// are unavailable. Do not touch (or replace) the last text observation.
+		return startWatch(terminalId, terminal.name, ctx, pattern, timeoutMs, buffer);
+	}
 	const key = cursorKey(ctx.narratorId, terminalId);
 	const previous = readCursors.get(key);
 	if (previous?.buffer && previous.buffer !== buffer) discardReadCursor(key);
-	let source = startAt === "now" ? undefined : readCursors.get(key)?.observation;
-	if (source && source.layoutRevision !== buffer?.layoutRevision) {
-		// A marker tracks rows, not a column inside a reflowed row. Reusing its
-		// prefix after horizontal resize could mistake already-observed text for new.
-		discardReadCursor(key);
-		source = undefined;
-	}
+	const source = startAt === "now" ? undefined : readCursors.get(key)?.observation;
 	const trimmed = !!source?.marker.isDisposed;
 	// Cloning is synchronous and preserves the old prefix. Reading a new baseline
 	// here would consume exactly the output in the tool-to-tool registration gap.
@@ -622,8 +639,8 @@ async function watchTerminal(
 	if (!buffer || !point) {
 		return {
 			output:
-				"Cannot watch this terminal right now: no live normal buffer is available (a full-screen program may be active).",
-			isError: true,
+				"No live normal buffer is available (a full-screen program may be active); no observation was registered.",
+			metadata: { kind: "watch", type: "terminal", id: terminalId, status: "unavailable" },
 		};
 	}
 	if (ctx.signal.aborted) {
@@ -708,8 +725,9 @@ async function writeInput(
 	}
 	const echoBuffer =
 		notifyOn === undefined ? undefined : terminalService.getActiveBuffer(terminalId);
-	const marker = notifyOn === undefined ? undefined : await echoBuffer?.markCursorRow();
-	if (notifyOn !== undefined && !marker) {
+	const echoPoint = notifyOn === undefined ? undefined : await echoBuffer?.markReadCursor();
+	const marker = echoPoint?.marker;
+	if (notifyOn !== undefined && !echoPoint) {
 		return {
 			output:
 				"Cannot use notify_on right now: a full-screen program (alternate screen) is active. Nothing was sent.",
@@ -728,7 +746,7 @@ async function writeInput(
 				isError: true,
 			};
 		}
-		const processed = processEscapes(input);
+		const processed = processTerminalEscapes(input);
 		terminalService.write(terminalId, processed);
 		const deadline = Date.now() + WRITE_SETTLE_TIMEOUT_MS;
 		let lastChangeTime = Date.now();
@@ -769,7 +787,7 @@ async function writeInput(
 			if (!result.isError) observation?.commit(fullText.length);
 			return result;
 		};
-		if (notifyOn !== undefined && marker) {
+		if (notifyOn !== undefined && marker && echoPoint) {
 			if (!echoBuffer || terminalService.getActiveBuffer(terminalId) !== echoBuffer) {
 				return {
 					output:
@@ -779,7 +797,9 @@ async function writeInput(
 				};
 			}
 			const pattern = normalizeWatchPattern(notifyOn);
-			const { text: fromMarker } = await echoBuffer.readFromMarker(marker);
+			const frames = await echoBuffer.readCursor(echoPoint);
+			const watchStart: WatchStart = { kind: "echo", input: processed };
+			const matchFrame = createWatchFrameMatcher(pattern, watchStart);
 			if (signal.aborted) return makeAbortedResult(terminal.name ?? terminalId);
 			if (terminalService.getActiveBuffer(terminalId) !== echoBuffer) {
 				return {
@@ -789,8 +809,15 @@ async function writeInput(
 					title: terminal.name ?? terminalId,
 				};
 			}
-			const start = echoEnd(fromMarker, processed);
-			if (start !== undefined && fromMarker.indexOf(pattern, start) !== -1) {
+			for (const frame of frames) {
+				if (frame.kind === "error") {
+					return {
+						output: `Input was sent, but ${frame.message}. Read the terminal before continuing; do not resend input automatically.`,
+						isError: true,
+						title: terminal.name ?? terminalId,
+					};
+				}
+				if (matchFrame(frame) === -1) continue;
 				const truncated = truncateOutput(
 					`(${JSON.stringify(pattern)} already appeared; no watch was started)\n\n${body}`,
 				);
@@ -809,10 +836,9 @@ async function writeInput(
 				timeoutMs,
 				echoBuffer,
 				marker,
-				{
-					kind: "echo",
-					input: processed,
-				},
+				watchStart,
+				echoPoint,
+				matchFrame,
 			);
 			const truncated = truncateOutput(`${watch.output}\n\n${body}`);
 			return finish({
@@ -837,19 +863,6 @@ async function writeInput(
 		});
 	} finally {
 		observation?.dispose();
-		if (!markerOwned) marker?.dispose();
+		if (!markerOwned) echoPoint?.dispose();
 	}
-}
-
-/**
- * Process common escape sequences in user-provided input strings.
- * Converts literal backslash-escaped sequences to their actual byte values.
- */
-function processEscapes(input: string): string {
-	return input
-		.replace(/\\n/g, "\n")
-		.replace(/\\r/g, "\r")
-		.replace(/\\t/g, "\t")
-		.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
-		.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
 }

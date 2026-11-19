@@ -9,7 +9,7 @@ beforeAll(() => {
 });
 
 const SANS =
-	"-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji";
+	'ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif';
 
 /**
  * The xs body line the measure layer reads live: 20 at the default setting (the

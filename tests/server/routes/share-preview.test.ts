@@ -1,10 +1,16 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
-import { SHARE_HTML_MAX_BYTES, SHARE_TEXT_MAX_BYTES } from "../../../shared/share-preview";
+import { WorkerHandle } from "../../../server/lib/worker-runtime/lifecycle";
+import {
+	SHARE_HTML_MAX_BYTES,
+	SHARE_HTML_OUTPUT_MAX_BYTES,
+	SHARE_HTML_TIMEOUT_MS,
+	SHARE_TEXT_MAX_BYTES,
+} from "../../../shared/share-preview";
 
 const home = await mkdtemp(join(tmpdir(), "nf-share-preview-"));
 const oldHome = process.env.NARRAFORK_HOME;
@@ -14,9 +20,74 @@ const { createShare, revokeShareRegistry } = await import("../../../server/lib/s
 const { AppError } = await import("../../../server/lib/errors");
 const { narraforkDir } = await import("../../../server/lib/settings");
 const { shareFileTool } = await import("../../../server/lib/agent/tools/share-file");
-const { renderShareHtml, shareHtmlWorkerSpecifiers } = await import(
-	"../../../server/lib/share-preview-html"
-);
+const {
+	closeSharePreviewHtmlWorkers,
+	renderShareHtml,
+	resetSharePreviewHtmlWorkersForTests,
+	shareHtmlWorkerSpecifiers,
+} = await import("../../../server/lib/share-preview-html");
+const restoreSpies: (() => void)[] = [];
+const nativeHandles: ReturnType<typeof WorkerHandle.thread>[] = [];
+
+/** Fault injection still launches native threads through the production ownership primitive. */
+function htmlWorkerFixture(body: string, ready = true, dispatches = 1) {
+	const launch = WorkerHandle.thread;
+	let dispatched = 0;
+	let started!: () => void;
+	const startedTask = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let created!: () => void;
+	const createdTask = new Promise<void>((resolve) => {
+		created = resolve;
+	});
+	const exited = new Set<ReturnType<typeof WorkerHandle.thread>>();
+	const spy = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+		const handle = launch(
+			`const { parentPort } = require("node:worker_threads");
+			parentPort.on("message", path => {
+				parentPort.postMessage({ ready: true, dispatched: path });
+				${body}
+			});
+			${ready ? "parentPort.postMessage({ ready: true });" : ""}`,
+			{ eval: true },
+		);
+		nativeHandles.push(handle);
+		created();
+		void handle.exited.then(() => exited.add(handle));
+		handle.resource.on("message", (message) => {
+			if (typeof message.dispatched === "string" && ++dispatched === dispatches) started();
+		});
+		return handle;
+	});
+	restoreSpies.push(() => spy.mockRestore());
+	return {
+		spy,
+		createdTask,
+		startedTask,
+		exited,
+		get dispatched() {
+			return dispatched;
+		},
+	};
+}
+
+function forbidMainThreadHtmlRead() {
+	const spy = spyOn(Bun, "file").mockImplementation(() => {
+		throw new Error("HTML must not be read on the main thread");
+	});
+	restoreSpies.push(() => spy.mockRestore());
+	return spy;
+}
+
+function shortenHtmlTimeout() {
+	const timeout = AbortSignal.timeout.bind(AbortSignal);
+	const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
+		timeout(ms === SHARE_HTML_TIMEOUT_MS ? 500 : ms),
+	);
+	restoreSpies.push(() => spy.mockRestore());
+	return spy;
+}
 const app = new Hono();
 app.onError((error, c) =>
 	c.json({ error: error.message }, (error instanceof AppError ? error.statusCode : 500) as 400),
@@ -46,10 +117,14 @@ async function fixture(name: string, data: string | Uint8Array, bytes?: number) 
 	});
 	return { id, path, record, url: `/api/shares/${id}/preview` };
 }
-afterEach(() => {
+afterEach(async () => {
+	await resetSharePreviewHtmlWorkersForTests();
+	await Promise.all(nativeHandles.splice(0).map((handle) => handle.close()));
+	for (const restore of restoreSpies.splice(0).reverse()) restore();
 	for (const id of ids.splice(0)) revokeShareRegistry(id);
 });
 afterAll(async () => {
+	await closeSharePreviewHtmlWorkers();
 	if (oldHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = oldHome;
 	await rm(home, { recursive: true, force: true });
@@ -199,6 +274,157 @@ describe("share preview HTTP", () => {
 		controller.abort();
 		await expect(renderShareHtml(f.path, controller.signal)).rejects.toThrow();
 		expect(await renderShareHtml(f.path, new AbortController().signal)).toBe("<p>ok</p>");
+	});
+});
+
+describe("HTML worker admission and ownership", () => {
+	test("hot re-evaluation cannot reopen a production-closed HTML pool", async () => {
+		const f = await fixture("closed-across-hot.html", "<p>must remain closed</p>");
+		await closeSharePreviewHtmlWorkers();
+		// Bun normalizes URL queries; an actual neighboring copy guarantees fresh module evaluation.
+		const source = new URL("../../../server/lib/share-preview-html.ts", import.meta.url);
+		const copy = new URL(
+			`../../../server/lib/.share-preview-html-hot-${crypto.randomUUID()}.ts`,
+			import.meta.url,
+		);
+		await writeFile(copy, await readFile(source, "utf8"), { flag: "wx" });
+		try {
+			const reloaded = await import(copy.href);
+			expect(reloaded.renderShareHtml).not.toBe(renderShareHtml);
+			const launch = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+				throw new Error("closed owner tried to create another thread");
+			});
+			restoreSpies.push(() => launch.mockRestore());
+			await expect(
+				reloaded.renderShareHtml(f.path, new AbortController().signal),
+			).rejects.toMatchObject({ statusCode: 503, code: "SHARE_PREVIEW_FAILED" });
+			expect(launch).not.toHaveBeenCalled();
+		} finally {
+			await rm(copy, { force: true });
+		}
+	});
+	test("native worker still enforces input and sanitized output byte budgets", async () => {
+		const input = await fixture("too-large.html", "x", SHARE_HTML_MAX_BYTES + 1);
+		await expect(renderShareHtml(input.path, new AbortController().signal)).rejects.toMatchObject({
+			statusCode: 422,
+			message: "HTML preview exceeds 1 MiB",
+		});
+		const output = await fixture(
+			"expanded.html",
+			"&".repeat(Math.floor(SHARE_HTML_OUTPUT_MAX_BYTES / 5) + 1),
+		);
+		const response = await app.request(output.url);
+		expect(response.status).toBe(422);
+		expect(await response.text()).toContain("HTML preview output exceeds budget");
+	});
+
+	test("two active native workers reject the next public request with 429 and no queue", async () => {
+		const f = await fixture("busy.html", "<p>busy</p>");
+		const injected = htmlWorkerFixture("", true, 2);
+		const controllers = [new AbortController(), new AbortController()];
+		const results = Promise.allSettled(controllers.map((c) => renderShareHtml(f.path, c.signal)));
+		await injected.startedTask;
+		const response = await app.request(f.url);
+		expect(response.status).toBe(429);
+		expect(await response.text()).toContain("Preview busy; please retry");
+		expect(injected.spy).toHaveBeenCalledTimes(2);
+		for (const controller of controllers) controller.abort();
+		for (const result of await results) {
+			expect(result.status).toBe("rejected");
+			if (result.status === "rejected") expect(result.reason.statusCode).toBe(504);
+		}
+		expect(injected.exited.size).toBe(2);
+	});
+
+	test("duplicate ready messages do not dispatch again and each result closes its one-shot thread", async () => {
+		const f = await fixture("one-shot.html", "unused");
+		const injected = htmlWorkerFixture(
+			'parentPort.postMessage({ ready: true }); parentPort.postMessage({ html: "<p>native</p>" });',
+		);
+		for (let n = 0; n < 2; n++) {
+			const html = await renderShareHtml(f.path, new AbortController().signal);
+			expect(html).toBe("<p>native</p>");
+			expect(injected.exited.size).toBe(n + 1);
+		}
+		expect(injected.spy).toHaveBeenCalledTimes(2);
+		expect(injected.dispatched).toBe(2);
+	});
+
+	test("constructor failure rejects without main-thread HTML work", async () => {
+		const f = await fixture("unavailable.html", "<p>must not run inline</p>");
+		const read = forbidMainThreadHtmlRead();
+		const launch = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+			throw new Error("native worker creation denied");
+		});
+		restoreSpies.push(() => launch.mockRestore());
+		await expect(renderShareHtml(f.path, new AbortController().signal)).rejects.toThrow(
+			"native worker creation denied",
+		);
+		expect(launch).toHaveBeenCalledTimes(1);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		"throw new Error('native sanitizer crashed');",
+		"process.exit(7);",
+	])("native runtime failure is not replayed or run inline: %s", async (body) => {
+		const f = await fixture("crash.html", "<script>unsafe()</script>");
+		const injected = htmlWorkerFixture(body);
+		const read = forbidMainThreadHtmlRead();
+		await expect(renderShareHtml(f.path, new AbortController().signal)).rejects.toThrow();
+		expect(injected.spy).toHaveBeenCalledTimes(1);
+		expect(injected.dispatched).toBe(1);
+		expect(injected.exited.size).toBe(1);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test.each([false, true])("total timeout covers a native worker ready=%s", async (ready) => {
+		const f = await fixture("timeout.html", "<p>never inline</p>");
+		const injected = htmlWorkerFixture("", ready);
+		const read = forbidMainThreadHtmlRead();
+		const timeout = shortenHtmlTimeout();
+		await expect(renderShareHtml(f.path, new AbortController().signal)).rejects.toMatchObject({
+			statusCode: 504,
+			code: "SHARE_PREVIEW_TIMEOUT",
+		});
+		expect(timeout).toHaveBeenCalledWith(SHARE_HTML_TIMEOUT_MS);
+		expect(injected.spy).toHaveBeenCalledTimes(1);
+		expect(injected.dispatched).toBe(ready ? 1 : 0);
+		expect(injected.exited.size).toBe(1);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		false,
+		true,
+	])("production close disables admission and waits for native exit, ready=%s", async (ready) => {
+		const f = await fixture("close.html", "<p>no reopening</p>");
+		const injected = htmlWorkerFixture("", ready);
+		const read = forbidMainThreadHtmlRead();
+		const active = Promise.allSettled([renderShareHtml(f.path, new AbortController().signal)]);
+		await (ready ? injected.startedTask : injected.createdTask);
+		const closing = closeSharePreviewHtmlWorkers();
+		expect(closeSharePreviewHtmlWorkers()).toBe(closing);
+		await closing;
+		for (const result of await active) {
+			expect(result.status).toBe("rejected");
+			if (result.status === "rejected") expect(result.reason.statusCode).toBe(503);
+		}
+		expect(injected.exited.size).toBe(1);
+		expect(injected.dispatched).toBe(ready ? 1 : 0);
+		await expect(renderShareHtml(f.path, new AbortController().signal)).rejects.toMatchObject({
+			statusCode: 503,
+		});
+		expect(injected.spy).toHaveBeenCalledTimes(1);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("reset is explicit and repeatable after production close", async () => {
+		await closeSharePreviewHtmlWorkers();
+		await resetSharePreviewHtmlWorkersForTests();
+		await resetSharePreviewHtmlWorkersForTests();
+		const f = await fixture("reset.html", "<p>reset</p>");
+		expect(await renderShareHtml(f.path, new AbortController().signal)).toBe("<p>reset</p>");
 	});
 });
 

@@ -1114,7 +1114,24 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 			page,
 			(f) => f.outlinePanels()[0]?.title === "Level five is what the panel focuses",
 		);
-		await page.waitForSelector("[data-testid=outline-crumbs-more]", { timeout: 10_000 });
+		// The seed can show the fold before the live snapshot arrives. Its upgrade briefly
+		// replaces that path before the editor reports its live focus: wait for that path,
+		// not merely the fold's first appearance, and for the narrow layout to be measured.
+		await page.waitForFunction(
+			(parentId) => {
+				const surface = document.querySelector<HTMLElement>("[data-testid=outline-surface]");
+				const nav = surface?.querySelector("[data-testid=outline-crumbs]");
+				const parent = nav?.querySelector<HTMLAnchorElement>("a[data-last]");
+				return (
+					surface?.dataset.compact === "true" &&
+					surface.querySelector("[data-testid=outline-editor][data-status=live]") !== null &&
+					nav?.querySelector("[data-testid=outline-crumbs-more]") !== null &&
+					parent?.pathname.split("/").at(-1) === parentId
+				);
+			},
+			{ timeout: 10_000 },
+			tidy.deep[3],
+		);
 		const bar = () =>
 			page.evaluate(() => {
 				const nav = document.querySelector<HTMLElement>("[data-testid=outline-crumbs]");
@@ -1167,8 +1184,24 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 			(f) => f.outlinePanels()[0]?.title === "Level two is long as well and would not fit either",
 		);
 		expect((await call(page, (f) => f.outlinePanels()))[0]?.params.blockId).toBe(tidy.deep[1]);
-		// One level up there is less to fold: page and parent, no "…".
-		expect((await bar())?.links.slice(2)).toEqual(["Tidy page", DEEP_TITLES[0] as string]);
+		// One level up there is less to fold: page and parent, no "…". (The bar follows the read
+		// of the newly focused block, which may land a moment after the panel's title.)
+		const wanted = ["Tidy page", DEEP_TITLES[0] as string];
+		const deadline = Date.now() + 10_000;
+		while (
+			Date.now() < deadline &&
+			JSON.stringify((await bar())?.links.slice(2)) !== JSON.stringify(wanted)
+		) {
+			await page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => r(true))));
+		}
+		expect((await bar())?.links.slice(2)).toEqual(wanted);
+		// The page's "show in the outline tree" is among its controls, not in the bar.
+		expect(
+			await page.evaluate(() => {
+				const link = document.querySelector("[data-testid=outline-locate]");
+				return !!link && !link.closest("[data-testid=outline-crumbs]");
+			}),
+		).toBe(true);
 		expect(await page.$("[data-testid=outline-crumbs-more]")).toBeNull();
 		expect((await bar())?.rows).toBe(1);
 		expect(errors).toEqual([]);

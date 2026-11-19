@@ -23,6 +23,7 @@ import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { storageTransferApi } from "./storage-transfer";
 import { systemLifecycleApi } from "./system-lifecycle";
+import { teamsApi } from "./teams";
 import { terminalsApi } from "./terminals";
 import { tokendanceApi } from "./tokendance";
 import { traitLayersApi } from "./trait-layers";
@@ -80,6 +81,7 @@ export const api = {
 	...commandCodeApi,
 	...storageTransferApi,
 	...providerImportApi,
+	...teamsApi,
 };
 
 export {

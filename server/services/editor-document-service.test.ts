@@ -409,8 +409,8 @@ describe("large editor objects and real durable pipeline", () => {
 					statusCode: 403,
 					code: change === "revoked" ? "FORBIDDEN" : "EDITOR_IDENTITY_CHANGED",
 				});
-				expect(Reflect.get(jobs, "transfers")).toBe(0);
-				expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+				expect(jobs.diagnostics.transfer.active).toBe(0);
+				expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 				const sessions = Reflect.get(service, "sessions") as Map<string, { pins: number }>;
 				expect(sessions.get(doc.docId)?.pins).toBe(0);
 			} finally {
@@ -461,7 +461,7 @@ describe("large editor objects and real durable pipeline", () => {
 			const pending = service.commit(actor, doc.docId, uploadId, {}).catch((error) => error);
 			try {
 				await queued.promise;
-				expect((Reflect.get(jobs, "queue") as unknown[]).length).toBe(1);
+				expect(jobs.diagnostics.io.queued).toBe(1);
 				if (change === "revision") revision++;
 				else {
 					await rename(workspace, `${workspace}-old`);
@@ -528,7 +528,9 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(first.value?.byteLength).toBe(64 * 1024);
 		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
-		expect(Reflect.get(Reflect.get(service, "jobs"), "transfers")).toBe(0);
+		expect((Reflect.get(service, "jobs") as EditorDocumentJobs).diagnostics.transfer.active).toBe(
+			0,
+		);
 		controller.abort();
 		await expect(reader.read()).rejects.toThrow("cancelled");
 		await service.sweep(Date.now() + EDITOR_SESSION_IDLE_MS + 1);
@@ -551,8 +553,8 @@ describe("large editor objects and real durable pipeline", () => {
 				code: "EDITOR_SOURCE_CHANGED",
 			});
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		await service.remove(actor, doc.docId);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 	});
@@ -562,8 +564,8 @@ describe("large editor objects and real durable pipeline", () => {
 		await service.dispose();
 		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 	});
 	test("unread source response expires and releases memory, pins and permits", async () => {
@@ -597,7 +599,7 @@ describe("large editor objects and real durable pipeline", () => {
 			callback: () => void,
 			delay?: number,
 		) => {
-			if (delay === 30_000) {
+			if (delay !== undefined && delay >= 29_000 && delay <= 30_000) {
 				deadline = callback;
 				return original(() => {}, 60_000);
 			}
@@ -606,11 +608,17 @@ describe("large editor objects and real durable pipeline", () => {
 		try {
 			const stream = await service.content(actor, doc.docId, doc.versionHandle);
 			expect(timers).toHaveBeenCalled();
-			deadline();
+			const expiredAt = Date.now() + 30_001;
+			const clock = spyOn(Date, "now").mockReturnValue(expiredAt);
+			try {
+				deadline();
+			} finally {
+				clock.mockRestore();
+			}
 			await expect(new Response(stream).text()).rejects.toThrow("timed out");
 			await service.remove(actor, doc.docId);
-			expect(Reflect.get(jobs, "transfers")).toBe(0);
-			expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+			expect(jobs.diagnostics.transfer.active).toBe(0);
+			expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 			expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 		} finally {
 			timers.mockRestore();
@@ -1024,7 +1032,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 				expect(operations()[0].executionOutcome).toBe("succeeded");
 				expect(warnings).toHaveBeenCalledWith("Editor save recovery description unavailable", {
 					operationId,
-					error: expect.stringContaining("unreadable or incompatible"),
+					reason: "description_unavailable",
 				});
 				await service.dispose();
 				service = new EditorDocumentService({
@@ -1605,12 +1613,12 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			stale.data.conflictVersionHandle as string,
 		);
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(1);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024);
+		expect(jobs.diagnostics.transfer.active).toBe(1);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(64 * 1024);
 		await service.remove(actor, doc.docId);
 		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 		expect(await bodies()).toHaveLength(0);
 	});
@@ -1837,7 +1845,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		a.release();
 		a.release();
 		const c = await third;
-		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024 * 1024 + 1);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(64 * 1024 * 1024 + 1);
 		b.release();
 		c.release();
 		const active = await Promise.all(Array.from({ length: 8 }, () => jobs.acquireTransfer(1)));
@@ -1848,9 +1856,9 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		controller.abort();
 		expect((await failures).every((error) => error.code === "EDITOR_TIMEOUT")).toBe(true);
 		for (const permit of active) permit.release();
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
-		expect(Reflect.get(jobs, "transferQueue")).toHaveLength(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
+		expect(jobs.diagnostics.transfer.queued).toBe(0);
 	});
 	test("source transfer permit is independent of inherited IO admission", async () => {
 		const jobs = new EditorDocumentJobs();
@@ -1859,7 +1867,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			await jobs.withIo(actor.userId, async () => {});
 			permit.release();
 		});
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
 	});
 	test("IO admission runs four users at once, one task each, and caps each user's queue", async () => {
 		const jobs = new EditorDocumentJobs(),

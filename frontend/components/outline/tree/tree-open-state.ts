@@ -120,6 +120,13 @@ export class TreeOpenState {
 		this.commit(withTreeOpen(this.keys, key, open));
 	}
 
+	/** Open or close several nodes at once, in the order given (the last is the newest). */
+	setMany(keys: readonly string[], open: boolean): void {
+		let next: readonly string[] = this.keys;
+		for (const key of keys) next = withTreeOpen(next, key, open);
+		this.commit(next);
+	}
+
 	toggle(key: string): void {
 		this.setOpen(key, !this.set.has(key));
 	}

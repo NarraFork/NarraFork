@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { NoProxyRule } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
 import type { StorageRetentionSettings } from "@shared/storage-retention";
@@ -450,6 +451,16 @@ export interface OutboundProxyConfig {
 	mode: OutboundProxyMode;
 	/** Proxy URL, only used when mode is "custom". */
 	url?: string;
+	/**
+	 * Targets that must bypass the proxy, shared by every proxied channel.
+	 *
+	 * Evaluated in `net/proxy.ts` after the loopback and ambient `NO_PROXY`
+	 * checks, right before a request becomes a proxied connection. Rules support
+	 * wildcard globs and regular expressions; a rule only exempts a target and
+	 * can never force one through the proxy. See `net/no-proxy.ts` for the
+	 * matching priority and syntax.
+	 */
+	noProxyRules?: NoProxyRule[];
 }
 
 /**
@@ -738,6 +749,13 @@ export interface NarraForkSettings {
 		 * re-import). `off`: not at all.
 		 */
 		specImport?: "auto" | "manual" | "off";
+		/**
+		 * When the swallowed-content scan (outline P2 PR 12c) first ran on this instance (ISO time;
+		 * written by the scan, not meant to be edited). The scan ships after the Spec panel's editor
+		 * was fixed, so a person's save made after this moment was made with the fixed editor: what
+		 * it removed was removed on purpose, and the scan does not look at it.
+		 */
+		specLossCutoff?: string;
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */

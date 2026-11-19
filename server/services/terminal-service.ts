@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, terminals } from "../db/schema";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -22,6 +23,7 @@ import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
 import { REMOTE_PTY_READY_FEATURE, spawnRemotePty } from "../terminal/runtime-remote";
 import { sendToTerminal } from "../websocket/terminal-ws";
+import { withTerminalSlot } from "./agent-resource-caps";
 import { getConnectedDeviceHello, isDeviceOnline } from "./device-connection-service";
 import {
 	DeviceScopeError,
@@ -412,199 +414,214 @@ async function recoverTerminalsOnStartup(): Promise<void> {
 	});
 }
 
-export const terminalService = {
-	async create(opts: {
-		narratorId?: string;
-		name?: string;
-		cols?: number;
-		rows?: number;
-		/** Route this terminal to a remote executor device. */
-		deviceId?: string;
-		worktreeResourceId?: string;
-	}) {
-		assertLegacyRuntimeOwner(opts);
-		const cols = opts.cols ?? 80;
-		const rows = opts.rows ?? 24;
-		let cwd: string;
-		const projectId: string | null = null;
-		const narratorId: string | undefined = opts.narratorId;
-		const requestedDeviceId = opts.deviceId?.trim();
-		const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
-		let deviceId: string | undefined =
-			hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
+interface CreateTerminalOptions {
+	narratorId?: string;
+	name?: string;
+	cols?: number;
+	rows?: number;
+	/** Route this terminal to a remote executor device. */
+	deviceId?: string;
+	worktreeResourceId?: string;
+}
 
-		if (narratorId) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-			});
-			if (!narrator) throw new NotFoundError("Narrator", narratorId);
-			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
-				deviceId = narrator.defaultDeviceId;
-			}
-			cwd = narrator.cwd ?? getHome();
-			if (!cwd || cwd === getHome()) {
-				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
-			}
-		} else {
-			// Standalone terminals are used by global flows such as setup wizard dependency installs.
-			cwd = getHome();
-		}
+/** Spawn the PTY and record the terminal; the subagent cap is checked by `create`. */
+async function createTerminal(opts: CreateTerminalOptions) {
+	assertLegacyRuntimeOwner(opts);
+	const cols = opts.cols ?? 80;
+	const rows = opts.rows ?? 24;
+	let cwd: string;
+	const projectId: string | null = null;
+	const narratorId: string | undefined = opts.narratorId;
+	const requestedDeviceId = opts.deviceId?.trim();
+	const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
+	let deviceId: string | undefined =
+		hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
 
-		let remoteShell: string | null = null;
-		if (deviceId) {
-			const device = await requireAuthorizedDeviceForProject(deviceId, projectId);
-			if (!isDeviceOnline(deviceId)) {
-				throw new DeviceScopeError(
-					`Selected remote device "${deviceId}" is offline`,
-					"DEVICE_OFFLINE",
-				);
-			}
-			const hello = getConnectedDeviceHello(deviceId);
-			const capabilities = hello?.capabilities ?? device.capabilities;
-			if (capabilities?.pty !== true) {
-				throw new DeviceScopeError(
-					`Remote device "${deviceId}" does not support interactive PTY terminals`,
-					"DEVICE_PTY_UNAVAILABLE",
-				);
-			}
-			const platformOs = hello?.platform.os ?? device.platformOs;
-			if (platformOs === "windows") {
-				throw new DeviceScopeError(
-					"Remote interactive terminals are not supported on Windows devices yet",
-					"DEVICE_PLATFORM_UNSUPPORTED",
-				);
-			}
-			if (!deviceHasFeature(capabilities, REMOTE_PTY_READY_FEATURE)) {
-				throw new DeviceScopeError(
-					`Remote device "${deviceId}" requires an executor upgrade for interactive terminals (${REMOTE_PTY_READY_FEATURE})`,
-					"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
-				);
-			}
-			cwd = hello?.defaultCwd || device.defaultCwd || "/";
-			remoteShell = hello?.platform.shellPath || device.shellPath || "/bin/sh";
-		}
-
-		// All remote authorization/capability checks above must finish before any terminal side effect.
-		const id = generateId();
-		const now = new Date().toISOString();
-		// Assigned as soon as the PTY exists, before `await runtime.ready`, so
-		// replies during remote startup hit the runtime's pre-ready queue.
-		let runtime: TerminalRuntime | undefined;
-		const buffer = createBufferManager(id, cols, rows, () => runtime);
-		buffer.startPeriodicFlush();
-		// Remote terminals run on a device PTY; dtach (local detach) does not apply.
-		const useRemote = !!deviceId;
-		const useDtach = !useRemote && (await dtachService.isAvailable());
-
-		let dtachSocket: string | null = null;
-
-		if (useRemote && deviceId && remoteShell) {
-			runtime = spawnRemotePty(deviceId, {
-				cmd: [remoteShell, "-l"],
-				cwd,
-				env: {
-					HISTFILE: "/dev/null",
-					TERM: "xterm-256color",
-				},
-				cols,
-				rows,
-				onData: (data) => onData(id, buffer, data),
-			});
-		} else if (useDtach) {
-			// dtach mode: create detached session, then attach via PTY
-			await dtachService.createSession({ terminalId: id, cwd });
-			dtachSocket = dtachService.getSocketPath(id);
-			runtime = dtachService.attachSession({
-				terminalId: id,
-				cols,
-				rows,
-				onData: (text) => onData(id, buffer, text),
-			});
-		} else {
-			// Direct mode: platform-appropriate PTY. On some Linux-like runtimes
-			// (notably Android/proot), Bun.Terminal may be present but fail at spawn
-			// time, so keep the portable PTY as a Unix fallback too.
-			const spawnOpts: TerminalSpawnOptions = {
-				cmd: [DEFAULT_SHELL, "-l"],
-				cwd,
-				// User-facing shell: restore the ambient proxy variables NarraFork
-				// blanks for its own fetch, so the user's tools behave as they do
-				// outside NarraFork.
-				env: envWithAmbientProxy({
-					// Empty disables Bash history on every platform. "NUL" is an ordinary
-					// filename to Git Bash and creates a Windows-reserved file in the terminal CWD.
-					HISTFILE: "",
-					TERM: "xterm-256color",
-				}),
-				cols,
-				rows,
-				onData: (data) => onData(id, buffer, data),
-			};
-			if (IS_WINDOWS) {
-				runtime = spawnPortablePty(spawnOpts);
-			} else {
-				try {
-					runtime = spawnBunTerminal(spawnOpts);
-				} catch (err) {
-					logger.warn("Bun.Terminal failed, falling back to portable PTY", {
-						error: String(err),
-					});
-					runtime = spawnPortablePty(spawnOpts);
-				}
-			}
-		}
-
-		if (runtime.ready) {
-			try {
-				await runtime.ready;
-			} catch (error) {
-				runtime.kill();
-				await buffer.dispose();
-				throw new ValidationError(
-					`Remote terminal failed to start: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-
-		activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
-
-		if (useDtach) {
-			monitorAttachProcess(id, runtime, narratorId ?? null);
-		} else {
-			// Direct mode: process exit means the shell exited
-			runtime.exited.then(async (code) => {
-				const active = activeTerminals.get(id);
-				if (!active) return;
-				await active.buffer.dispose();
-				activeTerminals.delete(id);
-				runtime.close();
-				await markTerminalExited(id, code ?? 0, narratorId ?? null);
-				sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
-				logger.info("Terminal exited", { terminalId: id, code });
-			});
-		}
-
-		const [terminal] = await db
-			.insert(terminals)
-			.values({
-				id,
-				narratorId: narratorId ?? null,
-				name: opts.name ?? "Terminal",
-				cwd,
-				dtachSocket,
-				deviceId: deviceId ?? null,
-				status: "running",
-				createdAt: now,
-			})
-			.returning();
-
-		logger.info("Terminal created", { id, narratorId, useDtach });
-		eventBus.emit({
-			type: "terminal:created",
-			terminalId: id,
-			narratorId: narratorId ?? null,
+	if (narratorId) {
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
 		});
-		return terminal;
+		if (!narrator) throw new NotFoundError("Narrator", narratorId);
+		if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
+			deviceId = narrator.defaultDeviceId;
+		}
+		cwd = narrator.cwd ?? getHome();
+		if (!cwd || cwd === getHome()) {
+			logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
+		}
+	} else {
+		// Standalone terminals are used by global flows such as setup wizard dependency installs.
+		cwd = getHome();
+	}
+
+	let remoteShell: string | null = null;
+	if (deviceId) {
+		const device = await requireAuthorizedDeviceForProject(deviceId, projectId);
+		if (!isDeviceOnline(deviceId)) {
+			throw new DeviceScopeError(
+				`Selected remote device "${deviceId}" is offline`,
+				"DEVICE_OFFLINE",
+			);
+		}
+		const hello = getConnectedDeviceHello(deviceId);
+		const capabilities = hello?.capabilities ?? device.capabilities;
+		if (capabilities?.pty !== true) {
+			throw new DeviceScopeError(
+				`Remote device "${deviceId}" does not support interactive PTY terminals`,
+				"DEVICE_PTY_UNAVAILABLE",
+			);
+		}
+		const platformOs = hello?.platform.os ?? device.platformOs;
+		if (platformOs === "windows") {
+			throw new DeviceScopeError(
+				"Remote interactive terminals are not supported on Windows devices yet",
+				"DEVICE_PLATFORM_UNSUPPORTED",
+			);
+		}
+		if (!deviceHasFeature(capabilities, REMOTE_PTY_READY_FEATURE)) {
+			throw new DeviceScopeError(
+				`Remote device "${deviceId}" requires an executor upgrade for interactive terminals (${REMOTE_PTY_READY_FEATURE})`,
+				"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
+			);
+		}
+		cwd = hello?.defaultCwd || device.defaultCwd || "/";
+		remoteShell = hello?.platform.shellPath || device.shellPath || "/bin/sh";
+	}
+
+	// All remote authorization/capability checks above must finish before any terminal side effect.
+	const id = generateId();
+	const now = new Date().toISOString();
+	// Assigned as soon as the PTY exists, before `await runtime.ready`, so
+	// replies during remote startup hit the runtime's pre-ready queue.
+	let runtime: TerminalRuntime | undefined;
+	const buffer = createBufferManager(id, cols, rows, () => runtime);
+	buffer.startPeriodicFlush();
+	// Remote terminals run on a device PTY; dtach (local detach) does not apply.
+	const useRemote = !!deviceId;
+	const useDtach = !useRemote && (await dtachService.isAvailable());
+
+	let dtachSocket: string | null = null;
+
+	if (useRemote && deviceId && remoteShell) {
+		runtime = spawnRemotePty(deviceId, {
+			cmd: [remoteShell, "-l"],
+			cwd,
+			env: {
+				HISTFILE: "/dev/null",
+				TERM: "xterm-256color",
+			},
+			cols,
+			rows,
+			onData: (data) => onData(id, buffer, data),
+		});
+	} else if (useDtach) {
+		// dtach mode: create detached session, then attach via PTY
+		await dtachService.createSession({ terminalId: id, cwd });
+		dtachSocket = dtachService.getSocketPath(id);
+		runtime = dtachService.attachSession({
+			terminalId: id,
+			cols,
+			rows,
+			onData: (text) => onData(id, buffer, text),
+		});
+	} else {
+		// Direct mode: platform-appropriate PTY. On some Linux-like runtimes
+		// (notably Android/proot), Bun.Terminal may be present but fail at spawn
+		// time, so keep the portable PTY as a Unix fallback too.
+		const spawnOpts: TerminalSpawnOptions = {
+			cmd: [DEFAULT_SHELL, "-l"],
+			cwd,
+			// User-facing shell: restore the ambient proxy variables NarraFork
+			// blanks for its own fetch, so the user's tools behave as they do
+			// outside NarraFork.
+			env: envWithAmbientProxy({
+				// Empty disables Bash history on every platform. "NUL" is an ordinary
+				// filename to Git Bash and creates a Windows-reserved file in the terminal CWD.
+				HISTFILE: "",
+				TERM: "xterm-256color",
+			}),
+			cols,
+			rows,
+			onData: (data) => onData(id, buffer, data),
+		};
+		if (IS_WINDOWS) {
+			runtime = spawnPortablePty(spawnOpts);
+		} else {
+			try {
+				runtime = spawnBunTerminal(spawnOpts);
+			} catch (err) {
+				logger.warn("Bun.Terminal failed, falling back to portable PTY", {
+					error: String(err),
+				});
+				runtime = spawnPortablePty(spawnOpts);
+			}
+		}
+	}
+
+	if (runtime.ready) {
+		try {
+			await runtime.ready;
+		} catch (error) {
+			runtime.kill();
+			await buffer.dispose();
+			throw new ValidationError(
+				`Remote terminal failed to start: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
+
+	if (useDtach) {
+		monitorAttachProcess(id, runtime, narratorId ?? null);
+	} else {
+		// Direct mode: process exit means the shell exited
+		runtime.exited.then(async (code) => {
+			const active = activeTerminals.get(id);
+			if (!active) return;
+			await active.buffer.dispose();
+			activeTerminals.delete(id);
+			runtime.close();
+			await markTerminalExited(id, code ?? 0, narratorId ?? null);
+			sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
+			logger.info("Terminal exited", { terminalId: id, code });
+		});
+	}
+
+	const [terminal] = await db
+		.insert(terminals)
+		.values({
+			id,
+			narratorId: narratorId ?? null,
+			name: opts.name ?? "Terminal",
+			cwd,
+			dtachSocket,
+			deviceId: deviceId ?? null,
+			status: "running",
+			createdAt: now,
+		})
+		.returning();
+
+	logger.info("Terminal created", { id, narratorId, useDtach });
+	eventBus.emit({
+		type: "terminal:created",
+		terminalId: id,
+		narratorId: narratorId ?? null,
+	});
+	return terminal;
+}
+
+export const terminalService = {
+	/**
+	 * A subagent holds at most `SUBAGENT_TERMINAL_LIMIT` running terminals; the count and the
+	 * create run serialized per narrator (`agent-resource-caps.ts`).
+	 */
+	async create(opts: CreateTerminalOptions) {
+		return withTerminalSlot(
+			opts.narratorId,
+			() => createTerminal(opts),
+			(terminal) => this.kill(terminal.id),
+		);
 	},
 
 	write(terminalId: string, data: string) {
@@ -929,6 +946,49 @@ export const terminalService = {
 			}
 		}
 		await db.delete(terminals).where(and(eq(col, value), isNull(terminals.worktreeResourceId)));
+	},
+
+	/**
+	 * Terminals that die with a worktree: the resource-owned shells and any narrator
+	 * shell whose directory is inside the checkout.
+	 *
+	 * Both kinds must be gone before the owner row is, because `terminals.worktree_resource_id`
+	 * is `onDelete: restrict`. Nothing here touches a shell that merely shares a parent
+	 * directory — the path check is containment, and the scan is bounded.
+	 */
+	async cleanupForWorktree(input: {
+		worktreeResourceId?: string | null;
+		worktreePath?: string | null;
+	}): Promise<{ closedTerminals: number }> {
+		const matched: (typeof terminals.$inferSelect)[] = [];
+		if (input.worktreeResourceId) {
+			matched.push(
+				...(await db.query.terminals.findMany({
+					where: eq(terminals.worktreeResourceId, input.worktreeResourceId),
+				})),
+			);
+		}
+		const path = input.worktreePath ?? null;
+		if (path) {
+			const owned = await db.query.terminals.findMany({
+				where: isNull(terminals.worktreeResourceId),
+				limit: 500,
+			});
+			for (const terminal of owned) {
+				if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd)) matched.push(terminal);
+			}
+		}
+		const ids = [...new Set(matched.map((terminal) => terminal.id))];
+		for (const terminal of matched) {
+			if (terminal.status !== "running") continue;
+			try {
+				await this.kill(terminal.id);
+			} catch {
+				// best effort: a dead runtime must not keep the row alive
+			}
+		}
+		for (const id of ids) await db.delete(terminals).where(eq(terminals.id, id));
+		return { closedTerminals: ids.length };
 	},
 
 	/**

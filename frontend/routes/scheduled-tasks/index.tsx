@@ -534,7 +534,7 @@ function TaskFormModal({
 	const { t } = useTranslation("scheduledTasks");
 	const { t: tc } = useTranslation("common");
 	const { data: projects = [] } = useProjects();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 
 	const patch = useCallback(
 		(p: Partial<TaskDraft>) => setDraft((d) => ({ ...d, ...p })),
@@ -784,6 +784,7 @@ function TaskFormModal({
 					description={t("modelDesc")}
 					data={groupedModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					value={draft.model || FOLLOW_DEFAULT_MODEL}
 					onChange={(v) => patch({ model: v && v !== FOLLOW_DEFAULT_MODEL ? v : "" })}

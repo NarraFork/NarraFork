@@ -68,6 +68,7 @@ describe("main staging final authority regression", () => {
 				browser_download_url: "old",
 			});
 			const writes: string[] = [];
+			const binaryId = f.assets[0].id;
 			let now = Date.parse("2026-10-15T03:05:00.000Z");
 			const client = {
 				ensureCollection: async () => {},
@@ -97,6 +98,7 @@ describe("main staging final authority regression", () => {
 				},
 				downloadAsset: async (options) => {
 					await f.downloadAsset(options);
+					if (options.assetId !== binaryId) return;
 					now += 9 * 60_000;
 					if (mutation !== "none")
 						Object.assign(f.assets[0], {
@@ -123,19 +125,19 @@ describe("main staging final authority regression", () => {
 					const receipt = (error as IndependentMirrorError).receipt;
 					expect(receipt.status).toBe("FAILED");
 					expect(receipt.failureCode).toBe("MIRROR_FAILED");
-					expect(receipt.uploaded).toHaveLength(4);
+					expect(receipt.uploaded).toHaveLength(5);
 					expect(receipt.verified).toEqual([]);
 					expect(receipt.relay).toBeUndefined();
 				}
-				expect(writes).toHaveLength(5); // four assets + commit payload, but no ready
+				expect(writes).toHaveLength(6); // five assets + commit payload, but no ready
 				expect(writes.every((path) => path.includes("/objects/"))).toBe(true);
 			} else {
 				const receipt = await operation;
 				expect(receipt.status).toBe("STAGED_FOR_PULL");
-				expect(receipt.uploaded).toHaveLength(4);
+				expect(receipt.uploaded).toHaveLength(5);
 				expect(receipt.verified).toEqual([]);
 				expect(receipt.relay?.expiresAt).toBe("2026-10-22T03:05:00.000Z");
-				expect(writes).toHaveLength(6);
+				expect(writes).toHaveLength(7);
 				expect(writes.at(-1)).toContain("/ready/");
 			}
 			expect(f.httpCalls).toHaveLength(0);

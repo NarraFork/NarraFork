@@ -16,6 +16,8 @@ export const RUNTIME_POLICY_TRAIT_PREFIX = "custom-runtime-policy:";
 /** Capabilities a layer may deny; `agent-runtime/policy.ts` merges declarations. */
 const CAPABILITY_KEYS = [
 	"spawnAgent",
+	"watchAgent",
+	// Legacy persisted deny remains authoritative for Watch(agent).
 	"awaitAgent",
 	"askUserQuestion",
 	"planApproval",
@@ -54,6 +56,13 @@ const runtimePolicyTraitSchema = z.strictObject({
 			keys.filter((key): key is RuntimeCapabilityKey => !retiredCapability.has(key)),
 		)
 		.optional(),
+	/**
+	 * How many delegation levels below a primary narrator this layer sits (1 = a subagent of
+	 * a primary, 2 = a subagent of a subagent). Stamped at creation from the parent chain.
+	 * Merging takes the deepest declaration, and at the deepest allowed level the ceiling
+	 * removes spawning and agent waits (`agent-runtime/policy.ts`). Omitted = not declared.
+	 */
+	delegationDepth: z.number().int().min(1).max(16).optional(),
 	/** Self-continuation ceiling. Omitted = promote todo, unlimited progress passes. */
 	continuation: z
 		.strictObject({

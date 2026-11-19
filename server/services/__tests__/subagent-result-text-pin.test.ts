@@ -3,10 +3,9 @@
  * service (`agent-runtime/run.ts`): the foreground tool result, a background task's result, the
  * conclusion rewrite of a call no task projects, and a held result released with no live run.
  *
- * Pinned before outline P2 PR 9a added report attachment to that shared path: a subagent sent
- * without `task` (every spec session, and most outline delegations) must get its result byte for
- * byte as before. Only the model pass is scripted; the run service, the publication, the task
- * projection and the conclusion rewrite are real.
+ * A subagent sent without `task` keeps its body unchanged, with the alias selector and a
+ * copyable reference to its real session id on every result delivery. Only the model pass is
+ * scripted; the run service, publication, task projection and conclusion rewrite are real.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
@@ -208,18 +207,33 @@ const toolOutput = async (callId: string) =>
 describe("subagent result text without task (pinned)", () => {
 	test("foreground: the tool result", async () => {
 		replies = ["The race is in refresh().\n\n- evidence: auth.ts:42"];
-		const { output } = await launch(false);
+		const { output, childId } = await launch(false);
 		expect(output).toBe(
-			"<subagent_id>pin-run</subagent_id>\n\nThe race is in refresh().\n\n- evidence: auth.ts:42",
+			`<subagent_id>pin-run</subagent_id>\n\n[Pin run](nf-agent://open?id=${childId})\n\n` +
+				"The race is in refresh().\n\n- evidence: auth.ts:42",
 		);
+		expect(output).not.toContain("nf-agent://open?id=pin-run");
+	});
+
+	test("a conflicting alias still links to the newly created real session", async () => {
+		replies = ["first", "second"];
+		const first = await launch(false);
+		const second = await launch(false);
+		expect(second.childId).not.toBe(first.childId);
+		expect(second.output).toStartWith("<subagent_id>pin-run-2</subagent_id>\n\n");
+		expect(second.output).toContain(`[Pin run](nf-agent://open?id=${second.childId})`);
+		expect(second.output).not.toContain(`nf-agent://open?id=${first.childId}`);
+		expect(second.output).not.toContain("nf-agent://open?id=pin-run-2");
 	});
 
 	test("background: the task's result and the session's background result", async () => {
 		replies = ["Background answer."];
 		const { output, childId } = await launch(true);
 		expect(output).toBe(
-			'<background_task_id>pin-run</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "pin-run" })',
+			`<background_task_id>pin-run</background_task_id>\n\n[Pin run](nf-agent://open?id=${childId})\n\n` +
+				'Background task started. Completion notifies automatically. Watch({ type: "agent", id: "pin-run" }) registers an observation or retrieves the saved result.',
 		);
+		expect(output).not.toContain("nf-agent://open?id=pin-run");
 		await until(() => runEnded(childId));
 		await until(
 			async () =>
@@ -243,14 +257,16 @@ describe("subagent result text without task (pinned)", () => {
 		await handle.terminal;
 		await until(() => runEnded(childId));
 		expect(await toolOutput(call.binding.toolCallId)).toBe(
-			"<subagent_id>pin-run</subagent_id>\n\nsecond answer",
+			`<subagent_id>pin-run</subagent_id>\n\n[Pin run](nf-agent://open?id=${childId})\n\nsecond answer`,
 		);
 	});
 
 	test("a failed run: the foreground tool result, and a background task's failure", async () => {
 		replies = [{ text: "Model refused the request.", hasError: true }];
 		const fg = await launch(false);
-		expect(fg.output).toBe("<subagent_id>pin-run</subagent_id>\n\nModel refused the request.");
+		expect(fg.output).toBe(
+			`<subagent_id>pin-run</subagent_id>\n\n[Pin run](nf-agent://open?id=${fg.childId})\n\nModel refused the request.`,
+		);
 		replies = [{ text: "Provider error: overloaded", hasError: true }];
 		const { childId } = await launch(true);
 		await until(() => runEnded(childId));
@@ -277,7 +293,7 @@ describe("subagent result text without task (pinned)", () => {
 		first.resolve();
 		const fg = await pending;
 		expect(fg.output).toBe(
-			"<subagent_id>pin-run</subagent_id>\n\nInterrupted: Caller interrupted in test",
+			`<subagent_id>pin-run</subagent_id>\n\n[Pin run](nf-agent://open?id=${fg.childId})\n\nInterrupted: Caller interrupted in test`,
 		);
 		const second = Promise.withResolvers<void>();
 		replies = [{ text: "", gate: second.promise }];
@@ -303,7 +319,7 @@ describe("subagent result text without task (pinned)", () => {
 		expect(await controlRun(childId, { kind: "release" })).toBe(true);
 		// The session has no assistant message of its own (the pass is scripted).
 		expect(await toolOutput(call.binding.toolCallId)).toBe(
-			"<subagent_id>pin-run</subagent_id>\n\n(no output)",
+			`<subagent_id>pin-run</subagent_id>\n\n[Pin run](nf-agent://open?id=${childId})\n\n(no output)`,
 		);
 	});
 });

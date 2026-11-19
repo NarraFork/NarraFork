@@ -26,7 +26,7 @@
  * database here is the shared in-memory schema; no real file is touched by the maintenance stub.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type {
 	CheckpointRequest,
 	DatabaseMaintenancePort,
@@ -324,6 +324,142 @@ describe("row cleanup never opens a maintenance window", () => {
 				sqlite,
 				databaseMaintenance: stubMaintenance,
 			}));
+		}
+	});
+});
+
+async function workerBarrierSpies(
+	events: string[],
+	behavior: { tokenPause?: () => Promise<void>; historyResume?: () => Promise<void> } = {},
+) {
+	const [token, history, readers] = await Promise.all([
+		import("../token-recalculation-worker-client"),
+		import("../agent-runtime/model-history-source"),
+		import("../../lib/db-worker/pool"),
+	]);
+	const reclaim = stubMaintenance.reclaimSpace.bind(stubMaintenance);
+	const spies = [
+		spyOn(token, "pauseTokenRecalculationWorkers").mockImplementation(async () => {
+			events.push("token.pause");
+			await behavior.tokenPause?.();
+		}),
+		spyOn(history, "pauseModelHistorySourceWorkers").mockImplementation(async () => {
+			events.push("history.pause");
+		}),
+		spyOn(readers, "shutdownDbWorkerPool").mockImplementation(async () => {
+			events.push("readers.pause");
+		}),
+		spyOn(readers, "resumeDbWorkerPool").mockImplementation(() => {
+			events.push("readers.resume");
+		}),
+		spyOn(history, "resumeModelHistorySourceWorkers").mockImplementation(async () => {
+			events.push("history.resume");
+			await behavior.historyResume?.();
+		}),
+		spyOn(token, "resumeTokenRecalculationWorkers").mockImplementation(async () => {
+			events.push("token.resume");
+		}),
+		spyOn(stubMaintenance, "reclaimSpace").mockImplementation(() => {
+			events.push("vacuum");
+			return reclaim();
+		}),
+	];
+	return () => {
+		for (const spy of spies) spy.mockRestore();
+	};
+}
+
+describe("worker-owned database connections around the maintenance window", () => {
+	test("awaits the token owner's commit boundary before closing readers or reclaiming", async () => {
+		const events: string[] = [];
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const restore = await workerBarrierSpies(events, {
+			tokenPause: async () => {
+				entered();
+				await gate;
+			},
+		});
+		const pending = databaseCleanupService.vacuumDatabase();
+		void pending.catch(() => {});
+		try {
+			await started;
+			expect(events).toEqual(["token.pause"]);
+			expect(calls).not.toContain("reclaim");
+			release();
+			expect((await pending).vacuumRan).toBe(true);
+			expect(events).toEqual([
+				"token.pause",
+				"history.pause",
+				"readers.pause",
+				"vacuum",
+				"readers.resume",
+				"history.resume",
+				"token.resume",
+			]);
+		} finally {
+			release();
+			await pending.catch(() => {});
+			restore();
+		}
+	});
+
+	test("a partial pause failure never reclaims and still attempts every production resume", async () => {
+		const events: string[] = [];
+		const failure = new Error("token owner has not stopped");
+		const restore = await workerBarrierSpies(events, {
+			tokenPause: async () => {
+				throw failure;
+			},
+		});
+		try {
+			expect(await databaseCleanupService.vacuumDatabase().catch((error: unknown) => error)).toBe(
+				failure,
+			);
+			expect(events).toEqual(["token.pause", "readers.resume", "history.resume", "token.resume"]);
+			expect(events).not.toContain("vacuum");
+		} finally {
+			restore();
+		}
+	});
+
+	test("an original maintenance conflict is not replaced by a secondary resume failure", async () => {
+		const events: string[] = [];
+		behaviour.reclaim = { throws: new Error("SQLITE_BUSY: locked during maintenance") };
+		const restore = await workerBarrierSpies(events, {
+			historyResume: async () => {
+				throw new Error("history resume also failed");
+			},
+		});
+		try {
+			expect((await rejection(databaseCleanupService.vacuumDatabase())).statusCode).toBe(409);
+			expect(events.slice(-3)).toEqual(["readers.resume", "history.resume", "token.resume"]);
+		} finally {
+			restore();
+		}
+	});
+	test("one failed resume does not skip the remaining owner or return false success", async () => {
+		const events: string[] = [];
+		const failure = new Error("history owner remains closed");
+		const restore = await workerBarrierSpies(events, {
+			historyResume: async () => {
+				throw failure;
+			},
+		});
+		try {
+			const error = await databaseCleanupService.vacuumDatabase().catch((error: unknown) => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors).toEqual([failure]);
+			expect(events).toContain("vacuum");
+			expect(events.slice(-3)).toEqual(["readers.resume", "history.resume", "token.resume"]);
+		} finally {
+			restore();
 		}
 	});
 });

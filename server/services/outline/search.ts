@@ -15,6 +15,14 @@
  *      then the backend's relevance, and the first `limit` (at most 50) are returned.
  *
  * Snippets and paths are cut here, the same way on both backends.
+ *
+ * PAGES (readability F: the search drawn as a tree)
+ * -------------------------------------------------
+ * {@link searchOutlinePage} returns a page of that ranked list and a cursor for the next: the
+ * position in the list. The list itself never grows past the candidates one search reads
+ * (`candidates`, plus exact alias matches), so paging is bounded by it: at most that many hits
+ * can ever be reached, a page at a time. A commit between two pages may move a hit by a place;
+ * the client shows each hit once.
  */
 import { ValidationError } from "@server/lib/errors";
 import { blockTitle, isAlias } from "@shared/outline";
@@ -48,7 +56,18 @@ export interface OutlineSearchRequest {
 	contextSpaceId?: string | null;
 	/** Default 20, at most 50. */
 	limit?: number;
+	/** Where the page starts in the ranked list (a cursor's position); default 0. */
+	offset?: number;
 	store?: OutlineStore;
+}
+
+/** A page of search hits; see the module header. */
+export interface OutlineSearchPage {
+	hits: OutlineSearchHit[];
+	/** The position of the next page; null when the ranked list ends here. */
+	nextOffset: number | null;
+	/** The spaces of this page's hits. */
+	spaces: OutlineSpaceRow[];
 }
 
 export interface OutlineSearchHit {
@@ -64,6 +83,8 @@ export interface OutlineSearchHit {
 	snippet: string;
 	/** Titles of the ancestors, the page first. */
 	path: string[];
+	/** Ids of those ancestors, the page first (as many as `path`). */
+	pathIds: string[];
 	/** A task, under one, or session content read from another space. */
 	process: boolean;
 	/** The task at or nearest above the block, if any. */
@@ -133,6 +154,12 @@ function shortTitle(content: string): string {
  * snippet and its path. An empty query finds nothing.
  */
 export async function searchOutline(request: OutlineSearchRequest): Promise<OutlineSearchHit[]> {
+	return (await searchOutlinePage(request)).hits;
+}
+
+/** {@link searchOutline} a page at a time: `limit` hits from `offset` of the ranked list. */
+export async function searchOutlinePage(request: OutlineSearchRequest): Promise<OutlineSearchPage> {
+	const none: OutlineSearchPage = { hits: [], nextOffset: null, spaces: [] };
 	const store = request.store ?? outlineStore;
 	const safe = sanitizeQuery(request.query);
 	const spaceIds = [...new Set(request.spaceIds)];
@@ -141,7 +168,8 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 			OUTLINE_TEXT.errors.tooManySpaces(OUTLINE_SEARCH_LIMITS.maxSpaces, spaceIds.length),
 		);
 	}
-	if (safe === "" || spaceIds.length === 0) return [];
+	if (safe === "" || spaceIds.length === 0) return none;
+	const offset = Math.max(0, Math.floor(request.offset ?? 0));
 	const limit = Math.max(
 		1,
 		Math.min(
@@ -165,7 +193,7 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 			}
 		}
 	}
-	if (candidates.size === 0) return [];
+	if (candidates.size === 0) return none;
 
 	// Ancestors, level by level, for paths and the tasks above each candidate.
 	const known = new Map<string, Ancestry>();
@@ -204,7 +232,7 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 	}
 
 	const terms = [...indexed, ...short].map((t) => t.toLowerCase());
-	const ranked = [...candidates.values()]
+	const everyRanked = [...candidates.values()]
 		.map((row) => {
 			const chain: Ancestry[] = [];
 			for (
@@ -236,10 +264,12 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 				Number(a.process) - Number(b.process) ||
 				a.row.rank - b.row.rank ||
 				(a.row.id < b.row.id ? -1 : a.row.id > b.row.id ? 1 : 0),
-		)
-		.slice(0, limit);
+		);
+	const ranked = everyRanked.slice(offset, offset + limit);
+	const hitSpaces = new Map<string, OutlineSpaceRow>();
+	for (const hit of ranked) if (hit.space) hitSpaces.set(hit.space.id, hit.space);
 
-	return ranked.map(({ row, chain, task, space, process }) => {
+	const hits = ranked.map(({ row, chain, task, space, process }) => {
 		const key = (space as OutlineSpaceRow).key;
 		return {
 			blockId: row.id,
@@ -252,10 +282,16 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 			title: shortTitle(row.content),
 			snippet: searchSnippet(row.content, terms),
 			path: chain.map((a) => shortTitle(a.content)),
+			pathIds: chain.map((a) => a.id),
 			process,
 			task: task
 				? { blockId: task.id, address: `${key}/${task.sid}`, title: shortTitle(task.content) }
 				: null,
 		};
 	});
+	return {
+		hits,
+		nextOffset: offset + limit < everyRanked.length ? offset + limit : null,
+		spaces: [...hitSpaces.values()],
+	};
 }

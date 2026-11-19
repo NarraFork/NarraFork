@@ -17,6 +17,7 @@
 import crypto from "node:crypto";
 import { blake2b } from "@noble/hashes/blake2.js";
 import nacl from "tweetnacl";
+import { applyProxyExemptions } from "./net/proxy";
 
 export const CODEX_AGENT_IDENTITY_AUTH_MODE = "agent_identity";
 
@@ -121,9 +122,13 @@ interface TaskRegistrationResponse {
 }
 
 function pfetch(url: string, init: RequestInit, proxy?: string): Promise<Response> {
-	if (proxy) {
+	// The caller passes an already-resolved proxy (custom / system / inherited
+	// global); exemptions are applied here so a target covered by
+	// `settings.proxy.noProxyRules` goes direct whichever mode produced the proxy.
+	const effective = proxy ? applyProxyExemptions(proxy, url) : undefined;
+	if (effective) {
 		// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-		return fetch(url, { ...init, proxy } as any);
+		return fetch(url, { ...init, proxy: effective } as any);
 	}
 	return fetch(url, init);
 }

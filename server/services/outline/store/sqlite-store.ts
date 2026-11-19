@@ -98,6 +98,25 @@ import {
 import { sqliteOutlineDigests } from "./sqlite-digest";
 import { sqliteOutlineReads } from "./sqlite-read";
 
+/**
+ * How SQLite reads a block's task status, its lock and whether it is live, for a block aliased
+ * `alias`: the text of the partial indexes' own predicates (`schema.ts`), so a statement built
+ * from it is served by them. For reads written once for both backends that must name these
+ * (`access-reads.ts`: the connected outline's row facts); the PostgreSQL side spells the same
+ * with `#>>` there, as `postgres-store.ts` does.
+ */
+export function sqliteTaskPredicateText(alias: string): {
+	status: string;
+	lock: string;
+	live: string;
+} {
+	return {
+		status: `json_extract(${alias}."task_json", '$.status')`,
+		lock: `json_extract(${alias}."task_json", '$.lock')`,
+		live: `${alias}."deleted" = 0`,
+	};
+}
+
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /** Extended result codes for a uniqueness conflict (primary key, unique index). */

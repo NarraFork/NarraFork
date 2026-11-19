@@ -9,6 +9,13 @@ import {
 	publicCredentialNetwork,
 	restoreMaskedProxy,
 } from "@shared/credential-network";
+import {
+	isPoolCooldownActive,
+	type PoolFault,
+	type PoolSelectionMode,
+	poolFailureState,
+	selectPoolEntry,
+} from "./agent/credential-pool";
 import { SessionAffinity } from "./agent/session-affinity";
 import {
 	type AgentIdentityKey,
@@ -84,7 +91,7 @@ const USAGE_HISTORY_DEDUPE_WINDOW_MS = 60_000;
 // === Types ===
 
 export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted" | "banned";
-export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
+export type LoadBalancingMode = PoolSelectionMode;
 
 const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = ["too_many_failures", "banned"];
 const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
@@ -796,37 +803,15 @@ export class CodexManager {
 		this.reviveQuotaResetCredentials();
 		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
-		// Archived credentials are retired: they never participate in selection, so
-		// the retry budget must only count the pool that can actually serve.
 		const total = this.poolEntries.length;
 		const triedIds = new Set<string>();
-		const stickyEnabled =
-			(this.loadBalancingMode === "balanced" || this.loadBalancingMode === "tier-balanced") &&
-			!!sessionKey;
-
-		if (stickyEnabled && sessionKey) {
-			const stickyCredentialId = this.sessionAffinity.get(sessionKey);
-			if (stickyCredentialId) {
-				const stickyEntry = this.entries.find((e) => e.id === stickyCredentialId);
-				if (!stickyEntry || stickyEntry.disabled || isArchivedCodexCredential(stickyEntry)) {
-					this.unbindSession(sessionKey);
-				} else {
-					const ctx = await this.tryEnsureToken(stickyEntry);
-					if (ctx) {
-						this.bindSession(sessionKey, ctx.id);
-						return ctx;
-					}
-					triedIds.add(stickyEntry.id);
-					this.unbindSession(sessionKey);
-				}
-			}
-		}
+		// Priority mode deliberately follows priority instead of session affinity.
+		const stickyEnabled = this.loadBalancingMode !== "priority" && !!sessionKey;
+		const stickyId = stickyEnabled && sessionKey ? this.sessionAffinity.get(sessionKey) : undefined;
 
 		while (triedIds.size < total) {
-			const entry = this.selectEntry(triedIds);
-
+			const entry = this.selectEntry(triedIds, stickyId);
 			if (!entry) {
-				// Try self-healing
 				if (this.trySelfHeal()) {
 					const healed = this.selectEntry(triedIds);
 					if (healed) {
@@ -835,7 +820,6 @@ export class CodexManager {
 							if (stickyEnabled && sessionKey) this.bindSession(sessionKey, ctx.id);
 							return ctx;
 						}
-						triedIds.add(healed.id);
 					}
 				}
 				break;
@@ -846,13 +830,11 @@ export class CodexManager {
 				if (stickyEnabled && sessionKey) this.bindSession(sessionKey, ctx.id);
 				return ctx;
 			}
-
 			triedIds.add(entry.id);
+			if (stickyEnabled && sessionKey) this.unbindSession(sessionKey);
 		}
 
-		if (stickyEnabled && sessionKey) {
-			this.unbindSession(sessionKey);
-		}
+		if (stickyEnabled && sessionKey) this.unbindSession(sessionKey);
 		throw new Error(`All Codex credentials exhausted (available: ${this.availableCount}/${total})`);
 	}
 
@@ -861,48 +843,20 @@ export class CodexManager {
 		return this.entries.filter((e) => !isArchivedCodexCredential(e));
 	}
 
-	private selectEntry(excludeIds?: Set<string>): CodexCredential | null {
-		const available = this.entries.filter((e) => {
-			if (e.disabled) return false;
-			if (isArchivedCodexCredential(e)) return false;
-			if (excludeIds?.has(e.id)) return false;
-			return true;
-		});
-
-		if (available.length === 0) return null;
-
-		if (this.loadBalancingMode === "balanced") {
-			return this.selectRandomEntry(available);
-		}
-
-		if (this.loadBalancingMode === "tier-balanced") {
-			const effectiveTierOrder = this.getEffectiveTierOrder();
-			let bestTierRank = Number.POSITIVE_INFINITY;
-			let bestTierEntries: CodexCredential[] = [];
-
-			for (const entry of available) {
-				const tier = normalizeCodexPlanTier(entry.usage?.plan_type);
-				const tierRank = effectiveTierOrder.indexOf(tier);
-				const rank = tierRank >= 0 ? tierRank : effectiveTierOrder.length;
-				if (rank < bestTierRank) {
-					bestTierRank = rank;
-					bestTierEntries = [entry];
-				} else if (rank === bestTierRank) {
-					bestTierEntries.push(entry);
-				}
-			}
-
-			return this.selectRandomEntry(bestTierEntries);
-		}
-
-		// Priority mode: lowest priority number first
-		return available.reduce((best, e) => (e.priority < best.priority ? e : best));
-	}
-
-	private selectRandomEntry(entries: CodexCredential[]): CodexCredential | null {
-		if (entries.length === 0) return null;
-		const randomIndex = Math.floor(Math.random() * entries.length);
-		return entries[randomIndex] ?? entries[0];
+	private selectEntry(excludeIds?: Set<string>, stickyId?: string): CodexCredential | null {
+		const tierOrder = this.getEffectiveTierOrder();
+		return (
+			selectPoolEntry(this.entries, {
+				now: Date.now(),
+				mode: this.loadBalancingMode,
+				exclude: excludeIds,
+				stickyId,
+				tierRank: (entry) => {
+					const rank = tierOrder.indexOf(normalizeCodexPlanTier(entry.usage?.plan_type));
+					return rank >= 0 ? rank : tierOrder.length;
+				},
+			}) ?? null
+		);
 	}
 
 	private getEffectiveTierOrder(): CodexPlanTier[] {
@@ -1126,44 +1080,11 @@ export class CodexManager {
 	}
 
 	reportFailure(id: string): boolean {
-		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
-		stats.failureCount++;
-		stats.lastUsedAt = new Date().toISOString();
-		this.stats.set(id, stats);
-
-		const entry = this.entries.find((e) => e.id === id);
-		if (entry && stats.failureCount >= MAX_FAILURES_PER_CREDENTIAL) {
-			entry.disabled = true;
-			entry.disabledReason = "too_many_failures";
-			this.evictSessionsByCredential(id);
-			this.saveCredentials();
-			this.schedulePublicQuotaOverviewBroadcast();
-		}
-
-		this.saveStatsDebounced();
-		this.rescheduleUsageRefresh();
-		return this.hasUsablePoolCredential();
+		return this.reportPoolFault(id, { kind: "failure" });
 	}
 
 	reportQuotaExhausted(id: string, resetsAt?: number): boolean {
-		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
-		stats.failureCount = MAX_FAILURES_PER_CREDENTIAL;
-		stats.lastUsedAt = new Date().toISOString();
-		this.stats.set(id, stats);
-
-		const entry = this.entries.find((e) => e.id === id);
-		if (entry) {
-			entry.disabled = true;
-			entry.disabledReason = "quota_exhausted";
-			entry.quotaResetsAt = resetsAt;
-			this.evictSessionsByCredential(id);
-			this.saveCredentials();
-			this.schedulePublicQuotaOverviewBroadcast();
-		}
-
-		this.saveStatsDebounced();
-		this.rescheduleUsageRefresh();
-		return this.hasUsablePoolCredential();
+		return this.reportPoolFault(id, { kind: "quota", resetsAt });
 	}
 
 	async reportQuotaExhaustedAndRefreshUsage(id: string, resetsAt?: number): Promise<boolean> {
@@ -1189,21 +1110,34 @@ export class CodexManager {
 	}
 
 	markBanned(id: string): boolean {
+		return this.reportPoolFault(id, { kind: "banned" });
+	}
+
+	private reportPoolFault(
+		id: string,
+		fault: Extract<PoolFault, { kind: "failure" | "quota" }> | { kind: "banned" },
+	): boolean {
 		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
-		stats.failureCount = MAX_FAILURES_PER_CREDENTIAL;
+		const failure = poolFailureState(
+			fault,
+			stats.failureCount,
+			MAX_FAILURES_PER_CREDENTIAL,
+			Date.now(),
+		);
+		stats.failureCount = failure.failureCount;
 		stats.lastUsedAt = new Date().toISOString();
 		this.stats.set(id, stats);
 
-		const entry = this.entries.find((e) => e.id === id);
-		if (entry) {
+		const entry = this.entries.find((candidate) => candidate.id === id);
+		if (entry && failure.disabledReason) {
 			entry.disabled = true;
-			entry.disabledReason = "banned";
-			entry.quotaResetsAt = undefined;
+			// Only Codex faults enter here; API-key-only `invalid` is not a Codex state.
+			entry.disabledReason = failure.disabledReason as DisabledReason;
+			if (fault.kind !== "failure") entry.quotaResetsAt = failure.quotaResetsAt;
 			this.evictSessionsByCredential(id);
 			this.saveCredentials();
 			this.schedulePublicQuotaOverviewBroadcast();
 		}
-
 		this.saveStatsDebounced();
 		this.rescheduleUsageRefresh();
 		return this.hasUsablePoolCredential();
@@ -1239,7 +1173,7 @@ export class CodexManager {
 		// runs this again so a since-reset quota is cleared on the way back in.
 		for (const e of this.poolEntries) {
 			if (e.disabledReason !== "quota_exhausted") continue;
-			if (!e.quotaResetsAt || e.quotaResetsAt > now) continue;
+			if (!e.quotaResetsAt || isPoolCooldownActive(e.quotaResetsAt, now)) continue;
 			e.disabled = false;
 			e.disabledReason = undefined;
 			e.quotaResetsAt = undefined;

@@ -227,7 +227,9 @@ async function launch(
 	]).finally(() => clearTimeout(timer));
 	await until(() => observedAtStart !== undefined);
 	expect(execute).toHaveBeenCalledTimes(1);
-	expect(output).toContain("<background_task_id>");
+	expect(output).toContain("<background_task_id>creation-takeover-regression</background_task_id>");
+	expect(output).toContain(`[Creation takeover regression](nf-agent://open?id=${activeChildId})`);
+	expect(output).not.toContain("nf-agent://open?id=creation-takeover-regression");
 	return { output, observedAtStart, childId: activeChildId as string };
 }
 
@@ -316,7 +318,7 @@ describe("Agent creation in user takeover mode", () => {
 		const { output, observedAtStart, childId } = await launch(false, "success");
 		expect(observedAtStart?.held).toBe(false);
 		expect(output).toContain("Background task started.");
-		expect(output).toContain("Await({");
+		expect(output).toContain("Watch({");
 		releaseExecution?.();
 		await until(() => runEnded(childId));
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });

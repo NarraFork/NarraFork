@@ -567,7 +567,8 @@ async function assertCancelledExtractor(mode: "slow-close" | "ignore-term" | "sh
 	await f.shim(
 		"python3",
 		`import signal,time
-owned=os.path.join(sys.argv[-2],'owned-extraction')
+# Destination follows the archive; trailing byte budgets may change independently.
+owned=os.path.join(sys.argv[sys.argv.index('-c')+3],'owned-extraction')
 with open(owned,'w') as output: output.write('temporary')
 def terminate(signum,frame):
  time.sleep(0.2)
@@ -756,7 +757,8 @@ signal.signal(signal.SIGTERM,signal.SIG_IGN)
 signal.signal(signal.SIGALRM,lambda *_: sys.exit(0))
 signal.setitimer(signal.ITIMER_REAL,0.75)
 with open(e['FIXTURE_MARKER'],'w') as output: output.write(str(os.getpid()))
-with open(os.path.join(sys.argv[-2],'owned-extraction'),'w') as output: output.write('temporary')
+# Destination follows the archive, not the final numeric budget arguments.
+with open(os.path.join(sys.argv[sys.argv.index('-c')+3],'owned-extraction'),'w') as output: output.write('temporary')
 sys.stderr.write('gh: Not Found (HTTP 404)\\n'+e['GH_TOKEN']+'\\n'); sys.stderr.flush()
 ${mode === "stderr-failure" ? "sys.exit(7)" : `sys.${mode === "stderr-overflow" ? "stderr" : "stdout"}.buffer.write(b'x'*(1024*1024+1)); sys.${mode === "stderr-overflow" ? "stderr" : "stdout"}.flush()\nsignal.pause()`}`,
 			);

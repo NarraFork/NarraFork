@@ -5,15 +5,18 @@
  * Supports message editing for progressive streaming.
  */
 
+import type { Dispatcher } from "undici";
 import { logger } from "../../lib/logger";
 import {
 	closeUndiciDispatcher,
 	createUndiciProxyDispatcher,
-	resolveOverride,
-	type UndiciDispatcherLike,
+	resolveProxyForUrl,
 } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { DiscordConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
+
+/** Discord REST endpoint; the proxy is resolved against it so no_proxy rules apply. */
+const DISCORD_API_ENDPOINT = "https://discord.com/api/v10/";
 
 interface DiscordUserLike {
 	id: string;
@@ -58,7 +61,7 @@ export class DiscordAdapter extends BaseAdapter {
 
 	private client: DiscordClientLike | null = null;
 	/** undici ProxyAgent (dispatcher) for REST; closed on disconnect to avoid leaks. */
-	private restAgent: UndiciDispatcherLike | null = null;
+	private restAgent: Dispatcher | null = null;
 	private config: DiscordConfig;
 
 	constructor(config: DiscordConfig) {
@@ -72,9 +75,12 @@ export class DiscordAdapter extends BaseAdapter {
 
 			// Route Discord REST traffic through the resolved proxy (this platform's
 			// override, else the global policy). discord.js REST `agent` expects an
-			// undici Dispatcher. NOTE: this covers REST (sending/editing messages);
-			// the Gateway WebSocket has no proxy entry point and is not routed.
-			const proxy = resolveOverride(this.config.proxy);
+			// undici Dispatcher. Resolved against the REST endpoint so
+			// `settings.proxy.noProxyRules` applies to this channel too (a matching
+			// rule yields no dispatcher, i.e. direct). NOTE: this covers REST
+			// (sending/editing messages); the Gateway WebSocket has no proxy entry
+			// point and is not routed.
+			const proxy = resolveProxyForUrl(DISCORD_API_ENDPOINT, this.config.proxy);
 			this.restAgent = (await createUndiciProxyDispatcher(proxy)) ?? null;
 			if (proxy) {
 				logger.warn(
@@ -89,8 +95,7 @@ export class DiscordAdapter extends BaseAdapter {
 					GatewayIntentBits.DirectMessages,
 					GatewayIntentBits.MessageContent,
 				],
-				// biome-ignore lint/suspicious/noExplicitAny: rest.agent typed as undici Dispatcher
-				...(this.restAgent ? { rest: { agent: this.restAgent as any } } : {}),
+				...(this.restAgent ? { rest: { agent: this.restAgent } } : {}),
 			}) as DiscordClientLike;
 
 			this.client.on("messageCreate", (msg) => this.handleDiscordMessage(msg));

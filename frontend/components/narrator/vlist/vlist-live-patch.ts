@@ -61,6 +61,7 @@ import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
 } from "@shared/pretext-layout/reflection";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import {
 	activityForSubagent,
 	getNewestReflectionToolOccurrence,
@@ -689,6 +690,40 @@ function markTakenOverForNarrator(
 		return next;
 	});
 	return { messages: changed ? updated : messages, changed };
+}
+
+/**
+ * `subagent_nested_changed` → replace the card's nested helper rows (the helpers its
+ * child launched). HEIGHT-AFFECTING (one row each), keyed in `subagentRevision` through
+ * the card's `nestedAgents`. A card without an activity summary yet gets a minimal one
+ * naming its child, like the first live activity event would.
+ */
+export function patchSubagentNested(
+	messages: readonly TreeMessage[],
+	toolUseId: string,
+	subagentNarratorId: string,
+	nested: SubagentNestedSummary,
+): LivePatchResult {
+	if (!toolUseId || !Array.isArray(messages) || messages.length === 0) return unchanged(messages);
+	const result = updateSubagentActivityInMessages(
+		messages as TreeMessage[],
+		toolUseId,
+		(current) => {
+			const base: SubagentActivitySummary = current ?? {
+				subagentNarratorId,
+				model: null,
+				latestToolCalls: [],
+			};
+			if (base.subagentNarratorId && base.subagentNarratorId !== subagentNarratorId) return current;
+			if (nested.total === 0) {
+				if (!base.nested) return current;
+				const { nested: _gone, ...rest } = base;
+				return rest;
+			}
+			return { ...base, nested };
+		},
+	);
+	return result.changed ? result : unchanged(messages);
 }
 
 /**

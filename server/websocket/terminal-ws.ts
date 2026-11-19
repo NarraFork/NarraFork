@@ -1,7 +1,14 @@
 import type { ServerWebSocket } from "bun";
-import { AppError } from "../lib/errors";
+import { AppError, NotFoundError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
+import { hotOnce } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { terminalWsMessageSchema } from "../lib/validators";
+import {
+	narratorTerminalAccessAllowed,
+	rememberStandaloneTerminalCreator,
+	terminalAccessAllowed,
+} from "../services/terminal-access";
 import { terminalService } from "../services/terminal-service";
 import type { WSData } from "./ws-handler";
 
@@ -11,6 +18,10 @@ export interface TerminalWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	subscribedTerminals: Set<string>;
+	/** The authenticated user, for subagent terminals' ACL (`subagent-terminals.ts`). */
+	userId?: string;
+	/** Live role at upgrade; `admin` passes every narrator ACL. */
+	userRole?: string;
 }
 
 // Server → Client messages
@@ -88,6 +99,8 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 			return terminalService.getScrollback(terminalId);
 		})
 		.then((scrollback) => {
+			// Dropped meanwhile (access re-check): no scrollback for it.
+			if (!ws.data.subscribedTerminals.has(terminalId)) return;
 			if (scrollback) {
 				try {
 					ws.send(
@@ -114,6 +127,131 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 				}
 			}
 		});
+}
+
+function principalOf(ws: TerminalWS) {
+	return {
+		userId: ws.data.userId ?? ws.data.sessionUserId ?? "",
+		isAdmin: ws.data.userRole === "admin",
+	};
+}
+
+/** The one answer for a terminal that does not exist and one this user may not open. */
+function sendTerminalNotFound(ws: TerminalWS, terminalId: string): void {
+	try {
+		ws.send(
+			JSON.stringify({
+				type: "error",
+				terminalId,
+				code: "TERMINAL_NOT_FOUND",
+				message: "Terminal not found",
+			}),
+		);
+	} catch {
+		// connection may be dead
+	}
+}
+
+/**
+ * Opening a terminal (watching its output and scrollback, typing, renaming, closing) needs
+ * write access to its narrator, a subagent's judged on its ACL root; a standalone terminal is
+ * its creator's and admins' (`terminal-access.ts`). Checked on subscribe and again on every
+ * input, kill and rename, so a revoked grant stops the next keystroke. A refusal drops the
+ * subscription and answers exactly like an unknown id.
+ */
+async function mayOpenTerminal(ws: TerminalWS, terminalId: string): Promise<boolean> {
+	if (await terminalAccessAllowed(terminalId, principalOf(ws), "write")) return true;
+	ws.data.subscribedTerminals.delete(terminalId);
+	if (lastActiveClient.get(terminalId) === ws) lastActiveClient.delete(terminalId);
+	sendTerminalNotFound(ws, terminalId);
+	return false;
+}
+
+/**
+ * Keystrokes are written in the order they arrived although each waits for its access check:
+ * one chain per connection and terminal.
+ */
+const inputChains = new WeakMap<TerminalWS, Map<string, Promise<void>>>();
+
+function enqueueInput(
+	ws: TerminalWS,
+	terminalId: string,
+	work: () => Promise<void>,
+): Promise<void> {
+	let chains = inputChains.get(ws);
+	if (!chains) {
+		chains = new Map();
+		inputChains.set(ws, chains);
+	}
+	const next = (chains.get(terminalId) ?? Promise.resolve()).then(work, work);
+	chains.set(terminalId, next);
+	void next.finally(() => {
+		if (chains?.get(terminalId) === next) chains.delete(terminalId);
+	});
+	return next;
+}
+
+/**
+ * Re-check every terminal subscription (or those of `sockets`) and drop the ones whose user
+ * may no longer open the terminal, so a revoked share stops the output stream at once rather
+ * than at that user's next keystroke. Called on every access change. One check per
+ * user, role and terminal per sweep; the set is small (one socket per open terminal panel).
+ */
+export async function dropUnauthorizedTerminalSubscriptions(
+	sockets: Iterable<TerminalWS> = connections,
+): Promise<number> {
+	const verdicts = new Map<string, Promise<boolean>>();
+	let dropped = 0;
+	for (const ws of [...sockets]) {
+		for (const terminalId of [...ws.data.subscribedTerminals]) {
+			const principal = principalOf(ws);
+			const key = `${principal.userId}:${principal.isAdmin}:${terminalId}`;
+			let verdict = verdicts.get(key);
+			if (!verdict) {
+				verdict = terminalAccessAllowed(terminalId, principal, "write").catch(() => false);
+				verdicts.set(key, verdict);
+			}
+			if (await verdict) continue;
+			if (!ws.data.subscribedTerminals.delete(terminalId)) continue;
+			if (lastActiveClient.get(terminalId) === ws) lastActiveClient.delete(terminalId);
+			sendTerminalNotFound(ws, terminalId);
+			dropped++;
+		}
+	}
+	return dropped;
+}
+
+let accessSweep: Promise<unknown> | null = null;
+let accessSweepAgain = false;
+
+/** Coalesce bursts of access changes into sweeps that never overlap. */
+function scheduleTerminalAccessSweep(): void {
+	if (accessSweep) {
+		accessSweepAgain = true;
+		return;
+	}
+	accessSweep = dropUnauthorizedTerminalSubscriptions()
+		.catch((error) =>
+			logger.warn("Terminal subscription re-check failed", { error: String(error) }),
+		)
+		.finally(() => {
+			accessSweep = null;
+			if (accessSweepAgain) {
+				accessSweepAgain = false;
+				scheduleTerminalAccessSweep();
+			}
+		});
+}
+
+/** Tests only: wait for the sweep in flight, if any. */
+export async function settleTerminalAccessSweep(): Promise<void> {
+	while (accessSweep) await accessSweep;
+}
+
+if (hotOnce("narrafork.terminalWs.accessListeners")) {
+	eventBus.on("narrator:access_changed", scheduleTerminalAccessSweep);
+	eventBus.on("project:access_changed", scheduleTerminalAccessSweep);
+	eventBus.on("auth:changed", scheduleTerminalAccessSweep);
 }
 
 // === WebSocket handlers ===
@@ -157,7 +295,11 @@ export const handleTerminalWS = {
 				break;
 			case "subscribe": {
 				for (const id of msg.terminalIds) {
+					if (!(await mayOpenTerminal(ws, id))) continue;
 					subscribeToTerminal(ws, id);
+					// An access sweep that ran between the check and the subscription missed it:
+					// check once more now that it is in place.
+					await mayOpenTerminal(ws, id);
 				}
 				logger.debug("Terminal WS subscribed", { count: msg.terminalIds.length });
 				break;
@@ -174,22 +316,27 @@ export const handleTerminalWS = {
 			case "input": {
 				const { terminalId, data } = msg;
 				if (!ws.data.subscribedTerminals.has(terminalId)) break;
-				const prev = lastActiveClient.get(terminalId);
-				if (prev !== ws) {
-					lastActiveClient.set(terminalId, ws);
-					// Active client changed — ask the new client to re-send its dimensions
-					try {
-						ws.send(JSON.stringify({ type: "requestResize", terminalId }));
-					} catch {
-						// noop
+				await enqueueInput(ws, terminalId, async () => {
+					if (!ws.data.subscribedTerminals.has(terminalId)) return;
+					if (!(await mayOpenTerminal(ws, terminalId))) return;
+					const prev = lastActiveClient.get(terminalId);
+					if (prev !== ws) {
+						lastActiveClient.set(terminalId, ws);
+						// Active client changed — ask the new client to re-send its dimensions
+						try {
+							ws.send(JSON.stringify({ type: "requestResize", terminalId }));
+						} catch {
+							// noop
+						}
 					}
-				}
-				terminalService.write(terminalId, data);
+					terminalService.write(terminalId, data);
+				});
 				break;
 			}
 			case "resize": {
 				const { terminalId, cols, rows } = msg;
 				if (!ws.data.subscribedTerminals.has(terminalId)) break;
+				if (!(await mayOpenTerminal(ws, terminalId))) break;
 				// Only honor resize from the last client that sent input
 				const active = lastActiveClient.get(terminalId);
 				if (!active || active === ws) {
@@ -200,7 +347,15 @@ export const handleTerminalWS = {
 			case "create": {
 				const { requestId, ...opts } = msg;
 				try {
+					// A shell on a narrator is its workspace: write access, as for REST create.
+					if (
+						opts.narratorId &&
+						!(await narratorTerminalAccessAllowed(opts.narratorId, principalOf(ws), "write"))
+					)
+						throw new NotFoundError("Narrator", opts.narratorId);
 					const terminal = await terminalService.create(opts);
+					if (!opts.narratorId)
+						rememberStandaloneTerminalCreator(terminal.id, principalOf(ws).userId);
 					try {
 						ws.send(JSON.stringify({ type: "created", requestId, terminal }));
 					} catch {
@@ -224,6 +379,7 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "kill": {
+				if (!(await mayOpenTerminal(ws, msg.terminalId))) break;
 				try {
 					await terminalService.kill(msg.terminalId);
 					sendToTerminal(msg.terminalId, { type: "killed", terminalId: msg.terminalId });
@@ -245,6 +401,7 @@ export const handleTerminalWS = {
 				break;
 			}
 			case "rename": {
+				if (!(await mayOpenTerminal(ws, msg.terminalId))) break;
 				try {
 					await terminalService.rename(msg.terminalId, msg.name);
 					sendToTerminal(msg.terminalId, {

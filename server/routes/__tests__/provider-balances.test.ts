@@ -266,7 +266,7 @@ describe("apikey-quota answers every entry point consistently", () => {
 		// The plugin owns the capability, so disabling it must be visible on the route the UI
 		// reads — and the bundled transport must not answer the question behind its back.
 		const engine = createApikeyQuotaEngine({
-			tools: {
+			commands: {
 				invoke: async () => {
 					throw Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" });
 				},

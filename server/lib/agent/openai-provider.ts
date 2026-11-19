@@ -96,7 +96,13 @@ import {
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
-import { type AgentToolUse, ApiError, isDeepSeekModel, type ResolvedToolDefinition } from "./types";
+import {
+	type AgentToolUse,
+	ApiError,
+	isDeepSeekModel,
+	type ReasoningProviderMetadata,
+	type ResolvedToolDefinition,
+} from "./types";
 import {
 	omitUnsupportedParameters,
 	parseUnsupportedParameter,
@@ -155,6 +161,7 @@ function parsedUsageToUsageData(
 		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
+		...(usage.cacheReported !== undefined && { cacheReported: usage.cacheReported }),
 	};
 }
 
@@ -182,6 +189,13 @@ function openAIUsageToParsedUsage(
 	}
 	if (normalized.cacheCreationInputTokens !== undefined) {
 		merged.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+	}
+	// Relays that omit prompt/input token details leave both counters undefined. Only a
+	// prompt count without them proves absence; output-only partials stay unknown.
+	if (merged.cachedInputTokens !== undefined || merged.cacheCreationInputTokens !== undefined) {
+		merged.cacheReported = true;
+	} else if (merged.promptTokens != null) {
+		merged.cacheReported = false;
 	}
 	if (
 		usage.output_tokens_details?.reasoning_tokens != null ||
@@ -1088,6 +1102,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
+		if (this.apiMode !== "codex" && params.conversationId) {
+			// OpenAI's prompt cache is per-machine; load-balanced relays need a stable routing key (codex sets its own).
+			body.prompt_cache_key = params.conversationId;
+		}
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 
@@ -2373,7 +2391,11 @@ export interface ResponsesReasoningAccum {
 	emittedParts?: Set<string>;
 	/** Exact bytes seen per native content part, including partial delta recovery. */
 	nativeParts?: Map<number, string>;
+	/** Summary bytes are separate from the rendered text and its inserted boundaries. */
+	summaryParts?: Map<number, string>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
+	/** Last terminal snapshot, so completed.output may enrich it without duplicating text. */
+	replayMetadata?: ReasoningProviderMetadata["openai"];
 	completed?: boolean;
 }
 
@@ -2409,6 +2431,12 @@ function resolveReasoningAccum(
 	return findActiveReasoningAccum(reasoningAccum);
 }
 
+/** Partial/empty terminal snapshots cannot truncate bytes already received for this part. */
+function rememberReasoningPart(parts: Map<number, string>, index: number, text: string): void {
+	const previous = parts.get(index);
+	if (previous === undefined || !previous.startsWith(text)) parts.set(index, text);
+}
+
 function pushReasoningTextEvent(
 	results: ParsedStreamEvent[],
 	chunk: ResponsesAPIChunk,
@@ -2431,14 +2459,21 @@ function pushReasoningTextEvent(
 		const index = chunk.content_index ?? 0;
 		const previous = acc.nativeParts.get(index) ?? "";
 		if (options.emitOnlyIfAccumulatorEmpty) {
+			rememberReasoningPart(acc.nativeParts, index, text);
 			if (!text.startsWith(previous)) return;
-			acc.nativeParts.set(index, text);
 			text = text.slice(previous.length);
 			if (!text) return;
 		} else {
 			acc.nativeParts.set(index, previous + text);
 		}
-	} else if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
+	} else {
+		acc.summaryParts ??= new Map();
+		const index = chunk.summary_index ?? 0;
+		const previous = acc.summaryParts.get(index) ?? "";
+		if (options.emitOnlyIfAccumulatorEmpty) rememberReasoningPart(acc.summaryParts, index, text);
+		else acc.summaryParts.set(index, previous + text);
+		if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
+	}
 	acc.emittedParts ??= new Set();
 	acc.emittedParts.add(partKey);
 
@@ -2481,6 +2516,51 @@ function pushReasoningTextEvent(
 		reasoning: emitText,
 		reasoningOutputIndex: chunk.output_index,
 	});
+}
+
+/** Snapshot replay materials only at item boundaries, never on every token delta. */
+function responsesReasoningSnapshot(
+	acc: ResponsesReasoningAccum,
+	item: {
+		id?: string;
+		content?: unknown;
+		summary?: unknown;
+		encrypted_content?: string | null;
+	} = {},
+): NonNullable<ReasoningProviderMetadata["openai"]> {
+	const parts = <T extends "reasoning_text" | "summary_text">(
+		value: unknown,
+		collected: Map<number, string>,
+		type: T,
+	): Array<{ type: T; text: string }> => {
+		if (Array.isArray(value)) {
+			for (const [index, part] of value.entries()) {
+				if (part?.type === type && typeof part.text === "string")
+					rememberReasoningPart(collected, index, part.text);
+			}
+		}
+		// Both empty and nonempty partial snapshots may omit previously seen parts.
+		// Merge by their native index instead of replacing the complete collection.
+		return [...collected].sort(([a], [b]) => a - b).map(([, text]) => ({ type, text }));
+	};
+	acc.nativeParts ??= new Map();
+	acc.summaryParts ??= new Map();
+	const reasoningContent = parts(item.content, acc.nativeParts, "reasoning_text");
+	const reasoningSummary = parts(item.summary, acc.summaryParts, "summary_text");
+	return {
+		itemId: item.id ?? acc.itemId,
+		reasoningEncryptedContent: item.encrypted_content ?? acc.encryptedContent,
+		textFormat:
+			reasoningContent.length && reasoningSummary.length
+				? "mixed"
+				: reasoningContent.length
+					? "reasoning_text"
+					: reasoningSummary.length
+						? "summary_text"
+						: acc.textFormat,
+		reasoningContent,
+		reasoningSummary,
+	};
 }
 
 export function parseResponsesAPIEvent(
@@ -2935,65 +3015,62 @@ export function parseResponsesAPIEvent(
 	}
 
 	// ── Reasoning: output_item.done (type=reasoning) ──
-	// Update encrypted_content with the final value from the done event and
-	// emit a metadata-only event so the loop can persist the final value.
+	// Keep replay materials independent of display text; a later response.output
+	// may enrich an already completed item without emitting its text twice.
 	if (type === "response.output_item.done" && chunk.item?.type === "reasoning") {
 		const itemChunk = { ...chunk, item_id: chunk.item.id ?? chunk.item_id };
 		let acc = resolveReasoningAccum(itemChunk, reasoningAccum);
-		if (acc?.completed) return results;
 		if (!acc) {
 			acc = { itemId: chunk.item.id ?? "", emittedText: "" };
 			reasoningAccum.set(chunk.output_index ?? -(reasoningAccum.size + 1), acc);
 		}
-		// A done-only item is legal on relays. Recover each summary independently.
-		for (const [summaryIndex, part] of (chunk.item.summary ?? []).entries()) {
-			if (typeof part?.text === "string" && part.text) {
-				pushReasoningTextEvent(
-					results,
-					{ ...itemChunk, summary_index: summaryIndex },
-					reasoningAccum,
-					part.text,
-					{ emitOnlyIfAccumulatorEmpty: true },
-				);
+		const completed = acc.completed;
+		if (!completed) {
+			// A done-only item is legal on relays. Recover each part independently.
+			for (const [summaryIndex, part] of (chunk.item.summary ?? []).entries()) {
+				if (typeof part?.text === "string" && part.text) {
+					pushReasoningTextEvent(
+						results,
+						{ ...itemChunk, summary_index: summaryIndex },
+						reasoningAccum,
+						part.text,
+						{ emitOnlyIfAccumulatorEmpty: true },
+					);
+				}
+			}
+			for (const [contentIndex, part] of (chunk.item.content ?? []).entries()) {
+				if (part?.type === "reasoning_text" && typeof part.text === "string") {
+					pushReasoningTextEvent(
+						results,
+						{ ...itemChunk, type: "response.reasoning_text.done", content_index: contentIndex },
+						reasoningAccum,
+						part.text,
+						{ emitOnlyIfAccumulatorEmpty: true },
+					);
+				}
 			}
 		}
-		for (const [contentIndex, part] of (chunk.item.content ?? []).entries()) {
-			if (part?.type === "reasoning_text" && typeof part.text === "string") {
-				pushReasoningTextEvent(
-					results,
-					{
-						...itemChunk,
-						type: "response.reasoning_text.done",
-						content_index: contentIndex,
-					},
-					reasoningAccum,
-					part.text,
-					{ emitOnlyIfAccumulatorEmpty: true },
-				);
-			}
-		}
-		const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
-		acc.encryptedContent = finalEncrypted;
+		const metadata = responsesReasoningSnapshot(acc, chunk.item);
+		if (completed && JSON.stringify(metadata) === JSON.stringify(acc.replayMetadata))
+			return results;
+		acc.replayMetadata = metadata;
+		acc.encryptedContent = metadata.reasoningEncryptedContent;
 		acc.completed = true;
 		results.push({
-			reasoningMetadata: {
-				openai: {
-					itemId: chunk.item.id ?? acc?.itemId,
-					reasoningEncryptedContent: finalEncrypted,
-					textFormat: acc.textFormat,
-				},
-			},
+			reasoningMetadata: { openai: metadata },
 			reasoningBlockId: responsesBlockId(itemChunk, "reasoning"),
 			reasoningOutputIndex: chunk.output_index,
 		});
-		results.push({
-			contentBoundary: {
-				kind: "reasoning",
-				phase: "complete",
-				blockId: responsesBlockId(itemChunk, "reasoning"),
-				outputIndex: chunk.output_index,
-			},
-		});
+		if (!completed) {
+			results.push({
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "complete",
+					blockId: responsesBlockId(itemChunk, "reasoning"),
+					outputIndex: chunk.output_index,
+				},
+			});
+		}
 		return results;
 	}
 
@@ -3019,7 +3096,7 @@ export function parseResponsesAPIEvent(
 		type === "response.reasoning_summary_part.done"
 	) {
 		const text = chunk.text ?? chunk.part?.text;
-		if (typeof text === "string" && text) {
+		if (typeof text === "string") {
 			pushReasoningTextEvent(results, chunk, reasoningAccum, text, {
 				emitOnlyIfAccumulatorEmpty: true,
 			});
@@ -3183,6 +3260,21 @@ export function parseResponsesAPIEvent(
 					),
 				);
 			}
+		}
+		// Some relays finish after reasoning deltas/done without including output items.
+		for (const [outputIndex, acc] of reasoningAccum) {
+			if (acc.completed) continue;
+			results.push(
+				...parseResponsesAPIEvent(
+					{
+						type: "response.output_item.done",
+						output_index: outputIndex >= 0 ? outputIndex : undefined,
+						item: { type: "reasoning", id: acc.itemId },
+					},
+					toolAccum,
+					reasoningAccum,
+				),
+			);
 		}
 		// Legacy relays may omit output_item.done but still send text.done.
 		for (const [blockId, lane] of textLanes) {
@@ -3915,29 +4007,55 @@ function expandResponsesToolResults(messages: ResponsesFunctionCallOutputMessage
 	if (content.length) items.push({ role: "user", content });
 	return items;
 }
-/** Legacy unmarked text may be a summary, even on DeepSeek; never infer native bytes. */
+/** Legacy unmarked/mixed display text is never evidence of native reasoning bytes. */
 function serializeResponsesReasoning(
 	block: ResponsesReasoningBlock,
 	options: ReasoningReplayOptions,
-	trustedCurrentTurn = false,
+	sameSource = signatureSourcesCompatible(
+		block.providerMetadata?.signatureSource,
+		options.currentSource,
+	),
 ): OAIMessage | undefined {
+	if (!sameSource) return undefined;
 	const metadata = block.providerMetadata?.openai;
-	const sameSource =
-		trustedCurrentTurn ||
-		signatureSourcesCompatible(block.providerMetadata?.signatureSource, options.currentSource);
-	if (metadata?.reasoningEncryptedContent && sameSource) {
-		return {
-			type: "reasoning",
-			id: metadata.itemId,
-			summary: block.text.trim() ? [{ type: "summary_text", text: block.text.trim() }] : [],
-			encrypted_content: metadata.reasoningEncryptedContent,
-		} as unknown as OAIMessage;
+	if (!options.strict) {
+		// An explicit snapshot takes precedence over display text, even for mixed items.
+		// Its absence (not an empty/invalid array) enables the legacy native-text path.
+		const native = metadata?.reasoningContent;
+		const content =
+			native === undefined
+				? metadata?.textFormat === "reasoning_text" && block.text
+					? [{ type: "reasoning_text", text: block.text }]
+					: undefined
+				: Array.isArray(native) &&
+						native.length > 0 &&
+						native.every((part) => part?.type === "reasoning_text" && typeof part.text === "string")
+					? native
+					: undefined;
+		if (content) {
+			return { type: "reasoning", id: metadata?.itemId, content } as unknown as OAIMessage;
+		}
 	}
-	if (!options.strict && sameSource && metadata?.textFormat === "reasoning_text" && block.text) {
+	// Unknown gateways may genuinely require opaque state. Preserve that legacy
+	// path, but never let it suppress proven plaintext on a non-strict model.
+	if (metadata?.reasoningEncryptedContent) {
+		const savedSummary = metadata.reasoningSummary;
+		const summary =
+			savedSummary === undefined
+				? block.text.trim()
+					? [{ type: "summary_text", text: block.text.trim() }]
+					: []
+				: Array.isArray(savedSummary) &&
+						savedSummary.every(
+							(part) => part?.type === "summary_text" && typeof part.text === "string",
+						)
+					? savedSummary
+					: [];
 		return {
 			type: "reasoning",
 			id: metadata.itemId,
-			content: [{ type: "reasoning_text", text: block.text }],
+			summary,
+			encrypted_content: metadata.reasoningEncryptedContent,
 		} as unknown as OAIMessage;
 	}
 	return undefined;
@@ -3956,9 +4074,9 @@ function mergeAssistantText(text: string, reasoningFallbackText: string): string
  * `strict` — the target model is credential-bound (Claude family / official
  * OpenAI ids): reasoning items replay only when their `encrypted_content`
  * carries a source identity matching `currentSource` (`signatureSourcesCompatible`);
- * everything else is dropped. `strict: false` — relay models never send
- * `encrypted_content` (meaningless payload for a non-OpenAI upstream) and
- * degrade reasoning text into assistant messages instead.
+ * everything else is dropped. `strict: false` — proven native reasoning text
+ * takes precedence over opaque state. Encrypted-only gateway history remains
+ * replayable from the same source; other reasoning falls back to assistant text.
  */
 interface ReasoningReplayOptions {
 	strict: boolean;
@@ -4055,34 +4173,20 @@ function responsesWireHistory(
 			flushText();
 			switch (item.kind) {
 				case "reasoning": {
-					const openai = (item.credentials.openai ?? {}) as {
-						itemId?: string;
-						reasoningEncryptedContent?: string;
-						textFormat?: string;
-					};
-					const text = item.text.trim();
-					if (openai.reasoningEncryptedContent && item.sameSource) {
-						history.push({
-							type: "reasoning",
-							id: openai.itemId,
-							summary: text ? [{ type: "summary_text", text }] : [],
-							encrypted_content: openai.reasoningEncryptedContent,
-						} as unknown as OAIMessage);
-					} else if (
-						!options.strict &&
-						item.sameSource &&
-						openai.textFormat === "reasoning_text" &&
-						item.text
-					) {
-						history.push({
-							type: "reasoning",
-							id: openai.itemId,
-							content: [{ type: "reasoning_text", text: item.text }],
-						} as unknown as OAIMessage);
-					} else if (!options.strict && text) {
-						// A relay echoes reasoning it cannot replay natively as plain text, so the
-						// model still sees its earlier thinking; strict models drop it.
-						history.push(assistantText(text));
+					const reasoning = serializeResponsesReasoning(
+						{
+							text: item.text,
+							providerMetadata: {
+								openai: item.credentials.openai as ReasoningProviderMetadata["openai"],
+							},
+						},
+						options,
+						item.sameSource,
+					);
+					if (reasoning) history.push(reasoning);
+					else if (!options.strict && item.text.trim()) {
+						// Ordinary text is not native reasoning, and never forwards foreign credentials.
+						history.push(assistantText(item.text.trim()));
 					}
 					break;
 				}

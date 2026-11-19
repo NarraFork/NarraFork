@@ -365,6 +365,43 @@ describe("pushed custom API quota precedence with the real WS hook", () => {
 	});
 });
 
+describe("quota isolation between a main agent and its subagent side by side", () => {
+	test("a subagent's quota frame never reaches this panel's balance or its provider cache", async () => {
+		quotaProviderId = "p1";
+		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		await render();
+		expect(current.quotaBalance).toBeNull();
+
+		await event({
+			type: "quota_balance",
+			quotaBalance: "subagent balance",
+			detailedQuotaBalance: "subagent details",
+			isSubagent: true,
+		});
+
+		expect(current.quotaBalance).toBeNull();
+		expect(current.detailedQuotaBalance).toBeNull();
+		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toBeUndefined();
+	});
+
+	test("a subagent's payment_required never arms this panel's recharge state", async () => {
+		quotaProviderId = "p1";
+		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		await render();
+
+		await event({
+			type: "payment_required",
+			providerId: "p1",
+			balance: 0,
+			required: 5,
+			resumeAction: "retry",
+			isSubagent: true,
+		});
+
+		expect(current.paymentRequired).toBeNull();
+	});
+});
+
 describe("mounted panel and real WS hook reconciliation", () => {
 	test("mounting on an already connected socket still starts a fresh post-subscription read", async () => {
 		connected = true;

@@ -756,6 +756,16 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// otherwise keep drawing the previous numbers.
 	rev += subagentFileChangesRevision(d.fileChanges);
 	if (d.fileChangesExpanded === true) rev += "|gfx:1";
+	// Nested helpers: the row COUNT (and the overflow row) decide height; each row's
+	// status, awaiting mark and title are painted from the cached payload, and the live
+	// `subagent_nested_changed` patch writes them alone. Bounded: at most 5 short rows.
+	if (Array.isArray(d.nestedAgents)) {
+		rev += `|gnr:${d.nestedAgents.length}:${typeof d.nestedTotal === "number" ? d.nestedTotal : 0}`;
+		for (const agent of d.nestedAgents as Array<Record<string, unknown>>) {
+			rev += `|gna:${String(agent.subagentNarratorId)}:${String(agent.status)}:${agent.awaitingPermission === true ? 1 : 0}:${String(agent.ended ?? "")}`;
+			if (typeof agent.title === "string") rev += `:${textSignature(agent.title)}`;
+		}
+	}
 	// Permission blocks force expansion and add their own bodies; presence + count
 	// is enough because the bodies themselves are keyed by the permission measure.
 	if (d.selfPermission != null) rev += "|gf:1";

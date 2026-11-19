@@ -123,6 +123,8 @@ const { readSubtree, loadBodies } = await import("../outline/read");
 const { OUTLINE_TASK_START_ACTOR } = await import("../task-source/outline");
 const { invalidateTaskBackend } = await import("../task-source");
 const { resetOutlineTaskEditsForTests } = await import("../outline-task-edits");
+const { startOutlineTeamEvents, settleOutlineTeamEventsForTests, OUTLINE_TEAM_SOURCE } =
+	await import("../outline/team-events");
 
 const NOW = "2026-11-11T00:00:00.000Z";
 const dirs: string[] = [];
@@ -1717,5 +1719,108 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect(entry?.previousDirectory).toBeUndefined();
 		const hidden = await readProjectTaskBoard({ userId: stranger, isAdmin: false }, p.id);
 		expect(hidden.sections.flatMap((s) => [...s.open, ...s.finished])).toHaveLength(0);
+	});
+});
+
+describe("handed out: a new session does the copy, the original's session is woken and ticks its task (PR 10c-3)", () => {
+	const asSession = (spaceId: string, narratorId: string, userId: string, ops: Op[]) =>
+		writeOutline({
+			spaceId,
+			ops,
+			actor: { kind: "agent", id: narratorId },
+			narratorId,
+			responsibleUserId: userId,
+		});
+	const patch = (userId: string, path: string, body: unknown) => {
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: userId, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			await next();
+		});
+		app.onError(
+			(error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: String(error) }, 500),
+		);
+		app.route("/outline", outlineRoutes);
+		return app.request(`http://localhost/outline${path}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	};
+
+	test("「交给团队」 → the copy in the pool → 「开新会话做这个」 does it → the team event wakes the original's session → it ticks the original", async () => {
+		startOutlineTeamEvents();
+		const alice = await person("alice");
+		const p = await project(alice);
+		const main = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "Main",
+			taskBackend: "outline",
+		});
+		opened.push(main.id);
+		const sessionSpace = await ensureSessionSpace(main.id);
+		const seeded = await asSession(sessionSpace.id, main.id, alice, [
+			{ op: "insert", tempId: "p", parent: null, content: "Work" },
+			{
+				op: "insert",
+				parent: { tempId: "p" },
+				content: "Port the parser",
+				task: { status: "todo" },
+			},
+		]);
+		const original = seeded.results[1]?.blockId as string;
+
+		// ── Handed to the team from the session's board. ──
+		const handed = await patch(alice, `/tasks/${original}`, {
+			baseVersionSeq: (await stateOf(original)).versionSeq,
+			assign: { kind: "team" },
+		});
+		expect(handed.status).toBe(200);
+		const { handedOut } = (await handed.json()) as {
+			handedOut: { copyId: string; address: string };
+		};
+		expect(await stateOf(original)).toMatchObject({ status: "todo", holder: null });
+		// The copy is in the pool: nobody on it, a session can be opened for it.
+		const board = await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id);
+		const pooled = board.sections.flatMap((s) => s.open).find((e) => e.id === handedOut.copyId);
+		expect(pooled).toMatchObject({ status: "todo", openSession: true, executor: { kind: "none" } });
+		// Handing it out by the board woke nobody.
+		await settleOutlineTeamEventsForTests();
+		expect(requests).toHaveLength(0);
+
+		// ── A new session does the copy; the original's session is then woken and ticks it. ──
+		let worker = "";
+		onTurn = async (turn) => {
+			if (turn === 1)
+				await asSession(p.space.id, worker, alice, [
+					{ op: "setTask", block: { id: handedOut.copyId }, task: { status: "done" } },
+				]);
+			else
+				await asSession(sessionSpace.id, main.id, alice, [
+					{ op: "setTask", block: { id: original }, task: { status: "done" } },
+				]);
+		};
+		const opening = open(alice, {
+			id: handedOut.copyId,
+			versionSeq: (await stateOf(handedOut.copyId)).versionSeq as number,
+		});
+		for (let i = 0; i < 400 && !worker; i++) {
+			worker = (await sessionsOf(p.id)).find((row) => row.id !== main.id)?.id ?? "";
+			if (!worker) await Bun.sleep(2);
+		}
+		expect((await opening).status).toBe(201);
+		await idle(worker, 1);
+		expect(await stateOf(handedOut.copyId)).toMatchObject({ status: "done" });
+		await settleOutlineTeamEventsForTests();
+		await idle(main.id, 2);
+
+		expect(requests).toHaveLength(2);
+		// The woken turn read why: the prerequisite it waited for was done.
+		const told = (await history(main.id)).find((row) => row.source === OUTLINE_TEAM_SOURCE);
+		expect(told?.text).toContain(handedOut.address);
+		expect(requests[1]?.input).toContain(handedOut.address);
+		expect(await stateOf(original)).toMatchObject({ status: "done" });
 	});
 });

@@ -3,7 +3,9 @@
  * production access executor, on a database with every `drizzle-postgres` migration applied
  * verbatim: paging in byte order (ids chosen to order differently under ICU and byte order, with
  * a tie on the commit time and never-committed spaces), at every page size, without repeats or
- * skips; the bounded counts; and who sees which projects and loose sessions.
+ * skips; the bounded counts; who sees which projects and loose sessions; and what a row says of
+ * its space (readability F: the questions waiting for the reader, the tasks in progress and the
+ * block its one line is read from), each subquery on its partial index's own predicate.
  *
  * Rules, same as the other PostgreSQL suites:
  *   - `PG_INTEGRATION=1` means PostgreSQL really has to run; a blocked harness fails;
@@ -18,6 +20,7 @@ import {
 	createPostgresOutlineAccessExecutor,
 	type OutlineTreeScope,
 	outlineAccessBackend,
+	readOutlineTreeSpaceFacts,
 	readOutlineTreeSpacePage,
 	setOutlineAccessExecutor,
 } from "../../../../server/services/outline/access-reads";
@@ -91,6 +94,43 @@ async function seed(run: (q: SQL) => Promise<unknown>) {
 	}
 }
 
+/** Blocks of the session space `sa_b` (and one of `saB`): tasks, questions, a summary. */
+async function seedWork(run: (q: SQL) => Promise<unknown>) {
+	const block = async (
+		id: string,
+		space: string,
+		seq: number,
+		extra: { task?: string; alias?: string; deleted?: boolean } = {},
+	) => {
+		const task = extra.task ? JSON.stringify({ status: extra.task }) : null;
+		await run(
+			sql`insert into outline_blocks (id, space_id, sid, parent_id, page_id, order_key, content, content_hash, alias, task_json, author_kind, author_id, version_seq, deleted) values (${id}, ${space}, ${id}, null, ${id}, ${id}, ${`title ${id}`}, 'h', ${extra.alias ?? null}, ${task}, 'human', 'me', ${seq}, ${extra.deleted === true})`,
+		);
+	};
+	await block("t1", "sa_b", 1, { task: "doing" });
+	await block("t2", "sa_b", 5, { task: "doing" });
+	await block("t3", "sa_b", 6, { task: "doing", deleted: true });
+	await block("t4", "sa_b", 2, { task: "done" });
+	await block("t5", "sa_b", 4, { task: "cancelled" });
+	await block("t6", "sa_b", 7, { task: "todo" });
+	await block("n1", "sa_b", 3, { alias: "summary" });
+	await block("q1", "sa_b", 8);
+	await block("q2", "sa_b", 9);
+	await block("q3", "sa_b", 10, { deleted: true });
+	await block("q4", "sa_b", 11);
+	await block("x1", "saB", 1, { task: "done" });
+	for (const [id, to, state] of [
+		["q1", "me", "open"],
+		["q2", "other", "open"],
+		["q3", "me", "open"],
+		["q4", "me", "answered"],
+	] as const) {
+		await run(
+			sql`insert into outline_questions (block_id, space_id, state, to_user_id, created_at) values (${id}, 'sa_b', ${state}, ${to}, ${NOW})`,
+		);
+	}
+}
+
 async function walk(scope: OutlineTreeScope, limit: number): Promise<string[]> {
 	const seen: string[] = [];
 	let after: { lastCommitAt: string | null; id: string } | null = null;
@@ -142,6 +182,9 @@ describe("PostgreSQL connected outline", () => {
 						icu: boolean;
 					}>;
 					await seed((q) => client.db.execute(q));
+					await seedWork((q) => client.db.execute(q));
+					const facts = await readOutlineTreeSpaceFacts("me", ["sa_b", "saB", "sAA"], 100);
+					const cappedFacts = await readOutlineTreeSpaceFacts("me", ["sa_b"], 1);
 					const sessions = await walk({ kind: "project", projectId: "P1" }, 100);
 					const bySize: Record<number, string[]> = {};
 					for (const limit of [1, 2, 3, 4]) {
@@ -151,6 +194,8 @@ describe("PostgreSQL connected outline", () => {
 						backend: outlineAccessBackend(),
 						icuOrder: order?.icu === true,
 						sessions,
+						facts: Object.fromEntries(facts),
+						cappedDoing: cappedFacts.get("sa_b")?.doing,
 						bySize,
 						count: await countOutlineTreeSpaces(me, { kind: "project", projectId: "P1" }, 100),
 						capped: await countOutlineTreeSpaces(me, { kind: "project", projectId: "P1" }, 4),
@@ -193,6 +238,38 @@ describe("PostgreSQL connected outline", () => {
 			expect(new Set(outcome.loose)).toEqual(new Set(["sL1", "sL2"]));
 			expect(outcome.looseCount).toBe(2);
 			expect(outcome.orphaned).toBe(0);
+			// What a row says: live blocks only, the reader's own open questions, the latest picks.
+			expect(outcome.facts).toEqual({
+				sa_b: {
+					waiting: 1,
+					waitingBlockId: "q1",
+					waitingPageId: "q1",
+					doing: 2,
+					doingId: "t2",
+					// The task done last; the cancelled one after it is not it.
+					finishedId: "t4",
+					summaryId: "n1",
+				},
+				saB: {
+					waiting: 0,
+					waitingBlockId: null,
+					waitingPageId: null,
+					doing: 0,
+					doingId: null,
+					finishedId: "x1",
+					summaryId: null,
+				},
+				sAA: {
+					waiting: 0,
+					waitingBlockId: null,
+					waitingPageId: null,
+					doing: 0,
+					doingId: null,
+					finishedId: null,
+					summaryId: null,
+				},
+			});
+			expect(outcome.cappedDoing).toBe(1);
 		},
 		RUN_TIMEOUT_MS,
 	);

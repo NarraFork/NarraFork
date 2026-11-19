@@ -11,23 +11,20 @@
  * because its filesystem is not reachable through the local one.
  */
 
-import { Alert, Button, Group, Loader, Modal, Stack, Text } from "@mantine/core";
+import { Alert, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { IconAlertTriangle, IconFolder } from "@tabler/icons-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import { api } from "../../../lib/api";
 import { Z } from "../../../lib/z-index";
+import { DeviceDirectoryBrowser } from "../../common/DeviceDirectoryPicker";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
-
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
-
-const LOCAL_DEVICE = "local";
+import { LOCAL_DEVICE } from "../../common/device-directory-options";
+import {
+	DIRECTORY_BROWSER_MODAL_STYLES,
+	DIRECTORY_BROWSER_ROOT_STYLE,
+} from "../../common/directory-browser-modal";
 
 export interface DeviceDirectoryDialogProps {
 	narratorId: string;
@@ -98,27 +95,26 @@ export function DeviceDirectoryDialog({
 			zIndex={Z.modal}
 			styles={DIRECTORY_BROWSER_MODAL_STYLES}
 		>
-			<Stack gap="sm">
+			<Stack gap="sm" p="md" style={DIRECTORY_BROWSER_ROOT_STYLE}>
 				<Text size="xs" c="dimmed">
 					{isRemote
 						? t("deviceDirectoryRemoteHint", { device: deviceName ?? target })
 						: t("deviceDirectoryLocalHint")}
 				</Text>
 				{isRemote ? (
-					<Suspense fallback={<Loader size="sm" />}>
-						<RemoteDirectoryBrowser
-							deviceLabel={deviceName ?? target}
-							initialPath={cwd.trim() || undefined}
-							listDirectory={(path, opts) =>
-								api.browseNarratorDevice(narratorId, target, path, {
-									showHidden: opts.showHidden,
-								})
-							}
-							queryKey={["narratorDeviceBrowse", narratorId, target]}
-							onSelect={setCwd}
-							onCancel={onClose}
-						/>
-					</Suspense>
+					<DeviceDirectoryBrowser
+						deviceId={target}
+						deviceLabel={deviceName ?? target}
+						initialPath={cwd.trim() || undefined}
+						listDirectory={(path, opts) =>
+							api.browseNarratorDevice(narratorId, target, path, {
+								showHidden: opts.showHidden,
+							})
+						}
+						queryKey={["narratorDeviceBrowse", narratorId, target]}
+						onSelect={setCwd}
+						onCancel={onClose}
+					/>
 				) : (
 					<DirectoryPicker
 						label={t("deviceDirectoryLabel")}

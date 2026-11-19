@@ -25,7 +25,6 @@ import {
 	groupToolExecutions,
 	isAgentDependentToolExecutionGroup,
 } from "../lib/agent/tool-execution-groups";
-import { listRunningAwaits } from "../lib/agent/tools/await";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -333,7 +332,6 @@ export async function runContinuationRecoveryGroups(
 /** Persist every process-owned wait that may still be live when the replacement starts. */
 export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpdateRecoverySnapshot> {
 	const snapshot = capturePlannedUpdateRecoverySnapshot();
-	const runningAwaits = new Map(listRunningAwaits().map((entry) => [entry.toolUseId, entry]));
 	const [{ BACKGROUND_TASK_TIMEOUT_MS }, { listDeliveringRuns }] = await Promise.all([
 		import("./subagent-runner"),
 		import("./agent-runtime/run"),
@@ -452,32 +450,6 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 					logicalRunId: runtime?.logicalRunId ?? readAgentLogicalRunId(subagentId),
 					...deadline,
 				},
-			});
-			continue;
-		}
-		const awaitEntry = runningAwaits.get(toolCall.toolUseId);
-		if (
-			toolCall.toolName === "Await" &&
-			(awaitEntry?.awaitType === "agent" || input?.type === "agent")
-		) {
-			const targetId =
-				awaitEntry?.targetId ?? (typeof input?.id === "string" ? input.id : undefined);
-			if (!targetId) continue;
-			const existingContinuation = await toolContinuationService.getByToolCallId(toolCall.id);
-			const deadlineAt =
-				awaitEntry?.deadlineAt ??
-				payloadString(existingContinuation?.payloadJson ?? null, "awaitDeadlineAt") ??
-				new Date(
-					Date.now() + (typeof input?.timeout === "number" ? input.timeout : 600_000),
-				).toISOString();
-			await toolContinuationService.checkpoint({
-				toolCallId: toolCall.id,
-				narratorId: toolCall.narratorId,
-				updateEpoch: snapshot.updateEpoch,
-				kind: "await_agent",
-				state: "waiting",
-				deadlineAt,
-				payloadJson: { targetId, awaitDeadlineAt: deadlineAt },
 			});
 		}
 	}
@@ -1005,7 +977,7 @@ async function persistRecoveredBackgroundAgentStartResult(
 	await narratorService.updateToolCallResult(
 		toolCall.toolUseId,
 		{
-			output: buildBackgroundAgentStartOutput(taskIdOrAlias),
+			output: buildBackgroundAgentStartOutput(taskIdOrAlias, subagentId),
 			status: "success",
 			completedAt: Date.now(),
 		},
@@ -1111,28 +1083,30 @@ async function restoreAwait(
 		(awaitDeadlineAt ? Date.parse(awaitDeadlineAt) : Date.now()) - Date.now(),
 		0,
 	);
-	const { awaitAgentResultDetailed } = await import("./agent-communication");
-	const { waiting } = await withRecoveryAdvance(record.updateEpoch, () => ({
-		waiting: awaitAgentResultDetailed({
-			callerNarratorId: record.narratorId,
-			id: targetId,
-			timeoutMs: remainingMs,
-			signal,
-		}),
-	}));
-	onMounted();
-	const result = await waiting;
-	if (signal.aborted) throw signal.reason ?? new Error("Await continuation recovery was aborted");
 	const toolCall = await db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, record.toolCallId),
 	});
-	if (!toolCall) throw new Error("Await tool call was deleted before recovery");
+	if (!toolCall) throw new Error("Legacy Await tool call was deleted before recovery");
+	const { registerRecoveryAgentWatch } = await import("./narrator-subagent-recovery");
+	const result = await withRecoveryAdvance(record.updateEpoch, () =>
+		registerRecoveryAgentWatch({
+			narratorId: record.narratorId,
+			id: targetId,
+			toolUseId: toolCall.toolUseId,
+			timeout: Math.max(1, remainingMs),
+			signal,
+		}),
+	);
+	onMounted();
 	const { narratorService } = await import("./narrator-service");
 	await narratorService.updateToolCallResult(
 		toolCall.toolUseId,
 		{
-			output: buildRecoveredAwaitToolOutput(targetId, result),
-			status: "success",
+			output: result.metadata
+				? { _text: result.output, _metadata: result.metadata }
+				: result.output,
+			status: result.isError ? "fail" : "success",
+			errorMessage: result.isError ? result.output : undefined,
 			completedAt: Date.now(),
 		},
 		toolCall.messageId,

@@ -17,7 +17,7 @@ export const DEFAULTS: NarraForkSettings = {
 	speech: { enabled: false, providers: [] },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
-	proxy: { mode: "direct" },
+	proxy: { mode: "direct", noProxyRules: [] },
 	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
 	// DATABASE_URL from the environment — the connection URL is never read from this file
 	// (see the `database` field comment in types.ts).
@@ -333,7 +333,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"server.tls.autoReissue": {
-		desc: "启动时，本机 IP 变化则自动重新签发内置证书，保留原 CA。默认开启。",
+		desc: "启动时，本机 IP 变化、证书有效期超过 825 天，或剩余不足 30 天，则自动重新签发内置证书，保留原 CA。默认开启。",
 		type: "boolean",
 	},
 	"server.tls.certFile": {
@@ -377,6 +377,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"proxy.url": {
 		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https 协议，仅填 host:port 时默认按 http 处理。',
 		type: "string",
+	},
+	"proxy.noProxyRules": {
+		desc: "直连规则（no_proxy）。每条含 match（wildcard / regex）、pattern、enabled。内置 HTTP 通道按目标豁免；插件提供商不按目标豁免。交互浏览器只收到部分通配主机规则，裸主机在 Chromium 里不是「主机及其子域」。规则只能直连，不能强制走代理。",
+		type: "array",
 	},
 
 	// ── paths ───────────────────────────────────────────────────────────
@@ -433,6 +437,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "大纲开关打开后，还在用 Dynamic Spec（spec://）记任务的旧会话怎样导入大纲。导入把会话当前的 spec 文件、任务和行为边界写进会话的大纲空间，逐条核对后把会话改成用大纲记任务；Dynamic Spec 的数据保留不删。auto（默认）：在会话下一次开始运行前（小会话）和后台在会话空闲时导入，也可以在 Spec 面板点「现在导入」；manual：只在 Spec 面板点「现在导入」（或管理员在设置页「大纲导入」重导）时导入；off：不导入。导入的状态、需要处理的会话、按会话重导和退回见设置页「大纲导入」。",
 		type: "string",
 		valid: "auto / manual / off，默认 auto",
+	},
+	"outline.specLossCutoff": {
+		desc: "「旧 Spec 面板可能吞掉的内容」排查第一次在本机运行的时间（系统内部使用，由排查自己写入，不要手动修改）。这个时间之后人在 Spec 面板的保存用的是修复后的编辑器，删掉的内容算有意删除，排查不再看。",
+		type: "string",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────

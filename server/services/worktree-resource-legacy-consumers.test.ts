@@ -306,10 +306,16 @@ function terminalHttpApp(userId = "owner") {
 	app.route("/terminals", terminalRoutes);
 	return app;
 }
+/** A terminal socket of the fixtures' narrator owner: creating on a narrator needs write access. */
 function fixtureWs() {
 	const messages: Array<{ type: string; terminal?: { id: string } }> = [];
 	const ws = {
-		data: { subscribedTerminals: new Set<string>(), lastPongAt: 0 },
+		data: {
+			subscribedTerminals: new Set<string>(),
+			lastPongAt: 0,
+			userId: "owner",
+			userRole: "user",
+		},
 		send: (payload: string) => messages.push(JSON.parse(payload)),
 	} as unknown as Parameters<typeof handleTerminalWS.message>[0];
 	return { ws, messages };

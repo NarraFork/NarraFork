@@ -217,6 +217,7 @@ export function projectPublicNarratorPayload<T>(narratorId: string, payload: T):
 	const toolRows = payloadToolRows(payload);
 	let visited = 0;
 	let reads = 0;
+	let redactedTools = 0;
 	const decisions = new Map<string, Identity>();
 	const classify = (identity: PublicToolIdentity, scope: string): Identity => {
 		if (isGenUiToolName(identity.toolName)) return "private";
@@ -241,7 +242,12 @@ export function projectPublicNarratorPayload<T>(narratorId: string, payload: T):
 		decisions.set(key, result);
 		return result;
 	};
-	const visit = (value: unknown, depth: number, scope: string): unknown => {
+	const visit = (
+		value: unknown,
+		depth: number,
+		scope: string,
+		position: "transcript" | "content" | "data" = "transcript",
+	): unknown => {
 		if (++visited > MAX_PROJECTION_NODES || depth > MAX_PROJECTION_DEPTH)
 			throw new AppError(
 				"Public transcript projection limit",
@@ -251,7 +257,7 @@ export function projectPublicNarratorPayload<T>(narratorId: string, payload: T):
 		if (Array.isArray(value)) {
 			let changed = false;
 			const projected = value.map((entry) => {
-				const next = visit(entry, depth + 1, scope);
+				const next = visit(entry, depth + 1, scope, position);
 				changed ||= next !== entry;
 				return next;
 			});
@@ -262,24 +268,76 @@ export function projectPublicNarratorPayload<T>(narratorId: string, payload: T):
 		if (
 			isGenUiToolName(value.toolName) ||
 			(value.type === "tool_use" && isGenUiToolName(value.name))
-		)
+		) {
+			redactedTools++;
 			return publicGenUiSummary(value);
+		}
 		const identity = identityFor(value);
 		if (identity) {
 			const state = classify(identity, localScope);
-			if (state === "private" || (state === "unknown" && value.type === "tool_result"))
+			if (state === "private" || (state === "unknown" && value.type === "tool_result")) {
+				redactedTools++;
 				return publicGenUiSummary(value);
+			}
 		}
 		let result = value;
+		if (
+			position === "content" &&
+			(value.type === "reasoning" || value.type === "thinking") &&
+			Object.hasOwn(value, "providerMetadata")
+		) {
+			// Replay state is never public display content. Match stripProviderMetadata's
+			// encryption-presence bit, without loading history or walking opaque payloads.
+			const metadata: Record<string, unknown> = object(value.providerMetadata)
+				? value.providerMetadata
+				: {};
+			let fields = 0;
+			let encrypted = metadata.hasEncryptedReasoning === true;
+			for (const key in metadata) {
+				if (!Object.hasOwn(metadata, key)) continue;
+				if (++visited > MAX_PROJECTION_NODES)
+					throw new AppError(
+						"Public transcript projection limit",
+						503,
+						"PUBLIC_SHARE_PROJECTION_LIMIT",
+					);
+				fields++;
+				const provider = metadata[key];
+				if (
+					object(provider) &&
+					typeof provider.reasoningEncryptedContent === "string" &&
+					provider.reasoningEncryptedContent.length > 0
+				)
+					encrypted = true;
+			}
+			if (fields !== 1 || metadata.hasEncryptedReasoning !== true) {
+				const { providerMetadata: _dropped, ...rest } = value;
+				result = encrypted ? { ...rest, providerMetadata: { hasEncryptedReasoning: true } } : rest;
+			}
+		}
 		for (const key of CONTAINERS) {
 			if (!object(value[key]) && !Array.isArray(value[key])) continue;
-			const next = visit(value[key], depth + 1, localScope);
+			// Only message-body elements are reasoning blocks. Nested tool/user JSON
+			// cannot opt into this projection with a lookalike type or contentJson key.
+			const childPosition =
+				position !== "transcript" || value.type === "tool_use" || value.type === "tool_result"
+					? "data"
+					: key === "contentJson"
+						? "content"
+						: "transcript";
+			const previousRedactedTools = redactedTools;
+			const next = visit(value[key], depth + 1, localScope, childPosition);
 			if (next !== value[key]) {
 				if (result === value) result = { ...value };
 				result[key] = next;
 				// A denormalized full-text fallback can contain the original tool result
-				// even after its structured block was replaced. Never return both copies.
-				if ((key === "contentJson" || key === "content") && "contentText" in result)
+				// even after its structured block was replaced. Metadata-only projection
+				// must instead retain the public text fallback unchanged.
+				if (
+					(key === "contentJson" || key === "content") &&
+					"contentText" in result &&
+					redactedTools !== previousRedactedTools
+				)
 					result.contentText = null;
 			}
 		}

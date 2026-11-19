@@ -19,6 +19,7 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
 import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
+import type { TeamPersonDecisionEventKind } from "@shared/project-teams";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -484,7 +485,7 @@ import {
 	markRecoveryCardResolved,
 	resumeIncompleteAgentWorkForContinue,
 	resumeRecoverySubagents,
-	startRecoveryAwaitBatch,
+	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
@@ -516,6 +517,8 @@ import {
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
+import { personActor, runAsTeamStatusActor } from "../services/teams/team-records";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -817,6 +820,17 @@ narratorRoutes.use("*", async (_c, next) => {
 	requireSqliteNarratorSurface();
 	return next();
 });
+
+/**
+ * Unarchive on the caller's behalf (the unarchive route and the auto-unarchive on interaction).
+ * Only this status write runs as the caller, so a team coordinator's unarchive event names the
+ * person; whatever the request goes on to start does not inherit them (see team-records.ts).
+ */
+function unarchiveAsCaller(c: Context, id: string) {
+	return runAsTeamStatusActor(personActor(c.get("user")?.sub), () =>
+		narratorService.updateStatus(id, "idle"),
+	);
+}
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
@@ -2573,7 +2587,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const {
@@ -3137,7 +3151,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3172,7 +3186,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	}
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3234,9 +3248,9 @@ narratorRoutes.post("/:id/continue", async (c) => {
 });
 
 // Resume error subagents listed on the recovery card inserted after a narrator error.
-// mode "notify": restart them and inject a prompt so the model awaits them itself.
-// mode "await":  restart them, then synthesize one assistant turn with N Await
-//                tool calls, run them server-side, and continue ONCE.
+// mode "notify": restart them and tell the model that normal completion will notify.
+// mode "watch": restart them and register non-blocking Watch calls, then return.
+// Legacy "await" requests normalize to "watch"; no blocking tool is synthesized.
 narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
@@ -3276,8 +3290,8 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
 	}
 
-	if (body.mode === "await") {
-		await startRecoveryAwaitBatch({
+	if (body.mode === "watch") {
+		await startRecoveryWatchBatch({
 			narratorId: id,
 			aliases: resumed,
 			locale,
@@ -3285,7 +3299,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			userId,
 			humanReplyContext: { locale, replyInUserLanguage },
 		});
-		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
+		return c.json({ ok: true, mode: "watch", resumed: resumed.length, skipped });
 	}
 
 	// notify: a `sys` message would be skipped by getLastContinuableTopLevelMessage
@@ -3331,7 +3345,7 @@ async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
 	}
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3550,7 +3564,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	await prepareHistoryRewrite(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const locale = await getUserLanguage(userId);
@@ -3593,7 +3607,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const userId = c.get("user").sub;
@@ -3610,7 +3624,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
+		await unarchiveAsCaller(c, id);
 	}
 
 	const result = await restoreAssistantMessage(id, messageId);
@@ -4754,7 +4768,7 @@ narratorRoutes.post("/:id/blocks/rollback", async (c) => {
 	const narrator = await narratorService.getById(id);
 	// As for the index route: the rollback discards the running turn it lands in.
 	await prepareHistoryRewrite(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	const result = await rollbackToBlocks(id, blockIds, {
 		revertPlan,
 		skipRevert: skipRevert === true,
@@ -4832,7 +4846,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 	const id = c.req.param("id");
 	const { content } = editAssistantMessageSchema.parse(await c.req.json());
 	const narrator = await narratorService.getById(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await editOutputBlock(id, c.req.param("blockId"), content, c.get("user").sub));
 });
 
@@ -4840,7 +4854,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 narratorRoutes.post("/:id/blocks/:blockId/restore", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (narrator.status === "archived") await narratorService.updateStatus(id, "idle");
+	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await restoreOutputBlock(id, c.req.param("blockId")));
 });
 
@@ -5983,7 +5997,6 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 	// HTTP write ACL and Agent controller authorization share the same mechanism:
 	// end the complete run (including a hold), then archive any kind of session.
 	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
-
 	// 顺便提问子会话跟主会话绑在一起，归档主会话就把它们一起归档。
 	const archivedChildIds: string[] = [];
 	for (;;) {
@@ -5991,7 +6004,9 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 		if (batch.length === 0) break;
 		for (const child of batch) {
 			await rememberArchivedTabPlacement(c.get("user").sub, child.id);
-			const childResult = await interruptAndArchiveSubagent(child.id);
+			const childResult = await runAsTeamStatusActor(personActor(c.get("user").sub), () =>
+				interruptAndArchiveSubagent(child.id),
+			);
 			// 子会话刚被别处删掉不算失败：主会话的归档不该被它挡住。
 			if (!childResult.ok && childResult.error !== "not_found") {
 				throw new ValidationError(childResult.error ?? "Failed to archive narrator");
@@ -6002,7 +6017,10 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 	}
 
 	await rememberArchivedTabPlacement(c.get("user").sub, id);
-	const result = await interruptAndArchiveSubagent(id);
+	// Only the archive itself runs as the caller (a team coordinator's event names them).
+	const result = await runAsTeamStatusActor(personActor(c.get("user").sub), () =>
+		interruptAndArchiveSubagent(id),
+	);
 	if (!result.ok && result.error === "not_found") throw new NotFoundError("Narrator", id);
 	if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive narrator");
 	return c.json({ ok: true, archivedChildIds });
@@ -6020,24 +6038,13 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 		const batch = await pendingAskInPassingCascade(id, "active");
 		if (batch.length === 0) break;
 		for (const child of batch) {
-			await narratorService.updateStatus(child.id, "idle");
+			await unarchiveAsCaller(c, child.id);
 			await restoreArchivedTabPlacement(c.get("user").sub, child.id, child.title ?? child.id);
 		}
 		if (batch.length < ASK_IN_PASSING_CASCADE_BATCH) break;
 	}
 
-	await narratorService.updateStatus(id, "idle");
-	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
-	return c.json({ ok: true });
-});
-
-// Unarchive narrator
-narratorRoutes.patch("/:id/unarchive", async (c) => {
-	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	await narratorService.updateStatus(id, "idle");
-	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
-	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
+	await unarchiveAsCaller(c, id);
 	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
 	return c.json({ ok: true });
 });
@@ -6560,6 +6567,23 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 	});
 });
 
+/** A person's action on an asynchronous question of a team tree, recorded with them (M1). */
+function recordAsyncQuestionAction(
+	narratorId: string,
+	questionId: string,
+	userId: string,
+	kind: TeamPersonDecisionEventKind,
+) {
+	recordTeamPersonDecision({
+		requestId: questionId,
+		target: { narratorId, toolName: "AskUserQuestion" },
+		userId,
+		decision: kind === "question.answered" ? "allow" : "deny",
+		kind,
+		questionId,
+	});
+}
+
 narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const narratorId = c.req.param("id");
 	const questionId = c.req.param("questionId");
@@ -6574,11 +6598,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 		return c.json({ error: "Question not found" }, 404);
 	}
 	const userId = c.get("user").sub;
+	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
 		userId,
-		locale: (await getUserLanguage(userId)) as Locale,
+		locale,
 	});
 	if (!result.ok) {
 		return c.json(
@@ -6586,6 +6613,7 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 			result.reason === "not_found" ? 404 : 409,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.supplemented");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6611,6 +6639,8 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding: the gate ran before the body arrived.
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await answerAsyncQuestion(questionId, {
 		answers: parsed.data.answers,
 		annotations: parsed.data.annotations ?? null,
@@ -6623,6 +6653,7 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.answered");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6642,6 +6673,8 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await dismissAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6649,6 +6682,7 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.dismissed");
 	return c.json({ ok: true, question: result.record });
 });
 
@@ -6670,6 +6704,8 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	}
 
 	const locale = (await getUserLanguage(userId)) as Locale;
+	// Last await before deciding (the gate ran before the request was read).
+	await requireNarratorAccess(c, narratorId, "write");
 	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
@@ -6677,8 +6713,25 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 			result.reason === "stale" ? 409 : 404,
 		);
 	}
+	recordAsyncQuestionAction(narratorId, questionId, userId, "question.ignored");
 	return c.json({ ok: true, question: result.record });
 });
+
+/**
+ * A person's decision on a pending call: read the call first (the team's record of who decided,
+ * M1, needs it, and deciding takes it out of the live registries), then check write access on
+ * its session again, then decide. The gate above ran before the body arrived; `assertStillAllowed`
+ * runs once more inside the decision, after any wait to resume a paused restart recovery, so
+ * access revoked while the request was in flight (a member removed from a team) never lets it
+ * through.
+ */
+async function prepareDecision(c: Context, requestId: string) {
+	const target = await readDecisionTarget(requestId);
+	const assertStillAllowed = () =>
+		requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	await assertStillAllowed();
+	return { target, assertStillAllowed };
+}
 
 // Approve permission
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
@@ -6686,7 +6739,9 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "allow", ...body });
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "allow", {
+		assertStillAllowed,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		compactAfter: parsed.success ? parsed.data.compactAfter : undefined,
@@ -6695,22 +6750,35 @@ narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			answered: parsed.success && !!parsed.data.answers,
+		});
 	return c.json({ ok: true });
 });
 
 // Deny permission
 narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const requestId = c.req.param("requestId");
+	const userId = c.get("user").sub;
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const resolved = await resolvePermissionOrDangerReflection(requestId, "deny", {
+		assertStillAllowed,
 		denyMessage: parsed.success ? parsed.data.message : undefined,
 		answers: parsed.success ? parsed.data.answers : undefined,
 		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
 		updatedPlan: parsed.success ? parsed.data.updatedPlan : undefined,
+		userId,
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	if (target) recordTeamPersonDecision({ requestId, target, userId, decision: "deny" });
 	return c.json({ ok: true });
 });
 
@@ -6725,11 +6793,21 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	// Read the call, then check write access again: the gate ran before the body arrived.
+	const { target, assertStillAllowed } = await prepareDecision(c, requestId);
 	const result = await decideOutlinePlanRequest({
 		requestId,
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		body: parsed.data,
+		assertStillAllowed,
 	});
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: user.sub,
+			decision: parsed.data.action === "return" ? "deny" : "allow",
+		});
 	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
 	return c.json(response);
 });
@@ -6746,7 +6824,16 @@ narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
 narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 	const requestId = c.req.param("requestId");
 	const userId = c.get("user").sub;
+	const { target } = await prepareDecision(c, requestId);
 	const result = await deferPendingQuestion(requestId, { userId });
+	if (result.ok && target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId,
+			decision: "allow",
+			kind: "question.deferred",
+		});
 	if (!result.ok) {
 		return c.json(
 			{
@@ -6764,10 +6851,20 @@ narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 // Run AskUserQuestion reflection immediately and submit the generated answers
 narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 	const requestId = c.req.param("requestId");
+	const { target } = await prepareDecision(c, requestId);
 	const result = await reflectPendingAskUserQuestion(requestId);
 	if (!result.ok) {
 		return c.json({ error: result.reason ?? "Question reflection request not found" }, 404);
 	}
+	// A person had the AI answer: recorded with them (M1), as its own kind.
+	if (target)
+		recordTeamPersonDecision({
+			requestId,
+			target,
+			userId: c.get("user").sub,
+			decision: "allow",
+			kind: "question.answered_by_ai",
+		});
 	return c.json({ ok: true, answers: result.answers ?? {} });
 });
 

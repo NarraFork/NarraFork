@@ -159,6 +159,68 @@ describe("public-share WebSocket scoping", () => {
 		expect(sent).toHaveLength(2);
 	});
 
+	it("public message broadcasts strip replay metadata while private subscribers keep it", async () => {
+		const f = await shareFixture();
+		const shared = openShareWs(f);
+		const regular = openShareWs();
+		regular.ws.data.userId = f.owner;
+		for (const { ws } of [shared, regular]) {
+			await handleNarratorWS.message(ws, {
+				type: "subscribe",
+				narratorIds: [f.narratorId],
+				kind: "messages",
+			});
+		}
+		const messageId = generateId();
+		for (const [type, text, encrypted] of [
+			["message", "Public initial reasoning", false],
+			["message_updated", "Public updated reasoning", true],
+			["message_updated", "Public replacement reasoning", false],
+		] as const) {
+			const providerMetadata = {
+				openai: {
+					itemId: "private-reasoning-id",
+					reasoningContent: [{ type: "reasoning_text", text: "private-native-body" }],
+					reasoningSummary: [{ type: "summary_text", text: "private-native-summary" }],
+					...(encrypted ? { reasoningEncryptedContent: "private-ciphertext" } : {}),
+				},
+				anthropic: { signature: "private-anthropic-signature" },
+				gemini: { thoughtSignature: "private-gemini-signature" },
+				opaque: { payload: "private-opaque-replay" },
+			};
+			const event = {
+				type,
+				narratorId: f.narratorId,
+				message: {
+					id: messageId,
+					narratorId: f.narratorId,
+					role: "assistant",
+					contentJson: [{ type: "reasoning", text, providerMetadata }],
+				},
+			};
+			const original = structuredClone(event);
+			shared.sent.length = 0;
+			regular.sent.length = 0;
+			broadcastToNarrator(f.narratorId, event);
+			const publicFrame = shared.sent.find((frame) => frame.type === "message_upserted");
+			const privateFrame = regular.sent.find((frame) => frame.type === "message_upserted");
+			expect(publicFrame?.cause).toBe(type);
+			expect(privateFrame?.cause).toBe(type);
+			const publicBlocks = publicFrame?.blocks as Array<{ elements: unknown[] }>;
+			const privateBlocks = privateFrame?.blocks as Array<{ elements: unknown[] }>;
+			expect(publicBlocks.flatMap((block) => block.elements)).toEqual([
+				{
+					type: "reasoning",
+					text,
+					...(encrypted ? { providerMetadata: { hasEncryptedReasoning: true } } : {}),
+				},
+			]);
+			expect(JSON.stringify(publicFrame)).not.toContain("private-");
+			expect(privateBlocks.flatMap((block) => block.elements)).toEqual(event.message.contentJson);
+			expect(event).toEqual(original);
+		}
+	});
+
 	it("lifecycle invalidation sends only a marker and never reaches anonymous shares", async () => {
 		const shared = openShareWs(await shareFixture());
 		const regular = openShareWs();

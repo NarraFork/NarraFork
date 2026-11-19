@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { z } from "zod";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
 import { isRetryableError } from "../error-handling";
@@ -95,122 +96,215 @@ function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 }
 
 describe("native Responses reasoning continuation", () => {
-	test("mock SSE round trip preserves metadata through aggregation, storage and the next request", async () => {
-		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
-		const raw = "  inspect\nthen call  ";
-		const item = {
-			type: "reasoning",
-			id: "rs_mock",
-			content: [{ type: "reasoning_text", text: raw }],
-		};
-		const call = {
-			type: "function_call",
-			id: "fc_mock",
-			call_id: "call_mock",
-			name: "Read",
-			arguments: "{}",
-		};
-		const requests: Array<{ input: Array<Record<string, unknown>> }> = [];
-		const originalFetch = globalThis.fetch;
-		globalThis.fetch = (async (_input, init) => {
-			requests.push(JSON.parse(String(init?.body)));
-			const payload = requests.length === 1 ? [item, call] : [];
-			return new Response(
-				`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: payload } })}\n\n`,
-				{ headers: { "Content-Type": "text/event-stream" } },
-			);
-		}) as typeof fetch;
-		try {
-			const params = {
-				conversationId: "native-mock",
-				content: "inspect",
-				model: "deepseek-v4.1-flash",
-				cwd: ".",
-				history: [],
-				tools: [],
-				toolResults: [],
-				signal: new AbortController().signal,
-			};
-			const content = new OutputContentAccumulator();
-			for await (const event of provider.chat(params)) {
-				const lane = { blockId: event.reasoningBlockId, outputIndex: event.reasoningOutputIndex };
-				if (event.reasoning != null)
-					content.append("reasoning", event.reasoning, lane, event.reasoningMetadata);
-				else if (event.reasoningMetadata)
-					[...content.reasoningMetadata(event.reasoningMetadata, lane)];
-				if (event.contentBoundary) [...content.boundary(event.contentBoundary)];
-			}
-			const blocks = content.orderedContent();
-			expect(blocks).toHaveLength(1);
-			expect(blocks[0]).toMatchObject({
-				text: raw,
-				providerMetadata: {
-					openai: { textFormat: "reasoning_text" },
-					signatureSource: provider.getActiveReasoningSource(),
-				},
+	for (const variant of [
+		"native",
+		"native-with-state",
+		"mixed-with-state",
+		"truncated-with-state",
+	] as const) {
+		test(`mock SSE ${variant} survives aggregation, storage and the next request`, async () => {
+			const provider = new OpenAIProvider({
+				...TEST_PROVIDER,
+				defaultModel: "deepseek-v4.1-flash",
 			});
-			const tool = {
-				type: "tool_use" as const,
-				toolUseId: call.call_id,
-				name: call.name,
-				input: {},
-				outputIndex: 1,
-			};
-			const live = await liveHistory(provider, [...blocks, tool], params.model, {
-				[call.call_id]: { output: "ok" },
-			});
-			const stored = await provider.buildHistory(
-				[
-					makeAssistantMessage({
-						contentJson: JSON.parse(
-							JSON.stringify([
-								...blocks,
-								{ type: "tool_use", id: call.call_id, name: call.name, input: {} },
-							]),
-						),
-						toolCalls: [
-							{
-								toolUseId: call.call_id,
-								toolName: call.name,
-								inputJson: {},
-								outputJson: "ok",
-								status: "success",
-							},
-						],
-					}),
+			const raw = "  inspect\nthen call  ";
+			const withSummary = variant === "mixed-with-state" || variant === "truncated-with-state";
+			const nativeItem = {
+				type: "reasoning",
+				id: "rs_mock",
+				content: [
+					{ type: "reasoning_text", text: raw.slice(0, 10) },
+					{ type: "reasoning_text", text: raw.slice(10) },
 				],
-				params.model,
-			);
-			// The loop's own rows and the stored rows project to the same request.
-			expect(live).toEqual(stored.history);
-			expect(stored.history.at(-1)).toEqual({
-				type: "function_call_output",
-				call_id: call.call_id,
-				output: "ok",
-			});
-			for (const replay of [live, stored.history]) {
-				for await (const _event of provider.chat({
-					...params,
-					content: "",
-					history: replay,
-					toolResults: [],
-				})) {
-					/* consume mocked stream */
+			};
+			const summary = [{ type: "summary_text", text: "A separate summary." }];
+			const item = {
+				...nativeItem,
+				...(variant !== "native"
+					? { encrypted_content: "56fcdf46-262e-44a1-ac68-166500000000-0" }
+					: {}),
+				...(withSummary ? { summary } : {}),
+			};
+			const terminalItem =
+				variant === "truncated-with-state"
+					? {
+							...item,
+							content: [{ type: "reasoning_text", text: nativeItem.content[0].text.slice(0, 4) }],
+							summary: [{ type: "summary_text", text: "A" }],
+						}
+					: item;
+			const call = {
+				type: "function_call",
+				id: "fc_mock",
+				call_id: "call_mock",
+				name: "Read",
+				arguments: "{}",
+			};
+			const requests: Array<{ input: Array<Record<string, unknown>> }> = [];
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = (async (_input, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const chunks: Array<Record<string, unknown>> = [];
+				if (requests.length === 1 && variant === "truncated-with-state") {
+					chunks.push({
+						type: "response.output_item.added",
+						output_index: 0,
+						item: { type: "reasoning", id: item.id, encrypted_content: item.encrypted_content },
+					});
+					for (const [index, part] of nativeItem.content.entries())
+						chunks.push({
+							type: "response.reasoning_text.delta",
+							output_index: 0,
+							item_id: item.id,
+							content_index: index,
+							delta: part.text,
+						});
+					chunks.push(
+						{
+							type: "response.reasoning_summary_text.delta",
+							output_index: 0,
+							item_id: item.id,
+							summary_index: 0,
+							delta: summary[0].text,
+						},
+						{
+							type: "response.reasoning_summary_text.done",
+							output_index: 0,
+							item_id: item.id,
+							summary_index: 0,
+							text: "",
+						},
+						{ type: "response.output_item.done", output_index: 0, item: terminalItem },
+					);
 				}
+				chunks.push({
+					type: "response.completed",
+					response: {
+						status: "completed",
+						output: requests.length === 1 ? [terminalItem, call] : [],
+					},
+				});
+				return new Response(
+					chunks
+						.map((chunk) => `event: ${chunk.type}\ndata: ${JSON.stringify(chunk)}\n\n`)
+						.join(""),
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			}) as typeof fetch;
+			try {
+				const params = {
+					conversationId: "native-mock",
+					content: "inspect",
+					model: "deepseek-v4.1-flash",
+					cwd: ".",
+					history: [],
+					tools: [
+						{
+							name: "Read",
+							description: "Read a test file",
+							parameters: z.object({}),
+							execute: async () => ({ output: "ok" }),
+						},
+					],
+					toolResults: [],
+					signal: new AbortController().signal,
+				};
+				const content = new OutputContentAccumulator();
+				for await (const event of provider.chat(params)) {
+					const lane = { blockId: event.reasoningBlockId, outputIndex: event.reasoningOutputIndex };
+					if (event.reasoning != null)
+						content.append("reasoning", event.reasoning, lane, event.reasoningMetadata);
+					else if (event.reasoningMetadata)
+						[...content.reasoningMetadata(event.reasoningMetadata, lane)];
+					if (event.contentBoundary) [...content.boundary(event.contentBoundary)];
+				}
+				const blocks = content.orderedContent();
+				expect(blocks).toHaveLength(1);
+				expect(blocks[0]).toMatchObject({
+					text:
+						variant === "truncated-with-state"
+							? `${raw}A separate summary.`
+							: withSummary
+								? `A separate summary.${raw}`
+								: raw,
+					providerMetadata: {
+						openai: { textFormat: withSummary ? "mixed" : "reasoning_text" },
+						signatureSource: provider.getActiveReasoningSource(),
+					},
+				});
+				const tool = {
+					type: "tool_use" as const,
+					toolUseId: call.call_id,
+					name: call.name,
+					input: {},
+					outputIndex: 1,
+				};
+				const live = await liveHistory(provider, [...blocks, tool], params.model, {
+					[call.call_id]: { output: "ok" },
+				});
+				const stored = await provider.buildHistory(
+					[
+						makeAssistantMessage({
+							contentJson: JSON.parse(
+								JSON.stringify([
+									...blocks,
+									{ type: "tool_use", id: call.call_id, name: call.name, input: {} },
+								]),
+							),
+							toolCalls: [
+								{
+									toolUseId: call.call_id,
+									toolName: call.name,
+									inputJson: {},
+									outputJson: "ok",
+									status: "success",
+								},
+							],
+						}),
+					],
+					params.model,
+				);
+				// The loop's own rows and the stored rows project to the same request.
+				expect(live).toEqual(stored.history);
+				expect(stored.history.at(-1)).toEqual({
+					type: "function_call_output",
+					call_id: call.call_id,
+					output: "ok",
+				});
+				for (const replay of [live, stored.history]) {
+					for await (const _event of provider.chat({
+						...params,
+						content: "",
+						history: replay,
+						toolResults: [],
+					})) {
+						/* consume mocked stream */
+					}
+				}
+				for (const request of requests.slice(1)) {
+					expect(request.input.map((entry) => entry.type)).toEqual([
+						"reasoning",
+						"function_call",
+						"function_call_output",
+					]);
+					expect(request.input[0]).toEqual(nativeItem);
+					expect(
+						(request.input[0].content as Array<{ text: string }>).map((part) => part.text).join(""),
+					).toBe(raw);
+				}
+				expect(blocks[0]).toMatchObject({
+					providerMetadata: {
+						openai: {
+							reasoningContent: nativeItem.content,
+							reasoningSummary: withSummary ? summary : [],
+						},
+					},
+				});
+			} finally {
+				globalThis.fetch = originalFetch;
 			}
-			for (const request of requests.slice(1)) {
-				expect(request.input.map((entry) => entry.type)).toEqual([
-					"reasoning",
-					"function_call",
-					"function_call_output",
-				]);
-				expect(request.input[0]).toEqual(item);
-				expect(JSON.stringify(request.input).split(JSON.stringify(raw)).length - 1).toBe(1);
-			}
-		} finally {
-			globalThis.fetch = originalFetch;
-		}
-	});
+		});
+	}
 
 	test("only marked same-source native text replays; ambiguous legacy, summaries and foreign text do not", async () => {
 		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
@@ -311,7 +405,7 @@ describe("native Responses reasoning continuation", () => {
 		}
 	});
 
-	test("native and summary text in one item remains ambiguous, and encrypted replay wins", () => {
+	test("legacy native text beats opaque state only on non-strict models", () => {
 		const tools = new Map();
 		const reasoning = new Map();
 		const events = parseResponsesAPIEvent(
@@ -352,11 +446,274 @@ describe("native Responses reasoning continuation", () => {
 				{
 					type: "reasoning",
 					id: "rs_encrypted",
-					encrypted_content: "cipher",
-					summary: [{ type: "summary_text", text: "raw" }],
+					...(strict
+						? { encrypted_content: "cipher", summary: [{ type: "summary_text", text: "raw" }] }
+						: { content: [{ type: "reasoning_text", text: "raw" }] }),
 				},
 			]);
 		}
+	});
+
+	test("structured replay keeps native bytes separate from display text and strict credentials", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const source = provider.getActiveReasoningSource();
+		const native = [
+			{ type: "reasoning_text" as const, text: "  raw\r\n" },
+			{ type: "reasoning_text" as const, text: "" },
+			{ type: "reasoning_text" as const, text: "tail\u0000  " },
+		];
+		const summary = [{ type: "summary_text" as const, text: "  an actual summary  " }];
+		for (const strict of [true, false]) {
+			for (const signatureSource of [source, "foreign", undefined]) {
+				for (const encrypted of [true, false]) {
+					const block = {
+						text: "Display text is not a native replay payload",
+						providerMetadata: {
+							signatureSource,
+							openai: {
+								itemId: "rs_structured",
+								textFormat: "mixed" as const,
+								reasoningContent: native,
+								reasoningSummary: summary,
+								...(encrypted ? { reasoningEncryptedContent: "opaque" } : {}),
+							},
+						},
+					};
+					const sameSource = signatureSource === source;
+					const expected =
+						sameSource && (!strict || encrypted)
+							? [
+									{
+										type: "reasoning",
+										id: "rs_structured",
+										...(strict ? { summary, encrypted_content: "opaque" } : { content: native }),
+									},
+								]
+							: strict
+								? []
+								: [{ role: "assistant", content: [{ type: "output_text", text: block.text }] }];
+					const model = strict ? "gpt-5" : "deepseek-flash";
+					const stored = await provider.buildHistory(
+						[makeAssistantMessage({ contentJson: [{ type: "reasoning", ...block }] })],
+						model,
+					);
+					const live = await liveHistory(provider, [{ type: "reasoning", ...block }], model);
+					const converted = convertHistoryToResponsesApi(
+						[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+						{ strict, currentSource: source },
+					);
+					for (const history of [stored.history, live, converted])
+						expect(history).toEqual(expected);
+				}
+			}
+		}
+	});
+
+	test("an explicit empty native snapshot never reinterprets display text as native reasoning", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		for (const encrypted of [true, false]) {
+			const block = {
+				text: "legacy-looking display text",
+				providerMetadata: {
+					signatureSource: provider.getActiveReasoningSource(),
+					openai: {
+						itemId: "rs_empty_snapshot",
+						textFormat: "reasoning_text" as const,
+						reasoningContent: [],
+						reasoningSummary: [],
+						...(encrypted ? { reasoningEncryptedContent: "opaque-only-gateway" } : {}),
+					},
+				},
+			};
+			const stored = await provider.buildHistory(
+				[makeAssistantMessage({ contentJson: [{ type: "reasoning", ...block }] })],
+				"deepseek-flash",
+			);
+			const converted = convertHistoryToResponsesApi(
+				[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+				{ strict: false, currentSource: provider.getActiveReasoningSource() },
+			);
+			for (const history of [stored.history, converted]) {
+				expect(history).toEqual(
+					encrypted
+						? [
+								{
+									type: "reasoning",
+									id: "rs_empty_snapshot",
+									summary: [],
+									encrypted_content: "opaque-only-gateway",
+								},
+							]
+						: [{ role: "assistant", content: [{ type: "output_text", text: block.text }] }],
+				);
+			}
+		}
+	});
+
+	for (const terminal of [
+		"item",
+		"response",
+		"no-items",
+		"empty-items",
+		"partial-items",
+		"prefix-items",
+		"shrinking-response",
+	] as const) {
+		test(`${terminal} snapshots native and summary parts separately without per-token copies`, () => {
+			const tools = new Map();
+			const reasoning = new Map();
+			const events = [];
+			const native = [
+				{ type: "reasoning_text", text: "  raw\r\n" },
+				{ type: "reasoning_text", text: "" },
+				{ type: "reasoning_text", text: "tail  " },
+			];
+			const summary = [
+				{ type: "summary_text", text: " First. " },
+				{ type: "summary_text", text: " Second. " },
+			];
+			const item = {
+				type: "reasoning",
+				id: "rs_parts",
+				content: native,
+				summary,
+				encrypted_content: "opaque",
+			};
+			events.push(
+				...parseResponsesAPIEvent(
+					{
+						type: "response.output_item.added",
+						output_index: 0,
+						item: { type: "reasoning", id: item.id, encrypted_content: "opaque" },
+					},
+					tools,
+					reasoning,
+				),
+			);
+			for (const index of [2, 0, 1]) {
+				const part = native[index];
+				const delta = parseResponsesAPIEvent(
+					{
+						type: "response.reasoning_text.delta",
+						output_index: 0,
+						item_id: item.id,
+						content_index: index,
+						delta: part.text,
+					},
+					tools,
+					reasoning,
+				);
+				for (const event of delta)
+					expect(event.reasoningMetadata?.openai?.reasoningContent).toBeUndefined();
+				events.push(...delta);
+			}
+			for (const [index, part] of summary.entries()) {
+				events.push(
+					...parseResponsesAPIEvent(
+						{
+							type: "response.reasoning_summary_text.delta",
+							output_index: 0,
+							item_id: item.id,
+							summary_index: index,
+							delta: part.text,
+						},
+						tools,
+						reasoning,
+					),
+				);
+			}
+			if (terminal === "prefix-items")
+				events.push(
+					...parseResponsesAPIEvent(
+						{
+							type: "response.reasoning_summary_text.done",
+							output_index: 0,
+							item_id: item.id,
+							summary_index: 0,
+							text: "",
+						},
+						tools,
+						reasoning,
+					),
+				);
+			if (terminal === "item" || terminal === "shrinking-response")
+				events.push(
+					...parseResponsesAPIEvent(
+						{ type: "response.output_item.done", output_index: 0, item },
+						tools,
+						reasoning,
+					),
+				);
+			const finalItem =
+				terminal === "empty-items"
+					? { ...item, content: [], summary: [] }
+					: terminal === "partial-items" || terminal === "shrinking-response"
+						? { ...item, content: [native[0]], summary: [summary[0]] }
+						: terminal === "prefix-items"
+							? {
+									...item,
+									content: [{ type: "reasoning_text", text: "  raw" }],
+									summary: [{ type: "summary_text", text: " First" }],
+								}
+							: item;
+			const completed = {
+				type: "response.completed",
+				response: { output: terminal === "no-items" ? [] : [finalItem] },
+			};
+			events.push(...parseResponsesAPIEvent(completed, tools, reasoning));
+			const snapshots = events.filter(
+				(event) => event.reasoningMetadata?.openai?.reasoningContent !== undefined,
+			);
+			expect(snapshots).toHaveLength(1);
+			expect<unknown>(snapshots[0].reasoningMetadata?.openai).toEqual({
+				itemId: item.id,
+				reasoningContent: native,
+				reasoningSummary: summary,
+				reasoningEncryptedContent: "opaque",
+				textFormat: "mixed",
+			});
+			expect(parseResponsesAPIEvent(completed, tools, reasoning)).toEqual([]);
+		});
+	}
+
+	test("completed output may enrich an earlier terminal snapshot without repeating display text", () => {
+		const tools = new Map();
+		const reasoning = new Map();
+		const summary = [{ type: "summary_text", text: "summary" }];
+		parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "reasoning", id: "rs_late", summary },
+			},
+			tools,
+			reasoning,
+		);
+		const content = [{ type: "reasoning_text", text: "  actual native bytes  " }];
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.completed",
+				response: {
+					output: [
+						{ type: "reasoning", id: "rs_late", summary, content, encrypted_content: "opaque" },
+					],
+				},
+			},
+			tools,
+			reasoning,
+		);
+		expect(events.every((event) => event.reasoning === undefined && !event.contentBoundary)).toBe(
+			true,
+		);
+		expect<unknown>(
+			events.find((event) => event.reasoningMetadata)?.reasoningMetadata?.openai,
+		).toEqual({
+			itemId: "rs_late",
+			reasoningContent: content,
+			reasoningSummary: summary,
+			reasoningEncryptedContent: "opaque",
+			textFormat: "mixed",
+		});
 	});
 
 	for (const terminal of ["done", "completed", "stream"] as const) {
@@ -446,7 +803,7 @@ describe("native Responses reasoning continuation", () => {
 			const expected = {
 				type: "reasoning",
 				id: item.id,
-				content: [{ type: "reasoning_text", text: raw }],
+				content: item.content,
 			};
 			expect(history[0]).toEqual(expected);
 			expect(history[1]).toMatchObject({ type: "function_call" });

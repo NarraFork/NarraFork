@@ -139,6 +139,7 @@ export async function finishApiRequest(
 		cacheCreation5mTokens: usage?.cacheCreation5mInputTokens ?? 0,
 		cacheCreation1hTokens: usage?.cacheCreation1hInputTokens ?? 0,
 		reasoningTokens: usage?.reasoningTokens ?? 0,
+		cacheUsageReported: usage?.cacheReported ?? null,
 		ttftMs: options.ttftMs ?? null,
 		durationMs: options.durationMs ?? Date.now() - handle.startTime,
 		decodeMs: options.decodeMs ?? null,

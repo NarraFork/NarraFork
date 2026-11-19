@@ -123,8 +123,8 @@ describe("owned process lifecycle", () => {
 		expect(h.calls[0].command).toEqual([process.execPath, "run", "db:migrate"]);
 		expect(h.calls[1].command).toEqual([process.execPath, "run", "--hot", "server/index.ts"]);
 		expect(h.calls[1].env).toMatchObject({
-			PORT: "7779",
-			NARRAFORK_DEV_APP_URL: "http://localhost:7778",
+			PORT: "7778",
+			NARRAFORK_DEV_APP_URL: "http://localhost:41221",
 		});
 		h.children[1].finish(0);
 		expect(await run).toBe(0);

@@ -643,3 +643,32 @@ test("report awaits asynchronous numeric preparation before returning to provide
 	await reporting;
 	expect(complete).toBe(true);
 });
+
+describe("main-thread occupancy budget", () => {
+	test("time spent off the event loop after a yield is not charged to the budget", async () => {
+		// A contended runner can delay the traversal's yield far past the 100 ms budget
+		// without occupying the main thread. Charging that wait made whole-request
+		// counts report "unavailable" on machines that are merely busy.
+		const now = spyOn(performance, "now");
+		const timer = spyOn(globalThis, "setTimeout");
+		try {
+			let clock = 0;
+			now.mockImplementation(() => clock);
+			timer.mockImplementation(((callback: () => void) => {
+				clock += 500;
+				callback();
+				return 0;
+			}) as unknown as typeof setTimeout);
+			// 256 characters per step: this description alone forces the 2048-step yield.
+			const description = "x".repeat(256 * 2600);
+			const counts = await countInputCharacters({
+				tools: [{ name: "tool", description, parameters: { type: "object" } }],
+			});
+			expect(counts).not.toBeNull();
+			expect(counts?.totalChars).toBeGreaterThan(description.length);
+		} finally {
+			timer.mockRestore();
+			now.mockRestore();
+		}
+	});
+});

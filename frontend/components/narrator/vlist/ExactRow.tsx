@@ -274,7 +274,7 @@ export interface ExactRowProps {
 	 */
 	resolveRowToolActions?: (rowKey: string) => VListRowToolActions | undefined;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
-	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
+	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "watch") => void;
 	/**
 	 * Close the subagent-recovery card without resuming anything (mutation lives
 	 * outside vlist/). Absent → the card paints no close button at all.
@@ -556,6 +556,9 @@ export const ExactRow = memo(
 					if (subToolActions?.onViewSubagentSession) {
 						subExtra.onOpenSession = subToolActions.onViewSubagentSession;
 					}
+					if (subToolActions?.onViewNestedSession) {
+						subExtra.onOpenNestedSession = subToolActions.onViewNestedSession;
+					}
 					if (viewControls) {
 						const subData = cardData as { resultText?: unknown; agentType?: unknown };
 						const description =
@@ -683,7 +686,7 @@ export const ExactRow = memo(
 			const messageId = sourceIds[0];
 			if (messageId && onResumeSubagentRecovery) {
 				const specKey = item.spec.key;
-				extra.onResume = (mode: "notify" | "await") =>
+				extra.onResume = (mode: "notify" | "watch") =>
 					onResumeSubagentRecovery(messageId, specKey, mode);
 			}
 			if (messageId && onDismissSubagentRecovery) {
@@ -785,6 +788,9 @@ export const ExactRow = memo(
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+			}
+			if (interaction?.toolActions?.onViewNestedSession) {
+				extra.onOpenNestedSession = interaction.toolActions.onViewNestedSession;
 			}
 			// Prompt fold. Same story as onOpenSession: RenderSubagent drew the
 			// chevron row but nothing supplied the handler, so clicking it did

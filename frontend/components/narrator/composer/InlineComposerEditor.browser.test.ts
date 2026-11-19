@@ -738,6 +738,9 @@ test("arrow navigation permits typing between adjacent atoms and before first at
 			],
 		};
 		await load(page, doc);
+		// Establish user focus: PM treats a start-of-document selection within 200ms of
+		// programmatic focus, without a recent pointer event, as a browser focus reset.
+		await page.click('[role="textbox"]');
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(0));
 		await settle(page);
 		await focusedEditor(page);
@@ -750,6 +753,24 @@ test("arrow navigation permits typing between adjacent atoms and before first at
 		).toEqual(["quote", "text", "quote"]);
 		await focusedEditor(page);
 		await page.keyboard.press("Home");
+		await page.waitForFunction(
+			() => {
+				const native = window.getSelection();
+				const paragraph = document.querySelector('[role="textbox"] p');
+				const selection = (window as unknown as FixtureWindow).fixture.snapshot().selection;
+				return (
+					paragraph !== null &&
+					native?.isCollapsed &&
+					native.anchorNode === paragraph &&
+					native.anchorOffset === 0 &&
+					selection?.empty &&
+					selection.type === "text" &&
+					selection.start === 0 &&
+					selection.end === 0
+				);
+			},
+			{ timeout: 2_000 },
+		);
 		await page.keyboard.type("before");
 		await settle(page);
 		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({

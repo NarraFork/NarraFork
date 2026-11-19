@@ -143,6 +143,26 @@ afterAll(() => {
 	sqlite.close();
 });
 
+describe("account preference invalidation", () => {
+	it("reaches only the target account's sockets and carries no preferences or user identifiers", () => {
+		const first = openFakeWs({ userId: "preferences-owner" });
+		const second = openFakeWs({ userId: "preferences-owner" });
+		const other = openFakeWs({ userId: "preferences-other" });
+		const anonymous = createFakeWs();
+		anonymous.ws.data.userId = undefined;
+		handleNarratorWS.open(anonymous.ws);
+		openedConnections.push(anonymous.ws);
+
+		eventBus.emit({ type: "user_preferences:changed", userId: "preferences-owner" });
+		const frames = (sent: SentMessage[]) =>
+			sent.filter((frame) => frame.type === "user_preferences_changed");
+		expect(frames(first.sent)).toEqual([{ type: "user_preferences_changed" }]);
+		expect(frames(second.sent)).toEqual([{ type: "user_preferences_changed" }]);
+		expect(frames(other.sent)).toEqual([]);
+		expect(frames(anonymous.sent)).toEqual([]);
+	});
+});
+
 describe("HumanAttention global invalidation", () => {
 	it("reaches authenticated clients without any narrator subscription and carries no source data", async () => {
 		const first = openFakeWs({ userId: "attention-user-a" });

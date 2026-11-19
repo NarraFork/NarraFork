@@ -87,7 +87,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
@@ -185,9 +185,11 @@ import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions"
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
+import { useSubagentSessionOpener } from "./interaction/use-subagent-session-opener";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { AgentReferenceOpenerContext } from "./markdown/AgentReferenceLink";
 import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
@@ -266,11 +268,9 @@ const FilePanelContent = REMOTE_BUILD
 			})),
 		);
 
-// Flag-gated pretext virtualized list. Now the default renderer, but still lazily
-// imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
-// guard requires this dynamic import (no static import of vlist from outside the
-// vlist/ directory). The exact-layout shell is the sole Virtual renderer (the band
-// path has been retired).
+// Loaded lazily. The isolation guard requires this dynamic import (no static
+// import of vlist from outside the vlist/ directory). The exact-layout shell is
+// the sole renderer; the band path has been retired.
 const PretextExactMessageList = lazy(() =>
 	import("./vlist/PretextExactMessageList").then((module) => ({
 		default: module.PretextExactMessageList,
@@ -417,6 +417,7 @@ function NarratorPanelBody({
 	const {
 		visibleWithDefault: allModels,
 		groupedModels,
+		modelOptionsFilter,
 		defaultModelValue,
 		summaryModelValue,
 		settingsData,
@@ -822,6 +823,7 @@ function NarratorPanelBody({
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
 	const activeTerminalCount = useMemo(
 		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
 		[narratorTerminals],
@@ -1599,7 +1601,9 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
+	// Hidden from read-only viewers: opening a terminal needs write access.
+	const terminalToolAvailable =
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals !== false;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
@@ -2160,22 +2164,7 @@ function NarratorPanelBody({
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
-	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string, messageId?: string) => {
-			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId, messageId);
-				return;
-			}
-			// Standalone fallback: the narrator page reads `?scrollTo=` as its
-			// highlight target, which is the same jump the dock performs in-place.
-			navigate({
-				to: "/narrators/$narratorId",
-				params: { narratorId: subagentNarratorId },
-				search: messageId ? { scrollTo: messageId } : undefined,
-			});
-		},
-		[onViewSubagentSession, navigate],
-	);
+	const handleVlistViewSubagentSession = useSubagentSessionOpener(onViewSubagentSession);
 
 	/**
 	 * Open the Dynamic Spec panel with one file selected.
@@ -2276,7 +2265,6 @@ function NarratorPanelBody({
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
-	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
 	const vlistRowHandlers = useMemo(
 		() => ({
 			onForkFromMessage: forkHandler,
@@ -2286,8 +2274,7 @@ function NarratorPanelBody({
 			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
 			onDeleteBlock: handleDeleteBlock,
 			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
-			// Message editing: same gating as the chunked branch below — the user
-			// flow requires provider support, the assistant text edit does not.
+			// The user flow requires provider support; the assistant text edit does not.
 			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 			resolveQueuedMessage,
 			onEditAssistantMessage: handleEditAssistantMessage,
@@ -4066,6 +4053,7 @@ function NarratorPanelBody({
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}
@@ -4075,5 +4063,9 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
-	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
+	return (
+		<AgentReferenceOpenerContext.Provider value={handleVlistViewSubagentSession}>
+			<OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>
+		</AgentReferenceOpenerContext.Provider>
+	);
 }

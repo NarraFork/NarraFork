@@ -143,6 +143,7 @@ mock.module("../outline/task-board/TaskBoardViews", () => ({
 	SessionTaskBoard: () => null,
 }));
 mock.module("../../lib/outline-router", () => ({ useOpenOutlinePage: () => () => {} }));
+mock.module("../teams/ProjectTeamsList", () => ({ ProjectTeamsList: () => null }));
 mock.module("./ProjectSettingsPanel", () => ({
 	ProjectSettingsPanel: () => {
 		if (settingsError) throw new Error("optional settings failed");

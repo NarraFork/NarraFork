@@ -476,6 +476,54 @@ describe("search and backlinks", () => {
 		expect((await call(bob, "/search?q=")).status).toBe(400);
 	});
 
+	test("search pages by cursor, names each hit's ancestors and spaces, and never past what it ranks", async () => {
+		const made = await write(personal, [
+			{ op: "insert", tempId: "p", parent: null, content: "Paging page" },
+			{ op: "insert", tempId: "mid", parent: { tempId: "p" }, content: "Middle" },
+			...Array.from({ length: 7 }, (_, i) => ({
+				op: "insert" as const,
+				parent: { tempId: "mid" },
+				content: `zebracorn item ${i}`,
+			})),
+		]);
+		const [pageId, midId] = made.results.map((r) => (r as { blockId: string }).blockId);
+		const seen: string[] = [];
+		let cursor: string | null = null;
+		for (let guard = 0; guard < 10; guard++) {
+			const res: { status: number; body: OutlineSearchResponse } =
+				await call<OutlineSearchResponse>(
+					alice,
+					`/search?q=zebracorn&limit=3${cursor ? `&cursor=${cursor}` : ""}`,
+				);
+			expect(res.status).toBe(200);
+			expect(res.body.hits.length).toBeLessThanOrEqual(3);
+			for (const hit of res.body.hits) {
+				expect(hit.pathIds).toEqual([pageId as string, midId as string]);
+				expect(hit.path).toEqual(["Paging page", "Middle"]);
+			}
+			expect(res.body.spaces?.map((space) => space.id)).toEqual(
+				res.body.hits.length > 0 ? [personal.id] : [],
+			);
+			seen.push(...res.body.hits.map((hit) => hit.blockId));
+			cursor = res.body.nextCursor ?? null;
+			if (!cursor) break;
+		}
+		expect(seen).toHaveLength(7);
+		expect(new Set(seen).size).toBe(7);
+		// Someone who cannot read the space finds nothing, and no space is named to them.
+		const forBob = await call<OutlineSearchResponse>(bob, "/search?q=zebracorn");
+		expect(forBob.body).toEqual({ hits: [], nextCursor: null, spaces: [] });
+		expect((await call(alice, "/search?q=zebracorn&cursor=!!")).status).toBe(400);
+		expect(
+			(
+				await call(
+					alice,
+					`/search?q=zebracorn&cursor=${Buffer.from("99999").toString("base64url")}`,
+				)
+			).status,
+		).toBe(400);
+	});
+
 	test("backlinks come from the caller's readable spaces only", async () => {
 		const forAlice = await call<OutlineBacklinksResponse>(
 			alice,

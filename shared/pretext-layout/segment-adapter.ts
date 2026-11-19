@@ -51,6 +51,7 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { isClearedToolOutput } from "../storage-retention";
+import { normalizeSubagentNestedSummary, type SubagentNestedAgent } from "../subagent-nested";
 import { subagentResultText } from "../subagent-result-text";
 import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
 
@@ -369,6 +370,11 @@ export interface AdapterToolItem {
 			takenOver?: boolean;
 			/** Follow/fallback decision for `__parent__` children (height-neutral badge). */
 			modelInheritance?: unknown;
+			/**
+			 * The helpers this child launched itself (its one nested level). Height-affecting
+			 * (a row list), keyed in `subagentRevision` through the card's `nestedAgents`.
+			 */
+			nested?: unknown;
 		} | null;
 		/**
 		 * The subagent this call is waiting on is TAKEN OVER by the user, so the call
@@ -2564,6 +2570,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	subagentRecoveryToBackground: "to background",
 	subagentRecoveryResumeAndNotify: "Resume and notify",
 	subagentRecoveryResumeAndWait: "Resume and wait",
+	subagentRecoveryResumeAndWatch: "Resume and observe",
+	subagentRecoveryResolvedWatch:
+		"Restarted {count} subagent(s) and registered observations; results will notify automatically.",
 	subagentRecoveryResolvedNotify:
 		"Restarted {count} subagent(s); the narrator was told to await them.",
 	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
@@ -2636,6 +2645,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceOutlineTaskBrief: "Opening brief",
 	sidecarSourceSpecImport: "Dynamic Spec moved to the outline",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
+	sidecarSourceTeamStatus: "Team status",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2766,6 +2776,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	// The session's Dynamic Spec was moved into the outline: where it went (P2 PR 12b2).
 	spec_import: "sidecarSourceSpecImport",
 	outline_answer: "sidecarSourceOutlineAnswer",
+	// A team coordinator's team status (Project Teams P2).
+	team_status: "sidecarSourceTeamStatus",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3699,13 +3711,15 @@ function adaptSystemBlock(
 				subagents: rows,
 				summary: countLabel(
 					ctx,
-					block.mode === "await"
-						? "subagentRecoveryResolvedWait"
-						: "subagentRecoveryResolvedNotify",
+					block.mode === "watch"
+						? "subagentRecoveryResolvedWatch"
+						: block.mode === "await"
+							? "subagentRecoveryResolvedWait"
+							: "subagentRecoveryResolvedNotify",
 					resumedCount,
 				),
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
-				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
+				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWatch"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
 				// Close button (aria-label + tooltip). Height-neutral: it sits inside
 				// the header lane the measure layer already reserves.
@@ -4387,6 +4401,16 @@ function adaptToolItemFull(
 	};
 }
 
+/** `nestedAgents` / `nestedTotal` for a card whose child launched helpers, else `{}`. */
+function nestedCardFields(value: unknown): {
+	nestedAgents?: SubagentNestedAgent[];
+	nestedTotal?: number;
+} {
+	const nested = normalizeSubagentNestedSummary(value);
+	if (!nested || nested.total === 0) return {};
+	return { nestedAgents: nested.agents, nestedTotal: nested.total };
+}
+
 /**
  * The complete `SubagentCardData` payload for ONE subagent tool call.
  *
@@ -4563,6 +4587,8 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		...(activity?.fileChanges && ctx.isFileChangesOpen?.(key) === true
 			? { fileChangesExpanded: true }
 			: {}),
+		// The helpers this child launched (its one nested level): one row each, bounded.
+		...nestedCardFields(activity?.nested),
 		recentCallCount: recentCallNames.length,
 		recentCallNames,
 		recentCallSummaries,
@@ -4822,6 +4848,8 @@ const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
  * will never be killed is the divergence this reproduces correctly.
  */
 function effectiveTimeoutMs(tc: AdapterToolItem["tc"], category: string): number | undefined {
+	// Watch's timeout belongs to the observation, not an active tool execution.
+	if (category === "watch") return undefined;
 	if (category !== "bash" && category !== "await") return readFiniteNumber(tc._timeoutMs);
 	const explicit =
 		readFiniteNumber(tc._timeoutMs) ?? readFiniteNumber(asObject(tc.inputJson).timeout);

@@ -1,4 +1,5 @@
 import {
+	ActionIcon,
 	Alert,
 	Badge,
 	Button,
@@ -9,11 +10,14 @@ import {
 	Select,
 	Skeleton,
 	Stack,
+	Switch,
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
@@ -23,12 +27,18 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import { miscApi } from "../../lib/api/misc";
 import {
+	buildOutboundProxyPatch,
 	buildUpdateProxyPatch,
 	buildWebToolProxyPatch,
+	findNoProxyRuleError,
+	MAX_NO_PROXY_RULES,
+	type NoProxyRule,
 	normalizeProxyUrl,
 	type OutboundProxyMode,
 	type ProxyOverride,
+	summarizeNoProxyRules,
 	summarizeOutboundProxyPolicy,
+	validateNoProxyPattern,
 } from "../../lib/proxy";
 
 export const Route = createFileRoute("/settings/proxy")({
@@ -53,6 +63,7 @@ function ProxyManagementPage() {
 			</div>
 
 			<OutboundProxyCard />
+			<NoProxyRulesCard />
 
 			<div>
 				<Title order={3}>{t("proxyOverridesSection")}</Title>
@@ -101,7 +112,15 @@ function OutboundProxyCard() {
 
 	const saveMut = useMutation({
 		mutationFn: (payload: { mode: OutboundProxyMode; url?: string }) =>
-			api.updateSettings({ proxy: payload }),
+			// The server replaces `settings.proxy` wholesale, so the shared no_proxy
+			// list must travel with every policy save or it would be dropped.
+			api.updateSettings(
+				buildOutboundProxyPatch({
+					mode: payload.mode,
+					url: payload.url,
+					noProxyRules: summarizeNoProxyRules(currentPolicy),
+				}),
+			),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			notifications.show({ message: t("proxySaved"), color: "green" });
@@ -114,6 +133,9 @@ function OutboundProxyCard() {
 		mode === "custom" && initialized && !!url.trim() && !normalizeProxyUrl(url);
 
 	const handleSave = useCallback(() => {
+		// Settings replace `proxy` wholesale. Saving before they load would send
+		// `noProxyRules: []` and wipe the stored list.
+		if (!initialized) return;
 		if (mode === "custom") {
 			const normalized = normalizeProxyUrl(url);
 			if (!normalized) {
@@ -125,7 +147,7 @@ function OutboundProxyCard() {
 		} else {
 			saveMut.mutate({ mode });
 		}
-	}, [mode, url, saveMut, t]);
+	}, [initialized, mode, url, saveMut, t]);
 
 	return (
 		<Card withBorder padding="md" maw={640}>
@@ -173,8 +195,231 @@ function OutboundProxyCard() {
 				</Alert>
 
 				<Group justify="flex-end">
-					<Button size="xs" onClick={handleSave} loading={saveMut.isPending}>
+					<Button
+						size="xs"
+						onClick={handleSave}
+						loading={saveMut.isPending}
+						disabled={!initialized}
+					>
 						{t("proxySave")}
+					</Button>
+				</Group>
+			</Stack>
+		</Card>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// no_proxy rules (targets that always bypass the proxy)
+// ---------------------------------------------------------------------------
+
+/** Local editor row identifier, so React keys survive reordering and deletion. */
+function newRuleId(): string {
+	const random = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+	return `np_${random.slice(0, 8)}`;
+}
+
+/**
+ * Targets that must never go through the proxy.
+ *
+ * Stored globally (`settings.proxy.noProxyRules`) and applied by the server in
+ * the shared proxy resolver, so one list covers every proxied channel. The
+ * browser can only honour wildcard host rules — that limit is stated in the card.
+ */
+function NoProxyRulesCard() {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const { data: settingsData, isLoading } = useQuery({
+		queryKey: ["admin", "settings"],
+		queryFn: api.getSettings,
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
+	});
+
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const currentPolicy = (settingsData as any)?.proxy;
+	const policySummary = summarizeOutboundProxyPolicy(currentPolicy);
+	const [rules, setRules] = useState<NoProxyRule[]>([]);
+	const [initialized, setInitialized] = useState(false);
+
+	useEffect(() => {
+		if (settingsData && !initialized) {
+			setRules(summarizeNoProxyRules(currentPolicy));
+			setInitialized(true);
+		}
+	}, [settingsData, currentPolicy, initialized]);
+
+	// Blank rows are "not filled in yet" and are never persisted.
+	const editedRules = rules
+		.map((rule) => ({ ...rule, pattern: rule.pattern.trim() }))
+		.filter((rule) => rule.pattern !== "");
+	const dirty =
+		JSON.stringify(editedRules) !== JSON.stringify(summarizeNoProxyRules(currentPolicy));
+
+	const updateRule = (index: number, patch: Partial<NoProxyRule>) => {
+		setRules((prev) => prev.map((rule, i) => (i === index ? { ...rule, ...patch } : rule)));
+	};
+
+	const addRule = () => {
+		setRules((prev) => [
+			...prev,
+			{ id: newRuleId(), match: "wildcard", pattern: "", enabled: true },
+		]);
+	};
+
+	const removeRule = (index: number) => {
+		setRules((prev) => prev.filter((_, i) => i !== index));
+	};
+
+	const saveMut = useMutation({
+		mutationFn: (nextRules: NoProxyRule[]) =>
+			// `settings.proxy` is replaced wholesale, so the mode and custom URL must
+			// travel with the rule list.
+			api.updateSettings(
+				buildOutboundProxyPatch({
+					mode: policySummary.mode,
+					url: policySummary.url,
+					noProxyRules: nextRules,
+				}),
+			),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+		onError: (error) => {
+			notifications.show({
+				message: t("proxySaveFailed", { error: error.message }),
+				color: "red",
+			});
+		},
+	});
+
+	const handleSave = useCallback(() => {
+		const error = findNoProxyRuleError(editedRules);
+		if (error) {
+			notifications.show({
+				message: t("noProxyInvalidRegex", { error: error.message }),
+				color: "red",
+			});
+			return;
+		}
+		setRules(editedRules);
+		saveMut.mutate(editedRules);
+	}, [editedRules, saveMut, t]);
+
+	return (
+		<Card withBorder padding="md" maw={640}>
+			<Stack gap="sm">
+				<Text fw={600}>{t("noProxySection")}</Text>
+				<Text size="xs" c="dimmed">
+					{t("noProxyDesc")}
+				</Text>
+
+				{isLoading ? (
+					<Skeleton height={48} radius="sm" />
+				) : rules.length === 0 ? (
+					<Text size="xs" c="dimmed" fs="italic">
+						{t("noProxyEmpty")}
+					</Text>
+				) : (
+					<Stack gap="xs">
+						{rules.map((rule, index) => {
+							const patternError = rule.pattern.trim()
+								? validateNoProxyPattern(rule.match, rule.pattern)
+								: undefined;
+							return (
+								<Group
+									key={rule.id ?? index}
+									align="flex-start"
+									gap="xs"
+									wrap="nowrap"
+									data-testid="no-proxy-rule-row"
+								>
+									<Select
+										w={132}
+										data={[
+											{ value: "wildcard", label: t("noProxyMatchWildcard") },
+											{ value: "regex", label: t("noProxyMatchRegex") },
+										]}
+										value={rule.match}
+										allowDeselect={false}
+										aria-label={t("noProxyMatchLabel")}
+										onChange={(value) =>
+											updateRule(index, { match: value === "regex" ? "regex" : "wildcard" })
+										}
+									/>
+									<TextInput
+										style={{ flex: 1, minWidth: 0 }}
+										aria-label={t("noProxyPatternLabel")}
+										placeholder={
+											rule.match === "regex"
+												? t("noProxyPatternPlaceholderRegex")
+												: t("noProxyPatternPlaceholderWildcard")
+										}
+										value={rule.pattern}
+										error={
+											patternError ? t("noProxyInvalidRegex", { error: patternError }) : undefined
+										}
+										onChange={(event) => updateRule(index, { pattern: event.currentTarget.value })}
+									/>
+									<Tooltip label={t("noProxyEnabled")} withArrow>
+										<Switch
+											pt={7}
+											checked={rule.enabled !== false}
+											aria-label={t("noProxyEnabled")}
+											onChange={(event) =>
+												updateRule(index, { enabled: event.currentTarget.checked })
+											}
+										/>
+									</Tooltip>
+									<Tooltip label={t("noProxyRemove")} withArrow>
+										<ActionIcon
+											mt={4}
+											variant="subtle"
+											color="red"
+											aria-label={t("noProxyRemove")}
+											onClick={() => removeRule(index)}
+										>
+											<IconTrash size={16} />
+										</ActionIcon>
+									</Tooltip>
+								</Group>
+							);
+						})}
+					</Stack>
+				)}
+
+				<Alert variant="light" color="gray" p="xs">
+					<Text size="xs" c="dimmed">
+						{t("noProxyPriorityNote")}
+					</Text>
+					<Text size="xs" c="dimmed" mt={4}>
+						{t("noProxySyntaxWildcard")}
+					</Text>
+					<Text size="xs" c="dimmed" mt={2}>
+						{t("noProxySyntaxRegex")}
+					</Text>
+					<Text size="xs" c="dimmed" mt={4}>
+						{t("noProxyBrowserNote")}
+					</Text>
+				</Alert>
+
+				<Group justify="space-between">
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconPlus size={14} />}
+						disabled={isLoading || rules.length >= MAX_NO_PROXY_RULES}
+						onClick={addRule}
+					>
+						{t("noProxyAdd")}
+					</Button>
+					<Button
+						size="xs"
+						onClick={handleSave}
+						loading={saveMut.isPending}
+						disabled={isLoading || !dirty}
+					>
+						{t("noProxySave")}
 					</Button>
 				</Group>
 			</Stack>
