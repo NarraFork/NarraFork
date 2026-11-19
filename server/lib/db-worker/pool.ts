@@ -14,11 +14,17 @@ import {
 	DB_WORKER_READY_TIMEOUT_MS,
 	type DbReadTaskParams,
 	type DbWorkerOutbound,
+	type SelectRowsParams,
+	type SelectRowsResult,
 } from "./protocol";
+import { validateSelectRows } from "./select-rows";
 
 const DEFAULT_TASK_TIMEOUT_MS = 120_000;
 const MAX_SPAWN_FAILURES = 2;
 export const DB_WORKER_MAX_QUEUE = 32;
+const SHORT_READ_TIMEOUT_MS = 5_000;
+const SHORT_READ_MAX_QUEUE = 8;
+const SHORT_READ_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 export class DbReadTaskOverloadedError extends Error {
 	readonly code = "DB_READ_TASK_OVERLOADED";
@@ -64,10 +70,12 @@ interface SharedRead {
 	promise: Promise<unknown>;
 	subscribers: Set<{ progress?: RunReadTaskOptions["onProgress"] }>;
 }
+type ReadPoolProfile = "pool" | "ephemeral" | "shortReads";
 interface PoolState {
 	runtimeVersion: 1;
 	pool?: WorkerPool<ReadRequest, unknown>;
 	ephemeral?: WorkerPool<ReadRequest, unknown>;
+	shortReads?: WorkerPool<ReadRequest, unknown>;
 	inFlight: Map<string, SharedRead>;
 	spawnFailures: number;
 	failureReason: string | null;
@@ -177,12 +185,12 @@ export function getConfiguredConcurrency(): number {
 	}
 	return Math.max(1, Math.min(4, cpuCount));
 }
-function workersDisabled(): string | null {
+function workersDisabled(profile: ReadPoolProfile = "pool"): string | null {
 	const s = state();
 	if (s.permanent || s.paused || s.closing) return "pool_shutdown";
 	if (process.env.NARRAFORK_DB_WORKER === "off") return "disabled_by_env";
 	if (getConfiguredConcurrency() === 0) return "concurrency_zero";
-	return s.failureReason;
+	return profile === "pool" ? s.failureReason : null;
 }
 type WorkerFailurePhase = "create" | "ready" | "run" | "message" | "close" | "dispatch";
 function logWorkerFailure(phase: WorkerFailurePhase, error: unknown): void {
@@ -217,15 +225,15 @@ function cancellationError(context: WorkerTaskContext): Error {
 /** Only DB RPC state lives here. Admission, reuse, idle timers and capacity belong to WorkerPool. */
 async function createReader(
 	context: WorkerTaskContext,
-	ephemeral: boolean,
+	profile: ReadPoolProfile,
 ): Promise<PoolWorker<ReadRequest, unknown>> {
 	const s = state();
 	// Startup already owns a bounded queue permit while legacy owners finish exiting.
 	await s.upgrade;
 	if (context.signal.aborted) throw cancellationError(context);
 	if (s.permanent || s.paused || s.closing) throw new WorkersUnavailableError("pool_shutdown");
-	const disabled = workersDisabled();
-	if (!ephemeral && disabled) throw new WorkersUnavailableError(disabled);
+	const disabled = workersDisabled(profile);
+	if (profile !== "ephemeral" && disabled) throw new WorkersUnavailableError(disabled);
 	let connected: Awaited<ReturnType<typeof connectCompiledWorker>>;
 	try {
 		connected = await connectCompiledWorker(workerSpecifierCandidates(), {
@@ -246,11 +254,14 @@ async function createReader(
 		if (Date.now() >= context.deadlineAt)
 			throw new DbReadTaskTimeoutError("database read task timed out before dispatch");
 		logWorkerFailure("ready", error);
-		if (!ephemeral && ++s.spawnFailures >= MAX_SPAWN_FAILURES)
+		// Short reads retry on the next request, under their own slot, queue and deadline.
+		if (profile === "pool" && ++s.spawnFailures >= MAX_SPAWN_FAILURES)
 			s.failureReason = "worker_unavailable";
-		throw new WorkersUnavailableError(ephemeral ? "ephemeral_spawn_failed" : "worker_spawn_failed");
+		throw new WorkersUnavailableError(
+			profile === "ephemeral" ? "ephemeral_spawn_failed" : "worker_spawn_failed",
+		);
 	}
-	if (!ephemeral) s.spawnFailures = 0;
+	if (profile === "pool") s.spawnFailures = 0;
 	const { worker, handle } = connected;
 	return new ReadWorker(worker, handle);
 }
@@ -414,19 +425,19 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 	}
 }
 
-function runtime(ephemeral: boolean): WorkerPool<ReadRequest, unknown> {
+function runtime(profile: ReadPoolProfile): WorkerPool<ReadRequest, unknown> {
 	const s = state();
-	const key = ephemeral ? "ephemeral" : "pool";
-	s[key] ??= new WorkerPool({
-		// The emergency one-shot scan is a separate bounded profile, never an unbounded escape hatch.
-		concurrency: ephemeral ? 1 : Math.max(1, getConfiguredConcurrency()),
-		maxQueued: DB_WORKER_MAX_QUEUE,
-		maxQueuedBytes: 64 * 1024 * 1024,
-		timeoutMs: DEFAULT_TASK_TIMEOUT_MS,
-		reuse: !ephemeral,
-		create: (context) => createReader(context, ephemeral),
+	const short = profile === "shortReads";
+	s[profile] ??= new WorkerPool({
+		// Short reads and the one-shot emergency scan each have their own bounded slot.
+		concurrency: profile === "pool" ? Math.max(1, getConfiguredConcurrency()) : 1,
+		maxQueued: short ? SHORT_READ_MAX_QUEUE : DB_WORKER_MAX_QUEUE,
+		maxQueuedBytes: short ? SHORT_READ_MAX_QUEUE_BYTES : 64 * 1024 * 1024,
+		timeoutMs: short ? SHORT_READ_TIMEOUT_MS : DEFAULT_TASK_TIMEOUT_MS,
+		reuse: profile !== "ephemeral",
+		create: (context) => createReader(context, profile),
 	});
-	return s[key];
+	return s[profile];
 }
 /** Constant-size/count-only accounting: never serialize or scan retained SQL parameters/body data. */
 function requestBytes(request: ReadRequest): number {
@@ -452,7 +463,7 @@ function execute(
 	dbPath: string,
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions,
-	ephemeral: boolean,
+	profile: ReadPoolProfile,
 ): Promise<unknown> {
 	const s = state();
 	if (s.permanent || s.paused || s.closing)
@@ -463,8 +474,12 @@ function execute(
 		traceParent: currentSqlTraceSpan()?.id,
 		onProgress: options.onProgress,
 	};
-	const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
-	return runtime(ephemeral)
+	const timeoutMs =
+		profile === "shortReads"
+			? Math.min(options.timeoutMs ?? SHORT_READ_TIMEOUT_MS, SHORT_READ_TIMEOUT_MS)
+			: (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
+	const deadlineAt = Date.now() + timeoutMs;
+	return runtime(profile)
 		.run(request, {
 			signal: options.signal,
 			deadlineAt,
@@ -515,7 +530,7 @@ export async function runReadTask<T>(
 	if (disabled) throw new WorkersUnavailableError(disabled);
 	if (options.signal?.aborted) throw new Error("database read task aborted");
 	const s = state();
-	if (!options.dedupeKey) return execute(dbPath, params, options, false) as Promise<T>;
+	if (!options.dedupeKey) return execute(dbPath, params, options, "pool") as Promise<T>;
 	const key = `${dbPath}\0${options.dedupeKey}`;
 	let shared = s.inFlight.get(key);
 	if (!shared || shared.controller.signal.aborted) {
@@ -531,7 +546,7 @@ export async function runReadTask<T>(
 					for (const subscriber of entry.subscribers) subscriber.progress?.(progress);
 				},
 			},
-			false,
+			"pool",
 		).finally(() => {
 			if (s.inFlight.get(key) === entry) s.inFlight.delete(key);
 		});
@@ -540,13 +555,27 @@ export async function runReadTask<T>(
 	}
 	return subscribe(shared, options) as Promise<T>;
 }
+/** Opt-in for indexed, bounded SQLite SELECTs; does not share the ordinary read queue. */
+export async function runShortReadTask(
+	dbPath: string,
+	params: SelectRowsParams,
+	options: Pick<RunReadTaskOptions, "signal" | "timeoutMs"> = {},
+): Promise<SelectRowsResult> {
+	const disabled = workersDisabled("shortReads");
+	if (disabled) throw new WorkersUnavailableError(disabled);
+	options.signal?.throwIfAborted();
+	// Bound retained parameters before admission; the worker still validates what it receives.
+	validateSelectRows(params);
+	return execute(dbPath, params, options, "shortReads") as Promise<SelectRowsResult>;
+}
+
 /** Bounded one-shot isolation when the reusable pool is disabled; never bypasses maintenance/exit. */
 export async function runEphemeralReadTask<T>(
 	dbPath: string,
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions = {},
 ): Promise<T> {
-	return execute(dbPath, params, options, true) as Promise<T>;
+	return execute(dbPath, params, options, "ephemeral") as Promise<T>;
 }
 
 /** Real exit barrier. Default drains then permits explicit reuse; permanent is the process shutdown. */
@@ -560,14 +589,19 @@ export function shutdownDbWorkerPool(
 	const reason = new WorkersUnavailableError("pool_shutdown");
 	const pool = s.pool;
 	const ephemeral = s.ephemeral;
-	const closing = Promise.all([s.upgrade, pool?.close(reason), ephemeral?.close(reason)]).then(
-		() => {
-			if (s.pool === pool) s.pool = undefined;
-			if (s.ephemeral === ephemeral) s.ephemeral = undefined;
-			s.inFlight.clear();
-			s.closing = undefined;
-		},
-	);
+	const shortReads = s.shortReads;
+	const closing = Promise.all([
+		s.upgrade,
+		pool?.close(reason),
+		ephemeral?.close(reason),
+		shortReads?.close(reason),
+	]).then(() => {
+		if (s.pool === pool) s.pool = undefined;
+		if (s.ephemeral === ephemeral) s.ephemeral = undefined;
+		if (s.shortReads === shortReads) s.shortReads = undefined;
+		s.inFlight.clear();
+		s.closing = undefined;
+	});
 	s.closing = closing;
 	// Failed close stays quarantined: no reset/reuse until real resource exit was confirmed.
 	void closing.catch(() => {});
