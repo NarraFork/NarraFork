@@ -588,6 +588,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 	],
 	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/services/file-change-history-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",
