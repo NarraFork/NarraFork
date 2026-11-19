@@ -21,10 +21,10 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
 import { FILE_CHANGE_LIMITS } from "../../shared/file-change-protocol";
-import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
+import * as workerRead from "../db/worker-read";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -40,8 +40,14 @@ import type {
 	ToolContext,
 	ToolExecutionTarget,
 } from "../lib/agent/types";
+import { readAborted } from "../lib/db-worker/errors";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
+import { FileChangeBlobCatalog, FileChangeBlobCatalogError } from "./file-change-blob-catalog";
+import type { FileChangeBlobRelease } from "./file-change-blob-store";
+import * as localIoModule from "./file-change-local-io";
 import {
 	createFileChangeLocalIo,
 	type FileChangeLocalIo,
@@ -79,7 +85,7 @@ beforeEach(async () => {
 	// Schema-only copy from the preload's isolated database. No rows, production
 	// directory, migration file or application connection settings are changed.
 	// A byte image built once per process replaces replaying ~550 DDL statements per case.
-	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	sqlite = openFileWorkerDatabase(isolatedTemplate);
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = database(sqlite);
 	narratorId = generateId();
@@ -99,9 +105,15 @@ afterEach(async () => {
 	await runtime.initialize().catch(() => {});
 	// Drizzle prepares uncached statements; close() alone defers native disposal until GC.
 	// Strict close finalizes them before Windows removes this fixture's directory.
-	sqlite.close(true);
+	await closeFileWorkerDatabase(sqlite);
 	await rm(root, { recursive: true, force: true });
 });
+
+function namespaceDiagnosticLogs(calls: readonly (readonly unknown[])[]) {
+	return calls
+		.filter(([message]) => message === "File history namespace diagnostic")
+		.map(([, fields]) => fields as Record<string, unknown>);
+}
 
 function makeRuntime(options: Partial<LocalFileChangeRuntimeOptions> = {}) {
 	return new LocalFileChangeRuntime({
@@ -385,6 +397,150 @@ describe("editor providers with independent history", () => {
 });
 
 describe("single-file writes with independent history", () => {
+	test.each([
+		"binding",
+		"actor",
+	] as const)("execution cancellation aborts blocked %s metadata before target IO", async (stage) => {
+		const path = join(workspace, `cancel-${stage}.txt`);
+		await writeFile(path, "before");
+		const controller = new AbortController();
+		const ctx = { ...(await callContext("Write", path)), signal: controller.signal };
+		const entered = Promise.withResolvers<AbortSignal | undefined>();
+		const read = workerRead.readQueryFirst;
+		let release: (() => void) | undefined;
+		let readerCancelled = false;
+		const reader = spyOn(workerRead, "readQueryFirst").mockImplementation(((
+			query: Parameters<typeof read>[0],
+			options?: Parameters<typeof read>[1],
+		) => {
+			const sql = query.toSQL().sql;
+			const selected =
+				stage === "binding"
+					? /\bfrom\s+"narrator_tool_calls"/i.test(sql)
+					: /\bfrom\s+"narrators"/i.test(sql);
+			if (!selected) return read(query, options);
+			entered.resolve(options?.signal);
+			return new Promise<unknown>((_resolve, reject) => {
+				const cancelled = () => {
+					readerCancelled = true;
+					reject(readAborted());
+				};
+				release = () => {
+					options?.signal?.removeEventListener("abort", cancelled);
+					reject(new Error("Metadata test gate released"));
+				};
+				if (options?.signal?.aborted) cancelled();
+				else options?.signal?.addEventListener("abort", cancelled, { once: true });
+			});
+		}) as typeof read);
+		const targetRead = spyOn(io, "read");
+		const targetApply = spyOn(io, "apply");
+		let constructed = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const pending = runtime.execute({
+			ctx,
+			backend: localBackend,
+			toolName: "Write",
+			filePath: path,
+			input: { file_path: path, content: "after" },
+			construct: () => {
+				constructed = true;
+				return { nextBytes: Buffer.from("after"), result: { output: "saved" }, lineStats: null };
+			},
+		});
+		const settled = pending.then(
+			() => ({ status: "fulfilled" as const }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
+		);
+		try {
+			const signal = await Promise.race([
+				entered.promise,
+				settled.then(() => {
+					throw new Error("Execution did not reach the metadata gate");
+				}),
+			]);
+			expect(signal).toBe(controller.signal);
+			controller.abort();
+			const outcome = await Promise.race([
+				settled,
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("Cancelled metadata read did not settle")),
+						1000,
+					);
+				}),
+			]);
+			expect(readerCancelled).toBe(true);
+			expect(outcome).toMatchObject({ status: "rejected", error: { code: "DB_READ_ABORTED" } });
+			expect(constructed).toBe(false);
+			expect(targetRead).not.toHaveBeenCalled();
+			expect(targetApply).not.toHaveBeenCalled();
+			expect(await readFile(path, "utf8")).toBe("before");
+		} finally {
+			if (timer) clearTimeout(timer);
+			controller.abort();
+			release?.();
+			await settled;
+			reader.mockRestore();
+			targetRead.mockRestore();
+			targetApply.mockRestore();
+		}
+	});
+
+	test("cancelled execution retains its independent no-dispatch audit", async () => {
+		const path = join(workspace, "cancelled-audit.txt");
+		await writeFile(path, "before");
+		const ctx = { ...(await callContext("Write", path)), signal: AbortSignal.abort() };
+		const targetRead = spyOn(io, "read");
+		const targetApply = spyOn(io, "apply");
+		try {
+			await runtime.recordHostNoDispatch(ctx, "Write", "cancelled_before_dispatch", true);
+			expect(operations()).toMatchObject([
+				{
+					executionOutcome: "interrupted",
+					settlement: "settled",
+					expectedEffectCount: 0,
+					reason: "no_dispatch:cancelled_before_dispatch",
+				},
+			]);
+			expect(effects()).toHaveLength(0);
+			expect(targetRead).not.toHaveBeenCalled();
+			expect(targetApply).not.toHaveBeenCalled();
+			expect(await readFile(path, "utf8")).toBe("before");
+		} finally {
+			targetRead.mockRestore();
+			targetApply.mockRestore();
+		}
+	});
+	test("the synchronous execution fence rejects an attempt changed after Worker preflight", async () => {
+		const path = join(workspace, "changed-attempt.txt");
+		await writeFile(path, "before");
+		const ctx = await callContext("Write", path);
+		const binding = ctx.toolCallBinding;
+		if (!binding) throw new Error("Missing test attempt");
+		ctx.recheckAuthorization = async () => {
+			db.update(schema.narratorToolCalls)
+				.set({ executionAttempt: binding.attempt + 1 })
+				.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
+				.run();
+		};
+		await expect(
+			runtime.execute({
+				ctx,
+				backend: localBackend,
+				toolName: "Write",
+				filePath: path,
+				input: { file_path: path, content: "after" },
+				construct: () => ({
+					nextBytes: Buffer.from("after"),
+					result: { output: "saved" },
+					lineStats: null,
+				}),
+			}),
+		).rejects.toThrow("changed after metadata preflight");
+		expect(await readFile(path, "utf8")).toBe("before");
+		expect(operations()).toHaveLength(0);
+	});
 	test("history notice describes only confirmed saves with unavailable history", () => {
 		const result = {
 			output: "Wrote file",
@@ -737,6 +893,7 @@ describe("single-file writes with independent history", () => {
 			const { store } = await runtime.initialize();
 			const put = spyOn(store, "putBytes");
 			const record = spyOn(runtime.evidence, "recordEffect");
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 			const fail = spyOn(runtime.evidence, method).mockImplementation(() => {
 				throw new Error("history allocation unavailable");
 			});
@@ -750,12 +907,17 @@ describe("single-file writes with independent history", () => {
 				expect(await readFile(path, "utf8")).toBe("saved");
 				expect(put).not.toHaveBeenCalled();
 				expect(record).not.toHaveBeenCalled();
+				expect(namespaceDiagnosticLogs(warn.mock.calls)).toHaveLength(1);
+				expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+					historyStage: method === "prepareScope" ? "prepare_scope" : "begin_operation",
+				});
 				expect((await write(path, "replayed", ctx)).isError).toBe(true);
 				expect(await readFile(path, "utf8")).toBe("saved");
 			} finally {
 				fail.mockRestore();
 				put.mockRestore();
 				record.mockRestore();
+				warn.mockRestore();
 			}
 			expect((await write(path, "next")).metadata?.historyStatus).toBe("complete");
 		});
@@ -793,6 +955,7 @@ describe("single-file writes with independent history", () => {
 		const ctx = await callContext("Write", path);
 		const { store } = await runtime.initialize();
 		const put = spyOn(store, "putBytes");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		sqlite.exec(`CREATE TEMP TRIGGER reject_operation_link
 			BEFORE UPDATE OF file_change_operation_id ON narrator_tool_calls
 			BEGIN SELECT RAISE(ABORT, 'operation link unavailable'); END`);
@@ -808,9 +971,13 @@ describe("single-file writes with independent history", () => {
 			expect(effects()).toHaveLength(1);
 			expect(effects()[0].beforeStateJson.kind).toBe("regular");
 			expect(effects()[0].observedAfterStateJson.kind).toBe("regular");
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+				historyStage: "link_tool",
+			});
 		} finally {
 			sqlite.exec("DROP TRIGGER reject_operation_link");
 			put.mockRestore();
+			warn.mockRestore();
 		}
 	});
 
@@ -818,6 +985,7 @@ describe("single-file writes with independent history", () => {
 		test(`${method} failure reports applied and history unavailable, then future requests work`, async () => {
 			const path = join(workspace, `${method}.txt`);
 			const ctx = await callContext("Write", path);
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 			const spy = spyOn(runtime.evidence, method).mockImplementation(() => {
 				throw new Error("history unavailable");
 			});
@@ -829,14 +997,310 @@ describe("single-file writes with independent history", () => {
 					historyStatus: "unavailable",
 				});
 				expect(result.output).toContain("File saved; history is unavailable for this operation.");
+				expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+					historyStage: method === "recordEffect" ? "record_effect" : "finish_operation",
+				});
 				expect(await readFile(path, "utf8")).toBe("saved");
 				expect((await write(path, "repeat", ctx)).isError).toBe(true);
 			} finally {
 				spy.mockRestore();
+				warn.mockRestore();
 			}
 			expect((await write(path, "next")).isError).not.toBe(true);
 		});
 	}
+
+	test("shared initialization failure is diagnosed once per actual attempt and preserves its exception", async () => {
+		let now = 0;
+		runtime = makeRuntime({ historyDiagnosticClock: () => now });
+		const original = new FileChangeBlobCatalogError(
+			"namespace_mismatch",
+			"original initialization failure",
+		);
+		const initialize = spyOn(
+			FileChangeBlobCatalog.prototype,
+			"initializeNamespace",
+		).mockImplementation(() => {
+			throw original;
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				if (attempt === 2) now = 60_000;
+				const pending = runtime.initialize();
+				expect(runtime.initialize()).toBe(pending);
+				const results = await Promise.allSettled([
+					pending,
+					runtime.initialize(),
+					runtime.initialize(),
+				]);
+				for (const result of results) {
+					expect(result.status).toBe("rejected");
+					if (result.status === "rejected") expect(result.reason).toBe(original);
+				}
+			}
+			expect(initialize).toHaveBeenCalledTimes(3);
+			const diagnostics = namespaceDiagnosticLogs(warn.mock.calls);
+			expect(diagnostics).toHaveLength(2);
+			expect(diagnostics[0]).toMatchObject({ historyStage: "initialize", failureCount: 1 });
+			expect(diagnostics[1]).toMatchObject({ historyStage: "initialize", failureCount: 2 });
+			expect(
+				warn.mock.calls.every(([message]) => message === "File history namespace diagnostic"),
+			).toBe(true);
+		} finally {
+			initialize.mockRestore();
+			warn.mockRestore();
+		}
+		await runtime.initialize();
+		expect(
+			(await write(join(workspace, "init-recovery.txt"), "saved")).metadata?.historyStatus,
+		).toBe("complete");
+	});
+
+	test("concurrent write waiters retain applied outcomes and count only their shared initialization failure", async () => {
+		let now = 0;
+		runtime = makeRuntime({ historyDiagnosticClock: () => now });
+		const initialize = spyOn(
+			FileChangeBlobCatalog.prototype,
+			"initializeNamespace",
+		).mockImplementation(() => {
+			throw new Error("namespace unavailable");
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		let release!: () => void;
+		const bothWaiting = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const readIdentity = localIoModule.localDirectoryIdentity;
+		const identity = spyOn(localIoModule, "localDirectoryIdentity").mockImplementation(
+			async (path) => {
+				if (path === join(privateRoot, "file-change-blobs")) await bothWaiting;
+				return readIdentity(path);
+			},
+		);
+		const initializeRuntime = runtime.initialize.bind(runtime);
+		let waiting = 0;
+		const waiters = spyOn(runtime, "initialize").mockImplementation(() => {
+			const pending = initializeRuntime();
+			if (++waiting === 2) release();
+			return pending;
+		});
+		try {
+			const paths = [join(workspace, "waiter-a.txt"), join(workspace, "waiter-b.txt")];
+			// Prepare tool identities before execution so both requests share the same pending init.
+			const contexts = await Promise.all(paths.map((path) => callContext("Write", path)));
+			const results = await Promise.all(
+				paths.map((path, index) => write(path, "saved", contexts[index])),
+			);
+			for (const result of results)
+				expect(result.metadata).toMatchObject({
+					diskOutcome: "applied",
+					historyStatus: "unavailable",
+				});
+			expect(initialize).toHaveBeenCalledTimes(1);
+			expect(namespaceDiagnosticLogs(warn.mock.calls)).toHaveLength(1);
+			now = 60_000;
+			await runtime.initialize().catch(() => {});
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[1].failureCount).toBe(1);
+			expect(
+				warn.mock.calls.filter(
+					([message]) => message === "File history unavailable for this request",
+				),
+			).toHaveLength(2);
+			for (const path of paths) expect(await readFile(path, "utf8")).toBe("saved");
+		} finally {
+			release();
+			waiters.mockRestore();
+			identity.mockRestore();
+			initialize.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("a real initialization budget timeout has a distinct controlled label and still saves", async () => {
+		const blocked = spyOn(runtime, "initialize").mockImplementation(() => new Promise(() => {}));
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const path = join(workspace, "initialization-budget.txt");
+		try {
+			const result = await write(path, "saved");
+			expect(result.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			expect(await readFile(path, "utf8")).toBe("saved");
+			const diagnostics = namespaceDiagnosticLogs(warn.mock.calls);
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toMatchObject({
+				historyStage: "initialize",
+				errorCode: "history_budget_exceeded",
+				errorName: "Error",
+			});
+			const warnings = warn.mock.calls.filter(
+				([message]) => message === "File history unavailable for this request",
+			);
+			expect(warnings[0][1]).toMatchObject({
+				error: "Error: File history preparation budget exceeded",
+			});
+			expect(JSON.stringify(result.metadata)).not.toContain("history_budget_exceeded");
+		} finally {
+			blocked.mockRestore();
+			warn.mockRestore();
+		}
+		expect((await write(path, "recovered")).metadata?.historyStatus).toBe("complete");
+	});
+
+	test("real catalog mismatch logs stable combined fingerprints and process-scoped identity without changing binding", async () => {
+		const source = await runtime.initialize();
+		const budget = await source.catalog.getBudget();
+		if (!budget) throw new Error("Initialized test catalog is missing its budget");
+		const storedKey = "a".repeat(64);
+		db.update(schema.fileChangeStorageBudgets).set({ namespaceKey: storedKey }).run();
+		runtime = makeRuntime();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const path = join(workspace, "namespace-mismatch.txt");
+			const result = await write(path, "private file content");
+			expect(result.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			const diagnostics = namespaceDiagnosticLogs(warn.mock.calls);
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toMatchObject({
+				historyStage: "initialize",
+				errorCode: "namespace_mismatch",
+				errorName: "FileChangeBlobCatalogError",
+				identityScope: "process",
+				currentKeyFingerprint: createHash("sha256").update(budget.namespaceKey).digest("hex"),
+				catalog: {
+					catalogStage: "initialize",
+					reason: "key_mismatch",
+					keysEqual: false,
+					storedKeyFingerprint: createHash("sha256").update(storedKey).digest("hex"),
+					currentKeyFingerprint: createHash("sha256").update(budget.namespaceKey).digest("hex"),
+				},
+			});
+			const serialized = JSON.stringify(diagnostics);
+			for (const sensitive of [
+				source.sourceInstanceId,
+				privateRoot,
+				workspace,
+				path,
+				storedKey,
+				budget.namespaceKey,
+				"private file content",
+				"SELECT",
+				"namespace_key",
+			])
+				expect(serialized).not.toContain(sensitive);
+			expect(JSON.stringify(result.metadata)).not.toContain("Fingerprint");
+			expect(db.select().from(schema.fileChangeStorageBudgets).get()?.namespaceKey).toBe(storedKey);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("diagnostic logger failure preserves the existing warning and an applied unavailable result", async () => {
+		await runtime.initialize();
+		const failure = new Error("original effect history failure");
+		const record = spyOn(runtime.evidence, "recordEffect").mockImplementation(() => {
+			throw failure;
+		});
+		const warn = spyOn(logger, "warn").mockImplementation((message) => {
+			if (message === "File history namespace diagnostic")
+				throw new Error("new diagnostic logger failed");
+		});
+		try {
+			const path = join(workspace, "logger-failure.txt");
+			const result = await write(path, "saved");
+			expect(result.isError).not.toBe(true);
+			expect(result.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			expect(await readFile(path, "utf8")).toBe("saved");
+			const warnings = warn.mock.calls.filter(
+				([message]) => message === "File history unavailable for this request",
+			);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0][1]).toMatchObject({ error: String(failure) });
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+				historyStage: "record_effect",
+			});
+			expect(JSON.stringify(result.metadata)).not.toContain("Fingerprint");
+		} finally {
+			record.mockRestore();
+			warn.mockRestore();
+		}
+		expect(
+			(await write(join(workspace, "logger-recovery.txt"), "saved")).metadata?.historyStatus,
+		).toBe("complete");
+	});
+
+	test("wrapped publication accounting failure retains its catalog stage in the runtime diagnostic", async () => {
+		const path = join(workspace, "accounting-mismatch.txt");
+		await writeFile(path, "before");
+		const ns = await runtime.initialize();
+		const reserve = ns.catalog.reserve.bind(ns.catalog);
+		const admission = spyOn(ns.catalog, "reserve").mockImplementation(async (...args) => {
+			const lease = await reserve(...args);
+			return {
+				...lease,
+				release: (result: FileChangeBlobRelease) => {
+					db.update(schema.fileChangeStorageBudgets)
+						.set({ namespaceKey: "a".repeat(64) })
+						.run();
+					return lease.release(result);
+				},
+			};
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const result = await write(path, "saved");
+			expect(result.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			expect(await readFile(path, "utf8")).toBe("saved");
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+				historyStage: "publish_before",
+				catalog: { catalogStage: "publication_accounting", reason: "key_mismatch" },
+			});
+		} finally {
+			admission.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("intended-after publication failure is distinct from before publication and reuses successful identity context", async () => {
+		const path = join(workspace, "publish-after.txt");
+		await writeFile(path, "before");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const ns = await runtime.initialize();
+		expect(namespaceDiagnosticLogs(warn.mock.calls)).toEqual([]);
+		const put = ns.store.putBytes.bind(ns.store);
+		let calls = 0;
+		const publication = spyOn(ns.store, "putBytes").mockImplementation((...args) => {
+			if (++calls === 2) return Promise.reject(new Error("after publication failed"));
+			return put(...args);
+		});
+		try {
+			const result = await write(path, "after");
+			expect(result.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "unavailable",
+			});
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+				historyStage: "publish_intended_after",
+				identityScope: "process",
+			});
+			expect(await readFile(path, "utf8")).toBe("after");
+		} finally {
+			publication.mockRestore();
+			warn.mockRestore();
+		}
+		expect((await write(path, "recovered")).metadata?.historyStatus).toBe("complete");
+	});
 
 	test("failed initialization is a local history gap and is retried without resetting data", async () => {
 		await writeFile(privateRoot, "not a directory");
@@ -853,6 +1317,7 @@ describe("single-file writes with independent history", () => {
 		await writeFile(path, "before");
 		const ns = await runtime.initialize();
 		const spy = spyOn(ns.store, "putBytes").mockRejectedValue(new Error("bad blob"));
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const result = await write(path, "after");
 			expect(result.metadata).toMatchObject({
@@ -860,8 +1325,12 @@ describe("single-file writes with independent history", () => {
 				historyStatus: "unavailable",
 			});
 			expect(await readFile(path, "utf8")).toBe("after");
+			expect(namespaceDiagnosticLogs(warn.mock.calls)[0]).toMatchObject({
+				historyStage: "publish_before",
+			});
 		} finally {
 			spy.mockRestore();
+			warn.mockRestore();
 		}
 		expect((await write(path, "usable")).metadata?.historyStatus).toBe("complete");
 	});

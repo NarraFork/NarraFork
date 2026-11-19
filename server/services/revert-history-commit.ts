@@ -675,13 +675,18 @@ export class RevertHistoryCommitService {
 				row: { message_id: message.id, owner_id: message.narratorId, shared },
 				count: 1,
 			});
-			const inventory = await this.page<Tool & { cursor: number }>(
-				work,
-				"SELECT id,message_id,narrator_id,tool_use_id,is_file_history_checkpoint,status,execution_attempt,file_change_operation_id,tool_name,octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,rowid AS cursor FROM narrator_tool_calls",
-				"idx_toolcalls_message",
-				"message_id",
-				message.id,
-			);
+			// An empty fixed tool set needs only its apply-time membership fence. A new
+			// tool is also rejected by the final collector; never establish a fresh baseline.
+			const inventory =
+				changes.size === 0
+					? []
+					: await this.page<Tool & { cursor: number }>(
+							work,
+							"SELECT id,narrator_id,message_id,tool_use_id,is_file_history_checkpoint,status,execution_attempt,file_change_operation_id,tool_name,octet_length(input_json) AS inputBytes,octet_length(output_json) AS outputBytes,rowid AS cursor FROM narrator_tool_calls",
+							"idx_toolcalls_message",
+							"message_id",
+							message.id,
+						);
 			toolTargets.push({ row: { message_id: message.id }, count: inventory.length });
 			for (const { cursor: _cursor, ...tool } of inventory) {
 				capture(allTools, tool.id, tool);
