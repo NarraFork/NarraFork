@@ -971,6 +971,39 @@ export async function runAgentLoopUnlocked(
 	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
 	// at each pass and tool boundary, and on a timer through long tool calls).
 	let outlineLeases: OutlineLeaseKeeper | undefined;
+	let historyPreparation: ModelHistoryPreparation | undefined;
+	const gitRefresh = new GitToolRefreshQueue({
+		state: active,
+		markDirty: markStatusDirty,
+		peek: peekStatusSummary,
+		read: getStatusSummaryCached,
+		hasReaders: () => {
+			for (const ws of getNarratorConnections()) {
+				if (
+					ws.data.subscribedNarrators.has(narratorId) &&
+					!ws.data.activityOnlyNarrators?.has(narratorId)
+				)
+					return true;
+			}
+			return false;
+		},
+		isCurrent: (path) =>
+			active.alive && owner.isCurrent() && gitTrackPathForSession(active) === path,
+		publish: (gitStatus, toolUseId) => {
+			const { files: _files, ...statusWithoutFiles } = gitStatus;
+			broadcastToNarrator(narratorId, {
+				type: "git_status",
+				narratorId,
+				toolUseId,
+				status: statusWithoutFiles as typeof gitStatus,
+				linesAdded: gitStatus.linesAdded,
+				linesRemoved: gitStatus.linesRemoved,
+			});
+		},
+		onError: (error) => {
+			logger.debug("Git status tracking failed", { narratorId, error: String(error) });
+		},
+	});
 	try {
 		outlineLeases = keepOutlineTaskLeases(narratorId);
 		// An outline session moves its old fence text to its behavior page once, before its first

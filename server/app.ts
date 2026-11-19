@@ -337,7 +337,6 @@ app.use("/api/*", async (c, next) => {
 			logger.warn("Slow API request", {
 				...httpRequestLogFields(c, endedAt),
 				status: c.res.status,
-				durationMs,
 				...stallTimeBetween(startedAt, endedAt),
 			});
 		}

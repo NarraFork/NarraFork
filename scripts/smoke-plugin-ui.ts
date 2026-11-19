@@ -81,7 +81,10 @@ export function isolatedSmokeEnvironment(home: string): Record<string, string> {
 	};
 }
 
-export async function createSmokeRuntime() {
+export async function createSmokeRuntime(options: { watchdogMs?: number } = {}) {
+	const watchdogMs = options.watchdogMs ?? WATCHDOG_MS;
+	if (!Number.isSafeInteger(watchdogMs) || watchdogMs <= 0 || watchdogMs > 600_000)
+		throw new Error("Smoke watchdogMs must be an integer from 1 to 600000");
 	mkdirSync(join(ROOT, ".narrafork"), { recursive: true });
 	const evidenceDir = mkdtempSync(join(ROOT, ".narrafork", "browser-smoke-"));
 	console.log(`Smoke evidence: ${evidenceDir}`);
@@ -228,8 +231,8 @@ export async function createSmokeRuntime() {
 	process.once("SIGINT", onInterrupt);
 	process.once("SIGTERM", onTerminate);
 	const watchdog = setTimeout(
-		() => stop(`WATCHDOG: smoke exceeded ${WATCHDOG_MS}ms`, 2),
-		WATCHDOG_MS,
+		() => stop(`WATCHDOG: smoke exceeded ${watchdogMs}ms`, 2),
+		watchdogMs,
 	);
 	try {
 		const port = await reservePort();

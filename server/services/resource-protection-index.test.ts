@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join, parse, resolve } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import {
 	initializeAbsentReceiptProtectionSource,
 	installResourceProtectionTriggers,

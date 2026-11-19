@@ -91,6 +91,7 @@ import {
 	type SyncMode,
 	syncEnvelopeNow,
 	syncQueueMark,
+	withBlockSyncStats,
 } from "./narrator-block-sync";
 import { bodyColumns, envelopeStoredBytesSql, fillBodies, fillBody } from "./narrator-body-reads";
 import {

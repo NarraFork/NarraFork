@@ -271,11 +271,11 @@ async function runWorker(input: WorkerInput): Promise<WorkerReport> {
 		"../../tests/sqlite-schema-image.ts",
 		`file://${modulePaths["@server/services/file-change-runtime"]}`,
 	).href;
-	const { openSchemaCopyInMemory } = (await import(
+	const { openSchemaCopyAt } = (await import(
 		helper
 	)) as typeof import("../../tests/sqlite-schema-image");
-	const sqlite = openSchemaCopyInMemory(sourceDb.sqlite);
-	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
+	const sqlite = openSchemaCopyAt(sourceDb.sqlite, join(input.sandbox, "file-history.sqlite"));
+	sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	const workspace = join(input.sandbox, "workspace");
 	const privateRoot = join(input.sandbox, "private");
 	await mkdir(workspace, { mode: 0o700 });
@@ -517,6 +517,8 @@ async function runWorker(input: WorkerInput): Promise<WorkerReport> {
 			};
 			await cleanup.waitForRetiredFileChangeCleanup(privateRoot);
 		}
+		const { closeReadDatabase } = await import("@server/lib/db-worker/pool");
+		await closeReadDatabase(sqlite.filename, { timeoutMs: 5000 });
 		sqlite.close(true);
 		sourceDb.markDatabaseCleanShutdown();
 		sourceDb.sqlite.close(true);

@@ -3,6 +3,7 @@
  */
 import { Hono } from "hono";
 import { z } from "zod";
+import { activeDatabaseBackend, sqlite } from "../db";
 import { logger } from "../lib/logger";
 import { permissionModeSchema } from "../lib/permission-modes";
 import { requireAdmin } from "../middleware/auth";
@@ -16,9 +17,10 @@ import {
 	getRunSummary,
 	getSuite,
 	listRuns,
-	listSuites,
+	listSuitesPostgres,
 	startRun,
 } from "../services/benchmark-service";
+import { createBenchmarkSuiteListStream } from "../services/benchmark-suite-stream";
 
 export const benchmarkRoutes = new Hono();
 
@@ -117,8 +119,9 @@ benchmarkRoutes.post("/suites", async (c) => {
 });
 
 benchmarkRoutes.get("/suites", async (c) => {
-	const suites = await listSuites();
-	return c.json(suites);
+	if (activeDatabaseBackend === "postgres") return c.json(await listSuitesPostgres());
+	const stream = await createBenchmarkSuiteListStream(sqlite, { signal: c.req.raw.signal });
+	return c.newResponse(stream, 200, { "Content-Type": "application/json; charset=UTF-8" });
 });
 
 benchmarkRoutes.get("/suites/:id", async (c) => {

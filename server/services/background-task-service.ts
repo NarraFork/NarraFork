@@ -248,6 +248,82 @@ export const BACKGROUND_TASK_LIST_EPOCH = hotSafe("narrafork:bg-task:listEpoch",
  * later frame would be dropped too and the panel would freeze with no signal.
  */
 const MAX_TRACKED_LIST_VERSIONS = 500;
+const SLOW_LIST_MS = 100;
+const SLOW_LIST_LOG_INTERVAL_MS = 30_000;
+
+/** Per-request scalars only. Parallel read/wait durations are summed, not CPU time. */
+interface BackgroundTaskListObservation {
+	workerReadElapsedMs: number;
+	workerReadCount: number;
+	workerRows: number;
+	occupancyWaitMs: number;
+	mappingSyncMs: number;
+	mergeSortSyncMs: number;
+	unifiedRows: number;
+	legacyRows: number;
+	activeRows: number;
+	returnedRows: number;
+}
+
+function createListObservation(): BackgroundTaskListObservation {
+	return {
+		workerReadElapsedMs: 0,
+		workerReadCount: 0,
+		workerRows: 0,
+		occupancyWaitMs: 0,
+		mappingSyncMs: 0,
+		mergeSortSyncMs: 0,
+		unifiedRows: 0,
+		legacyRows: 0,
+		activeRows: 0,
+		returnedRows: 0,
+	};
+}
+
+/** End-to-end wall elapsed, including query preparation, worker wait and result mapping. */
+async function observeListRead<T>(
+	observation: BackgroundTaskListObservation | undefined,
+	read: () => Promise<T[]>,
+): Promise<T[]> {
+	if (!observation) return read();
+	const started = performance.now();
+	observation.workerReadCount++;
+	try {
+		const rows = await read();
+		observation.workerRows += rows.length;
+		return rows;
+	} finally {
+		observation.workerReadElapsedMs += performance.now() - started;
+	}
+}
+
+async function observeListOccupancy<T>(
+	observation: BackgroundTaskListObservation | undefined,
+	read: () => Promise<T>,
+): Promise<T> {
+	if (!observation) return read();
+	const started = performance.now();
+	try {
+		return await read();
+	} finally {
+		observation.occupancyWaitMs += performance.now() - started;
+	}
+}
+
+/** Only accepts synchronous work; no awaited stage is charged to these fields. */
+function observeListSync<T>(
+	observation: BackgroundTaskListObservation | undefined,
+	field: "mappingSyncMs" | "mergeSortSyncMs",
+	work: () => T,
+): T {
+	if (!observation) return work();
+	const started = performance.now();
+	try {
+		return work();
+	} finally {
+		observation[field] += performance.now() - started;
+	}
+}
 
 /**
  * Truncate a string so that its UTF-8 byte length does not exceed `maxBytes`.
@@ -361,6 +437,34 @@ function boundedOutputTail(column: Column, limit: number) {
 }
 
 class BackgroundTaskService {
+	private lastListSlowLogAt = Number.NEGATIVE_INFINITY;
+
+	private logSlowList(
+		mode: "page" | "legacy-snapshot",
+		started: number,
+		completed: boolean,
+		observation: BackgroundTaskListObservation,
+	): void {
+		const now = performance.now();
+		const elapsedMs = now - started;
+		if (elapsedMs < SLOW_LIST_MS || now - this.lastListSlowLogAt < SLOW_LIST_LOG_INTERVAL_MS)
+			return;
+		this.lastListSlowLogAt = now;
+		// Diagnostics must not replace a successful result or the original rejection.
+		try {
+			logger.warn("Slow background task list", {
+				mode,
+				completed,
+				...observation,
+				elapsedMs,
+			});
+		} catch {}
+	}
+
+	private bashLifecycle = hotSafe(
+		"narrafork:bg-task:bashLifecycle",
+		() => new BackgroundBashLifecycle(),
+	);
 	/** Abort controllers for running tasks (bash process abort, agent loop abort) */
 	private abortControllers: Map<string, AbortController>;
 	/** Kill handlers for bash processes (sends SIGTERM/SIGKILL) */
@@ -457,6 +561,7 @@ class BackgroundTaskService {
 
 	/** Reset the tracked versions. Test-only — production relies on the epoch. */
 	resetListVersionsForTests(): void {
+		this.lastListSlowLogAt = Number.NEGATIVE_INFINITY;
 		this.listVersions.clear();
 		backgroundOccupancyStore.resetForTests();
 	}
@@ -2379,11 +2484,14 @@ class BackgroundTaskService {
 	}
 
 	/** Read the maintained active closure; never discover historical descendants here. */
-	private async descendantOccupancy(rootIds: string[]): Promise<{
+	private async descendantOccupancy(
+		rootIds: string[],
+		observation?: BackgroundTaskListObservation,
+	): Promise<{
 		childCounts: Map<string, number>;
 		occupied: Set<string>;
 	}> {
-		await backgroundOccupancyStore.flush();
+		await observeListOccupancy(observation, () => backgroundOccupancyStore.flush());
 		return backgroundOccupancyStore.snapshot(rootIds);
 	}
 
@@ -2397,6 +2505,7 @@ class BackgroundTaskService {
 	 */
 	private async reconcileSummaries(
 		tasks: BackgroundTaskRecord[],
+		observation?: BackgroundTaskListObservation,
 	): Promise<BackgroundTaskSummary[]> {
 		const agentIds = [
 			...new Set(
@@ -2406,64 +2515,71 @@ class BackgroundTaskService {
 			),
 		];
 		if (agentIds.length === 0) {
-			return tasks.map((task) => ({
-				...task,
-				effectiveStatus: task.status,
-				currentNarratorStatus: null,
-				activeChildTaskCount: 0,
-				canCancelActiveWork: isCancellableTaskStatus(task.status),
-			}));
+			return observeListSync(observation, "mappingSyncMs", () =>
+				tasks.map((task) => ({
+					...task,
+					effectiveStatus: task.status,
+					currentNarratorStatus: null,
+					activeChildTaskCount: 0,
+					canCancelActiveWork: isCancellableTaskStatus(task.status),
+				})),
+			);
 		}
 
 		const [narratorRows, { childCounts }] = await Promise.all([
-			db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					isBackground: narrators.isBackground,
-					backgroundStatus: narrators.backgroundStatus,
-					substatus: narrators.substatus,
-					errorMessage: narrators.errorMessage,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, agentIds))
-				.all(),
-			this.descendantOccupancy(agentIds),
+			observeListRead(observation, () =>
+				readQuery(
+					db
+						.select({
+							id: narrators.id,
+							status: narrators.status,
+							isBackground: narrators.isBackground,
+							backgroundStatus: narrators.backgroundStatus,
+							substatus: narrators.substatus,
+							errorMessage: narrators.errorMessage,
+						})
+						.from(narrators)
+						.where(inArray(narrators.id, agentIds)),
+					{ executionPolicy: "worker-required" },
+				),
+			),
+			this.descendantOccupancy(agentIds, observation),
 		]);
-		const narratorState = new Map(narratorRows.map((row) => [row.id, row]));
-
-		return tasks.map((task) => {
-			const subagentNarratorId =
-				task.type === "agent" ? (task.subagentNarratorId ?? task.id) : null;
-			const currentNarrator = subagentNarratorId
-				? (narratorState.get(subagentNarratorId) ?? null)
-				: null;
-			const currentNarratorStatus = currentNarrator?.status ?? null;
-			const activeChildTaskCount = subagentNarratorId
-				? (childCounts.get(subagentNarratorId) ?? 0)
-				: 0;
-			const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
-				taskStatus: task.status,
-				currentNarratorStatus,
-				currentNarratorIsBackground: currentNarrator?.isBackground,
-				currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
-				currentNarratorSubstatus: currentNarrator?.substatus,
-				currentNarratorErrorMessage: currentNarrator?.errorMessage,
-				activeChildTaskCount,
+		return observeListSync(observation, "mappingSyncMs", () => {
+			const narratorState = new Map(narratorRows.map((row) => [row.id, row]));
+			return tasks.map((task) => {
+				const subagentNarratorId =
+					task.type === "agent" ? (task.subagentNarratorId ?? task.id) : null;
+				const currentNarrator = subagentNarratorId
+					? (narratorState.get(subagentNarratorId) ?? null)
+					: null;
+				const currentNarratorStatus = currentNarrator?.status ?? null;
+				const activeChildTaskCount = subagentNarratorId
+					? (childCounts.get(subagentNarratorId) ?? 0)
+					: 0;
+				const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
+					taskStatus: task.status,
+					currentNarratorStatus,
+					currentNarratorIsBackground: currentNarrator?.isBackground,
+					currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
+					currentNarratorSubstatus: currentNarrator?.substatus,
+					currentNarratorErrorMessage: currentNarrator?.errorMessage,
+					activeChildTaskCount,
+				});
+				return {
+					...task,
+					// A stale terminal row can carry the previous run's error text. Do not
+					// show that text alongside a reconciled current-run status.
+					output: effectiveStatus === task.status ? task.output : null,
+					effectiveStatus,
+					currentNarratorStatus,
+					activeChildTaskCount,
+					canCancelActiveWork:
+						isCancellableTaskStatus(task.status) ||
+						effectiveStatus === "continued" ||
+						activeChildTaskCount > 0,
+				};
 			});
-			return {
-				...task,
-				// A stale terminal row can carry the previous run's error text. Do not
-				// show that text alongside a reconciled current-run status.
-				output: effectiveStatus === task.status ? task.output : null,
-				effectiveStatus,
-				currentNarratorStatus,
-				activeChildTaskCount,
-				canCancelActiveWork:
-					isCancellableTaskStatus(task.status) ||
-					effectiveStatus === "continued" ||
-					activeChildTaskCount > 0,
-			};
 		});
 	}
 
@@ -2497,26 +2613,31 @@ class BackgroundTaskService {
 	}
 
 	/** Overlay in-process liveness onto reconciled rows. */
-	private async applyLiveness(items: BackgroundTaskListItem[]): Promise<BackgroundTaskListItem[]> {
+	private async applyLiveness(
+		items: BackgroundTaskListItem[],
+		observation?: BackgroundTaskListObservation,
+	): Promise<BackgroundTaskListItem[]> {
 		if (items.length === 0) return items;
-		const withProgress = await this.applyTransferProgress(items);
+		const withProgress = await this.applyTransferProgress(items, observation);
 		const isLive = await this.getLivenessFn();
 		if (!isLive) return withProgress;
-		return withProgress.map((item) => {
-			if (item.type !== "agent") return item;
-			if (!isLive(item.subagentNarratorId ?? item.id)) return item;
-			return {
-				...item,
-				effectiveStatus:
-					item.effectiveStatus === "taken_over"
-						? "taken_over"
-						: item.status === "running"
-							? "running"
-							: "continued",
-				currentNarratorStatus: "working",
-				canCancelActiveWork: true,
-			};
-		});
+		return observeListSync(observation, "mappingSyncMs", () =>
+			withProgress.map((item) => {
+				if (item.type !== "agent") return item;
+				if (!isLive(item.subagentNarratorId ?? item.id)) return item;
+				return {
+					...item,
+					effectiveStatus:
+						item.effectiveStatus === "taken_over"
+							? "taken_over"
+							: item.status === "running"
+								? "running"
+								: "continued",
+					currentNarratorStatus: "working",
+					canCancelActiveWork: true,
+				};
+			}),
+		);
 	}
 
 	/**
@@ -2535,57 +2656,67 @@ class BackgroundTaskService {
 	 */
 	private async applyTransferProgress(
 		items: BackgroundTaskListItem[],
+		observation?: BackgroundTaskListObservation,
 	): Promise<BackgroundTaskListItem[]> {
 		const transferRows = items.filter(
 			(item) => item.type === "transfer" && isBackgroundTaskActiveStatus(item.effectiveStatus),
 		);
 		if (transferRows.length === 0) return items;
 		const projectionIds = transferRows.map((item) => item.id);
-		const owners = await db
-			.select({
-				projectionId: backgroundTasks.id,
-				direction: deviceTransferTasks.direction,
-				bytesTransferred: deviceTransferTasks.bytesTransferred,
-				totalBytes: deviceTransferTasks.totalBytes,
-				filesTransferred: deviceTransferTasks.filesTransferred,
-				totalFiles: deviceTransferTasks.totalFiles,
-				currentFile: deviceTransferTasks.currentFile,
-				startedAt: deviceTransferTasks.startedAt,
-				updatedAt: deviceTransferTasks.updatedAt,
-			})
-			.from(backgroundTasks)
-			.innerJoin(deviceTransferTasks, eq(backgroundTasks.transferTaskId, deviceTransferTasks.id))
-			.where(inArray(backgroundTasks.id, projectionIds))
-			.all();
+		const owners = await observeListRead(observation, () =>
+			readQuery(
+				db
+					.select({
+						projectionId: backgroundTasks.id,
+						direction: deviceTransferTasks.direction,
+						bytesTransferred: deviceTransferTasks.bytesTransferred,
+						totalBytes: deviceTransferTasks.totalBytes,
+						filesTransferred: deviceTransferTasks.filesTransferred,
+						totalFiles: deviceTransferTasks.totalFiles,
+						currentFile: deviceTransferTasks.currentFile,
+						startedAt: deviceTransferTasks.startedAt,
+						updatedAt: deviceTransferTasks.updatedAt,
+					})
+					.from(backgroundTasks)
+					.innerJoin(
+						deviceTransferTasks,
+						eq(backgroundTasks.transferTaskId, deviceTransferTasks.id),
+					)
+					.where(inArray(backgroundTasks.id, projectionIds)),
+				{ executionPolicy: "worker-required" },
+			),
+		);
 		if (owners.length === 0) return items;
-		const byProjection = new Map(owners.map((row) => [row.projectionId, row]));
-		return items.map((item) => {
-			const owner = byProjection.get(item.id);
-			if (!owner) return item;
-			const progress: ToolProgressPayload = {
-				completed: owner.bytesTransferred,
-				// Omitted rather than zeroed when unknown: a `total: 0` lets the client
-				// compute 0% and paint a bar frozen at zero, which reads as a stalled
-				// transfer instead of an unmeasurable one.
-				...(owner.totalBytes != null && owner.totalBytes > 0 ? { total: owner.totalBytes } : {}),
-				...(owner.totalFiles != null && owner.totalFiles > 1
-					? { itemsDone: owner.filesTransferred, itemsTotal: owner.totalFiles }
-					: {}),
-				...(owner.currentFile ? { currentItem: owner.currentFile } : {}),
-				// Elapsed spans the CURRENT run only (startedAt is re-stamped on resume),
-				// so a transfer paused overnight does not report an overnight-long elapsed
-				// and therefore a near-zero rate.
-				...(owner.startedAt
-					? {
-							elapsedMs: Math.max(
-								0,
-								new Date(owner.updatedAt).getTime() - new Date(owner.startedAt).getTime(),
-							),
-						}
-					: {}),
-				phase: owner.direction,
-			};
-			return { ...item, progress };
+		return observeListSync(observation, "mappingSyncMs", () => {
+			const byProjection = new Map(owners.map((row) => [row.projectionId, row]));
+			return items.map((item) => {
+				const owner = byProjection.get(item.id);
+				if (!owner) return item;
+				const progress: ToolProgressPayload = {
+					completed: owner.bytesTransferred,
+					// Omitted rather than zeroed when unknown: a `total: 0` lets the client
+					// compute 0% and paint a bar frozen at zero, which reads as a stalled
+					// transfer instead of an unmeasurable one.
+					...(owner.totalBytes != null && owner.totalBytes > 0 ? { total: owner.totalBytes } : {}),
+					...(owner.totalFiles != null && owner.totalFiles > 1
+						? { itemsDone: owner.filesTransferred, itemsTotal: owner.totalFiles }
+						: {}),
+					...(owner.currentFile ? { currentItem: owner.currentFile } : {}),
+					// Elapsed spans the CURRENT run only (startedAt is re-stamped on resume),
+					// so a transfer paused overnight does not report an overnight-long elapsed
+					// and therefore a near-zero rate.
+					...(owner.startedAt
+						? {
+								elapsedMs: Math.max(
+									0,
+									new Date(owner.updatedAt).getTime() - new Date(owner.startedAt).getTime(),
+								),
+							}
+						: {}),
+					phase: owner.direction,
+				};
+				return { ...item, progress };
+			});
 		});
 	}
 
@@ -2629,21 +2760,23 @@ class BackgroundTaskService {
 		const ids = [...new Set(taskIds)].filter(Boolean);
 		if (ids.length === 0) return [];
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
-		const rows = await db
-			.select({
-				...columns,
-				output: sql<
-					string | null
-				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-			})
-			.from(backgroundTasks)
-			.where(
-				and(
-					eq(backgroundTasks.parentNarratorId, parentNarratorId),
-					inArray(backgroundTasks.id, ids),
+		const rows = await readQuery(
+			db
+				.select({
+					...columns,
+					output: sql<
+						string | null
+					>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+				})
+				.from(backgroundTasks)
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						inArray(backgroundTasks.id, ids),
+					),
 				),
-			)
-			.all();
+			{ executionPolicy: "worker-required" },
+		);
 		const summaries = await this.reconcileSummaries(rows);
 		return this.applyLiveness(summaries.map((summary) => this.toListItem(summary)));
 	}
@@ -2676,8 +2809,10 @@ class BackgroundTaskService {
 			/** Skip the preview column entirely; for count-only callers. */
 			omitOutput?: boolean;
 		},
+		observation?: BackgroundTaskListObservation,
 	): Promise<BackgroundTaskListItem[]> {
-		if (opts.activeOnly) await backgroundOccupancyStore.flush();
+		if (opts.activeOnly)
+			await observeListOccupancy(observation, () => backgroundOccupancyStore.flush());
 		const activeIds = opts.activeOnly
 			? backgroundOccupancyStore.getActiveLegacyIds(parentNarratorId, opts.limit)
 			: null;
@@ -2707,80 +2842,94 @@ class BackgroundTaskService {
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, narrators.createdAt, narrators.id)
 			: undefined;
-		const rows = await db
-			.select({
-				id: narrators.id,
-				subagentType: narrators.subagentType,
-				substatus: narrators.substatus,
-				errorMessage: narrators.errorMessage,
-				isBackground: narrators.isBackground,
-				backgroundStatus: narrators.backgroundStatus,
-				backgroundResult: opts.omitOutput
-					? sql<string | null>`null`
-					: sql<
-							string | null
-						>`substr(${narrators.backgroundResult}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-				backgroundResultChars: sql<number>`coalesce(length(${narrators.backgroundResult}), 0)`,
-				backgroundCompletedAt: narrators.backgroundCompletedAt,
-				status: narrators.status,
-				createdAt: narrators.createdAt,
-				title: narrators.title,
-			})
-			.from(narrators)
-			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
-			.orderBy(desc(narrators.createdAt), desc(narrators.id))
-			.limit(opts.limit)
-			.all();
+		const rows = await observeListRead(observation, () =>
+			readQuery(
+				db
+					.select({
+						id: narrators.id,
+						subagentType: narrators.subagentType,
+						substatus: narrators.substatus,
+						errorMessage: narrators.errorMessage,
+						isBackground: narrators.isBackground,
+						backgroundStatus: narrators.backgroundStatus,
+						backgroundResult: opts.omitOutput
+							? sql<string | null>`null`
+							: sql<
+									string | null
+								>`substr(${narrators.backgroundResult}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+						backgroundResultChars: sql<number>`coalesce(length(${narrators.backgroundResult}), 0)`,
+						backgroundCompletedAt: narrators.backgroundCompletedAt,
+						status: narrators.status,
+						createdAt: narrators.createdAt,
+						title: narrators.title,
+					})
+					.from(narrators)
+					.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
+					.orderBy(desc(narrators.createdAt), desc(narrators.id))
+					.limit(opts.limit),
+				{ executionPolicy: "worker-required" },
+			),
+		);
 
-		const { childCounts } = await this.descendantOccupancy(rows.map((row) => row.id));
+		const { childCounts } = await this.descendantOccupancy(
+			rows.map((row) => row.id),
+			observation,
+		);
 		return this.applyLiveness(
-			rows.map((row) => {
-				const activeChildTaskCount = childCounts.get(row.id) ?? 0;
-				const status =
-					row.backgroundStatus ??
-					(row.status === "working" || row.status === "waiting" ? "running" : "completed");
-				const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
-					taskStatus: status as BackgroundTaskRecord["status"],
-					currentNarratorStatus: row.status,
-					currentNarratorIsBackground: row.isBackground,
-					currentNarratorBackgroundStatus: row.backgroundStatus,
-					currentNarratorSubstatus: row.substatus,
-					currentNarratorErrorMessage: row.errorMessage,
-					activeChildTaskCount,
-				});
-				const chars = Number(row.backgroundResultChars) || 0;
-				const preview = toListPreview(row.backgroundResult);
-				return {
-					id: row.id,
-					type: "agent" as const,
-					backgroundKind: "task" as const,
-					status,
-					effectiveStatus,
-					currentNarratorStatus: row.status,
-					activeChildTaskCount,
-					canCancelActiveWork:
-						isCancellableTaskStatus(status) ||
-						effectiveStatus === "continued" ||
-						activeChildTaskCount > 0,
-					command: null,
-					exitCode: null,
-					toolUseId: null,
-					subagentNarratorId: row.id,
-					subagentType: row.subagentType,
-					alias: null,
-					title: row.title,
-					output: preview.preview,
-					outputBytes: chars,
-					// The legacy path stores whatever the subagent returned, uncapped — so
-					// nothing was lost at write time, only at preview time.
-					outputTruncated: false,
-					outputPreviewTruncated: preview.truncated,
-					startedAt: row.createdAt,
-					completedAt: row.backgroundCompletedAt,
-					createdAt: row.createdAt,
-					legacy: true,
-				};
-			}),
+			observeListSync(observation, "mappingSyncMs", () =>
+				rows.map((row) => {
+					const activeChildTaskCount = childCounts.get(row.id) ?? 0;
+					const backgroundStatus =
+						row.status === "archived" && row.backgroundStatus === "running"
+							? "cancelled"
+							: row.backgroundStatus;
+					const status =
+						backgroundStatus ??
+						(row.status === "working" || row.status === "waiting" ? "running" : "completed");
+					const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
+						taskStatus: status as BackgroundTaskRecord["status"],
+						currentNarratorStatus: row.status,
+						currentNarratorIsBackground: row.isBackground,
+						currentNarratorBackgroundStatus: backgroundStatus,
+						currentNarratorSubstatus: row.substatus,
+						currentNarratorErrorMessage: row.errorMessage,
+						activeChildTaskCount,
+					});
+					const chars = Number(row.backgroundResultChars) || 0;
+					const preview = toListPreview(row.backgroundResult);
+					return {
+						id: row.id,
+						type: "agent" as const,
+						backgroundKind: "task" as const,
+						status,
+						effectiveStatus,
+						currentNarratorStatus: row.status,
+						activeChildTaskCount,
+						canCancelActiveWork:
+							isCancellableTaskStatus(status) ||
+							effectiveStatus === "continued" ||
+							activeChildTaskCount > 0,
+						command: null,
+						exitCode: null,
+						toolUseId: null,
+						subagentNarratorId: row.id,
+						subagentType: row.subagentType,
+						alias: null,
+						title: row.title,
+						output: preview.preview,
+						outputBytes: chars,
+						// The legacy path stores whatever the subagent returned, uncapped — so
+						// nothing was lost at write time, only at preview time.
+						outputTruncated: false,
+						outputPreviewTruncated: preview.truncated,
+						startedAt: row.createdAt,
+						completedAt: row.backgroundCompletedAt,
+						createdAt: row.createdAt,
+						legacy: true,
+					};
+				}),
+			),
+			observation,
 		);
 	}
 
@@ -2793,10 +2942,11 @@ class BackgroundTaskService {
 			serviceOnly?: boolean;
 			omitOutput?: boolean;
 		},
+		observation?: BackgroundTaskListObservation,
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [eq(backgroundTasks.parentNarratorId, parentNarratorId)];
 		if (opts.activeOnly) {
-			await backgroundOccupancyStore.flush();
+			await observeListOccupancy(observation, () => backgroundOccupancyStore.flush());
 			const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
 				serviceOnly: opts.serviceOnly,
 				limit: opts.limit,
@@ -2814,22 +2964,31 @@ class BackgroundTaskService {
 			? listCursorCondition(opts.cursor, backgroundTasks.createdAt, backgroundTasks.id)
 			: undefined;
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
-		const rows = await db
-			.select({
-				...columns,
-				output: opts.omitOutput
-					? sql<string | null>`null`
-					: sql<
-							string | null
-						>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-			})
-			.from(backgroundTasks)
-			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
-			.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-			.limit(opts.limit)
-			.all();
-		const summaries = await this.reconcileSummaries(rows);
-		return this.applyLiveness(summaries.map((summary) => this.toListItem(summary)));
+		const rows = await observeListRead(observation, () =>
+			readQuery(
+				db
+					.select({
+						...columns,
+						output: opts.omitOutput
+							? sql<string | null>`null`
+							: sql<
+									string | null
+								>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+					})
+					.from(backgroundTasks)
+					.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
+					.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+					.limit(opts.limit),
+				{ executionPolicy: "worker-required" },
+			),
+		);
+		const summaries = await this.reconcileSummaries(rows, observation);
+		return this.applyLiveness(
+			observeListSync(observation, "mappingSyncMs", () =>
+				summaries.map((summary) => this.toListItem(summary)),
+			),
+			observation,
+		);
 	}
 
 	/**
@@ -2891,9 +3050,10 @@ class BackgroundTaskService {
 	private async listActiveItems(
 		parentNarratorId: string,
 		opts?: { omitOutput?: boolean },
+		observation?: BackgroundTaskListObservation,
 	): Promise<{ items: BackgroundTaskListItem[]; truncated: boolean }> {
 		const limit = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
-		await backgroundOccupancyStore.flush();
+		await observeListOccupancy(observation, () => backgroundOccupancyStore.flush());
 		const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
 			serviceOnly: false,
 			limit,
@@ -2902,54 +3062,71 @@ class BackgroundTaskService {
 		const [candidateRows, legacyActive, serviceActive] = await Promise.all([
 			activeIds.length === 0
 				? Promise.resolve([])
-				: db
-						.select({
-							...columns,
-							output: opts?.omitOutput
-								? sql<string | null>`null`
-								: sql<
-										string | null
-									>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-						})
-						.from(backgroundTasks)
-						.where(
-							and(
-								eq(backgroundTasks.parentNarratorId, parentNarratorId),
-								inArray(backgroundTasks.id, activeIds),
-							),
-						)
-						.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-						.limit(limit)
-						.all(),
-			this.listLegacyRows(parentNarratorId, {
-				limit,
-				activeOnly: true,
-				omitOutput: opts?.omitOutput,
-			}),
-			this.listUnifiedItems(parentNarratorId, {
-				limit,
-				activeOnly: true,
-				serviceOnly: true,
-				omitOutput: opts?.omitOutput,
-			}),
+				: observeListRead(observation, () =>
+						readQuery(
+							db
+								.select({
+									...columns,
+									output: opts?.omitOutput
+										? sql<string | null>`null`
+										: sql<
+												string | null
+											>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+								})
+								.from(backgroundTasks)
+								.where(
+									and(
+										eq(backgroundTasks.parentNarratorId, parentNarratorId),
+										inArray(backgroundTasks.id, activeIds),
+									),
+								)
+								.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+								.limit(limit),
+							{ executionPolicy: "worker-required" },
+						),
+					),
+			this.listLegacyRows(
+				parentNarratorId,
+				{
+					limit,
+					activeOnly: true,
+					omitOutput: opts?.omitOutput,
+				},
+				observation,
+			),
+			this.listUnifiedItems(
+				parentNarratorId,
+				{
+					limit,
+					activeOnly: true,
+					serviceOnly: true,
+					omitOutput: opts?.omitOutput,
+				},
+				observation,
+			),
 		]);
-		const summaries = await this.reconcileSummaries(candidateRows);
+		const summaries = await this.reconcileSummaries(candidateRows, observation);
 		const unifiedActive = await this.applyLiveness(
-			summaries.map((summary) => this.toListItem(summary)),
+			observeListSync(observation, "mappingSyncMs", () =>
+				summaries.map((summary) => this.toListItem(summary)),
+			),
+			observation,
 		);
-		const items = unifiedActive
-			.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus))
-			.concat(legacyActive.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus)))
-			.sort(compareBackgroundTaskListItemsDesc);
-		return {
-			items: [
-				...items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
-				...serviceActive.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
-			].sort(compareBackgroundTaskListItemsDesc),
-			truncated:
-				items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
-				serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT,
-		};
+		return observeListSync(observation, "mergeSortSyncMs", () => {
+			const items = unifiedActive
+				.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus))
+				.concat(legacyActive.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus)))
+				.sort(compareBackgroundTaskListItemsDesc);
+			return {
+				items: [
+					...items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+					...serviceActive.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+				].sort(compareBackgroundTaskListItemsDesc),
+				truncated:
+					items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
+					serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT,
+			};
+		});
 	}
 
 	/**
@@ -2968,6 +3145,23 @@ class BackgroundTaskService {
 		parentNarratorId: string,
 		opts?: { cursor?: string; limit?: number },
 	): Promise<BackgroundTaskListPage> {
+		const started = performance.now();
+		const observation = createListObservation();
+		let completed = false;
+		try {
+			const page = await this.readListPageByParent(parentNarratorId, opts, observation);
+			completed = true;
+			return page;
+		} finally {
+			this.logSlowList("page", started, completed, observation);
+		}
+	}
+
+	private async readListPageByParent(
+		parentNarratorId: string,
+		opts: { cursor?: string; limit?: number } | undefined,
+		observation: BackgroundTaskListObservation,
+	): Promise<BackgroundTaskListPage> {
 		const limit = clampListLimit(opts?.limit);
 		const cursor = decodeBackgroundTaskListCursor(opts?.cursor);
 		const isFirstPage = !cursor;
@@ -2976,14 +3170,19 @@ class BackgroundTaskService {
 		// side, so both must be able to supply a full page plus the lookahead that
 		// decides `nextCursor`.
 		const [unified, legacy, active] = await Promise.all([
-			this.listUnifiedItems(parentNarratorId, { cursor, limit: limit + 1 }),
-			this.listLegacyRows(parentNarratorId, { cursor, limit: limit + 1 }),
+			this.listUnifiedItems(parentNarratorId, { cursor, limit: limit + 1 }, observation),
+			this.listLegacyRows(parentNarratorId, { cursor, limit: limit + 1 }, observation),
 			isFirstPage
-				? this.listActiveItems(parentNarratorId)
+				? this.listActiveItems(parentNarratorId, undefined, observation)
 				: Promise.resolve({ items: [] as BackgroundTaskListItem[], truncated: false }),
 		]);
 
-		const merged = [...unified, ...legacy].sort(compareBackgroundTaskListItemsDesc);
+		observation.unifiedRows = unified.length;
+		observation.legacyRows = legacy.length;
+		observation.activeRows = active.items.length;
+		const merged = observeListSync(observation, "mergeSortSyncMs", () =>
+			[...unified, ...legacy].sort(compareBackgroundTaskListItemsDesc),
+		);
 		const hasMore = merged.length > limit;
 		const tasks = hasMore ? merged.slice(0, limit) : merged;
 		const last = tasks.at(-1);
@@ -2999,7 +3198,10 @@ class BackgroundTaskService {
 					activeWorkCount: active.items.length - serviceCount,
 					activeServiceCount: serviceCount,
 				}
-			: await this.countActiveKindsByParent(parentNarratorId);
+			: await observeListOccupancy(observation, () =>
+					this.countActiveKindsByParent(parentNarratorId),
+				);
+		observation.returnedRows = tasks.length;
 		return {
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.getListVersion(parentNarratorId),
@@ -3026,15 +3228,23 @@ class BackgroundTaskService {
 	async listLegacySnapshotByParent(
 		parentNarratorId: string,
 	): Promise<BackgroundTaskListPage & { legacySubagentTasks: never[] }> {
-		const page = await this.listPageByParent(parentNarratorId);
-		const byId = new Map(page.tasks.map((task) => [task.id, task]));
-		// The active read is fresher and wins if a row appears in both sets.
-		for (const task of page.activeTasks ?? []) byId.set(task.id, task);
-		return {
-			...page,
-			tasks: [...byId.values()].sort(compareBackgroundTaskListItemsDesc),
-			legacySubagentTasks: [],
-		};
+		const started = performance.now();
+		const observation = createListObservation();
+		let completed = false;
+		try {
+			const page = await this.readListPageByParent(parentNarratorId, undefined, observation);
+			const tasks = observeListSync(observation, "mergeSortSyncMs", () => {
+				const byId = new Map(page.tasks.map((task) => [task.id, task]));
+				// The active read is fresher and wins if a row appears in both sets.
+				for (const task of page.activeTasks ?? []) byId.set(task.id, task);
+				return [...byId.values()].sort(compareBackgroundTaskListItemsDesc);
+			});
+			observation.returnedRows = tasks.length;
+			completed = true;
+			return { ...page, tasks, legacySubagentTasks: [] };
+		} finally {
+			this.logSlowList("legacy-snapshot", started, completed, observation);
+		}
 	}
 
 	/**

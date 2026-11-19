@@ -862,6 +862,7 @@ export class NarratorWorktreeService<Principal> {
 		writing = false,
 		maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
 		scope: WorktreeGitScope = { kind: "workspace" },
+		observation?: ListObservation,
 	) {
 		if (!target.backend || target.backend.kind !== "local")
 			error(
@@ -878,6 +879,7 @@ export class NarratorWorktreeService<Principal> {
 						cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
 						timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
 						maxOutputBytes: maxBytes,
+						...(observation ? { includeTerminationReason: true } : {}),
 						killProcessTree: true,
 						env: {
 							...process.env,
@@ -988,6 +990,7 @@ export class NarratorWorktreeService<Principal> {
 		result: SafeSpawnResult,
 		signal: AbortSignal,
 		listing = false,
+		observation?: ListObservation,
 	): Promise<ReturnType<typeof parseWorktreePorcelain>> {
 		const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
 		if (result.stdoutTruncated || result.stderrTruncated) return incomplete;
@@ -1055,6 +1058,8 @@ export class NarratorWorktreeService<Principal> {
 			signal,
 			false,
 			maxBytes,
+			{ kind: "workspace" },
+			observation,
 		);
 		let legacy = false;
 		// Retry only an explicit unsupported -z diagnostic, never an ordinary Git failure.
@@ -1065,7 +1070,15 @@ export class NarratorWorktreeService<Principal> {
 			/^error: unknown (?:switch|option) [`'"]z['"`]\r?$/m.test(result.stderr)
 		) {
 			legacy = true;
-			result = await this.run(target, ["worktree", "list", "--porcelain"], signal, false, maxBytes);
+			result = await this.run(
+				target,
+				["worktree", "list", "--porcelain"],
+				signal,
+				false,
+				maxBytes,
+				{ kind: "workspace" },
+				observation,
+			);
 		}
 		if (result.exitCode !== 0) worktreeListError(result);
 		if (legacy) return this.legacyEntries(target, result, signal, listing, observation);
@@ -1086,7 +1099,9 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		entries: WorktreeEntry[],
 		signal: AbortSignal,
+		observation: ListObservation,
 	): Promise<void> {
+		const started = performance.now();
 		const metadataTimeout = Math.max(
 			1,
 			Math.min(this.ports.metadataTimeoutMs ?? WORKTREE_READ_TIMEOUT_MS, WORKTREE_READ_TIMEOUT_MS),
@@ -1100,7 +1115,6 @@ export class NarratorWorktreeService<Principal> {
 			(head): head is string =>
 				!!head && /^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(head) && !/^0+$/.test(head),
 		);
-		const started = performance.now();
 		const times = new Map<string, number>();
 		const commits = async () => {
 			// Bound argv size and source output; one Git child at a time, at most 128 heads per batch.
@@ -1322,35 +1336,57 @@ export class NarratorWorktreeService<Principal> {
 					observation.stages.snapshotSyncMs += performance.now() - snapshotStarted;
 				}
 			}
+			observation.matchedEntryCount = snapshot.entries.length;
+			observation.snapshotBytes = snapshot.bytes;
+			observation.truncated = snapshot.truncated;
+			signal.throwIfAborted();
+			const pageStarted = performance.now();
+			const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
+			const hasMore = offset + entries.length < snapshot.entries.length;
+			// Removal needs both a wired retirement adapter and a healthy local checkout to
+			// inspect; the write ACL itself is enforced on the removal call, not claimed here.
+			const canRemove =
+				!!this.ports.retirement &&
+				target.workspace.state === "ready" &&
+				target.workspace.deviceId === "local" &&
+				target.backend?.kind === "local";
+			const page: WorktreeListResult = {
+				repositoryKey: target.workspace.repositoryKey,
+				hasMore,
+				nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
+				truncated: snapshot.truncated,
+				entries,
+				capabilities: {
+					list: true,
+					create: target.workspace.capabilities.write,
+					switch: false,
+					delete: canRemove,
+					prune: false,
+					remote: false,
+					reason: canRemove
+						? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
+						: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
+				},
+			};
+			observation.stages.pageSyncMs += performance.now() - pageStarted;
+			observation.pageEntryCount = entries.length;
+			stopReason = "complete";
+			return page;
+		} catch (cause) {
+			if (
+				(cause instanceof AppError && cause.code === "WORKTREE_LIST_TOO_LARGE") ||
+				observation.inventoryTerminationReason === "timeout" ||
+				observation.inventoryTerminationReason === "output-limit"
+			)
+				stopReason = "budget";
+			throw cause;
+		} finally {
+			this.noteSlowList(
+				observation,
+				performance.now() - started,
+				signal.aborted ? "cancelled" : listSignal.aborted ? "budget" : stopReason,
+			);
 		}
-		signal.throwIfAborted();
-		const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
-		const hasMore = offset + entries.length < snapshot.entries.length;
-		// Removal needs both a wired retirement adapter and a healthy local checkout to
-		// inspect; the write ACL itself is enforced on the removal call, not claimed here.
-		const canRemove =
-			!!this.ports.retirement &&
-			target.workspace.state === "ready" &&
-			target.workspace.deviceId === "local" &&
-			target.backend?.kind === "local";
-		return {
-			repositoryKey: target.workspace.repositoryKey,
-			hasMore,
-			nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
-			truncated: snapshot.truncated,
-			entries,
-			capabilities: {
-				list: true,
-				create: target.workspace.capabilities.write,
-				switch: false,
-				delete: canRemove,
-				prune: false,
-				remote: false,
-				reason: canRemove
-					? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
-					: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
-			},
-		};
 	}
 
 	/**

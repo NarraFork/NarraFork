@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import puppeteer, { type Browser, type HTTPRequest, type Page } from "puppeteer-core";
+import type { ReadFanoutReport } from "../server/lib/read-fanout-diagnostics";
 
 interface SmokeRuntime {
 	home: string;
@@ -12,6 +13,7 @@ interface SmokeRuntime {
 	start(): void;
 	cleanup(): Promise<void>;
 	assertHealthyProcess(): void;
+	logTail?(): string;
 	ownBrowser(browser: Browser): void;
 	report(checks: Array<{ name: string; ok: boolean; detail: string }>): void;
 }
@@ -22,13 +24,14 @@ const { assertSmokeInputs, createSmokeRuntime, isolatedSmokeEnvironment } = (awa
 	HARNESS_MODULE
 )) as {
 	assertSmokeInputs(paths: readonly string[]): void;
-	createSmokeRuntime(): Promise<SmokeRuntime>;
+	createSmokeRuntime(options?: { watchdogMs?: number }): Promise<SmokeRuntime>;
 	isolatedSmokeEnvironment(home: string): Record<string, string>;
 };
 
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const HTTP_TIMEOUT_MS = 10_000;
 const GIT_DELAY_MS = 2_000;
+const readFanout = process.argv.includes("--read-fanout");
 const diagnosticMobile = process.argv.includes("--diagnostic-mobile");
 const diagnostic = diagnosticMobile || process.argv.includes("--diagnostic");
 const faultMode = process.argv.find((arg) => arg.startsWith("--fault="))?.split("=")[1];
@@ -61,6 +64,7 @@ interface Paint {
 		statusHeight: number;
 		innerHeight: number;
 		textarea: {
+			kind: "textarea" | "contenteditable";
 			rect: Rect;
 			clientWidth: number;
 			inlineHeight: string;
@@ -83,6 +87,7 @@ interface BrowserProbe {
 	firstViewport: Paint | null;
 	firstMessage: Paint | null;
 	viewportChanges: Paint[];
+	failure?: { message: string; frame: number };
 }
 interface ProbeWindow extends Window {
 	__loadingProbe: BrowserProbe;
@@ -134,6 +139,796 @@ export function summarize(samples: readonly number[]) {
 		Math.round((ordered[Math.max(0, Math.ceil(ordered.length * q) - 1)] ?? 0) * 10) / 10;
 	return { n: ordered.length, p50Ms: percentile(0.5), p95Ms: percentile(0.95) };
 }
+// Fanout evidence is a separate allowlisted aggregate, never a copy of RequestRecord.
+const FANOUT_LIMITS = {
+	pendingHttp: 1_024,
+	httpRows: 128,
+	wsRows: 128,
+	windowsPerRound: 16,
+	resourceTimingEntries: 1_024,
+	webSockets: 32,
+	frameBytes: 64 * 1_024,
+	serverReportBytes: 2 * 1_024 * 1_024,
+	evidenceBytes: 64 * 1_024 * 1_024,
+};
+const FANOUT_LATENCY_BOUNDS_MS = [1, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 30_000];
+type FanoutPhase = "cold" | "A_to_B" | "B_to_A" | "idle";
+type FanoutLabel = FanoutPhase | "between-windows";
+interface FanoutHttpCounts {
+	started: number;
+	responses: number;
+	completed: number;
+	failed: number;
+	statuses: Record<string, number>;
+}
+interface FanoutHttpRow extends FanoutHttpCounts {
+	category: string;
+	method: string;
+	originWindowId: number | "untracked";
+}
+interface FanoutInflight {
+	tracked: number;
+	groups: Array<{
+		category: string;
+		method: string;
+		originWindowId: number;
+		count: number;
+	}>;
+	groupOverflow: number;
+}
+interface FanoutBrowserWindow {
+	windowId: number;
+	label: FanoutLabel;
+	documentNavigations: number;
+	startedAtMs: number;
+	endedAtMs?: number;
+	http: FanoutHttpCounts & {
+		rows: FanoutHttpRow[];
+		completionDurationMs: { count: number; sumMs: number; maxMs: number; buckets: number[] };
+	};
+	ws: {
+		sent: number;
+		rows: Array<{ connection: string; type: string; kind: string; sent: number }>;
+	};
+	inflightAtStart: FanoutInflight;
+	inflightAtEnd?: FanoutInflight;
+	overflow: {
+		httpRows: number;
+		wsRows: number;
+		pendingHttp: number;
+		untrackedResponses: number;
+		untrackedCompletions: number;
+		webSockets: number;
+		oversizedFrames: number;
+		observerErrors: number;
+	};
+}
+interface FanoutPendingHttp {
+	category: string;
+	method: string;
+	originWindowId: number;
+	startedAtMs: number;
+}
+const newHttpCounts = (): FanoutHttpCounts => ({
+	started: 0,
+	responses: 0,
+	completed: 0,
+	failed: 0,
+	statuses: {},
+});
+
+// Only these fixed labels may leave the classifier. Neither IDs nor query strings survive.
+export function readFanoutHttpCategory(url: string): string | null {
+	let pathname: string;
+	try {
+		pathname = new URL(url).pathname;
+	} catch {
+		return null;
+	}
+	if (pathname !== "/api" && !pathname.startsWith("/api/")) return null;
+	if (/^\/api\/narrators\/[^/]+(?:\/|$)/.test(pathname)) {
+		if (/^\/api\/narrators\/[^/]+$/.test(pathname)) return "narrators.detail";
+		if (/^\/api\/narrators\/[^/]+\/pretext-document$/.test(pathname))
+			return "narrators.pretext-document";
+		if (/^\/api\/narrators\/[^/]+\/message-location\/[^/]+$/.test(pathname))
+			return "narrators.message-location";
+		for (const suffix of ["git/summary", "git/workspace", "git/status"])
+			if (pathname.endsWith(`/${suffix}`)) return `narrators.${suffix.replace("/", ".")}`;
+		return "narrators.other";
+	}
+	const category = pathname.split("/")[2] ?? "";
+	return [
+		"narrators",
+		"auth",
+		"health",
+		"settings",
+		"user-preferences",
+		"projects",
+		"workspaces",
+		"skills",
+		"routines",
+		"messages",
+		"notifications",
+		"plugins",
+		"admin",
+		"users",
+		"models",
+		"providers",
+		"knowledge",
+		"devices",
+		"terminals",
+		"files",
+		"storage",
+		"permissions",
+		"system",
+		"git",
+		"search",
+		"licenses",
+		"context",
+		"capabilities",
+		"config",
+		"sessions",
+		"teams",
+		"tasks",
+	].includes(category)
+		? category
+		: "unknown";
+}
+function fanoutMethod(method: string) {
+	return ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method)
+		? method
+		: "OTHER";
+}
+export function readFanoutWsCategory(payload: string, opcode = 1) {
+	if (opcode !== 1) return { type: "non-text", kind: "none" };
+	if (Buffer.byteLength(payload) > FANOUT_LIMITS.frameBytes)
+		return { type: "oversized", kind: "none" };
+	try {
+		const frame = JSON.parse(payload) as { type?: unknown; kind?: unknown } | null;
+		const known = [
+			"pong",
+			"subscribe",
+			"unsubscribe",
+			"subscribe_stats",
+			"unsubscribe_stats",
+			"sync_check",
+			"reasoning_translation_visibility",
+			"presence_join",
+			"presence_leave",
+			"chat_subscribe",
+			"chat_unsubscribe",
+			"editor_file_subscribe",
+			"editor_file_unsubscribe",
+			"git_workspace_subscribe",
+			"git_workspace_unsubscribe",
+			"git_workspace_refresh",
+			"outline_page_subscribe",
+			"outline_page_unsubscribe",
+			"permission_decision",
+			"buffer_message",
+			"cancel_buffer",
+			"update_buffer",
+			"remove_buffer",
+			"update_timeout",
+			"input",
+			"resize",
+			"create",
+			"kill",
+			"rename",
+		];
+		const type =
+			typeof frame?.type === "string" && known.includes(frame.type) ? frame.type : "unknown";
+		const kind =
+			type !== "subscribe"
+				? "none"
+				: frame?.kind === undefined
+					? "default-messages"
+					: typeof frame.kind === "string" &&
+							["list", "panel", "messages", "activity"].includes(frame.kind)
+						? frame.kind
+						: "unknown";
+		return { type, kind };
+	} catch {
+		return { type: "invalid-json", kind: "none" };
+	}
+}
+
+export class ReadFanoutBrowserCounter {
+	readonly windows: FanoutBrowserWindow[] = [];
+	private readonly pending = new Map<object, FanoutPendingHttp>();
+	private readonly epoch: number;
+	constructor(private readonly clock: () => number = () => performance.now()) {
+		this.epoch = clock();
+		this.begin("between-windows");
+	}
+	now() {
+		return this.clock() - this.epoch;
+	}
+	get current() {
+		return this.windows[this.windows.length - 1] as FanoutBrowserWindow;
+	}
+	private inflight(): FanoutInflight {
+		const groups: FanoutInflight["groups"] = [];
+		let groupOverflow = 0;
+		for (const request of this.pending.values()) {
+			const group = groups.find(
+				(row) =>
+					row.category === request.category &&
+					row.method === request.method &&
+					row.originWindowId === request.originWindowId,
+			);
+			if (group) group.count++;
+			else if (groups.length < FANOUT_LIMITS.httpRows)
+				groups.push({
+					category: request.category,
+					method: request.method,
+					originWindowId: request.originWindowId,
+					count: 1,
+				});
+			else groupOverflow++;
+		}
+		return { tracked: this.pending.size, groups, groupOverflow };
+	}
+	close() {
+		if (this.current.endedAtMs !== undefined) return;
+		this.current.endedAtMs = this.now();
+		this.current.inflightAtEnd = this.inflight();
+	}
+	begin(label: FanoutLabel) {
+		if (this.windows.length) this.close();
+		if (this.windows.length >= FANOUT_LIMITS.windowsPerRound)
+			throw new Error("Fanout browser window budget exceeded");
+		const window: FanoutBrowserWindow = {
+			windowId: this.windows.length,
+			label,
+			documentNavigations: 0,
+			startedAtMs: this.now(),
+			http: {
+				...newHttpCounts(),
+				rows: [],
+				completionDurationMs: {
+					count: 0,
+					sumMs: 0,
+					maxMs: 0,
+					buckets: Array(FANOUT_LATENCY_BOUNDS_MS.length + 1).fill(0),
+				},
+			},
+			ws: { sent: 0, rows: [] },
+			inflightAtStart: this.inflight(),
+			overflow: {
+				httpRows: 0,
+				wsRows: 0,
+				pendingHttp: 0,
+				untrackedResponses: 0,
+				untrackedCompletions: 0,
+				webSockets: 0,
+				oversizedFrames: 0,
+				observerErrors: 0,
+			},
+		};
+		this.windows.push(window);
+		return window;
+	}
+	private row(
+		request: Pick<FanoutPendingHttp, "category" | "method"> & {
+			originWindowId: number | "untracked";
+		},
+	) {
+		const rows = this.current.http.rows;
+		let row = rows.find(
+			(item) =>
+				item.category === request.category &&
+				item.method === request.method &&
+				item.originWindowId === request.originWindowId,
+		);
+		if (!row && rows.length < FANOUT_LIMITS.httpRows) {
+			row = {
+				category: request.category,
+				method: request.method,
+				originWindowId: request.originWindowId,
+				...newHttpCounts(),
+			};
+			rows.push(row);
+		}
+		if (!row) this.current.overflow.httpRows++;
+		return row;
+	}
+	request(key: object, url: string, method: string) {
+		const category = readFanoutHttpCategory(url);
+		if (!category) return;
+		const request = {
+			category,
+			method: fanoutMethod(method),
+			originWindowId: this.current.windowId,
+			startedAtMs: this.now(),
+		};
+		this.current.http.started++;
+		const row = this.row(request);
+		if (row) row.started++;
+		if (this.pending.size < FANOUT_LIMITS.pendingHttp) this.pending.set(key, request);
+		else this.current.overflow.pendingHttp++;
+	}
+	response(key: object, url: string, method: string, status: number) {
+		const category = readFanoutHttpCategory(url);
+		if (!category) return;
+		const request = this.pending.get(key);
+		if (!request) this.current.overflow.untrackedResponses++;
+		const row = this.row(
+			request ?? { category, method: fanoutMethod(method), originWindowId: "untracked" },
+		);
+		const statusClass =
+			Number.isInteger(status) && status >= 100 && status < 600
+				? `${Math.floor(status / 100)}xx`
+				: "unknown";
+		for (const counts of [this.current.http, ...(row ? [row] : [])]) {
+			counts.responses++;
+			counts.statuses[statusClass] = (counts.statuses[statusClass] ?? 0) + 1;
+		}
+	}
+	finish(key: object, url: string, method: string, failed = false) {
+		const category = readFanoutHttpCategory(url);
+		if (!category) return;
+		const request = this.pending.get(key);
+		this.pending.delete(key);
+		if (!request) this.current.overflow.untrackedCompletions++;
+		const row = this.row(
+			request ?? { category, method: fanoutMethod(method), originWindowId: "untracked" },
+		);
+		const field = failed ? "failed" : "completed";
+		this.current.http[field]++;
+		if (row) row[field]++;
+		if (request) {
+			const ms = Math.max(0, this.now() - request.startedAtMs);
+			const histogram = this.current.http.completionDurationMs;
+			histogram.count++;
+			histogram.sumMs += ms;
+			histogram.maxMs = Math.max(ms, histogram.maxMs);
+			const bucket = FANOUT_LATENCY_BOUNDS_MS.findIndex((bound) => ms <= bound);
+			histogram.buckets[bucket < 0 ? FANOUT_LATENCY_BOUNDS_MS.length : bucket]++;
+		}
+	}
+	frame(connection: string, payload: string, opcode = 1) {
+		const safeConnection = ["narrator", "terminal"].includes(connection) ? connection : "unknown";
+		const category = readFanoutWsCategory(payload, opcode);
+		if (category.type === "oversized") this.current.overflow.oversizedFrames++;
+		this.current.ws.sent++;
+		const rows = this.current.ws.rows;
+		const row = rows.find(
+			(item) =>
+				item.connection === safeConnection &&
+				item.type === category.type &&
+				item.kind === category.kind,
+		);
+		if (row) row.sent++;
+		else if (rows.length < FANOUT_LIMITS.wsRows)
+			rows.push({ connection: safeConnection, ...category, sent: 1 });
+		else this.current.overflow.wsRows++;
+	}
+}
+
+async function monitorReadFanout(page: Page) {
+	const counter = new ReadFanoutBrowserCounter();
+	const cdp = await page.createCDPSession();
+	const sockets = new Map<string, string>();
+	cdp.on("Network.webSocketCreated", ({ requestId, url }) => {
+		if (sockets.size >= FANOUT_LIMITS.webSockets) {
+			counter.current.overflow.webSockets++;
+			return;
+		}
+		let connection = "unknown";
+		try {
+			const path = new URL(url).pathname;
+			if (path === "/ws/narrator") connection = "narrator";
+			if (path === "/ws/terminal") connection = "terminal";
+		} catch {
+			counter.current.overflow.observerErrors++;
+		}
+		sockets.set(requestId, connection);
+	});
+	cdp.on("Network.webSocketClosed", ({ requestId }) => sockets.delete(requestId));
+	cdp.on("Network.webSocketFrameSent", ({ requestId, response }) => {
+		counter.frame(sockets.get(requestId) ?? "unknown", response.payloadData, response.opcode);
+	});
+	const request = (value: HTTPRequest) => {
+		if (value.isNavigationRequest?.() && value.frame() === page.mainFrame())
+			counter.current.documentNavigations++;
+		counter.request(value, value.url(), value.method());
+	};
+	const response = (value: import("puppeteer-core").HTTPResponse) =>
+		counter.response(value.request(), value.url(), value.request().method(), value.status());
+	const finished = (value: HTTPRequest) => counter.finish(value, value.url(), value.method());
+	const failed = (value: HTTPRequest) => counter.finish(value, value.url(), value.method(), true);
+	page.on("request", request);
+	page.on("response", response);
+	page.on("requestfinished", finished);
+	page.on("requestfailed", failed);
+	try {
+		await cdp.send("Network.enable");
+	} catch (error) {
+		page.off("request", request);
+		page.off("response", response);
+		page.off("requestfinished", finished);
+		page.off("requestfailed", failed);
+		await cdp.detach().catch(() => {});
+		throw error;
+	}
+	return {
+		counter,
+		async cleanup() {
+			counter.close();
+			page.off("request", request);
+			page.off("response", response);
+			page.off("requestfinished", finished);
+			page.off("requestfailed", failed);
+			await cdp.detach().catch(() => {
+				counter.current.overflow.observerErrors++;
+			});
+		},
+	};
+}
+
+interface FanoutCapture {
+	phase: FanoutPhase;
+	browserWindowId: number;
+	status: "starting" | "active" | "complete" | "phase-failed" | "start-failed" | "stop-failed";
+	stableBoundary: boolean;
+	firstVisibleMs?: number;
+	control: {
+		startSentAtMs: number;
+		startReceivedAtMs?: number;
+		stopSentAtMs?: number;
+		stopReceivedAtMs?: number;
+	};
+	serverStart?: { captureId: string; durationMs: number; startedAt: string; endsAt: string };
+	server?: ReadFanoutReport;
+}
+interface FanoutRound {
+	viewport: string;
+	iteration: number;
+	kind: "functional" | "measured" | "diagnostic";
+	browser: FanoutBrowserWindow[];
+	captures: FanoutCapture[];
+	closed: boolean;
+}
+
+export function assertReadFanoutPrivacy(value: unknown, forbidden: readonly string[]) {
+	const text = JSON.stringify(value);
+	if (forbidden.some((secret) => secret.length > 0 && text.includes(secret)))
+		throw new Error("Read-fanout evidence privacy guard rejected sensitive fixture data");
+	return text;
+}
+export function writeReadFanoutEvidence(
+	path: string,
+	value: unknown,
+	forbidden: readonly string[],
+) {
+	const text = assertReadFanoutPrivacy(value, forbidden);
+	if (Buffer.byteLength(text) > FANOUT_LIMITS.evidenceBytes)
+		throw new Error("Read-fanout evidence byte budget exceeded");
+	writeFileSync(path, `${text}\n`, { mode: 0o600 });
+	chmodSync(path, 0o600);
+}
+
+async function postReadFanout<T>(
+	base: string,
+	token: string,
+	action: "start" | "stop",
+	body: unknown,
+): Promise<T> {
+	const response = await fetch(`${base}/api/admin/diagnostics/read-fanout/${action}`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+	});
+	if (!response.ok) {
+		await response.body?.cancel();
+		throw new Error(`Read-fanout ${action} rejected with HTTP ${response.status}`);
+	}
+	if (action === "stop" && !response.headers.get("cache-control")?.includes("no-store")) {
+		await response.body?.cancel();
+		throw new Error("Read-fanout stop response must be no-store");
+	}
+	const reader = response.body?.getReader();
+	if (!reader) throw new Error("Read-fanout control returned no body");
+	const buffer = Buffer.allocUnsafe(FANOUT_LIMITS.serverReportBytes);
+	let bytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (bytes + value.byteLength > FANOUT_LIMITS.serverReportBytes)
+				throw new Error("Read-fanout server report byte budget exceeded");
+			buffer.set(value, bytes);
+			bytes += value.byteLength;
+		}
+		return JSON.parse(buffer.subarray(0, bytes).toString("utf8")) as T;
+	} catch {
+		await reader.cancel().catch(() => {});
+		throw new Error("Read-fanout control response could not be read within its JSON budget");
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+export async function createReadFanoutSession(
+	page: Page,
+	runtime: SmokeRuntime,
+	token: string,
+	round: FanoutRound,
+	forbidden: readonly string[],
+	persist: () => void,
+) {
+	const monitor = await monitorReadFanout(page);
+	round.browser = monitor.counter.windows;
+	let active: FanoutCapture | undefined;
+	return {
+		async begin(phase: FanoutPhase) {
+			if (active) throw new Error("Read-fanout phase is already active");
+			const window = monitor.counter.begin(phase);
+			const capture: FanoutCapture = {
+				phase,
+				browserWindowId: window.windowId,
+				status: "starting",
+				stableBoundary: false,
+				control: { startSentAtMs: monitor.counter.now() },
+			};
+			round.captures.push(capture);
+			try {
+				const start = await postReadFanout<NonNullable<FanoutCapture["serverStart"]>>(
+					runtime.base,
+					token,
+					"start",
+					{ durationMs: 60_000 },
+				);
+				if (
+					typeof start.captureId !== "string" ||
+					!start.captureId ||
+					start.captureId.length > 128 ||
+					!Number.isInteger(start.durationMs) ||
+					start.durationMs <= 0 ||
+					start.durationMs > 60_000 ||
+					!Number.isFinite(Date.parse(start.startedAt)) ||
+					!Number.isFinite(Date.parse(start.endsAt))
+				)
+					throw new Error("Read-fanout start schema mismatch");
+				assertReadFanoutPrivacy(start, forbidden);
+				capture.serverStart = {
+					captureId: start.captureId,
+					durationMs: start.durationMs,
+					startedAt: start.startedAt,
+					endsAt: start.endsAt,
+				};
+				capture.control.startReceivedAtMs = monitor.counter.now();
+				capture.status = "active";
+				active = capture;
+			} catch (error) {
+				capture.status = "start-failed";
+				monitor.counter.begin("between-windows");
+				persist();
+				throw error;
+			}
+		},
+		async end(stableBoundary = true, firstVisibleMs?: number) {
+			if (!active) return;
+			const capture = active;
+			active = undefined;
+			capture.stableBoundary = stableBoundary;
+			capture.firstVisibleMs = firstVisibleMs;
+			// Browser attribution ends at the stable boundary, not after the control response.
+			monitor.counter.begin("between-windows");
+			capture.control.stopSentAtMs = monitor.counter.now();
+			try {
+				const report = await postReadFanout<ReadFanoutReport>(runtime.base, token, "stop", {
+					captureId: capture.serverStart?.captureId,
+				});
+				capture.control.stopReceivedAtMs = monitor.counter.now();
+				if (
+					report.schemaVersion !== 1 ||
+					report.captureId !== capture.serverStart?.captureId ||
+					!Number.isFinite(report.durationMs) ||
+					report.durationMs < 0 ||
+					!Array.isArray(report.sources) ||
+					!Array.isArray(report.templates) ||
+					!Array.isArray(report.scopes) ||
+					!Array.isArray(report.histogramUpperBoundsMs) ||
+					!Array.isArray(report.readsPerScopeUpperBounds) ||
+					!Number.isFinite(Date.parse(report.startedAt)) ||
+					!Number.isFinite(Date.parse(report.endedAt)) ||
+					!["stop", "timeout"].includes(report.endReason) ||
+					!report.totals ||
+					!report.timings ||
+					!report.overflow
+				)
+					throw new Error("Read-fanout server report schema mismatch");
+				assertReadFanoutPrivacy(report, forbidden);
+				capture.server = report;
+				capture.status =
+					stableBoundary && report.endReason === "stop" ? "complete" : "phase-failed";
+				persist();
+				if (report.endReason !== "stop")
+					throw new Error("Read-fanout capture expired before its stable boundary");
+			} catch (error) {
+				if (!capture.server) capture.status = "stop-failed";
+				persist();
+				throw error;
+			}
+		},
+		async cleanup() {
+			try {
+				if (active) await this.end(false);
+			} finally {
+				await monitor.cleanup();
+				round.closed = true;
+				persist();
+			}
+		},
+	};
+}
+
+export function summarizeReadFanoutValues(values: readonly number[]) {
+	if (!values.length) return null;
+	if (values.some((value) => !Number.isFinite(value) || value < 0))
+		throw new Error("Invalid read-fanout numeric sample");
+	const ordered = [...values].sort((a, b) => a - b);
+	const quantile = (q: number) => ordered[Math.ceil(ordered.length * q) - 1];
+	return {
+		n: ordered.length,
+		sum: values.reduce((sum, value) => sum + value, 0),
+		min: ordered[0],
+		max: ordered[ordered.length - 1],
+		p50: quantile(0.5),
+		p95: quantile(0.95),
+	};
+}
+export function readFanoutTemplateRepeats(report: Pick<ReadFanoutReport, "templates">) {
+	const templates = report.templates.filter((template) =>
+		/^[a-f0-9]{64}$/.test(template.fingerprint),
+	);
+	const repeats = (key: "logicalReads" | "poolEntries" | "dispatched") =>
+		templates.reduce((sum, template) => sum + Math.max(0, template.counts[key] - 1), 0);
+	return {
+		exactGroups: templates.length,
+		excludedGroups: report.templates.length - templates.length,
+		logicalReadRepeats: repeats("logicalReads"),
+		poolEntryRepeats: repeats("poolEntries"),
+		dispatchedRepeats: repeats("dispatched"),
+	};
+}
+export function summarizeReadFanoutHistogram(
+	histograms: readonly { count: number; sumMs: number; maxMs: number; buckets: number[] }[],
+	upperBoundsMs: readonly (number | "infinity")[],
+) {
+	const buckets = upperBoundsMs.map(() => 0);
+	let n = 0;
+	let sumMs = 0;
+	let maxMs = 0;
+	for (const histogram of histograms) {
+		if (
+			histogram.buckets.length !== buckets.length ||
+			histogram.count < 0 ||
+			!Number.isFinite(histogram.sumMs) ||
+			!Number.isFinite(histogram.maxMs) ||
+			histogram.buckets.some((count) => !Number.isSafeInteger(count) || count < 0) ||
+			histogram.buckets.reduce((sum, count) => sum + count, 0) !== histogram.count
+		)
+			throw new Error("Read-fanout histogram schema mismatch");
+		n += histogram.count;
+		sumMs += histogram.sumMs;
+		maxMs = Math.max(maxMs, histogram.maxMs);
+		for (let index = 0; index < buckets.length; index++) buckets[index] += histogram.buckets[index];
+	}
+	const quantileUpperBound = (q: number) => {
+		if (!n) return null;
+		let cumulative = 0;
+		const rank = Math.ceil(n * q);
+		for (let index = 0; index < buckets.length; index++) {
+			cumulative += buckets[index];
+			if (cumulative >= rank) return upperBoundsMs[index];
+		}
+		return null;
+	};
+	return {
+		n,
+		sumMs,
+		maxMs,
+		buckets,
+		upperBoundsMs,
+		p50UpperBoundMs: quantileUpperBound(0.5),
+		p95UpperBoundMs: quantileUpperBound(0.95),
+		estimator: "fixed-bucket-upper-bound",
+	};
+}
+function summarizeReadFanout(rounds: readonly FanoutRound[]) {
+	const summary = [];
+	for (const viewport of ["desktop", "mobile390"]) {
+		for (const phase of ["cold", "A_to_B", "B_to_A", "idle"] as const) {
+			const captures = rounds
+				.filter((round) => round.viewport === viewport && round.kind === "measured")
+				.flatMap((round) =>
+					round.captures
+						.filter((capture) => capture.phase === phase && capture.status === "complete")
+						.map((capture) => ({ capture, window: round.browser[capture.browserWindowId] })),
+				);
+			const reports = captures.map(({ capture }) => capture.server as ReadFanoutReport);
+			if (!captures.length) continue;
+			const fields = Object.keys(reports[0].totals) as Array<keyof ReadFanoutReport["totals"]>;
+			const timingKeys = Object.keys(reports[0].timings) as Array<
+				keyof ReadFanoutReport["timings"]
+			>;
+			summary.push({
+				viewport,
+				phase,
+				n: captures.length,
+				firstVisibleMs: summarizeReadFanoutValues(
+					captures.flatMap(({ capture }) =>
+						capture.firstVisibleMs === undefined ? [] : [capture.firstVisibleMs],
+					),
+				),
+				browser: {
+					documentNavigations: summarizeReadFanoutValues(
+						captures.map(({ window }) => window.documentNavigations),
+					),
+					durationMs: summarizeReadFanoutValues(
+						captures.map(
+							({ window }) => (window.endedAtMs ?? window.startedAtMs) - window.startedAtMs,
+						),
+					),
+					httpStarted: summarizeReadFanoutValues(captures.map(({ window }) => window.http.started)),
+					httpResponses: summarizeReadFanoutValues(
+						captures.map(({ window }) => window.http.responses),
+					),
+					httpCompleted: summarizeReadFanoutValues(
+						captures.map(({ window }) => window.http.completed),
+					),
+					httpFailed: summarizeReadFanoutValues(captures.map(({ window }) => window.http.failed)),
+					wsSent: summarizeReadFanoutValues(captures.map(({ window }) => window.ws.sent)),
+				},
+				server: {
+					durationMs: summarizeReadFanoutValues(reports.map((report) => report.durationMs)),
+					totals: Object.fromEntries(
+						fields.map((field) => [
+							field,
+							summarizeReadFanoutValues(reports.map((report) => report.totals[field])),
+						]),
+					),
+					timings: Object.fromEntries(
+						timingKeys.map((key) => [
+							key,
+							{
+								...Object.fromEntries(
+									(["count", "sumMs", "maxMs"] as const).map((field) => [
+										field,
+										summarizeReadFanoutValues(reports.map((report) => report.timings[key][field])),
+									]),
+								),
+								observations: summarizeReadFanoutHistogram(
+									reports.map((report) => report.timings[key]),
+									reports[0].histogramUpperBoundsMs,
+								),
+							},
+						]),
+					),
+					templateRepeats: Object.fromEntries(
+						Object.keys(readFanoutTemplateRepeats(reports[0])).map((key) => [
+							key,
+							summarizeReadFanoutValues(
+								reports.map(
+									(report) =>
+										readFanoutTemplateRepeats(report)[
+											key as keyof ReturnType<typeof readFanoutTemplateRepeats>
+										],
+								),
+							),
+						]),
+					),
+				},
+			});
+		}
+	}
+	return summary;
+}
+
 export function requestKind(url: string): { kind: string; narratorId: string } | null {
 	const parsed = new URL(url);
 	const match = parsed.pathname.match(/^\/api\/narrators\/([^/]+)(.*)$/);
@@ -379,7 +1174,13 @@ function seedMessages(home: string, ids: Record<Subject, string>) {
 
 // No hidden textContent counts as paint: text Range bounds must intersect a visible,
 // unclipped viewport, and the same two unique sentinels must survive two rAF samples.
-function installBrowserProbe(token: string, target: string, expected: string[]) {
+function installBrowserProbe(
+	token: string,
+	target: string,
+	expected: string[],
+	resourceTimingEntries = 0,
+) {
+	if (resourceTimingEntries > 0) performance.setResourceTimingBufferSize(resourceTimingEntries);
 	localStorage.setItem("narrafork_token", token);
 	localStorage.setItem("narrafork_lang", "en");
 	const host = window as unknown as ProbeWindow;
@@ -423,112 +1224,154 @@ function installBrowserProbe(token: string, target: string, expected: string[]) 
 	const tick = () => {
 		const probe = host.__loadingProbe;
 		probe.frames++;
-		if (location.pathname === `/narrators/${probe.target}` && probe.frames <= 240) {
-			const viewport = Array.from(
-				document.querySelectorAll<HTMLElement>("[data-pretext-exact-message-list]"),
-			).find(visible);
-			if (viewport) {
-				const panel = viewport.closest("[data-narrator-panel]");
-				const textarea = panel?.querySelector<HTMLTextAreaElement>("[data-narrator-composer]");
-				const header = panel?.querySelector("[data-narrator-header-layout]");
-				const toRect = (element: Element): Rect => {
-					const box = element.getBoundingClientRect();
-					return { top: box.top, height: box.height, width: box.width };
-				};
-				const containers: Array<{ className: string; rect: Rect }> = [];
-				for (
-					let ancestor = textarea?.parentElement;
-					ancestor && ancestor !== panel && containers.length < 5;
-					ancestor = ancestor.parentElement
-				)
-					containers.push({ className: ancestor.className.slice(0, 160), rect: toRect(ancestor) });
-				const slot = panel?.querySelector<HTMLElement>("[data-git-slot]");
-				const rect = viewport.getBoundingClientRect();
-				const slotRect = slot && visible(slot) ? slot.getBoundingClientRect() : null;
-				const found: string[] = [];
-				const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_TEXT);
-				for (
-					let node = walker.nextNode(), budget = 0;
-					node && budget < 5_000;
-					node = walker.nextNode(), budget++
-				) {
-					if (!node.textContent?.includes("LOADING_SENTINEL_")) continue;
-					const parent = node.parentElement;
-					if (!parent || !visible(parent)) continue;
-					const range = document.createRange();
-					range.selectNodeContents(node);
-					if (Array.from(range.getClientRects()).some((textRect) => intersects(textRect, rect)))
-						found.push(node.textContent.trim());
-				}
-				const paint: Paint = {
-					elapsedMs: performance.now() - probe.startedAt,
-					viewport: { top: rect.top, height: rect.height, width: rect.width },
-					slot: slotRect
-						? { top: slotRect.top, height: slotRect.height, width: slotRect.width }
-						: null,
-					gitText: slot?.innerText ?? "",
-					sentinels: found,
-					frame: probe.frames,
-					chrome: {
-						panelHeight: panel?.getBoundingClientRect().height ?? 0,
-						textareaHeight: panel?.querySelector("textarea")?.getBoundingClientRect().height ?? 0,
-						statusHeight:
-							panel?.querySelector('[data-testid="narrator-status-bar"]')?.getBoundingClientRect()
-								.height ?? 0,
-						innerHeight,
-						textarea: textarea
-							? {
-									rect: toRect(textarea),
-									clientWidth: textarea.clientWidth,
-									inlineHeight: textarea.style.height,
-									inlineMinHeight: textarea.style.minHeight,
-									computedMinHeight: getComputedStyle(textarea).minHeight,
-									placeholder: textarea.placeholder,
-									valueLength: textarea.value.length,
-								}
+		try {
+			if (location.pathname === `/narrators/${probe.target}` && probe.frames <= 240) {
+				const viewport = Array.from(
+					document.querySelectorAll<HTMLElement>("[data-pretext-exact-message-list]"),
+				).find(visible);
+				if (viewport) {
+					const panel = viewport.closest("[data-narrator-panel]");
+					const textarea = panel?.querySelector<HTMLElement>("[data-narrator-composer]");
+					const header = panel?.querySelector("[data-narrator-header-layout]");
+					const toRect = (element: Element): Rect => {
+						const box = element.getBoundingClientRect();
+						return { top: box.top, height: box.height, width: box.width };
+					};
+					const containers: Array<{ className: string; rect: Rect }> = [];
+					for (
+						let ancestor = textarea?.parentElement;
+						ancestor && ancestor !== panel && containers.length < 5;
+						ancestor = ancestor.parentElement
+					)
+						containers.push({
+							className: ancestor.className.slice(0, 160),
+							rect: toRect(ancestor),
+						});
+					const slot = panel?.querySelector<HTMLElement>("[data-git-slot]");
+					const rect = viewport.getBoundingClientRect();
+					const slotRect = slot && visible(slot) ? slot.getBoundingClientRect() : null;
+					const found: string[] = [];
+					const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_TEXT);
+					for (
+						let node = walker.nextNode(), budget = 0;
+						node && budget < 5_000;
+						node = walker.nextNode(), budget++
+					) {
+						if (!node.textContent?.includes("LOADING_SENTINEL_")) continue;
+						const parent = node.parentElement;
+						if (!parent || !visible(parent)) continue;
+						const range = document.createRange();
+						range.selectNodeContents(node);
+						if (Array.from(range.getClientRects()).some((textRect) => intersects(textRect, rect)))
+							found.push(node.textContent.trim());
+					}
+					const paint: Paint = {
+						elapsedMs: performance.now() - probe.startedAt,
+						viewport: { top: rect.top, height: rect.height, width: rect.width },
+						slot: slotRect
+							? { top: slotRect.top, height: slotRect.height, width: slotRect.width }
 							: null,
-						containers,
-						header: header ? toRect(header) : null,
-						actionButtons: Array.from(
-							textarea
-								?.closest(".mantine-Group-root")
-								?.querySelectorAll<HTMLButtonElement>("button") ?? [],
-						)
-							.filter(visible)
-							.slice(0, 8)
-							.map((button) => ({
-								text: button.innerText.slice(0, 40),
-								width: button.getBoundingClientRect().width,
-								height: button.getBoundingClientRect().height,
-							})),
-					},
-				};
-				probe.firstViewport ??= paint;
-				const previous = probe.viewportChanges.at(-1);
-				if (
-					probe.viewportChanges.length < 16 &&
-					(!previous ||
-						previous.viewport.top !== paint.viewport.top ||
-						previous.viewport.height !== paint.viewport.height ||
-						previous.gitText !== paint.gitText)
-				)
-					probe.viewportChanges.push(paint);
-				if (
-					probe.expected.every((text) => found.filter((value) => value === text).length === 1) &&
-					!found.some((value) => !probe.expected.includes(value))
-				) {
-					probe.candidateFrames++;
-					if (probe.candidateFrames >= 2) probe.firstMessage ??= paint;
-				} else probe.candidateFrames = 0;
+						gitText: slot?.innerText ?? "",
+						sentinels: found,
+						frame: probe.frames,
+						chrome: {
+							panelHeight: panel?.getBoundingClientRect().height ?? 0,
+							textareaHeight: textarea?.getBoundingClientRect().height ?? 0,
+							statusHeight:
+								panel?.querySelector('[data-testid="narrator-status-bar"]')?.getBoundingClientRect()
+									.height ?? 0,
+							innerHeight,
+							textarea: textarea
+								? {
+										kind: textarea instanceof HTMLTextAreaElement ? "textarea" : "contenteditable",
+										rect: toRect(textarea),
+										clientWidth: textarea.clientWidth,
+										inlineHeight: textarea.style.height,
+										inlineMinHeight: textarea.style.minHeight,
+										computedMinHeight: getComputedStyle(textarea).minHeight,
+										placeholder:
+											textarea instanceof HTMLTextAreaElement
+												? textarea.placeholder
+												: (textarea
+														.querySelector("[data-placeholder]")
+														?.getAttribute("data-placeholder") ?? ""),
+										valueLength: (textarea instanceof HTMLTextAreaElement
+											? textarea.value
+											: textarea.innerText.replace(/\n$/, "")
+										).length,
+									}
+								: null,
+							containers,
+							header: header ? toRect(header) : null,
+							actionButtons: Array.from(
+								textarea
+									?.closest(".mantine-Group-root")
+									?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+							)
+								.filter(visible)
+								.slice(0, 8)
+								.map((button) => ({
+									text: button.innerText.slice(0, 40),
+									width: button.getBoundingClientRect().width,
+									height: button.getBoundingClientRect().height,
+								})),
+						},
+					};
+					probe.firstViewport ??= paint;
+					const previous = probe.viewportChanges.at(-1);
+					if (
+						probe.viewportChanges.length < 16 &&
+						(!previous ||
+							previous.viewport.top !== paint.viewport.top ||
+							previous.viewport.height !== paint.viewport.height ||
+							previous.gitText !== paint.gitText)
+					)
+						probe.viewportChanges.push(paint);
+					if (
+						probe.expected.every((text) => found.filter((value) => value === text).length === 1) &&
+						!found.some((value) => !probe.expected.includes(value))
+					) {
+						probe.candidateFrames++;
+						if (probe.candidateFrames >= 2) probe.firstMessage ??= paint;
+					} else probe.candidateFrames = 0;
+				}
 			}
+		} catch (error) {
+			probe.failure = { message: String(error).slice(0, 500), frame: probe.frames };
+			throw error;
 		}
 		requestAnimationFrame(tick);
 	};
 	requestAnimationFrame(tick);
 }
+async function browserOpeningRequestTimings(page: Page, narratorId: string) {
+	return page.evaluate((id) => {
+		const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+		const first = (suffix: string) => {
+			const entry = entries.find((item) => {
+				try {
+					return new URL(item.name).pathname === `/api/narrators/${id}${suffix}`;
+				} catch {
+					return false;
+				}
+			});
+			return entry
+				? {
+						startedAtMs: entry.startTime,
+						responseEndedAtMs: entry.responseEnd,
+						initiator: entry.initiatorType === "fetch" ? "fetch" : "other",
+					}
+				: null;
+		};
+		return { entriesObserved: entries.length, detail: first(""), tail: first("/pretext-document") };
+	}, narratorId);
+}
 async function paint(page: Page): Promise<{ firstViewport: Paint; firstMessage: Paint }> {
 	await page.waitForFunction(
-		() => !!(window as unknown as ProbeWindow).__loadingProbe.firstMessage,
+		() => {
+			const probe = (window as unknown as ProbeWindow).__loadingProbe;
+			return !!(probe.firstMessage || probe.failure);
+		},
 		{
 			timeout: 15_000,
 			polling: "raf",
@@ -536,6 +1379,8 @@ async function paint(page: Page): Promise<{ firstViewport: Paint; firstMessage: 
 	);
 	return page.evaluate(() => {
 		const probe = (window as unknown as ProbeWindow).__loadingProbe;
+		if (probe.failure)
+			throw new Error(`Paint probe frame ${probe.failure.frame}: ${probe.failure.message}`);
 		if (!probe.firstViewport || !probe.firstMessage)
 			throw new Error("Missing browser paint observation");
 		return { firstViewport: probe.firstViewport, firstMessage: probe.firstMessage };
@@ -593,29 +1438,47 @@ async function waitGit(page: Page, branch: string) {
 		branch,
 	);
 }
-async function exerciseDraftTextarea(page: Page) {
+export async function exerciseDraftComposer(page: Page) {
 	const selector = "[data-narrator-composer]";
-	const before = await page.$eval(selector, (element) => element.getBoundingClientRect().height);
-	const setDraft = async (text: string) =>
-		page.evaluate(
-			(value, target) => {
-				const textarea = document.querySelector<HTMLTextAreaElement>(target);
-				const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-				if (!textarea || !setter) throw new Error("Missing native textarea value setter");
-				setter.call(textarea, value);
-				textarea.dispatchEvent(new Event("input", { bubbles: true }));
-			},
-			text,
-			selector,
-		);
-	// A native input event exercises React's controlled draft path without Enter/send.
+	const before = await page.$eval(selector, (element) => {
+		const value =
+			element instanceof HTMLTextAreaElement ? element.value : (element.textContent ?? "");
+		if (value.trim()) throw new Error("Draft growth fixture requires an empty composer");
+		return element.getBoundingClientRect().height;
+	});
+	const setDraft = async (text: string) => {
+		await page.focus(selector);
+		await page.$eval(selector, (element) => {
+			if (element instanceof HTMLTextAreaElement) element.select();
+			else {
+				if (!(element instanceof HTMLElement) || !element.isContentEditable)
+					throw new Error("Missing editable narrator composer");
+				const selection = getSelection();
+				if (!selection) throw new Error("Missing composer selection");
+				const range = document.createRange();
+				range.selectNodeContents(element);
+				selection.removeAllRanges();
+				selection.addRange(range);
+			}
+		});
+		await page.keyboard.press("Backspace");
+		// CDP Input.insertText exercises the real input path, never the Enter/send shortcut.
+		if (text) await page.keyboard.sendCharacter(text);
+	};
 	const multiline =
 		"SMOKE DRAFT LINE 1\nSMOKE DRAFT LINE 2\nSMOKE DRAFT LINE 3\nSMOKE DRAFT LINE 4";
 	await setDraft(multiline);
 	await page.waitForFunction(
 		(target, text, height) => {
-			const textarea = document.querySelector<HTMLTextAreaElement>(target);
-			return textarea?.value === text && textarea.getBoundingClientRect().height >= height + 20;
+			const editor = document.querySelector<HTMLElement>(target);
+			if (!editor) return false;
+			const value =
+				editor instanceof HTMLTextAreaElement
+					? editor.value
+					: Array.from(editor.children)
+							.map((child) => (child as HTMLElement).innerText.replace(/\n$/, ""))
+							.join("\n");
+			return value === text && editor.getBoundingClientRect().height >= height + 20;
 		},
 		{ timeout: 5_000, polling: "raf" },
 		selector,
@@ -626,10 +1489,10 @@ async function exerciseDraftTextarea(page: Page) {
 	await setDraft("");
 	await page.waitForFunction(
 		(target, height) => {
-			const textarea = document.querySelector<HTMLTextAreaElement>(target);
-			return (
-				textarea?.value === "" && Math.abs(textarea.getBoundingClientRect().height - height) <= 0.5
-			);
+			const editor = document.querySelector<HTMLElement>(target);
+			if (!editor) return false;
+			const value = editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText.trim();
+			return value === "" && Math.abs(editor.getBoundingClientRect().height - height) <= 0.5;
 		},
 		{ timeout: 5_000, polling: "raf" },
 		selector,
@@ -639,7 +1502,18 @@ async function exerciseDraftTextarea(page: Page) {
 	return { before, grown, restored };
 }
 
-async function monitor(page: Page) {
+async function monitor(page: Page, forbidden: readonly string[] = []) {
+	const consoleMessages: Array<{ level: string; text: string }> = [];
+	if (readFanout)
+		page.on("console", (message) => {
+			if (!["warn", "error"].includes(message.type()) || consoleMessages.length >= 20) return;
+			let text = message.text().slice(0, 2_000);
+			for (const secret of forbidden) if (secret) text = text.split(secret).join("[redacted]");
+			consoleMessages.push({
+				level: message.type(),
+				text: text.replace(/\?[^\s"')]+/g, "?[redacted]").slice(0, 1_000),
+			});
+		});
 	const records: RequestRecord[] = [];
 	const pending = new Map<HTTPRequest, RequestRecord>();
 	const activeTails = new Map<string, number>();
@@ -834,6 +1708,7 @@ async function monitor(page: Page) {
 	return {
 		records,
 		errors,
+		consoleMessages,
 		injected,
 		armFault: (id: string) => {
 			faultNarrator = id;
@@ -896,14 +1771,122 @@ export async function main(iterations = 10) {
 	const chrome = process.env.NF_TEST_CHROMIUM_PATH ?? process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (!chrome || !existsSync(chrome))
 		throw new Error("Set NF_TEST_CHROMIUM_PATH to an installed Chrome (no download)");
-	const runtime = await createSmokeRuntime();
+	if (readFanout && Bun.version !== "1.4.3")
+		throw new Error(
+			"Read-fanout measurements require Bun 1.4.3 for the harness and source backend",
+		);
+	const runtime = await createSmokeRuntime(readFanout ? { watchdogMs: 600_000 } : undefined);
+	const fanoutRounds: FanoutRound[] = [];
+	const fanoutForbidden = ["loading_smoke_admin", "loading-smoke-pass-123456"];
+	let fanoutStatus: "running" | "complete" | "failed" = "running";
+	let browserVersion: string | undefined;
+	const fanoutPath = join(runtime.evidenceDir, "read-fanout.json");
+	const fanoutCoverageComplete = () =>
+		fanoutRounds.length > 0 &&
+		fanoutRounds.every(
+			(round) =>
+				round.closed &&
+				round.captures.every(
+					(capture) =>
+						capture.status === "complete" &&
+						capture.server &&
+						Object.values(capture.server.overflow).every((value) => value === 0),
+				) &&
+				round.browser.every(
+					(window) =>
+						Object.values(window.overflow).every((value) => value === 0) &&
+						window.inflightAtStart.groupOverflow === 0 &&
+						(window.inflightAtEnd?.groupOverflow ?? 0) === 0,
+				),
+		);
+	const fanoutMeasuredRoundsComplete = () =>
+		["desktop", "mobile390"].every((viewport) => {
+			const rounds = fanoutRounds.filter(
+				(round) => round.viewport === viewport && round.kind === "measured",
+			);
+			return (
+				rounds.length === iterations &&
+				rounds.every((round) =>
+					(["cold", "A_to_B", "B_to_A"] as const).every(
+						(phase) =>
+							round.captures.filter(
+								(capture) =>
+									capture.phase === phase &&
+									capture.status === "complete" &&
+									round.browser[capture.browserWindowId].documentNavigations ===
+										(phase === "cold" ? 1 : 0),
+							).length === 1,
+					),
+				) &&
+				rounds
+					.flatMap((round) => round.captures)
+					.filter((capture) => capture.phase === "idle" && capture.status === "complete").length ===
+					1
+			);
+		});
+	const persistFanout = () => {
+		if (!readFanout) return;
+		writeReadFanoutEvidence(
+			fanoutPath,
+			{
+				schemaVersion: 1,
+				kind: "isolated-narrator-read-fanout",
+				status: fanoutStatus,
+				diagnosticOnly: diagnostic || !!faultMode,
+				acceptanceEligible:
+					fanoutStatus === "complete" &&
+					!diagnostic &&
+					!faultMode &&
+					fanoutCoverageComplete() &&
+					fanoutMeasuredRoundsComplete(),
+				coverageComplete: fanoutCoverageComplete(),
+				requestedMeasuredRoundsPerViewport: iterations,
+				runtime: {
+					bunVersion: Bun.version,
+					executable: process.execPath,
+					sourceEntry: "server/index.ts",
+					browserVersion,
+				},
+				methodology: {
+					fixture:
+						"Isolated HOME/SQLite/source backend on loopback; two fixed short messages; no provider invocation.",
+					cold: "Fresh browser context, HTTP cache disabled; backend and OS caches may be warm. Exactly one main-frame document request is required for cold and none for tab switches; unexpected automatic reloads reject acceptance.",
+					warm: "A_to_B and B_to_A are recent-tab clicks in the same page runtime; B_to_A revisits A.",
+					functionalRound:
+						"An additional first round per viewport retains original 2s Git delay and fixture/cache-aging assertions; excluded from measured distributions.",
+					idle: "One 1500ms no-action observation after the last round per viewport; n=1 is background context, not a performance percentile acceptance sample.",
+					boundary:
+						"Browser window opens before start control is sent and closes immediately after finishPhase's history completion/100ms quiet/two-rAF visible sentinel acceptance; unrelated polling may still be in flight. Idle has a bounded elapsed-time predicate. Other browser traffic remains in explicit between-windows intervals.",
+					clock:
+						"Browser events use harness monotonic receipt time relative to each round, not CDP packet time. Control send/receive brackets are reported on that clock; backend durationMs is its own monotonic window, startedAt/endedAt are ISO wall clock. These windows differ by control RTT and are not assumed identical.",
+					http: "All browser /api requests classified into fixed route categories and methods; unknown buckets retained. Started, response-status and completion/failure counts belong to their observed window; rows retain start-origin window, including cross-window completions. Inflight snapshots include only bounded tracked requests; overflow makes coverage incomplete. No raw URL/query/IDs retained.",
+					ws: "CDP Network.webSocketFrameSent observes outgoing browser frames, with fixed connection/type/subscription-kind labels only. Sent is not a server-handler acknowledgment. Unknown, invalid, non-text and oversized frames remain fixed buckets; payloads are discarded.",
+					server:
+						"Complete bounded schemaVersion=1 backend aggregate retained per capture: sources, scopes, exact-template fingerprints, totals, timing histograms, limits and overflow. Logical reads, pool entries and dispatched tasks are distinct; not a total-SQL count.",
+					timing:
+						"Summary count distributions use exact nearest-rank p50/p95 across complete measured windows; timing count/sumMs/maxMs distributions describe per-window aggregates. Pooled same-metric observations retain fixed buckets and explicitly approximate p50/p95 upper bounds (including infinity), not fabricated exact values; overlapping metrics must not be summed. compileSync.count is compile entry count, not internal Drizzle _toSQL count.",
+					templates:
+						"Repeated counts are sum(max(0,count-1)) per exact HMAC template separately for logicalReads/poolEntries/dispatched; overflow/oversized groups excluded. Fingerprints are capture-local and never joined across captures. Equal template does not imply equal binds or safe dedupe.",
+					attribution:
+						"Window correlation only, not switching causality. Between-window traffic and backend background_or_unattributed/pre_window/detached remain explicit; background windows are not subtracted from phases.",
+				},
+				limits: FANOUT_LIMITS,
+				browserHistogramUpperBoundsMs: [...FANOUT_LATENCY_BOUNDS_MS, "infinity"],
+				summary: summarizeReadFanout(fanoutRounds),
+				rounds: fanoutRounds,
+			},
+			fanoutForbidden,
+		);
+	};
 	const checks: Check[] = [];
 	const samples: Sample[] = [];
 	const details: unknown[] = [];
 	const check = (name: string, ok: boolean, detail: unknown) => {
 		checks.push({ name, ok, detail });
 		console.log(`[${ok ? "PASS" : "FAIL"}] ${name} ${JSON.stringify(detail).slice(0, 1_000)}`);
-		if (!ok && (diagnostic || faultMode))
+		// Fanout diagnostics retain failures while collecting independent stages. Original
+		// smoke diagnostics and fault injection retain their fail-fast boundary.
+		if (!ok && (faultMode || (diagnostic && !readFanout)))
 			throw new Error(`Functional smoke assertion failed: ${name}`);
 	};
 	let failure: string | undefined;
@@ -930,6 +1913,7 @@ export async function main(iterations = 10) {
 			"POST",
 			{ username: "loading_smoke_admin", password: "loading-smoke-pass-123456" },
 		);
+		fanoutForbidden.push(token);
 		const dirs = { A: join(runtime.home, "repo-a"), B: join(runtime.home, "repo-b") };
 		for (const dir of Object.values(dirs)) {
 			mkdirSync(dir);
@@ -953,6 +1937,7 @@ export async function main(iterations = 10) {
 				lastVisitedAt: Date.now(),
 			});
 		}
+		fanoutForbidden.push(ids.A, ids.B);
 		seedMessages(runtime.home, ids);
 		const browser = await puppeteer.launch({
 			executablePath: chrome,
@@ -962,13 +1947,15 @@ export async function main(iterations = 10) {
 			protocolTimeout: 20_000,
 		});
 		runtime.ownBrowser(browser);
+		if (readFanout) browserVersion = await browser.version();
 		for (const viewport of [
 			{ name: "desktop", width: 1440, height: 900, mobile: false },
 			{ name: "mobile390", width: 390, height: 844, mobile: true },
 		]) {
 			if (diagnosticMobile && !viewport.mobile) continue;
 			// Diagnostic mode deliberately cannot satisfy the measured-round acceptance check.
-			for (let iteration = 0; iteration < (diagnostic || faultMode ? 1 : iterations); iteration++) {
+			const roundCount = diagnostic || faultMode ? 1 : iterations + (readFanout ? 1 : 0);
+			for (let iteration = 0; iteration < roundCount; iteration++) {
 				const context = await browser.createBrowserContext();
 				const page = await context.newPage();
 				await page.setViewport({
@@ -978,10 +1965,38 @@ export async function main(iterations = 10) {
 					hasTouch: viewport.mobile,
 				});
 				await page.setCacheEnabled(false);
-				await page.evaluateOnNewDocument(installBrowserProbe, token, ids.A, SENTINELS.A);
-				const network = await monitor(page);
+				await page.evaluateOnNewDocument(
+					installBrowserProbe,
+					token,
+					ids.A,
+					SENTINELS.A,
+					readFanout ? FANOUT_LIMITS.resourceTimingEntries : 0,
+				);
+				const network = await monitor(page, readFanout ? fanoutForbidden : []);
+				const fanoutRound: FanoutRound = {
+					viewport: viewport.name,
+					iteration,
+					kind:
+						diagnostic || faultMode ? "diagnostic" : iteration === 0 ? "functional" : "measured",
+					browser: [],
+					captures: [],
+					closed: false,
+				};
+				let fanout: Awaited<ReturnType<typeof createReadFanoutSession>> | undefined;
 				try {
+					if (readFanout) {
+						fanoutRounds.push(fanoutRound);
+						fanout = await createReadFanoutSession(
+							page,
+							runtime,
+							token,
+							fanoutRound,
+							fanoutForbidden,
+							persistFanout,
+						);
+					}
 					if (iteration === 0) network.delay(ids.A);
+					await fanout?.begin("cold");
 					const coldStart = performance.now();
 					await page.goto(`${runtime.base}/narrators/${ids.A}`, {
 						waitUntil: "domcontentloaded",
@@ -1010,6 +2025,9 @@ export async function main(iterations = 10) {
 						const tail = network.records.find(
 							(record) => record.narratorId === ids.A && record.kind === "tail",
 						);
+						const browserRequestTimings = readFanout
+							? await browserOpeningRequestTimings(page, ids.A)
+							: undefined;
 						check(
 							`${viewport.name}: detail/tail parallel with delayed Git`,
 							!!summary?.releaseMs &&
@@ -1027,6 +2045,7 @@ export async function main(iterations = 10) {
 								visibleMessageMs: cold.firstMessage.elapsedMs,
 								beforeGit: coldPaintAt < (summary?.releaseMs ?? 0),
 								coldTailRequests: coldCount,
+								browserRequestTimings,
 							},
 						);
 						const after = await geometry(page);
@@ -1044,9 +2063,11 @@ export async function main(iterations = 10) {
 					// Count through the phase boundary too: a sequential post-paint reread must
 					// not hide behind a count captured before the first WS baseline arrives.
 					const settledCold = await network.finishPhase(ids.A, 0, SENTINELS.A);
+					await fanout?.end(true, cold.firstMessage.elapsedMs);
 					coldCount = network.count(ids.A, 0, "tail");
 					const coldRequests = historyRequestCounts(network.records, ids.A);
 					network.delay();
+					await fanout?.begin("A_to_B");
 					const beforeB = network.records.length;
 					const switchB = await navigate(page, ids.B, "B", viewport.mobile);
 					let switchBCount = network.count(ids.B, beforeB, "tail");
@@ -1083,12 +2104,15 @@ export async function main(iterations = 10) {
 						network.delay(ids.A);
 					}
 					const settledB = await network.finishPhase(ids.B, beforeB, SENTINELS.B);
+					await fanout?.end(true, switchB.firstMessage.elapsedMs);
 					switchBCount = network.count(ids.B, beforeB, "tail");
 					const switchBRequests = historyRequestCounts(network.records, ids.B, beforeB);
+					await fanout?.begin("B_to_A");
 					const beforeHot = network.records.length;
 					if (faultMode) network.armFault(ids.A);
 					const hot = await navigate(page, ids.A, "A", viewport.mobile);
 					const settledHot = await network.finishPhase(ids.A, beforeHot, SENTINELS.A);
+					await fanout?.end(true, hot.firstMessage.elapsedMs);
 					let hotCount = network.count(ids.A, beforeHot, "tail");
 					let hotRequests = historyRequestCounts(network.records, ids.A, beforeHot);
 					if (iteration === 0) {
@@ -1122,7 +2146,7 @@ export async function main(iterations = 10) {
 								viewportChanges,
 							},
 						);
-						const draftGrowth = await exerciseDraftTextarea(page);
+						const draftGrowth = await exerciseDraftComposer(page);
 						check(
 							`${viewport.name}: multiline draft grows naturally and empty draft restores`,
 							draftGrowth.grown >= draftGrowth.before + 20 &&
@@ -1182,27 +2206,44 @@ export async function main(iterations = 10) {
 							switchBCount,
 							hotCount,
 						});
+					if (fanout && iteration === roundCount - 1) {
+						await fanout.begin("idle");
+						const idleStartedAt = performance.now();
+						await until(
+							async () => performance.now() - idleStartedAt >= 1_500,
+							2_500,
+							"bounded no-action background observation",
+						);
+						await fanout.end();
+					}
 					if (faultMode)
 						throw new Error(
 							`Fault mode did not reject the hot phase: ${faultMode}; injected=${network.injected.length}`,
 						);
-					if (diagnostic)
-						throw new Error("Diagnostic-only functional round; no performance sample");
-					samples.push({
-						viewport: viewport.name,
-						iteration,
-						coldMs: cold.firstMessage.elapsedMs,
-						switchBMs: switchB.firstMessage.elapsedMs,
-						hotMs: hot.firstMessage.elapsedMs,
-						coldTailRequests: coldCount,
-						switchBTailRequests: switchBCount,
-						hotTailRequests: hotCount,
-						phaseRequestCounts: {
-							cold: coldRequests,
-							switchB: switchBRequests,
-							hot: hotRequests,
-						},
-					});
+					if (diagnostic) {
+						const failed = checks.filter((item) => !item.ok).map((item) => item.name);
+						throw new Error(
+							failed.length
+								? `Diagnostic functional assertions failed: ${failed.join("; ")}`
+								: "Diagnostic-only functional round; no performance sample",
+						);
+					}
+					if (!readFanout || iteration > 0)
+						samples.push({
+							viewport: viewport.name,
+							iteration,
+							coldMs: cold.firstMessage.elapsedMs,
+							switchBMs: switchB.firstMessage.elapsedMs,
+							hotMs: hot.firstMessage.elapsedMs,
+							coldTailRequests: coldCount,
+							switchBTailRequests: switchBCount,
+							hotTailRequests: hotCount,
+							phaseRequestCounts: {
+								cold: coldRequests,
+								switchB: switchBRequests,
+								hot: hotRequests,
+							},
+						});
 				} catch (error) {
 					try {
 						await page.screenshot({
@@ -1215,6 +2256,7 @@ export async function main(iterations = 10) {
 							requests: network.records,
 							injected: network.injected,
 							errors: network.errors,
+							consoleMessages: network.consoleMessages,
 							currentFrames: await settledVisibleFrames(page),
 							probe: await page.evaluate(() => (window as unknown as ProbeWindow).__loadingProbe),
 						});
@@ -1233,7 +2275,11 @@ export async function main(iterations = 10) {
 					throw error;
 				} finally {
 					network.cleanup();
-					await context.close();
+					try {
+						await fanout?.cleanup();
+					} finally {
+						await context.close();
+					}
 				}
 			}
 		}
@@ -1270,6 +2316,13 @@ export async function main(iterations = 10) {
 			!checks.some((item) => !item.ok) && samples.length === 2 * iterations,
 			{ measuredRounds: samples.length },
 		);
+		if (readFanout) {
+			check(
+				"read-fanout measured windows and bounded observer coverage",
+				fanoutMeasuredRoundsComplete() && fanoutCoverageComplete(),
+				{ rounds: fanoutRounds.length, coverageComplete: fanoutCoverageComplete() },
+			);
+		}
 		result = {
 			diagnostic,
 			methodology:
@@ -1284,11 +2337,15 @@ export async function main(iterations = 10) {
 		);
 		if (checks.some((item) => !item.ok))
 			throw new Error("Narrator loading smoke assertions failed");
+		fanoutStatus = "complete";
 	} catch (error) {
+		fanoutStatus = "failed";
 		failure = String(error);
 		throw error;
 	} finally {
 		try {
+			persistFanout();
+			if (readFanout) console.log(`Read-fanout evidence: ${fanoutPath}`);
 			writeFileSync(
 				join(runtime.evidenceDir, "narrator-loading.json"),
 				`${JSON.stringify({ failure, diagnostic, faultMode, result, checks, samples, details }, null, "\t")}\n`,
@@ -1302,11 +2359,21 @@ export async function main(iterations = 10) {
 				})),
 			);
 		} finally {
-			await runtime.cleanup();
-			// Shared harness writes a 4KiB log; this smoke retains only small JSON/images.
-			rmSync(join(runtime.evidenceDir, "server-tail.log"), { force: true });
-			await formatHarnessSummary(join(runtime.evidenceDir, "summary.json"));
-			console.log(`Artifacts: ${runtime.evidenceDir}`);
+			try {
+				if (readFanout && failure && runtime.logTail) {
+					let tail = Buffer.from(runtime.logTail()).subarray(-4_096).toString("utf8");
+					for (const secret of fanoutForbidden)
+						if (secret) tail = tail.split(secret).join("[redacted]");
+					writeFileSync(join(runtime.evidenceDir, "server-phase-tail.log"), tail, { mode: 0o600 });
+				}
+			} finally {
+				await runtime.cleanup();
+				// Preserve pre-cleanup diagnostics separately from the shutdown-heavy final tail.
+				if (!readFanout || !failure)
+					rmSync(join(runtime.evidenceDir, "server-tail.log"), { force: true });
+				await formatHarnessSummary(join(runtime.evidenceDir, "summary.json"));
+				console.log(`Artifacts: ${runtime.evidenceDir}`);
+			}
 		}
 	}
 }

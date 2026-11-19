@@ -7,8 +7,8 @@ import { cpSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { and, asc, eq, gt } from "drizzle-orm";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import {
 	benchmarkRuns,
 	benchmarkSuites,
@@ -17,6 +17,8 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { readDomainTask, readQuery } from "../db/worker-read";
+import { DbReadError } from "../lib/db-worker/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -32,6 +34,7 @@ import { swebenchEvaluator } from "./benchmark-evaluators/swe-bench";
 import type { BenchmarkEvaluator, BenchmarkTask, EvalResult } from "./benchmark-evaluators/types";
 import { narratorService } from "./narrator-service";
 import { interruptNarrator, sendMessage } from "./narrator-session";
+import { collectKeysetRows } from "./read/read-collect";
 
 // ── Evaluator registry ──────────────────────────────────────────────
 
@@ -74,12 +77,34 @@ export async function createSuite(input: {
 	return suite;
 }
 
-export async function listSuites() {
+export async function listSuitesPostgres() {
+	if (activeDatabaseBackend !== "postgres")
+		throw new DbReadError(
+			"DB_READ_UNSUPPORTED",
+			"SQLite benchmark lists require the snapshot stream",
+		);
 	return db.select().from(benchmarkSuites).orderBy(benchmarkSuites.createdAt);
 }
 
 export async function getSuite(id: string) {
-	return db.query.benchmarkSuites.findFirst({ where: eq(benchmarkSuites.id, id) });
+	if (activeDatabaseBackend === "postgres")
+		return readQuery(db.query.benchmarkSuites.findFirst({ where: eq(benchmarkSuites.id, id) }), {
+			executionPolicy: "worker-required",
+		});
+	const row = await readDomainTask(
+		sqlite,
+		"benchmarkSuiteSnapshot",
+		{ suiteId: id, format: "raw" },
+		{ executionPolicy: "worker-required" },
+	);
+	if (row === null) return undefined;
+	if (typeof row === "string")
+		throw new DbReadError("DB_READ_FAILED", "Unexpected benchmark suite encoding");
+	return {
+		...row,
+		tasksJson:
+			row.tasksJson === null ? null : benchmarkSuites.tasksJson.mapFromDriverValue(row.tasksJson),
+	};
 }
 
 // ── Run CRUD ────────────────────────────────────────────────────────
@@ -131,22 +156,71 @@ export async function createRun(input: {
 }
 
 export async function listRuns(suiteId?: string) {
-	if (suiteId) {
-		return db
-			.select()
-			.from(benchmarkRuns)
-			.where(eq(benchmarkRuns.suiteId, suiteId))
-			.orderBy(benchmarkRuns.createdAt);
-	}
-	return db.select().from(benchmarkRuns).orderBy(benchmarkRuns.createdAt);
+	const rows = await collectKeysetRows(
+		(after) =>
+			readQuery(
+				db
+					.select()
+					.from(benchmarkRuns)
+					.where(
+						and(
+							suiteId ? eq(benchmarkRuns.suiteId, suiteId) : undefined,
+							after === null ? undefined : gt(benchmarkRuns.id, after),
+						),
+					)
+					.orderBy(asc(benchmarkRuns.id))
+					.limit(200),
+				{ executionPolicy: "worker-required" },
+			),
+		(row) => row.id,
+	);
+	return rows.sort((left, right) =>
+		left.createdAt < right.createdAt ? -1 : left.createdAt > right.createdAt ? 1 : 0,
+	);
 }
 
 export async function getRun(id: string) {
-	return db.query.benchmarkRuns.findFirst({ where: eq(benchmarkRuns.id, id) });
+	return readQuery(db.query.benchmarkRuns.findFirst({ where: eq(benchmarkRuns.id, id) }), {
+		executionPolicy: "worker-required",
+	});
 }
 
 export async function getRunResults(runId: string) {
-	return db.select().from(benchmarkTaskResults).where(eq(benchmarkTaskResults.runId, runId));
+	return readQuery(
+		db.select().from(benchmarkTaskResults).where(eq(benchmarkTaskResults.runId, runId)),
+		{ executionPolicy: "worker-required" },
+	);
+}
+
+/** Summaries and progress never load evaluator output or arbitrary task metadata. */
+async function readRunResultMetrics(runId: string) {
+	return collectKeysetRows(
+		(after) =>
+			readQuery(
+				db
+					.select({
+						id: benchmarkTaskResults.id,
+						taskId: benchmarkTaskResults.taskId,
+						status: benchmarkTaskResults.status,
+						score: benchmarkTaskResults.score,
+						costUsd: benchmarkTaskResults.costUsd,
+						tokensIn: benchmarkTaskResults.tokensIn,
+						tokensOut: benchmarkTaskResults.tokensOut,
+						durationMs: benchmarkTaskResults.durationMs,
+					})
+					.from(benchmarkTaskResults)
+					.where(
+						and(
+							eq(benchmarkTaskResults.runId, runId),
+							after === null ? undefined : gt(benchmarkTaskResults.id, after),
+						),
+					)
+					.orderBy(asc(benchmarkTaskResults.id))
+					.limit(200),
+				{ executionPolicy: "worker-required" },
+			),
+		(row) => row.id,
+	);
 }
 
 // ── Run execution ───────────────────────────────────────────────────
@@ -160,10 +234,13 @@ async function waitForNarratorIdle(
 	signal: AbortSignal,
 ): Promise<boolean> {
 	// Check current status first — may already be idle
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true },
-	});
+	const current = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!current) return false;
 	if (current.status === "idle") return true;
 	if (signal.aborted) return false;
@@ -194,24 +271,37 @@ async function waitForNarratorIdle(
 }
 
 /** Collect metrics from narrator messages and tool calls. */
-async function collectMetrics(narratorId: string) {
-	// Usage columns only: the bodies are never read here.
-	const messages = await db
-		.select({
-			role: narratorMessages.role,
-			contentText: narratorMessages.contentText,
-			tokensIn: narratorMessages.tokensIn,
-			outputTokens: narratorMessages.outputTokens,
-			reasoningTokens: narratorMessages.reasoningTokens,
-			costUsd: narratorMessages.costUsd,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.narratorId, narratorId));
+async function collectMetrics(narratorId: string, signal?: AbortSignal) {
+	if (activeDatabaseBackend !== "postgres")
+		return readDomainTask(
+			sqlite,
+			"benchmarkMetricsSnapshot",
+			{ narratorId },
+			{ executionPolicy: "worker-required", signal },
+		);
+	// PostgreSQL keeps the native asynchronous driver.
+	const messages = await readQuery(
+		db
+			.select({
+				role: narratorMessages.role,
+				contentText: narratorMessages.contentText,
+				tokensIn: narratorMessages.tokensIn,
+				outputTokens: narratorMessages.outputTokens,
+				reasoningTokens: narratorMessages.reasoningTokens,
+				costUsd: narratorMessages.costUsd,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, narratorId)),
+		{ executionPolicy: "worker-required" },
+	);
 
-	const toolCalls = await db
-		.select()
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.narratorId, narratorId));
+	const toolCalls = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.narratorId, narratorId)),
+		{ executionPolicy: "worker-required" },
+	);
 
 	let tokensIn = 0;
 	let tokensOut = 0;
@@ -267,7 +357,15 @@ async function executeTask(
 	let containerId: string | undefined;
 
 	// Determine if this is a SWE-bench task that needs container isolation
-	const suite = run.suiteId ? await getSuite(run.suiteId) : null;
+	const suite = run.suiteId
+		? await readQuery(
+				db.query.benchmarkSuites.findFirst({
+					where: eq(benchmarkSuites.id, run.suiteId),
+					columns: { name: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)
+		: null;
 	const isSWEBench = suite?.name === "swe-bench";
 	const meta = (task.metadata ?? {}) as Record<string, unknown>;
 
@@ -399,7 +497,7 @@ async function executeTask(
 		}
 
 		// Collect metrics
-		const metrics = await collectMetrics(narrator.id);
+		const metrics = await collectMetrics(narrator.id, signal);
 		const durationMs = Date.now() - startTime;
 
 		if (!completed) {
@@ -584,7 +682,7 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 	if (!suite) throw new Error(`Suite not found: ${run.suiteId}`);
 
 	const tasks = (suite.tasksJson ?? []) as BenchmarkTask[];
-	const taskResults = await getRunResults(runId);
+	const taskResults = await readRunResultMetrics(runId);
 
 	const abortController = new AbortController();
 	activeRuns.set(runId, abortController);
@@ -621,9 +719,13 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 			await executeTask(run, task, taskResult.id, abortController.signal);
 
 			// Refresh task result
-			const updated = await db.query.benchmarkTaskResults.findFirst({
-				where: eq(benchmarkTaskResults.id, taskResult.id),
-			});
+			const updated = await readQuery(
+				db.query.benchmarkTaskResults.findFirst({
+					where: eq(benchmarkTaskResults.id, taskResult.id),
+					columns: { status: true, costUsd: true, tokensIn: true, tokensOut: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 
 			completedCount++;
 			if (updated?.status === "passed") passedCount++;
@@ -711,8 +813,16 @@ export async function getRunSummary(runId: string) {
 	const run = await getRun(runId);
 	if (!run) throw new Error(`Run not found: ${runId}`);
 
-	const results = await getRunResults(runId);
-	const suite = run.suiteId ? await getSuite(run.suiteId) : null;
+	const results = await readRunResultMetrics(runId);
+	const suite = run.suiteId
+		? await readQuery(
+				db.query.benchmarkSuites.findFirst({
+					where: eq(benchmarkSuites.id, run.suiteId),
+					columns: { name: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)
+		: null;
 
 	const passed = results.filter((r) => r.status === "passed").length;
 	const failed = results.filter((r) => r.status === "failed").length;

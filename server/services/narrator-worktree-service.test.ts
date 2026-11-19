@@ -13,6 +13,8 @@ import {
 } from "../lib/agent/tools/worktree";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
+import { setGitHardeningProbeForTests } from "../lib/git-exec-hardening";
+import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
 import type { WorktreeCreateRequest } from "../lib/validators/narrator-worktrees";
 import { createNarratorWorktreeRoutes } from "../routes/narrator-worktrees";
@@ -595,6 +597,342 @@ describe("bounded worktree snapshot pagination", () => {
 		});
 		return { rows, calls };
 	}
+
+	test("slow diagnostics separate awaiting Git from synchronous stages and reuse snapshot encoding", async () => {
+		const { rows, calls } = inventory(45);
+		const run = ports.runGit;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let now = 0;
+		let inputBytes = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now++);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		const stringify = spyOn(JSON, "stringify");
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] === "worktree") {
+				started.resolve();
+				await release.promise;
+			}
+			const result = await run(workspace, args, abort, writing);
+			if (args[0] === "worktree") inputBytes = Buffer.byteLength(result.stdout);
+			return result;
+		};
+		try {
+			const pending = service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			await started.promise;
+			now += 1500;
+			release.resolve();
+			const page = await pending;
+			expect(page.entries.map((entry) => entry.path)).toEqual(
+				rows
+					.toReversed()
+					.slice(0, 20)
+					.map((row) => row.path),
+			);
+			expect(stringify).toHaveBeenCalledTimes(2);
+			expect(warning).toHaveBeenCalledTimes(1);
+			const fields = warning.mock.calls[0]?.[1];
+			expect(warning.mock.calls[0]?.[0]).toBe("Slow worktree listing");
+			expect(fields).toMatchObject({
+				inputBytes,
+				entryCount: 45,
+				matchedEntryCount: 45,
+				pageEntryCount: 20,
+				cacheHit: false,
+				truncated: false,
+				metadataStopReason: "complete",
+				stopReason: "complete",
+				stages: {
+					outputBoundSyncMs: 1,
+					porcelainParseSyncMs: 1,
+					filterSortSyncMs: 1,
+					snapshotSyncMs: 1,
+					pageSyncMs: 1,
+				},
+			});
+			expect(
+				(fields?.stages as Record<string, number>).inventoryGitElapsedMs,
+			).toBeGreaterThanOrEqual(1500);
+			expect(fields?.snapshotBytes).toBe(
+				Buffer.byteLength(String(stringify.mock.results[0]?.value)) +
+					Buffer.byteLength(String(stringify.mock.results[1]?.value)) +
+					256,
+			);
+			expect(fields).not.toHaveProperty("entries");
+			expect(fields).not.toHaveProperty("repositoryPath");
+			const callCount = calls.length;
+			now += 60_000;
+			ports.authorize = async () => {
+				now += 1500;
+				return target;
+			};
+			const next = await service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: page.nextCursor },
+				signal(),
+			);
+			expect(next.entries.map((entry) => entry.path)).toEqual(
+				rows
+					.toReversed()
+					.slice(20, 40)
+					.map((row) => row.path),
+			);
+			expect(calls).toHaveLength(callCount);
+			expect(stringify).toHaveBeenCalledTimes(3);
+			expect(warning).toHaveBeenCalledTimes(2);
+			expect(warning.mock.calls[1]?.[1]).toMatchObject({
+				cacheHit: true,
+				inputBytes: 0,
+				entryCount: 0,
+				matchedEntryCount: 45,
+				pageEntryCount: 20,
+				metadataStopReason: "not_started",
+				stages: {
+					inventoryElapsedMs: 0,
+					inventoryGitElapsedMs: 0,
+					outputBoundSyncMs: 0,
+					porcelainParseSyncMs: 0,
+					metadataElapsedMs: 0,
+					filterSortSyncMs: 0,
+					snapshotSyncMs: 0,
+					pageSyncMs: 1,
+				},
+			});
+		} finally {
+			release.resolve();
+			stringify.mockRestore();
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("slow diagnostics share one bounded limiter across repositories and ignore fast requests", async () => {
+		inventory(1);
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			expect(warning).not.toHaveBeenCalled();
+			ports.authorize = async () => {
+				now += 1000;
+				return target;
+			};
+			for (let index = 0; index < 4; index++) {
+				target.workspace.repositoryKey = `repository-${index}`;
+				await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			}
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning.mock.calls[0]?.[1]).toMatchObject({
+				rateLimitIntervalMs: 60_000,
+				suppressedSinceLastLog: 0,
+				stages: { authorizationElapsedMs: 1000, inventoryGitElapsedMs: 0 },
+			});
+			now = 60_000;
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			expect(warning).toHaveBeenCalledTimes(2);
+			expect(warning.mock.calls[1]?.[1]).toMatchObject({ suppressedSinceLastLog: 3 });
+		} finally {
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("slow diagnostics preserve caller cancellation and distinguish the metadata budget", async () => {
+		inventory(1);
+		const run = ports.runGit;
+		const controller = new AbortController();
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			ports.runGit = async () => {
+				now += 1500;
+				controller.abort(new Error("cancelled listing"));
+				return new Promise(() => {});
+			};
+			await expect(
+				service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
+			).rejects.toThrow("cancelled listing");
+			expect(warning.mock.calls[0]?.[1]).toMatchObject({
+				stopReason: "cancelled",
+				metadataStopReason: "not_started",
+				stages: { inventoryGitElapsedMs: 1500 },
+			});
+			now += 60_000;
+			ports.runGit = run;
+			ports.metadataTimeoutMs = 123;
+			const metadataBudget = new AbortController();
+			const timeout = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
+				ms === 123 ? metadataBudget.signal : new AbortController().signal,
+			);
+			ports.statDirectory = async () => {
+				now += 1500;
+				metadataBudget.abort(new DOMException("metadata budget", "TimeoutError"));
+				return new Promise(() => {});
+			};
+			try {
+				const page = await service.list(
+					"actor",
+					"narrator",
+					{ workspaceKey: "workspace" },
+					signal(),
+				);
+				expect(page.entries).toHaveLength(1);
+				expect(page.entries[0]?.createdAt).toBeNull();
+				expect(warning).toHaveBeenCalledTimes(2);
+				expect(warning.mock.calls[1]?.[1]).toMatchObject({
+					stopReason: "complete",
+					metadataStopReason: "budget",
+					stages: { metadataElapsedMs: 1500 },
+				});
+			} finally {
+				timeout.mockRestore();
+			}
+		} finally {
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("local listing observes the safeSpawn hard-timeout contract through capture-mode opt-in", async () => {
+		delete ports.runGit;
+		setGitHardeningProbeForTests(async () => true);
+		const exit = Promise.withResolvers<number>();
+		const spawned = Promise.withResolvers<void>();
+		const deadline: { fire?: () => void } = {};
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		const timeout = spyOn(globalThis, "setTimeout").mockImplementation(((fire: () => void) => {
+			deadline.fire = fire;
+			return 1;
+		}) as unknown as typeof setTimeout);
+		const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {
+			deadline.fire = undefined;
+		});
+		const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+			spawned.resolve();
+			return {
+				stdout: new Blob([""]).stream(),
+				stderr: new Blob(["timeout"]).stream(),
+				exited: exit.promise,
+				kill: () => exit.resolve(143),
+			} as unknown as ReturnType<typeof Bun.spawn>;
+		});
+		try {
+			const pending = service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			await spawned.promise;
+			expect(deadline.fire).toBeDefined();
+			now += 10_000;
+			deadline.fire?.();
+			await expect(pending).rejects.toMatchObject({ code: "WORKTREE_LIST_FAILED" });
+			expect(
+				warning.mock.calls.find(([message]) => message === "Slow worktree listing")?.[1],
+			).toMatchObject({
+				inventoryTerminationReason: "timeout",
+				stopReason: "budget",
+				stages: { inventoryGitElapsedMs: 10_000 },
+			});
+		} finally {
+			exit.resolve(143);
+			spawn.mockRestore();
+			setGitHardeningProbeForTests(null);
+			clear.mockRestore();
+			timeout.mockRestore();
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("slow diagnostics classify reported child budgets separately from ordinary Git failures", async () => {
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			for (const terminationReason of ["timeout", "output-limit", undefined] as const) {
+				now += 60_000;
+				ports.runGit = async () => {
+					now += 1500;
+					return { stdout: "", stderr: "Git read failed", exitCode: 1, terminationReason };
+				};
+				await expect(
+					service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+				).rejects.toMatchObject({ code: "WORKTREE_LIST_FAILED", statusCode: 409 });
+				expect(warning.mock.calls.at(-1)?.[1]).toMatchObject({
+					stopReason: terminationReason ? "budget" : "error",
+					inventoryTerminationReason: terminationReason,
+					metadataStopReason: "not_started",
+					stages: { inventoryGitElapsedMs: 1500 },
+				});
+			}
+			expect(warning).toHaveBeenCalledTimes(3);
+		} finally {
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("snapshot diagnostics retain encoded size when the existing cache byte budget rejects it", async () => {
+		inventory(900, "\x01".repeat(3400));
+		let now = 0;
+		ports.authorize = async () => {
+			now += 1000;
+			return target;
+		};
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await expect(
+				service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_LIST_TOO_LARGE", statusCode: 413 });
+			expect(warning).toHaveBeenCalledTimes(1);
+			const fields = warning.mock.calls[0]?.[1];
+			expect(fields).toMatchObject({
+				entryCount: 900,
+				matchedEntryCount: 900,
+				pageEntryCount: 0,
+				cacheHit: false,
+				truncated: false,
+				stopReason: "budget",
+			});
+			expect(Number(fields?.snapshotBytes)).toBeGreaterThan(WORKTREE_LIST_CACHE_MAX_BYTES);
+		} finally {
+			warning.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("UTF-8 output bounds retain exact-size text and report the existing source byte count", () => {
+		for (const [stdout, stderr, expectedOut, expectedErr, truncated] of [
+			["éé", "🙂", "éé", "🙂", false],
+			["ééx", "🙂x", "éé", "🙂", true],
+			["ab€z", "a🙂", "ab", "a", true],
+		] as const) {
+			let bytes = 0;
+			const result = boundWorktreeGitResult({ stdout, stderr, exitCode: 0 }, 4, (value) => {
+				bytes = value;
+			});
+			expect(result.stdout).toBe(expectedOut);
+			expect(result.stderr).toBe(expectedErr);
+			expect(result.stdoutTruncated).toBe(truncated);
+			expect(result.stderrTruncated).toBe(truncated);
+			expect(bytes).toBe(Buffer.byteLength(stdout));
+			expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(4);
+			expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(4);
+		}
+		expect(
+			boundWorktreeGitResult({
+				stdout: "x",
+				stderr: "",
+				exitCode: 0,
+				stdoutTruncated: true,
+				terminationReason: "output-limit",
+			}),
+		).toMatchObject({ stdout: "x", stdoutTruncated: true, terminationReason: "output-limit" });
+	});
 
 	test("default 20 newest entries and every subsequent page cover more than 128 without re-enumeration", async () => {
 		const { rows, calls } = inventory(257);
