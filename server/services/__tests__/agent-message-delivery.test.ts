@@ -3,6 +3,7 @@ import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import * as workerRead from "../../db/worker-read";
+import { logger } from "../../lib/logger";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
@@ -658,6 +659,35 @@ describe("Send exact delivery receipts", () => {
 		expect(ids.filter((id) => consumedAt(id) !== null).length).toBeLessThan(ids.length);
 		await Promise.all(writes);
 		expect(ids.every((id) => consumedAt(id) !== null)).toBe(true);
+	});
+
+	test("failed receipt preflight still writes the receipt without failing the communication drain", async () => {
+		const sent = await send();
+		const id = sent.targets[0].deliveryMessageId as string;
+		await consume();
+		await drainRuntimeTestWork();
+		expect(consumedAt(id)).toBeNull();
+
+		const error = new Error("receipt preflight unavailable");
+		const preflight = failNextWorkerRead("receipt_probe", error);
+		const warn = spyOn(logger, "warn");
+		try {
+			await markAgentMessageConsumed({
+				recipientNarratorId: "child",
+				recipientMessageId: id,
+				senderNarratorId: "parent",
+				fromToolUseId: "send-call",
+			});
+			expect(warn).toHaveBeenCalledWith(
+				"Agent receipt batch preflight failed; checking entries individually",
+				{ error: String(error) },
+			);
+			expect(consumedAt(id)).toBeNumber();
+			await drainRuntimeTestWork();
+		} finally {
+			warn.mockRestore();
+			preflight.mockRestore();
+		}
 	});
 
 	test.each([

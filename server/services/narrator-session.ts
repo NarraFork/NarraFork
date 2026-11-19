@@ -154,6 +154,7 @@ import {
 	claimInboxHead,
 	deliverInboxInjection,
 	flushInboxPublicationBarrier,
+	type InboxAgentMetadata,
 	type InboxWakeOptions,
 	inboxClaim,
 	inboxConsumption,
@@ -2541,6 +2542,7 @@ async function deliverPendingInjectionsInOrder(
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
 	active?: ActiveNarrator,
 	inputParts?: AgentInputPart[],
+	onModelSwitch?: (plan: import("./subagent-model-switch").SubagentModelSwitchPlan) => void,
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
@@ -2575,9 +2577,12 @@ async function deliverPendingInjectionsInOrder(
 			);
 			if (!row) break;
 			try {
-				const questionAnswer = inboxMetadata<{ questionAnswer?: { messageId: string } }>(
-					row,
-				).questionAnswer;
+				const metadata = inboxMetadata<
+					Pick<InboxAgentMetadata, "subagentModelSwitch"> & {
+						questionAnswer?: { messageId: string };
+					}
+				>(row);
+				const { questionAnswer } = metadata;
 				if (questionAnswer) {
 					// A person's answer: the run that takes it up is theirs too (outline P2 PR 10c-2).
 					if (active) active._runPersonActed = true;
@@ -2639,6 +2644,14 @@ async function deliverPendingInjectionsInOrder(
 					if (row.kind !== "agent_message") adoptedMailbox?.push(inboxConsumption(row));
 					if (entry.kind === "subagent_message" && entry.message.delivery) {
 						adoptedDeliveries?.push(entry.message.delivery);
+						const plan = metadata.subagentModelSwitch;
+						if (plan) {
+							if (onModelSwitch) onModelSwitch(plan);
+							else {
+								const { applyDeliveryModelSwitch } = await import("./subagent-model-switch");
+								await applyDeliveryModelSwitch(narratorId, plan);
+							}
+						}
 					}
 				}
 			} catch (err) {
@@ -2870,6 +2883,7 @@ export async function deliverPendingInjection(
 export async function drainAndPersistPendingInjections(
 	active: ActiveNarrator,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	onModelSwitch?: (plan: import("./subagent-model-switch").SubagentModelSwitchPlan) => void,
 ): Promise<string | null> {
 	return deliverPendingInjectionsInOrder(
 		active.narratorId,
@@ -2879,6 +2893,8 @@ export async function drainAndPersistPendingInjections(
 		undefined,
 		subagent,
 		active,
+		undefined,
+		onModelSwitch,
 	);
 }
 
@@ -6159,7 +6175,13 @@ export async function startParentInboundContinuationIfPossible(
 			if (active._loopRunning) return { started: false };
 			active._currentUserId = principal.userId;
 
-			const delivered = await drainAndPersistPendingInjections(active);
+			// Forward the choice from this exact adopted batch, not from whichever Send wakes us.
+			let subagentModelSwitch:
+				| import("./subagent-model-switch").SubagentModelSwitchPlan
+				| undefined;
+			const delivered = await drainAndPersistPendingInjections(active, undefined, (plan) => {
+				subagentModelSwitch = plan;
+			});
 			if (!delivered) return { started: false };
 
 			active._continuationSuppressed = false;
@@ -6174,6 +6196,7 @@ export async function startParentInboundContinuationIfPossible(
 				runAgentLoop(active, "", undefined, {
 					principal: principal.userId,
 					initiatedBy: "system",
+					subagentModelSwitch,
 				}).catch(async (err) => {
 					logger.error("runAgentLoop unhandled error (subagent message)", {
 						narratorId,

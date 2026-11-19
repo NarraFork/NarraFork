@@ -55,9 +55,17 @@ export interface InboxAgentMetadata {
 	channel: "buffer" | "parent" | "team";
 	isBroadcast?: boolean;
 	fromMessageId?: string | null;
+	subagentModelSwitch?: import("../subagent-model-switch").SubagentModelSwitchPlan;
 	/** Initiating user for the producing pass; null/undefined means unattributed. */
 	userId?: string | null;
 }
+
+type InboxAgentOptions = Partial<
+	Pick<
+		InboxAgentMetadata,
+		"channel" | "userId" | "isBroadcast" | "fromMessageId" | "subagentModelSwitch"
+	>
+> & { createdBy?: string | null };
 
 export interface InboxExecutionBinding {
 	toolCallBinding: ToolCallBinding;
@@ -169,13 +177,7 @@ export type InboxEnqueueResult = {
 export async function enqueueInboxAgent(
 	delivery: AgentMessageDelivery,
 	modelText: string,
-	options: {
-		channel?: InboxAgentMetadata["channel"];
-		createdBy?: string | null;
-		userId?: string | null;
-		isBroadcast?: boolean;
-		fromMessageId?: string | null;
-	} = {},
+	options: InboxAgentOptions = {},
 ): Promise<InboxEnqueueResult> {
 	const binding = delivery.senderToolCallBinding;
 	if (!binding) throw new Error("Agent message requires exact tool execution receipt");
@@ -201,13 +203,7 @@ export function notifyAgentInboxChanged(narratorId: string): void {
 function enqueueInboxAgentSqlite(
 	delivery: AgentMessageDelivery,
 	modelText: string,
-	options: {
-		channel?: InboxAgentMetadata["channel"];
-		createdBy?: string | null;
-		userId?: string | null;
-		isBroadcast?: boolean;
-		fromMessageId?: string | null;
-	},
+	options: InboxAgentOptions,
 ): InboxEnqueueResult {
 	const binding = delivery.senderToolCallBinding;
 	if (!binding) throw new Error("Agent message requires exact tool execution receipt");
@@ -276,6 +272,7 @@ function enqueueInboxAgentSqlite(
 					isBroadcast: options.isBroadcast,
 					fromMessageId: options.fromMessageId,
 					userId: options.userId ?? options.createdBy ?? null,
+					subagentModelSwitch: options.subagentModelSwitch,
 				},
 			},
 			tx,
@@ -298,13 +295,7 @@ async function enqueueInboxAgentPg(
 	port: NonNullable<ReturnType<typeof getRuntimeQueuePort>>,
 	delivery: AgentMessageDelivery,
 	modelText: string,
-	options: {
-		channel?: InboxAgentMetadata["channel"];
-		createdBy?: string | null;
-		userId?: string | null;
-		isBroadcast?: boolean;
-		fromMessageId?: string | null;
-	},
+	options: InboxAgentOptions,
 ): Promise<InboxEnqueueResult> {
 	const binding = delivery.senderToolCallBinding;
 	if (!binding) throw new Error("Agent message requires exact tool execution receipt");
@@ -334,6 +325,7 @@ async function enqueueInboxAgentPg(
 			isBroadcast: options.isBroadcast,
 			fromMessageId: options.fromMessageId,
 			userId: options.userId ?? options.createdBy ?? null,
+			subagentModelSwitch: options.subagentModelSwitch,
 		},
 	};
 	const result = await port.mailbox.admitAgentMessage(input, {

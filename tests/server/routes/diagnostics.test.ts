@@ -1,19 +1,30 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import type { Profiler, Session } from "node:inspector";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { Hono } from "hono";
-import { buildAppErrorResponse } from "../../../server/lib/app-error-response";
-import { diagnosticsRoutes } from "../../../server/routes/diagnostics";
+import { createServerRequestDispatcher } from "../../../server/http-dispatcher";
+import { createServerRequestLifecycle } from "../../../server/http-request-lifecycle";
+import * as auth from "../../../server/lib/auth";
+import * as oauthProvider from "../../../server/lib/oauth-provider";
+import { createStartupReadinessGate } from "../../../server/lib/startup-readiness";
+import { authSessionStore } from "../../../server/services/auth/store";
 import { CpuProfiler, cpuProfiler } from "../../../server/services/cpu-profiler";
 
 const profile: Profiler.Profile = { nodes: [], startTime: 1, endTime: 2, samples: [] };
-const app = new Hono().route("/api/diagnostics", diagnosticsRoutes);
-app.use("/api/*", async (c) => c.json({ error: "Session required" }, 401));
-app.onError((error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: error.message }, 500));
+type App = typeof import("../../../server/app").app;
+
+function profileRequest(init: RequestInit = {}, token: string | null = "nfs_admin") {
+	const headers = new Headers(init.headers);
+	if (token) headers.set("Authorization", `Bearer ${token}`);
+	return new Request("http://localhost/api/diagnostics/cpu-profile", {
+		...init,
+		method: "POST",
+		headers,
+	});
+}
 
 afterEach(() => mock.restore());
 
@@ -50,14 +61,76 @@ class FakeSession {
 }
 
 describe("POST /api/diagnostics/cpu-profile", () => {
-	test("is mounted before authentication and returns a JSON attachment with the default duration", async () => {
+	let app: App;
+	beforeAll(async () => {
+		const previous = process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE;
+		process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE = "1";
+		try {
+			({ app } = await import("../../../server/app"));
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE;
+			else process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE = previous;
+		}
+	});
+	beforeEach(() => {
+		spyOn(auth, "verifyToken").mockImplementation(async (token) => {
+			const now = Math.floor(Date.now() / 1000);
+			const role = token === "nfs_admin" ? "admin" : "user";
+			return { sub: role, role, sid: `session-${role}`, iat: now, exp: now + 7 * 24 * 3600 };
+		});
+	});
+
+	test("is not mounted by default", async () => {
+		const home = mkdtempSync(join(tmpdir(), "cpu-profile-default-off-"));
+		try {
+			const moduleUrl = new URL("../../../server/app.ts", import.meta.url).href;
+			// The app registers routes only once per process; check its default in a fresh one.
+			const code = `
+				import assert from "node:assert/strict";
+				delete process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE;
+				const { app } = await import(${JSON.stringify(moduleUrl)});
+				assert.equal(app.routes.some(({ method, path }) =>
+					method === "POST" && path === "/api/diagnostics/cpu-profile"), false);
+				process.exit(0);
+			`;
+			await promisify(execFile)(process.execPath, ["-e", code], {
+				timeout: 10_000,
+				env: { ...process.env, NARRAFORK_HOME: home, BUN_OPTIONS: "" },
+			});
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	test("requires an admin session when enabled", async () => {
 		const capture = spyOn(cpuProfiler, "capture").mockResolvedValue(profile);
-		const source = readFileSync(new URL("../../../server/app.ts", import.meta.url), "utf8");
-		const mount = source.indexOf('app.route("/api/diagnostics", diagnosticsRoutes)');
-		expect(mount).toBeGreaterThan(0);
-		expect(mount).toBeLessThan(source.indexOf('app.use("/api/*", requireSessionAuth)'));
+		spyOn(oauthProvider, "validateAccessToken").mockResolvedValue({
+			tokenId: "test-token",
+			userId: "admin",
+			clientId: "test-client",
+			oauthClientId: "test-client-id",
+			grantId: null,
+			refreshFamilyId: null,
+			expiresAt: "2099-01-01T00:00:00.000Z",
+			scopes: [],
+		});
+		spyOn(authSessionStore, "findSessionState").mockResolvedValue({
+			id: "admin",
+			role: "admin",
+			tokenVersion: 0,
+		});
+		expect((await app.fetch(profileRequest({}, null))).status).toBe(401);
+		const oauth = await app.fetch(profileRequest({}, "oauth-admin"));
+		expect(oauth.status).toBe(401);
+		expect(await oauth.json()).toMatchObject({ code: "SESSION_REQUIRED" });
+		expect((await app.fetch(profileRequest({}, "nfs_user"))).status).toBe(403);
+		expect(capture).not.toHaveBeenCalled();
+	});
+
+	test("returns a JSON attachment with the default duration for an admin session", async () => {
+		const capture = spyOn(cpuProfiler, "capture").mockResolvedValue(profile);
 		for (const body of [undefined, "{}"]) {
-			const response = await app.request("/api/diagnostics/cpu-profile", { method: "POST", body });
+			const response = await app.fetch(profileRequest({ body }));
 			expect(response.status).toBe(200);
 			expect(response.headers.get("cache-control")).toBe("no-store");
 			expect(response.headers.get("content-type")).toContain("application/json");
@@ -69,33 +142,65 @@ describe("POST /api/diagnostics/cpu-profile", () => {
 		}
 	});
 
-	test("forwards a custom duration and request cancellation signal", async () => {
+	test("allows 1 KiB and rejects larger bodies with or without Content-Length", async () => {
 		const capture = spyOn(cpuProfiler, "capture").mockResolvedValue(profile);
-		const controller = new AbortController();
-		const response = await app.request("/api/diagnostics/cpu-profile", {
-			method: "POST",
-			body: '{"durationMs":2147483647}',
-			signal: controller.signal,
+		const body = "{}".padEnd(1024);
+		expect((await app.fetch(profileRequest({ body }))).status).toBe(200);
+		const declared = profileRequest({ body: `${body} `, headers: { "Content-Length": "1025" } });
+		expect((await app.fetch(declared)).status).toBe(413);
+		const encoder = new TextEncoder();
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(body));
+				controller.enqueue(encoder.encode(" "));
+				controller.close();
+			},
 		});
-		expect(response.status).toBe(200);
-		const [duration, signal] = capture.mock.calls[0];
-		expect(duration).toBe(2_147_483_647);
-		controller.abort();
-		expect(signal?.aborted).toBe(true);
+		expect((await app.fetch(profileRequest({ body: stream }))).status).toBe(413);
+		expect(capture).toHaveBeenCalledTimes(1);
 	});
 
-	test("rejects malformed bodies and durations outside the timer range", async () => {
+	test("rejects malformed bodies and durations above 30 seconds", async () => {
 		for (const body of [
 			"{",
 			"null",
 			"[]",
 			'{"durationMs":"1"}',
-			...[0, -1, 1.5, 2_147_483_648].map((durationMs) => JSON.stringify({ durationMs })),
+			...[0, -1, 1.5, 30_001].map((durationMs) => JSON.stringify({ durationMs })),
 		]) {
-			const response = await app.request("/api/diagnostics/cpu-profile", { method: "POST", body });
+			const response = await app.fetch(profileRequest({ body }));
 			expect(response.status).toBe(400);
 			expect(response.headers.get("cache-control")).toBe("no-store");
 		}
+	});
+
+	test("allows 30 seconds, keeps the standard HTTP timeout and stops on request cancellation", async () => {
+		const session = new FakeSession();
+		const profiler = new CpuProfiler(() => session.asSession());
+		const capture = spyOn(cpuProfiler, "capture").mockImplementation((duration, signal) =>
+			profiler.capture(duration, signal),
+		);
+		const readiness = createStartupReadinessGate();
+		readiness.settle({ ok: true });
+		const dispatch = createServerRequestDispatcher({
+			app,
+			lifecycle: createServerRequestLifecycle(),
+			startupReadiness: readiness,
+			activeDatabaseBackend: "sqlite",
+		});
+		const server = { requestIP: () => null, upgrade: () => false, timeout: mock(() => {}) };
+		const controller = new AbortController();
+		const pending = dispatch(
+			profileRequest({ body: '{"durationMs":30000}', signal: controller.signal }),
+			server,
+		);
+		await session.started.promise;
+		controller.abort();
+		expect((await pending)?.status).toBe(499);
+		expect(capture).toHaveBeenCalledWith(30_000, expect.any(AbortSignal));
+		expect(server.timeout).not.toHaveBeenCalled();
+		expect(session.stopCount()).toBe(1);
+		expect(session.disconnect).toHaveBeenCalledTimes(1);
 	});
 });
 

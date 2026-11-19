@@ -10,6 +10,7 @@ import { logger } from "../../logger";
 import { WorkerCleanupError, WorkerHandle } from "../../worker-runtime/lifecycle";
 import { type PoolWorker, WorkerPool } from "../../worker-runtime/pool";
 import {
+	assertDbReadersReady,
 	DB_READ_QUEUE_MAX_BYTES,
 	DB_READ_QUEUE_MAX_TASKS,
 	DbReadTaskOverloadedError,
@@ -21,6 +22,7 @@ import {
 	resumeDbWorkerPool,
 	runEphemeralReadTask,
 	runReadTask,
+	runTrackedEphemeralReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
 } from "../pool";
@@ -82,9 +84,9 @@ class ControlledWorker {
 	confirmExit(): void {
 		this.events.emit("exit", 0);
 	}
-	constructor() {
+	constructor(ready = true) {
 		workers.push(this);
-		queueMicrotask(() => this.emit({ type: "ready", buildId: null }));
+		if (ready) queueMicrotask(() => this.emit({ type: "ready", buildId: null }));
 	}
 	emit(data: DbWorkerOutbound): void {
 		this.events.emit("message", data);
@@ -110,6 +112,12 @@ class ControlledWorker {
 		this.current = undefined;
 		if (!this.deferExit) this.confirmExit();
 	}
+}
+
+function controlledHandle(ready = true): WorkerHandle<NodeWorker> {
+	const worker = new ControlledWorker(ready);
+	const exited = new Promise<number>((resolve) => worker.once("exit", resolve));
+	return new WorkerHandle(worker as unknown as NodeWorker, exited, () => worker.terminate());
 }
 
 async function flushUntil(condition: () => boolean): Promise<void> {
@@ -201,11 +209,7 @@ beforeEach(async () => {
 	warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
 		records.push({ message, fields: fields ?? {} });
 	});
-	spawn = spyOn(WorkerHandle, "thread").mockImplementation(() => {
-		const worker = new ControlledWorker();
-		const exited = new Promise<number>((resolve) => worker.once("exit", resolve));
-		return new WorkerHandle(worker as unknown as NodeWorker, exited, () => worker.terminate());
-	});
+	spawn = spyOn(WorkerHandle, "thread").mockImplementation(() => controlledHandle());
 	globalThis.setTimeout = ((
 		callback: (...args: unknown[]) => void,
 		delay = 0,
@@ -248,6 +252,92 @@ afterEach(async () => {
 		else process.env.NARRAFORK_DB_WORKER = previousWorker;
 		rmSync(directory, { recursive: true, force: true });
 	}
+});
+
+describe("main reader creation cooldown", () => {
+	async function tripCooldown() {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			spawn.mockImplementationOnce(() => {
+				throw new Error("controlled startup failure");
+			});
+			expect(await start().result).toMatchObject({ reason: "worker_spawn_failed" });
+		}
+		expect(getDbWorkerPoolStats()).toMatchObject({ spawnFailures: 2, disabledReason: null });
+	}
+
+	test("normal and short requests reuse eligible healthy slots while creation cools down", async () => {
+		const lower = start();
+		const healthy = start();
+		await flushUntil(() => workers.length === 2 && workers.every((worker) => worker.current));
+		lower.controller.abort();
+		expect(await lower.result).toMatchObject({ code: "DB_READ_ABORTED" });
+		await tripCooldown();
+		expect(await start().result).toMatchObject({ reason: "worker_unavailable" });
+		workers[1].finish();
+		expect(await healthy.result).toEqual({ columns: ["value"], rows: [[42]] });
+
+		for (const options of [{}, { schedulingHint: "auth-session" as const }]) {
+			const next = start(select(), options);
+			await flushUntil(() => Boolean(workers[1].current));
+			workers[1].finish();
+			expect(await next.result).toEqual({ columns: ["value"], rows: [[42]] });
+		}
+		const fresh = runTrackedEphemeralReadTask(databasePath, select());
+		expect(await failureOf(fresh.result)).toMatchObject({ reason: "worker_unavailable" });
+		await fresh.released;
+		expect(workers[1].terminated).toBe(false);
+		expect(spawn).toHaveBeenCalledTimes(4);
+	});
+
+	test.each([
+		"exit",
+		"abort",
+	])("an already ready database recovers on demand after recovery %s", async (mode) => {
+		const ready = assertDbReadersReady(databasePath);
+		await flushUntil(() => Boolean(workers[0]?.current));
+		workers[0].finish();
+		await ready;
+		await tripCooldown();
+		expect(getDbWorkerAvailability(databasePath)).toEqual({ available: true, reason: null });
+		expect(getDbReadSchedulingPressure().available).toBe(true);
+		now += 999;
+		fireDueTimers();
+		expect(await start().result).toMatchObject({ reason: "worker_unavailable" });
+		now += 1;
+		fireDueTimers();
+		expect(spawn).toHaveBeenCalledTimes(3); // No timer or readiness read spawns a worker.
+
+		spawn.mockImplementationOnce(() => controlledHandle(false));
+		const firstRecovery = start();
+		const concurrent = start();
+		await flushUntil(() => workers.length === 2);
+		expect(await concurrent.result).toMatchObject({ reason: "worker_unavailable" });
+		now += 1_000;
+		fireDueTimers();
+		expect(await start().result).toMatchObject({ reason: "worker_unavailable" });
+		expect(spawn).toHaveBeenCalledTimes(4);
+		if (mode === "abort") {
+			firstRecovery.controller.abort();
+			expect(await firstRecovery.result).toMatchObject({ code: "DB_READ_ABORTED" });
+			expect(workers[1].terminated).toBe(true);
+		} else {
+			workers[1].confirmExit();
+			expect(await firstRecovery.result).toMatchObject({ reason: "worker_spawn_failed" });
+		}
+		expect(getDbWorkerPoolStats().spawnFailures).toBe(2);
+		expect(await start().result).toMatchObject({ reason: "worker_unavailable" });
+
+		now += 1_000;
+		fireDueTimers();
+		const recovered = start();
+		await flushUntil(() => Boolean(workers[2]?.current));
+		workers[2].finish();
+		expect(await recovered.result).toEqual({ columns: ["value"], rows: [[42]] });
+		expect(getDbWorkerPoolStats().spawnFailures).toBe(0);
+		expect(getDbWorkerAvailability(databasePath)).toEqual({ available: true, reason: null });
+		await fillActive(3);
+		expect(spawn).toHaveBeenCalledTimes(7);
+	});
 });
 
 describe("main read reservations and deadlines", () => {

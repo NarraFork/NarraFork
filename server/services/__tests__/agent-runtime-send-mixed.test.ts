@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessages,
@@ -9,8 +9,11 @@ import {
 } from "../../db/schema";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
@@ -84,13 +87,13 @@ beforeEach(() => {
 	}
 	tryClaimExecution("parent-root", "run");
 });
-afterAll(() => {
+afterAll(async () => {
 	for (const id of ids) {
 		setRunHold(id, undefined);
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
-	sqlite.close();
+	await fixture.close();
 });
 function input(
 	callerNarratorId = "sender-child",
@@ -398,7 +401,7 @@ test("resume=true restarts an error-stopped child through the explicit override 
 			...input("parent-root", ["sibling-a"]),
 			resume: true,
 		});
-		expect(wake).toHaveBeenCalledWith("sibling-a", "en", { resumeStopped: ["error"] });
+		expect(wake).toHaveBeenCalledWith("sibling-a", undefined, { resumeStopped: ["error"] });
 		expect(result.targets[0]).toMatchObject({ status: "started", resumed: true });
 		expect(result.output).toContain("resumed after its failed last turn");
 	} finally {
@@ -426,30 +429,54 @@ test("resume and model require control of the target: a child cannot steer its s
 	expect(rows()).toHaveLength(0);
 });
 
-test("model switches a child before delivery and announces it to an idle page", async () => {
+test("only adopting the accepted Send applies its model, not a rejected or duplicate enqueue", async () => {
 	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
 		"test:model",
 		"test:other",
 	]);
+	const { drainAndPersistPendingInjections } = await import("../narrator-session");
+	const model = () => db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model;
+	const active = {
+		narratorId: "sibling-a",
+		locale: "en",
+		abortController: new AbortController(),
+	} as import("../narrator-session-state").ActiveNarrator;
 	try {
-		const result = await sendSubagentMessageDetailed({
-			...input("parent-root", ["sibling-a"]),
+		const before = model();
+		const invalid = input("parent-root", ["sibling-a"]);
+		const failed = await sendSubagentMessageDetailed({
+			...invalid,
+			toolUseId: `${invalid.toolUseId}-stale`,
 			model: "test:other",
 		});
+		expect(failed.targets[0]?.status).toBe("failed");
+		expect(model()).toBe(before);
+		expect(rows("sibling-a")).toHaveLength(0);
+
+		const request = input("parent-root", ["sibling-a"]);
+		const result = await sendSubagentMessageDetailed({ ...request, model: "test:other" });
 		expect(result.targets[0]).toMatchObject({ status: "queued", model: "test:other" });
-		expect(result.output).toContain("Model switched to test:other (applies from its next");
-		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
-			"test:other",
-		);
+		expect(result.output).toContain("Model test:other queued with this message");
+		const duplicate = await sendSubagentMessageDetailed({ ...request, model: "test:model" });
+		expect(duplicate.targets[0]?.model).toBeUndefined();
+		expect(model()).toBe(before);
+		expect(rows("sibling-a")).toHaveLength(1);
+
+		expect(await drainAndPersistPendingInjections(active)).toContain(request.message);
+		expect(model()).toBe("test:other");
 		expect(broadcasts).toContainEqual({
 			narratorId: "sibling-a",
 			type: "model_changed",
 			model: "test:other",
 		});
+
 		await sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "parent" });
-		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
-			"__parent__",
-		);
+		const owned: unknown[] = [];
+		await drainAndPersistPendingInjections(active, undefined, (plan) => owned.push(plan));
+		expect(owned).toEqual([{ model: "__parent__" }]);
+		expect(model()).toBe("test:other");
+		expect(await drainAndPersistPendingInjections(active)).toBeNull();
+		expect(model()).toBe("test:other");
 	} finally {
 		visible.mockRestore();
 	}

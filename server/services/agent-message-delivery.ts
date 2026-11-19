@@ -214,7 +214,6 @@ async function drainConsumptionWrites(): Promise<void> {
 			try {
 				missing = await missingConsumptionRefs(batch);
 			} catch (error) {
-				markCommunicationWorkFailed();
 				logger.warn("Agent receipt batch preflight failed; checking entries individually", {
 					error: String(error),
 				});

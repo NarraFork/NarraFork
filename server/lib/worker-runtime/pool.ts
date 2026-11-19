@@ -49,6 +49,8 @@ export interface WorkerPoolOptions<Request, Result> extends TaskQueueOptions {
 	reservedCapacity?: number;
 	/** Returns a ready worker; failed/cancelled startup must clean up anything it created. */
 	create(context: WorkerTaskContext): Promise<PoolWorker<Request, Result>>;
+	/** Classified pools can prefer an eligible live owner over a cell that would need creation. */
+	isWorkerCreationBlocked?: () => boolean;
 	/** Positive idle TTL; default 60 seconds. Idle timers never keep a process alive. */
 	idleTimeoutMs?: number;
 	/** False keeps existing one-shot isolation: every completed job closes its worker. */
@@ -107,6 +109,10 @@ function diagnosticClock(): () => number {
 export class WorkerPool<Request, Result> {
 	private readonly queue: TaskQueue;
 	private readonly create: WorkerPoolOptions<Request, Result>["create"];
+	private readonly isWorkerCreationBlocked: WorkerPoolOptions<
+		Request,
+		Result
+	>["isWorkerCreationBlocked"];
 	private readonly idleTimeoutMs: number;
 	private readonly reuse: boolean;
 	private readonly concurrency: number;
@@ -161,6 +167,7 @@ export class WorkerPool<Request, Result> {
 			normalQueue: options.normalQueue ? { ...options.normalQueue } : undefined,
 		};
 		this.create = options.create;
+		this.isWorkerCreationBlocked = options.isWorkerCreationBlocked;
 		this.concurrency = options.concurrency;
 		this.onTaskComplete = options.onTaskComplete;
 		this.reuse = options.reuse ?? true;
@@ -410,11 +417,20 @@ export class WorkerPool<Request, Result> {
 	private availableCell(taskClass: TaskClass): CapacityCell<Request, Result> | undefined {
 		const eligible = (cell: CapacityCell<Request, Result>) =>
 			!cell.claim && !cell.starting && !cell.slot?.closing && !cell.slot?.quarantined;
-		if (taskClass === "short") {
-			const reserved = this.cells?.find((cell) => cell.reserved && eligible(cell));
-			if (reserved) return reserved;
+		const find = (matches: typeof eligible) => {
+			if (taskClass === "short") {
+				const reserved = this.cells?.find((cell) => cell.reserved && matches(cell));
+				if (reserved) return reserved;
+			}
+			return this.cells?.find((cell) => !cell.reserved && matches(cell));
+		};
+		if (this.isWorkerCreationBlocked?.()) {
+			const live = find((cell) => eligible(cell) && !!cell.slot && !cell.slot.worker.closed);
+			if (live) return live;
 		}
-		return this.cells?.find((cell) => !cell.reserved && eligible(cell));
+		// Still grant an otherwise eligible empty cell; the factory can fail promptly, not queue
+		// behind a cooldown that has no timer to wake the queue.
+		return find(eligible);
 	}
 
 	private claimCell(taskClass: TaskClass): CapacityClaim<Request, Result> {
@@ -453,6 +469,9 @@ export class WorkerPool<Request, Result> {
 		this.check(context);
 		const { cell } = claim;
 		if (cell.claim?.token !== claim.token) throw new WorkerPoolError("WORKER_POOL_UNAVAILABLE");
+		// In particular, a fresh job must not retire a live owner if creation is blocked.
+		if (fresh && this.isWorkerCreationBlocked?.())
+			throw new WorkerPoolError("WORKER_POOL_UNAVAILABLE");
 		if (cell.slot) {
 			if (fresh || cell.slot.worker.closed) {
 				await this.retire(cell.slot);

@@ -903,19 +903,14 @@ describe("worker pool", () => {
 		expect(ok.pageSize).toBeGreaterThan(0);
 	}, 60_000);
 
-	test("repeated spawn failures disable the pool so callers stop paying for spawns", async () => {
+	test("repeated spawn failures do not latch pool unavailability", async () => {
 		setDbWorkerSpecifiersForTest([pathToFileURL(join(home, "no-such-worker.ts")).href]);
 		for (let attempt = 0; attempt < 2; attempt++) {
-			await expect(runReadTask(dbPath, { kind: "storageScanContext" })).rejects.toBeInstanceOf(
-				WorkersUnavailableError,
-			);
+			await expect(runReadTask(dbPath, { kind: "storageScanContext" })).rejects.toMatchObject({
+				reason: "worker_spawn_failed",
+			});
 		}
-		expect(getDbWorkerPoolStats().disabledReason).toBe("worker_unavailable");
-		// Restoring a good specifier must not resurrect the pool: only an explicit reset does.
-		setDbWorkerSpecifiersForTest(null);
-		await expect(runReadTask(dbPath, { kind: "storageScanContext" })).rejects.toBeInstanceOf(
-			WorkersUnavailableError,
-		);
+		expect(getDbWorkerPoolStats()).toMatchObject({ disabledReason: null, spawnFailures: 2 });
 	}, 60_000);
 
 	/**

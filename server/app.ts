@@ -477,13 +477,13 @@ app.route("/api/storage/export/download", exportTicketDownloadRoutes);
 // reached. Only that one path is public — the rest of /api/fs stays behind the gate.
 app.route("/api/fs", fsPublicDownloadRoutes);
 
-// On-demand local diagnostics are public and return their recording directly.
-app.route("/api/diagnostics", diagnosticsRoutes);
-
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
 app.use("/api/*", requireSessionAuth);
+if (process.env.NARRAFORK_ENABLE_HTTP_CPU_PROFILE === "1") {
+	app.route("/api/diagnostics", diagnosticsRoutes);
+}
 app.route("/api/remote-access", remoteAccessRoutes);
 
 // When git is not installed, only block routes that are known to execute git.

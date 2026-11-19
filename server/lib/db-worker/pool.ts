@@ -88,6 +88,7 @@ import {
 
 const DEFAULT_TASK_TIMEOUT_MS = 120_000;
 const MAX_SPAWN_FAILURES = 2;
+const SPAWN_COOLDOWN_MS = 1_000;
 /** Main-pool defaults; instantiated pools retain their frozen configuration. */
 export const DB_WORKER_MAX_QUEUE = DB_READ_DEFAULT_MAX_QUEUED;
 export const DB_READ_QUEUE_MAX_TASKS = DB_READ_DEFAULT_MAX_QUEUED;
@@ -183,6 +184,7 @@ interface PoolState {
 	owners: Set<ReaderOwner>;
 	requestCounter: number;
 	spawnFailures: number;
+	spawnCooldown?: { retryAt: number; recovering: boolean };
 	failureReason: string | null;
 	testSpecifiers: string[] | null;
 	closing?: Promise<void>;
@@ -314,6 +316,10 @@ function upgradeLegacy(s: PoolState): PoolState {
 			if (old.workers) old.workers.length = 0;
 			old.starting?.clear();
 			old.tracked?.clear();
+			if (next.failureReason === "worker_unavailable") {
+				next.failureReason = null;
+				next.spawnCooldown = { retryAt: Date.now() + SPAWN_COOLDOWN_MS, recovering: false };
+			}
 			next.upgrade = undefined;
 			resolveUpgrade();
 		},
@@ -384,6 +390,12 @@ function workersDisabled(compatibleEphemeral = false): string | null {
 	}
 	return s.failureReason;
 }
+
+function isSpawnBlocked(s: PoolState): boolean {
+	const cooldown = s.spawnCooldown;
+	return cooldown !== undefined && (cooldown.recovering || Date.now() < cooldown.retryAt);
+}
+
 type WorkerFailurePhase = "create" | "ready" | "run" | "message" | "close" | "dispatch";
 function logWorkerFailure(phase: WorkerFailurePhase, error: unknown): void {
 	try {
@@ -449,6 +461,11 @@ async function createReader(
 		const disabled = workersDisabled(compatibleEphemeral);
 		if (disabled) throw new WorkersUnavailableError(disabled);
 		if (request?.identity) assertReadDatabaseOpen(request.identity);
+		const recovery = compatibleEphemeral ? undefined : s.spawnCooldown;
+		if (!compatibleEphemeral && isSpawnBlocked(s))
+			throw new WorkersUnavailableError("worker_unavailable");
+		// This claim is synchronous and is only reached when a real request needs a new worker.
+		if (recovery) recovery.recovering = true;
 		let connected: Awaited<ReturnType<typeof connectCompiledWorker>>;
 		try {
 			connected = await connectCompiledWorker(workerSpecifierCandidates(), {
@@ -482,13 +499,24 @@ async function createReader(
 			if (Date.now() >= context.deadlineAt)
 				throw new DbReadTaskTimeoutError("database read task timed out before dispatch");
 			logWorkerFailure("ready", error);
-			if (!compatibleEphemeral && ++s.spawnFailures >= MAX_SPAWN_FAILURES)
-				s.failureReason = "worker_unavailable";
+			if (!compatibleEphemeral && !s.spawnCooldown && ++s.spawnFailures >= MAX_SPAWN_FAILURES)
+				s.spawnCooldown = { retryAt: Date.now() + SPAWN_COOLDOWN_MS, recovering: false };
 			throw new WorkersUnavailableError(
 				compatibleEphemeral ? "ephemeral_spawn_failed" : "worker_spawn_failed",
 			);
+		} finally {
+			if (recovery) {
+				// Even a cancelled recovery must not let traffic spin up another worker immediately.
+				recovery.retryAt = Date.now() + SPAWN_COOLDOWN_MS;
+				recovery.recovering = false;
+			}
 		}
-		if (!compatibleEphemeral) s.spawnFailures = 0;
+		// Once cooldown begins, only the elected recovery can reopen creation; a late
+		// success from a start already in flight must not unlock parallel attempts.
+		if (!compatibleEphemeral && (recovery || !s.spawnCooldown)) {
+			s.spawnFailures = 0;
+			s.spawnCooldown = undefined;
+		}
 		const reader = new ReadWorker(connected.worker, connected.handle);
 		if (request?.identity) reader.databaseIds.add(request.identity.id);
 		trackOwner(reader, context.requestId);
@@ -787,6 +815,7 @@ function runtime(compatibleEphemeral: boolean): WorkerPool<ReadRequest, unknown>
 		...(config
 			? {
 					reservedCapacity: config.reservedCapacity,
+					isWorkerCreationBlocked: () => isSpawnBlocked(s),
 					normalQueue: {
 						maxQueued: config.normalMaxQueued,
 						maxQueuedBytes: config.normalMaxQueuedBytes,
@@ -1414,6 +1443,7 @@ export function resumeDbWorkerPool(): void {
 	if (!s.permanent) s.paused = false;
 	s.failureReason = null;
 	s.spawnFailures = 0;
+	s.spawnCooldown = undefined;
 }
 export async function assertDbReadersReady(
 	dbPath: string,
@@ -1455,6 +1485,7 @@ export async function resetDbWorkerPoolForTest(): Promise<void> {
 	const s = state();
 	await shutdownDbWorkerPool();
 	s.spawnFailures = 0;
+	s.spawnCooldown = undefined;
 	s.failureReason = null;
 	s.testSpecifiers = null;
 	s.paused = false;

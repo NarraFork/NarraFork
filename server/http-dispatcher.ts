@@ -15,9 +15,9 @@ import { toDatabaseReadUnavailablePayload } from "./lib/app-error-response";
 import { verifyToken } from "./lib/auth";
 import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import {
+	type DatabaseReaderReadiness,
 	databaseReadersAvailable,
 	databaseReaderUnavailableResponse,
-	type DatabaseReaderReadiness,
 	requiresDatabaseReaders,
 } from "./lib/db-reader-readiness";
 import { AppError } from "./lib/errors";
@@ -129,11 +129,7 @@ export function createServerRequestDispatcher(options: {
 		activeDatabaseBackend,
 		databaseReaderReadiness = { state: { status: "not-required" } },
 	} = options;
-	return (
-		req: Request,
-		server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade"> &
-			Partial<Pick<Bun.Server<WSData>, "timeout">>,
-	) => {
+	return (req: Request, server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">) => {
 		if (!lifecycle.accepting) {
 			return new Response("Server is shutting down", {
 				status: 503,
@@ -143,10 +139,6 @@ export function createServerRequestDispatcher(options: {
 		const requestId = lifecycle.nextRequestId();
 		const url = new URL(req.url);
 		const pending = lifecycle.context.run(requestId, async () => {
-			if (req.method === "POST" && url.pathname === "/api/diagnostics/cpu-profile") {
-				server.timeout?.(req, 0);
-			}
-
 			// Keep liveness available while exposing whether continuation recovery is still
 			// running or has failed. Recovery is considered admitted once every continuation
 			// has been protected and mounted in the background; terminal Agent/Await and user

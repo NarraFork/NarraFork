@@ -1,7 +1,6 @@
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { ValidationError } from "../lib/errors";
-import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import {
 	type EffectiveSubagentModelPolicy,
@@ -16,6 +15,7 @@ import {
 	normalizeAutoModelValueForSave,
 } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getRunHold } from "./agent-runtime/ownership";
 import { narratorService } from "./narrator-service";
 import { updateNarratorProfileForPlugin } from "./narrator-session";
 import { activeNarrators } from "./narrator-session-state";
@@ -123,27 +123,6 @@ export async function planSubagentModelSwitch(
 	};
 }
 
-// Explicit per-request model switches (Send `model`) that the next new run must keep.
-// In memory only: a restart drops them, and the next run then re-selects normally.
-const EXPLICIT_PIN_TTL_MS = 10 * 60 * 1000;
-const explicitModelPins = hotSafe<Map<string, { model: string; expiresAt: number }>>(
-	"narrafork.subagentExplicitModelPins",
-	() => new Map(),
-);
-
-/** Record that `model` was explicitly requested for the session's next run. */
-export function markExplicitSubagentModelPin(narratorId: string, model: string): void {
-	explicitModelPins.set(narratorId, { model, expiresAt: Date.now() + EXPLICIT_PIN_TTL_MS });
-}
-
-/** One-shot: true when a still-valid explicit pin for exactly `currentModel` existed. */
-function consumeExplicitSubagentModelPin(narratorId: string, currentModel: string): boolean {
-	const pin = explicitModelPins.get(narratorId);
-	if (!pin) return false;
-	explicitModelPins.delete(narratorId);
-	return pin.expiresAt > Date.now() && pin.model === currentModel;
-}
-
 async function typePreferenceOf(
 	subagentType: string | null | undefined,
 ): Promise<string | undefined> {
@@ -176,8 +155,8 @@ export function isNewSubagentModelSelectionRun(req: {
  * the creation rule (`selectSubagentModel`) and persist through the ordinary switch.
  *
  * Kept as is: `__parent__` rows (they follow live), same provider, a provider that
- * cannot be determined on either side, a missing source, and a model explicitly
- * requested for this run. Returns whether the stored model changed. Never throws.
+ * cannot be determined on either side, or a missing source. Explicit model intents
+ * are handled by the input owner. Returns whether the stored model changed. Never throws.
  */
 export async function reselectSubagentModelForNewRun(
 	narratorId: string,
@@ -187,7 +166,6 @@ export async function reselectSubagentModelForNewRun(
 		const child = await narratorService.getById(narratorId);
 		if (child.type !== "subagent") return false;
 		const currentModel = child.model || FOLLOW_DEFAULT_MODEL;
-		if (consumeExplicitSubagentModelPin(narratorId, currentModel)) return false;
 		if (currentModel === FOLLOW_PARENT_MODEL) return false;
 		const sourceId = policySourceIdOf(child) ?? child.parentNarratorId;
 		if (!sourceId) return false;
@@ -250,4 +228,23 @@ export async function applySubagentModelSwitch(
 	// A live session announces the change itself; an idle page still shows the old pick.
 	if (!activeNarrators.get(narratorId)?.alive)
 		broadcastToNarrator(narratorId, { type: "model_changed", narratorId, model: plan.model });
+}
+
+/** Apply when the owning run adopts the Send, not when its producer enqueues it. */
+export async function applyDeliveryModelSwitch(
+	narratorId: string,
+	plan: SubagentModelSwitchPlan,
+): Promise<boolean> {
+	if (getRunHold(narratorId)) return false;
+	try {
+		await applySubagentModelSwitch(narratorId, plan);
+		return true;
+	} catch (error) {
+		// The message is already in history; a profile write failure cannot undo it.
+		logger.warn("Accepted Send model switch could not be applied", {
+			narratorId,
+			error: String(error),
+		});
+		return false;
+	}
 }

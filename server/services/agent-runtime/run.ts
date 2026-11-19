@@ -125,6 +125,8 @@ export interface StartNarratorRunRequest {
 	 * delegated session does not re-select it against its source's provider.
 	 */
 	skipModelReselect?: boolean;
+	/** Validated model from an agent message materialized for this idle wake. */
+	subagentModelSwitch?: import("../subagent-model-switch").SubagentModelSwitchPlan;
 }
 
 export interface RegisteredAgentStart {
@@ -626,6 +628,7 @@ async function executeRun(
 				"../subagent-model-switch"
 			);
 			if (
+				!req.subagentModelSwitch &&
 				isNewSubagentModelSelectionRun(req) &&
 				(await reselectSubagentModelForNewRun(id, principal))
 			)
@@ -647,6 +650,17 @@ async function executeRun(
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
+		const switchPlan = req.subagentModelSwitch;
+		if (source.type === "subagent" && switchPlan) {
+			const { applyDeliveryModelSwitch } = await import("../subagent-model-switch");
+			if (await applyDeliveryModelSwitch(id, switchPlan)) {
+				source = {
+					...source,
+					model: switchPlan.model,
+					reasoningEffort: switchPlan.reasoningEffort ?? source.reasoningEffort,
+				};
+			}
+		}
 		if (deliverTo) {
 			outputCountRunId = binding.logicalRunId;
 			const { startSubagentOutputCharCount } = await import("../narrator-event-handler");

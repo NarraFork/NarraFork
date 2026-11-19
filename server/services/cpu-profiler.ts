@@ -2,7 +2,7 @@ import { type Profiler, Session } from "node:inspector";
 import { AppError, ValidationError } from "../lib/errors";
 
 export const DEFAULT_CPU_PROFILE_DURATION_MS = 15_000;
-export const MAX_CPU_PROFILE_DURATION_MS = 2_147_483_647;
+export const MAX_CPU_PROFILE_DURATION_MS = 30_000;
 
 /** Owns only the inspector session and recording started by this service. */
 export class CpuProfiler {

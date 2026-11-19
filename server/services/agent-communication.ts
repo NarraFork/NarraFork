@@ -33,12 +33,7 @@ import {
 	resolveAgentLabel,
 	shortAgentId,
 } from "./subagent-label";
-import {
-	applySubagentModelSwitch,
-	markExplicitSubagentModelPin,
-	planSubagentModelSwitch,
-	type SubagentModelSwitchPlan,
-} from "./subagent-model-switch";
+import { planSubagentModelSwitch, type SubagentModelSwitchPlan } from "./subagent-model-switch";
 
 const TAKEN_OVER_SUBSTATUS = "taken_over";
 const isTakenOver = (narratorId: string) => !!getRunHold(narratorId);
@@ -1209,15 +1204,7 @@ export async function sendSubagentMessageDetailed(
 			const interruptTarget = input.doInterrupt && !takenOver;
 			const running = fresh.status === "working" || fresh.status === "waiting";
 			const modelPlan = modelPlans.get(fresh.id);
-			let modelNote = "";
-			if (modelPlan) {
-				await applySubagentModelSwitch(fresh.id, modelPlan);
-				// The run this Send starts (or the next one) keeps the explicit model.
-				markExplicitSubagentModelPin(fresh.id, modelPlan.model);
-				modelNote =
-					` Model switched to ${modelPlan.model}` +
-					(running ? " (applies from its next model request)." : ".");
-			}
+			const modelNote = modelPlan ? ` Model ${modelPlan.model} queued with this message.` : "";
 
 			// Prefix sibling/child-bound messages with a sender label so the recipient
 			// can tell who sent it (user-typed page messages bypass this path entirely).
@@ -1248,6 +1235,7 @@ export async function sendSubagentMessageDetailed(
 			if (running) {
 				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
 					createdBy: input.userId ?? null,
+					subagentModelSwitch: modelPlan,
 				});
 				if (enqueued.delivery.state === "cancelled" || enqueued.delivery.state === "failed")
 					throw new Error(
@@ -1264,7 +1252,7 @@ export async function sendSubagentMessageDetailed(
 						}),
 					);
 				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = modelNote + takeoverNote;
+				let interruptNote = (buffered.duplicate ? "" : modelNote) + takeoverNote;
 				let interrupted: boolean | undefined;
 				if (interruptTarget && !buffered.duplicate) {
 					interrupted = await controlRun(fresh.id, { kind: "stop" });
@@ -1282,7 +1270,7 @@ export async function sendSubagentMessageDetailed(
 					status: "queued",
 					deliveryMessageId,
 					...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),
-					...(modelPlan && { model: modelPlan.model }),
+					...(modelPlan && !buffered.duplicate && { model: modelPlan.model }),
 					interrupted,
 				});
 				await notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
@@ -1292,6 +1280,7 @@ export async function sendSubagentMessageDetailed(
 			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
 				createdBy: input.userId ?? null,
 				userId: input.userId ?? null,
+				subagentModelSwitch: modelPlan,
 			});
 			deliveryMessageId = delivery.recipientMessageId;
 			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
@@ -1333,14 +1322,14 @@ export async function sendSubagentMessageDetailed(
 					: resumeRequested
 						? `Sent to ${label}; resumed after its failed last turn and started asynchronously.`
 						: `Sent to ${label}; subagent started asynchronously.`;
-			sections.push(outcome + modelNote + takeoverNote);
+			sections.push(outcome + (accepted.status === "accepted" ? modelNote : "") + takeoverNote);
 			targetResults.push({
 				id: fresh.id,
 				label,
 				title: fresh.title,
 				status: blockedReason ? "blocked" : wakeFailed ? "queued" : "started",
 				...(blockedReason && { blockedReason }),
-				...(modelPlan && { model: modelPlan.model }),
+				...(modelPlan && accepted.status === "accepted" && { model: modelPlan.model }),
 				...(resumeRequested && !wakeFailed && { resumed: true }),
 				deliveryMessageId,
 				...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),

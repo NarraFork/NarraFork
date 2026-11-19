@@ -64,7 +64,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { selectSubagentModel } = await import("../subagent-model");
 	const {
 		isNewSubagentModelSelectionRun,
-		markExplicitSubagentModelPin,
+		applyDeliveryModelSwitch,
 		reselectSubagentModelForNewRun,
 	} = await import("../subagent-model-switch");
 
@@ -272,16 +272,14 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(writes).toEqual([]);
 		});
 
-		test("an explicit Send model is kept for the next run, once", async () => {
+		test("adopting an explicit Send model leaves no pin for a later run", async () => {
 			setPool(["provA:m1", "provB:m2"]);
 			setParent("provA:m1");
-			setChild("provB:m2");
-			markExplicitSubagentModelPin(CHILD, "provB:m2");
-			expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(false);
-			expect(writes).toEqual([]);
-			// The pin is one-shot: a later new run applies the ordinary rule.
+			setChild("provA:m1");
+			await applyDeliveryModelSwitch(CHILD, { model: "provB:m2" });
+			expect(writes[0]?.input.model).toBe("provB:m2");
 			expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(true);
-			expect(writes[0]?.input.model).toBe("provA:m1");
+			expect(writes[1]?.input.model).toBe("provA:m1");
 		});
 	});
 }
