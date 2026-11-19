@@ -391,7 +391,11 @@ if (!skipBuild && !uploadOnly) {
 	try {
 		execFileSync("bun", buildArgs, {
 			cwd: ROOT,
-			env: { ...process.env, NF_BUILD_GITHUB_REPOSITORY: githubRepository },
+			env: {
+				...process.env,
+				NF_BUILD_GITHUB_REPOSITORY: githubRepository,
+				NF_BUILD_RELEASE_CONTEXT: "1",
+			},
 			stdio: "inherit",
 			timeout: 600_000,
 		});

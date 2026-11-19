@@ -98,6 +98,23 @@ bun scripts/build-cross-platform.ts --platform=linux
 bun scripts/build-cross-platform.ts --platform=linux-arm64
 ```
 
+### 本地 alpha 服务端诊断构建
+
+正式入口 [scripts/build-cross-platform.ts](../scripts/build-cross-platform.ts) 在启动时冻结一次后端编译配置，并打印配置名称、严格校验状态、编译参数和实际命令参数数组：
+
+- 合法 SemVer 的 `alpha` 预发布版本（例如 `0.9.10-alpha.9`），在本地默认使用 `diagnostic`：`--keep-names --sourcemap --minify-syntax --minify-whitespace`。
+- 非 alpha 版本，或启用了 `CI`、`GITHUB_ACTIONS`、内部 `NF_BUILD_RELEASE_CONTEXT` 的构建，使用 `release`，保持 `--minify`。这三个环境值统一忽略首尾空白和大小写；未设置、空值、`false`、`0` 视为关闭，其余非空值视为开启。
+- [scripts/release.ts](../scripts/release.ts) 为构建子进程强制设置 `NF_BUILD_RELEASE_CONTEXT=1`，覆盖继承值。该标记用于内部发布上下文，不是公开 CLI 开关。
+- `--release-ci` 只开启严格校验（固定 Bun 版本、完整 commit、平台依赖和 sidecar 等），不选择编译配置。本地 alpha 加上该参数仍使用诊断配置；CI 和发布上下文仍使用发布配置。
+
+主入口和所有显式编译的 worker 共享同一配置。前端仍按原 Vite 配置构建，不因后端诊断配置新增公开 sourcemap，也不改变二进制 metadata schema。
+
+构建和验证使用根目录 `packageManager` 固定的 Bun **1.4.3**，先运行所选 Bun 的 `--version`，并保证子进程沿用同一可执行文件。`--compile` 隐含 production 默认行为，因此诊断能力不能仅凭移除 `--minify` 推断。[tests/scripts/build-profile.test.ts](../tests/scripts/build-profile.test.ts) 用真实 compile fixture 验证函数/类名称、主入口与 worker 原始文件行号，以及 CPU profile 中命名热函数的有效采样；运行前设置独立 `HOME`、`NARRAFORK_HOME`、`TMPDIR/TMP/TEMP` 和 `NARRAFORK_ALLOW_MULTIPLE=1`，使用固定 Bun 执行 `test --isolate ./tests/scripts/build-profile.test.ts`。
+
+普通 compile 的 sourcemap 嵌入二进制，可用于异常堆栈的源码定位；测试删除相邻源文件和 `.map` 后仍验证映射。编译器另行生成的后端 `.map` 副产物只保留在私有构建目录，不放入 `dist/frontend/` 或公开分发。嵌入 map 的诊断二进制本身也可能包含源码，应按敏感构建产物保管。
+
+需要 CPU 采样时，仅在隔离数据目录、独立 loopback 端口的有界调试进程上，通过 `BUN_OPTIONS` 临时设置 `--cpu-prof --cpu-prof-dir=<私有目录> --cpu-prof-name=<名称>.cpuprofile`，正常退出后解析结果；不把采样参数嵌入交付二进制，不增加调试端口或常驻 profiler。保留名称不保证所有匿名函数都有业务名称，嵌入 map 也不保证 Linux perf 自动解析全部 JIT 原生地址。
+
 ### fork 的默认更新仓库
 
 构建时按显式 `NF_BUILD_GITHUB_REPOSITORY=owner/repo`、可信 Actions 仓库、源码 GitHub origin 的顺序确定仓库，无法推导时才使用官方默认值。Actions 中显式值必须等于当前仓库；本地 `release.ts --target=github --github-repository=owner/repo` 会自动传递该构建身份。

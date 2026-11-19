@@ -40,6 +40,7 @@ analyze2/
 script/
 scripts/*
 !scripts/check-style-tokens.ts
+!scripts/build-alpha.ts
 !scripts/benchmark-token-repair-bulk.ts
 !scripts/benchmark-token-recalculation.ts
 !scripts/lib/
@@ -75,6 +76,7 @@ scripts/lib/*
 !scripts/lib/compiled-build.ts
 !scripts/lib/runtime-compiler.ts
 !scripts/lib/runtime-build-process.ts
+!scripts/lib/build-profile.ts
 !scripts/lib/update-index*.ts
 # Protected CI update-server bridge and immutable mirror restoration.
 !scripts/lib/update-server-bridge-*.ts

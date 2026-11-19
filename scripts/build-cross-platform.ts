@@ -17,6 +17,7 @@ import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
+import { resolveBuildProfile } from "./lib/build-profile";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
 import {
@@ -52,6 +53,12 @@ const WINDOWS_ICON_PATH = join(DIST_DIR, "narrafork.ico");
 const args = process.argv.slice(2);
 const skipFrontend = args.includes("--skip-frontend");
 const releaseCi = args.includes("--release-ci");
+// Freeze the backend profile once; --release-ci only enables strict validation.
+const BUILD_PROFILE = resolveBuildProfile(VERSION, process.env);
+console.log(
+	`Backend build profile: ${BUILD_PROFILE.name}; version: ${VERSION}; strict validation: ${releaseCi}`,
+);
+console.log(`Backend compile flags: ${BUILD_PROFILE.compileArgs.join(" ")}`);
 let commitHash = "";
 try {
 	commitHash = execSync(
@@ -141,6 +148,7 @@ if (releaseCi) {
 }
 
 async function runBuildStep(command: string[]): Promise<{ exitCode: number }> {
+	console.log(`Build command: ${JSON.stringify(command)}`);
 	if (releaseCi) {
 		await runCiBuildCommand(command, 30 * 60_000, ROOT);
 		return { exitCode: 0 };
@@ -232,7 +240,8 @@ for (const platform of selectedPlatforms) {
 		...Object.entries(runtimeBuildDefines(RUNTIME_BUILD_ID, false)).map(
 			([name, value]) => `--define=${name}=${value}`,
 		),
-		...compiledBuildArguments(),
+		...compiledBuildArguments().filter((argument) => argument !== "--minify"),
+		...BUILD_PROFILE.compileArgs,
 		"--target",
 		platform.target,
 		// Windows：面板自带 UI，编译产物不该再弹控制台；图标由
