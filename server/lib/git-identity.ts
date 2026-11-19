@@ -169,6 +169,7 @@ function loadIdentityQueryDependencies() {
  * pick" are common cases and must not re-query on every command.
  */
 const IDENTITY_CACHE_TTL_MS = 30_000;
+let identityCacheRevision = 0;
 const identityCache = new Map<string, { identity: GitIdentity | null; expiresAt: number }>();
 
 const userCacheKey = (userId: string) => `user:${userId}`;
@@ -187,6 +188,7 @@ const folderOfCache = new Map<string, { folderId: string | null; expiresAt: numb
  * a user who just fixed their name must not keep committing under the old one.
  */
 export function invalidateGitIdentityCache(userId?: string | null): void {
+	identityCacheRevision++;
 	if (!userId) {
 		identityCache.clear();
 		folderOfCache.clear();
@@ -204,6 +206,7 @@ export function invalidateGitIdentityCache(userId?: string | null): void {
 
 /** Drop cached narrator→folder lookups after any sidebar layout mutation for this user. */
 export function invalidateNarratorFolderCache(userId: string): void {
+	identityCacheRevision++;
 	const suffix = `:${userId}`;
 	for (const key of folderOfCache.keys()) {
 		if (key.endsWith(suffix)) folderOfCache.delete(key);
@@ -212,11 +215,13 @@ export function invalidateNarratorFolderCache(userId: string): void {
 
 /** Drop one user's narrated pick. Called when that pick (not their identities) changes. */
 export function invalidateNarratorGitIdentityPickCache(narratorId: string, userId: string): void {
+	identityCacheRevision++;
 	identityCache.delete(pickCacheKey(narratorId, userId));
 }
 
 /** Drop one folder's cached pick. The narrator→folder lookup itself is unaffected. */
 export function invalidateFolderGitIdentityPickCache(folderId: string, userId: string): void {
+	identityCacheRevision++;
 	identityCache.delete(folderCacheKey(folderId, userId));
 }
 
@@ -240,6 +245,7 @@ export async function resolveGitIdentityForUser(
 	const cached = identityCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) return cached.identity;
 
+	const revision = identityCacheRevision;
 	let identity: GitIdentity | null = null;
 	try {
 		identity = await fetchDefaultIdentity(userId);
@@ -250,7 +256,8 @@ export async function resolveGitIdentityForUser(
 		return null;
 	}
 
-	identityCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	if (revision === identityCacheRevision)
+		identityCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
 	return identity;
 }
 
@@ -283,8 +290,10 @@ async function cachedNarratorPick(narratorId: string, userId: string): Promise<G
 	const key = pickCacheKey(narratorId, userId);
 	const cached = identityCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) return cached.identity;
+	const revision = identityCacheRevision;
 	const picked = await fetchPickedIdentity(narratorId, userId).catch(() => null);
-	identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	if (revision === identityCacheRevision)
+		identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
 	return picked;
 }
 
@@ -292,8 +301,10 @@ async function cachedFolderPick(folderId: string, userId: string): Promise<GitId
 	const key = folderCacheKey(folderId, userId);
 	const cached = identityCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) return cached.identity;
+	const revision = identityCacheRevision;
 	const picked = await fetchFolderPick(folderId, userId).catch(() => null);
-	identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	if (revision === identityCacheRevision)
+		identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
 	return picked;
 }
 
@@ -320,8 +331,10 @@ async function cachedNarratorFolder(narratorId: string, userId: string): Promise
 	const key = folderOfCacheKey(narratorId, userId);
 	const cached = folderOfCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) return cached.folderId;
+	const revision = identityCacheRevision;
 	const folderId = await fetchNarratorFolderId(narratorId, userId).catch(() => null);
-	folderOfCache.set(key, { folderId, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	if (revision === identityCacheRevision)
+		folderOfCache.set(key, { folderId, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
 	return folderId;
 }
 

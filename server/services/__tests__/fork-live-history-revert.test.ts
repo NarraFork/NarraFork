@@ -24,7 +24,7 @@ const { claimNarratorRuntime, isNarratorRuntimeBusy } = await import("../narrato
 const { applyLocalRevertPlan, prepareLocalRevertAction } = await import(
 	"../revert-planner-local-access"
 );
-const { closeRevertBodyWorkers } = await import("../revert-selection-service");
+const { closeReadDatabase } = await import("../../lib/db-worker/pool");
 const { closeRevertManifestWorkers } = await import("../revert-transaction-worker");
 const { localBackend } = await import("../../lib/agent/execution/local-backend");
 const { writeTool } = await import("../../lib/agent/tools/write");
@@ -63,7 +63,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-	await closeRevertBodyWorkers();
+	await closeReadDatabase(db.$client.filename, { timeoutMs: 30_000 });
 	await closeRevertManifestWorkers();
 });
 

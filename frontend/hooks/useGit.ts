@@ -18,6 +18,7 @@ import {
 	type GitCommitPatch,
 } from "../../shared/git-commit-preview";
 import type { GitLineStats } from "../../shared/git-line-stats";
+import type { GitStatusPageScopeProof } from "../../shared/git-status-page";
 import type { GitWorkspaceSummary } from "../../shared/git-workspace";
 import type { GitWorkspaceSnapshot, GitWorkspaceView } from "../../shared/git-workspace-events";
 import { type ApiError, api } from "../lib/api";
@@ -153,6 +154,8 @@ const GIT_QUERY_GC_TIME_MS = 60_000;
 const GIT_WORKSPACE_RECOVERY_INTERVAL_MS = 30_000;
 export const GIT_FACT_QUERIES = [
 	"gitStatus",
+	"gitStatusPages",
+	"gitStatusPageStats",
 	"gitLineStats",
 	"gitWorkspaceSnapshot",
 	"gitModifications",
@@ -161,6 +164,9 @@ export const GIT_FACT_QUERIES = [
 	"gitStashList",
 	"gitCommitDetail",
 	"gitCommitDiff",
+	"gitStagingLists",
+	"gitStagingFiles",
+	"gitStagingDiff",
 ];
 
 /**
@@ -174,7 +180,8 @@ export const GIT_FACT_QUERIES = [
  * it themselves because a push does not move HEAD.
  */
 export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
-	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
+	(prefix) =>
+		!["gitCommitDetail", "gitCommitDiff"].includes(prefix) && !prefix.startsWith("gitStaging"),
 );
 
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
@@ -233,15 +240,26 @@ export function useGitWorkspaceSubscription(
 	target: GitTarget | null | undefined,
 	view: GitWorkspaceView = "details",
 ) {
-	const subscriptions = workspaceSubscriptions(useQueryClient());
+	const qc = useQueryClient();
+	const subscriptions = workspaceSubscriptions(qc);
+	const principal = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
 	const narratorId = target?.narratorId;
 	const workspaceKey = gitTargetKey(target);
+	const repositoryKey = target?.repositoryKey;
 	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	useEffect(() => {
-		if (REMOTE_BUILD) return;
-		if (REMOTE_BUILD || !workspaceKey || !narratorId) return;
-		return subscriptions.subscribe({ narratorId, workspaceKey, canWrite: false }, view);
-	}, [subscriptions, narratorId, workspaceKey, view]);
+		if (
+			REMOTE_BUILD ||
+			!workspaceKey ||
+			!narratorId ||
+			qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id !== principal
+		)
+			return;
+		return subscriptions.subscribe(
+			{ narratorId, workspaceKey, repositoryKey, canWrite: false },
+			view,
+		);
+	}, [subscriptions, narratorId, workspaceKey, repositoryKey, view, principal, qc]);
 	return subscriptions;
 }
 
@@ -396,7 +414,7 @@ function subscribeGitAccess(qc: QueryClient) {
 	};
 }
 
-async function readWorkspace<T>(
+export async function readWorkspace<T>(
 	qc: QueryClient,
 	target: GitTarget | null | undefined,
 	read: () => Promise<T>,
@@ -647,6 +665,7 @@ export function invalidateWorkspaceQueries(
 		for (const prefix of GIT_FACT_QUERIES) {
 			if (
 				prefix === "gitWorkspaceSnapshot" ||
+				prefix.startsWith("gitStaging") ||
 				(pushed && ["gitStatus", "gitLineStats"].includes(prefix))
 			)
 				continue;
@@ -675,13 +694,10 @@ export function invalidateGitStatusPushQueries(
 		if (workspace?.workspaceKey) keys.add(workspace.workspaceKey);
 	}
 	for (const key of keys) {
-		for (const prefix of GIT_LIVE_FACT_QUERIES) {
-			if (
-				prefix === "gitWorkspaceSnapshot" ||
-				(gitWorkspaceSubscriptions.get(qc)?.owns(key) &&
-					["gitStatus", "gitLineStats"].includes(prefix))
-			)
-				continue;
+		// This unversioned message only describes the narrator header. Verified
+		// workspace changes own pages, diffs, history and changelist invalidation.
+		if (gitWorkspaceSubscriptions.get(qc)?.owns(key)) continue;
+		for (const prefix of ["gitStatus", "gitLineStats"]) {
 			void qc.invalidateQueries({ queryKey: [prefix, key] });
 		}
 	}
@@ -986,21 +1002,27 @@ function useGitMutation<T, R>(
 }
 
 export function useGitStage(target: GitTarget) {
-	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
-		api.gitStage(target, body),
+	return useGitMutation(
+		target,
+		(body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof }) =>
+			api.gitStage(target, body),
 	);
 }
 export function useGitUnstage(target: GitTarget) {
-	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
-		api.gitUnstage(target, body),
+	return useGitMutation(
+		target,
+		(body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof }) =>
+			api.gitUnstage(target, body),
 	);
 }
 export function useGitCommit(target: GitTarget) {
 	return useGitMutation(target, (message: string) => api.gitCommit(target, message));
 }
 export function useGitDiscard(target: GitTarget) {
-	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
-		api.gitDiscard(target, body),
+	return useGitMutation(
+		target,
+		(body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof }) =>
+			api.gitDiscard(target, body),
 	);
 }
 export function useGitStash(target: GitTarget) {

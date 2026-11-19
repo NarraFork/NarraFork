@@ -24,6 +24,7 @@ import {
 	diffRowAtOffset,
 	diffRowBodyTop,
 	diffRowTarget,
+	diffVisualLineAtColumn,
 	estimatedDiffRowTop,
 	layoutDiffRows,
 	sliceDiffFragments,
@@ -34,6 +35,7 @@ import { findVisibleRange, spacerHeights } from "@shared/pretext-layout/vlist-vi
 import {
 	Fragment,
 	memo,
+	type ReactNode,
 	useLayoutEffect,
 	useMemo,
 	useRef,
@@ -43,6 +45,18 @@ import {
 import { useTranslation } from "react-i18next";
 import { useContentViewport } from "../scroll/AutoFollowScroll";
 import { DiffWordTokens } from "./DiffWordTokens";
+
+/** Optional Git-owned controls. Row indexes refer to the supplied, unwindowed lines. */
+export interface DiffLineOperations {
+	width: number;
+	render: (lineIndex: number) => ReactNode;
+	selected?: ReadonlySet<number>;
+	/** Stable identities let a retained preview recover its reading position. */
+	keys?: ReadonlyMap<number, string>;
+	/** Only these full diff indexes host controls; identities can cover whole units. */
+	anchors?: ReadonlySet<number>;
+	minHeight?: number;
+}
 
 export interface DiffContentProps {
 	document?: DiffDocument;
@@ -57,6 +71,7 @@ export interface DiffContentProps {
 	/** Initial inner width, including gutter, excluding the host's padding. */
 	contentWidth?: number;
 	onNearBottom?: () => void;
+	lineOperations?: DiffLineOperations;
 }
 
 const EMPTY_LINES: readonly DiffLine[] = [];
@@ -68,6 +83,7 @@ interface ReadingAnchor {
 	row: number;
 	column: number;
 	pixelOffset: number;
+	key?: string;
 }
 
 interface Frame {
@@ -75,6 +91,7 @@ interface Frame {
 	lines: readonly DiffLine[];
 	projection: DiffProjection | null;
 	layout: DiffRowsLayout;
+	lineKeys?: ReadonlyMap<number, string>;
 }
 
 interface View {
@@ -111,6 +128,7 @@ function readAnchor(frame: Frame, top: number, preferred?: "old" | "new"): Readi
 		row,
 		column: position.column,
 		pixelOffset: position.pixelOffset,
+		key: frame.lineKeys?.get(row),
 	};
 }
 
@@ -121,6 +139,14 @@ function anchorTop(
 	let row = Math.min(anchor.row, Math.max(0, frame.layout.totalRows - 1));
 	let column = anchor.column;
 	let loss: DiffProjection["anchorLossReason"] = null;
+	if (anchor.key && frame.lineKeys) {
+		for (const [index, key] of frame.lineKeys) {
+			if (key === anchor.key) {
+				row = index;
+				break;
+			}
+		}
+	}
 	if (frame.document && anchor.point) {
 		const resolved = resolveDiffSourcePoint(frame.document, anchor.point);
 		row = resolved.row;
@@ -131,9 +157,13 @@ function anchorTop(
 	}
 	if (!frame.layout.totalRows || loss === "epoch" || loss === "side") return { top: 0, loss };
 	const target = diffRowTarget(frame.layout, row - frame.layout.startRow, column);
-	const pixelOffset = loss
-		? 0
-		: Math.min(frame.layout.typography.lineHeight - 1, anchor.pixelOffset);
+	const rowLayout = frame.layout.rows[row - frame.layout.startRow];
+	const visual = rowLayout ? diffVisualLineAtColumn(rowLayout, column) : -1;
+	const anchorHeight =
+		rowLayout && visual === rowLayout.visualLines.length - 1
+			? rowLayout.height - visual * frame.layout.typography.lineHeight
+			: frame.layout.typography.lineHeight;
+	const pixelOffset = loss ? 0 : Math.min(anchorHeight - 1, anchor.pixelOffset);
 	return {
 		top: Math.max(0, (target?.top ?? estimatedDiffRowTop(frame.layout, row, true)) + pixelOffset),
 		loss,
@@ -169,6 +199,10 @@ const DiffLineRow = memo(function DiffLineRow({
 	viewportHeight,
 	overscan,
 	focus,
+	operations,
+	operationWidth,
+	selected,
+	lineIndex,
 }: {
 	line: DiffLine;
 	rowLayout: DiffRowLayout;
@@ -183,6 +217,10 @@ const DiffLineRow = memo(function DiffLineRow({
 	viewportHeight: number;
 	overscan: number;
 	focus: boolean;
+	operations?: ReactNode;
+	operationWidth: number;
+	selected?: boolean;
+	lineIndex: number;
 }) {
 	const start = Math.max(0, Math.floor((viewportTop - overscan - top) / lineHeight));
 	const end = Math.min(
@@ -198,12 +236,15 @@ const DiffLineRow = memo(function DiffLineRow({
 	return (
 		<div
 			data-diff-row={line.type}
+			data-diff-line-index={lineIndex}
+			data-diff-selected={selected || undefined}
 			data-diff-focus={focus || undefined}
 			data-diff-source-line={pointOf(line)?.line}
 			data-diff-source-side={pointOf(line)?.side}
 			style={{
 				position: "relative",
 				height: rowLayout.height,
+				boxShadow: selected ? "inset 0 0 0 1px var(--mantine-primary-color-filled)" : undefined,
 				backgroundColor:
 					line.type === "removed"
 						? colors.removedLine
@@ -212,12 +253,26 @@ const DiffLineRow = memo(function DiffLineRow({
 							: undefined,
 			}}
 		>
+			{operations ? (
+				<div
+					data-diff-line-operations
+					style={{
+						position: "sticky",
+						left: 0,
+						width: operationWidth,
+						height: 0,
+						zIndex: 2,
+					}}
+				>
+					{operations}
+				</div>
+			) : null}
 			<span
 				data-diff-gutter="true"
 				style={{
 					position: "absolute",
 					top: 0,
-					left: 0,
+					left: operationWidth,
 					width: gutterWidth,
 					userSelect: "none",
 					opacity: 0.6,
@@ -237,7 +292,7 @@ const DiffLineRow = memo(function DiffLineRow({
 						data-diff-visual-line={start + offset}
 						style={{
 							position: "absolute",
-							left: gutterWidth,
+							left: gutterWidth + operationWidth,
 							top: (start + offset) * lineHeight,
 							height: lineHeight,
 							whiteSpace: "pre",
@@ -280,6 +335,7 @@ export const DiffContent = memo(function DiffContent({
 	gutterMinWidth,
 	contentWidth,
 	onNearBottom,
+	lineOperations,
 }: DiffContentProps) {
 	const viewport = useContentViewport();
 	if (!viewport) throw new Error("DiffContent requires an AutoFollowScroll viewport");
@@ -296,6 +352,14 @@ export const DiffContent = memo(function DiffContent({
 	const { t } = useTranslation("narrator");
 	const dark = useSharedComputedColorScheme("dark") !== "light";
 	const colors = useMemo(() => palette(dark), [dark]);
+	const operationWidth = lineOperations?.width ?? 0;
+	const rowMinHeights = useMemo(
+		() =>
+			lineOperations?.anchors && lineOperations.minHeight
+				? new Map([...lineOperations.anchors].map((row) => [row, lineOperations.minHeight ?? 0]))
+				: undefined,
+		[lineOperations?.anchors, lineOperations?.minHeight],
+	);
 	const typographyRevision = useSyncExternalStore(
 		onTypographyChange,
 		getTypographyRevision,
@@ -404,10 +468,12 @@ export const DiffContent = memo(function DiffContent({
 			document: diffDocument,
 			lines,
 			projection: selected,
+			lineKeys: lineOperations?.keys,
 			layout: layoutDiffRows(
 				ready ? lines : EMPTY_LINES,
 				{
-					contentWidth: Math.max(1, width),
+					contentWidth: Math.max(1, width - operationWidth),
+					rowMinHeights,
 					wordWrap,
 					lineNoWidth,
 					startRow: ready ? startRow : 0,
@@ -422,6 +488,9 @@ export const DiffContent = memo(function DiffContent({
 			lines,
 			selected,
 			width,
+			operationWidth,
+			lineOperations?.keys,
+			rowMinHeights,
 			ready,
 			wordWrap,
 			lineNoWidth,
@@ -508,7 +577,10 @@ export const DiffContent = memo(function DiffContent({
 		const previous = current.current;
 		const anchor = reading.current;
 		current.current = frame;
-		setContentSize({ width: frame.layout.maxWidth, height: frame.layout.totalHeight });
+		setContentSize({
+			width: frame.layout.maxWidth + operationWidth,
+			height: frame.layout.totalHeight,
+		});
 		let target: { top: number; bottom: number } | null = null;
 		if (frame.document && focus) {
 			const resolved = resolveDiffSourcePoint(frame.document, focus);
@@ -557,6 +629,7 @@ export const DiffContent = memo(function DiffContent({
 		notifyLayout,
 		getSnapshot,
 		setContentSize,
+		operationWidth,
 		height,
 		ready,
 	]);
@@ -589,8 +662,8 @@ export const DiffContent = memo(function DiffContent({
 				position: "relative",
 				// CSS-owned entries bootstrap with one intrinsic line, never guessed viewport dimensions.
 				height: ready ? undefined : frame.layout.typography.lineHeight,
-				width: ready ? frame.layout.maxWidth : undefined,
-				minWidth: wordWrap ? 0 : frame.layout.maxWidth,
+				width: ready ? frame.layout.maxWidth + operationWidth : undefined,
+				minWidth: wordWrap ? 0 : frame.layout.maxWidth + operationWidth,
 				font: frame.layout.typography.font,
 				lineHeight: `${frame.layout.typography.lineHeight}px`,
 				letterSpacing: frame.layout.typography.letterSpacing,
@@ -638,11 +711,15 @@ export const DiffContent = memo(function DiffContent({
 									borderTop: "1px solid var(--nf-diff-hunk-line)",
 									borderBottom: "1px solid var(--nf-diff-hunk-line)",
 									userSelect: "none",
-									paddingLeft: frame.layout.gutterWidth,
+									paddingLeft: frame.layout.gutterWidth + operationWidth,
 								}}
 							>{`@@ ${hunk.range} @@${hunk.heading ? ` ${hunk.heading}` : ""}`}</div>
 						) : null}
 						<DiffLineRow
+							operations={lineOperations?.render(startRow + index)}
+							operationWidth={operationWidth}
+							selected={lineOperations?.selected?.has(startRow + index)}
+							lineIndex={startRow + index}
 							line={line}
 							rowLayout={rowLayout}
 							tokens={tokens}

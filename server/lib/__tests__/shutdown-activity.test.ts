@@ -107,10 +107,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
 		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
 		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
-		const cleanupEnd = shutdown.indexOf(
-			'await shutdownStep(tracker, "vnetUdpRendezvous.stop"',
-			cleanupStart,
-		);
+		const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
 		expect(prepareStart).toBeGreaterThanOrEqual(0);
 		expect(prepareEnd).toBeGreaterThan(prepareStart);
 		expect(cleanupStart).toBeGreaterThan(prepareEnd);
@@ -121,8 +118,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const calls: unknown[] = [];
 		const close = new Function(
 			"options",
-			"tracker",
-			"shutdownStep",
+			"step",
 			"prepareSignalRestartRecovery",
 			"markUpdateRestarting",
 			"killAllBashProcesses",
@@ -130,8 +126,7 @@ describe("main shutdown wiring without booting the server", () => {
 		);
 		await close(
 			{ reason: "signal" },
-			new ShutdownActivityTracker(),
-			async (_tracker: unknown, label: string, action: () => Promise<unknown>) => {
+			async (label: string, action: () => Promise<unknown>) => {
 				await action();
 				return label === "restartRecovery.prepare" ? outcome : "ok";
 			},
@@ -156,6 +151,12 @@ describe("main shutdown wiring without booting the server", () => {
 		const pg = position("postgresRuntime.close");
 		expect(shutdown).toContain("shutdownDbWorkerPool({ permanent: true })");
 		expect(shutdown).toContain("closePrefixSnapshotStore({ permanent: true })");
+		expect(position("databaseWork.drain")).toBeLessThan(db);
+		expect(shutdown).toContain("drainDbWorkerPool({ deadlineAt: readerDeadlineAt })");
+		expect(shutdown).not.toContain("closeRevertBodyWorkers");
+		expect(shutdown.match(/"dbWorkerPool.shutdown"/g)).toHaveLength(1);
+		expect(shutdown.match(/"prefixSnapshots.close"/g)).toHaveLength(1);
+		expect(shutdown.match(/"postgresRuntime.close"/g)).toHaveLength(1);
 		for (const owner of [
 			"pluginManager.shutdown",
 			"mcpManager.shutdown",
@@ -239,7 +240,6 @@ describe("main shutdown wiring without booting the server", () => {
 	test("real compute close promises are awaited together and failures degrade shutdown", () => {
 		for (const close of [
 			"owner.closeRevertManifestWorkers()",
-			"owner.closeRevertBodyWorkers()",
 			"owner.closeRevertRewriteWorkers()",
 			"owner.closeSharePreviewHtmlWorkers()",
 			"owner.closeRequestJsonWorkers()",

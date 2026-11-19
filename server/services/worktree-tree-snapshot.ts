@@ -68,6 +68,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { GIT_STAGING_EXCLUDE_PATHSPEC, isGitStagingInternalPath } from "./git-staging-files";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import {
 	legacyTreeSnapshotKey,
@@ -610,6 +611,7 @@ async function syncExcludes(
 	// silently dropped.
 	parts.push("/.git/\n");
 	parts.push(`/${WORKTREES_DIR_NAME}/\n`);
+	if (existsSync(resolve(worktreePath, ".git"))) parts.push("/.narrafork/git-staging/\n");
 	await writeShadowMetadata(dir, "exclude", parts.join("\n"), signal, beforeWrite);
 	await writeShadowAttributes(dir, signal, beforeWrite);
 }
@@ -1352,6 +1354,34 @@ async function captureUnlocked(
  * `add -A` records its removal (verified), so the force-add is only ever needed to
  * *introduce* an entry.
  */
+async function assertSnapshotStagingUntracked(worktreePath: string) {
+	const internal = await safeSpawn({
+		cmd: [
+			"git",
+			"--no-optional-locks",
+			"ls-files",
+			"-z",
+			"--",
+			":(top,literal).narrafork/git-staging",
+		],
+		cwd: worktreePath,
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: 16_384,
+		env: { ...process.env, LC_ALL: "C" },
+	});
+	if (
+		internal.exitCode !== 0 ||
+		internal.stdoutTruncated ||
+		internal.stderrTruncated ||
+		internal.stderr.trim()
+	)
+		throw new TreeSnapshotError("snapshot internal staging-path coverage could not be verified");
+	if (internal.stdout)
+		throw new TreeSnapshotError(
+			"The reserved .narrafork/git-staging path contains tracked user files; resolve this explicitly without untracking them automatically",
+		);
+}
+
 async function addAllUnlocked(
 	dir: string,
 	worktreePath: string,
@@ -1359,7 +1389,35 @@ async function addAllUnlocked(
 	signal?: AbortSignal,
 ): Promise<GitResult> {
 	const addArgs = ["add", "-A", "--no-warn-embedded-repo"];
-	const added = await runGit(addArgs, dir, worktreePath, gitTimeoutMs, signal);
+	const excludeStaging = existsSync(resolve(worktreePath, ".git"));
+	if (excludeStaging) {
+		const indexKey = realIndexIdentity(worktreePath);
+		if (indexKey === null || trackedIgnoredCache.get(dir)?.indexKey !== indexKey)
+			await assertSnapshotStagingUntracked(worktreePath);
+		const removed = await runGit(
+			[
+				"rm",
+				"--cached",
+				"-r",
+				"--force",
+				"--ignore-unmatch",
+				"--",
+				":(top,literal).narrafork/git-staging",
+			],
+			dir,
+			worktreePath,
+			gitTimeoutMs,
+			signal,
+		);
+		if (removed.exitCode !== 0) return removed;
+	}
+	const added = await runGit(
+		excludeStaging ? [...addArgs, "--", ":/", GIT_STAGING_EXCLUDE_PATHSPEC] : addArgs,
+		dir,
+		worktreePath,
+		gitTimeoutMs,
+		signal,
+	);
 	// Never retry with --ignore-errors: a skipped path is unknown, not absent.
 	// Publishing that index as a tree would report the path as deleted.
 	if (added.exitCode !== 0) return added;
@@ -1374,7 +1432,13 @@ async function addAllUnlocked(
 		const forced = await trackedButIgnoredPaths(dir, worktreePath);
 		for (const batch of batchArgs(forced)) {
 			const result = await runGit(
-				[...addArgs, "--force", "--", ...batch],
+				[
+					...addArgs,
+					"--force",
+					"--",
+					...batch,
+					...(excludeStaging ? [GIT_STAGING_EXCLUDE_PATHSPEC] : []),
+				],
 				dir,
 				worktreePath,
 				gitTimeoutMs,
@@ -1423,6 +1487,8 @@ async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promis
 	const cached = trackedIgnoredCache.get(dir);
 	if (indexKey !== null && cached?.indexKey === indexKey) return [];
 
+	if (existsSync(resolve(worktreePath, ".git"))) await assertSnapshotStagingUntracked(worktreePath);
+
 	const result = await safeSpawn({
 		cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
 		cwd: worktreePath,
@@ -1442,7 +1508,10 @@ async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promis
 	if (result.stderr.trim()) {
 		throw new TreeSnapshotError(`snapshot tracked path coverage is incomplete: ${result.stderr}`);
 	}
-	const paths = result.stdout.split("\0").filter(Boolean);
+	const excludeStaging = existsSync(resolve(worktreePath, ".git"));
+	const paths = result.stdout
+		.split("\0")
+		.filter((path) => path && !(excludeStaging && isGitStagingInternalPath(path)));
 	if (paths.length > MAX_TRACKED_IGNORED_PATHS) {
 		throw new TreeSnapshotError("snapshot tracked path count exceeded the size limit");
 	}

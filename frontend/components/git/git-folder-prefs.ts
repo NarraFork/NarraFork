@@ -70,13 +70,39 @@ export function parseFolderPrefs(raw: string | null): GitFolderPrefs {
 	return result;
 }
 
+/** Keep expansion intent on every real ancestor, including legacy compact-row records. */
+export function normalizeExpandedPaths(paths: Iterable<string>): Set<string> {
+	const expanded = new Set<string>();
+	for (let path of paths) {
+		while (path && !expanded.has(path)) {
+			expanded.add(path);
+			// Git always uses '/'; a backslash can be part of a POSIX directory name.
+			const separator = path.lastIndexOf("/");
+			if (separator < 0) break;
+			path = path.slice(0, separator);
+		}
+	}
+	return expanded;
+}
+
+/** Opening a compact path opens its ancestors; closing a folder closes its subtree. */
+export function toggleExpandedPath(paths: Iterable<string>, path: string): Set<string> {
+	const expanded = normalizeExpandedPaths(paths);
+	if (!expanded.has(path)) return normalizeExpandedPaths([...expanded, path]);
+	const prefix = `${path}/`;
+	for (const entry of expanded) {
+		if (entry === path || entry.startsWith(prefix)) expanded.delete(entry);
+	}
+	return expanded;
+}
+
 /** Expanded paths for one workspace+section. Absent workspace → nothing expanded. */
 export function readExpanded(
 	prefs: GitFolderPrefs,
 	scopeKey: string,
 	section: GitFolderSection,
 ): Set<string> {
-	return new Set(prefs[scopeKey]?.[section] ?? []);
+	return normalizeExpandedPaths(prefs[scopeKey]?.[section] ?? []);
 }
 
 /**
@@ -92,7 +118,6 @@ export function toggleExpanded(
 	path: string,
 ): GitFolderPrefs {
 	const existing = prefs[scopeKey] ?? { staged: [], unstaged: [] };
-	const current = existing[section];
-	const next = current.includes(path) ? current.filter((p) => p !== path) : [...current, path];
+	const next = [...toggleExpandedPath(existing[section], path)];
 	return { ...prefs, [scopeKey]: { ...existing, [section]: next } };
 }

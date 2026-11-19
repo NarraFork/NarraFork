@@ -13,7 +13,7 @@
  *     each other's pick, and would make one user's choice visible to the other.
  */
 
-import { db } from "@server/db";
+import { activeDatabaseBackend, db } from "@server/db";
 import {
 	folderGitIdentityBindings,
 	narratorGitIdentityBindings,
@@ -21,6 +21,7 @@ import {
 	userRecentTabs,
 	users,
 } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	invalidateFolderGitIdentityPickCache,
@@ -142,21 +143,24 @@ export async function updateLegacyGitIdentityProfile(
 
 /** A user's identities, default first and then oldest first. */
 export async function listUserGitIdentities(userId: string): Promise<GitIdentityRecord[]> {
-	const rows = await db
-		.select({
-			id: userGitIdentities.id,
-			name: userGitIdentities.name,
-			email: userGitIdentities.email,
-			isDefault: userGitIdentities.isDefault,
-			createdAt: userGitIdentities.createdAt,
-		})
-		.from(userGitIdentities)
-		.where(eq(userGitIdentities.userId, userId))
-		.orderBy(
-			desc(userGitIdentities.isDefault),
-			asc(userGitIdentities.createdAt),
-			asc(userGitIdentities.id),
-		);
+	const rows = await readQuery(
+		db
+			.select({
+				id: userGitIdentities.id,
+				name: userGitIdentities.name,
+				email: userGitIdentities.email,
+				isDefault: userGitIdentities.isDefault,
+				createdAt: userGitIdentities.createdAt,
+			})
+			.from(userGitIdentities)
+			.where(eq(userGitIdentities.userId, userId))
+			.orderBy(
+				desc(userGitIdentities.isDefault),
+				asc(userGitIdentities.createdAt),
+				asc(userGitIdentities.id),
+			),
+		{ executionPolicy: "worker-required", maxRows: 10000 },
+	);
 	return rows;
 }
 
@@ -287,16 +291,19 @@ export async function getNarratorGitIdentityPick(
 	userId: string,
 	narratorId: string,
 ): Promise<string | null> {
-	const row = await db
-		.select({ identityId: narratorGitIdentityBindings.identityId })
-		.from(narratorGitIdentityBindings)
-		.where(
-			and(
-				eq(narratorGitIdentityBindings.narratorId, narratorId),
-				eq(narratorGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const row = await readQuery(
+		db
+			.select({ identityId: narratorGitIdentityBindings.identityId })
+			.from(narratorGitIdentityBindings)
+			.where(
+				and(
+					eq(narratorGitIdentityBindings.narratorId, narratorId),
+					eq(narratorGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return row[0]?.identityId ?? null;
 }
 
@@ -323,35 +330,67 @@ export async function setNarratorGitIdentityPick(
 		invalidateNarratorGitIdentityPickCache(narratorId, userId);
 		return;
 	}
-	const owned = await db
-		.select({ id: userGitIdentities.id })
-		.from(userGitIdentities)
-		.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
-		.limit(1);
+	const owned = await readQuery(
+		db
+			.select({ id: userGitIdentities.id })
+			.from(userGitIdentities)
+			.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (owned.length === 0) throw new NotFoundError("Git identity", identityId);
 	const updatedAt = nowIso();
-	await db
-		.insert(narratorGitIdentityBindings)
-		.values({ id: generateId(), narratorId, userId, identityId, updatedAt })
-		.onConflictDoUpdate({
-			target: [narratorGitIdentityBindings.narratorId, narratorGitIdentityBindings.userId],
-			set: { identityId, updatedAt },
+	if (activeDatabaseBackend === "postgres") {
+		await db.transaction(async (tx) => {
+			const [current] = await tx
+				.select({ id: userGitIdentities.id })
+				.from(userGitIdentities)
+				.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+				.limit(1);
+			if (!current) throw new NotFoundError("Git identity", identityId);
+			await tx
+				.insert(narratorGitIdentityBindings)
+				.values({ id: generateId(), narratorId, userId, identityId, updatedAt })
+				.onConflictDoUpdate({
+					target: [narratorGitIdentityBindings.narratorId, narratorGitIdentityBindings.userId],
+					set: { identityId, updatedAt },
+				});
+		});
+	} else
+		db.transaction((tx) => {
+			const current = tx
+				.select({ id: userGitIdentities.id })
+				.from(userGitIdentities)
+				.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+				.limit(1)
+				.get();
+			if (!current) throw new NotFoundError("Git identity", identityId);
+			tx.insert(narratorGitIdentityBindings)
+				.values({ id: generateId(), narratorId, userId, identityId, updatedAt })
+				.onConflictDoUpdate({
+					target: [narratorGitIdentityBindings.narratorId, narratorGitIdentityBindings.userId],
+					set: { identityId, updatedAt },
+				})
+				.run();
 		});
 	invalidateNarratorGitIdentityPickCache(narratorId, userId);
 }
 
 async function assertFolderOwned(userId: string, folderId: string): Promise<void> {
-	const folder = await db
-		.select({ id: userRecentTabs.id })
-		.from(userRecentTabs)
-		.where(
-			and(
-				eq(userRecentTabs.userId, userId),
-				eq(userRecentTabs.type, "folder"),
-				eq(userRecentTabs.entityId, folderId),
-			),
-		)
-		.limit(1);
+	const folder = await readQuery(
+		db
+			.select({ id: userRecentTabs.id })
+			.from(userRecentTabs)
+			.where(
+				and(
+					eq(userRecentTabs.userId, userId),
+					eq(userRecentTabs.type, "folder"),
+					eq(userRecentTabs.entityId, folderId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (folder.length === 0) throw new NotFoundError("Sidebar folder", folderId);
 }
 
@@ -361,16 +400,19 @@ export async function getFolderGitIdentityPick(
 	folderId: string,
 ): Promise<string | null> {
 	await assertFolderOwned(userId, folderId);
-	const row = await db
-		.select({ identityId: folderGitIdentityBindings.identityId })
-		.from(folderGitIdentityBindings)
-		.where(
-			and(
-				eq(folderGitIdentityBindings.folderId, folderId),
-				eq(folderGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const row = await readQuery(
+		db
+			.select({ identityId: folderGitIdentityBindings.identityId })
+			.from(folderGitIdentityBindings)
+			.where(
+				and(
+					eq(folderGitIdentityBindings.folderId, folderId),
+					eq(folderGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return row[0]?.identityId ?? null;
 }
 
@@ -398,11 +440,14 @@ export async function setFolderGitIdentityPick(
 		invalidateFolderGitIdentityPickCache(folderId, userId);
 		return;
 	}
-	const owned = await db
-		.select({ id: userGitIdentities.id })
-		.from(userGitIdentities)
-		.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
-		.limit(1);
+	const owned = await readQuery(
+		db
+			.select({ id: userGitIdentities.id })
+			.from(userGitIdentities)
+			.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (owned.length === 0) throw new NotFoundError("Git identity", identityId);
 	const updatedAt = nowIso();
 	await db

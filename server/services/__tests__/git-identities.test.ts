@@ -8,13 +8,16 @@
  *      commit inherits the host git config (the original behaviour).
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+beforeAll(() => workerFixture.ready);
+mock.module("../../db", () => ({ activeDatabaseBackend: "sqlite", db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
 	getNarratorPresenceBatch: () => new Map(),
@@ -81,9 +84,9 @@ beforeEach(async () => {
 	narratorId = await makeNarrator();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	invalidateGitIdentityCache();
-	sqlite.close();
+	await workerFixture.close();
 });
 
 describe("legacy profile compatibility", () => {

@@ -1409,7 +1409,7 @@ const realDelivery: OutlineAnswerDelivery = {
 					.limit(1)
 					.get();
 				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
-				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq)) return false;
+				if (ref && (await assistantReplyFollowsAnswer(narratorId, ref.seq))) return false;
 				return await wakeIdleAfterDelivery(narratorId, "en", executionPrincipal);
 			},
 			// Its own question ("did the session reply after it"): a later team row's deferral

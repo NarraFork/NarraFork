@@ -17,6 +17,7 @@ import {
 	users,
 	worktreeTreeSnapshots,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { normalizePathForComparison } from "../../lib/platform-path";
@@ -693,26 +694,31 @@ describe("local historical tree fallback", () => {
 			const retained = await Promise.all(
 				["HEAD", "config", "index"].map((name) => readFile(join(fixture.legacy, name))),
 			);
-			let snapshotQueries = 0;
-			const prepare = sqlite.prepare.bind(sqlite);
-			const queries = spyOn(sqlite, "prepare").mockImplementation(
-				(...args: Parameters<typeof sqlite.prepare>) => {
-					if (args[0].includes('"worktree_tree_snapshots"')) snapshotQueries++;
-					return prepare(...args);
-				},
-			);
+			const queries = spyOn(workerRead, "readQuery");
+			const snapshotQueries = () =>
+				queries.mock.calls.filter(([query]) =>
+					query.toSQL().sql.includes('"worktree_tree_snapshots"'),
+				);
 			try {
 				const direct = await preview(fixture.owner.id, fixture.call);
 				expect(direct.source).toBe("tree");
 				expect(direct.before).toEqual({ status: "available", content: "v1 before\n" });
 				expect(direct.after).toEqual({ status: "available", content: "v1 after\n" });
-				expect(snapshotQueries).toBe(1);
+				expect(snapshotQueries()).toHaveLength(1);
+				expect(snapshotQueries()[0]?.[1]).toMatchObject({
+					executionPolicy: "worker-required",
+					maxRows: 4,
+				});
 				const response = await appFor(fixture.owner.ownerUserId).request(
 					url(fixture.owner.id, fixture.call),
 				);
 				expect(response.status).toBe(200);
 				expect(await response.json()).toEqual(direct);
-				expect(snapshotQueries).toBe(2);
+				expect(snapshotQueries()).toHaveLength(2);
+				expect(snapshotQueries()[1]?.[1]).toMatchObject({
+					executionPolicy: "worker-required",
+					maxRows: 4,
+				});
 				queries.mockRestore();
 				expect(
 					db

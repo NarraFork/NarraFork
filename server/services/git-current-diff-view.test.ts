@@ -292,6 +292,7 @@ describe("current Git targets matched against recorded writes", () => {
 		expect(partial.byFile[0]?.worktree.actor?.kind).toBe("human");
 	});
 
+	// Budget for four bounded views and their worker/Git process IO.
 	test("commit, discard and same-second commit+write never reuse a time boundary", async () => {
 		await aiWrite("first after\n");
 		const changed = await view();
@@ -314,7 +315,7 @@ describe("current Git targets matched against recorded writes", () => {
 		expect(again.version).not.toBe(clean.version);
 		await git("restore", "--", "a.txt");
 		expect((await view()).clean).toBe(true);
-	});
+	}, 20_000);
 
 	test("known external observations veto equal-byte matches; unobserved equal bytes do not prove continuity", async () => {
 		await aiWrite("matching bytes\n");

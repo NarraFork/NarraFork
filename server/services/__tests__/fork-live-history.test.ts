@@ -3,7 +3,8 @@ import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { testEnvironment } from "../../../tests/preload";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
 import {
 	backgroundTasks,
 	narratorBlocks,
@@ -13,10 +14,9 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../../db/schema";
+import { closeReadDatabase } from "../../lib/db-worker/pool";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+// Use preload's isolated file database so fork reads retain their Worker requirement.
 // Preserve the existing service -> persistence import order across their cycle.
 const { narratorService } = await import("../narrator-service");
 const {
@@ -131,9 +131,9 @@ beforeEach(() => {
 	seedNarrator();
 });
 afterEach(() => activeNarrators.delete("source"));
-afterAll(() => {
-	mock.module("../../db", () => realDbModule);
+afterAll(async () => {
 	mock.restore();
+	await closeReadDatabase(sqlite.filename, { timeoutMs: 30_000 });
 	cleanDb(sqlite);
 });
 

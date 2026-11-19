@@ -141,12 +141,16 @@ async function inRunStartedBy<T>(
 let delivered: Array<{ narratorId: string; messageId: string; content: string }> = [];
 
 /** Wakes the real delivery asks for, recorded instead of starting the session. */
-function fakeWakes(started: boolean): Array<{ narratorId: string; userId: string | null }> {
+function fakeWakes(
+	started: boolean,
+	onWake?: () => void,
+): Array<{ narratorId: string; userId: string | null }> {
 	const wakes: Array<{ narratorId: string; userId: string | null }> = [];
 	setInjectionScheduler({
 		requestSoftStop: () => false,
 		wakeIfIdle: async (narratorId, _locale, principal) => {
 			wakes.push({ narratorId, userId: principal?.userId ?? null });
+			onWake?.();
 			return { started };
 		},
 	});
@@ -725,7 +729,8 @@ describe("telling", () => {
 			for (let i = 0; i < OUTLINE_TEAM_WAKE_LIMITS.perWindow; i++)
 				expect(takeTeamWake(w.a)).toBe(true);
 			setOutlineAnswerDelivery(null);
-			const wakes = fakeWakes(true);
+			const wake = Promise.withResolvers<void>();
+			const wakes = fakeWakes(true, wake.resolve);
 			const done = await answerOutlineQuestions({
 				userId: w.alice.id,
 				answers: [{ blockId: q, adopt: true }],
@@ -774,8 +779,7 @@ describe("telling", () => {
 				timer.done = true;
 				timer.fn();
 			}
-			for (let i = 0; i < 50 && wakes.length === 0; i++)
-				await new Promise<void>((resolve) => setImmediate(resolve));
+			await wake.promise;
 			expect(wakes).toEqual([{ narratorId: w.a, userId: w.alice.id }]);
 			expect(hasDeferredTeamWake(w.a)).toBe(false);
 		} finally {

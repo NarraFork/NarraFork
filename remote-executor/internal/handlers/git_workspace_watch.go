@@ -15,9 +15,10 @@ func gitWatchFingerprint(value string) string {
 }
 
 // gitWorkspaceWatch adds four commands to the shared root/helper/HEAD checks,
-// regardless of how many files Git reports. It never reads file contents or
-// runs per-file diffs. All subprocesses share the request deadline and byte cap.
-func (h *Handlers) gitWorkspaceWatch(g *workspaceGit, head string) (any, error) {
+// regardless of how many files Git reports. Worktree files use metadata only;
+// no per-file diffs are spawned.
+// All subprocesses share the request deadline and byte cap.
+func (h *Handlers) gitWorkspaceWatch(g *workspaceGit, head string) (result any, resultErr error) {
 	// HEAD and its symbolic name have an independent small metadata budget:
 	// large worktree output must never make log identity uncertain.
 	budget := g.remaining
@@ -30,7 +31,7 @@ func (h *Handlers) gitWorkspaceWatch(g *workspaceGit, head string) (any, error) 
 		return nil, fmt.Errorf("Git symbolic HEAD exceeds metadata budget")
 	}
 	g.remaining = budget
-	status, _, err := g.runNUL("status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status, _, err := g.runNUL("--no-literal-pathspecs", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".", stagingExcludeSpec())
 	if err != nil {
 		return nil, err
 	}

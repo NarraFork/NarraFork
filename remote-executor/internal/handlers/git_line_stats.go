@@ -256,21 +256,21 @@ func (h *Handlers) untrackedLineCount(g *workspaceGit, path string, remaining *i
 func (h *Handlers) gitWorkspaceLineStats(g *workspaceGit, maxBytes int64) (any, error) {
 	files := make(map[string]*gitLineStatsFile)
 	order := []string{}
-	staged, stagedCut, err := g.runLineStatsNUL(30000, "diff", "--cached", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--")
+	staged, stagedCut, err := g.runLineStatsNUL(30000, "--no-literal-pathspecs", "diff", "--cached", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--", ".", stagingExcludeSpec())
 	if err != nil {
 		return nil, err
 	}
 	if err = parseLineStatsNumstat(staged, true, stagedCut, files, &order); err != nil {
 		return nil, err
 	}
-	unstaged, unstagedCut, err := g.runLineStatsNUL(30000, "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--")
+	unstaged, unstagedCut, err := g.runLineStatsNUL(30000, "--no-literal-pathspecs", "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--", ".", stagingExcludeSpec())
 	if err != nil {
 		return nil, err
 	}
 	if err = parseLineStatsNumstat(unstaged, false, unstagedCut, files, &order); err != nil {
 		return nil, err
 	}
-	untracked, untrackedCut, err := g.runLineStatsNUL(gitLineStatsUntrackedFiles, "ls-files", "--others", "--exclude-standard", "-z", "--")
+	untracked, untrackedCut, err := g.runLineStatsNUL(gitLineStatsUntrackedFiles, "--no-literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", ".", stagingExcludeSpec())
 	if err != nil {
 		return nil, err
 	}

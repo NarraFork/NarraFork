@@ -88,6 +88,11 @@ export const ERROR_CATALOG = {
 		code: "INTERNAL_ERROR",
 		en: "Internal server error",
 	},
+	DATABASE_READ_UNAVAILABLE: {
+		status: 503,
+		code: "DB_READ_UNAVAILABLE",
+		en: "Database reads are temporarily unavailable. Please try again later.",
+	},
 
 	// --- retired features ------------------------------------------------------
 	TUTORIAL_REMOVED: {
@@ -214,6 +219,11 @@ export const ERROR_CATALOG = {
 		status: 401,
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
+	},
+	GIT_REQUEST_CANCELLED: {
+		status: 499,
+		code: "GIT_REQUEST_CANCELLED",
+		en: "Git request was cancelled",
 	},
 
 	// --- auth / session --------------------------------------------------------

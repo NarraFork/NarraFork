@@ -18,6 +18,8 @@ export interface WorkerTaskContext {
 export interface WorkerTaskOptions extends TaskQueueAdmission {
 	/** Reuse an existing RPC ID, never a message/connection's business identity. */
 	requestId?: string;
+	/** Create a new owner for this job and await its real exit afterwards, within this pool's quota. */
+	fresh?: boolean;
 }
 
 /** Fixed, payload-free summary. Close time includes the domain's drain/ACK and actual exit. */

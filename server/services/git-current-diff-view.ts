@@ -9,7 +9,7 @@ import {
 	fileChangeStatesEqual,
 	hasSettledMeasuredFileEffect,
 } from "../../shared/file-change-protocol";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import {
 	fileAttributions,
 	fileChangeBlobs,
@@ -17,6 +17,7 @@ import {
 	fileChangeOperations,
 	fileChangeScopes,
 } from "../db/schema";
+import { readDomainTask, readQuery, readQueryFirst } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
@@ -104,27 +105,29 @@ function incarnation(source: string, root: string, object?: string): string {
 		digest.update(`${Buffer.byteLength(part)}:`).update(part);
 	return digest.digest("hex");
 }
-function scopeFor(baseline: CurrentGitBaseline) {
+async function scopeFor(baseline: CurrentGitBaseline, signal?: AbortSignal) {
 	if (!baseline.sourceInstanceId) return undefined;
-	return db
-		.select()
-		.from(fileChangeScopes)
-		.where(
-			and(
-				eq(fileChangeScopes.sourceInstanceId, baseline.sourceInstanceId),
-				eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
-				eq(fileChangeScopes.canonicalRoot, baseline.canonicalRoot),
-				inArray(fileChangeScopes.workspaceInstanceId, [
-					incarnation(baseline.sourceInstanceId, baseline.canonicalRoot),
-					incarnation(baseline.sourceInstanceId, baseline.canonicalRoot, baseline.rootIdentity),
-				]),
-			),
-		)
-		.orderBy(desc(fileChangeScopes.updatedAt), desc(fileChangeScopes.id))
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select()
+			.from(fileChangeScopes)
+			.where(
+				and(
+					eq(fileChangeScopes.sourceInstanceId, baseline.sourceInstanceId),
+					eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
+					eq(fileChangeScopes.canonicalRoot, baseline.canonicalRoot),
+					inArray(fileChangeScopes.workspaceInstanceId, [
+						incarnation(baseline.sourceInstanceId, baseline.canonicalRoot),
+						incarnation(baseline.sourceInstanceId, baseline.canonicalRoot, baseline.rootIdentity),
+					]),
+				),
+			)
+			.orderBy(desc(fileChangeScopes.updatedAt), desc(fileChangeScopes.id))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, signal },
+	);
 }
-function scopeVersion(scope: ReturnType<typeof scopeFor>): string {
+function scopeVersion(scope: Awaited<ReturnType<typeof scopeFor>>): string {
 	return hash(scope ? [scope.id, scope.sourceInstanceId, scope.workspaceInstanceId] : null);
 }
 function target(
@@ -199,59 +202,66 @@ type Candidate = {
 	subagentType: string | null;
 	updatedAt: string;
 };
-function candidate(
+async function candidate(
 	id: string,
-	scope: NonNullable<ReturnType<typeof scopeFor>>,
+	scope: NonNullable<Awaited<ReturnType<typeof scopeFor>>>,
 	file: CurrentFileBaseline,
-): Candidate | undefined {
+	signal?: AbortSignal,
+): Promise<Candidate | undefined> {
 	// Every selected JSON field is independently bounded before SQLite returns it.
-	const row = db
-		.select()
-		.from(fileChangeEffects)
-		.where(
-			and(
-				eq(fileChangeEffects.id, id),
-				sql`length(cast(${fileChangeEffects.identityJson} as blob)) <= ${METADATA_BYTES}`,
-				sql`length(cast(${fileChangeEffects.beforeStateJson} as blob)) <= ${METADATA_BYTES}`,
-				sql`length(cast(${fileChangeEffects.intendedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
-				sql`length(cast(${fileChangeEffects.observedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
-				sql`(${fileChangeEffects.executionReceiptJson} IS NULL OR length(cast(${fileChangeEffects.executionReceiptJson} as blob)) <= ${METADATA_BYTES})`,
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(fileChangeEffects)
+			.where(
+				and(
+					eq(fileChangeEffects.id, id),
+					sql`length(cast(${fileChangeEffects.identityJson} as blob)) <= ${METADATA_BYTES}`,
+					sql`length(cast(${fileChangeEffects.beforeStateJson} as blob)) <= ${METADATA_BYTES}`,
+					sql`length(cast(${fileChangeEffects.intendedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
+					sql`length(cast(${fileChangeEffects.observedAfterStateJson} as blob)) <= ${METADATA_BYTES}`,
+					sql`(${fileChangeEffects.executionReceiptJson} IS NULL OR length(cast(${fileChangeEffects.executionReceiptJson} as blob)) <= ${METADATA_BYTES})`,
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, signal },
+	);
 	if (!row) return undefined;
-	const operation = db
-		.select({
-			id: fileChangeOperations.id,
-			attempt: fileChangeOperations.attempt,
-			source: fileChangeOperations.sourceInstanceId,
-			kind: fileChangeOperations.sourceKind,
-			actor: fileChangeOperations.actorJson,
-			coverage: fileChangeOperations.coverage,
-			settlement: fileChangeOperations.settlement,
-		})
-		.from(fileChangeOperations)
-		.where(
-			and(
-				eq(fileChangeOperations.id, row.operationId),
-				sql`length(cast(${fileChangeOperations.actorJson} as blob)) <= ${METADATA_BYTES}`,
-			),
-		)
-		.limit(1)
-		.get();
-	const projection = db
-		.select({
-			action: fileAttributions.action,
-			operationId: fileAttributions.operationId,
-			scopeId: fileAttributions.scopeId,
-			fileKey: fileAttributions.fileKey,
-			subagentType: fileAttributions.subagentType,
-		})
-		.from(fileAttributions)
-		.where(eq(fileAttributions.effectId, row.id))
-		.limit(1)
-		.get();
+	const operation = await readQueryFirst(
+		db
+			.select({
+				id: fileChangeOperations.id,
+				attempt: fileChangeOperations.attempt,
+				source: fileChangeOperations.sourceInstanceId,
+				kind: fileChangeOperations.sourceKind,
+				actor: fileChangeOperations.actorJson,
+				coverage: fileChangeOperations.coverage,
+				settlement: fileChangeOperations.settlement,
+			})
+			.from(fileChangeOperations)
+			.where(
+				and(
+					eq(fileChangeOperations.id, row.operationId),
+					sql`length(cast(${fileChangeOperations.actorJson} as blob)) <= ${METADATA_BYTES}`,
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, signal },
+	);
+	const projection = await readQueryFirst(
+		db
+			.select({
+				action: fileAttributions.action,
+				operationId: fileAttributions.operationId,
+				scopeId: fileAttributions.scopeId,
+				fileKey: fileAttributions.fileKey,
+				subagentType: fileAttributions.subagentType,
+			})
+			.from(fileAttributions)
+			.where(eq(fileAttributions.effectId, row.id))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, signal },
+	);
 	if (
 		!operation ||
 		operation.source !== scope.sourceInstanceId ||
@@ -311,12 +321,14 @@ function candidate(
 	)
 		return undefined;
 	for (const ref of rawRefs(effect)) {
-		const blob = db
-			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
-			.from(fileChangeBlobs)
-			.where(eq(fileChangeBlobs.digest, ref.digest))
-			.limit(1)
-			.get();
+		const blob = await readQueryFirst(
+			db
+				.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+				.from(fileChangeBlobs)
+				.where(eq(fileChangeBlobs.digest, ref.digest))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!blob || blob.status !== "ready" || blob.size !== ref.sizeBytes) return undefined;
 	}
 	return {
@@ -335,27 +347,29 @@ function matches(effect: FileChangeEffect, state: FileChangeState, index: boolea
 	);
 }
 
-function readObservations(canonicalRoot: string, filePath: string) {
-	return db
-		.select({
-			id: fileAttributions.id,
-			rowId: sql<number>`${fileAttributions}.rowid`,
-			effectId: fileAttributions.effectId,
-			action: fileAttributions.action,
-			grade: fileAttributions.attributionGrade,
-			changedAt: fileAttributions.changedAt,
-		})
-		.from(fileAttributions)
-		.where(
-			and(
-				eq(fileAttributions.deviceId, LOCAL_DEVICE_ID),
-				eq(fileAttributions.workspacePath, canonicalRoot),
-				eq(fileAttributions.filePath, filePath),
-			),
-		)
-		.orderBy(desc(fileAttributions.changedAt), sql`${fileAttributions}.rowid desc`)
-		.limit(EFFECT_WINDOW + 1)
-		.all();
+async function readObservations(canonicalRoot: string, filePath: string, signal?: AbortSignal) {
+	return readQuery(
+		db
+			.select({
+				id: fileAttributions.id,
+				rowId: sql<number>`${fileAttributions}.rowid`,
+				effectId: fileAttributions.effectId,
+				action: fileAttributions.action,
+				grade: fileAttributions.attributionGrade,
+				changedAt: fileAttributions.changedAt,
+			})
+			.from(fileAttributions)
+			.where(
+				and(
+					eq(fileAttributions.deviceId, LOCAL_DEVICE_ID),
+					eq(fileAttributions.workspacePath, canonicalRoot),
+					eq(fileAttributions.filePath, filePath),
+				),
+			)
+			.orderBy(desc(fileAttributions.changedAt), sql`${fileAttributions}.rowid desc`)
+			.limit(EFFECT_WINDOW + 1),
+		{ executionPolicy: "worker-required", maxRows: EFFECT_WINDOW + 1, signal },
+	);
 }
 
 /** No cache/TTL and no timestamp-based baseline: current targets are fingerprinted twice. */
@@ -380,7 +394,18 @@ export async function getGitCurrentDiffView(
 			privateRoot,
 			signal,
 		);
-		const scope = scopeFor(before);
+		const evidenceSnapshot =
+			activeDatabaseBackend === "sqlite"
+				? await readDomainTask(
+						db.$client,
+						"gitCurrentDiffEvidence",
+						{ baseline: before },
+						{ executionPolicy: "worker-required", signal },
+					)
+				: null;
+		const scope = evidenceSnapshot
+			? (evidenceSnapshot.scope ?? undefined)
+			: await scopeFor(before, signal);
 		const scopeStamp = scopeVersion(scope);
 		const version = hash([before.version, scopeStamp]);
 		const byFile: CurrentDiffFile[] = [];
@@ -425,26 +450,35 @@ export async function getGitCurrentDiffView(
 				objectRole: "referent",
 			});
 			const fileKey = fileChangeIdentityKey(identity);
-			const summaries = db
-				.select({
-					id: fileChangeEffects.id,
-					digest: fileChangeEffects.observedAfterBlobDigest,
-					revision: fileChangeEffects.scopeRevision,
-					journalSeq: fileChangeEffects.journalSeq,
-					settlement: fileChangeEffects.settlement,
-					confirmed: fileChangeEffects.executionConfirmed,
-					grade: fileChangeEffects.attributionGrade,
-					phase: fileChangeEffects.phase,
-				})
-				.from(fileChangeEffects)
-				.where(and(eq(fileChangeEffects.scopeId, scope.id), eq(fileChangeEffects.fileKey, fileKey)))
-				.orderBy(
-					desc(fileChangeEffects.journalSeq),
-					desc(fileChangeEffects.scopeRevision),
-					desc(fileChangeEffects.id),
-				)
-				.limit(EFFECT_WINDOW + 1)
-				.all();
+			const fileEvidence = evidenceSnapshot?.files.find(
+				(entry) => entry.filePath === file.filePath,
+			);
+			const summaries =
+				fileEvidence?.summaries ??
+				(await readQuery(
+					db
+						.select({
+							id: fileChangeEffects.id,
+							digest: fileChangeEffects.observedAfterBlobDigest,
+							revision: fileChangeEffects.scopeRevision,
+							journalSeq: fileChangeEffects.journalSeq,
+							settlement: fileChangeEffects.settlement,
+							confirmed: fileChangeEffects.executionConfirmed,
+							grade: fileChangeEffects.attributionGrade,
+							phase: fileChangeEffects.phase,
+						})
+						.from(fileChangeEffects)
+						.where(
+							and(eq(fileChangeEffects.scopeId, scope.id), eq(fileChangeEffects.fileKey, fileKey)),
+						)
+						.orderBy(
+							desc(fileChangeEffects.journalSeq),
+							desc(fileChangeEffects.scopeRevision),
+							desc(fileChangeEffects.id),
+						)
+						.limit(EFFECT_WINDOW + 1),
+					{ executionPolicy: "worker-required", maxRows: EFFECT_WINDOW + 1, signal },
+				));
 			// Conservative until an exact indexed v2 projection replaces this bounded sample.
 			if (summaries.length > EFFECT_WINDOW) {
 				for (const result of [entry.index, entry.worktree])
@@ -473,7 +507,9 @@ export async function getGitCurrentDiffView(
 					if (result.status !== "clean") result.reason = "unverified_effect";
 				continue;
 			}
-			const observations = readObservations(before.canonicalRoot, file.filePath);
+			const observations =
+				fileEvidence?.observations ??
+				(await readObservations(before.canonicalRoot, file.filePath, signal));
 			observationVersions.set(file.filePath, hash(observations));
 			// The entire observation set must fit the budget. Within that set rowid is
 			// insertion order (not execution proof); changedAt only expands the tie group.
@@ -511,7 +547,9 @@ export async function getGitCurrentDiffView(
 					result.reason = summaries.length ? "state_mismatch" : "no_evidence";
 					continue;
 				}
-				const evidence = candidate(summary.id, scope, file);
+				const evidence = fileEvidence
+					? fileEvidence.candidates.find((item) => item.effect.id === summary.id)
+					: await candidate(summary.id, scope, file, signal);
 				if (!evidence) {
 					result.reason = "unverified_effect";
 					continue;
@@ -558,12 +596,16 @@ export async function getGitCurrentDiffView(
 			privateRoot,
 			signal,
 		);
-		const observationsChanged = [...observationVersions].some(
-			([path, stamp]) => hash(readObservations(after.canonicalRoot, path)) !== stamp,
-		);
+		let observationsChanged = false;
+		for (const [path, stamp] of observationVersions) {
+			if (hash(await readObservations(after.canonicalRoot, path, signal)) !== stamp) {
+				observationsChanged = true;
+				break;
+			}
+		}
 		if (
 			after.version !== before.version ||
-			scopeVersion(scopeFor(after)) !== scopeStamp ||
+			scopeVersion(await scopeFor(after, signal)) !== scopeStamp ||
 			observationsChanged
 		)
 			return empty(

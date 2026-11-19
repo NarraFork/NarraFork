@@ -162,7 +162,9 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"services/editor-document-stream-worker.ts": ["services/editor-document-streams.ts"],
 	"services/outline/edit-text-worker.ts": ["services/outline/edit-text-runner.ts"],
 	"services/git-untracked-line-worker.ts": ["services/git-line-stats.ts"],
+	"services/git-status-page-worker.ts": ["services/git-status-page.ts"],
 	"services/git-current-baseline-worker.ts": ["services/git-current-baseline.ts"],
+	"services/git-staging-worker.ts": ["services/git-staging-lists-service.ts"],
 	"services/agent-runtime/model-history-worker.ts": [
 		"services/agent-runtime/model-history-source.ts",
 	],
@@ -171,11 +173,6 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"services/token-recalculation-worker.ts": ["services/token-recalculation-worker-client.ts"],
 };
 const evalOwners = [
-	{
-		kind: "Body",
-		owners: ["services/revert-selection-service.ts"],
-		marker: "connectCompiledWorker([BODY_WORKER]",
-	},
 	{
 		kind: "Rewrite",
 		owners: ["services/revert-history-commit.ts"],
@@ -242,7 +239,7 @@ test("all 30 families have explicit common-runtime coverage: 19 entries, 6 trust
 		expect(text.includes(marker), `${kind}: ${marker}`).toBe(true);
 		expect(admission.test(text), `${kind}: admission`).toBe(true);
 		expect(text.includes("inlineFallback"), kind).toBe(false);
-		if (kind === "Body" || kind === "Rewrite" || kind === "historical-input")
+		if (kind === "Rewrite" || kind === "historical-input")
 			expect(/\beval:\s*true/.test(text), `${kind}: trusted eval`).toBe(true);
 		else expect(text.includes("URL.createObjectURL"), `${kind}: trusted Blob`).toBe(true);
 	}
@@ -254,6 +251,24 @@ test("all 30 families have explicit common-runtime coverage: 19 entries, 6 trust
 		expect(admission.test(text), `${kind}: admission`).toBe(true);
 		expect(text.includes("inlineFallback"), kind).toBe(false);
 	}
+});
+
+test("revert body reads and batch verification are dispatched through the shared database worker", () => {
+	const service = ownerText(["services/revert-selection-service.ts"]);
+	const registry = ownerText(["lib/db-worker/domain-task-registry.ts"]);
+	for (const [task, reader] of [
+		["revertSelectionBody", "readRevertSelectionBody"],
+		["revertSelectionBodyVerify", "readRevertSelectionBodyVerify"],
+	]) {
+		expect(service).toMatch(
+			new RegExp(`readDomainTask\\([^;]*"${task}"[^;]*executionPolicy:\\s*"worker-required"`),
+		);
+		expect(registry).toContain(`${task}: async`);
+		expect(registry).toContain(reader);
+	}
+	expect(service).not.toMatch(/\breadRevertSelectionBody(?:Verify)?\s*\(/);
+	expect(ownerText(["db/worker-read.ts"])).toMatch(/\brunReadTask\s*\(/);
+	expect(ownerText(["lib/db-worker/worker-entry.ts"])).toMatch(/\brunDomainRead\s*\(/);
 });
 
 test("special worker process launchers keep native spawn centralized or wrapped, not a broad process exemption", () => {

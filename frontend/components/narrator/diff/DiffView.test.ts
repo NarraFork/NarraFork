@@ -37,6 +37,32 @@ describe("DiffView explicit viewport layout", () => {
 		);
 	});
 
+	test("forwards optional row actions and exact selected ranges without enabling defaults", () => {
+		const lines = [
+			{ type: "removed" as const, content: "old", oldLineNo: 1 },
+			{ type: "added" as const, content: "new", newLineNo: 1 },
+		];
+		const viewport = renderViewport({
+			lines,
+			layout: { width: 320, height: 120 },
+			lineOperations: {
+				width: 84,
+				selected: new Set([1]),
+				render: (index) =>
+					index === 0
+						? createElement("button", { type: "button", "aria-label": "Move exact unit" }, "Move")
+						: null,
+			},
+		});
+		expect(viewport.querySelectorAll("[data-diff-line-operations]")).toHaveLength(1);
+		expect(
+			viewport.querySelector("[data-diff-selected]")?.getAttribute("data-diff-line-index"),
+		).toBe("1");
+		const ordinary = renderViewport({ lines, layout: { width: 320, height: 120 } });
+		expect(ordinary.querySelector("[data-diff-line-operations]")).toBeNull();
+		expect(ordinary.querySelector("[data-diff-selected]")).toBeNull();
+	});
+
 	test("does not invent a layout from a Git-style maxHeight", () => {
 		const viewport = renderViewport({ maxHeight: 500 });
 		expect(viewport.getAttribute("data-content-geometry")).toBe("dom");

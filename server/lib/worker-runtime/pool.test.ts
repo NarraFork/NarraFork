@@ -114,6 +114,93 @@ describe("WorkerPool reuse and admission", () => {
 		expect(pool.stats).toMatchObject({ active: 0, workers: 1, idle: 1, created: 1, reused: 1 });
 	});
 
+	test("fresh jobs replace an idle owner and close their own owner before returning", async () => {
+		const fixture = setup();
+		expect(await fixture.pool.run(1)).toBe("1:1");
+		expect(await fixture.pool.run(2, { fresh: true })).toBe("2:2");
+		expect(fixture.workers.map((worker) => worker.stopped)).toEqual([true, true]);
+		expect(fixture.pool.stats).toMatchObject({ active: 0, workers: 0, reused: 0 });
+		expect(await fixture.pool.run(3)).toBe("3:3");
+		expect(await fixture.pool.run(4)).toBe("3:4");
+		expect(fixture.createCalls).toBe(3);
+	});
+
+	test("fresh replacement and completion retain one native slot until each real exit", async () => {
+		const priorExit = gate();
+		const freshExit = gate();
+		const freshCloseStarted = gate();
+		const fixture = setup({
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1) worker.onClose = () => priorExit.promise;
+				if (id === 2)
+					worker.onClose = () => {
+						freshCloseStarted.open();
+						return freshExit.promise;
+					};
+				return worker;
+			},
+		});
+		await fixture.pool.run(1);
+		const fresh = observed(fixture.pool.run(2, { fresh: true }));
+		await fixture.workers[0]?.closeStarted.promise;
+		const queued = observed(fixture.pool.run(3));
+		expect(fixture.createCalls).toBe(1);
+		expect(fixture.pool.stats).toMatchObject({ active: 1, workers: 1, retiring: 1, queued: 1 });
+		priorExit.open();
+		await freshCloseStarted.promise;
+		expect(fixture.createCalls).toBe(2);
+		expect(fixture.pool.stats).toMatchObject({ active: 1, workers: 1, retiring: 1, queued: 1 });
+		freshExit.open();
+		expect(await fresh).toBe("2:2");
+		expect(await queued).toBe("3:3");
+		expect(fixture.pool.stats).toMatchObject({ active: 0, queued: 0, workers: 1 });
+	});
+
+	test.each([
+		"create",
+		"run",
+	] as const)("fresh cancellation during %s drains before releasing capacity", async (phase) => {
+		const entered = gate();
+		const ready = gate();
+		const exit = gate();
+		const closeStarted = gate();
+		const fixture = setup({
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1) {
+					worker.onClose = () => {
+						closeStarted.open();
+						return exit.promise;
+					};
+					if (phase === "create") {
+						entered.open();
+						await ready.promise;
+					} else
+						worker.onRun = async (_request, context) => {
+							entered.open();
+							return aborted(context.signal);
+						};
+				}
+				return worker;
+			},
+		});
+		const controller = new AbortController();
+		const pending = observed(fixture.pool.run(1, { fresh: true, signal: controller.signal }));
+		await entered.promise;
+		controller.abort();
+		ready.open();
+		await closeStarted.promise;
+		const queued = observed(fixture.pool.run(2));
+		expect(fixture.createCalls).toBe(1);
+		expect(fixture.pool.stats).toMatchObject({ active: 1, workers: 1, retiring: 1, queued: 1 });
+		exit.open();
+		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		expect(await queued).toBe("2:2");
+		expect(fixture.workers[0]?.stopped).toBe(true);
+		expect(fixture.pool.stats).toMatchObject({ active: 0, queued: 0, starting: 0, workers: 1 });
+	});
+
 	test("concurrent jobs claim different workers and a third job waits", async () => {
 		const entered = [gate(), gate()];
 		const finish = gate();

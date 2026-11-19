@@ -167,7 +167,7 @@ describe("collectRevertBlockers", () => {
 	});
 
 	for (const status of ["initializing", "pending", "running"] as const)
-		test(`historical ${status} copies are not live tools, but an explicit new attempt is`, () => {
+		test(`historical ${status} copies are not live tools, but an explicit new attempt is`, async () => {
 			const timestamp = now();
 			const originId = generateId();
 			const copyId = generateId();
@@ -195,8 +195,8 @@ describe("collectRevertBlockers", () => {
 					},
 				])
 				.run();
-			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
-			expect(collectRevertBlockers(ids.other)).toEqual([
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
+			expect(await collectRevertBlockers(ids.other)).toEqual([
 				{
 					kind: "running_tool",
 					toolCallId: originId,
@@ -218,7 +218,7 @@ describe("collectRevertBlockers", () => {
 					createdAt: timestamp,
 				})
 				.run();
-			expect(collectRevertBlockers(ids.narrator)).toEqual([
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([
 				{
 					kind: "running_tool",
 					toolCallId: retryId,

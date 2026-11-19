@@ -19,6 +19,7 @@ import {
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
@@ -43,6 +44,7 @@ import {
 	pendingDangerReflections,
 	pendingPermissions,
 	withNarratorMutationAdmission,
+	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
 import { syncNarratorProjectLinksSafely } from "./project-index";
@@ -50,6 +52,15 @@ import { transitionWorkspaceContext, workspaceConflict } from "./workspace-conte
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
 const writingRepositories = hotSafe("narrafork.workspaceRepositoryWrites", () => new Set<string>());
+const parallelRevisionWrites = hotSafe(
+	"narrafork.workspaceParallelRevisionWrites",
+	() => new Map<string, number>(),
+);
+
+function assertNoParallelRevisionWrites(id: string): void {
+	if (parallelRevisionWrites.has(id))
+		throw workspaceConflict("ChangeList writes are in progress", "WORKSPACE_CONTEXT_BUSY");
+}
 
 /** Repository common-dir identity, shared across linked worktrees. */
 export async function withWorkspaceRepositoryLock<T>(
@@ -89,21 +100,24 @@ export interface WorkspaceSwitchOptions {
 }
 
 async function loadWorkspaceRow(id: string) {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: {
-			id: true,
-			cwd: true,
-			workspaceRevision: true,
-			workspaceContext: true,
-			workspaceDirectories: true,
-			defaultDeviceId: true,
-			contextProjectId: true,
-			variant: true,
-			traits: true,
-			status: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: {
+				id: true,
+				cwd: true,
+				workspaceRevision: true,
+				workspaceContext: true,
+				workspaceDirectories: true,
+				defaultDeviceId: true,
+				contextProjectId: true,
+				variant: true,
+				traits: true,
+				status: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Narrator", id);
 	return row;
 }
@@ -493,6 +507,7 @@ async function assertTargetAllowed(narratorId: string, target: WorkspaceTarget) 
 }
 
 function assertSwitchAdmission(id: string, options: WorkspaceSwitchOptions) {
+	assertNoParallelRevisionWrites(id);
 	const active = activeNarrators.get(id);
 	if (active?._workspaceInstallFailed)
 		throw workspaceConflict("Workspace runtime requires recovery");
@@ -528,6 +543,7 @@ export const workspaceContextService = {
 		action: (context: WorkspaceContext) => Promise<T>,
 	): Promise<T> {
 		return withNarratorMutationAdmission(id, async () => {
+			assertNoParallelRevisionWrites(id);
 			if (isNarratorRevertAdmissionBlocked(id))
 				throw workspaceConflict("Narrator history is reserved");
 			const context = await this.get(id);
@@ -537,6 +553,38 @@ export const workspaceContextService = {
 			)
 				throw workspaceConflict("Workspace identity changed");
 			return action(context);
+		});
+	},
+	/** Parallel private-index writes share a work lease while freezing this workspace revision. */
+	async withParallelRevision<T>(
+		id: string,
+		expectedRevision: number,
+		expectedWorktreeKey: string | undefined,
+		action: (context: WorkspaceContext) => Promise<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
+		return withNarratorWorkAdmission(id, async () => {
+			const context = await withNarratorMutationAdmission(id, async () => {
+				signal?.throwIfAborted();
+				if (isNarratorRevertAdmissionBlocked(id))
+					throw workspaceConflict("Narrator history is reserved");
+				const current = await this.get(id);
+				if (
+					current.revision !== expectedRevision ||
+					(expectedWorktreeKey !== undefined && current.git?.workspaceKey !== expectedWorktreeKey)
+				)
+					throw workspaceConflict("Workspace identity changed");
+				parallelRevisionWrites.set(id, (parallelRevisionWrites.get(id) ?? 0) + 1);
+				return current;
+			});
+			try {
+				signal?.throwIfAborted();
+				return await action(context);
+			} finally {
+				const remaining = (parallelRevisionWrites.get(id) ?? 1) - 1;
+				if (remaining) parallelRevisionWrites.set(id, remaining);
+				else parallelRevisionWrites.delete(id);
+			}
 		});
 	},
 	/** Metadata for directory recovery only; never use this to admit tool execution. */
@@ -550,10 +598,13 @@ export const workspaceContextService = {
 		const row = await loadWorkspaceRow(id);
 		const projectId = row.contextProjectId ?? undefined;
 		const project = projectId
-			? await db.query.projects.findFirst({
-					where: eq(projects.id, projectId),
-					columns: { gitPath: true },
-				})
+			? await readQuery(
+					db.query.projects.findFirst({
+						where: eq(projects.id, projectId),
+						columns: { gitPath: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: undefined;
 		// Persistence is authoritative, including while runtime installation is awaiting.
 		const deviceId = row.workspaceContext
@@ -656,6 +707,7 @@ export const workspaceContextService = {
 		const previous = await this.get(id);
 		const targetDeviceId = deviceId ?? "local";
 		const checkAdmission = () => {
+			assertNoParallelRevisionWrites(id);
 			if (options.origin === "agent") return assertSwitchAdmission(id, options);
 			// The existing HTTP device picker can change a busy session's *next* pass.
 			// It never changes targets already admitted by that session.

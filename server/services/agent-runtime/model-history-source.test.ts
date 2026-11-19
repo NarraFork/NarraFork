@@ -30,10 +30,75 @@ import {
 
 const connections: Database[] = [];
 const directories: string[] = [];
-// bun:test's spy type models callable functions, not constructor-only globals.
-const workerGlobal = globalThis as unknown as {
-	Worker: (...args: ConstructorParameters<typeof Worker>) => Worker;
-};
+function spyHistoryWorker(
+	implementation: (...args: ConstructorParameters<typeof Worker>) => Worker,
+) {
+	const ActualWorker = globalThis.Worker;
+	const historyWorker = mock(implementation);
+	// Route only history construction through the spy. Signature probes still start real
+	// DB Workers, and Bun's readonly mock methods are never replaced during cleanup setup.
+	globalThis.Worker = new Proxy(ActualWorker, {
+		construct(_target, argumentsList) {
+			const args = argumentsList as ConstructorParameters<typeof Worker>;
+			return String(args[0]).includes("model-history-worker")
+				? historyWorker(...args)
+				: new ActualWorker(...args);
+		},
+	});
+	return {
+		spy: historyWorker,
+		mockRestore: () => {
+			globalThis.Worker = ActualWorker;
+		},
+	};
+}
+/** Controllable native workers keep production readiness, ACKs and observed-exit ownership. */
+function controlledHistoryWorkers(onRequest: (worker: Worker) => void) {
+	const ActualWorker = globalThis.Worker;
+	const url = URL.createObjectURL(
+		new Blob(
+			[
+				`self.onmessage=({data})=>{
+					if (data.type === 'test_emit') postMessage(data.message);
+					else if (data.type === 'ack') postMessage({type:'test_ack'});
+					else if ('narratorId' in data) postMessage({type:'test_started'});
+				};postMessage({type:'ready',buildId:${JSON.stringify(RUNTIME_BUILD_ID)}});`,
+			],
+			{ type: "application/javascript" },
+		),
+	);
+	let exited = 0;
+	const intercepted = spyHistoryWorker(() => {
+		const worker = new ActualWorker(url);
+		worker.addEventListener("message", (event) => {
+			if (event.data.type === "test_started") onRequest(worker);
+		});
+		worker.addEventListener("close", () => exited++);
+		return worker;
+	});
+	return {
+		spy: intercepted.spy,
+		get exited() {
+			return exited;
+		},
+		mockRestore: () => {
+			intercepted.mockRestore();
+			URL.revokeObjectURL(url);
+		},
+	};
+}
+async function emitHistoryPage(worker: Worker, message: unknown): Promise<void> {
+	const acknowledged = new Promise<void>((resolve) => {
+		const receive = (event: MessageEvent) => {
+			if (event.data.type !== "test_ack") return;
+			worker.removeEventListener("message", receive);
+			resolve();
+		};
+		worker.addEventListener("message", receive);
+	});
+	worker.postMessage({ type: "test_emit", message });
+	await acknowledged;
+}
 function fixture(file = false) {
 	const directory = file ? mkdtempSync(join(tmpdir(), "nf-model-history-")) : null;
 	if (directory) directories.push(directory);

@@ -1,6 +1,8 @@
+import { type GitStatusPageQuery, isGitStatusFilterChar } from "@shared/git-status-page";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { AppError, ValidationError, zodValidationError } from "../lib/errors";
+import { basePath } from "hono/route";
+import { AppError, catalogError, ValidationError, zodValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
@@ -21,16 +23,29 @@ import {
 	gitUnstageSchema,
 } from "../lib/validators";
 import {
+	gitStagingActionSchema,
+	gitStagingDiffQuerySchema,
+	gitStagingFilesQuerySchema,
+	gitStagingListIdSchema,
+	gitStatusPageStatsQuerySchema,
+} from "../lib/validators/git";
+import { getAuthPrincipal, revalidateAuthPrincipal } from "../middleware/auth";
+import {
+	assertGitWorkspaceStatusPageScope,
 	getGitWorkspaceLineStats,
 	getGitWorkspaceStatus,
+	getGitWorkspaceStatusPage,
+	getGitWorkspaceStatusPageStats,
 	gitAttributionScopes,
 	gitManagementService,
 	invalidateGitWorkspace,
+	invalidateGitWorkspaceFacts,
 	validateFilePaths,
 	validateGitFileTargets,
 } from "../services/git-management-service";
 import { type GitStatusSummary, withGitRequestContext } from "../services/git-service";
-import { getStatusSummaryCached } from "../services/git-status-cache";
+import { getGitStagingListsService } from "../services/git-staging-lists-service";
+import { GitStatusPageError } from "../services/git-status-page";
 import { assertGitWorkspaceKey, type GitWorkspaceTarget } from "../services/git-workspace";
 import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
 import {
@@ -42,10 +57,42 @@ import {
 	workspaceContextService,
 } from "../services/workspace-context-service";
 import { getWorkspaceModificationView } from "../services/workspace-modification-view";
+import { withWorkspaceAdmission } from "../services/worktree-lifecycle-guard";
 
 export { validateFilePaths } from "../services/git-management-service";
 
 type GitEnv = { Variables: { gitTarget: GitWorkspaceTarget } };
+
+function stagingGrantId(c: Context): string | undefined {
+	const principal = getAuthPrincipal(c);
+	return principal?.type === "oauth"
+		? JSON.stringify([
+				c.req.param("id"),
+				"oauth",
+				principal.oauth.tokenId,
+				principal.oauth.clientId,
+				principal.oauth.grantId,
+			])
+		: c.req.param("id");
+}
+
+function statusPageQuery(c: Context): GitStatusPageQuery {
+	const cursor = c.req.query("cursor");
+	const limit = c.req.query("limit");
+	const filter = c.req.query("filter");
+	if (cursor !== undefined && (!cursor || cursor.length > 4096))
+		throw new ValidationError("A bounded Git status cursor is required");
+	if (limit !== undefined && (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 200))
+		throw new ValidationError("Git status page limit must be between 1 and 200");
+	const filters = filter ? filter.split(",") : [];
+	if ((filter?.length ?? 0) > 32 || !filters.every(isGitStatusFilterChar))
+		throw new ValidationError("Invalid Git status filter");
+	return {
+		...(cursor !== undefined ? { cursor } : {}),
+		...(limit !== undefined ? { limit: Number(limit) } : {}),
+		filter: filters,
+	};
+}
 
 function modificationCursor(c: Context) {
 	const cursorAt = c.req.query("cursorAt");
@@ -150,58 +197,133 @@ async function cancelledModificationResponse(c: Context) {
 function createGitRoutes() {
 	const routes = new Hono<GitEnv>();
 	const prefix = "/:id/git";
-	routes.use(`${prefix}/*`, bodyLimit({ maxSize: 1024 * 1024 }));
+	routes.use(
+		`${prefix}/*`,
+		bodyLimit({
+			maxSize: 1024 * 1024,
+			onError: (c) =>
+				c.json({ error: "Git request body exceeds 1 MiB", code: "PAYLOAD_TOO_LARGE" }, 413),
+		}),
+	);
 	routes.use(`${prefix}/*`, async (c, next) => {
-		const need = c.req.method === "GET" ? "read" : "write";
-		const workspaceRequest = c.req.method === "GET" && c.req.path.endsWith("/workspace");
-		const origin = { narratorId: c.req.param("id") ?? "" };
-		if (c.req.method === "GET" && c.req.path.endsWith("/modifications") && c.req.raw.signal.aborted)
-			return cancelledModificationResponse(c);
-		const target = await authorizeGitTarget(c, origin, need);
-		if (!workspaceRequest) {
-			if (need === "write") {
-				// Hono caches parsed JSON: each handler still uses its existing Zod schema.
-				const body = await c.req.json().catch(() => ({}));
-				assertGitWorkspaceKey(target.workspace, body.workspaceKey);
-			} else if (c.req.query("workspaceKey") !== undefined)
-				assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
-			requireReadyGitTarget(target, need);
-		}
-		target.beforeWrite = async () => {
-			const fresh = await authorizeGitTarget(c, origin, "write");
-			assertGitWorkspaceKey(fresh.workspace, target.workspace.workspaceKey);
-			requireReadyGitTarget(fresh, "write");
-			if (fresh.backend?.runtimeGeneration !== target.backend?.runtimeGeneration)
-				throw new AppError(
-					"Git device connection changed; refresh before retrying",
-					409,
-					"GIT_WORKSPACE_CHANGED",
-				);
-		};
-		const lockKey = need === "write" ? target.workspace.repositoryKey : null;
-		c.set("gitTarget", target);
-		const started = performance.now();
-		const run = () => withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
-		const write = () => (lockKey ? withWorkspaceRepositoryLock(lockKey, run) : run());
 		try {
-			if (need === "write" && target.workspace.deviceId === "local") {
-				const id = c.req.param("id") ?? "";
-				const context = await workspaceContextService.get(id);
-				await workspaceContextService.withRevision(
-					id,
-					context.revision,
-					target.workspace.workspaceKey ?? undefined,
-					write,
-				);
-			} else await write();
-		} finally {
-			if (need === "write" || performance.now() - started > 1000)
-				logger.info("Git workspace request", {
-					operation: c.req.path.split("/").pop(),
-					workspaceKey: target.workspace.workspaceKey,
-					deviceId: target.workspace.deviceId,
-					elapsedMs: Math.round(performance.now() - started),
-				});
+			// The deferred summary owns its authorization and cached discovery chain.
+			if (
+				c.req.method === "GET" &&
+				/^\/[^/]+\/git\/summary$/.test(c.req.path.slice(basePath(c).length))
+			)
+				return await next();
+			const need = c.req.method === "GET" ? "read" : "write";
+			const workspaceRequest = c.req.method === "GET" && c.req.path.endsWith("/workspace");
+			const origin = { narratorId: c.req.param("id") ?? "" };
+			if (
+				c.req.method === "GET" &&
+				c.req.path.endsWith("/modifications") &&
+				c.req.raw.signal.aborted
+			)
+				return cancelledModificationResponse(c);
+			const discoveryMode = c.req.path.includes("/staging-lists")
+				? ("metadata" as const)
+				: undefined;
+			const target = await authorizeGitTarget(c, origin, need, discoveryMode);
+			let parallelStagingWrite = false;
+			if (!workspaceRequest) {
+				if (need === "write") {
+					// Hono caches parsed JSON: each handler still uses its existing Zod schema.
+					const body = await c.req.json().catch((error: unknown) => {
+						if (error instanceof Error && error.name === "BodyLimitError")
+							throw new AppError("Git request body exceeds 1 MiB", 413, "PAYLOAD_TOO_LARGE");
+						return {};
+					});
+					assertGitWorkspaceKey(target.workspace, body.workspaceKey);
+					if (target.backend?.kind === "local" && c.req.path.endsWith("/staging-lists/action")) {
+						const action = gitStagingActionSchema.safeParse(body);
+						parallelStagingWrite =
+							action.success && action.data.action !== "commit" && action.data.action !== "recover";
+					}
+				} else if (c.req.query("workspaceKey") !== undefined)
+					assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+				requireReadyGitTarget(target, need);
+			}
+			if (
+				c.req.method === "GET" &&
+				c.req.query("fresh") === "1" &&
+				(c.req.path.endsWith("/status") || c.req.path.endsWith("/line-stats"))
+			)
+				invalidateGitWorkspaceFacts(target);
+			target.beforeWrite = async () => {
+				if (c.req.path.endsWith("/staging-lists/action")) await revalidateAuthPrincipal(c);
+				const fresh = await authorizeGitTarget(c, origin, "write", discoveryMode);
+				assertGitWorkspaceKey(fresh.workspace, target.workspace.workspaceKey);
+				requireReadyGitTarget(fresh, "write");
+				target.authorizeFilePaths = fresh.authorizeFilePaths;
+				if (
+					(fresh.discoveryRuntimeGeneration ?? fresh.backend?.runtimeGeneration) !==
+					(target.discoveryRuntimeGeneration ?? target.backend?.runtimeGeneration)
+				)
+					throw new AppError(
+						"Git device connection changed; refresh before retrying",
+						409,
+						"GIT_WORKSPACE_CHANGED",
+					);
+			};
+			const lockKey =
+				need === "write" && !parallelStagingWrite ? target.workspace.repositoryKey : null;
+			c.set("gitTarget", target);
+			const started = performance.now();
+			const run = () => withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+			const write = () => (lockKey ? withWorkspaceRepositoryLock(lockKey, run) : run());
+			try {
+				if (need === "write" && target.workspace.deviceId === "local") {
+					const id = c.req.param("id") ?? "";
+					const context = await workspaceContextService.get(id);
+					if (parallelStagingWrite) {
+						await workspaceContextService.withParallelRevision(
+							id,
+							context.revision,
+							target.workspace.workspaceKey ?? undefined,
+							() =>
+								withWorkspaceAdmission(
+									{
+										deviceId: target.workspace.deviceId,
+										path: target.workspace.rootPath ?? undefined,
+										repositoryKey: target.workspace.repositoryKey ?? undefined,
+									},
+									write,
+								),
+							c.req.raw.signal,
+						);
+					} else {
+						await workspaceContextService.withRevision(
+							id,
+							context.revision,
+							target.workspace.workspaceKey ?? undefined,
+							write,
+						);
+					}
+				} else await write();
+			} finally {
+				if (need === "write" || performance.now() - started > 1000)
+					logger.info("Git workspace request", {
+						operation: c.req.path.split("/").pop(),
+						workspaceKey: target.workspace.workspaceKey,
+						deviceId: target.workspace.deviceId,
+						elapsedMs: Math.round(performance.now() - started),
+					});
+			}
+		} catch (error) {
+			// Only cancellation of the original HTTP request qualifies; reader deadlines
+			// and other database failures retain their existing error boundary.
+			if (
+				c.req.raw.signal.aborted &&
+				error instanceof Error &&
+				"code" in error &&
+				error.code === "DB_READ_ABORTED"
+			)
+				throw catalogError("GIT_REQUEST_CANCELLED");
+			if (error instanceof GitStatusPageError)
+				throw new AppError(error.message, error.status, error.code);
+			throw error;
 		}
 	});
 	const access = (c: Context<GitEnv>) => {
@@ -220,6 +342,46 @@ function createGitRoutes() {
 
 	routes.get(`${prefix}/workspace`, (c) => c.json(c.get("gitTarget").workspace));
 	routes.get(`${prefix}/status`, async (c) => c.json(await summary(c)));
+	routes.get(`${prefix}/status-files`, async (c) => {
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+		const query = statusPageQuery(c);
+		try {
+			return c.json(
+				await getGitWorkspaceStatusPage(
+					target,
+					narratorPrincipalOf(c).userId,
+					query,
+					c.req.raw.signal,
+				),
+			);
+		} catch (error) {
+			if (error instanceof GitStatusPageError)
+				throw new AppError(error.message, error.status, error.code);
+			throw error;
+		}
+	});
+	routes.get(`${prefix}/status-page-stats`, async (c) => {
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+		const parsed = gitStatusPageStatsQuerySchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		validateFilePaths(parsed.data.rows.map((row) => row.path));
+		try {
+			return c.json(
+				await getGitWorkspaceStatusPageStats(
+					target,
+					narratorPrincipalOf(c).userId,
+					parsed.data,
+					c.req.raw.signal,
+				),
+			);
+		} catch (error) {
+			if (error instanceof GitStatusPageError)
+				throw new AppError(error.message, error.status, error.code);
+			throw error;
+		}
+	});
 	routes.get(`${prefix}/line-stats`, async (c) =>
 		c.json(
 			await getGitWorkspaceLineStats(
@@ -276,7 +438,79 @@ function createGitRoutes() {
 				warningScanComplete: false,
 			};
 		}
-		return c.json(await redactGitModificationView(view, narratorPrincipalOf(c)));
+		return c.json(await redactGitModificationView(view, narratorPrincipalOf(c), c.req.raw.signal));
+	});
+	routes.get(`${prefix}/staging-lists`, async (c) => {
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+		const staging = await getGitStagingListsService(
+			target,
+			narratorPrincipalOf(c).userId,
+			c.req.raw.signal,
+			stagingGrantId(c),
+		);
+		return c.json(await staging.summary());
+	});
+	routes.get(`${prefix}/staging-lists/:listId/files`, async (c) => {
+		const parsed = gitStagingFilesQuerySchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, parsed.data.workspaceKey);
+		const staging = await getGitStagingListsService(
+			target,
+			narratorPrincipalOf(c).userId,
+			c.req.raw.signal,
+			stagingGrantId(c),
+		);
+		return c.json(
+			await staging.files(gitStagingListIdSchema.parse(c.req.param("listId")), {
+				cursor: parsed.data.cursor,
+				limit: parsed.data.limit,
+				filter: parsed.data.filter,
+			}),
+		);
+	});
+	routes.get(`${prefix}/staging-lists/:listId/diff`, async (c) => {
+		const parsed = gitStagingDiffQuerySchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, parsed.data.workspaceKey);
+		const { path, oldPath } = parsed.data;
+		await validateGitFileTargets(target, [path, ...(oldPath ? [oldPath] : [])]);
+		const staging = await getGitStagingListsService(
+			target,
+			narratorPrincipalOf(c).userId,
+			c.req.raw.signal,
+			stagingGrantId(c),
+		);
+		return c.json(
+			await staging.diff(gitStagingListIdSchema.parse(c.req.param("listId")), { path, oldPath }),
+		);
+	});
+	routes.post(`${prefix}/staging-lists/action`, async (c) => {
+		const parsed = gitStagingActionSchema.safeParse(await c.req.json());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const { workspaceKey, ...action } = parsed.data;
+		const target = c.get("gitTarget");
+		assertGitWorkspaceKey(target.workspace, workspaceKey);
+		const staging = await getGitStagingListsService(
+			target,
+			narratorPrincipalOf(c).userId,
+			c.req.raw.signal,
+			stagingGrantId(c),
+		);
+		const identity =
+			action.action === "commit" ? await resolveUserGitIdentityEnv(c.get("user").sub) : null;
+		const result = await staging.action(
+			action.action === "commit" && identity?.GIT_AUTHOR_NAME && identity.GIT_AUTHOR_EMAIL
+				? {
+						...action,
+						identity: { name: identity.GIT_AUTHOR_NAME, email: identity.GIT_AUTHOR_EMAIL },
+					}
+				: action,
+		);
+		if (action.action === "commit" && result.commitOid) changed(c);
+		return c.json(result);
 	});
 	for (const operation of ["stage", "unstage", "discard"] as const) {
 		routes.post(`${prefix}/${operation}`, async (c) => {
@@ -289,6 +523,24 @@ function createGitRoutes() {
 						: gitDiscardSchema;
 			const body = schema.parse(await c.req.json());
 			if (body.files) await validateGitFileTargets(target, body.files);
+			if (body.snapshotScope) {
+				const expectedSection = operation === "unstage" ? "staged" : "unstaged";
+				if (body.snapshotScope.section !== expectedSection)
+					throw new ValidationError("Git snapshot section does not match this operation");
+				await assertGitWorkspaceStatusPageScope(
+					target,
+					narratorPrincipalOf(c).userId,
+					body.snapshotScope,
+					body.files ?? [],
+					c.req.raw.signal,
+				).catch((error: unknown) => {
+					// Hono may serialize handler failures before an outer middleware's
+					// catch runs, so preserve the cursor error at the mutation boundary.
+					if (error instanceof GitStatusPageError)
+						throw new AppError(error.message, error.status, error.code);
+					throw error;
+				});
+			}
 			if (operation === "stage") {
 				if (body.all) await git.stageAll(path);
 				else {

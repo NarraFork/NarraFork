@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as workerRead from "../../db/worker-read";
 import * as failures from "../../lib/db-worker/failure";
 import {
 	assertDbReadersReady,
@@ -11,8 +12,8 @@ import {
 	shutdownDbWorkerPool,
 } from "../../lib/db-worker/pool";
 import { logger } from "../../lib/logger";
-import { settings } from "../../lib/settings";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
+import { readSqliteModelHistorySignature } from "./model-history-revision";
 import { renderModelHistoryRevisionSql } from "./model-history-revision-sql";
 import {
 	clearModelHistorySourceCacheForTest,
@@ -53,11 +54,16 @@ function intercept(
 	create: (RealWorker: typeof Worker, args: ConstructorParameters<typeof Worker>) => Worker,
 ) {
 	const RealWorker = globalThis.Worker;
-	const spy = spyOn(workerGlobal, "Worker").mockImplementation((...args) =>
+	const historyWorker = mock((...args: ConstructorParameters<typeof Worker>) =>
 		create(RealWorker, args),
 	);
+	const spy = spyOn(workerGlobal, "Worker").mockImplementation((...args) =>
+		String(args[0]).includes("model-history-worker")
+			? historyWorker(...args)
+			: new RealWorker(...args),
+	);
 	restores.push(() => spy.mockRestore());
-	return spy;
+	return Object.assign(historyWorker, { restore: () => spy.mockRestore() });
 }
 function noSlots() {
 	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0, cacheEntries: 0 });
@@ -89,7 +95,7 @@ function failureDiagnostics() {
 		expect(serialized).not.toContain(secret);
 	return logs;
 }
-beforeEach(() => {
+beforeEach(async () => {
 	root = mkdtempSync(join(tmpdir(), "nf-history-lifecycle-"));
 	db = new Database(join(root, "fixture.db"));
 	db.run("PRAGMA journal_mode=WAL");
@@ -112,15 +118,23 @@ beforeEach(() => {
 	);
 });
 afterEach(async () => {
-	await resetModelHistoryWorkersForTest();
-	resumeDbWorkerPool();
-	clearModelHistorySourceCacheForTest();
-	for (const restore of restores.splice(0).reverse()) restore();
-	for (const url of urls.splice(0)) URL.revokeObjectURL(url);
-	delete process.env.NARRAFORK_DB_WORKER;
-	delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-	db.close();
-	rmSync(root, { recursive: true, force: true });
+	let drained = false;
+	try {
+		await resetModelHistoryWorkersForTest();
+		await shutdownDbWorkerPool({ pause: true });
+		drained = true;
+	} finally {
+		clearModelHistorySourceCacheForTest();
+		for (const restore of restores.splice(0).reverse()) restore();
+		for (const url of urls.splice(0)) URL.revokeObjectURL(url);
+		delete process.env.NARRAFORK_DB_WORKER;
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		if (drained) {
+			db.close();
+			rmSync(root, { recursive: true, force: true });
+			resumeDbWorkerPool();
+		}
+	}
 });
 
 test("synchronous creation failures keep bounded scalar root diagnostics without text or paths", async () => {
@@ -282,22 +296,14 @@ test.each([
 test.each([
 	"SQLITE_BUSY",
 	"SQLITE_ERROR",
-])("request metadata SELECT preserves %s without broadening retries", async (code) => {
-	const oldRead = settings.narratorBlocks.read;
-	settings.narratorBlocks.read = false;
-	restores.push(() => {
-		settings.narratorBlocks.read = oldRead;
-	});
-	const original = db.query.bind(db);
+])("signature metadata read preserves %s without broadening retries", async (code) => {
+	const original = workerRead.readDomainTask;
 	let metadataReads = 0;
-	const query = spyOn(db, "query").mockImplementation(((sql: string) => {
-		if (
-			sql === "SELECT 1 FROM narrator_messages WHERE body_rows_only = 1 LIMIT 1" &&
-			++metadataReads === 1
-		)
+	const query = spyOn(workerRead, "readDomainTask").mockImplementation(async (...args) => {
+		if (args[1] === "modelHistorySignature" && ++metadataReads === 1)
 			throw Object.assign(new Error("database is locked"), { code });
-		return original(sql);
-	}) as typeof db.query);
+		return original(...args);
+	});
 	restores.push(() => query.mockRestore());
 	let sends = 0;
 	const worker = intercept((RealWorker, args) => {
@@ -311,12 +317,13 @@ test.each([
 	});
 	if (code === "SQLITE_BUSY") {
 		expect((await load()).messages).toHaveLength(1);
-		expect(worker).toHaveBeenCalledTimes(2);
 		expect(metadataReads).toBe(2);
+		expect(worker).toHaveBeenCalledTimes(1);
 		expect(sends).toBe(1);
 	} else {
 		await expect(load()).rejects.toMatchObject({ code: "SQLITE_ERROR" });
-		expect(worker).toHaveBeenCalledTimes(1);
+		expect(metadataReads).toBe(1);
+		expect(worker).not.toHaveBeenCalled();
 		expect(sends).toBe(0);
 		noSlots();
 	}
@@ -530,8 +537,9 @@ test("history retry count is bounded and cancellation during backoff does not sp
 test.each([
 	"off",
 	"zero",
-])("disabled worker %s may serve a verified cache hit but never computes a miss inline", async (mode) => {
-	const cached = await load();
+])("disabled worker %s blocks unverified cache hits and never computes a miss inline", async (mode) => {
+	expect((await load()).messages).toHaveLength(1);
+	const hits = modelHistorySourceStats().hits;
 	if (mode === "off") process.env.NARRAFORK_DB_WORKER = "off";
 	else {
 		// Concurrency is frozen until the main pool closes; keep the history cache intact.
@@ -541,26 +549,40 @@ test.each([
 	const worker = intercept(() => {
 		throw new Error("must not construct");
 	});
-	expect(await load()).toBe(cached);
+	const unavailable = {
+		code: "DB_READ_UNAVAILABLE",
+		reason: mode === "off" ? "disabled_by_env" : "concurrency_zero",
+	};
+	await expect(load()).rejects.toMatchObject(unavailable);
 	insert(1);
-	await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_DISABLED" });
+	await expect(load()).rejects.toMatchObject(unavailable);
 	expect(worker).not.toHaveBeenCalled();
-	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0 });
+	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0, hits, cacheEntries: 1 });
 });
 
 test("history admission rejects overload and queued cancellation releases all slots", async () => {
+	const signature = readSqliteModelHistorySignature(db, "owner");
+	const signatureRead = spyOn(workerRead, "readDomainTask").mockResolvedValue(signature as never);
+	restores.push(() => signatureRead.mockRestore());
 	const url = standIn("self.onmessage=()=>{};postMessage({type:'ready'});");
 	intercept((RealWorker) => new RealWorker(url));
 	const controller = new AbortController();
 	const pending = Array.from({ length: MODEL_HISTORY_MAX_QUEUE + 2 }, () =>
 		load(controller.signal).catch((error) => error),
 	);
-	await Promise.resolve();
-	await Promise.resolve();
-	expect(modelHistorySourceStats()).toMatchObject({ workers: 2, queued: MODEL_HISTORY_MAX_QUEUE });
-	await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_OVERLOADED" });
-	controller.abort();
-	await Promise.all(pending);
+	try {
+		const deadlineAt = Date.now() + 2_000;
+		while (modelHistorySourceStats().queued !== MODEL_HISTORY_MAX_QUEUE && Date.now() < deadlineAt)
+			await Bun.sleep(0);
+		expect(modelHistorySourceStats()).toMatchObject({
+			workers: 2,
+			queued: MODEL_HISTORY_MAX_QUEUE,
+		});
+		await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_OVERLOADED" });
+	} finally {
+		controller.abort();
+		await Promise.all(pending);
+	}
 	noSlots();
 });
 
@@ -573,7 +595,7 @@ test("permanent close blocks verified cache hits and only an explicit reset rebu
 	const error = await load().catch((error) => error);
 	expect(error.code).toBe("MODEL_HISTORY_WORKER_CLOSED");
 	expect(worker).not.toHaveBeenCalled();
-	worker.mockRestore();
+	worker.restore();
 	await resetModelHistoryWorkersForTest();
 	expect((await load()).messages).toHaveLength(1);
 });

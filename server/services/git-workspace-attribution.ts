@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, gte, inArray, lt } from "drizzle-orm";
 import { db } from "../db";
 import { fileAttributions, narrators } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { type AttributionActor, EXTERNAL_ACTOR } from "./attribution-actors";
 import type { GitWorkspaceTarget } from "./git-workspace";
@@ -126,13 +127,15 @@ export async function collectGitAttributionScopes(
 			lt(fileAttributions.workspacePath, upperBound),
 		];
 		if (cursor) conditions.push(gt(fileAttributions.workspacePath, cursor));
-		const row = await db
-			.select({ workspacePath: fileAttributions.workspacePath })
-			.from(fileAttributions)
-			.where(and(...conditions))
-			.orderBy(asc(fileAttributions.workspacePath))
-			.limit(1)
-			.then((rows) => rows[0]);
+		const row = await readQueryFirst(
+			db
+				.select({ workspacePath: fileAttributions.workspacePath })
+				.from(fileAttributions)
+				.where(and(...conditions))
+				.orderBy(asc(fileAttributions.workspacePath))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!row) break;
 		cursor = row.workspacePath;
 		candidates.push(row.workspacePath);
@@ -220,7 +223,9 @@ export function redactGitActors(
 export async function redactGitModificationView(
 	view: WorkspaceModificationView,
 	principal: NarratorPrincipal,
+	signal?: AbortSignal,
 ): Promise<WorkspaceModificationView> {
+	signal?.throwIfAborted();
 	const ids = new Set<string>();
 	const add = (actor: AttributionActor | null) => {
 		if (actor?.narratorId) ids.add(actor.narratorId);
@@ -240,12 +245,20 @@ export async function redactGitModificationView(
 	// Bounded pages, with no messages, titles or snapshot contents loaded for ACL checks.
 	const all = [...ids];
 	for (let start = 0; start < all.length; start += 200) {
-		const rows = await db.query.narrators.findMany({
-			where: inArray(narrators.id, all.slice(start, start + 200)),
-			columns: NARRATOR_ACL_COLUMNS,
-			limit: 200,
-		});
-		for (const row of rows) if (await canReadNarrator(row, principal)) readable.add(row.id);
+		signal?.throwIfAborted();
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, all.slice(start, start + 200)),
+				columns: NARRATOR_ACL_COLUMNS,
+				limit: 200,
+			}),
+			{ executionPolicy: "worker-required", maxRows: 200, signal },
+		);
+		for (const row of rows) {
+			signal?.throwIfAborted();
+			if (await canReadNarrator(row, principal)) readable.add(row.id);
+		}
 	}
+	signal?.throwIfAborted();
 	return redactGitActors(view, readable);
 }
