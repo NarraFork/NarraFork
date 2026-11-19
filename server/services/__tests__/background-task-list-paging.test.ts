@@ -183,6 +183,7 @@ async function seedLegacyTask(opts: {
 	createdAt: string;
 	result?: string;
 	backgroundStatus?: "running" | "completed" | "failed" | "cancelled";
+	status?: "idle" | "archived";
 }): Promise<void> {
 	await seedNarrators({
 		id: opts.id,
@@ -193,7 +194,7 @@ async function seedLegacyTask(opts: {
 		backgroundStatus: opts.backgroundStatus ?? "completed",
 		backgroundResult: opts.result ?? "legacy result",
 		backgroundCompletedAt: opts.createdAt,
-		status: "idle",
+		status: opts.status ?? "idle",
 		title: `legacy ${opts.id}`,
 		createdAt: opts.createdAt,
 		updatedAt: opts.createdAt,
@@ -649,6 +650,27 @@ describe("background task active count", () => {
 		expect(after.activeTasks?.map((t) => t.id)).toEqual([subagentId]);
 		expect(after.activeCount).toBe(1);
 		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+	});
+
+	test("keeps archived legacy tasks in history without treating stale running as active", async () => {
+		await seedParent();
+		await seedLegacyTask({
+			id: "archived-legacy",
+			createdAt: "2026-05-01T00:00:00.000Z",
+			backgroundStatus: "running",
+			status: "archived",
+		});
+
+		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
+		expect(page.tasks).toHaveLength(1);
+		expect(page.tasks[0]).toMatchObject({
+			id: "archived-legacy",
+			status: "cancelled",
+			effectiveStatus: "cancelled",
+			canCancelActiveWork: false,
+		});
+		expect(page.activeTasks).toEqual([]);
+		expect(page.activeCount).toBe(0);
 	});
 
 	test("counts a legacy row still marked running", async () => {
