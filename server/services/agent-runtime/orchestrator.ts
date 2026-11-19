@@ -210,6 +210,7 @@ import {
 	clearActiveHistoryCompactPending,
 	clearPlanModePromptRebuild,
 	compactLocks,
+	hasNarratorRuntimeClaim,
 	hasPendingHistoryCompact,
 	isNarratorRevertAdmissionBlocked,
 	knowledgeInjectionCycleStates,

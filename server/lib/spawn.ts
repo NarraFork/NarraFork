@@ -64,6 +64,8 @@ export interface SafeSpawnOptions {
 	timeout?: number;
 	/** AbortSignal for external cancellation (e.g. narrator interrupt). */
 	signal?: AbortSignal;
+	/** Include the observed kill reason in capture mode; streaming always includes it. */
+	includeTerminationReason?: boolean;
 	/**
 	 * Watchdog callback, invoked every 15 s while the process is running.
 	 * If omitted, the default policy is:
@@ -327,7 +329,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			exitCode,
 			stdoutTruncated: stdout.truncated,
 			stderrTruncated: stderr.truncated,
-			...(opts.stdoutStream ? { terminationReason } : {}),
+			...(opts.stdoutStream || opts.includeTerminationReason ? { terminationReason } : {}),
 		};
 	} catch (error) {
 		// Pipe failures must not release callers' resource locks while the child still runs.

@@ -940,6 +940,10 @@ async function ensureShadowRepo(
 	worktreePath: string,
 	signal?: AbortSignal,
 ): Promise<void> {
+	signal?.throwIfAborted();
+	// Inspect the physical leaf before canonicalization can follow a dangling link.
+	if ((await lstatIfPresent(dir))?.isSymbolicLink())
+		throw new TreeSnapshotError("shadow directory must not be a symbolic link");
 	await withLifecycleContext(
 		[worktreePath],
 		async () => {

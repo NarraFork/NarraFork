@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, eq, isNotNull, ne, or } from "drizzle-orm";
 import { narratorWorktreeResources } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 
 export interface VerifiedWorktreeScope {
@@ -79,15 +80,18 @@ export function createWorktreeResourceRegistry(
 					})
 					.onConflictDoNothing()
 					.returning({ id: narratorWorktreeResources.id });
-				const existing = database
-					.select({
-						repositoryKey: narratorWorktreeResources.repositoryKey,
-						createRequestId: narratorWorktreeResources.createRequestId,
-						ownerNarratorId: narratorWorktreeResources.ownerNarratorId,
-					})
-					.from(narratorWorktreeResources)
-					.where(eq(narratorWorktreeResources.id, id))
-					.get();
+				const existing = await readQueryFirst(
+					database
+						.select({
+							repositoryKey: narratorWorktreeResources.repositoryKey,
+							createRequestId: narratorWorktreeResources.createRequestId,
+							ownerNarratorId: narratorWorktreeResources.ownerNarratorId,
+						})
+						.from(narratorWorktreeResources)
+						.where(eq(narratorWorktreeResources.id, id))
+						.limit(1),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (
 					!existing ||
 					existing.repositoryKey !== resource.repositoryKey ||
@@ -149,18 +153,21 @@ export function createWorktreeResourceRegistry(
 			validateVerifiedWorktreeScope(scope);
 			if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
 				throw new AppError("Invalid ownership revision", 409, "WORKTREE_SCOPE_REVISION");
-			const identity = database
-				.select({
-					scopeKind: narratorWorktreeResources.scopeKind,
-					scopeProjectId: narratorWorktreeResources.scopeProjectId,
-					deviceId: narratorWorktreeResources.deviceId,
-					repositoryKey: narratorWorktreeResources.repositoryKey,
-					worktreePath: narratorWorktreeResources.worktreePath,
-					createRequestId: narratorWorktreeResources.createRequestId,
-				})
-				.from(narratorWorktreeResources)
-				.where(eq(narratorWorktreeResources.id, id))
-				.get();
+			const identity = await readQueryFirst(
+				database
+					.select({
+						scopeKind: narratorWorktreeResources.scopeKind,
+						scopeProjectId: narratorWorktreeResources.scopeProjectId,
+						deviceId: narratorWorktreeResources.deviceId,
+						repositoryKey: narratorWorktreeResources.repositoryKey,
+						worktreePath: narratorWorktreeResources.worktreePath,
+						createRequestId: narratorWorktreeResources.createRequestId,
+					})
+					.from(narratorWorktreeResources)
+					.where(eq(narratorWorktreeResources.id, id))
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			if (!identity) return false;
 			if (identity.scopeKind === "project" && identity.scopeProjectId === null)
 				throw new AppError(

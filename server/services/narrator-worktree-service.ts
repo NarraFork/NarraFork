@@ -80,6 +80,34 @@ export const WORKTREE_LIST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const WORKTREE_LIST_CACHE_TTL_MS = 60_000;
 export const WORKTREE_LIST_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 export const WORKTREE_LIST_CACHE_MAX_SNAPSHOTS = 16;
+const WORKTREE_LIST_SLOW_MS = 1000;
+const WORKTREE_LIST_SLOW_LOG_INTERVAL_MS = 60_000;
+
+type ListObservation = {
+	/** Elapsed stages can include awaits and overlap; sync stages contain no await. Neither is CPU time. */
+	stages: {
+		authorizationElapsedMs: number;
+		inventoryElapsedMs: number;
+		inventoryGitElapsedMs: number;
+		outputBoundSyncMs: number;
+		porcelainParseSyncMs: number;
+		legacyVerificationElapsedMs: number;
+		metadataElapsedMs: number;
+		filterSortSyncMs: number;
+		snapshotSyncMs: number;
+		pageSyncMs: number;
+	};
+	/** Enumeration stdout bytes before bounding, reusing the existing output buffer allocation. */
+	inputBytes: number;
+	entryCount: number;
+	matchedEntryCount: number;
+	pageEntryCount: number;
+	snapshotBytes: number;
+	cacheHit: boolean;
+	truncated: boolean;
+	metadataStopReason: "not_started" | "complete" | "budget" | "cancelled";
+	inventoryTerminationReason?: SafeSpawnResult["terminationReason"];
+};
 
 type ListSnapshot = {
 	binding: string;
@@ -99,19 +127,28 @@ export type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator
 export function boundWorktreeGitResult(
 	result: SafeSpawnResult,
 	maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
+	onStdoutBytes?: (bytes: number) => void,
 ): SafeSpawnResult {
 	const bound = (text: string) => {
 		const bytes = Buffer.from(text);
-		return bytes.byteLength <= maxBytes
-			? text
-			: new TextDecoder().decode(bytes.subarray(0, maxBytes), { stream: true });
+		return {
+			text:
+				bytes.byteLength <= maxBytes
+					? text
+					: new TextDecoder().decode(bytes.subarray(0, maxBytes), { stream: true }),
+			bytes: bytes.byteLength,
+			truncated: bytes.byteLength > maxBytes,
+		};
 	};
+	const stdout = bound(result.stdout);
+	const stderr = bound(result.stderr);
+	onStdoutBytes?.(stdout.bytes);
 	return {
 		...result,
-		stdout: bound(result.stdout),
-		stderr: bound(result.stderr),
-		stdoutTruncated: result.stdoutTruncated || Buffer.byteLength(result.stdout) > maxBytes,
-		stderrTruncated: result.stderrTruncated || Buffer.byteLength(result.stderr) > maxBytes,
+		stdout: stdout.text,
+		stderr: stderr.text,
+		stdoutTruncated: result.stdoutTruncated || stdout.truncated,
+		stderrTruncated: result.stderrTruncated || stderr.truncated,
 	};
 }
 
@@ -739,8 +776,41 @@ export class NarratorWorktreeService<Principal> {
 	private readonly listCursorSecret = randomUUID();
 	private readonly listSnapshots = new Map<string, ListSnapshot>();
 	private listCacheBytes = 0;
+	// One limiter per service, shared across repositories and cached/uncached listing requests.
+	private listSlowLoggedAt = Number.NEGATIVE_INFINITY;
+	private listSlowSuppressed = 0;
 
 	constructor(private readonly ports: WorktreeServicePorts<Principal>) {}
+
+	private noteSlowList(
+		observation: ListObservation,
+		elapsedMs: number,
+		stopReason: "complete" | "cancelled" | "budget" | "error",
+	) {
+		if (elapsedMs < WORKTREE_LIST_SLOW_MS) return;
+		const now = performance.now();
+		if (now - this.listSlowLoggedAt < WORKTREE_LIST_SLOW_LOG_INTERVAL_MS) {
+			this.listSlowSuppressed = Math.min(this.listSlowSuppressed + 1, Number.MAX_SAFE_INTEGER);
+			return;
+		}
+		const suppressedSinceLastLog = this.listSlowSuppressed;
+		this.listSlowLoggedAt = now;
+		this.listSlowSuppressed = 0;
+		try {
+			logger.warn("Slow worktree listing", {
+				...observation,
+				stages: Object.fromEntries(
+					Object.entries(observation.stages).map(([stage, ms]) => [stage, Math.round(ms)]),
+				),
+				elapsedMs: Math.round(elapsedMs),
+				stopReason,
+				rateLimitIntervalMs: WORKTREE_LIST_SLOW_LOG_INTERVAL_MS,
+				suppressedSinceLastLog,
+			});
+		} catch {
+			// Diagnostics must not change listing results, errors or cancellation.
+		}
+	}
 
 	private listCursor(id: string, offset: number): string {
 		const token = `${id}:${offset}`;
@@ -800,6 +870,7 @@ export class NarratorWorktreeService<Principal> {
 				409,
 			);
 		signal.throwIfAborted();
+		const started = observation ? performance.now() : 0;
 		const operation = this.ports.runGit
 			? this.ports.runGit(target, args, signal, writing, scope)
 			: this.hardenedConfig(target, args, scope, writing, signal).then((config) =>
@@ -822,9 +893,23 @@ export class NarratorWorktreeService<Principal> {
 						signal,
 					}),
 				);
-		const result = writing ? await operation : await abortableRead(operation, signal);
+		let result: SafeSpawnResult;
+		try {
+			result = writing ? await operation : await abortableRead(operation, signal);
+		} finally {
+			if (observation) observation.stages.inventoryGitElapsedMs += performance.now() - started;
+		}
 		signal.throwIfAborted();
-		return boundWorktreeGitResult(result, maxBytes);
+		if (!observation) return boundWorktreeGitResult(result, maxBytes);
+		observation.inventoryTerminationReason = result.terminationReason;
+		const boundStarted = performance.now();
+		try {
+			return boundWorktreeGitResult(result, maxBytes, (bytes) => {
+				observation.inputBytes += bytes;
+			});
+		} finally {
+			observation.stages.outputBoundSyncMs += performance.now() - boundStarted;
+		}
 	}
 
 	/**
@@ -928,13 +1013,19 @@ export class NarratorWorktreeService<Principal> {
 				cancelled,
 			]);
 			limited.throwIfAborted();
-			return parseLegacyWorktreePorcelain(
-				result.stdout,
-				false,
-				registered,
-				target.backend?.paths.identityKey,
-				listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
-			);
+			const parseStarted = observation ? performance.now() : 0;
+			try {
+				return parseLegacyWorktreePorcelain(
+					result.stdout,
+					false,
+					registered,
+					target.backend?.paths.identityKey,
+					listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+				);
+			} finally {
+				if (observation)
+					observation.stages.porcelainParseSyncMs += performance.now() - parseStarted;
+			}
 		} catch (cause) {
 			signal.throwIfAborted();
 			logger.warn("Unable to verify legacy Git worktree registrations", {
@@ -943,12 +1034,20 @@ export class NarratorWorktreeService<Principal> {
 			return incomplete;
 		} finally {
 			if (abort) limited.removeEventListener("abort", abort);
-			const elapsedMs = Math.round(performance.now() - started);
-			if (elapsedMs >= 1000)
-				logger.warn("Slow legacy Git registration verification", { elapsedMs });
+			const elapsedMs = performance.now() - started;
+			if (observation) observation.stages.legacyVerificationElapsedMs += elapsedMs;
+			else if (elapsedMs >= 1000)
+				logger.warn("Slow legacy Git registration verification", {
+					elapsedMs: Math.round(elapsedMs),
+				});
 		}
 	}
-	private async entries(target: WorktreeTarget, signal: AbortSignal, listing = false) {
+	private async entries(
+		target: WorktreeTarget,
+		signal: AbortSignal,
+		listing = false,
+		observation?: ListObservation,
+	) {
 		const maxBytes = listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES;
 		let result = await this.run(
 			target,
@@ -969,12 +1068,17 @@ export class NarratorWorktreeService<Principal> {
 			result = await this.run(target, ["worktree", "list", "--porcelain"], signal, false, maxBytes);
 		}
 		if (result.exitCode !== 0) worktreeListError(result);
-		if (legacy) return this.legacyEntries(target, result, signal, listing);
-		return parseWorktreePorcelain(
-			result.stdout,
-			!!(result.stdoutTruncated || result.stderrTruncated),
-			listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
-		);
+		if (legacy) return this.legacyEntries(target, result, signal, listing, observation);
+		const parseStarted = observation ? performance.now() : 0;
+		try {
+			return parseWorktreePorcelain(
+				result.stdout,
+				!!(result.stdoutTruncated || result.stderrTruncated),
+				listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+			);
+		} finally {
+			if (observation) observation.stages.porcelainParseSyncMs += performance.now() - parseStarted;
+		}
 	}
 
 	/** Best-effort list metadata only; raw entries remain unchanged for creation/reconciliation. */
@@ -1060,13 +1164,12 @@ export class NarratorWorktreeService<Principal> {
 			await Promise.all([commits(), ...Array.from({ length: 4 }, directories)]);
 			signal.throwIfAborted();
 		} finally {
-			const elapsedMs = Math.round(performance.now() - started);
-			if (elapsedMs >= 1000)
-				logger.warn("Slow worktree list metadata", {
-					elapsedMs,
-					entries: entries.length,
-					incomplete: metadataSignal.aborted,
-				});
+			observation.stages.metadataElapsedMs += performance.now() - started;
+			observation.metadataStopReason = signal.aborted
+				? "cancelled"
+				: metadataSignal.aborted
+					? "budget"
+					: "complete";
 		}
 	}
 
@@ -1076,69 +1179,106 @@ export class NarratorWorktreeService<Principal> {
 		input: unknown,
 		signal: AbortSignal,
 	): Promise<WorktreeListResult> {
-		const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
-		signal.throwIfAborted();
-		const target = await (this.ports.authorizeList ?? this.ports.authorize)(
-			principal,
-			narratorId,
-			"read",
-			signal,
-		);
-		if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
-			if (target.workspace.workspaceKey !== workspaceKey)
-				error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
-			if (
-				!target.repositoryPath ||
-				!target.workspace.repositoryKey ||
-				!target.backend ||
-				target.backend.kind !== "local"
-			)
-				error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
-		} else assertReady(target, "read", workspaceKey);
-		const binding = JSON.stringify([
-			this.actorKey(principal),
-			narratorId,
-			target.workspace.repositoryKey,
-			target.workspace.deviceId,
-			target.repositoryPath,
-			target.workspace.rootPath,
-			workspaceKey,
-			sort,
-			order,
-			search,
-		]);
-		this.pruneListSnapshots(Date.now());
-		let snapshot: ListSnapshot;
-		let id: string | undefined;
-		let offset = 0;
-		if (cursor) {
-			const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
-			if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
-			id = match[1] ?? "";
-			offset = Number(match[2]);
-			const cached = this.listSnapshots.get(id);
-			if (!cached)
-				error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
-			if (cursor !== this.listCursor(id, offset))
-				error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
-			if (cached.binding !== binding)
-				error(
-					"WORKTREE_CURSOR_MISMATCH",
-					"Cursor does not match actor, workspace or list query",
-					409,
-				);
-			if (offset >= cached.entries.length)
-				error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
-			snapshot = cached;
-		} else {
-			const started = performance.now();
-			const listSignal = AbortSignal.any([
-				signal,
-				AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
-			]);
+		const started = performance.now();
+		const observation: ListObservation = {
+			stages: {
+				authorizationElapsedMs: 0,
+				inventoryElapsedMs: 0,
+				inventoryGitElapsedMs: 0,
+				outputBoundSyncMs: 0,
+				porcelainParseSyncMs: 0,
+				legacyVerificationElapsedMs: 0,
+				metadataElapsedMs: 0,
+				filterSortSyncMs: 0,
+				snapshotSyncMs: 0,
+				pageSyncMs: 0,
+			},
+			inputBytes: 0,
+			entryCount: 0,
+			matchedEntryCount: 0,
+			pageEntryCount: 0,
+			snapshotBytes: 0,
+			cacheHit: false,
+			truncated: false,
+			metadataStopReason: "not_started",
+		};
+		let listSignal = signal;
+		let stopReason: "complete" | "budget" | "error" = "error";
+		try {
+			const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
+			signal.throwIfAborted();
+			const authorizationStarted = performance.now();
+			let target: WorktreeTarget;
 			try {
-				const result = await this.entries(target, listSignal, true);
-				await this.enrichListEntries(target, result.entries, listSignal);
+				target = await (this.ports.authorizeList ?? this.ports.authorize)(
+					principal,
+					narratorId,
+					"read",
+					signal,
+				);
+			} finally {
+				observation.stages.authorizationElapsedMs += performance.now() - authorizationStarted;
+			}
+			if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
+				if (target.workspace.workspaceKey !== workspaceKey)
+					error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
+				if (
+					!target.repositoryPath ||
+					!target.workspace.repositoryKey ||
+					!target.backend ||
+					target.backend.kind !== "local"
+				)
+					error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
+			} else assertReady(target, "read", workspaceKey);
+			const binding = JSON.stringify([
+				this.actorKey(principal),
+				narratorId,
+				target.workspace.repositoryKey,
+				target.workspace.deviceId,
+				target.repositoryPath,
+				target.workspace.rootPath,
+				workspaceKey,
+				sort,
+				order,
+				search,
+			]);
+			this.pruneListSnapshots(Date.now());
+			let snapshot: ListSnapshot;
+			let id: string | undefined;
+			let offset = 0;
+			if (cursor) {
+				const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
+				if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
+				id = match[1] ?? "";
+				offset = Number(match[2]);
+				const cached = this.listSnapshots.get(id);
+				if (!cached)
+					error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
+				if (cursor !== this.listCursor(id, offset))
+					error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
+				if (cached.binding !== binding)
+					error(
+						"WORKTREE_CURSOR_MISMATCH",
+						"Cursor does not match actor, workspace or list query",
+						409,
+					);
+				if (offset >= cached.entries.length)
+					error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
+				snapshot = cached;
+				observation.cacheHit = true;
+			} else {
+				listSignal = AbortSignal.any([signal, AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2)]);
+				const inventoryStarted = performance.now();
+				let result: Awaited<ReturnType<typeof this.entries>>;
+				try {
+					result = await this.entries(target, listSignal, true, observation);
+				} finally {
+					observation.stages.inventoryElapsedMs += performance.now() - inventoryStarted;
+				}
+				observation.entryCount = result.entries.length;
+				observation.truncated = result.truncated;
+				await this.enrichListEntries(target, result.entries, listSignal, observation);
+				const filterSortStarted = performance.now();
 				const needle = search.toLowerCase();
 				const name = (entry: WorktreeEntry) =>
 					entry.branch?.replace(/^refs\/heads\//, "") ??
@@ -1164,18 +1304,23 @@ export class NarratorWorktreeService<Principal> {
 							return left === right ? tie : left === null ? 1 : -1;
 						return (order === "asc" ? 1 : -1) * (left - right) || tie;
 					});
+				observation.stages.filterSortSyncMs += performance.now() - filterSortStarted;
 				listSignal.throwIfAborted();
-				snapshot = {
-					binding,
-					entries,
-					truncated: result.truncated,
-					expiresAt: Date.now() + WORKTREE_LIST_CACHE_TTL_MS,
-					bytes: Buffer.byteLength(JSON.stringify(entries)) + Buffer.byteLength(binding) + 256,
-				};
-				if (entries.length > limit) id = this.rememberListSnapshot(snapshot);
-			} finally {
-				const elapsedMs = Math.round(performance.now() - started);
-				if (elapsedMs >= 1000) logger.warn("Slow worktree listing", { elapsedMs });
+				const snapshotStarted = performance.now();
+				try {
+					snapshot = {
+						binding,
+						entries,
+						truncated: result.truncated,
+						expiresAt: Date.now() + WORKTREE_LIST_CACHE_TTL_MS,
+						bytes: Buffer.byteLength(JSON.stringify(entries)) + Buffer.byteLength(binding) + 256,
+					};
+					observation.matchedEntryCount = entries.length;
+					observation.snapshotBytes = snapshot.bytes;
+					if (entries.length > limit) id = this.rememberListSnapshot(snapshot);
+				} finally {
+					observation.stages.snapshotSyncMs += performance.now() - snapshotStarted;
+				}
 			}
 		}
 		signal.throwIfAborted();

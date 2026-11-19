@@ -194,6 +194,72 @@ afterEach(async () => {
 });
 
 describe("worktree tree snapshots", () => {
+	test("excludes only root staging internals and removes legacy shadow entries without changing user index", async () => {
+		const repo = await createRepo("nf-tree-staging-internal-");
+		mkdirSync(join(repo, ".narrafork", "git-staging"), { recursive: true });
+		mkdirSync(join(repo, "docs", ".narrafork", "git-staging"), { recursive: true });
+		writeFileSync(join(repo, "code.txt"), "code\n");
+		writeFileSync(join(repo, ".narrafork", "notes.txt"), "user notes\n");
+		writeFileSync(join(repo, ".narrafork", "git-staging", "lists.json"), "private state\n");
+		writeFileSync(
+			join(repo, "docs", ".narrafork", "git-staging", "example.txt"),
+			"documentation\n",
+		);
+		writeFileSync(
+			join(repo, ".gitignore"),
+			"!.narrafork/git-staging/\n!.narrafork/git-staging/**\n",
+		);
+		const staged = await safeSpawn({
+			cmd: ["git", "add", "--", ".narrafork/notes.txt"],
+			cwd: repo,
+			timeout: 15_000,
+		});
+		expect(staged.exitCode).toBe(0);
+		const index = readFileSync(join(repo, ".git", "index"));
+		const first = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, first)).toContain(".narrafork/notes.txt");
+		expect(await treePaths(repo, first)).toContain("docs/.narrafork/git-staging/example.txt");
+		expect(
+			(await treePaths(repo, first)).some((path) => path.startsWith(".narrafork/git-staging/")),
+		).toBe(false);
+		const legacy = await shadowGit(repo, [
+			"--work-tree",
+			repo,
+			"add",
+			"--force",
+			"--",
+			".narrafork/git-staging/lists.json",
+		]);
+		expect(legacy.exitCode).toBe(0);
+		writeFileSync(join(repo, ".narrafork", "git-staging", "lists.json"), "updated private state\n");
+		const second = await worktreeTreeSnapshot.capture(repo);
+		expect(
+			(await treePaths(repo, second)).some((path) => path.startsWith(".narrafork/git-staging/")),
+		).toBe(false);
+		expect(await treePaths(repo, second)).toContain(".narrafork/notes.txt");
+		expect(readFileSync(join(repo, ".git", "index"))).toEqual(index);
+		expect(readFileSync(join(repo, ".narrafork", "git-staging", "lists.json"), "utf8")).toBe(
+			"updated private state\n",
+		);
+	});
+	test("reports already-tracked staging-path user files without changing their bytes or native index", async () => {
+		const repo = await createRepo("nf-tree-staging-tracked-");
+		mkdirSync(join(repo, ".narrafork", "git-staging"), { recursive: true });
+		writeFileSync(join(repo, ".narrafork", "git-staging", "user-file"), "tracked user bytes\n");
+		const staged = await safeSpawn({
+			cmd: ["git", "add", "--", ".narrafork/git-staging/user-file"],
+			cwd: repo,
+			timeout: 15_000,
+		});
+		expect(staged.exitCode).toBe(0);
+		const index = readFileSync(join(repo, ".git", "index"));
+		await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("tracked user files");
+		expect(readFileSync(join(repo, ".git", "index"))).toEqual(index);
+		expect(readFileSync(join(repo, ".narrafork", "git-staging", "user-file"), "utf8")).toBe(
+			"tracked user bytes\n",
+		);
+	});
+
 	test("captures a mixed-case native workspace through its canonical comparison path", async () => {
 		const repo = await createRepo("Nf-Tree-Case-Identity-");
 		const target = normalizePathForComparison(repo);

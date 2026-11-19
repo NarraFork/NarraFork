@@ -18,6 +18,7 @@ import {
 	fileChangeOperations,
 	narratorToolCalls,
 } from "../db/schema";
+import { readDbAll, readQuery } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { SELECT_ROWS_MAX_ROWS } from "../lib/db-worker/protocol";
@@ -179,15 +180,22 @@ function completeness(
 
 /** Only a v2 effect -> operation -> actual tool-call PK can bind a boundary.
  * Provider toolUseIds are reusable across forks/retries; v1 therefore stays unknown. */
-async function loadTreeHashes(effectIds: string[]): Promise<Map<string, string | null>> {
+async function loadTreeHashes(
+	effectIds: string[],
+	signal?: AbortSignal,
+): Promise<Map<string, string | null>> {
+	signal?.throwIfAborted();
 	if (effectIds.length === 0) return new Map();
-	const rows = await db
-		.select({ effectId: fileChangeEffects.id, treeHashAfter: narratorToolCalls.treeHashAfter })
-		.from(fileChangeEffects)
-		.innerJoin(fileChangeOperations, eq(fileChangeOperations.id, fileChangeEffects.operationId))
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, fileChangeOperations.toolCallId))
-		.where(inArray(fileChangeEffects.id, effectIds))
-		.limit(MAX_QUERY_PATHS * PER_PATH_EVENT_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({ effectId: fileChangeEffects.id, treeHashAfter: narratorToolCalls.treeHashAfter })
+			.from(fileChangeEffects)
+			.innerJoin(fileChangeOperations, eq(fileChangeOperations.id, fileChangeEffects.operationId))
+			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, fileChangeOperations.toolCallId))
+			.where(inArray(fileChangeEffects.id, effectIds))
+			.limit(MAX_QUERY_PATHS * PER_PATH_EVENT_LIMIT),
+		{ executionPolicy: "worker-required", maxRows: MAX_QUERY_PATHS * PER_PATH_EVENT_LIMIT, signal },
+	);
 	return new Map(rows.map((row) => [row.effectId, row.treeHashAfter]));
 }
 
@@ -334,6 +342,7 @@ async function selectPerPathRows(
 	baseConditions: SQL[],
 	workspaceKeys: string[],
 	scopes: ReadonlyMap<string, WorkspaceAttributionScope>,
+	signal?: AbortSignal,
 ): Promise<{ rows: EventRow[]; truncatedPaths: Set<string> }> {
 	const targets: HistoryTarget[] = [];
 	filePaths.forEach((filePath, ord) => {
@@ -344,7 +353,10 @@ async function selectPerPathRows(
 	});
 	const candidates = new Map<number, { rowId: number; changedAt: string }[]>();
 	for (const batch of batchTargets(targets)) {
-		const fetched = await db.all<{ ord: number; rowId: number; changedAt: string }>(sql`
+		signal?.throwIfAborted();
+		const fetched = await readDbAll<{ ord: number; rowId: number; changedAt: string }>(
+			db,
+			sql`
 			with "targets"("ord", "workspacePath", "filePath") as (
 				select json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')
 				from json_each(${JSON.stringify(batch)})
@@ -359,7 +371,9 @@ async function selectPerPathRows(
 				)}
 				order by ${fileAttributions.changedAt} desc, ${EVENT_ROW_ID} desc
 				limit ${PER_PATH_EVENT_LIMIT + 1}
-			)`);
+			)`,
+			{ executionPolicy: "worker-required", maxRows: SELECT_ROWS_MAX_ROWS, signal },
+		);
 		for (const row of fetched) {
 			const list = candidates.get(row.ord);
 			if (list) list.push(row);
@@ -382,8 +396,11 @@ async function selectPerPathRows(
 	const rows: EventRow[] = [];
 	const rowIds = [...kept.keys()];
 	for (let offset = 0; offset < rowIds.length; offset += DETAIL_ROWS_PER_QUERY) {
+		signal?.throwIfAborted();
 		const ids = rowIds.slice(offset, offset + DETAIL_ROWS_PER_QUERY);
-		const details = await db.all<EventRow>(sql`
+		const details = await readDbAll<EventRow>(
+			db,
+			sql`
 			select
 				${fileAttributions.id} as "id",
 				${EVENT_ROW_ID} as "rowId",
@@ -400,7 +417,9 @@ async function selectPerPathRows(
 				${fileAttributions.linesAdded} as "linesAdded",
 				${fileAttributions.linesRemoved} as "linesRemoved"
 			from ${fileAttributions}
-			where ${EVENT_ROW_ID} in (select value from json_each(${JSON.stringify(ids)}))`);
+			where ${EVENT_ROW_ID} in (select value from json_each(${JSON.stringify(ids)}))`,
+			{ executionPolicy: "worker-required", maxRows: DETAIL_ROWS_PER_QUERY, signal },
+		);
 		for (const row of details)
 			for (const ord of kept.get(row.rowId) ?? []) rows.push({ ...row, filePath: filePaths[ord] });
 	}
@@ -408,15 +427,23 @@ async function selectPerPathRows(
 }
 
 /** Spellings with no stored rows cannot contribute history; one indexed EXISTS per key. */
-async function workspaceKeysWithHistory(deviceId: string, keys: string[]): Promise<Set<string>> {
+async function workspaceKeysWithHistory(
+	deviceId: string,
+	keys: string[],
+	signal?: AbortSignal,
+): Promise<Set<string>> {
 	if (keys.length === 0) return new Set();
-	const rows = await db.all<{ key: string }>(sql`
+	const rows = await readDbAll<{ key: string }>(
+		db,
+		sql`
 		select "json_each".value as "key" from json_each(${JSON.stringify(keys)})
 		where exists (
 			select 1 from ${fileAttributions}
 			where ${fileAttributions.deviceId} = ${deviceId}
 				and ${fileAttributions.workspacePath} = "json_each".value
-		)`);
+		)`,
+		{ executionPolicy: "worker-required", maxRows: keys.length, signal },
+	);
 	return new Set(rows.map((row) => row.key));
 }
 
@@ -424,6 +451,7 @@ export async function getWorkspaceModificationView(
 	workspacePath: string,
 	options: WorkspaceModificationViewOptions = {},
 ): Promise<WorkspaceModificationView> {
+	options.signal?.throwIfAborted();
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
 	const key = deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
 	const workspaceKeys = new Set([key]);
@@ -498,9 +526,11 @@ export async function getWorkspaceModificationView(
 	// Speculative cwd spellings (ancestor directories, legacy/canonical forms) only cost
 	// query work; dropping the ones with no stored rows loses no history. The cap applies
 	// afterwards so empty guesses cannot crowd out spellings that really hold rows.
-	const stored = await workspaceKeysWithHistory(deviceId, [
-		...new Set([...workspaceKeys, ...candidateScopes.keys()]),
-	]);
+	const stored = await workspaceKeysWithHistory(
+		deviceId,
+		[...new Set([...workspaceKeys, ...candidateScopes.keys()])],
+		options.signal,
+	);
 	const scopes = new Map<string, WorkspaceAttributionScope>();
 	let scopesTruncated = options.additionalScopesTruncated === true;
 	for (const [scopeKey, scope] of candidateScopes) {
@@ -525,6 +555,7 @@ export async function getWorkspaceModificationView(
 			conditions,
 			queryKeys,
 			scopes,
+			options.signal,
 		);
 		rows = selected.rows;
 		rows.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
@@ -538,12 +569,15 @@ export async function getWorkspaceModificationView(
 		const fetched = (
 			await Promise.all(
 				queryKeys.map(async (workspaceKey) => {
-					const rows = await db
-						.select(EVENT_COLUMNS)
-						.from(fileAttributions)
-						.where(and(...conditions, eq(fileAttributions.workspacePath, workspaceKey)))
-						.orderBy(desc(fileAttributions.changedAt), desc(EVENT_ROW_ID))
-						.limit(limit + 1);
+					const rows = await readQuery(
+						db
+							.select(EVENT_COLUMNS)
+							.from(fileAttributions)
+							.where(and(...conditions, eq(fileAttributions.workspacePath, workspaceKey)))
+							.orderBy(desc(fileAttributions.changedAt), desc(EVENT_ROW_ID))
+							.limit(limit + 1),
+						{ executionPolicy: "worker-required", maxRows: limit + 1, signal: options.signal },
+					);
 					return rows
 						.map((row) => ({
 							...row,
@@ -588,9 +622,10 @@ export async function getWorkspaceModificationView(
 			),
 		]),
 		wantTimeline
-			? loadTreeHashes([
-					...new Set(windowRows.flatMap((row) => (row.effectId ? [row.effectId] : []))),
-				])
+			? loadTreeHashes(
+					[...new Set(windowRows.flatMap((row) => (row.effectId ? [row.effectId] : [])))],
+					options.signal,
+				)
 			: Promise.resolve(new Map<string, string | null>()),
 	]);
 
@@ -722,7 +757,13 @@ export interface ImpreciseChangesReport {
 /** Bounded warning scan: reaching the cap can never silently become "no risk". */
 export async function findImpreciseChanges(
 	workspacePath: string,
-	options: { deviceId?: string; since?: string; until?: string; excludeNarratorId?: string } = {},
+	options: {
+		deviceId?: string;
+		since?: string;
+		until?: string;
+		excludeNarratorId?: string;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<ImpreciseChangesReport> {
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
 	const key = deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
@@ -731,17 +772,20 @@ export async function findImpreciseChanges(
 		eq(fileAttributions.workspacePath, key),
 	];
 	addTimeConditions(conditions, options);
-	const fetched = await db
-		.select({
-			filePath: fileAttributions.filePath,
-			narratorId: fileAttributions.narratorId,
-			userId: fileAttributions.userId,
-			action: fileAttributions.action,
-		})
-		.from(fileAttributions)
-		.where(and(...conditions))
-		.orderBy(desc(fileAttributions.changedAt))
-		.limit(MAX_EVENT_LIMIT + 1);
+	const fetched = await readQuery(
+		db
+			.select({
+				filePath: fileAttributions.filePath,
+				narratorId: fileAttributions.narratorId,
+				userId: fileAttributions.userId,
+				action: fileAttributions.action,
+			})
+			.from(fileAttributions)
+			.where(and(...conditions))
+			.orderBy(desc(fileAttributions.changedAt))
+			.limit(MAX_EVENT_LIMIT + 1),
+		{ executionPolicy: "worker-required", maxRows: MAX_EVENT_LIMIT + 1, signal: options.signal },
+	);
 	const hasMore = fetched.length > MAX_EVENT_LIMIT;
 	const rows = fetched.slice(0, MAX_EVENT_LIMIT);
 	let externalCount = 0;
