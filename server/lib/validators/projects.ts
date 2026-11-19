@@ -1,3 +1,8 @@
+import {
+	TEAM_EXCLUSIVE_PATH_MAX_LENGTH,
+	TEAM_EXCLUSIVE_PATHS_MAX,
+	TEAM_EXCLUSIVE_PATHS_MAX_BYTES,
+} from "@shared/project-teams";
 import { z } from "zod";
 import {
 	blacklistDirEntrySchema,
@@ -21,6 +26,47 @@ export const createProjectSchema = z.object({
 	clonePassword: z.string().max(200).optional(),
 });
 
+/**
+ * One exclusive path glob: relative to the repository root, `/` separators, no `..` segment and
+ * no leading `/` (e.g. `drizzle/**`, `server/db/schema.ts`).
+ */
+const exclusivePathGlobSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(TEAM_EXCLUSIVE_PATH_MAX_LENGTH)
+	.refine(
+		(glob) =>
+			!glob.startsWith("/") &&
+			!glob.includes("\\") &&
+			!glob.split("/").includes("..") &&
+			// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are refused.
+			!/[\u0000-\u001f\u007f]/.test(glob),
+		"An exclusive path is a glob relative to the repository root",
+	)
+	// A directory written `dir/` covers everything under it.
+	.transform((glob) => {
+		const relative = glob.replace(/^(\.\/)+/, "");
+		return relative.endsWith("/") ? `${relative.replace(/\/+$/, "")}/**` : relative;
+	})
+	// Only `*` / `**` segments (`*`, `**`, `**` then `*`, …) would lock every change of the project.
+	.refine(
+		(glob) => glob.split("/").some((segment) => segment.length > 0 && !/^\*+$/.test(segment)),
+		"Too broad an exclusive path: it matches everything",
+	);
+
+export const teamProjectSettingsSchema = z
+	.object({
+		exclusivePaths: z.array(exclusivePathGlobSchema).max(TEAM_EXCLUSIVE_PATHS_MAX).optional(),
+	})
+	.strict()
+	.refine(
+		(value) =>
+			Buffer.byteLength(JSON.stringify(value.exclusivePaths ?? []), "utf8") <=
+			TEAM_EXCLUSIVE_PATHS_MAX_BYTES,
+		`The exclusive paths are at most ${TEAM_EXCLUSIVE_PATHS_MAX_BYTES} bytes`,
+	);
+
 export const projectChapterSettingsSchema = z.object({
 	commands: z.array(commandSchema).max(100).optional(),
 	routines: z
@@ -35,6 +81,8 @@ export const projectChapterSettingsSchema = z.object({
 	blacklistDirs: z.array(blacklistDirEntrySchema).max(50).optional(),
 	commandWhitelist: z.array(commandWhitelistEntrySchema).max(50).optional(),
 	commandBlacklist: z.array(commandBlacklistEntrySchema).max(50).optional(),
+	/** Project Teams settings: exclusive path globs (see `TeamProjectSettings`). */
+	teams: teamProjectSettingsSchema.optional(),
 });
 
 export const updateProjectSchema = z.object({

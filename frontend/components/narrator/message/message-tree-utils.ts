@@ -171,6 +171,8 @@ export function replaceSubagentActivitySnapshot(
 		// the previous value: a snapshot arriving after the user stopped the takeover
 		// is precisely the correction this channel exists to deliver.
 		...(activity.takenOver ? { takenOver: true } : {}),
+		// Authoritative too: the snapshot lists the child's helpers as they are now.
+		...(activity.nested ? { nested: activity.nested } : {}),
 		latestToolCalls: [],
 	};
 	for (const header of activity.latestToolCalls ?? []) {

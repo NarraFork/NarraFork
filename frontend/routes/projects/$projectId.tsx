@@ -1,4 +1,5 @@
 import { ProjectSessionList } from "@frontend/components/project/ProjectSessionList";
+import { ProjectTeamsList } from "@frontend/components/teams/ProjectTeamsList";
 import {
 	Alert,
 	Button,
@@ -142,6 +143,20 @@ function ProjectPage() {
 							}
 						/>
 					</Suspense>
+				</ProjectToolsBoundary>
+			)}
+			{!showTasks && (
+				<ProjectToolsBoundary fallback={<Alert color="red">{t("teams.loadFailed")}</Alert>}>
+					<ProjectTeamsList
+						projectId={projectId}
+						canCreate={canWrite}
+						onOpenTeam={(teamId) =>
+							void navigate({
+								to: "/projects/$projectId/teams/$teamId",
+								params: { projectId, teamId },
+							})
+						}
+					/>
 				</ProjectToolsBoundary>
 			)}
 			{!showTasks && <Title order={4}>{t("compatibility.sessions")}</Title>}

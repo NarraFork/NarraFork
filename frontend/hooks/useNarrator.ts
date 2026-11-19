@@ -655,7 +655,7 @@ export function useResumeRecoverySubagents() {
 			narratorId: string;
 			messageId: string;
 			subagentIds: string[];
-			mode: "notify" | "await";
+			mode: "notify" | "watch";
 		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
 		onSuccess: (data, { narratorId }) => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
@@ -780,6 +780,8 @@ export function useCreateNarrator() {
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			questionReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
+			/** Execution device the session starts on. Omit/"local" for this server. */
+			deviceId?: string | null;
 			title?: string;
 			makeNamed?: boolean;
 			handle?: string;

@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { zodToJsonSchema } from "@server/lib/agent/tool-registry";
 import { awaitTool, listRunningAwaits } from "@server/lib/agent/tools/await";
 import { sendTool } from "@server/lib/agent/tools/send";
+import { watchTool } from "@server/lib/agent/tools/watch";
 import type { ToolContext } from "@server/lib/agent/types";
 import {
 	compileDelegationPolicy,
 	type DelegationTemplateInput,
 	isRuntimeToolAllowed,
 	resolveRuntimePolicy,
-	runtimeAwaitTargets,
 	runtimeInteractionHint,
+	runtimeWatchTargets,
 } from "../agent-runtime/policy";
 import {
 	assertRuntimeCanAwaitAgent,
@@ -36,7 +38,7 @@ const profiles: Profile[] = [
 			toolAccess: "custom",
 			customTools: [
 				"Send",
-				"Await",
+				"Watch",
 				"AskUserQuestion",
 				"Agent",
 				"Task",
@@ -68,7 +70,8 @@ describe("shared capability projections", () => {
 				: undefined;
 			const filter = input ? resolveToolFilter(input.template, custom) : runtimeToolFilter(policy);
 			expect(filter?.(sendTool)).toBe(true);
-			expect(filter?.(awaitTool)).toBe(true);
+			expect(filter?.(watchTool)).toBe(true);
+			expect(filter?.(awaitTool)).toBe(false);
 			for (const name of [
 				"Agent",
 				"Task",
@@ -82,15 +85,15 @@ describe("shared capability projections", () => {
 				expect(filter?.(tool)).toBe(isRuntimeToolAllowed(policy, name));
 			}
 			const sendProperties = sendTool.rawJsonSchema?.properties as Record<string, unknown>;
-			const awaitProperties = awaitTool.rawJsonSchema?.properties as {
+			const watchProperties = zodToJsonSchema(watchTool.parameters).properties as {
 				type: { enum: string[] };
 			};
 			expect(sendProperties.await).toBeUndefined();
-			expect(awaitProperties.type.enum).toEqual(["agent", "bash", "transfer", "question"]);
-			for (const target of runtimeAwaitTargets(policy)) {
-				expect(awaitProperties.type.enum).toContain(target);
+			expect(watchProperties.type.enum).toEqual(["terminal", "bash", "agent"]);
+			for (const target of runtimeWatchTargets(policy)) {
+				expect(watchProperties.type.enum).toContain(target);
 			}
-			expect(awaitProperties.type.enum).toContain("question");
+			expect(watchProperties.type.enum).not.toContain("question");
 			const awaitGuard = () => assertRuntimeCanAwaitAgent(policy);
 			if (child) {
 				expect(awaitGuard).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
@@ -195,7 +198,7 @@ describe("shared capability projections", () => {
 		expect(awaitTool.parameters.safeParse({ type: "agent", id: "sibling" }).success).toBe(true);
 		const result = await awaitTool.execute({ type: "agent", id: "sibling" }, ctx);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
+		expect(result.output).toContain("Await is retired");
 		expect(listRunningAwaits().some((entry) => entry.toolUseId === ctx.currentToolUseId)).toBe(
 			false,
 		);

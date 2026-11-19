@@ -151,6 +151,8 @@ export function rowActionHandlerDependencies(
 export interface VListRowToolActions {
 	/** "Open full session" / "View session" — the resolved child narrator id. */
 	onViewSubagentSession?: () => void;
+	/** Open one of the child's own helpers (a subagent card's nested row). */
+	onViewNestedSession?: (narratorId: string) => void;
 	/** "Detach to background". */
 	onDetachSubagent?: () => void;
 	/** "Detach to background" for a Bash tool call. */
@@ -197,6 +199,10 @@ export function buildRowToolActions(
 		meta.subagentNarratorId ?? meta.awaitAgentNarratorId ?? meta.sendTargetNarratorId;
 	if (sessionNarratorId && handlers.onViewSubagentSession) {
 		actions.onViewSubagentSession = () => handlers.onViewSubagentSession?.(sessionNarratorId);
+	}
+	// A subagent card's nested rows open the helpers its child launched.
+	if (meta.subagentNarratorId && handlers.onViewSubagentSession) {
+		actions.onViewNestedSession = (narratorId) => handlers.onViewSubagentSession?.(narratorId);
 	}
 
 	// Background lifecycle actions only ever apply to a real child narrator.

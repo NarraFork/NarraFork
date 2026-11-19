@@ -633,10 +633,10 @@ export const DiffContent = memo(function DiffContent({
 								style={{
 									height: frame.layout.typography.lineHeight + 2,
 									boxSizing: "border-box",
-									color: dark ? "#9198a1" : "#59636e",
-									backgroundColor: dark ? "#121d2f" : "#ddf4ff",
-									borderTop: `1px solid ${dark ? "#1f2a37" : "#c6e6ff"}`,
-									borderBottom: `1px solid ${dark ? "#1f2a37" : "#c6e6ff"}`,
+									color: "var(--nf-diff-hunk-text)",
+									backgroundColor: "var(--nf-diff-hunk-bg)",
+									borderTop: "1px solid var(--nf-diff-hunk-line)",
+									borderBottom: "1px solid var(--nf-diff-hunk-line)",
 									userSelect: "none",
 									paddingLeft: frame.layout.gutterWidth,
 								}}

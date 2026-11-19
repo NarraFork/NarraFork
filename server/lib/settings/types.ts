@@ -6,6 +6,7 @@
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { PlatformInstanceKind } from "@shared/platform-instances";
+import type { NoProxyRule } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
 import type { StorageRetentionSettings } from "@shared/storage-retention";
@@ -451,6 +452,16 @@ export interface OutboundProxyConfig {
 	mode: OutboundProxyMode;
 	/** Proxy URL, only used when mode is "custom". */
 	url?: string;
+	/**
+	 * Targets that must bypass the proxy, shared by every proxied channel.
+	 *
+	 * Evaluated in `net/proxy.ts` after the loopback and ambient `NO_PROXY`
+	 * checks, right before a request becomes a proxied connection. Rules support
+	 * wildcard globs and regular expressions; a rule only exempts a target and
+	 * can never force one through the proxy. See `net/no-proxy.ts` for the
+	 * matching priority and syntax.
+	 */
+	noProxyRules?: NoProxyRule[];
 }
 
 /**

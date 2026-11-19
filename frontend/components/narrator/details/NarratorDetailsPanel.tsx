@@ -12,7 +12,6 @@ import {
 	Drawer,
 	FileButton,
 	Group,
-	Modal,
 	MultiSelect,
 	Paper,
 	ScrollArea,
@@ -46,7 +45,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import React, { createContext, lazy, Suspense, useContext, useMemo, useState } from "react";
+import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
@@ -77,7 +76,7 @@ import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorContainerBrowserToolAutoEnableCapability,
 } from "../../../hooks/usePlatform";
-import { useNarratorTerminals } from "../../../hooks/useTerminals";
+import { useNarratorTerminals, useTreeTerminals } from "../../../hooks/useTerminals";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import type {
@@ -99,9 +98,8 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../../lib/safe-area";
-import { Z } from "../../../lib/z-index";
+import { DeviceDirectoryModal } from "../../common/DeviceDirectoryPicker";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
 import { UserAvatar } from "../../UserAvatar";
 import {
 	DetailsPanelContentLifetime,
@@ -132,6 +130,7 @@ import {
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
+import { SubagentTerminalsList } from "./SubagentTerminalsList";
 import { TurnRangeInput } from "./TurnRangeInput";
 import { TurnRangePickerModal } from "./TurnRangePickerModal";
 import {
@@ -392,12 +391,6 @@ function RuleList({
 	return <Stack gap="xs">{items.map((item, index) => renderItem(item, index))}</Stack>;
 }
 
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
-
 const EMPTY_POOLS: SubagentModelPools = {};
 const EMPTY_SELECTION: string[] = [];
 
@@ -442,6 +435,7 @@ function NarratorDetailsContent({
 		opened && browserSessionsSupported ? narratorId : "",
 	);
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
+	const { data: treeTerminals } = useTreeTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
 	const { data: whitelistDirs } = useWhitelistDirs(opened ? narratorId : "");
 	const { data: blacklistDirs } = useBlacklistDirs(opened ? narratorId : "");
@@ -1217,34 +1211,25 @@ function NarratorDetailsContent({
 						/>
 					) : null}
 					{isRemoteCwd ? (
-						<Modal
+						<DeviceDirectoryModal
 							opened={remoteCwdOpened}
 							onClose={() => setRemoteCwdOpened(false)}
 							title={t("details.cwdBrowseRemoteTitle", { device: deviceLabel(editDeviceId) })}
-							size="md"
-							zIndex={Z.modal}
-							styles={DIRECTORY_BROWSER_MODAL_STYLES}
-						>
-							{remoteCwdOpened ? (
-								<Suspense fallback={null}>
-									<RemoteDirectoryBrowser
-										deviceLabel={deviceLabel(editDeviceId)}
-										initialPath={cwdValue.trim() || undefined}
-										listDirectory={(path, opts) =>
-											api.browseNarratorDevice(narratorId, editDeviceId, path, {
-												showHidden: opts.showHidden,
-											})
-										}
-										queryKey={["narratorDeviceBrowse", narratorId, editDeviceId]}
-										onSelect={(path) => {
-											setCwdValue(path);
-											setRemoteCwdOpened(false);
-										}}
-										onCancel={() => setRemoteCwdOpened(false)}
-									/>
-								</Suspense>
-							) : null}
-						</Modal>
+							deviceId={editDeviceId}
+							deviceLabel={deviceLabel(editDeviceId)}
+							initialPath={cwdValue.trim() || undefined}
+							listDirectory={(path, opts) =>
+								api.browseNarratorDevice(narratorId, editDeviceId, path, {
+									showHidden: opts.showHidden,
+								})
+							}
+							queryKey={["narratorDeviceBrowse", narratorId, editDeviceId]}
+							onSelect={(path) => {
+								setCwdValue(path);
+								setRemoteCwdOpened(false);
+							}}
+							onCancel={() => setRemoteCwdOpened(false)}
+						/>
 					) : null}
 					<Stack gap="xs">
 						{/* Executor first: it decides what the directory below even means. This is
@@ -2064,6 +2049,7 @@ function NarratorDetailsContent({
 					searchableText={[
 						t("details.viewerNames"),
 						t("details.browserSessions"),
+						t("details.subagentTerminals"),
 						t("details.pendingPermissions"),
 					]}
 				>
@@ -2127,6 +2113,24 @@ function NarratorDetailsContent({
 							)
 						}
 					/>
+
+					{/* Subagents' terminals, read-only; a subagent shows its helpers' only when it has any. */}
+					{treeTerminals &&
+					(narrator?.type !== "subagent" || treeTerminals.terminals.length > 0) ? (
+						<DetailRow
+							label={t("details.subagentTerminals")}
+							value={
+								<SubagentTerminalsList
+									terminals={treeTerminals.terminals}
+									truncated={treeTerminals.truncated}
+									canOpen={treeTerminals.canOpen}
+									onOpenSession={(id) =>
+										void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } })
+									}
+								/>
+							}
+						/>
+					) : null}
 
 					{browserToolAutoEnableDefaultOff && (
 						<DetailRow

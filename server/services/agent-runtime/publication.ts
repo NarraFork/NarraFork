@@ -1,9 +1,10 @@
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, like, ne, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { resolveDatabaseBackendConfig } from "../../db/postgres-runtime";
 import {
 	backgroundTasks,
+	deviceTransferTasks,
 	narratorBlocks,
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -23,6 +24,7 @@ import {
 	registerRun,
 } from "../../lib/validators/runtime-registration";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 
 export interface StartRunInput {
 	narratorId: string;
@@ -68,6 +70,7 @@ import {
 	type PgPublicationRegistrations,
 	type PgRestartAgentTaskInput,
 	type PgStaleTaskRow,
+	type PgStartTransferTaskInput,
 	type PgTakeoverInput,
 	type PgTerminalTransitionInput,
 	type PgUpdateNarratorBackgroundInput,
@@ -773,7 +776,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 						...registration.run,
 						eventKind: registration.eventKind,
 						resultRef: persistResult(registration.run, result, tx),
-						summary: `[System] Background ${source.producerKind} "${entry.task.title ?? entry.task.alias ?? source.taskId}" (ID: ${entry.task.alias ?? source.taskId}) ${registration.eventKind}. Use Await to inspect the stored result.`,
+						summary: `[System] Background ${source.producerKind} "${entry.task.title ?? entry.task.alias ?? source.taskId}" (ID: ${entry.task.alias ?? source.taskId}) ${registration.eventKind}. Use ${source.producerKind === "agent" ? `Watch({ type: "agent", id: "${entry.task.alias ?? source.taskId}" })` : `TeamStatus({ action: "get_task", target_id: "${entry.task.alias ?? source.taskId}" })`} to inspect the stored result.`,
 					},
 					tx,
 				);
@@ -930,6 +933,8 @@ export interface AsyncRuntimePublicationService {
 		/** PG-only: insert background_tasks row + reserve publication slots in one section. */
 		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
 	}): Promise<PublicationRun>;
+	/** Transfer owner-generation check, projection revival and result reservation are atomic. */
+	startTransferTask(input: PgStartTransferTaskInput): Promise<BackgroundTaskRecord | undefined>;
 	/** Restart an existing agent task: CAS → "running" + logical run link. */
 	restartAgentTask(input: PgRestartAgentTaskInput): Promise<{ id: string } | undefined>;
 	/** Update narrator background completion fields + optional terminal publication. */
@@ -1074,6 +1079,82 @@ function createSqliteAsyncPublicationService(
 			);
 			return run;
 		},
+		startTransferTask: async (input) =>
+			runAtomicWrite(db, "publication.startTransferTask", (tx) => {
+				const owner = tx
+					.select({
+						id: deviceTransferTasks.id,
+						parentNarratorId: deviceTransferTasks.parentNarratorId,
+						status: deviceTransferTasks.status,
+						generation: deviceTransferTasks.runGeneration,
+					})
+					.from(deviceTransferTasks)
+					.where(eq(deviceTransferTasks.id, input.taskRow.transferTaskId))
+					.get();
+				if (!owner || owner.parentNarratorId !== input.taskRow.parentNarratorId) return undefined;
+				const existing = tx
+					.select()
+					.from(backgroundTasks)
+					.where(
+						and(
+							eq(backgroundTasks.transferTaskId, owner.id),
+							eq(backgroundTasks.parentNarratorId, owner.parentNarratorId),
+						),
+					)
+					.get();
+				if (
+					owner.status !== "running" ||
+					(input.runGeneration !== undefined && input.runGeneration !== owner.generation)
+				)
+					return existing;
+				const generationRunId = `transfer:${owner.id}:${owner.generation}`;
+				const alias = existing?.alias ?? input.taskRow.alias ?? null;
+				if (existing?.status === "running" && existing.logicalRunId) {
+					if (alias !== existing.alias)
+						return tx
+							.update(backgroundTasks)
+							.set({ alias })
+							.where(eq(backgroundTasks.id, existing.id))
+							.returning()
+							.get();
+					return existing;
+				}
+				if (existing && existing.status !== "paused" && existing.logicalRunId === generationRunId)
+					return existing;
+				const run: PublicationRun = {
+					producerKind: "bash",
+					taskId: existing?.id ?? input.taskRow.id,
+					recipientId: owner.parentNarratorId,
+					logicalRunId:
+						existing?.status === "paused" && existing.logicalRunId
+							? existing.logicalRunId
+							: generationRunId,
+				};
+				legacy.reserve(run, tx);
+				if (existing)
+					return tx
+						.update(backgroundTasks)
+						.set({
+							status: "running",
+							logicalRunId: run.logicalRunId,
+							alias,
+							output: null,
+							outputBytes: 0,
+							outputTruncated: false,
+							exitCode: null,
+							completedAt: null,
+							notified: false,
+							updatedAt: input.taskRow.updatedAt,
+						})
+						.where(eq(backgroundTasks.id, existing.id))
+						.returning()
+						.get();
+				return tx
+					.insert(backgroundTasks)
+					.values({ ...input.taskRow, logicalRunId: run.logicalRunId })
+					.returning()
+					.get();
+			}),
 		releaseUnusedRunSlots: async (run) => Promise.resolve(legacy.store.releaseUnusedRunSlots(run)),
 		restartAgentTask: async (input) => {
 			const now = input.now;
@@ -1146,7 +1227,7 @@ function createSqliteAsyncPublicationService(
 							...run,
 							eventKind: input.backgroundStatus === "completed" ? "completed" : "failed",
 							resultRef: legacy.persistResult(run, input.backgroundResult, tx),
-							summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Await({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
+							summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Watch({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
 						},
 						tx,
 					);
@@ -1156,6 +1237,14 @@ function createSqliteAsyncPublicationService(
 		},
 		commitTerminalTransition: async (input) => {
 			const task = runAtomicWrite(db, "publication.commitTerminalTransition", (tx) => {
+				if (input.expectedTransfer) {
+					const owner = tx
+						.select({ generation: deviceTransferTasks.runGeneration })
+						.from(deviceTransferTasks)
+						.where(eq(deviceTransferTasks.id, input.expectedTransfer.id))
+						.get();
+					if (owner?.generation !== input.expectedTransfer.generation) return undefined;
+				}
 				// The SQLite branch pre-reads the task for its logicalRunId, which the
 				// publication run needs. The CAS guard (WHERE status = "running") prevents
 				// double-transition.
@@ -1169,7 +1258,12 @@ function createSqliteAsyncPublicationService(
 					.from(backgroundTasks)
 					.where(eq(backgroundTasks.id, input.taskId))
 					.get();
-				if (before && before.type !== "transfer" && !before.logicalRunId) {
+				if (
+					before &&
+					before.type !== "transfer" &&
+					!before.logicalRunId &&
+					!input.silentObservation
+				) {
 					legacy.store.registerLegacyRunningRunSlots(
 						{
 							producerKind: before.type,
@@ -1184,7 +1278,27 @@ function createSqliteAsyncPublicationService(
 				const updated = tx
 					.update(backgroundTasks)
 					.set(input.setFields)
-					.where(and(eq(backgroundTasks.id, input.taskId), eq(backgroundTasks.status, "running")))
+					.where(
+						and(
+							eq(backgroundTasks.id, input.taskId),
+							input.expectedTransfer
+								? and(
+										eq(backgroundTasks.type, "transfer"),
+										eq(backgroundTasks.transferTaskId, input.expectedTransfer.id),
+										inArray(backgroundTasks.status, ["running", "paused"]),
+									)
+								: eq(backgroundTasks.status, "running"),
+							input.silentObservation
+								? and(
+										eq(backgroundTasks.type, "bash"),
+										or(
+											like(backgroundTasks.command, `${WATCH_COMMAND_PREFIX}%`),
+											like(backgroundTasks.command, `${TERMINAL_WATCH_COMMAND_PREFIX}%`),
+										),
+									)
+								: undefined,
+						),
+					)
 					.returning({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
@@ -1197,12 +1311,23 @@ function createSqliteAsyncPublicationService(
 						logicalRunId: backgroundTasks.logicalRunId,
 					})
 					.get();
-				if (!updated || updated.type === "transfer" || input.deferPublication)
-					return updated ?? undefined;
-				const run = taskPublicationRun({
-					...updated,
-					logicalRunId: before?.logicalRunId ?? null,
-				});
+				if (!updated) return undefined;
+				if (input.silentObservation) {
+					if (updated.logicalRunId)
+						legacy.store.releaseUnusedRunSlots(taskPublicationRun(updated), tx);
+					return updated;
+				}
+				if (input.deferPublication) return updated;
+				if (updated.type === "transfer" && !updated.logicalRunId) {
+					const run = legacy.newBashRun(updated.id, updated.parentNarratorId);
+					legacy.reserve(run, tx);
+					tx.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, updated.id))
+						.run();
+					updated.logicalRunId = run.logicalRunId;
+				}
+				const run = taskPublicationRun(updated);
 				legacy.commit(
 					{
 						...run,
@@ -1284,8 +1409,17 @@ function createSqliteAsyncPublicationService(
 					})
 					.get();
 				if (!updated) return undefined;
-				if (updated.type !== "transfer" && existing.logicalRunId) {
-					const run = taskPublicationRun({ ...updated, logicalRunId: existing.logicalRunId });
+				if (updated.type === "transfer" && !updated.logicalRunId) {
+					const run = legacy.newBashRun(updated.id, updated.parentNarratorId);
+					legacy.reserve(run, tx);
+					tx.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, updated.id))
+						.run();
+					updated.logicalRunId = run.logicalRunId;
+				}
+				if (updated.logicalRunId) {
+					const run = taskPublicationRun(updated);
 					const resultRef = legacy.persistResult(run, input.capturedOutput ?? "(cancelled)", tx);
 					if (existing.type === "bash" && existing.backgroundKind === "service") {
 						// Explicit service stop settles the durable result, not a new parent turn.
@@ -1298,7 +1432,7 @@ function createSqliteAsyncPublicationService(
 							...run,
 							eventKind: "cancelled",
 							resultRef,
-							summary: `[System] Background ${existing.type} cancelled. Use Await({ type: "${existing.type}", id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
+							summary: `[System] Background ${existing.type} cancelled. Use TeamStatus({ action: "get_task", target_id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
 						},
 						tx,
 					);
@@ -1559,6 +1693,8 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 			logicalRunId: generateId(),
 		}),
 		startBashRun: (input) => engine.startBashRun(input),
+		startTransferTask: async (input) =>
+			(await engine.startTransferTask(input)) as BackgroundTaskRecord | undefined,
 		releaseUnusedRunSlots: (run) => queue.outbox.releaseUnusedRunSlots(run),
 		restartAgentTask: (input) => engine.restartAgentTask(input),
 		updateNarratorBackground: async (input) => {
@@ -1602,7 +1738,7 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 				admission,
 				resultText: result,
 				summary: admission
-					? `[System] Background ${source.producerKind} "${entry.task.title ?? entry.task.alias ?? source.taskId}" (ID: ${entry.task.alias ?? source.taskId}) ${admission.eventKind}. Use Await to inspect the stored result.`
+					? `[System] Background ${source.producerKind} "${entry.task.title ?? entry.task.alias ?? source.taskId}" (ID: ${entry.task.alias ?? source.taskId}) ${admission.eventKind}. Use ${source.producerKind === "agent" ? `Watch({ type: "agent", id: "${entry.task.alias ?? source.taskId}" })` : `TeamStatus({ action: "get_task", target_id: "${entry.task.alias ?? source.taskId}" })`} to inspect the stored result.`
 					: "",
 			});
 			// The publisher schedules bounded retries after the durable intent commits.
@@ -1731,7 +1867,7 @@ export function taskPublicationRun(task: {
 }): PublicationRun {
 	if (!task.logicalRunId) throw new ValidationError("Task has no registered publication run");
 	return {
-		producerKind: task.type as NoticeKind,
+		producerKind: task.type === "transfer" ? "bash" : (task.type as NoticeKind),
 		taskId: task.id,
 		recipientId: task.parentNarratorId,
 		logicalRunId: task.logicalRunId,

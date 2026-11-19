@@ -26,7 +26,7 @@ import {
 } from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
+import { compileDelegationPolicy } from "./agent-runtime/policy";
 import { controlRun, startNarratorRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import { customSubagentService } from "./custom-subagent-service";
@@ -56,7 +56,7 @@ export function buildBackgroundAgentStartOutput(
 	return (
 		`<background_task_id>${taskIdOrAlias}</background_task_id>\n\n` +
 		`${agentMarkdownReference(narratorId, title || taskIdOrAlias)}\n\n` +
-		`Background task started. Await({ type: "agent", id: "${taskIdOrAlias}" })`
+		`Background task started. Completion notifies automatically. Watch({ type: "agent", id: "${taskIdOrAlias}" }) registers an observation or retrieves the saved result.`
 	);
 }
 
@@ -167,6 +167,11 @@ export interface RunSubagentInput {
 	onDelegatedResult?: (
 		note: import("@shared/outline-report-note").OutlineReportNote | null,
 	) => void;
+	/**
+	 * Told the subagent's id as soon as it exists, before its run starts (a team work item records
+	 * its worker here, so the run's end can find the item). A failure is logged, never fatal.
+	 */
+	onCreated?: (subagentId: string) => void;
 }
 
 /**
@@ -182,7 +187,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const {
 		parentNarratorId,
 		toolUseId,
-		subagentType,
 		prompt,
 		cwd,
 		title,
@@ -193,6 +197,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	} = input;
 	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
 	// id the catalog does not know fails here instead of at the child's first request.
+	// "Worker" or "GENERAL" means that built-in, never the read-only unknown-type fallback.
+	const subagentType = customSubagentService.canonicalTemplateName(input.subagentType);
 	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background
@@ -203,9 +209,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	// The template compiles into ordinary data on the created narrator: a capability
 	// ceiling trait and a base prompt. Neither is read from the template again.
-	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
-		? null
-		: await customSubagentService.loadByName(subagentType);
+	const customDef = await customSubagentService.resolveTemplateDefinition(subagentType);
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,
@@ -310,6 +314,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		});
 		const subagentId = subagent.id;
 		updateLease.setNarratorId(subagentId);
+		if (input.onCreated) {
+			try {
+				input.onCreated(subagentId);
+			} catch (error) {
+				logger.warn("Subagent creation hook failed", {
+					subagentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		// Validates the pool now (a refused model fails the call before any run starts).
 		const { inheritance } = await resolveSubagentModelForRun(subagent, userId);
 		let aliasRegistration: { alias: string; conflicted: boolean };
@@ -440,7 +454,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 						`${agentMarkdownReference(subagentId, title || aliasRegistration.alias)}\n\n` +
 						"Background task started. User takeover is already active. The initial prompt runs independently; " +
 						"turn completion will not notify or wake the parent. " +
-						"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
+						"The user can continue interacting until they explicitly end takeover. Do not automatically Watch this agent."
 					: buildBackgroundAgentStartOutput(aliasRegistration.alias, subagentId, title)) +
 				delegationNote +
 				formatSubagentModelFallbackNote(inheritance) +
@@ -495,7 +509,7 @@ export function aliasConflictNote(
 	return (
 		`\n\nNote: The requested alias "${requested}" was already taken. ` +
 		`This agent was assigned "${assigned}" instead.` +
-		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+		(background ? "" : " Use this alias with Watch or Send to reference this agent.")
 	);
 }
 

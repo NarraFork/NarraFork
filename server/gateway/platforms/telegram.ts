@@ -8,9 +8,12 @@
 import type TelegramBot from "node-telegram-bot-api";
 import type { TelegramMessage } from "node-telegram-bot-api";
 import { logger } from "../../lib/logger";
-import { resolveOverride } from "../../lib/net/proxy";
+import { resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, TelegramConfig } from "../types";
+
+/** Telegram Bot API endpoint; the proxy is resolved against it so rules apply. */
+const TELEGRAM_API_ENDPOINT = "https://api.telegram.org/";
 
 export class TelegramAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "telegram";
@@ -29,9 +32,10 @@ export class TelegramAdapter extends BaseAdapter {
 		try {
 			const TelegramBotCtor = (await import("node-telegram-bot-api")).default;
 			// Telegram uses long-polling over HTTP; route all API traffic through the
-			// resolved proxy (this platform's override, else the global policy).
-			// Empty proxy → default direct behaviour.
-			const proxy = resolveOverride(this.config.proxy);
+			// resolved proxy (this platform's override, else the global policy),
+			// resolved against the Bot API endpoint so `settings.proxy.noProxyRules`
+			// applies here too. Empty proxy → default direct behaviour.
+			const proxy = resolveProxyForUrl(TELEGRAM_API_ENDPOINT, this.config.proxy);
 			this.bot = new TelegramBotCtor(this.config.token, {
 				polling: true,
 				...(proxy ? { request: { proxy } } : {}),

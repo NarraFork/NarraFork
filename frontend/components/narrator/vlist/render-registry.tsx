@@ -232,6 +232,10 @@ export function resolveRenderExtra(spec: {
 			// row count that decides height, while the paths and figures the rows PAINT
 			// live on the card data.
 			if ("fileChanges" in data) extra.fileChanges = data.fileChanges;
+			// Same split for the nested helpers: the measure keeps the row count, the rows
+			// paint each helper from the card data.
+			if ("nestedAgents" in data) extra.nestedAgents = data.nestedAgents;
+			if ("nestedTotal" in data) extra.nestedTotal = data.nestedTotal;
 			if ("isActive" in data) extra.isActive = data.isActive;
 			if ("status" in data) extra.status = data.status;
 			break;
@@ -462,7 +466,7 @@ export function renderElement(
 				<RenderSubagentRecovery
 					measured={m}
 					onToggleRow={extra.onToggleRow as ((rowIndex: number) => void) | undefined}
-					onResume={extra.onResume as ((mode: "notify" | "await") => void) | undefined}
+					onResume={extra.onResume as ((mode: "notify" | "watch") => void) | undefined}
 					onDismiss={extra.onDismiss as (() => void) | undefined}
 				/>
 			);
@@ -580,6 +584,11 @@ export function renderElement(
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
 					onToggleFileChanges={extra.onToggleFileChanges as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
+					nestedAgents={extra.nestedAgents as never}
+					nestedTotal={extra.nestedTotal as number | undefined}
+					onOpenNestedSession={
+						extra.onOpenNestedSession as ((narratorId: string) => void) | undefined
+					}
 					onResolveOverride={extra.onResolveOverride as (() => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
 					// Same viewer wiring as the tool card: the prompt / result bodies own

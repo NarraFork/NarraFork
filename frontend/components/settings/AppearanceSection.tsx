@@ -16,6 +16,8 @@ import {
 } from "../../hooks/usePluginThemes";
 import { typographyPreferencePatch } from "../../lib/typography-preferences";
 import { LanguageSwitcher } from "../LanguageSwitcher";
+import { BackgroundCard } from "../settings/BackgroundCard";
+import { ThemeColorCard } from "../settings/ThemeColorCard";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
 import {
@@ -197,6 +199,9 @@ export function AppearanceSection({
 					allowDeselect={false}
 				/>
 			)}
+
+			<ThemeColorCard />
+			<BackgroundCard />
 
 			{/* Display */}
 			<Title order={5} mt="sm">

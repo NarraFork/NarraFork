@@ -11,6 +11,7 @@ import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
 import type { StorageCategoryKey } from "@shared/storage-categories";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -434,7 +435,8 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "backgroundRunning"
 	| "nonArchived"
 	| "nonStaleStatus"
-	| "recentActivity";
+	| "recentActivity"
+	| "teamLiveWork";
 
 export type DatabaseCleanupWarningCode = string;
 
@@ -673,6 +675,8 @@ export interface SubagentActivitySummary {
 	 * rendering a plain "running" card.
 	 */
 	takenOver?: boolean;
+	/** The helpers this child launched itself (its one nested level); absent when none. */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {

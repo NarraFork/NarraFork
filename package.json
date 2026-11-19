@@ -122,6 +122,7 @@
 	},
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
+		"check:tokens": "bun scripts/check-style-tokens.ts",
 		"sql:report": "bun scripts/sql-trace-report.ts",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts && bun scripts/generate-builtin-plugins.ts",
 		"build:remote": "bun scripts/build-remote-frontend.ts",
@@ -145,7 +146,7 @@
 		"db:baseline:pg": "bun scripts/postgres-migrations.ts baseline",
 		"db:resume:pg": "bun scripts/postgres-migrations.ts resume",
 		"db:migrate": "bun server/db/migrate.ts",
-		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
+		"dev": "bun run db:migrate; PORT=7778 bun run --hot server/index.ts",
 		"dev:all": "bun server/dev-all.ts",
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:ts": "bun server/dev-all.ts",

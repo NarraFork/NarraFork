@@ -125,6 +125,8 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconGitFork;
 		case "await":
 			return IconClock;
+		case "watch":
+			return IconEye;
 		case "stop":
 			return IconPlayerStop;
 		case "send":

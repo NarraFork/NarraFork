@@ -18,8 +18,8 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 
 | 命令 | 用途 |
 |------|------|
-| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7779） |
-| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 7778，代理 /api 和 /ws 到 7779） |
+| `bun run dev` | 后端：运行数据库迁移 + 热重载服务器（端口 7778） |
+| `bun run dev:frontend` | 前端：Vite 开发服务器（端口 41221，代理 /api 和 /ws 到 7778） |
 | `bun run build` | 构建前端到 `dist/frontend/` |
 | `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
@@ -45,10 +45,11 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 
 **Bash 工具注意事项：** 当命令输出很大时，系统会自动将完整输出存放到一个你有权限读取的临时文件中，请使用 Read 工具读取该文件获取完整内容。**禁止手动将输出重定向或 `cat` 到 `/tmp`**，这会导致路径超出工作目录范围，需要额外的用户批准。
 
-**后台任务与 Await 使用规则（严格遵守）：**
-- **非必要不使用 Await 阻塞等待后台任务。** 后台 subagent 结束或后台 bash 任务结束时会自动唤醒主代理并带回结果，因此启动后台任务后应**直接结束当前响应**，等待唤醒通知，而不是在回合内轮询/等待。
-- 仅当后续步骤**强依赖**该任务结果、且必须在当前回合内立即拿到才能继续时，才使用 Await；此时也应设置有意义的超时，避免反复短轮询。
-- 对后台 subagent 同样适用：派生后直接结束响应即可，不要 Await 等它完成；有新信息需要传达时用 Send，没有就等自动唤醒。
+**后台任务与 Watch 使用规则（严格遵守）：**
+- 后台 subagent 或 bash 任务完成后会自动唤醒主代理并带回结果；启动后应继续无依赖工作，或**直接结束当前响应**等通知，不在回合内轮询。
+- `Watch({ type: "terminal" | "bash" | "agent", id, pattern?, timeout?, start_at? })` 登记非阻塞观察并立即返回；`timeout` 单位为毫秒，默认 600000、上限 86400000，只约束观察，不停止目标。终端写入的 `notify_on` 保持原子写入并登记，Terminal 的 `timeout` 仍使用秒。
+- Watch 卡片的“已登记观察”不是工具仍在运行。任务完成、输出命中或观察超时会通过通知送达；结果已保存时可用 Watch 获取有界结果。
+- Await 已退役，旧声明或历史卡片不授予执行权。问题与文件传输沿用自动通知及 Question／后台任务列表查询；有新信息需要传递时用 Send，不发催促或状态轮询消息。
 
 **发布工作区规则（严格遵守）：**
 - **发布（`bun scripts/release.ts`）必须在当前主仓库工作区就地执行，禁止为了发布新建/使用隔离 git worktree。** 隔离发布会导致 release 提交和 tag 落在别的分支、主仓库 main 上缺少版本 bump 与 changelog，需要二次合并。若当前工作区有未提交的无关改动，应先与用户确认提交或暂不发布，而不是旁路到隔离工作区。
@@ -119,11 +120,12 @@ server/
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播，所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起）由用户决策解除（5 分钟超时）。
-- **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（预留，当前等同 manual）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。
+- **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（不预装，经 ToolSearch 按需成组加载）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。`isPreloadedMode` 只对 `resident` 为真；`auto` 故意不进旧的启用/禁用名单。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
 - **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引可随时整表重建（启动时后台分页重建）。
-- **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何清理逻辑都不得删除它们。
+- **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何**自动**清理逻辑都不得删除它们；用户在删除弹窗里逐个确认删除某一个（含无记录的）是允许的，分支永不删除。
+  删除（`POST /api/narrators/:id/git/worktrees/removal`）是用户显式操作，只能走受保护退役通道：先迁移依赖该目录的会话（请求者真实切换，归档会话与子代理静默修复）、关闭后台任务/浏览器/终端，再撤登记行，最后在 `withProtectionReservation` 内执行 `git worktree remove`（目录已不存在时用 `git worktree remove -- <path>` 只移除这一条 Git 登记，不跑会清掉全部失效登记的 `prune`）。依赖该目录的其他主会话必须已被用户归档；归档本身不释放保护 claim，必须迁移 cwd 才行。有未提交改动或只有游离 HEAD 才可达的提交时必须强制确认，且确认的数字须与锁内重新测得的完全一致；`git status` 失败、被杀或超时按阻塞处理，不当作干净。删除要求请求者自己的 checkout 健康：目录已被外部删掉的会话只能从同仓库的另一个会话发起删除。目标路径必须是 Git 登记的 worktree、有 NarraFork owner 行、或位于 `<主工作树>/.worktrees/` 下，否则拒绝——`rows` 退役仍会关终端、搬会话，不能对任意目录执行。`storage-service` 的自动维护仍然永不删除无记录目录，两者不冲突。
 - **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
 - **项目页**：`/projects/$projectId` 列出目录与会话（按链接表过滤，任何角色的链接都算）。
@@ -154,7 +156,7 @@ frontend/
 ```
 
 **路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目、叙述者、管理面板、例程、设置、搜索、登录、许可证。
-**Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
+**Vite 开发代理：** `/api/*` → `localhost:7778`，`/ws/*` → `ws://localhost:7778`。
 
 ### API 路由
 

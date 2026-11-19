@@ -940,7 +940,7 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	const proto = getProtocol();
 	const listenUrl = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
 	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
-	// (7779); the banner and the browser open must send the user to the frontend.
+	// (7778); the banner and the browser open must send the user to the frontend.
 	const url = resolveAdvertisedAppUrl({
 		listenUrl,
 		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,
@@ -1038,6 +1038,12 @@ try {
 } catch {
 	logger.warn("DeepSeek balance startup refresh failed");
 }
+
+// A user's subagent template in a later built-in's directory (`worker`) is moved aside
+// to `worker-custom` with a warning: nothing is lost, and the built-in always wins.
+void import("./services/custom-subagent-service")
+	.then(({ moveAsideReservedTemplates }) => moveAsideReservedTemplates())
+	.catch((err) => logger.warn("Reserved subagent template check failed", { error: String(err) }));
 
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
@@ -1389,6 +1395,24 @@ initNotificationFanout();
 startNotificationCenterMaintenance();
 
 if (activeDatabaseBackend === "sqlite") {
+	// A project team follows its coordinator session's archive state, whichever path changed it.
+	import("./services/teams/team-service")
+		.then(({ startTeamStatusSync }) => startTeamStatusSync())
+		.catch((err) => logger.warn("Team status sync failed to start", { error: String(err) }));
+	// A coordinator's saved tool outputs go with its session; leftovers are swept once.
+	import("./services/teams/coordinator-maintenance")
+		.then(({ startCoordinatorMaintenance }) => startCoordinatorMaintenance())
+		.catch((err) =>
+			logger.warn("Coordinator output maintenance failed to start", { error: String(err) }),
+		);
+	// Team work items: isolated items settle when their subagent's run ends; check-ins re-arm.
+	import("./services/teams/work-items")
+		.then(({ startTeamWorkLifecycle }) => startTeamWorkLifecycle())
+		.catch((err) => logger.warn("Team work lifecycle failed to start", { error: String(err) }));
+	// Team work items' changed paths stay current in the background (overlaps, exclusive paths).
+	import("./services/teams/team-overlap")
+		.then(({ startTeamOverlapJob }) => startTeamOverlapJob())
+		.catch((err) => logger.warn("Team overlap job failed to start", { error: String(err) }));
 	// Stop containers and release ports that removed chapters left behind.
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });

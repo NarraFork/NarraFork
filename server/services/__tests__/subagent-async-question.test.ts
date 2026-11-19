@@ -28,7 +28,7 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const questionService = await import("../narrator-question-service");
 const { askUserQuestionTool } = await import("../../lib/agent/tools/ask-user-question");
-const { awaitTool } = await import("../../lib/agent/tools/await");
+const { questionTool } = await import("../../lib/agent/tools/question");
 const { handlePermission } = await import("../narrator-permission");
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { deliverInjection, setInjectionScheduler } = await import("../narrator-injection");
@@ -339,11 +339,10 @@ describe("asynchronous question integration", () => {
 		for (const type of ["general", "explore", "plan", "review", "search", "missing-custom"]) {
 			const policy = resolveRuntimePolicy([compileDelegationPolicy({ template: type })]);
 			expect(policy.capabilities.askUserQuestion).toBe("disabled");
-			// Waiting on a question that already exists is a separate capability.
-			expect(policy.capabilities.awaitOwnQuestion).toBe(true);
+			// Inspecting an existing question never grants authority to ask a new one.
 			const filter = resolveToolFilter(type);
 			expect(filter?.(askUserQuestionTool)).toBe(false);
-			expect(filter?.(awaitTool)).toBe(true);
+			expect(filter?.(questionTool)).toBe(true);
 		}
 		const schema = askUserQuestionTool.rawJsonSchema as Record<string, unknown>;
 		for (const key of ["anyOf", "oneOf", "allOf"]) expect(schema[key]).toBeUndefined();
@@ -352,13 +351,12 @@ describe("asynchronous question integration", () => {
 	test("an explicit custom allowlist cannot re-enable asking", async () => {
 		const customDefinition = {
 			toolAccess: "custom" as const,
-			customTools: ["Read", "Await", "AskUserQuestion"],
+			customTools: ["Read", "Question", "AskUserQuestion"],
 		};
 		const policy = resolveRuntimePolicy([
 			compileDelegationPolicy({ template: "custom", customDefinition }),
 		]);
 		expect(policy.capabilities.askUserQuestion).toBe("disabled");
-		expect(policy.capabilities.awaitOwnQuestion).toBe(true);
 		const filter = resolveToolFilter("custom", {
 			...customDefinition,
 			name: "custom",
@@ -368,7 +366,7 @@ describe("asynchronous question integration", () => {
 			location: "test",
 		});
 		expect(filter?.(askUserQuestionTool)).toBe(false);
-		expect(filter?.(awaitTool)).toBe(true);
+		expect(filter?.(questionTool)).toBe(true);
 	});
 
 	test("a subagent question is refused at the tool, the permission gate and the service", async () => {
@@ -565,15 +563,16 @@ describe("asynchronous question integration", () => {
 			.where(eq(narratorMessageRefs.messageId, message.id));
 		expect(refs.map((row) => row.narratorId)).toEqual([PARENT]);
 		expect(wakes).toEqual([PARENT]);
-		const own = await awaitTool.execute({ type: "question", id: record.id }, ctx);
+		const own = await questionTool.execute({ action: "get", id: record.id }, ctx);
 		expect(own.isError).not.toBe(true);
 		expect(own.output).toContain("Disk");
 		for (const narratorId of [OTHER, CHILD]) {
-			const foreign = await awaitTool.execute(
-				{ type: "question", id: record.id },
+			const foreign = await questionTool.execute(
+				{ action: "get", id: record.id },
 				{ ...ctx, narratorId },
 			);
-			expect(foreign.isError).toBe(true);
+			expect(JSON.parse(foreign.output)).toMatchObject({ record: null, events: [] });
+			expect(foreign.output).not.toContain("Disk");
 		}
 	});
 

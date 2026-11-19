@@ -6,7 +6,11 @@
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { type Subprocess, spawn } from "bun";
-import { devAllBackendEnv } from "./lib/dev-app-url";
+import {
+	DEFAULT_DEV_FRONTEND_PORT,
+	DEV_ALL_BACKEND_PORT,
+	devAllBackendEnv,
+} from "./lib/dev-app-url";
 
 export interface LaunchOptions {
 	production: boolean;
@@ -128,7 +132,11 @@ export async function runDevAll(
 		const running: Child[] = [backend];
 		if (!options.production || options.frontendDev) {
 			const frontendEnv = options.production
-				? { ...env, VITE_PORT: env.VITE_PORT || "41221", BACKEND_PORT: env.PORT || "7778" }
+				? {
+						...env,
+						VITE_PORT: env.VITE_PORT || DEFAULT_DEV_FRONTEND_PORT,
+						BACKEND_PORT: env.PORT || DEV_ALL_BACKEND_PORT,
+					}
 				: { ...env };
 			running.push(
 				start(

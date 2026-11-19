@@ -17,6 +17,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readResponseTextWithLimit } from "./agent/response-body";
 import { logger } from "./logger";
+import { applyProxyExemptions } from "./net/proxy";
 import { findExcludingRange, readWindowsExcludedPortRangesAsync } from "./windows-excluded-ports";
 
 // === Constants ===
@@ -68,15 +69,22 @@ interface IdTokenClaims {
 /**
  * Wrapper around global `fetch` that injects Bun's `proxy` option when provided.
  * Bun extends the Fetch API with a non-standard `proxy` property on RequestInit.
+ *
+ * The caller passes an already-resolved proxy (custom / system / inherited
+ * global). Exemptions are applied here rather than at the call sites because this
+ * is the module's single egress point: whatever mode produced the proxy, a
+ * target covered by `settings.proxy.noProxyRules` still goes direct.
  */
 function pfetch(
 	input: string | URL | Request,
 	init?: RequestInit,
 	proxy?: string,
 ): Promise<Response> {
-	if (proxy) {
+	const target = typeof input === "string" || input instanceof URL ? input : input.url;
+	const effective = proxy ? applyProxyExemptions(proxy, target) : undefined;
+	if (effective) {
 		// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-		return fetch(input, { ...init, proxy } as any);
+		return fetch(input, { ...init, proxy: effective } as any);
 	}
 	return fetch(input, init);
 }

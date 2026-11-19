@@ -72,6 +72,7 @@ import { opencodeRoutes } from "./routes/opencode";
 import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
+import { projectTeamRoutes } from "./routes/project-teams";
 import { projectRoutes } from "./routes/projects";
 import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
@@ -173,7 +174,7 @@ app.use("*", async (c, next) => {
  *     construction, and its desktop origin contains a per-webview random UUID that
  *     cannot be configured ahead of time.
  *  2. The former dev value was `http://localhost:5173`, while this repo's Vite dev
- *     server runs on 7778 (`frontend/vite.config.ts`). That mismatch was invisible
+ *     server runs on 41221 (`frontend/vite.config.ts`). That mismatch was invisible
  *     because development is same-origin through Vite's proxy, so the branch had
  *     simply never been exercised — a good illustration of why this decision belongs
  *     in a tested function rather than inline.
@@ -455,6 +456,7 @@ app.use("/api/*", async (c, next) => {
 	throw catalogError("GIT_NOT_INSTALLED");
 });
 
+app.route("/api/projects", projectTeamRoutes);
 app.route("/api/projects", projectRoutes);
 app.route("/api/containers", containerRoutes);
 app.route("/api/chat", chatRoutes);

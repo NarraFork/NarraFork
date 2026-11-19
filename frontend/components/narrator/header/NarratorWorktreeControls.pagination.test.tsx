@@ -39,6 +39,7 @@ mock.module("@frontend/hooks/useWorkspaceContext", () => ({
 		},
 	}),
 	useSwitchWorkspaceContext: () => ({ mutateAsync: async () => {}, isPending: false }),
+	workspaceContextKey: (id: string) => ["workspaceContext", id],
 }));
 const requests: Array<{ workspaceKey: string; query: WorktreeListQuery }> = [];
 mock.module("@frontend/lib/api", () => ({
@@ -107,6 +108,8 @@ const Button = ({
 mock.module("@mantine/core", () => ({
 	ActionIcon: Button,
 	Button,
+	// One list row is a switch target plus a delete action, so both carry the row's identity.
+	UnstyledButton: Button,
 	Group: Wrapper,
 	Stack: Wrapper,
 	Tooltip: Wrapper,
@@ -114,6 +117,8 @@ mock.module("@mantine/core", () => ({
 	Alert: Wrapper,
 	Badge: Wrapper,
 	Loader: Wrapper,
+	Divider: () => null,
+	Checkbox: () => null,
 	ScrollArea: { Autosize: Wrapper },
 	Modal: ({ opened, children }: { opened: boolean; children?: ReactNode }) =>
 		opened ? <div>{children}</div> : null,

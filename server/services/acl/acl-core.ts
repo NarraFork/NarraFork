@@ -92,7 +92,7 @@ function adminCaps(principal: AclPrincipal): ScopeCaps {
 	};
 }
 
-type GrantRow = {
+export type GrantRow = {
 	scopeType: string;
 	scopeId: string | null;
 	capability: string;
@@ -139,8 +139,12 @@ async function loadGrants(principal: AclPrincipal, scopes: AclScope[]): Promise<
 		);
 }
 
-/** Fold one grant row into an accumulator, honouring the two row shapes. */
-function applyGrant(
+/**
+ * Fold one grant row into an accumulator, honouring the two row shapes. Exported for batch
+ * judges that load many principals' grants in one query (`judgeNarratorAccessBatch`) and must
+ * read each row exactly as {@link resolveCaps} does.
+ */
+export function applyGrant(
 	target: { read: boolean; write: boolean; manage: boolean },
 	domain: AclDomainCredentials,
 	grant: GrantRow,

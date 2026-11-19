@@ -20,7 +20,14 @@ async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promi
 	}
 }
 
-type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
+type TeamAction =
+	| "list"
+	| "list_agents"
+	| "list_bash"
+	| "get_task"
+	| "file_changes"
+	| "broadcast"
+	| "send";
 
 /**
  * Default and maximum rows PER KIND (agents, bash) for the list actions.
@@ -45,6 +52,11 @@ const LIST_MAX_LIMIT = 100;
  * how much of that window is printed.
  */
 const LIST_RECENT_TERMINAL_LIMIT = 5;
+/**
+ * Helpers shown under each listed agent: the one nested level of a team tree (a first-level
+ * subagent's own subagents). Active ones first; the rest is counted, never silently dropped.
+ */
+const LIST_NESTED_LIMIT = 5;
 
 function clampListLimit(raw: unknown): number {
 	const n = typeof raw === "number" ? raw : Number(raw);
@@ -92,7 +104,7 @@ function bashLabel(title: string | null, command: string | null): string {
  * would report "no file changes" or "not a direct subagent".
  *
  * Accepts real ids, id prefixes, titles, title slugs and persisted aliases (the
- * same selector grammar Send/Await honour). Returns the input unchanged when
+ * same selector grammar Send/Watch honour). Returns the input unchanged when
  * nothing matches, so the caller's own validation produces the error.
  */
 async function resolveTeamMemberId(callerNarratorId: string, selector: string): Promise<string> {
@@ -113,23 +125,28 @@ export const teamStatusTool: ToolDefinition = {
 		'- "list": List background agents and background bash tasks (kind=agent|bash; bash includes background_kind=task|service)\n' +
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
+		'- "get_task": Read one owned bash/agent/transfer task immediately by durable ID or alias (requires target_id). Includes bounded output and transfer progress; queued, paused and offline transfers remain queryable. Does not wait or consume completion notifications.\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
 		'- "broadcast": Send ONLY to working/waiting direct subagents. Returns recipient names and idle subagents active within the last hour (name + slug + id), which are NOT sent to or woken; use a separate Send if needed. More than 100 candidates is refused; use explicit Send instead.\n' +
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
-		"- All actions are limited to the current narrator's direct subagent team.\n" +
+		"- Agent listings are a tree: each agent's own helper agents (the second level) are indented under it.\n" +
+		"- get_task is limited to tasks started by the current narrator.\n" +
+		"- broadcast, send and file_changes are limited to the current narrator's direct subagent team.\n" +
 		`- The list actions are bounded: active members come first, then a few recent finished ones, up to ${LIST_DEFAULT_LIMIT} rows per kind. A trailing note reports what was omitted.\n` +
 		"- Use `query` to find a specific member by name/alias/id prefix past that window, and `limit` to widen it.\n" +
 		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.",
 	parameters: z.object({
 		action: z
-			.enum(["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"])
+			.enum(["list", "list_agents", "list_bash", "get_task", "file_changes", "broadcast", "send"])
 			.describe("The action to perform"),
 		target_id: z
 			.string()
 			.optional()
-			.describe("Target subagent ID (required for 'send', optional for 'file_changes')"),
+			.describe(
+				"Target task ID/persisted alias for 'get_task'; subagent ID for 'send'/'file_changes'",
+			),
 		message: z.string().optional().describe("Message text (required for 'broadcast' and 'send')"),
 		query: z
 			.string()
@@ -151,10 +168,11 @@ export const teamStatusTool: ToolDefinition = {
 			action: {
 				description: "The action to perform",
 				type: "string",
-				enum: ["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"],
+				enum: ["list", "list_agents", "list_bash", "get_task", "file_changes", "broadcast", "send"],
 			},
 			target_id: {
-				description: "Target subagent ID (required for 'send', optional for 'file_changes')",
+				description:
+					"Target task ID/persisted alias for 'get_task'; subagent ID for 'send'/'file_changes'",
 				type: "string",
 			},
 			message: {
@@ -182,6 +200,21 @@ export const teamStatusTool: ToolDefinition = {
 			query?: string;
 			limit?: number;
 		};
+
+		if (action === "get_task") {
+			if (!target_id) return { output: "Error: get_task requires target_id.", isError: true };
+			const { backgroundTaskService } = await import("@server/services/background-task-service");
+			const task = await backgroundTaskService.readTaskSnapshot(ctx.narratorId, target_id);
+			if (!task)
+				return {
+					output: `Error: No owned task matches "${target_id.slice(0, 200)}".`,
+					isError: true,
+				};
+			return {
+				output: JSON.stringify(task),
+				metadata: { kind: "team_status", action, targetId: task.id, status: task.status },
+			};
+		}
 
 		// A narrator nobody controls is its own team root; a member shares its root's scope.
 		const { narratorService: sessions } = await import("@server/services/narrator-service");
@@ -227,14 +260,32 @@ export const teamStatusTool: ToolDefinition = {
 			const lines: string[] = [];
 			const notes: string[] = [];
 			if (agentView) {
-				for (const s of agentView.subagents) {
+				// The tree's one nested level: each listed agent's own helpers, indented under it.
+				const nested = await narratorService.listNestedSubagentsForTeamView(
+					agentView.subagents.map((s) => s.id),
+					LIST_NESTED_LIMIT,
+				);
+				const agentLine = (
+					s: (typeof agentView.subagents)[number],
+					labelScope: string,
+					indent: string,
+				) => {
 					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
 					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
 					// Lead with the alias, like the bash rows below, so the model addresses
 					// agents by a readable handle instead of copying the nanoid back.
-					lines.push(
-						`- kind=agent | alias=${agentLabelFromNarrator(s, scopeId)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
-					);
+					return `${indent}- kind=agent | alias=${agentLabelFromNarrator(s, labelScope)}${isSelf} | id=${s.id} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`;
+				};
+				for (const s of agentView.subagents) {
+					lines.push(agentLine(s, scopeId, ""));
+					const children = nested.get(s.id);
+					if (!children) continue;
+					for (const child of children.subagents) lines.push(agentLine(child, s.id, "  "));
+					const more = children.total - children.subagents.length;
+					if (more > 0)
+						lines.push(
+							`  (${more} more helper agents of ${agentLabelFromNarrator(s, scopeId)} not shown)`,
+						);
 				}
 				const note = omissionNote(
 					"agents",
@@ -275,12 +326,14 @@ export const teamStatusTool: ToolDefinition = {
 					output: needle ? `No ${scope} match "${needle}".` : `No ${scope} found.`,
 				};
 			}
+			// Counted rows are the top-level ones; nested helper rows are indented under them.
+			const listed = lines.filter((line) => line.startsWith("- ")).length;
 			const header =
 				action === "list_agents"
-					? `Sibling subagents (${lines.length}):`
+					? `Sibling subagents (${listed}):`
 					: action === "list_bash"
-						? `Background bash tasks (${lines.length}):`
-						: `Background tasks (${lines.length}):`;
+						? `Background bash tasks (${listed}):`
+						: `Background tasks (${listed}):`;
 			const body = `${header}\n${lines.join("\n")}`;
 			return { output: notes.length > 0 ? `${body}\n${notes.join("\n")}` : body };
 		}

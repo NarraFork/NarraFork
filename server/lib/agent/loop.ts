@@ -204,7 +204,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 		large: ["prompt"],
 	},
 	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
-	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
+	Watch: { short: ["type", "id", "pattern", "timeout", "start_at"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
 		large: ["message"],
@@ -592,7 +592,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
-	"Await",
+	"Watch",
 	"Stop",
 	"ShareFile",
 	"ContextAsk",

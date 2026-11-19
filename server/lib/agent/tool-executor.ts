@@ -423,10 +423,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
-	if (
-		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent")
-	) {
+	if (tu.name === "Agent" && typeof tu.input.stop !== "string") {
 		return "resumable";
 	}
 	return "ordinary";
@@ -476,9 +473,6 @@ async function upsertDeferredTool(
 			executionAttempt: binding.attempt,
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
-			...(tu.name === "Await" && typeof tu.input.type === "string"
-				? { awaitType: tu.input.type }
-				: {}),
 			...(tu.name === "Agent"
 				? {
 						runInBackground: tu.input.run_in_background === true || tu.input.background === true,
@@ -940,6 +934,15 @@ async function executeToolUntraced(
 			await preAdmitToolExecution(tu, config, { state: admissionState });
 		}
 		config.assertWorkspaceCurrent?.();
+		// A frozen epoch or a stale registry entry must not revive the removed waiter.
+		if (tu.name === "Await") {
+			return {
+				output:
+					"Await is retired and cannot execute. Use Watch to register a non-blocking observation.",
+				isError: true,
+				durationMs: 0,
+			};
+		}
 		const tool = toolRegistry.get(tu.name);
 
 		// Defense-in-depth: when unified native search is enabled for this provider/model,
@@ -1590,6 +1593,8 @@ async function executeToolUntraced(
 						childTu,
 						{
 							...config,
+							// The script reads the file, not the model: its text is never annotated.
+							annotateToolResult: undefined,
 							defaultDeviceId,
 							signal: combinedSignal,
 							permissionHandler: async (...args) => {
@@ -1804,10 +1809,22 @@ async function executeToolUntraced(
 				}
 			}
 
+			const annotationCwd = frozenExecution?.target.cwd ?? config.cwd;
+			// Ran on this server, and the session's own Reads go here too.
+			const annotationLocal =
+				(frozenExecution?.target.deviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID &&
+				(config.defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID;
 			// If the tool already truncated its output, pass through as-is.
 			if (result.truncated) {
 				return {
-					output: finalOutput,
+					output: await annotateToolOutput(config, tu, effectiveInput, finalOutput, result, {
+						cwd: annotationCwd,
+						local: annotationLocal,
+						fullOutputPath:
+							typeof result.metadata?.fullOutputPath === "string"
+								? result.metadata.fullOutputPath
+								: undefined,
+					}),
 					isError: result.isError,
 					fatal: result.fatal,
 					durationMs: Date.now() - start,
@@ -1826,7 +1843,14 @@ async function executeToolUntraced(
 			}
 			const truncated = truncateOutput(result.output);
 			return {
-				output: truncated.content + appendNotice,
+				output: await annotateToolOutput(
+					config,
+					tu,
+					effectiveInput,
+					truncated.content + appendNotice,
+					result,
+					{ cwd: annotationCwd, local: annotationLocal, fullOutputPath: truncated.outputPath },
+				),
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
@@ -1900,6 +1924,41 @@ async function executeToolUntraced(
 				attemptClaimed,
 			);
 		}
+	}
+}
+
+/**
+ * `AgentConfig.annotateToolResult` over a finished call's text (a team coordinator's soft-limit
+ * reminders). The tool has already run; a failing annotator keeps the text unchanged.
+ */
+async function annotateToolOutput(
+	config: AgentConfig,
+	tu: AgentToolUse,
+	input: Record<string, unknown>,
+	output: string,
+	result: ToolResult,
+	where: { cwd: string; local: boolean; fullOutputPath?: string },
+): Promise<string> {
+	if (!config.annotateToolResult) return output;
+	try {
+		return (
+			(await config.annotateToolResult({
+				toolName: tu.name,
+				toolUseId: tu.toolUseId,
+				input,
+				output,
+				isError: result.isError ?? false,
+				metadata: result.metadata,
+				...where,
+			})) ?? output
+		);
+	} catch (error) {
+		logger.warn("Tool result annotation failed; the result is kept as it was", {
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			error: String(error),
+		});
+		return output;
 	}
 }
 

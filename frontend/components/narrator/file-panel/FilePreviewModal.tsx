@@ -16,6 +16,7 @@
  */
 
 import { Box, Group, Loader, Modal, Text } from "@mantine/core";
+import { isDocumentFilePath, isLegacyDocumentFilePath } from "@shared/document-file-extensions";
 import { getFileReferenceImageMimeType } from "@shared/file-reference-image";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,6 +26,7 @@ import { apiUrl } from "../../../lib/base-path";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { ContentViewer } from "../content/ContentViewer";
+import { DocumentPreview } from "../file-viewer/DocumentPreview";
 
 const PDF_EXTS = new Set([".pdf"]);
 export const MAX_FILE_PREVIEW_TEXT_CHARS = 120_000;
@@ -65,12 +67,23 @@ export async function readTextPreview(
 	return { text, truncated };
 }
 
-export function getFilePreviewType(filePath: string): "image" | "pdf" | "text" {
+/**
+ * How a path should be previewed.
+ *
+ * `document` / `legacy-doc` were added for Word files: without them a `.docx` fell through to
+ * `text`, so the viewer read a ZIP container as UTF-8 and showed garbage. The server decides
+ * the real format from the bytes; this only picks the client-side route.
+ */
+export type FilePreviewType = "image" | "pdf" | "text" | "document" | "legacy-doc";
+
+export function getFilePreviewType(filePath: string): FilePreviewType {
 	const dot = filePath.lastIndexOf(".");
 	if (dot === -1) return "text";
 	const ext = filePath.slice(dot).toLowerCase();
 	if (getFileReferenceImageMimeType(filePath)) return "image";
 	if (PDF_EXTS.has(ext)) return "pdf";
+	if (isDocumentFilePath(filePath)) return "document";
+	if (isLegacyDocumentFilePath(filePath)) return "legacy-doc";
 	return "text";
 }
 
@@ -115,9 +128,14 @@ export function FilePreviewModal({
 		};
 	}, [blobUrl]);
 
-	// Fetch file content when modal opens
 	useEffect(() => {
 		if (!opened || !previewCapability.supported) return;
+		// Documents are fetched and rendered by `DocumentPreview` itself; `/preview` would return
+		// the raw container (or, before this change, decoded ZIP bytes as text).
+		if (previewType === "document" || previewType === "legacy-doc") {
+			setLoading(false);
+			return;
+		}
 		let cancelled = false;
 		const controller = new AbortController();
 		setLoading(true);
@@ -217,6 +235,14 @@ export function FilePreviewModal({
 					</Text>
 				</Box>
 			)}
+			{!error && !loading && (previewType === "document" || previewType === "legacy-doc") && (
+				<DocumentPreview
+					key={`${filePath}:${opened}`}
+					filePath={filePath}
+					// The modal only ever previews the local filesystem (same `/api/fs/*` endpoints).
+					deviceId="local"
+				/>
+			)}
 			{!error && !loading && previewType === "image" && blobUrl && (
 				<Box p="xs" style={{ textAlign: "center" }}>
 					{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there */}
@@ -242,12 +268,14 @@ export function FilePreviewModal({
 					/>
 				</Box>
 			)}
+			{/* Deliberately unsandboxed: Chrome's built-in PDF viewer refuses to run in a sandboxed
+			    frame (any value, including ""), rendering its "blocked by Chrome" error page. See
+			    FileViewerContent's PDF branch and `pdf-iframe.test.ts`. */}
 			{!error && !loading && previewType === "pdf" && blobUrl && (
 				<iframe
 					src={blobUrl}
 					title={fileName}
 					onError={() => setError(true)}
-					sandbox="allow-same-origin allow-scripts"
 					style={{
 						width: "100%",
 						height: "80vh",

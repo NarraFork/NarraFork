@@ -591,7 +591,7 @@ describe("markRecoveryCardResolved DB retry state", () => {
 		const input = {
 			narratorId: PARENT_ID,
 			messageId: CARD_ID,
-			mode: "await" as const,
+			mode: "watch" as const,
 			resumedAliases: [],
 			retrySubagentIds: CARD_ENTRIES.map((entry) => entry.id),
 		};
@@ -609,7 +609,7 @@ describe("markRecoveryCardResolved DB retry state", () => {
 			const input = {
 				narratorId: PARENT_ID,
 				messageId: CARD_ID,
-				mode: "await" as const,
+				mode: "watch" as const,
 				resumedAliases: ["retry-works"],
 				...(retrySubagentIds ? { retrySubagentIds } : {}),
 			};
@@ -618,7 +618,7 @@ describe("markRecoveryCardResolved DB retry state", () => {
 
 			expect(await readRecoveryCard()).toMatchObject({
 				status: "resolved",
-				mode: "await",
+				mode: "watch",
 				resumedCount: 1,
 			});
 		});

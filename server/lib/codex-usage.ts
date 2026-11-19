@@ -2,6 +2,7 @@
 // Based on https://chatgpt.com/backend-api/wham/usage
 
 import { logger } from "./logger";
+import { applyProxyExemptions } from "./net/proxy";
 
 export type CodexUsageWindowType = "5h" | "weekly" | "monthly" | "unknown";
 
@@ -356,9 +357,13 @@ export async function fetchCodexUsage(
 		headers,
 		signal: abortController.signal,
 	};
-	if (proxy) {
+	// Exemptions are applied here so a usage endpoint covered by
+	// `settings.proxy.noProxyRules` is reached directly, whichever proxy mode
+	// (custom / system / inherited global) produced this URL.
+	const effectiveProxy = proxy ? applyProxyExemptions(proxy, USAGE_API_URL) : undefined;
+	if (effectiveProxy) {
 		// @ts-expect-error - Bun supports proxy option
-		fetchOptions.proxy = proxy;
+		fetchOptions.proxy = effectiveProxy;
 	}
 
 	try {
@@ -446,9 +451,13 @@ export async function consumeCodexResetCredit(
 		body: JSON.stringify({ redeem_request_id: crypto.randomUUID() }),
 		signal: abortController.signal,
 	};
-	if (proxy) {
+	// Same exemption step as `fetchCodexUsage`: rules win over every proxy mode.
+	const effectiveProxy = proxy
+		? applyProxyExemptions(proxy, RESET_CREDITS_CONSUME_API_URL)
+		: undefined;
+	if (effectiveProxy) {
 		// @ts-expect-error - Bun supports proxy option
-		fetchOptions.proxy = proxy;
+		fetchOptions.proxy = effectiveProxy;
 	}
 
 	try {

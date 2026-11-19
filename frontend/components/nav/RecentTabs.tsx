@@ -1,6 +1,10 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
-import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
+import {
+	hasDirectorySubtitle,
+	isTeamOnlookerTab,
+	statusAttention,
+} from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -25,6 +29,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { installTeamOnlookerRefresh } from "../../hooks/team-onlooker-refresh";
 import { useFolderDisplay } from "../../hooks/useFolderDisplay";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
@@ -59,6 +64,7 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	clearNotifiedAttention,
 	triggerNotification,
@@ -242,6 +248,18 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		void refreshRuntime().catch(() => {});
 	}, [refreshRuntime, runtimeNarratorIds]);
 
+	// A sharing change can turn a team onlooker into a member (or back): read the runtime patches
+	// again so `teamOnlooker` (which silences "waiting" alerts) follows it without a reload. M1.
+	useEffect(
+		() =>
+			installTeamOnlookerRefresh(
+				narratorWSManager,
+				() => tabsRef.current,
+				() => void refreshRuntime().catch(() => {}),
+			),
+		[refreshRuntime],
+	);
+
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
 	const tabPatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -309,7 +327,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
-					event.awaited === true,
+					// A team onlooker cannot answer: never alerted (M1).
+					event.awaited === true && tab?.teamOnlooker !== true,
 					tab?.title,
 					userPrefsRef.current,
 				);
@@ -333,18 +352,20 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				const isWaitingForModel =
 					event.substatus?.includes("model_unavailable") ||
 					event.substatus?.includes("quota_exhausted");
-				const shouldNotify =
-					!isReflecting &&
-					!isWaitingForModel &&
-					(event.status === "waiting" || event.substatus?.includes("unread"));
+				// A team session waits for a member: an onlooker, who cannot approve or answer,
+				// gets no "waiting" alert (favicon, sound, PWA); "unread" still alerts. M1.
+				const attention =
+					isReflecting || isWaitingForModel
+						? null
+						: statusAttention(
+								event.status,
+								event.substatus,
+								isTeamOnlookerTab(tabsRef.current, narratorId),
+							);
 				if (isReflecting) {
 					setFaviconAlert(narratorId, "reflecting");
-				} else if (shouldNotify) {
-					const alertKind = event.substatus?.includes("error")
-						? "error"
-						: event.status === "waiting"
-							? "waiting"
-							: "unread";
+				} else if (attention) {
+					const alertKind = event.substatus?.includes("error") ? "error" : attention;
 					setFaviconAlert(narratorId, alertKind);
 					// Done while non-service background work is still running: keep the
 					// in-app unread + favicon state, but stay silent (no sound, no PWA
@@ -356,7 +377,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 							triggerNotification(
 								narratorId,
 								tab.title,
-								event.status === "waiting" ? "waiting" : "unread",
+								attention,
 								userPrefsRef.current,
 								event.turnStartedAt,
 							);

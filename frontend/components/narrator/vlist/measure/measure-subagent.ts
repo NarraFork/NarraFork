@@ -43,10 +43,10 @@
  * we only need to know whether the content exceeds the cap.
  *
  * P10 DEPENDENCY: pendingPermissions render a ToolCallCard each (owned by P10,
- * `measure-tool-call.ts`, which is not yet available). Each pending card uses a
- * conservative placeholder height; when the caller supplies InlinePermissionData
- * per pending permission we refine it via measureInlinePermission + a header
- * estimate. Reported back to the main agent.
+ * `measure-tool-call.ts`). Each pending card uses a conservative placeholder
+ * height only when there is no InlinePermissionData; when the caller supplies
+ * InlinePermissionData per pending permission we refine it via
+ * measureInlinePermission + a header estimate.
  *
  * Zero DOM. Follows the measure-reasoning.ts / measure-web-search.ts template.
  */
@@ -62,6 +62,7 @@ import type { SubagentDelegation } from "@shared/outline-report-note";
 import { BARE_ROW_HEIGHT, bareRowMetrics } from "@shared/pretext-layout/row-metrics";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { scaleFontSize } from "@shared/pretext-layout/typography";
+import { SUBAGENT_NESTED_CARD_LIMIT, type SubagentNestedAgent } from "@shared/subagent-nested";
 import { readBackgroundTaskId } from "@shared/subagent-result-text";
 import {
 	accumulateFrame,
@@ -397,6 +398,16 @@ export interface SubagentCardData {
 	fileChanges?: SubagentFileChangesData;
 	/** The reader expanded the file list (shows all rows instead of the capped head). */
 	fileChangesExpanded?: boolean;
+	/**
+	 * The helpers this child launched itself — the card's one nested level (a first-level
+	 * `worker` seen from the primary's page). HEIGHT-AFFECTING: one row per helper (the
+	 * server caps them) plus an overflow row when `nestedTotal` exceeds them. Always
+	 * shown, like recent calls, because a helper waiting for approval must be visible
+	 * on a folded card too.
+	 */
+	nestedAgents?: SubagentNestedAgent[];
+	/** Every helper the child launched (≥ `nestedAgents.length`). */
+	nestedTotal?: number;
 	/** Result text — drives the result preview line + expanded result block. */
 	resultText?: string;
 	/** Whether the tool call is in a terminal status (gates the result preview). */
@@ -484,6 +495,12 @@ export interface MeasuredSubagent extends MeasuredElement {
 	delegationRowHeight: number;
 	/** Recent-calls region height (0 when no activity calls). */
 	recentCallsHeight: number;
+	/** Nested-helpers region height (0 when the child launched none). */
+	nestedHeight: number;
+	/** Helper rows drawn (the summary's own bounded list). */
+	nestedRowCount: number;
+	/** Whether the trailing "N more helpers" row is drawn. */
+	hasNestedOverflowRow: boolean;
 	/** Number of recent rows drawn (min(count, 3)). */
 	recentRowCount: number;
 	/** Whether the recent-calls title button is drawn. */
@@ -728,6 +745,21 @@ export function measureSubagentCard(
 		recentCallsHeight = titleRow + RECENT_TITLE_MARGIN_BOTTOM + rowsHeight + BLOCK_PADDING_BOTTOM;
 	}
 
+	// ── Nested helpers (always shown when the child launched any) ──────────────
+	// Title row + one fixed trace-height row per helper + an optional overflow row.
+	const nestedRowCount = Math.min(data.nestedAgents?.length ?? 0, SUBAGENT_NESTED_CARD_LIMIT);
+	const hasNestedOverflowRow = (data.nestedTotal ?? 0) > nestedRowCount;
+	let nestedHeight = 0;
+	if (nestedRowCount > 0 || hasNestedOverflowRow) {
+		const rows = nestedRowCount + (hasNestedOverflowRow ? 1 : 0);
+		nestedHeight =
+			typographyMetrics().line.xs +
+			RECENT_TITLE_MARGIN_BOTTOM +
+			rows * bareRowMetrics().height +
+			(rows - 1) * RECENT_STACK_GAP +
+			BLOCK_PADDING_BOTTOM;
+	}
+
 	// ── Expanded body (LazyCollapse) ────────────────────────────────────────────
 	let expandedHeight = 0;
 	let selfPermissionMeasured: MeasuredInlinePermission | null = null;
@@ -822,6 +854,7 @@ export function measureSubagentCard(
 		borderHeight +
 		headerHeight +
 		recentCallsHeight +
+		nestedHeight +
 		(effectiveExpanded ? expandedHeight : 0) +
 		dividerHeight;
 
@@ -839,6 +872,9 @@ export function measureSubagentCard(
 		recentCallsHeight,
 		recentRowCount,
 		hasRecentCallsButton,
+		nestedHeight,
+		nestedRowCount,
+		hasNestedOverflowRow,
 		expandedHeight,
 		dividerHeight,
 		borderHeight,

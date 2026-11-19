@@ -262,9 +262,11 @@ import {
 	consumePlanModePromptRebuild,
 	hasNarratorAdmissionWork,
 	hasPendingHistoryCompact,
+	hasRevertBlockingAdmissionWork,
 	isNarratorRevertAdmissionBlocked,
 	isNarratorRuntimeBusy,
 	listNarratorAdmissionOwners,
+	loadBackgroundSubagentIds,
 	narratorCreationLocks,
 	narratorLoopAdmissions,
 	pendingFeedback,
@@ -276,6 +278,7 @@ import {
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
 	resolveNarratorAdmissionRoot,
+	retainBackgroundSubagentWork,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
@@ -1662,8 +1665,8 @@ async function createNarrator(
 		}
 	} else {
 		// Preload optional tools whose routine mode is `resident` (project override
-		// first, then global). `manual` and `auto` are not preloaded — `auto` is the
-		// toolsearch placeholder and behaves like `manual` until that lands.
+		// first, then global). `manual` stays out until `/load`. `auto` is not
+		// preloaded either; ToolSearch loads that group on demand.
 		for (const routine of getBuiltinToolRoutines()) {
 			if (!routine.tool) continue;
 			const { mode } = resolveEffectiveToolRoutineMode(
@@ -3024,6 +3027,16 @@ export async function drainInjectionsIntoHistory(
 		const activity = await writeOutlineTeamActivity(narratorId, locale, "boundary");
 		if (activity?.turnText)
 			parts.push({ text: activity.turnText, messageId: activity.messageId ?? undefined });
+		// A team coordinator's status again, at most every ten minutes and only when it changed
+		// (Project Teams P2; a map lookup for every other session).
+		const { writeTeamStatusAtBoundary } = await import("./teams/team-status");
+		const teamStatus = await writeTeamStatusAtBoundary({
+			narratorId,
+			locale,
+			contextPercent: active._contextUsagePct,
+		});
+		if (teamStatus?.turnText)
+			parts.push({ text: teamStatus.turnText, messageId: teamStatus.messageId ?? undefined });
 	}
 
 	return {
@@ -8864,6 +8877,11 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	// A stopped subagent's helpers stop with it, even when it is between turns while they
+	// still run in the background. A no-op for primaries and helper-less subagents.
+	void import("./agent-runtime/run")
+		.then(({ stopSubagentHelpers }) => stopSubagentHelpers(narratorId, "Parent subagent stopped"))
+		.catch(() => {});
 	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
@@ -8994,10 +9012,21 @@ export async function acquireNarratorRevertAdmission(
 			const interrupted = new Set<AbortController>();
 			interruptPlannedUpdateRecovery(narratorId);
 			// No start mutex is held here. Starting work may not have mounted its abort
-			// controller yet, so rescan until ALL admitted work (including delivery) exits.
-			while (busy() || hasNarratorAdmissionWork(narratorId)) {
+			// controller yet, so rescan until the reverted session's own work exits.
+			// Background subagents share this admission root but are not part of the
+			// turn: cancelling them here is what stopped agents launched with
+			// run_in_background. Foreground runs on this root are still cancelled,
+			// including a held run, and so is the session being reverted.
+			for (;;) {
 				signal.throwIfAborted();
-				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
+				const owners = listNarratorAdmissionOwners(narratorId);
+				const background = await loadBackgroundSubagentIds(
+					owners.filter((id) => id !== narratorId),
+				);
+				retainBackgroundSubagentWork(narratorId, background);
+				if (!busy() && !hasRevertBlockingAdmissionWork(narratorId)) break;
+				for (const owner of new Set([narratorId, ...owners])) {
+					if (background.has(owner)) continue;
 					// A revert needs the real terminal boundary, including a held run: cancel
 					// the run itself, not only its current turn.
 					const run = getRunControl(owner);
@@ -9027,7 +9056,11 @@ export async function acquireNarratorRevertAdmission(
 				});
 			}
 		}
-		await reservation.acquire(signal, busy);
+		await reservation.acquire(
+			signal,
+			busy,
+			interrupt ? { retainBackgroundSubagents: true } : undefined,
+		);
 		return releaseAndResume;
 	} catch (error) {
 		releaseAndResume();

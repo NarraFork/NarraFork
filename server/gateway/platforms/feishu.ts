@@ -6,9 +6,12 @@
  */
 
 import { logger } from "../../lib/logger";
-import { createProxyAgent, resolveOverride } from "../../lib/net/proxy";
+import { createProxyAgent, resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
+
+/** Feishu open-platform endpoint; the proxy is resolved against it so rules apply. */
+const FEISHU_API_ENDPOINT = "https://open.feishu.cn/open-apis/";
 
 interface FeishuClientLike {
 	contact: {
@@ -67,27 +70,24 @@ export class FeishuAdapter extends BaseAdapter {
 			// agent fields explicitly (agent when proxied, undefined when not) so a
 			// later reconnect after switching from custom/system to direct clears a
 			// previously-attached agent instead of leaving it stale on the singleton.
-			const proxy = resolveOverride(this.config.proxy);
+			const proxy = resolveProxyForUrl(FEISHU_API_ENDPOINT, this.config.proxy);
 			const agent = await createProxyAgent(proxy);
 			if (proxy) {
 				logger.warn(
 					"[feishu] Outbound proxy applies to REST only; the event WSClient is not proxied. In a locked-down network the bot may send but not receive events.",
 				);
 			}
-			// biome-ignore lint/suspicious/noExplicitAny: axios instance defaults are loosely typed here
-			const inst = lark.defaultHttpInstance as any;
-			inst.defaults.httpsAgent = agent;
-			inst.defaults.httpAgent = agent;
+			const httpInstance = lark.defaultHttpInstance;
+			httpInstance.defaults.httpsAgent = agent;
+			httpInstance.defaults.httpAgent = agent;
 			// Disable axios's own env-based proxy so the agent (or direct) is used exclusively.
-			inst.defaults.proxy = false;
-			const httpInstance: unknown = inst;
+			httpInstance.defaults.proxy = false;
 
 			this.client = new lark.Client({
 				appId: this.config.appId,
 				appSecret: this.config.appSecret,
 				appType: lark.AppType.SelfBuild,
-				// biome-ignore lint/suspicious/noExplicitAny: httpInstance typed as lark HttpInstance
-				...(httpInstance ? { httpInstance: httpInstance as any } : {}),
+				httpInstance,
 			}) as unknown as FeishuClientLike;
 
 			// Create WebSocket client for event subscription

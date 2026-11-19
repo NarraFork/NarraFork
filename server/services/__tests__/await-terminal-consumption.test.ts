@@ -1,15 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
-import {
-	backgroundTasks,
-	narratorBufferedMessages,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	runtimeAwaitedTerminalConsumptions,
-	runtimePublicationOutbox,
-} from "../../db/schema";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+import { backgroundTasks, narrators } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
@@ -23,9 +15,7 @@ const { awaitAgentResultDetailed, waitForSubagentResult } = await import("../age
 const { getRuntimePublicationService, runtimePublication } = await import(
 	"../agent-runtime/publication"
 );
-const { awaitTool, listRunningAgentAwaitsForSubagent, listRunningAwaits } = await import(
-	"../../lib/agent/tools/await"
-);
+const { awaitTool, listRunningAwaits } = await import("../../lib/agent/tools/await");
 const { setRunHold } = await import("../agent-runtime/ownership");
 const markTakenOver = (id: string) => setRunHold(id, { released: false });
 const clearTakenOver = (id: string) => setRunHold(id, undefined);
@@ -100,21 +90,22 @@ function commitAgentResult(source = agentRun, output = "current final") {
 	});
 }
 
-function appendAssistant(messageId: string, output: string, seq: number) {
-	const now = new Date().toISOString();
-	db.insert(narratorMessages)
-		.values({
-			id: messageId,
-			narratorId: child,
-			role: "assistant",
-			contentText: output,
-			contentJson: [{ type: "text", text: output }],
-			createdAt: now,
-		})
-		.run();
-	db.insert(narratorMessageRefs)
-		.values({ id: `ref-${messageId}`, narratorId: child, messageId, seq })
-		.run();
+for (const type of ["agent", "bash", "question", "transfer"] as const) {
+	test(`retired Await(${type}) never waits, creates a timer or consumes a completion`, async () => {
+		const wait = spyOn(backgroundTaskService, "waitForCompletion");
+		const text = spyOn(backgroundTaskService, "waitForText");
+		const publication = await getRuntimePublicationService();
+		const consume = spyOn(publication, "consumeAwaitedTerminal");
+		const timer = spyOn(globalThis, "setTimeout");
+		const result = await awaitTool.execute({ type, id: taskId, timeout: 600000 }, ctx());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Await is retired");
+		expect(wait).not.toHaveBeenCalled();
+		expect(text).not.toHaveBeenCalled();
+		expect(consume).not.toHaveBeenCalled();
+		expect(timer).not.toHaveBeenCalled();
+		expect(listRunningAwaits()).toEqual([]);
+	});
 }
 
 for (const method of ["completion", "text"] as const) {
@@ -221,85 +212,6 @@ for (const cause of ["timeout", "parent"] as const) {
 	});
 }
 
-for (const cause of ["timeout", "parent"] as const) {
-	test(`Await tool completed→restart ${cause} removes running entry and clears its timer`, async () => {
-		const now = new Date().toISOString();
-		await db.update(narrators).set({ isBackground: true }).where(eq(narrators.id, child));
-		await db.insert(backgroundTasks).values({
-			id: child,
-			type: "agent",
-			subagentNarratorId: child,
-			parentNarratorId: parent,
-			status: "completed",
-			output: "OLD RESULT",
-			logicalRunId: agentRun.logicalRunId,
-			startedAt: now,
-			createdAt: now,
-			updatedAt: now,
-		});
-		const entered = Promise.withResolvers<void>();
-		const realWait = backgroundTaskService.waitForCompletion.bind(backgroundTaskService);
-		spyOn(backgroundTaskService, "waitForCompletion").mockImplementation(async (...args) => {
-			await db
-				.update(backgroundTasks)
-				.set({ status: "running", logicalRunId: "restarted-run", output: null })
-				.where(eq(backgroundTasks.id, child));
-			entered.resolve();
-			return realWait(...args);
-		});
-		const timer = spyOn(globalThis, "setTimeout"),
-			clear = spyOn(globalThis, "clearTimeout");
-		const controller = new AbortController();
-		const toolUseId = `restart-${cause}`;
-		const pending = awaitTool.execute(
-			{ type: "agent", id: child, timeout: 1000 },
-			{ ...ctx(), signal: controller.signal, currentToolUseId: toolUseId },
-		);
-		await entered.promise;
-		expect(listRunningAwaits().some((row) => row.toolUseId === toolUseId)).toBe(true);
-		if (cause === "parent") controller.abort();
-		const result = await pending;
-		expect(result.metadata?.status).toBe(cause === "timeout" ? "timeout" : "aborted");
-		expect(listRunningAwaits().some((row) => row.toolUseId === toolUseId)).toBe(false);
-		const timerIndex = timer.mock.calls.findIndex((call) => call[1] === 1000);
-		expect(timerIndex).toBeGreaterThanOrEqual(0);
-		expect(clear).toHaveBeenCalledWith(timer.mock.results[timerIndex].value);
-	});
-}
-
-test("agent wait publishes its resolved target for live output forwarding", async () => {
-	const now = new Date().toISOString();
-	await db.update(narrators).set({ isBackground: true }).where(eq(narrators.id, child));
-	await db.insert(backgroundTasks).values({
-		id: child,
-		type: "agent",
-		subagentNarratorId: child,
-		parentNarratorId: parent,
-		status: "running",
-		output: null,
-		logicalRunId: agentRun.logicalRunId,
-		startedAt: now,
-		createdAt: now,
-		updatedAt: now,
-	});
-	const toolUseId = "await-live-output";
-	const pending = awaitTool.execute(
-		{ type: "agent", id: child, timeout: 1000 },
-		{ ...ctx(), currentToolUseId: toolUseId },
-	);
-	// The target resolves as soon as the wait starts; this registry entry is what
-	// the event handler reads to forward the child's live output char count.
-	const deadline = Date.now() + 2_000;
-	while (listRunningAgentAwaitsForSubagent(child).length === 0 && Date.now() < deadline)
-		await Bun.sleep(10);
-	expect(listRunningAgentAwaitsForSubagent(child)).toEqual([{ narratorId: parent, toolUseId }]);
-	// The running task never finishes, so the wait ends on its own timeout…
-	const result = await pending;
-	expect(result.metadata?.status).toBe("timeout");
-	// …and the registry entry leaves with it.
-	expect(listRunningAgentAwaitsForSubagent(child)).toEqual([]);
-});
-
 test("running text match and aborted/deadline waits have no terminal receipt", async () => {
 	await db.update(backgroundTasks).set({ status: "running" }).where(eq(backgroundTasks.id, taskId));
 	spyOn(backgroundTaskService, "getOutputBuffer").mockReturnValue("needle");
@@ -315,70 +227,6 @@ test("running text match and aborted/deadline waits have no terminal receipt", a
 	).toBeUndefined();
 });
 
-test("Await consumes terminal found and preserves the result on failure", async () => {
-	const consume = spyOn(getRuntimePublicationService(), "consumeAwaitedTerminal").mockRejectedValue(
-		new Error("receipt unavailable"),
-	);
-	const result = await awaitTool.execute(
-		{ type: "bash", id: taskId, wait_for_text: "needle" },
-		ctx(),
-	);
-	expect(consume).toHaveBeenCalledWith(run);
-	expect(result.isError).not.toBe(true);
-	expect(result.output).toContain("final needle");
-});
-
-test("Await does not consume a running text match", async () => {
-	await db.update(backgroundTasks).set({ status: "running" }).where(eq(backgroundTasks.id, taskId));
-	spyOn(backgroundTaskService, "getOutputBuffer").mockReturnValue("needle");
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	await awaitTool.execute({ type: "bash", id: taskId, wait_for_text: "needle" }, ctx());
-	expect(consume).not.toHaveBeenCalled();
-});
-
-test("an already interrupted Await does not consume even a terminal fast result", async () => {
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	const context = ctx();
-	const controller = new AbortController();
-	controller.abort();
-	context.signal = controller.signal;
-	await awaitTool.execute({ type: "bash", id: taskId }, context);
-	expect(consume).not.toHaveBeenCalled();
-});
-
-test("foreground fast result carries its narrator run, and Await consumes it", async () => {
-	commitAgentResult();
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	// The foreground path resolves the target row first, so both the early notice
-	// and the returned metadata carry the session title without an extra query.
-	let notifiedTitle: string | null | undefined;
-	const result = await awaitAgentResultDetailed({
-		callerNarratorId: parent,
-		id: child,
-		signal: new AbortController().signal,
-		onTargetResolved: (_id, title) => {
-			notifiedTitle = title;
-		},
-	});
-	expect(notifiedTitle).toBe("Receipt child");
-	expect(result).toMatchObject({
-		terminalResultReceived: true,
-		publicationRun: agentRun,
-		title: "Receipt child",
-	});
-	await awaitTool.execute({ type: "agent", id: child }, ctx());
-	expect(consume.mock.calls[0]?.[0]).toEqual(agentRun);
-});
-
 test("foreground output read racing a continuation never guesses the later run", async () => {
 	spyOn(getRuntimePublicationService(), "readAgentTerminalResult").mockImplementation(async () => {
 		await db
@@ -388,7 +236,8 @@ test("foreground output read racing a continuation never guesses the later run",
 		return { output: "old output", source: "terminal" as const };
 	});
 	const result = await waitForSubagentResult({ subagentId: child, recipientId: parent });
-	expect(result.output).toBe("old output");
+	expect(result.status).toBe("superseded");
+	expect(result.output).not.toContain("old output");
 	expect(result.publicationRun).toBeUndefined();
 });
 
@@ -511,319 +360,4 @@ test("taken-over foreground result is not final", async () => {
 	const result = await waitForSubagentResult({ subagentId: child, recipientId: parent });
 	expect(result.status).toBe("taken_over");
 	expect(result.publicationRun).toBeUndefined();
-});
-
-test("native startup with new runId and old idle cannot consume the prior assistant", async () => {
-	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startRun({
-		narratorId: child,
-		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-	}).publication!;
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	const result = await awaitTool.execute({ type: "agent", id: child }, ctx());
-	expect(result.output).not.toContain("old run answer");
-	expect(consume).not.toHaveBeenCalled();
-	expect((await narratorService.getById(child)).logicalRunId).toBe(next.logicalRunId);
-});
-
-test("a pre-run compact fallback cannot become the continuation result", async () => {
-	const now = new Date().toISOString();
-	db.insert(narratorMessages)
-		.values({
-			id: "old-compact",
-			narratorId: child,
-			role: "system",
-			contentText: "old compact summary",
-			contentJson: [{ type: "compact", status: "compacted", summary: "old compact summary" }],
-			createdAt: now,
-		})
-		.run();
-	db.insert(narratorMessageRefs)
-		.values({
-			id: "old-compact-ref",
-			narratorId: child,
-			messageId: "old-compact",
-			seq: 0,
-			isCompact: 1,
-		})
-		.run();
-	runtimePublication.startRun({
-		narratorId: child,
-		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-	}).publication!;
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	const result = await awaitTool.execute({ type: "agent", id: child }, ctx());
-	expect(result.output).not.toContain("old compact summary");
-	expect(consume).not.toHaveBeenCalled();
-});
-
-test("early failed continuation without a new assistant never consumes old text", async () => {
-	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startRun({
-		narratorId: child,
-		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-	}).publication!;
-	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	const waiting = awaitTool.execute({ type: "agent", id: child }, ctx());
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	await db
-		.update(narrators)
-		.set({ status: "idle", substatus: JSON.stringify(["error"]), errorMessage: "early failure" })
-		.where(eq(narrators.id, child));
-	eventBus.emit({
-		type: "narrator:status_changed",
-		narratorId: child,
-		status: "idle",
-		substatus: ["error"],
-	});
-	const result = await waiting;
-	expect(result.output).not.toContain("old run answer");
-	expect(consume).not.toHaveBeenCalled();
-	await getRuntimePublicationService().commitAgentTerminal({
-		run: next,
-		eventKind: "failed",
-		text: "early failure",
-		summary: "failed",
-	});
-	const terminal = await awaitTool.execute({ type: "agent", id: child }, ctx());
-	expect(terminal.output).toContain("early failure");
-	expect(consume.mock.calls[0]?.[0]).toEqual({
-		producerKind: next.producerKind,
-		taskId: next.taskId,
-		recipientId: next.recipientId,
-		logicalRunId: next.logicalRunId,
-	});
-});
-
-test("deferred continuation requires a post-boundary assistant and observed same-run settlement", async () => {
-	runtimePublication.stop();
-	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startRun({
-		narratorId: child,
-		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-	}).publication!;
-	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
-	const waiting = awaitTool.execute({ type: "agent", id: child }, ctx());
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	appendAssistant("new-answer", "current run answer", 1);
-	await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, child));
-	eventBus.emit({ type: "narrator:status_changed", narratorId: child, status: "idle" });
-	const result = await waiting;
-	expect(result.output).toContain("current run answer");
-	expect(result.output).not.toContain("old run answer");
-	expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()[0]?.logicalRunId).toBe(
-		next.logicalRunId,
-	);
-	await getRuntimePublicationService().commitAgentTerminal({
-		run: next,
-		eventKind: "completed",
-		text: "current run answer",
-		summary: "completed",
-	});
-	await getRuntimePublicationService().flushRecipient(parent);
-	expect(
-		db
-			.select()
-			.from(narratorBufferedMessages)
-			.all()
-			.every((row) => row.state === "cancelled"),
-	).toBe(true);
-});
-
-test("background agent waiter sourceResultRef is forwarded without a new result lookup", async () => {
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ isBackground: true, backgroundStatus: "running", status: "working" })
-		.where(eq(narrators.id, child));
-	await db.insert(backgroundTasks).values({
-		id: child,
-		type: "agent",
-		subagentNarratorId: child,
-		parentNarratorId: parent,
-		status: "running",
-		logicalRunId: agentRun.logicalRunId,
-		startedAt: now,
-		createdAt: now,
-		updatedAt: now,
-	});
-	spyOn(backgroundTaskService, "waitForCompletion").mockResolvedValue({
-		status: "completed",
-		output: "background final",
-		terminalResultReceived: true,
-		publicationRun: agentRun,
-		sourceResultRef: "message:background-answer",
-	});
-	const consume = spyOn(
-		getRuntimePublicationService(),
-		"consumeAwaitedTerminal",
-	).mockResolvedValue();
-	await awaitTool.execute({ type: "agent", id: child }, ctx());
-	expect(consume).toHaveBeenCalledWith(agentRun, { sourceResultRef: "message:background-answer" });
-});
-
-test("Await forwards the exact deferred source even when another run starts before consume", async () => {
-	runtimePublication.stop();
-	appendAssistant("prior-answer", "old run answer", 0);
-	const next = runtimePublication.startRun({
-		narratorId: child,
-		binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-	}).publication!;
-	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
-	const publication = getRuntimePublicationService();
-	const consume = publication.consumeAwaitedTerminal.bind(publication);
-	const observer = spyOn(publication, "consumeAwaitedTerminal").mockImplementation(
-		async (source, options) => {
-			runtimePublication.startRun({
-				narratorId: child,
-				binding: { deliverTo: { narratorId: parent, toolUseId: "test-tool-use" } },
-			}).publication!;
-			appendAssistant("later-run-answer", "later run answer", 2);
-			await consume(source, options);
-		},
-	);
-	const waiting = awaitTool.execute({ type: "agent", id: child }, ctx());
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	appendAssistant("awaited-answer", "awaited run answer", 1);
-	await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, child));
-	eventBus.emit({ type: "narrator:status_changed", narratorId: child, status: "idle" });
-	const result = await waiting;
-	expect(result.output).toContain("awaited run answer");
-	expect(result.output).not.toContain("later run answer");
-	expect(observer).toHaveBeenCalledWith(
-		{
-			producerKind: next.producerKind,
-			taskId: next.taskId,
-			recipientId: next.recipientId,
-			logicalRunId: next.logicalRunId,
-		},
-		{ sourceResultRef: "message:awaited-answer" },
-	);
-	expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()[0]?.sourceResultRef).toBe(
-		"message:awaited-answer",
-	);
-	await publication.commitAgentTerminal({
-		run: next,
-		eventKind: "completed",
-		text: "awaited run answer",
-		summary: "completed",
-	});
-	const snapshot = readTestMessageContent(sqlite, `publication-result:${next.logicalRunId}`);
-	expect(snapshot).toMatchObject([
-		{ publicationResult: { sourceResultRef: "message:awaited-answer" } },
-	]);
-});
-
-for (const producerKind of ["agent", "bash"] as const) {
-	for (const deliveryStage of ["pending", "queued"] as const) {
-		test(`real Await ${producerKind} result suppresses ${deliveryStage} notification without re-reading output`, async () => {
-			runtimePublication.stop();
-			const publication = getRuntimePublicationService();
-			const source = producerKind === "bash" ? run : agentRun;
-			if (producerKind === "agent") {
-				const now = new Date().toISOString();
-				await db
-					.update(narrators)
-					.set({ isBackground: true, backgroundStatus: "completed" })
-					.where(eq(narrators.id, child));
-				await db.insert(backgroundTasks).values({
-					id: child,
-					type: "agent",
-					subagentNarratorId: child,
-					parentNarratorId: parent,
-					status: "completed",
-					logicalRunId: source.logicalRunId,
-					output: "final needle",
-					startedAt: now,
-					createdAt: now,
-					updatedAt: now,
-				});
-			}
-			db.transaction((tx) => runtimePublication.reserve(source, tx));
-			const terminal = {
-				run: source,
-				eventKind: "completed" as const,
-				text: "final needle",
-				summary: "completed",
-			};
-			if (producerKind === "agent") await publication.commitAgentTerminal(terminal);
-			else await publication.commitBashTerminal(terminal);
-			if (deliveryStage === "queued") {
-				await publication.flushRecipient(parent);
-				expect(db.select().from(narratorBufferedMessages).all()[0]?.state).toBe("queued");
-			} else {
-				expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(1);
-			}
-			const result = await awaitTool.execute({ type: producerKind, id: source.taskId }, ctx());
-			expect(result.isError).not.toBe(true);
-			expect(result.output).toContain("final needle");
-			expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()).toHaveLength(1);
-			await publication.flushRecipient(parent);
-			expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
-			expect(
-				db
-					.select()
-					.from(narratorBufferedMessages)
-					.all()
-					.every((row) => row.state === "cancelled"),
-			).toBe(true);
-			expect((await backgroundTaskService.getById(source.taskId))?.output).toBe("final needle");
-		});
-	}
-}
-
-for (const preAborted of [false, true]) {
-	test(`queued guidance ${preAborted ? "already pending" : "arriving mid-wait"} ends a bash Await without touching the task`, async () => {
-		await db
-			.update(backgroundTasks)
-			.set({ status: "running", output: null })
-			.where(eq(backgroundTasks.id, taskId));
-		const guidance = new AbortController();
-		if (preAborted) guidance.abort();
-		const started = Date.now();
-		const pending = awaitTool.execute(
-			{ type: "bash", id: taskId, timeout: 60_000 },
-			{ ...ctx(), guidanceSignal: guidance.signal, currentToolUseId: `guidance-${preAborted}` },
-		);
-		if (!preAborted) {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-			guidance.abort();
-		}
-		const result = await pending;
-		expect(Date.now() - started).toBeLessThan(1000);
-		expect(result.isError).not.toBe(true);
-		expect(result.metadata).toMatchObject({ status: "aborted", endedForGuidance: true });
-		expect(result.output).toContain("still running");
-		expect(result.output).toContain("user sent new guidance");
-		expect((await backgroundTaskService.getById(taskId))?.status).toBe("running");
-		expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()).toHaveLength(0);
-	});
-}
-
-test("Await without guidance keeps its plain interrupt wording", async () => {
-	await db
-		.update(backgroundTasks)
-		.set({ status: "running", output: null })
-		.where(eq(backgroundTasks.id, taskId));
-	const parentAbort = new AbortController();
-	const pending = awaitTool.execute(
-		{ type: "bash", id: taskId, timeout: 60_000 },
-		{ ...ctx(), signal: parentAbort.signal, guidanceSignal: new AbortController().signal },
-	);
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	parentAbort.abort();
-	const result = await pending;
-	expect(result.metadata?.status).toBe("aborted");
-	expect(result.metadata?.endedForGuidance).toBeUndefined();
-	expect(result.output).not.toContain("user sent new guidance");
 });

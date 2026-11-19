@@ -1114,7 +1114,24 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 			page,
 			(f) => f.outlinePanels()[0]?.title === "Level five is what the panel focuses",
 		);
-		await page.waitForSelector("[data-testid=outline-crumbs-more]", { timeout: 10_000 });
+		// The seed can show the fold before the live snapshot arrives. Its upgrade briefly
+		// replaces that path before the editor reports its live focus: wait for that path,
+		// not merely the fold's first appearance, and for the narrow layout to be measured.
+		await page.waitForFunction(
+			(parentId) => {
+				const surface = document.querySelector<HTMLElement>("[data-testid=outline-surface]");
+				const nav = surface?.querySelector("[data-testid=outline-crumbs]");
+				const parent = nav?.querySelector<HTMLAnchorElement>("a[data-last]");
+				return (
+					surface?.dataset.compact === "true" &&
+					surface.querySelector("[data-testid=outline-editor][data-status=live]") !== null &&
+					nav?.querySelector("[data-testid=outline-crumbs-more]") !== null &&
+					parent?.pathname.split("/").at(-1) === parentId
+				);
+			},
+			{ timeout: 10_000 },
+			tidy.deep[3],
+		);
 		const bar = () =>
 			page.evaluate(() => {
 				const nav = document.querySelector<HTMLElement>("[data-testid=outline-crumbs]");

@@ -52,7 +52,12 @@ import {
 	parseTraits,
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/runtime-source";
+import {
+	controllerOf,
+	executionPrincipalOf,
+	RUNTIME_SOURCE_COLUMNS,
+	runDeliverToOf,
+} from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
@@ -821,22 +826,19 @@ async function driveRecoveryCandidate(
 			return;
 		}
 
-		const [
-			{ awaitAgentResultDetailed },
-			{ buildRecoveredAwaitToolOutput },
-			{ DEFAULT_AWAIT_TIMEOUT_MS },
-		] = await Promise.all([
-			import("./agent-communication"),
-			import("./update-recovery-service"),
-			import("../lib/agent/tools/await"),
-		]);
-		const result = await awaitAgentResultDetailed({
-			callerNarratorId: narratorId,
+		// Close a legacy Await slot with an observation receipt, never a hidden waiter.
+		const result = await registerRecoveryAgentWatch({
+			narratorId,
 			id: candidate.targetId,
-			timeoutMs: DEFAULT_AWAIT_TIMEOUT_MS,
+			toolUseId: candidate.toolUseId,
+			userId: input.userId,
 			signal,
 		});
-		output = buildRecoveredAwaitToolOutput(candidate.targetId, result);
+		output = result.metadata ? { _text: result.output, _metadata: result.metadata } : result.output;
+		if (result.isError) {
+			status = "fail";
+			errorMessage = result.output;
+		}
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		status = "fail";
@@ -1245,7 +1247,7 @@ export async function resumeRecoverySubagents(input: {
 export async function markRecoveryCardResolved(input: {
 	narratorId: string;
 	messageId: string;
-	mode: "notify" | "await";
+	mode: "notify" | "watch";
 	resumedAliases: string[];
 	/** Failed starts stay actionable; successful starts must not be restarted twice. */
 	retrySubagentIds?: string[];
@@ -1291,33 +1293,81 @@ export async function markRecoveryCardResolved(input: {
 	});
 }
 
+/** Recovery registers an observation under the same live capability ceiling as tools. */
+export async function registerRecoveryAgentWatch(input: {
+	narratorId: string;
+	id: string;
+	toolUseId: string;
+	signal: AbortSignal;
+	userId?: string | null;
+	timeout?: number;
+}) {
+	const [{ watchTool }, { resolveNarratorRuntimePolicy }, { isRuntimeToolAllowed }] =
+		await Promise.all([
+			import("../lib/agent/tools/watch"),
+			import("./trait-layer-service"),
+			import("./agent-runtime/policy"),
+		]);
+	const owner = await narratorService.getById(input.narratorId);
+	const userId = input.userId !== undefined ? input.userId : executionPrincipalOf(owner)?.userId;
+	if (userId === undefined)
+		throw new Error("Recovery observation requires a registered execution principal");
+	const policy = await resolveNarratorRuntimePolicy(input.narratorId, userId);
+	const recheckAuthorization = async () => {
+		const current = await resolveNarratorRuntimePolicy(input.narratorId, userId);
+		if (!isRuntimeToolAllowed(current, "Watch") || !current.capabilities.watchAgent)
+			throw new Error("Watch(agent) is unavailable under the current runtime policy");
+	};
+	await recheckAuthorization();
+	return watchTool.execute(
+		{
+			type: "agent",
+			id: input.id,
+			...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
+		},
+		{
+			narratorId: input.narratorId,
+			currentToolUseId: input.toolUseId,
+			cwd: owner.cwd ?? ".",
+			locale: "en",
+			signal: input.signal,
+			userId,
+			runtimePolicy: policy,
+			recheckAuthorization,
+			requestPermission: async () => ({
+				behavior: "deny",
+				message: "Recovery requires existing authority",
+			}),
+		},
+	);
+}
+
 export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): string {
 	const lines = entries.map((entry) => `- ${entry.alias}`).join("\n");
 	return (
 		"[System] The following background agents were restarted after a narrator error:\n" +
 		`${lines}\n` +
-		'Use Await({ type: "agent", id: "<alias>" }) to collect each result before continuing.'
+		"Results notify automatically. Continue unrelated work, or end the turn if the restarted work blocks the next step. Watch can register a non-blocking observation."
 	);
 }
 
 /**
- * "Resume and wait": synthesize one assistant turn holding N `Await` tool_use
- * blocks, run them server-side, then continue ONCE so the model sees every
- * result in a single request.
+ * "Resume and watch": register one non-blocking observation per restarted agent.
+ * The synthetic Watch calls finish at registration; notifications resume the parent.
  */
-export function startRecoveryAwaitBatch(
-	input: Parameters<typeof startRecoveryAwaitBatchUnlocked>[0],
+export function startRecoveryWatchBatch(
+	input: Parameters<typeof startRecoveryWatchBatchUnlocked>[0],
 ): Promise<{ messageId: string; toolUseIds: string[] }> {
 	const acceptedInput = {
 		...input,
 		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
 	};
 	return withNarratorStartAdmission(input.narratorId, () =>
-		startRecoveryAwaitBatchUnlocked(acceptedInput),
+		startRecoveryWatchBatchUnlocked(acceptedInput),
 	);
 }
 
-async function startRecoveryAwaitBatchUnlocked(input: {
+async function startRecoveryWatchBatchUnlocked(input: {
 	narratorId: string;
 	aliases: string[];
 	locale: Locale;
@@ -1329,12 +1379,11 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
 	}
 	if (input.aliases.length === 0) throw new ValidationError("No subagents were resumed");
-	const { DEFAULT_AWAIT_TIMEOUT_MS } = await import("../lib/agent/tools/await");
 	const blocks = input.aliases.map((alias) => ({
 		type: "tool_use",
 		id: `toolu_recover_${generateShortId()}`,
-		name: "Await",
-		input: { type: "agent", id: alias, timeout: DEFAULT_AWAIT_TIMEOUT_MS },
+		name: "Watch",
+		input: { type: "agent", id: alias },
 	}));
 
 	const message = await narratorService.persistAssistantMessage(input.narratorId, {
@@ -1348,7 +1397,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 			content: [
 				{
 					type: "text",
-					text: `Collecting results from ${input.aliases.length} restarted background agent(s).`,
+					text: `Registering observations for ${input.aliases.length} restarted background agent(s).`,
 				},
 				...blocks,
 			],
@@ -1377,7 +1426,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 			narratorId: input.narratorId,
 			toolCallId: toolCallIdByUseId.get(block.id) ?? null,
 			toolUseId: block.id,
-			toolName: "Await",
+			toolName: "Watch",
 			input: block.input,
 		});
 	}
@@ -1387,11 +1436,8 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		setTurnStart: true,
 	});
 
-	// Same reasoning as the Path A stage: this batch runs with no activeNarrators entry,
-	// so a registered controller is the ONLY thing Interrupt can reach. Without it the
-	// user's interrupt does nothing and they sit through the full Await timeout.
-	// `foregroundSubagentIds` stays empty — these awaits own only the parent-side
-	// wait, and the resumed background agents should keep running.
+	// Protect the bounded registration stage from concurrent starts. This controller
+	// never owns the observed agents and is released once registration finishes.
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
 	const registration = registerPlannedUpdateRecoveryController(
@@ -1409,7 +1455,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		throw error;
 	}
 
-	void runRecoveryAwaitBatch(
+	await runRecoveryWatchBatch(
 		{
 			narratorId: input.narratorId,
 			messageId: message.id,
@@ -1425,7 +1471,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		controller.signal,
 	)
 		.catch((err) => {
-			logger.error("Recovery await batch failed", {
+			logger.error("Recovery Watch registration failed", {
 				narratorId: input.narratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
@@ -1443,7 +1489,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 	return { messageId: message.id, toolUseIds: blocks.map((block) => block.id) };
 }
 
-async function runRecoveryAwaitBatch(
+async function runRecoveryWatchBatch(
 	input: {
 		narratorId: string;
 		messageId: string;
@@ -1454,11 +1500,6 @@ async function runRecoveryAwaitBatch(
 	},
 	signal: AbortSignal,
 ): Promise<void> {
-	const [{ awaitAgentResultDetailed }, { buildRecoveredAwaitToolOutput }] = await Promise.all([
-		import("./agent-communication"),
-		import("./update-recovery-service"),
-	]);
-
 	try {
 		await Promise.all(
 			input.entries.map(async (entry, index) => {
@@ -1466,19 +1507,24 @@ async function runRecoveryAwaitBatch(
 				let status: "success" | "fail" = "success";
 				let errorMessage: string | undefined;
 				try {
-					// The caller's registered signal, not a throwaway controller: an interrupt has
-					// to be able to release this wait. Every branch still writes a terminal result
-					// below, so an aborted await cannot leave a tool_use without a tool_result.
-					const result = await awaitAgentResultDetailed({
-						callerNarratorId: input.narratorId,
+					const result = await registerRecoveryAgentWatch({
+						narratorId: input.narratorId,
 						id: entry.alias,
+						toolUseId: entry.toolUseId,
+						userId: input.userId,
 						signal,
 					});
-					output = buildRecoveredAwaitToolOutput(entry.alias, result);
+					output = result.metadata
+						? { _text: result.output, _metadata: result.metadata }
+						: result.output;
+					if (result.isError) {
+						status = "fail";
+						errorMessage = result.output;
+					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					status = "fail";
-					errorMessage = `Await failed: ${message}`;
+					errorMessage = `Watch registration failed: ${message}`;
 					output = errorMessage;
 				}
 				await narratorService
@@ -1507,34 +1553,16 @@ async function runRecoveryAwaitBatch(
 					narratorId: input.narratorId,
 					toolCallId: entry.toolCallId,
 					toolUseId: entry.toolUseId,
-					toolName: "Await",
+					toolName: "Watch",
 					status,
 					output,
 				});
 			}),
 		);
 	} finally {
-		const { continueNarrator } = await import("./narrator-session");
-		const continued = await continueNarrator(
-			input.narratorId,
-			input.locale,
-			input.replyInUserLanguage,
-			input.userId,
-		).catch((err) => {
-			logger.error("continueNarrator after recovery await batch failed", {
-				narratorId: input.narratorId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-			return { ok: false };
-		});
-		if (!continued.ok) {
-			await narratorService
-				.updateStatus(input.narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: "Recovery awaits finished but the narrator could not be continued.",
-				})
-				.catch(() => {});
-		}
+		// Registration is finished, not the observed work. Release the parent now;
+		// the normal completion/mailbox path will resume it when a result arrives.
+		await narratorService.updateStatus(input.narratorId, "idle", { substatus: [] });
 	}
 }
 

@@ -486,7 +486,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			expect(result.output).toBe(
 				`<background_task_id>bind-bash</background_task_id>\n\n` +
 					`Background bash task started: ${result.title}\n` +
-					'Await({ type: "bash", id: "bind-bash" })',
+					'Watch({ type: "bash", id: "bind-bash" })',
 			);
 			expect(result.isError).toBeFalsy();
 			expect(updateExecutionLease.transfer).toHaveBeenCalledTimes(1);

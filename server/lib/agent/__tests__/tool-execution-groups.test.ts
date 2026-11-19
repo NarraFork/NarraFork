@@ -51,7 +51,7 @@ describe("tool execution grouping", () => {
 			tool("Write"),
 			tool("Agent"),
 			tool("Read"),
-			tool("Await"),
+			tool("Watch"),
 			tool("Bash", { strict_serial: true }),
 			tool("Agent"),
 			tool("StartPipeline"),
@@ -61,9 +61,9 @@ describe("tool execution grouping", () => {
 
 		expect(groupToolExecutions(tools).map((group) => group.map(({ name }) => name))).toEqual([
 			["Write"],
-			// Await opens a fresh group because the preceding parallel batch spawned an Agent.
+			// Watch opens a fresh group because the preceding parallel batch spawned an Agent.
 			["Agent", "Read"],
-			["Await"],
+			["Watch"],
 			["Bash"],
 			["Agent"],
 			["StartPipeline"],
@@ -75,14 +75,14 @@ describe("tool execution grouping", () => {
 		const recoveryItems = [
 			{ toolName: "Read", input: {} },
 			{ toolName: "Agent", input: {} },
-			{ toolName: "Await", input: {} },
+			{ toolName: "Watch", input: {} },
 			{ toolName: "Bash", input: { strict_serial: true } },
 			{ toolName: "Agent", input: {} },
 		];
 
 		expect(
 			groupToolExecutions(recoveryItems).map((group) => group.map((item) => item.toolName)),
-		).toEqual([["Read", "Agent"], ["Await"], ["Bash"], ["Agent"]]);
+		).toEqual([["Read", "Agent"], ["Watch"], ["Bash"], ["Agent"]]);
 		expect(isStrictSerialToolExecution(recoveryItems[3])).toBe(true);
 	});
 
@@ -168,13 +168,13 @@ describe("tool execution grouping", () => {
 		});
 	});
 
-	describe("Agent barrier for Await/Send", () => {
-		test("Await after an Agent in the same batch opens a new group", () => {
+	describe("Agent barrier for Watch/Send", () => {
+		test("Watch after an Agent in the same batch opens a new group", () => {
 			expect(
-				groupToolExecutions([tool("Agent"), tool("Await")]).map((group) =>
+				groupToolExecutions([tool("Agent"), tool("Watch")]).map((group) =>
 					group.map(({ name }) => name),
 				),
-			).toEqual([["Agent"], ["Await"]]);
+			).toEqual([["Agent"], ["Watch"]]);
 		});
 
 		test("Send after an Agent in the same batch opens a new group", () => {
@@ -199,20 +199,20 @@ describe("tool execution grouping", () => {
 			]);
 		});
 
-		test("Await after a Send in the same batch opens a new group", () => {
-			// Send wakes the idle subagent before returning; a concurrent Await would read
+		test("Watch after a Send in the same batch opens a new group", () => {
+			// Send wakes the idle subagent before returning; a concurrent Watch would read
 			// the previous run's terminal result.
 			expect(
-				groupToolExecutions([tool("Send"), tool("Read"), tool("Await")]).map((group) =>
+				groupToolExecutions([tool("Send"), tool("Read"), tool("Watch")]).map((group) =>
 					group.map(({ name }) => name),
 				),
-			).toEqual([["Send", "Read"], ["Await"]]);
+			).toEqual([["Send", "Read"], ["Watch"]]);
 		});
 
 		test("sharesParallelGroup follows the Send barrier past an intervening call", () => {
 			expect(sharesParallelGroup([tool("Send"), tool("Read")])).toBe(true);
-			expect(sharesParallelGroup([tool("Send"), tool("Read"), tool("Await")])).toBe(false);
-			expect(sharesParallelGroup([tool("Await"), tool("Send")])).toBe(true);
+			expect(sharesParallelGroup([tool("Send"), tool("Read"), tool("Watch")])).toBe(false);
+			expect(sharesParallelGroup([tool("Watch"), tool("Send")])).toBe(true);
 		});
 
 		test("Agent + Agent stays parallel", () => {
@@ -231,29 +231,29 @@ describe("tool execution grouping", () => {
 			).toEqual([["Agent", "Read"]]);
 		});
 
-		test("Await/Send without a preceding Agent stay in the parallel batch", () => {
+		test("Watch/Send without a preceding Agent stay in the parallel batch", () => {
 			expect(
-				groupToolExecutions([tool("Read"), tool("Await"), tool("Send"), tool("Glob")]).map(
+				groupToolExecutions([tool("Read"), tool("Watch"), tool("Send"), tool("Glob")]).map(
 					(group) => group.map(({ name }) => name),
 				),
-			).toEqual([["Read", "Await", "Send", "Glob"]]);
+			).toEqual([["Read", "Watch", "Send", "Glob"]]);
 		});
 
-		test("an Await group can re-accumulate later parallel tools", () => {
-			// After the barrier splits Await into its own group, subsequent parallel-safe tools
+		test("an Watch group can re-accumulate later parallel tools", () => {
+			// After the barrier splits Watch into its own group, subsequent parallel-safe tools
 			// (no Agent in that new group) keep batching normally.
 			expect(
-				groupToolExecutions([tool("Agent"), tool("Await"), tool("Read"), tool("Grep")]).map(
+				groupToolExecutions([tool("Agent"), tool("Watch"), tool("Read"), tool("Grep")]).map(
 					(group) => group.map(({ name }) => name),
 				),
-			).toEqual([["Agent"], ["Await", "Read", "Grep"]]);
+			).toEqual([["Agent"], ["Watch", "Read", "Grep"]]);
 		});
 
 		test("exposes the same Agent mount barrier to recovery scheduling", () => {
 			const groups = groupToolExecutions([
 				{ toolName: "Agent", input: {} },
 				{ toolName: "Read", input: {} },
-				{ toolName: "Await", input: {} },
+				{ toolName: "Watch", input: {} },
 			]);
 
 			expect(isAgentDependentToolExecutionGroup(groups[0], groups[1] ?? [])).toBe(true);
@@ -378,9 +378,9 @@ describe("selectStreamingToolExecutions", () => {
 		expect(selectStreamingToolExecutions(items)).toEqual([]);
 	});
 
-	test("an Agent blocks Await and Send until it has settled", () => {
+	test("an Agent blocks Watch and Send until it has settled", () => {
 		const agent = tool("Agent");
-		const awaitTool = tool("Await");
+		const awaitTool = tool("Watch");
 		const send = tool("Send");
 		const items = [entry(agent), entry(awaitTool), entry(send)];
 		expect(selectStreamingToolExecutions(items)).toEqual([agent]);

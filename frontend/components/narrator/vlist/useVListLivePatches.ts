@@ -54,6 +54,7 @@ import {
 	LivePatchQueue,
 	patchSubagentActivitySnapshots,
 	patchSubagentIdentity,
+	patchSubagentNested,
 	patchSubagentTakeoverByNarrator,
 } from "./vlist-live-patch";
 
@@ -426,6 +427,13 @@ export function useVListLivePatches(
 				enqueue((messages) =>
 					patchSubagentTakeoverByNarrator(messages, subagentNarratorId, takenOver),
 				);
+			},
+
+			// The helpers of a first-level subagent changed (this page is the tree's root):
+			// its card's nested rows are replaced by the server's bounded summary.
+			onSubagentNestedChanged: ({ subagentNarratorId, toolUseId, nested }) => {
+				if (!toolUseId) return;
+				enqueue((messages) => patchSubagentNested(messages, toolUseId, subagentNarratorId, nested));
 			},
 
 			// Execution began (permission granted). The persisted half of the same signal

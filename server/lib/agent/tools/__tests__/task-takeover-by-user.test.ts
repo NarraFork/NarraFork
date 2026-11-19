@@ -40,7 +40,7 @@ describe("Agent takeover_by_user tool contract", () => {
 			expect(schema.properties.takeover_by_user.description).toContain("returns immediately");
 			expect(schema.properties.takeover_by_user.description).toContain("does not notify or wake");
 			expect(schema.properties.takeover_by_user.description).toContain(
-				"Do not automatically Await",
+				"Do not automatically Watch",
 			);
 		}
 	});

@@ -386,12 +386,12 @@ describe("isToolQueuedBehindUpstream — same parallel group is concurrency, not
 		).toBe(true);
 	});
 
-	it("respects the Agent → Await barrier", () => {
-		// Await after an Agent opens a new group so the spawned child is observable.
+	it("respects the Agent → Watch barrier", () => {
+		// Watch after an Agent opens a new group so the spawned child is observable.
 		expect(
 			isToolQueuedBehindUpstream({
 				status: "initializing",
-				toolName: "Await",
+				toolName: "Watch",
 				input: {},
 				earlierTools: [running("Agent")],
 			}),

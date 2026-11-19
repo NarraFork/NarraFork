@@ -4,16 +4,19 @@ import { migrate } from "drizzle-orm/bun-sql/migrator";
 import { withPostgres } from "../../../tests/db/pg-test-harness";
 import { createPostgresClient } from "../../db/postgres-client";
 import {
+	backgroundTasks,
 	runtimeAwaitedTerminalConsumptions as consumptions,
+	deviceTransferTasks,
 	narratorBufferedMessages as mailbox,
 	narrators,
 	runtimePublicationOutbox as outbox,
+	remoteDevices,
 } from "../../db/postgres-schema";
 import { createPostgresRuntimePublication } from "./postgres-runtime-publication";
 import { createPostgresRuntimeQueue } from "./postgres-runtime-queue";
 
 (process.env.PG_INTEGRATION === "1" ? test : test.skip)(
-	"real PG service cancellation retains Await result without terminal outbox or pending mailbox",
+	"real PG service cancellation, transfer notification and silent observation retain durable results",
 	async () => {
 		let callbackError: unknown;
 		const result = await withPostgres(async ({ port, credentials }) => {
@@ -190,6 +193,349 @@ import { createPostgresRuntimeQueue } from "./postgres-runtime-queue";
 				} finally {
 					await client.sql.unsafe(
 						"DROP TRIGGER reject_service_receipt ON runtime_awaited_terminal_consumptions; DROP FUNCTION reject_service_receipt()",
+					);
+				}
+				// Transfers need no new notice kind. Their terminal CAS reserves a bash
+				// publication, and a paused projection produces neither terminal nor notice.
+				for (const status of ["completed", "failed", "cancelled"] as const) {
+					const id = `transfer-${status}`;
+					await db.insert(backgroundTasks).values({
+						id,
+						parentNarratorId: "parent",
+						type: "transfer",
+						status: "paused",
+						startedAt: now,
+						createdAt: now,
+						updatedAt: now,
+					});
+					expect(await db.select().from(outbox).where(eq(outbox.taskId, id))).toHaveLength(0);
+					await db
+						.update(backgroundTasks)
+						.set({ status: "running" })
+						.where(eq(backgroundTasks.id, id));
+					if (status === "cancelled") {
+						const input = {
+							taskId: id,
+							now,
+							capturedOutput: null,
+							capturedOutputBytes: 0,
+							capturedTruncated: false,
+						};
+						expect(await engine.cancelTask(input)).not.toBeNull();
+						expect(await engine.cancelTask(input)).toBeNull();
+					} else {
+						const input = {
+							taskId: id,
+							setFields: { status, output: "transfer result", completedAt: now },
+							fullOutput: "transfer result",
+							summary: `transfer ${status}`,
+							eventKind: status,
+						};
+						expect(await engine.commitTerminalTransition(input)).toBeDefined();
+						expect(await engine.commitTerminalTransition(input)).toBeUndefined();
+					}
+					expect((await engine.readTaskDetail(id))?.logicalRunId).toBeTruthy();
+					expect((await queue.outbox.transferNext("parent", "bash")).status).toBe("transferred");
+				}
+
+				await db.insert(remoteDevices).values({
+					id: "retry-device",
+					name: "retry",
+					slug: "retry",
+					tokenHash: "hash",
+					tokenPrefix: "test",
+					createdBy: "test",
+					createdAt: now,
+					updatedAt: now,
+				});
+				for (const status of ["completed", "failed"] as const) {
+					const ownerId = `retry-${status}`;
+					await db.insert(deviceTransferTasks).values({
+						id: ownerId,
+						deviceId: "retry-device",
+						parentNarratorId: "parent",
+						direction: "upload",
+						remotePath: "/remote",
+						localPath: "/local",
+						status: "running",
+						createdAt: now,
+						updatedAt: now,
+					});
+					const taskRow = {
+						id: `projection-${ownerId}`,
+						parentNarratorId: "parent",
+						transferTaskId: ownerId,
+						type: "transfer" as const,
+						status: "running" as const,
+						startedAt: now,
+						createdAt: now,
+						updatedAt: now,
+					};
+					const first = await engine.startTransferTask({ taskRow, runGeneration: 0 });
+					expect(first?.logicalRunId).toBe(`transfer:${ownerId}:0`);
+					await db
+						.update(deviceTransferTasks)
+						.set({ status: "failed" })
+						.where(eq(deviceTransferTasks.id, ownerId));
+					const failed = {
+						taskId: taskRow.id,
+						expectedTransfer: { id: ownerId, generation: 0 },
+						setFields: { status: "failed", output: "first failure", completedAt: now },
+						eventKind: "failed" as const,
+						fullOutput: "first failure",
+						summary: `${ownerId} first failure`,
+					};
+					expect(await engine.commitTerminalTransition(failed)).toBeDefined();
+					await queue.outbox.transferNext("parent", "bash");
+					// Same owner transition as resume + claim: generation advances exactly once.
+					await db
+						.update(deviceTransferTasks)
+						.set({ status: "running", runGeneration: 1 })
+						.where(eq(deviceTransferTasks.id, ownerId));
+					if (status === "completed") {
+						await client.sql.unsafe(
+							"CREATE FUNCTION reject_retry_slot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'retry slot failure'; END $$; CREATE TRIGGER reject_retry_slot BEFORE INSERT ON runtime_publication_outbox FOR EACH ROW EXECUTE FUNCTION reject_retry_slot()",
+						);
+						try {
+							await expect(
+								engine.startTransferTask({ taskRow, runGeneration: 1 }),
+							).rejects.toThrow();
+							expect(await engine.readTaskDetail(taskRow.id)).toMatchObject({
+								status: "failed",
+								logicalRunId: first?.logicalRunId,
+							});
+							expect(
+								await db.select().from(outbox).where(eq(outbox.taskId, taskRow.id)),
+							).toHaveLength(0);
+						} finally {
+							await client.sql.unsafe(
+								"DROP TRIGGER reject_retry_slot ON runtime_publication_outbox; DROP FUNCTION reject_retry_slot()",
+							);
+						}
+					}
+					const [second, replayed] = await Promise.all([
+						engine.startTransferTask({ taskRow, runGeneration: 1 }),
+						engine.startTransferTask({ taskRow, runGeneration: 1 }),
+					]);
+					expect(replayed?.logicalRunId).toBe(second?.logicalRunId);
+					expect(await db.select().from(outbox).where(eq(outbox.taskId, taskRow.id))).toHaveLength(
+						1,
+					);
+					expect(second?.id).toBe(first?.id);
+					expect(second?.logicalRunId).toBe(`transfer:${ownerId}:1`);
+					expect(second?.logicalRunId).not.toBe(first?.logicalRunId);
+					expect(
+						(await engine.startTransferTask({ taskRow, runGeneration: 0 }))?.logicalRunId,
+					).toBe(second?.logicalRunId);
+					expect(await engine.commitTerminalTransition(failed)).toBeUndefined();
+					expect((await engine.readTaskDetail(taskRow.id))?.status).toBe("running");
+					await db
+						.update(deviceTransferTasks)
+						.set({ status })
+						.where(eq(deviceTransferTasks.id, ownerId));
+					const terminal = {
+						taskId: taskRow.id,
+						expectedTransfer: { id: ownerId, generation: 1 },
+						setFields: { status, output: "second result", completedAt: now },
+						eventKind: status,
+						fullOutput: "second result",
+						summary: `${ownerId} second ${status}`,
+					};
+					expect(await engine.commitTerminalTransition(terminal)).toBeDefined();
+					expect(await engine.commitTerminalTransition(terminal)).toBeUndefined();
+					await engine.startTransferTask({ taskRow, runGeneration: 1 });
+					await queue.outbox.transferNext("parent", "bash");
+					const notices = (await db.select().from(mailbox)).filter((row) =>
+						row.text.includes(ownerId),
+					);
+					expect(notices).toHaveLength(2);
+					expect(new Set(notices.map((row) => row.dedupeKey)).size).toBe(2);
+					expect((await engine.readTaskDetail(taskRow.id))?.status).toBe(status);
+				}
+				await db.insert(deviceTransferTasks).values({
+					id: "pause-owner",
+					deviceId: "retry-device",
+					parentNarratorId: "parent",
+					direction: "upload",
+					remotePath: "/remote",
+					localPath: "/local",
+					status: "running",
+					createdAt: now,
+					updatedAt: now,
+				});
+				const pausedRow = {
+					id: "pause-projection",
+					parentNarratorId: "parent",
+					transferTaskId: "pause-owner",
+					type: "transfer" as const,
+					status: "running" as const,
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				};
+				const pausedRun = await engine.startTransferTask({ taskRow: pausedRow, runGeneration: 0 });
+				await db
+					.update(backgroundTasks)
+					.set({ status: "paused" })
+					.where(eq(backgroundTasks.id, pausedRow.id));
+				const pausedSlots = await db.select().from(outbox).where(eq(outbox.taskId, pausedRow.id));
+				await db
+					.update(deviceTransferTasks)
+					.set({ status: "running", runGeneration: 1 })
+					.where(eq(deviceTransferTasks.id, "pause-owner"));
+				expect(
+					(await engine.startTransferTask({ taskRow: pausedRow, runGeneration: 1 }))?.logicalRunId,
+				).toBe(pausedRun?.logicalRunId);
+				expect(await db.select().from(outbox).where(eq(outbox.taskId, pausedRow.id))).toEqual(
+					pausedSlots,
+				);
+				expect(
+					await engine.commitTerminalTransition({
+						taskId: pausedRow.id,
+						expectedTransfer: { id: "pause-owner", generation: 0 },
+						setFields: { status: "failed" },
+						fullOutput: "late",
+						summary: "late",
+						eventKind: "failed",
+					}),
+				).toBeUndefined();
+
+				await engine.cleanupTasks({
+					cutoff: "2099-01-01T00:00:00.000Z",
+					limit: 100,
+					excludedStatuses: ["running", "paused"],
+					excludedNarratorStatuses: ["working", "waiting"],
+					subagentPath: "$",
+				});
+				for (const status of ["completed", "failed", "cancelled"])
+					expect(await engine.readTaskDetail(`transfer-${status}`)).not.toBeNull();
+
+				for (const prefix of ["[watch]", "[terminal watch]"]) {
+					const id = `observation-${prefix}`;
+					const run = await engine.startBashRun({
+						taskId: id,
+						recipientId: "parent",
+						taskRow: {
+							id,
+							parentNarratorId: "parent",
+							type: "bash",
+							command: `${prefix} source-task`,
+							status: "running",
+							startedAt: now,
+							createdAt: now,
+							updatedAt: now,
+						},
+					});
+					const before = await db.select().from(mailbox);
+					const input = {
+						taskId: id,
+						setFields: {
+							status: "completed",
+							output: "source completed",
+							completedAt: now,
+							notified: true,
+						},
+						fullOutput: "source completed",
+						summary: "",
+						eventKind: "completed" as const,
+						silentObservation: true,
+					};
+					expect(await engine.commitTerminalTransition(input)).toBeDefined();
+					expect(await engine.commitTerminalTransition(input)).toBeUndefined();
+					expect(
+						await db.select().from(outbox).where(eq(outbox.logicalRunId, run.logicalRunId)),
+					).toHaveLength(0);
+					expect(
+						await db.select().from(consumptions).where(eq(consumptions.taskId, id)),
+					).toHaveLength(0);
+					expect(await db.select().from(mailbox)).toEqual(before);
+				}
+				const notWatch = await engine.startBashRun({
+					taskId: "not-observation",
+					recipientId: "parent",
+					taskRow: {
+						id: "not-observation",
+						parentNarratorId: "parent",
+						type: "bash",
+						command: "build",
+						status: "running",
+						startedAt: now,
+						createdAt: now,
+						updatedAt: now,
+					},
+				});
+				expect(
+					await engine.commitTerminalTransition({
+						taskId: notWatch.taskId,
+						setFields: { status: "completed" },
+						fullOutput: "",
+						summary: "",
+						eventKind: "completed",
+						silentObservation: true,
+					}),
+				).toBeUndefined();
+				expect((await engine.readTaskDetail(notWatch.taskId))?.status).toBe("running");
+				await db.insert(backgroundTasks).values({
+					id: "legacy-watch",
+					parentNarratorId: "parent",
+					type: "bash",
+					status: "running",
+					command: "[watch] source",
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				});
+				await engine.recoverStaleTask({
+					taskId: "legacy-watch",
+					now,
+					eventKind: "failed",
+					text: "Observation interrupted; the target was not stopped.",
+				});
+				await queue.outbox.transferNext("parent", "bash");
+				expect(
+					(await db.select().from(mailbox)).some((row) =>
+						row.text.includes("Observation interrupted"),
+					),
+				).toBe(true);
+
+				await engine.startBashRun({
+					taskId: "silent-rollback",
+					recipientId: "parent",
+					taskRow: {
+						id: "silent-rollback",
+						parentNarratorId: "parent",
+						type: "bash",
+						status: "running",
+						command: "[watch] source",
+						startedAt: now,
+						createdAt: now,
+						updatedAt: now,
+					},
+				});
+				await client.sql.unsafe(
+					"CREATE FUNCTION reject_silent_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'silent cleanup failure'; END $$; CREATE TRIGGER reject_silent_cleanup BEFORE DELETE ON runtime_publication_outbox FOR EACH ROW EXECUTE FUNCTION reject_silent_cleanup()",
+				);
+				try {
+					await expect(
+						engine.commitTerminalTransition({
+							taskId: "silent-rollback",
+							setFields: { status: "completed", notified: true },
+							fullOutput: "done",
+							summary: "",
+							eventKind: "completed",
+							silentObservation: true,
+						}),
+					).rejects.toThrow();
+					expect(await engine.readTaskDetail("silent-rollback")).toMatchObject({
+						status: "running",
+						notified: false,
+					});
+					expect(
+						await db.select().from(outbox).where(eq(outbox.taskId, "silent-rollback")),
+					).toHaveLength(1);
+				} finally {
+					await client.sql.unsafe(
+						"DROP TRIGGER reject_silent_cleanup ON runtime_publication_outbox; DROP FUNCTION reject_silent_cleanup()",
 					);
 				}
 				return "passed";

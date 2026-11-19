@@ -16,6 +16,7 @@ import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-docum
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
@@ -1102,6 +1103,19 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			toolUseId?: string;
 			takenOver: boolean;
+	  }
+	/**
+	 * The helpers a first-level subagent launched changed (one started, changed status or
+	 * asks for or got a permission decision). Sent to the ACL root's page, where that
+	 * subagent is a card; `nested` replaces the card's helper rows. Like the takeover
+	 * frame, `toolUseId` is best-effort and the client may match by `subagentNarratorId`.
+	 */
+	| {
+			type: "subagent_nested_changed";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId?: string;
+			nested: SubagentNestedSummary;
 	  }
 	| {
 			type: "subagent_warning";

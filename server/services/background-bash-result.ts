@@ -93,16 +93,16 @@ export async function prepareBackgroundBashResult(
 		return {
 			outputPath,
 			content:
-				`Background Bash captured output saved to: ${outputPath}\n` +
+				`Captured output saved to: ${outputPath}\n` +
 				(clipped
 					? "Captured output was clipped to a UTF-8 complete prefix of at most 10 MiB; the file is not the complete output.\n"
 					: "This file contains captured output, not a guarantee of the command's complete output.\n") +
-				'Use Read or Grep with device: "local" and the path above. No Await is needed.\n' +
-				`If Read reports that the file was cleaned up, you may try Await with type: "bash", id: ${JSON.stringify(taskId)}; it may retain only a preview and does not guarantee complete output.\n` +
+				'Use Read or Grep with device: "local" and the path above. No observation is needed.\n' +
+				`If Read reports that the file was cleaned up, use Watch with the original target type and id: ${JSON.stringify(taskId)}; it may retain only a preview and does not guarantee complete output.\n` +
 				`Captured output tail preview (at most ${PREVIEW_BYTES} UTF-8 bytes):\n${preview}`,
 		};
 	} catch {
-		logger.warn("Background Bash captured output could not be saved", {
+		logger.warn("Captured output could not be saved", {
 			taskId,
 			reason: failed ? "write_timeout" : "write_failed",
 		});
@@ -113,7 +113,7 @@ export async function prepareBackgroundBashResult(
 		return {
 			content:
 				"Failed to save captured output (write failed or timed out); no output file is available.\n" +
-				`Use Await with type: "bash", id: ${JSON.stringify(taskId)} to retrieve captured output.\n` +
+				`Use Watch with the original target type and id: ${JSON.stringify(taskId)} to retrieve captured output.\n` +
 				(clipped
 					? "Captured output exceeds the 10 MiB capture limit; only a bounded preview is shown.\n"
 					: "") +

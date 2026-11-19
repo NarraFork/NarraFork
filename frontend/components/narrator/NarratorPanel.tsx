@@ -87,7 +87,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
@@ -268,11 +268,9 @@ const FilePanelContent = REMOTE_BUILD
 			})),
 		);
 
-// Flag-gated pretext virtualized list. Now the default renderer, but still lazily
-// imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
-// guard requires this dynamic import (no static import of vlist from outside the
-// vlist/ directory). The exact-layout shell is the sole Virtual renderer (the band
-// path has been retired).
+// Loaded lazily. The isolation guard requires this dynamic import (no static
+// import of vlist from outside the vlist/ directory). The exact-layout shell is
+// the sole renderer; the band path has been retired.
 const PretextExactMessageList = lazy(() =>
 	import("./vlist/PretextExactMessageList").then((module) => ({
 		default: module.PretextExactMessageList,
@@ -837,6 +835,7 @@ function NarratorPanelBody({
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
 	const activeTerminalCount = useMemo(
 		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
 		[narratorTerminals],
@@ -1614,7 +1613,9 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
+	// Hidden from read-only viewers: opening a terminal needs write access.
+	const terminalToolAvailable =
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals !== false;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
@@ -2276,7 +2277,6 @@ function NarratorPanelBody({
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
-	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
 	const vlistRowHandlers = useMemo(
 		() => ({
 			onForkFromMessage: forkHandler,
@@ -2286,8 +2286,7 @@ function NarratorPanelBody({
 			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
 			onDeleteBlock: handleDeleteBlock,
 			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
-			// Message editing: same gating as the chunked branch below — the user
-			// flow requires provider support, the assistant text edit does not.
+			// The user flow requires provider support; the assistant text edit does not.
 			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 			resolveQueuedMessage,
 			onEditAssistantMessage: handleEditAssistantMessage,

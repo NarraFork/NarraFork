@@ -28,6 +28,8 @@ import {
 import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
+import { requestDocumentAsset, requestDocumentPreview } from "../lib/document-preview/client";
+import { MAX_DOCUMENT_BYTES, OMITTED_DOCUMENT_IMAGE_MIMES } from "../lib/document-preview/limits";
 import { AppError, ValidationError } from "../lib/errors";
 import { claimDownloadTicket, issueDownloadTicket } from "../lib/fs-download-ticket";
 import {
@@ -531,6 +533,12 @@ fsRoutes.get("/preview", async (c) => {
 				"Content-Disposition": "inline",
 				"Content-Length": String(stat.size),
 				"Cache-Control": "private, max-age=60",
+				// The MIME type comes from the extension, so it is a claim about the bytes rather
+				// than a fact. `nosniff` makes the browser trust it: without it, a `.pdf` whose
+				// contents are HTML could be sniffed as HTML and rendered — which matters because
+				// the PDF preview frame is intentionally unsandboxed (Chrome's PDF viewer refuses
+				// to run in a sandboxed frame; see FileViewerContent's PDF branch).
+				"X-Content-Type-Options": "nosniff",
 			},
 		});
 	}
@@ -548,6 +556,93 @@ fsRoutes.get("/preview", async (c) => {
 });
 
 /**
+ * `GET /api/fs/document-preview?path=...` — read-only preview of a document file.
+ *
+ * Answers with Markdown plus the list of embedded pictures, so the client renders it with the
+ * SAME renderer as a `.md` preview. The format is decided by CONTENT inside the worker, not by
+ * the extension: a legacy binary `.doc` is refused with a reason (`ok: false`) instead of being
+ * read as text, which is what produced garbage previews before.
+ *
+ * Parsing runs in a worker (see `lib/document-preview/client.ts`); the main thread only does
+ * the cheap stat/authorization here.
+ */
+fsRoutes.get("/document-preview", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) throw new ValidationError("path is required");
+
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	let info: ReturnType<typeof statSync>;
+	try {
+		info = statSync(absPath);
+	} catch {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	if (!info.isFile()) throw new ValidationError(`Not a file: ${absPath}`);
+	if (info.size > MAX_DOCUMENT_BYTES) {
+		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	const outcome = await requestDocumentPreview(absPath);
+	return c.json(outcome);
+});
+
+/** Asset ids are minted by the parser (`a1`, `a2`, …); anything else is refused unread. */
+const DOCUMENT_ASSET_ID_PATTERN = /^a[0-9]{1,6}$/;
+
+/**
+ * `GET /api/fs/document-asset?path=...&id=...` — one embedded picture of a document.
+ *
+ * The id is resolved by re-walking the document, so a caller can only address pictures the
+ * parser found; it can never name a ZIP entry and read an arbitrary part of a container.
+ */
+fsRoutes.get("/document-asset", async (c) => {
+	const rawPath = c.req.query("path");
+	const assetId = c.req.query("id");
+	if (!rawPath) throw new ValidationError("path is required");
+	if (!assetId) throw new ValidationError("id is required");
+	if (!DOCUMENT_ASSET_ID_PATTERN.test(assetId)) {
+		throw new ValidationError(`Unknown document asset: ${assetId}`);
+	}
+
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	let info: ReturnType<typeof statSync>;
+	try {
+		info = statSync(absPath);
+	} catch {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	if (!info.isFile()) throw new ValidationError(`Not a file: ${absPath}`);
+	if (info.size > MAX_DOCUMENT_BYTES) {
+		return c.json({ error: "File too large to preview" }, 413);
+	}
+
+	const asset = await requestDocumentAsset(absPath, assetId);
+	if (!asset) throw new ValidationError(`Unknown document asset: ${assetId}`);
+	// The worker already omits these. Refuse again at the HTTP boundary: the client puts the
+	// body in a same-origin blob, so a response of this type would be an executable document.
+	// This is a type check, not a parse — `sanitizeSvg` stays off the main thread.
+	if (OMITTED_DOCUMENT_IMAGE_MIMES.has(asset.mime)) {
+		throw new ValidationError(`Unknown document asset: ${assetId}`);
+	}
+
+	return new Response(Buffer.from(asset.bytes), {
+		headers: {
+			// `nosniff` keeps the declared type honest: these bytes come from a document, not
+			// from a file this API validated as an image.
+			"Content-Type": asset.mime,
+			"Content-Length": String(asset.bytes.length),
+			"Content-Disposition": "inline",
+			"X-Content-Type-Options": "nosniff",
+			"Cache-Control": "private, max-age=60",
+		},
+	});
+});
+
+/**
  * Cap on the body of one human save.
  *
  * Matches `/preview`'s text cap: the editor can only open what preview serves, so a
@@ -555,7 +650,6 @@ fsRoutes.get("/preview", async (c) => {
  * whole-file diff computed for line stats, which runs on the server's only JS thread.
  */
 const MAX_WRITE_BYTES = 1024 * 1024;
-
 /**
  * `GET /api/fs/edit-source?path=...` — load a file FOR EDITING.
  *
