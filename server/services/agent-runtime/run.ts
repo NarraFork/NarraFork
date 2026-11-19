@@ -52,6 +52,7 @@ import {
 	withNarratorWorkAdmission,
 } from "../narrator-session-state";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
+import { freezeCheckpointStopAdmission, matchesCheckpointRun } from "./checkpoint-stop";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -134,6 +135,7 @@ export interface RegisteredAgentStart {
 
 export interface RunHandle {
 	started: boolean;
+	notStartedReason?: "owned" | "admission_closed";
 	logicalRunId?: string;
 	/** The caller's result: terminal, or a handoff when the run is detached. */
 	foreground: Promise<RunResult>;
@@ -151,6 +153,44 @@ const notStarted: RunResult = {
 	interrupted: false,
 	timedOut: false,
 };
+
+let acceptingRuns = true;
+const pendingRunCompletions = new Set<Promise<RunResult>>();
+let shutdownRunFailures = 0;
+export function stopNarratorRunAdmission(): void {
+	acceptingRuns = false;
+	freezeCheckpointStopAdmission();
+}
+
+export function getNarratorRunShutdownSnapshot() {
+	return {
+		stopped: !acceptingRuns,
+		pending: pendingRunCompletions.size,
+		failed: shutdownRunFailures,
+	};
+}
+
+export async function drainNarratorRunCompletions(options: { deadlineAt: number }): Promise<void> {
+	while (pendingRunCompletions.size) {
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator run cleanup drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingRunCompletions]),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("Narrator run cleanup drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	if (shutdownRunFailures) throw new Error("Narrator run cleanup failed during shutdown");
+}
 
 type Session = typeof import("../narrator-session");
 const session = (): Promise<Session> => import("../narrator-session");
@@ -316,12 +356,27 @@ async function announceRunToDestination(
  */
 export async function startNarratorRun(req: StartNarratorRunRequest): Promise<RunHandle> {
 	const id = req.narratorId;
+	let notStartedReason: RunHandle["notStartedReason"] = "owned";
 	const launch = await withNarratorStartAdmission(id, async () => {
+		if (!acceptingRuns) {
+			notStartedReason = "admission_closed";
+			return null;
+		}
 		req.admission?.check();
 		const owner = tryClaimExecution(id, "run");
 		if (!owner) return null;
-		req.admission?.onAdmitted();
-		const { promise: terminal, resolve: resolveTerminal } = Promise.withResolvers<RunResult>();
+		try {
+			req.admission?.onAdmitted();
+		} catch (error) {
+			owner.release();
+			throw error;
+		}
+		const {
+			promise: terminal,
+			resolve: resolveTerminal,
+			reject: rejectTerminal,
+		} = Promise.withResolvers<RunResult>();
+		void terminal.catch(() => {});
 		const {
 			promise: foreground,
 			resolve: resolveForeground,
@@ -357,6 +412,22 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 				return result;
 			},
 			(error) => {
+				if (run.checkpointStop) {
+					if (error !== run.checkpointStop) run.checkpointStop.cleanupFailure ??= error;
+					if (error !== run.checkpointStop || run.checkpointStop.cleanupFailure !== undefined) {
+						shutdownRunFailures++;
+						logger.warn("Checkpoint run local cleanup failed", {
+							narratorId: id,
+							error: String(run.checkpointStop.cleanupFailure ?? error),
+						});
+					}
+					rejectTerminal(run.checkpointStop);
+					if (!foregroundSettled) {
+						foregroundSettled = true;
+						rejectForeground(run.checkpointStop);
+					}
+					throw run.checkpointStop;
+				}
 				const failed: RunResult = {
 					...notStarted,
 					started: true,
@@ -374,12 +445,19 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 				throw error;
 			},
 		);
-		void completion.catch(() => {});
+		pendingRunCompletions.add(completion);
+		void completion.then(
+			() => pendingRunCompletions.delete(completion),
+			(error) => {
+				pendingRunCompletions.delete(completion);
+				if (!acceptingRuns && run.checkpointStop !== error) shutdownRunFailures++;
+			},
+		);
 		return { run, completion, foreground: req.foreground ? foreground : terminal };
 	});
 	if (!launch) {
 		const idle = Promise.resolve(notStarted);
-		return { started: false, foreground: idle, terminal: idle, completion: idle };
+		return { started: false, notStartedReason, foreground: idle, terminal: idle, completion: idle };
 	}
 	return {
 		started: true,
@@ -783,6 +861,26 @@ async function executeRun(
 		finished = true;
 		return await finishRun(id, run, deliverTo, publicationRun, { ...outcome, delegated }, req);
 	} catch (error) {
+		if (run.checkpointStop) {
+			allowInboxWake = false;
+			if (active) active._resumeBufferedAfterLoop = false;
+			throw error;
+		}
+		const preparingRunId = run.logicalRunId ?? req.registeredStart?.logicalRunId;
+		if (
+			preparingRunId &&
+			!run.cancel.signal.aborted &&
+			matchesCheckpointRun(error, {
+				narratorId: id,
+				logicalRunId: preparingRunId,
+				executionEpoch: owner.epoch,
+			})
+		) {
+			run.checkpointStop = error;
+			allowInboxWake = false;
+			if (active) active._resumeBufferedAfterLoop = false;
+			throw error;
+		}
 		// An exiting process may have closed a worker while this run was preparing.
 		const pausedForRestart = await waitForRestartBeforeFailure(run.cancel.signal);
 		// Infrastructure failure is not a successful turn boundary. In particular,
@@ -801,6 +899,8 @@ async function executeRun(
 				req,
 			);
 		}
+		if (!finished && !deliverToResolved && req.registeredStart && !pausedForRestart)
+			await settleRegisteredAgentStartFailure(req.registeredStart, error, owner);
 		// A run that threw still ends exactly once at its destination (the same
 		// finalizer); the error then reaches the session's own error reporting.
 		if (!finished && deliverTo && publicationRun)
@@ -842,9 +942,19 @@ async function executeRun(
 		if (deadlineTimer) clearTimeout(deadlineTimer);
 		removeCallerListener?.();
 		removeCancelListener?.();
-		const { backgroundTaskService } = await import("../background-task-service");
-		backgroundTaskService.unregisterAbortController(id, run.cancel);
-		if (owner.release()) afterRunRelease(id, active, allowInboxWake);
+		try {
+			if (outputCountRunId) {
+				const { retireSubagentOutputCharCount } = await import("../narrator-event-handler");
+				retireSubagentOutputCharCount(id, outputCountRunId);
+			}
+		} finally {
+			try {
+				const { backgroundTaskService } = await import("../background-task-service");
+				backgroundTaskService.unregisterAbortController(id, run.cancel);
+			} finally {
+				if (owner.release() && !run.checkpointStop) afterRunRelease(id, active, allowInboxWake);
+			}
+		}
 	}
 }
 
@@ -853,6 +963,10 @@ async function executeRun(
  * runtime-paused runs keep their input for an explicit retry.
  */
 function afterRunRelease(id: string, active: ActiveNarrator | undefined, allowInboxWake: boolean) {
+	if (!acceptingRuns) {
+		if (active) active._resumeBufferedAfterLoop = false;
+		return;
+	}
 	const resumeBuffered = active?._resumeBufferedAfterLoop === true;
 	if (active) active._resumeBufferedAfterLoop = false;
 	if (!allowInboxWake && !resumeBuffered) return;

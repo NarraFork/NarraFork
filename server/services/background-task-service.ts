@@ -59,6 +59,7 @@ import {
 import { assertPublicationTaskIdentity } from "./agent-runtime/publication-outbox";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
+import { BackgroundBashLifecycle } from "./background-bash-lifecycle";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
@@ -499,7 +500,17 @@ class BackgroundTaskService {
 	 * was dropped would leave every client permanently one behind, and each would
 	 * then refetch on every subsequent delta.
 	 */
-	private async broadcastListDelta(
+	private broadcastListDelta(
+		parentNarratorId: string,
+		delta: Omit<BackgroundTaskListDelta, "listEpoch" | "version" | "activeCount">,
+	): Promise<void> {
+		if (this.bashLifecycle.isStopped) return Promise.resolve();
+		return this.bashLifecycle.trackTerminal(
+			this.readAndBroadcastListDelta(parentNarratorId, delta),
+		);
+	}
+
+	private async readAndBroadcastListDelta(
 		parentNarratorId: string,
 		delta: Omit<BackgroundTaskListDelta, "listEpoch" | "version" | "activeCount">,
 	): Promise<void> {
@@ -512,6 +523,7 @@ class BackgroundTaskService {
 		try {
 			counts = await this.countActiveKindsByParent(parentNarratorId);
 		} catch (err) {
+			this.bashLifecycle.markFailed();
 			logger.warn("Failed to count active background tasks for list delta", {
 				parentNarratorId,
 				error: err instanceof Error ? err.message : String(err),
@@ -553,18 +565,20 @@ class BackgroundTaskService {
 			// Prefer a direct task match, and keep both lookups in the requested parent.
 			let [unified] = await this.listItemsByIds(parentNarratorId, [taskId]);
 			if (!unified) {
-				const projection = await db
-					.select({ id: backgroundTasks.id })
-					.from(backgroundTasks)
-					.where(
-						and(
-							eq(backgroundTasks.parentNarratorId, parentNarratorId),
-							eq(backgroundTasks.type, "agent"),
-							eq(backgroundTasks.subagentNarratorId, taskId),
-						),
-					)
-					.limit(1)
-					.get();
+				const projection = await readQueryFirst(
+					db
+						.select({ id: backgroundTasks.id })
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.parentNarratorId, parentNarratorId),
+								eq(backgroundTasks.type, "agent"),
+								eq(backgroundTasks.subagentNarratorId, taskId),
+							),
+						)
+						.limit(1),
+					{ executionPolicy: "worker-required" },
+				);
 				if (projection) {
 					[unified] = await this.listItemsByIds(parentNarratorId, [projection.id]);
 				}
@@ -577,6 +591,7 @@ class BackgroundTaskService {
 			}
 			await this.broadcastListDelta(parentNarratorId, { upsert: item });
 		} catch (err) {
+			this.bashLifecycle.markFailed();
 			logger.warn("Failed to broadcast background task list delta", {
 				parentNarratorId,
 				taskId,
@@ -587,9 +602,10 @@ class BackgroundTaskService {
 
 	/** Fire-and-forget wrapper for the synchronous mark* paths. */
 	private queueTaskUpsert(parentNarratorId: string, taskId: string): void {
+		if (this.bashLifecycle.isStopped) return;
 		backgroundOccupancyStore.refreshTask(taskId);
 		if (backgroundOccupancyStore.isReady) {
-			void this.broadcastTaskUpsert(parentNarratorId, taskId);
+			this.bashLifecycle.trackTerminal(this.broadcastTaskUpsert(parentNarratorId, taskId));
 		}
 	}
 
@@ -719,6 +735,7 @@ class BackgroundTaskService {
 		alias?: string;
 		title?: string;
 	}): Promise<BackgroundTaskRecord> {
+		this.bashLifecycle.assertAdmission();
 		const binding = opts.toolCallBinding;
 		if (
 			binding !== undefined &&
@@ -1388,6 +1405,65 @@ class BackgroundTaskService {
 		expectedAbortController?: AbortController,
 		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
 	): Promise<boolean> {
+		if (!this.canStartTerminal(taskId, expectedAbortController)) return Promise.resolve(false);
+		return this.bashLifecycle.trackTerminal(
+			this.commitCompleted(taskId, output, exitCode, expectedAbortController, publicationOptions),
+		);
+	}
+
+	markFailed(
+		taskId: string,
+		error: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
+	): Promise<boolean> {
+		if (!this.canStartTerminal(taskId, expectedAbortController)) return Promise.resolve(false);
+		return this.bashLifecycle.trackTerminal(
+			this.commitFailed(taskId, error, exitCode, expectedAbortController, publicationOptions),
+		);
+	}
+
+	markTimedOut(
+		taskId: string,
+		error: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
+	): Promise<boolean> {
+		if (!this.canStartTerminal(taskId, expectedAbortController)) return Promise.resolve(false);
+		return this.bashLifecycle.trackTerminal(
+			this.commitTimedOut(taskId, error, exitCode, expectedAbortController, publicationOptions),
+		);
+	}
+
+	markCancelled(
+		taskId: string,
+		expectedAbortController?: AbortController,
+		publicationOptions?: { expectedRun?: PublicationRun },
+	): Promise<boolean> {
+		if (!this.canStartTerminal(taskId, expectedAbortController)) return Promise.resolve(false);
+		// Capture the current generation even for callers without an explicit controller.
+		const owner = expectedAbortController ?? this.abortControllers.get(taskId);
+		return this.bashLifecycle.runCancellation(taskId, owner, () =>
+			this.commitCancelled(taskId, owner, publicationOptions?.expectedRun),
+		);
+	}
+
+	private canStartTerminal(taskId: string, expectedAbortController?: AbortController): boolean {
+		return (
+			this.ownsAbortController(taskId, expectedAbortController) &&
+			this.bashLifecycle.canStartTerminal(taskId)
+		);
+	}
+
+	private async commitCompleted(
+		taskId: string,
+		output: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
+	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		const outputBytes = Buffer.byteLength(output, "utf-8");
@@ -1407,6 +1483,7 @@ class BackgroundTaskService {
 			},
 			output,
 			publicationOptions?.deferPublication,
+			publicationOptions?.expectedRun,
 		);
 
 		if (!task) {
@@ -1444,12 +1521,12 @@ class BackgroundTaskService {
 		return true;
 	}
 
-	async markFailed(
+	private async commitFailed(
 		taskId: string,
 		error: string,
 		exitCode?: number,
 		expectedAbortController?: AbortController,
-		publicationOptions?: { deferPublication?: boolean },
+		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
 	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
@@ -1471,6 +1548,7 @@ class BackgroundTaskService {
 			},
 			error,
 			publicationOptions?.deferPublication,
+			publicationOptions?.expectedRun,
 		);
 
 		if (!task) {
@@ -1509,12 +1587,12 @@ class BackgroundTaskService {
 		return true;
 	}
 
-	async markTimedOut(
+	private async commitTimedOut(
 		taskId: string,
 		error: string,
 		exitCode?: number,
 		expectedAbortController?: AbortController,
-		publicationOptions?: { deferPublication?: boolean },
+		publicationOptions?: { deferPublication?: boolean; expectedRun?: PublicationRun },
 	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
@@ -1535,6 +1613,7 @@ class BackgroundTaskService {
 			},
 			error,
 			publicationOptions?.deferPublication,
+			publicationOptions?.expectedRun,
 		);
 
 		if (!task) {
@@ -1572,7 +1651,11 @@ class BackgroundTaskService {
 		return true;
 	}
 
-	async markCancelled(taskId: string, expectedAbortController?: AbortController): Promise<boolean> {
+	private async commitCancelled(
+		taskId: string,
+		expectedAbortController?: AbortController,
+		expectedRun?: PublicationRun,
+	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		const output = this.getOutputBuffer(taskId);
@@ -1596,6 +1679,7 @@ class BackgroundTaskService {
 					capturedOutputBytes: outputBytes,
 					capturedTruncated: !!prepared?.outputPath || truncated,
 					now,
+					expectedRun,
 				});
 			} catch (error) {
 				await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
@@ -1637,7 +1721,7 @@ class BackgroundTaskService {
 			setFields.outputBytes = outputBytes;
 			setFields.outputTruncated = truncated;
 		}
-		const task = await this.transitionTerminalTask(taskId, setFields, output);
+		const task = await this.transitionTerminalTask(taskId, setFields, output, false, expectedRun);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -3004,6 +3088,71 @@ class BackgroundTaskService {
 
 	// ── Operations ──────────────────────────────────────────────────────
 
+	/** Own setup until its collector is registered, including async task creation/start. */
+	runBashStartup<T>(start: () => Promise<T>): Promise<T> {
+		this.bashLifecycle.assertAdmission();
+		return this.bashLifecycle.trackTerminal(start());
+	}
+
+	trackBashCollector<T>(
+		taskId: string,
+		controller: AbortController,
+		work: Promise<T>,
+		processStarted = true,
+	): Promise<T> {
+		this.bashLifecycle.trackCollector(taskId, work, processStarted);
+		const cleanupPreserved = () => {
+			if (this.bashLifecycle.getSnapshot().preserving) this.cleanupRuntime(taskId, controller);
+		};
+		void work.then(cleanupPreserved, (error) => {
+			cleanupPreserved();
+			logger.warn("Background Bash collector failed", {
+				taskId,
+				error: String(error).slice(0, 1_000),
+			});
+		});
+		const state = this.bashLifecycle.getSnapshot();
+		if (state.stopped && !state.preserving) this.stopBashProcess(taskId, controller);
+		return work;
+	}
+
+	markBashCollectorStarted(taskId: string): void {
+		this.bashLifecycle.markCollectorStarted(taskId);
+		if (!this.bashLifecycle.canStartTerminal(taskId)) {
+			const timer = this.outputBroadcastTimers.get(taskId);
+			if (timer) clearTimeout(timer);
+			this.outputBroadcastTimers.delete(taskId);
+		}
+	}
+
+	/** Freeze before request draining; killing must not wait on collector/DB settlement. */
+	stopBashCollectors(options: { preserveProcesses?: boolean } = {}): void {
+		this.bashLifecycle.stop(options);
+		for (const timer of this.outputBroadcastTimers.values()) clearTimeout(timer);
+		this.outputBroadcastTimers.clear();
+		if (options.preserveProcesses) return;
+		for (const taskId of this.bashLifecycle.getTaskIds()) {
+			this.stopBashProcess(taskId, this.abortControllers.get(taskId));
+		}
+	}
+
+	private stopBashProcess(taskId: string, controller?: AbortController): void {
+		controller?.abort();
+		try {
+			this.killHandlers.get(taskId)?.();
+		} catch (error) {
+			logger.warn("Kill handler error during Bash shutdown", { taskId, error: String(error) });
+		}
+	}
+
+	drainBashCollectors(options: { deadlineAt?: number } = {}): Promise<void> {
+		return this.bashLifecycle.drain(options);
+	}
+
+	getBashShutdownSnapshot() {
+		return this.bashLifecycle.getSnapshot();
+	}
+
 	/** Synchronous signal for process-exit handlers racing with cancellation publication. */
 	isCancellationRequested(taskId: string): boolean {
 		return this.abortControllers.get(taskId)?.signal.aborted ?? false;
@@ -3203,11 +3352,16 @@ class BackgroundTaskService {
 
 	registerKillHandler(taskId: string, handler: () => void): void {
 		this.killHandlers.set(taskId, handler);
+		const state = this.bashLifecycle.getSnapshot();
+		if (state.stopped && !state.preserving && this.bashLifecycle.getTaskIds().has(taskId)) {
+			this.stopBashProcess(taskId, this.abortControllers.get(taskId));
+		}
 	}
 
 	// ── Bash output management ──────────────────────────────────────────
 
 	appendOutput(taskId: string, chunk: string): void {
+		if (!this.bashLifecycle.canStartTerminal(taskId)) return;
 		// Defensive cap: stop accumulating if we've exceeded the in-memory limit
 		const currentBytes = this.outputByteCounts.get(taskId) ?? 0;
 		const chunkBytes = Buffer.byteLength(chunk, "utf-8");
@@ -3237,12 +3391,18 @@ class BackgroundTaskService {
 					taskId,
 					setTimeout(() => {
 						this.outputBroadcastTimers.delete(taskId);
+						if (this.bashLifecycle.isStopped || !this.bashLifecycle.canStartTerminal(taskId))
+							return;
 						const totalBytes = (this.outputChunks.get(taskId) ?? []).reduce(
 							(sum, c) => sum + Buffer.byteLength(c, "utf-8"),
 							0,
 						);
 						this.getBroadcastFn().then((fn) => {
-							if (fn) {
+							if (
+								fn &&
+								!this.bashLifecycle.isStopped &&
+								this.bashLifecycle.canStartTerminal(taskId)
+							) {
 								fn(parentNarratorId, {
 									type: "background_task_output",
 									narratorId: parentNarratorId,
@@ -3994,18 +4154,16 @@ class BackgroundTaskService {
 					? undefined
 					: manifest.startedAt + manifest.timeoutMs - Date.now();
 			const { monitorBackgroundBash } = await import("../lib/agent/tools/bash");
-			void monitorBackgroundBash({
-				taskId,
-				handle,
-				bgAbort: ctrl,
-				backgroundKind: "service",
-				timeoutMs: remaining,
-			}).catch((error) =>
-				logger.warn("Adopted background service monitor failed", {
+			const lifecycle = Promise.resolve().then(() =>
+				monitorBackgroundBash({
 					taskId,
-					error: String(error),
+					handle,
+					bgAbort: ctrl,
+					backgroundKind: "service",
+					timeoutMs: remaining,
 				}),
 			);
+			this.trackBashCollector(taskId, ctrl, lifecycle, false);
 			this.queueTaskUpsert(parentNarratorId, taskId);
 			logger.info("Re-attached background service after restart", {
 				taskId,

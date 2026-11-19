@@ -19,10 +19,12 @@ const SWEEP_BATCH = 500;
 const SWEEP_MAX = 20_000;
 
 /** Remove saved-output directories of narrators that no longer exist. Returns how many. */
-export async function sweepOrphanCoordinatorOutputs(): Promise<number> {
+export async function sweepOrphanCoordinatorOutputs(isStopped = () => false): Promise<number> {
+	if (isStopped()) return 0;
 	const owners = await listCoordinatorOutputOwners(SWEEP_MAX);
 	let removed = 0;
 	for (let start = 0; start < owners.length; start += SWEEP_BATCH) {
+		if (isStopped()) break;
 		const batch = owners.slice(start, start + SWEEP_BATCH);
 		const alive = new Set(
 			db
@@ -33,6 +35,7 @@ export async function sweepOrphanCoordinatorOutputs(): Promise<number> {
 				.map((row) => row.id),
 		);
 		for (const id of batch) {
+			if (isStopped()) return removed;
 			if (alive.has(id)) continue;
 			await removeCoordinatorOutputs(id);
 			removed++;
@@ -41,15 +44,32 @@ export async function sweepOrphanCoordinatorOutputs(): Promise<number> {
 	return removed;
 }
 
-/** Follow narrator deletions and sweep orphans once. Returns the stop function. */
-export function startCoordinatorMaintenance(): () => void {
+/** Stop admission synchronously, then drain this owner's finite filesystem/database work. */
+export function startCoordinatorMaintenance(): () => Promise<void> {
+	let stopped = false;
+	let failed = false;
+	const pending = new Set<Promise<unknown>>();
+	const track = <T>(work: Promise<T>): Promise<T> => {
+		pending.add(work);
+		void work.then(
+			() => pending.delete(work),
+			() => {
+				failed = true;
+				pending.delete(work);
+			},
+		);
+		return work;
+	};
 	const onDeleted = (event: { narratorId: string }) => {
+		if (stopped) return;
 		forgetTeamStatus(event.narratorId);
 		forgetCoordinatorRun(event.narratorId);
-		void removeCoordinatorOutputs(event.narratorId);
+		void track(removeCoordinatorOutputs(event.narratorId)).catch((error) =>
+			logger.warn("Removing saved coordinator outputs failed", { error: String(error) }),
+		);
 	};
 	eventBus.on("narrator:deleted", onDeleted);
-	sweepOrphanCoordinatorOutputs()
+	void track(sweepOrphanCoordinatorOutputs(() => stopped))
 		.then((removed) => {
 			if (removed > 0)
 				logger.info("Removed saved coordinator outputs of deleted sessions", { removed });
@@ -57,5 +77,14 @@ export function startCoordinatorMaintenance(): () => void {
 		.catch((error) =>
 			logger.warn("Sweeping saved coordinator outputs failed", { error: String(error) }),
 		);
-	return () => eventBus.off("narrator:deleted", onDeleted);
+	return async () => {
+		stopped = true;
+		try {
+			eventBus.off("narrator:deleted", onDeleted);
+		} catch {
+			failed = true;
+		}
+		while (pending.size) await Promise.allSettled([...pending]);
+		if (failed) throw new Error("Coordinator maintenance did not drain successfully");
+	};
 }

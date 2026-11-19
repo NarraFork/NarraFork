@@ -7,6 +7,7 @@ import {
 	getRecoverySource,
 	getReservedRecoverySourceEpochs,
 	invalidateRecoveryTarget,
+	isRecoveryTargetPending,
 	normalizeRecoverySources,
 	type RecoverySource,
 	registerRecoverySource,
@@ -26,6 +27,35 @@ const source = (epoch = "old"): RecoverySource => ({
 });
 beforeEach(() => resetRecoveryHandoffForTests());
 describe("recovery handoff short barrier", () => {
+	test("pending target lookup follows current progress rather than retained manifest evidence", () => {
+		const original: RecoverySource = {
+			...source(),
+			logicalRuns: [{ narratorId: "n", logicalRunId: null }],
+		};
+		expect(isRecoveryTargetPending("n")).toBe(false);
+		const handle = registerRecoverySource(original);
+		expect(isRecoveryTargetPending("n")).toBe(true);
+		expect(isRecoveryTargetPending("unknown")).toBe(false);
+		handle.update({ ...original, pendingNarratorIds: [] });
+		expect(isRecoveryTargetPending("n")).toBe(false);
+		expect(getRecoverySource("old")?.narrators).toEqual(original.narrators);
+		handle.retire();
+		expect(isRecoveryTargetPending("n")).toBe(false);
+	});
+	test("pending target lookup protects all sources and drops withdrawn targets", () => {
+		const first = registerRecoverySource(source("first"));
+		const second = registerRecoverySource({ ...source("second"), kind: "ordinary" });
+		first.update({ ...source("first"), pendingNarratorIds: [] });
+		expect(isRecoveryTargetPending("n")).toBe(true);
+		second.retire();
+		expect(isRecoveryTargetPending("n")).toBe(false);
+		first.update(source("first"));
+		expect(isRecoveryTargetPending("n")).toBe(true);
+		invalidateRecoveryTarget("n");
+		expect(isRecoveryTargetPending("n")).toBe(false);
+		first.update(source("first"));
+		expect(isRecoveryTargetPending("n")).toBe(false);
+	});
 	test("discovery rejects reservation without pausing work", () => {
 		beginRecoveryDiscovery();
 		expect(() => reserveRecoveryHandoff()).toThrow("discovery");

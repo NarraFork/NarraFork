@@ -57,7 +57,7 @@ export function isOccupancyNarratorSeed(row: OccupancyNarrator): boolean {
 		row.status === "working" ||
 		row.status === "waiting" ||
 		row.takenOver ||
-		(row.backgroundStatus === "running" && !row.hasProjection)
+		(row.status !== "archived" && row.backgroundStatus === "running" && !row.hasProjection)
 	);
 }
 

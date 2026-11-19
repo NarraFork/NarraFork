@@ -156,6 +156,51 @@ describe("maintained background occupancy graph", () => {
 		expect(index.snapshot(["root"]).occupied).toEqual(new Set(["root"]));
 	});
 
+	test("archived raw running is not a seed, while real work still propagates through archived nodes", () => {
+		const index = new BackgroundOccupancyIndex();
+		index.upsertNarrator(narrator("root"));
+		index.upsertNarrator(
+			narrator("archived", "root", {
+				status: "archived",
+				backgroundStatus: "running",
+			}),
+		);
+		index.rebuild();
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(0);
+		expect(index.getActiveLegacyIds("root")).toEqual([]);
+
+		index.setRuntimeLive("archived", true);
+		index.rebuild();
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		index.setRuntimeLive("archived", false);
+		index.upsertNarrator(narrator("leaf", "archived", { status: "working" }));
+		index.rebuild();
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		expect(index.getAncestorIds("leaf")).toEqual(["archived", "root"]);
+
+		index.upsertNarrator(narrator("leaf", "archived"));
+		index.setRuntimeLive("archived", true);
+		index.rebuild();
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		index.setRuntimeLive("archived", false);
+		index.upsertNarrator(
+			narrator("archived", "root", {
+				status: "archived",
+				backgroundStatus: "running",
+				hasProjection: true,
+			}),
+		);
+		index.upsertTask(
+			task("projection", "root", {
+				type: "agent",
+				subagentNarratorId: "archived",
+			}),
+		);
+		index.rebuild();
+		expect(index.getActiveTaskIds("root")).toEqual(["projection"]);
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+	});
+
 	test("terminal unified projection excludes stale legacy running; live descendants revive it", () => {
 		const index = new BackgroundOccupancyIndex();
 		index.upsertNarrator(

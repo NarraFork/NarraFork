@@ -6019,7 +6019,6 @@ export async function startInjectionContinuationIfPossible(
 			);
 			return { started: true };
 		});
-		return { started: true };
 	});
 }
 
@@ -6162,12 +6161,12 @@ export async function startParentInboundContinuationIfPossible(
 			const delivered = await drainAndPersistPendingInjections(active);
 			if (!delivered) return { started: false };
 
-		active._continuationSuppressed = false;
-		active._continuationStallCount = 0;
-		active._continuationStallKey = undefined;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
+			active._continuationSuppressed = false;
+			active._continuationStallCount = 0;
+			active._continuationStallKey = undefined;
+			active._lastTokenUsage = undefined;
+			active._ttftMs = undefined;
+			active._turnStartedAt = new Date().toISOString();
 
 			await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 			withTrackedNarratorSessionCleanup(() =>
@@ -6184,7 +6183,6 @@ export async function startParentInboundContinuationIfPossible(
 			);
 			return { started: true };
 		});
-		return { started: true };
 	});
 }
 
@@ -9430,10 +9428,10 @@ export async function acquireNarratorRevertAdmission(
 		// A loop's one-shot finalizer may already have tried (and been refused by
 		// the waiting gate). Cancellation can also leave admitted cleanup running:
 		// wait for its real settlement, rather than losing the wakeup to busy once.
-		void (async () => {
+		withTrackedNarratorSessionWork(async () => {
 			await waitForNarratorAdmissionWork(narratorId, new AbortController().signal);
 			await resumeBufferedMessagesIfIdle(narratorId, "en");
-		})().catch((error) => {
+		}).catch((error) => {
 			if (!isNarratorRevertAdmissionBlocked(narratorId)) {
 				logger.warn("Could not resume messages after file revert", {
 					narratorId,

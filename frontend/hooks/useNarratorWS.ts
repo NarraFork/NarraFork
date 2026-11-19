@@ -359,6 +359,7 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
 	blockId?: string | null;
 	toolName?: string | null;
@@ -919,6 +920,7 @@ export interface NarratorWSCallbacks {
 			/** Latest determinate progress, so a reconnect paints the bar immediately. */
 			structuredProgress?: ToolProgressPayload;
 			toolCallId?: string | null;
+			executionAttempt?: number;
 			createdAt?: string | number | null;
 			timing?: SubagentToolCallTiming | null;
 			subagentNarratorId?: string | null;

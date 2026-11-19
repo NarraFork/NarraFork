@@ -880,6 +880,48 @@ describe("background occupancy coordinator", () => {
 		expect(store.isReady).toBe(false);
 	});
 
+	test("settling a cached legacy claim publishes zero occupancy through every ancestor", async () => {
+		const { source, store } = fixture();
+		const narratorScan = spyOn(source, "scanNarrators");
+		const taskScan = spyOn(source, "scanTasks");
+		source.narrators.set("leaf", narrator("leaf", "child", { backgroundStatus: "running" }));
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(store.snapshot(["root", "child"]).childCounts).toEqual(
+			new Map([
+				["root", 1],
+				["child", 1],
+			]),
+		);
+		const delivered = deferred();
+		let notified: readonly string[] = [];
+		store.subscribe("claim-settled", (ids) => {
+			notified = ids;
+			delivered.resolve();
+		});
+		// The persisted archive/CAS commits before it queues this entity-specific refresh.
+		source.narrators.set(
+			"leaf",
+			narrator("leaf", "child", {
+				status: "archived",
+				backgroundStatus: "cancelled",
+			}),
+		);
+		store.refreshNarrator("leaf");
+		await store.flush();
+		await delivered.promise;
+		expect(notified).toEqual(expect.arrayContaining(["root", "child", "leaf"]));
+		for (const id of ["root", "child", "leaf"]) {
+			expect(store.snapshot([id]).childCounts.get(id)).toBe(0);
+			expect(store.snapshot([id]).counts.get(id)?.activeCount).toBe(0);
+		}
+		expect(narratorScan).toHaveBeenCalledTimes(1);
+		expect(taskScan).toHaveBeenCalledTimes(1);
+		narratorScan.mockRestore();
+		taskScan.mockRestore();
+		await store.stop();
+	});
+
 	test("keyed subscribers run asynchronously after publication and may flush without deadlock", async () => {
 		const { source, store } = fixture();
 		source.narrators.set("cold", narrator("cold", "root"));

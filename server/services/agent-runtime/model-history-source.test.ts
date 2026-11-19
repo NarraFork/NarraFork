@@ -7,6 +7,8 @@ import * as workerRead from "@server/db/worker-read";
 import { closeReadDatabase } from "@server/lib/db-worker/pool";
 import { splitEnvelope } from "@shared/narrator-blocks/storage";
 import { logger } from "../../lib/logger";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
+import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { modelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
 import {

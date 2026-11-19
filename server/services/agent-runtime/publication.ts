@@ -9,17 +9,21 @@ import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
+	narratorToolCalls,
+	narratorToolContinuations,
 	runtimeAwaitedTerminalConsumptions,
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { assembledBodyLengthSql } from "../../lib/narrator-body-length";
+import { parseSubstatus, parseTraits } from "../../lib/narrator-utils";
 import {
 	type RunBindingInput,
 	type RuntimeRunBinding,
+	readRuntimeRegistrationColumn,
 	registerRun,
 } from "../../lib/validators/runtime-registration";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
@@ -54,9 +58,11 @@ import {
 	raiseSeqFloorForClaim,
 	readTopRefSeq,
 } from "../narrator-refs/seq-store";
+import { trackCommunicationWork } from "./async-work";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { NoticeKind, RuntimeDb, RuntimeTx } from "./mailbox-types";
 import {
+	type ArchivedOrphanBackgroundClaim,
 	createPostgresRuntimePublication,
 	type PgCancelAgentNarratorInput,
 	type PgCancelTaskInput,
@@ -74,6 +80,7 @@ import {
 	requirePublicationTx,
 } from "./postgres-runtime-publication";
 import {
+	assertPublicationTaskIdentity,
 	createPublicationOutbox,
 	type LegacyCompletionAdmission,
 	type LegacyPublicationSource,
@@ -81,6 +88,7 @@ import {
 	type PublicationEvent,
 	type PublicationIntent,
 	type PublicationRun,
+	PublicationStateError,
 	publicationDedupeKey,
 	publicationEventFromDedupeKey,
 	type RunPublicationStatus,
@@ -145,6 +153,18 @@ export function publicationSummary(text: string): string {
 	return summary;
 }
 
+function sameDeliveryTarget(
+	current: RunBindingInput["deliverTo"],
+	expected: RunBindingInput["deliverTo"],
+): boolean {
+	return (
+		current?.narratorId === expected?.narratorId &&
+		current?.toolUseId === expected?.toolUseId &&
+		current?.toolCallId === expected?.toolCallId &&
+		current?.attempt === expected?.attempt
+	);
+}
+
 export function createRuntimePublicationService(database: RuntimeDb) {
 	const legacyReaders: Partial<
 		Record<NoticeKind, (source: LegacyPublicationSource) => LegacyRuntimeAdmission | undefined>
@@ -178,16 +198,29 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	 * it as a background task in the same transaction.
 	 */
 	function startRun(input: StartRunInput): StartedRun {
+		if (input.taskRow && !input.binding.deliverTo)
+			throw new ValidationError("Background task registration requires a delivery destination");
 		return runAtomicWrite(database, "publication.startRun", (tx) => {
 			const recipientId = input.binding.deliverTo?.narratorId;
 			let resumeRunId = input.resumeRunId;
-			if ((input.taskRow || input.adoptRegisteredRun) && recipientId && resumeRunId === undefined) {
+			if ((input.taskRow || input.adoptRegisteredRun) && recipientId) {
 				const actor = tx
-					.select({ logicalRunId: narrators.logicalRunId })
+					.select({
+						logicalRunId: narrators.logicalRunId,
+						runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+					})
 					.from(narrators)
 					.where(eq(narrators.id, input.narratorId))
 					.get();
-				if (actor?.logicalRunId) {
+				const registered = readRuntimeRegistrationColumn(actor?.runtimeRegistrationJson)?.run;
+				if (
+					actor?.logicalRunId &&
+					registered?.logicalRunId === actor.logicalRunId &&
+					registered.deliverTo &&
+					!sameDeliveryTarget(registered.deliverTo, input.binding.deliverTo)
+				)
+					throw new ValidationError("Stale task publication destination");
+				if (resumeRunId === undefined && actor?.logicalRunId) {
 					const existingRun: PublicationRun = {
 						producerKind: "agent",
 						taskId: input.narratorId,
@@ -207,13 +240,58 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			const publication: PublicationRun | undefined = recipientId
 				? { producerKind: "agent", taskId: input.narratorId, logicalRunId, recipientId }
 				: undefined;
-			if (publication) reserve(publication, tx, input.started);
+			if (publication) {
+				const liveTask = tx
+					.select({
+						id: backgroundTasks.id,
+						type: backgroundTasks.type,
+						parentNarratorId: backgroundTasks.parentNarratorId,
+						subagentNarratorId: backgroundTasks.subagentNarratorId,
+						logicalRunId: backgroundTasks.logicalRunId,
+						status: backgroundTasks.status,
+					})
+					.from(backgroundTasks)
+					.where(
+						and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
+					)
+					.get();
+				for (const task of [input.taskRow, liveTask]) {
+					if (
+						task &&
+						(task.id !== publication.taskId ||
+							task.type !== publication.producerKind ||
+							task.parentNarratorId !== publication.recipientId ||
+							(task.subagentNarratorId != null && task.subagentNarratorId !== input.narratorId))
+					)
+						throw new PublicationStateError("identity_mismatch", "start", publication, {
+							producerKind: task.type,
+							taskId: task.id,
+							recipientId: task.parentNarratorId,
+							state: task.status,
+						});
+				}
+				reserve(publication, tx, input.started);
+			}
 			const topSeq = readTopRefSeq(tx, input.narratorId) ?? NARRATOR_REF_SEQ_EMPTY_TOP;
 			const source = tx
-				.select({ runtimeRegistrationJson: narrators.runtimeRegistrationJson })
+				.select({
+					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+					traits: narrators.traits,
+				})
 				.from(narrators)
 				.where(eq(narrators.id, input.narratorId))
 				.get();
+			const priorRun = readRuntimeRegistrationColumn(source?.runtimeRegistrationJson)?.run;
+			if (
+				publication &&
+				resumeRunId &&
+				priorRun?.logicalRunId === logicalRunId &&
+				!sameDeliveryTarget(priorRun.deliverTo, input.binding.deliverTo)
+			)
+				throw new PublicationStateError("identity_mismatch", "start", publication, {
+					logicalRunId: priorRun.logicalRunId,
+					recipientId: priorRun.deliverTo?.narratorId,
+				});
 			const registration = registerRun(
 				source?.runtimeRegistrationJson,
 				logicalRunId,
@@ -223,6 +301,16 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			tx.update(narrators)
 				.set({
 					runtimeRegistrationJson: registration,
+					...(input.taskRow
+						? {
+								isBackground: true,
+								backgroundStatus: "running" as const,
+								backgroundResult: null,
+								backgroundCompletedAt: null,
+								traits: [...new Set([...parseTraits(source?.traits), "background"])],
+								updatedAt: new Date().toISOString(),
+							}
+						: {}),
 				})
 				.where(eq(narrators.id, input.narratorId))
 				.run();
@@ -317,6 +405,25 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		// Bash has one durable task per actual attempt; its output is already normalized
 		// to the existing 512 KiB budget. Never copy raw stdout into a message row.
 		if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
+		const actor = tx
+			.select({
+				logicalRunId: narrators.logicalRunId,
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, run.taskId))
+			.get();
+		const registered = readRuntimeRegistrationColumn(actor?.runtimeRegistrationJson)?.run;
+		if (
+			actor?.logicalRunId === run.logicalRunId &&
+			registered?.logicalRunId === run.logicalRunId &&
+			registered.deliverTo &&
+			registered.deliverTo.narratorId !== run.recipientId
+		)
+			throw new PublicationStateError("identity_mismatch", "finish", run, {
+				logicalRunId: registered.logicalRunId,
+				recipientId: registered.deliverTo.narratorId,
+			});
 		const source = tx
 			.select({ resultRef: runtimePublicationOutbox.resultRef })
 			.from(runtimePublicationOutbox)
@@ -507,8 +614,10 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		// Restart/cancel notices are observable on the next pass, not permission to spend a turn.
 		if (event === "started" || event === "cancelled") return;
 		try {
-			void Promise.resolve(wake(recipientId)).catch((error) =>
-				logger.warn("Publication wake deferred", { recipientId, error: String(error) }),
+			void trackCommunicationWork(
+				Promise.resolve(wake(recipientId)).catch((error) =>
+					logger.warn("Publication wake deferred", { recipientId, error: String(error) }),
+				),
 			);
 		} catch (error) {
 			logger.warn("Publication wake deferred", { recipientId, error: String(error) });
@@ -553,12 +662,16 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		timer = setTimeout(
 			() => {
 				timer = undefined;
-				try {
-					if (flushPage() && retry++ < L.claimMaxAttempts) schedule(false);
-				} catch (error) {
-					logger.warn("Runtime publication delivery deferred", { retry, error: String(error) });
-					if (retry++ < L.claimMaxAttempts) schedule(false);
-				}
+				void trackCommunicationWork(
+					(async () => {
+						try {
+							if ((await flushPage()) && retry++ < L.claimMaxAttempts) schedule(false);
+						} catch (error) {
+							logger.warn("Runtime publication delivery deferred", { retry, error: String(error) });
+							if (retry++ < L.claimMaxAttempts) schedule(false);
+						}
+					})(),
+				);
 			},
 			retry ? Math.min(50 * 2 ** retry, 1000) : 0,
 		);
@@ -784,6 +897,79 @@ export type PublicationCommitResult = {
 	toolConclusionApplied?: boolean;
 };
 
+/** Exact admission evidence, checked again inside the terminal transaction. */
+export interface AgentStartFailureGuard {
+	deliverTo: NonNullable<RunBindingInput["deliverTo"]>;
+	/** Keep takeover and its same-run result; background delivery waits for release. */
+	retainHeldResult?: boolean;
+	assertOwner(): void;
+}
+
+/** Shared SQLite/PG predicate; callers read these rows in their committing transaction. */
+export function assertAgentStartFailureIdentity(
+	run: PublicationRun,
+	guard: AgentStartFailureGuard,
+	actor:
+		| {
+				logicalRunId: string | null;
+				parentNarratorId: string | null;
+				runtimeRegistrationJson: unknown;
+				backgroundStatus: string | null;
+				substatus: unknown;
+		  }
+		| undefined,
+	task:
+		| {
+				type: string;
+				status: string;
+				parentNarratorId: string;
+				subagentNarratorId: string | null;
+				logicalRunId: string | null;
+				toolUseId: string | null;
+				toolCallId: string | null;
+				executionAttempt: number | null;
+		  }
+		| undefined,
+	source:
+		| {
+				id: string;
+				narratorId: string;
+				toolUseId: string;
+				executionAttempt: number;
+		  }
+		| undefined,
+): void {
+	guard.assertOwner();
+	const destination = guard.deliverTo;
+	const registered = readRuntimeRegistrationColumn(actor?.runtimeRegistrationJson)?.run;
+	if (
+		run.producerKind !== "agent" ||
+		run.recipientId !== destination.narratorId ||
+		actor?.logicalRunId !== run.logicalRunId ||
+		actor.parentNarratorId !== destination.narratorId ||
+		actor.backgroundStatus !== "running" ||
+		(guard.retainHeldResult && !parseSubstatus(actor.substatus).includes("taken_over")) ||
+		parseSubstatus(actor.substatus).includes(`terminal_run:${run.logicalRunId}`) ||
+		registered?.logicalRunId !== run.logicalRunId ||
+		!sameDeliveryTarget(registered.deliverTo, destination) ||
+		registered.deliverTo?.viaTask !== destination.viaTask ||
+		task?.type !== "agent" ||
+		task.status !== "running" ||
+		task.parentNarratorId !== destination.narratorId ||
+		task.subagentNarratorId !== run.taskId ||
+		task.logicalRunId !== run.logicalRunId ||
+		task.toolUseId !== destination.toolUseId ||
+		task.toolCallId !== (destination.toolCallId ?? null) ||
+		task.executionAttempt !== (destination.attempt ?? null) ||
+		(destination.toolCallId !== undefined &&
+			(source?.id !== destination.toolCallId ||
+				source.narratorId !== destination.narratorId ||
+				source.toolUseId !== destination.toolUseId ||
+				source.executionAttempt !== destination.attempt))
+	)
+		throw new ValidationError("Stale agent startup failure");
+}
+
 /** The terminal-commit composite input (result snapshot + intent in one section). */
 export interface PublicationTerminalCommit {
 	readonly run: PublicationRun;
@@ -793,6 +979,8 @@ export interface PublicationTerminalCommit {
 	readonly summary: string;
 	/** Foreground delivery stores the snapshot then consumes in the same transaction, without notice/wake. */
 	readonly delivery?: "background" | "foreground";
+	/** A registered task failed before normal execution preparation took over. */
+	readonly startupFailure?: AgentStartFailureGuard;
 	/** Detached PG fallback: exact tool card and terminal publish in one transaction. */
 	readonly toolConclusion?: {
 		toolCallId: string;
@@ -842,6 +1030,15 @@ export interface AsyncRuntimePublicationService {
 		  }
 		| undefined
 	>;
+	/** Worker-required SQLite read / native async PG read of one archive compensation identity. */
+	readArchivedOrphanBackgroundClaim(
+		narratorId: string,
+	): Promise<ArchivedOrphanBackgroundClaim | null>;
+	/** Caller holds start admission and excludes runtime drivers. No model result or publication is emitted. */
+	settleArchivedOrphanBackgroundClaim(
+		claim: ArchivedOrphanBackgroundClaim,
+		now: string,
+	): Promise<boolean>;
 	/** Named bounded read: full background task detail by id (LIMIT 1). */
 	readBackgroundTask(taskId: string): Promise<BackgroundTaskRecord | null>;
 	/**
@@ -940,8 +1137,117 @@ function createSqliteAsyncPublicationService(
 ): AsyncRuntimePublicationService {
 	const commitTerminal = (input: PublicationTerminalCommit): Promise<PublicationCommitResult> =>
 		Promise.resolve(
-			runAtomicWrite(db, "publication.commitTerminal", (tx) =>
-				legacy.commit(
+			runAtomicWrite(db, "publication.commitTerminal", (tx) => {
+				if (input.startupFailure) {
+					const guard = input.startupFailure;
+					const actor = tx
+						.select({
+							logicalRunId: narrators.logicalRunId,
+							parentNarratorId: narrators.parentNarratorId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							backgroundStatus: narrators.backgroundStatus,
+							substatus: narrators.substatus,
+							status: narrators.status,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.run.taskId))
+						.get();
+					const task = tx
+						.select({
+							type: backgroundTasks.type,
+							status: backgroundTasks.status,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							logicalRunId: backgroundTasks.logicalRunId,
+							toolUseId: backgroundTasks.toolUseId,
+							toolCallId: backgroundTasks.toolCallId,
+							executionAttempt: backgroundTasks.executionAttempt,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.run.taskId))
+						.get();
+					const source = guard.deliverTo.toolCallId
+						? tx
+								.select({
+									id: narratorToolCalls.id,
+									narratorId: narratorToolCalls.narratorId,
+									toolUseId: narratorToolCalls.toolUseId,
+									executionAttempt: narratorToolCalls.executionAttempt,
+								})
+								.from(narratorToolCalls)
+								.where(eq(narratorToolCalls.id, guard.deliverTo.toolCallId))
+								.get()
+						: undefined;
+					assertAgentStartFailureIdentity(input.run, guard, actor, task, source);
+					const now = new Date().toISOString();
+					const status =
+						input.eventKind === "cancelled" ? ("cancelled" as const) : ("failed" as const);
+					if (guard.retainHeldResult) {
+						tx.update(narrators)
+							.set({
+								status: actor?.status === "archived" ? "archived" : "idle",
+								substatus: JSON.stringify([
+									...new Set([
+										...parseSubstatus(actor?.substatus),
+										status === "cancelled" ? "interrupted" : "error",
+										`terminal_run:${input.run.logicalRunId}`,
+									]),
+								]),
+								backgroundStatus: status,
+								backgroundResult: input.text,
+								backgroundCompletedAt: now,
+								updatedAt: now,
+							})
+							.where(
+								and(
+									eq(narrators.id, input.run.taskId),
+									eq(narrators.logicalRunId, input.run.logicalRunId),
+								),
+							)
+							.run();
+						if (input.delivery !== "foreground")
+							return { status: "committed" as const, deliveryId: null, arrivalSeq: null };
+					}
+					tx.update(backgroundTasks)
+						.set({
+							status,
+							output: input.text,
+							outputBytes: Buffer.byteLength(input.text),
+							completedAt: now,
+							updatedAt: now,
+						})
+						.where(
+							and(
+								eq(backgroundTasks.id, input.run.taskId),
+								eq(backgroundTasks.logicalRunId, input.run.logicalRunId),
+								eq(backgroundTasks.status, "running"),
+							),
+						)
+						.run();
+					if (!guard.retainHeldResult)
+						tx.update(narrators)
+							.set({
+								status: actor?.status === "archived" ? "archived" : "idle",
+								substatus: JSON.stringify([status === "cancelled" ? "interrupted" : "error"]),
+								backgroundStatus: status,
+								backgroundResult: input.text,
+								backgroundCompletedAt: now,
+								updatedAt: now,
+							})
+							.where(
+								and(
+									eq(narrators.id, input.run.taskId),
+									eq(narrators.logicalRunId, input.run.logicalRunId),
+								),
+							)
+							.run();
+				}
+				if (input.delivery === "foreground") {
+					legacy.persistResult(input.run, input.text, tx, input.eventKind);
+					legacy.store.consumeAwaitedTerminal(input.run, tx);
+					return { status: "committed" as const, deliveryId: null, arrivalSeq: null };
+				}
+				return legacy.commit(
 					{
 						...input.run,
 						eventKind: input.eventKind,
@@ -949,12 +1255,18 @@ function createSqliteAsyncPublicationService(
 						summary: input.summary,
 					},
 					tx,
-				),
-			),
+				);
+			}),
 		);
 	return {
 		backend: "sqlite",
-		startRun: async (input) => legacy.startRun(input),
+		startRun: async (input) => {
+			const started = legacy.startRun(input);
+			// The SQLite transaction has committed. Invalidate in this same stack,
+			// before the async facade returns its Promise to any caller.
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		},
 		getAgentRun: async (narratorId, recipientId) => legacy.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => legacy.newBashRun(taskId, recipientId),
 		startBashRun: async (input) => {
@@ -1054,6 +1366,40 @@ function createSqliteAsyncPublicationService(
 			if (!existing) return undefined;
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
+					const current = tx
+						.select({
+							type: backgroundTasks.type,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.taskId))
+						.get();
+					if (
+						!current ||
+						current.type !== "agent" ||
+						(current.subagentNarratorId !== null &&
+							current.subagentNarratorId !== input.subagentNarratorId)
+					)
+						return undefined;
+					const actor = tx
+						.select({
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.subagentNarratorId))
+						.get();
+					const registered = readRuntimeRegistrationColumn(actor?.runtimeRegistrationJson)?.run;
+					if (
+						actor?.logicalRunId !== input.logicalRunId ||
+						(registered &&
+							(registered.logicalRunId !== input.logicalRunId ||
+								registered.deliverTo?.narratorId !== current.parentNarratorId ||
+								(input.toolUseId !== undefined &&
+									registered.deliverTo?.toolUseId !== input.toolUseId)))
+					)
+						return undefined;
 					const updated = tx
 						.update(backgroundTasks)
 						.set({
@@ -1078,6 +1424,9 @@ function createSqliteAsyncPublicationService(
 						.where(
 							and(
 								eq(backgroundTasks.id, input.taskId),
+								existing.logicalRunId === null
+									? isNull(backgroundTasks.logicalRunId)
+									: eq(backgroundTasks.logicalRunId, existing.logicalRunId),
 								eq(
 									backgroundTasks.status,
 									input.expectedStatus as
@@ -1142,10 +1491,12 @@ function createSqliteAsyncPublicationService(
 						type: backgroundTasks.type,
 						parentNarratorId: backgroundTasks.parentNarratorId,
 						logicalRunId: backgroundTasks.logicalRunId,
+						status: backgroundTasks.status,
 					})
 					.from(backgroundTasks)
 					.where(eq(backgroundTasks.id, input.taskId))
 					.get();
+				if (input.expectedRun) assertPublicationTaskIdentity(input.expectedRun, before);
 				if (
 					before &&
 					before.type !== "transfer" &&
@@ -1236,6 +1587,133 @@ function createSqliteAsyncPublicationService(
 					"SQLite cleanup is handled directly by background-task-service.cleanupCompleted.",
 			);
 		},
+		readArchivedOrphanBackgroundClaim: async (narratorId) => {
+			return (
+				(await readQueryFirst(
+					db
+						.select({
+							id: narrators.id,
+							parentNarratorId: narrators.parentNarratorId,
+							type: narrators.type,
+							status: narrators.status,
+							backgroundStatus: narrators.backgroundStatus,
+							backgroundCompletedAt: narrators.backgroundCompletedAt,
+							logicalRunId: narrators.logicalRunId,
+							registrationText: sql<
+								string | null
+							>`cast(${narrators.runtimeRegistrationJson} as text)`,
+							substatus: narrators.substatus,
+							updatedAt: narrators.updatedAt,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+					},
+				)) ?? null
+			);
+		},
+		settleArchivedOrphanBackgroundClaim: async (claim, now) => {
+			if (
+				claim.type !== "subagent" ||
+				claim.status !== "archived" ||
+				claim.backgroundStatus !== "running" ||
+				claim.logicalRunId !== null ||
+				readRuntimeRegistrationColumn(
+					claim.registrationText === null ? null : JSON.parse(claim.registrationText),
+				)?.run ||
+				parseSubstatus(claim.substatus).some(
+					(tag) => tag === "taken_over" || tag.startsWith("terminal_run:"),
+				)
+			)
+				return false;
+			return runAtomicWrite(db, "publication.settleArchivedOrphanBackgroundClaim", (tx) => {
+				// Terminal continuation rows can still own a result awaiting delivery.
+				const unmounted = and(
+					ne(narratorToolContinuations.state, "cancelled"),
+					sql`coalesce(json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase'), '') <> 'owner_continuation_started'`,
+				);
+				const settled = tx
+					.update(narrators)
+					.set({
+						backgroundStatus: "cancelled",
+						backgroundCompletedAt: claim.backgroundCompletedAt ?? now,
+						updatedAt: now,
+					})
+					.where(
+						and(
+							eq(narrators.id, claim.id),
+							eq(narrators.type, "subagent"),
+							eq(narrators.status, "archived"),
+							eq(narrators.backgroundStatus, "running"),
+							isNull(narrators.logicalRunId),
+							eq(narrators.updatedAt, claim.updatedAt),
+							claim.parentNarratorId === null
+								? isNull(narrators.parentNarratorId)
+								: eq(narrators.parentNarratorId, claim.parentNarratorId),
+							claim.backgroundCompletedAt === null
+								? isNull(narrators.backgroundCompletedAt)
+								: eq(narrators.backgroundCompletedAt, claim.backgroundCompletedAt),
+							claim.substatus === null
+								? isNull(narrators.substatus)
+								: eq(narrators.substatus, claim.substatus),
+							claim.registrationText === null
+								? isNull(narrators.runtimeRegistrationJson)
+								: sql`cast(${narrators.runtimeRegistrationJson} as text) = ${claim.registrationText}`,
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(backgroundTasks)
+									.where(eq(backgroundTasks.id, claim.id))
+									.limit(1),
+							),
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(backgroundTasks)
+									.where(
+										and(
+											eq(backgroundTasks.type, "agent"),
+											eq(backgroundTasks.subagentNarratorId, claim.id),
+										),
+									)
+									.limit(1),
+							),
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(narratorToolContinuations)
+									.where(and(eq(narratorToolContinuations.narratorId, claim.id), unmounted))
+									.limit(1),
+							),
+							claim.parentNarratorId === null
+								? undefined
+								: notExists(
+										tx
+											.select({ one: sql`1` })
+											.from(narratorToolContinuations)
+											.where(
+												and(
+													eq(narratorToolContinuations.narratorId, claim.parentNarratorId),
+													inArray(narratorToolContinuations.kind, [
+														"foreground_agent",
+														"background_agent",
+													]),
+													unmounted,
+													sql`json_extract(${narratorToolContinuations.payloadJson}, '$.subagentId') = ${claim.id}`,
+												),
+											)
+											.limit(1),
+									),
+						),
+					)
+					.returning({ id: narrators.id })
+					.get();
+				return settled !== undefined;
+			});
+		},
 		readBackgroundTask: async (taskId) => {
 			const row = await readQueryFirst(
 				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).limit(1),
@@ -1267,6 +1745,7 @@ function createSqliteAsyncPublicationService(
 					.from(backgroundTasks)
 					.where(eq(backgroundTasks.id, input.taskId))
 					.get();
+				if (input.expectedRun) assertPublicationTaskIdentity(input.expectedRun, existing);
 				if (!existing || (existing.status !== "running" && existing.status !== "paused"))
 					return undefined;
 				const setFields: Record<string, unknown> = {
@@ -1425,6 +1904,7 @@ function createSqliteAsyncPublicationService(
 		commitAgentTerminal: async (input) => {
 			if (input.run.producerKind !== "agent")
 				throw new Error("Agent terminal commit requires an agent run");
+			if (input.startupFailure) return commitTerminal(input);
 			if (input.delivery === "foreground")
 				return runAtomicWrite(db, "publication.commitForegroundTerminal", (tx) => {
 					const existing = tx
@@ -1503,8 +1983,10 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 		// Restart/cancel notices are observable on the next pass, not permission to spend a turn.
 		if (event === "started" || event === "cancelled") return;
 		try {
-			void Promise.resolve(handler(recipientId)).catch((error) =>
-				logger.warn("Publication wake deferred", { recipientId, error: String(error) }),
+			void trackCommunicationWork(
+				Promise.resolve(handler(recipientId)).catch((error) =>
+					logger.warn("Publication wake deferred", { recipientId, error: String(error) }),
+				),
 			);
 		} catch (error) {
 			logger.warn("Publication wake deferred", { recipientId, error: String(error) });
@@ -1548,14 +2030,16 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 	function runFlushTick(): void {
 		if (flushing) return;
 		let again = false;
-		flushing = (async () => {
-			try {
-				if ((await flushPage()) && retry++ < L.claimMaxAttempts) again = true;
-			} catch (error) {
-				logger.warn("Runtime publication delivery deferred", { retry, error: String(error) });
-				if (retry++ < L.claimMaxAttempts) again = true;
-			}
-		})();
+		flushing = trackCommunicationWork(
+			(async () => {
+				try {
+					if ((await flushPage()) && retry++ < L.claimMaxAttempts) again = true;
+				} catch (error) {
+					logger.warn("Runtime publication delivery deferred", { retry, error: String(error) });
+					if (retry++ < L.claimMaxAttempts) again = true;
+				}
+			})(),
+		);
 		void flushing.finally(() => {
 			flushing = undefined;
 			if (again && !stopped) schedule(false);
@@ -1578,7 +2062,11 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 
 	return {
 		backend: "postgres",
-		startRun: (input) => engine.startRun(input),
+		startRun: async (input) => {
+			const started = await engine.startRun(input);
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		},
 		getAgentRun: (narratorId, recipientId) => engine.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => ({
 			producerKind: "bash",
@@ -1597,6 +2085,10 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 		},
 		commitTerminalTransition: (input) => engine.commitTerminalTransition(input),
 		cleanupTasks: (input) => engine.cleanupTasks(input),
+		readArchivedOrphanBackgroundClaim: (narratorId) =>
+			engine.readArchivedOrphanBackgroundClaim(narratorId),
+		settleArchivedOrphanBackgroundClaim: (claim, now) =>
+			engine.settleArchivedOrphanBackgroundClaim(claim, now),
 		readBackgroundTask: async (taskId) =>
 			(await engine.readBackgroundTask(taskId)) as BackgroundTaskRecord | null,
 		readTaskDetail: async (taskId) =>
@@ -1733,6 +2225,12 @@ export const runtimePublication: RuntimePublicationService = (() => {
 	return createRuntimePublicationService(db);
 })();
 workerLifecycle.stop = () => runtimePublication.stop();
+
+/** Stop existing producers without opening or instantiating a database backend. */
+export function stopRuntimePublications(): void {
+	runtimePublication.stop();
+	asyncPublicationService?.service.stop();
+}
 export async function flushRuntimePublications(recipientId?: string): Promise<void> {
 	const service = getRuntimePublicationService();
 	if (recipientId) await service.flushRecipient(recipientId);

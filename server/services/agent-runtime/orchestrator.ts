@@ -254,8 +254,15 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
+import {
+	bindCheckpointGateActor,
+	checkpointStopForRun,
+	registerNarratorLoop,
+	waitForRestartBeforeFailure,
+} from "../update-coordinator";
+import { trackCommunicationWork } from "./async-work";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
+import { type CheckpointStop, isCheckpointStop } from "./checkpoint-stop";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
@@ -441,6 +448,10 @@ export async function runAgentLoopUnlocked(
 		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
 		// A question a person has yet to answer: their answer wakes the session.
 		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
+	let checkpointPause: CheckpointStop | undefined;
+	const checkpointIdentity = run?.logicalRunId
+		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }
+		: undefined;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -512,10 +523,19 @@ export async function runAgentLoopUnlocked(
 	let deliverTo: RunDeliverTo | undefined;
 	let placement: { parentNarratorId: string; parentToolUseId: string } | undefined;
 	let messageWriters = createRuntimeMessageWriters();
+	const checkpointParentId = run?.deliverTo?.narratorId;
 	try {
 		unregisterUpdateLoop = registerNarratorLoop(narratorId, locale, {
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
+			logicalRunId: run?.logicalRunId,
+			executionEpoch: owner.epoch,
+			parentNarratorId: checkpointParentId,
+			// A loop-less recovery stage can still own this child's terminal even
+			// after another parent run appears. Its live claim is a consumer fence.
+			canPauseForCheckpoint: checkpointParentId
+				? () => !hasNarratorRuntimeClaim(checkpointParentId)
+				: undefined,
 		});
 		// A legitimately admitted run is an explicit recovery from a previous stop.
 		if (!active.abortController.signal.aborted)
@@ -524,7 +544,7 @@ export async function runAgentLoopUnlocked(
 				.where(eq(narrators.id, narratorId))
 				.run();
 		const initNarrator = await narratorService.getById(narratorId);
-		deliverTo = runDeliverToOf(initNarrator);
+		deliverTo = run?.deliverTo ?? runDeliverToOf(initNarrator);
 		placement = deliverTo
 			? { parentNarratorId: deliverTo.narratorId, parentToolUseId: deliverTo.toolUseId }
 			: undefined;
@@ -1020,6 +1040,16 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
+			historyPreparation?.finish();
+			historyPreparation = new ModelHistoryPreparation({
+				narratorId,
+				kind: "initial",
+				logicalRunId: run?.logicalRunId,
+				signal: active.abortController.signal,
+				timeoutMs: null,
+				warn: (message, fields) => logger.warn(message, fields),
+				stallTimeBetween,
+			});
 
 			historyPreparation.phase("tools");
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
@@ -1049,6 +1079,7 @@ export async function runAgentLoopUnlocked(
 				narratorId,
 				active._currentUserId ?? null,
 			);
+			historyPreparation.check();
 			const runtimePolicy = passCapabilities.policy;
 			const profileToolFilter = runtimeToolFilter(runtimePolicy);
 			// Where the session's tasks live, once per pass (one indexed read). An outline root
@@ -1064,6 +1095,7 @@ export async function runAgentLoopUnlocked(
 					return "spec" as const;
 				},
 			);
+			historyPreparation.check();
 			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
 			// A root session the Dynamic Spec import moved: its `spec://` calls are told where the
 			// old files went (outline P2 PR 12b2). One cached primary-key read per session.
@@ -1076,13 +1108,16 @@ export async function runAgentLoopUnlocked(
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
 				const { workspaceContextService } = await import("../workspace-context-service");
-				active._workspaceContext = await workspaceContextService.get(narratorId);
+				const workspaceContext = await workspaceContextService.get(narratorId);
+				historyPreparation.check();
+				active._workspaceContext = workspaceContext;
 				active._workspacePassInvalidated = false;
 			}
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
 				active._currentUserId,
 			);
+			historyPreparation.check();
 			if (oauthRuntime) {
 				active._projectId = oauthRuntime.projectId ?? undefined;
 				active._defaultDeviceId = oauthRuntime.defaultDeviceId;
@@ -1092,6 +1127,7 @@ export async function runAgentLoopUnlocked(
 			const actingUserId = active._currentUserId ?? null;
 			const resolvedTurnSessionDevices =
 				(await resolveSessionDevices(active._projectId ?? null, actingUserId)) ?? [];
+			historyPreparation.check();
 			const turnTraits = passCapabilities.traits;
 			active._disabledTools = getDisabledToolSet(turnTraits.traits);
 			const turnBlocked = getBlockedSkills(turnTraits.traits);
@@ -1108,7 +1144,11 @@ export async function runAgentLoopUnlocked(
 			const managedOptionalTools = new Set<string>();
 			let toolCandidates: readonly ToolDefinition[] = [];
 			let toolRegistryRevision = toolRegistry.revision;
-			const refreshMcpToolLoading = async () => {
+			const refreshMcpToolLoading = async (
+				_identity: RequestModelIdentity,
+				preparation?: ModelHistoryPreparation,
+			) => {
+				preparation?.check();
 				const candidates = toolRegistry.all();
 				toolRegistryRevision = toolRegistry.revision;
 				toolCandidates = candidates;
@@ -1262,6 +1302,7 @@ export async function runAgentLoopUnlocked(
 					);
 				}
 			}
+			historyPreparation.check();
 			runState.initialSettingsApplied = true;
 			const turnModelRef = active._modelRef;
 			const turnEffectiveModel = active.model;
@@ -1308,27 +1349,35 @@ export async function runAgentLoopUnlocked(
 			const buildPrefixPrompt = async (
 				model: RequestModelIdentity,
 				{ locale, replyInUserLanguage }: import("@shared/reply-context").ReplyContext,
+				preparation?: ModelHistoryPreparation,
 			) => {
 				preparation?.phase("systemPrompt");
 				active.abortController.signal.throwIfAborted();
 				// A compact racing this read is retried by the shared request preparer.
 				const compactMessageId = await currentCompactMessageId(narratorId);
+				preparation?.check();
 				const current = await narratorService.getById(narratorId);
+				preparation?.check();
 				const currentOAuth = await assertOAuthNarratorRuntimeActive(
 					narratorId,
 					active._currentUserId,
 				);
+				preparation?.check();
 				const devices =
 					(await resolveSessionDevices(active._projectId ?? null, actingUserId)) ?? [];
+				preparation?.check();
 				turnSessionDevices = resolveInjectedDevices(
 					currentOAuth ? filterOAuthSessionDevices(devices, currentOAuth) : devices,
 					turnTraits.deviceInjection,
 				);
 				await ensureSkillCacheFreshForActiveNarrator(active);
+				preparation?.check();
 				const { workspaceContextService } = await import("../workspace-context-service");
 				const workspace = await workspaceContextService.get(narratorId);
+				preparation?.check();
 				const { buildPendingQuestionHint } = await import("../narrator-question-service");
 				const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
+				preparation?.check();
 				const planMode = currentOAuth
 					? false
 					: (active._planModeLive ?? isPlanModeTrait(current.traits));
@@ -1352,6 +1401,7 @@ export async function runAgentLoopUnlocked(
 				const outlinePlan = outlinePlanView
 					? { root: outlinePlanView.root, relaxed: relaxedPlan }
 					: undefined;
+				preparation?.check();
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1428,6 +1478,7 @@ export async function runAgentLoopUnlocked(
 							.join("\n\n"),
 					},
 				);
+				preparation?.check();
 				return {
 					...built,
 					compactMessageId,
@@ -1444,11 +1495,14 @@ export async function runAgentLoopUnlocked(
 				},
 				getModel: () => resolved.model,
 				getProvider: () => resolved.provider,
-				signal: active.abortController.signal,
+				signal: historyPreparation.signal,
+				preparation: historyPreparation,
 				getToolLoading: toolLoadingInput,
-				refreshToolLoading: refreshMcpToolLoading,
-				buildPrefixPrompt,
+				refreshToolLoading: (identity) => refreshMcpToolLoading(identity, historyPreparation),
+				buildPrefixPrompt: (identity, replyContext) =>
+					buildPrefixPrompt(identity, replyContext, historyPreparation),
 			});
+			historyPreparation.check();
 			const { prompt: prefixPrompt, reconciled, sourceMessages: rawMessages } = preparedPrefix;
 			if (!prefixPrompt || !reconciled) throw new Error("Runtime prefix was not prepared");
 			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
@@ -1460,7 +1514,8 @@ export async function runAgentLoopUnlocked(
 				currentInput: runState.input.text,
 				currentMedia: runState.input.media,
 				attachmentCwd: active.cwd,
-				attachmentSignal: active.abortController.signal,
+				attachmentSignal: historyPreparation.signal,
+				preparation: historyPreparation,
 				toolLoading: preparedPrefix.toolLoading,
 			};
 			let preparedHistory = await buildRuntimeHistory({
@@ -1481,6 +1536,7 @@ export async function runAgentLoopUnlocked(
 						already: knowledgeInjectedIds,
 						projectId: active._projectId ?? undefined,
 					});
+					historyPreparation.check();
 					if (hits.length > 0) {
 						const block = knowledgeInjection.formatInjections(
 							hits,
@@ -1522,6 +1578,7 @@ export async function runAgentLoopUnlocked(
 						}
 					}
 				} catch (err) {
+					historyPreparation.check();
 					logger.warn("Knowledge injection (user message) failed", {
 						narratorId,
 						error: String(err),
@@ -1534,7 +1591,10 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal },
+						{
+							signal: historyPreparation.signal,
+							preparation: historyPreparation,
+						},
 					),
 				});
 			}
@@ -1569,6 +1629,8 @@ export async function runAgentLoopUnlocked(
 			const initialSystemChars = (active.systemPrompt?.length ?? 0) - runtimeSummaryChars;
 
 			await storeRuntimeCharacters({ systemChars: initialSystemChars });
+			historyPreparation.check();
+			historyPreparation.finish();
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
@@ -1662,8 +1724,9 @@ export async function runAgentLoopUnlocked(
 				clearCompactDone: () => {
 					compactDoneFlag = false;
 				},
-				buildPrefixPrompt: async (identity, replyContext) => {
-					const result = await buildPrefixPrompt(identity, replyContext);
+				buildPrefixPrompt: async (identity, replyContext, preparation) => {
+					const result = await buildPrefixPrompt(identity, replyContext, preparation);
+					preparation?.check();
 					runtimeSummaryChars = result.summaryChars;
 					return result;
 				},
@@ -2381,7 +2444,7 @@ export async function runAgentLoopUnlocked(
 						if (!warnings.length) return;
 						event = { ...event, warnings };
 					}
-					processEvent(event, eventContext, hooks).catch((err) => {
+					trackCommunicationWork(processEvent(event, eventContext, hooks)).catch((err) => {
 						logger.error("Side-channel event processing error", {
 							narratorId,
 							eventType: event.type,
@@ -2668,6 +2731,7 @@ export async function runAgentLoopUnlocked(
 					hooks,
 				);
 			let result: ExecuteLoopResult;
+			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
 				result = await executeAgentLoop({
 					config,
@@ -2684,6 +2748,7 @@ export async function runAgentLoopUnlocked(
 					runState.totalTokens += accountTokenUsageForTurn(active);
 				});
 			} catch (error) {
+				if (isCheckpointStop(error)) throw error;
 				// A held run keeps the user's session: a failed turn reports its error and
 				// parks at the hold like any other turn end, instead of ending the run.
 				if (!run || !getRunHold(narratorId) || getRunHold(narratorId)?.released) throw error;
@@ -3628,6 +3693,18 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		historyPreparation?.finish(err);
+		// A child may unwind its foreground parent, but only the parent's own persisted
+		// identity authorizes releasing this owner. Never inherit the child's identity.
+		if (isCheckpointStop(err) && checkpointIdentity && !run?.cancel.signal.aborted) {
+			const own = checkpointStopForRun(checkpointIdentity);
+			if (own?.updateEpoch === err.updateEpoch) {
+				own.cleanupFailure = err.cleanupFailure;
+				checkpointPause = own;
+				if (run) run.checkpointStop = own;
+				throw own;
+			}
+		}
 		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
 		// Keep the run active for the next process instead of publishing a false failure.
 		await waitForRestartBeforeFailure(active.abortController.signal);
@@ -3672,26 +3749,53 @@ export async function runAgentLoopUnlocked(
 			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
 	} finally {
+		historyPreparation?.finish();
 		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
 		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
-		// started that ended by itself are given back with a handoff (not waited for).
-		void outlineLeases?.stop({
-			natural:
-				!freshInput &&
-				!runState.hadError &&
-				!runState.wasInterrupted &&
-				!active.abortController.signal.aborted,
-			// A subagent's run is never a person's hour of its own: its claims pass to its root.
-			person: personRun() && !deliverTo,
-			reply: runState.finalText,
-			forTaskId: runForTaskId,
-			pending: workPendingAtEnd,
-		});
-		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
+		// started that ended by itself are given back with a handoff. Detached work joins the
+		// database shutdown drain; a checkpoint pause is not a natural run end.
+		if (outlineLeases)
+			void trackCommunicationWork(
+				outlineLeases.stop({
+					natural:
+						!checkpointPause &&
+						!freshInput &&
+						!runState.hadError &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted,
+					// A subagent's run is never a person's hour of its own: its claims pass to its root.
+					person: personRun() && !deliverTo,
+					reply: runState.finalText,
+					forTaskId: runForTaskId,
+					pending: workPendingAtEnd,
+				}),
+			);
+		// All provider consumers for this pass have settled. Preserve the logical run's
+		// total while releasing closed requests' span details before a held fresh pass.
+		if (owner.isCurrent() && run?.logicalRunId)
+			sealSubagentOutputPass(narratorId, run.logicalRunId);
+		if (
+			!checkpointPause &&
+			run &&
+			!freshInput &&
+			(!getRunHold(narratorId) || getRunHold(narratorId)?.released)
+		)
 			run.finalizing = true;
 		unregisterUpdateLoop();
+		// Pausing ends only this process's execution. Retain pending tools, model override,
+		// turn/status and publication reservations for the replacement owner.
+		if (checkpointPause && owner.isCurrent()) {
+			active._loopRunning = false;
+			active.alive = false;
+			active._resumeBufferedAfterLoop = false;
+			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
+			clearStreamingSnapshot(narratorId);
+			active.events.removeAllListeners();
+			active._bashBeforeStatus?.clear();
+		}
 		// The one session finalizer; result delivery belongs to the run service.
 		if (owner.isCurrent()) {
 			active._loopRunning = false;

@@ -510,7 +510,8 @@ test("recovery without candidates or with a live owner never adopts the human pa
 	const owner = tryClaimExecution(recipient, "run");
 	if (!owner) throw new Error("Could not claim fixture owner");
 	try {
-		await expect(startRecoveryWatchBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
+		await expectRejectedMessage(
+			startRecoveryWatchBatch({ ...input, aliases: ["missing"] }),
 			"already running",
 		);
 		expect(recipientRow().replyContext).toEqual(zh);
@@ -662,7 +663,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 		const owner = tryClaimExecution(recipient, "run");
 		if (!owner) throw new Error("Could not claim recovery fixture owner");
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"already running",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);
@@ -676,7 +678,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 			throw new Error("fixture registration failed");
 		});
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"fixture registration failed",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);

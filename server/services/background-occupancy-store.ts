@@ -179,6 +179,7 @@ class OccupancyGenerationCancelled extends Error {}
 export class BackgroundOccupancyStore {
 	private index = new BackgroundOccupancyIndex();
 	private ready = false;
+	private stopped = false;
 	private generation = 0;
 	private worker: Promise<void> | null = null;
 	private failure: unknown = null;
@@ -205,6 +206,7 @@ export class BackgroundOccupancyStore {
 	}
 
 	ensureReady(): Promise<void> {
+		if (this.stopped) return Promise.reject(new Error("Background occupancy store stopped"));
 		if (this.worker) return this.worker;
 		if (this.ready && !this.failure) return Promise.resolve();
 		return this.launch(!this.ready);
@@ -253,7 +255,18 @@ export class BackgroundOccupancyStore {
 		this.schedule();
 	}
 
+	async stop(): Promise<void> {
+		this.stopped = true;
+		this.generation++;
+		try {
+			await this.worker;
+		} catch (error) {
+			if (!(error instanceof OccupancyGenerationCancelled)) throw error;
+		}
+	}
+
 	resetForTests(): void {
+		this.stopped = false;
 		this.generation++;
 		this.index = new BackgroundOccupancyIndex();
 		this.ready = false;
@@ -318,7 +331,7 @@ export class BackgroundOccupancyStore {
 
 	private schedule(): void {
 		// Startup is explicit. Pre-start events stay queued for shadow replay.
-		if (this.ready && !this.worker) this.launch(false);
+		if (!this.stopped && this.ready && !this.worker) this.launch(false);
 	}
 
 	private launch(initial: boolean): Promise<void> {
@@ -350,7 +363,7 @@ export class BackgroundOccupancyStore {
 			.finally(() => {
 				if (this.worker === work) {
 					this.worker = null;
-					if (!this.failure && this.ready && this.hasDirty()) this.launch(false);
+					if (!this.stopped && !this.failure && this.ready && this.hasDirty()) this.launch(false);
 				}
 			});
 		return work;
@@ -703,6 +716,10 @@ export class BackgroundOccupancyStore {
 			frontier = [...next];
 		}
 	}
+}
+
+export async function stopBackgroundOccupancy(): Promise<void> {
+	await backgroundOccupancyStore.stop();
 }
 
 export const backgroundOccupancyStore = hotSafe(
