@@ -167,11 +167,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
 		[liveTabs],
 	);
-	// The serialized form is the dependency for everything runtime-related below, so it
-	// must only be recomputed when the live window itself changed — not on every render
-	// of a component that re-renders on each narrator status tick.
+	// Runtime depends on membership, not display/subscription order. Sorting this copy
+	// keeps promotions and status-driven reordering from requesting the same snapshot.
 	const runtimeTargetsKey = useMemo(
-		() => JSON.stringify(liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)])),
+		() =>
+			JSON.stringify(
+				liveTabs
+					.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const)
+					.sort(([left], [right]) => left.localeCompare(right)),
+			),
 		[liveTabs],
 	);
 	const runtimeTargets = useMemo(
@@ -201,43 +205,87 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	runtimeNarratorIdsRef.current = runtimeNarratorIds;
 	const inFlightRuntimeNarratorIdsRef = useRef(new Map<number, ReadonlySet<string>>());
 
-	const refreshRuntime = useCallback(async () => {
-		const requestGeneration = ++runtimeRefreshGenerationRef.current;
-		if (runtimeKeys.length === 0) return;
-		const requestNarratorIds = new Set(runtimeNarratorIdsByKey.values());
-		const versionsAtRequest = snapshotRecentTabRuntimeVersions(
-			runtimeVersionsRef.current,
-			requestNarratorIds,
-		);
-		inFlightRuntimeNarratorIdsRef.current.set(requestGeneration, requestNarratorIds);
-		try {
-			const result = await api.getRecentTabsRuntime(runtimeKeys);
-			if (
-				!shouldApplyRecentTabsRuntimeResponse(
-					requestGeneration,
-					runtimeRefreshGenerationRef.current,
-				)
-			) {
-				return;
+	const runtimeRequestTargetsRef = useRef({
+		runtimeTargetsKey,
+		runtimeKeys,
+		runtimeNarratorIdsByKey,
+	});
+	runtimeRequestTargetsRef.current = { runtimeTargetsKey, runtimeKeys, runtimeNarratorIdsByKey };
+	const providerMountedRef = useRef(false);
+	const runtimeRefreshPendingRef = useRef(false);
+	const runtimeRefreshPromiseRef = useRef<Promise<void> | null>(null);
+	useEffect(() => {
+		providerMountedRef.current = true;
+		return () => {
+			providerMountedRef.current = false;
+			runtimeRefreshPendingRef.current = false;
+			runtimeRefreshGenerationRef.current++;
+		};
+	}, []);
+
+	const refreshRuntime = useCallback((): Promise<void> => {
+		runtimeRefreshGenerationRef.current++;
+		runtimeRefreshPendingRef.current =
+			providerMountedRef.current && runtimeRequestTargetsRef.current.runtimeKeys.length > 0;
+		if (!runtimeRefreshPendingRef.current) return Promise.resolve();
+		if (runtimeRefreshPromiseRef.current) return runtimeRefreshPromiseRef.current;
+
+		// One in-flight request plus one replaceable refresh, never a queue of targets.
+		// Defer starting until the shared promise is installed, including sync API failures.
+		const request = Promise.resolve().then(async () => {
+			let failure: { error: unknown } | undefined;
+			try {
+				while (providerMountedRef.current && runtimeRefreshPendingRef.current) {
+					runtimeRefreshPendingRef.current = false;
+					const targets = runtimeRequestTargetsRef.current;
+					if (targets.runtimeKeys.length === 0) break;
+					const requestGeneration = runtimeRefreshGenerationRef.current;
+					const requestNarratorIds = new Set(targets.runtimeNarratorIdsByKey.values());
+					const versionsAtRequest = snapshotRecentTabRuntimeVersions(
+						runtimeVersionsRef.current,
+						requestNarratorIds,
+					);
+					inFlightRuntimeNarratorIdsRef.current.set(requestGeneration, requestNarratorIds);
+					try {
+						const result = await api.getRecentTabsRuntime(targets.runtimeKeys);
+						if (
+							providerMountedRef.current &&
+							targets.runtimeTargetsKey === runtimeRequestTargetsRef.current.runtimeTargetsKey &&
+							shouldApplyRecentTabsRuntimeResponse(
+								requestGeneration,
+								runtimeRefreshGenerationRef.current,
+							)
+						) {
+							applyRecentTabsRuntimePatches(
+								qc,
+								reconcileRecentTabsRuntimePatches(
+									result.patches,
+									targets.runtimeNarratorIdsByKey,
+									versionsAtRequest,
+									runtimeVersionsRef.current,
+								),
+							);
+						}
+						failure = undefined;
+					} catch (error) {
+						failure = { error };
+					} finally {
+						inFlightRuntimeNarratorIdsRef.current.delete(requestGeneration);
+						pruneRecentTabsRuntimeVersions(
+							runtimeVersionsRef.current,
+							runtimeNarratorIdsRef.current,
+							inFlightRuntimeNarratorIdsRef.current.values(),
+						);
+					}
+				}
+				if (failure) throw failure.error;
+			} finally {
+				runtimeRefreshPromiseRef.current = null;
 			}
-			applyRecentTabsRuntimePatches(
-				qc,
-				reconcileRecentTabsRuntimePatches(
-					result.patches,
-					runtimeNarratorIdsByKey,
-					versionsAtRequest,
-					runtimeVersionsRef.current,
-				),
-			);
-		} finally {
-			inFlightRuntimeNarratorIdsRef.current.delete(requestGeneration);
-			pruneRecentTabsRuntimeVersions(
-				runtimeVersionsRef.current,
-				runtimeNarratorIdsRef.current,
-				inFlightRuntimeNarratorIdsRef.current.values(),
-			);
-		}
-	}, [qc, runtimeKeys, runtimeNarratorIdsByKey]);
+		});
+		runtimeRefreshPromiseRef.current = request;
+		return request;
+	}, [qc]);
 
 	useEffect(() => {
 		pruneRecentTabsRuntimeVersions(
@@ -261,6 +309,43 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
+	const inFlightPromotionsRef = useRef(new Set<string>());
+	const pendingPromotionsRef = useRef(new Set<string>());
+	const promoteWorkingTab = useCallback(
+		async (narratorId: string, key: string) => {
+			if (!providerMountedRef.current) return;
+			if (inFlightPromotionsRef.current.has(narratorId)) {
+				// Only a real status transition reaches here; replayed working never queues.
+				pendingPromotionsRef.current.add(narratorId);
+				return;
+			}
+			inFlightPromotionsRef.current.add(narratorId);
+			try {
+				let currentKey = key;
+				while (true) {
+					pendingPromotionsRef.current.delete(narratorId);
+					try {
+						// The server promotes folder members together with their folder.
+						const result = await api.moveRecentTab(currentKey, { position: "above_idle" });
+						await applyRecentTabsDeltaAndFollowUp(qc, result);
+					} catch {
+						// A failure alone does not retry; a queued new turn still gets its promotion.
+					}
+					if (!pendingPromotionsRef.current.delete(narratorId) || !providerMountedRef.current)
+						break;
+					const currentTabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? tabsRef.current;
+					const tab = currentTabs.find((item) => getRecentTabNarratorId(item) === narratorId);
+					const status = pendingTabPatchesRef.current.get(narratorId)?.status ?? tab?.status;
+					if (!tab || status !== "working") break;
+					currentKey = tabSortId(tab);
+				}
+			} finally {
+				inFlightPromotionsRef.current.delete(narratorId);
+				pendingPromotionsRef.current.delete(narratorId);
+			}
+		},
+		[qc],
+	);
 	const tabPatchRafRef = useRef(0);
 	const tabPatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -389,23 +474,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
+			const existing = pendingTabPatchesRef.current.get(narratorId);
 			if (event.type === "status" && event.status === "working") {
-				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
-				if (tab && tab.status !== "working") {
-					// A folder member is promoted inside its folder and the folder moves with it;
-					// the server resolves that from the member key.
-					api
-						.moveRecentTab(tabSortId(tab), { position: "above_idle" })
-						.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
-						.catch(() => {});
+				// Pending WS status wins before RAF, and the cache wins after RAF but before
+				// React commits tabsRef. Replayed working states are not new transitions.
+				const currentTabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? tabsRef.current;
+				const tab = currentTabs.find((item) => getRecentTabNarratorId(item) === narratorId);
+				if (tab && (existing?.status ?? tab.status) !== "working") {
+					void promoteWorkingTab(narratorId, tabSortId(tab));
 				}
 			}
 
-			const existing = pendingTabPatchesRef.current.get(narratorId);
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
-		[qc, scheduleTabPatchFlush],
+		[promoteWorkingTab, qc, scheduleTabPatchFlush],
 	);
 
 	const handleGlobalEvent = useCallback(
