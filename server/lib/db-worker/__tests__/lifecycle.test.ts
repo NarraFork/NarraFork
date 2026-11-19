@@ -9,10 +9,12 @@ import { logger } from "../../logger";
 import { RUNTIME_BUILD_ID } from "../../runtime-target";
 import * as sqlTrace from "../../sql-trace";
 import { WorkerHandle } from "../../worker-runtime/lifecycle";
+import { DbReadError } from "../errors";
 import * as failures from "../failure";
 import {
 	DB_WORKER_MAX_QUEUE,
 	DbReadTaskOverloadedError,
+	drainDbWorkerPool,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	resumeDbWorkerPool,
@@ -556,6 +558,33 @@ test("SQL close diagnostics keep the last request and wait for native exit confi
 	expect(getDbWorkerPoolStats().workers).toBe(0);
 });
 
+test("unconfirmed SQL close keeps start evidence and the owner through the drain deadline", async () => {
+	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+	fixture(success);
+	expect(await runReadTask(unusedDb, task)).toBe(42);
+	const gate = deferred();
+	const worker = handles[0]?.resource;
+	if (!worker) throw new Error("Expected worker handle");
+	const terminate = worker.terminate.bind(worker);
+	spyOn(worker, "terminate").mockImplementation(async () => {
+		await gate.promise;
+		return terminate();
+	});
+	try {
+		expect(await failureOf(drainDbWorkerPool({ timeoutMs: 25 }))).toMatchObject({
+			code: "DB_READ_TASK_TIMEOUT",
+		});
+		const sqlLogs = (
+			logger.warn as ReturnType<typeof spyOn<typeof logger, "warn">>
+		).mock.calls.filter(([message]) => message === "Database read worker SQL diagnostic");
+		expect(sqlLogs.some(([, fields]) => fields?.phase === "close-start")).toBe(true);
+		expect(sqlLogs.some(([, fields]) => fields?.phase === "close-complete")).toBe(false);
+		expect(getDbWorkerPoolStats().tracked).toBeGreaterThan(0);
+	} finally {
+		gate.resolve();
+		await shutdownDbWorkerPool();
+	}
+});
 test("maintenance pause blocks both profiles until explicit resume", async () => {
 	fixture(success);
 	await shutdownDbWorkerPool({ pause: true });
@@ -931,8 +960,12 @@ test("real SQLite diagnostics omit query bodies and database paths while retaini
 			maxRows: 10,
 		}),
 	);
-	expect(error).toMatchObject({ name: "DbReadTaskExecutionError", code: "SQLITE_ERROR" });
-	expect((error as Error).message).toContain("PRIVATE_QUERY_BODY");
+	expect(error).toBeInstanceOf(DbReadError);
+	expect(error).toMatchObject({
+		code: "DB_READ_FAILED",
+		message: "database read worker query failed",
+	});
+	expect((error as Error).message).not.toContain("PRIVATE_QUERY_BODY");
 	expect(
 		await runReadTask(dbPath, {
 			kind: "selectRows",
@@ -946,13 +979,12 @@ test("real SQLite diagnostics omit query bodies and database paths while retaini
 	expect(calls).toEqual([
 		[
 			"Database read worker query failed",
-			{
+			expect.objectContaining({
 				entry: "db-read-worker",
 				phase: "read",
 				buildId: RUNTIME_BUILD_ID,
 				errorType: "SQLiteError",
-				code: "SQLITE_ERROR",
-			},
+			}),
 		],
 	]);
 	const logs = JSON.stringify(calls);

@@ -1094,7 +1094,6 @@ export async function runAgentLoopUnlocked(
 			});
 			historyPreparationStarted = true;
 			historyPreparation.recordPhase("tools");
-
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
@@ -1640,11 +1639,13 @@ export async function runAgentLoopUnlocked(
 					});
 				}
 			};
+			historyPreparation.phase("systemPrompt");
 			const { usedCompactSummary } = prefixPrompt;
 			active.systemPrompt = reconciled.systemPrompt ?? prefixPrompt.prompt;
 			// Legacy prompt offsets do not address the epoch's rendered baseline.
 			let runtimeSummaryChars = prefixPrompt.summaryChars;
 			const initialSystemChars = (active.systemPrompt?.length ?? 0) - runtimeSummaryChars;
+
 			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
@@ -3726,7 +3727,9 @@ export async function runAgentLoopUnlocked(
 			logger.error("Narrator loop error", {
 				...historyPreparationFailure(err),
 				narratorId,
-				error: err instanceof Error ? err.message : String(err),
+				...(historyPreparationFailure(err) ?? {
+					error: err instanceof Error ? err.message : String(err),
+				}),
 			});
 			try {
 				await withDbRetry(

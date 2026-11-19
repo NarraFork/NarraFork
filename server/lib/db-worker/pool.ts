@@ -666,9 +666,14 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 	run(request: ReadRequest, context: WorkerTaskContext): Promise<unknown> {
 		requestOwners.get(context.requestId)?.add(this);
 		if (this.closed) return Promise.reject(new WorkersUnavailableError("worker_unavailable"));
+		if (request.identity) {
+			assertReadDatabaseOpen(request.identity);
+			this.databaseIds.add(request.identity.id);
+		}
+		request.diagnostics.requestId = context.requestId;
 		request.poolDiagnostic.requestId = context.requestId;
 		request.poolDiagnostic.dispatchedAt = Date.now();
-		if (request.identity) this.databaseIds.add(request.identity.id);
+		request.phase.phase = "dispatching";
 		this.lastDiagnostic = request.poolDiagnostic.sql ? request.poolDiagnostic : undefined;
 		if (request.poolDiagnostic.sql) {
 			this.diagnosticWorker ??= `dbw-${++sqlDiagnosticWorkerCounter}`;
