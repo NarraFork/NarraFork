@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "../db/worker-read";
 /**
  * Workspace membership: the authoritative answer to "which panels are in this
  * workspace".
@@ -148,9 +149,12 @@ function serializeConfig(config: unknown): string | null {
 
 /** Assert the workspace exists and belongs to this user, returning its row. */
 async function requireOwnedWorkspace(userId: string, workspaceId: string) {
-	const workspace = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
-	});
+	const workspace = await readQuery(
+		db.query.workspaces.findFirst({
+			where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!workspace) throw new NotFoundError("Workspace", workspaceId);
 	return workspace;
 }
@@ -503,11 +507,13 @@ export async function removeWorkspacePanel(
 	panelId: string,
 ): Promise<void> {
 	await requireOwnedWorkspace(userId, workspaceId);
-	const row = db
-		.select()
-		.from(workspacePanels)
-		.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId)))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(workspacePanels)
+			.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId))),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 
 	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
@@ -561,10 +567,13 @@ export async function saveWorkspaceLayout(
 		.returning({ layoutRevision: workspaces.layoutRevision });
 
 	if (updated.length === 0) {
-		const current = await db.query.workspaces.findFirst({
-			where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
-			columns: { layoutRevision: true },
-		});
+		const current = await readQuery(
+			db.query.workspaces.findFirst({
+				where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
+				columns: { layoutRevision: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		throw new WorkspaceLayoutConflictError(current?.layoutRevision ?? 0);
 	}
 	const layoutRevision = updated[0].layoutRevision;
@@ -584,11 +593,13 @@ export async function updateWorkspacePanelConfig(
 	config: unknown,
 ): Promise<WorkspacePanel> {
 	await requireOwnedWorkspace(userId, workspaceId);
-	const row = db
-		.select()
-		.from(workspacePanels)
-		.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId)))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(workspacePanels)
+			.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId))),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 	if (row.kind === "narrator") {
 		throw new ValidationError(

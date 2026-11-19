@@ -600,6 +600,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						!localPathSemantics.contains(targetPath, claimPath) &&
 						!(target.repositoryKey && target.repositoryKey === canonical.repositoryKey) &&
 						!(target.shadowKey && target.shadowKey === canonical.shadowKey);
+
 					if (
 						pathOnlyAncestor &&
 						claim.kind === "narrator" &&

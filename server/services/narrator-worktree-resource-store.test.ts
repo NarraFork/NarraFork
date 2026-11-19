@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +9,7 @@ import { applyPendingMigrationsByHash } from "../db/run-migrations";
 import * as schema from "../db/schema";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
 import { safeSpawn } from "../lib/spawn";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import {
 	createWorktreeResourceRegistry,
@@ -38,7 +39,7 @@ const registration = {
 	createRequestId: "request",
 };
 function fixture(upgraded = true) {
-	const sqlite = new Database(":memory:");
+	const sqlite = openFileWorkerDatabase();
 	fixtures.push(sqlite);
 	const folder = mkdtempSync(join(tmpdir(), "nf-resource-schema-fixture-"));
 	try {
@@ -67,8 +68,8 @@ function upgrade(sqlite: Database) {
 		if (statement.trim()) sqlite.exec(statement);
 	sqlite.exec("PRAGMA foreign_keys=ON");
 }
-afterEach(() => {
-	for (const sqlite of fixtures.splice(0)) sqlite.close();
+afterEach(async () => {
+	for (const sqlite of fixtures.splice(0)) await closeFileWorkerDatabase(sqlite);
 });
 
 describe("resource schema real old-chain upgrade", () => {
