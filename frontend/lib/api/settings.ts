@@ -523,10 +523,11 @@ export const settingsApi = {
 			...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
 		};
 	},
-	getRecentTabsRuntime: (keys: string[]) =>
+	getRecentTabsRuntime: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsRuntimeResult>("/user-preferences/recent-tabs/runtime", {
 			method: "POST",
 			body: JSON.stringify({ keys }),
+			signal,
 		}),
 	upsertRecentTab: (tab: RecentTabUpsertInput) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs", {
