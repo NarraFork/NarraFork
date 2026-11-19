@@ -178,6 +178,7 @@ import {
 } from "./vlist-exact-row-state";
 import {
 	applyExactScrollCorrection,
+	createPinnedBottomFrame,
 	getDistanceFromBottom,
 	getScrollBottomTarget,
 	isBottomLostToContentGrowth,
@@ -4175,7 +4176,7 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				void scrollGeometryRevision;
 				if (!pinnedToBottom || !exactLayout) return;
-				const frame = requestAnimationFrame(() => {
+				const snap = () => {
 					// SNAPS, and must keep snapping. This effect is the catch-all for EVERY
 					// geometry change, so most of what reaches it is a document being
 					// ESTABLISHED or SETTLING rather than content arriving for a reader who is
@@ -4196,7 +4197,8 @@ export const PretextExactMessageList = memo(
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					if (smoothFollowerRef.current?.isActive() === true) return;
 					writeScrollTop(getScrollBottomTarget(viewportRef.current));
-				});
+				};
+				const frame = requestAnimationFrame(createPinnedBottomFrame(pinnedToBottomRef, snap));
 				return () => cancelAnimationFrame(frame);
 			}, [exactLayout, pinnedToBottom, scrollGeometryRevision, writeScrollTop]);
 
