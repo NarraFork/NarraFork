@@ -4666,6 +4666,289 @@ describe("subagent live output char count", () => {
 		await untilOutput("101");
 	});
 
+	test("registers zero without text and excludes reasoning from the JS string-length count", async () => {
+		const sub = startOutputContext(makeSubagentContext(), "zero-run", "zero-pk", 0, true);
+		expect(toolOutputFrames().at(-1)).toMatchObject({
+			output: "0",
+			subagentOutputCount: { ...sub.subagentOutputIdentity, count: 0, active: true },
+		});
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)).toBeUndefined();
+		await processEvent(
+			{
+				type: "stream_reasoning",
+				text: "private reasoning",
+				blockId: "reasoning",
+				blockRevision: 1,
+				blockTextOffset: 0,
+			},
+			sub,
+		);
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(0);
+		await body(sub, "𠮷");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...sub.subagentOutputIdentity, count: 2, active: true },
+		]);
+		expect(JSON.stringify(getSubagentOutputCounts(PARENT_NARRATOR_ID))).not.toContain("private");
+	});
+
+	test("parent tool result, persisted response and turn cleanup preserve a background child's total", async () => {
+		const parentId = "output-count-parent-boundaries";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: parentId, createdAt: now, updatedAt: now });
+		const parent = { ...makeMainContext(), narratorId: parentId, broadcastTargetId: parentId };
+		const sub = startOutputContext({ ...makeSubagentContext(), broadcastTargetId: parentId });
+		try {
+			await processEvent(
+				{
+					type: "tool_call",
+					toolUseId: PARENT_TOOL_USE_ID,
+					toolName: "Agent",
+					input: { prompt: "go" },
+				},
+				parent,
+			);
+			await body(sub, "first");
+			await processEvent(
+				{
+					type: "tool_result",
+					toolUseId: PARENT_TOOL_USE_ID,
+					toolName: "Agent",
+					output: "background_task_id: child",
+					isError: false,
+				},
+				parent,
+			);
+			expect(getStreamingSnapshot(parentId)?.toolChunks.has(PARENT_TOOL_USE_ID)).toBe(false);
+			await body(sub, "-second", 5);
+			await processEvent({ type: "assistant_message", text: "Delegated", toolUses: [] }, parent);
+			clearStreamingSnapshot(parentId);
+			await body(sub, "-third", 12);
+			await untilOutput("18");
+			expect(getStreamingSnapshot(parentId)).toBeUndefined();
+			expect(getSubagentOutputCounts(parentId)).toEqual([
+				{ ...sub.subagentOutputIdentity, count: 18, active: true },
+			]);
+		} finally {
+			clearStreamingSnapshot(parentId);
+			await cleanupFileContextNarrator(parentId);
+		}
+	});
+
+	test("exact trusted receipt attempts travel with tool_started and its reconnect chunk", async () => {
+		const parent = makeMainContext();
+		parent.toolExecutionReceipts = new Map([
+			[
+				PARENT_TOOL_USE_ID,
+				{ messageId: "saved-step", binding: { toolCallId: "exact-pk", attempt: 3 } },
+			],
+		]);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: PARENT_TOOL_USE_ID,
+				toolName: "Agent",
+				input: { prompt: "go" },
+			},
+			parent,
+		);
+		expect(broadcastMessages.at(-1)).toMatchObject({
+			type: "tool_started",
+			toolCallId: "exact-pk",
+			executionAttempt: 3,
+		});
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(PARENT_TOOL_USE_ID),
+		).toMatchObject({
+			toolCallId: "exact-pk",
+			executionAttempt: 3,
+		});
+	});
+
+	test("a new run retires its exact predecessor before announcing zero and ignores late old events", async () => {
+		await parentAgentChunk();
+		const parentSnapshot = getStreamingSnapshot(PARENT_NARRATOR_ID);
+		const old = startOutputContext();
+		await body(old, "old body");
+		const oldIdentity = old.subagentOutputIdentity;
+		broadcastMessages.length = 0;
+		const next = startOutputContext(makeSubagentContext(), "next-run", "agent-tool-pk", 0, true);
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)).toBe(parentSnapshot);
+		expect(toolOutputFrames()).toEqual([
+			expect.objectContaining({ subagentOutputCount: { ...oldIdentity, count: 8, active: false } }),
+			expect.objectContaining({
+				subagentOutputCount: { ...next.subagentOutputIdentity, count: 0, active: true },
+			}),
+		]);
+		await body(next, "next");
+		await body(old, "late old body", 8, "late-old-run-body");
+		expect(
+			getStreamingSnapshot(SUBAGENT_NARRATOR_ID)?.streamingBlocks.some(
+				(block) => block.type === "text" && block.id === "late-old-run-body",
+			),
+		).toBe(true);
+		await processEvent({ type: "stream_reset" }, old);
+		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID, "count-run");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...next.subagentOutputIdentity, count: 4, active: true },
+		]);
+		startSubagentOutputCharCount(SUBAGENT_NARRATOR_ID, "next-run");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(4);
+	});
+
+	test("late attempts and reused wire ids stay isolated by narrator and persisted tool PK", async () => {
+		const old = startOutputContext();
+		await body(old, "old");
+		const next = startOutputContext(makeSubagentContext(), "attempt-run", "replacement-pk", 1);
+		const peer = startOutputContext(
+			{
+				...makeSubagentContext(),
+				narratorId: "other-count-child",
+				broadcastTargetId: "other-count-parent",
+			},
+			"peer-run",
+			"peer-pk",
+		);
+		await body(next, "new");
+		await body(peer, "peer body");
+		await body(old, "late", 3, "late-old-attempt-body");
+		const currentIdentity = next.subagentOutputIdentity;
+		if (!currentIdentity) throw new Error("Expected exact count identity");
+		await body(
+			{ ...next, subagentOutputIdentity: { ...currentIdentity, attempt: 0 } },
+			"wrong attempt",
+			0,
+			"wrong-attempt-body",
+		);
+		await body(
+			{ ...next, subagentOutputIdentity: { ...currentIdentity, toolCallId: "old-pk" } },
+			"wrong PK",
+			0,
+			"wrong-pk-body",
+		);
+		const receivedBlocks = getStreamingSnapshot(SUBAGENT_NARRATOR_ID)
+			?.streamingBlocks.filter((block) => block.type === "text")
+			.map((block) => block.id);
+		expect(receivedBlocks).toContain("late-old-attempt-body");
+		expect(receivedBlocks).toContain("wrong-attempt-body");
+		expect(receivedBlocks).toContain("wrong-pk-body");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...next.subagentOutputIdentity, count: 3, active: true },
+		]);
+		expect(getSubagentOutputCounts("other-count-parent")).toEqual([
+			{ ...peer.subagentOutputIdentity, count: 9, active: true },
+		]);
+	});
+
+	test("two live child runs sharing one parent's wire id retain separate persisted-tool identities", async () => {
+		const first = startOutputContext();
+		const second = startOutputContext(
+			{ ...makeSubagentContext(), narratorId: "same-parent-other-child" },
+			"same-parent-other-run",
+			"same-parent-other-pk",
+		);
+		await body(first, "one");
+		await body(second, "second");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...first.subagentOutputIdentity, count: 3, active: true },
+			{ ...second.subagentOutputIdentity, count: 6, active: true },
+		]);
+		retireSubagentOutputCharCount(first.narratorId, "count-run");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([
+			{ ...second.subagentOutputIdentity, count: 6, active: true },
+		]);
+	});
+
+	test("retirement cancels its trailing timer and an already-queued old callback cannot emit a new run", async () => {
+		const clock = spyOn(Date, "now").mockReturnValue(10_000);
+		const timers = spyOn(globalThis, "setTimeout");
+		const cancelled = spyOn(globalThis, "clearTimeout");
+		try {
+			const sub = startOutputContext();
+			await body(sub, "a");
+			await body(sub, "b", 1);
+			const scheduled = timers.mock.calls.at(-1);
+			if (!scheduled || typeof scheduled[0] !== "function")
+				throw new Error("Expected a count timer");
+			retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID, "count-run");
+			expect(cancelled).toHaveBeenCalled();
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([]);
+			const next = startOutputContext(makeSubagentContext(), "timer-next-run");
+			await body(next, "next");
+			const emitted = toolOutputFrames().length;
+			scheduled[0]();
+			expect(toolOutputFrames()).toHaveLength(emitted);
+			expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(4);
+		} finally {
+			timers.mockRestore();
+			cancelled.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("live owner cancellation removes its projection and prevents late body events from reviving it", async () => {
+		const sub = startOutputContext();
+		await body(sub, "a");
+		await body(sub, "b", 1);
+		getRunControl(SUBAGENT_NARRATOR_ID)?.cancel.abort("cancelled");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([]);
+		expect(toolOutputFrames().at(-1)?.subagentOutputCount).toMatchObject({
+			count: 2,
+			active: false,
+		});
+		const emitted = toolOutputFrames().length;
+		await body(sub, "late", 2);
+		startSubagentOutputCharCount(SUBAGENT_NARRATOR_ID, "count-run");
+		expect(toolOutputFrames()).toHaveLength(emitted);
+	});
+
+	test("Watch registration and completion leave live counts on the spawning Agent card", async () => {
+		const main = makeMainContext();
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "watch-child",
+				toolName: "Watch",
+				input: { id: SUBAGENT_NARRATOR_ID, type: "agent" },
+			},
+			main,
+		);
+		const sub = startOutputContext();
+		await body(sub, "child");
+		expect(toolOutputFrames().every((frame) => frame.toolUseId === PARENT_TOOL_USE_ID)).toBe(true);
+		expect(toolOutputFrames().at(-1)).toMatchObject({
+			output: "5",
+			subagentOutputCount: { count: 5, active: true },
+		});
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("watch-child")?.streamingOutput,
+		).toBeUndefined();
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "watch-child",
+				toolName: "Watch",
+				output: "Observation registered",
+			},
+			main,
+		);
+		broadcastMessages.length = 0;
+		await body(sub, "!", 5);
+		await untilOutput("6");
+		expect(toolOutputFrames().every((frame) => frame.toolUseId === PARENT_TOOL_USE_ID)).toBe(true);
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)[0]?.count).toBe(6);
+	});
+
+	test("ordinary numeric stdout never gains Agent run metadata", async () => {
+		await parentAgentChunk("plain-output");
+		await processEvent(
+			{ type: "tool_output", toolUseId: "plain-output", output: "123" },
+			makeMainContext(),
+		);
+		expect(toolOutputFrames().at(-1)).toMatchObject({ output: "123" });
+		expect(toolOutputFrames().at(-1)).not.toHaveProperty("subagentOutputCount");
+		expect(getSubagentOutputCounts(PARENT_NARRATOR_ID)).toEqual([]);
+	});
+
 	test("run end flushes the final count and retires the counter", async () => {
 		await parentAgentChunk();
 		const sub = startOutputContext();

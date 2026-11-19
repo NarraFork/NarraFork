@@ -35,6 +35,7 @@ import {
 } from "./subagent-label";
 import {
 	applySubagentModelSwitch,
+	markExplicitSubagentModelPin,
 	planSubagentModelSwitch,
 	type SubagentModelSwitchPlan,
 } from "./subagent-model-switch";

@@ -42,6 +42,7 @@ import {
 	isLiveToolStatusRegression,
 	LIVE_TOOL_PHASE_RANK,
 	mergeToolLifecycleRecord,
+	TERMINAL_TOOL_ROW_STATUSES,
 } from "@shared/tool-row-status";
 import {
 	completeStreamingFieldRanges,
@@ -177,7 +178,116 @@ export function createStreamingToolStore(): StreamingToolStore {
 	return new Map();
 }
 
+type InputBinding = { toolCallId: string; executionAttempt: number };
+const MAX_RETIRED_INPUT_BINDINGS = 32;
+
+function inputBinding(
+	value: { toolCallId?: string | null; executionAttempt?: number } | undefined,
+): InputBinding | undefined {
+	return value?.toolCallId &&
+		value.toolCallId.trim() &&
+		value.toolCallId.length <= 256 &&
+		typeof value.executionAttempt === "number" &&
+		Number.isSafeInteger(value.executionAttempt) &&
+		value.executionAttempt >= 0
+		? { toolCallId: value.toolCallId, executionAttempt: value.executionAttempt }
+		: undefined;
+}
+
+function inputBindingKey(binding: InputBinding): string {
+	return JSON.stringify([binding.toolCallId, binding.executionAttempt]);
+}
+
+function countsPrompt(toolName: string): boolean {
+	return toolName === "Agent" || toolName === "Task";
+}
+
+function promptIdentityUnknown(
+	existing: TopLevelStreamingChunk | undefined,
+	incoming: InputBinding | undefined,
+	startedAt?: number,
+): boolean {
+	if (!existing || !countsPrompt(existing.toolName)) return false;
+	const current = inputBinding(existing);
+	if (!current || !incoming || inputBindingKey(current) === inputBindingKey(incoming))
+		return existing._promptInputIdentityUnknown === true;
+	if (
+		current.toolCallId === incoming.toolCallId &&
+		incoming.executionAttempt > current.executionAttempt
+	)
+		return false;
+	if (
+		typeof startedAt === "number" &&
+		Number.isFinite(startedAt) &&
+		typeof existing._startedAt === "number" &&
+		startedAt > existing._startedAt
+	)
+		return false;
+	// Terminal entries release historical identities. Accept a new authoritative
+	// input/status, but do not claim its prompt identity from a reused wire id alone.
+	return (
+		existing._promptInputIdentityUnknown === true ||
+		TERMINAL_TOOL_ROW_STATUSES.has(existing._status ?? "")
+	);
+}
+
+/** Shared by snapshots and both input lifecycle folds before they touch a tool. */
+export function isRetiredStreamingToolBinding(
+	store: StreamingToolStore,
+	event: {
+		toolUseId: string;
+		toolName?: string;
+		toolCallId?: string | null;
+		executionAttempt?: number;
+	},
+): boolean {
+	const existing = store.get(event.toolUseId);
+	const incoming = inputBinding(event);
+	if (!existing || !incoming) return false;
+	const key = inputBindingKey(incoming);
+	const current = inputBinding(existing);
+	if (event.toolName && !countsPrompt(event.toolName)) {
+		return (
+			current?.toolCallId === incoming.toolCallId &&
+			incoming.executionAttempt < current.executionAttempt
+		);
+	}
+	if (existing._retiredInputBindings?.includes(incoming.toolCallId)) return true;
+	if (!current || key === inputBindingKey(current)) return false;
+	if (current.toolCallId === incoming.toolCallId)
+		return incoming.executionAttempt < current.executionAttempt;
+	return countsPrompt(existing.toolName) && existing._inputBindingLimitReached === true;
+}
+
+/** The fixed budget is admission-only: saturation never forgets an old identity. */
+function retireInputBinding(
+	store: StreamingToolStore,
+	existing: TopLevelStreamingChunk,
+	incoming: InputBinding,
+	incomingToolName: string,
+): readonly string[] | false {
+	const retired = existing._retiredInputBindings ?? [];
+	if (!countsPrompt(existing.toolName) || !countsPrompt(incomingToolName)) return [];
+	const current = inputBinding(existing);
+	// Attempts of one PK are ordered; their scalar watermark rejects older ones.
+	if (!current || current.toolCallId === incoming.toolCallId) return retired;
+	if (retired.length >= MAX_RETIRED_INPUT_BINDINGS) {
+		store.set(existing.toolUseId, {
+			...existing,
+			_inputBindingLimitReached: true,
+			streamingPromptChars: null,
+		});
+		return false;
+	}
+	return [...retired, current.toolCallId];
+}
+
 export interface ToolChunkEvent {
+	toolCallId?: string | null;
+	executionAttempt?: number;
+	/** Subscription snapshots are authoritative identity boundaries, not live deltas. */
+	fromSnapshot?: boolean;
+	streamStartedAt?: number;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
@@ -186,7 +296,7 @@ export interface ToolChunkEvent {
 	extractedFields?: Record<string, string>;
 	metadata?: Record<string, unknown>;
 	/** One delta of a field being streamed (accumulated across frames). */
-	streamingField?: { name: string; delta: string; startsField?: boolean };
+	streamingField?: { name: string; delta: string; startsField?: boolean; offset?: number };
 	inputDocument?: import("@shared/pretext-layout/text-document").TextDocumentStreamUpdate;
 }
 
@@ -197,25 +307,74 @@ export interface ToolChunkEvent {
  * running total the server recomputes, so it is simply overwritten.
  */
 export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolChunkEvent): boolean {
-	if (!event.toolUseId) return false;
+	if (!event.toolUseId || isRetiredStreamingToolBinding(store, event)) return false;
 	if (
 		event.inputDocument &&
 		isRetiredStreamingDocument(store, event.toolUseId, event.inputDocument.ref)
 	)
 		return false;
-	const existing = event.inputDocument
+	let existing = event.inputDocument
 		? switchStreamingDocument(store, event.toolUseId, event.inputDocument.ref)
 		: store.get(event.toolUseId);
+	const binding = inputBinding(event);
+	const unknownPromptIdentity =
+		countsPrompt(event.toolName) && promptIdentityUnknown(existing, binding, event.streamStartedAt);
+	let retiredBindings = countsPrompt(event.toolName) ? existing?._retiredInputBindings : undefined;
+	if (existing && binding) {
+		const current = inputBinding(existing);
+		if (current && inputBindingKey(current) !== inputBindingKey(binding)) {
+			if (current.toolCallId !== binding.toolCallId && !event.fromSnapshot) return false;
+			const retired = retireInputBinding(store, existing, binding, event.toolName);
+			if (retired === false) return true;
+			retiredBindings = retired;
+			existing = undefined;
+		} else if (!current) existing = undefined;
+	}
+	if (existing && existing.toolName !== event.toolName) existing = undefined;
+	if (
+		existing &&
+		event.inputCharsTotal < existing.inputCharsTotal &&
+		(event.toolName === "Agent" || event.toolName === "Task")
+	)
+		return false;
 	// A promoted tool (started/completed) owns its state through the lifecycle
 	// events below; a late argument chunk must not demote it back to "streaming".
 	if (existing?._started) return false;
 
+	const sameBinding =
+		binding &&
+		existing?.toolCallId === binding.toolCallId &&
+		existing.executionAttempt === binding.executionAttempt;
 	const fields = foldStreamingToolFields(existing, event);
+	if (
+		event.fromSnapshot &&
+		!sameBinding &&
+		event.extractedFields?.prompt === undefined &&
+		(event.toolName === "Agent" || event.toolName === "Task")
+	) {
+		// Snapshots do not carry the active large prompt's decoded offset. Never
+		// reuse a wire-id-only tail length across an unproven stream identity.
+		fields.streamingPromptChars = null;
+	}
 
 	store.set(event.toolUseId, {
 		...existing,
 		toolUseId: event.toolUseId,
 		toolName: event.toolName,
+		...(binding ?? {}),
+		...(retiredBindings?.length
+			? { _retiredInputBindings: retiredBindings }
+			: existing?._retiredInputBindings
+				? { _retiredInputBindings: undefined }
+				: {}),
+		...(!countsPrompt(event.toolName) && existing?._inputBindingLimitReached
+			? { _inputBindingLimitReached: undefined }
+			: {}),
+		...(unknownPromptIdentity
+			? { _promptInputIdentityUnknown: true }
+			: existing?._promptInputIdentityUnknown
+				? { _promptInputIdentityUnknown: undefined }
+				: {}),
 		inputCharsTotal: event.inputCharsTotal,
 		...(event.inputDocument ? { textDocument: event.inputDocument.ref } : {}),
 		...(event.extractedFilePath !== undefined
@@ -231,6 +390,8 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 }
 
 export interface ToolStartedEvent {
+	toolCallId?: string | null;
+	executionAttempt?: number;
 	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
 	toolName: string;
@@ -281,22 +442,49 @@ export function applyStreamingToolStarted(
 	store: StreamingToolStore,
 	event: ToolStartedEvent,
 ): boolean {
-	if (!event.toolUseId) return false;
+	if (!event.toolUseId || isRetiredStreamingToolBinding(store, event)) return false;
 	const document = isTextDocumentRef(event.input?.textDocument)
 		? event.input.textDocument
 		: undefined;
 	if (document && isRetiredStreamingDocument(store, event.toolUseId, document)) return false;
-	const existing = document
+	let existing = document
 		? switchStreamingDocument(store, event.toolUseId, document)
 		: store.get(event.toolUseId);
+	const binding = inputBinding(event);
+	const unknownPromptIdentity =
+		countsPrompt(event.toolName) && promptIdentityUnknown(existing, binding, event.streamStartedAt);
+	let retiredBindings = countsPrompt(event.toolName) ? existing?._retiredInputBindings : undefined;
+	if (existing && binding) {
+		const current = inputBinding(existing);
+		if (current && inputBindingKey(current) !== inputBindingKey(binding)) {
+			const retired = retireInputBinding(store, existing, binding, event.toolName);
+			if (retired === false) return true;
+			retiredBindings = retired;
+			existing = undefined;
+		} else if (!current) existing = { ...existing, streamingPromptChars: null };
+	}
 	store.set(event.toolUseId, {
 		inputCharsTotal: existing?.inputCharsTotal ?? 0,
 		...existing,
+		...(retiredBindings?.length
+			? { _retiredInputBindings: retiredBindings }
+			: existing?._retiredInputBindings
+				? { _retiredInputBindings: undefined }
+				: {}),
+		...(!countsPrompt(event.toolName) && existing?._inputBindingLimitReached
+			? { _inputBindingLimitReached: undefined }
+			: {}),
+		...(unknownPromptIdentity
+			? { _promptInputIdentityUnknown: true }
+			: existing?._promptInputIdentityUnknown
+				? { _promptInputIdentityUnknown: undefined }
+				: {}),
 		toolUseId: event.toolUseId,
 		// AFTER the spread, not before: `applyStreamingToolExecuting` may have created this
 		// entry with a placeholder name (it gets no name of its own), and `...existing`
 		// would otherwise let that placeholder shadow the real one this event carries.
 		toolName: event.toolName || existing?.toolName || UNKNOWN_TOOL_NAME,
+		...(binding ?? {}),
 		_started: true,
 		// Field-scoped guard: everything else in this object still merges normally.
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),
@@ -458,6 +646,9 @@ export function applyStreamingToolCompleted(
 		...existing,
 		_started: true,
 		_status: event.status,
+		...(TERMINAL_TOOL_ROW_STATUSES.has(event.status)
+			? { _retiredInputBindings: undefined, _inputBindingLimitReached: undefined }
+			: {}),
 		...(event.output !== undefined ? { _output: event.output } : {}),
 		...(event.durationMs != null ? { _durationMs: event.durationMs } : {}),
 		...(event.updatedInput

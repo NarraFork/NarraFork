@@ -6724,7 +6724,6 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();

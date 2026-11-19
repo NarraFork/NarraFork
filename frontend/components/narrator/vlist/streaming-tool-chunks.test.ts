@@ -23,9 +23,244 @@ import {
 	applyStreamingToolStarted,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
+	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
+
+describe("streaming input binding retirement", () => {
+	it("rejects retired snapshots and starts after a new exact call, then releases history at terminal state", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "wire",
+			toolName: "Agent",
+			inputCharsTotal: 100,
+			toolCallId: "old-call",
+			executionAttempt: 0,
+			streamingField: { name: "prompt", delta: "old", offset: 0, startsField: true },
+		});
+		applyStreamingToolStarted(store, {
+			toolUseId: "wire",
+			toolName: "Agent",
+			toolCallId: "new-call",
+			executionAttempt: 0,
+			input: { prompt: "new prompt" },
+		});
+		const current = store.get("wire");
+		expect(current?._retiredInputBindings).toHaveLength(1);
+		expect(
+			applyStreamingToolChunk(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				inputCharsTotal: 200,
+				toolCallId: "old-call",
+				executionAttempt: 0,
+				fromSnapshot: true,
+				extractedFields: { prompt: "late snapshot" },
+			}),
+		).toBe(false);
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "old-call",
+				executionAttempt: 0,
+				input: { prompt: "late started" },
+			}),
+		).toBe(false);
+		expect(store.get("wire")).toBe(current);
+		applyStreamingToolCompleted(store, { toolUseId: "wire", status: "success" });
+		expect(store.get("wire")?._retiredInputBindings).toBeUndefined();
+		// With terminal history released, an unproven different PK may be a new
+		// authoritative input. Keep its lifecycle usable, but hide the prompt count.
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "old-call",
+				executionAttempt: 0,
+				input: { prompt: "unproven terminal identity" },
+			}),
+		).toBe(true);
+		const unproven = store.get("wire");
+		if (!unproven) throw new Error("missing unproven input");
+		expect(unproven).toMatchObject({
+			toolCallId: "old-call",
+			_status: "initializing",
+			_promptInputIdentityUnknown: true,
+		});
+		expect(topLevelStreamingChunkToToolFields(unproven).inputJson).toMatchObject({
+			_streamingPromptChars: null,
+		});
+		dropDiscardedStreamingTools(store, ["wire"]);
+		expect(store.size).toBe(0);
+	});
+
+	it("admits newer attempts and proven new stream starts after terminal input", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, {
+			toolUseId: "wire",
+			toolName: "Agent",
+			toolCallId: "call-a",
+			executionAttempt: 0,
+			streamStartedAt: 100,
+			input: { prompt: "initial" },
+		});
+		applyStreamingToolCompleted(store, { toolUseId: "wire", status: "success" });
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "call-a",
+				executionAttempt: 1,
+				streamStartedAt: 200,
+				input: { prompt: "retry" },
+			}),
+		).toBe(true);
+		const retry = store.get("wire");
+		if (!retry) throw new Error("missing retry");
+		expect(retry).toMatchObject({ executionAttempt: 1, _status: "initializing" });
+		expect(retry._promptInputIdentityUnknown).not.toBe(true);
+		expect(topLevelStreamingChunkToToolFields(retry).inputJson).toEqual({ prompt: "retry" });
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "call-a",
+				executionAttempt: 0,
+				input: { prompt: "old" },
+			}),
+		).toBe(false);
+		applyStreamingToolCompleted(store, { toolUseId: "wire", status: "cancelled" });
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "call-b",
+				executionAttempt: 0,
+				streamStartedAt: 300,
+				input: { prompt: "new stream" },
+			}),
+		).toBe(true);
+		const next = store.get("wire");
+		if (!next) throw new Error("missing next stream");
+		expect(next._promptInputIdentityUnknown).not.toBe(true);
+		expect(topLevelStreamingChunkToToolFields(next).inputJson).toEqual({ prompt: "new stream" });
+	});
+
+	it("keeps ordinary tool COW and retry initialization independent of the prompt retirement budget", () => {
+		const store = createStreamingToolStore();
+		for (let call = 0; call < 40; call++) {
+			expect(
+				applyStreamingToolStarted(store, {
+					toolUseId: "bash",
+					toolName: "Bash",
+					toolCallId: `call-${call}`,
+					executionAttempt: 0,
+					input: { command: `command-${call}` },
+				}),
+			).toBe(true);
+			applyStreamingToolCompleted(store, { toolUseId: "bash", status: "success" });
+		}
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "bash",
+				toolName: "Bash",
+				toolCallId: "call-39",
+				executionAttempt: 1,
+				input: { command: "retry" },
+			}),
+		).toBe(true);
+		const current = store.get("bash");
+		expect(current).toMatchObject({
+			toolCallId: "call-39",
+			executionAttempt: 1,
+			_status: "initializing",
+			_input: { command: "retry" },
+		});
+		expect(current?._retiredInputBindings).toBeUndefined();
+		expect(current?._inputBindingLimitReached).toBeUndefined();
+	});
+
+	it("fails closed at a fixed retirement budget without evicting the oldest binding", () => {
+		const store = createStreamingToolStore();
+		for (let call = 0; call <= 32; call++) {
+			expect(
+				applyStreamingToolChunk(store, {
+					toolUseId: "wire",
+					toolName: "Agent",
+					inputCharsTotal: 100,
+					toolCallId: `call-${call}`,
+					executionAttempt: 0,
+					fromSnapshot: true,
+					extractedFields: { prompt: "known" },
+				}),
+			).toBe(true);
+		}
+		expect(store.get("wire")?._retiredInputBindings).toHaveLength(32);
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "call-33",
+				executionAttempt: 0,
+				input: { prompt: "unadmitted" },
+			}),
+		).toBe(true);
+		const current = store.get("wire");
+		expect(current).toMatchObject({
+			toolCallId: "call-32",
+			_inputBindingLimitReached: true,
+			streamingPromptChars: null,
+		});
+		expect(current?._retiredInputBindings).toHaveLength(32);
+		if (!current) throw new Error("missing saturated input");
+		expect(topLevelStreamingChunkToToolFields(current).inputJson).toMatchObject({
+			_streamingPromptChars: null,
+		});
+		for (const toolCallId of ["call-0", "call-33", "call-1000"]) {
+			expect(
+				applyStreamingToolChunk(store, {
+					toolUseId: "wire",
+					toolName: "Agent",
+					inputCharsTotal: 200,
+					toolCallId,
+					executionAttempt: 0,
+					fromSnapshot: true,
+				}),
+			).toBe(false);
+			expect(
+				applyStreamingToolStarted(store, {
+					toolUseId: "wire",
+					toolName: "Agent",
+					toolCallId,
+					executionAttempt: 0,
+					input: { prompt: "late" },
+				}),
+			).toBe(false);
+		}
+		expect(store.get("wire")).toBe(current);
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "wire",
+				toolName: "Agent",
+				toolCallId: "call-32",
+				executionAttempt: 1,
+				input: { prompt: "monotonic retry" },
+			}),
+		).toBe(true);
+		expect(store.get("wire")).toMatchObject({
+			toolCallId: "call-32",
+			executionAttempt: 1,
+			_status: "initializing",
+		});
+		expect(store.get("wire")?._inputBindingLimitReached).toBeUndefined();
+		expect(store.get("wire")?._retiredInputBindings).toHaveLength(32);
+		applyStreamingToolCompleted(store, { toolUseId: "wire", status: "cancelled" });
+		expect(store.get("wire")?._retiredInputBindings).toBeUndefined();
+		expect(store.get("wire")?._inputBindingLimitReached).toBeUndefined();
+	});
+});
 
 describe("Edit origin handoff", () => {
 	const input = {

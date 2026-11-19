@@ -145,7 +145,7 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
-	retireSubagentOutputCharCount,
+	sealSubagentOutputPass,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
 import { deliverInjection } from "../narrator-injection";
@@ -1585,6 +1585,16 @@ export async function runAgentLoopUnlocked(
 				// Subagent dual-broadcast fields — when set, dualBroadcast sends
 				// events to both the parent narrator and the subagent's own page.
 				parentToolUseId: placement?.parentToolUseId,
+				subagentOutputIdentity:
+					run?.logicalRunId && deliverTo?.toolCallId && deliverTo.attempt !== undefined
+						? {
+								childNarratorId: narratorId,
+								logicalRunId: run.logicalRunId,
+								toolUseId: deliverTo.toolUseId,
+								toolCallId: deliverTo.toolCallId,
+								attempt: deliverTo.attempt,
+							}
+						: undefined,
 				subagentModel: placement ? resolved.model : undefined,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
@@ -3795,7 +3805,6 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
-			retireSubagentOutputCharCount(narratorId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;

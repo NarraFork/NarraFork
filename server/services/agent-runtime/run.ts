@@ -119,6 +119,17 @@ export interface StartNarratorRunRequest {
 	 * synchronously with the execution-owner claim.
 	 */
 	admission?: { check(): void; onAdmitted(): void };
+	/**
+	 * The caller chose this run's model itself (delegation creation): a new run of a
+	 * delegated session does not re-select it against its source's provider.
+	 */
+	skipModelReselect?: boolean;
+}
+
+export interface RegisteredAgentStart {
+	narratorId: string;
+	logicalRunId: string;
+	deliverTo: RunDeliverTo;
 }
 
 export interface RunHandle {
@@ -486,6 +497,7 @@ async function executeRun(
 	let publicationRun: PublicationRun | undefined;
 	/** The outline task the session was sent to do: its results are attached under it. */
 	let delegated: DelegatedTaskRegistration | undefined;
+	let outputCountRunId: string | undefined;
 	let finished = false;
 	try {
 		const sessionModule = await session();
@@ -505,7 +517,7 @@ async function executeRun(
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
 		syncActiveReplyContext(id, replyContext);
 		const preparedSession = active;
-		const source = await readRunSource(id);
+		let source = await readRunSource(id);
 		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
 		// An explicitly anonymous binding must not fall through to an old session user.
@@ -528,6 +540,19 @@ async function executeRun(
 			});
 			return notStarted;
 		}
+		// A NEW run of a delegated session re-selects a model left on another provider
+		// than its source's current one. Recovery, an adopted run and a delegation that
+		// just chose the model keep it; later passes of this run never re-select.
+		if (source.type === "subagent") {
+			const { isNewSubagentModelSelectionRun, reselectSubagentModelForNewRun } = await import(
+				"../subagent-model-switch"
+			);
+			if (
+				isNewSubagentModelSelectionRun(req) &&
+				(await reselectSubagentModelForNewRun(id, principal))
+			)
+				source = await readRunSource(id);
+		}
 		const prepared = await prepareLogicalRun(id, source, req, principal);
 		const binding = prepared.binding;
 		publicationRun = prepared.publicationRun;
@@ -544,6 +569,11 @@ async function executeRun(
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
+		if (deliverTo) {
+			outputCountRunId = binding.logicalRunId;
+			const { startSubagentOutputCharCount } = await import("../narrator-event-handler");
+			startSubagentOutputCharCount(id, outputCountRunId);
+		}
 		if (deliverTo)
 			await announceRunToDestination(id, source, deliverTo, principal).catch((error) =>
 				logger.debug("Run announcement skipped", { id, error: String(error) }),

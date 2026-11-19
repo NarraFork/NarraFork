@@ -17,7 +17,6 @@ import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
 	expandAllowedPoolForDisplay,
-	FOLLOW_DEFAULT_MODEL,
 	normalizeAutoModelValueForSave,
 	settings,
 } from "../lib/settings";

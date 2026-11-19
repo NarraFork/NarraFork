@@ -11,12 +11,15 @@ if (process.env[CHILD_ENV] !== "1") {
 	test("subagent model inheritance: isolated real-DB execution chain", async () => {
 		const env: NodeJS.ProcessEnv = { ...process.env, [CHILD_ENV]: "1" };
 		delete env.NARRAFORK_HOME;
-		const child = Bun.spawn([process.execPath, "test", "--isolate", import.meta.path], {
-			cwd: resolve(import.meta.dir, "../../.."),
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const child = Bun.spawn(
+			[process.execPath, "test", "--no-env-file", "--isolate", import.meta.path],
+			{
+				cwd: resolve(import.meta.dir, "../../.."),
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
 		const timer = setTimeout(() => child.kill(), 45_000);
 		const readBounded = async (stream: ReadableStream<Uint8Array>) => {
 			const reader = stream.getReader();
@@ -51,6 +54,7 @@ if (process.env[CHILD_ENV] !== "1") {
 } else {
 	const { eq } = await import("drizzle-orm");
 	const { cleanDb } = await import("../../../tests/setup");
+	const { captureWorkerRejectionThrower } = await import("./narrator-worker-fixture");
 	// The snapshot worker shares the preload-isolated file-backed database.
 	const { db, sqlite } = await import("../../db");
 	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
@@ -442,7 +446,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 		for (const background of [false, true]) {
 			for (const poolSource of ["settings", "traits"] as const) {
-				test(`${background ? "background" : "foreground"}: ${poolSource} pool's first entry beats an allowed parent and type preference`, async () => {
+				test(`${background ? "background" : "foreground"}: ${poolSource} pool's allowed parent model beats its first entry and type preference`, async () => {
 					settings.agent.subagentModels.explore = B;
 					if (poolSource === "settings") {
 						settings.agent.subagentAllowedModels.explore = [C, A, B];
@@ -456,18 +460,20 @@ if (process.env[CHILD_ENV] !== "1") {
 						await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
 					}
 					const child = await spawn({ subagentType: "explore", background });
-					await assertRun(child.id, C, C);
+					await assertRun(child.id, A, A);
+					await narratorService.updateModel(PARENT, B);
+					// Same provider as the parent's new model: the pinned child keeps its model.
+					await drive(child.id, "resume");
+					await assertRun(child.id, A, A);
+					const explicit = await spawn({ subagentType: "explore", background, model: C });
+					await assertRun(explicit.id, C, C);
 					if (poolSource === "traits") {
 						expect(configs.at(-1)?.reasoningEffort).toBe("max");
 					}
-					await narratorService.updateModel(PARENT, B);
-					await drive(child.id, "resume");
-					await assertRun(child.id, C, C);
-					const explicit = await spawn({ subagentType: "explore", background, model: A });
-					await assertRun(explicit.id, A, A);
-					await expect(
+					const disallowedModel = await captureWorkerRejectionThrower(
 						spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
-					).rejects.toThrow("No candidate model");
+					);
+					expect(disallowedModel).toThrow("No candidate model");
 				});
 			}
 		}
@@ -571,8 +577,10 @@ if (process.env[CHILD_ENV] !== "1") {
 					pools: { general: [] },
 				});
 				await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
-				await expect(drive(child.id, entry)).rejects.toThrow("No models are allowed");
-				await expect(spawn()).rejects.toThrow("No models are allowed");
+				const refusedRun = await captureWorkerRejectionThrower(drive(child.id, entry));
+				expect(refusedRun).toThrow("No models are allowed");
+				const refusedSpawn = await captureWorkerRejectionThrower(spawn());
+				expect(refusedSpawn).toThrow("No models are allowed");
 				expect(configs).toHaveLength(1);
 				expect((await narratorService.getById(child.id)).model).toBe(FOLLOW_PARENT_MODEL);
 				expect((await narratorService.getById(child.id)).status).toBe("idle");

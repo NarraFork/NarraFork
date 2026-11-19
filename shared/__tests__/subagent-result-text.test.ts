@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+	MAX_SUBAGENT_RESULT_BLOCKS,
 	MAX_SUBAGENT_RESULT_TEXT_CHARS,
 	parseSubagentOutputText,
 	readBackgroundTaskId,
@@ -48,6 +49,24 @@ describe("parseSubagentOutputText", () => {
 				{ text: "second" },
 			]),
 		).toBe("first\nsecond");
+	});
+
+	it("bounds array inspection and stops before reading text beyond the character cap", () => {
+		const unread = {
+			get text(): string {
+				throw new Error("past extraction budget");
+			},
+		};
+		const huge = "x".repeat(MAX_SUBAGENT_RESULT_TEXT_CHARS + 1);
+		expect(parseSubagentOutputText([{ text: huge }, unread])).toBe(
+			huge.slice(0, MAX_SUBAGENT_RESULT_TEXT_CHARS),
+		);
+		const empty = Array.from({ length: MAX_SUBAGENT_RESULT_BLOCKS }, () => ({}));
+		expect(parseSubagentOutputText([...empty, unread])).toBe("");
+		const prefix = "x".repeat(MAX_SUBAGENT_RESULT_TEXT_CHARS - 2);
+		expect(parseSubagentOutputText([{ text: prefix }, { text: "abc" }, unread])).toBe(
+			`${prefix}\na`,
+		);
 	});
 
 	it("falls back to a display-safe dump for an unrecognized object", () => {

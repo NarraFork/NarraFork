@@ -141,6 +141,9 @@ export interface SubagentLabels {
 	lateReasons?: Partial<Record<OutlineReportLateReason | "late", string>>;
 	/** Live output counter badge: `{count}` chars written so far. */
 	liveOutputChars?: string;
+	/** Prompt-length badge, shown only before execution begins. */
+	promptChars?: string;
+	promptCharsTooltip?: string;
 	/** The model follows the parent's live selection, not a concrete snapshot. */
 	followParent?: string;
 	/** Tooltip on a followed-parent badge. */
@@ -223,6 +226,8 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	lateBadge: "Late",
 	lateReasons: DEFAULT_LATE_REASONS,
 	liveOutputChars: "{count} chars",
+	promptChars: "{count} chars",
+	promptCharsTooltip: "Prompt length",
 	followParent: "Follow parent",
 	followTooltip: "Following the parent model",
 	fallbackReason: "The parent's {parentModel} is not in the {pool} pool",
@@ -320,6 +325,10 @@ interface RenderSubagentProps {
 	delegation?: SubagentDelegation;
 	/** The child's live reply char count — a badge on the fixed header row. */
 	liveOutputChars?: number;
+	/** Known prompt length; independent of output and the fixed card geometry. */
+	promptChars?: number;
+	/** The adapter's fresh pre-execution phase, not the launch tool's isActive. */
+	showPromptChars?: boolean;
 	/** Extra model badge. */
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
@@ -767,6 +776,8 @@ function SubagentInner({
 	isTakenOver,
 	delegation,
 	liveOutputChars,
+	promptChars,
+	showPromptChars,
 	model,
 	modelInheritance,
 	reasoningEffort,
@@ -847,9 +858,14 @@ function SubagentInner({
 						{reasoningEffort}
 					</Badge>
 				) : null}
-				{/* Live reply counter (grey, same fixed badge row): the child's streamed
-				    output char count, ticking while it works. */}
-				{active && typeof liveOutputChars === "number" ? (
+				{/* Prepared input takes precedence over a caller-supplied live reply count. */}
+				{showPromptChars && typeof promptChars === "number" ? (
+					<Tooltip label={labels.promptCharsTooltip}>
+						<Badge data-testid="subagent-prompt-chars" size="xs" variant="light" color="gray">
+							{withCount(labels.promptChars, promptChars)}
+						</Badge>
+					</Tooltip>
+				) : active && typeof liveOutputChars === "number" ? (
 					<Badge data-testid="subagent-output-chars" size="xs" variant="light" color="gray">
 						{withCount(labels.liveOutputChars, liveOutputChars)}
 					</Badge>

@@ -93,6 +93,9 @@ export interface TopLevelStreamingChunk {
 	textDocument?: import("@shared/pretext-layout/text-document").TextDocumentRef;
 	toolUseId: string;
 	toolName: string;
+	/** Trusted execution identity from tool_started / reconnect, not result metadata. */
+	toolCallId?: string;
+	executionAttempt?: number;
 	inputCharsTotal: number;
 	extractedFilePath?: string;
 	contentCharsReceived?: number;
@@ -100,6 +103,12 @@ export interface TopLevelStreamingChunk {
 	metadata?: Record<string, unknown>;
 	streamingFieldName?: string;
 	streamingFieldValue?: string;
+	/** Exact decoded UTF-16 prompt length, or null while only an unlocated tail is known. */
+	streamingPromptChars?: number | null;
+	/** Retired call PKs for this mounted tool; older attempts use the current watermark. */
+	_retiredInputBindings?: readonly string[];
+	_inputBindingLimitReached?: boolean;
+	_promptInputIdentityUnknown?: boolean;
 	/** Kept after a field finishes and after the tool starts/completes. */
 	streamingFieldRanges?: Record<string, SourceTextRange>;
 	// Sentinel fields set once the tool is promoted to started/completed.
@@ -148,18 +157,65 @@ export function foldStreamingToolFields(
 		toolUseId: string;
 		inputCharsTotal: number;
 		extractedFields?: Record<string, string>;
-		streamingField?: { name: string; delta: string; startsField?: boolean };
+		streamingField?: { name: string; delta: string; startsField?: boolean; offset?: number };
 		inputDocument?: import("@shared/pretext-layout/text-document").TextDocumentStreamUpdate;
 	},
 ): Pick<
 	TopLevelStreamingChunk,
-	"streamingFieldName" | "streamingFieldValue" | "streamingFieldRanges" | "extractedFields"
+	| "streamingFieldName"
+	| "streamingFieldValue"
+	| "streamingFieldRanges"
+	| "extractedFields"
+	| "streamingPromptChars"
 > {
+	if (previous?.toolUseId !== event.toolUseId) previous = undefined;
+	let promptChars = previous?.streamingPromptChars;
+	const stale = previous !== undefined && event.inputCharsTotal < previous.inputCharsTotal;
+	let streamingField = event.streamingField;
+	if (stale && streamingField?.name === "prompt") streamingField = undefined;
+	if (!stale && Object.hasOwn(event.extractedFields ?? {}, "prompt")) {
+		// extractedFields are completed, decoded fields, not previews. Capture their
+		// raw string length before the display-source layer trims or normalizes it.
+		promptChars = event.extractedFields?.prompt?.length;
+	} else if (streamingField?.name === "prompt") {
+		const field = streamingField;
+		const offset = field.offset;
+		const end =
+			typeof offset === "number" &&
+			Number.isSafeInteger(offset) &&
+			offset >= 0 &&
+			Number.isSafeInteger(offset + field.delta.length)
+				? offset + field.delta.length
+				: undefined;
+		if (offset !== undefined && end === undefined) promptChars = null;
+		else if (end !== undefined) {
+			// The scanner's offset is raw decoded UTF-16, unlike SourceTextRange's
+			// CRLF-normalized coordinates. It also locates a reconnect tail exactly.
+			const old = typeof promptChars === "number" && end <= promptChars;
+			if (!old) promptChars = end;
+			else streamingField = undefined;
+		} else if (field.startsField === true) {
+			if (
+				!previous ||
+				event.inputCharsTotal > previous.inputCharsTotal ||
+				promptChars === undefined
+			) {
+				promptChars = field.delta.length;
+			} else streamingField = undefined;
+		} else if (previous?.streamingFieldName === "prompt" && typeof promptChars === "number") {
+			// Older servers omit decoded offsets. Count only an uninterrupted stream
+			// observed from its explicit start, and do not append a duplicate frame.
+			if (event.inputCharsTotal > previous.inputCharsTotal) {
+				const next = promptChars + field.delta.length;
+				promptChars = Number.isSafeInteger(next) ? next : null;
+			} else streamingField = undefined;
+		} else promptChars = null;
+	}
 	// Descriptor-backed Write.content never enters the legacy 16k tail accumulator.
 	if (event.inputDocument || previous?.textDocument) {
 		const fields = { ...previous?.extractedFields, ...event.extractedFields };
 		delete fields.content;
-		const name = event.streamingField?.name;
+		const name = streamingField?.name;
 		if (!name || name === "content")
 			return {
 				extractedFields: fields,
@@ -173,7 +229,7 @@ export function foldStreamingToolFields(
 	let name = previous?.streamingFieldName;
 	let value = previous?.streamingFieldValue;
 	const discontinuous = previous !== undefined && event.inputCharsTotal < previous.inputCharsTotal;
-	if (name !== undefined && value !== undefined && event.streamingField?.name !== name)
+	if (name !== undefined && value !== undefined && streamingField?.name !== name)
 		fields[name] = value;
 	for (const [field, text] of Object.entries(event.extractedFields ?? {})) {
 		const before = streamingFieldSource(previous, field);
@@ -185,11 +241,11 @@ export function foldStreamingToolFields(
 		ranges[field] = source.range;
 		if (field === name) value = source.text;
 	}
-	if (event.streamingField) {
-		const field = event.streamingField.name;
+	if (streamingField) {
+		const field = streamingField.name;
 		const same = name === field;
 		const before =
-			!discontinuous && same && !event.streamingField.startsField
+			!discontinuous && same && !streamingField.startsField
 				? streamingFieldSource(previous, field)
 				: undefined;
 		// Only an explicit field-start marker proves a first delta is not a reconnect tail.
@@ -199,10 +255,10 @@ export function foldStreamingToolFields(
 					epoch: ranges[field]
 						? nextSourceEpoch(ranges[field].epoch)
 						: `${event.toolUseId}:${field}`,
-					originKnown: event.streamingField.startsField === true,
+					originKnown: streamingField.startsField === true,
 					streaming: true,
 				}),
-			event.streamingField.delta,
+			streamingField.delta,
 			STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS,
 		);
 		name = field;
@@ -225,6 +281,7 @@ export function foldStreamingToolFields(
 		...(Object.keys(ranges).length ? { streamingFieldRanges: ranges } : {}),
 		...(name !== undefined ? { streamingFieldName: name } : {}),
 		...(value !== undefined ? { streamingFieldValue: value } : {}),
+		...(promptChars !== undefined ? { streamingPromptChars: promptChars } : {}),
 	};
 }
 
@@ -255,7 +312,10 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 			: {};
 	if (chunk._input) {
 		// Validated once on started/updatedInput; rendering never re-hashes old_string.
-		return copyStreamingEditInput(chunk._input, ranges);
+		const input = copyStreamingEditInput(chunk._input, ranges);
+		return chunk._inputBindingLimitReached || chunk._promptInputIdentityUnknown
+			? { ...input, _streamingPromptChars: null }
+			: input;
 	}
 	return {
 		_streamingChars: chunk.inputCharsTotal,
@@ -270,6 +330,16 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 			: {}),
 		...(chunk.streamingFieldValue !== undefined
 			? { _streamingFieldValue: chunk.streamingFieldValue }
+			: {}),
+		...(chunk._inputBindingLimitReached ||
+		chunk._promptInputIdentityUnknown ||
+		chunk.streamingPromptChars !== undefined
+			? {
+					_streamingPromptChars:
+						chunk._inputBindingLimitReached || chunk._promptInputIdentityUnknown
+							? null
+							: chunk.streamingPromptChars,
+				}
 			: {}),
 		...ranges,
 	};
@@ -288,6 +358,9 @@ export function topLevelStreamingChunkToToolFields(
 	// result metadata would bypass target validation and shadow the actual result.
 	const metadata = chunk._metadata ?? (chunk.toolName === "Edit" ? undefined : chunk.metadata);
 	const receipts = {
+		...(chunk.toolCallId && chunk.executionAttempt !== undefined
+			? { tcId: chunk.toolCallId, executionAttempt: chunk.executionAttempt }
+			: {}),
 		...(chunk.textDocument?.source?.toolCallId
 			? { tcId: chunk.textDocument.source.toolCallId }
 			: {}),
@@ -400,6 +473,21 @@ export function buildTopLevelStreamingChunksMsg(
 					...toolCalls[tcIdx],
 					_metadata: chunk.metadata,
 				} as (typeof toolCalls)[number];
+			}
+		}
+		if (chunk.toolCallId && chunk.executionAttempt !== undefined) {
+			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (index >= 0)
+				toolCalls[index] = {
+					...toolCalls[index],
+					id: chunk.toolCallId,
+					executionAttempt: chunk.executionAttempt,
+				};
+			for (const block of blocks) {
+				if (block.type === "tool_use" && block.id === chunk.toolUseId) {
+					block.tcId = chunk.toolCallId;
+					block.executionAttempt = chunk.executionAttempt;
+				}
 			}
 		}
 		if (chunk.textDocument?.source) {

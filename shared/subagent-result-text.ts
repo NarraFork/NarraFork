@@ -30,6 +30,8 @@ import { readLeafText, stringifyForDisplay } from "./pretext-layout/tool-io-proj
  * pathological output cannot hand a render/measure path an unbounded string.
  */
 export const MAX_SUBAGENT_RESULT_TEXT_CHARS = 120_000;
+/** Also bound inspection when an array contains no readable text blocks. */
+export const MAX_SUBAGENT_RESULT_BLOCKS = 1024;
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 
@@ -73,19 +75,22 @@ export function parseSubagentOutputText(output: unknown): string {
 	const leaf = readLeafText(record);
 	if (leaf !== undefined) return capText(leaf, MAX_SUBAGENT_RESULT_TEXT_CHARS);
 	if (Array.isArray(output)) {
-		return capText(
-			output
-				.map((block) =>
-					block &&
-					typeof block === "object" &&
-					typeof (block as { text?: unknown }).text === "string"
-						? ((block as { text: string }).text ?? "")
-						: "",
-				)
-				.filter(Boolean)
-				.join("\n"),
-			MAX_SUBAGENT_RESULT_TEXT_CHARS,
-		);
+		const parts: string[] = [];
+		let remaining = MAX_SUBAGENT_RESULT_TEXT_CHARS;
+		for (let index = 0; index < Math.min(output.length, MAX_SUBAGENT_RESULT_BLOCKS); index++) {
+			if (remaining === 0) break;
+			const block = output[index];
+			const text = block && typeof block === "object" ? block.text : undefined;
+			if (typeof text !== "string" || !text) continue;
+			if (parts.length > 0) {
+				parts.push("\n");
+				remaining--;
+			}
+			const part = capText(text, remaining);
+			parts.push(part);
+			remaining -= part.length;
+		}
+		return parts.join("");
 	}
 	return capText(stringifyForDisplay(output), MAX_SUBAGENT_RESULT_TEXT_CHARS);
 }

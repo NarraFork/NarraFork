@@ -1285,6 +1285,7 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
+					}
 					case "tool_structured_progress": {
 						// Validated rather than cast: a malformed frame must degrade to a
 						// barless card, not to a bar reading `NaN%`.
