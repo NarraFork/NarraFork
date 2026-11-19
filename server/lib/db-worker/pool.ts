@@ -504,6 +504,8 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 	readonly exited: Promise<number>;
 	private closing?: Promise<void>;
 	private failed = false;
+	private diagnosticWorker?: string;
+	private lastDiagnostic?: ReadPoolTaskDiagnostics;
 	private active?: {
 		request: ReadRequest;
 		requestId: string;
@@ -531,6 +533,22 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 		const active = this.active;
 		if (!active || !message || message.type === "ready" || message.requestId !== active.requestId)
 			return;
+		const request = active.request;
+		if (message.type === "sqlDiagnostic") {
+			const sql = request.poolDiagnostic.sql;
+			if (sql) {
+				const accepted = acceptSqlDiagnosticEvent(sql, message, Date.now());
+				logReadSqlDiagnostic(
+					accepted && message.phase !== "coverageLost"
+						? message.phase === "start"
+							? "sql-start"
+							: "sql-end"
+						: "coverage-lost",
+					request.poolDiagnostic,
+				);
+			}
+			return;
+		}
 		if (message.type === "progress") {
 			try {
 				request.onProgress?.({
@@ -595,6 +613,13 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 					phase: "read",
 					buildId: RUNTIME_BUILD_ID,
 					...workerFailureDetails(message.diagnostic ?? message, false),
+					...(request.poolDiagnostic.sql
+						? readPoolTaskSnapshot(
+								request.poolDiagnostic,
+								Date.now(),
+								request.poolDiagnostic.dispatchedAt,
+							)
+						: {}),
 				});
 			} catch {
 				/* diagnostics cannot prevent settlement */
@@ -626,6 +651,20 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 	run(request: ReadRequest, context: WorkerTaskContext): Promise<unknown> {
 		requestOwners.get(context.requestId)?.add(this);
 		if (this.closed) return Promise.reject(new WorkersUnavailableError("worker_unavailable"));
+		if (request.identity) {
+			assertReadDatabaseOpen(request.identity);
+			this.databaseIds.add(request.identity.id);
+		}
+		request.diagnostics.requestId = context.requestId;
+		request.poolDiagnostic.dispatchedAt = Date.now();
+		request.phase.phase = "dispatching";
+		this.lastDiagnostic = request.poolDiagnostic.sql ? request.poolDiagnostic : undefined;
+		if (request.poolDiagnostic.sql) {
+			this.diagnosticWorker ??= `dbw-${++sqlDiagnosticWorkerCounter}`;
+			request.poolDiagnostic.sql.worker = this.diagnosticWorker;
+			this.lastDiagnostic = request.poolDiagnostic;
+			logReadSqlDiagnostic("dispatch", request.poolDiagnostic);
+		}
 		return new Promise((resolve, reject) => {
 			let cancelled: Error | undefined;
 			let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -637,6 +676,11 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 				if (this.active !== active) return;
 				clearTimeout(watchdog);
 				context.signal.removeEventListener("abort", abort);
+				if (request.poolDiagnostic.sql) {
+					request.poolDiagnostic.sql.endedAt = Date.now();
+					request.poolDiagnostic.sql.outcome = cancelled || error ? "failed" : "completed";
+					logReadSqlDiagnostic("finish", request.poolDiagnostic);
+				}
 				this.active = undefined;
 				if (request.fresh) this.failed = true;
 				done();
@@ -688,6 +732,7 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 					deadlineAt: context.deadlineAt,
 					params: request.params,
 					traceParent: request.traceParent,
+					...(request.sqlDiagnostic ? { sqlDiagnostic: request.sqlDiagnostic } : {}),
 				});
 				postReadFanoutTask(request.fanout);
 				request.phase.phase = "running";
@@ -702,6 +747,9 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 	close(): Promise<void> {
 		if (!this.closing) {
 			const active = this.active;
+			const diagnostic = this.lastDiagnostic;
+			const closeStartedAt = diagnostic ? Date.now() : undefined;
+			logReadSqlDiagnostic("close-start", diagnostic);
 			this.closing = Promise.resolve().then(async () => {
 				if (active) {
 					active.cancel(new WorkersUnavailableError("pool_shutdown"));
@@ -713,6 +761,11 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 					/* already gone */
 				}
 				await this.handle.close();
+				logReadSqlDiagnostic(
+					"close-complete",
+					diagnostic,
+					closeStartedAt === undefined ? undefined : Math.max(0, Date.now() - closeStartedAt),
+				);
 				this.worker.off("message", this.onMessage);
 				this.worker.off("error", this.onError);
 				this.worker.off("messageerror", this.onMessageError);

@@ -45,8 +45,12 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
-import { resolveFastModeForUser } from "../../lib/fast-mode";
+import { stallTimeBetween } from "../../lib/event-loop-monitor";
 import { logger } from "../../lib/logger";
+import {
+	historyPreparationFailure,
+	ModelHistoryPreparation,
+} from "../../lib/model-history-preparation";
 import {
 	formatSubagentModelRestrictionDescription,
 	getBlockedSkills,
@@ -1014,6 +1018,7 @@ export async function runAgentLoopUnlocked(
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
 
+			historyPreparation.phase("tools");
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
@@ -1301,6 +1306,7 @@ export async function runAgentLoopUnlocked(
 				model: RequestModelIdentity,
 				{ locale, replyInUserLanguage }: import("@shared/reply-context").ReplyContext,
 			) => {
+				preparation?.phase("systemPrompt");
 				active.abortController.signal.throwIfAborted();
 				// A compact racing this read is retried by the shared request preparer.
 				const compactMessageId = await currentCompactMessageId(narratorId);
@@ -1425,6 +1431,7 @@ export async function runAgentLoopUnlocked(
 					summaryChars: built.usedCompactSummary ? (current.contextSummary?.length ?? 0) : 0,
 				};
 			};
+			historyPreparation.phase("epoch");
 			const preparedPrefix = await preparePrefixRequest({
 				narratorId,
 				locale,
@@ -1551,11 +1558,13 @@ export async function runAgentLoopUnlocked(
 					});
 				}
 			};
+			historyPreparation.phase("systemPrompt");
 			const { usedCompactSummary } = prefixPrompt;
 			active.systemPrompt = reconciled.systemPrompt ?? prefixPrompt.prompt;
 			// Legacy prompt offsets do not address the epoch's rendered baseline.
 			let runtimeSummaryChars = prefixPrompt.summaryChars;
 			const initialSystemChars = (active.systemPrompt?.length ?? 0) - runtimeSummaryChars;
+
 			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
@@ -3675,7 +3684,9 @@ export async function runAgentLoopUnlocked(
 			const errorMsg = serializeCatalogErrorMessage(err);
 			logger.error("Narrator loop error", {
 				narratorId,
-				error: err instanceof Error ? err.message : String(err),
+				...(historyPreparationFailure(err) ?? {
+					error: err instanceof Error ? err.message : String(err),
+				}),
 			});
 			try {
 				await withDbRetry(

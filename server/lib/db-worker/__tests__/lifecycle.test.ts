@@ -9,6 +9,7 @@ import { logger } from "../../logger";
 import { RUNTIME_BUILD_ID } from "../../runtime-target";
 import * as sqlTrace from "../../sql-trace";
 import { WorkerHandle } from "../../worker-runtime/lifecycle";
+import { DbReadError } from "../errors";
 import * as failures from "../failure";
 import {
 	DB_WORKER_MAX_QUEUE,
@@ -35,6 +36,7 @@ function deferred<T = void>() {
 	return { promise, resolve };
 }
 let dir: string;
+let previousSqlDiagnostics: string | undefined;
 let handles: WorkerHandle<Worker>[];
 let restores: Array<() => void>;
 let posted: Array<{ type?: string; requestId?: string; traceParent?: string }>;
@@ -52,6 +54,8 @@ const success = `parentPort.on("message", data => {
 });`;
 const hanging = `parentPort.on("message", () => {});`;
 beforeEach(async () => {
+	previousSqlDiagnostics = process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+	delete process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
 	await resetDbWorkerPoolForTest();
 	dir = mkdtempSync(join(tmpdir(), "nf-db-lifecycle-"));
 	unusedDb = join(dir, "source.sqlite");
@@ -84,6 +88,8 @@ afterEach(async () => {
 	for (const restore of restores.reverse()) restore();
 	delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	delete process.env.NARRAFORK_DB_WORKER;
+	if (previousSqlDiagnostics === undefined) delete process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+	else process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = previousSqlDiagnostics;
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -341,6 +347,75 @@ test("shutdown disables admission before cancellation and waits for actual termi
 	await closing;
 	expect(getDbWorkerPoolStats().workers).toBe(0);
 	expect(await failureOf(runReadTask(unusedDb, task))).toMatchObject({ reason: "pool_shutdown" });
+});
+
+test("SQL close diagnostics keep the last request and wait for native exit confirmation", async () => {
+	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+	fixture(success);
+	expect(await runReadTask(unusedDb, task, { diagnosticSource: "auth.session" })).toBe(42);
+	const gate = deferred();
+	const stopping = deferred();
+	const worker = handles[0]?.resource;
+	if (!worker) throw new Error("Expected owned worker");
+	const terminate = worker.terminate.bind(worker);
+	spyOn(worker, "terminate").mockImplementation(async () => {
+		stopping.resolve();
+		await gate.promise;
+		return terminate();
+	});
+	const closing = shutdownDbWorkerPool();
+	await stopping.promise;
+	const logs = logger.warn as ReturnType<typeof spyOn<typeof logger, "warn">>;
+	const sqlLogs = () =>
+		logs.mock.calls
+			.filter(([message]) => message === "Database read worker SQL diagnostic")
+			.map(([, fields]) => fields);
+	const start = sqlLogs().find((record) => record?.phase === "close-start");
+	expect(start).toMatchObject({
+		source: "auth.session",
+		kind: "storageScanContext",
+		requestId: posted.find((message) => message.type === "task")?.requestId,
+		sql: { state: "settled" },
+	});
+	expect(sqlLogs().some((record) => record?.phase === "close-complete")).toBe(false);
+	expect(getDbWorkerPoolStats().workers).toBe(1);
+	gate.resolve();
+	await closing;
+	const complete = sqlLogs().find((record) => record?.phase === "close-complete");
+	expect(complete).toMatchObject({
+		requestId: start?.requestId,
+		source: "auth.session",
+		closeDurationMs: expect.any(Number),
+	});
+	expect(getDbWorkerPoolStats().workers).toBe(0);
+});
+
+test("unconfirmed SQL close keeps start evidence and the owner through the drain deadline", async () => {
+	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+	fixture(success);
+	expect(await runReadTask(unusedDb, task)).toBe(42);
+	const gate = deferred();
+	const worker = handles[0]?.resource;
+	if (!worker) throw new Error("Expected worker handle");
+	const terminate = worker.terminate.bind(worker);
+	spyOn(worker, "terminate").mockImplementation(async () => {
+		await gate.promise;
+		return terminate();
+	});
+	try {
+		expect(await failureOf(drainDbWorkerPool({ timeoutMs: 25 }))).toMatchObject({
+			code: "DB_READ_TASK_TIMEOUT",
+		});
+		const sqlLogs = (
+			logger.warn as ReturnType<typeof spyOn<typeof logger, "warn">>
+		).mock.calls.filter(([message]) => message === "Database read worker SQL diagnostic");
+		expect(sqlLogs.some(([, fields]) => fields?.phase === "close-start")).toBe(true);
+		expect(sqlLogs.some(([, fields]) => fields?.phase === "close-complete")).toBe(false);
+		expect(getDbWorkerPoolStats().tracked).toBeGreaterThan(0);
+	} finally {
+		gate.resolve();
+		await shutdownDbWorkerPool();
+	}
 });
 
 test("maintenance pause blocks both profiles until explicit resume", async () => {
@@ -718,8 +793,12 @@ test("real SQLite diagnostics omit query bodies and database paths while retaini
 			maxRows: 10,
 		}),
 	);
-	expect(error).toMatchObject({ name: "DbReadTaskExecutionError", code: "SQLITE_ERROR" });
-	expect((error as Error).message).toContain("PRIVATE_QUERY_BODY");
+	expect(error).toBeInstanceOf(DbReadError);
+	expect(error).toMatchObject({
+		code: "DB_READ_FAILED",
+		message: "database read worker query failed",
+	});
+	expect((error as Error).message).not.toContain("PRIVATE_QUERY_BODY");
 	expect(
 		await runReadTask(dbPath, {
 			kind: "selectRows",
@@ -733,13 +812,12 @@ test("real SQLite diagnostics omit query bodies and database paths while retaini
 	expect(calls).toEqual([
 		[
 			"Database read worker query failed",
-			{
+			expect.objectContaining({
 				entry: "db-read-worker",
 				phase: "read",
 				buildId: RUNTIME_BUILD_ID,
 				errorType: "SQLiteError",
-				code: "SQLITE_ERROR",
-			},
+			}),
 		],
 	]);
 	const logs = JSON.stringify(calls);

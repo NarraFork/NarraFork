@@ -3194,6 +3194,7 @@ export interface ContextManagementOptions {
 	buildPrefixPrompt?: (
 		identity: RequestModelIdentity,
 		replyContext: ReplyContext,
+		preparation?: ModelHistoryPreparation,
 	) => Promise<{
 		contract: string;
 		parts: import("../../shared/prefix-context").PromptPart[];

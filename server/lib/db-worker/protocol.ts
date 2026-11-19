@@ -328,6 +328,8 @@ export interface DbWorkerRequest {
 	params: DbReadTaskParams;
 	/** SQL trace span that issued the task; the worker attributes its SQL to a child span. */
 	traceParent?: string;
+	/** Ephemeral, host-owned session secret. Never logged or echoed in responses. */
+	sqlDiagnostic?: import("./sql-diagnostics").SqlDiagnosticConfig;
 }
 
 export interface DbWorkerShutdown {

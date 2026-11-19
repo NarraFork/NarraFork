@@ -11,6 +11,8 @@ import {
 	measureTable,
 	scanDatabaseObjectStorage,
 } from "../../../services/storage-scan-queries";
+import { logger } from "../../logger";
+import { DbReadError } from "../errors";
 import {
 	DB_READ_QUEUE_MAX_BYTES,
 	DB_READ_QUEUE_MAX_TASKS,
@@ -27,6 +29,7 @@ import {
 	WorkersUnavailableError,
 } from "../pool";
 import type { StorageScanContextResult, StorageScanTablesResult } from "../protocol";
+import { getDbReadAbortDiagnostics } from "../read-diagnostics";
 import { shardTableNames } from "../storage-scan-runner";
 
 /**
@@ -1071,4 +1074,493 @@ describe("worker pool", () => {
 		);
 		expect(completions).toEqual(names);
 	}, 90_000);
+});
+
+describe("read cancellation diagnostics", () => {
+	let home = "";
+	let dbPath = "";
+	const receivedTaskWorker = `
+	self.onmessage = (event) => {
+		if (event.data?.type !== "task") return;
+		postMessage({ type: "progress", requestId: event.data.requestId, tableName: event.data.requestId, done: 0, total: 1 });
+	};
+	`;
+	beforeEach(async () => {
+		home = mkdtempSync(join(tmpdir(), "narrafork-db-abort-diagnostics-"));
+		dbPath = join(home, "private-source.db");
+		writeFileSync(dbPath, "fake database source");
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		await resetDbWorkerPoolForTest();
+	});
+	afterEach(async () => {
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		setDbWorkerSpecifiersForTest(null);
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("pre-aborted ordinary, ephemeral and tracked reads have admission context without an ID", async () => {
+		const controller = new AbortController();
+		controller.abort(new Error("private cancellation reason"));
+		const params = {
+			kind: "selectRows",
+			sql: "SELECT ?",
+			params: ["private bind"],
+			maxRows: 1,
+		} as const;
+		const options = { signal: controller.signal, diagnosticSource: "private caller label" };
+		const tasks = [
+			runReadTask(dbPath, { ...params, params: [...params.params] }, options),
+			runEphemeralReadTask(dbPath, { ...params, params: [...params.params] }, options),
+		];
+		const tracked = runTrackedEphemeralReadTask(
+			dbPath,
+			{ ...params, params: [...params.params] },
+			options,
+		);
+		tasks.push(tracked.result);
+		for (const task of tasks) {
+			const error = await task.catch((failure: unknown) => failure);
+			expect(error).toBeInstanceOf(DbReadError);
+			expect(error).toMatchObject({
+				name: "DbReadError",
+				code: "DB_READ_ABORTED",
+				message: "database read task aborted",
+			});
+			expect(getDbReadAbortDiagnostics(error)).toEqual({ kind: "selectRows", phase: "admission" });
+		}
+		await tracked.released;
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+	});
+
+	test("cancellation during ephemeral startup remains acquiring and has no allocated task ID", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "starting-worker.ts", `await new Promise(() => {});`),
+		]);
+		const controller = new AbortController();
+		const task = runEphemeralReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{ signal: controller.signal, timeoutMs: 5000 },
+		).catch((error: unknown) => error);
+		await Bun.sleep(0);
+		expect(getDbWorkerPoolStats()).toMatchObject({ starting: 1, tracked: 0 });
+		controller.abort("private startup reason");
+		const error = await task;
+		expect(error).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "storageScanContext",
+			phase: "acquiring",
+		});
+		expect(getDbWorkerPoolStats().busy).toBe(0);
+	});
+
+	test("queued cancellation has no allocated ID while the dispatched blocker retains its ID", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "queued-worker.ts", receivedTaskWorker),
+		]);
+		const started = Promise.withResolvers<string>();
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				onProgress: ({ tableName }) => started.resolve(tableName),
+				timeoutMs: 5000,
+			},
+		).catch((error: unknown) => error);
+		const taskId = await started.promise;
+		const controller = new AbortController();
+		const queued = runReadTask(
+			dbPath,
+			{ kind: "storageScanTables", tableNames: ["private_table"] },
+			{ signal: controller.signal, timeoutMs: 5000 },
+		).catch((error: unknown) => error);
+		await Promise.resolve();
+		expect(getDbWorkerPoolStats().queued).toBe(1);
+		controller.abort();
+		expect(getDbReadAbortDiagnostics(await queued)).toEqual({
+			kind: "storageScanTables",
+			phase: "queued",
+		});
+		expect(getDbWorkerPoolStats().queued).toBe(0);
+		blockerController.abort();
+		expect(getDbReadAbortDiagnostics(await blocker)).toEqual({
+			kind: "storageScanContext",
+			phase: "running",
+			taskId,
+		});
+	});
+
+	test("tracked running cancellation correlates the actual posted ID without private inputs", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "running-worker.ts", receivedTaskWorker),
+		]);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<string>();
+		const task = runTrackedEphemeralReadTask(
+			dbPath,
+			{
+				kind: "selectRows",
+				sql: "SELECT secret_payload FROM private_table WHERE token = ?",
+				params: ["private bind"],
+				maxRows: 1,
+			},
+			{
+				signal: controller.signal,
+				diagnosticSource: "private source label",
+				onProgress: ({ tableName }) => started.resolve(tableName),
+				timeoutMs: 5000,
+			},
+		);
+		const result = task.result.catch((error: unknown) => error);
+		const taskId = await started.promise;
+		controller.abort({ sql: "private reason SQL", params: ["private reason bind"], dbPath });
+		const error = await result;
+		expect(error).toBeInstanceOf(DbReadError);
+		expect(taskId).toMatch(/^dbr-[a-z0-9]+-[a-z0-9]+$/);
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "selectRows",
+			phase: "running",
+			taskId,
+		});
+		expect(JSON.stringify(getDbReadAbortDiagnostics(error))).not.toContain("private");
+		expect(JSON.stringify(error)).toBe('{"code":"DB_READ_ABORTED","name":"DbReadError"}');
+		await task.released;
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+	});
+
+	test("worker-returned cancellation uses the host domain and task ID, not remote error properties", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"aborted-worker.ts",
+				`
+			self.onmessage = (event) => {
+				if (event.data?.type !== "task") return;
+				const { requestId } = event.data;
+				postMessage({ type: "progress", requestId, tableName: requestId, done: 0, total: 1 });
+				postMessage({ type: "error", requestId, code: "DB_READ_ABORTED", message: "database read task aborted", durationMs: 0,
+					taskId: "dbr-forged-1", phase: "admission", domainTask: "private task", sql: "private SQL", remoteError: { reason: "private" } });
+			};
+			`,
+			),
+		]);
+		let taskId = "";
+		const error = await runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{
+				onProgress: ({ tableName }) => {
+					taskId = tableName;
+				},
+				timeoutMs: 5000,
+			},
+		).catch((failure: unknown) => failure);
+		expect(error).toBeInstanceOf(DbReadError);
+		expect(taskId).toMatch(/^dbr-[a-z0-9]+-[a-z0-9]+$/);
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "domainRead",
+			domainTask: "readerProbe",
+			phase: "running",
+			taskId,
+		});
+		expect(error).not.toHaveProperty("remoteError");
+		expect(error).not.toHaveProperty("taskId");
+	});
+
+	test("deduplicated subscriptions cancel independently and retain the execution owner's diagnostics", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "shared-worker.ts", receivedTaskWorker),
+		]);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<string>();
+		const owner = runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{
+				signal: controller.signal,
+				dedupeKey: "shared-abort",
+				timeoutMs: 5000,
+				onProgress: ({ tableName }) => started.resolve(tableName),
+			},
+		).catch((error: unknown) => error);
+		const waiterController = new AbortController();
+		const waiter = runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{ dedupeKey: "shared-abort", timeoutMs: 5000, signal: waiterController.signal },
+		).catch((error: unknown) => error);
+		const taskId = await started.promise;
+		controller.abort();
+		const ownerError = await owner;
+		expect(ownerError).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(getDbWorkerPoolStats()).toMatchObject({ inFlight: 1, busy: 1 });
+		waiterController.abort();
+		const waiterError = await waiter;
+		expect(waiterError).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(waiterError).not.toBe(ownerError);
+		expect(getDbReadAbortDiagnostics(waiterError)).toEqual({
+			kind: "domainRead",
+			domainTask: "readerProbe",
+			phase: "running",
+			taskId,
+		});
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		expect(getDbWorkerPoolStats().inFlight).toBe(0);
+	});
+
+	test("cancellation after ID allocation but before post remains dispatching and does not post a task", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"counting-worker.ts",
+				`
+			let posted = 0;
+			self.onmessage = (event) => {
+				if (event.data?.type !== "task") return;
+				postMessage({ type: "result", requestId: event.data.requestId, result: ++posted, durationMs: 0 });
+			};
+			`,
+			),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		let aborted = false;
+		Object.defineProperty(controller.signal, "aborted", {
+			// Binding an ID makes the worker busy before the final pre-post cancellation check.
+			get: () => {
+				if (!aborted && getDbWorkerPoolStats().busy === 1) {
+					aborted = true;
+					controller.abort("private pre-post reason");
+				}
+				return aborted;
+			},
+		});
+		const posted = spyOn(Worker.prototype, "postMessage");
+		try {
+			const error = await runReadTask(
+				dbPath,
+				{ kind: "storageScanContext" },
+				{ signal: controller.signal, timeoutMs: 5000 },
+			).catch((failure: unknown) => failure);
+			expect(error).toMatchObject({ code: "DB_READ_ABORTED" });
+			expect(getDbReadAbortDiagnostics(error)).toEqual({
+				kind: "storageScanContext",
+				phase: "dispatching",
+				taskId: expect.stringMatching(/^dbr-[a-z0-9]+-[a-z0-9]+$/),
+			});
+			expect(posted.mock.calls.filter(([message]) => message?.type === "task")).toHaveLength(0);
+			expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, tracked: 0 });
+			expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		} finally {
+			posted.mockRestore();
+		}
+	});
+});
+
+describe("queue admission diagnostics", () => {
+	let home = "";
+	let dbPath = "";
+
+	beforeEach(async () => {
+		home = mkdtempSync(join(tmpdir(), "narrafork-db-queue-diagnostics-"));
+		dbPath = join(home, "fake.db");
+		// The stand-in workers never open it: only the source-identity filesystem check runs.
+		writeFileSync(dbPath, "fake database source");
+		await resetDbWorkerPoolForTest();
+	});
+
+	afterEach(async () => {
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		setDbWorkerSpecifiersForTest(null);
+		delete process.env.NARRAFORK_DB_WORKER;
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("queue admission diagnostics preserve the count boundary and rate-limit without payloads", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "diagnostic-hanging-worker.ts", HANGING_WORKER_BODY),
+		]);
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				timeoutMs: 30_000,
+			},
+		).catch((error: unknown) => error);
+		const controllers: AbortController[] = [];
+		const waiters: Array<Promise<unknown>> = [];
+		const records: Array<Record<string, unknown>> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
+			if (message === "Database read queue admission rejected") records.push(fields ?? {});
+		});
+		let wallClock: { mockRestore(): void } | undefined;
+		try {
+			const readyBy = performance.now() + 2_000;
+			while (!getDbWorkerPoolStats().busy && performance.now() < readyBy) await Bun.sleep(1);
+			expect(getDbWorkerPoolStats().busy).toBe(1);
+			for (let index = 0; index < (DB_READ_QUEUE_MAX_TASKS * 3) / 4; index++) {
+				const controller = new AbortController();
+				controllers.push(controller);
+				waiters.push(
+					runReadTask(
+						dbPath,
+						{ kind: "storageScanContext" },
+						{
+							signal: controller.signal,
+							timeoutMs: 30_000,
+						},
+					).catch((error: unknown) => error),
+				);
+			}
+			await Bun.sleep(0);
+			expect(getDbWorkerPoolStats().queued).toBe((DB_READ_QUEUE_MAX_TASKS * 3) / 4);
+			const queuedBytes = getDbWorkerPoolStats().queuedBytes;
+			let now = Date.now() + 20_000;
+			wallClock = spyOn(Date, "now").mockImplementation(() => now);
+			const secret = "https://private.invalid/?token=private-queue-payload";
+			const rejected = () =>
+				runReadTask(
+					dbPath,
+					{
+						kind: "selectRows",
+						sql: "SELECT ? AS private_queue_template",
+						params: [secret],
+						maxRows: 1,
+					},
+					{ diagnosticSource: secret },
+				);
+			for (let index = 0; index < 8; index++) {
+				const error = await rejected().catch((error: unknown) => error);
+				expect(error).toBeInstanceOf(DbReadTaskOverloadedError);
+				expect(error).toMatchObject({
+					code: "DB_READ_OVERLOADED",
+					name: "DbReadTaskOverloadedError",
+					message: "Database read worker queue is full",
+				});
+			}
+			expect(records).toHaveLength(5);
+			expect(records[0]).toMatchObject({
+				reason: "normal-count",
+				taskKind: "selectRows",
+				queued: (DB_READ_QUEUE_MAX_TASKS * 3) / 4,
+				queuedBytes,
+				maxQueued: DB_READ_QUEUE_MAX_TASKS,
+				maxQueuedBytes: DB_READ_QUEUE_MAX_BYTES,
+				workers: 1,
+				busy: 1,
+				retiring: 0,
+				pendingSpawns: 0,
+				concurrency: 2,
+				rateLimitWindowMs: 10_000,
+				rateLimitMaxLogs: 5,
+			});
+			now += 10_000;
+			await expect(rejected()).rejects.toMatchObject({ code: "DB_READ_OVERLOADED" });
+			expect(records).toHaveLength(6);
+			expect(records.at(-1)?.suppressedSinceLastLog).toBe(3);
+			const text = JSON.stringify(records);
+			for (const privateText of [
+				secret,
+				"private_queue_template",
+				dbPath,
+				"sql",
+				"params",
+				"diagnosticSource",
+			])
+				expect(text).not.toContain(privateText);
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				queued: (DB_READ_QUEUE_MAX_TASKS * 3) / 4,
+				queuedBytes,
+			});
+		} finally {
+			wallClock?.mockRestore();
+			for (const controller of controllers) controller.abort();
+			blockerController.abort();
+			await Promise.all([...waiters, blocker]);
+			warn.mockRestore();
+		}
+	});
+
+	test("queue admission diagnostics preserve the inclusive byte boundary", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "diagnostic-byte-worker.ts", HANGING_WORKER_BODY),
+		]);
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				timeoutMs: 30_000,
+			},
+		).catch((error: unknown) => error);
+		const queuedController = new AbortController();
+		const probeController = new AbortController();
+		let probe: Promise<unknown> | undefined;
+		let queued: Promise<unknown> | undefined;
+		const records: Array<Record<string, unknown>> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
+			if (message === "Database read queue admission rejected") records.push(fields ?? {});
+		});
+		try {
+			const readyBy = performance.now() + 2_000;
+			while (!getDbWorkerPoolStats().busy && performance.now() < readyBy) await Bun.sleep(1);
+			expect(getDbWorkerPoolStats().busy).toBe(1);
+			probe = runReadTask(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: [""] },
+				{
+					signal: probeController.signal,
+					timeoutMs: 30_000,
+				},
+			).catch((error: unknown) => error);
+			await Bun.sleep(0);
+			const overhead = getDbWorkerPoolStats().queuedBytes;
+			expect(overhead).toBeGreaterThan(0);
+			probeController.abort();
+			await probe;
+			queued = runReadTask(
+				dbPath,
+				{
+					kind: "storageScanTables",
+					tableNames: ["private-queue-body".padEnd(6 * 1024 * 1024 - overhead, "x")],
+				},
+				{ signal: queuedController.signal, timeoutMs: 30_000 },
+			).catch((error: unknown) => error);
+			await Bun.sleep(0);
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				queued: 1,
+				queuedBytes: 6 * 1024 * 1024,
+			});
+			const error = await runReadTask(dbPath, { kind: "storageScanContext" }).catch(
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(DbReadError);
+			expect(error).toMatchObject({ code: "DB_READ_OVERLOADED" });
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({
+				reason: "normal-bytes",
+				taskKind: "storageScanContext",
+				queued: 1,
+				queuedBytes: 6 * 1024 * 1024,
+				busy: 1,
+			});
+			expect(JSON.stringify(records)).not.toContain("private-queue-body");
+			expect(getDbWorkerPoolStats().queued).toBe(1);
+		} finally {
+			probeController.abort();
+			queuedController.abort();
+			blockerController.abort();
+			await Promise.all([probe, queued, blocker]);
+			warn.mockRestore();
+		}
+	});
 });

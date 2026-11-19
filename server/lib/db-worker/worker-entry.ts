@@ -58,10 +58,12 @@ import { ReadBudgetMeter } from "./read-budget";
 import { runSelectDigestBatch } from "./select-digest-batch";
 import { runSelectChunks, runSelectValues } from "./select-extended";
 import { runSelectRows } from "./select-rows";
+import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
 const port = parentPort;
+const sqlDiagnostics = createWorkerSqlDiagnostics((event) => port.postMessage(event));
 
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
 const connections = new Map<string, Database>();
