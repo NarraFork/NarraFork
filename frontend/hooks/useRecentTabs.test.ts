@@ -13,7 +13,6 @@ import {
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
-	shouldApplyRecentTabsRuntimeResponse,
 	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
@@ -1202,23 +1201,14 @@ describe("recent tabs loaded-window refresh", () => {
 });
 
 describe("recent tabs runtime races", () => {
-	test("prunes versions outside the live window but retains in-flight snapshots", () => {
+	test("prunes versions outside the live window", () => {
 		const versions = new Map([
 			["live", new Map([["status", 1]])],
-			["in-flight", new Map([["status", 2]])],
-			["stale", new Map([["status", 3]])],
+			["stale", new Map([["status", 2]])],
 		]);
 
-		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), [new Set(["in-flight"])]);
-		expect([...versions.keys()]).toEqual(["live", "in-flight"]);
-
-		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), []);
+		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]));
 		expect([...versions.keys()]).toEqual(["live"]);
-	});
-
-	test("rejects an older runtime request generation", () => {
-		expect(shouldApplyRecentTabsRuntimeResponse(4, 5)).toBeFalse();
-		expect(shouldApplyRecentTabsRuntimeResponse(5, 5)).toBeTrue();
 	});
 
 	test("bumps only the fields a WS event actually delivered", () => {
