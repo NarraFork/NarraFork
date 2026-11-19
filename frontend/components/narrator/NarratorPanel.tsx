@@ -228,8 +228,8 @@ import {
 import { filePanelBaseName } from "./panels/panel-kind";
 import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
-import { ReasoningTranslationVisibilityProvider } from "./reasoning-translation-visibility";
 import { RemoteUnsupported } from "./RemoteUnsupported";
+import { ReasoningTranslationVisibilityProvider } from "./reasoning-translation-visibility";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";

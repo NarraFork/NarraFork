@@ -1507,24 +1507,24 @@ export async function listPage(
 		const cursorWhere = decoded
 			? afterCursorWhere(decoded as CursorPayload & { p: 0 | 1 })
 			: undefined;
-// The pinned block is the head of the list by definition, so the page order says so
-// directly instead of trusting every stored sort key to agree. `regroupFolders` keeps
-// the stored order in the same shape, which makes this the stored order whenever the
-// list was last written by current code. Bounded: one user's section holds at most
-// RECENT_TABS_STORAGE_LIMIT rows, read through the (user, section, ...) index.
-const topLevelRows = await readQuery(
-	db
-		.select()
-		.from(userRecentTabs)
-		.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
-		.orderBy(
-			desc(userRecentTabs.pinned),
-			asc(userRecentTabs.sortOrder),
-			asc(userRecentTabs.tabKey),
-		)
-		.limit(pageLimit + 1),
-	{ executionPolicy: "worker-required" },
-);
+		// The pinned block is the head of the list by definition, so the page order says so
+		// directly instead of trusting every stored sort key to agree. `regroupFolders` keeps
+		// the stored order in the same shape, which makes this the stored order whenever the
+		// list was last written by current code. Bounded: one user's section holds at most
+		// RECENT_TABS_STORAGE_LIMIT rows, read through the (user, section, ...) index.
+		const topLevelRows = await readQuery(
+			db
+				.select()
+				.from(userRecentTabs)
+				.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
+				.orderBy(
+					desc(userRecentTabs.pinned),
+					asc(userRecentTabs.sortOrder),
+					asc(userRecentTabs.tabKey),
+				)
+				.limit(pageLimit + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		const hasMore = topLevelRows.length > pageLimit;
 		const pageTopLevelRows = topLevelRows.slice(0, pageLimit);
 		// A page always carries its folders' members, so a folder is never split across pages.

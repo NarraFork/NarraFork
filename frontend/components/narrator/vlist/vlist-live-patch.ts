@@ -62,13 +62,13 @@ import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
 } from "@shared/pretext-layout/reflection";
-import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import {
 	getValidReasoningTranslationParts,
 	mergeReasoningTranslationParts,
 	type ReasoningTranslationPatch,
 	readReasoningTranslationPatch,
 } from "@shared/reasoning-translation";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	activityForSubagent,

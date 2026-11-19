@@ -14,11 +14,11 @@ import {
 	readReasoningTranslationPatch,
 } from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
-import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	normalizeSubagentNestedSummary,
 	type SubagentNestedSummary,
 } from "@shared/subagent-nested";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,

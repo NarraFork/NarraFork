@@ -1214,7 +1214,12 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		) {
 			terminalCommitted = await backgroundTaskService.markCancelled(taskId, bgAbort);
 		} else if (timedOut) {
-			terminalCommitted = await backgroundTaskService.markTimedOut(taskId, error, undefined, bgAbort);
+			terminalCommitted = await backgroundTaskService.markTimedOut(
+				taskId,
+				error,
+				undefined,
+				bgAbort,
+			);
 		} else {
 			terminalCommitted = await backgroundTaskService.markFailed(taskId, error, undefined, bgAbort);
 		}

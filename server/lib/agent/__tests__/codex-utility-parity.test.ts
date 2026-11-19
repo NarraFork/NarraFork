@@ -111,8 +111,8 @@ describe.each([
 		expect(first.body.prompt_cache_key).toBeTruthy();
 		expect(second.body.prompt_cache_key).toBeTruthy();
 		expect(first.body.prompt_cache_key).not.toBe(second.body.prompt_cache_key);
-		expect(first.headers["session-id"]).toBe(first.body.prompt_cache_key);
-		expect(second.headers["session-id"]).toBe(second.body.prompt_cache_key);
+		expect(first.body.prompt_cache_key).toBe(first.headers["session-id"]);
+		expect(second.body.prompt_cache_key).toBe(second.headers["session-id"]);
 	});
 
 	test("sends the stable managed Codex client headers", async () => {

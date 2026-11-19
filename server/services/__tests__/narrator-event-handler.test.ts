@@ -4928,6 +4928,7 @@ describe("subagent live output char count", () => {
 				toolUseId: "watch-child",
 				toolName: "Watch",
 				output: "Observation registered",
+				isError: false,
 			},
 			main,
 		);
