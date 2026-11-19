@@ -60,10 +60,15 @@ const provider: ProviderAdapter = {
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
-// Use the isolated schema-built DB; worktrees need not carry ignored migration SQL.
-const { getTestDb } = await import("../../../../tests/setup");
-const { db, sqlite } = getTestDb();
+// The real loop's worker-only reads use an isolated, ready WAL database.
+const { getRuntimeTestDb, closeRuntimeTestDb } = await import(
+	"../../../services/__tests__/agent-runtime-test-database"
+);
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+const realDb = { ...(await import("../../../db")) };
 const dbStub = {
+	...realDb,
 	db,
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
@@ -76,6 +81,7 @@ mock.module("../../../db", () => dbStub);
 mock.module("@server/db", () => dbStub);
 const realProvider = { ...(await import("../provider")) };
 mock.module("../provider", () => ({
+	...realProvider,
 	getProvider: () => provider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
@@ -95,10 +101,13 @@ beforeEach(() => {
 	requestSignals.length = 0;
 });
 afterEach(() => resetUpdateCoordinationForTests());
-afterAll(() => {
+afterAll(async () => {
 	toolRegistry.unregister("RestartProbe");
 	mock.module("../provider", () => realProvider);
 	mock.restore();
+	await closeRuntimeTestDb(sqlite);
+	mock.module("../../../db", () => realDb);
+	mock.module("@server/db", () => realDb);
 });
 function run(events: AgentEvent[], consume?: (event: AgentEvent) => void | Promise<void>) {
 	const controller = new AbortController();

@@ -18,6 +18,10 @@
  * `toBlockCatchUp`).
  */
 
+import {
+	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
+	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
+} from "@shared/reasoning-translation";
 import { blockIdForElement } from "../services/narrator-block-ids";
 import { ledgerBlockId, toEnvelopes } from "../services/narrator-block-page";
 import type { NarratorServerMessage } from "./narrator-ws-types";
@@ -139,8 +143,60 @@ function withToolBlock(frame: Frame): NarratorServerMessage | undefined {
 	return blockId ? ({ ...frame, blockId } as unknown as NarratorServerMessage) : undefined;
 }
 
+/** A completed part is already addressed by the successful state writer's persistent identity. */
+export function reasoningTranslationPatchFrame(
+	message: Extract<NarratorServerMessage, { type: "reasoning_translation_patch" }>,
+): NarratorServerMessage {
+	const { part } = message;
+	const identity = [
+		message.narratorId,
+		message.ownerNarratorId,
+		message.messageId,
+		message.blockId,
+		message.elementId,
+		message.translationGeneration,
+		part?.id,
+	];
+	if (
+		identity.some((value) => typeof value !== "string" || !value || value.length > 256) ||
+		!Number.isSafeInteger(message.blockRevision) ||
+		message.blockRevision < 0 ||
+		!Number.isSafeInteger(message.stateRevision) ||
+		message.stateRevision < 0 ||
+		!part ||
+		part.generation !== message.translationGeneration ||
+		!Number.isSafeInteger(part.start) ||
+		part.start < 0 ||
+		!Number.isSafeInteger(part.end) ||
+		part.end <= part.start ||
+		typeof part.sourceText !== "string" ||
+		part.sourceText.length !== part.end - part.start ||
+		typeof part.translatedText !== "string" ||
+		!part.translatedText.trim() ||
+		Buffer.byteLength(part.sourceText) > MAX_REASONING_TRANSLATION_SOURCE_BYTES ||
+		Buffer.byteLength(part.translatedText) > MAX_REASONING_TRANSLATION_OUTPUT_BYTES
+	)
+		throw new Error("Invalid reasoning translation patch");
+	return {
+		type: "reasoning_translation_patch",
+		narratorId: message.narratorId,
+		ownerNarratorId: message.ownerNarratorId,
+		messageId: message.messageId,
+		blockId: message.blockId,
+		elementId: message.elementId,
+		blockRevision: message.blockRevision,
+		stateRevision: message.stateRevision,
+		translationGeneration: message.translationGeneration,
+		part,
+		...(message.parentToolUseId ? { parentToolUseId: message.parentToolUseId } : {}),
+		...(message.subagentNarratorId ? { subagentNarratorId: message.subagentNarratorId } : {}),
+	};
+}
+
 /** The frames a v2 connection receives for one v1 broadcast frame. */
 export function toBlockFrames(message: NarratorServerMessage): NarratorServerMessage[] {
+	if (message.type === "reasoning_translation_patch")
+		return [reasoningTranslationPatchFrame(message)];
 	const frame = message as unknown as Frame;
 	if (MESSAGE_FRAMES.has(frame.type)) return [upserted(frame) ?? message];
 	if (TOOL_FRAMES.has(frame.type)) return [withToolBlock(frame) ?? message];

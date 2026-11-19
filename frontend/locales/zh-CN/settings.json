@@ -1143,7 +1143,7 @@
 	"legacyEncoding": "旧编码支持",
 	"legacyEncodingDesc": "自动检测并保留非 UTF-8 文件编码（如 GBK、Shift_JIS）。处理旧项目代码时启用此选项。",
 	"translateReasoning": "翻译思考内容",
-	"translateReasoningDesc": "每个思考/推理块完成后将其翻译为你的语言。翻译模型可在模型设置页单独选择，默认跟随摘要模型。原始内容和翻译内容均会保存。",
+	"translateReasoningDesc": "仅在打开的叙述者面板中实际看到未译思考/推理文字时按需翻译。隐藏面板、屏幕外文字及折叠正文不会请求翻译。翻译模型可在模型设置页单独选择，默认跟随摘要模型。原文与已完成的译文均会保存。",
 	"requestEvidenceRingEnabled": "循环录制请求与响应",
 	"requestEvidenceRingEnabledDesc": "默认开启，有界保留近期请求与响应，超出容量时淘汰旧数据。可通过 /save_dump、报错卡片或使用历史固定证据，不发送给模型，也不中断会话。配置保存后即时生效。录制包含会话正文，请仅与可信人员分享。",
 	"requestEvidenceRequestCapacity": "请求侧容量",

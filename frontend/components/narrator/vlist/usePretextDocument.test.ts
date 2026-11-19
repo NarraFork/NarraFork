@@ -25,21 +25,38 @@
  * the call delta across a generation bump IS the number of live subscribers.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
+import { useLocalPref } from "@frontend/hooks/useLocalPref";
+import type { NarratorWSCallbacks } from "@frontend/hooks/useNarratorWS";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
-import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { MantineProvider } from "@mantine/core";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
-import { createElement } from "react";
+import { act, createElement, useCallback, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { RenderLodCtx } from "../lod/RenderLodCtx";
 import { bumpFontRevisionForTest } from "./katex-runtime";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { measureCache } from "./measure-cache";
 import type { PretextDocumentFetchPage } from "./pretext-document-loader";
 import { captureCoordinatorAnchor } from "./pretext-layout-coordinator";
+import { renderElement, resolveRenderExtra } from "./render-registry";
 import type { PretextDocumentView, UsePretextDocumentResult } from "./usePretextDocument";
 import { usePretextDocument } from "./usePretextDocument";
+import { useVListReasoningExpansion } from "./useVListReasoningExpansion";
+import type { VListDataSource } from "./vlist-data-source";
+import { resolveRowOpenState } from "./vlist-exact-row-state";
+import {
+	createVListInteractionState,
+	resetVListInteractionStateForLod,
+	setVListExpanded,
+	toggleVListRowExpansion,
+	type VListInteractionState,
+} from "./vlist-interaction-state";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
 
 const DOM_GLOBAL_KEYS = [
@@ -52,6 +69,9 @@ const DOM_GLOBAL_KEYS = [
 	"IS_REACT_ACT_ENVIRONMENT",
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
+	"localStorage",
+	"matchMedia",
+	"ResizeObserver",
 ] as const;
 
 function installDom(): () => void {
@@ -60,7 +80,19 @@ function installDom(): () => void {
 		previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 	}
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	const storage = new Map<string, string>();
 	const values: Record<string, unknown> = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
+		matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+		ResizeObserver: class {
+			observe() {}
+			unobserve() {}
+			disconnect() {}
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -224,6 +256,502 @@ afterEach(async () => {
 	restoreCanvas = null;
 	restoreDom?.();
 	restoreDom = null;
+});
+
+const REASONING_BODY = `${"a reasoning paragraph ".repeat(12)}BODY_SENTINEL`;
+const STEPS_BODY = `**First**\n\n${REASONING_BODY}\n\n**Second**\n\nsecond body SECOND_SENTINEL`;
+let reasoningResult: UsePretextDocumentResult | undefined;
+let reasoningInteraction: VListInteractionState;
+let setReasoningPreference: (value: boolean) => void;
+let reasoningMountId = 0;
+
+function reasoningMessage(seq: number, text: string, structured = false): TreeMessage {
+	return rowWithElements(
+		{ ...message(seq, ""), model: structured ? "gpt-5.6" : "claude-sonnet-4" },
+		[{ id: `reasoning-block-${seq}`, type: "reasoning", text }],
+	) as TreeMessage;
+}
+
+/** The same preference hook, document builder and click reducer used by the exact list. */
+function ReasoningHarness({
+	id,
+	lod,
+	isSubagent = false,
+}: {
+	id: string;
+	lod: 2 | 5;
+	isSubagent?: boolean;
+}) {
+	const [interaction, setInteraction] = useState(() => createVListInteractionState(lod));
+	if (interaction.lod !== lod) setInteraction(resetVListInteractionStateForLod(interaction, lod));
+	const active =
+		interaction.lod === lod ? interaction : resetVListInteractionStateForLod(interaction, lod);
+	reasoningInteraction = active;
+	const policy = useVListReasoningExpansion(active);
+	const [, setPreference] = useLocalPref("narrafork_expand_reasoning");
+	setReasoningPreference = setPreference;
+	const isExpanded = useCallback((key: string) => active.expanded.get(key), [active]);
+	const result = usePretextDocument(id, {
+		...policy,
+		isSubagent,
+		isExpanded,
+		lod,
+		widthBucket: "860",
+		contentWidth: 860,
+		viewportHeight: 720,
+		scrollTop: 0,
+		pinnedToBottom: false,
+		getCurrentView: readCurrentView,
+		loadOptions: harnessLoadOptions,
+	});
+	reasoningResult = result;
+	return createElement(
+		MantineProvider,
+		null,
+		result.items.map((item) => {
+			const extra = resolveRenderExtra(item.spec);
+			extra.onToggle = () =>
+				setInteraction((previous) =>
+					setVListExpanded(
+						previous,
+						item.spec.key,
+						!resolveRowOpenState(item.measured, previous, item.spec.key),
+					),
+				);
+			extra.onToggleRow = (index: number, rowKey?: string) =>
+				setInteraction((previous) => toggleVListRowExpansion(previous, item.spec, index, rowKey));
+			return createElement(
+				"section",
+				{ key: item.spec.key, "data-pref-item": item.spec.key, "data-pref-kind": item.spec.kind },
+				renderElement(item.spec.kind, item.measured, extra),
+			);
+		}),
+	);
+}
+
+function reasoningView(): UsePretextDocumentResult {
+	if (!reasoningResult) throw new Error("reasoning harness has not rendered");
+	return reasoningResult;
+}
+
+function reasoningItems() {
+	return reasoningView().items.filter((item) =>
+		["reasoning", "reasoning-steps", "activity-trace"].includes(item.spec.kind),
+	);
+}
+
+function reasoningItem(index = 0) {
+	const item = reasoningItems().at(index);
+	if (!item) throw new Error("missing reasoning item");
+	return item;
+}
+
+function reasoningExpanded(item = reasoningItem(), rowIndex = 0): boolean {
+	if (item.spec.kind === "reasoning")
+		return (item.measured as { form?: string }).form === "expanded";
+	return (item.spec.opts?.expandedIndices as number[]).includes(rowIndex);
+}
+
+async function mountReasoning(lod: 2 | 5, isSubagent = false) {
+	Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
+		value: true,
+		configurable: true,
+	});
+	reasoningResult = undefined;
+	const container = document.createElement("div");
+	document.body.appendChild(container);
+	const root = createRoot(container);
+	roots.push(root);
+	containers.push(container);
+	const id = `reasoning-pref-${++reasoningMountId}`;
+	await act(async () => {
+		root.render(createElement(ReasoningHarness, { id, lod, isSubagent }));
+		await settle();
+	});
+	return { root, container, id };
+}
+
+async function clickReasoning(container: HTMLElement, itemKey = reasoningItem().spec.key) {
+	const section = [...container.querySelectorAll("[data-pref-item]")].find(
+		(node) => node.getAttribute("data-pref-item") === itemKey,
+	);
+	const control =
+		section?.getAttribute("data-pref-kind") === "reasoning"
+			? section.querySelector(".mantine-Group-root")
+			: section?.querySelector("[data-nf-trace-titlerow][role=button]");
+	if (!control) throw new Error("missing rendered reasoning toggle");
+	await act(async () => {
+		(control as HTMLElement).click();
+		await settle();
+	});
+}
+
+function configureReasoningPage(structured: boolean) {
+	const source = reasoningMessage(0, structured ? STEPS_BODY : REASONING_BODY, structured);
+	harnessLoadOptions = {
+		fetchPage: async () => ({
+			messages: [source],
+			minSeq: 0,
+			maxSeq: 0,
+			hasNext: false,
+			hasPrev: false,
+			messageVersion: 1,
+		}),
+	};
+	return source;
+}
+
+describe("reasoning preference → production document → rendered click", () => {
+	afterEach(() => {
+		act(() => {
+			for (const root of roots) root.unmount();
+		});
+		roots = [];
+	});
+
+	for (const shape of ["plain", "steps", "folded"] as const) {
+		for (const enabled of [false, true]) {
+			test(`${shape}: initial ${enabled}, same-tab setter, storage, append and manual priority`, async () => {
+				const structured = shape !== "plain";
+				configureReasoningPage(structured);
+				localStorage.setItem("narrafork_expand_reasoning", String(enabled));
+				const { container } = await mountReasoning(shape === "folded" ? 2 : 5);
+				expect(reasoningView().status).toBe("ready");
+				expect(reasoningExpanded()).toBe(enabled);
+				expect(container.textContent?.includes("BODY_SENTINEL")).toBe(enabled);
+				const key = reasoningItem().spec.key;
+				const initialHeight = reasoningItem().measured.height;
+
+				await clickReasoning(container);
+				expect(reasoningExpanded()).toBe(!enabled);
+				expect(container.textContent?.includes("BODY_SENTINEL")).toBe(!enabled);
+				if (enabled) expect(reasoningItem().measured.height).toBeLessThan(initialHeight);
+				else expect(reasoningItem().measured.height).toBeGreaterThan(initialHeight);
+				await act(async () => {
+					setReasoningPreference(!enabled);
+					await settle();
+				});
+				expect(localStorage.getItem("narrafork_expand_reasoning")).toBe(String(!enabled));
+				expect(reasoningExpanded()).toBe(!enabled);
+				if (structured) expect(reasoningExpanded(undefined, 1)).toBe(!enabled);
+
+				await act(async () => {
+					expect(
+						reasoningView().appendMessage(reasoningMessage(1, REASONING_BODY, structured)),
+					).toBe(true);
+					await settle();
+				});
+				expect(reasoningItem().spec.key).toBe(key);
+				expect(reasoningExpanded()).toBe(!enabled);
+				const appended = reasoningItem(-1);
+				const appendedIndex =
+					appended.spec.kind === "activity-trace"
+						? (appended.spec.data as { items: unknown[] }).items.length - 1
+						: 0;
+				expect(reasoningExpanded(appended, appendedIndex)).toBe(!enabled);
+
+				await act(async () => {
+					localStorage.setItem("narrafork_expand_reasoning", String(enabled));
+					const event = document.createEvent("Event");
+					event.initEvent("storage", false, false);
+					Object.defineProperty(event, "key", { value: "narrafork_expand_reasoning" });
+					window.dispatchEvent(event);
+					await settle();
+				});
+				expect(reasoningExpanded()).toBe(!enabled);
+				expect(reasoningExpanded(reasoningItem(-1), appendedIndex)).toBe(enabled);
+
+				await act(async () => {
+					expect(
+						reasoningView().applyLivePatch((messages) => ({
+							changed: true,
+							messages: messages.map((row, index) =>
+								index === 0
+									? (rowWithElements(
+											row,
+											messageBody(row).map((block) => ({
+												...block,
+												translatedText: structured
+													? STEPS_BODY.replaceAll("body", "translated body")
+													: `${REASONING_BODY} translated`,
+											})),
+										) as TreeMessage)
+									: row,
+							),
+						})),
+					).toBe(true);
+					await settle();
+				});
+				expect(reasoningItem().spec.key).toBe(key);
+				expect(reasoningExpanded()).toBe(!enabled);
+				await clickReasoning(container, key);
+				expect(reasoningExpanded()).toBe(enabled);
+				expect(reasoningInteraction.fullPayloadRequested.size).toBe(0);
+				expect(reasoningInteraction.promptOpen.size).toBe(0);
+			});
+		}
+	}
+
+	test("the real exact list wires saved settings, ExactRow clicks and arriving messages", async () => {
+		Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
+			value: true,
+			configurable: true,
+		});
+		localStorage.setItem("narrafork_expand_reasoning", "true");
+		localStorage.setItem("narrafork_advanced_anim", "false");
+		localStorage.setItem("narrafork_unified_morph", "false");
+		const geometry = new Map<string, PropertyDescriptor | undefined>();
+		const prototype = window.HTMLElement.prototype;
+		const properties: PropertyDescriptorMap = {
+			clientWidth: { get: () => 900 },
+			offsetWidth: { get: () => 900 },
+			clientHeight: { get: () => 900 },
+			offsetHeight: { get: () => 900 },
+			scrollHeight: { get: () => 900 },
+			scrollTop: { value: 0, writable: true },
+			getBoundingClientRect: {
+				value: () => ({
+					x: 0,
+					y: 0,
+					top: 0,
+					left: 0,
+					right: 900,
+					bottom: 900,
+					width: 900,
+					height: 900,
+				}),
+			},
+		};
+		for (const [key, descriptor] of Object.entries(properties)) {
+			geometry.set(key, Object.getOwnPropertyDescriptor(prototype, key));
+			Object.defineProperty(prototype, key, { ...descriptor, configurable: true });
+		}
+		Object.defineProperty(window, "matchMedia", {
+			configurable: true,
+			value: (query: string) => ({
+				matches: query.includes("prefers-reduced-motion"),
+				addEventListener() {},
+				removeEventListener() {},
+				addListener() {},
+				removeListener() {},
+			}),
+		});
+		Object.defineProperty(window, "getSelection", { configurable: true, value: () => null });
+		const blockedRequests: { method: string; pathname: string }[] = [];
+		const rejectFetch = Object.assign(
+			async (
+				input: Parameters<typeof globalThis.fetch>[0],
+				init?: Parameters<typeof globalThis.fetch>[1],
+			) => {
+				const request = input instanceof Request ? input : undefined;
+				const method = (init?.method ?? request?.method ?? "GET").slice(0, 16);
+				const pathname = new URL(
+					request?.url ?? String(input),
+					"https://fixture.invalid",
+				).pathname.slice(0, 200);
+				if (blockedRequests.length < 8) blockedRequests.push({ method, pathname });
+				throw new Error(`blocked exact-list fixture request: ${method} ${pathname}`);
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetch = spyOn(globalThis, "fetch").mockImplementation(rejectFetch);
+		const { narratorWSManager } = await import("@frontend/lib/narrator-ws-manager");
+		let subscriptionId = 10_000;
+		const subscribe = spyOn(narratorWSManager, "subscribe").mockImplementation((ids, options) => ({
+			_id: ++subscriptionId,
+			_narratorIds: ids,
+			_kind: options?.kind ?? "list",
+		}));
+		const id = `reasoning-shell-${++reasoningMountId}`;
+		const client = new QueryClient({
+			defaultOptions: {
+				queries: { enabled: false, retry: false, staleTime: Infinity, gcTime: Infinity },
+			},
+		});
+		client.setQueryData(["narrators", id], { id, model: "gpt-5.6" });
+		client.setQueryData(["user-preferences"], {
+			autoLoadOlderMessages: false,
+			showTokenUsage: false,
+		});
+		const source = reasoningMessage(0, STEPS_BODY, true);
+		let handlers: NarratorWSCallbacks | undefined;
+		const dataSource: VListDataSource = {
+			viewerId: null,
+			fetchPage: async () => ({
+				messages: [source],
+				minSeq: 0,
+				maxSeq: 0,
+				hasNext: false,
+				hasPrev: false,
+				messageVersion: 1,
+			}),
+			subscribeMessages: (callbacks) => {
+				handlers = callbacks;
+				return () => {
+					handlers = undefined;
+				};
+			},
+		};
+		const container = document.body.appendChild(document.createElement("div"));
+		const root = createRoot(container);
+		let setPreference: (value: boolean) => void = () => {};
+		function SettingsProbe() {
+			[, setPreference] = useLocalPref("narrafork_expand_reasoning");
+			return null;
+		}
+		function titleRows() {
+			return [...container.querySelectorAll<HTMLElement>("[data-nf-trace-titlerow][role=button]")];
+		}
+		async function flush() {
+			await act(async () => {
+				await settle();
+			});
+		}
+		try {
+			const { PretextExactMessageList } = await import("./PretextExactMessageList");
+			await act(async () => {
+				root.render(
+					createElement(
+						QueryClientProvider,
+						{ client },
+						createElement(
+							MantineProvider,
+							null,
+							createElement(
+								ConfirmDialogProvider,
+								null,
+								createElement(
+									RenderLodCtx.Provider,
+									{ value: { lod: 5, interactive: true } },
+									createElement(SettingsProbe),
+									createElement(PretextExactMessageList, { narratorId: id, dataSource }),
+								),
+							),
+						),
+					),
+				);
+			});
+			for (let attempt = 0; attempt < 20 && titleRows().length < 2; attempt++) await flush();
+			expect(container.querySelectorAll("[data-nf-row-key]")).toHaveLength(1);
+			expect(titleRows()).toHaveLength(2);
+			expect(titleRows().map((node) => node.getAttribute("aria-expanded"))).toEqual([
+				"true",
+				"true",
+			]);
+			expect(container.textContent).toContain("BODY_SENTINEL");
+			await act(async () => {
+				titleRows()[0]?.click();
+			});
+			await flush();
+			expect(titleRows().map((node) => node.getAttribute("aria-expanded"))).toEqual([
+				"false",
+				"true",
+			]);
+			expect(container.textContent).not.toContain("BODY_SENTINEL");
+			await act(async () => {
+				setPreference(false);
+			});
+			await flush();
+			expect(titleRows().map((node) => node.getAttribute("aria-expanded"))).toEqual([
+				"false",
+				"false",
+			]);
+			await act(async () => {
+				setPreference(true);
+			});
+			await flush();
+			expect(titleRows().map((node) => node.getAttribute("aria-expanded"))).toEqual([
+				"false",
+				"true",
+			]);
+			await act(async () => {
+				const appended = reasoningMessage(1, "**New**\n\nnew reasoning NEW_MESSAGE_SENTINEL", true);
+				appended.narratorId = id;
+				handlers?.onMessage?.({ message: appended });
+			});
+			await flush();
+			expect(container.querySelectorAll("[data-nf-row-key]")).toHaveLength(2);
+			expect(titleRows().map((node) => node.getAttribute("aria-expanded"))).toEqual([
+				"false",
+				"true",
+				"true",
+			]);
+			expect(container.textContent).toContain("NEW_MESSAGE_SENTINEL");
+			expect(blockedRequests).toEqual([]);
+			expect(fetch).not.toHaveBeenCalled();
+		} finally {
+			await act(async () => root.unmount());
+			client.clear();
+			container.remove();
+			subscribe.mockRestore();
+			fetch.mockRestore();
+			for (const [key, descriptor] of geometry) {
+				if (descriptor) Object.defineProperty(prototype, key, descriptor);
+				else Reflect.deleteProperty(prototype, key);
+			}
+		}
+	});
+
+	test("subagent pages and live appends consume the committed reasoning policy", async () => {
+		const source = configureReasoningPage(true);
+		source.parentToolUseId = "parent-agent";
+		localStorage.setItem("narrafork_expand_reasoning", "true");
+		await mountReasoning(5, true);
+		expect(reasoningExpanded()).toBe(true);
+		await act(async () => {
+			setReasoningPreference(false);
+			await settle();
+		});
+		expect(reasoningExpanded()).toBe(false);
+		await act(async () => {
+			const appended = reasoningMessage(1, STEPS_BODY, true);
+			appended.parentToolUseId = "parent-agent";
+			expect(reasoningView().appendMessage(appended)).toBe(true);
+			await settle();
+		});
+		expect(reasoningExpanded(reasoningItem(-1))).toBe(false);
+		await act(async () => {
+			setReasoningPreference(true);
+			await settle();
+		});
+		await act(async () => {
+			const live = reasoningMessage(2, STEPS_BODY, true);
+			live.id = "__streaming__";
+			live.parentToolUseId = "parent-agent";
+			reasoningView().setStreamingMessage(live);
+			await settle();
+		});
+		expect(reasoningItem(-1).spec.opts?.expandedIndices).toEqual([0, 1]);
+	});
+
+	test("preference-only rebuild preserves the scroll anchor and LOD row-fold lifecycle", async () => {
+		configureReasoningPage(true);
+		const { root, container, id } = await mountReasoning(5);
+		const before = reasoningView();
+		if (!before.index) throw new Error("missing reasoning index");
+		harnessView = {
+			scrollTop: before.index.itemStart(0) + 3,
+			viewportHeight: 60,
+			pinnedToBottom: false,
+		};
+		const anchor = captureCoordinatorAnchor(before.index, harnessView);
+		await act(async () => {
+			setReasoningPreference(true);
+			await settle();
+		});
+		const opened = reasoningView();
+		expect(opened.index).not.toBe(before.index);
+		if (!opened.index) throw new Error("missing updated reasoning index");
+		expect(opened.scrollTopCorrection).toBe(restorePretextLayoutAnchor(anchor, opened.index, 60));
+		await clickReasoning(container);
+		expect(reasoningExpanded()).toBe(false);
+		await act(async () => {
+			root.render(createElement(ReasoningHarness, { id, lod: 2 }));
+			await settle();
+		});
+		expect(reasoningInteraction.reasoningRowOverrides.size).toBe(0);
+		expect(reasoningExpanded()).toBe(true);
+	});
 });
 
 describe("usePretextDocument font-generation subscription", () => {

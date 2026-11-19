@@ -403,15 +403,29 @@ function measureStreamingElement(
 		if (!expandState.textExpanded && text.length > TEXT_PREVIEW_MAX_CHARS) {
 			return measureReasoning(data as AnyData, contentWidth, lod, expandState);
 		}
+		const tail = (data as AnyData).reasoningTail;
+		const tailIdentity = tail
+			? {
+					id: tail.id,
+					start: expandState.showOriginal ? tail.originalStart : tail.start,
+					end: expandState.showOriginal ? tail.originalEnd : tail.end,
+					...(expandState.showOriginal ? {} : { translationRevision: tail.translationRevision }),
+				}
+			: undefined;
 		return measureReasoning(data as AnyData, contentWidth, lod, {
 			...expandState,
 			// Scope the cache per body: the translation toggle flips between two
 			// independently growing texts, which must not share an entry.
 			preparedBlocks: streamingCache
-				? streamingCache.get(`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`, text)
+				? streamingCache.get(
+						`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`,
+						text,
+						tailIdentity,
+					)
 				: getStreamingPreparedBlocks(
 						`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`,
 						text,
+						tailIdentity,
 					),
 		});
 	}

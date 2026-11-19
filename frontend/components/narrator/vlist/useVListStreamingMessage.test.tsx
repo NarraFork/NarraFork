@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { useSubagentOutputCounts } from "@frontend/hooks/useSubagentOutputCounts";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
@@ -9,12 +10,14 @@ import { act, useEffect, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
+import { getSubagentOutputCount } from "../subagent-output-count-store";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { measureCache } from "./measure-cache";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import { renderElement, resolveRenderExtra } from "./render-registry";
+import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
-import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
+import { isLiveStreamAnimSpec, resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
 
 let nextMountEpoch = 0;
 
@@ -67,22 +70,42 @@ async function withStream(
 		animationCount: () => number;
 		thinkingShimmerCount: () => number;
 		animationText: () => string;
+		animationDelays: () => string[];
+		animationNodes: () => Element[];
+		advanceTime: (ms: number) => void;
+		scrollTailNode: () => Element | null;
+		unitNode: (id: string) => Element | null;
+		inlineNode: (text: string) => Element | null;
 		showOnlyKeys: (keys: readonly string[] | null) => Promise<void>;
 		coordinator: PretextLayoutCoordinator;
 		switchNarrator: (id: string, subagent?: boolean) => Promise<void>;
 		live: () => TreeMessage | null;
+		promptCounts: () => string[];
+		setStreamingEnabled: (enabled: boolean) => Promise<void>;
 	}) => Promise<void>,
 	{
 		animateStreaming = false,
 		textExpanded = false,
 		keepEmptyReasoningLive = false,
+		livePatches = false,
+		lod = 5,
+		expandReasoningRows = false,
 	}: {
+		expandReasoningRows?: boolean;
+		lod?: 1 | 2 | 3 | 4 | 5;
+		livePatches?: boolean;
 		animateStreaming?: boolean;
 		textExpanded?: boolean;
 		keepEmptyReasoningLive?: boolean;
 	} = {},
 ) {
-	const build = { ...BUILD, keepEmptyReasoningLive, isTextExpanded: () => textExpanded };
+	const build = {
+		...BUILD,
+		lod,
+		keepEmptyReasoningLive,
+		isTextExpanded: () => textExpanded,
+		...(expandReasoningRows ? { expandedRows: () => [0, 1, 2, 3, 4] } : {}),
+	};
 	let mountEpoch = ++nextMountEpoch;
 	// Keep active tokens alive while measuring/rendering the large snapshot fixture.
 	const clock = animateStreaming ? spyOn(Date, "now").mockReturnValue(Date.now()) : null;
@@ -156,13 +179,21 @@ async function withStream(
 	const root = createRoot(container);
 	let narratorId = "handoff-n";
 	let isSubagent = false;
+	let streamingEnabled = true;
 	let visibleKeys: ReadonlySet<string> | null = null;
 	let latestLive: TreeMessage | null = null;
 	function Harness() {
+		useSubagentOutputCounts(narratorId);
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
 		const committed = snapshot.input?.messages ?? [];
+		useVListLivePatches(livePatches ? narratorId : undefined, {
+			enabled: livePatches,
+			isSubagent,
+			messages: committed,
+			applyLivePatch: (patch) => coordinator.applyLivePatch(patch, VIEW),
+		});
 		const streaming = useVListStreamingMessage(narratorId, {
-			enabled: true,
+			enabled: streamingEnabled,
 			isSubagent,
 			committedMessages: committed,
 		});
@@ -188,11 +219,12 @@ async function withStream(
 				{snapshot.items
 					?.filter((item) => visibleKeys == null || visibleKeys.has(item.spec.key))
 					.map((item) => (
-						<div key={item.spec.key}>
+						<div key={item.spec.key} data-test-spec-kind={item.spec.kind}>
 							{renderElement(item.spec.kind, item.measured, {
 								...resolveRenderExtra(item.spec),
+								narratorId,
 								...resolveStreamAnimExtra({
-									animateStreaming: animateStreaming && item.spec.key.startsWith("__streaming__"),
+									animateStreaming: animateStreaming && isLiveStreamAnimSpec(item.spec),
 									kind: item.spec.kind,
 									specKey: item.spec.key,
 									narratorId,
@@ -228,12 +260,41 @@ async function withStream(
 			coordinator,
 			text: () => container.textContent ?? "",
 			animationCount: () => container.querySelectorAll("span.vlist-anim-token").length,
-			thinkingShimmerCount: () => container.querySelectorAll(".nf-trace-shimmer--stream").length,
+			thinkingShimmerCount: () =>
+				Array.from(container.querySelectorAll(".nf-trace-shimmer--stream")).filter((node) => {
+					const unit = node.closest("[data-nf-unit]")?.getAttribute("data-nf-unit");
+					return unit?.startsWith("reason-") || node.closest('[data-test-spec-kind="reasoning"]');
+				}).length,
 			animationText: () =>
 				Array.from(container.querySelectorAll("span.vlist-anim-token"))
 					.map((span) => span.textContent ?? "")
 					.join(""),
+			animationDelays: () =>
+				Array.from(container.querySelectorAll<HTMLElement>("span.vlist-anim-token")).map(
+					(span) => span.style.animationDelay ?? "",
+				),
+			animationNodes: () => Array.from(container.querySelectorAll("span.vlist-anim-token")),
+			advanceTime: (ms) => clock?.mockReturnValue(Date.now() + ms),
+			scrollTailNode: () =>
+				Array.from(container.querySelectorAll<HTMLElement>("p")).find(
+					(node) => node.style.direction === "rtl",
+				) ?? null,
 			live: () => latestLive,
+			unitNode: (id) => container.querySelector(`[data-nf-unit="${id}"]`),
+			inlineNode: (text) =>
+				Array.from(container.querySelectorAll("[data-vlist-inline-block]")).find(
+					(node) => node.textContent === text,
+				) ?? null,
+			promptCounts: () =>
+				Array.from(container.querySelectorAll('[data-testid="subagent-prompt-chars"]')).map(
+					(badge) => badge.textContent ?? "",
+				),
+			setStreamingEnabled: async (enabled) => {
+				await act(async () => {
+					streamingEnabled = enabled;
+					root.render(<Harness />);
+				});
+			},
 			showOnlyKeys: async (keys) => {
 				await act(async () => {
 					visibleKeys = keys == null ? null : new Set(keys);
@@ -297,6 +358,709 @@ async function withStream(
 		}
 	}
 }
+
+describe("Agent prompt length through real WS / hook / coordinator / DOM", () => {
+	const identity = {
+		childNarratorId: "child",
+		logicalRunId: "logical-a",
+		toolUseId: "agent-wire",
+		toolCallId: "agent-call",
+		attempt: 0,
+	};
+	const input = {
+		subagent_type: "explore",
+		description: "Counted child",
+		prompt: "inspect repo",
+		background: true,
+	};
+	const persisted = (status: string) => ({
+		type: "tool_use",
+		id: identity.toolUseId,
+		name: "Agent",
+		input,
+		tcId: identity.toolCallId,
+		executionAttempt: identity.attempt,
+		status,
+		...(status === "success" ? { output: { background_task_id: "child" } } : {}),
+	});
+	it("counts over-16k raw prompt frames including CRLF and unchanged saturated previews", async () => {
+		await withStream(async (h) => {
+			const first = "x\r\n".repeat(7000);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50000,
+				streamingField: { name: "prompt", delta: first, offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21000 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50001,
+				streamingField: { name: "prompt", delta: "\r", offset: 21000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21001 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50002,
+				streamingField: { name: "prompt", delta: "\n", offset: 21001 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50003,
+				streamingField: { name: "prompt", delta: "stale", offset: 20 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 60000,
+				streamingField: { name: "description", delta: "description", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+		});
+	});
+
+	it("recovers raw prompt length from live offsets after cold snapshots without inventing a tail length", async () => {
+		await withStream(async (h) => {
+			const binding = { toolCallId: identity.toolCallId, executionAttempt: 0 };
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50000,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50010,
+				...binding,
+				streamingField: { name: "prompt", delta: "tail", offset: 25000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50010,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50000,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 30,
+						toolCallId: "next-call",
+						executionAttempt: 0,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				inputCharsTotal: 40,
+				streamingField: { name: "prompt", delta: "new", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50020,
+						...binding,
+						started: true,
+						executing: true,
+						input: { prompt: "retired snapshot" },
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({
+				id: "next-call",
+				executionAttempt: 0,
+				status: "initializing",
+			});
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				...binding,
+				input: { prompt: "retired started" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50020,
+				...binding,
+				streamingField: { name: "prompt", delta: "late", offset: 25004 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 1,
+				inputCharsTotal: 50,
+				streamingField: { name: "prompt", delta: "retry", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50030,
+						toolCallId: "next-call",
+						executionAttempt: 0,
+						started: true,
+						executing: true,
+						input: { prompt: "retired attempt snapshot" },
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				input: { prompt: "retired attempt started" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({
+				id: "next-call",
+				executionAttempt: 1,
+				status: "initializing",
+			});
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				inputCharsTotal: 60,
+				streamingField: { name: "prompt", delta: "late", offset: 3 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+		});
+	});
+
+	it("hides an unbound warm snapshot's length until a decoded offset proves it again", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40000,
+				streamingField: { name: "prompt", delta: "x".repeat(20000), offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20000 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 40000,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40010,
+				streamingField: { name: "prompt", delta: "tail", offset: 20000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20004 chars"]);
+		});
+	});
+
+	it("resets an unknown wire-only prompt when the exact stream identity becomes known", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40000,
+				streamingField: { name: "prompt", delta: "x".repeat(20000), offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20000 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 40000,
+						toolCallId: identity.toolCallId,
+						executionAttempt: 0,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				inputCharsTotal: 40010,
+				streamingField: { name: "prompt", delta: "tail", offset: 20000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20004 chars"]);
+			await h.switchNarrator("other-narrator");
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 100,
+				streamingField: { name: "prompt", delta: "unknown tail" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("counts streamed prompt growth and keeps it visible while generating description, then hides on execution", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 800,
+				streamingField: { name: "prompt", delta: "abc", startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 803,
+				streamingField: { name: "prompt", delta: "def" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 2000,
+				streamingField: { name: "description", delta: "description".repeat(50), startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			const prepared = { ...input, prompt: "abcdef" };
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				streamStartedAt: 100,
+				input: prepared,
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			await h.frame({
+				type: "tool_executing",
+				toolUseId: identity.toolUseId,
+				executionStartedAt: 200,
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 3000,
+				streamingField: { name: "prompt", delta: "late" },
+			});
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "0",
+				subagentOutputCount: { ...identity, count: 0, active: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("keeps a single preparation badge through persistence and applies tool_executing to that card", async () => {
+		await withStream(
+			async (h) => {
+				await h.frame({
+					type: "tool_started",
+					toolUseId: identity.toolUseId,
+					toolName: "Agent",
+					toolCallId: identity.toolCallId,
+					executionAttempt: 0,
+					streamStartedAt: 100,
+					input,
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual(["12 chars"]);
+				await h.commit([persisted("initializing")]);
+				await h.raf();
+				expect(h.live()).toBeNull();
+				expect(h.promptCounts()).toEqual(["12 chars"]);
+				await h.frame({
+					type: "tool_executing",
+					toolUseId: identity.toolUseId,
+					executionStartedAt: 200,
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual([]);
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [],
+					toolChunks: [
+						{
+							toolUseId: identity.toolUseId,
+							toolName: "Agent",
+							toolCallId: identity.toolCallId,
+							executionAttempt: 0,
+							inputCharsTotal: 5000,
+							started: true,
+							executing: true,
+							input: { ...input, _streamingChars: 5000 },
+							streamingOutput: "2000",
+						},
+					],
+					subagentOutputCounts: [{ ...identity, count: 2000, active: true }],
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual([]);
+				expect(h.live()).toBeNull();
+			},
+			{ livePatches: true },
+		);
+	});
+
+	it("shows known zero and permission-wait prompt length, but never fabricates a missing prompt", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				input: { ...input, prompt: "" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["0 chars"]);
+			await h.commit([{ ...persisted("pending"), input: { ...input, prompt: "" } }]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["0 chars"]);
+			await h.commit([persisted("pending")]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["12 chars"]);
+			await h.commit([{ ...persisted("pending"), input: { description: "missing prompt" } }]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("keeps output counts out of synthetic, persisted running, and background-success cards", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				input,
+			});
+			await h.frame({ type: "tool_executing", toolUseId: identity.toolUseId });
+			await h.raf();
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({ id: "agent-call", executionAttempt: 0 });
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "0",
+				subagentOutputCount: { ...identity, count: 0, active: true },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			const before = h.coordinator.getSnapshot();
+			const live = h.live();
+			const stats = [measureCache.hits, measureCache.misses];
+			for (const count of [40, 88, 88])
+				await h.frame({
+					type: "tool_output",
+					toolUseId: identity.toolUseId,
+					output: String(count),
+					subagentOutputCount: { ...identity, count, active: true },
+				});
+			await h.raf();
+			expect(h.live()).toBe(live);
+			expect(h.coordinator.getSnapshot()).toBe(before);
+			expect([measureCache.hits, measureCache.misses]).toEqual(stats);
+			expect(h.promptCounts()).toEqual([]);
+			await h.commit([persisted("running")]);
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "124",
+				subagentOutputCount: { ...identity, count: 124, active: true },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.commit([persisted("success")]);
+			await h.setStreamingEnabled(false);
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "200",
+				subagentOutputCount: { ...identity, count: 200, active: true },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "200",
+				subagentOutputCount: { ...identity, count: 200, active: false },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "999",
+				subagentOutputCount: { ...identity, count: 999, active: true },
+			});
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+	it("keeps output rollback and reconnect snapshots independent of an idle owner's Agent badge", async () => {
+		await withStream(async (h) => {
+			await h.commit([persisted("success")]);
+			await h.setStreamingEnabled(false);
+			await h.raf();
+			const before = h.coordinator.getSnapshot();
+			const stats = [measureCache.hits, measureCache.misses];
+			for (const count of [100, 0, 10]) {
+				await h.frame({
+					type: "tool_output",
+					toolUseId: identity.toolUseId,
+					output: String(count),
+					subagentOutputCount: { ...identity, count, active: true },
+				});
+				expect(h.promptCounts()).toEqual([]);
+				expect(
+					getSubagentOutputCount("handoff-n", {
+						toolUseId: identity.toolUseId,
+						toolCallId: identity.toolCallId,
+						executionAttempt: 0,
+					})?.count,
+				).toBe(count);
+			}
+			await h.raf();
+			expect(h.coordinator.getSnapshot()).toBe(before);
+			expect([measureCache.hits, measureCache.misses]).toEqual(stats);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [{ ...identity, count: 3, active: true }],
+			});
+			expect(h.promptCounts()).toEqual([]);
+			expect(
+				getSubagentOutputCount("handoff-n", {
+					toolUseId: identity.toolUseId,
+					toolCallId: identity.toolCallId,
+					executionAttempt: 0,
+				})?.count,
+			).toBe(3);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "3",
+				subagentOutputCount: { ...identity, count: 3, active: false },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "99",
+				subagentOutputCount: { ...identity, count: 99, active: true },
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [{ ...identity, count: 99, active: true }],
+			});
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("restores executing synthetic identity without an output badge from the same snapshot", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						toolCallId: identity.toolCallId,
+						executionAttempt: 0,
+						inputCharsTotal: 0,
+						started: true,
+						executing: true,
+						input,
+					},
+				],
+				subagentOutputCounts: [{ ...identity, count: 73, active: true }],
+			});
+			await h.raf();
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({ id: "agent-call", executionAttempt: 0 });
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+	it("never shows reply counts after a background launch, including idle reconnects", async () => {
+		await withStream(async (h) => {
+			await h.commit([persisted("success")]);
+			await h.setStreamingEnabled(false);
+			await h.raf();
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [{ ...identity, count: 0, active: true }],
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({ type: "streaming_snapshot", streamingBlocks: [], toolChunks: [] });
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [{ ...identity, count: 80, active: true }],
+			});
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [],
+			});
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+	it("does not turn count metadata into a synthetic card and preserves ordinary numeric Bash stdout", async () => {
+		await withStream(async (h) => {
+			const before = h.coordinator.getSnapshot();
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "123",
+				subagentOutputCount: { ...identity, count: 123, active: true },
+			});
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(h.coordinator.getSnapshot()).toBe(before);
+			await h.frame({
+				type: "tool_started",
+				toolUseId: "bash",
+				toolName: "Bash",
+				input: { command: "printf 123" },
+			});
+			await h.frame({ type: "tool_executing", toolUseId: "bash" });
+			await h.raf();
+			const previous = h.live();
+			await h.frame({ type: "tool_output", toolUseId: "bash", output: "123" });
+			await h.raf();
+			expect(h.live()).not.toBe(previous);
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({ _streamingOutput: "123" });
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+});
 
 describe("snapshot animation through real WS / hook / coordinator / DOM", () => {
 	for (const type of ["text", "reasoning"] as const) {
@@ -1010,6 +1774,695 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			await h.raf();
 			expect(h.live()).toBeNull();
 		});
+	});
+});
+
+describe("full reasoning translations retain visual activity", () => {
+	for (const lod of [1, 2, 3, 4, 5] as const) {
+		for (const structured of [false, true]) {
+			for (const translatedText of [
+				"短译",
+				"**译文甲**\n\n一段完整译文\n\n**译文乙**\n\n第二段译文\n\n最后译文",
+			]) {
+				it(`L${lod} ${structured ? "structured" : "plain"} keeps a fully translated waiting item: ${translatedText.length}`, async () => {
+					await withStream(
+						async (h) => {
+							if (structured)
+								await h.frame({ type: "streaming_identity", model: "gpt-5", provider: "openai" });
+							const original = structured
+								? "**Original first**\n\nfirst body\n\n**Original tail**\n\nlast body"
+								: "Original first paragraph\n\nlast body";
+							const block = content("reasoning", "r", original, 1, 0);
+							const activity = {
+								elementId: "r",
+								revision: 1,
+								displayTailStart: 0,
+								completedRanges: [] as { start: number; end: number }[],
+							};
+							await h.delta(block);
+							await h.raf();
+							await h.frame({
+								type: "message_updated",
+								message: { ...message([block]), ...(structured ? { model: "gpt-5" } : {}) },
+								reasoningTranslationActivity: activity,
+							});
+							await h.raf();
+							await h.delta(content("reasoning", "r", " live", 2, original.length));
+							await h.raf();
+							const raw = `${original} live`;
+							const complete = {
+								...activity,
+								revision: 2,
+								completedRanges: [{ start: 0, end: raw.length }],
+							};
+							const persisted = { ...content("reasoning", "r", raw, 2), completed: true };
+							await h.frame({
+								type: "message",
+								message: { ...message([persisted]), ...(structured ? { model: "gpt-5" } : {}) },
+								reasoningTranslationActivity: complete,
+							});
+							await h.raf();
+							const current = () =>
+								h.coordinator
+									.getSnapshot()
+									.items?.find((item) =>
+										["reasoning", "reasoning-steps", "activity-trace"].includes(item.spec.kind),
+									);
+							const key = current()?.spec.key;
+							const unit = h.unitNode("reason-live-r");
+							const scrollTail = h.scrollTailNode();
+							const paragraph = h.inlineNode("last body live");
+							if (lod <= 2 || structured) expect(unit).not.toBeNull();
+							if (lod <= 2) expect(scrollTail).not.toBeNull();
+							else expect(paragraph).not.toBeNull();
+							const epoch = h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch;
+							const anim = () => {
+								const spec = current()?.spec;
+								return spec
+									? resolveStreamAnimExtra({
+											animateStreaming: isLiveStreamAnimSpec(spec),
+											kind: spec.kind,
+											specKey: spec.key,
+											narratorId: "handoff-n",
+											mountEpoch: 9,
+											snapshotEpoch:
+												h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch,
+										})
+									: null;
+							};
+							const beforeAnim = anim();
+							// Translation delivery follows the scheduler's elapsed fixed window.
+							h.advanceTime(10_000);
+							const translated = {
+								...persisted,
+								translationGeneration: "g",
+								translationParts: [
+									{
+										id: "full",
+										generation: "g",
+										start: 0,
+										end: raw.length,
+										sourceText: raw,
+										translatedText,
+									},
+								],
+							};
+							await h.frame({
+								type: "message_updated",
+								message: { ...message([translated]), ...(structured ? { model: "gpt-5" } : {}) },
+								reasoningTranslationActivity: complete,
+							});
+							await h.raf();
+							expect(current()?.spec.key).toBe(key);
+							expect(current()?.spec.liveContentProjection).toBe(true);
+							expect(h.live()?.reasoningTranslationActivity).toEqual(complete);
+							expect(h.text()).toContain(translatedText === "短译" ? "短译" : "最后译文");
+							expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+							expect(h.animationCount()).toBe(0);
+							expect(anim()).toEqual(beforeAnim);
+							expect(h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch).toBe(
+								epoch,
+							);
+							if (unit) expect(h.unitNode("reason-live-r")).toBe(unit);
+							if (scrollTail) expect(h.scrollTailNode()).toBe(scrollTail);
+							if (paragraph)
+								expect(h.inlineNode(translatedText === "短译" ? "短译" : "最后译文")).toBe(
+									paragraph,
+								);
+							for (let wait = 0; wait < 3; wait++) {
+								h.advanceTime(10_000);
+								await h.frame({
+									type: "streaming_snapshot",
+									streamingBlocks: [],
+									toolChunks: [],
+									reasoningTranslationActivity: complete,
+								});
+								await h.raf();
+								expect(current()?.spec.key).toBe(key);
+								expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+								expect(h.animationCount()).toBe(0);
+								if (unit) expect(h.unitNode("reason-live-r")).toBe(unit);
+								if (scrollTail) expect(h.scrollTailNode()).toBe(scrollTail);
+							}
+							await h.frame({ type: "status_change", status: "idle" });
+							await h.raf();
+							expect(h.live()).toBeNull();
+							expect(h.thinkingShimmerCount()).toBe(0);
+						},
+						{ lod, animateStreaming: true, textExpanded: true, expandReasoningRows: structured },
+					);
+				});
+			}
+		}
+	}
+
+	for (const lod of [2, 5] as const) {
+		for (const successor of [
+			"text",
+			"tool",
+			"reasoning",
+			"reopen",
+			"idle",
+			"error",
+			"cancel",
+		] as const) {
+			it(`L${lod} hands a fully translated waiting item to ${successor}`, async () => {
+				await withStream(
+					async (h) => {
+						const raw = "original waiting thought";
+						const activity = {
+							elementId: "r",
+							revision: 2,
+							displayTailStart: 0,
+							completedRanges: [{ start: 0, end: raw.length }],
+						};
+						const translated = {
+							...content("reasoning", "r", raw, 2, 0),
+							rawTextLength: raw.length,
+							completed: true,
+							translationGeneration: "g",
+							translationParts: [
+								{
+									id: "full",
+									generation: "g",
+									start: 0,
+									end: raw.length,
+									sourceText: raw,
+									translatedText: "完整译文",
+								},
+							],
+						};
+						// Already-persisted handoff followed by an empty reconnect snapshot.
+						await h.commit([translated], true);
+						await h.frame({
+							type: "streaming_snapshot",
+							streamingBlocks: [],
+							toolChunks: [],
+							reasoningTranslationActivity: activity,
+						});
+						await h.raf();
+						expect(h.live()?.reasoningTranslationActivity).toEqual(activity);
+						expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+						expect(h.animationCount()).toBe(0);
+						if (successor === "tool")
+							await h.frame({
+								type: "tool_use_chunk",
+								toolUseId: "next-tool",
+								toolName: "Read",
+								inputCharsTotal: 1,
+							});
+						else if (successor === "error")
+							await h.frame({ type: "narrator_error", error: "fixture failure" });
+						else if (successor === "idle") await h.frame({ type: "status_change", status: "idle" });
+						else if (successor === "cancel") await h.frame({ type: "streaming_reset" });
+						else
+							await h.delta(
+								content(
+									successor === "text" ? "text" : "reasoning",
+									successor === "reopen" ? "r" : "next",
+									successor === "reopen" ? " appended" : "next content",
+									successor === "reopen" ? 3 : 1,
+									successor === "reopen" ? raw.length : 0,
+								),
+							);
+						await h.raf();
+						if (successor === "reopen") {
+							expect(h.live()?.reasoningTranslationActivity).toMatchObject({
+								elementId: "r",
+								revision: 3,
+								displayTailStart: 0,
+							});
+							expect(h.text()).toContain("完整译文");
+							expect(h.text()).toContain("appended");
+							expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+						} else if (successor === "reasoning") {
+							expect(h.live()?.reasoningTranslationActivity?.elementId).toBe("next");
+							expect(h.unitNode("reason-live-r")).toBeNull();
+						} else {
+							expect(h.live()?.reasoningTranslationActivity).toBeUndefined();
+							expect(h.unitNode("reason-live-r")).toBeNull();
+							expect(h.thinkingShimmerCount()).toBe(0);
+						}
+					},
+					{ lod, animateStreaming: true, textExpanded: true },
+				);
+			});
+		}
+	}
+
+	for (const structured of [false, true]) {
+		it(`${structured ? "structured" : "plain"} carries unfinished births through full replacement without replay`, async () => {
+			await withStream(
+				async (h) => {
+					if (structured)
+						await h.frame({ type: "streaming_identity", model: "gpt-5", provider: "openai" });
+					const original = structured
+						? "**First**\n\nfirst body\n\n**Tail**\n\nlast body"
+						: "first body\n\nlast body";
+					const activity = {
+						elementId: "r",
+						revision: 1,
+						displayTailStart: 0,
+						completedRanges: [] as { start: number; end: number }[],
+					};
+					await h.delta(content("reasoning", "r", original, 1, 0));
+					await h.raf();
+					await h.frame({
+						type: "message_updated",
+						message: {
+							...message([content("reasoning", "r", original, 1)]),
+							...(structured ? { model: "gpt-5" } : {}),
+						},
+						reasoningTranslationActivity: activity,
+					});
+					await h.raf();
+					await h.delta(content("reasoning", "r", " live", 2, original.length));
+					await h.raf();
+					expect(h.animationText()).toContain("live");
+					const unit = h.unitNode("reason-live-r");
+					const paragraph = h.inlineNode("last body live");
+					h.advanceTime(80);
+					const raw = `${original} live`;
+					const translatedText = "**译一**\n\n新增段落一\n\n**译二**\n\n新增段落二\n\n尾";
+					const complete = {
+						...activity,
+						revision: 2,
+						completedRanges: [{ start: 0, end: raw.length }],
+					};
+					const translated = {
+						...content("reasoning", "r", raw, 2),
+						completed: true,
+						translationGeneration: "g",
+						translationParts: [
+							{
+								id: "full",
+								generation: "g",
+								start: 0,
+								end: raw.length,
+								sourceText: raw,
+								translatedText,
+							},
+						],
+					};
+					await h.frame({
+						type: "message_updated",
+						message: { ...message([translated]), ...(structured ? { model: "gpt-5" } : {}) },
+						reasoningTranslationActivity: complete,
+					});
+					await h.raf();
+					expect(h.inlineNode("尾")).toBe(paragraph);
+					if (unit) expect(h.unitNode("reason-live-r")).toBe(unit);
+					expect(h.animationText()).toBe("尾");
+					expect(
+						h
+							.animationDelays()
+							.every((delay) => /^-\d+ms$/.test(delay) && Number.parseInt(delay, 10) < 0),
+					).toBe(true);
+					expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+					const fadingNodes = h.animationNodes();
+					const birthDelays = h.animationDelays();
+					h.advanceTime(1_000);
+					await h.frame({
+						type: "streaming_snapshot",
+						streamingBlocks: [],
+						toolChunks: [],
+						reasoningTranslationActivity: complete,
+					});
+					await h.raf();
+					// A cached structured body may retain the already-finished CSS span.
+					// That is not replay: no node or animation-delay may be born again.
+					expect(h.animationNodes().every((node) => fadingNodes.includes(node))).toBe(true);
+					if (h.animationNodes().length) expect(h.animationDelays()).toEqual(birthDelays);
+					expect(h.inlineNode("尾")).toBe(paragraph);
+					// Repaint the same content at a new width, without any source delta.
+					// Expired births then seal instead of replaying on the reflowed lines.
+					await act(async () => {
+						h.coordinator.rebuild({
+							...BUILD,
+							contentWidth: 799,
+							isTextExpanded: () => true,
+							expandedRows: () => [0, 1, 2, 3, 4],
+						});
+					});
+					expect(h.animationCount()).toBe(0);
+					expect(h.inlineNode("尾")).toBe(paragraph);
+					expect(h.thinkingShimmerCount()).toBeGreaterThan(0);
+				},
+				{ animateStreaming: true, textExpanded: true, expandReasoningRows: structured },
+			);
+		});
+	}
+});
+
+describe("reasoning activity authority through WS / checkpoint / DOM", () => {
+	it.each([
+		"reasoning",
+		"text",
+	] as const)("a reconnect snapshot with a new reasoning body hands off the earlier %s lane without another delta", async (earlierType) => {
+		await withStream(async (h) => {
+			await h.delta(content(earlierType, "earlier", "earlier content", 1, 0));
+			await h.raf();
+			const activity = {
+				elementId: "new-current",
+				revision: 2,
+				displayTailStart: 0,
+				completedRanges: [],
+			};
+			await h.frame({
+				type: "streaming_snapshot",
+				toolChunks: [],
+				streamingBlocks: [
+					{ ...content("reasoning", "new-current", "new current thought", 2, 0), outputIndex: 2 },
+				],
+				reasoningTranslationActivity: activity,
+			});
+			await h.raf();
+			expect(h.live()?.reasoningTranslationActivity).toEqual(activity);
+			expect(messageBody(h.live())[h.live()?.liveBlockIndex ?? -1]?.id).toBe("new-current");
+			expect(h.text()).toContain("new current thought");
+			expect(h.thinkingShimmerCount()).toBe(1);
+			const key = h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning")
+				?.spec.key;
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: activity,
+			});
+			await h.raf();
+			expect(h.live()?.reasoningTranslationActivity).toEqual(activity);
+			expect(
+				h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning")?.spec.key,
+			).toBe(key);
+			expect(h.thinkingShimmerCount()).toBe(1);
+		});
+	});
+
+	it.each([
+		"reasoning",
+		"text",
+		"tool",
+	] as const)("a late empty snapshot cannot reclaim an earlier item after real %s content", async (successor) => {
+		await withStream(async (h) => {
+			await h.delta(content("reasoning", "earlier", "earlier thought", 1, 0));
+			await h.raf();
+			if (successor === "tool")
+				await h.frame({
+					type: "tool_use_chunk",
+					toolUseId: "later-tool",
+					toolName: "Read",
+					inputCharsTotal: 1,
+				});
+			else await h.delta(content(successor, "later", "later content", 1, 0));
+			await h.raf();
+			const lane = h.live()?.liveBlockIndex;
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: {
+					elementId: "earlier",
+					revision: 1,
+					displayTailStart: 0,
+					completedRanges: [{ start: 0, end: 15 }],
+				},
+			});
+			await h.raf();
+			expect(h.live()?.liveBlockIndex).toBe(lane);
+			if (successor === "reasoning")
+				expect(h.live()?.reasoningTranslationActivity?.elementId).toBe("later");
+			else {
+				expect(h.live()?.reasoningTranslationActivity).toBeUndefined();
+				expect(h.thinkingShimmerCount()).toBe(0);
+			}
+		});
+	});
+
+	it("keeps a caught-up real row live through empty snapshots and late source patches", async () => {
+		await withStream(async (h) => {
+			const block = content("reasoning", "r", "sealed tail", 3, 0);
+			const activity = { elementId: "r", revision: 3, completedRanges: [{ start: 0, end: 6 }] };
+			await h.delta(block);
+			await h.raf();
+			await h.frame({
+				type: "message_updated",
+				message: message([block]),
+				reasoningTranslationActivity: activity,
+			});
+			await h.raf();
+			expect(messageBody(h.live())).toEqual([]);
+			const activeSpec = () =>
+				h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning")?.spec;
+			expect(activeSpec()?.liveContentProjection).toBe(true);
+			expect(activeSpec()?.data).toMatchObject({ text: "sealed tail", isStreaming: true });
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: activity,
+			});
+			await h.raf();
+			const key = activeSpec()?.key;
+			const translated = {
+				...block,
+				translationGeneration: "g",
+				translationParts: [
+					{
+						id: "p",
+						generation: "g",
+						start: 0,
+						end: 6,
+						sourceText: "sealed",
+						translatedText: "封存",
+					},
+					{
+						id: "late",
+						generation: "g",
+						start: 7,
+						end: 11,
+						sourceText: "tail",
+						translatedText: "错误尾部",
+					},
+				],
+			};
+			await h.frame({ type: "message_updated", message: message([translated]) });
+			await h.raf();
+			expect(activeSpec()?.key).toBe(key);
+			expect(activeSpec()?.data).toMatchObject({ translatedText: "封存 tail", isStreaming: true });
+			expect(h.text()).toContain("封存 tail");
+			expect(h.text()).not.toContain("错误尾部");
+			await h.delta(content("reasoning", "r", " plus", 4, 11));
+			await h.raf();
+			await h.frame({
+				type: "message",
+				message: message([block]),
+				reasoningTranslationActivity: null,
+			});
+			await h.raf();
+			expect(h.live()?.reasoningTranslationActivity?.revision).toBe(4);
+			expect(activeSpec()?.data).toMatchObject({ isStreaming: true });
+		});
+	});
+
+	it("reconnect restores activity from an empty body without replacing unrelated live blocks", async () => {
+		await withStream(async (h) => {
+			const block = content("reasoning", "r", "checkpoint tail", 3, 0);
+			await h.commit([block]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: { elementId: "r", revision: 3, completedRanges: [] },
+			});
+			await h.raf();
+			expect(h.live()?.reasoningTranslationActivity?.elementId).toBe("r");
+			expect(
+				h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning")?.spec
+					.data,
+			).toMatchObject({ isStreaming: true });
+			await h.delta(content("text", "answer", "unpersisted answer", 1, 0));
+			await h.raf();
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: null,
+			});
+			await h.raf();
+			expect(h.text()).toContain("unpersisted answer");
+		});
+	});
+
+	it("preserves the plain active tail DOM and animation births when a prefix translation adds a paragraph", async () => {
+		await withStream(
+			async (h) => {
+				const prefix = "A-original";
+				const original = `${prefix}\n\nB-original`;
+				const activity = {
+					elementId: "r",
+					revision: 1,
+					completedRanges: [{ start: 0, end: prefix.length }],
+				};
+				await h.delta(content("reasoning", "r", original, 1, 0));
+				await h.raf();
+				await h.frame({
+					type: "message_updated",
+					message: message([content("reasoning", "r", original, 1)]),
+					reasoningTranslationActivity: activity,
+				});
+				await h.raf();
+				await h.delta(content("reasoning", "r", " live", 2, original.length));
+				await h.raf();
+				const tail = h.inlineNode("B-original live");
+				const birth = tail?.querySelector("span.vlist-anim-token");
+				expect(tail).not.toBeNull();
+				expect(birth).not.toBeNull();
+				const translated = {
+					...content("reasoning", "r", `${original} live`, 2),
+					translationGeneration: "g",
+					translationParts: [
+						{
+							id: "a",
+							generation: "g",
+							start: 0,
+							end: prefix.length,
+							sourceText: prefix,
+							translatedText: "甲一\n\n甲二",
+						},
+					],
+				};
+				await h.frame({
+					type: "message_updated",
+					message: message([translated]),
+					reasoningTranslationActivity: { ...activity, revision: 2 },
+				});
+				await h.raf();
+				expect(h.text()).toContain("甲一");
+				expect(h.text()).toContain("甲二");
+				expect(h.inlineNode("B-original live") === tail).toBe(true);
+				expect(
+					h.inlineNode("B-original live")?.querySelector("span.vlist-anim-token") === birth,
+				).toBe(true);
+				expect(h.animationText()).toContain("live");
+			},
+			{ animateStreaming: true, textExpanded: true },
+		);
+	});
+
+	it("preserves authoritative pending activity on completed persisted elements until response completion", async () => {
+		await withStream(async (h) => {
+			const block = {
+				...content("reasoning", "r", "A\n\nB", 2, 0),
+				completed: true,
+				translationGeneration: "g",
+				translationParts: [
+					{ id: "a", generation: "g", start: 0, end: 1, sourceText: "A", translatedText: "甲" },
+					{ id: "b", generation: "g", start: 3, end: 4, sourceText: "B", translatedText: "乙" },
+				],
+			};
+			const activity = { elementId: "r", revision: 2, completedRanges: [{ start: 0, end: 1 }] };
+			await h.delta(content("reasoning", "r", block.text, 2, 0));
+			await h.raf();
+			const activeSpec = () =>
+				h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning")?.spec;
+			for (const type of ["message_updated", "message"]) {
+				await h.frame({ type, message: message([block]), reasoningTranslationActivity: activity });
+				await h.raf();
+				expect(h.live()?.reasoningTranslationActivity).toEqual(activity);
+				expect(activeSpec()?.data).toMatchObject({ translatedText: "甲\n\nB", isStreaming: true });
+				expect(activeSpec()?.liveContentProjection).toBe(true);
+				expect(h.inlineNode("B")).not.toBeNull();
+				expect(h.inlineNode("乙")).toBeNull();
+			}
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: activity,
+			});
+			await h.raf();
+			expect(activeSpec()?.data).toMatchObject({ isStreaming: true });
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [],
+				reasoningTranslationActivity: null,
+			});
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(activeSpec()?.data).toMatchObject({ translatedText: "甲\n\n乙", isStreaming: false });
+		});
+	});
+
+	it("animates new original tokens on an active real checkpoint row", async () => {
+		await withStream(
+			async (h) => {
+				const block = content("reasoning", "r", "original", 1, 0);
+				await h.delta(block);
+				await h.raf();
+				await h.frame({
+					type: "message_updated",
+					message: message([block]),
+					reasoningTranslationActivity: { elementId: "r", revision: 1, completedRanges: [] },
+				});
+				await h.raf();
+				await h.delta(content("reasoning", "r", " new-token", 2, 8));
+				await h.raf();
+				expect(h.animationText()).toContain("new-token");
+				const spec = h.coordinator
+					.getSnapshot()
+					.items?.find((item) => item.spec.kind === "reasoning")?.spec;
+				expect(spec && isLiveStreamAnimSpec(spec)).toBe(true);
+			},
+			{ animateStreaming: true, textExpanded: true },
+		);
+	});
+
+	it("completed prefix translation preserves the active structured tail DOM node and shimmer", async () => {
+		await withStream(
+			async (h) => {
+				await h.frame({ type: "streaming_identity", model: "gpt-5", provider: "openai" });
+				const a = content("reasoning", "a", "**First**\n\nbody", 1, 0);
+				const c = content("reasoning", "c", "**Tail**\n\nlive", 1, 0);
+				await h.delta(a);
+				await h.delta(c);
+				await h.raf();
+				const activity = { elementId: "c", revision: 1, completedRanges: [] };
+				await h.frame({
+					type: "message_updated",
+					message: { ...message([a, c]), model: "gpt-5" },
+					reasoningTranslationActivity: activity,
+				});
+				await h.raf();
+				const tail = h.unitNode("reason-live-c");
+				expect(tail).not.toBeNull();
+				const key = h.coordinator
+					.getSnapshot()
+					.items?.find((item) => item.spec.kind === "reasoning-steps")?.spec.key;
+				await h.frame({
+					type: "message_updated",
+					message: {
+						...message([{ ...a, translatedText: "**译一**\n\none\n\n**译二**\n\ntwo" }, c]),
+						model: "gpt-5",
+					},
+				});
+				await h.raf();
+				expect(h.unitNode("reason-live-c")).toBe(tail);
+				expect(h.thinkingShimmerCount()).toBe(1);
+				expect(
+					h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning-steps")
+						?.spec.key,
+				).toBe(key);
+				expect(h.text()).toContain("译一");
+				expect(
+					h.coordinator.getSnapshot().items?.find((item) => item.spec.kind === "reasoning-steps")
+						?.spec.data,
+				).toMatchObject({
+					steps: expect.arrayContaining([expect.objectContaining({ body: "live", shimmer: true })]),
+				});
+			},
+			{ animateStreaming: true, textExpanded: true },
+		);
 	});
 });
 

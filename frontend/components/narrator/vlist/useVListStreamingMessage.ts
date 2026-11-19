@@ -24,6 +24,10 @@
 import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
+import {
+	type ReasoningTranslationActivity,
+	readReasoningTranslationActivity,
+} from "@shared/reasoning-translation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { documentWriteInput, receiveWriteDocument } from "../content/document-source";
@@ -60,6 +64,7 @@ import {
 	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
 	isRetiredStreamingDocument,
+	isRetiredStreamingToolBinding,
 	isTextDocumentPersisted,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
@@ -119,8 +124,13 @@ export function useVListStreamingMessage(
 		>
 	>(new Map());
 	const rafRef = useRef(0);
-	/** The current lane by reference: native-block insertion may shift array indices. */
-	const liveBlockRef = useRef<StreamingBlock | null>(null);
+	/** A checkpoint may retire the body object without closing its active lane. */
+	const liveLaneRef = useRef<{
+		id: string;
+		revision: number;
+		type: "text" | "reasoning";
+	} | null>(null);
+	const reasoningActivityRef = useRef<ReasoningTranslationActivity | null>(null);
 	const snapshotEpochRef = useRef<number | undefined>(undefined);
 	// Membership, not a second copy of the snapshot body. Weak references also
 	// release checkpointed lanes that are no longer in the raw accumulator.
@@ -134,6 +144,50 @@ export function useVListStreamingMessage(
 			setVersion((value) => value + 1);
 		});
 	}, []);
+
+	const applyReasoningActivity = useCallback(
+		(
+			next: ReasoningTranslationActivity | null | undefined,
+			message?: NarratorMsg,
+			restore = false,
+		) => {
+			if (next === undefined) return;
+			const current = reasoningActivityRef.current;
+			const lane = liveLaneRef.current;
+			// A late subscription baseline cannot take ownership back from content
+			// actually received on this connection. No tombstone is required.
+			if (
+				restore &&
+				next &&
+				((lane && (lane.type !== "reasoning" || lane.id !== next.elementId)) ||
+					(!lane && toolStoreRef.current.size > 0))
+			)
+				return;
+			if (
+				next &&
+				((current?.elementId === next.elementId && current.revision > next.revision) ||
+					(current?.elementId !== next.elementId &&
+						(finalizedRef.current.get(next.elementId) ?? -1) >= next.revision &&
+						!(restore && !liveLaneRef.current && toolStoreRef.current.size === 0)))
+			)
+				return;
+			if (!next && current && message) {
+				const completed = messageBody(message).find((block) => block.id === current.elementId);
+				const identity = completed && contentBlockIdentity(completed);
+				if (!identity || identity.revision < current.revision) return;
+			}
+			reasoningActivityRef.current = next;
+			if (next)
+				liveLaneRef.current = {
+					id: next.elementId,
+					revision: next.revision,
+					type: "reasoning",
+				};
+			else if (liveLaneRef.current?.type === "reasoning") liveLaneRef.current = null;
+			flush();
+		},
+		[flush],
+	);
 
 	// Pins belong to this streaming surface, not to a mounted body row: a Write
 	// can be collapsed/offscreen while its only source is still arriving.
@@ -178,14 +232,18 @@ export function useVListStreamingMessage(
 				cancelAnimationFrame(rafRef.current);
 				rafRef.current = 0;
 			}
+			const hadContent =
+				blocksRef.current.length > 0 ||
+				toolStoreRef.current.size > 0 ||
+				reasoningActivityRef.current !== null;
 			clearOutputTimers();
 			releaseDocuments(discardDocuments);
 			finalizedRef.current.clear();
 			identityRef.current = {};
-			liveBlockRef.current = null;
+			liveLaneRef.current = null;
+			reasoningActivityRef.current = null;
 			snapshotEpochRef.current = undefined;
 			snapshotBlocksRef.current = new WeakSet();
-			const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
 			if (hadContent) {
 				blocksRef.current = [];
 				toolStoreRef.current = createStreamingToolStore();
@@ -314,7 +372,28 @@ export function useVListStreamingMessage(
 		{
 			onMessage: (data) => {
 				const message = data.message as NarratorMsg | undefined;
-				if (message?.role !== "assistant" || (!isSubagent && message.parentToolUseId)) return;
+				if (
+					message?.role !== "assistant" ||
+					message.narratorId !== narratorId ||
+					(!isSubagent && message.parentToolUseId)
+				)
+					return;
+				if (data.reasoningTranslationActivity !== undefined)
+					applyReasoningActivity(
+						readReasoningTranslationActivity(data.reasoningTranslationActivity),
+						message,
+					);
+				else {
+					// Legacy final messages can settle a legacy lane. Once the server
+					// supplied independent display ownership, omission cannot revoke it.
+					const active = reasoningActivityRef.current;
+					if (
+						active &&
+						active.displayTailStart === undefined &&
+						messageBody(message).some((block) => block.id === active.elementId)
+					)
+						applyReasoningActivity(null, message);
+				}
 				for (const block of messageBody(message)) {
 					const identity = contentBlockIdentity(block);
 					if (identity)
@@ -331,8 +410,18 @@ export function useVListStreamingMessage(
 				}
 				flush();
 			},
+			onMessageUpdated: (message, _replacement, activity) => {
+				if (message.narratorId !== narratorId || (!isSubagent && message.parentToolUseId)) return;
+				applyReasoningActivity(activity, message);
+			},
 			onStreamEvent: (wsData: { event?: Record<string, unknown>; [key: string]: unknown }) => {
-				const delta = (wsData.event as StreamDeltaEvent | undefined)?.delta;
+				const event = wsData.event as StreamDeltaEvent | undefined;
+				if (
+					(!isSubagent && (wsData.parentToolUseId || event?.subagentToolUseId)) ||
+					(wsData.subagentNarratorId && wsData.subagentNarratorId !== narratorId)
+				)
+					return;
+				const delta = event?.delta;
 				if (
 					typeof delta?.id === "string" &&
 					typeof delta.revision === "number" &&
@@ -345,14 +434,31 @@ export function useVListStreamingMessage(
 					isSubagent,
 				);
 				if (result.applied) {
-					// The lane this delta landed in is now the live one. A reasoning delta
-					// arriving after a tool call legitimately REOPENS the text lane, which is
-					// why this is set on every delta rather than only advanced forward.
-					// Capture the block ITSELF while the index is still fresh. See
-					// liveBlockRef's declaration for why the index cannot be resolved later.
-					liveBlockRef.current = blocksRef.current[result.blockIndex] ?? null;
+					const block = blocksRef.current[result.blockIndex];
+					if (block?.type === "reasoning" || block?.type === "text") {
+						liveLaneRef.current = { id: block.id, revision: block.revision, type: block.type };
+						const previous = reasoningActivityRef.current;
+						reasoningActivityRef.current =
+							block.type === "reasoning"
+								? {
+										elementId: block.id,
+										revision: block.revision,
+										completedRanges:
+											previous?.elementId === block.id ? previous.completedRanges : [],
+										...(previous?.elementId === block.id && previous.displayTailStart !== undefined
+											? { displayTailStart: previous.displayTailStart }
+											: {}),
+									}
+								: null;
+					}
 					flush();
 				}
+				// A rejected replay delta cannot clear/reopen the newer accepted lane.
+				if (!result.applied && typeof delta?.text === "string" && delta.text) return;
+				if (wsData.reasoningTranslationActivity !== undefined)
+					applyReasoningActivity(
+						readReasoningTranslationActivity(wsData.reasoningTranslationActivity),
+					);
 			},
 			onStreamingIdentity: (identity) => {
 				if (!isSubagent && identity.parentToolUseId) return;
@@ -365,6 +471,11 @@ export function useVListStreamingMessage(
 				}
 			},
 			onStreamingSnapshot: (snapshot) => {
+				if (
+					(!isSubagent && snapshot.parentToolUseId) ||
+					(snapshot.subagentNarratorId && snapshot.subagentNarratorId !== narratorId)
+				)
+					return;
 				// Old-server snapshots omit identity; never erase a newer live identity.
 				const identity = {
 					model: snapshot.model ?? identityRef.current.model,
@@ -380,6 +491,9 @@ export function useVListStreamingMessage(
 				let toolsChanged = false;
 				for (const chunk of snapshot.toolChunks) {
 					if (!isSubagent && chunk.parentToolUseId) continue;
+					// Retired bindings must not reach the snapshot's later started/executing
+					// folds either; rejecting only its raw input chunk would be too late.
+					if (isRetiredStreamingToolBinding(toolStoreRef.current, chunk)) continue;
 					if (
 						chunk.inputDocument
 							? isTextDocumentPersisted(chunk.inputDocument.ref, persistedDocumentPins)
@@ -408,8 +522,12 @@ export function useVListStreamingMessage(
 					// A name-only tool may receive no more deltas for a long time.
 					// Restore it from the subscription snapshot, not the next live event.
 					toolsChanged =
-						applyStreamingToolChunk(toolStoreRef.current, { ...chunk, inputDocument }) ||
-						toolsChanged;
+						applyStreamingToolChunk(toolStoreRef.current, {
+							...chunk,
+							inputDocument,
+							fromSnapshot: true,
+						}) || toolsChanged;
+					if (isRetiredStreamingToolBinding(toolStoreRef.current, chunk)) continue;
 					if (chunk.started) {
 						toolsChanged =
 							applyStreamingToolStarted(toolStoreRef.current, {
@@ -465,14 +583,53 @@ export function useVListStreamingMessage(
 						),
 					);
 				}
-				if (applied.changed) {
-					liveBlockRef.current = blocksRef.current.at(-1) ?? null;
+				const snapshotActivity = snapshot.reasoningTranslationActivity;
+				const snapshotTail = blocksRef.current.at(-1);
+				if (
+					applied.changed &&
+					snapshotActivity &&
+					snapshotTail?.type === "reasoning" &&
+					snapshotTail.id === snapshotActivity.elementId &&
+					snapshotTail.revision <= snapshotActivity.revision &&
+					snapshot.streamingBlocks.some((block) => {
+						const identity = contentBlockIdentity(block);
+						return (
+							block.type === "reasoning" &&
+							identity?.id === snapshotTail.id &&
+							identity.revision === snapshotTail.revision
+						);
+					})
+				) {
+					// Unlike an empty baseline, accepted new current content is a real
+					// handoff during disconnection, even when no later delta arrives.
+					liveLaneRef.current = {
+						id: snapshotTail.id,
+						revision: snapshotTail.revision,
+						type: "reasoning",
+					};
+				}
+				if (applied.changed && snapshot.reasoningTranslationActivity === undefined) {
+					const block = blocksRef.current.at(-1);
+					if (block?.type === "text" || block?.type === "reasoning") {
+						liveLaneRef.current = { id: block.id, revision: block.revision, type: block.type };
+						reasoningActivityRef.current =
+							block.type === "reasoning"
+								? { elementId: block.id, revision: block.revision, completedRanges: [] }
+								: null;
+					}
 					flush();
 				}
 				if (toolsChanged) {
-					liveBlockRef.current = null;
+					if (snapshot.reasoningTranslationActivity === undefined) {
+						liveLaneRef.current = null;
+						reasoningActivityRef.current = null;
+					}
 					flush();
 				}
+				if (applied.changed) flush();
+				// A subscription can restore a persisted current item with no raw body.
+				// Final-message tombstones retire text, not this visual ownership.
+				applyReasoningActivity(snapshot.reasoningTranslationActivity, undefined, true);
 			},
 			onStreamingReset: (parentToolUseId) => {
 				// The owning page receives the reset without a parentToolUseId; the
@@ -576,7 +733,7 @@ export function useVListStreamingMessage(
 				extractedFields,
 				metadata,
 				streamingField,
-				_meta,
+				meta,
 				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
@@ -597,11 +754,16 @@ export function useVListStreamingMessage(
 				// The model is writing tool arguments, so no text lane is open: whatever
 				// reasoning or text preceded this is finished and must settle now instead of
 				// waiting for the turn to persist.
-				liveBlockRef.current = null;
+				liveLaneRef.current = null;
+				reasoningActivityRef.current = null;
 				if (
 					applyStreamingToolChunk(toolStoreRef.current, {
 						toolUseId,
 						toolName,
+						...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}),
+						...(meta?.executionAttempt !== undefined
+							? { executionAttempt: meta.executionAttempt }
+							: {}),
 						inputCharsTotal,
 						...(extractedFilePath !== undefined ? { extractedFilePath } : {}),
 						...(contentCharsReceived !== undefined ? { contentCharsReceived } : {}),
@@ -637,6 +799,10 @@ export function useVListStreamingMessage(
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
+						...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}),
+						...(meta?.executionAttempt !== undefined
+							? { executionAttempt: meta.executionAttempt }
+							: {}),
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input
@@ -698,7 +864,9 @@ export function useVListStreamingMessage(
 			},
 			// Live stdout of a running command. Throttled per tool: a build emitting
 			// megabytes would otherwise re-render the row on every socket frame.
-			onToolOutput: (toolUseId, output, rawParentToolUseId) => {
+			onToolOutput: (toolUseId, output, rawParentToolUseId, meta) => {
+				// Explicit Agent counts paint a keyed badge, never a synthetic tool or flush.
+				if (meta?.subagentOutputCount) return;
 				if (!isSubagent && rawParentToolUseId) return;
 				pushToolOutput(toolUseId, output);
 			},
@@ -727,19 +895,39 @@ export function useVListStreamingMessage(
 		void version; // re-read the mutable refs on each version bump
 		if (!enabled || !narratorId || ownerRef.current !== narratorId) return null;
 		const chunks = streamingToolChunks(toolStoreRef.current);
-		if (blocksRef.current.length === 0 && chunks.length === 0) return null;
+		const activity = reasoningActivityRef.current;
+		if (blocksRef.current.length === 0 && chunks.length === 0 && !activity) return null;
 		// Both halves go through the chunked path's own builders, so the two lists
 		// render identical cards from identical state. Text/reasoning/native blocks
 		// come first, then the live tool cards — the order the model produced them.
 		const toolChunksMsg =
 			chunks.length > 0 ? buildTopLevelStreamingChunksMsg(chunks, narratorId, null) : null;
-		const streaming = buildStreamingMsg({
-			...identityRef.current,
-			streamingBlocks: blocksRef.current,
-			toolChunksMsg,
-			narratorId,
-			liveBlockIndex: liveBlockRef.current ? blocksRef.current.indexOf(liveBlockRef.current) : -1,
-		});
+		const lane = liveLaneRef.current;
+		const streaming =
+			buildStreamingMsg({
+				...identityRef.current,
+				streamingBlocks: blocksRef.current,
+				toolChunksMsg,
+				narratorId,
+				liveBlockIndex: lane
+					? blocksRef.current.findIndex((block) => block.id === lane.id && block.type === lane.type)
+					: -1,
+			}) ??
+			(activity
+				? ({
+						id: "__streaming__",
+						narratorId,
+						role: "assistant",
+						parentToolUseId: null,
+						blocks: [],
+						toolCalls: [],
+						contentText: null,
+						createdAt: "",
+						liveBlockIndex: -1,
+						...identityRef.current,
+					} as NarratorMsg)
+				: null);
+		if (streaming && activity) streaming.reasoningTranslationActivity = activity;
 		if (streaming && snapshotEpochRef.current != null) {
 			streaming._streamAnimSnapshotEpoch = snapshotEpochRef.current;
 			// The builder emits fresh block objects in raw-accumulator order. Mark

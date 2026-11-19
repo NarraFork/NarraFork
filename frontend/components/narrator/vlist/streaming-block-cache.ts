@@ -12,6 +12,7 @@
  */
 
 import {
+	type PreparedMarkdownUnit,
 	parseMarkdownToPreparedBlocks,
 	parseMarkdownUnits,
 } from "@shared/pretext-layout/parse-markdown";
@@ -35,7 +36,43 @@ interface LiveUnit {
 	blocks: PreparedBlock[];
 }
 
+export interface StreamingTailIdentity {
+	id: string;
+	/** Display-source coordinates, before Markdown normalization. */
+	start: number;
+	end: number;
+	/** Only replacements intersecting this visual tail; completed prefixes do not change it. */
+	translationRevision?: string;
+}
+
+/** Keys decorate copies only; cached prepared handles and geometry stay untouched. */
+function appendUnitBlocks(
+	out: PreparedBlock[],
+	unit: PreparedMarkdownUnit,
+	sourceOffset: number,
+	tail: StreamingTailIdentity,
+): void {
+	const start = sourceOffset + unit.consumedLength - unit.raw.length;
+	const active = start < tail.end && sourceOffset + unit.consumedLength > tail.start;
+	for (let index = 0; index < unit.blocks.length; index++) {
+		const block = unit.blocks[index] as PreparedBlock;
+		out.push(
+			active
+				? {
+						...block,
+						reasoningTailKey: `${tail.id}:${start - tail.start}:${index}`,
+						reasoningTail: { id: tail.id, translationRevision: tail.translationRevision },
+					}
+				: block,
+		);
+	}
+}
+
 interface StreamingEntry {
+	/** Re-key only when the active source part advances, not on ordinary appends. */
+	tailId?: string;
+	tailStart?: number;
+	tailTranslationRevision?: string;
 	/** Only CURRENT live units, not old versions or already-settled raw keys. */
 	memo: LiveUnit[];
 	/** Exactly one current full source, needed to distinguish append from replacement. */
@@ -94,7 +131,7 @@ export class StreamingBlockCache {
 		this.maxUnits = Math.min(MAX_UNITS, limit(options.maxUnits, MAX_UNITS));
 	}
 
-	get(key: string, text: string): PreparedBlock[] {
+	get(key: string, text: string, tail?: StreamingTailIdentity): PreparedBlock[] {
 		const revision = preparationRevision();
 		if (revision !== this.revision) {
 			// Drop every row, including settled blocks prepared with old font metrics.
@@ -117,14 +154,21 @@ export class StreamingBlockCache {
 			text.includes("]:")
 		) {
 			this.clear(key);
-			return parseMarkdownToPreparedBlocks(text, math);
+			if (!tail) return parseMarkdownToPreparedBlocks(text, math);
+			const blocks: PreparedBlock[] = [];
+			for (const unit of parseMarkdownUnits(text, math)) appendUnitBlocks(blocks, unit, 0, tail);
+			return blocks;
 		}
 
 		const previous = this.entries.get(key);
 		// Matching only the settled prefix is insufficient: replacing "abc\n\n..."
 		// with "abcDEF" merges that settled paragraph back into the new live text.
 		const entry =
-			previous && text.startsWith(previous.lastText)
+			previous &&
+			previous.tailId === tail?.id &&
+			previous.tailStart === tail?.start &&
+			previous.tailTranslationRevision === tail?.translationRevision &&
+			text.startsWith(previous.lastText)
 				? previous
 				: { memo: [], lastText: "", settledLength: 0, settledBlocks: [], settledUnits: 0 };
 		const settledLength = entry.settledLength;
@@ -137,8 +181,13 @@ export class StreamingBlockCache {
 				)?.blocks,
 		});
 		const blocks = [...entry.settledBlocks];
-		for (const unit of liveUnits) {
-			for (const block of unit.blocks) blocks.push(block);
+		if (tail) {
+			for (const unit of liveUnits) appendUnitBlocks(blocks, unit, settledLength, tail);
+		} else {
+			// Ordinary Markdown retains its allocation-free append path.
+			for (const unit of liveUnits) {
+				for (const block of unit.blocks) blocks.push(block);
+			}
 		}
 
 		// Replace the old entry, rather than adding a new raw key on every frame.
@@ -173,6 +222,9 @@ export class StreamingBlockCache {
 			this.clear(oldest);
 		}
 		this.entries.set(key, {
+			tailId: tail?.id,
+			tailStart: tail?.start,
+			tailTranslationRevision: tail?.translationRevision,
 			memo,
 			lastText: text,
 			settledLength: settledLength + boundary,
@@ -243,8 +295,12 @@ export class StreamingBlockCache {
 // Compatibility for standalone callers. Production panes should own an instance.
 const defaultCache = new StreamingBlockCache();
 
-export function getStreamingPreparedBlocks(key: string, text: string): PreparedBlock[] {
-	return defaultCache.get(key, text);
+export function getStreamingPreparedBlocks(
+	key: string,
+	text: string,
+	tail?: StreamingTailIdentity,
+): PreparedBlock[] {
+	return defaultCache.get(key, text, tail);
 }
 
 export function resetStreamingBlockCache(key?: string): void {

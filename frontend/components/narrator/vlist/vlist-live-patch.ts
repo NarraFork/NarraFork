@@ -43,6 +43,7 @@
  */
 
 import type {
+	BaseContentBlock,
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
 	TreeMessage,
@@ -63,11 +64,19 @@ import {
 } from "@shared/pretext-layout/reflection";
 import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import {
+	getValidReasoningTranslationParts,
+	mergeReasoningTranslationParts,
+	type ReasoningTranslationPatch,
+	readReasoningTranslationPatch,
+} from "@shared/reasoning-translation";
+import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import {
 	activityForSubagent,
 	getNewestReflectionToolOccurrence,
 	mergeFieldsIntoNewestToolOccurrence,
 	mergeToolCallFieldsInRows,
 	replaceSubagentActivitySnapshot,
+	subagentToolCallOrder,
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
 } from "../message/message-tree-utils";
@@ -91,6 +100,171 @@ export type LivePatch = (messages: readonly TreeMessage[]) => LivePatchResult;
 
 function unchanged(messages: readonly TreeMessage[]): LivePatchResult {
 	return { messages, changed: false };
+}
+
+/** Merge display-only parts without treating the envelope version as a per-part watermark. */
+export function patchReasoningTranslation(
+	messages: readonly TreeMessage[],
+	patch: ReasoningTranslationPatch,
+): LivePatchResult {
+	if (!readReasoningTranslationPatch(patch)) return unchanged(messages);
+	const index = messages.findIndex(
+		(message) => message.id === patch.messageId && message.narratorId === patch.ownerNarratorId,
+	);
+	if (index < 0) return unchanged(messages);
+	const message = messages[index];
+	let changed = false;
+	const blocks = message.blocks.map((block) => {
+		if (!block.named || block.id !== patch.blockId || block.revision < patch.blockRevision)
+			return block;
+		const elements = block.elements.map((element) => {
+			// A pre-state snapshot of this exact persisted body can regain its lineage
+			// from the successful patch. A different explicit generation is never replaced.
+			if (
+				(element.type !== "reasoning" && element.type !== "thinking") ||
+				element.id !== patch.elementId ||
+				(element.translationGeneration !== patch.translationGeneration &&
+					!(!element.translationGeneration && block.revision === patch.blockRevision))
+			)
+				return element;
+			const text = element.thinking ?? element.text ?? "";
+			if (
+				!getValidReasoningTranslationParts(text, patch.translationGeneration, [patch.part]).length
+			)
+				return element;
+			const parts = mergeReasoningTranslationParts(
+				text,
+				patch.translationGeneration,
+				element.translationParts,
+				[patch.part],
+			);
+			if (
+				parts.length === element.translationParts?.length &&
+				parts.every((part, partIndex) => part === element.translationParts?.[partIndex])
+			)
+				return element;
+			changed = true;
+			return {
+				...element,
+				translationGeneration: patch.translationGeneration,
+				translationParts: parts,
+			};
+		});
+		return elements.some((element, offset) => element !== block.elements[offset])
+			? { ...block, elements }
+			: block;
+	});
+	// A larger envelope revision does NOT make another independently valid part stale.
+	if (!changed) return unchanged(messages);
+	const result = [...messages];
+	result[index] = {
+		...message,
+		blocks,
+		stateRevision: Math.max(message.stateRevision ?? 0, patch.stateRevision),
+	};
+	return { messages: result, changed: true };
+}
+
+/** Retained completed parts also cover a checkpoint/page that was already in flight. */
+export class ReasoningTranslationPatchStore {
+	private patches = new Map<string, { patch: ReasoningTranslationPatch; bytes: number }>();
+	private bytes = 0;
+
+	constructor(
+		private maxBytes = 1024 * 1024,
+		private maxParts = 128,
+	) {}
+
+	/** False requests authoritative recovery when bounded retention had to evict a part. */
+	remember(patch: ReasoningTranslationPatch): boolean {
+		if (!readReasoningTranslationPatch(patch)) return true;
+		const key = JSON.stringify([
+			patch.ownerNarratorId,
+			patch.messageId,
+			patch.blockId,
+			patch.elementId,
+			patch.translationGeneration,
+			patch.part.id,
+		]);
+		if (this.patches.has(key)) return true;
+		const bytes = new TextEncoder().encode(JSON.stringify(patch)).byteLength;
+		if (bytes > this.maxBytes) return false;
+		let retained = true;
+		while (this.patches.size >= this.maxParts || this.bytes + bytes > this.maxBytes) {
+			const oldest = this.patches.entries().next().value;
+			if (!oldest) return false;
+			this.patches.delete(oldest[0]);
+			this.bytes -= oldest[1].bytes;
+			retained = false;
+		}
+		this.patches.set(key, { patch, bytes });
+		this.bytes += bytes;
+		return retained;
+	}
+
+	apply(messages: readonly TreeMessage[]): LivePatchResult {
+		let next = messages;
+		for (const { patch } of this.patches.values()) {
+			next = patchReasoningTranslation(next, patch).messages;
+		}
+		return { messages: next, changed: next !== messages };
+	}
+
+	forget(messageIds: readonly string[]): void {
+		const ids = new Set(messageIds);
+		for (const [key, entry] of this.patches) {
+			if (!ids.has(entry.patch.messageId)) continue;
+			this.patches.delete(key);
+			this.bytes -= entry.bytes;
+		}
+	}
+
+	clear(): void {
+		this.patches.clear();
+		this.bytes = 0;
+	}
+}
+
+/** Preserve validated local parts when a late full-message/checkpoint carries older state. */
+export function preserveReasoningTranslationElement<T extends BaseContentBlock>(
+	incoming: T,
+	previous: BaseContentBlock | undefined,
+	/** Caller proves the same persistent body revision and an explicitly older envelope state. */
+	inheritMissingGeneration = false,
+): T {
+	if (
+		!previous ||
+		(incoming.type !== "reasoning" && incoming.type !== "thinking") ||
+		incoming.type !== previous.type ||
+		incoming.id !== previous.id
+	)
+		return incoming;
+	const text = incoming.thinking ?? incoming.text ?? "";
+	const candidate =
+		inheritMissingGeneration &&
+		incoming.translationGeneration === undefined &&
+		incoming.translationParts === undefined &&
+		previous.translationGeneration &&
+		text === (previous.thinking ?? previous.text ?? "")
+			? { ...incoming, translationGeneration: previous.translationGeneration }
+			: incoming;
+	if (
+		!candidate.translationGeneration ||
+		candidate.translationGeneration !== previous.translationGeneration
+	)
+		return incoming;
+	const parts = mergeReasoningTranslationParts(
+		text,
+		candidate.translationGeneration,
+		previous.translationParts,
+		candidate.translationParts,
+	);
+	if (
+		parts.length === (candidate.translationParts?.length ?? 0) &&
+		parts.every((part, index) => part === candidate.translationParts?.[index])
+	)
+		return candidate;
+	return { ...candidate, translationParts: parts };
 }
 
 /**
@@ -419,11 +593,357 @@ export function patchReflection(
 	return result.changed ? result : unchanged(messages);
 }
 
-/**
- * Upsert one child tool-call header into a parent Agent/Task/Send card's
- * `_subagentActivity` summary (the "recent calls" rows on a subagent card).
- * Mirrors the chunked path's `applySubagentToolActivity`.
- */
+/** Drop discarded pre-receipt argument rows only for their identified child. */
+export function patchDiscardedSubagentTools(
+	messages: readonly TreeMessage[],
+	parentToolUseId: string,
+	toolUseIds: readonly string[],
+	subagentNarratorId: string | undefined,
+): LivePatchResult {
+	if (!subagentNarratorId || toolUseIds.length === 0) return unchanged(messages);
+	return updateSubagentActivityInMessages(
+		messages as TreeMessage[],
+		parentToolUseId,
+		(activity) => {
+			if (activity?.subagentNarratorId !== subagentNarratorId) return activity;
+			const latestToolCalls = activity.latestToolCalls.filter(
+				(header) =>
+					header.status !== "streaming" ||
+					header.toolCallId != null ||
+					header.executionAttempt != null ||
+					!toolUseIds.includes(header.toolUseId),
+			);
+			return latestToolCalls.length === activity.latestToolCalls.length
+				? activity
+				: { ...activity, latestToolCalls };
+		},
+	);
+}
+
+export interface SubagentActivityUpdate {
+	parentToolUseId: string;
+	header: SubagentToolCallHeader;
+	meta?: {
+		subagentNarratorId?: string | null;
+		model?: string | null;
+		reasoningEffort?: string | null;
+	};
+}
+
+const PENDING_SUBAGENT_CALL_LIMIT = 128;
+const PENDING_SUBAGENT_CHAR_LIMIT = 512_000;
+const SUBAGENT_HEADER_TIMING_KEYS = [
+	"startedAt",
+	"streamStartedAt",
+	"streamCompletedAt",
+	"permissionStartedAt",
+	"executionStartedAt",
+	"completedAt",
+	"durationMs",
+] as const;
+
+function samePendingSubagentCall(a: SubagentToolCallHeader, b: SubagentToolCallHeader): boolean {
+	return (
+		a.toolUseId === b.toolUseId && (!a.toolCallId || !b.toolCallId || a.toolCallId === b.toolCallId)
+	);
+}
+
+/** Own only projected fields, never a raw WS object, input, output or closure. */
+function projectPendingSubagentUpdate(
+	update: SubagentActivityUpdate,
+): SubagentActivityUpdate | null {
+	const { header, meta } = update;
+	if (
+		typeof update.parentToolUseId !== "string" ||
+		!update.parentToolUseId ||
+		typeof header.toolUseId !== "string" ||
+		!header.toolUseId
+	)
+		return null;
+	const timing: NonNullable<SubagentToolCallHeader["timing"]> = {};
+	for (const key of SUBAGENT_HEADER_TIMING_KEYS) {
+		const value = header.timing?.[key];
+		if (typeof value === "string" || (typeof value === "number" && Number.isFinite(value)))
+			Object.assign(timing, { [key]: value });
+	}
+	return {
+		parentToolUseId: update.parentToolUseId,
+		header: {
+			toolCallId: typeof header.toolCallId === "string" ? header.toolCallId : null,
+			...(Number.isSafeInteger(header.executionAttempt) && (header.executionAttempt ?? -1) >= 0
+				? { executionAttempt: header.executionAttempt }
+				: {}),
+			toolUseId: header.toolUseId,
+			toolName: typeof header.toolName === "string" ? header.toolName : "Tool",
+			status: typeof header.status === "string" ? header.status : "initializing",
+			createdAt:
+				typeof header.createdAt === "string" ||
+				(typeof header.createdAt === "number" && Number.isFinite(header.createdAt))
+					? header.createdAt
+					: null,
+			timing: Object.keys(timing).length ? timing : null,
+			...(header.inputSummary !== undefined
+				? { inputSummary: normalizeSubagentToolInputSummary(header.inputSummary) }
+				: {}),
+		},
+		meta: {
+			subagentNarratorId:
+				typeof meta?.subagentNarratorId === "string" ? meta.subagentNarratorId : null,
+			model: normalizeModel(meta?.model),
+			reasoningEffort: normalizeModel(meta?.reasoningEffort),
+		},
+	};
+}
+
+interface PendingSubagentActivityEntry {
+	update: SubagentActivityUpdate;
+	order: number;
+	waiting: boolean;
+	chars: number;
+}
+
+/** Missing-parent compensation; a loaded duplicate/rejected target is never retained. */
+export class SubagentActivityPatchStore {
+	private narratorId: string | undefined;
+	private entries = new Map<string, PendingSubagentActivityEntry>();
+	private retainedChars = 0;
+	private nextOrder = 0;
+
+	get size(): number {
+		return this.entries.size;
+	}
+
+	get chars(): number {
+		return this.retainedChars;
+	}
+
+	clear(): void {
+		this.entries.clear();
+		this.retainedChars = 0;
+		this.nextOrder = 0;
+		this.narratorId = undefined;
+	}
+
+	private forget(key: string, expected?: PendingSubagentActivityEntry): void {
+		const entry = this.entries.get(key);
+		if (!entry || (expected && expected !== entry)) return;
+		this.retainedChars -= entry.chars;
+		this.entries.delete(key);
+	}
+
+	/** False requests one coalesced authoritative reload instead of retaining an overflow. */
+	remember(narratorId: string | undefined, raw: SubagentActivityUpdate): boolean {
+		if (this.narratorId !== narratorId) {
+			this.clear();
+			this.narratorId = narratorId;
+		}
+		const update = projectPendingSubagentUpdate(raw);
+		if (!update) return true;
+		const group = [...this.entries]
+			.filter(
+				([, entry]) =>
+					entry.update.parentToolUseId === update.parentToolUseId &&
+					entry.update.meta?.subagentNarratorId === update.meta?.subagentNarratorId,
+			)
+			.sort(([, a], [, b]) => a.order - b.order);
+		const previous = group.find(([, entry]) =>
+			samePendingSubagentCall(entry.update.header, update.header),
+		);
+		if (previous) {
+			const old = previous[1].update;
+			if (
+				old.header.executionAttempt != null &&
+				(update.header.executionAttempt == null ||
+					update.header.executionAttempt < old.header.executionAttempt)
+			)
+				return true;
+			update.header = upsertSubagentToolCallHeader(
+				{ subagentNarratorId: null, model: null, latestToolCalls: [old.header] },
+				update.header,
+			).latestToolCalls[0];
+			update.meta = {
+				...update.meta,
+				model: update.meta?.model ?? old.meta?.model,
+				reasoningEffort: update.meta?.reasoningEffort ?? old.meta?.reasoningEffort,
+			};
+		}
+		// Check actual retained strings before JSON encoding; no raw input/output is visited.
+		const strings = [
+			narratorId,
+			update.parentToolUseId,
+			update.header.toolUseId,
+			update.header.toolCallId,
+			update.header.toolName,
+			update.header.status,
+			update.header.createdAt,
+			...Object.values(update.header.timing ?? {}),
+			...Object.values(update.header.inputSummary ?? {}),
+			...Object.values(update.meta ?? {}),
+		];
+		if (
+			strings.reduce<number>(
+				(sum, value) => sum + (typeof value === "string" ? value.length : 0),
+				0,
+			) > PENDING_SUBAGENT_CHAR_LIMIT
+		)
+			return false;
+		const key = JSON.stringify([
+			narratorId,
+			update.parentToolUseId,
+			update.meta?.subagentNarratorId,
+			update.header.toolUseId,
+			update.header.toolCallId,
+			update.header.executionAttempt,
+		]);
+		const order = previous?.[1].order ?? ++this.nextOrder;
+		// Reserve the maximum counter width too, so bookkeeping is inside the cap.
+		const entry = {
+			update,
+			order,
+			waiting: previous?.[1].waiting ?? false,
+			chars:
+				key.length +
+				JSON.stringify({ update, order, waiting: false, chars: PENDING_SUBAGENT_CHAR_LIMIT })
+					.length,
+		};
+		let recent: SubagentActivitySummary | undefined;
+		for (const [, item] of group) recent = upsertSubagentToolCallHeader(recent, item.update.header);
+		recent = upsertSubagentToolCallHeader(recent, update.header);
+		const removed = group.filter(
+			([oldKey, item]) =>
+				oldKey === previous?.[0] ||
+				!recent.latestToolCalls.some((header) =>
+					samePendingSubagentCall(header, item.update.header),
+				),
+		);
+		if (!recent.latestToolCalls.some((header) => samePendingSubagentCall(header, update.header)))
+			return true;
+		const nextCount = this.entries.size - removed.length + 1;
+		const nextChars =
+			this.retainedChars - removed.reduce((sum, [, item]) => sum + item.chars, 0) + entry.chars;
+		if (nextCount > PENDING_SUBAGENT_CALL_LIMIT || nextChars > PENDING_SUBAGENT_CHAR_LIMIT)
+			return false;
+		for (const [oldKey] of removed) this.forget(oldKey);
+		this.entries.set(key, entry);
+		this.retainedChars = nextChars;
+		return true;
+	}
+
+	/** Identity channels supersede child headers, even before the parent card is loaded. */
+	identify(parentToolUseId: string, subagentNarratorId: string): void {
+		for (const [key, entry] of this.entries) {
+			if (
+				entry.update.parentToolUseId === parentToolUseId &&
+				entry.update.meta?.subagentNarratorId !== subagentNarratorId
+			)
+				this.forget(key, entry);
+		}
+	}
+
+	discard(parentToolUseId: string, toolUseIds: readonly string[], child: string | undefined): void {
+		if (!child) return;
+		for (const [key, entry] of this.entries) {
+			const { header, meta } = entry.update;
+			if (
+				entry.update.parentToolUseId === parentToolUseId &&
+				meta?.subagentNarratorId === child &&
+				toolUseIds.includes(header.toolUseId) &&
+				header.status === "streaming" &&
+				header.toolCallId == null &&
+				header.executionAttempt == null
+			)
+				this.forget(key, entry);
+		}
+	}
+
+	rememberSnapshot(
+		narratorId: string | undefined,
+		parentToolUseId: string,
+		activity: SubagentActivitySummary,
+	): boolean {
+		if (this.narratorId !== narratorId) {
+			this.clear();
+			this.narratorId = narratorId;
+		}
+		if (activity.subagentNarratorId) this.identify(parentToolUseId, activity.subagentNarratorId);
+		const previousHeaders = [...this.entries.values()]
+			.filter(
+				(entry) =>
+					entry.update.parentToolUseId === parentToolUseId &&
+					entry.update.meta?.subagentNarratorId === activity.subagentNarratorId,
+			)
+			.sort((a, b) => a.order - b.order)
+			.map((entry) => entry.update.header);
+		activity = replaceSubagentActivitySnapshot(activity, {
+			subagentNarratorId: activity.subagentNarratorId,
+			model: null,
+			latestToolCalls: previousHeaders,
+		});
+		for (const [key, entry] of this.entries) {
+			if (
+				entry.update.parentToolUseId === parentToolUseId &&
+				entry.update.meta?.subagentNarratorId === activity.subagentNarratorId &&
+				!activity.latestToolCalls.some((header) =>
+					samePendingSubagentCall(header, entry.update.header),
+				)
+			)
+				this.forget(key, entry);
+		}
+		let retained = true;
+		for (const header of activity.latestToolCalls) {
+			if (!this.remember(narratorId, { parentToolUseId, header, meta: activity })) retained = false;
+		}
+		return retained;
+	}
+
+	apply(messages: readonly TreeMessage[], narratorId: string | undefined): LivePatchResult {
+		if (narratorId !== this.narratorId) return unchanged(messages);
+		let current = messages;
+		let changed = false;
+		for (const [key, entry] of [...this.entries].sort(([, a], [, b]) => a.order - b.order)) {
+			const { parentToolUseId, header, meta } = entry.update;
+			const targetExists = current.some(
+				(message) =>
+					messageBody(message).some(
+						(block) => block.type === "tool_use" && block.id === parentToolUseId,
+					) || message.toolCalls?.some((call) => call.toolUseId === parentToolUseId),
+			);
+			if (!targetExists) {
+				entry.waiting = true;
+				continue;
+			}
+			// An old replay without comparable timestamps cannot evict a full,
+			// newer authoritative window. Fresh live calls still append normally.
+			const authoritative = entry.waiting
+				? current.flatMap((message) => {
+						const block = messageBody(message).find(
+							(item) => item.type === "tool_use" && item.id === parentToolUseId,
+						);
+						const call = message.toolCalls?.find((item) => item.toolUseId === parentToolUseId);
+						return (block?._subagentActivity ?? call?._subagentActivity)?.latestToolCalls ?? [];
+					})
+				: [];
+			if (
+				authoritative.length >= 3 &&
+				!authoritative.some((call) => samePendingSubagentCall(call, header)) &&
+				(subagentToolCallOrder(header) == null ||
+					authoritative.some((call) => subagentToolCallOrder(call) == null))
+			) {
+				this.forget(key, entry);
+				continue;
+			}
+			const result = patchSubagentActivity(current, parentToolUseId, header, meta);
+			// A duplicate, stale attempt, or replaced child is a consumed event, not a miss.
+			this.forget(key, entry);
+			if (!result.changed) continue;
+			current = result.messages;
+			changed = true;
+		}
+		return changed ? { messages: current, changed } : unchanged(messages);
+	}
+}
+
+/** Upsert one bounded child header into the parent card's recent activity. */
 export function patchSubagentActivity(
 	messages: readonly TreeMessage[],
 	parentToolUseId: string,
@@ -440,6 +960,14 @@ export function patchSubagentActivity(
 		messages as TreeMessage[],
 		parentToolUseId,
 		(existing) => {
+			// Ownership comes from the persisted/identity channel. A late child tool
+			// frame may enrich an unassigned card, never switch an assigned child.
+			if (
+				existing?.subagentNarratorId &&
+				meta?.subagentNarratorId &&
+				existing.subagentNarratorId !== meta.subagentNarratorId
+			)
+				return existing;
 			const current = activityForSubagent(existing, meta?.subagentNarratorId);
 			const next = upsertSubagentToolCallHeader(current, header);
 			// Same "never erase a known value" rule as the model: a tool event that
@@ -448,6 +976,13 @@ export function patchSubagentActivity(
 				normalizeModel(meta?.reasoningEffort) ??
 				normalizeModel(current?.reasoningEffort) ??
 				normalizeModel(next.reasoningEffort);
+			if (
+				next === existing &&
+				(meta?.subagentNarratorId ?? next.subagentNarratorId) === next.subagentNarratorId &&
+				(normalizeModel(meta?.model) ?? next.model) === next.model &&
+				reasoningEffort === normalizeModel(next.reasoningEffort)
+			)
+				return existing;
 			return {
 				...next,
 				subagentNarratorId:
@@ -842,10 +1377,24 @@ export class LivePatchQueue {
 		this.queuedFor = undefined;
 		if (queued.length === 0) return;
 		if (queuedFor !== this.host.currentNarratorId()) return;
-		const applied = this.host.apply(composeLivePatches(queued.map((entry) => entry.patch)));
+		const missed = new Set<() => void>();
+		const applied = this.host.apply(
+			composeLivePatches(
+				queued.map((entry) => (messages) => {
+					const result = entry.patch(messages);
+					if (!result.changed && entry.onMiss) missed.add(entry.onMiss);
+					return result;
+				}),
+			),
+		);
+		// A host can reject the whole commit without evaluating the patches (e.g.
+		// before its document loads). Otherwise notify each missed entry even when
+		// a sibling patch succeeded. Notifications run after apply, once per callback.
 		if (!applied) {
-			for (const entry of queued) entry.onMiss?.();
+			for (const entry of queued) if (entry.onMiss) missed.add(entry.onMiss);
 		}
+		if (queuedFor !== this.host.currentNarratorId()) return;
+		for (const onMiss of missed) onMiss();
 	}
 
 	/** Discard everything pending (unmount / narrator switch). */

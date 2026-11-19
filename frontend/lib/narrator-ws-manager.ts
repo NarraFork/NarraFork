@@ -10,10 +10,20 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import {
+	clearReasoningTranslationStatus,
+	setReasoningTranslationStatus,
+} from "@frontend/components/narrator/reasoning-translation-status-store";
 import { businessTransport } from "@frontend/lib/business-transport";
 import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import {
+	REASONING_TRANSLATION_VISIBILITY_LIMITS,
+	type ReasoningTranslationVisibilityGroup,
+	type ReasoningTranslationVisibilityTarget,
+	readReasoningTranslationStatus,
+} from "@shared/reasoning-translation";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	RECENT_TABS_WS_BATCH_SIZE,
@@ -264,6 +274,7 @@ const REALTIME_HISTORY_EVENT_TYPES = new Set([
 	"catch_up",
 	"messages_deleted",
 	"message_updated",
+	"reasoning_translation_patch",
 	"tool_started",
 	"tool_completed",
 	"tool_long_running",
@@ -384,6 +395,15 @@ export function setNarratorWSShareAuth(auth: { shareId: string; token: string } 
 	if (changed) narratorWSManager.reconnect();
 }
 
+export interface ReasoningTranslationVisibilitySnapshot {
+	targets: ReasoningTranslationVisibilityTarget[];
+	groups: ReasoningTranslationVisibilityGroup[];
+}
+
+type ReasoningVisibilityReader = () =>
+	| ReasoningTranslationVisibilityTarget[]
+	| ReasoningTranslationVisibilitySnapshot;
+
 export class NarratorWSManager {
 	private ws: BusinessSocket | null = null;
 	private _connected = false;
@@ -415,6 +435,26 @@ export class NarratorWSManager {
 	private subscriptions = new Map<number, SubscriptionRecord>();
 	private requestToSubscription = new Map<string, number>();
 	private requestMessageVersionSnapshots = new Map<string, RequestMessageVersionSnapshot>();
+	/** One automatic reader-state recovery per message handle until authoritative success. */
+	private translationRecoveries = new Map<
+		number,
+		Map<string, { failed: boolean; acceptedReload: boolean; requestId?: string }>
+	>();
+	private queuedTranslationRestores = new Set<number>();
+	/** Independent of history subscriptions: reconnect re-reads current DOM visibility. */
+	private reasoningVisibility = new Map<
+		string,
+		{
+			narratorId: string;
+			readTargets: ReasoningVisibilityReader;
+			lastSignature: string;
+			queued: boolean;
+			revision: number;
+			groupIds: Set<string>;
+			socket: BusinessSocket | null;
+		}
+	>();
+	private nextReasoningVisibilityRevision = 1;
 
 	// --- Presence ref-counting ---
 	// narratorId → Set of handle IDs that requested presence
@@ -474,6 +514,137 @@ export class NarratorWSManager {
 		return this.nextId++;
 	}
 
+	/** Only an authenticated narrator surface registers a visible demand holder. */
+	registerReasoningTranslationVisibility(
+		narratorId: string,
+		visibilityId: string,
+		readTargets: ReasoningVisibilityReader,
+	): { update: () => void; dispose: () => void } {
+		if (
+			shareAuth ||
+			this.reasoningVisibility.size >= REASONING_TRANSLATION_VISIBILITY_LIMITS.holdersPerConnection
+		)
+			return { update() {}, dispose() {} };
+		const record = {
+			narratorId,
+			readTargets,
+			lastSignature: "[]",
+			queued: false,
+			revision: 0,
+			groupIds: new Set<string>(),
+			socket: null as BusinessSocket | null,
+		};
+		const previous = this.reasoningVisibility.get(visibilityId);
+		if (previous) clearReasoningTranslationStatus(previous.narratorId, visibilityId);
+		this.reasoningVisibility.set(visibilityId, record);
+		const update = () => {
+			if (record.queued) return;
+			record.queued = true;
+			queueMicrotask(() => {
+				record.queued = false;
+				if (this.reasoningVisibility.get(visibilityId) === record)
+					this._sendReasoningVisibility(visibilityId);
+			});
+		};
+		update();
+		return {
+			update,
+			dispose: () => {
+				if (this.reasoningVisibility.get(visibilityId) !== record) return;
+				this.reasoningVisibility.delete(visibilityId);
+				clearReasoningTranslationStatus(narratorId, visibilityId);
+				if (record.lastSignature !== "[]" && this.ws?.readyState === 1 && !shareAuth)
+					this.ws.send(
+						JSON.stringify({
+							type: "reasoning_translation_visibility",
+							narratorId,
+							visibilityId,
+							revision: this.nextReasoningVisibilityRevision++,
+							groups: [],
+							targets: [],
+						}),
+					);
+			},
+		};
+	}
+
+	private _sendReasoningVisibility(visibilityId: string, restored = false): void {
+		const record = this.reasoningVisibility.get(visibilityId);
+		if (!record || shareAuth || this.ws?.readyState !== 1) return;
+		let targets: ReasoningTranslationVisibilityTarget[];
+		let groups: ReasoningTranslationVisibilityGroup[] = [];
+		try {
+			const snapshot = record.readTargets();
+			targets = (Array.isArray(snapshot) ? snapshot : snapshot.targets).slice(
+				0,
+				REASONING_TRANSLATION_VISIBILITY_LIMITS.targets,
+			);
+			if (!Array.isArray(snapshot))
+				groups = snapshot.groups
+					.slice(0, REASONING_TRANSLATION_VISIBILITY_LIMITS.targets)
+					.map((group) => ({
+						...group,
+						targetIndexes: group.targetIndexes.filter(
+							(index) => Number.isSafeInteger(index) && index >= 0 && index < targets.length,
+						),
+					}))
+					.filter((group) => group.targetIndexes.length > 0);
+		} catch {
+			// Unknown geometry cannot authorize work or interrupt ordinary restoration.
+			targets = [];
+			groups = [];
+		}
+		const signature = targets.length ? JSON.stringify({ targets, groups }) : "[]";
+		if (
+			!restored &&
+			signature === record.lastSignature &&
+			(!targets.length || record.socket === this.ws)
+		)
+			return;
+		record.lastSignature = signature;
+		record.socket = null;
+		clearReasoningTranslationStatus(record.narratorId, visibilityId);
+		if (restored && !targets.length) return;
+		record.revision = this.nextReasoningVisibilityRevision++;
+		record.groupIds = new Set(groups.map((group) => group.groupId));
+		record.socket = this.ws;
+		this.ws.send(
+			JSON.stringify({
+				type: "reasoning_translation_visibility",
+				narratorId: record.narratorId,
+				visibilityId,
+				revision: record.revision,
+				targets,
+				groups,
+			}),
+		);
+	}
+
+	private _receiveReasoningTranslationStatus(value: unknown): void {
+		const status = readReasoningTranslationStatus(value);
+		if (!status) return;
+		const holder = this.reasoningVisibility.get(status.visibilityId);
+		if (
+			!holder ||
+			shareAuth ||
+			holder.socket !== this.ws ||
+			!holder.socket ||
+			holder.narratorId !== status.narratorId ||
+			holder.revision !== status.revision ||
+			status.groups.some((group) => !holder.groupIds.has(group.groupId))
+		)
+			return;
+		setReasoningTranslationStatus(status.narratorId, status.visibilityId, status.groups);
+	}
+
+	private _clearReasoningTranslationStatuses(narratorId?: string): void {
+		for (const [visibilityId, holder] of this.reasoningVisibility) {
+			if (narratorId && holder.narratorId !== narratorId) continue;
+			holder.socket = null;
+			clearReasoningTranslationStatus(holder.narratorId, visibilityId);
+		}
+	}
+
 	// -----------------------------------------------------------------------
 	// Lifecycle
 	// -----------------------------------------------------------------------
@@ -500,6 +671,8 @@ export class NarratorWSManager {
 		this._socketDiscarded = false;
 		this.pendingDispatchQueue = [];
 		this.dispatchScheduled = false;
+		this.translationRecoveries.clear();
+		this.queuedTranslationRestores.clear();
 		removeWSStatus(WS_STATUS_ID);
 		const ws = this.ws;
 		this.ws = null;
@@ -592,6 +765,8 @@ export class NarratorWSManager {
 	unsubscribe(handle: SubscriptionHandle): void {
 		const removedIds: string[] = [];
 		this._clearRequestsForHandle(handle._id);
+		this.translationRecoveries.delete(handle._id);
+		this.queuedTranslationRestores.delete(handle._id);
 		this.subscriptions.delete(handle._id);
 		for (const nId of handle._narratorIds) {
 			const refs = this.narratorRefCounts.get(nId);
@@ -599,6 +774,7 @@ export class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
+				this._clearReasoningTranslationStatuses(nId);
 				this._clearMessageVersionState(nId);
 				if (this.catchUpCursors.has(nId)) this.legacyCatchUpCursors.add(nId);
 				this.realtimeEpochs.delete(nId);
@@ -659,11 +835,13 @@ export class NarratorWSManager {
 
 		const actuallyRemoved: string[] = [];
 		for (const narratorId of toRemove) {
+			this.translationRecoveries.get(handle._id)?.delete(narratorId);
 			const refs = this.narratorRefCounts.get(narratorId);
 			if (!refs) continue;
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(narratorId);
+				this._clearReasoningTranslationStatuses(narratorId);
 				this._clearMessageVersionState(narratorId);
 				if (this.catchUpCursors.has(narratorId)) this.legacyCatchUpCursors.add(narratorId);
 				this.realtimeEpochs.delete(narratorId);
@@ -1071,6 +1249,11 @@ export class NarratorWSManager {
 		}
 		this.stagedCatchUpStates.delete(narratorId);
 		this.pendingMessageReconciles.delete(narratorId);
+		// REST/document success resets accepted requests, not a sibling's failed listener.
+		for (const recovery of this.translationRecoveries.values()) {
+			const state = recovery.get(narratorId);
+			if (state?.acceptedReload && !state.failed) recovery.delete(narratorId);
+		}
 		return true;
 	}
 
@@ -1117,20 +1300,30 @@ export class NarratorWSManager {
 		}
 	}
 
-	private _clearRequestsForHandle(handleId: number): void {
+	private _clearRequestsForHandle(handleId: number, preserveRestores = false): void {
 		const record = this.subscriptions.get(handleId);
+		const protectedIds = new Set(
+			preserveRestores
+				? [...(this.translationRecoveries.get(handleId)?.values() ?? [])].flatMap((recovery) =>
+						recovery.requestId ? [recovery.requestId] : [],
+					)
+				: [],
+		);
 		for (const requestId of record?.activeRequestIds ?? []) {
+			if (protectedIds.has(requestId)) continue;
 			this.requestToSubscription.delete(requestId);
 			this.requestMessageVersionSnapshots.delete(requestId);
+			record?.activeRequestIds.delete(requestId);
 		}
-		record?.activeRequestIds.clear();
 	}
 
 	private _registerRequest(handle: SubscriptionHandle): string | undefined {
 		if (handle._kind === "list") return undefined;
 		const record = this.subscriptions.get(handle._id);
 		if (!record) return undefined;
-		this._clearRequestsForHandle(handle._id);
+		// Other targets on this handle can still be awaiting a reader-state restore.
+		// Protected IDs remain bounded by the handle's active narrator recoveries.
+		this._clearRequestsForHandle(handle._id, true);
 		const requestId = `${handle._kind}-${handle._id}-${Date.now()}-${this.nextId++}`;
 		record.activeRequestIds.add(requestId);
 		this.requestToSubscription.set(requestId, handle._id);
@@ -1332,7 +1525,11 @@ export class NarratorWSManager {
 		if (this.pendingMessageReconciles.has(narratorId)) return false;
 		if (this.ws?.readyState !== 1) return false;
 		const handle = [...this.subscriptions.values()].find(
-			(record) => record.kind === "messages" && record.narratorIds.includes(narratorId),
+			(record) =>
+				record.kind === "messages" &&
+				record.narratorIds.includes(narratorId) &&
+				// Keep an in-flight restore's request routing intact; sibling handles still sync normally.
+				!this._translationRecoveryFor(record.id, narratorId),
 		);
 		if (!handle) return false;
 		const version = this.messageVersions.get(narratorId) ?? 0;
@@ -1503,6 +1700,10 @@ export class NarratorWSManager {
 			}
 			try {
 				const data = JSON.parse(event.data);
+				if (data.type === "reasoning_translation_status") {
+					this._receiveReasoningTranslationStatus(data);
+					return;
+				}
 				if (data.type === "ping") {
 					ws.send(JSON.stringify({ type: "pong" }));
 					this._resetPingTimeout();
@@ -1689,6 +1890,7 @@ export class NarratorWSManager {
 		isReconnect: boolean,
 		disconnected = connected ? false : this._disconnected,
 	): void {
+		if (!connected) this._clearReasoningTranslationStatuses();
 		const changed = this._connected !== connected || this._disconnected !== disconnected;
 		this._connected = connected;
 		this._disconnected = disconnected;
@@ -1723,6 +1925,9 @@ export class NarratorWSManager {
 	private _restoreSubscriptions(): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== 1) return;
+		// A new physical connection grants each surviving handle one fresh attempt.
+		this.translationRecoveries.clear();
+		this.queuedTranslationRestores.clear();
 
 		// Restore every handle, not just every narrator. Request-scoped snapshots
 		// (panel runtime / message catch-up) must be delivered to the consumer that
@@ -1736,8 +1941,14 @@ export class NarratorWSManager {
 			this._sendSubscribe(
 				{ _id: record.id, _narratorIds: record.narratorIds, _kind: record.kind },
 				record.narratorIds,
+				{ restoreState: record.kind === "messages" },
 			);
 		}
+
+		// Message restoration is cache recovery, never model demand. Only holders
+		// whose text is still actually visible may re-enter on this connection.
+		for (const visibilityId of this.reasoningVisibility.keys())
+			this._sendReasoningVisibility(visibilityId, true);
 
 		// Presence
 		for (const narratorId of this.presenceRefCounts.keys()) {
@@ -1976,7 +2187,7 @@ export class NarratorWSManager {
 	private _sendSubscribe(
 		handle: SubscriptionHandle,
 		narratorIds: string[],
-		opts?: { downgrade?: boolean },
+		opts?: { downgrade?: boolean; restoreState?: boolean },
 	): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== 1) return;
@@ -1989,6 +2200,12 @@ export class NarratorWSManager {
 		if (activeNarratorIds.length === 0) return;
 		const kind = record.kind;
 		const requestId = this._registerRequest(handle);
+		if (kind === "messages" && opts?.restoreState) {
+			for (const narratorId of activeNarratorIds) {
+				const recovery = this._translationRecoveryFor(handle._id, narratorId, true);
+				if (recovery) recovery.requestId = requestId;
+			}
+		}
 
 		if (kind === "messages" && activeNarratorIds.length === 1) {
 			const narratorId = activeNarratorIds[0];
@@ -2004,6 +2221,7 @@ export class NarratorWSManager {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
 				kind,
+				...(opts?.restoreState ? { restoreState: true } : {}),
 				...(requestId ? { requestId } : {}),
 			};
 			if (cursor) msg.catchUpCursor = cursor;
@@ -2027,6 +2245,7 @@ export class NarratorWSManager {
 					type: "subscribe",
 					narratorIds,
 					kind,
+					...(kind === "messages" && opts?.restoreState ? { restoreState: true } : {}),
 					...(requestId ? { requestId } : {}),
 					...(downgrade ? { downgrade: true } : {}),
 				}),
@@ -2076,6 +2295,57 @@ export class NarratorWSManager {
 		}
 	}
 
+	private _messageRecoveryHandles(narratorId: string, handleId?: number): SubscriptionRecord[] {
+		return [...this.subscriptions.values()].filter(
+			(record) =>
+				record.kind === "messages" &&
+				record.narratorIds.includes(narratorId) &&
+				(handleId === undefined || record.id === handleId),
+		);
+	}
+
+	private _translationRecoveryFor(
+		handleId: number,
+		narratorId: string,
+		create = false,
+	): { failed: boolean; acceptedReload: boolean; requestId?: string } | undefined {
+		let narrators = this.translationRecoveries.get(handleId);
+		if (!narrators && create) {
+			narrators = new Map();
+			this.translationRecoveries.set(handleId, narrators);
+		}
+		let recovery = narrators?.get(narratorId);
+		if (!recovery && create) {
+			recovery = { failed: false, acceptedReload: false };
+			narrators?.set(narratorId, recovery);
+		}
+		return recovery;
+	}
+
+	private _recoverTranslationState(narratorId: string, handleId?: number): void {
+		for (const record of this._messageRecoveryHandles(narratorId, handleId)) {
+			if (this._translationRecoveryFor(record.id, narratorId)) continue;
+			this._translationRecoveryFor(record.id, narratorId, true);
+			if (this.queuedTranslationRestores.has(record.id)) continue;
+			this.queuedTranslationRestores.add(record.id);
+			queueMicrotask(() => {
+				if (!this.queuedTranslationRestores.delete(record.id) || this.cancelled) return;
+				const current = this.subscriptions.get(record.id);
+				if (!current || current.kind !== "messages") return;
+				const pendingIds = current.narratorIds.filter((id) => {
+					const recovery = this._translationRecoveryFor(current.id, id);
+					return recovery && !recovery.failed && !recovery.requestId;
+				});
+				if (!pendingIds.length) return;
+				this._sendSubscribe(
+					{ _id: current.id, _narratorIds: current.narratorIds, _kind: current.kind },
+					pendingIds,
+					{ restoreState: true },
+				);
+			});
+		}
+	}
+
 	private _dispatchImmediate(data: Record<string, unknown>): void {
 		const msgType = typeof data.type === "string" ? data.type : undefined;
 		const narratorId = typeof data.narratorId === "string" ? data.narratorId : undefined;
@@ -2104,6 +2374,8 @@ export class NarratorWSManager {
 			this.noteStructuralEvent(narratorId);
 		}
 
+		const failedRecoveryHandles = new Set<number>();
+		let acceptedRecoveryFrame = false;
 		for (const entry of this.listeners.values()) {
 			if (
 				!shouldDeliverToListener(
@@ -2117,26 +2389,69 @@ export class NarratorWSManager {
 				continue;
 			try {
 				entry.cb(data);
+				if (
+					(msgType === "catch_up" || msgType === "full_reload") &&
+					targetSubscriptionId !== undefined
+				)
+					acceptedRecoveryFrame = true;
 			} catch (err) {
-				// A consumer that fails on a persisted-history frame has silently missed
-				// content while the version counters above already advanced — the next
-				// sync_check would compare equal and the server would never replay the
-				// lost frame. Drop the committed sync anchors so the following sync
-				// distrusts the local view and forces a catch-up / full reload, then
-				// nudge that sync immediately (gated internally by reconcile state).
 				console.warn(
 					`[NarratorWSManager] Listener failed on "${msgType}" for narrator ${narratorId}; ` +
-						"committed sync anchors were reset so the next sync re-fetches from the server.",
+						"the affected reader subscription requires authoritative state.",
 					err,
 				);
 				if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
-					this.clearCommittedCatchUpAnchor(narratorId);
-					const recoveryNarratorId = narratorId;
-					queueMicrotask(() => {
-						if (!this.cancelled) this.checkSync(recoveryNarratorId);
-					});
+					const handleId = entry.opts.subscriptionId ?? targetSubscriptionId;
+					const handles = this._messageRecoveryHandles(narratorId, handleId);
+					for (const record of handles) failedRecoveryHandles.add(record.id);
+					if (msgType === "reasoning_translation_patch") {
+						// Claim the handle before scheduling so listeners/patches coalesce.
+						this._recoverTranslationState(narratorId, handleId);
+					} else if (
+						handles.some((record) => this._translationRecoveryFor(record.id, narratorId))
+					) {
+						// Failed restore responses cannot start a sync/full_reload loop.
+						for (const record of handles) {
+							const recovery = this._translationRecoveryFor(record.id, narratorId);
+							if (recovery) recovery.failed = true;
+						}
+					} else {
+						// Ordinary history/focus recovery retains its existing behavior.
+						this.clearCommittedCatchUpAnchor(narratorId);
+						const recoveryNarratorId = narratorId;
+						queueMicrotask(() => {
+							if (!this.cancelled) this.checkSync(recoveryNarratorId);
+						});
+					}
 				}
 			}
+		}
+		if (
+			acceptedRecoveryFrame &&
+			narratorId &&
+			targetSubscriptionId !== undefined &&
+			!failedRecoveryHandles.has(targetSubscriptionId)
+		) {
+			if (msgType === "full_reload") {
+				const recovery = this._translationRecoveryFor(targetSubscriptionId, narratorId);
+				if (recovery && !recovery.failed) recovery.acceptedReload = true;
+				return;
+			}
+			const rows = [
+				...(Array.isArray(data.topLevel) ? data.topLevel : []),
+				...(Array.isArray(data.orphanChildren) ? data.orphanChildren : []),
+			];
+			// sync_ok/full_reload are control acknowledgements, not accepted reader state.
+			if (
+				rows.some(
+					(row) =>
+						row &&
+						typeof row === "object" &&
+						Array.isArray(row.blocks) &&
+						typeof row.stateRevision === "number",
+				)
+			)
+				this.translationRecoveries.get(targetSubscriptionId)?.delete(narratorId);
 		}
 	}
 }

@@ -60,6 +60,9 @@ export interface ComputeLayoutOptions {
 	/** Canvas top / bottom padding (px). */
 	topPadding?: number;
 	bottomPadding?: number;
+	/** Default policy for reasoning bodies only; explicit row choices win. */
+	expandReasoning?: AdapterContext["expandReasoning"];
+	isReasoningRowExpanded?: AdapterContext["isReasoningRowExpanded"];
 	/** Resolve an element's expanded state (reasoning/tool/subagent/trace). */
 	isExpanded?: (key: string) => boolean | undefined;
 	/** Reader opted out of the body preview; distinct from opening the card. */
@@ -179,6 +182,8 @@ export function computePretextVListLayout(
 	const ctx: AdapterContext = {
 		compactAuxiliaryContent: opts.compactAuxiliaryContent,
 		lod: opts.lod,
+		expandReasoning: opts.expandReasoning,
+		isReasoningRowExpanded: opts.isReasoningRowExpanded,
 		isExpanded: opts.isExpanded,
 		isTextExpanded: opts.isTextExpanded,
 		isLodUserOverride: opts.isLodUserOverride,

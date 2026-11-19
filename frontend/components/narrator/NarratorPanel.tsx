@@ -168,6 +168,7 @@ import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badge
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
+import { isFastModeSubagent } from "./interaction/fast-mode-state";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
@@ -227,6 +228,7 @@ import {
 import { filePanelBaseName } from "./panels/panel-kind";
 import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
+import { ReasoningTranslationVisibilityProvider } from "./reasoning-translation-visibility";
 import { RemoteUnsupported } from "./RemoteUnsupported";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -322,7 +324,8 @@ function NarratorPanelBody({
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
 	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
-	const narrator = narratorProp ?? fetchedNarrator;
+	// The detail query owns current settings; a host's opening snapshot is only a fallback.
+	const narrator = fetchedNarrator ?? narratorProp;
 	const isModelTrace = Array.isArray(narrator?.traits) && narrator.traits.includes("modeltrace");
 	const handleModelTraceReturn = useCallback(() => {
 		if (!narrator) return;
@@ -1211,8 +1214,7 @@ function NarratorPanelBody({
 	}, [isWorkspacePreview, scrollToBottom, suppressAutoFocusOnPromote]);
 
 	// --- WebSocket + real-time state ---
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = !!(fetchedNarrator as any)?.variant?.startsWith("subagent:");
+	const isSubagent = isFastModeSubagent(narrator ?? {});
 
 	// Parse persisted substatus from narrator data to seed the WS hook's reducer
 	const narratorSubstatus = useMemo(() => {
@@ -3495,26 +3497,28 @@ function NarratorPanelBody({
 															</Box>
 														}
 													>
-														<PretextExactMessageList
-															ref={chunkListRef}
-															narratorId={narratorId}
-															isSubagent={isSubagent}
-															isActive={isActive}
-															scrollRef={chunkViewportRef}
-															contentRef={contentRef}
-															onAtBottomChange={setIsAtBottom}
-															onUnreadCountChange={setUnreadCount}
-															onTailMetaChange={handleMessageListTailMetaChange}
-															onLodStep={handleLodStep}
-															onSelectionResolverChange={setChunkSelectionResolver}
-															rowHandlers={vlistRowHandlers}
-															permCb={permCbWithAsyncQuestions}
-															enableOutlineAsk={!isWorkspacePreview}
-															highlightMessageId={highlightMessageId}
-															highlightRequestId={highlightRequestId}
-															highlightNeedle={highlightNeedle}
-															tailFooter={messageListTailFooter}
-														/>
+														<ReasoningTranslationVisibilityProvider narratorId={narratorId}>
+															<PretextExactMessageList
+																ref={chunkListRef}
+																narratorId={narratorId}
+																isSubagent={isSubagent}
+																isActive={isActive}
+																scrollRef={chunkViewportRef}
+																contentRef={contentRef}
+																onAtBottomChange={setIsAtBottom}
+																onUnreadCountChange={setUnreadCount}
+																onTailMetaChange={handleMessageListTailMetaChange}
+																onLodStep={handleLodStep}
+																onSelectionResolverChange={setChunkSelectionResolver}
+																rowHandlers={vlistRowHandlers}
+																permCb={permCbWithAsyncQuestions}
+																enableOutlineAsk={!isWorkspacePreview}
+																highlightMessageId={highlightMessageId}
+																highlightRequestId={highlightRequestId}
+																highlightNeedle={highlightNeedle}
+																tailFooter={messageListTailFooter}
+															/>
+														</ReasoningTranslationVisibilityProvider>
 													</Suspense>
 												</RenderLodCtx.Provider>
 												<LodSwitchToast
@@ -3812,6 +3816,9 @@ function NarratorPanelBody({
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
+							effectiveFastMode: narrator.effectiveFastMode,
+							fastModeSource: narrator.fastModeSource,
+							isSubagent,
 							fastModeDefault,
 							fastModeUsesTapSettings,
 							fastModeMutation,

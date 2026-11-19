@@ -4,7 +4,7 @@ import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 } from "../../shared/recent-tabs";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
 import {
 	backgroundTasks,
 	narratorMessageRefs,
@@ -12,8 +12,11 @@ import {
 	narrators,
 	projects,
 } from "../db/schema";
+import { getNarratorWorkerTestDb } from "../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
@@ -57,6 +60,7 @@ function createFakeWs(
 			if (throwOnSend) throw new Error("socket closed");
 			sent.push(JSON.parse(payload) as SentMessage);
 		},
+		close() {},
 	} as unknown as FakeNarratorWS;
 	return {
 		ws,
@@ -138,9 +142,429 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
+});
+
+describe("reasoning translation visibility lifecycle", () => {
+	async function delayNextAcl() {
+		const workerReads = await import("../db/worker-read");
+		const original = workerReads.readQuery;
+		let enter = () => {};
+		let resume = () => {};
+		let fail = (_error: Error) => {};
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const gate = new Promise<void>((resolve, reject) => {
+			resume = resolve;
+			fail = reject;
+		});
+		let delayed = false;
+		const intercept = <T>(
+			query: PromiseLike<T> & { toSQL(): { sql: string; params: unknown[] } },
+			options?: import("../db/worker-read").ReadQueryOptions,
+		): Promise<T> => {
+			const result = original<T>(query, options);
+			if (!delayed) {
+				delayed = true;
+				return result.then((snapshot) => {
+					enter();
+					return gate.then(() => snapshot);
+				});
+			}
+			return result;
+		};
+		const read = spyOn(workerReads, "readQuery").mockImplementation(intercept);
+		return { entered, resume, fail, restore: () => read.mockRestore() };
+	}
+
+	it("retains first/reconnected visible demand behind the actual pending messages authorization", async () => {
+		const { reasoningTranslationVisibility } = await import(
+			"../services/reasoning-translation-runtime"
+		);
+		seedReadableNarrator("delayed-view");
+		const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(() => true);
+		const notify = spyOn(reasoningTranslationVisibility, "notify").mockImplementation(() => {});
+		const target = {
+			ownerNarratorId: "owner",
+			messageId: "message",
+			blockId: "block",
+			elementId: "element",
+		};
+		try {
+			for (const attempt of ["first", "reconnect"]) {
+				const connection = openFakeWs();
+				const delayed = await delayNextAcl();
+				const subscribing = handleNarratorWS.message(connection.ws, {
+					type: "subscribe",
+					narratorIds: ["delayed-view"],
+					kind: "messages",
+				});
+				try {
+					await delayed.entered;
+					await handleNarratorWS.message(connection.ws, {
+						type: "reasoning_translation_visibility",
+						narratorId: "delayed-view",
+						visibilityId: attempt,
+						targets: [target],
+					});
+					const call = replace.mock.calls.at(-1);
+					expect(call?.[3]).toEqual([target]);
+					expect(call?.[2].isCurrent()).toBe(false);
+					delayed.resume();
+					await subscribing;
+					expect(call?.[2].isCurrent()).toBe(true);
+					expect(notify).toHaveBeenCalled();
+				} finally {
+					delayed.resume();
+					await subscribing;
+					delayed.restore();
+					handleNarratorWS.close(connection.ws);
+				}
+			}
+		} finally {
+			replace.mockRestore();
+			notify.mockRestore();
+		}
+	});
+
+	for (const action of ["hide", "unsubscribe", "close", "denied"] as const) {
+		it(`pending ACL completion cannot revive ${action} visibility`, async () => {
+			const { reasoningTranslationVisibility } = await import(
+				"../services/reasoning-translation-runtime"
+			);
+			seedReadableNarrator("delayed-view");
+			if (action === "denied")
+				db.update(narrators)
+					.set({ visibility: "private" })
+					.where(eq(narrators.id, "delayed-view"))
+					.run();
+			const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(
+				() => true,
+			);
+			const release = spyOn(reasoningTranslationVisibility, "release");
+			const delayed = await delayNextAcl();
+			const connection = openFakeWs();
+			const frame = {
+				type: "reasoning_translation_visibility" as const,
+				narratorId: "delayed-view",
+				visibilityId: "panel",
+				targets: [
+					{
+						ownerNarratorId: "owner",
+						messageId: "message",
+						blockId: "block",
+						elementId: "element",
+					},
+				],
+			};
+			const subscribing = handleNarratorWS.message(connection.ws, {
+				type: "subscribe",
+				narratorIds: ["delayed-view"],
+				kind: "messages",
+			});
+			try {
+				await delayed.entered;
+				await handleNarratorWS.message(connection.ws, frame);
+				const observer = replace.mock.calls.at(-1)?.[2];
+				if (action === "hide")
+					await handleNarratorWS.message(connection.ws, { ...frame, targets: [] });
+				if (action === "unsubscribe")
+					await handleNarratorWS.message(connection.ws, {
+						type: "unsubscribe",
+						narratorIds: ["delayed-view"],
+					});
+				if (action === "close") handleNarratorWS.close(connection.ws);
+				delayed.resume();
+				await subscribing;
+				expect(connection.ws.data.pendingNarratorSubscriptions?.size ?? 0).toBe(0);
+				if (action === "hide") expect(replace.mock.calls.at(-1)?.[3]).toEqual([]);
+				else {
+					expect(observer?.isCurrent()).toBe(false);
+					expect(connection.ws.data.translationMessageNarrators?.has("delayed-view") ?? false).toBe(
+						false,
+					);
+					expect(release).toHaveBeenCalled();
+				}
+			} finally {
+				delayed.resume();
+				await subscribing;
+				delayed.restore();
+				replace.mockRestore();
+				release.mockRestore();
+			}
+		});
+	}
+
+	for (const kinds of [
+		["messages", "panel"],
+		["messages", "list"],
+		["panel", "messages"],
+		["messages", "messages"],
+	] as const) {
+		it(`independent ${kinds.join(" then ")} requests retain their own authorization permits`, async () => {
+			const { reasoningTranslationVisibility } = await import(
+				"../services/reasoning-translation-runtime"
+			);
+			seedReadableNarrator("multi-view");
+			const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(
+				() => true,
+			);
+			const delayed = await delayNextAcl();
+			const connection = openFakeWs();
+			const first = handleNarratorWS.message(connection.ws, {
+				type: "subscribe",
+				narratorIds: ["multi-view"],
+				kind: kinds[0],
+				requestId: "first",
+			});
+			try {
+				await delayed.entered;
+				await handleNarratorWS.message(connection.ws, {
+					type: "subscribe",
+					narratorIds: ["multi-view"],
+					kind: kinds[1],
+					requestId: "second",
+				});
+				const targets = [
+					{
+						ownerNarratorId: "owner",
+						messageId: "message",
+						blockId: "block",
+						elementId: "element",
+					},
+				];
+				await handleNarratorWS.message(connection.ws, {
+					type: "reasoning_translation_visibility",
+					narratorId: "multi-view",
+					visibilityId: "panel",
+					targets,
+				});
+				expect(replace.mock.calls.at(-1)?.[3]).toEqual(targets);
+				delayed.resume();
+				await first;
+				expect(connection.ws.data.translationMessageNarrators?.has("multi-view")).toBe(true);
+				expect(replace.mock.calls.at(-1)?.[2].isCurrent()).toBe(true);
+				for (const [index, kind] of kinds.entries())
+					if (kind === "messages") {
+						expect(
+							connection.sent.some(
+								(frame) =>
+									frame.type === "streaming_snapshot" &&
+									frame.subscriptionRequestId === (index === 0 ? "first" : "second"),
+							),
+						).toBe(true);
+					}
+			} finally {
+				delayed.resume();
+				await first;
+				delayed.restore();
+				replace.mockRestore();
+			}
+		});
+	}
+
+	it("activity upgrades wake demand only after the full message level becomes current", async () => {
+		const { reasoningTranslationVisibility } = await import(
+			"../services/reasoning-translation-runtime"
+		);
+		seedReadableNarrator("activity-upgrade");
+		const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(() => true);
+		let observer: Parameters<typeof reasoningTranslationVisibility.replace>[2] | undefined;
+		const currentAtWake: boolean[] = [];
+		const notify = spyOn(reasoningTranslationVisibility, "notify").mockImplementation(() => {
+			currentAtWake.push(observer?.isCurrent() ?? false);
+		});
+		const delayed = await delayNextAcl();
+		const connection = openFakeWs({ subscribedNarrators: new Set(["activity-upgrade"]) });
+		connection.ws.data.activityOnlyNarrators = new Set(["activity-upgrade"]);
+		const subscribing = handleNarratorWS.message(connection.ws, {
+			type: "subscribe",
+			narratorIds: ["activity-upgrade"],
+			kind: "messages",
+		});
+		try {
+			await delayed.entered;
+			await handleNarratorWS.message(connection.ws, {
+				type: "reasoning_translation_visibility",
+				narratorId: "activity-upgrade",
+				visibilityId: "panel",
+				targets: [
+					{
+						ownerNarratorId: "owner",
+						messageId: "message",
+						blockId: "block",
+						elementId: "element",
+					},
+				],
+			});
+			observer = replace.mock.calls.at(-1)?.[2];
+			expect(observer?.isCurrent()).toBe(false);
+			delayed.resume();
+			await subscribing;
+			expect(currentAtWake).toEqual([true]);
+		} finally {
+			delayed.resume();
+			await subscribing;
+			delayed.restore();
+			replace.mockRestore();
+			notify.mockRestore();
+		}
+	});
+
+	it("late denial from an unsubscribed request cannot evict a newly authorized subscription", async () => {
+		seedReadableNarrator("replaced-view");
+		db.update(narrators)
+			.set({ visibility: "private" })
+			.where(eq(narrators.id, "replaced-view"))
+			.run();
+		const delayed = await delayNextAcl();
+		const connection = openFakeWs();
+		const old = handleNarratorWS.message(connection.ws, {
+			type: "subscribe",
+			narratorIds: ["replaced-view"],
+			kind: "messages",
+			requestId: "old",
+		});
+		try {
+			await delayed.entered;
+			await handleNarratorWS.message(connection.ws, {
+				type: "unsubscribe",
+				narratorIds: ["replaced-view"],
+			});
+			db.update(narrators)
+				.set({ visibility: "public" })
+				.where(eq(narrators.id, "replaced-view"))
+				.run();
+			await handleNarratorWS.message(connection.ws, {
+				type: "subscribe",
+				narratorIds: ["replaced-view"],
+				kind: "messages",
+				requestId: "new",
+			});
+			delayed.resume();
+			await old;
+			expect(connection.ws.data.translationMessageNarrators?.has("replaced-view")).toBe(true);
+			expect(
+				connection.sent.some(
+					(frame) => frame.type === "subscribe_denied" && frame.requestId === "old",
+				),
+			).toBe(false);
+		} finally {
+			delayed.resume();
+			await old;
+			delayed.restore();
+		}
+	});
+
+	it("an older read failure cannot evict a newer successful independent messages request", async () => {
+		seedReadableNarrator("successful-view");
+		const delayed = await delayNextAcl();
+		const connection = openFakeWs();
+		const first = handleNarratorWS.message(connection.ws, {
+			type: "subscribe",
+			narratorIds: ["successful-view"],
+			kind: "messages",
+			requestId: "old-failure",
+		});
+		try {
+			await delayed.entered;
+			await handleNarratorWS.message(connection.ws, {
+				type: "subscribe",
+				narratorIds: ["successful-view"],
+				kind: "messages",
+				requestId: "new-success",
+			});
+			delayed.fail(new Error("bounded fixture read failed"));
+			await first;
+			expect(connection.ws.data.subscribedNarrators.has("successful-view")).toBe(true);
+			expect(connection.ws.data.translationMessageNarrators?.has("successful-view")).toBe(true);
+			expect(
+				connection.sent.some(
+					(frame) => frame.type === "subscribe_denied" && frame.requestId === "old-failure",
+				),
+			).toBe(false);
+			const { dropNarratorSubscriptionsForUnauthorizedUsers } = await import("./narrator-ws");
+			db.update(narrators)
+				.set({ visibility: "private" })
+				.where(eq(narrators.id, "successful-view"))
+				.run();
+			await dropNarratorSubscriptionsForUnauthorizedUsers("successful-view");
+			expect(connection.ws.data.subscribedNarrators.has("successful-view")).toBe(false);
+			expect(connection.ws.data.translationMessageNarrators?.has("successful-view")).toBe(false);
+			expect(connection.ws.data.narratorSubscriptionGrants?.has("successful-view")).toBe(false);
+		} finally {
+			delayed.resume();
+			await first;
+			delayed.restore();
+		}
+	});
+
+	it("requires an authenticated message subscription and releases on unsubscribe/close", async () => {
+		const { reasoningTranslationVisibility } = await import(
+			"../services/reasoning-translation-runtime"
+		);
+		const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(() => true);
+		const release = spyOn(reasoningTranslationVisibility, "release");
+		const target = {
+			ownerNarratorId: "owner",
+			messageId: "message",
+			blockId: "block",
+			elementId: "element",
+		};
+		const frame = {
+			type: "reasoning_translation_visibility" as const,
+			narratorId: "view",
+			visibilityId: "panel",
+			targets: [target],
+		};
+		try {
+			const connection = openFakeWs({ subscribedNarrators: new Set(["view"]) });
+			await handleNarratorWS.message(connection.ws, frame);
+			expect(replace.mock.calls[0]?.[3]).toEqual([]);
+			connection.ws.data.translationMessageNarrators = new Set(["view"]);
+			await handleNarratorWS.message(connection.ws, frame);
+			expect(replace.mock.calls[1]?.[3]).toEqual([target]);
+			const viewer = replace.mock.calls[1]?.[2];
+			expect(viewer?.isCurrent()).toBe(true);
+			await handleNarratorWS.message(connection.ws, { type: "unsubscribe", narratorIds: ["view"] });
+			expect(release).toHaveBeenCalledWith(connection.ws, undefined, "view");
+			expect(viewer?.isCurrent()).toBe(false);
+			handleNarratorWS.close(connection.ws);
+			expect(release).toHaveBeenCalledWith(connection.ws);
+		} finally {
+			replace.mockRestore();
+			release.mockRestore();
+		}
+	});
+
+	it("anonymous and public-share sockets cannot request translation models", async () => {
+		const { reasoningTranslationVisibility } = await import(
+			"../services/reasoning-translation-runtime"
+		);
+		const replace = spyOn(reasoningTranslationVisibility, "replace").mockImplementation(() => true);
+		try {
+			const connection = openFakeWs({ subscribedNarrators: new Set(["view"]) });
+			const frame = {
+				type: "reasoning_translation_visibility" as const,
+				narratorId: "view",
+				visibilityId: "panel",
+				targets: [],
+			};
+			connection.ws.data.userId = undefined;
+			await handleNarratorWS.message(connection.ws, frame);
+			connection.ws.data.userId = "authenticated";
+			connection.ws.data.publicShare = { narratorId: "view" } as NonNullable<
+				typeof connection.ws.data.publicShare
+			>;
+			await handleNarratorWS.message(connection.ws, frame);
+			expect(replace).not.toHaveBeenCalled();
+		} finally {
+			replace.mockRestore();
+		}
+	});
 });
 
 describe("account preference invalidation", () => {
@@ -294,6 +718,56 @@ describe("HumanAttention global invalidation", () => {
 });
 
 describe("narrator WebSocket message snapshot subscribe", () => {
+	it("restores state after a missed part even when the model message version is equal", async () => {
+		seedReadableNarrator("state-reconnect");
+		const { ws, sent } = openFakeWs();
+		const { narratorService } = await import("../services/narrator-service");
+		const version = await narratorService.getMessageVersion("state-reconnect");
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "messages",
+			narratorIds: ["state-reconnect"],
+			version,
+			restoreState: true,
+			requestId: "restore-reader-state",
+		});
+		expect(
+			sent.some(
+				(frame) =>
+					frame.type === "full_reload" && frame.subscriptionRequestId === "restore-reader-state",
+			),
+		).toBe(true);
+		expect(sent.some((frame) => frame.type === "sync_ok")).toBe(false);
+	});
+
+	it("a translation frame exceeding the socket budget closes for bounded recovery", () => {
+		const { ws } = openFakeWs({ subscribedNarrators: new Set(["state-backpressure"]) });
+		const close = spyOn(ws, "close").mockImplementation(() => {});
+		ws.getBufferedAmount = () => 256 * 1024;
+		broadcastToNarrator("state-backpressure", {
+			type: "reasoning_translation_patch",
+			narratorId: "state-backpressure",
+			ownerNarratorId: "state-backpressure",
+			messageId: "m",
+			blockId: "persisted",
+			elementId: "reason",
+			blockRevision: 1,
+			stateRevision: 2,
+			translationGeneration: "g",
+			part: {
+				id: "part",
+				generation: "g",
+				start: 0,
+				end: 1,
+				sourceText: "A",
+				translatedText: "甲",
+			},
+		});
+		expect(close).toHaveBeenCalledWith(1013, "Reasoning translation recovery required");
+		expect(getNarratorConnections().has(ws)).toBe(false);
+		close.mockRestore();
+	});
+
 	it("returns request-scoped sync_ok for a matching version-only empty snapshot", async () => {
 		await seedNarrators();
 		const { ws, sent } = openFakeWs();

@@ -269,6 +269,8 @@ export interface TraceItemData {
 	category?: string;
 	/** Markdown body for an expandable row; null/empty → non-expandable dot row. */
 	bodyText?: string | null;
+	/** Height-neutral visual lineage for the active reasoning body. */
+	reasoningTail?: PreparedBlock["reasoningTail"];
 	/** Streaming shimmer on this row (renderer only). */
 	shimmer?: boolean;
 	/**
@@ -804,6 +806,17 @@ export function measureCollapsibleTrace(
 					textExpanded: expandState.textExpandedKeys?.includes(item.key ?? String(itemIndex)),
 					direction: item.shimmer ? "tail" : "head",
 				});
+				if (item.reasoningTail) {
+					const tail = item.reasoningTail;
+					body = {
+						...body,
+						blocks: body.blocks.map((block, index) => ({
+							...block,
+							reasoningTailKey: `${tail.id}:${index}`,
+							reasoningTail: tail,
+						})),
+					};
+				}
 				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.height;
 			}
 		}
@@ -1053,6 +1066,7 @@ export interface ReasoningStepItem {
 	body?: string | null;
 	shimmer?: boolean;
 	key?: string;
+	reasoningTail?: PreparedBlock["reasoningTail"];
 	/**
 	 * LOD-independent identity of this step, matching the `unitId` of the folded
 	 * `activity-trace` row the same step becomes at L1/L2 (see `TraceItemData.unitId`).
@@ -1081,6 +1095,7 @@ export function measureReasoningStepsTrace(
 				title: s.title,
 				hasIcon: false,
 				bodyText: s.body ?? null,
+				reasoningTail: s.reasoningTail,
 				shimmer: s.shimmer,
 				key: s.key,
 				// Passthrough so the step row paints `data-nf-unit` and can be paired with

@@ -1143,7 +1143,7 @@
 	"legacyEncoding": "Legacy Encoding Support",
 	"legacyEncodingDesc": "Auto-detect and preserve non-UTF-8 file encodings (e.g. GBK, Shift_JIS). Enable this when working with legacy codebases.",
 	"translateReasoning": "Translate Reasoning Blocks",
-	"translateReasoningDesc": "Translate AI thinking/reasoning content into your language after each block completes. The translation model is configured on the Models page and follows the summary model by default. Both original and translated text are stored.",
+	"translateReasoningDesc": "Translate untranslated thinking/reasoning only when its text is visible in an open narrator panel. Hidden panels, off-screen text and collapsed bodies do not request translation. The model is configured on the Models page and follows the summary model by default. Original text and completed translations are stored.",
 	"requestEvidenceRingEnabled": "Ring recording of requests and responses",
 	"requestEvidenceRingEnabledDesc": "Enabled by default. Keeps recent requests and responses within bounded capacities, evicting older data when full. Use /save_dump, the error card or usage history to pin evidence without sending anything to the model or interrupting the session. Saved settings take effect live. Recordings contain conversation text; share only with trusted people.",
 	"requestEvidenceRequestCapacity": "Request capacity",

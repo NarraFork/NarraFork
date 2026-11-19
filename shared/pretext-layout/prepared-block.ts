@@ -45,6 +45,10 @@ export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 /** Common fields shared by every prepared block. */
 export interface PreparedBlockBase {
+	/** Reasoning-only active-tail identity; independent of translated-prefix block indices. */
+	reasoningTailKey?: string;
+	/** Height-neutral display lineage; replacement is not a newly streamed birth. */
+	reasoningTail?: { id: string; translationRevision?: string };
 	/** Top margin (px) applied before this block within its element. First
 	 * block in an element typically uses 0. */
 	marginTop: number;

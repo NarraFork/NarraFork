@@ -691,6 +691,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// SQLite-gated project indexing uses connection change counters only to invalidate
 	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.
 	"server/services/project-index.ts": ["handle", "sessionFn"],
+	"server/services/reasoning-translation-store.ts": ["handle", "json1", "glob"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",

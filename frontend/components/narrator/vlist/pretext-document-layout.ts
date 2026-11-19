@@ -46,6 +46,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
+	expandReasoning?: boolean;
+	isReasoningRowExpanded?: (key: string, rowKey: string | number) => boolean | undefined;
 	isExpanded?: (key: string) => boolean | undefined;
 	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	isLodUserOverride?: (key: string) => boolean;

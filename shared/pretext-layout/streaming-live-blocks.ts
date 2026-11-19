@@ -1,4 +1,5 @@
 import { type MessageBodySource, messageBody } from "../narrator-blocks/message-blocks";
+import type { ReasoningTranslationActivity } from "../reasoning-translation";
 /**
  * streaming-live-blocks.ts — Which block of the LIVE synthetic message is still
  * being written, as opposed to merely un-persisted.
@@ -53,6 +54,8 @@ export interface LiveBlocksMessageLike extends MessageBodySource {
 	liveBlockIndex?: number | null;
 	/** Frontend-only: a real checkpoint row currently projects a newer live block. */
 	liveContentProjection?: boolean;
+	/** Activity survives checkpoint retirement of the synthetic body's display copy. */
+	reasoningTranslationActivity?: ReasoningTranslationActivity | null;
 }
 
 /**
@@ -103,6 +106,15 @@ export function resolveLiveBlockIndex(
 	msg: LiveBlocksMessageLike | null | undefined,
 ): number {
 	if (!msg || (!isStreamingMessage && !msg.liveContentProjection)) return -1;
+	const activity = msg.reasoningTranslationActivity;
+	if (activity) {
+		const index = messageBody(msg).findIndex(
+			(block) =>
+				(block as { id?: unknown }).id === activity.elementId &&
+				isStreamableTextBlock(block as LiveBlockLike),
+		);
+		if (index >= 0) return index;
+	}
 	// A checkpointed real message can temporarily project a newer live revision.
 	// Only that local projection carries a stamp; persisted messages never do.
 	const stamped = msg.liveBlockIndex;

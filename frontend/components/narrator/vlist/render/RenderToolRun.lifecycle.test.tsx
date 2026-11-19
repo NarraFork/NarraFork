@@ -11,13 +11,23 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
+import type { ReasoningTranslationGroup } from "@shared/pretext-layout/reasoning-translation-sources";
 import { TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import {
+	clearReasoningTranslationStatus,
+	setReasoningTranslationStatus,
+} from "../../reasoning-translation-status-store";
 import { measureReasoning } from "../measure/measure-reasoning";
-import { measureActivityTrace, measureCollapsibleTrace } from "../measure/measure-tool-run";
+import {
+	measureActivityTrace,
+	measureCollapsibleTrace,
+	measureReasoningStepsTrace,
+} from "../measure/measure-tool-run";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderReasoning } from "./RenderReasoning";
 import { RenderToolRun, type TraceRenderLabels } from "./RenderToolRun";
@@ -157,6 +167,77 @@ describe("live reasoning row label", () => {
 		expect(rowText()).not.toContain("思考已完成");
 		expect(rowText()).not.toContain("正在思考");
 		act(() => root.unmount());
+	});
+});
+
+describe("reasoning translation indicator", () => {
+	it("updates both headers in place and clears at idle, narrator switch and holder disposal", () => {
+		const group: ReasoningTranslationGroup = {
+			groupId: "translation-run",
+			anchor: {
+				ownerNarratorId: "owner",
+				messageId: "message",
+				blockId: "block",
+				elementId: "element",
+			},
+		};
+		const trace = measureReasoningStepsTrace([{ title: "Analyze", key: "seg0" }], WIDTH);
+		const plain = measureReasoning({ text: "Analyze" }, WIDTH);
+		const source = { text: "Analyze", ranges: [], group };
+		// Bun omits CSS-module class mappings; verify motion rules at their stylesheet boundary.
+		const css = readFileSync(
+			new URL("../../reasoning-translation-indicator.module.css", import.meta.url),
+			"utf8",
+		);
+		expect(css).toMatch(/\.indicator\s*\{[^}]*animation:\s*reasoning-translation-breathe/);
+		expect(css).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*animation:\s*none/);
+		const { root, render } = mount();
+		const headers = (narratorId: string) => (
+			<>
+				<RenderToolRun
+					narratorId={narratorId}
+					measured={trace}
+					translationGroup={group}
+					labels={{ translationStatusLabel: "正在翻译思考内容" }}
+				/>
+				<RenderReasoning
+					narratorId={narratorId}
+					measured={plain}
+					translationSource={source}
+					labels={{ translationStatusLabel: "正在翻译思考内容" }}
+				/>
+			</>
+		);
+		const icons = () => host.querySelectorAll("[data-reasoning-translation-status]");
+		const update = (state: "queued" | "running" | "idle") =>
+			act(() => {
+				setReasoningTranslationStatus("viewer", "panel", [{ groupId: group.groupId, state }]);
+			});
+		try {
+			render(headers("viewer"));
+			expect(icons()).toHaveLength(0);
+			const text = host.textContent;
+			update("queued");
+			expect(icons()).toHaveLength(2);
+			for (const icon of icons()) {
+				expect(icon.getAttribute("aria-label")).toBe("正在翻译思考内容");
+				expect(icon.querySelector(".tabler-icon-language")?.getAttribute("width")).toBe("12");
+			}
+			expect(host.textContent).toBe(text);
+			update("running");
+			expect(icons()[0]?.getAttribute("data-reasoning-translation-status")).toBe("running");
+			update("idle");
+			expect(icons()).toHaveLength(0);
+			update("running");
+			render(headers("other-viewer"));
+			expect(icons()).toHaveLength(0);
+			act(() => clearReasoningTranslationStatus("viewer", "panel"));
+			render(headers("viewer"));
+			expect(icons()).toHaveLength(0);
+		} finally {
+			act(() => root.unmount());
+			clearReasoningTranslationStatus("viewer", "panel");
+		}
 	});
 });
 

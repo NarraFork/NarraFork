@@ -10,6 +10,10 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type {
+	ReasoningTranslationActivity,
+	ReasoningTranslationFields,
+} from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
@@ -608,6 +612,8 @@ export interface SubagentToolCallTiming {
 
 export interface SubagentToolCallHeader {
 	toolCallId: string | null;
+	/** Present only when the event identifies the persisted execution attempt. */
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -631,7 +637,7 @@ export interface SubagentToolCallHeader {
 	 * feed the normal tool card rather than an activity row and need no summary.
 	 * See `SubagentActivityRow`.
 	 */
-	inputSummary?: SubagentToolInputSummary;
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface SubagentFileChanges {
@@ -696,7 +702,7 @@ export interface ExecutionTargetIdentity {
 	selectionSource?: "explicit" | "session_default" | "local_default";
 }
 
-export interface BaseContentBlock {
+export interface BaseContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string;
 	thinking?: string;
@@ -1083,6 +1089,8 @@ export interface TreeMessage {
 	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
 	 */
 	blocks: MessageRowBlock[];
+	/** Mutable envelope state version; independent of each block's body revision. */
+	stateRevision?: number;
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;
@@ -1140,6 +1148,10 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/** Client projection of an author-local active reasoning lane, separate from its body. */
+	reasoningTranslationActivity?: ReasoningTranslationActivity | null;
+	/** A real checkpoint row carrying an active live lane. Never persisted. */
+	liveContentProjection?: boolean;
 	/**
 	 * Client-only synthetic row: animation baseline of the last accepted text
 	 * snapshot. Travels with this message through the layout commit, so new

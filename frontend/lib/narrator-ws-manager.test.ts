@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { readReasoningTranslationPatch } from "@shared/reasoning-translation";
 import { NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION } from "@shared/recent-tabs";
 import { coerceMessageReplacementAliases } from "../hooks/useNarratorWS";
+import { decodeBlockFrame } from "./block-protocol";
 import {
 	chunkNarratorIds,
 	limitNarratorSubscriptionIds,
@@ -8,6 +10,437 @@ import {
 	NarratorWSManager,
 	shouldDeliverToListener,
 } from "./narrator-ws-manager";
+
+describe("reasoning translation recovery", () => {
+	test("restored message subscriptions recover missed state despite an equal messageVersion", async () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 7);
+		const messages = manager.subscribe(["n1"], { kind: "messages" });
+		manager.subscribe(["n1"], { kind: "panel" });
+		manager.subscribe(["n2"], { kind: "activity" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_restoreSubscriptions: () => void;
+			_sendSubscribe: (handle: typeof messages, ids: string[]) => void;
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		internal._sendSubscribe(messages, ["n1"]);
+		expect(sent[0]).not.toHaveProperty("restoreState");
+		sent.length = 0;
+		// A completed state-only part can be missed while a backpressured socket is
+		// closed (1013). Reopening the message handle must not trust version equality.
+		internal.ws.readyState = WebSocket.CLOSED;
+		internal.ws.readyState = WebSocket.OPEN;
+		internal._restoreSubscriptions();
+		const restored = sent.find((frame) => frame.kind === "messages");
+		expect(restored).toMatchObject({ type: "subscribe", version: 7, restoreState: true });
+		for (const frame of sent.filter((frame) => frame.kind !== "messages")) {
+			expect(frame).not.toHaveProperty("restoreState");
+		}
+		const seen: Record<string, unknown>[] = [];
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: messages._id }, (frame) =>
+			seen.push(frame),
+		);
+		dispatch(manager, {
+			type: "full_reload",
+			narratorId: "n1",
+			subscriptionRequestId: restored?.requestId,
+		});
+		expect(seen.map((frame) => frame.type)).toEqual(["full_reload"]);
+		expect(manager.getMessageVersion("n1")).toBe(7);
+		expect(manager.checkSync("n1")).toBe(false);
+		manager.markMessageReconcilePending("n1");
+		expect(manager.commitMessageReconcile("n1", 7)).toBe(true);
+		sent.length = 0;
+		manager.checkSync("n1");
+		expect(sent[0]).toMatchObject({ type: "sync_check", version: 7 });
+		expect(sent[0]).not.toHaveProperty("restoreState");
+	});
+
+	test("a failed state-patch listener re-subscribes reader state instead of equal-version sync", async () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 4);
+		const messages = manager.subscribe(["n1"], { kind: "messages" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: messages._id }, (frame) => {
+			if (frame.type === "reasoning_translation_patch") throw new Error("render failed");
+		});
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({
+				type: "subscribe",
+				narratorIds: ["n1"],
+				kind: "messages",
+				restoreState: true,
+			});
+			expect(sent.some((frame) => frame.type === "sync_check")).toBe(false);
+			dispatch(manager, {
+				type: "full_reload",
+				narratorId: "n1",
+				subscriptionRequestId: sent[0].requestId,
+			});
+			manager.markMessageReconcilePending("n1");
+			expect(manager.commitMessageReconcile("n1", 4)).toBe(true);
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(2);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("bounds restore-response failures across multiple listeners and patches until state succeeds", async () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 4);
+		const affected = manager.subscribe(["n1"], { kind: "messages" });
+		const sibling = manager.subscribe(["n1"], { kind: "messages" });
+		const unrelated = manager.subscribe(["n2"], { kind: "messages" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_restoreSubscriptions: () => void;
+			translationRecoveries: Map<number, Map<string, { failed: boolean }>>;
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		let failing = true;
+		let accepted = 0;
+		const listener = () => {
+			if (failing) throw new Error("render failed");
+		};
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: affected._id }, listener);
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: affected._id }, listener);
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: affected._id }, () => accepted++);
+		manager.addListener({ narratorIds: ["n1"], subscriptionId: sibling._id }, () => accepted++);
+		manager.addListener({ narratorIds: ["n1"] }, () => accepted++);
+		manager.addListener({ narratorIds: ["n2"], subscriptionId: unrelated._id }, () => {});
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({ type: "subscribe", restoreState: true });
+			const requestId = sent[0].requestId;
+			// A sibling's commit before this response arrives cannot reopen its recovery gate.
+			manager.markMessageReconcilePending("n1");
+			expect(manager.commitMessageReconcile("n1", 4)).toBe(true);
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(1);
+			// A second valid listener is not proof that the failing subscription accepted state.
+			for (let round = 0; round < 2; round++) {
+				dispatch(manager, {
+					type: "full_reload",
+					narratorId: "n1",
+					subscriptionRequestId: requestId,
+				});
+				dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+				await Promise.resolve();
+			}
+			expect(sent).toHaveLength(1);
+			expect(sent.some((frame) => frame.type === "sync_check")).toBe(false);
+			expect(accepted).toBeGreaterThan(0);
+			expect(internal.translationRecoveries.get(affected._id)?.get("n1")?.failed).toBe(true);
+			expect(internal.translationRecoveries.has(sibling._id)).toBe(false);
+			// Even a full-state frame does not reset the gate if one matching listener fails.
+			dispatch(manager, {
+				type: "catch_up",
+				narratorId: "n1",
+				subscriptionRequestId: requestId,
+				topLevel: [{ id: "m", blocks: [], stateRevision: 9 }],
+				orphanChildren: [],
+			});
+			// A sibling's REST commit cannot reset a handle whose own response failed.
+			manager.markMessageReconcilePending("n1");
+			expect(manager.commitMessageReconcile("n1", 4)).toBe(true);
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(1);
+			// Once all of this handle's listeners accept authoritative reader state,
+			// one later failure may start one new bounded recovery.
+			failing = false;
+			dispatch(manager, {
+				type: "catch_up",
+				narratorId: "n1",
+				subscriptionRequestId: requestId,
+				topLevel: [{ id: "m", blocks: [], stateRevision: 9 }],
+				orphanChildren: [],
+			});
+			failing = true;
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(2);
+			// Rebuilding the physical connection renews each surviving handle once.
+			internal._restoreSubscriptions();
+			expect(sent.filter((frame) => frame.type === "subscribe")).toHaveLength(5);
+			const restored = sent.findLast(
+				(frame) =>
+					typeof frame.requestId === "string" &&
+					frame.requestId.startsWith(`messages-${affected._id}-`),
+			);
+			for (let round = 0; round < 2; round++) {
+				dispatch(manager, {
+					type: "full_reload",
+					narratorId: "n1",
+					subscriptionRequestId: restored?.requestId,
+				});
+				await Promise.resolve();
+			}
+			expect(sent).toHaveLength(5);
+			// Explicit focus checks resume normally once unrelated restored state commits.
+			const restoredUnrelated = sent.findLast(
+				(frame) =>
+					typeof frame.requestId === "string" &&
+					frame.requestId.startsWith(`messages-${unrelated._id}-`),
+			);
+			dispatch(manager, {
+				type: "full_reload",
+				narratorId: "n2",
+				subscriptionRequestId: restoredUnrelated?.requestId,
+			});
+			manager.markMessageReconcilePending("n2");
+			expect(manager.commitMessageReconcile("n2", 0)).toBe(true);
+			expect(manager.checkSync("n2")).toBe(true);
+			expect(sent[5]).toMatchObject({ type: "sync_check", narratorId: "n2" });
+			manager.unsubscribe(affected);
+			expect(internal.translationRecoveries.has(affected._id)).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("coalesces two narrator restores on one message handle and preserves both response routes across sync", async () => {
+		const manager = new NarratorWSManager();
+		for (const id of ["n1", "n2"]) manager.updateMessageVersion(id, 4);
+		const messages = manager.subscribe(["n1", "n2", "n3"], { kind: "messages" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const received: string[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			requestToSubscription: Map<string, number>;
+			subscriptions: Map<number, { activeRequestIds: Set<string> }>;
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		manager.addListener(
+			{ narratorIds: ["n1", "n2", "n3"], subscriptionId: messages._id },
+			(frame) => {
+				if (frame.type === "reasoning_translation_patch") throw new Error("render failed");
+				if (frame.type === "full_reload") received.push(frame.narratorId as string);
+			},
+		);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n2" });
+			await Promise.resolve();
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({
+				type: "subscribe",
+				kind: "messages",
+				narratorIds: ["n1", "n2"],
+				restoreState: true,
+			});
+			const requestId = sent[0].requestId as string;
+			// A normal sync for a third target must not retire either pending restore response.
+			expect(manager.checkSync("n3")).toBe(true);
+			expect(internal.requestToSubscription.get(requestId)).toBe(messages._id);
+			dispatch(manager, {
+				type: "full_reload",
+				narratorId: "n1",
+				subscriptionRequestId: requestId,
+			});
+			manager.markMessageReconcilePending("n1");
+			expect(manager.commitMessageReconcile("n1", 4)).toBe(true);
+			// The first target may resume syncing while the second still owns the shared restore ID.
+			expect(manager.checkSync("n1")).toBe(true);
+			expect(internal.requestToSubscription.get(requestId)).toBe(messages._id);
+			expect(internal.subscriptions.get(messages._id)?.activeRequestIds.size).toBe(2);
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n2" });
+			dispatch(manager, {
+				type: "full_reload",
+				narratorId: "n2",
+				subscriptionRequestId: requestId,
+			});
+			await Promise.resolve();
+			expect(received).toEqual(["n1", "n2"]);
+			expect(sent.filter((frame) => frame.restoreState === true)).toHaveLength(1);
+			manager.markMessageReconcilePending("n2");
+			expect(manager.commitMessageReconcile("n2", 4)).toBe(true);
+			expect(manager.checkSync("n2")).toBe(true);
+			expect(internal.requestToSubscription.has(requestId)).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("keeps an earlier restore request when another narrator on the same handle fails later", async () => {
+		const manager = new NarratorWSManager();
+		const messages = manager.subscribe(["n1", "n2"], { kind: "messages" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const received: string[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			requestToSubscription: Map<string, number>;
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		manager.addListener({ narratorIds: ["n1", "n2"], subscriptionId: messages._id }, (frame) => {
+			if (frame.type === "reasoning_translation_patch") throw new Error("render failed");
+			if (frame.type === "full_reload") received.push(frame.narratorId as string);
+		});
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			for (const narratorId of ["n1", "n2"]) {
+				dispatch(manager, { type: "reasoning_translation_patch", narratorId });
+				await Promise.resolve();
+			}
+			expect(sent).toHaveLength(2);
+			expect(sent.map((frame) => frame.narratorIds)).toEqual([["n1"], ["n2"]]);
+			const firstId = sent[0].requestId as string;
+			const secondId = sent[1].requestId as string;
+			expect(firstId).not.toBe(secondId);
+			for (const requestId of [firstId, secondId]) {
+				expect(internal.requestToSubscription.get(requestId)).toBe(messages._id);
+			}
+			// Responses may complete in reverse order without stranding the earlier target.
+			dispatch(manager, { type: "full_reload", narratorId: "n2", subscriptionRequestId: secondId });
+			dispatch(manager, { type: "full_reload", narratorId: "n1", subscriptionRequestId: firstId });
+			for (const narratorId of ["n1", "n2"]) {
+				dispatch(manager, { type: "reasoning_translation_patch", narratorId });
+			}
+			await Promise.resolve();
+			expect(received).toEqual(["n2", "n1"]);
+			expect(sent).toHaveLength(2);
+			manager.unsubscribe(messages);
+			expect(internal.requestToSubscription.has(firstId)).toBe(false);
+			expect(internal.requestToSubscription.has(secondId)).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("cleans queued translation recovery on unsubscribe or subscription changes", async () => {
+		const manager = new NarratorWSManager();
+		const removed = manager.subscribe(["n1"], { kind: "messages" });
+		const changed = manager.subscribe(["n1"], { kind: "messages" });
+		await Promise.resolve();
+		const sent: Record<string, unknown>[] = [];
+		const internal = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			translationRecoveries: Map<number, Map<string, { failed: boolean }>>;
+		};
+		internal.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		for (const handle of [removed, changed]) {
+			manager.addListener({ narratorIds: ["n1"], subscriptionId: handle._id }, () => {
+				throw new Error("render failed");
+			});
+		}
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+			manager.unsubscribe(removed);
+			manager.updateSubscription(changed, ["n2"]);
+			await Promise.resolve();
+			expect(sent.filter((frame) => frame.restoreState === true)).toHaveLength(0);
+			expect(internal.translationRecoveries.has(removed._id)).toBe(false);
+			expect(internal.translationRecoveries.get(changed._id)?.has("n1") ?? false).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("records translation state epochs without changing the model/history version", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 4);
+		const epoch = manager.getRealtimeEpoch("n1");
+		dispatch(manager, { type: "reasoning_translation_patch", narratorId: "n1" });
+		expect(manager.getRealtimeEpoch("n1")).toBe(epoch + 1);
+		expect(manager.getMessageVersion("n1")).toBe(4);
+	});
+
+	test("v2 message-upsert recovery retains source generation, parts and state revision", () => {
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "abc",
+			translatedText: "甲",
+		};
+		const decoded = decodeBlockFrame({
+			type: "message_upserted",
+			cause: "message_updated",
+			narratorId: "n1",
+			messages: [
+				{ id: "m", narratorId: "n1", blockIds: ["b"], parentMessageId: null, stateRevision: 9 },
+			],
+			blocks: [
+				{
+					id: "b",
+					revision: 2,
+					kind: "reasoning",
+					elements: [
+						{
+							type: "reasoning",
+							id: "e",
+							text: "abc",
+							translationGeneration: "g",
+							translationParts: [part],
+						},
+					],
+				},
+			],
+		});
+		expect(decoded[0]?.type).toBe("message_updated");
+		expect(decoded[0]?.message).toMatchObject({
+			stateRevision: 9,
+			blocks: [{ id: "b", revision: 2, named: true, elements: [{ translationParts: [part] }] }],
+		});
+		expect(
+			readReasoningTranslationPatch({
+				narratorId: "n1",
+				ownerNarratorId: "n1",
+				messageId: "m",
+				blockId: "b",
+				elementId: "e",
+				blockRevision: 2,
+				stateRevision: 9,
+				translationGeneration: "g",
+				part,
+			}),
+		).not.toBeNull();
+	});
+});
 
 describe("complete input document lane ordering", () => {
 	test("snapshot and seal descriptors are not overtaken by immediate live input deltas", async () => {

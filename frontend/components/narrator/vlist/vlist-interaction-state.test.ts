@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	createVListInteractionState,
+	isVListReasoningRowExpanded,
 	isVListTextExpanded,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
@@ -8,12 +9,85 @@ import {
 	textExpansionSignature,
 	toggleVListLodUserOverride,
 	toggleVListRow,
+	toggleVListRowExpansion,
 	toggleVListShowEarlier,
 	toggleVListShowOriginal,
 	toggleVListTextExpanded,
 } from "./vlist-interaction-state";
 
 describe("vlist interaction state", () => {
+	it("records both manual reasoning-row choices and toggles the actual default-open state", () => {
+		const initial = createVListInteractionState(5);
+		const spec = {
+			kind: "reasoning-steps" as const,
+			key: "reasoning",
+			data: {},
+			opts: { expandedIndices: [0, 1] },
+		};
+		expect(isVListReasoningRowExpanded(initial, spec.key, 0)).toBeUndefined();
+		const closed = toggleVListRowExpansion(initial, spec, 0);
+		expect(isVListReasoningRowExpanded(closed, spec.key, 0)).toBe(false);
+		expect(isVListReasoningRowExpanded(closed, spec.key, 1)).toBeUndefined();
+		expect(initial.reasoningRowOverrides.size).toBe(0);
+		const opened = toggleVListRowExpansion(closed, { ...spec, opts: { expandedIndices: [1] } }, 0);
+		expect(isVListReasoningRowExpanded(opened, spec.key, 0)).toBe(true);
+		expect(closed.expandedRows.size).toBe(0);
+		expect(closed.fullPayloadRequested.size).toBe(0);
+	});
+
+	it("addresses folded reasoning by stable row key rather than changing row index", () => {
+		const spec = {
+			kind: "activity-trace" as const,
+			key: "trace",
+			data: { items: [{ key: "reason-step-0", bodyText: "body" }] },
+			opts: { expandedIndices: [0] },
+		};
+		const closed = toggleVListRowExpansion(
+			createVListInteractionState(2),
+			spec,
+			0,
+			"reason-step-0",
+		);
+		expect(isVListReasoningRowExpanded(closed, "trace", "reason-step-0")).toBe(false);
+		expect(isVListReasoningRowExpanded(closed, "trace", "reason-step-1")).toBeUndefined();
+		const shifted = { ...spec, opts: { expandedIndices: [0] } };
+		const opened = toggleVListRowExpansion(closed, shifted, 1, "reason-step-0");
+		expect(isVListReasoningRowExpanded(opened, "trace", "reason-step-0")).toBe(true);
+		expect(opened.expandedTraceRows.size).toBe(0);
+	});
+
+	it("keeps tool drill-down and recovery deselection on their existing channels", () => {
+		const initial = createVListInteractionState(2);
+		const tool = toggleVListRowExpansion(
+			initial,
+			{ kind: "activity-trace", key: "trace", data: { items: [{ key: "tool-1", card: {} }] } },
+			1,
+			"tool-1",
+		);
+		expect(tool.expandedTraceRows.get("trace")?.has("tool-1")).toBe(true);
+		const recovery = toggleVListRowExpansion(
+			tool,
+			{ kind: "subagent-recovery", key: "recovery", data: {} },
+			2,
+		);
+		expect(recovery.expandedRows.get("recovery")?.has(2)).toBe(true);
+		expect(recovery.reasoningRowOverrides.size).toBe(0);
+		expect(recovery.promptOpen.size).toBe(0);
+		expect(recovery.fullPayloadRequested.size).toBe(0);
+	});
+
+	it("resets reasoning row overrides with the existing LOD-local row folds", () => {
+		const state = toggleVListRowExpansion(
+			setVListExpanded(createVListInteractionState(5), "plain", false),
+			{ kind: "reasoning-steps", key: "steps", data: {}, opts: { expandedIndices: [0] } },
+			0,
+		);
+		expect(resetVListInteractionStateForLod(state, 5)).toBe(state);
+		const reset = resetVListInteractionStateForLod(state, 2);
+		expect(reset.reasoningRowOverrides.size).toBe(0);
+		expect(reset.expanded.get("plain")).toBe(false);
+	});
+
 	it("synchronizes durable body aliases and clears old live preferences on collapse", () => {
 		const initial = createVListInteractionState(5);
 		const canonical = "text-lifecycle:blk:body-1";

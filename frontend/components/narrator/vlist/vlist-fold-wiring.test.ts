@@ -178,6 +178,7 @@ describe("fold transition: reduced-motion drill retention", () => {
 			const smoothFollowerRef = { current: null };
 			const foldCaptureRef = { current: { stale: true } };
 			const scrollTopRef = { current: 0 };
+			const loadedTopNarratorRef = { current: null };
 			const readFoldGeometryRef = { current: () => (${geometryAvailable ? '{ geometry: new Map([["trace", {}]]), documentRevision: 1, lod: 1 }' : "null"}) };
 			const useCallback = (fn) => fn;
 			${capture}, []);
@@ -187,8 +188,12 @@ describe("fold transition: reduced-motion drill retention", () => {
 			const measuredByKeyRef = { current: { get: () => ({ rows: [{ key: "tool", cardMeasured: hasCard ? {} : undefined }] }) } };
 			const setClosingRows = (update) => { closingRows = update(closingRows); };
 			const setInteraction = (update) => update({});
-			const toggleVListTraceRow = () => { hasCard = !hasCard; };
-			const toggleVListRow = () => { throw new Error("wrong fold channel"); };
+			const renderItemsRef = { current: [{ spec: { key, kind: "activity-trace" } }] };
+			const toggleVListRowExpansion = (_state, spec, rowIndex, rowKey) => {
+				if (spec.key !== key || rowIndex !== 0 || rowKey !== "tool")
+					throw new Error("wrong fold identity");
+				hasCard = !hasCard;
+			};
 			const toggles = { ${toggle} };
 			return {
 				toggle: () => toggles.onToggleRow(0, "tool"),

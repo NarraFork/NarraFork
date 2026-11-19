@@ -24,6 +24,7 @@
 import { describe, expect, it } from "bun:test";
 import { StreamAnimStore } from "./render/stream-token-anim";
 import {
+	isLiveStreamAnimSpec,
 	nextStreamAnimEpoch,
 	resolveStreamAnimExtra,
 	streamAnimScope,
@@ -58,6 +59,41 @@ function frame(
 	store.commitFrame(key, text, now, extra.animScope, resolved);
 	return Math.max(0, text.length - resolved.sealOffset);
 }
+
+describe("real checkpoint streaming admission", () => {
+	it("uses the same active-spec predicate for animation and window-row reuse", () => {
+		for (const spec of [
+			{ key: "checkpoint-block", liveContentProjection: true },
+			{ key: "__streaming__-block" },
+		]) {
+			expect(isLiveStreamAnimSpec(spec)).toBe(true);
+			expect(
+				resolveStreamAnimExtra({
+					animateStreaming: isLiveStreamAnimSpec(spec),
+					kind: "reasoning",
+					specKey: spec.key,
+					narratorId: "n1",
+					mountEpoch: 1,
+				})?.animateStreaming,
+			).toBe(true);
+		}
+		for (const spec of [
+			{ key: "completed-prefix" },
+			{ key: "history", liveContentProjection: false },
+		]) {
+			expect(isLiveStreamAnimSpec(spec)).toBe(false);
+			expect(
+				resolveStreamAnimExtra({
+					animateStreaming: isLiveStreamAnimSpec(spec),
+					kind: "reasoning",
+					specKey: spec.key,
+					narratorId: "n1",
+					mountEpoch: 1,
+				}),
+			).toBeNull();
+		}
+	});
+});
 
 describe("mount epoch", () => {
 	it("mints a strictly increasing generation", () => {

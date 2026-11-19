@@ -32,6 +32,7 @@ import {
 } from "./streaming-tool-chunks";
 import {
 	reflectionResolvedPatch,
+	subagentActivityUpdate,
 	toolCompletedPatch,
 	toolExecutingPatch,
 	toolStartedPatch,
@@ -42,6 +43,7 @@ import {
 	patchSubagentActivity,
 	patchSubagentActivitySnapshots,
 	patchToolCallFields,
+	SubagentActivityPatchStore,
 } from "./vlist-live-patch";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +95,225 @@ function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage
 		})),
 	);
 }
+
+describe("bounded missing-parent child activity", () => {
+	const event = (id = 1, overrides: Partial<Parameters<typeof subagentActivityUpdate>[0]> = {}) =>
+		subagentActivityUpdate({
+			parentToolUseId: "agent",
+			subagentNarratorId: "child",
+			toolUseId: `tool-${id}`,
+			toolCallId: `call-${id}`,
+			toolName: "Grep",
+			executionAttempt: 1,
+			status: "running",
+			createdAt: id,
+			inputSummary: { pattern: `pattern-${id}` },
+			...overrides,
+		});
+	const parent = (id = "agent") =>
+		assistantWithTools("parent", [{ toolUseId: id, toolName: "Agent", status: "success" }]);
+	const calls = (messages: readonly TreeMessage[]) =>
+		messageBody(messages[0])[0]._subagentActivity?.latestToolCalls ?? [];
+
+	it("merges sparse completion and explicit clear without retaining input/output or regressing terminal state", () => {
+		const store = new SubagentActivityPatchStore();
+		const update = event();
+		Object.defineProperties(update, {
+			input: {
+				get: () => {
+					throw new Error("raw input visited");
+				},
+			},
+			output: {
+				get: () => {
+					throw new Error("raw output visited");
+				},
+			},
+		});
+		expect(store.remember("n1", update)).toBe(true);
+		expect(
+			store.remember(
+				"n1",
+				event(1, { status: "success", inputSummary: undefined, timing: { durationMs: 1234 } }),
+			),
+		).toBe(true);
+		expect(store.size).toBe(1);
+		expect(store.chars).toBeLessThan(2000);
+		expect(store.apply([], "n1").changed).toBe(false);
+		let result = store.apply([parent()], "n1");
+		expect(calls(result.messages)[0]).toMatchObject({
+			status: "success",
+			inputSummary: { pattern: "pattern-1" },
+			timing: { durationMs: 1234 },
+		});
+		expect(store.size).toBe(0);
+		expect(store.chars).toBe(0);
+		store.remember("n1", event(1, { status: "success", inputSummary: null }));
+		store.remember("n1", event(1, { inputSummary: { pattern: "late" } }));
+		result = store.apply(result.messages, "n1");
+		expect(calls(result.messages)[0].inputSummary).toBeNull();
+		expect(calls(result.messages)[0].status).toBe("success");
+	});
+
+	it("authoritative pending snapshot clear revokes a terminal label before the parent loads", () => {
+		const store = new SubagentActivityPatchStore();
+		store.remember("n1", event(1, { status: "success", inputSummary: { pattern: "old" } }));
+		store.apply([], "n1");
+		store.rememberSnapshot("n1", "agent", {
+			subagentNarratorId: "child",
+			model: null,
+			latestToolCalls: [event(1, { status: "running", inputSummary: null }).header],
+		});
+		expect(calls(store.apply([parent()], "n1").messages)[0]).toMatchObject({
+			status: "success",
+			inputSummary: null,
+		});
+	});
+
+	it("keeps latest three in call order and isolates persisted identity and attempts", () => {
+		const store = new SubagentActivityPatchStore();
+		for (const id of [2, 3, 4, 1]) store.remember("n1", event(id));
+		expect(store.size).toBe(3);
+		store.remember("n1", event(2, { status: "success", inputSummary: undefined }));
+		store.remember("n1", event(2, { executionAttempt: 2, inputSummary: undefined }));
+		store.remember(
+			"n1",
+			event(2, { executionAttempt: undefined, inputSummary: { pattern: "unknown" } }),
+		);
+		store.remember("n1", event(2, { executionAttempt: 1, inputSummary: { pattern: "old" } }));
+		const result = store.apply([parent()], "n1");
+		expect(calls(result.messages).map((call) => call.toolUseId)).toEqual([
+			"tool-2",
+			"tool-3",
+			"tool-4",
+		]);
+		expect(calls(result.messages)[0]).toMatchObject({ executionAttempt: 2, status: "running" });
+		expect(calls(result.messages)[0].inputSummary).toBeUndefined();
+		const cold = result.messages;
+		store.remember("n1", event(1));
+		expect(store.apply(cold, "n1").messages).toBe(cold);
+		expect(store.size).toBe(0);
+		store.remember("n1", event(2, { executionAttempt: 1 }));
+		expect(store.apply(cold, "n1").messages).toBe(cold);
+		expect(store.size).toBe(0);
+	});
+
+	it("timestamp-free old replays do not displace a full authoritative recent window", () => {
+		const store = new SubagentActivityPatchStore();
+		store.remember("n1", event(1, { createdAt: null }));
+		store.apply([], "n1");
+		let loaded: readonly TreeMessage[] = [parent()];
+		for (const id of [2, 3, 4])
+			loaded = patchSubagentActivity(loaded, "agent", event(id, { createdAt: null }).header, {
+				subagentNarratorId: "child",
+			}).messages;
+		expect(store.apply(loaded, "n1").messages).toBe(loaded);
+		expect(store.size).toBe(0);
+		store.remember("n1", event(5, { createdAt: null }));
+		expect(calls(store.apply(loaded, "n1").messages).map((call) => call.toolUseId)).toEqual([
+			"tool-3",
+			"tool-4",
+			"tool-5",
+		]);
+	});
+
+	it("consumes loaded no-ops and replaced children while retaining only missing siblings", () => {
+		const store = new SubagentActivityPatchStore();
+		store.remember("n1", event());
+		store.remember("n1", event(2, { parentToolUseId: "missing" }));
+		const first = store.apply([parent()], "n1");
+		expect(first.changed).toBe(true);
+		expect(store.size).toBe(1);
+		store.remember("n1", event());
+		expect(store.apply(first.messages, "n1").messages).toBe(first.messages);
+		expect(store.size).toBe(1);
+		store.remember("n1", event(3, { subagentNarratorId: "old-child" }));
+		expect(store.apply(first.messages, "n1").messages).toBe(first.messages);
+		expect(store.size).toBe(1);
+		expect(calls(store.apply([parent("missing")], "n1").messages)[0].toolUseId).toBe("tool-2");
+		expect(store.size).toBe(0);
+		expect(store.apply(first.messages, "n1").messages).toBe(first.messages);
+	});
+
+	it("snapshot authority, discard, child identity and session scope clear only eligible pending calls", () => {
+		const store = new SubagentActivityPatchStore();
+		store.remember("n1", event());
+		store.remember("n1", event(2));
+		store.rememberSnapshot("n1", "agent", {
+			subagentNarratorId: "child",
+			model: null,
+			latestToolCalls: [event(2, { status: "success", inputSummary: undefined }).header],
+		});
+		expect(store.size).toBe(1);
+		expect(calls(store.apply([parent()], "n1").messages)[0].inputSummary).toEqual({
+			pattern: "pattern-2",
+		});
+		store.remember(
+			"n1",
+			event(3, { status: "streaming", toolCallId: null, executionAttempt: undefined }),
+		);
+		store.discard("agent", ["tool-3"], "other-child");
+		expect(store.size).toBe(1);
+		store.discard("agent", ["tool-3"], "child");
+		expect(store.size).toBe(0);
+		store.remember("n1", event());
+		store.identify("agent", "replacement-child");
+		expect(store.size).toBe(0);
+		store.remember("n1", event());
+		expect(store.apply([parent()], "n2").changed).toBe(false);
+		store.remember("n2", event(2));
+		expect(store.size).toBe(1);
+		expect(calls(store.apply([parent()], "n2").messages)[0].toolUseId).toBe("tool-2");
+		store.clear();
+		expect(store.chars).toBe(0);
+	});
+
+	it("bounds calls and counts retained identity, summary, timing and metadata characters", () => {
+		const store = new SubagentActivityPatchStore();
+		for (let id = 0; id < 128; id++)
+			expect(store.remember("n1", event(id, { parentToolUseId: `parent-${id}` }))).toBe(true);
+		expect(store.size).toBe(128);
+		expect(store.remember("n1", event(129, { parentToolUseId: "parent-129" }))).toBe(false);
+		for (let index = 0; index < 100; index++)
+			expect(store.remember("n1", event(1, { parentToolUseId: "parent-1" }))).toBe(true);
+		expect(store.size).toBe(128);
+		store.clear();
+		for (const overrides of [
+			{ parentToolUseId: "x".repeat(260_000) },
+			{ subagentNarratorId: "x".repeat(260_000) },
+			{ model: "x".repeat(512_001) },
+			{ timing: { startedAt: "x".repeat(512_001) } },
+		]) {
+			expect(store.remember("n1", event(1, overrides))).toBe(false);
+			expect(store.size).toBe(0);
+			expect(store.chars).toBe(0);
+		}
+	});
+
+	it("an in-flight replay never deletes a newer same-key update", () => {
+		const store = new SubagentActivityPatchStore();
+		store.remember("n1", event());
+		const row = parent();
+		const toolCalls = row.toolCalls;
+		let updated = false;
+		Object.defineProperty(row, "toolCalls", {
+			configurable: true,
+			get: () => {
+				if (!updated) {
+					updated = true;
+					store.remember("n1", event(1, { inputSummary: { pattern: "newer" } }));
+				}
+				return toolCalls;
+			},
+		});
+		const oldReplay = store.apply([row], "n1");
+		expect(store.size).toBe(1);
+		expect(calls(store.apply(oldReplay.messages, "n1").messages)[0].inputSummary).toEqual({
+			pattern: "newer",
+		});
+		expect(store.size).toBe(0);
+	});
+});
 
 describe("persisted Edit origin handoff", () => {
 	it("keeps verified file rows on both storage sites until the result overrides them", () => {
@@ -967,13 +1188,30 @@ describe("subagent file changes survive live updates", () => {
 		expect(read(next.messages).fileChanges).toEqual(nextScope);
 	});
 
-	it("does not carry files into a different child on identity, tool or snapshot events", async () => {
+	it("authoritative child changes clear files while tool frames respect assigned ownership", async () => {
 		const { patchSubagentIdentity } = await import("./vlist-live-patch");
 		const identity = { subagentNarratorId: "sub-2" };
 		const { fileChanges: _files, ...omitted } = activity;
+		const original = seed();
+		const foreign = patchSubagentActivity(
+			original,
+			"tu-parent",
+			header("foreign-child", "running"),
+			identity,
+		);
+		expect(foreign.changed).toBe(false);
+		expect(foreign.messages).toBe(original);
+		expect(read(foreign.messages).subagentNarratorId).toBe("sub-1");
+		expect(read(foreign.messages).fileChanges).toEqual(fileChanges);
+		const assigned = patchSubagentIdentity(original, "tu-parent", identity);
 		const results = [
-			patchSubagentIdentity(seed(), "tu-parent", identity),
-			patchSubagentActivity(seed(), "tu-parent", header("new-child", "running"), identity),
+			assigned,
+			patchSubagentActivity(
+				assigned.messages,
+				"tu-parent",
+				header("new-child", "running"),
+				identity,
+			),
 			patchSubagentActivitySnapshots(seed(), [
 				{ parentToolUseId: "tu-parent", activity: { ...omitted, ...identity } },
 			]),

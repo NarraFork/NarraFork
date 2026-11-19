@@ -121,6 +121,15 @@ export interface ReasoningBlockData {
 	stepCount?: number;
 	/** Char-count override for the header; defaults to displayText.length. */
 	charCount?: number;
+	/** Active original suffix in display/raw coordinates; only reasoning preparation consumes it. */
+	reasoningTail?: {
+		id: string;
+		start: number;
+		end: number;
+		originalStart: number;
+		originalEnd: number;
+		translationRevision?: string;
+	};
 }
 
 export interface ReasoningExpandState {

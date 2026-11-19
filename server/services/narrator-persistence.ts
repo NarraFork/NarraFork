@@ -87,6 +87,7 @@ import {
 	flushQueuedSince,
 	newEnvelopeColumns,
 	patchEnvelopeState,
+	patchReasoningPartState,
 	type SyncMode,
 	syncEnvelopeNow,
 	syncQueueMark,
@@ -3233,6 +3234,9 @@ const sqliteNarratorPersistence = {
 					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
+					translationGeneration?: string;
+					translationLocale?: string;
+					translationParts?: ReasoningTranslationPart[];
 			  }
 			| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 			| {
@@ -3374,6 +3378,10 @@ const sqliteNarratorPersistence = {
 							(block.type === "text" || block.type === "reasoning") && block.id
 								? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
 								: -1;
+						const newBlock =
+							block.type === "reasoning"
+								? { ...block, translationGeneration: block.translationGeneration ?? generateId() }
+								: block;
 						if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
 							const previous = current[matchingIndex] as Record<string, unknown>;
 							const stale =
@@ -3392,6 +3400,38 @@ const sqliteNarratorPersistence = {
 								);
 							}
 							if (previous.text !== block.text) delete next.translatedText;
+							if (block.type === "reasoning") {
+								const appendOnly =
+									typeof previous.text === "string" && block.text.startsWith(previous.text);
+								const previousGeneration = previous.translationGeneration;
+								const generation = appendOnly
+									? (previousGeneration ?? block.translationGeneration ?? generateId())
+									: block.translationGeneration &&
+											block.translationGeneration !== previousGeneration
+										? block.translationGeneration
+										: generateId();
+								next.translationGeneration = generation;
+								const unknownTranslatedLocale =
+									!previous.translationLocale &&
+									(previous.translatedText ||
+										(Array.isArray(previous.translationParts) && previous.translationParts.length));
+								if (appendOnly) {
+									if (previous.translationLocale)
+										next.translationLocale = previous.translationLocale;
+									else if (unknownTranslatedLocale) delete next.translationLocale;
+								} else {
+									if (block.translationLocale) next.translationLocale = block.translationLocale;
+									else delete next.translationLocale;
+								}
+								const previousParts = appendOnly
+									? (previous.translationParts as ReasoningTranslationPart[] | undefined)
+									: undefined;
+								next.translationParts = getValidReasoningTranslationParts(
+									block.text,
+									String(generation),
+									[...(previousParts ?? []), ...(block.translationParts ?? [])],
+								);
+							}
 							if (stale || isDeepStrictEqual(previous, next)) {
 								content = current;
 							} else {
@@ -3407,7 +3447,7 @@ const sqliteNarratorPersistence = {
 							};
 							// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
 							// avoid the former wrapper object + two extra arrays for every checkpoint.
-							content = [...current, block as StoredAssistantBlock];
+							content = [...current, newBlock as StoredAssistantBlock];
 							content.sort((a, b) => {
 								const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
 								const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
@@ -3416,7 +3456,7 @@ const sqliteNarratorPersistence = {
 						} else {
 							// Unindexed providers/checkpoints already arrive in occurrence order. Do not
 							// pull later reasoning in front of text/tools that were actually seen first.
-							content = [...current, block];
+							content = [...current, newBlock];
 						}
 						if (
 							content === current &&
@@ -3559,6 +3599,25 @@ const sqliteNarratorPersistence = {
 			reportAssistantContentFailure(error, observation);
 			throw error;
 		}
+	},
+
+	/** Merge one validated part with the latest checkpoint; reader state is shared by holders. */
+	async patchReasoningTranslationPart(input: {
+		messageId: string;
+		elementId: string;
+		expected: { sourceText: string; generation: string };
+		part: ReasoningTranslationPart;
+		signal?: AbortSignal;
+	}): Promise<null | {
+		messageId: string;
+		blockId: string;
+		elementId: string;
+		blockRevision: number;
+		stateRevision: number;
+		translationGeneration: string;
+		part: ReasoningTranslationPart;
+	}> {
+		return patchReasoningPartState(input);
 	},
 
 	async patchReasoningTranslation(

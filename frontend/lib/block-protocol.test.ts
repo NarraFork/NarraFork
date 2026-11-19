@@ -93,6 +93,59 @@ describe("block protocol decoding", () => {
 		expect((frame.orphanChildren as TreeMessage[]).map((row) => row.id)).toEqual(["o1"]);
 	});
 
+	test("activity authority and author scope survive v2 opening, delta and checkpoint frames", () => {
+		const activity = { elementId: "r", revision: 2, completedRanges: [{ start: 0, end: 4 }] };
+		const scope = { narratorId: "n1", subagentNarratorId: "child", parentToolUseId: "agent" };
+		for (const type of ["block_opened", "block_delta"]) {
+			const [decoded] = decodeBlockFrame({
+				type,
+				...scope,
+				kind: "reasoning",
+				elementId: "r",
+				revision: 2,
+				reasoningTranslationActivity: activity,
+			});
+			expect(decoded).toMatchObject({
+				type: "stream_event",
+				...scope,
+				reasoningTranslationActivity: activity,
+			});
+		}
+		const [cleared] = decodeBlockFrame({
+			type: "block_opened",
+			...scope,
+			reasoningTranslationActivity: null,
+		});
+		expect(cleared).toHaveProperty("reasoningTranslationActivity", null);
+		const [checkpoint] = decodeBlockFrame({
+			type: "message_upserted",
+			cause: "message_updated",
+			...scope,
+			reasoningTranslationActivity: activity,
+			messages: [envelope("m1", [])],
+			blocks: [],
+		});
+		expect(checkpoint).toMatchObject({
+			type: "message_updated",
+			...scope,
+			reasoningTranslationActivity: activity,
+		});
+	});
+
+	test("legacy delta author scope stays inside its original event envelope", () => {
+		const [frame] = decodeBlockFrame({
+			type: "block_delta",
+			narratorId: "parent",
+			kind: "reasoning",
+			elementId: "r",
+			text: "legacy",
+			subagentToolUseId: "agent",
+			subagentNarratorId: "child",
+		});
+		expect(frame).not.toHaveProperty("subagentNarratorId");
+		expect(frame.event).toMatchObject({ subagentToolUseId: "agent", subagentNarratorId: "child" });
+	});
+
 	test("a block opening reaches no listener", () => {
 		expect(
 			decodeBlockFrame({

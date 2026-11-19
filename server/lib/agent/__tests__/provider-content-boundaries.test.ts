@@ -73,6 +73,139 @@ async function replay(
 afterEach(() => setOutboundFetchOverrideForTest(null));
 
 describe("native content boundaries", () => {
+	test("Responses expose summary identity only on real text and terminate after recovered output", () => {
+		const parse = responsesParser();
+		const chunk = { output_index: 0, item_id: "rs-pending" };
+		const first = parse({
+			...chunk,
+			type: "response.reasoning_summary_text.delta",
+			summary_index: 0,
+			delta: "A",
+		});
+		expect(first[0]).toMatchObject({ reasoning: "A", reasoningSummaryPart: { index: 0 } });
+		const sealed = parse({
+			...chunk,
+			type: "response.reasoning_summary_text.done",
+			summary_index: 0,
+			text: "A",
+		});
+		const identity = (first[0] as ParsedStreamEvent & { reasoningSummaryPart: { id: string } })
+			.reasoningSummaryPart.id;
+		expect(sealed.at(-1)?.contentBoundary?.summaryPart?.id).toBe(identity);
+		const empty = parse({
+			...chunk,
+			type: "response.reasoning_summary_text.delta",
+			summary_index: 1,
+			delta: "",
+		});
+		expect(empty.some((event) => event.reasoning)).toBe(false);
+		const second = parse({
+			...chunk,
+			type: "response.reasoning_summary_text.delta",
+			summary_index: 1,
+			delta: "B",
+		});
+		expect(second[0]).toMatchObject({ reasoning: "\n\nB", reasoningSummaryPart: { index: 1 } });
+		const itemDone = parse({
+			type: "response.output_item.done",
+			output_index: 0,
+			item: {
+				type: "reasoning",
+				id: "rs-pending",
+				summary: [
+					{ type: "summary_text", text: "A" },
+					{ type: "summary_text", text: "B" },
+				],
+			},
+		});
+		expect(itemDone.some((event) => "reasoningResponseCompleted" in event)).toBe(false);
+		const completed = parse({
+			type: "response.completed",
+			response: {
+				status: "completed",
+				output: [
+					{
+						type: "reasoning",
+						id: "rs-pending",
+						summary: [
+							{ type: "summary_text", text: "A" },
+							{ type: "summary_text", text: "B" },
+						],
+					},
+				],
+			},
+		});
+		expect(completed.at(-1)).toMatchObject({ reasoningResponseCompleted: true });
+	});
+
+	test("Responses HTTP carries real summary identities and a reliable terminal through the shared parser", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			sse([
+				{ type: "response.created", response: { id: "resp-summary" } },
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "reasoning", id: "rs-http" },
+				},
+				{
+					type: "response.reasoning_summary_text.delta",
+					output_index: 0,
+					item_id: "rs-http",
+					summary_index: 0,
+					delta: "A",
+				},
+				{
+					type: "response.reasoning_summary_text.done",
+					output_index: 0,
+					item_id: "rs-http",
+					summary_index: 0,
+					text: "A",
+				},
+				{
+					type: "response.reasoning_summary_text.delta",
+					output_index: 0,
+					item_id: "rs-http",
+					summary_index: 1,
+					delta: "B",
+				},
+				{
+					type: "response.reasoning_summary_text.done",
+					output_index: 0,
+					item_id: "rs-http",
+					summary_index: 1,
+					text: "B",
+				},
+				{ type: "response.completed", response: { id: "resp-summary", status: "completed" } },
+			]),
+		);
+		const events = await collect(
+			new OpenAIProvider({ ...config, apiMode: "responses" }).chat(chatParams()),
+		);
+		expect(
+			events.filter((event) => event.reasoning).map((event) => event.reasoningSummaryPart?.index),
+		).toEqual([0, 1]);
+		expect(events.filter((event) => event.reasoningResponseCompleted)).toHaveLength(1);
+		expect(events.findIndex((event) => event.reasoningResponseCompleted)).toBeGreaterThan(
+			events.findLastIndex((event) => !!event.contentBoundary?.summaryPart),
+		);
+	});
+
+	test("Responses reseal a late extension of the same summary without inventing a successor", () => {
+		const parse = responsesParser();
+		const chunk = { output_index: 0, item_id: "rs-late", summary_index: 0 };
+		parse({ ...chunk, type: "response.reasoning_summary_text.delta", delta: "A" });
+		const first = parse({ ...chunk, type: "response.reasoning_summary_text.done", text: "A" });
+		const late = parse({ ...chunk, type: "response.reasoning_summary_text.delta", delta: "+" });
+		expect(late[0]).toMatchObject({ reasoning: "+", reasoningSummaryPart: { index: 0 } });
+		const again = parse({ ...chunk, type: "response.reasoning_summary_text.done", text: "A+" });
+		expect(again.at(-1)?.contentBoundary?.summaryPart).toMatchObject({
+			id: first.at(-1)?.contentBoundary?.summaryPart?.id,
+			index: 0,
+			start: 0,
+			end: 2,
+		});
+	});
+
 	test("Anthropic completes signed and unsigned thinking and text at their native stops", async () => {
 		const events = await collect(
 			parseAnthropicSSEStream(
@@ -160,7 +293,17 @@ describe("native content boundaries", () => {
 				],
 			},
 		});
-		expect(checkpoint.at(-1)?.contentBoundary?.phase).toBe("checkpoint");
+		expect(checkpoint.at(-1)?.contentBoundary).toMatchObject({
+			phase: "checkpoint",
+			summaryPart: { index: 0, start: 0, end: 5 },
+		});
+		expect(second.at(-1)?.contentBoundary).toMatchObject({
+			phase: "checkpoint",
+			summaryPart: { index: 1, start: 7, end: 13 },
+		});
+		expect(
+			[...checkpoint, ...second].some((event) => event.contentBoundary?.phase === "complete"),
+		).toBe(false);
 		expect(second.find((event) => event.reasoning)?.reasoning).toBe("\n\nsecond");
 		expect(first[0].reasoningBlockId).toBe(second[0].reasoningBlockId);
 		expect(done.some((event) => event.reasoning)).toBe(false);

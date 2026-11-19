@@ -143,6 +143,7 @@ import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
 	type EventHooks,
+	finishReasoningTranslationActivity,
 	persistDetachedToolResult,
 	processEvent,
 	sealSubagentOutputPass,
@@ -3797,7 +3798,12 @@ export async function runAgentLoopUnlocked(
 			active._bashBeforeStatus?.clear();
 		}
 		// The one session finalizer; result delivery belongs to the run service.
-		if (owner.isCurrent()) {
+		if (!checkpointPause && owner.isCurrent()) {
+			finishReasoningTranslationActivity(
+				narratorId,
+				placement?.parentNarratorId ?? narratorId,
+				true,
+			);
 			active._loopRunning = false;
 			active.alive = false;
 

@@ -381,6 +381,9 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	// A completed translation changes display/geometry without changing the source body.
+	if (typeof d.translatedText === "string") rev += `|rt:${textSignature(d.translatedText)}`;
+	if (typeof d.translationRevision === "string") rev += `|rp:${d.translationRevision}`;
 	// Chat regrouping can add/remove the fixed header without editing the message.
 	// Body format also changes geometry while text/id/document version stay equal.
 	// Normalize the narrator defaults so omitted and explicit defaults share a key.
@@ -613,6 +616,16 @@ function traceRevision(d: Record<string, unknown>): string {
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
 		if (r.shimmer === true) rev += "|tw:1";
+		// Display ownership may change without changing a translated body's text.
+		if (r.reasoningTail && typeof r.reasoningTail === "object") {
+			const tail = r.reasoningTail as { id?: string; translationRevision?: string };
+			rev += `|trt:${JSON.stringify([
+				tail.id,
+				typeof tail.translationRevision === "string"
+					? textSignature(tail.translationRevision)
+					: null,
+			])}`;
+		}
 		// A DRILLED-IN row nests a whole tool card, so the trace's height now depends
 		// on that card's own height-bearing fields. `opts.expandedIndices` only tells
 		// us WHICH rows are open, not what is inside them — so the one transition it
@@ -686,9 +699,9 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// Recent calls: the ROW COUNT is what drives the block height (capped at 3).
 	if (typeof d.recentCallCount === "number") rev += `|gn:${d.recentCallCount}`;
 	if (Array.isArray(d.recentCallNames)) {
-		rev += `|gk:${d.recentCallNames.length}`;
-		for (const name of d.recentCallNames) {
-			if (typeof name === "string") rev += `|gm:${name}`;
+		rev += `|gk:${Math.min(3, d.recentCallNames.length)}`;
+		for (const [index, name] of d.recentCallNames.slice(0, 3).entries()) {
+			rev += `|gm:${index}:${typeof name === "string" ? textSignature(name) : "-"}`;
 		}
 	}
 	// Row label detail + category chip. Height-neutral, but PAINTED from the cached
@@ -698,13 +711,22 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// names and status all stay put — without this the row keeps its bare tool name
 	// until the next full rebuild. Bounded: at most 3 short strings each.
 	if (Array.isArray(d.recentCallSummaries)) {
-		for (const summary of d.recentCallSummaries) {
-			if (typeof summary === "string") rev += `|gs:${textSignature(summary)}`;
+		for (const [index, summary] of d.recentCallSummaries.slice(0, 3).entries()) {
+			rev += `|gs:${index}:${typeof summary === "string" ? textSignature(summary) : "-"}`;
 		}
 	}
 	if (Array.isArray(d.recentCallCategories)) {
-		for (const category of d.recentCallCategories) {
-			if (typeof category === "string") rev += `|gc:${category}`;
+		for (const [index, category] of d.recentCallCategories.slice(0, 3).entries()) {
+			rev += `|gc:${index}:${typeof category === "string" ? textSignature(category) : "-"}`;
+		}
+	}
+	if (Array.isArray(d.recentCallTimings)) {
+		for (const [index, timing] of d.recentCallTimings.slice(0, 3).entries()) {
+			rev += `|gr:${index}`;
+			if (!timing || typeof timing !== "object") continue;
+			const row = timing as Record<string, unknown>;
+			if (typeof row.status === "string") rev += `:${row.status}`;
+			rev += toolTimingRevision(row);
 		}
 	}
 	if (d.hasRecentCallsButton === true) rev += "|gb:1";

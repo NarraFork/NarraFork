@@ -65,6 +65,7 @@ import { FragmentGap, LINE_FRAGMENTS_STYLE, LineFragments } from "./line-fragmen
 import { MarkdownLineFragments } from "./MarkdownLineFragments";
 import { staticInlineMarkupCache } from "./static-inline-markup";
 import {
+	clampAnimBoundary,
 	graphemeAnimAge,
 	type StreamAnimFrame,
 	StreamAnimStore,
@@ -189,6 +190,78 @@ interface MarkdownBodyProps extends RenderMarkdownProps {
 	typographyRevision: number;
 }
 
+interface ReasoningRenderBlock {
+	sourceKey: string | number;
+	key: string | number;
+	kind: PreparedBlock["kind"];
+	tail: PreparedBlock["reasoningTail"];
+}
+
+/** A replacement may re-segment Markdown, but the current visual unit stays mounted. */
+function reasoningRenderBlocks(
+	blocks: readonly PreparedBlock[],
+	previous: readonly ReasoningRenderBlock[],
+): ReasoningRenderBlock[] {
+	if (!blocks.some((block) => block.reasoningTail)) return [];
+	const next = blocks.map((block, index) => ({
+		sourceKey: block.reasoningTailKey ?? index,
+		key: block.reasoningTailKey ?? index,
+		kind: block.kind,
+		tail: block.reasoningTail,
+	}));
+	const owners = new Set(next.flatMap((block) => (block.tail ? [block.tail.id] : [])));
+	for (const [index, block] of next.entries()) {
+		const before = previous[index];
+		if (
+			!block.tail &&
+			before?.kind === block.kind &&
+			(before.tail ? !owners.has(before.tail.id) : before.sourceKey === block.sourceKey)
+		)
+			block.key = before.key;
+	}
+	for (const owner of owners) {
+		const before = previous.filter((block) => block.tail?.id === owner);
+		const after = next.filter((block) => block.tail?.id === owner);
+		const replacement =
+			before.length > 0 &&
+			before[0]?.tail?.translationRevision !== after[0]?.tail?.translationRevision;
+		const used = new Set<string | number>();
+		for (let index = after.length - 1; index >= 0; index--) {
+			const block = after[index];
+			if (!block) continue;
+			const matched = replacement
+				? before[before.length - after.length + index]
+				: before.find((candidate) => candidate.sourceKey === block.sourceKey);
+			if (matched?.kind === block.kind) block.key = matched.key;
+			if (used.has(block.key)) block.key = `${block.sourceKey}:display:${index}`;
+			used.add(block.key);
+		}
+	}
+	return next;
+}
+
+/** Rebase only births still in flight; a translation never starts a fresh fade. */
+function reasoningTranslationAnimFrame(
+	previous: StreamAnimFrame,
+	previousLength: number,
+	length: number,
+): StreamAnimFrame {
+	if (length <= 0) return { animBoundary: 0, sealOffset: 0, births: [], now: previous.now };
+	const births = previous.births.map((birth) => ({
+		offset: clampAnimBoundary(
+			Math.min(length - 1, Math.floor((birth.offset * length) / Math.max(1, previousLength))),
+			length,
+		),
+		ts: birth.ts,
+	}));
+	return {
+		animBoundary: length,
+		sealOffset: births[0]?.offset ?? length,
+		births: length > 0 ? births : [],
+		now: previous.now,
+	};
+}
+
 function sameOwnValues<T extends object>(a: T, b: T): boolean {
 	if (a === b) return true;
 	const keys = Object.keys(a) as (keyof T)[];
@@ -224,6 +297,21 @@ function RenderMarkdownBody({
 	animScope,
 }: MarkdownBodyProps) {
 	const { blocks, frame, contentWidth } = measured;
+	const committedBlocks = useRef<{
+		key: string | undefined;
+		scope: string | undefined;
+		blocks: ReasoningRenderBlock[];
+	} | null>(null);
+	const previousBlocks = committedBlocks.current;
+	const renderBlocks = reasoningRenderBlocks(
+		blocks,
+		previousBlocks && previousBlocks.key === animKeyBase && previousBlocks.scope === animScope
+			? previousBlocks.blocks
+			: [],
+	);
+	useEffect(() => {
+		committedBlocks.current = { key: animKeyBase, scope: animScope, blocks: renderBlocks };
+	}, [animKeyBase, animScope, renderBlocks]);
 	const hostRef = useRef<HTMLDivElement | null>(null);
 	// Metadata is also present on short, unclipped bodies. Their source can have
 	// more visual lines than the rendered Markdown (e.g. soft line breaks), so
@@ -338,8 +426,8 @@ function RenderMarkdownBody({
 					if (!blockFrame) return null;
 					return (
 						<div
-							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
-							key={index}
+							// Reasoning tails use source identity; ordinary Markdown keeps ordered indices.
+							key={renderBlocks[index]?.key ?? index}
 							data-vlist-flow-block={block.kind}
 							style={{
 								position: "relative",
@@ -354,7 +442,11 @@ function RenderMarkdownBody({
 								frame={{ ...blockFrame, top: 0 }}
 								contentWidth={contentWidth}
 								flowing
-								animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+								animKey={
+									animateStreaming && animKeyBase
+										? `${animKeyBase}:${renderBlocks[index]?.key ?? index}`
+										: undefined
+								}
 								animScope={animScope}
 								sealAnimation={sealAnimation}
 								codeCopyPlacement={copyPlacements.get(index)}
@@ -381,8 +473,8 @@ function RenderMarkdownBody({
 				if (!blockFrame) return null;
 				const marginTop = block.marginTop;
 				return (
-					// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
-					<Fragment key={index}>
+					// Reasoning tails use source identity; ordinary Markdown keeps ordered indices.
+					<Fragment key={renderBlocks[index]?.key ?? index}>
 						{/* The blank strip above this block (accumulateFrame advances by
 						    marginTop before frame.top) belongs to no text box; fill it so a
 						    drag-selection can resolve a caret there. */}
@@ -392,7 +484,11 @@ function RenderMarkdownBody({
 							frame={blockFrame}
 							contentWidth={contentWidth}
 							flowing={false}
-							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+							animKey={
+								animateStreaming && animKeyBase
+									? `${animKeyBase}:${renderBlocks[index]?.key ?? index}`
+									: undefined
+							}
 							animScope={animScope}
 							sealAnimation={sealAnimation}
 							codeCopyPlacement={copyPlacements.get(index)}
@@ -959,11 +1055,24 @@ function InlineBlockView({
 		[animScope, animKey],
 	);
 	const committedScope = useRef<typeof scoped | null>(null);
+	const committedText = useRef<{
+		key: string;
+		text: string;
+		translationRevision: string | undefined;
+	} | null>(null);
+	const previousText = committedScope.current === scoped ? committedText.current : null;
+	const translationRevision = block.reasoningTail?.translationRevision;
+	const translatedMount = translationRevision !== undefined && previousText?.key !== animKey;
+	const translationReplacement =
+		previousText !== null &&
+		previousText.key === animKey &&
+		previousText.translationRevision !== translationRevision;
 	// LRU eviction is not a new paragraph. A long body may have more mounted
 	// blocks than the shared store retains; never replay those blocks merely
 	// because their entries disappeared. Reseed them statically on the next commit.
 	const sealFrame =
 		sealAnimation ||
+		translatedMount ||
 		(animKey != null && committedScope.current === scoped && !scoped.hasEntry(animKey));
 	// Named `animFrame`, not `frame`: this component's `frame` prop is the measured
 	// BlockFrame (geometry). Two different meanings of the word in one scope is how
@@ -973,7 +1082,13 @@ function InlineBlockView({
 			? null
 			: sealFrame
 				? { animBoundary: totalLen, sealOffset: totalLen, births: [], now }
-				: scoped.peekFrame(animKey, visibleText, now);
+				: translationReplacement && previousText
+					? reasoningTranslationAnimFrame(
+							scoped.peekFrame(animKey, previousText.text, now),
+							previousText.text.length,
+							totalLen,
+						)
+					: scoped.peekFrame(animKey, visibleText, now);
 	// `now` is deliberately NOT a dependency: it changes on every render, so including
 	// it would commit a birth on renders that appended nothing (a hover, a resize, a
 	// parent rebuild), restamping text that was already mid-fade and restarting its
@@ -984,10 +1099,12 @@ function InlineBlockView({
 	// biome-ignore lint/correctness/useExhaustiveDependencies: commit only on text/key/policy changes, not clock ticks
 	useEffect(() => {
 		committedScope.current = animKey != null ? scoped : null;
+		committedText.current =
+			animKey != null ? { key: animKey, text: visibleText, translationRevision } : null;
 		if (animKey != null && animFrame != null) {
 			scoped.commitFrame(animKey, visibleText, animFrame.now, animFrame);
 		}
-	}, [animKey, visibleText, scoped, sealFrame]);
+	}, [animKey, visibleText, scoped, sealFrame, translationRevision]);
 	// The split point is the SEAL offset, not the append boundary — a grapheme must
 	// keep its span until its animation finishes (see stream-token-anim's header).
 	const sealOffset = animFrame?.sealOffset ?? Number.POSITIVE_INFINITY;

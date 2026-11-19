@@ -1469,16 +1469,39 @@ async function discardAttemptPersistedBlocks(
 
 // === Reasoning translation ===
 
-const LOCALE_NAMES: Record<string, string> = {
-	en: "English",
-	"zh-CN": "简体中文",
-	zh: "中文",
-	es: "Español",
-	fr: "Français",
-	de: "Deutsch",
-	ja: "日本語",
-	ko: "한국어",
-};
+function publishReasoningActivity(ctx: EventHandlerContext): void {
+	const snap = streamingSnapshots.get(ctx.narratorId);
+	dualBroadcast(ctx, {
+		type: "streaming_snapshot",
+		narratorId: ctx.broadcastTargetId,
+		model: snap?.model,
+		provider: snap?.provider,
+		streamingBlocks: snap?.streamingBlocks ?? [],
+		toolChunks: [...(snap?.toolChunks.values() ?? [])],
+		reasoningTranslationActivity: reasoningTranslationActivities.get(ctx.narratorId),
+		...(ctx.parentToolUseId
+			? { parentToolUseId: ctx.parentToolUseId, subagentNarratorId: ctx.narratorId }
+			: {}),
+	});
+}
+
+/** Complete only this author's persisted lane, never the parent's active tail. */
+export function finishReasoningTranslationActivity(
+	narratorId: string,
+	broadcastTargetId = narratorId,
+	forget = false,
+): void {
+	const target = reasoningTranslationActivities.finish(narratorId);
+	if (target) reasoningTranslationVisibility.complete(target, broadcastTargetId);
+	if (target) reasoningTranslationVisibility.notify(target.messageId);
+	if (forget) reasoningTranslationActivities.finish(narratorId, true);
+}
+
+function finishReasoningActivity(ctx: EventHandlerContext): void {
+	if (!reasoningTranslationActivities.get(ctx.narratorId)) return;
+	finishReasoningTranslationActivity(ctx.narratorId, ctx.broadcastTargetId);
+	publishReasoningActivity(ctx);
+}
 
 type PersistedReasoningBlock = {
 	type?: string;
@@ -1831,6 +1854,12 @@ export async function processEvent(
 
 		case "block_complete": {
 			const { block } = event;
+			if (
+				block.type === "text"
+					? !!block.text
+					: block.type !== "reasoning" && block.type !== "redacted_thinking"
+			)
+				finishReasoningActivity(ctx);
 			const snapshotNarratorId = ctx.parentToolUseId ? narratorId : broadcastTargetId;
 			const textBlockId = block.type === "text" ? block.id : undefined;
 			// The element's own context; a text block without an element id names no
@@ -1970,23 +1999,32 @@ export async function processEvent(
 					...(block.completed != null ? { completed: block.completed } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
+					// The writer atomically retains these on append and replaces them on rewrite.
+					translationGeneration: randomUUID(),
+					translationLocale: ctx.locale || "en",
 				});
 				retireCompletedSnapshot();
-				// Summary segments share a block ID and can repeatedly checkpoint a growing
-				// prefix. Only retain the latest version until real output begins.
-				if (settings.agent.translateReasoning && block.text) {
-					const key = JSON.stringify([
-						partialId,
-						block.id ??
-							getReasoningItemId(block.providerMetadata) ??
-							block.outputIndex ??
-							block.text,
-					]);
-					if (!ctx.dispatchedReasoningTranslations?.has(key)) {
-						ctx.pendingReasoningTranslations ??= new Map();
-						ctx.pendingReasoningTranslations.set(key, { messageId: partialId, block });
+				if (block.id) {
+					const target = await resolveReasoningTranslationTarget(narratorId, partialId, block.id, {
+						blockRevision: block.revision ?? 0,
+						start: 0,
+						end: block.text.length,
+						sourceText: block.text,
+						completed: block.completed === true,
+					});
+					if (target) {
+						const completed = reasoningTranslationActivities.checkpoint(
+							narratorId,
+							target,
+							block.revision ?? 0,
+							block.text.length,
+							block.completed === true,
+						);
+						if (completed) reasoningTranslationVisibility.complete(target, broadcastTargetId);
+						publishReasoningActivity(ctx);
 					}
 				}
+				reasoningTranslationVisibility.notify(partialId);
 			} else if (block.type === "redacted_thinking") {
 				await writeAttemptItem(ctx, partialId, {
 					type: "redacted_thinking",
@@ -2176,6 +2214,47 @@ export async function processEvent(
 			return null;
 		}
 
+		case "reasoning_summary_sealed": {
+			const messageId = ctx.getPartialMessageId();
+			if (
+				!messageId ||
+				event.sourceText.length !== event.end - event.start ||
+				!Number.isSafeInteger(event.start) ||
+				!Number.isSafeInteger(event.end) ||
+				event.start < 0 ||
+				event.end <= event.start ||
+				event.sourceText.length > 256 * 1024
+			)
+				return null;
+			const persisted = await resolveReasoningTranslationTarget(
+				narratorId,
+				messageId,
+				event.blockId,
+				event,
+			);
+			if (!persisted) return null;
+			const target = reasoningTranslationActivities.seal(
+				narratorId,
+				event.blockId,
+				event.blockRevision,
+				event.start,
+				event.end,
+				{ id: event.nativePartId, index: event.nativePartIndex },
+			);
+			if (target) {
+				reasoningTranslationVisibility.complete(target, broadcastTargetId);
+				reasoningTranslationVisibility.notify(messageId);
+				publishReasoningActivity(ctx);
+			}
+			return null;
+		}
+
+		case "reasoning_response_complete": {
+			finishReasoningActivity(ctx);
+			reasoningTranslationActivities.finish(narratorId, true);
+			return null;
+		}
+
 		case "assistant_message": {
 			const fileReferenceContext = ctx.fileReferenceContexts?.fallback() ?? null;
 			// Retain reconnect state until the final durable message has been published.
@@ -2310,6 +2389,8 @@ export async function processEvent(
 				if (partialId && savedId !== partialId) ctx.setPartialMessageId(savedId);
 			}
 
+			finishReasoningActivity(ctx);
+			reasoningTranslationActivities.finish(narratorId, true);
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
 			let fullMessage = await readNarratorMessageRow(savedId, {
 				includeTools: true,
@@ -2432,6 +2513,8 @@ export async function processEvent(
 
 			const savedMsg = fullMessage ?? { id: savedId };
 			ctx.sseEmitter?.emit("event", { type: "assistant_message", data: savedMsg });
+
+			if (event.outputCompleted !== false) reasoningTranslationVisibility.notify(savedId);
 
 			// Effects deferred until the response is persisted whole (plan approval restart).
 			if (hooks?.onAssistantMessageFinalized) {
@@ -2808,6 +2891,8 @@ export async function processEvent(
 		}
 
 		case "error": {
+			finishReasoningActivity(ctx);
+			reasoningTranslationActivities.finish(narratorId, true);
 			// Snapshot: clear streaming state on error
 			clearAuthorStreamingSnapshot(ctx);
 			ctx.fileReferenceContexts?.clear();
@@ -2940,6 +3025,25 @@ export async function processEvent(
 			const base = ctx.committedContentSnapshots?.get(reasoningId);
 			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
 			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
+			const previousActivity = reasoningTranslationActivities.get(narratorId);
+			const completedTarget = reasoningTranslationActivities.start(
+				narratorId,
+				reasoningId,
+				event.blockRevision,
+				event.blockTextOffset,
+				event.reasoningSummaryPart,
+			);
+			if (completedTarget)
+				reasoningTranslationVisibility.complete(completedTarget, broadcastTargetId);
+			if (completedTarget) reasoningTranslationVisibility.notify(completedTarget.messageId);
+			// Immediately invalidate only tasks that now cross the reopened active tail.
+			if (
+				base &&
+				(previousActivity?.elementId !== reasoningId ||
+					previousActivity.completedRanges.some((range) => range.end > event.blockTextOffset)) &&
+				ctx.getPartialMessageId()
+			)
+				reasoningTranslationVisibility.notify(ctx.getPartialMessageId());
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
 				ctx.addSubstatus("reasoning").catch(() => {});
@@ -3013,6 +3117,12 @@ export async function processEvent(
 					},
 				},
 			});
+			if (
+				completedTarget ||
+				previousActivity?.displayTailStart !==
+					reasoningTranslationActivities.get(narratorId)?.displayTailStart
+			)
+				publishReasoningActivity(ctx);
 			return null;
 		}
 
@@ -3583,6 +3693,11 @@ export async function processEvent(
 			}
 			return null;
 		}
+
+		case "done":
+			finishReasoningActivity(ctx);
+			reasoningTranslationActivities.finish(narratorId, true);
+			return null;
 
 		default:
 			return null;

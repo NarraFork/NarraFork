@@ -7,6 +7,7 @@ import {
 	planTreeViewSignature,
 } from "@shared/outline-plan-tree";
 import type { RenderLod } from "./prepared-block";
+import type { ElementSpec } from "./segment-adapter";
 
 export interface VListInteractionState {
 	lod: RenderLod;
@@ -22,7 +23,8 @@ export interface VListInteractionState {
 	/**
 	 * INDEX-addressed per-row state, for lists whose row ORDINALS are stable:
 	 * the subagent-recovery card's checkboxes (where the set means "deselected"),
-	 * and a `reasoning-steps` element's step rows.
+	 * and legacy open-only `reasoning-steps` inputs. Explicit reasoning row choices
+	 * use `reasoningRowOverrides` so closing a default-open row records false.
 	 *
 	 * ⚠️ NOT for the trace that folds a live row list. See `expandedTraceRows`
 	 * and `traceRowFoldChannel`.
@@ -46,6 +48,8 @@ export interface VListInteractionState {
 	 * within the unit.
 	 */
 	expandedTraceRows: ReadonlyMap<string, ReadonlySet<string>>;
+	/** Reasoning-only row choices, including explicit false. Reset with the other row folds. */
+	reasoningRowOverrides: ReadonlyMap<string, ReadonlyMap<string | number, boolean>>;
 	/**
 	 * Keys whose translated body is currently switched back to the ORIGINAL text.
 	 *
@@ -104,6 +108,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		showEarlier: new Set(),
 		expandedRows: new Map(),
 		expandedTraceRows: new Map(),
+		reasoningRowOverrides: new Map(),
 		showOriginal: new Set(),
 		fullPayloadRequested: new Set(),
 		promptOpen: new Set(),
@@ -334,6 +339,42 @@ export function applyVListPlanTreeAction(
 export function planTreeRowSignature(state: VListInteractionState, key: string): string {
 	const view = state.planTrees.get(key);
 	return view ? planTreeViewSignature(view) : "";
+}
+
+/** Undefined is untouched; false must not be confused with the default policy. */
+export function isVListReasoningRowExpanded(
+	state: VListInteractionState,
+	key: string,
+	rowKey: string | number,
+): boolean | undefined {
+	return state.reasoningRowOverrides.get(key)?.get(rowKey);
+}
+
+/** Toggle the rendered fold, not membership in a set that cannot encode default-open. */
+export function toggleVListRowExpansion(
+	state: VListInteractionState,
+	spec: Pick<ElementSpec, "kind" | "key" | "data" | "opts">,
+	rowIndex: number,
+	rowKey?: string,
+): VListInteractionState {
+	const data = spec.data as { items?: readonly { key?: string; bodyText?: string }[] } | null;
+	const reasoningRow =
+		spec.kind === "reasoning-steps" ||
+		(spec.kind === "activity-trace" &&
+			typeof data?.items?.find((row) => row.key === rowKey)?.bodyText === "string");
+	if (!reasoningRow) {
+		return rowKey === undefined
+			? toggleVListRow(state, spec.key, rowIndex)
+			: toggleVListTraceRow(state, spec.key, rowKey);
+	}
+	const identity = spec.kind === "reasoning-steps" ? rowIndex : rowKey;
+	if (identity === undefined) return state;
+	const expandedIndices = spec.opts?.expandedIndices as readonly number[] | undefined;
+	const next = new Map(state.reasoningRowOverrides);
+	const rows = new Map(next.get(spec.key));
+	rows.set(identity, !expandedIndices?.includes(rowIndex));
+	next.set(spec.key, rows);
+	return { ...state, reasoningRowOverrides: next };
 }
 
 export function toggleVListRow(

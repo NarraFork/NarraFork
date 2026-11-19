@@ -19,9 +19,9 @@
  *   tools at once therefore costs ONE document rebuild, not one per event.
  * - Nothing here refetches. The patch keeps `messageVersion` and the message
  *   count fixed, so the rebuild reuses every untouched card's cached measurement.
- * - Deliberately NOT handled: `tool_use_chunk` / `tool_output`. Those fire at
- *   streaming frequency; routing them through the document would rebuild the
- *   whole layout per chunk. They belong to the streaming tail instead.
+ * - Top-level `tool_use_chunk` / `tool_output` belong to the streaming tail.
+ *   Reduced child chunks only merge their bounded activity header here; repeated
+ *   headers are no-ops and never introduce top-level tools.
  *
  * Subagent routing follows the same rule as the chunked path: on a parent page a
  * child tool event only updates the parent card's activity summary, while on the
@@ -29,7 +29,10 @@
  */
 
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import { useSubagentOutputCounts } from "@frontend/hooks/useSubagentOutputCounts";
 import type { SubagentActivityCatchUp, TreeMessage } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { MAX_SUBAGENT_RESULT_TEXT_CHARS } from "@shared/subagent-result-text";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
 	awaitAgentResolvedPatch,
@@ -41,7 +44,7 @@ import {
 	reflectionStartedPatch,
 	reflectionStoppedPatch,
 	sendDeliveryResolvedPatch,
-	subagentActivityPatch,
+	subagentActivityUpdate,
 	subagentConclusionPatch,
 	subagentTakeoverPatch,
 	timeoutUpdatedPatch,
@@ -52,15 +55,20 @@ import {
 import {
 	type LivePatch,
 	LivePatchQueue,
+	patchDiscardedSubagentTools,
 	patchSubagentActivitySnapshots,
 	patchSubagentIdentity,
 	patchSubagentNested,
 	patchSubagentTakeoverByNarrator,
+	ReasoningTranslationPatchStore,
+	SubagentActivityPatchStore,
 } from "./vlist-live-patch";
 
 export interface UseVListLivePatchesOptions {
 	/** Only subscribe once a complete document exists to patch. */
 	enabled: boolean;
+	/** Replay retained completed parts after an in-flight page/checkpoint commits. */
+	messages?: readonly TreeMessage[];
 	/** A subagent page treats its own (parent-pointing) tool events as top-level. */
 	isSubagent: boolean;
 	/** Apply a patch to the loaded document; returns true when it changed something. */
@@ -109,6 +117,7 @@ export function useVListLivePatches(
 	narratorId: string | undefined,
 	options: UseVListLivePatchesOptions,
 ): void {
+	useSubagentOutputCounts(narratorId);
 	const { enabled, isSubagent, applyLivePatch, onUnappliedToolCompletion } = options;
 	const applyRef = useRef(applyLivePatch);
 	applyRef.current = applyLivePatch;
@@ -121,7 +130,18 @@ export function useVListLivePatches(
 	 * structural reload — the "status lags by one tool call" symptom. Replay them
 	 * when a message event indicates the document may now own the tool.
 	 */
-	const pendingCompletionsRef = useRef(new Map<string, LivePatch>());
+	const pendingCompletionsRef = useRef(
+		new Map<
+			string,
+			{ patch: LivePatch; chars: number; canRetain?: (messages: readonly TreeMessage[]) => boolean }
+		>(),
+	);
+	const pendingCompletionCharsRef = useRef(0);
+	const translationPartsRef = useRef(new ReasoningTranslationPatchStore());
+	const translationQueuedRef = useRef(false);
+	const childActivityRef = useRef(new SubagentActivityPatchStore());
+	const childActivityQueuedRef = useRef(false);
+	const childOverflowQueuedRef = useRef(false);
 	// Read fresh on every enqueue AND every flush: the queue rejects a batch whose
 	// narrator changed between the two (see LivePatchQueue for why the effect
 	// cleanup alone cannot cover that window).
@@ -148,33 +168,116 @@ export function useVListLivePatches(
 		queueRef.current?.enqueue(patch, onMiss);
 	}, []);
 
-	/** Enqueue a completion, remembering it when the tool is not loaded yet. */
+	const replayChildActivities = useCallback(() => {
+		if (childActivityQueuedRef.current || childActivityRef.current.size === 0) return;
+		childActivityQueuedRef.current = true;
+		enqueue(
+			(messages) => {
+				childActivityQueuedRef.current = false;
+				return childActivityRef.current.apply(messages, narratorRef.current);
+			},
+			() => {
+				childActivityQueuedRef.current = false;
+			},
+		);
+	}, [enqueue]);
+
+	const notifyChildOverflow = useCallback(() => {
+		if (childOverflowQueuedRef.current) return;
+		childOverflowQueuedRef.current = true;
+		enqueue((messages) => {
+			childOverflowQueuedRef.current = false;
+			return { messages, changed: false };
+		}, onUnappliedToolCompletion);
+	}, [enqueue, onUnappliedToolCompletion]);
+
+	const enqueueChildActivity = useCallback(
+		(event: Parameters<typeof subagentActivityUpdate>[0]) => {
+			if (!childActivityRef.current.remember(narratorRef.current, subagentActivityUpdate(event)))
+				notifyChildOverflow();
+			replayChildActivities();
+		},
+		[notifyChildOverflow, replayChildActivities],
+	);
+
+	useEffect(() => {
+		if (enabled && options.messages) replayChildActivities();
+	}, [enabled, options.messages, replayChildActivities]);
+
+	const replayTranslationParts = useCallback(() => {
+		if (translationQueuedRef.current) return;
+		translationQueuedRef.current = true;
+		enqueue((messages) => {
+			translationQueuedRef.current = false;
+			return translationPartsRef.current.apply(messages);
+		});
+	}, [enqueue]);
+
+	useEffect(() => {
+		if (enabled && options.messages) replayTranslationParts();
+	}, [enabled, options.messages, replayTranslationParts]);
+
+	const forgetPendingCompletion = useCallback((key: string) => {
+		const entry = pendingCompletionsRef.current.get(key);
+		if (!entry) return;
+		pendingCompletionCharsRef.current -= entry.chars;
+		pendingCompletionsRef.current.delete(key);
+	}, []);
+
+	/** Enqueue a completion, remembering bounded payloads until their row lands. */
 	const enqueueCompletion = useCallback(
-		(toolUseId: string, patch: LivePatch) => {
+		(
+			key: string,
+			patch: LivePatch,
+			chars: number | null = 0,
+			canRetain?: (messages: readonly TreeMessage[]) => boolean,
+		) => {
 			enqueue((messages) => {
 				const result = patch(messages);
-				if (!result.changed) {
-					pendingCompletionsRef.current.set(toolUseId, patch);
-					return result;
+				forgetPendingCompletion(key);
+				if (
+					!result.changed &&
+					chars != null &&
+					chars <= MAX_SUBAGENT_RESULT_TEXT_CHARS &&
+					pendingCompletionsRef.current.size < 128 &&
+					pendingCompletionCharsRef.current + chars <= 512_000 &&
+					(canRetain?.(messages) ?? true)
+				) {
+					pendingCompletionsRef.current.set(key, { patch, chars, canRetain });
+					pendingCompletionCharsRef.current += chars;
 				}
-				pendingCompletionsRef.current.delete(toolUseId);
+				// Rich/oversized misses use the existing structural reconciliation;
+				// never truncate a final result just to retain it here.
 				return result;
 			}, onUnappliedToolCompletion);
 		},
-		[enqueue, onUnappliedToolCompletion],
+		[enqueue, forgetPendingCompletion, onUnappliedToolCompletion],
 	);
 
 	/** Replay completions that missed while their tool_use was still unloaded. */
 	const replayPendingCompletions = useCallback(() => {
 		if (pendingCompletionsRef.current.size === 0) return;
-		for (const [toolUseId, patch] of pendingCompletionsRef.current) {
-			enqueue((messages) => {
-				const result = patch(messages);
-				if (result.changed) pendingCompletionsRef.current.delete(toolUseId);
-				return result;
-			});
+		// A launch completion can race the child's final conclusion. Restore tool
+		// lifecycle first, then the final result, independent of arrival order.
+		for (const conclusions of [false, true]) {
+			for (const [toolUseId, entry] of pendingCompletionsRef.current) {
+				if (toolUseId.startsWith("conclusion:") !== conclusions) continue;
+				enqueue((messages) => {
+					if (entry.canRetain && !entry.canRetain(messages)) {
+						forgetPendingCompletion(toolUseId);
+						return { messages, changed: false };
+					}
+					const result = entry.patch(messages);
+					if (result.changed) forgetPendingCompletion(toolUseId);
+					return result;
+				});
+			}
 		}
-	}, [enqueue]);
+	}, [enqueue, forgetPendingCompletion]);
+
+	useEffect(() => {
+		if (enabled && options.messages) replayPendingCompletions();
+	}, [enabled, options.messages, replayPendingCompletions]);
 
 	// Drop anything still queued on unmount / narrator switch: those patches target
 	// a document this hook no longer owns. narratorId/enabled are cleanup TRIGGERS
@@ -183,6 +286,12 @@ export function useVListLivePatches(
 	useEffect(() => {
 		return () => {
 			pendingCompletionsRef.current.clear();
+			pendingCompletionCharsRef.current = 0;
+			translationPartsRef.current.clear();
+			translationQueuedRef.current = false;
+			childActivityRef.current.clear();
+			childActivityQueuedRef.current = false;
+			childOverflowQueuedRef.current = false;
 			queueRef.current?.dispose();
 		};
 	}, [narratorId, enabled]);
@@ -276,7 +385,49 @@ export function useVListLivePatches(
 	useNarratorWS(
 		enabled ? narratorId : undefined,
 		{
+			onReasoningTranslationPatch: (patch) => {
+				// Authorized parent routing may describe a nested child row; identity checks
+				// in the pure patch prevent it from touching an unrelated parent element.
+				if (!translationPartsRef.current.remember(patch)) onUnappliedToolCompletion?.();
+				replayTranslationParts();
+			},
 			// ── Tool lifecycle ──────────────────────────────────────────────────
+			onToolUseDiscarded: (toolUseIds, rawParent, subagentNarratorId) => {
+				const parentToolUseId = routeParent(rawParent);
+				if (!parentToolUseId) return;
+				childActivityRef.current.discard(parentToolUseId, toolUseIds, subagentNarratorId);
+				enqueue((messages) =>
+					patchDiscardedSubagentTools(messages, parentToolUseId, toolUseIds, subagentNarratorId),
+				);
+			},
+			onToolUseChunk: (
+				toolUseId,
+				toolName,
+				_inputCharsTotal,
+				rawParent,
+				_extractedFilePath,
+				_contentCharsReceived,
+				_extractedFields,
+				_metadata,
+				_streamingField,
+				meta,
+			) => {
+				const parentToolUseId = routeParent(rawParent);
+				if (!parentToolUseId) return;
+				enqueueChildActivity({
+					parentToolUseId,
+					toolUseId,
+					toolName,
+					status: "streaming",
+					toolCallId: meta?.toolCallId,
+					executionAttempt: meta?.executionAttempt,
+					createdAt: meta?.createdAt,
+					timing: meta?.timing,
+					subagentNarratorId: meta?.subagentNarratorId,
+					model: meta?.model,
+					inputSummary: meta?.inputSummary,
+				});
+			},
 			onToolStarted: (
 				toolUseId,
 				toolName,
@@ -289,20 +440,19 @@ export function useVListLivePatches(
 			) => {
 				const parentToolUseId = routeParent(rawParent);
 				if (parentToolUseId) {
-					enqueue(
-						subagentActivityPatch({
-							parentToolUseId,
-							toolUseId,
-							toolName,
-							status: "running",
-							toolCallId: meta?.toolCallId ?? null,
-							createdAt: meta?.createdAt ?? null,
-							timing: meta?.timing ?? null,
-							subagentNarratorId: meta?.subagentNarratorId ?? null,
-							model: meta?.model ?? null,
-							inputSummary: meta?.inputSummary ?? null,
-						}),
-					);
+					enqueueChildActivity({
+						parentToolUseId,
+						toolUseId,
+						toolName,
+						status: "running",
+						toolCallId: meta?.toolCallId ?? null,
+						executionAttempt: meta?.executionAttempt,
+						createdAt: meta?.createdAt ?? null,
+						timing: meta?.timing ?? null,
+						subagentNarratorId: meta?.subagentNarratorId ?? null,
+						model: meta?.model ?? null,
+						inputSummary: meta?.inputSummary,
+					});
 					return;
 				}
 				enqueue(
@@ -318,7 +468,24 @@ export function useVListLivePatches(
 			},
 			onStreamingSnapshot: (snapshot) => {
 				for (const chunk of snapshot.toolChunks) {
-					if ((!isSubagent && chunk.parentToolUseId) || !chunk.started) continue;
+					const parentToolUseId = routeParent(chunk.parentToolUseId);
+					if (parentToolUseId) {
+						enqueueChildActivity({
+							parentToolUseId,
+							toolUseId: chunk.toolUseId,
+							toolName: chunk.toolName,
+							toolCallId: chunk.toolCallId,
+							executionAttempt: chunk.executionAttempt,
+							createdAt: chunk.createdAt,
+							timing: chunk.timing,
+							model: chunk.model,
+							subagentNarratorId: chunk.subagentNarratorId,
+							inputSummary: chunk.inputSummary,
+							status: chunk.started ? "running" : "streaming",
+						});
+						continue;
+					}
+					if (!chunk.started) continue;
 					enqueue(
 						toolStartedPatch({
 							toolUseId: chunk.toolUseId,
@@ -342,24 +509,23 @@ export function useVListLivePatches(
 			) => {
 				const parentToolUseId = routeParent(rawParent);
 				if (parentToolUseId) {
-					enqueue(
-						subagentActivityPatch({
-							parentToolUseId,
-							toolUseId,
-							toolName: meta?.toolName ?? "Tool",
-							status,
-							toolCallId: meta?.toolCallId ?? null,
-							createdAt: meta?.createdAt ?? null,
-							timing: meta?.timing ?? null,
-							subagentNarratorId: meta?.subagentNarratorId ?? null,
-							model: meta?.model ?? null,
-							inputSummary: meta?.inputSummary ?? null,
-						}),
-					);
+					enqueueChildActivity({
+						parentToolUseId,
+						toolUseId,
+						toolName: meta?.toolName ?? "Tool",
+						status,
+						toolCallId: meta?.toolCallId ?? null,
+						executionAttempt: meta?.executionAttempt,
+						createdAt: meta?.createdAt ?? null,
+						timing: meta?.timing ?? null,
+						subagentNarratorId: meta?.subagentNarratorId ?? null,
+						model: meta?.model ?? null,
+						inputSummary: meta?.inputSummary,
+					});
 					return;
 				}
 				enqueueCompletion(
-					toolUseId,
+					`tool:${toolUseId}`,
 					toolCompletedPatch({
 						toolUseId,
 						...(meta?.blockId ? { blockId: meta.blockId } : {}),
@@ -369,6 +535,13 @@ export function useVListLivePatches(
 						...(updatedInput ? { updatedInput } : {}),
 						...(metadata ? { metadata } : {}),
 					}),
+					// Keep deferred payloads bounded. Rich/large missed completions use
+					// the existing structural reconciliation rather than retaining blobs.
+					!updatedInput && !metadata && (output == null || typeof output === "string")
+						? typeof output === "string"
+							? output.length
+							: 0
+						: null,
 				);
 			},
 
@@ -487,6 +660,7 @@ export function useVListLivePatches(
 				modelInheritance,
 			) => {
 				if (!toolUseId) return;
+				if (subagentNarratorId) childActivityRef.current.identify(toolUseId, subagentNarratorId);
 				enqueue((messages) =>
 					patchSubagentIdentity(messages, toolUseId, {
 						...(subagentNarratorId ? { subagentNarratorId } : {}),
@@ -497,7 +671,7 @@ export function useVListLivePatches(
 				);
 			},
 			onSubagentConclusionUpdated: (
-				_subagentNarratorId,
+				subagentNarratorId,
 				toolUseId,
 				output,
 				hasError,
@@ -505,14 +679,28 @@ export function useVListLivePatches(
 				durationMs,
 			) => {
 				if (!toolUseId) return;
-				enqueue(
+				enqueueCompletion(
+					`conclusion:${subagentNarratorId}:${toolUseId}`,
 					subagentConclusionPatch({
 						toolUseId,
+						subagentNarratorId,
 						output,
 						hasError,
 						...(completedAt != null ? { completedAt } : {}),
 						...(durationMs != null ? { durationMs } : {}),
 					}),
+					typeof output === "string" ? output.length : null,
+					(messages) =>
+						messages.every((message) => {
+							const block = messageBody(message).find(
+								(entry) => entry.type === "tool_use" && entry.id === toolUseId,
+							);
+							const call = message.toolCalls?.find((entry) => entry.toolUseId === toolUseId);
+							const owner =
+								block?._subagentActivity?.subagentNarratorId ??
+								call?._subagentActivity?.subagentNarratorId;
+							return !owner || owner === subagentNarratorId;
+						}),
 				);
 			},
 
@@ -536,15 +724,43 @@ export function useVListLivePatches(
 			onCatchUp: (_orphanChildren, _topLevel, subagentActivities) => {
 				// A catch-up reload may finally load the tool_use a completion missed.
 				replayPendingCompletions();
-				if (subagentActivities.length === 0) return;
+				replayTranslationParts();
+				if (subagentActivities.length === 0) {
+					replayChildActivities();
+					return;
+				}
 				const snapshots = subagentActivities as SubagentActivityCatchUp[];
+				for (const snapshot of snapshots) {
+					if (
+						!childActivityRef.current.rememberSnapshot(
+							narratorRef.current,
+							snapshot.parentToolUseId,
+							snapshot.activity,
+						)
+					)
+						notifyChildOverflow();
+				}
 				enqueue((messages) => patchSubagentActivitySnapshots(messages, snapshots));
+				replayChildActivities();
 			},
 			// A landed / updated message can introduce the tool_use a completion
 			// previously could not find. Replay before other patches so the spinner
 			// clears in the same frame the card appears.
 			onMessage: () => {
 				replayPendingCompletions();
+				replayTranslationParts();
+				replayChildActivities();
+			},
+			onMessageUpdated: () => {
+				replayPendingCompletions();
+				replayTranslationParts();
+				replayChildActivities();
+			},
+			onMessagesDeleted: (messageIds) => {
+				translationPartsRef.current.forget(messageIds);
+				// Unloaded parents have no message id to correlate; deletion invalidates
+				// this short compensation window rather than resurrecting removed tools.
+				childActivityRef.current.clear();
 			},
 		},
 		undefined,

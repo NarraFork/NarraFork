@@ -4,6 +4,7 @@ import type { AgentConfig, AgentEvent } from "../types";
 
 // Scenario switches drive the mock provider's per-attempt behavior.
 let providerScenario:
+	| "reasoning_summary_parts"
 	| "reasoning_then_text" // attempt 1: reasoning only; attempt 2: real text
 	| "reasoning_high_context_then_text" // attempt 1: high-context reasoning only; attempt 2: text
 	| "reasoning_high_context_abort" // attempt 1: high-context reasoning only; recovery waits for abort
@@ -29,6 +30,40 @@ const testProvider: ProviderAdapter = {
 		contentLog.push(params.content || (last?.role === "user" ? (last.content ?? "") : ""));
 		resetLog.push(params.resetUpstreamSession === true);
 		params.onRequestStart?.();
+
+		if (providerScenario === "reasoning_summary_parts") {
+			yield {
+				reasoning: "A",
+				reasoningBlockId: "native-summary",
+				reasoningOutputIndex: 0,
+				reasoningSummaryPart: { id: "native-summary:summary:0", index: 0 },
+			};
+			yield {
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "checkpoint",
+					blockId: "native-summary",
+					outputIndex: 0,
+					summaryPart: { id: "native-summary:summary:0", index: 0, start: 0, end: 1 },
+				},
+			};
+			yield {
+				reasoning: "\n\nB",
+				reasoningBlockId: "native-summary",
+				reasoningOutputIndex: 0,
+				reasoningSummaryPart: { id: "native-summary:summary:1", index: 1 },
+			};
+			yield {
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "complete",
+					blockId: "native-summary",
+					outputIndex: 0,
+				},
+			};
+			yield { reasoningResponseCompleted: true };
+			return;
+		}
 
 		if (providerScenario === "reasoning_then_text") {
 			if (providerAttempts === 1) {
@@ -100,6 +135,39 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 }
 
 describe("agentLoop reasoning-only dead turn", () => {
+	test("summary successor identity reaches the attempt lane and terminal follows its durable checkpoint", async () => {
+		providerScenario = "reasoning_summary_parts";
+		providerAttempts = 0;
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal, {
+				shouldIdleOnReasoningOnly: async () => true,
+			}),
+			"inspect",
+			{ rows: [] },
+		))
+			events.push(event);
+		const deltas = events.filter((event) => event.type === "stream_reasoning");
+		expect(deltas.map((event) => event.reasoningSummaryPart?.index)).toEqual([0, 1]);
+		expect(deltas[0].blockId).toBe(deltas[1].blockId);
+		expect(deltas[0].blockId).not.toBe("native-summary");
+		const terminal = events.findIndex((event) => event.type === "reasoning_response_complete");
+		expect(terminal).toBeGreaterThan(0);
+		const checkpoint = events
+			.slice(0, terminal)
+			.findLast((event) => event.type === "block_complete");
+		expect(checkpoint).toMatchObject({
+			type: "block_complete",
+			block: {
+				type: "reasoning",
+				id: deltas[0].blockId,
+				text: "A\n\nB",
+				completed: true,
+			},
+		});
+		expect(events.filter((event) => event.type === "reasoning_response_complete")).toHaveLength(1);
+	});
+
 	test("等待外部工作时首个纯 reasoning 回合直接 idle，不重试或压缩", async () => {
 		providerScenario = "reasoning_high_context_then_text";
 		providerAttempts = 0;

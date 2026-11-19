@@ -1,0 +1,33 @@
+.indicator {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 12px;
+	width: 12px;
+	height: 12px;
+	line-height: 0;
+	color: var(--mantine-color-dimmed);
+	pointer-events: none;
+	user-select: none;
+	animation: reasoning-translation-breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes reasoning-translation-breathe {
+	0%,
+	100% {
+		opacity: 0.5;
+		transform: scale(0.92);
+	}
+	50% {
+		opacity: 0.95;
+		transform: scale(1);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.indicator {
+		animation: none;
+		opacity: 0.8;
+		transform: none;
+	}
+}

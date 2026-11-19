@@ -34,6 +34,10 @@
  * just finished never played.
  */
 
+import type {
+	ReasoningTranslationGroup,
+	ReasoningTranslationStepSource,
+} from "@shared/pretext-layout/reasoning-translation-sources";
 import {
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
@@ -51,6 +55,8 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ReasoningTranslationIndicator } from "../../reasoning-translation-indicator";
+import { ReasoningTranslationText } from "../../reasoning-translation-visibility";
 import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
@@ -131,6 +137,7 @@ function VariantHeaderIcon({ variant }: { variant: TraceVariant }) {
  * edge). Sensible English fallbacks keep the component self-contained.
  */
 export interface TraceRenderLabels {
+	translationStatusLabel?: string;
 	/** "Show earlier N" builder. */
 	showEarlier?: (hiddenCount: number) => string;
 	/** "Hide earlier" text. */
@@ -240,6 +247,9 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	narratorId?: string;
+	translationGroup?: ReasoningTranslationGroup;
+	translationSources?: ReadonlyMap<string, ReasoningTranslationStepSource>;
 	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
 	onUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
@@ -390,6 +400,9 @@ function UnknownHeightTrace(props: RenderToolRunProps) {
 }
 
 function RenderMeasuredToolRun({
+	narratorId,
+	translationGroup,
+	translationSources,
 	measured,
 	labels = {},
 	rowIcon,
@@ -460,6 +473,13 @@ function RenderMeasuredToolRun({
 					<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, flexShrink: 0, opacity: 0.5 }}>
 						{header.count}
 					</p>
+					{variant === "reasoning-steps" ? (
+						<ReasoningTranslationIndicator
+							narratorId={narratorId}
+							group={translationGroup}
+							label={labels.translationStatusLabel}
+						/>
+					) : null}
 				</div>
 			) : null}
 
@@ -507,6 +527,10 @@ function RenderMeasuredToolRun({
 				<TraceRowView
 					key={row.key}
 					row={row}
+					translationSource={translationSources?.get(row.key)}
+					narratorId={narratorId}
+					translationStatusLabel={labels.translationStatusLabel}
+					showTranslationStatus={variant === "activity"}
 					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
 					textPreviewLabels={textPreviewLabels}
 					onToggleTextExpanded={onToggleTextExpanded}
@@ -868,6 +892,10 @@ function LiveTailText({
 }
 
 function TraceRowView({
+	translationSource,
+	narratorId,
+	translationStatusLabel,
+	showTranslationStatus,
 	row,
 	rowIcon,
 	onToggleRow,
@@ -888,6 +916,10 @@ function TraceRowView({
 	onToggleTextExpanded,
 	onBodyUnknownHeight,
 }: {
+	narratorId?: string;
+	translationStatusLabel?: string;
+	showTranslationStatus?: boolean;
+	translationSource?: ReasoningTranslationStepSource;
 	onBodyUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
@@ -1064,24 +1096,33 @@ function TraceRowView({
 			    switch; a tail advancing or a title growing keeps its key and never re-fades.
 			    A row that mounted in its current form (scrolling into the window) is not a
 			    switch, so `fadeLabel` stays false for it. */}
-			{labelForm === "tail" && liveTail ? (
-				<LiveTailText
-					key="tail"
-					tail={liveTail}
-					charsLabel={liveTailChars}
-					shimmerClass={shimmerClass}
-					fadeIn={fadeLabel}
+			<ReasoningTranslationText source={translationSource?.title}>
+				{labelForm === "tail" && liveTail ? (
+					<LiveTailText
+						key="tail"
+						tail={liveTail}
+						charsLabel={liveTailChars}
+						shimmerClass={shimmerClass}
+						fadeIn={fadeLabel}
+					/>
+				) : labelForm === "pending" ? (
+					<TraceRowTitle key="pending" row={displayRow} shimmerClass={shimmerClass} />
+				) : (
+					<TraceRowTitle
+						key="title"
+						row={displayRow}
+						shimmerClass={shimmerClass}
+						fadeIn={fadeLabel}
+					/>
+				)}
+			</ReasoningTranslationText>
+			{showTranslationStatus && translationSource?.group ? (
+				<ReasoningTranslationIndicator
+					narratorId={narratorId}
+					group={translationSource.group}
+					label={translationStatusLabel}
 				/>
-			) : labelForm === "pending" ? (
-				<TraceRowTitle key="pending" row={displayRow} shimmerClass={shimmerClass} />
-			) : (
-				<TraceRowTitle
-					key="title"
-					row={displayRow}
-					shimmerClass={shimmerClass}
-					fadeIn={fadeLabel}
-				/>
-			)}
+			) : null}
 			{/* Status + duration, adjacent to the label rather than right-aligned: in a
 			    column of rows a far-right number has to be traced back across the gap to
 			    find its own row, which is exactly the misreading this avoids.
@@ -1186,17 +1227,19 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
-					<RenderTextPreview
-						textPreviewLabels={textPreviewLabels}
-						onToggleTextExpanded={onToggleTextExpanded}
-						bodyKey={row.key ?? String(row.itemIndex)}
-						measured={row.body}
-						onUnknownHeight={onBodyUnknownHeight}
-						animateStreaming={animateStreaming}
-						sealOnMount
-						animKeyBase={animKeyBase}
-						animScope={animScope}
-					/>
+					<ReasoningTranslationText source={translationSource?.body}>
+						<RenderTextPreview
+							textPreviewLabels={textPreviewLabels}
+							onToggleTextExpanded={onToggleTextExpanded}
+							bodyKey={row.key ?? String(row.itemIndex)}
+							measured={row.body}
+							onUnknownHeight={onBodyUnknownHeight}
+							animateStreaming={animateStreaming}
+							sealOnMount
+							animKeyBase={animKeyBase}
+							animScope={animScope}
+						/>
+					</ReasoningTranslationText>
 				</div>
 			) : null}
 

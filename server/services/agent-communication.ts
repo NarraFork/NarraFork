@@ -1068,7 +1068,7 @@ async function deliverSubagentMessageToParent(
 	// at its next after_tools sidecar boundary.
 	const started =
 		accepted.delivery.state === "queued" && !getExecutionOwner(parentId)
-			? await wakeInboxIfEligible(parentId, input.locale as Locale)
+			? await wakeInboxIfEligible(parentId)
 			: false;
 
 	return {
@@ -1257,7 +1257,7 @@ export async function sendSubagentMessageDetailed(
 				// The run may have ended while this was being queued; the ordinary wake
 				// rechecks ownership, so a still-live run simply adopts it at its boundary.
 				if (!buffered.duplicate)
-					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
+					void wakeInboxIfEligible(fresh.id).catch((error) =>
 						logger.warn("Queued Send wake deferred", {
 							narratorId: fresh.id,
 							error: String(error),
@@ -1312,7 +1312,7 @@ export async function sendSubagentMessageDetailed(
 						!wakeHeldRun(fresh.id) &&
 						!(await wakeInboxIfEligible(
 							fresh.id,
-							input.locale as Locale,
+							undefined,
 							resumeRequested ? { resumeStopped: ["error"] } : {},
 						));
 				} catch (error) {

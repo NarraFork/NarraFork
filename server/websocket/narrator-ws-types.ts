@@ -81,7 +81,18 @@ export interface RecentTabsSnapshotMessage {
 }
 
 // Server → Client messages
-export type NarratorServerMessage =
+export type NarratorServerMessage = NarratorServerMessageFrame & {
+	/** Undefined preserves older protocol state; null authoritatively clears the author. */
+	reasoningTranslationActivity?:
+		| import("@shared/reasoning-translation").ReasoningTranslationActivity
+		| null;
+};
+
+type NarratorServerMessageFrame =
+	| ({
+			type: "reasoning_translation_patch";
+	  } & import("@shared/reasoning-translation").ReasoningTranslationPatch)
+	| import("@shared/reasoning-translation").ReasoningTranslationStatus
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
 	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent

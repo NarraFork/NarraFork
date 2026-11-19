@@ -5,10 +5,13 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
 import { bodySql, readBodies } from "../lib/narrator-bodies";
+import { getNarratorWorkerTestDb } from "../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -20,6 +23,17 @@ const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await 
 	"./narrator-ws"
 );
 const protocol = await import("./narrator-block-protocol");
+const {
+	clearStreamingSnapshot,
+	getStreamingSnapshot,
+	getSubagentOutputCounts,
+	processEvent,
+	retireSubagentOutputCharCount,
+	startSubagentOutputCharCount,
+} = await import("../services/narrator-event-handler");
+const { getRunControl, setRunControl, tryClaimExecution } = await import(
+	"../services/agent-runtime/ownership"
+);
 const { decodeBlockFrame } = await import("@frontend/lib/block-protocol");
 
 /** A decoded value with each row's body back as the elements its blocks hold. */
@@ -39,11 +53,35 @@ const roundTrip = (frame: Parameters<typeof protocol.toBlockFrames>[0]) =>
 			.flatMap((item) => decodeBlockFrame(item as unknown as Record<string, unknown>)),
 	);
 
+test("translation is one bounded part frame using the successful writer's persistent identity", () => {
+	const patch = {
+		type: "reasoning_translation_patch" as const,
+		narratorId: "n1",
+		ownerNarratorId: "n1",
+		messageId: "message",
+		blockId: "persistent-block",
+		elementId: "output-element",
+		blockRevision: 3,
+		stateRevision: 8,
+		translationGeneration: "g",
+		part: { id: "part", generation: "g", start: 0, end: 1, sourceText: "A", translatedText: "甲" },
+	};
+	expect(protocol.toBlockFrames(patch)).toEqual([patch]);
+	expect(() =>
+		protocol.toBlockFrames({
+			...patch,
+			part: { ...patch.part, translatedText: "中".repeat(22000) },
+		}),
+	).toThrow();
+	expect(() => protocol.toBlockFrames({ ...patch, translationGeneration: "other" })).toThrow();
+});
+
 const NOW = "2026-10-01T00:00:00.000Z";
 
 type Sent = Record<string, unknown>;
 type FakeWs = Parameters<typeof handleNarratorWS.open>[0];
 const opened: FakeWs[] = [];
+const countOwners: import("../services/agent-runtime/ownership").ExecutionOwner[] = [];
 
 function openWs() {
 	const sent: Sent[] = [];
@@ -76,13 +114,21 @@ beforeEach(() => {
 	);
 });
 afterEach(() => {
+	for (const owner of countOwners.splice(0)) {
+		const runId = getRunControl(owner.narratorId)?.logicalRunId;
+		if (runId) retireSubagentOutputCharCount(owner.narratorId, runId);
+		setRunControl(owner, undefined);
+		owner.release();
+		clearStreamingSnapshot(owner.narratorId);
+	}
+	clearStreamingSnapshot("n1");
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 const delta = (elementId: string, text: string, type = "text_delta") => ({
@@ -257,6 +303,119 @@ describe("every subscriber gets the block-keyed protocol", () => {
 			...(version ? { protocol: version } : {}),
 		});
 	}
+
+	test("an idle parent subscribes and reconnects with zero/live run counts and empty terminal lists", async () => {
+		const childId = "count-snapshot-child";
+		const owner = tryClaimExecution(childId, "run");
+		if (!owner) throw new Error("Expected child owner");
+		countOwners.push(owner);
+		setRunControl(owner, {
+			logicalRunId: "snapshot-run",
+			deliverTo: { narratorId: "n1", toolUseId: "agent-wire", toolCallId: "agent-pk", attempt: 2 },
+			startedAt: Date.now(),
+			cancel: new AbortController(),
+			timedOut: false,
+			terminal: new Promise(() => {}),
+		});
+		startSubagentOutputCharCount(childId, "snapshot-run");
+		const identity = {
+			childNarratorId: childId,
+			logicalRunId: "snapshot-run",
+			toolUseId: "agent-wire",
+			toolCallId: "agent-pk",
+			attempt: 2,
+		};
+		const first = openWs();
+		await subscribe(first.ws);
+		expect(first.sent.find((frame) => frame.type === "streaming_snapshot")).toMatchObject({
+			protocol: 2,
+			streamingBlocks: [],
+			toolChunks: [],
+			subagentOutputCounts: [{ ...identity, count: 0, active: true }],
+		});
+		await processEvent(
+			{
+				type: "stream_text",
+				blockId: "private-body",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				text: "private reply body",
+			},
+			{
+				narratorId: childId,
+				broadcastTargetId: "n1",
+				parentToolUseId: "agent-wire",
+				subagentOutputIdentity: identity,
+				conversationId: "count-conversation",
+				getContextUsagePct: () => undefined,
+				getMeterUsage: () => undefined,
+				getMeterUnit: () => undefined,
+				getPartialMessageId: () => undefined,
+				getTokenUsage: () => undefined,
+				setPartialMessageId: () => {},
+				setContextUsagePct: () => {},
+				setMeterData: () => {},
+				setTokenUsage: () => {},
+			},
+		);
+		clearStreamingSnapshot("n1");
+		const reconnect = openWs();
+		await subscribe(reconnect.ws, 2);
+		const live = reconnect.sent.find((frame) => frame.type === "streaming_snapshot");
+		expect(live).toMatchObject({
+			streamingBlocks: [],
+			toolChunks: [],
+			subagentOutputCounts: [{ ...identity, count: 18, active: true }],
+		});
+		expect(JSON.stringify(live)).not.toContain("private reply body");
+		expect(JSON.stringify(live)).not.toContain("input");
+		expect(getStreamingSnapshot("n1")).toBeUndefined();
+		expect(getSubagentOutputCounts("n1")).toHaveLength(1);
+		retireSubagentOutputCharCount(childId, "snapshot-run");
+		const terminal = openWs();
+		await subscribe(terminal.ws, 1);
+		expect(terminal.sent.find((frame) => frame.type === "streaming_snapshot")).toMatchObject({
+			streamingBlocks: [],
+			toolChunks: [],
+			subagentOutputCounts: [],
+		});
+	});
+
+	test("count metadata survives block conversion without creating tool blocks", () => {
+		const count = {
+			childNarratorId: "child",
+			logicalRunId: "run",
+			toolUseId: "agent-wire",
+			toolCallId: "pk",
+			attempt: 0,
+			count: 0,
+			active: true,
+		};
+		const output = {
+			type: "tool_output" as const,
+			narratorId: "n1",
+			toolUseId: "agent-wire",
+			output: "0",
+			subagentOutputCount: count,
+		};
+		expect(protocol.toBlockFrames(output)).toEqual([output]);
+		expect(
+			protocol.toBlockSnapshot({
+				type: "streaming_snapshot",
+				narratorId: "n1",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [count],
+			}),
+		).toEqual({
+			type: "streaming_snapshot",
+			narratorId: "n1",
+			protocol: 2,
+			streamingBlocks: [],
+			toolChunks: [],
+			subagentOutputCounts: [count],
+		});
+	});
 
 	test("message rows reach every subscriber as envelopes, whatever protocol it named", async () => {
 		const subscribers = [openWs(), openWs(), openWs()];

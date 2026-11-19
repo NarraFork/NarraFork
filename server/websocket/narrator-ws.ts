@@ -6,6 +6,7 @@ import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
 } from "@shared/pretext-layout/text-document";
+import type { ReasoningTranslationVisibilityMessage } from "@shared/reasoning-translation";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
@@ -23,9 +24,10 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
 
 import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
-import { and, count as countFn, eq, inArray } from "drizzle-orm";
+import { and, count as countFn, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls, terminals } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { eventBus } from "../lib/event-bus";
@@ -48,7 +50,7 @@ import type {
 import { resolveCommand } from "../services/command-service";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
-import { getStreamingSnapshot } from "../services/narrator-event-handler";
+import { getStreamingSnapshot, getSubagentOutputCounts } from "../services/narrator-event-handler";
 import {
 	handleBlockAllSkillsCommand,
 	handleBlockSkillCommand,
@@ -83,6 +85,9 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { reasoningTranslationActivities } from "../services/reasoning-translation-activity";
+import { reasoningTranslationVisibility } from "../services/reasoning-translation-runtime";
+import { canReferenceVisibleTranslationTarget } from "../services/reasoning-translation-store";
 import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
@@ -125,6 +130,13 @@ export interface NarratorWSData {
 	 * sets it, any other kind clears it.
 	 */
 	activityOnlyNarrators?: Set<string>;
+	/** Only transcript subscriptions may hold display translation demand. */
+	translationMessageNarrators?: Set<string>;
+	/** Bounded pending subscribe permits; unsubscribe/close invalidate late ACL results. */
+	pendingNarratorSubscriptions?: Map<string, Map<object, boolean>>;
+	pendingNarratorSubscriptionRequests?: Set<object>;
+	/** Last successful independent request; older failed requests cannot evict it. */
+	narratorSubscriptionGrants?: Map<string, object>;
 	subscribedStats?: boolean;
 	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
 	catchingUpNarrators: Map<string, number>;
@@ -165,6 +177,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 
 // Client → Server messages
 export type NarratorClientMessage =
+	| ReasoningTranslationVisibilityMessage
 	| GitWorkspaceClientMessage
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
@@ -176,6 +189,8 @@ export type NarratorClientMessage =
 			kind?: NarratorSubscriptionKind;
 			requestId?: string;
 			version?: number;
+			/** Reader state can advance without changing the model message version. */
+			restoreState?: boolean;
 			/** `activity` only: lower narrators already streamed in full (see subscribe). */
 			downgrade?: boolean;
 	  }
@@ -221,6 +236,80 @@ type ViewerInfo = {
 	avatarImageId: string | null;
 };
 
+const readTaskState = hotSafe("narrafork.narratorWs.readTasks", () => ({
+	quiescing: false,
+	controller: new AbortController(),
+	pending: new Set<Promise<void>>(),
+	failure: undefined as unknown,
+}));
+
+export function trackNarratorWsReadTask(work: Promise<void>): void {
+	readTaskState.pending.add(work);
+	void work.then(
+		() => {
+			readTaskState.pending.delete(work);
+		},
+		(error) => {
+			readTaskState.pending.delete(work);
+			if (
+				readTaskState.quiescing &&
+				(error?.code === "DB_READ_ABORTED" || readTaskState.controller.signal.aborted)
+			)
+				return;
+			readTaskState.failure ??= new Error("Narrator WebSocket read task failed");
+			logger.warn("Narrator WebSocket read task failed", {
+				code: typeof error?.code === "string" ? error.code : "WS_READ_TASK_FAILED",
+			});
+		},
+	);
+}
+
+export function quiesceNarratorWsReadTasks(): void {
+	readTaskState.quiescing = true;
+	readTaskState.controller.abort();
+	for (const timer of pendingTerminalBroadcasts.values()) clearTimeout(timer);
+	pendingTerminalBroadcasts.clear();
+	for (const ws of connections) toolInputLaneSender.close(ws);
+}
+
+export function hasPendingNarratorWsReadTasks(): boolean {
+	return (
+		readTaskState.pending.size > 0 || !!readTaskState.failure || pendingTerminalBroadcasts.size > 0
+	);
+}
+
+export async function drainNarratorWsReadTasks(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	while (readTaskState.pending.size > 0) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator WebSocket read drain deadline exceeded");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort = () => {};
+		try {
+			await Promise.race([
+				Promise.allSettled([...readTaskState.pending]),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("Narrator WebSocket read drain deadline exceeded")),
+						remaining,
+					);
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Narrator WebSocket read drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (readTaskState.failure) throw readTaskState.failure;
+}
+
 const connections = hotSafe("narrafork.narratorWs.connections", () => new Set<NarratorWS>());
 const connectionsByUserId = hotSafe(
 	"narrafork.narratorWs.connectionsByUserId",
@@ -255,6 +344,11 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	reasoningTranslationVisibility.release(ws);
+	ws.data.translationMessageNarrators?.clear();
+	ws.data.pendingNarratorSubscriptions?.clear();
+	ws.data.pendingNarratorSubscriptionRequests?.clear();
+	ws.data.narratorSubscriptionGrants?.clear();
 	toolInputLaneSender.close(ws);
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
@@ -590,7 +684,7 @@ export class ToolInputLaneSender {
 		if (state.flushing || state.timer || (!state.blocked && !state.frames.length)) return;
 		state.timer = setTimeout(() => {
 			state.timer = undefined;
-			void this.flush(ws, state);
+			trackNarratorWsReadTask(this.flush(ws, state));
 		}, 16);
 		state.timer.unref?.();
 	}
@@ -633,6 +727,7 @@ export async function revalidateQueuedToolInputFrame(
 ): Promise<boolean> {
 	const ws = socket as NarratorWS;
 	const current = () =>
+		!readTaskState.quiescing &&
 		connections.has(ws) &&
 		ws.data.subscribedNarrators.has(identity.narratorId) &&
 		toolInputStreamSource.isCurrentInputLane(identity.narratorId, identity.refId, identity.epoch);
@@ -699,6 +794,25 @@ function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): bool
 
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
 	if (
+		["stream_event", "message", "message_updated", "streaming_snapshot"].includes(message.type) &&
+		message.reasoningTranslationActivity === undefined
+	) {
+		const routed = message as {
+			subagentNarratorId?: string;
+			event?: { subagentNarratorId?: string };
+			message?: { narratorId?: string };
+		};
+		const author =
+			routed.subagentNarratorId ??
+			routed.event?.subagentNarratorId ??
+			routed.message?.narratorId ??
+			narratorId;
+		message = {
+			...message,
+			reasoningTranslationActivity: reasoningTranslationActivities.get(author),
+		};
+	}
+	if (
 		["workspace_context_changed", "workspace_paths_changed", "permission_policy_changed"].includes(
 			message.type,
 		)
@@ -742,7 +856,13 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		frame: NarratorServerMessage,
 	): Array<[NarratorServerMessage, string]> => {
 		try {
-			return toBlockFrames(frame).map((item) => [item, JSON.stringify(item)]);
+			return toBlockFrames(frame).map((item) => {
+				const projected =
+					frame.reasoningTranslationActivity === undefined
+						? item
+						: { ...item, reasoningTranslationActivity: frame.reasoningTranslationActivity };
+				return [projected, JSON.stringify(projected)];
+			});
 		} catch (error) {
 			// A broadcast never fails its emitter; the v2 client reloads what it missed.
 			logger.warn("Message protocol v2 frame failed; asking the client to reload", {
@@ -782,12 +902,33 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		if (ws.data.catchingUpNarrators.has(narratorId)) {
 			const buffer = ws.data.catchUpBuffers.get(narratorId);
 			if (buffer) {
-				for (const [frame, framePayload] of frames)
-					bufferRealtimeMessage(buffer, frame, framePayload.length);
+				for (const [frame, framePayload] of frames) {
+					if (frame.type === "reasoning_translation_patch") {
+						if (buffer.overflowed) continue;
+						const bytes = Buffer.byteLength(framePayload);
+						const queued = (reasoningPatchCatchUpBytes.get(buffer) ?? 0) + bytes;
+						if ((ws.getBufferedAmount?.() ?? 0) + queued > INPUT_LANE_BACKLOG_BYTES) {
+							buffer.overflowed = true;
+							buffer.messages.length = 0;
+							buffer.bytes = 0;
+							reasoningPatchCatchUpBytes.delete(buffer);
+							continue;
+						}
+						reasoningPatchCatchUpBytes.set(buffer, queued);
+						bufferRealtimeMessage(buffer, frame, bytes);
+					} else bufferRealtimeMessage(buffer, frame, framePayload.length);
+				}
 				continue;
 			}
 		}
-		for (const [, framePayload] of frames) if (!sendPayload(ws, framePayload)) break;
+		for (const [frame, framePayload] of frames) {
+			if (
+				!(frame.type === "reasoning_translation_patch"
+					? sendReasoningTranslationPatch(ws, framePayload)
+					: sendPayload(ws, framePayload))
+			)
+				break;
+		}
 	}
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
@@ -807,6 +948,28 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	subscriptionRequestId?: string,
 ): T & { subscriptionRequestId?: string } {
 	return subscriptionRequestId ? { ...message, subscriptionRequestId } : message;
+}
+
+const reasoningPatchCatchUpBytes = new WeakMap<CatchUpBuffer, number>();
+
+/** One completed part per bounded auxiliary frame, live or after catch-up. */
+function sendReasoningTranslationPatch(ws: NarratorWS, payload: string): boolean {
+	if (!connections.has(ws)) return false;
+	try {
+		if ((ws.getBufferedAmount?.() ?? 0) + Buffer.byteLength(payload) > INPUT_LANE_BACKLOG_BYTES) {
+			ws.close(1013, "Reasoning translation recovery required");
+			removeConnection(ws);
+			return false;
+		}
+		if (ws.send(payload) === 0) {
+			removeConnection(ws);
+			return false;
+		}
+		return true;
+	} catch {
+		removeConnection(ws);
+		return false;
+	}
 }
 
 /** Send one serialized frame; a failed send drops the connection. */
@@ -842,6 +1005,8 @@ function safeSend(
 	if (inProtocol) outgoing = inProtocol(outgoing as Record<string, unknown> & { type: string });
 	if (outgoing.type === "tool_use_chunk" && outgoing.inputDocument)
 		return sendToolInputLane(ws, outgoing as unknown as ToolInputChunkMessage);
+	if (outgoing.type === "reasoning_translation_patch")
+		return sendReasoningTranslationPatch(ws, JSON.stringify(outgoing));
 	try {
 		ws.send(JSON.stringify(outgoing));
 		return true;
@@ -875,6 +1040,8 @@ async function authorizeReadableNarrators(
 	ws: NarratorWS,
 	narratorIds: string[],
 	requestId?: string,
+	isRequestCurrent: (narratorId: string) => boolean = () => true,
+	mayRevokeExisting: (narratorId: string) => boolean = () => true,
 ): Promise<string[]> {
 	const userId = ws.data.userId;
 	if (!userId) {
@@ -884,6 +1051,7 @@ async function authorizeReadableNarrators(
 		const share = ws.data.publicShare;
 		if (!share) {
 			for (const narratorId of narratorIds) {
+				if (!isRequestCurrent(narratorId)) continue;
 				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
 			}
 			return [];
@@ -893,16 +1061,20 @@ async function authorizeReadableNarrators(
 			liveShare = revalidatePublicShare(share);
 		} catch {
 			for (const narratorId of narratorIds) {
+				if (!isRequestCurrent(narratorId)) continue;
 				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
 			}
 			return [];
 		}
 		const allowed: string[] = [];
 		for (const narratorId of new Set(narratorIds)) {
+			if (!isRequestCurrent(narratorId)) continue;
 			if (narratorId === liveShare.narratorId) {
 				allowed.push(narratorId);
 			} else {
 				ws.data.subscribedNarrators.delete(narratorId);
+				reasoningTranslationVisibility.release(ws, undefined, narratorId);
+				ws.data.translationMessageNarrators?.delete(narratorId);
 				toolInputLaneSender.clearNarrator(ws, narratorId);
 				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
 			}
@@ -912,12 +1084,21 @@ async function authorizeReadableNarrators(
 	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
 	const allowed: string[] = [];
 	for (const narratorId of new Set(narratorIds)) {
+		if (!isRequestCurrent(narratorId)) continue;
 		let ok = false;
 		try {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: NARRATOR_ACL_COLUMNS,
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: NARRATOR_ACL_COLUMNS,
+				}),
+				{
+					executionPolicy: "worker-required",
+					maxRows: 1,
+					timeoutMs: 30_000,
+					signal: readTaskState.controller.signal,
+				},
+			);
 			ok = row ? await canReadNarrator(row, principal) : false;
 		} catch (err) {
 			logger.warn("Narrator subscribe authorization failed", {
@@ -926,10 +1107,15 @@ async function authorizeReadableNarrators(
 			});
 			ok = false;
 		}
+		if (!isRequestCurrent(narratorId)) continue;
 		if (ok) {
 			allowed.push(narratorId);
 		} else {
+			if (!mayRevokeExisting(narratorId)) continue;
+			ws.data.narratorSubscriptionGrants?.delete(narratorId);
 			ws.data.subscribedNarrators.delete(narratorId);
+			reasoningTranslationVisibility.release(ws, undefined, narratorId);
+			ws.data.translationMessageNarrators?.delete(narratorId);
 			toolInputLaneSender.clearNarrator(ws, narratorId);
 			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
 		}
@@ -1021,26 +1207,40 @@ async function authorizeNarratorId(
 	narratorId: string,
 	principal: { userId: string; isAdmin: boolean },
 	need: "read" | "write",
+	signal = readTaskState.controller.signal,
 ): Promise<boolean> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			timeoutMs: 30_000,
+			signal,
+		},
+	);
 	if (!row) return false;
 	return need === "write"
 		? await canWriteNarrator(row, principal)
 		: await canReadNarrator(row, principal);
 }
 
-function canAddSubscriptions(ws: NarratorWS, narratorIds: string[]): boolean {
-	let additions = 0;
-	for (const narratorId of new Set(narratorIds)) {
-		if (!ws.data.subscribedNarrators.has(narratorId)) additions += 1;
+function hasPendingMessageSubscription(ws: NarratorWS, narratorId: string): boolean {
+	for (const messages of ws.data.pendingNarratorSubscriptions?.get(narratorId)?.values() ?? []) {
+		if (messages) return true;
 	}
-	if (
-		ws.data.subscribedNarrators.size + additions <=
-		NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION
-	) {
+	return false;
+}
+
+function canAddSubscriptions(ws: NarratorWS, narratorIds: string[]): boolean {
+	const reserved = new Set([
+		...ws.data.subscribedNarrators,
+		...(ws.data.pendingNarratorSubscriptions?.keys() ?? []),
+	]);
+	for (const narratorId of narratorIds) reserved.add(narratorId);
+	if (reserved.size <= NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION) {
 		return true;
 	}
 	const error = {
@@ -1062,15 +1262,30 @@ type NarratorStatusRow = {
 
 async function loadStatusRows(narratorIds: string[]): Promise<NarratorStatusRow[]> {
 	if (narratorIds.length === 0) return [];
-	return db
-		.select({
-			id: narrators.id,
-			status: narrators.status,
-			substatus: narrators.substatus,
-			turnStartedAt: narrators.turnStartedAt,
-		})
-		.from(narrators)
-		.where(inArray(narrators.id, narratorIds));
+	const rows: NarratorStatusRow[] = [];
+	for (let offset = 0; offset < narratorIds.length; offset += RECENT_TABS_WS_BATCH_SIZE) {
+		const batch = narratorIds.slice(offset, offset + RECENT_TABS_WS_BATCH_SIZE);
+		rows.push(
+			...(await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						status: narrators.status,
+						substatus: narrators.substatus,
+						turnStartedAt: narrators.turnStartedAt,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, batch)),
+				{
+					executionPolicy: "worker-required",
+					maxRows: batch.length,
+					timeoutMs: 30_000,
+					signal: readTaskState.controller.signal,
+				},
+			)),
+		);
+	}
+	return rows;
 }
 
 function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnapshotItem {
@@ -1292,13 +1507,50 @@ function sendRuntimeSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: 
 	}
 }
 
+function translationViewer(ws: NarratorWS, narratorId: string) {
+	const userId = ws.data.userId;
+	const isCurrent = () =>
+		Boolean(userId) &&
+		connections.has(ws) &&
+		ws.data.userId === userId &&
+		!ws.data.publicShare &&
+		ws.data.subscribedNarrators.has(narratorId) &&
+		Boolean(ws.data.translationMessageNarrators?.has(narratorId)) &&
+		!ws.data.activityOnlyNarrators?.has(narratorId);
+	return {
+		narratorId,
+		userId: userId ?? "",
+		isCurrent,
+		status: (status: import("@shared/reasoning-translation").ReasoningTranslationStatus) => {
+			if (isCurrent()) safeSend(ws, { ...status });
+		},
+		authorize: async (
+			target: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget,
+			signal: AbortSignal,
+		) => {
+			if (!userId || !isCurrent() || signal.aborted) return false;
+			const allowed = await authorizeNarratorId(
+				narratorId,
+				{ userId, isAdmin: ws.data.userRole === "admin" },
+				"read",
+				signal,
+			);
+			return (
+				allowed &&
+				isCurrent() &&
+				!signal.aborted &&
+				(await canReferenceVisibleTranslationTarget(target, narratorId, signal))
+			);
+		},
+	};
+}
+
 function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
-		if (!snap) continue;
-		const hasStreaming =
-			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
-		if (!hasStreaming) continue;
+		// Every subscription is authoritative, including idle/zero/empty states.
+		// These run projections do not manufacture transient tool chunks.
+		const subagentOutputCounts = getSubagentOutputCounts(id);
 		if (
 			!safeSend(
 				ws,
@@ -1306,10 +1558,12 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
-						model: snap.model,
-						provider: snap.provider,
-						streamingBlocks: snap.streamingBlocks,
-						toolChunks: [...snap.toolChunks.values()],
+						model: snap?.model,
+						provider: snap?.provider,
+						streamingBlocks: snap?.streamingBlocks ?? [],
+						toolChunks: [...(snap?.toolChunks.values() ?? [])],
+						subagentOutputCounts,
+						reasoningTranslationActivity: reasoningTranslationActivities.get(id),
 					},
 					requestId,
 				),
@@ -1344,6 +1598,7 @@ function endCatchUp(ws: NarratorWS, narratorId: string, requestId?: string): boo
 	const buffer = ws.data.catchUpBuffers.get(narratorId);
 	ws.data.catchUpBuffers.delete(narratorId);
 	if (!buffer) return false;
+	reasoningPatchCatchUpBytes.delete(buffer);
 	// The client may have unsubscribed while the DB catch-up query was in flight.
 	// In that case drop the buffered realtime frames instead of resurrecting the
 	// subscription or sending events to a listener that no longer exists.
@@ -1502,14 +1757,27 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 	narratorId: string,
 ): Promise<void> {
 	editorFileSubscriptions.hint(narratorId);
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	reasoningTranslationVisibility.notify();
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			timeoutMs: 30_000,
+			signal: readTaskState.controller.signal,
+		},
+	);
 
 	const verdicts = new Map<string, boolean>();
 	for (const ws of connections) {
-		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+		if (
+			!ws.data.subscribedNarrators.has(narratorId) &&
+			!ws.data.pendingNarratorSubscriptions?.has(narratorId)
+		)
+			continue;
 		const userId = ws.data.userId;
 		const cacheKey = `${userId ?? ""}:${ws.data.userRole ?? ""}`;
 		let allowed = verdicts.get(cacheKey);
@@ -1521,14 +1789,21 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 			verdicts.set(cacheKey, allowed);
 		}
 		if (allowed) continue;
+		ws.data.pendingNarratorSubscriptions?.delete(narratorId);
+		ws.data.narratorSubscriptionGrants?.delete(narratorId);
 		ws.data.subscribedNarrators.delete(narratorId);
+		reasoningTranslationVisibility.release(ws, undefined, narratorId);
+		ws.data.translationMessageNarrators?.delete(narratorId);
 		toolInputLaneSender.clearNarrator(ws, narratorId);
 		safeSend(ws, { type: "subscribe_denied", narratorId });
 	}
 }
 
 export function broadcastToUser(userId: string, data: NarratorServerMessage): void {
-	if (data.type === "project_access_changed") editorFileSubscriptions.hint();
+	if (data.type === "project_access_changed") {
+		editorFileSubscriptions.hint();
+		reasoningTranslationVisibility.notify();
+	}
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
 	const msg = JSON.stringify(data);
@@ -1708,11 +1983,18 @@ const pendingTerminalBroadcasts = new Map<string, ReturnType<typeof setTimeout>>
 
 async function broadcastTerminalCount(narratorId: string | null) {
 	if (!narratorId) return;
-	const row = await db
-		.select({ count: countFn() })
-		.from(terminals)
-		.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running")))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({ count: countFn() })
+			.from(terminals)
+			.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running"))),
+		{
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			timeoutMs: 30_000,
+			signal: readTaskState.controller.signal,
+		},
+	);
 	broadcastToNarrator(narratorId, {
 		type: "terminal_count_changed",
 		narratorId,
@@ -1721,14 +2003,14 @@ async function broadcastTerminalCount(narratorId: string | null) {
 }
 
 function debouncedTerminalCount(narratorId: string | null) {
-	if (!narratorId) return;
+	if (readTaskState.quiescing || !narratorId) return;
 	const existing = pendingTerminalBroadcasts.get(narratorId);
 	if (existing) clearTimeout(existing);
 	pendingTerminalBroadcasts.set(
 		narratorId,
 		setTimeout(() => {
 			pendingTerminalBroadcasts.delete(narratorId);
-			broadcastTerminalCount(narratorId).catch(() => {});
+			trackNarratorWsReadTask(broadcastTerminalCount(narratorId));
 		}, 100),
 	);
 }
@@ -1857,18 +2139,23 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// === Recent tabs title sync ===
 	// Keep the actual JSON read-modify-write in user-preferences-service so every
 	// recent-tabs writer shares the same per-user lock.
-	eventBus.on("narrator:title_updated", async (event) => {
-		try {
-			const { syncNarratorTitleToRecentTabs } = await import(
-				"../services/user-preferences-service"
-			);
-			await syncNarratorTitleToRecentTabs(event.narratorId, event.title);
-		} catch (err) {
-			logger.error("Failed to sync recent tabs after title update", {
-				narratorId: event.narratorId,
-				error: String(err),
-			});
-		}
+	eventBus.on("narrator:title_updated", (event) => {
+		if (readTaskState.quiescing) return;
+		trackNarratorWsReadTask(
+			(async () => {
+				try {
+					const { syncNarratorTitleToRecentTabs } = await import(
+						"../services/user-preferences-service"
+					);
+					await syncNarratorTitleToRecentTabs(event.narratorId, event.title);
+				} catch (err) {
+					logger.error("Failed to sync recent tabs after title update", {
+						narratorId: event.narratorId,
+						error: String(err),
+					});
+				}
+			})(),
+		);
 	});
 } // end of hot-reload guard
 
@@ -1896,537 +2183,732 @@ export const handleNarratorWS = {
 	},
 
 	async message(ws: NarratorWS, parsed: NarratorClientMessage) {
-		const result = narratorWsMessageSchema.safeParse(parsed);
-		if (!result.success) {
-			logger.warn("Invalid narrator WS message", {
-				error: result.error.message,
-				parsed,
-			});
-			safeSend(ws, { type: "error", message: "Invalid message format" });
-			return;
-		}
-		const msg = result.data;
-
-		// Anonymous grants permit only the transcript/room protocol and heartbeat.
-		// In particular, output-stats sends directly from the connection registry.
-		if (
-			ws.data.publicShare &&
-			![
-				"pong",
-				"subscribe",
-				"unsubscribe",
-				"sync_check",
-				"chat_subscribe",
-				"chat_unsubscribe",
-			].includes(msg.type)
-		)
-			return;
-
-		// Update heartbeat timestamp on any valid message
-		ws.data.lastPongAt = Date.now();
-
-		// Frames that act on one narrator are authorized here, once, instead of in each
-		// case. Queueing or editing buffered input is indistinguishable from sending a
-		// message, so it needs write access; presence announces "I am looking at this",
-		// so read is enough. Decision frames (`permission_decision`)
-		// name only a request/session id, so their owner is resolved first — see
-		// `authorizeNarratorFrame`. `subscribe` authorizes itself (it takes a list, and
-		// reports per-id denials), and `sync_check` is covered transitively because it
-		// requires an already-authorized subscription.
-		if (!(await authorizeNarratorFrame(ws, msg))) return;
-
-		switch (msg.type) {
-			case "editor_file_subscribe":
-			case "editor_file_unsubscribe":
-				await handleEditorFileMessage(ws, msg);
-				break;
-			case "git_workspace_subscribe":
-			case "git_workspace_unsubscribe":
-			case "git_workspace_refresh":
-				await handleGitWorkspaceMessage(ws, msg);
-				break;
-			case "outline_page_subscribe":
-			case "outline_page_unsubscribe":
-				await handleOutlinePageMessage(ws, msg);
-				break;
-			case "pong":
-				// Heartbeat response — lastPongAt already updated above
-				break;
-			case "subscribe": {
-				// Public-share readers get the share's own filtered stream; the activity
-				// projection is not share-aware, so it is never offered to them.
-				const kind =
-					msg.kind === "activity" && ws.data.publicShare ? "list" : (msg.kind ?? "messages");
-				const requestId = msg.requestId;
-				if (!canAddSubscriptions(ws, msg.narratorIds)) break;
-
-				// Authorize BEFORE anything is added to the subscription set. This socket
-				// carries a user identity but the ids come from the client, so without this
-				// any authenticated user could stream a private narrator's whole timeline by
-				// guessing (or observing) its id — the catch-up path below happily replays
-				// history to whoever is subscribed.
-				const allowedIds = await authorizeReadableNarrators(ws, msg.narratorIds, requestId);
-				if (allowedIds.length === 0) break;
-
-				const messageNarratorId =
-					kind === "messages" && allowedIds.length === 1 ? allowedIds[0] : undefined;
-				const catchUpAnchor = messageNarratorId ? msg.catchUpCursor : undefined;
-
-				// An activity frame lowers only what it newly subscribes, or what the client
-				// explicitly downgrades after its last full handle went away; otherwise it
-				// just asks for the activity snapshot of a narrator streamed in full.
-				const activityLevelIds =
-					kind === "activity"
-						? allowedIds.filter(
-								(id) => msg.downgrade === true || !ws.data.subscribedNarrators.has(id),
-							)
-						: [];
-				// Reserve the full accepted set before any async snapshot/version work so
-				// concurrent subscribe frames cannot race past the per-connection limit.
-				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
-				if (kind === "activity") {
-					ws.data.activityOnlyNarrators ??= new Set();
-					for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
-				} else {
-					for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
-				}
-
-				if (kind === "activity") {
-					await sendListStateSnapshot(ws, allowedIds);
-					await sendActivitySnapshot(ws, allowedIds, requestId);
-					break;
-				}
-
-				if (kind === "list") {
-					await sendListStateSnapshot(ws, allowedIds);
-				}
-				if (kind === "panel") {
-					await sendStatusSnapshot(ws, allowedIds);
-					sendRuntimeSnapshot(ws, allowedIds, requestId);
-				}
-				if (kind === "messages") sendStreamingSnapshot(ws, allowedIds, requestId);
-
-				if (messageNarratorId && msg.version != null) {
-					// The version belongs to the REST snapshot used by THIS subscription,
-					// not necessarily the shared connection's latest optimistic state. Check
-					// it even for an empty snapshot with no cursor: if the first message
-					// landed between REST and subscribe, the body must reload rather than
-					// accepting a misleading sync_ok.
-					const serverVersion = await narratorService
-						.getMessageVersion(messageNarratorId)
-						.catch(() => null);
-					if (serverVersion != null && serverVersion === msg.version) {
-						safeSend(
-							ws,
-							withSubscriptionRequestId(
-								{ type: "sync_ok", narratorId: messageNarratorId, version: serverVersion },
-								requestId,
-							),
-						);
-						break;
-					}
-					if (!catchUpAnchor) {
-						safeSend(
-							ws,
-							withSubscriptionRequestId(
-								{ type: "full_reload", narratorId: messageNarratorId },
-								requestId,
-							),
-						);
-						break;
-					}
-				}
-
-				if (messageNarratorId && catchUpAnchor) {
-					sendCatchUpForAnchor(ws, messageNarratorId, catchUpAnchor, requestId).catch((err) => {
-						logger.warn("Failed to send catch-up messages", { error: String(err) });
-					});
-				}
-				break;
-			}
-			case "unsubscribe": {
-				for (const id of msg.narratorIds) {
-					ws.data.subscribedNarrators.delete(id);
-					ws.data.activityOnlyNarrators?.delete(id);
-					toolInputLaneSender.clearNarrator(ws, id);
-				}
-				break;
-			}
-			case "permission_decision": {
-				logger.debug("WS permission_decision received", {
-					requestId: msg.requestId,
-					decision: msg.decision,
-					hasFeedback: !!msg.feedbackText,
-					hasAnswers: !!msg.answers,
+		if (readTaskState.quiescing) return;
+		const work = (async () => {
+			const result = narratorWsMessageSchema.safeParse(parsed);
+			if (!result.success) {
+				logger.warn("Invalid narrator WS message", {
+					error: result.error.message,
+					parsed,
 				});
-				// Read before deciding: the team's record of who decided (M1) needs the call,
-				// which deciding takes out of the live registries.
-				readDecisionTarget(msg.requestId)
-					.then(async (target) => {
-						const resolved = await resolvePermissionOrDangerReflection(
-							msg.requestId,
-							msg.decision,
-							{
-								// Checked again inside the decision (after any restart-recovery wait):
-								// access revoked since the frame was authorized refuses it.
-								assertStillAllowed: async () => {
-									if (!(await authorizeNarratorFrame(ws, msg)))
-										throw new Error("Permission request not found");
-								},
-								denyMessage: msg.message,
-								answers: msg.answers,
-								feedbackText: msg.feedbackText,
-								compactAfter: msg.compactAfter,
-								updatedPlan: msg.updatedPlan,
-								userId: ws.data.userId,
-								decidedBy: "user",
+				safeSend(ws, { type: "error", message: "Invalid message format" });
+				return;
+			}
+			const msg = result.data;
+			let subscribePermit: object | undefined;
+			const grantsBeforeSubscribe = new Map(
+				msg.type === "subscribe"
+					? msg.narratorIds.map((id) => [id, ws.data.narratorSubscriptionGrants?.get(id)] as const)
+					: [],
+			);
+			if (msg.type === "subscribe") {
+				if (
+					!connections.has(ws) ||
+					!canAddSubscriptions(ws, msg.narratorIds) ||
+					(ws.data.pendingNarratorSubscriptionRequests?.size ?? 0) >= 64
+				)
+					return;
+				subscribePermit = {};
+				ws.data.pendingNarratorSubscriptionRequests ??= new Set();
+				ws.data.pendingNarratorSubscriptionRequests.add(subscribePermit);
+				ws.data.pendingNarratorSubscriptions ??= new Map();
+				for (const id of msg.narratorIds) {
+					const messages = (msg.kind ?? "messages") === "messages";
+					let permits = ws.data.pendingNarratorSubscriptions.get(id);
+					if (!permits) {
+						permits = new Map();
+						ws.data.pendingNarratorSubscriptions.set(id, permits);
+					}
+					if (msg.kind === "activity" && msg.downgrade === true) {
+						for (const [token, full] of permits) if (full) permits.delete(token);
+					}
+					permits.set(subscribePermit, messages);
+					if (
+						!messages &&
+						!ws.data.translationMessageNarrators?.has(id) &&
+						!hasPendingMessageSubscription(ws, id)
+					)
+						reasoningTranslationVisibility.release(ws, undefined, id);
+				}
+			} else if (msg.type === "unsubscribe") {
+				for (const id of msg.narratorIds) {
+					ws.data.pendingNarratorSubscriptions?.delete(id);
+					ws.data.narratorSubscriptionGrants?.delete(id);
+					reasoningTranslationVisibility.release(ws, undefined, id);
+				}
+			}
+
+			if (msg.type === "reasoning_translation_visibility") {
+				const userId = ws.data.userId;
+				if (!userId || ws.data.publicShare) return;
+				const isCurrent = () =>
+					connections.has(ws) &&
+					ws.data.userId === userId &&
+					!ws.data.publicShare &&
+					ws.data.subscribedNarrators.has(msg.narratorId) &&
+					Boolean(ws.data.translationMessageNarrators?.has(msg.narratorId)) &&
+					!ws.data.activityOnlyNarrators?.has(msg.narratorId);
+				// Replacement/release is synchronous: a later hide frame invalidates earlier async reads.
+				reasoningTranslationVisibility.replace(
+					ws,
+					msg.visibilityId,
+					{
+						narratorId: msg.narratorId,
+						userId,
+						isCurrent,
+						status: (status) => {
+							if (isCurrent()) safeSend(ws, { ...status });
+						},
+						authorize: async (target, signal) => {
+							if (!isCurrent() || signal.aborted) return false;
+							const allowed = await authorizeNarratorId(
+								msg.narratorId,
+								{ userId, isAdmin: ws.data.userRole === "admin" },
+								"read",
+								signal,
+							);
+							return (
+								allowed &&
+								isCurrent() &&
+								!signal.aborted &&
+								(await canReferenceVisibleTranslationTarget(target, msg.narratorId, signal))
+							);
+						},
+					},
+					isCurrent() || (connections.has(ws) && hasPendingMessageSubscription(ws, msg.narratorId))
+						? msg.targets
+						: [],
+					isCurrent() || (connections.has(ws) && hasPendingMessageSubscription(ws, msg.narratorId))
+						? msg.groups
+						: [],
+					msg.revision,
+				);
+				return;
+			}
+
+			// Anonymous grants permit only the transcript/room protocol and heartbeat.
+			// In particular, output-stats sends directly from the connection registry.
+			if (
+				ws.data.publicShare &&
+				![
+					"pong",
+					"subscribe",
+					"unsubscribe",
+					"sync_check",
+					"chat_subscribe",
+					"chat_unsubscribe",
+				].includes(msg.type)
+			)
+				return;
+
+			// Update heartbeat timestamp on any valid message
+			ws.data.lastPongAt = Date.now();
+
+			// Frames that act on one narrator are authorized here, once, instead of in each
+			// case. Queueing or editing buffered input is indistinguishable from sending a
+			// message, so it needs write access; presence announces "I am looking at this",
+			// so read is enough. Decision frames (`permission_decision`)
+			// name only a request/session id, so their owner is resolved first — see
+			// `authorizeNarratorFrame`. `subscribe` authorizes itself (it takes a list, and
+			// reports per-id denials), and `sync_check` is covered transitively because it
+			// requires an already-authorized subscription.
+			if (!(await authorizeNarratorFrame(ws, msg))) return;
+
+			switch (msg.type) {
+				case "editor_file_subscribe":
+				case "editor_file_unsubscribe":
+					await handleEditorFileMessage(ws, msg);
+					break;
+				case "git_workspace_subscribe":
+				case "git_workspace_unsubscribe":
+				case "git_workspace_refresh":
+					await handleGitWorkspaceMessage(ws, msg);
+					break;
+				case "outline_page_subscribe":
+				case "outline_page_unsubscribe":
+					await handleOutlinePageMessage(ws, msg);
+					break;
+				case "pong":
+					// Heartbeat response — lastPongAt already updated above
+					break;
+				case "subscribe": {
+					// Public-share readers get the share's own filtered stream; the activity
+					// projection is not share-aware, so it is never offered to them.
+					const kind =
+						msg.kind === "activity" && ws.data.publicShare ? "list" : (msg.kind ?? "messages");
+					const requestId = msg.requestId;
+					const permit = subscribePermit;
+					if (!permit || !connections.has(ws)) break;
+
+					// Authorize BEFORE anything is added to the subscription set. This socket
+					// carries a user identity but the ids come from the client, so without this
+					// any authenticated user could stream a private narrator's whole timeline by
+					// guessing (or observing) its id — the catch-up path below happily replays
+					// history to whoever is subscribed.
+					let allowedIds: string[] = [];
+					const currentPermit = (id: string) =>
+						connections.has(ws) &&
+						Boolean(ws.data.pendingNarratorSubscriptions?.get(id)?.has(permit));
+					try {
+						allowedIds = (
+							await authorizeReadableNarrators(
+								ws,
+								msg.narratorIds,
+								requestId,
+								currentPermit,
+								(id) =>
+									ws.data.narratorSubscriptionGrants?.get(id) === grantsBeforeSubscribe.get(id),
+							)
+						).filter(currentPermit);
+					} finally {
+						ws.data.pendingNarratorSubscriptionRequests?.delete(permit);
+						for (const id of msg.narratorIds) {
+							const permits = ws.data.pendingNarratorSubscriptions?.get(id);
+							if (!permits?.delete(permit)) continue;
+							if (!permits.size) ws.data.pendingNarratorSubscriptions?.delete(id);
+							if (
+								!ws.data.translationMessageNarrators?.has(id) &&
+								!hasPendingMessageSubscription(ws, id) &&
+								(kind !== "messages" || !allowedIds.includes(id))
+							)
+								reasoningTranslationVisibility.release(ws, undefined, id);
+						}
+					}
+					if (allowedIds.length === 0) break;
+
+					const messageNarratorId =
+						kind === "messages" && allowedIds.length === 1 ? allowedIds[0] : undefined;
+					const catchUpAnchor = messageNarratorId ? msg.catchUpCursor : undefined;
+
+					// An activity frame lowers only what it newly subscribes, or what the client
+					// explicitly downgrades after its last full handle went away; otherwise it
+					// just asks for the activity snapshot of a narrator streamed in full.
+					const activityLevelIds =
+						kind === "activity"
+							? allowedIds.filter(
+									(id) => msg.downgrade === true || !ws.data.subscribedNarrators.has(id),
+								)
+							: [];
+					// Reserve the full accepted set before any async snapshot/version work so
+					// concurrent subscribe frames cannot race past the per-connection limit.
+					ws.data.narratorSubscriptionGrants ??= new Map();
+					for (const id of allowedIds) {
+						ws.data.subscribedNarrators.add(id);
+						ws.data.narratorSubscriptionGrants.set(id, permit);
+					}
+					if (kind === "messages") {
+						ws.data.translationMessageNarrators ??= new Set();
+						for (const id of allowedIds) ws.data.translationMessageNarrators.add(id);
+					}
+					for (const id of activityLevelIds) {
+						ws.data.translationMessageNarrators?.delete(id);
+						reasoningTranslationVisibility.release(ws, undefined, id);
+					}
+					if (kind === "activity") {
+						ws.data.activityOnlyNarrators ??= new Set();
+						for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
+					} else {
+						for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
+					}
+					if (kind === "messages") {
+						if (ws.data.userId && !ws.data.publicShare)
+							for (const id of allowedIds)
+								reasoningTranslationVisibility.watch(ws, translationViewer(ws, id));
+						reasoningTranslationVisibility.notify();
+					}
+
+					if (kind === "activity") {
+						await sendListStateSnapshot(ws, allowedIds);
+						await sendActivitySnapshot(ws, allowedIds, requestId);
+						break;
+					}
+
+					if (kind === "list") {
+						await sendListStateSnapshot(ws, allowedIds);
+					}
+					if (kind === "panel") {
+						await sendStatusSnapshot(ws, allowedIds);
+						sendRuntimeSnapshot(ws, allowedIds, requestId);
+					}
+					if (kind === "messages") sendStreamingSnapshot(ws, allowedIds, requestId);
+
+					// A reconnect or failed patch listener may have missed state-only translations.
+					// Message versions cannot prove that reader state is complete. Reload through
+					// the existing bounded v2 page path rather than scanning historical state here.
+					if (kind === "messages" && msg.restoreState === true) {
+						for (const narratorId of allowedIds)
+							safeSend(
+								ws,
+								withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId),
+							);
+						break;
+					}
+
+					if (messageNarratorId && msg.version != null) {
+						// The version belongs to the REST snapshot used by THIS subscription,
+						// not necessarily the shared connection's latest optimistic state. Check
+						// it even for an empty snapshot with no cursor: if the first message
+						// landed between REST and subscribe, the body must reload rather than
+						// accepting a misleading sync_ok.
+						const serverVersion = await narratorService
+							.getMessageVersion(messageNarratorId)
+							.catch(() => null);
+						if (serverVersion != null && serverVersion === msg.version) {
+							safeSend(
+								ws,
+								withSubscriptionRequestId(
+									{ type: "sync_ok", narratorId: messageNarratorId, version: serverVersion },
+									requestId,
+								),
+							);
+							break;
+						}
+						if (!catchUpAnchor) {
+							safeSend(
+								ws,
+								withSubscriptionRequestId(
+									{ type: "full_reload", narratorId: messageNarratorId },
+									requestId,
+								),
+							);
+							break;
+						}
+					}
+
+					if (messageNarratorId && catchUpAnchor) {
+						await sendCatchUpForAnchor(ws, messageNarratorId, catchUpAnchor, requestId).catch(
+							(err) => {
+								logger.warn("Failed to send catch-up messages", { error: String(err) });
 							},
 						);
-						if (resolved && target)
-							recordTeamPersonDecision({
+					}
+					break;
+				}
+				case "unsubscribe": {
+					for (const id of msg.narratorIds) {
+						ws.data.subscribedNarrators.delete(id);
+						ws.data.translationMessageNarrators?.delete(id);
+						reasoningTranslationVisibility.release(ws, undefined, id);
+						ws.data.activityOnlyNarrators?.delete(id);
+						toolInputLaneSender.clearNarrator(ws, id);
+					}
+					break;
+				}
+				case "permission_decision": {
+					logger.debug("WS permission_decision received", {
+						requestId: msg.requestId,
+						decision: msg.decision,
+						hasFeedback: !!msg.feedbackText,
+						hasAnswers: !!msg.answers,
+					});
+					// Read before deciding: the team's record of who decided (M1) needs the call,
+					// which deciding takes out of the live registries.
+					await readDecisionTarget(msg.requestId)
+						.then(async (target) => {
+							const resolved = await resolvePermissionOrDangerReflection(
+								msg.requestId,
+								msg.decision,
+								{
+									// Checked again inside the decision (after any restart-recovery wait):
+									// access revoked since the frame was authorized refuses it.
+									assertStillAllowed: async () => {
+										if (!(await authorizeNarratorFrame(ws, msg)))
+											throw new Error("Permission request not found");
+									},
+									denyMessage: msg.message,
+									answers: msg.answers,
+									feedbackText: msg.feedbackText,
+									compactAfter: msg.compactAfter,
+									updatedPlan: msg.updatedPlan,
+									userId: ws.data.userId,
+									decidedBy: "user",
+								},
+							);
+							if (resolved && target)
+								recordTeamPersonDecision({
+									requestId: msg.requestId,
+									target,
+									userId: ws.data.userId,
+									decision: msg.decision,
+									answered: !!msg.answers,
+								});
+							return resolved;
+						})
+						.then((resolved) => {
+							if (resolved) return;
+							logger.warn("Permission request not found", {
 								requestId: msg.requestId,
-								target,
-								userId: ws.data.userId,
 								decision: msg.decision,
-								answered: !!msg.answers,
 							});
-						return resolved;
-					})
-					.then((resolved) => {
-						if (resolved) return;
-						logger.warn("Permission request not found", {
-							requestId: msg.requestId,
-							decision: msg.decision,
+							safeSend(ws, {
+								type: "error",
+								message: "Permission request not found",
+							});
+						})
+						.catch((err) => {
+							logger.error("Failed to resolve permission", { error: String(err) });
+							safeSend(ws, {
+								type: "error",
+								message: `Failed to resolve permission: ${String(err)}`,
+							});
 						});
-						safeSend(ws, {
-							type: "error",
-							message: "Permission request not found",
-						});
-					})
-					.catch((err) => {
-						logger.error("Failed to resolve permission", { error: String(err) });
-						safeSend(ws, {
-							type: "error",
-							message: `Failed to resolve permission: ${String(err)}`,
-						});
-					});
 
-				break;
-			}
-			case "buffer_message": {
-				// Resolve slash commands before buffering
-				let bufferText = msg.text;
-				let commandText: string | null = null;
-				let preBashCommand: string | null = null;
-				const userId = ws.data.userId;
-				if (userId) {
-					try {
-						const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
-						if (
-							cmdResult.resolved &&
-							("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)
-						) {
-							const locale = await getUserLanguage(userId);
-							await handleLoadToolCommand(
-								msg.narratorId,
-								cmdResult as LoadToolResult | LoadToolNotFound,
-								locale,
-								userId,
-							);
-							return;
-						}
-						if (
-							cmdResult.resolved &&
-							("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)
-						) {
-							const locale = await getUserLanguage(userId);
-							await handleUnloadToolCommand(
-								msg.narratorId,
-								cmdResult as UnloadToolResult | UnloadToolNotFound,
-								locale,
-								userId,
-							);
-							return;
-						}
-						if (cmdResult.resolved && "blockSkill" in cmdResult) {
-							const locale = await getUserLanguage(userId);
-							await handleBlockSkillCommand(msg.narratorId, cmdResult as BlockSkillResult, locale);
-							return;
-						}
-						if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
-							const locale = await getUserLanguage(userId);
-							await handleBlockAllSkillsCommand(
-								msg.narratorId,
-								cmdResult as BlockAllSkillsResult,
-								locale,
-							);
-							return;
-						}
-						if (cmdResult.resolved && "unblockSkill" in cmdResult) {
-							const locale = await getUserLanguage(userId);
-							await handleUnblockSkillCommand(
-								msg.narratorId,
-								cmdResult as UnblockSkillResult,
-								locale,
-							);
-							return;
-						}
-						if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
-							const locale = await getUserLanguage(userId);
-							await handleUnblockAllSkillsCommand(
-								msg.narratorId,
-								cmdResult as UnblockAllSkillsResult,
-								locale,
-							);
-							return;
-						}
-						if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
-							commandText = msg.text;
-							bufferText = cmdResult.expandedPrompt;
-							if ("bashCommand" in cmdResult && cmdResult.bashCommand) {
-								preBashCommand = cmdResult.bashCommand;
+					break;
+				}
+				case "buffer_message": {
+					// Resolve slash commands before buffering
+					let bufferText = msg.text;
+					let commandText: string | null = null;
+					let preBashCommand: string | null = null;
+					const userId = ws.data.userId;
+					if (userId) {
+						try {
+							const cmdResult = await resolveCommand(bufferText, msg.narratorId, userId);
+							if (
+								cmdResult.resolved &&
+								("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)
+							) {
+								const locale = await getUserLanguage(userId);
+								await handleLoadToolCommand(
+									msg.narratorId,
+									cmdResult as LoadToolResult | LoadToolNotFound,
+									locale,
+									userId,
+								);
+								return;
 							}
+							if (
+								cmdResult.resolved &&
+								("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)
+							) {
+								const locale = await getUserLanguage(userId);
+								await handleUnloadToolCommand(
+									msg.narratorId,
+									cmdResult as UnloadToolResult | UnloadToolNotFound,
+									locale,
+									userId,
+								);
+								return;
+							}
+							if (cmdResult.resolved && "blockSkill" in cmdResult) {
+								const locale = await getUserLanguage(userId);
+								await handleBlockSkillCommand(
+									msg.narratorId,
+									cmdResult as BlockSkillResult,
+									locale,
+								);
+								return;
+							}
+							if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
+								const locale = await getUserLanguage(userId);
+								await handleBlockAllSkillsCommand(
+									msg.narratorId,
+									cmdResult as BlockAllSkillsResult,
+									locale,
+								);
+								return;
+							}
+							if (cmdResult.resolved && "unblockSkill" in cmdResult) {
+								const locale = await getUserLanguage(userId);
+								await handleUnblockSkillCommand(
+									msg.narratorId,
+									cmdResult as UnblockSkillResult,
+									locale,
+								);
+								return;
+							}
+							if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
+								const locale = await getUserLanguage(userId);
+								await handleUnblockAllSkillsCommand(
+									msg.narratorId,
+									cmdResult as UnblockAllSkillsResult,
+									locale,
+								);
+								return;
+							}
+							if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
+								commandText = msg.text;
+								bufferText = cmdResult.expandedPrompt;
+								if ("bashCommand" in cmdResult && cmdResult.bashCommand) {
+									preBashCommand = cmdResult.bashCommand;
+								}
+							}
+						} catch (err) {
+							logger.warn("Failed to resolve command in buffer message", {
+								narratorId: msg.narratorId,
+								error: String(err),
+							});
 						}
-					} catch (err) {
-						logger.warn("Failed to resolve command in buffer message", {
+					} else {
+						logger.warn("Buffer message without userId, skipping command resolution", {
 							narratorId: msg.narratorId,
-							error: String(err),
 						});
 					}
-				} else {
-					logger.warn("Buffer message without userId, skipping command resolution", {
-						narratorId: msg.narratorId,
-					});
-				}
-				// An outline subagent has no tasks of its own to add a /goal to: refused before
-				// anything is queued, as the HTTP admission refuses it.
-				if (await isRefusedOutlineGoal(msg.narratorId, bufferText, commandText)) {
-					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
-					break;
-				}
-				let { ok } = await pushBufferedMessage(
-					msg.narratorId,
-					bufferText,
-					undefined,
-					commandText,
-					userId,
-					undefined,
-					undefined,
-					undefined,
-					preBashCommand,
-				);
-				// No live session to queue behind: the ordinary admission of any session
-				// (queues behind an owner, or starts a run that adopts the input).
-				if (!ok) {
-					try {
-						const { acceptUserMessage } = await import("../services/narrator-session");
-						await acceptUserMessage(msg.narratorId, bufferText, {
-							locale: userId ? await getUserLanguage(userId) : "en",
-							commandText,
-							userId,
-							preBashCommand,
-						});
-						ok = true;
-					} catch (err) {
-						logger.warn("Failed to admit buffered message", {
-							narratorId: msg.narratorId,
-							error: String(err),
-						});
-					}
-				}
-				if (ok) {
-					broadcastToNarrator(msg.narratorId, {
-						type: "buffer_set",
-						narratorId: msg.narratorId,
-						messages: toBufferSummary(await getBufferedMessagesAsync(msg.narratorId)),
-					});
-				} else {
-					safeSend(ws, {
-						type: "error",
-						message: "Failed to buffer message: narrator is not active",
-					});
-				}
-				break;
-			}
-			case "cancel_buffer": {
-				await clearBufferedMessages(msg.narratorId);
-				// Cancelling queued input must also drop a pending post-tool soft stop,
-				// otherwise the running turn ends at the next tool boundary with nothing
-				// to resume.
-				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
-				broadcastToNarrator(msg.narratorId, {
-					type: "buffer_cleared",
-					narratorId: msg.narratorId,
-					reason: "cancelled",
-				});
-				break;
-			}
-			case "update_buffer": {
-				if (await isRefusedOutlineGoal(msg.narratorId, msg.text)) {
-					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
-					break;
-				}
-				const ok = await updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
-				if (ok) await broadcastBufferQueueForNarrator(msg.narratorId);
-				break;
-			}
-			case "remove_buffer": {
-				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
-				if (ok) {
-					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
-					await broadcastBufferQueueForNarrator(msg.narratorId);
-				}
-				break;
-			}
-			case "presence_join": {
-				addPresence(ws, msg.narratorId);
-				break;
-			}
-			case "presence_leave": {
-				removePresence(ws, msg.narratorId);
-				break;
-			}
-			case "chat_subscribe": {
-				const userId = ws.data.userId;
-				if (!userId) {
-					// Public-share reader: exactly the share's own discussion room, nothing
-					// else. Revalidated so a revoked link cannot keep the room feed.
-					const share = ws.data.publicShare;
-					if (!share) break;
-					let liveShare: VerifiedPublicShare;
-					try {
-						liveShare = revalidatePublicShare(share);
-					} catch {
+					// An outline subagent has no tasks of its own to add a /goal to: refused before
+					// anything is queued, as the HTTP admission refuses it.
+					if (await isRefusedOutlineGoal(msg.narratorId, bufferText, commandText)) {
+						safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
 						break;
 					}
+					let { ok } = await pushBufferedMessage(
+						msg.narratorId,
+						bufferText,
+						undefined,
+						commandText,
+						userId,
+						undefined,
+						undefined,
+						undefined,
+						preBashCommand,
+					);
+					// No live session to queue behind: the ordinary admission of any session
+					// (queues behind an owner, or starts a run that adopts the input).
+					if (!ok) {
+						try {
+							const { acceptUserMessage } = await import("../services/narrator-session");
+							await acceptUserMessage(msg.narratorId, bufferText, {
+								locale: userId ? await getUserLanguage(userId) : "en",
+								commandText,
+								userId,
+								preBashCommand,
+							});
+							ok = true;
+						} catch (err) {
+							logger.warn("Failed to admit buffered message", {
+								narratorId: msg.narratorId,
+								error: String(err),
+							});
+						}
+					}
+					if (ok) {
+						broadcastToNarrator(msg.narratorId, {
+							type: "buffer_set",
+							narratorId: msg.narratorId,
+							messages: toBufferSummary(await getBufferedMessagesAsync(msg.narratorId)),
+						});
+					} else {
+						safeSend(ws, {
+							type: "error",
+							message: "Failed to buffer message: narrator is not active",
+						});
+					}
+					break;
+				}
+				case "cancel_buffer": {
+					await clearBufferedMessages(msg.narratorId);
+					// Cancelling queued input must also drop a pending post-tool soft stop,
+					// otherwise the running turn ends at the next tool boundary with nothing
+					// to resume.
+					await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+					broadcastToNarrator(msg.narratorId, {
+						type: "buffer_cleared",
+						narratorId: msg.narratorId,
+						reason: "cancelled",
+					});
+					break;
+				}
+				case "update_buffer": {
+					if (await isRefusedOutlineGoal(msg.narratorId, msg.text)) {
+						safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
+						break;
+					}
+					const ok = await updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
+					if (ok) await broadcastBufferQueueForNarrator(msg.narratorId);
+					break;
+				}
+				case "remove_buffer": {
+					const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
+					if (ok) {
+						await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+						await broadcastBufferQueueForNarrator(msg.narratorId);
+					}
+					break;
+				}
+				case "presence_join": {
+					addPresence(ws, msg.narratorId);
+					break;
+				}
+				case "presence_leave": {
+					removePresence(ws, msg.narratorId);
+					break;
+				}
+				case "chat_subscribe": {
+					const userId = ws.data.userId;
+					if (!userId) {
+						// Public-share reader: exactly the share's own discussion room, nothing
+						// else. Revalidated so a revoked link cannot keep the room feed.
+						const share = ws.data.publicShare;
+						if (!share) break;
+						let liveShare: VerifiedPublicShare;
+						try {
+							liveShare = revalidatePublicShare(share);
+						} catch {
+							break;
+						}
+						for (const roomId of msg.roomIds) {
+							if (roomId !== liveShare.roomId) continue;
+							if (ws.data.subscribedChatRooms.has(roomId)) continue;
+							addChatSubscription(ws, roomId);
+						}
+						break;
+					}
+					const { assertCanRead } = await import("../services/chat-service");
 					for (const roomId of msg.roomIds) {
-						if (roomId !== liveShare.roomId) continue;
 						if (ws.data.subscribedChatRooms.has(roomId)) continue;
+						if (ws.data.subscribedChatRooms.size >= MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION) {
+							safeSend(ws, {
+								type: "error",
+								message: "Too many chat room subscriptions on one connection",
+							});
+							break;
+						}
+						// The single delivery-side authorization point. A room the caller
+						// cannot read never enters the index, so it can never be delivered.
+						try {
+							await assertCanRead(roomId, userId);
+						} catch {
+							logger.debug("Chat subscribe denied", { roomId, userId });
+							continue;
+						}
 						addChatSubscription(ws, roomId);
 					}
 					break;
 				}
-				const { assertCanRead } = await import("../services/chat-service");
-				for (const roomId of msg.roomIds) {
-					if (ws.data.subscribedChatRooms.has(roomId)) continue;
-					if (ws.data.subscribedChatRooms.size >= MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION) {
-						safeSend(ws, {
-							type: "error",
-							message: "Too many chat room subscriptions on one connection",
-						});
-						break;
-					}
-					// The single delivery-side authorization point. A room the caller
-					// cannot read never enters the index, so it can never be delivered.
-					try {
-						await assertCanRead(roomId, userId);
-					} catch {
-						logger.debug("Chat subscribe denied", { roomId, userId });
-						continue;
-					}
-					addChatSubscription(ws, roomId);
-				}
-				break;
-			}
-			case "chat_unsubscribe": {
-				for (const roomId of msg.roomIds) removeChatSubscription(ws, roomId);
-				break;
-			}
-			case "subscribe_stats": {
-				if (!ws.data.subscribedStats) {
-					ws.data.subscribedStats = true;
-					addStatsSubscriber();
-				}
-				break;
-			}
-			case "unsubscribe_stats": {
-				if (ws.data.subscribedStats) {
-					ws.data.subscribedStats = false;
-					removeStatsSubscriber();
-				}
-				break;
-			}
-			case "sync_check": {
-				const narratorId = msg.narratorId;
-				const requestId = msg.requestId;
-				const serverVersion = await narratorService
-					.getMessageVersion(narratorId)
-					.catch((err: unknown) => {
-						logger.warn("sync_check failed", { error: String(err) });
-						return null;
-					});
-				if (serverVersion == null || !connections.has(ws)) return;
-				if (!ws.data.subscribedNarrators.has(narratorId)) break;
-				if (serverVersion === msg.version) {
-					safeSend(
-						ws,
-						withSubscriptionRequestId(
-							{ type: "sync_ok", narratorId, version: serverVersion },
-							requestId,
-						),
-					);
+				case "chat_unsubscribe": {
+					for (const roomId of msg.roomIds) removeChatSubscription(ws, roomId);
 					break;
 				}
-				const catchUpAnchor = msg.catchUpCursor;
-				if (catchUpAnchor) {
-					// Empty catch-up result (version bumped but no new top-level/child
-					// message since the anchor — e.g. a tool result written into an
-					// existing message) resolves with sync_ok, not full_reload: the
-					// connection is still subscribed and any structural change (delete /
-					// compact) already arrives via its own realtime broadcast. A truly
-					// unresolvable anchor still falls back to full_reload via the hitLimit
-					// path inside sendCatchUpForAnchor.
-					sendCatchUpForAnchor(ws, narratorId, catchUpAnchor, requestId).catch((err: unknown) =>
-						logger.warn("sync_check catch-up failed", { error: String(err) }),
-					);
-				} else {
-					safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
-				}
-				break;
-			}
-			case "update_timeout": {
-				// Only Bash execution has an editable live timeout. Watch already returned.
-				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
-				if (newMs != null) {
-					broadcastToNarrator(msg.narratorId, {
-						type: "timeout_updated",
-						narratorId: msg.narratorId,
-						toolUseId: msg.toolUseId,
-						timeoutMs: newMs,
-					});
-					// Persist the updated timeout into the tool call's inputJson
-					// so it survives page refresh.
-					try {
-						const row = db
-							.select({
-								id: narratorToolCalls.id,
-								messageId: narratorToolCalls.messageId,
-								inputJson: narratorToolCalls.inputJson,
-							})
-							.from(narratorToolCalls)
-							.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
-							.get();
-						if (row) {
-							const input = row.inputJson && typeof row.inputJson === "object" ? row.inputJson : {};
-							db.update(narratorToolCalls)
-								.set({
-									inputJson: { ...input, timeout: newMs },
-									inputChars: measureSerializedCharacters({ ...input, timeout: newMs }),
-								})
-								.where(eq(narratorToolCalls.id, row.id))
-								.run();
-							queueContextCharacterRefresh(msg.narratorId, row.messageId);
-						}
-					} catch (err) {
-						logger.warn("Failed to persist updated timeout", {
-							toolUseId: msg.toolUseId,
-							error: String(err),
-						});
+				case "subscribe_stats": {
+					if (!ws.data.subscribedStats) {
+						ws.data.subscribedStats = true;
+						addStatsSubscriber();
 					}
+					break;
 				}
-				break;
+				case "unsubscribe_stats": {
+					if (ws.data.subscribedStats) {
+						ws.data.subscribedStats = false;
+						removeStatsSubscriber();
+					}
+					break;
+				}
+				case "sync_check": {
+					const narratorId = msg.narratorId;
+					const requestId = msg.requestId;
+					const serverVersion = await narratorService
+						.getMessageVersion(narratorId)
+						.catch((err: unknown) => {
+							logger.warn("sync_check failed", { error: String(err) });
+							return null;
+						});
+					if (serverVersion == null || !connections.has(ws)) return;
+					if (!ws.data.subscribedNarrators.has(narratorId)) break;
+					if (serverVersion === msg.version) {
+						safeSend(
+							ws,
+							withSubscriptionRequestId(
+								{ type: "sync_ok", narratorId, version: serverVersion },
+								requestId,
+							),
+						);
+						break;
+					}
+					const catchUpAnchor = msg.catchUpCursor;
+					if (catchUpAnchor) {
+						// Empty catch-up result (version bumped but no new top-level/child
+						// message since the anchor — e.g. a tool result written into an
+						// existing message) resolves with sync_ok, not full_reload: the
+						// connection is still subscribed and any structural change (delete /
+						// compact) already arrives via its own realtime broadcast. A truly
+						// unresolvable anchor still falls back to full_reload via the hitLimit
+						// path inside sendCatchUpForAnchor.
+						await sendCatchUpForAnchor(ws, narratorId, catchUpAnchor, requestId).catch(
+							(err: unknown) => logger.warn("sync_check catch-up failed", { error: String(err) }),
+						);
+					} else {
+						safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
+					}
+					break;
+				}
+				case "update_timeout": {
+					// Only Bash execution has an editable live timeout. Watch already returned.
+					const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
+					if (newMs != null) {
+						broadcastToNarrator(msg.narratorId, {
+							type: "timeout_updated",
+							narratorId: msg.narratorId,
+							toolUseId: msg.toolUseId,
+							timeoutMs: newMs,
+						});
+						// Persist the updated timeout into the tool call's inputJson
+						// so it survives page refresh.
+						try {
+							const row = await readQueryFirst(
+								db
+									.select({ id: narratorToolCalls.id })
+									.from(narratorToolCalls)
+									.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
+									.limit(1),
+								{
+									executionPolicy: "worker-required",
+									maxRows: 1,
+									timeoutMs: 30_000,
+									signal: readTaskState.controller.signal,
+								},
+							);
+							if (row && !readTaskState.quiescing) {
+								// The current JSON read/modify/write remains one bounded synchronous commit.
+								// Worker metadata is not authority to overwrite a subsequently edited input.
+								const messageId = db.transaction((tx) => {
+									const where = and(
+										eq(narratorToolCalls.id, row.id),
+										eq(narratorToolCalls.toolUseId, msg.toolUseId),
+									);
+									const size = tx
+										.select({
+											bytes: sql<number>`coalesce(octet_length(${narratorToolCalls.inputJson}), 0)`,
+										})
+										.from(narratorToolCalls)
+										.where(where)
+										.get();
+									if (!size) return null;
+									if (size.bytes > 128 * 1024)
+										throw new Error("Timeout input exceeds its persistence budget");
+									const current = tx
+										.select({
+											inputJson: narratorToolCalls.inputJson,
+											messageId: narratorToolCalls.messageId,
+										})
+										.from(narratorToolCalls)
+										.where(where)
+										.get();
+									if (!current) return null;
+									const input =
+										current.inputJson && typeof current.inputJson === "object"
+											? current.inputJson
+											: {};
+									const updated = { ...input, timeout: newMs };
+									tx.update(narratorToolCalls)
+										.set({ inputJson: updated, inputChars: measureSerializedCharacters(updated) })
+										.where(where)
+										.run();
+									return current.messageId;
+								});
+								if (messageId) queueContextCharacterRefresh(msg.narratorId, messageId);
+							}
+						} catch (err) {
+							logger.warn("Failed to persist updated timeout", {
+								toolUseId: msg.toolUseId,
+								error: String(err),
+							});
+						}
+					}
+					break;
+				}
 			}
-		}
+		})();
+		trackNarratorWsReadTask(work);
+		return work;
 	},
 
 	close(ws: NarratorWS) {

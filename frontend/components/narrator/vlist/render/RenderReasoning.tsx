@@ -20,8 +20,12 @@
 
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { Box, Group, Text, ThemeIcon } from "@mantine/core";
+import type { ReasoningTranslationSource } from "@shared/pretext-layout/reasoning-translation-sources";
 import { TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import { IconBrain, IconChevronDown, IconChevronRight, IconLanguage } from "@tabler/icons-react";
+import type { ReactNode } from "react";
+import { ReasoningTranslationIndicator } from "../../reasoning-translation-indicator";
+import { ReasoningTranslationText } from "../../reasoning-translation-visibility";
 import {
 	type MeasuredReasoning,
 	REASONING_BODY_BORDER_LEFT,
@@ -51,6 +55,7 @@ import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 export interface ReasoningLabels {
 	reasoning?: string;
 	thinking?: string;
+	translationStatusLabel?: string;
 	countLabel?: (stepCount: number) => string;
 	charsLabel?: (formatted: string) => string;
 	/** Shown while the TRANSLATION is on screen (click → original). */
@@ -60,6 +65,8 @@ export interface ReasoningLabels {
 }
 
 interface RenderReasoningProps {
+	narratorId?: string;
+	translationSource?: ReasoningTranslationSource;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
@@ -96,6 +103,8 @@ function BrainBadge() {
 }
 
 export function RenderReasoning({
+	narratorId,
+	translationSource,
 	measured,
 	labels = {},
 	showSource,
@@ -109,16 +118,39 @@ export function RenderReasoning({
 	textPreviewLabels,
 	onToggleTextExpanded,
 }: RenderReasoningProps) {
+	const translationIndicator = (
+		<ReasoningTranslationIndicator
+			narratorId={narratorId}
+			group={translationSource?.group}
+			label={labels.translationStatusLabel}
+		/>
+	);
 	switch (measured.form) {
 		case "streaming":
 			return <StreamingRow labels={labels} />;
 		case "count":
-			return <CountLine measured={measured} labels={labels} onExpand={onToggle} />;
+			return (
+				<CountLine
+					measured={measured}
+					labels={labels}
+					onExpand={onToggle}
+					translationIndicator={translationIndicator}
+				/>
+			);
 		case "collapsed":
-			return <CollapsedHeader measured={measured} labels={labels} onToggle={onToggle} />;
+			return (
+				<CollapsedHeader
+					measured={measured}
+					labels={labels}
+					onToggle={onToggle}
+					translationIndicator={translationIndicator}
+				/>
+			);
 		case "expanded":
 			return (
 				<ExpandedView
+					translationIndicator={translationIndicator}
+					translationSource={translationSource}
 					measured={measured}
 					labels={labels}
 					showSource={showSource}
@@ -161,6 +193,7 @@ function StreamingRow({ labels }: { labels: ReasoningLabels }) {
 }
 
 function CountLine({
+	translationIndicator,
 	measured,
 	labels,
 	onExpand,
@@ -168,6 +201,7 @@ function CountLine({
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
 	onExpand?: () => void;
+	translationIndicator?: ReactNode;
 }) {
 	const reasoning = labels.reasoning ?? "reasoning";
 	const countLabel = labels.countLabel?.(measured.stepCount) ?? `${measured.stepCount} steps`;
@@ -187,6 +221,7 @@ function CountLine({
 			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{countLabel}
 			</Text>
+			{translationIndicator}
 			<IconChevronRight
 				size={REASONING_CHEVRON_SIZE}
 				style={{ marginLeft: "auto", opacity: 0.6 }}
@@ -199,13 +234,21 @@ function CollapsedHeader({
 	measured,
 	labels,
 	onToggle,
+	translationIndicator,
 }: {
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
 	onToggle?: () => void;
+	translationIndicator?: ReactNode;
 }) {
 	return (
-		<ReasoningHeaderRow expanded={false} labels={labels} measured={measured} onToggle={onToggle} />
+		<ReasoningHeaderRow
+			expanded={false}
+			labels={labels}
+			measured={measured}
+			onToggle={onToggle}
+			translationIndicator={translationIndicator}
+		/>
 	);
 }
 
@@ -214,11 +257,13 @@ function ReasoningHeaderRow({
 	labels,
 	measured,
 	onToggle,
+	translationIndicator,
 }: {
 	expanded: boolean;
 	labels: ReasoningLabels;
 	measured: MeasuredReasoning;
 	onToggle?: () => void;
+	translationIndicator?: ReactNode;
 }) {
 	const reasoning = labels.reasoning ?? "reasoning";
 	const formattedChars = formatLocaleNumber(measured.charCount);
@@ -244,7 +289,12 @@ function ReasoningHeaderRow({
 				<span style={{ width: REASONING_CHEVRON_SIZE, flexShrink: 0 }} />
 			)}
 			<BrainBadge />
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
+			<Text
+				size="xs"
+				c="dimmed"
+				className={measured.isStreaming ? TRACE_SHIMMER_CLASS.streaming : undefined}
+				style={{ lineHeight: `${typographyMetrics().line.xs}px` }}
+			>
 				{reasoning}
 			</Text>
 			{/* Monospace keeps digit advances equal, so a growing count does not
@@ -257,6 +307,7 @@ function ReasoningHeaderRow({
 			>
 				{charsLabel}
 			</Text>
+			{translationIndicator}
 			{preview ? (
 				<Text
 					size="xs"
@@ -277,6 +328,8 @@ function ReasoningHeaderRow({
 }
 
 function ExpandedView({
+	translationIndicator,
+	translationSource,
 	measured,
 	labels,
 	showSource,
@@ -290,6 +343,8 @@ function ExpandedView({
 	textPreviewLabels,
 	onToggleTextExpanded,
 }: {
+	translationIndicator?: ReactNode;
+	translationSource?: ReasoningTranslationSource;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
@@ -320,6 +375,7 @@ function ExpandedView({
 	return (
 		<div style={{ position: "relative", minHeight: measured.height }}>
 			<ReasoningHeaderRow
+				translationIndicator={translationIndicator}
 				expanded
 				labels={labels}
 				measured={measured}
@@ -338,22 +394,24 @@ function ExpandedView({
 			>
 				{/* Source view swaps the render for the raw text inside the SAME reserved
 				    body geometry, so the card cannot move (RenderMarkdown pins the box). */}
-				<RenderTextPreview
-					textPreviewLabels={textPreviewLabels}
-					onToggleTextExpanded={onToggleTextExpanded}
-					measured={bodyMeasured}
-					showSource={showSource}
-					sourceText={sourceText}
-					onUnknownHeight={
-						measured.textPreview?.expanded && hasUnpredictableBlock(measured.blocks)
-							? undefined
-							: onUnknownHeight
-					}
-					animateStreaming={animateStreaming}
-					sealOnMount
-					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
-					animScope={animScope}
-				/>
+				<ReasoningTranslationText source={translationSource}>
+					<RenderTextPreview
+						textPreviewLabels={textPreviewLabels}
+						onToggleTextExpanded={onToggleTextExpanded}
+						measured={bodyMeasured}
+						showSource={showSource}
+						sourceText={sourceText}
+						onUnknownHeight={
+							measured.textPreview?.expanded && hasUnpredictableBlock(measured.blocks)
+								? undefined
+								: onUnknownHeight
+						}
+						animateStreaming={animateStreaming}
+						sealOnMount
+						animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
+						animScope={animScope}
+					/>
+				</ReasoningTranslationText>
 				{measured.hasTranslationToggle ? (
 					<Group
 						gap={4}

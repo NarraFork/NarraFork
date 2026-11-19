@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { DecodableMessage } from "./decode";
+import { blockAssets, blockIndexText, parseStored, planEnvelopeBlocks } from "./plan";
 import { assembleContent, matchBlocks, splitEnvelope } from "./storage";
 
 function message(
@@ -91,6 +92,46 @@ const SHAPES: Record<string, DecodableMessage> = {
 };
 
 describe("block storage codec", () => {
+	test("reasoning generations and translated ranges are reader state, never model payload", () => {
+		const part = {
+			id: "p1",
+			generation: "g1",
+			start: 0,
+			end: 5,
+			sourceText: "think",
+			translatedText: "思考",
+		};
+		for (const type of ["reasoning", "thinking"]) {
+			const raw = {
+				type,
+				id: "r1",
+				text: "think",
+				translatedText: "想",
+				translationGeneration: "g1",
+				translationLocale: "zh-CN",
+				translationParts: [part],
+			};
+			const [block] = splitEnvelope(message("assistant", [raw])).blocks;
+			expect(block.payload.raw).toEqual([{ type, id: "r1", text: "think" }]);
+			expect(block.state).toEqual({
+				raw: [
+					{
+						translatedText: "想",
+						translationGeneration: "g1",
+						translationLocale: "zh-CN",
+						translationParts: [part],
+					},
+				],
+			});
+			expect(block.canonical?.state).toEqual({
+				translatedText: "想",
+				translationGeneration: "g1",
+				translationLocale: "zh-CN",
+				translationParts: [part],
+			});
+			expect(assembleContent([{ payload: block.payload, state: block.state }])).toEqual([raw]);
+		}
+	});
 	for (const [name, row] of Object.entries(SHAPES)) {
 		test(`round-trips: ${name}`, () => {
 			expect(assembleContent(rows(row))).toEqual(row.contentJson as unknown[]);
@@ -164,6 +205,75 @@ describe("block storage codec", () => {
 		expect(step("running", null)).toBe("open");
 		expect(step("success", "ok")).toBe("done");
 		expect(step("fail", { _text: "bad input", _broken: true })).toBe("failed");
+	});
+});
+
+describe("block planning", () => {
+	test.each([
+		['"plain result"', "plain result"],
+		["legacy unquoted result", "legacy unquoted result"],
+		["null", null],
+		[null, null],
+		[
+			JSON.stringify({
+				_text: "wrapped result",
+				_images: [{ imageId: "image-a", mediaType: "image/png", uploadNarratorId: "n1" }],
+			}),
+			{
+				_text: "wrapped result",
+				_images: [{ imageId: "image-a", mediaType: "image/png", uploadNarratorId: "n1" }],
+			},
+		],
+	] as const)("reuses the parsed ledger output %s with immutable legacy input", (outputJson, output) => {
+		const input = Object.freeze({ command: "legacy input" });
+		const raw = Object.freeze({ type: "tool_use", id: "c", name: "Bash", input });
+		const contentJson: unknown[] = [raw];
+		Object.freeze(contentJson);
+		const envelope = Object.freeze({
+			id: "m1",
+			role: "assistant" as const,
+			contentText: null,
+			parentToolUseId: null,
+			contentJson,
+		});
+		// Double-encoded legacy input remains the decoder's responsibility after planning.
+		const inputJson = JSON.stringify(JSON.stringify({ command: "ledger input" }));
+		const ledger = Object.freeze([
+			Object.freeze({ toolUseId: "c", toolName: "Bash", inputJson, outputJson, status: "success" }),
+		]);
+		const expected = splitEnvelope({
+			...envelope,
+			toolCalls: [{ ...ledger[0], inputJson: parseStored(inputJson), outputJson: output }],
+		}).blocks;
+		const parse = spyOn(JSON, "parse");
+		try {
+			const planned = planEnvelopeBlocks(envelope, ledger);
+			expect(planned.blocks.map((block) => block.draft)).toEqual(expected);
+			expect(planned.blocks[0].output).toEqual(output);
+			expect(parse.mock.calls.filter(([value]) => value === outputJson)).toHaveLength(
+				outputJson === null ? 0 : 1,
+			);
+			expect(planned.blocks[0].draft.canonical).toMatchObject({
+				kind: "tool",
+				payload: { input: { command: "ledger input" } },
+			});
+			expect(blockIndexText(planned.blocks[0].draft.canonical, output)).toContain("Bash");
+			expect(blockAssets(planned.blocks[0].draft, output)).toEqual(
+				typeof output === "object" && output !== null ? [["image-a", "tool_image"]] : [],
+			);
+			expect(assembleContent(planned.blocks.map((block) => block.draft))).toEqual([raw]);
+			expect(envelope.contentJson[0]).toBe(raw);
+			expect(raw.input).toBe(input);
+			expect(ledger[0]).toEqual({
+				toolUseId: "c",
+				toolName: "Bash",
+				inputJson,
+				outputJson,
+				status: "success",
+			});
+		} finally {
+			parse.mockRestore();
+		}
 	});
 });
 

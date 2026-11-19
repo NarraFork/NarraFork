@@ -181,6 +181,65 @@ async function runStream(
 	return events;
 }
 
+test("Responses WebSocket carries the same summary successor identity and terminal as HTTP", async () => {
+	const server = startServer(({ send }) => {
+		for (const event of [
+			{ type: "response.created", response: { id: "resp-summary" } },
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "reasoning", id: "rs-ws" },
+			},
+			{
+				type: "response.reasoning_summary_text.delta",
+				output_index: 0,
+				item_id: "rs-ws",
+				summary_index: 0,
+				delta: "A",
+			},
+			{
+				type: "response.reasoning_summary_text.done",
+				output_index: 0,
+				item_id: "rs-ws",
+				summary_index: 0,
+				text: "A",
+			},
+			{
+				type: "response.reasoning_summary_text.delta",
+				output_index: 0,
+				item_id: "rs-ws",
+				summary_index: 1,
+				delta: "",
+			},
+			{
+				type: "response.reasoning_summary_text.delta",
+				output_index: 0,
+				item_id: "rs-ws",
+				summary_index: 1,
+				delta: "B",
+			},
+			{
+				type: "response.reasoning_summary_text.done",
+				output_index: 0,
+				item_id: "rs-ws",
+				summary_index: 1,
+				text: "B",
+			},
+			{ type: "response.completed", response: { id: "resp-summary", status: "completed" } },
+		])
+			send(JSON.stringify(event));
+	});
+	activeServer = server;
+	const events = await runStream(server);
+	const output = events.filter((event) => event.reasoning);
+	expect(output.map((event) => event.reasoning)).toEqual(["A", "\n\nB"]);
+	expect(output.map((event) => event.reasoningSummaryPart?.index)).toEqual([0, 1]);
+	expect(events.filter((event) => event.reasoningResponseCompleted)).toHaveLength(1);
+	expect(events.findIndex((event) => event.reasoningResponseCompleted)).toBeGreaterThan(
+		events.findLastIndex((event) => !!event.contentBoundary?.summaryPart),
+	);
+});
+
 type RecordingEntry =
 	| { kind: "request"; request: RecordingRequest }
 	| { kind: "meta"; meta: Record<string, unknown> }

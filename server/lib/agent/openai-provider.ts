@@ -1385,7 +1385,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			};
 			const codexIdentity =
 				this.apiMode === "codex"
-					? createCodexRequestIdentity(undefined, this.codexInstallationId())
+					? createCodexRequestIdentity(options?.promptCacheKey, this.codexInstallationId())
 					: undefined;
 			if (instruction) {
 				body.instructions = instruction;
@@ -1500,7 +1500,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			};
 			const codexIdentity =
 				this.apiMode === "codex"
-					? createCodexRequestIdentity(undefined, this.codexInstallationId())
+					? createCodexRequestIdentity(options?.promptCacheKey, this.codexInstallationId())
 					: undefined;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
@@ -2389,10 +2389,12 @@ export interface ResponsesReasoningAccum {
 	lastSummaryIndex?: number;
 	/** Track each summary separately: a later done-only part must not be dropped. */
 	emittedParts?: Set<string>;
+	/** Parser-normalized source ranges; summary completion is not native item completion. */
+	summaryParts?: Map<number, { text: string; start: number; end: number; sealed: boolean }>;
 	/** Exact bytes seen per native content part, including partial delta recovery. */
 	nativeParts?: Map<number, string>;
-	/** Summary bytes are separate from the rendered text and its inserted boundaries. */
-	summaryParts?: Map<number, string>;
+	/** Replay bytes are separate from rendered summary ranges and inserted boundaries. */
+	replaySummaryParts?: Map<number, string>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	/** Last terminal snapshot, so completed.output may enrich it without duplicating text. */
 	replayMetadata?: ReasoningProviderMetadata["openai"];
@@ -2454,6 +2456,8 @@ function pushReasoningTextEvent(
 	const format = native ? "reasoning_text" : "summary_text";
 	acc.textFormat = acc.textFormat && acc.textFormat !== format ? "mixed" : format;
 	const partKey = `${native ? "content" : "summary"}:${chunk.summary_index ?? chunk.content_index ?? 0}`;
+	const summaryIndex = chunk.summary_index ?? 0;
+	const summaryPart = native ? undefined : acc.summaryParts?.get(summaryIndex);
 	if (native) {
 		acc.nativeParts ??= new Map();
 		const index = chunk.content_index ?? 0;
@@ -2467,13 +2471,20 @@ function pushReasoningTextEvent(
 			acc.nativeParts.set(index, previous + text);
 		}
 	} else {
-		acc.summaryParts ??= new Map();
-		const index = chunk.summary_index ?? 0;
-		const previous = acc.summaryParts.get(index) ?? "";
-		if (options.emitOnlyIfAccumulatorEmpty) rememberReasoningPart(acc.summaryParts, index, text);
-		else acc.summaryParts.set(index, previous + text);
-		if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
+		acc.replaySummaryParts ??= new Map();
+		const previous = acc.replaySummaryParts.get(summaryIndex) ?? "";
+		if (options.emitOnlyIfAccumulatorEmpty)
+			rememberReasoningPart(acc.replaySummaryParts, summaryIndex, text);
+		else acc.replaySummaryParts.set(summaryIndex, previous + text);
+		if (options.emitOnlyIfAccumulatorEmpty && summaryPart) {
+			if (!text.startsWith(summaryPart.text) || summaryPart.end !== (acc.emittedText?.length ?? 0))
+				return;
+			text = text.slice(summaryPart.text.length);
+			if (!text) return;
+		} else if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
 	}
+	// Empty native parts remain replay material, but never create a display segment.
+	if (!text) return;
 	acc.emittedParts ??= new Set();
 	acc.emittedParts.add(partKey);
 
@@ -2491,9 +2502,28 @@ function pushReasoningTextEvent(
 		) {
 			emitText = `\n\n${text}`;
 		}
-		acc.lastSummaryIndex = chunk.summary_index;
+		acc.lastSummaryIndex = Math.max(
+			acc.lastSummaryIndex ?? chunk.summary_index,
+			chunk.summary_index,
+		);
 	}
 
+	if (!native) {
+		acc.summaryParts ??= new Map();
+		const end = (acc.emittedText?.length ?? 0) + emitText.length;
+		if (summaryPart) {
+			summaryPart.text += text;
+			summaryPart.end = end;
+			summaryPart.sealed = false;
+		} else {
+			acc.summaryParts.set(summaryIndex, {
+				text,
+				start: end - text.length,
+				end,
+				sealed: false,
+			});
+		}
+	}
 	if (options.appendToAccumulator || options.emitOnlyIfAccumulatorEmpty) {
 		acc.emittedText = `${acc.emittedText ?? ""}${emitText}`;
 	}
@@ -2501,6 +2531,14 @@ function pushReasoningTextEvent(
 		results.push({
 			reasoning: emitText,
 			reasoningBlockId: responsesBlockId(chunk, "reasoning"),
+			...(!native
+				? {
+						reasoningSummaryPart: {
+							id: `${responsesBlockId(chunk, "reasoning")}:summary:${summaryIndex}`,
+							index: summaryIndex,
+						},
+					}
+				: {}),
 			reasoningMetadata: {
 				openai: {
 					itemId: acc.itemId,
@@ -2544,9 +2582,9 @@ function responsesReasoningSnapshot(
 		return [...collected].sort(([a], [b]) => a - b).map(([, text]) => ({ type, text }));
 	};
 	acc.nativeParts ??= new Map();
-	acc.summaryParts ??= new Map();
+	acc.replaySummaryParts ??= new Map();
 	const reasoningContent = parts(item.content, acc.nativeParts, "reasoning_text");
-	const reasoningSummary = parts(item.summary, acc.summaryParts, "summary_text");
+	const reasoningSummary = parts(item.summary, acc.replaySummaryParts, "summary_text");
 	return {
 		itemId: item.id ?? acc.itemId,
 		reasoningEncryptedContent: item.encrypted_content ?? acc.encryptedContent,
@@ -2561,6 +2599,33 @@ function responsesReasoningSnapshot(
 		reasoningContent,
 		reasoningSummary,
 	};
+}
+
+function pushReasoningSummarySeal(
+	results: ParsedStreamEvent[],
+	chunk: ResponsesAPIChunk,
+	acc: ResponsesReasoningAccum | undefined,
+	index: number,
+): void {
+	const part = acc?.summaryParts?.get(index);
+	if (
+		!part ||
+		part.sealed ||
+		!part.text ||
+		acc?.emittedText?.slice(part.start, part.end) !== part.text
+	)
+		return;
+	part.sealed = true;
+	const blockId = responsesBlockId(chunk, "reasoning");
+	results.push({
+		contentBoundary: {
+			kind: "reasoning",
+			phase: "checkpoint",
+			blockId,
+			outputIndex: chunk.output_index,
+			summaryPart: { id: `${blockId}:summary:${index}`, index, start: part.start, end: part.end },
+		},
+	});
 }
 
 export function parseResponsesAPIEvent(
@@ -3050,6 +3115,9 @@ export function parseResponsesAPIEvent(
 				}
 			}
 		}
+		for (const index of acc.summaryParts?.keys() ?? []) {
+			pushReasoningSummarySeal(results, itemChunk, acc, index);
+		}
 		const metadata = responsesReasoningSnapshot(acc, chunk.item);
 		if (completed && JSON.stringify(metadata) === JSON.stringify(acc.replayMetadata))
 			return results;
@@ -3101,16 +3169,24 @@ export function parseResponsesAPIEvent(
 				emitOnlyIfAccumulatorEmpty: true,
 			});
 		}
-		// A summary is not an independently replayable reasoning item. Final
-		// encrypted_content arrives only on output_item.done.
-		results.push({
-			contentBoundary: {
-				kind: "reasoning",
-				phase: "checkpoint",
-				blockId: responsesBlockId(chunk, "reasoning"),
-				outputIndex: chunk.output_index,
-			},
-		});
+		// Summary seals schedule display work without completing native replay credentials.
+		if (type !== "response.reasoning_text.done") {
+			pushReasoningSummarySeal(
+				results,
+				chunk,
+				resolveReasoningAccum(chunk, reasoningAccum),
+				chunk.summary_index ?? 0,
+			);
+		} else {
+			results.push({
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "checkpoint",
+					blockId: responsesBlockId(chunk, "reasoning"),
+					outputIndex: chunk.output_index,
+				},
+			});
+		}
 		return results;
 	}
 
@@ -3303,6 +3379,8 @@ export function parseResponsesAPIEvent(
 				acc.emitted = true;
 			}
 		}
+		// Last in the shared HTTP/WS normalization path, after all recovered output.
+		results.push({ reasoningResponseCompleted: true });
 		// Note: usage is already extracted at the top of this function
 		return results;
 	}

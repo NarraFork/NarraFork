@@ -117,6 +117,13 @@ function streamEvent(frame: Frame): Frame {
 	return {
 		type: "stream_event",
 		narratorId: frame.narratorId,
+		...(text(frame.parentToolUseId) ? { parentToolUseId: frame.parentToolUseId } : {}),
+		...(frame.reasoningTranslationActivity !== undefined && text(frame.subagentNarratorId)
+			? { subagentNarratorId: frame.subagentNarratorId }
+			: {}),
+		...(frame.reasoningTranslationActivity !== undefined
+			? { reasoningTranslationActivity: frame.reasoningTranslationActivity }
+			: {}),
 		event: {
 			type: "content_block_delta",
 			delta,
@@ -144,9 +151,9 @@ export function decodeBlockFrame(frame: Frame): Frame[] {
 		}
 		case "block_delta":
 			return [streamEvent(frame)];
-		// Its id reaches the store with the block's first checkpoint; nothing to render yet.
+		// Activity can close the preceding reasoning before the first body delta.
 		case "block_opened":
-			return [];
+			return frame.reasoningTranslationActivity !== undefined ? [streamEvent(frame)] : [];
 		case "catch_up": {
 			const { protocol: _protocol, messages, blocks, orphanMessageIds, ...rest } = frame;
 			const orphans = new Set(array<string>(orphanMessageIds));

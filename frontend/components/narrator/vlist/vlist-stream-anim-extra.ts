@@ -22,6 +22,14 @@
  */
 export type StreamAnimKind = "markdown" | "reasoning" | "reasoning-steps";
 
+/** Shared by animation admission and window-row reuse; only an active real spec opts in. */
+export function isLiveStreamAnimSpec(spec: {
+	key: string;
+	liveContentProjection?: boolean;
+}): boolean {
+	return spec.key.startsWith("__streaming__") || spec.liveContentProjection === true;
+}
+
 const STREAM_ANIM_KINDS: ReadonlySet<string> = new Set<StreamAnimKind>([
 	"markdown",
 	"reasoning",

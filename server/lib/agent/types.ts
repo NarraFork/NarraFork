@@ -578,6 +578,19 @@ export type AgentEvent =
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
+	| {
+			/** Scheduling hint after the corresponding checkpoint was acknowledged. */
+			type: "reasoning_summary_sealed";
+			blockId: string;
+			blockRevision: number;
+			outputIndex?: number;
+			nativePartId: string;
+			nativePartIndex: number;
+			start: number;
+			end: number;
+			sourceText: string;
+	  }
+	| { type: "reasoning_response_complete" }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "stream_reset" }
@@ -761,6 +774,8 @@ export type AgentEvent =
 	| {
 			type: "stream_reasoning";
 			text: string;
+			/** Internal provider summary identity; only real text advances the previous part. */
+			reasoningSummaryPart?: { id: string; index: number };
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
 			/** As on `stream_text`: the element this delta extends. */
@@ -890,6 +905,8 @@ export type ContentBlock =
 			type: "reasoning";
 			text: string;
 			translatedText?: string;
+			translationGeneration?: string;
+			translationParts?: import("@shared/reasoning-translation").ReasoningTranslationPart[];
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
 			id?: string;
@@ -996,7 +1013,7 @@ export interface AgentAfterToolsInput {
 	text: string;
 	/** Ordered fragments covering text, so a rebuild can replace only the rows it actually replayed. */
 	parts?: readonly AgentInputPart[];
-	onConsumed?: () => void;
+	onConsumed?: () => void | Promise<void>;
 }
 
 /**
@@ -1201,10 +1218,25 @@ export interface AgentConfig {
 	prepareToolNoDispatch?: (
 		ctx: ToolContext,
 		toolName: "Write" | "Edit" | "StructSed",
-	) => (
-		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
-		claimed: boolean,
-	) => Promise<void>;
+	) =>
+		| ((
+				reason:
+					| "validation_rejected"
+					| "cancelled_before_dispatch"
+					| "preview"
+					| "invocation_rejected",
+				claimed: boolean,
+		  ) => Promise<void>)
+		| Promise<
+				(
+					reason:
+						| "validation_rejected"
+						| "cancelled_before_dispatch"
+						| "preview"
+						| "invocation_rejected",
+					claimed: boolean,
+				) => Promise<void>
+		  >;
 	/** Optional host no-dispatch history; failures preserve the actual tool outcome. */
 	recordToolNoDispatch?: (
 		ctx: ToolContext,
@@ -1232,6 +1264,12 @@ export interface AgentConfig {
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** Resolve a fresh tier per attempt with this loop's signal; undefined disables the static tier. */
+	resolveServiceTier?: (request: {
+		provider: string;
+		model: string;
+		signal: AbortSignal;
+	}) => string | undefined | Promise<string | undefined>;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**
@@ -1335,7 +1373,7 @@ export interface AgentConfig {
 		sourceHistory: unknown[],
 		content: string,
 		questionAnswerEventIds?: ReadonlySet<string>,
-	) => void;
+	) => void | Promise<void>;
 	/** Authenticated receipt candidates, checked against the actual supplied model input. */
 	getQuestionModelReceipts?: () => readonly { id: string; text: string }[];
 	/**
@@ -1402,13 +1440,13 @@ export interface AgentConfig {
 	 * after each serial tool or complete parallel-safe group. If true, the loop exits
 	 * gracefully and marks later tool calls in the turn as skipped.
 	 */
-	shouldStop?: () => boolean;
+	shouldStop?: () => boolean | Promise<boolean>;
 	/**
 	 * Queued user input wants the model's attention. Never skips a tool call: every call
 	 * the response produced still runs, and the loop ends the turn once the step's tools
 	 * have settled instead of sending the next provider request. One-shot like shouldStop.
 	 */
-	shouldYieldToInput?: () => boolean;
+	shouldYieldToInput?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cut the provider response at the next tool-call
 	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
 	 * Supply a fresh signal for each loop invocation. */

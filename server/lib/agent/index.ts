@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
@@ -491,13 +492,23 @@ export async function summaryGenerate(
 	 * delta callbacks keep their dedicated slots so retries and progress stay
 	 * connected to the caller's request.
 	 */
-	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">>,
+	extraOptions?: Partial<
+		Pick<GenerateOptions, "responseFormat" | "onGenerationProgress" | "promptCacheKey">
+	>,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.
 	const requestTracking = tracking ? { ...tracking, userId: tracking.userId ?? null } : undefined;
+	// Share only the fixed translation prefix for the same user and model, across inputs and retries.
+	const promptCacheKey =
+		requestTracking?.kind === "reasoning_translation" && requestTracking.userId
+			? `nf-translation-v1:${createHash("sha256")
+					.update(JSON.stringify([requestTracking.userId, model, systemInstruction ?? ""]))
+					.digest("base64url")}`
+			: undefined;
 	const generateOptions: GenerateOptions = {
 		...SUMMARY_GENERATE_OPTIONS,
+		...(promptCacheKey ? { promptCacheKey } : {}),
 		...(signal ? { signal } : {}),
 		...(onTextDelta ? { onTextDelta } : {}),
 		...(onReasoningDelta ? { onReasoningDelta } : {}),

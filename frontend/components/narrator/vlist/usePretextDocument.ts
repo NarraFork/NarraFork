@@ -76,6 +76,8 @@ export interface UsePretextDocumentOptions {
 	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
+	expandReasoning?: boolean;
+	isReasoningRowExpanded?: (key: string, rowKey: string | number) => boolean | undefined;
 	isExpanded?: (key: string) => boolean | undefined;
 	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	isLodUserOverride?: (key: string) => boolean;
@@ -406,6 +408,8 @@ export function usePretextDocument(
 			segmentGap: options.segmentGap,
 			topPadding: options.topPadding ?? 16,
 			bottomPadding: options.bottomPadding ?? 16,
+			expandReasoning: options.expandReasoning,
+			isReasoningRowExpanded: options.isReasoningRowExpanded,
 			isExpanded: options.isExpanded,
 			isTextExpanded: options.isTextExpanded,
 			isLodUserOverride: options.isLodUserOverride,
@@ -457,6 +461,8 @@ export function usePretextDocument(
 			options.compactUsageLines,
 			options.formatUsageNumber,
 			options.contentWidth,
+			options.expandReasoning,
+			options.isReasoningRowExpanded,
 			options.expandedRows,
 			// Drilling into a trace row adds a whole measured card, so the resolver's
 			// identity must move with the expanded-row state or the document never

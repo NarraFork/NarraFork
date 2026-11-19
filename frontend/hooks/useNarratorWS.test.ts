@@ -9,8 +9,42 @@ import {
 	coerceCompactProgressEvent,
 	coercePermissionRoutingFields,
 	normalizeSubagentActivityCatchUp,
+	subagentToolEventMeta,
 	useNarratorWS,
 } from "./useNarratorWS";
+
+describe("subagent tool summary evidence", () => {
+	test("preserves omitted and undefined while null and invalid summaries explicitly clear", () => {
+		for (const data of [{}, { inputSummary: undefined }]) {
+			expect(Object.hasOwn(subagentToolEventMeta(data), "inputSummary")).toBe(false);
+		}
+		for (const inputSummary of [null, {}, [], "invalid", { path: "not-whitelisted" }]) {
+			expect(subagentToolEventMeta({ inputSummary }).inputSummary).toBeNull();
+		}
+		expect(
+			subagentToolEventMeta({ inputSummary: { pattern: "listen", content: "ignored" } })
+				.inputSummary,
+		).toEqual({ pattern: "listen" });
+		const [snapshot] = normalizeSubagentActivityCatchUp([
+			{
+				parentToolUseId: "parent",
+				activity: {
+					subagentNarratorId: "child",
+					model: null,
+					latestToolCalls: [
+						{
+							toolUseId: "grep",
+							toolName: "Grep",
+							status: "success",
+							inputSummary: undefined,
+						},
+					],
+				},
+			},
+		]);
+		expect(Object.hasOwn(snapshot.activity.latestToolCalls[0], "inputSummary")).toBe(false);
+	});
+});
 
 describe("coerceCompactProgressEvent", () => {
 	test("normalizes live compact progress", () => {
@@ -434,14 +468,19 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const receipts: unknown[] = [];
 		const editOrigins: unknown[] = [];
 		const snapshotOrigins: unknown[] = [];
+		const snapshotCounts: unknown[] = [];
+		const toolOutputs: unknown[][] = [];
 		const gitStatuses: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
 				onGitStatus: (status) => gitStatuses.push(status),
 				onToolStarted: (_id, _name, _start, _end, _input, _parent, _meta, origin) =>
 					editOrigins.push(origin),
-				onStreamingSnapshot: (snapshot) =>
-					snapshotOrigins.push(snapshot.toolChunks[0]?.streamingEditOrigin),
+				onStreamingSnapshot: (snapshot) => {
+					snapshotOrigins.push(snapshot.toolChunks[0]?.streamingEditOrigin);
+					snapshotCounts.push(snapshot.subagentOutputCounts);
+				},
+				onToolOutput: (...args) => toolOutputs.push(args),
 				onSendDeliveryResolved: (
 					toolUseId,
 					targets,
@@ -549,6 +588,73 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			});
 			expect(editOrigins).toEqual([origin, undefined, undefined]);
 			expect(snapshotOrigins).toEqual([origin]);
+			const count = {
+				childNarratorId: "child",
+				logicalRunId: "run",
+				toolUseId: "agent",
+				toolCallId: "exact",
+				attempt: 0,
+				count: 0,
+				active: true,
+			};
+			newListener?.({
+				type: "tool_output",
+				narratorId: "n2",
+				toolUseId: "bash",
+				output: "123",
+				parentToolUseId: "parent",
+			});
+			newListener?.({
+				type: "tool_output",
+				narratorId: "n2",
+				toolUseId: "agent",
+				output: "0",
+				subagentOutputCount: { ...count, ignored: "not forwarded" },
+			});
+			newListener?.({
+				type: "tool_output",
+				narratorId: "n2",
+				toolUseId: "agent",
+				output: "123",
+				subagentOutputCount: { ...count, count: -1 },
+			});
+			newListener?.({
+				type: "tool_output",
+				narratorId: "n2",
+				toolUseId: "other",
+				output: "123",
+				subagentOutputCount: count,
+			});
+			expect(toolOutputs).toEqual([
+				["bash", "123", "parent"],
+				["agent", "0", undefined, { subagentOutputCount: count }],
+				["agent", "123", undefined],
+				["other", "123", undefined],
+			]);
+			newListener?.({
+				type: "streaming_snapshot",
+				narratorId: "n2",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [
+					{ ...count, ignored: "not forwarded" },
+					{ ...count, attempt: -1 },
+				],
+			});
+			newListener?.({
+				type: "streaming_snapshot",
+				narratorId: "n2",
+				streamingBlocks: [],
+				toolChunks: [],
+				subagentOutputCounts: [],
+			});
+			newListener?.({
+				type: "streaming_snapshot",
+				narratorId: "n2",
+				streamingBlocks: [],
+				toolChunks: [],
+			});
+			expect(snapshotCounts).toEqual([undefined, [count], [], undefined]);
 			const targets = [
 				{
 					id: "child",
@@ -928,7 +1034,7 @@ describe("normalizeSubagentActivityCatchUp", () => {
 		});
 	});
 
-	test("omits the key entirely when no whitelisted value survives", () => {
+	test("clears an explicitly rejected summary and distinguishes an omitted field", () => {
 		const result = normalizeSubagentActivityCatchUp([
 			{
 				parentToolUseId: "parent-tool",
@@ -947,8 +1053,23 @@ describe("normalizeSubagentActivityCatchUp", () => {
 				},
 			},
 		]);
-		// Absent, not `{}`: the tree merge spreads an incoming header over the existing
-		// one, so an empty object would overwrite a label already on screen.
-		expect(result[0].activity.latestToolCalls[0]).not.toHaveProperty("inputSummary");
+		expect(result[0].activity.latestToolCalls[0].inputSummary).toBeNull();
+		for (const inputSummary of [null, undefined]) {
+			const header = {
+				toolUseId: "tool-1",
+				toolName: "Grep",
+				status: "running",
+				...(inputSummary === null ? { inputSummary } : {}),
+			};
+			const [snapshot] = normalizeSubagentActivityCatchUp([
+				{
+					parentToolUseId: "parent-tool",
+					activity: { subagentNarratorId: "child", model: null, latestToolCalls: [header] },
+				},
+			]);
+			expect(Object.hasOwn(snapshot.activity.latestToolCalls[0], "inputSummary")).toBe(
+				inputSummary === null,
+			);
+		}
 	});
 });

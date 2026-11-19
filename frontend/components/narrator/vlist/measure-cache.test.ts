@@ -18,6 +18,130 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("reasoning translation cache keys", () => {
+	it("refreshes structured visual-tail metadata without changing measured geometry", async () => {
+		const { extractDataRevision, measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		type Measured = import("./measure/measure-tool-run").MeasuredCollapsibleTrace;
+		const row = {
+			title: "same title",
+			body: "same paragraph",
+			shimmer: true,
+			key: "live",
+			unitId: "reason-live-r",
+			reasoningTail: { id: "r:0", translationRevision: "part-one" },
+		};
+		const data = { steps: [row] };
+		const next = {
+			steps: [{ ...row, reasoningTail: { id: "r:0", translationRevision: "part-two" } }],
+		};
+		expect(extractDataRevision(data)).not.toBe(extractDataRevision(next));
+		const measure = (value: typeof data) =>
+			measureElementCached(
+				"reasoning-steps",
+				value,
+				700,
+				5,
+				{ expandedIndices: [0] },
+				"reasoning-tail-cache",
+				"same-version",
+			) as Measured;
+		measureCache.clear();
+		try {
+			const first = measure(data);
+			const updated = measure(next);
+			expect(updated).not.toBe(first);
+			expect(updated.height).toBe(first.height);
+			expect(updated.frame).toEqual(first.frame);
+			expect(updated.rows[0]?.body?.blocks.length).toBeGreaterThan(0);
+			expect(
+				updated.rows[0]?.body?.blocks.every(
+					(block) => block.reasoningTail?.translationRevision === "part-two",
+				),
+			).toBe(true);
+		} finally {
+			measureCache.clear();
+		}
+	});
+
+	it("invalidates equal-length translated edits while keeping the source and body version fixed", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const source = { text: "source", translatedText: "甲译文", isStreaming: false };
+		expect(extractDataRevision(source)).not.toBe(
+			extractDataRevision({ ...source, translatedText: "乙译文" }),
+		);
+		expect(extractDataRevision({ ...source, translationRevision: "g:p1" })).not.toBe(
+			extractDataRevision({ ...source, translationRevision: "g:p2" }),
+		);
+	});
+});
+
+describe("subagent recent-call cache", () => {
+	it("remeasures positional labels/categories and status/timing-only updates", async () => {
+		const { measureCache, extractDataRevision } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		type Data = import("./measure/measure-subagent").SubagentCardData;
+		type Measured = import("./measure/measure-subagent").MeasuredSubagent;
+		const base: Data = {
+			agentType: "explore",
+			description: "inspect",
+			isTerminal: true,
+			recentCallCount: 2,
+			recentCallSummaries: [null, "listen"],
+			recentCallCategories: [null, "search"],
+			recentCallTimings: [{ status: "running", streamStartedAt: 1000 }, null],
+		};
+		const measure = (data: Data) =>
+			measureElementCached(
+				"subagent-card",
+				data,
+				700,
+				5,
+				{},
+				"tool-agent-positional",
+				"fixed-version",
+			) as Measured;
+		measureCache.clear();
+		try {
+			const first = measure(base);
+			expect(measure(base)).toBe(first);
+			const swapped = { ...base, recentCallSummaries: ["listen", null] };
+			const second = measure(swapped);
+			expect(second).not.toBe(first);
+			expect(second.recentCallSummaries).toEqual(["listen", null]);
+			const categories = { ...swapped, recentCallCategories: ["search", null] };
+			const third = measure(categories);
+			expect(third).not.toBe(second);
+			expect(third.recentCallCategories).toEqual(["search", null]);
+			let previous = third;
+			for (const timing of [
+				{ status: "success", streamStartedAt: 1000 },
+				{ status: "success", streamStartedAt: 1000, completedAt: 4000 },
+				{ status: "success", streamStartedAt: 1000, completedAt: 4000, durationMs: 3000 },
+				{ status: "success", streamStartedAt: 1000, completedAt: 4000, durationMs: 4000 },
+			]) {
+				const next = measure({ ...categories, recentCallTimings: [timing, null] });
+				expect(next).not.toBe(previous);
+				expect(next.height).toBe(first.height);
+				expect(next.recentCallTimings[0].status).toBe(timing.status);
+				if (timing.durationMs != null)
+					expect(next.recentCallTimings[0].durationMs).toBe(timing.durationMs);
+				previous = next;
+			}
+			// The painted window is three rows; hidden tails do not create new keys.
+			const three = { ...base, recentCallSummaries: [null, "listen", null] };
+			expect(
+				extractDataRevision({
+					...three,
+					recentCallSummaries: [...three.recentCallSummaries, "hidden"],
+				}),
+			).toBe(extractDataRevision(three));
+		} finally {
+			measureCache.clear();
+		}
+	});
+});
+
 describe("text preview cache keys", () => {
 	it("budgets the full preview source and nested trace bodies, not visible geometry", async () => {
 		const { retainedBodySourceChars, MeasureCache } = await import("./measure-cache");

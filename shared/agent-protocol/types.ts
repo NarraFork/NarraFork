@@ -238,12 +238,18 @@ export interface ParsedStreamEvent {
 	textBlockId?: string;
 	/** Provider-native reasoning item identity (not an individual summary fragment). */
 	reasoningBlockId?: string;
+	/** Internal identity on actual nonempty summary output, never on part.added. */
+	reasoningSummaryPart?: { id: string; index: number };
+	/** Reliable Responses terminal, after recovered output/checkpoints in that response. */
+	reasoningResponseCompleted?: boolean;
 	/** Native content lifecycle. Checkpoints never finalize credentials or split replay items. */
 	contentBoundary?: {
 		kind: "text" | "reasoning";
 		phase: "start" | "checkpoint" | "complete";
 		blockId?: string;
 		outputIndex?: number;
+		/** Native summary seal; ordinary checkpoints carry no translation boundary. */
+		summaryPart?: import("../reasoning-translation").ReasoningSummaryPartBoundary;
 	};
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;

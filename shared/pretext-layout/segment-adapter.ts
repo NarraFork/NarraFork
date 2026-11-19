@@ -41,6 +41,12 @@ import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
+	composeReasoningTranslation,
+	getValidReasoningTranslationParts,
+	type ReasoningTranslationActivity,
+	type ReasoningTranslationFields,
+} from "../reasoning-translation";
+import {
 	escapeMarkdown,
 	rawSideCarToMarkdown,
 	readSideCarBody,
@@ -103,6 +109,13 @@ import {
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
 import {
+	type ReasoningTranslationSource,
+	reasoningTranslationDisplayBlock,
+	reasoningTranslationDisplayRange,
+	reasoningTranslationSource,
+	reasoningTranslationStepSources,
+} from "./reasoning-translation-sources";
+import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
 	normalizeReflectionAfterToolStatus,
@@ -141,7 +154,7 @@ import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } 
 // satisfy these.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface AdapterContentBlock {
+export interface AdapterContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
@@ -261,6 +274,7 @@ export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	liveBlockIndex?: number;
 	/** Frontend projection only; never written back into stored messages. */
 	liveContentProjection?: boolean;
+	reasoningTranslationActivity?: ReasoningTranslationActivity | null;
 	creator?: {
 		id?: string;
 		username: string;
@@ -871,6 +885,8 @@ export interface ElementSpec {
 	kind: VListElementKind;
 	/** Stable key for React / virtualization. */
 	key: string;
+	/** The active lane lives in a real checkpoint row; keep its streaming paint path. */
+	liveContentProjection?: boolean;
 	/** Measure input `data` for `measureElement(kind, data, …)`. */
 	data: unknown;
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
@@ -986,6 +1002,10 @@ export interface AdapterContext {
 	compactAuxiliaryContent?: boolean;
 	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
 	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
+	/** Open reasoning bodies by default, without opening tools or activity groups. */
+	expandReasoning?: boolean;
+	/** Explicit reasoning-row choice; undefined inherits the default policy. */
+	isReasoningRowExpanded?: (key: string, rowKey: string | number) => boolean | undefined;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
 	/** Full body expansion; separate from the surrounding card's fold. */
@@ -1388,17 +1408,28 @@ function joinRunText(parts: readonly string[]): string {
 	return parts.filter((value) => value.length > 0).join("\n\n");
 }
 
-/**
- * A run's translation, or null when it is not fully translated.
- *
- * All-or-nothing on purpose: a partially translated run would otherwise render some
- * steps in one language and some in another. The denominator counts only NON-EMPTY
- * blocks, matching what `joinRunText` keeps.
- */
+/** Partial translations replace only their validated source ranges; gaps stay original. */
 function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
-	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
-	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
+	let translated = false;
+	const parts = blocks.map((block) => {
+		const text = block.thinking ?? block.text ?? "";
+		if (block.translationGeneration || block.translationParts) {
+			const valid = getValidReasoningTranslationParts(
+				text,
+				block.translationGeneration,
+				block.translationParts,
+			);
+			if (!valid.length) return text;
+			translated = true;
+			return composeReasoningTranslation(text, block.translationGeneration, valid);
+		}
+		if (block.translatedText) {
+			translated = true;
+			return block.translatedText;
+		}
+		return text;
+	});
+	return translated ? joinRunText(parts) : null;
 }
 
 /**
@@ -1414,6 +1445,41 @@ export function reasoningRunDisplayText(blocks: readonly AdapterContentBlock[]):
 	return canonicalReasoningRunTranslation(blocks) ?? canonicalReasoningRunText(blocks);
 }
 
+/** Active original coordinates survive translations changing the preceding Markdown shape. */
+function reasoningStreamingTail(msg: AdapterMessage, blocks: readonly AdapterContentBlock[]) {
+	const activity = msg.reasoningTranslationActivity;
+	if (!activity) return;
+	const index = blocks.findIndex((block) => block.id === activity.elementId);
+	const block = blocks[index];
+	if (!block) return;
+	const raw = block.thinking ?? block.text ?? "";
+	const completedEnd = Math.max(0, ...activity.completedRanges.map((range) => range.end));
+	// Old senders supplied only completed prefixes. Full completion is not a
+	// visual handoff: without an explicit boundary retain the whole current item.
+	const boundary = activity.displayTailStart ?? (completedEnd < raw.length ? completedEnd : 0);
+	// A shorter catch-up may lag activity metadata. It cannot prove that the
+	// visual tail ended; keep its available body until the matching source lands.
+	const sourceStart =
+		Number.isSafeInteger(boundary) && boundary >= 0 && boundary < raw.length ? boundary : 0;
+	if (!raw.length) return;
+	const before = blocks.slice(0, index);
+	const originalPrefix = canonicalReasoningRunText(before);
+	const displayPrefix = reasoningRunDisplayText(before);
+	const displayOffset = displayPrefix.length + (displayPrefix ? 2 : 0);
+	const displayRange = reasoningTranslationDisplayRange(block, sourceStart, raw.length);
+	const originalOffset = originalPrefix.length + (originalPrefix ? 2 : 0);
+	return {
+		id: JSON.stringify([activity.elementId, sourceStart]),
+		start: displayOffset + displayRange.start,
+		end: displayOffset + displayRange.end,
+		originalStart: originalOffset + sourceStart,
+		originalEnd: originalOffset + raw.length,
+		...(displayRange.translationRevision
+			? { translationRevision: displayRange.translationRevision }
+			: {}),
+	};
+}
+
 function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
 	const text = canonicalReasoningRunText(blocks);
 	const translatedText = canonicalReasoningRunTranslation(blocks);
@@ -1421,6 +1487,20 @@ function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
 	return {
 		text,
 		translatedText,
+		...(blocks.some((block) => block.translationGeneration || block.translationParts)
+			? {
+					translationRevision: JSON.stringify(
+						blocks.map((block) => [
+							block.translationGeneration ?? null,
+							getValidReasoningTranslationParts(
+								block.thinking ?? block.text ?? "",
+								block.translationGeneration,
+								block.translationParts,
+							).map((part) => [part.id, part.start, part.end]),
+						]),
+					),
+				}
+			: {}),
 		isStreaming,
 		stepCount: blocks.length,
 		charCount: displayText.length,
@@ -1477,20 +1557,36 @@ function reasoningStepsData(
 	isStreaming: boolean,
 	ctx: AdapterContext,
 	unitSource?: ReasoningStepUnitSource,
+	translationSource?: ReasoningTranslationSource,
+	activeElementId?: string,
+	reasoningTail?: { id: string; translationRevision?: string },
 ) {
+	const translationSources = reasoningTranslationStepSources(segments, translationSource);
 	return {
+		...(translationSource?.group ? { translationGroup: translationSource.group } : {}),
 		steps: segments.map((segment, index) => ({
+			...(translationSources?.[index] ? { translationSource: translationSources[index] } : {}),
 			title: reasoningStepTitle(segment),
 			body: segment.isEmpty ? null : segment.body,
 			shimmer: isStreaming && index === segments.length - 1,
-			key: `seg${index}`,
+			...(reasoningTail && index === segments.length - 1 ? { reasoningTail } : {}),
+			key:
+				activeElementId && index === segments.length - 1
+					? `seg-live-${activeElementId}`
+					: `seg${index}`,
 			// Same string the folded row of this step carries at L1/L2, so the two
 			// renderings pair across the level switch. Height-neutral passthrough.
-			...(unitSource
-				? {
-						unitId: reasoningStepUnitId(unitSource.messageId, unitSource.runStartBlockIndex, index),
-					}
-				: {}),
+			...(activeElementId && index === segments.length - 1
+				? { unitId: `reason-live-${activeElementId}` }
+				: unitSource
+					? {
+							unitId: reasoningStepUnitId(
+								unitSource.messageId,
+								unitSource.runStartBlockIndex,
+								index,
+							),
+						}
+					: {}),
 		})),
 		headerLabel: sysLabel(ctx, "reasoning"),
 		headerCount: countLabel(ctx, "reasoningSteps", segments.length),
@@ -2305,13 +2401,28 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
-			const data = reasoningData(reasoningBlocks, streaming);
+			const displayBlocks = reasoningBlocks.map((sourceBlock, index) =>
+				reasoningTranslationDisplayBlock(msg, sourceBlock, runIndices[index] ?? bi),
+			);
+			const tail = streaming ? reasoningStreamingTail(msg, displayBlocks) : undefined;
+			const data = {
+				...reasoningData(displayBlocks, streaming),
+				...(tail ? { reasoningTail: tail } : {}),
+			};
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
 			// languages wrap to different heights and the exact path paints at the
 			// predicted geometry.
 			const hasBothTexts = !!data.translatedText && data.text.length > 0;
 			const showOriginal = hasBothTexts && (ctx.showOriginal?.(key) ?? false);
+			const translationSource = reasoningTranslationSource(
+				msg,
+				reasoningBlocks.map((sourceBlock, index) => ({
+					block: sourceBlock,
+					index: runIndices[index] ?? bi,
+				})),
+				showOriginal,
+			);
 			// The structured/plain choice is made on the DEFAULT text on purpose: only
 			// the plain card carries the language toggle, so letting the flip change the
 			// element kind could swap in a trace with no way back.
@@ -2328,10 +2439,25 @@ function adaptMessage(
 							: parseReasoning(displayText)));
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
-			if (hasStructuredReasoning(parsed)) {
+			// A completed prefix translation may add/remove Markdown headings. Keep
+			// the active card's shape tied to its original source so that patch alone
+			// cannot replace the component currently animating the original tail.
+			const structured =
+				streaming && data.translatedText && usesStructuredReasoning(msg.model)
+					? hasStructuredReasoning(
+							isLongPlainReasoning(`${key}:source`, data.text)
+								? []
+								: ctx.resolveReasoningSegments
+									? parseReasoning(data.text)
+									: parseStreamingReasoningSegments(`high-lod-source:${key}`, data.text),
+						)
+					: hasStructuredReasoning(parsed);
+			if (structured) {
+				const expandedRows = new Set(ctx.expandedRows?.(key) ?? []);
 				specs.push({
 					kind: "reasoning-steps",
 					key,
+					...(streaming && msg.liveContentProjection ? { liveContentProjection: true } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2349,13 +2475,22 @@ function adaptMessage(
 						msg.id && msg.id !== STREAMING_MESSAGE_ID
 							? { messageId: msg.id, runStartBlockIndex: bi }
 							: undefined,
+						translationSource,
+						streaming ? msg.reasoningTranslationActivity?.elementId : undefined,
+						tail,
 					),
 					// No LOD input: a step trace has ONE shape at every level — titles
 					// visible, each step's body openable. A level that showed titles whose
 					// bodies could not be opened gave the reader a list of promises.
 					opts: {
 						showEarlier: ctx.showEarlier?.(key) ?? false,
-						expandedIndices: ctx.expandedRows?.(key) ?? [],
+						expandedIndices: parsed.flatMap((segment, index) =>
+							!segment.isEmpty &&
+							(ctx.isReasoningRowExpanded?.(key, index) ??
+								(expandedRows.has(index) || ctx.expandReasoning === true))
+								? [index]
+								: [],
+						),
 						textExpandedKeys: parsed.flatMap((_, index) =>
 							adapterTextExpanded(ctx, key, `seg${index}`, lifecycleId) ? [`seg${index}`] : [],
 						),
@@ -2365,10 +2500,11 @@ function adaptMessage(
 				specs.push({
 					kind,
 					key,
+					...(streaming && msg.liveContentProjection ? { liveContentProjection: true } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
-					data,
+					data: { ...data, ...(translationSource ? { translationSource } : {}) },
 					opts: {
-						expanded: ctx.isExpanded?.(key),
+						expanded: ctx.isExpanded?.(key) ?? (ctx.expandReasoning ? true : undefined),
 						textExpanded,
 						showOriginal,
 						// A live reasoning body (synthetic streaming row or checkpoint
@@ -2395,6 +2531,9 @@ function adaptMessage(
 					key,
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: markdownData(block),
+					...(msg.liveContentProjection && isLiveStreamingBlock(streamingMessage, msg, bi)
+						? { liveContentProjection: true }
+						: {}),
 
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
@@ -4467,23 +4606,17 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
 	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
 	const isActive = !isTerminalStatus(item.tc.status);
-	// The subagent's live reply length, streamed by the server as a bare numeric
-	// `tool_output` payload (the ContextAsk convention) and bridged onto the
-	// metadata by resolveToolMetadata. Height-neutral: painted as a badge on the
-	// fixed header row, so it is keyed in `subagentRevision` instead of measured.
-	const liveOutputChars = isActive
-		? parseLiveOutputChars(asObject(metadata)?._streamingOutput)
-		: null;
-	// A running card's "output" can BE that bare counter — `toolOutputValue` folds
-	// `_streamingOutput` in when no real output exists. The count rides the header
-	// badge, so it must never become the conclusion body (a lone number reading
-	// as the child's result).
+	// Legacy tool_output may carry a bare reply counter. It is not a conclusion
+	// body and does not describe the prompt that this card's header counts.
 	const resultIsLiveCount =
-		liveOutputChars != null &&
+		isActive &&
+		parseLiveOutputChars(asObject(metadata)?._streamingOutput) != null &&
 		resultValue !== undefined &&
 		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
 	const resultContent =
-		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+		(resultValue === undefined && !Array.isArray(outputJson)) || resultIsLiveCount
+			? undefined
+			: subagentResultText(outputJson);
 	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.
@@ -4498,6 +4631,32 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const promptSource = "input.prompt";
 	const prompt = readLeafText(input.prompt);
 	const promptTruncated = hasTruncatedLeaf(input.prompt);
+	// The leaf projection preserves the complete string length independently of
+	// its bounded preview. No prompt means unknown; an explicit empty string is 0.
+	const streamingInput = asObject(inputJson);
+	const streamedPromptChars = streamingInput._streamingPromptChars;
+	const promptChars = Object.hasOwn(streamingInput, "_streamingPromptChars")
+		? typeof streamedPromptChars === "number" &&
+			Number.isSafeInteger(streamedPromptChars) &&
+			streamedPromptChars >= 0
+			? streamedPromptChars
+			: undefined
+		: typeof input.prompt === "string"
+			? input.prompt.length
+			: isTruncated(input.prompt) &&
+					typeof input.prompt.fullLength === "number" &&
+					Number.isSafeInteger(input.prompt.fullLength) &&
+					input.prompt.fullLength >= 0
+				? input.prompt.fullLength
+				: undefined;
+	// `startedAt` is argument-stream time. Only these phases precede execution;
+	// stale streaming fields never make an executing or finished call preparatory.
+	const showPromptChars =
+		promptChars !== undefined &&
+		item.tc.executionStartedAt == null &&
+		(item.tc.status === "streaming" ||
+			item.tc.status === "initializing" ||
+			item.tc.status === "pending");
 	const bodyContext: ClassifyToolDetailInput = {
 		...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
 		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: key }),
@@ -4568,7 +4727,8 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-		...(liveOutputChars != null ? { liveOutputChars } : {}),
+		...(promptChars === undefined ? {} : { promptChars }),
+		showPromptChars,
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is
@@ -5826,7 +5986,17 @@ function adaptActivityItems(
 			// Resolves the translation exactly as L3+ does, so both sides parse the same
 			// string and step `sN` means the same step. See reasoningRunDisplayText.
 			const text = reasoningRunDisplayText(
-				runItems.map((runItem) => runItem.block).filter((b): b is AdapterContentBlock => !!b),
+				runItems.flatMap((runItem) =>
+					runItem.block
+						? [
+								reasoningTranslationDisplayBlock(
+									runItem.msg,
+									runItem.block,
+									runItem.blockIndex ?? 0,
+								),
+							]
+						: [],
+				),
 			);
 			// The LIVE row is re-adapted on every stream delta (that is the cost of
 			// folding live content into the trace — see render-units.ts), and the plain
@@ -5873,7 +6043,7 @@ function adaptActivityItems(
 			// Visual live state is per BLOCK, not per message: a reasoning run that the
 			// answer text or a tool call already followed is finished, and must settle
 			// immediately rather than shimmer until the turn persists.
-			const streaming = isLiveReasoningItem(item);
+			const streaming = runItems.some(isLiveReasoningItem);
 			// The LAST row of the live run is the one still being written, so it shows a
 			// scrolling tail instead of its settled title (which a never-closing step
 			// would freeze on).
@@ -5883,10 +6053,29 @@ function adaptActivityItems(
 			// to its first line, so a row body is itself a settled prefix — the exact
 			// thing the tail exists to look past. The end of `text` is the end of the
 			// last step, i.e. the newest characters.
-			const liveTail = streaming ? resolveReasoningLiveTail(text) : null;
+			const activeElementId = streaming
+				? runItems.find(isLiveReasoningItem)?.msg?.reasoningTranslationActivity?.elementId
+				: undefined;
+			// A short active tail must not disappear behind an already-translated run
+			// prefix: its first line may now belong entirely to completed content.
+			const liveTail = streaming
+				? resolveReasoningLiveTail(text, activeElementId ? 0 : undefined)
+				: null;
+			const translationSource = reasoningTranslationSource(
+				item.msg,
+				runItems.flatMap((runItem) =>
+					runItem.block && runItem.blockIndex !== undefined
+						? [{ block: runItem.block, index: runItem.blockIndex }]
+						: [],
+				),
+			);
+			const translationSources = reasoningTranslationStepSources(rows, translationSource);
 			for (const [index, row] of rows.entries()) {
 				const isLast = index === rows.length - 1;
-				const rowKey = `${keyBase}-step-${index}`;
+				const rowKey =
+					activeElementId && isLast
+						? `${keyBase}-live-${activeElementId}`
+						: `${keyBase}-step-${index}`;
 				if (bodyLifecycleId) {
 					textBodyPreferences[rowKey] = {
 						specKey: textExpansionStateKey(traceKey, bodyLifecycleId),
@@ -5898,12 +6087,16 @@ function adaptActivityItems(
 				// title list and the whole reply. Live rows carry no body (see above), and
 				// an empty/placeholder step has nothing to reveal.
 				const bodyText = isLiveParse ? null : reasoningStepBody(row);
-				const expanded = bodyText != null && (ctx.isRowExpanded?.(traceKey, rowKey) ?? false);
+				const expanded =
+					bodyText != null &&
+					(ctx.isReasoningRowExpanded?.(traceKey, rowKey) ??
+						(ctx.isRowExpanded?.(traceKey, rowKey) || ctx.expandReasoning === true));
 				// Recorded against the EMITTED row list, read before the push — the same
 				// numbering the measure layer resolves a visible row back to. See the note
 				// above the loop on why the reader's intent is keyed, not indexed.
 				if (expanded) expandedIndices.push(traceItems.length);
 				traceItems.push({
+					...(translationSources?.[index] ? { translationSource: translationSources[index] } : {}),
 					title: reasoningStepTitle(row),
 					hasIcon: true,
 					iconColor: "grape",
@@ -5923,9 +6116,12 @@ function adaptActivityItems(
 					// an id-derived identity would address a different row afterwards. Falls
 					// back to the run-ordinal form, unique per row (painted as `data-nf-unit`)
 					// but with no counterpart to pair.
-					unitId: identity
-						? reasoningStepUnitId(identity.messageId, identity.blockIndex, index)
-						: `reason-${keyBase}-${index}`,
+					unitId:
+						activeElementId && isLast
+							? `reason-live-${activeElementId}`
+							: identity
+								? reasoningStepUnitId(identity.messageId, identity.blockIndex, index)
+								: `reason-${keyBase}-${index}`,
 					...(bodyText != null ? { bodyText } : {}),
 					...(liveTail && isLast ? { liveTail } : {}),
 				});
@@ -6062,6 +6258,9 @@ export function adaptActivityUnit(
 	return {
 		kind: "activity-trace",
 		key,
+		...(items.some((item) => item.kind === "reasoning" && isLiveReasoningItem(item))
+			? { liveContentProjection: true }
+			: {}),
 		...(Object.keys(activity.textBodyPreferences).length > 0
 			? { textBodyPreferences: activity.textBodyPreferences }
 			: {}),

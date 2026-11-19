@@ -672,7 +672,9 @@ describe("native Responses reasoning continuation", () => {
 				reasoningEncryptedContent: "opaque",
 				textFormat: "mixed",
 			});
-			expect(parseResponsesAPIEvent(completed, tools, reasoning)).toEqual([]);
+			expect(parseResponsesAPIEvent(completed, tools, reasoning)).toEqual([
+				{ reasoningResponseCompleted: true },
+			]);
 		});
 	}
 

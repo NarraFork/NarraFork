@@ -8,8 +8,10 @@ import {
 	type AdapterActivityInput,
 	type AdapterContentBlock,
 	type AdapterContext,
+	type AdapterMessage,
 	type AdapterSegment,
 	type AdapterToolItem,
+	adaptActivityUnit,
 	adaptRenderUnits,
 	adaptSegment,
 	adaptSegments,
@@ -1964,46 +1966,163 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect("isTakenOver" in subagentData({ toolName: "Task", status: "running" })).toBe(false);
 	});
 
-	/**
-	 * The live output counter: the server streams the child's reply length as a
-	 * bare numeric `tool_output` payload (the ContextAsk convention), bridged onto
-	 * the card's metadata by `resolveToolMetadata`. It is a header BADGE — painted
-	 * from the cached payload — so the adapter must surface it (and
-	 * `subagentRevision` must key it) only while the child is still working.
-	 */
-	it("carries the child's live output counter while running", () => {
+	it("counts only the known prompt leaf, including projected fullLength and explicit zero", () => {
+		for (const [prompt, expected] of [
+			["hello🙂", 7],
+			["", 0],
+			[{ _truncated: true, preview: "preview", fullLength: 12000 }, 12000],
+		] as const) {
+			const data = subagentData({
+				toolName: "Agent",
+				status: "initializing",
+				inputJson: {
+					prompt,
+					description: "d".repeat(900),
+					context: "c".repeat(1200),
+					_streamingChars: 99999,
+				},
+				_streamingOutput: "4000",
+			});
+			expect(data.promptChars).toBe(expected);
+			expect(data.showPromptChars).toBe(true);
+			expect("liveOutputChars" in data).toBe(false);
+		}
+		for (const inputJson of [
+			{},
+			{ description: "hello", _streamingChars: 80 },
+			{ prompt: { _truncated: true, preview: "unknown length" } },
+		]) {
+			const data = subagentData({ toolName: "Agent", status: "initializing", inputJson });
+			expect("promptChars" in data).toBe(false);
+			expect(data.showPromptChars).toBe(false);
+		}
+	});
+
+	it("uses live prompt then settled fields then formal input independently of description streaming", () => {
+		const base = { toolName: "Agent", status: "streaming", startedAt: 100 };
+		const first = subagentData({
+			...base,
+			inputJson: {
+				prompt: "formal",
+				_streamingChars: 999,
+				_streamingFields: { prompt: "settled" },
+				_streamingFieldName: "prompt",
+				_streamingFieldValue: "live prompt",
+			},
+		});
+		const description = subagentData({
+			...base,
+			inputJson: {
+				prompt: "formal",
+				_streamingChars: 2000,
+				_streamingFields: { prompt: "live prompt" },
+				_streamingFieldName: "description",
+				_streamingFieldValue: "description".repeat(100),
+			},
+		});
+		const formal = subagentData({
+			...base,
+			status: "initializing",
+			inputJson: { prompt: "formal" },
+		});
+		expect(first.promptChars).toBe(11);
+		expect(first.promptBody.live).toBe(true);
+		expect(description.promptChars).toBe(11);
+		expect(description.promptBody.live).toBe(false);
+		expect([first, description, formal].map((data) => data.showPromptChars)).toEqual([
+			true,
+			true,
+			true,
+		]);
+		expect(formal.promptChars).toBe(6);
+	});
+
+	it("shows preparation and permission phases but execution evidence always hides the badge", () => {
+		for (const status of ["streaming", "initializing", "pending"]) {
+			expect(
+				subagentData({
+					toolName: "Agent",
+					status,
+					startedAt: 100,
+					inputJson: { prompt: "known prompt" },
+				}).showPromptChars,
+			).toBe(true);
+			expect(
+				subagentData({
+					toolName: "Agent",
+					status,
+					executionStartedAt: 0,
+					inputJson: { prompt: "known prompt" },
+				}).showPromptChars,
+			).toBe(false);
+		}
+		for (const status of ["running", "success", "completed", "fail", "cancelled", "hold"]) {
+			const data = subagentData({
+				toolName: "Agent",
+				status,
+				inputJson: {
+					prompt: "known prompt",
+					_streamingChars: 999,
+					_streamingFieldName: "prompt",
+					_streamingFieldValue: "known prompt",
+				},
+				_streamingOutput: "0",
+				_takenOver: true,
+			});
+			expect(data.promptChars).toBe(12);
+			expect(data.showPromptChars).toBe(false);
+		}
+	});
+
+	it("retains the prompt badge when an earlier tool queues an initializing Agent", () => {
+		const specs = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: false,
+						tc: {
+							toolUseId: "upstream",
+							toolName: "Bash",
+							status: "running",
+							inputJson: { command: "sleep 1" },
+						},
+					},
+					{
+						blockIndex: 1,
+						isSubagent: true,
+						tc: {
+							toolUseId: "queued-agent",
+							toolName: "Agent",
+							status: "initializing",
+							inputJson: { prompt: "queued prompt" },
+						},
+					},
+				],
+			},
+			CTX,
+		);
+		const data = specs.find((spec) => spec.kind === "subagent-card")?.data as Record<
+			string,
+			unknown
+		>;
+		expect(data).toMatchObject({ promptChars: 13, showPromptChars: true });
+	});
+
+	it("keeps a legacy output count out of both the prompt badge and conclusion", () => {
 		const data = subagentData({
 			toolName: "Agent",
 			status: "running",
-			inputJson: { subagent_type: "explore", description: "dig" },
+			inputJson: { description: "dig" },
 			_streamingOutput: "1240",
 		});
-		expect(data.liveOutputChars).toBe(1240);
-		// The count rides the header badge — `toolOutputValue` folds the same payload
-		// into the output slot, and it must never become the conclusion body.
+		expect("promptChars" in data).toBe(false);
+		expect("liveOutputChars" in data).toBe(false);
+		expect(data.showPromptChars).toBe(false);
 		expect(data.resultText).toBeUndefined();
 		expect(data.resultBody).toBeUndefined();
-	});
-
-	it("omits the counter on a terminal card or a non-numeric stream", () => {
-		expect(
-			"liveOutputChars" in
-				subagentData({
-					toolName: "Agent",
-					status: "success",
-					inputJson: {},
-					_streamingOutput: "1240",
-				}),
-		).toBe(false);
-		expect(
-			"liveOutputChars" in
-				subagentData({
-					toolName: "Agent",
-					status: "running",
-					inputJson: {},
-					_streamingOutput: "thinking…",
-				}),
-		).toBe(false);
 	});
 
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
@@ -2044,6 +2163,21 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		});
 		expect(data.resultText).toBe("# 结论\n\n正文");
 		expect(data.resultPreview).toBe("# 结论\n\n正文");
+	});
+
+	it("extracts conclusion text blocks used by background completion patches", () => {
+		const data = subagentData({
+			toolName: "Agent",
+			status: "success",
+			inputJson: { description: "inspect" },
+			outputJson: [
+				{ type: "text", text: "<subagent_id>child</subagent_id>\nPort 7779" },
+				{ type: "text", text: "confirmed" },
+			],
+		});
+		expect(data.resultText).toBe("Port 7779\nconfirmed");
+		expect(data.resultPreview).toBe("Port 7779\nconfirmed");
+		expect(data.resultBody).toBeDefined();
 	});
 
 	it("shows a truncated envelope body as its preview rather than a JSON dump", () => {
@@ -4588,6 +4722,558 @@ describe("mixed action-card display runs from real message segments", () => {
 		expect(before[2]?.opts).toMatchObject({ inRun: true, isLast: true });
 		expect(after[2]?.opts).toMatchObject({ inRun: true, isLast: false });
 		expect(after[3]?.opts).toMatchObject({ inRun: true, isLast: true });
+	});
+});
+
+describe("active reasoning translation display at both LODs", () => {
+	function views(blocks: AdapterContentBlock[], extra = {}) {
+		const msg: AdapterMessage = rowWithElements(
+			{
+				id: "translation-live",
+				narratorId: "owner",
+				role: "assistant",
+				liveContentProjection: true,
+				liveBlockIndex: blocks.length - 1,
+				reasoningTranslationActivity: { elementId: "c", revision: 3, completedRanges: [] },
+				...extra,
+			},
+			blocks,
+		);
+		for (const block of msg.blocks ?? []) block.named = true;
+		const high = adaptSegment({ kind: "message", msg }, CTX)[0]!;
+		const low = adaptActivityUnit(
+			blocks.map((block, blockIndex) => ({
+				kind: "reasoning" as const,
+				block,
+				blockIndex,
+				msg,
+				stableKeyBase: "run0",
+				stableKeyOffset: blockIndex,
+			})),
+			"translation-activity",
+			{ lod: 2 },
+		);
+		return { high, low };
+	}
+
+	it.each([
+		"短译",
+		"**译文甲**\n\n一段更长的完整译文\n\n**译文乙**\n\n第二段\n\n第三段",
+	])("full completion keeps the visual tail over the complete translation: %s", (translatedText) => {
+		const text = "Original first paragraph\n\nOriginal active paragraph";
+		const activity = {
+			elementId: "c",
+			revision: 3,
+			displayTailStart: 0,
+			completedRanges: [] as { start: number; end: number }[],
+		};
+		const before = views([{ type: "reasoning", id: "c", revision: 3, text }], {
+			reasoningTranslationActivity: activity,
+		});
+		const after = views(
+			[
+				{
+					type: "reasoning",
+					id: "c",
+					revision: 3,
+					text,
+					translationGeneration: "g",
+					translationParts: [
+						{
+							id: "full",
+							generation: "g",
+							start: 0,
+							end: text.length,
+							sourceText: text,
+							translatedText,
+						},
+					],
+				},
+			],
+			{
+				reasoningTranslationActivity: {
+					...activity,
+					completedRanges: [{ start: 0, end: text.length }],
+				},
+			},
+		);
+		expect(after.high.kind).toBe("reasoning");
+		expect(after.high.key).toBe(before.high.key);
+		expect(after.high.data).toMatchObject({
+			translatedText,
+			isStreaming: true,
+			reasoningTail: {
+				id: JSON.stringify(["c", 0]),
+				start: 0,
+				end: translatedText.length,
+				originalStart: 0,
+				originalEnd: text.length,
+			},
+		});
+		const lowTail = (view: typeof before) =>
+			(
+				view.low.data as {
+					items: { key: string; unitId: string; shimmer: boolean; liveTail?: unknown }[];
+				}
+			).items.at(-1);
+		expect(lowTail(after)).toMatchObject({
+			key: lowTail(before)?.key,
+			unitId: "reason-live-c",
+			shimmer: true,
+		});
+		expect(lowTail(after)?.liveTail).toBeDefined();
+	});
+
+	it("retains the display boundary independently of full completion and stale shorter source snapshots", () => {
+		const text = "A\n\nB";
+		for (const displayTailStart of [0, 3, text.length, text.length + 100]) {
+			const { high } = views([{ type: "reasoning", id: "c", text, revision: 3 }], {
+				reasoningTranslationActivity: {
+					elementId: "c",
+					revision: 3,
+					displayTailStart,
+					completedRanges: [{ start: 0, end: text.length }],
+				},
+			});
+			expect(high.data).toMatchObject({
+				reasoningTail: {
+					originalStart: displayTailStart < text.length ? displayTailStart : 0,
+					originalEnd: text.length,
+				},
+			});
+		}
+		const legacy = views([{ type: "reasoning", id: "c", text, revision: 3 }], {
+			reasoningTranslationActivity: {
+				elementId: "c",
+				revision: 3,
+				completedRanges: [{ start: 0, end: text.length }],
+			},
+		});
+		expect(legacy.high.data).toMatchObject({
+			reasoningTail: { originalStart: 0, originalEnd: text.length },
+		});
+	});
+
+	it("combines completed element translations with the non-first active element's original", () => {
+		const { high, low } = views([
+			{ type: "reasoning", id: "a", text: "first", translatedText: "一" },
+			{ type: "reasoning", id: "b", text: "second", translatedText: "二" },
+			{ type: "reasoning", id: "c", text: "tail", translatedText: "错误尾部" },
+		]);
+		expect(high.data).toMatchObject({
+			translatedText: "一\n\n二\n\ntail",
+			charCount: 10,
+			isStreaming: true,
+		});
+		expect(high.liveContentProjection).toBe(true);
+		const rows = (
+			low.data as { items: { title: string; shimmer: boolean; liveTail?: { tail: string } }[] }
+		).items;
+		expect(rows[0]?.title).toContain("一");
+		expect(rows.at(-1)).toMatchObject({ shimmer: true });
+		expect(rows.at(-1)?.liveTail?.tail).toContain("tail");
+		expect(JSON.stringify(low.data)).not.toContain("错误尾部");
+	});
+
+	it("same-element sealed prefixes accept exact parts while cached tail and crossing parts stay raw", () => {
+		const source = "sealed tail";
+		const { high, low } = views(
+			[
+				{
+					type: "reasoning",
+					id: "c",
+					revision: 3,
+					text: source,
+					translationGeneration: "g",
+					translationParts: [
+						{
+							id: "prefix",
+							generation: "g",
+							start: 0,
+							end: 6,
+							sourceText: "sealed",
+							translatedText: "封存",
+						},
+						{
+							id: "tail",
+							generation: "g",
+							start: 7,
+							end: 11,
+							sourceText: "tail",
+							translatedText: "错误尾部",
+						},
+					],
+				},
+			],
+			{
+				reasoningTranslationActivity: {
+					elementId: "c",
+					revision: 3,
+					completedRanges: [{ start: 0, end: 6 }],
+				},
+			},
+		);
+		expect(high.data).toMatchObject({
+			translatedText: "封存 tail",
+			charCount: 7,
+			isStreaming: true,
+		});
+		expect(JSON.stringify(low.data)).toContain("封存 tail");
+		expect(JSON.stringify(low.data)).not.toContain("错误尾部");
+	});
+
+	it("the sealed last part stays original until a real successor promotes it at both LODs", () => {
+		const block = {
+			type: "reasoning",
+			id: "c",
+			revision: 2,
+			completed: true,
+			text: "A\n\nB",
+			translationGeneration: "g",
+			translationParts: [
+				{ id: "a", generation: "g", start: 0, end: 1, sourceText: "A", translatedText: "甲" },
+				{ id: "b", generation: "g", start: 3, end: 4, sourceText: "B", translatedText: "乙" },
+			],
+		};
+		const pending = views([block], {
+			reasoningTranslationActivity: {
+				elementId: "c",
+				revision: 2,
+				completedRanges: [{ start: 0, end: 1 }],
+			},
+		});
+		expect(pending.high.data).toMatchObject({ translatedText: "甲\n\nB", isStreaming: true });
+		expect(pending.low.data).toMatchObject({
+			items: [expect.objectContaining({ shimmer: true, liveTail: { charCount: 4, tail: "甲 B" } })],
+		});
+		const next = { ...block, completed: false, revision: 3, text: "A\n\nB\n\nC" };
+		const advanced = views([next], {
+			reasoningTranslationActivity: {
+				elementId: "c",
+				revision: 3,
+				completedRanges: [
+					{ start: 0, end: 1 },
+					{ start: 3, end: 4 },
+				],
+			},
+		});
+		expect(advanced.high.data).toMatchObject({
+			translatedText: "甲\n\n乙\n\nC",
+			isStreaming: true,
+		});
+		expect(advanced.low.data).toMatchObject({
+			items: [
+				expect.objectContaining({ shimmer: true, liveTail: { charCount: 7, tail: "甲 乙 C" } }),
+			],
+		});
+	});
+
+	it("a cached part crossing the sealed boundary cannot cover the active source", () => {
+		const { high, low } = views(
+			[
+				{
+					type: "reasoning",
+					id: "c",
+					text: "sealed tail",
+					revision: 3,
+					translationGeneration: "g",
+					translationParts: [
+						{
+							id: "crossing",
+							generation: "g",
+							start: 0,
+							end: 11,
+							sourceText: "sealed tail",
+							translatedText: "越界译文",
+						},
+					],
+				},
+			],
+			{
+				reasoningTranslationActivity: {
+					elementId: "c",
+					revision: 3,
+					completedRanges: [{ start: 0, end: 6 }],
+				},
+			},
+		);
+		expect(high.data).toMatchObject({ text: "sealed tail", translatedText: null, charCount: 11 });
+		expect(JSON.stringify(low.data)).not.toContain("越界译文");
+	});
+
+	it("a translated prefix heading cannot replace an active plain reasoning card", () => {
+		const a = { type: "reasoning", id: "a", text: "plain prefix" };
+		const c = { type: "reasoning", id: "c", text: "original tail" };
+		const before = views([a, c], { model: "gpt-5" });
+		const after = views([{ ...a, translatedText: "**译文标题**\n\n译文内容" }, c], {
+			model: "gpt-5",
+		});
+		expect(before.high.kind).toBe("reasoning");
+		expect(after.high.kind).toBe("reasoning");
+		expect(after.high.key).toBe(before.high.key);
+		expect(after.high.data).toMatchObject({ isStreaming: true });
+	});
+
+	it.each([
+		"译文只有一段",
+		"**新标题一**\n\n一\n\n**新标题二**\n\n二\n\n**新标题三**\n\n三",
+	])("structured full translations retain the live unit at both LODs: %s", (translatedText) => {
+		const text = "**Original one**\n\nbody one\n\n**Original tail**\n\nbody tail";
+		const block = { type: "reasoning", id: "c", revision: 3, text };
+		const activity = {
+			elementId: "c",
+			revision: 3,
+			displayTailStart: 0,
+			completedRanges: [] as { start: number; end: number }[],
+		};
+		const before = views([block], { model: "gpt-5", reasoningTranslationActivity: activity });
+		const after = views(
+			[
+				{
+					...block,
+					translationGeneration: "g",
+					translationParts: [
+						{
+							id: "full",
+							generation: "g",
+							start: 0,
+							end: text.length,
+							sourceText: text,
+							translatedText,
+						},
+					],
+				},
+			],
+			{
+				model: "gpt-5",
+				reasoningTranslationActivity: {
+					...activity,
+					completedRanges: [{ start: 0, end: text.length }],
+				},
+			},
+		);
+		expect(after.high.kind).toBe("reasoning-steps");
+		expect(after.high.key).toBe(before.high.key);
+		const highTail = (view: typeof before) =>
+			(
+				view.high.data as {
+					steps: { key: string; unitId: string; shimmer: boolean; reasoningTail?: unknown }[];
+				}
+			).steps.at(-1);
+		const lowTail = (view: typeof before) =>
+			(
+				view.low.data as {
+					items: { key: string; unitId: string; shimmer: boolean; liveTail?: unknown }[];
+				}
+			).items.at(-1);
+		expect(highTail(after)).toMatchObject({
+			key: highTail(before)?.key,
+			unitId: "reason-live-c",
+			shimmer: true,
+			reasoningTail: { id: JSON.stringify(["c", 0]) },
+		});
+		expect(lowTail(after)).toMatchObject({
+			key: lowTail(before)?.key,
+			unitId: "reason-live-c",
+			shimmer: true,
+		});
+		expect(lowTail(after)?.liveTail).toBeDefined();
+	});
+
+	it("translated prefix parser changes retain the active tail key, unit and shimmer", () => {
+		const a = { type: "reasoning", id: "a", text: "**First**\n\nbody" };
+		const c = { type: "reasoning", id: "c", text: "**Tail**\n\nlive" };
+		const before = views([a, c], { model: "gpt-5" });
+		const after = views([{ ...a, translatedText: "**译一**\n\none\n\n**译二**\n\ntwo" }, c], {
+			model: "gpt-5",
+		});
+		const highTail = (view: typeof before) =>
+			(view.high.data as { steps: { key: string; unitId: string; shimmer: boolean }[] }).steps.at(
+				-1,
+			);
+		const lowTail = (view: typeof before) =>
+			(view.low.data as { items: { key: string; unitId: string; shimmer: boolean }[] }).items.at(
+				-1,
+			);
+		expect(highTail(after)).toMatchObject({
+			key: highTail(before)?.key,
+			unitId: "reason-live-c",
+			shimmer: true,
+		});
+		expect(lowTail(after)).toMatchObject({
+			key: lowTail(before)?.key,
+			unitId: "reason-live-c",
+			shimmer: true,
+		});
+		expect(after.high.key).toBe(before.high.key);
+	});
+});
+
+describe("reasoning-only default expansion", () => {
+	const text = "reasoning body ".repeat(20);
+	const steps = `**First**\n\n${text}\n\n**Second**\n\nsecond body`;
+	function reasoning(id: string, source = text, model = "claude-sonnet-4"): AdapterSegment {
+		return {
+			kind: "message",
+			msg: rowWithElements({ id, role: "assistant", model }, [
+				{ id: `${id}-reason`, type: "reasoning", text: source },
+			]),
+		};
+	}
+	function activityInputs(source = text, id = "reasoning"): AdapterActivityInput[] {
+		const segment = reasoning(id, source, "gpt-5.6");
+		if (segment.kind !== "message") throw new Error("expected reasoning message");
+		return [
+			{ kind: "reasoning", msg: segment.msg, blockIndex: 0, block: messageBody(segment.msg)[0] },
+		];
+	}
+	function measure(spec: ReturnType<typeof adaptActivityUnit>, lod: AdapterContext["lod"]) {
+		return VLIST_REGISTRY[spec.kind].measure(spec.data, 600, lod, spec.opts);
+	}
+
+	it("resolves ordinary reasoning defaults without overriding either manual choice", () => {
+		const segment = reasoning("plain");
+		const collapsed = adaptSegment(segment, { lod: 5, expandReasoning: false })[0]!;
+		const expanded = adaptSegment(segment, { lod: 5, expandReasoning: true })[0]!;
+		expect(collapsed.kind).toBe("reasoning");
+		expect(collapsed.opts?.expanded).toBeUndefined();
+		expect(expanded.opts?.expanded).toBe(true);
+		expect(measure(expanded, 5).height).toBeGreaterThan(measure(collapsed, 5).height);
+		for (const manual of [false, true]) {
+			for (const expandReasoning of [false, true]) {
+				const spec = adaptSegment(segment, {
+					lod: 5,
+					expandReasoning,
+					isExpanded: () => manual,
+				})[0]!;
+				expect(spec.opts?.expanded).toBe(manual);
+			}
+		}
+	});
+
+	it("opens each structured step and lets explicit false beat the default and legacy open set", () => {
+		const segment = reasoning("steps", steps, "gpt-5.6");
+		const closed = adaptSegment(segment, { lod: 5, expandReasoning: false })[0]!;
+		const opened = adaptSegment(segment, { lod: 5, expandReasoning: true })[0]!;
+		expect(opened.kind).toBe("reasoning-steps");
+		expect(closed.opts?.expandedIndices).toEqual([]);
+		expect(opened.opts?.expandedIndices).toEqual([0, 1]);
+		expect(measure(opened, 5).height).toBeGreaterThan(measure(closed, 5).height);
+		for (const expandReasoning of [false, true]) {
+			const manual = adaptSegment(segment, {
+				lod: 5,
+				expandReasoning,
+				expandedRows: () => [0],
+				isReasoningRowExpanded: (_, index) => index !== 0,
+			})[0]!;
+			expect(manual.opts?.expandedIndices).toEqual([1]);
+		}
+	});
+
+	it("opens only expandable folded reasoning and keeps both tool and subagent rows folded", () => {
+		const inputs: AdapterActivityInput[] = [
+			...activityInputs(steps),
+			...([false, true] as const).map((isSubagent) => ({
+				kind: "tool" as const,
+				blockIndex: 0,
+				isSubagent,
+				tc: {
+					toolUseId: isSubagent ? "agent" : "read",
+					toolName: isSubagent ? "Agent" : "Read",
+					status: "success",
+					inputJson: {},
+				},
+			})),
+		];
+		const closed = adaptActivityUnit(inputs, "activity", { lod: 2, expandReasoning: false });
+		const opened = adaptActivityUnit(inputs, "activity", { lod: 2, expandReasoning: true });
+		expect(closed.opts?.expandedIndices).toEqual([]);
+		expect(opened.opts?.expandedIndices).toEqual([0, 1]);
+		const rows = (opened.data as { items: { key: string; card?: unknown }[] }).items;
+		expect(rows.slice(2).every((row) => row.card === undefined)).toBe(true);
+		for (const expandReasoning of [false, true]) {
+			const manual = adaptActivityUnit(inputs, "activity", {
+				lod: 2,
+				expandReasoning,
+				isRowExpanded: () => true,
+				isReasoningRowExpanded: (_, key) => (key === rows[0]!.key ? false : true),
+			});
+			expect(manual.opts?.expandedIndices).toEqual([1, 2, 3]);
+		}
+	});
+
+	it("retains the low-LOD outer fold and visible-row cap", () => {
+		const inputs = Array.from({ length: 12 }, (_, index) =>
+			activityInputs(text, `r${index}`),
+		).flat();
+		const collapsed = adaptActivityUnit(inputs, "activity", {
+			lod: 1,
+			expandReasoning: true,
+			recentMessageIds: new Set(),
+		});
+		expect(collapsed.opts).toMatchObject({
+			collapsed: true,
+			itemsOpened: false,
+			showEarlier: false,
+		});
+		expect((measure(collapsed, 1) as { collapsedToHeader?: boolean }).collapsedToHeader).toBe(true);
+		const opened = adaptActivityUnit(inputs, "activity", { lod: 2, expandReasoning: true });
+		const measured = measure(opened, 2) as {
+			rows?: unknown[];
+			maxVisible?: number;
+			itemCount?: number;
+		};
+		expect(measured.itemCount).toBe(12);
+		expect(measured.rows).toHaveLength(10);
+		expect(measured.maxVisible).toBe(10);
+		expect(opened.opts).toMatchObject({ itemsOpened: false, showEarlier: false });
+	});
+
+	it("keeps bodyless live reasoning on its existing live tail even when enabled", () => {
+		const opened = adaptActivityUnit(activityInputs(steps, "__streaming__"), "live", {
+			lod: 2,
+			expandReasoning: true,
+		});
+		expect(opened.opts?.expandedIndices).toEqual([]);
+		const rows = (opened.data as { items: { bodyText?: string; liveTail?: unknown }[] }).items;
+		expect(rows.every((row) => row.bodyText === undefined)).toBe(true);
+		expect(rows.at(-1)?.liveTail).toBeDefined();
+	});
+
+	it("leaves standalone tools, subagents and recovery deselection unchanged", () => {
+		const toolSegment: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [false, true].map((isSubagent) => ({
+				blockIndex: 0,
+				isSubagent,
+				tc: {
+					toolUseId: `tool-${isSubagent}`,
+					toolName: isSubagent ? "Agent" : "Read",
+					status: "success",
+					inputJson: {},
+				},
+			})),
+		};
+		expect(adaptSegment(toolSegment, { lod: 5, expandReasoning: true })).toEqual(
+			adaptSegment(toolSegment, { lod: 5, expandReasoning: false }),
+		);
+		const recovery: AdapterSegment = {
+			kind: "message",
+			msg: rowWithElements({ id: "recovery", role: "sys" }, [
+				{ type: "subagent_recovery", subagents: [{ id: "agent" }] },
+			]),
+		};
+		for (const expandReasoning of [false, true]) {
+			const [spec] = adaptSegment(recovery, {
+				lod: 5,
+				expandReasoning,
+				expandedRows: () => [0],
+				isReasoningRowExpanded: () => true,
+			});
+			expect(spec!.kind).toBe("subagent-recovery");
+			expect(spec!.opts).toEqual({ deselected: [0] });
+		}
 	});
 });
 

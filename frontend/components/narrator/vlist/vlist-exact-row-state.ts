@@ -404,13 +404,15 @@ export function rowInteractionSig(state: VListInteractionState, key: string): st
 	// could skip the re-render that paints the revealed card.
 	const traceRows = state.expandedTraceRows.get(key);
 	const traceRowsSig = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
+	const reasoningRows = state.reasoningRowOverrides.get(key);
+	const reasoningRowsSig = reasoningRows ? JSON.stringify([...reasoningRows]) : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
 	// The file-list fold changes how many rows are DRAWN, so it must move the opts
 	// signature — otherwise expanding it would not re-measure the card.
 	const fileChangesOpen = state.fileChangesOpen.has(key) ? 1 : 0;
 	// An outline plan card's open nodes and texts change which rows it draws.
 	const planTree = planTreeRowSignature(state, key);
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}:${planTree}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${reasoningRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}:${planTree}`;
 }
 
 /**

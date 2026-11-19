@@ -164,6 +164,8 @@ export interface GenerateOptions {
 	reasoningEffort?: ChatParams["reasoningEffort"];
 	/** Optional provider output-token ceiling for lightweight generation helpers. */
 	maxOutputTokens?: number;
+	/** Optional stable prompt-cache identity for lightweight Codex generation. */
+	promptCacheKey?: string;
 	/** Optional abort signal to cancel the underlying upstream request. */
 	signal?: AbortSignal;
 	/**

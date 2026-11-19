@@ -82,6 +82,72 @@ const FIXTURES: Record<string, string> = {
 	].join("\n\n"),
 };
 
+describe("reasoning-only stable tail identity", () => {
+	it("marks every unit of a full translated tail and keeps its replacement lineage on idle reads", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		for (const options of [{}, { maxEntries: 0 }, { maxSourceChars: 1 }]) {
+			const cache = new StreamingBlockCache(options);
+			const id = JSON.stringify(["reasoning-item", 0]);
+			cache.get("full-tail", "original first\n\noriginal last", { id, start: 0, end: 29 });
+			for (const text of ["译", "# 新标题\n\n第一段\n\n## 第二个标题\n\n第二段\n\n第三段"]) {
+				const tail = { id, start: 0, end: text.length, translationRevision: "full-part" };
+				const translated = cache.get("full-tail", text, tail);
+				expect(translated.length).toBeGreaterThan(0);
+				expect(translated.every((block) => block.reasoningTail?.id === id)).toBe(true);
+				expect(
+					translated.every((block) => block.reasoningTail?.translationRevision === "full-part"),
+				).toBe(true);
+				expect(new Set(translated.map((block) => block.reasoningTailKey)).size).toBe(
+					translated.length,
+				);
+				expect(cache.get("full-tail", text, tail).map((block) => block.reasoningTailKey)).toEqual(
+					translated.map((block) => block.reasoningTailKey),
+				);
+				expect(
+					translated.map(({ reasoningTailKey: _key, reasoningTail: _tail, ...block }) => block),
+				).toEqual(parseMarkdownToPreparedBlocks(text, markdownMathSupport()));
+			}
+		}
+	});
+
+	it("keeps active source keys across translated prefix resegmentation without changing geometry", async () => {
+		const {
+			StreamingBlockCache,
+			measureMarkdown,
+			parseMarkdownToPreparedBlocks,
+			markdownMathSupport,
+		} = await load();
+		for (const options of [{}, { maxEntries: 0 }, { maxSourceChars: 1 }]) {
+			const cache = new StreamingBlockCache(options);
+			const before = "A\n\nB live";
+			const first = cache.get("reasoning-tail", before, {
+				id: "r:1",
+				start: 1,
+				end: before.length,
+			});
+			const after = "译一\n\n译二\n\nB live";
+			const prefix = "译一\n\n译二";
+			const next = cache.get("reasoning-tail", after, {
+				id: "r:1",
+				start: prefix.length,
+				end: after.length,
+			});
+			expect(first.at(-1)?.reasoningTailKey).toBeDefined();
+			expect(next.at(-1)?.reasoningTailKey).toBe(first.at(-1)?.reasoningTailKey);
+			const ordinary = parseMarkdownToPreparedBlocks(after, markdownMathSupport());
+			expect(
+				next.map(({ reasoningTailKey: _key, reasoningTail: _tail, ...block }) => block),
+			).toEqual(ordinary);
+			const measured = measureMarkdown(after, WIDTH, { preparedBlocks: next });
+			const full = measureMarkdown(after, WIDTH, { preparedBlocks: ordinary });
+			expect(measured.frame).toEqual(full.frame);
+			expect(measured.height).toBe(full.height);
+			expect(cache.get("ordinary-markdown", after)).toEqual(ordinary);
+		}
+	});
+});
+
 describe("getStreamingPreparedBlocks — byte-exact at every prefix", () => {
 	for (const [name, text] of Object.entries(FIXTURES)) {
 		it(`matches a full parse while streaming: ${name}`, async () => {

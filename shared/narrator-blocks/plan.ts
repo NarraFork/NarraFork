@@ -169,18 +169,16 @@ export function planEnvelopeBlocks(
 	ledger: readonly PlanLedgerRow[],
 	options: { streaming?: boolean } = {},
 ): { blocks: PlannedBlock[]; bodyBytes: number } {
-	const outputs = new Map(ledger.map((call) => [call.toolUseId, parseStored(call.outputJson)]));
+	const parsedLedger = ledger.map((call) => ({
+		toolUseId: call.toolUseId,
+		toolName: call.toolName,
+		inputJson: parseStored(call.inputJson),
+		outputJson: parseStored(call.outputJson),
+		status: call.status,
+	}));
+	const outputs = new Map(parsedLedger.map((call) => [call.toolUseId, call.outputJson]));
 	const drafts = splitEnvelope(
-		{
-			...envelope,
-			toolCalls: ledger.map((call) => ({
-				toolUseId: call.toolUseId,
-				toolName: call.toolName,
-				inputJson: parseStored(call.inputJson),
-				outputJson: parseStored(call.outputJson),
-				status: call.status,
-			})),
-		},
+		{ ...envelope, toolCalls: parsedLedger },
 		{ streaming: options.streaming },
 	).blocks;
 	let bodyBytes = 0;

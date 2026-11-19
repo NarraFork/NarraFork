@@ -64,23 +64,57 @@ async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Ca
 	return captured;
 }
 
-const genMeta = (p: OpenAIProvider) =>
-	p.generateWithMeta("hello", "codex:gpt-5.3-codex", "You are a title generator.", {
+const genMeta = (p: OpenAIProvider, promptCacheKey?: string, text = "hello") =>
+	p.generateWithMeta(text, "codex:gpt-5.3-codex", "You are a title generator.", {
 		reasoningEffort: "high",
+		...(promptCacheKey ? { promptCacheKey } : {}),
 	});
-const genHistory = (p: OpenAIProvider) =>
+const genHistory = (p: OpenAIProvider, promptCacheKey?: string, text = "content") =>
 	p.generateWithHistoryWithMeta(
 		"You are a title generator.",
-		"content",
+		text,
 		"codex:gpt-5.3-codex",
 		undefined,
-		{ reasoningEffort: "high" },
+		{ reasoningEffort: "high", ...(promptCacheKey ? { promptCacheKey } : {}) },
 	);
 
 describe.each([
 	["generateWithMeta", genMeta],
 	["generateWithHistoryWithMeta", genHistory],
 ])("codex utility request parity: %s", (_name, run) => {
+	test("reuses an explicit prompt cache key across inputs with matching headers and metadata", async () => {
+		const key = "nf-translation-v1:fixed-translation-prefix";
+		const first = await capture((provider) => run(provider, key, "first reasoning"));
+		const second = await capture((provider) => run(provider, key, "different reasoning"));
+
+		for (const req of [first, second]) {
+			expect(req.body.prompt_cache_key).toBe(key);
+			expect(req.headers["session-id"]).toBe(key);
+			expect(req.headers["thread-id"]).toBe(key);
+			expect(req.headers["x-client-request-id"]).toBe(key);
+			const metadata = req.body.client_metadata as Record<string, string>;
+			expect(metadata.session_id).toBe(key);
+			expect(metadata.thread_id).toBe(key);
+			expect(metadata["x-codex-window-id"]).toBe(req.headers["x-codex-window-id"]);
+			expect(req.body.store).toBe(false);
+			expect(req.body.previous_response_id).toBeUndefined();
+			expect(req.headers["x-codex-turn-state"]).toBeUndefined();
+		}
+		expect(first.headers["x-codex-window-id"]).toBe(second.headers["x-codex-window-id"]);
+		expect(first.body.input).not.toEqual(second.body.input);
+	});
+
+	test("keeps utility prompt cache identities fresh when no key is specified", async () => {
+		const first = await capture(run);
+		const second = await capture(run);
+
+		expect(first.body.prompt_cache_key).toBeTruthy();
+		expect(second.body.prompt_cache_key).toBeTruthy();
+		expect(first.body.prompt_cache_key).not.toBe(second.body.prompt_cache_key);
+		expect(first.headers["session-id"]).toBe(first.body.prompt_cache_key);
+		expect(second.headers["session-id"]).toBe(second.body.prompt_cache_key);
+	});
+
 	test("sends the stable managed Codex client headers", async () => {
 		const req = await capture(run);
 

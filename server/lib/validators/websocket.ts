@@ -1,4 +1,8 @@
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import {
+	MAX_REASONING_TRANSLATION_ID_LENGTH,
+	REASONING_TRANSLATION_VISIBILITY_LIMITS,
+} from "@shared/reasoning-translation";
 import { RECENT_TABS_WS_BATCH_SIZE } from "@shared/recent-tabs";
 import { z } from "zod";
 import { rejectUnsupportedTerminalResourceSelector } from "./terminals";
@@ -21,8 +25,78 @@ const catchUpCursorSchema = z
 	})
 	.strict();
 
+const reasoningTranslationTargetSchema = z
+	.object({
+		ownerNarratorId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH),
+		messageId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH),
+		blockId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH),
+		elementId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH).optional(),
+		legacyIndex: z.number().int().min(0).max(511).optional(),
+		legacyVersion: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+	})
+	.strict()
+	.refine((target) =>
+		target.elementId !== undefined
+			? target.legacyIndex === undefined && target.legacyVersion === undefined
+			: target.legacyIndex !== undefined && target.legacyVersion !== undefined,
+	);
+
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
+	z
+		.object({
+			type: z.literal("reasoning_translation_visibility"),
+			narratorId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH),
+			visibilityId: z.string().min(1).max(128),
+			targets: z
+				.array(reasoningTranslationTargetSchema)
+				.max(REASONING_TRANSLATION_VISIBILITY_LIMITS.targets),
+			revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+			groups: z
+				.array(
+					z
+						.object({
+							groupId: z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH),
+							anchor: reasoningTranslationTargetSchema,
+							targetIndexes: z
+								.array(
+									z
+										.number()
+										.int()
+										.min(0)
+										.max(REASONING_TRANSLATION_VISIBILITY_LIMITS.targets - 1),
+								)
+								.min(1)
+								.max(REASONING_TRANSLATION_VISIBILITY_LIMITS.targets),
+						})
+						.strict(),
+				)
+				.max(REASONING_TRANSLATION_VISIBILITY_LIMITS.targets)
+				.optional(),
+		})
+		.strict()
+		.refine((message) => {
+			const identities = message.targets.map((target) => JSON.stringify(target));
+			if (new Set(identities).size !== identities.length) return false;
+			const ids = new Set<string>();
+			const indices = new Set<number>();
+			for (const group of message.groups ?? []) {
+				if (ids.has(group.groupId)) return false;
+				ids.add(group.groupId);
+				for (const index of group.targetIndexes) {
+					const target = message.targets[index];
+					if (
+						!target ||
+						indices.has(index) ||
+						target.ownerNarratorId !== group.anchor.ownerNarratorId ||
+						target.messageId !== group.anchor.messageId
+					)
+						return false;
+					indices.add(index);
+				}
+			}
+			return true;
+		}),
 	z
 		.object({
 			type: z.literal("editor_file_subscribe"),
@@ -72,6 +146,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
 			catchUpCursor: catchUpCursorSchema.optional(),
 			kind: z.enum(["list", "panel", "messages", "activity"]).optional(),
+			restoreState: z.boolean().optional(),
 			requestId: z.string().min(1).optional(),
 			downgrade: z.boolean().optional(),
 			// Client's last-known messageVersion for this narrator. When it matches

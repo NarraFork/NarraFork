@@ -17,6 +17,11 @@ import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { SubagentDelegation } from "@shared/outline-report-note";
+import type {
+	ReasoningTranslationGroup,
+	ReasoningTranslationSource,
+	ReasoningTranslationStepSource,
+} from "@shared/pretext-layout/reasoning-translation-sources";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
@@ -80,6 +85,20 @@ export function resolveRenderExtra(spec: {
 }): RenderExtra {
 	const data = (spec.data ?? {}) as Record<string, unknown>;
 	const extra: RenderExtra = {};
+	if (spec.kind === "reasoning" && data.translationSource)
+		extra.translationSource = data.translationSource;
+	if (spec.kind === "reasoning-steps" || spec.kind === "activity-trace") {
+		if (spec.kind === "reasoning-steps" && data.translationGroup)
+			extra.translationGroup = data.translationGroup;
+		const rows = spec.kind === "reasoning-steps" ? data.steps : data.items;
+		if (Array.isArray(rows)) {
+			const sources = new Map<string, ReasoningTranslationStepSource>();
+			for (const row of rows)
+				if (row?.translationSource && typeof row.key === "string")
+					sources.set(row.key, row.translationSource);
+			if (sources.size) extra.translationSources = sources;
+		}
+	}
 	if (spec.opts?.labels) extra.labels = spec.opts.labels;
 	if (spec.opts?.onToggle) extra.onToggle = spec.opts.onToggle;
 	if (spec.opts?.onToggleItems) extra.onToggleItems = spec.opts.onToggleItems;
@@ -218,6 +237,9 @@ export function resolveRenderExtra(spec: {
 			if ("delegation" in data) extra.delegation = data.delegation;
 			// Same paint-only forwarding for the live output counter badge.
 			if ("liveOutputChars" in data) extra.liveOutputChars = data.liveOutputChars;
+			// Prompt length and phase are paint-only; read fresh even on a cached height.
+			if ("promptChars" in data) extra.promptChars = data.promptChars;
+			if ("showPromptChars" in data) extra.showPromptChars = data.showPromptChars;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
 			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
@@ -356,6 +378,8 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					narratorId={extra.narratorId as string | undefined}
+					translationSource={extra.translationSource as ReasoningTranslationSource | undefined}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
 						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
@@ -516,6 +540,13 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					narratorId={extra.narratorId as string | undefined}
+					translationGroup={extra.translationGroup as ReasoningTranslationGroup | undefined}
+					translationSources={
+						extra.translationSources as
+							| ReadonlyMap<string, ReasoningTranslationStepSource>
+							| undefined
+					}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
@@ -571,6 +602,8 @@ export function renderElement(
 					isTakenOver={extra.isTakenOver as boolean | undefined}
 					delegation={extra.delegation as SubagentDelegation | undefined}
 					liveOutputChars={extra.liveOutputChars as number | undefined}
+					promptChars={extra.promptChars as number | undefined}
+					showPromptChars={extra.showPromptChars as boolean | undefined}
 					model={extra.model as string | undefined}
 					modelInheritance={extra.modelInheritance as SubagentModelInheritance | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}

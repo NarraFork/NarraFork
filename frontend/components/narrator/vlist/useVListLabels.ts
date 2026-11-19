@@ -103,6 +103,7 @@ export interface VListTimingLabels {
 export interface VListRenderLabels {
 	textPreview?: { expand: string; collapse: string; loading?: string; loadFailed?: string };
 	reasoning: {
+		translationStatusLabel?: string;
 		reasoning: string;
 		thinking: string;
 		/** Builder: the step count is per element. */
@@ -160,6 +161,7 @@ export interface VListRenderLabels {
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
+		translationStatusLabel?: string;
 		hideEarlier: string;
 		showEarlier: (hiddenCount: number) => string;
 		/** Size prefix of a live reasoning row's scrolling tail ("1234 字符"). */
@@ -207,6 +209,9 @@ export interface VListRenderLabels {
 		>;
 		/** Live output counter badge: `{count}` chars written so far. */
 		liveOutputChars: string;
+		/** Prompt-length badge shown while the Agent input is being prepared. */
+		promptChars: string;
+		promptCharsTooltip: string;
 		followParent: string;
 		followTooltip: string;
 		/** `{parentModel}` / `{pool}` are substituted by the card. */
@@ -445,7 +450,7 @@ export function useVListLabels(): VListLabels {
 			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
 			contextAskStatusSummary: t("contextAskStatusSummary"),
 			// Generic live output counter ("123 chars") for any running tool whose
-			// streamed output is a bare cumulative count (Agent / Await today).
+			// streamed output is a bare cumulative count (Await).
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
@@ -843,6 +848,7 @@ export function useVListLabels(): VListLabels {
 				loadFailed: t("textPreview.loadFailed"),
 			},
 			reasoning: {
+				translationStatusLabel: t("reasoningTranslationStatus"),
 				reasoning: t("reasoning"),
 				thinking: t("thinking"),
 				countLabel: (stepCount: number) => t("reasoningSteps", { count: stepCount }),
@@ -928,6 +934,7 @@ export function useVListLabels(): VListLabels {
 				statusLabel: t("toolCallGroupStatusPending"),
 			},
 			trace: {
+				translationStatusLabel: t("reasoningTranslationStatus"),
 				hideEarlier: t("reasoningHideEarlier"),
 				showEarlier: (hiddenCount: number) => t("reasoningShowEarlier", { count: hiddenCount }),
 				// Size prefix of a live reasoning row's scrolling tail. Reuses the same
@@ -977,6 +984,8 @@ export function useVListLabels(): VListLabels {
 				// Same wording as the adapter-level live counter; one locale key serves
 				// both the header badge and the folded-row summary.
 				liveOutputChars: t("liveOutputChars", { count: "{count}" }),
+				promptChars: t("subagentPromptChars", { count: "{count}" }),
+				promptCharsTooltip: t("subagentPromptCharsTooltip"),
 				followParent: t("followParent"),
 				followTooltip: t("inheritance.followTooltip"),
 				// Placeholders stay literal so the card can substitute per-badge values.
