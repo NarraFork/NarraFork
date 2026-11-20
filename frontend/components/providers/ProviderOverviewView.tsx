@@ -12,8 +12,10 @@ export interface ProviderOverviewViewProps {
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
-	/** 从草稿里删掉一条 API key 供应商（保存后才落库）；平台/插件供应商不传。 */
+	/** 从草稿里删掉一条 API key 供应商（保存后才落库）；插件供应商不传。 */
 	onDeleteProvider?: (providerId: string) => void;
+	/** 平台实例按前缀删除（同样走草稿）；插件提供的平台供应商不传。 */
+	onDeletePlatformInstance?: (prefix: string) => void;
 	selectedProvider: string | null;
 	pendingProvider?: string;
 }
@@ -24,6 +26,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
 	onDeleteProvider,
+	onDeletePlatformInstance,
 	selectedProvider,
 	pendingProvider,
 }: ProviderOverviewViewProps) {
@@ -80,11 +83,16 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					controlsDisabled={pendingProvider === group.prefix}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
-					// 只有草稿里可增删的供应商才给删除按钮：平台与插件供应商由各自机制管理。
+					// 两类删除共用一张卡片：平台实例按前缀删，API key 供应商按 id 删；
+					// 插件提供的供应商由插件自己的机制管理，不给删除按钮。
 					onDelete={
-						!group.isPlatform && group.providerId && onDeleteProvider
-							? () => onDeleteProvider(group.providerId as string)
-							: undefined
+						group.isPlatform
+							? group.pluginId || !onDeletePlatformInstance
+								? undefined
+								: () => onDeletePlatformInstance(group.prefix)
+							: group.providerId && onDeleteProvider
+								? () => onDeleteProvider(group.providerId as string)
+								: undefined
 					}
 					isSelected={selectedProvider === (group.providerId ?? group.prefix)}
 				/>

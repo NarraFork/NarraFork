@@ -1,49 +1,26 @@
 /**
- * Command Code 设置区块：凭据、额度、启用开关与模型配置。
+ * Command Code 平台的管理区块：连接状态、额度与模型配置。
  *
- * 骨架对齐其它 provider 卡片（CustomApiProviderSection）：描述行 → 标题/徽章/开关 → 表单 →
- * 分隔线 → 模型区，表单控件统一 `size="xs"`；额度展示对齐 CodexUsageDisplay（标题 / 已用 /
- * 进度 / 重置倒计时）。
+ * 凭据（apiKey / baseUrl / 代理 / 指纹）属于**实例**，统一在实例配置页里编辑；这里只放平台
+ * 本身的状态与模型，实例页把它挂在实例配置下方。
  *
- * 凭据来自 Studio 生成的 API key（填进设置即可，无需安装 CLI）；若本机已有 CLI 登录的
- * `~/.commandcode/auth.json`，后端会作为回退自动使用。额度来自 /alpha/billing/credits
- * （月度余额与滚动窗口）与 /alpha/usage/summary（计费周期内的累计用量）。
- *
- * API key 与启用开关都是受控草稿，由页面底部的全局保存条统一提交 —— 停用必须落到
- * `settings.commandCode.disabled`，后端据此把该 provider 从可用候选里剔除。
+ * 额度来自 /alpha/billing/credits 与 /alpha/usage/summary，走的是内置连接（CLI 登录或
+ * 默认前缀实例的 key），因此只对默认前缀展示。
  */
 
 import { formatCompactNumber } from "@frontend/lib/compact-number";
-import { formatCountdown, relativeTime } from "@frontend/lib/relative-time";
-import {
-	Alert,
-	Anchor,
-	Badge,
-	Button,
-	Divider,
-	Group,
-	Loader,
-	Progress,
-	Stack,
-	Switch,
-	Text,
-	TextInput,
-} from "@mantine/core";
+import { formatCountdown } from "@frontend/lib/relative-time";
+import { Alert, Badge, Button, Divider, Group, Loader, Progress, Stack, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
-import { ProxyOverrideField } from "../common/ProxyOverrideField";
-import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
 import { COMMAND_CODE_PROTOCOL_OPTIONS } from "./ModelProtocolSelect";
-import type { CommandCodeState } from "./providers-reducer";
 import type { CustomApiProtocol } from "./types";
-
-const STUDIO_API_KEYS_URL = "https://commandcode.ai/studio/";
 
 const COMMAND_CODE_REASONS = {
 	not_configured: "commandcode.reasonNotConfigured",
@@ -62,12 +39,9 @@ function commandCodeReasonText(
 }
 
 export interface CommandCodeSectionProps {
-	/** settings.commandCode 的草稿镜像。 */
-	value: CommandCodeState;
-	onChange: (config: CommandCodeState) => void;
-	/** 启用开关：平台 provider 的开关统一走草稿入口（见 PLATFORM_PROVIDER_PREFIXES）。 */
-	onToggleDisabled: () => void;
-	/** 已带 `commandcode:` 前缀的模型选项。 */
+	/** 模型值前缀（实例前缀，如 `CommandCode` 或 `CommandCode-2`）。 */
+	prefix: string;
+	/** 已带该前缀的模型选项。 */
 	models?: ModelListItem[];
 	hiddenModels?: Set<string>;
 	onToggleHidden?: (modelVal: string) => void;
@@ -135,9 +109,7 @@ function UsageMeter({
 }
 
 export function CommandCodeSection({
-	value,
-	onChange,
-	onToggleDisabled,
+	prefix,
 	models: modelItems,
 	hiddenModels,
 	onToggleHidden,
@@ -150,9 +122,9 @@ export function CommandCodeSection({
 	onRefreshModels,
 }: CommandCodeSectionProps) {
 	const { t } = useTranslation("settings");
-	const { data, isLoading, dataUpdatedAt } = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
+	const { data, isLoading } = useQuery({
+		queryKey: ["commandcode", "usage", prefix],
+		queryFn: () => api.commandCodeUsage(prefix),
 		refetchInterval: 60_000,
 	});
 	const [refreshing, setRefreshing] = useState(false);
@@ -181,192 +153,130 @@ export function CommandCodeSection({
 		credits && monthlyUsed !== undefined ? credits.monthlyCredits + monthlyUsed : undefined;
 
 	return (
-		<Stack>
-			<Text size="sm" c="dimmed">
-				{t("commandcode.sectionDesc")}
-			</Text>
-
-			<Stack gap="xs" style={value.disabled ? { opacity: 0.6 } : undefined}>
-				<Group justify="space-between">
-					<Group gap="xs">
-						<Text fw={500} size="sm">
-							Command Code
-						</Text>
-						{value.disabled && (
-							<Badge size="xs" variant="light" color="gray">
-								{t("providerDisabled")}
-							</Badge>
-						)}
-						{!value.disabled && models.length > 0 && (
-							<Badge size="xs" variant="light">
-								{t("customApiModelsCount", { count: models.length })}
-							</Badge>
-						)}
-					</Group>
-					<Group gap="xs">
-						{isLoading ? (
-							<Loader size="xs" />
-						) : (
-							<Badge size="xs" variant="light" color={data?.loggedIn ? "green" : "gray"}>
-								{data?.loggedIn ? t("commandcode.configured") : t("commandcode.notConfigured")}
-							</Badge>
-						)}
-						<Switch
-							size="xs"
-							checked={!value.disabled}
-							aria-label={t("commandcode.enabled")}
-							onChange={onToggleDisabled}
-						/>
-					</Group>
-				</Group>
-
-				<TextInput
-					size="xs"
-					label={t("commandcode.apiKeyLabel")}
-					description={t("commandcode.apiKeyDesc")}
-					placeholder="user_..."
-					type="password"
-					value={value.apiKey}
-					onChange={(event) => onChange({ ...value, apiKey: event.currentTarget.value })}
-				/>
-				<Anchor
-					size="xs"
-					href={STUDIO_API_KEYS_URL}
-					target="_blank"
-					rel="noreferrer"
-					w="fit-content"
-				>
-					{t("commandcode.getKey")}
-				</Anchor>
-
-				<ProxyOverrideField
-					value={value.proxy}
-					onChange={(next) => onChange({ ...value, proxy: next })}
-				/>
-
-				<ClientFingerprintFields
-					value={{
-						userAgentMode: value.userAgentMode,
-						customUserAgent: value.customUserAgent,
-						extraHeaders: value.extraHeaders,
-					}}
-					onChange={(next) => onChange({ ...value, ...next })}
-				/>
-
-				{!isLoading && !data?.loggedIn && commandCodeReasonText(t, data?.reason) && (
-					<Alert color="yellow" variant="light">
-						{commandCodeReasonText(t, data?.reason)}
-					</Alert>
-				)}
-				{data?.error === "usage_unavailable" && (
-					<Alert color="red" variant="light">
-						{t("commandcode.usageFailed")}
-					</Alert>
-				)}
-
-				<Divider />
-				<Stack gap="xs">
-					<Text size="sm" fw={500}>
-						{t("commandcode.usageTitle")}
+		<Stack gap="xs">
+			<Group justify="space-between">
+				<Group gap="xs">
+					<Text fw={500} size="sm">
+						Command Code
 					</Text>
-					<Text size="xs" c="dimmed">
-						{t("commandcode.usageDesc")}
-					</Text>
-
-					{credits ? (
-						<Stack gap="sm" maw="100%">
-							{monthlyUsed !== undefined && monthlyTotal !== undefined && (
-								<UsageMeter
-									label={t("commandcode.monthlyCredits")}
-									used={monthlyUsed}
-									cap={monthlyTotal}
-								/>
-							)}
-							{data?.windowLimits?.fiveHour && (
-								<UsageMeter
-									label={t("commandcode.fiveHour")}
-									used={data.windowLimits.fiveHour.used}
-									cap={data.windowLimits.fiveHour.cap}
-									resetAt={data.windowLimits.fiveHour.resetAt}
-								/>
-							)}
-							{data?.windowLimits?.weekly && (
-								<UsageMeter
-									label={t("commandcode.weekly")}
-									used={data.windowLimits.weekly.used}
-									cap={data.windowLimits.weekly.cap}
-									resetAt={data.windowLimits.weekly.resetAt}
-								/>
-							)}
-							{summary && (
-								<Group gap="lg">
-									<Text size="xs" c="dimmed">
-										{t("commandcode.requests")}: {summary.totalCount}
-									</Text>
-									<Text size="xs" c="dimmed">
-										{t("commandcode.tokens")}: {formatCompactNumber(summary.totalTokens).compact}
-									</Text>
-									<Text size="xs" c="dimmed">
-										{t("commandcode.successRate")}: {summary.successRate}%
-									</Text>
-								</Group>
-							)}
-							<Text size="xs" c="dimmed">
-								{relativeTime(new Date(dataUpdatedAt).toISOString())}
-							</Text>
-						</Stack>
-					) : (
-						!isLoading && (
-							<Text size="xs" c="dimmed">
-								{t("commandcode.usageUnavailable")}
-							</Text>
-						)
-					)}
-				</Stack>
-
-				<Divider />
-				<Stack gap="xs">
-					<Text size="sm" fw={500}>
-						{t("commandcode.modelsTitle")}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{t("commandcode.modelsDesc")}
-					</Text>
-					<Group gap="xs">
-						<Button
-							size="xs"
-							variant="light"
-							leftSection={<IconRefresh size={14} />}
-							loading={refreshing}
-							disabled={value.disabled || !onRefreshModels}
-							onClick={handleRefreshModels}
-						>
-							{refreshing ? t("customApiRefreshModelsLoading") : t("customApiRefreshModels")}
-						</Button>
-					</Group>
 					{models.length > 0 && (
-						<ModelList
-							models={models}
-							hiddenModels={hiddenModels ?? new Set()}
-							onToggleHidden={onToggleHidden ?? (() => {})}
-							onBatchToggleHidden={onBatchToggleHidden}
-							modelProtocols={modelProtocols}
-							onModelProtocolChange={onModelProtocolChange}
-							protocols={COMMAND_CODE_PROTOCOL_OPTIONS}
-							onTestModel={onTestModel}
-						/>
+						<Badge size="xs" variant="light">
+							{t("customApiModelsCount", { count: models.length })}
+						</Badge>
 					)}
-					{customModels && onCustomModelsChange && (
-						<InlineCustomModels
-							prefix="CommandCode"
-							customModels={customModels}
-							onCustomModelsChange={onCustomModelsChange}
-							hiddenModels={hiddenModels ?? new Set()}
-							onToggleHidden={onToggleHidden ?? (() => {})}
-							onTestModel={onTestModel}
-						/>
-					)}
-				</Stack>
+				</Group>
+				{isLoading ? (
+					<Loader size="xs" />
+				) : (
+					<Badge size="xs" variant="light" color={data?.loggedIn ? "green" : "gray"}>
+						{data?.loggedIn ? t("commandcode.configured") : t("commandcode.notConfigured")}
+					</Badge>
+				)}
+			</Group>
+
+			{!isLoading && !data?.loggedIn && commandCodeReasonText(t, data?.reason) && (
+				<Alert color="yellow" variant="light">
+					{commandCodeReasonText(t, data?.reason)}
+				</Alert>
+			)}
+			{data?.error === "usage_unavailable" && (
+				<Alert color="red" variant="light">
+					{t("commandcode.usageFailed")}
+				</Alert>
+			)}
+
+			<Divider />
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("commandcode.usageTitle")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("commandcode.usageDesc")}
+				</Text>
+
+				{credits ? (
+					<Stack gap="sm" maw="100%">
+						{monthlyUsed !== undefined && monthlyTotal !== undefined && (
+							<UsageMeter
+								label={t("commandcode.monthlyCredits")}
+								used={monthlyUsed}
+								cap={monthlyTotal}
+							/>
+						)}
+						{data?.windowLimits?.fiveHour && (
+							<UsageMeter
+								label={t("commandcode.fiveHour")}
+								used={data.windowLimits.fiveHour.used}
+								cap={data.windowLimits.fiveHour.cap}
+								resetAt={data.windowLimits.fiveHour.resetAt}
+							/>
+						)}
+						{data?.windowLimits?.weekly && (
+							<UsageMeter
+								label={t("commandcode.weekly")}
+								used={data.windowLimits.weekly.used}
+								cap={data.windowLimits.weekly.cap}
+								resetAt={data.windowLimits.weekly.resetAt}
+							/>
+						)}
+						{summary && (
+							<Text size="xs" c="dimmed">
+								{t("commandcode.requests")}: {summary.totalCount} ·{" "}
+								{formatCompactNumber(summary.totalTokens).compact} · {summary.successRate}%
+							</Text>
+						)}
+					</Stack>
+				) : (
+					!isLoading && (
+						<Text size="xs" c="dimmed">
+							{t("commandcode.usageUnavailable")}
+						</Text>
+					)
+				)}
+			</Stack>
+
+			<Divider />
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("commandcode.modelsTitle")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("commandcode.modelsDesc")}
+				</Text>
+				<Group gap="xs">
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconRefresh size={14} />}
+						loading={refreshing}
+						disabled={!onRefreshModels}
+						onClick={handleRefreshModels}
+					>
+						{refreshing ? t("customApiRefreshModelsLoading") : t("customApiRefreshModels")}
+					</Button>
+				</Group>
+				{models.length > 0 && (
+					<ModelList
+						models={models}
+						hiddenModels={hiddenModels ?? new Set()}
+						onToggleHidden={onToggleHidden ?? (() => {})}
+						onBatchToggleHidden={onBatchToggleHidden}
+						modelProtocols={modelProtocols}
+						onModelProtocolChange={onModelProtocolChange}
+						protocols={COMMAND_CODE_PROTOCOL_OPTIONS}
+						onTestModel={onTestModel}
+					/>
+				)}
+				{customModels && onCustomModelsChange && (
+					<InlineCustomModels
+						prefix={prefix}
+						customModels={customModels}
+						onCustomModelsChange={onCustomModelsChange}
+						hiddenModels={hiddenModels ?? new Set()}
+						onToggleHidden={onToggleHidden ?? (() => {})}
+						onTestModel={onTestModel}
+					/>
+				)}
 			</Stack>
 		</Stack>
 	);

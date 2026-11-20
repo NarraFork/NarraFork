@@ -60,7 +60,7 @@ describe("registered provider source readiness", () => {
 		const gate = async (ready: boolean) => {
 			const providerReadiness = await listProviderReadiness();
 			expect(providerReadiness.find((entry) => entry.prefix === "tokendance")).toEqual({
-				id: "builtin:tokendance",
+				id: "platform-tokendance",
 				prefix: "tokendance",
 				name: "TokenDance",
 				ready,
@@ -115,7 +115,7 @@ describe("registered provider source readiness", () => {
 			} else settings.openaiProviders = [config];
 			const providerReadiness = await listProviderReadiness();
 			expect(providerReadiness.filter((entry) => entry.prefix === "tokendance")).toEqual([
-				{ id: "builtin:tokendance", prefix: "tokendance", name: "TokenDance", ready: false },
+				{ id: "platform-tokendance", prefix: "tokendance", name: "TokenDance", ready: false },
 				{ id: "api:conflicting-api", prefix: "tokendance", name: "Legacy API", ready: false },
 			]);
 			expect(countConfiguredProviders({ providerReadiness })).toBe(0);
@@ -139,7 +139,7 @@ describe("registered provider source readiness", () => {
 			}));
 			const restored = await listProviderReadiness();
 			expect(restored).toContainEqual({
-				id: "builtin:tokendance",
+				id: "platform-tokendance",
 				prefix: "tokendance",
 				name: "TokenDance",
 				ready: true,
@@ -158,7 +158,7 @@ describe("registered provider source readiness", () => {
 		codexReady = true;
 		const providerReadiness = await listProviderReadiness();
 		expect(providerReadiness).toContainEqual({
-			id: "builtin:codex",
+			id: "platform-codex",
 			prefix: "codex",
 			name: "Codex",
 			ready: true,

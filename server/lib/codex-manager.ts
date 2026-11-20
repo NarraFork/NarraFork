@@ -799,21 +799,45 @@ export class CodexManager {
 
 	// ==================== Credential Selection ====================
 
-	async acquireContext(sessionKey?: string): Promise<CallContext> {
+	/**
+	 * 取一个可用凭据。
+	 *
+	 * `options.credentialIds` 把候选限定在平台实例自己选中的凭据上：键不存在表示不限制
+	 * （内置实例沿用整个账号池），空数组表示这个实例一个都没选，直接失败——绝不回落到
+	 * 其它实例的凭据。
+	 */
+	async acquireContext(
+		sessionKey?: string,
+		options?: { credentialIds?: readonly string[] },
+	): Promise<CallContext> {
 		this.reviveQuotaResetCredentials();
 		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
-		const total = this.poolEntries.length;
+		const allowed = options?.credentialIds ? new Set(options.credentialIds) : undefined;
+		if (allowed && !this.poolEntries.some((entry) => allowed.has(entry.id))) {
+			throw new Error("No usable Codex credential is selected for this instance");
+		}
+		// Archived credentials are retired: they never participate in selection, so
+		// the retry budget must only count the pool that can actually serve.
+		const total = allowed
+			? this.poolEntries.filter((entry) => allowed.has(entry.id)).length
+			: this.poolEntries.length;
 		const triedIds = new Set<string>();
 		// Priority mode deliberately follows priority instead of session affinity.
 		const stickyEnabled = this.loadBalancingMode !== "priority" && !!sessionKey;
-		const stickyId = stickyEnabled && sessionKey ? this.sessionAffinity.get(sessionKey) : undefined;
+		let stickyId = stickyEnabled && sessionKey ? this.sessionAffinity.get(sessionKey) : undefined;
+		// 实例把候选限死在 credentialIds 上：粘到名单外的凭据必须解绑，
+		// 否则这一个会话会继续用别的实例的账号。
+		if (stickyId && allowed && !allowed.has(stickyId)) {
+			if (sessionKey) this.unbindSession(sessionKey);
+			stickyId = undefined;
+		}
 
 		while (triedIds.size < total) {
-			const entry = this.selectEntry(triedIds, stickyId);
+			const entry = this.selectEntry(triedIds, stickyId, allowed);
 			if (!entry) {
 				if (this.trySelfHeal()) {
-					const healed = this.selectEntry(triedIds);
+					const healed = this.selectEntry(triedIds, undefined, allowed);
 					if (healed) {
 						const ctx = await this.tryEnsureToken(healed);
 						if (ctx) {
@@ -843,10 +867,17 @@ export class CodexManager {
 		return this.entries.filter((e) => !isArchivedCodexCredential(e));
 	}
 
-	private selectEntry(excludeIds?: Set<string>, stickyId?: string): CodexCredential | null {
+	private selectEntry(
+		excludeIds?: Set<string>,
+		stickyId?: string,
+		allowedIds?: ReadonlySet<string>,
+	): CodexCredential | null {
 		const tierOrder = this.getEffectiveTierOrder();
+		const entries = allowedIds
+			? this.entries.filter((entry) => allowedIds.has(entry.id))
+			: this.entries;
 		return (
-			selectPoolEntry(this.entries, {
+			selectPoolEntry(entries, {
 				now: Date.now(),
 				mode: this.loadBalancingMode,
 				exclude: excludeIds,
@@ -2510,6 +2541,16 @@ export class CodexManager {
 		this.reviveQuotaResetCredentials();
 		this.applyCachedQuotaStates();
 		return this.entries.some((entry) => !isArchivedCodexCredential(entry) && !entry.disabled);
+	}
+
+	/** 选中凭据里是否还有可用的——平台实例按自己的凭据集合判断就绪。 */
+	hasAvailableCredentialsAmong(ids: readonly string[]): boolean {
+		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
+		const allowed = new Set(ids);
+		return this.entries.some(
+			(entry) => !isArchivedCodexCredential(entry) && !entry.disabled && allowed.has(entry.id),
+		);
 	}
 
 	/** Enabled, non-archived credentials — i.e. what can actually serve a request. */

@@ -67,21 +67,33 @@ function authHeaders(): HeadersInit {
 }
 
 export const commandCodeApi = {
-	async commandCodeStatus(): Promise<CommandCodeStatus> {
-		const response = await fetch(`${apiBase()}/commandcode/status`, { headers: authHeaders() });
+	async commandCodeStatus(prefix?: string): Promise<CommandCodeStatus> {
+		const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
+		const response = await fetch(`${apiBase()}/commandcode/status${query}`, {
+			headers: authHeaders(),
+		});
 		return (await response.json()) as CommandCodeStatus;
 	},
 
-	async commandCodeUsage(): Promise<CommandCodeUsageResponse> {
-		const response = await fetch(`${apiBase()}/commandcode/usage`, { headers: authHeaders() });
+	/** 额度按平台实例取：每个实例用自己的 key 与 baseUrl。 */
+	async commandCodeUsage(prefix?: string): Promise<CommandCodeUsageResponse> {
+		const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
+		const response = await fetch(`${apiBase()}/commandcode/usage${query}`, {
+			headers: authHeaders(),
+		});
 		return (await response.json()) as CommandCodeUsageResponse;
 	},
 
 	/**
 	 * 丢弃服务端的模型缓存并重新拉取。
-	 * `apiKey` 只在设置页有尚未保存的新 key 时传入，服务端不会把它写进 settings。
+	 * `apiKey`/`baseUrl` 只在设置页有尚未保存的草稿时传入，服务端不会把它写进 settings；
+	 * `prefix` 指定按哪个平台实例的配置拉取。
 	 */
-	async commandCodeRefreshModels(draft?: { apiKey?: string; baseUrl?: string }): Promise<string[]> {
+	async commandCodeRefreshModels(draft?: {
+		apiKey?: string;
+		baseUrl?: string;
+		prefix?: string;
+	}): Promise<string[]> {
 		const response = await fetch(`${apiBase()}/commandcode/models/refresh`, {
 			method: "POST",
 			headers: { ...authHeaders(), "Content-Type": "application/json" },

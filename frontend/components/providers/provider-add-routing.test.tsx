@@ -155,6 +155,22 @@ const { Route: callbackFileRoute } = await import(
 const tokenDanceFlow = await import("./tokendance-flow");
 restoreDom();
 
+/** 迁移出来的平台实例：卡片只来自这份清单。 */
+function platformInstance(
+	platform: "codex" | "CommandCode" | "tokendance",
+	suffix = "",
+	config: Record<string, unknown> = {},
+) {
+	return {
+		id: `platform-${platform}`,
+		platform,
+		suffix,
+		prefix: platform,
+		disabled: false,
+		config,
+	};
+}
+
 const initialSettings = {
 	customApiProviders: [
 		{
@@ -168,7 +184,15 @@ const initialSettings = {
 		},
 	],
 	nugProviders: [],
-	agent: { disabledProviders: [], hiddenModels: [] },
+	agent: {
+		disabledProviders: [],
+		hiddenModels: [],
+		platformInstances: [
+			platformInstance("codex"),
+			platformInstance("CommandCode"),
+			platformInstance("tokendance"),
+		],
+	},
 };
 const i18n = createInstance();
 await i18n.init({
@@ -301,7 +325,17 @@ beforeEach(() => {
 		savedPayloads.push(clone(payload));
 		requestOptions.push(options);
 		if (saveGate) await saveGate;
-		if (!saveError || persistBeforeError) serverSettings = { ...serverSettings, ...clone(payload) };
+		if (!saveError || persistBeforeError) {
+			const patch = clone(payload) as Record<string, unknown>;
+			// 服务端对 `agent` 是浅合并：只带部分字段的补丁不会清掉平台实例清单等设置。
+			if (patch.agent && typeof patch.agent === "object") {
+				patch.agent = {
+					...(serverSettings.agent as Record<string, unknown>),
+					...(patch.agent as Record<string, unknown>),
+				};
+			}
+			serverSettings = { ...serverSettings, ...patch };
+		}
 		if (saveError) throw saveError;
 		return clone(serverSettings);
 	});
@@ -370,7 +404,7 @@ async function mount(href = "/settings/providers") {
 	});
 }
 function button(key: string) {
-	const found = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+	const found = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
 		(node) => node.textContent?.trim() === text(key),
 	);
 	if (!found) throw new Error(`Missing button: ${key}`);
@@ -465,7 +499,7 @@ describe("provider deep link", () => {
 	test("`?provider=` opens the provider and follows URL changes while mounted", async () => {
 		await mount("/settings/providers?provider=existing");
 		expect(currentCustomDetail()?.provider.id).toBe("existing");
-		expect(container.querySelector("button.mantine-ActionIcon-root")).not.toBeNull();
+		expect(container.querySelector('[data-testid="provider-config-back"]')).not.toBeNull();
 
 		// Leaving the detail returns to the overview and clears the link.
 		await leaveDetail();
@@ -589,8 +623,8 @@ describe("provider add nested route", () => {
 				});
 			expect(router.state.location.pathname).toBe("/settings/providers");
 			expectOriginalDisabled();
-			// codex + CommandCode + existing: CommandCode 平台卡加入概览后多一张。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+			// codex + CommandCode + TokenDance + existing：平台卡只来自实例清单。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 			expect(container.textContent).not.toContain("Discard this draft");
 			expectNoSave();
 		});
@@ -635,8 +669,8 @@ describe("provider add nested route", () => {
 			await leaveDetail();
 			expectOriginalDisabled();
 			expect(container.textContent).toContain(text("unsavedSave"));
-			// codex + CommandCode + existing + 新增的 draft。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
+			// codex + CommandCode + TokenDance + existing + 新增的 draft。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(5);
 		});
 	}
 
@@ -754,7 +788,7 @@ describe("provider add nested route", () => {
 		);
 		// The removed provider no longer resolves from `?provider=`, so the page is back
 		// on the overview instead of an empty detail view.
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.textContent).toContain(text("providerStatsTotal"));
 		await openAdd();
 		await fillDraft();
 		await submit();
@@ -995,7 +1029,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => deleteSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing connected TokenDance");
 		expect(card.textContent).toContain(text("providerTypePlatform"));
@@ -1022,7 +1056,11 @@ describe("provider add nested route", () => {
 	test("successful TokenDance callback opens its detail with unified hide/show model controls", async () => {
 		serverSettings = {
 			...clone(initialSettings),
-			agent: { hiddenModels: ["existing:keep"], disabledProviders: [] },
+			agent: {
+				...clone(initialSettings).agent,
+				hiddenModels: ["existing:keep"],
+				disabledProviders: [],
+			},
 			tokendance: {
 				connected: true,
 				name: "TokenDance fresh",
@@ -1110,7 +1148,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => refreshSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
@@ -1155,7 +1193,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		if (!toggle) throw new Error("Missing platform switch");
@@ -1167,14 +1205,18 @@ describe("provider add nested route", () => {
 		expect(saveCalls).toBe(0);
 		expect(container.textContent).toContain(text("unsavedSave"));
 		expect(container.textContent).toContain(text("unsavedDiscard"));
-		// 保存条是唯一的提交点：点「保存更改」后才写连接与 settings。
+		// 保存条是唯一的提交点：平台实例的开关只写 disabledProviders，不碰连接记录。
 		await click(button("unsavedSave"));
-		expect(updateSpy).toHaveBeenCalledTimes(1);
-		expect(updateSpy.mock.calls[0]?.[0]).toBe(true);
+		expect(updateSpy).toHaveBeenCalledTimes(0);
 		expect(saveCalls).toBe(1);
+		// 平台实例的开关落在实例自己的 disabled 上，而不是前缀集合。
 		expect(
-			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
-		).not.toContain("tokendance");
+			(
+				savedPayloads.at(-1)?.agent as {
+					platformInstances?: Array<{ platform: string; disabled: boolean }>;
+				}
+			).platformInstances?.find((entry) => entry.platform === "tokendance")?.disabled,
+		).toBe(true);
 	});
 
 	test("TokenDance detail enable switch drafts locally too", async () => {
@@ -1208,7 +1250,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
@@ -1239,10 +1281,10 @@ describe("provider add nested route", () => {
 			[...container.querySelectorAll('[role="button"]')].findIndex((node) =>
 				node.textContent?.includes(needle),
 			);
-		// 两者都启用：按插入序 codex 在 CommandCode 前。
-		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		// 两者都启用：按插入序 Codex 在 Command Code 前。
+		expect(cardIndex("Codex")).toBeLessThan(cardIndex("Command Code"));
 		const codexCard = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("codex"),
+			node.textContent?.includes("Codex"),
 		);
 		const toggle = codexCard?.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		if (!toggle) throw new Error("Missing codex platform switch");
@@ -1252,14 +1294,18 @@ describe("provider add nested route", () => {
 		});
 		expect(saveCalls).toBe(0);
 		expect(container.textContent).toContain(text("unsavedSave"));
-		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		expect(cardIndex("Codex")).toBeLessThan(cardIndex("Command Code"));
 		// 保存后才重排一次：codex 在平台分区内沉底。
 		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		expect(
-			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
-		).toContain("codex");
-		expect(cardIndex("codex")).toBeGreaterThan(cardIndex("CommandCode"));
+			(
+				savedPayloads.at(-1)?.agent as {
+					platformInstances?: Array<{ platform: string; disabled: boolean }>;
+				}
+			).platformInstances?.find((entry) => entry.platform === "codex")?.disabled,
+		).toBe(true);
+		expect(cardIndex("Codex")).toBeGreaterThan(cardIndex("Command Code"));
 	});
 
 	test("slow settings keep the add-page title and back navigation visible", async () => {
@@ -1291,9 +1337,78 @@ describe("provider add nested route", () => {
 		await click(button("addProviderCancel"));
 		expect(router.state.location.pathname).toBe("/settings/providers");
 		expect(container.textContent).toContain("Existing provider");
-		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
-		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+		// codex + CommandCode + TokenDance + existing：平台卡只来自实例清单。
+		expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 		expectNoSave();
+	});
+
+	test("添加平台：后缀与前缀留空时自动取第一个空闲数字，且先进草稿", async () => {
+		await mount();
+		await click(button("platformInstanceAddButton"));
+		// codex / CommandCode / tokendance 已占用，所以自动编号从 1 开始。
+		expect(document.body.textContent).toContain("codex-1:model");
+		await click(button("platformInstanceAdd"));
+		// 与 API key 类供应商一致：先落草稿，底部出现保存条，点「保存更改」才落库。
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		expect(container.querySelectorAll('[role="button"]').length).toBe(5);
+		await click(button("unsavedSave"));
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as {
+				platformInstances?: Array<{ platform: string; suffix: string; prefix: string }>;
+			}
+		).platformInstances;
+		expect(saved).toHaveLength(4);
+		expect(saved?.at(-1)).toMatchObject({ platform: "codex", suffix: "1", prefix: "codex-1" });
+	});
+
+	test("卡片删除按钮走草稿：放弃更改会还原，保存后才落库", async () => {
+		await mount();
+		const deleteButtons = () =>
+			[...container.querySelectorAll<HTMLButtonElement>("button")].filter(
+				(node) => node.getAttribute("aria-label") === text("platformInstanceDelete"),
+			);
+		// 三张平台卡各有一个垃圾桶，位置在开关右侧。
+		expect(deleteButtons()).toHaveLength(3);
+		await click(deleteButtons()[0] as HTMLButtonElement);
+		expect(saveCalls).toBe(0);
+		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+		expect(container.textContent).toContain(text("unsavedSave"));
+
+		await click(button("unsavedDiscard"));
+		expect(container.querySelectorAll('[role="button"]').length).toBe(4);
+		expect(saveCalls).toBe(0);
+
+		await click(deleteButtons()[0] as HTMLButtonElement);
+		await click(button("unsavedSave"));
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as { platformInstances?: Array<{ platform: string }> }
+		).platformInstances;
+		expect(saved?.map((entry) => entry.platform)).toEqual(["CommandCode", "tokendance"]);
+	});
+
+	test("平台实例的开关只写草稿，保存时才提交 disabled", async () => {
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance"),
+		);
+		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		if (!toggle) throw new Error("Missing platform switch");
+		await act(async () => {
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		await click(button("unsavedSave"));
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as {
+				platformInstances?: Array<{ platform: string; disabled: boolean }>;
+			}
+		).platformInstances;
+		expect(saved?.find((entry) => entry.platform === "tokendance")?.disabled).toBe(true);
 	});
 });
 
@@ -1315,7 +1430,10 @@ describe("草稿删除供应商", () => {
 
 		// 与详情页里的删除同一条路径：只改草稿，卡片立刻从概览消失。
 		expect(card("Existing provider")).toBeUndefined();
-		expect(container.querySelectorAll('[role="button"]')).toHaveLength(2);
+		// 只剩平台卡片：平台数量随实例清单变化，这里只断言被删的那张已经不在。
+		const remainingCards = [...container.querySelectorAll('[role="button"]')];
+		expect(remainingCards.length).toBeGreaterThan(0);
+		for (const node of remainingCards) expect(node.textContent).not.toContain("Existing provider");
 		expectNoSave();
 
 		const discard = [...container.querySelectorAll("button")].find(
@@ -1349,6 +1467,10 @@ describe("草稿删除供应商", () => {
 			node.textContent?.includes(text("providerTypePlatform")),
 		);
 		expect(platform).toBeDefined();
+		// 平台卡片删的是一条实例，用的是实例自己的文案，不是「删除这个供应商」。
+		expect(
+			platform?.querySelector(`[aria-label="${text("platformInstanceDelete")}"]`),
+		).not.toBeNull();
 		expect(platform?.querySelector(`[aria-label="${text("providerDelete")}"]`)).toBeNull();
 	});
 
@@ -1369,9 +1491,9 @@ describe("草稿删除供应商", () => {
 
 		// 卡片的数据来自服务端下发的模型分组，草稿删除后必须立刻消失。
 		expect(card("Existing provider")).toBeUndefined();
-		expect(
-			[...container.querySelectorAll('[role="button"]')].map((node) => node.textContent),
-		).toHaveLength(2);
+		for (const node of container.querySelectorAll('[role="button"]')) {
+			expect(node.textContent).not.toContain("Existing provider");
+		}
 
 		// 放弃更改：草稿回到快照，URL 仍指向它，于是又落回这条供应商的详情页。
 		const discard = [...container.querySelectorAll("button")].find(

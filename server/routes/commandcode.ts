@@ -14,7 +14,7 @@ import {
 import { invalidateCommandCodeModelsCache, listCommandCodeModels } from "../lib/commandcode-models";
 import { CommandCodeUsageError, fetchCommandCodeUsage } from "../lib/commandcode-usage";
 import { logger } from "../lib/logger";
-import { settings } from "../lib/settings";
+import { commandCodeConfigForPrefix } from "../lib/settings/provider";
 import { requireAdmin } from "../middleware/auth";
 
 export const commandCodeRoutes = new Hono();
@@ -23,6 +23,8 @@ const refreshSchema = z
 	.object({
 		apiKey: z.string().max(4_000).optional(),
 		baseUrl: z.string().max(2_000).optional(),
+		/** 按哪个平台实例的配置拉取；省略时用默认前缀那条。 */
+		prefix: z.string().max(64).optional(),
 	})
 	.strict();
 
@@ -36,7 +38,8 @@ function usableDraftKey(value: string | undefined): string | undefined {
 /** GET /api/commandcode/status — 凭据是否可用。 */
 commandCodeRoutes.get("/status", (c) => {
 	// 状态查询要能反映"刚在 CLI 里登录"，所以跳过凭据短缓存。
-	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey, { fresh: true });
+	const config = commandCodeConfigForPrefix(c.req.query("prefix") || undefined);
+	const auth = resolveCommandCodeToken(config?.apiKey, { fresh: true });
 	return c.json({
 		loggedIn: !!auth.credential,
 		userName: auth.credential?.userName,
@@ -47,14 +50,15 @@ commandCodeRoutes.get("/status", (c) => {
 /** GET /api/commandcode/usage — 额度；同时回报登录状态，让前端一次请求就能渲染。 */
 commandCodeRoutes.get("/usage", async (c) => {
 	// 与 /status 同理：额度面板上的登录状态必须是当前的真实状态。
-	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey, { fresh: true });
+	const config = commandCodeConfigForPrefix(c.req.query("prefix") || undefined);
+	const auth = resolveCommandCodeToken(config?.apiKey, { fresh: true });
 	if (!auth.credential) {
 		return c.json({ loggedIn: false, reason: auth.reason });
 	}
 	try {
 		return c.json({
 			loggedIn: true,
-			...(await fetchCommandCodeUsage(auth.credential.token, settings.commandCode?.baseUrl)),
+			...(await fetchCommandCodeUsage(auth.credential.token, config?.baseUrl)),
 		});
 	} catch (error) {
 		const code = error instanceof CommandCodeUsageError ? error.message : "usage_unavailable";
@@ -87,9 +91,11 @@ commandCodeRoutes.post("/models/refresh", requireAdmin, async (c) => {
 		if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
 		draft = parsed.data;
 	}
-	const apiKey = usableDraftKey(draft.apiKey) ?? settings.commandCode?.apiKey;
-	const baseUrl = draft.baseUrl?.trim() || settings.commandCode?.baseUrl;
-	invalidateCommandCodeModelsCache();
+	const saved = commandCodeConfigForPrefix(draft.prefix);
+	const apiKey = usableDraftKey(draft.apiKey) ?? saved?.apiKey;
+	const baseUrl = draft.baseUrl?.trim() || saved?.baseUrl;
+	// 只丢这条实例的模型缓存：其它实例的列表不该因为一次刷新被清空。
+	invalidateCommandCodeModelsCache(apiKey, baseUrl);
 	// 刷新也意味着"现在的凭据"，不要沿用短缓存里的旧 token。
 	invalidateCommandCodeAuthCache();
 	const result = await listCommandCodeModels(apiKey, baseUrl);

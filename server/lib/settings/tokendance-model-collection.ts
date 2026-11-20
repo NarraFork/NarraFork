@@ -70,16 +70,24 @@ export const TOKENDANCE_COLLECTED_MODEL_IDS = [
 	"mimo-v2.6-flash",
 ] as const;
 
-/** Seed the existing unified visibility setting once; later edits are authoritative. */
+/**
+ * Seed the existing unified visibility setting once per connected TokenDance instance;
+ * later edits are authoritative.
+ */
 export function initializeTokenDanceModelCollection(settings: NarraForkSettings): boolean {
-	const connection = settings.tokendance;
-	if (!connection?.apiKey || connection.modelCollectionInitialized) return false;
-	settings.agent.hiddenModels = [
-		...new Set([
-			...(settings.agent.hiddenModels ?? []),
-			...TOKENDANCE_COLLECTED_MODEL_IDS.map((id) => `tokendance:${id}`),
-		]),
-	];
-	connection.modelCollectionInitialized = true;
-	return true;
+	let changed = false;
+	for (const instance of settings.agent?.platformInstances ?? []) {
+		if (instance.platform !== "tokendance") continue;
+		const config = instance.config as { apiKey?: string; modelCollectionInitialized?: boolean };
+		if (!config.apiKey || config.modelCollectionInitialized) continue;
+		settings.agent.hiddenModels = [
+			...new Set([
+				...(settings.agent.hiddenModels ?? []),
+				...TOKENDANCE_COLLECTED_MODEL_IDS.map((id) => `${instance.prefix}:${id}`),
+			]),
+		];
+		instance.config = { ...instance.config, modelCollectionInitialized: true };
+		changed = true;
+	}
+	return changed;
 }

@@ -44,15 +44,17 @@ export interface CommandCodeProviderSettings {
 export function buildCommandCodeProvider(
 	model: string,
 	config?: CommandCodeProviderSettings,
+	/** 实例自己的前缀；省略时是内置的那一条。 */
+	prefix: string = COMMAND_CODE_PREFIX,
 ): ProviderAdapter | undefined {
 	if (config?.disabled) return undefined;
 	const auth = resolveCommandCodeToken(config?.apiKey);
 	if (!auth.credential) return undefined;
-	const bare = bareCommandCodeModelId(model);
+	const bare = bareCommandCodeModelId(model, prefix);
 	const shared = {
 		id: "CommandCode",
 		name: "Command Code",
-		prefix: COMMAND_CODE_PREFIX,
+		prefix,
 		apiKey: auth.credential.token,
 		defaultModel: bare || model,
 		baseUrl: commandCodeProviderBase(config?.baseUrl),
@@ -63,11 +65,13 @@ export function buildCommandCodeProvider(
 	};
 	// 逐模型协议：优先取设置页里为该模型显式选择的协议（「编辑此连接覆盖」保存的那层优先），
 	// 其次用 commandCode.endpoints、目录里的 supported_endpoints，最后按裸模型名推断。
-	const chosen = resolveModelProtocol(COMMAND_CODE_PREFIX, model);
-	const endpoint = selectCommandCodeEndpoint(model, {
+	const chosen = resolveModelProtocol(prefix, model);
+	const endpoint = selectCommandCodeEndpoint(bare || model, {
 		protocol: chosen,
 		overrides: config?.endpoints,
-		supportedEndpoints: getCachedCommandCodeModel(bare)?.endpoints,
+		// 目录按实例自己的凭据缓存：不同实例可能是不同上游。
+		supportedEndpoints: getCachedCommandCodeModel(bare, config?.apiKey, config?.baseUrl)?.endpoints,
+		prefix,
 	});
 	if (endpoint === "messages") {
 		return new AnthropicProvider(shared);

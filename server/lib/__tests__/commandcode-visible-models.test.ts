@@ -20,7 +20,7 @@ const OTHER_MODEL_ID = "qwen/other-model";
 const OTHER_MODEL = `CommandCode:${OTHER_MODEL_ID}`;
 
 const originalFetch = globalThis.fetch;
-const originalCommandCode = settings.commandCode;
+const originalInstances = structuredClone(settings.agent.platformInstances ?? []);
 const originalHiddenModels = settings.agent.hiddenModels;
 
 /** 本机有没有 CLI 凭据决定了"无凭据"用例能不能跑，见文件末尾。 */
@@ -42,15 +42,21 @@ async function primeCatalog(apiKey = "test_key", modelId = MODEL_ID): Promise<vo
 	await listCommandCodeModels(apiKey, BASE);
 }
 
+/** 清单是唯一事实来源：改默认那条 Command Code 实例的凭据与启用状态。 */
 function configureCommandCode(apiKey: string, disabled: boolean): void {
-	settings.commandCode = { disabled, apiKey, baseUrl: BASE };
+	const target = settings.agent.platformInstances?.find(
+		(entry) => entry.platform === "CommandCode",
+	);
+	if (!target) throw new Error("迁移应该已经生成默认的 Command Code 实例");
+	target.config = { ...target.config, apiKey, baseUrl: BASE };
+	target.disabled = disabled;
 }
 
 afterEach(() => {
 	globalThis.fetch = originalFetch;
 	invalidateCommandCodeModelsCache();
 	invalidateCommandCodeAuthCache();
-	settings.commandCode = originalCommandCode;
+	settings.agent.platformInstances = structuredClone(originalInstances);
 	settings.agent.hiddenModels = originalHiddenModels;
 });
 

@@ -48,6 +48,7 @@ import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
 	nugOAuthKeyOwner,
+	platformInstanceKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
@@ -1671,8 +1672,12 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
+			const incomingInstanceId = typeof copy.id === "string" ? copy.id : "";
 			if (!copy.id || existingIds.has(String(copy.id))) copy.id = uniqueProviderId(existingIds);
 			existingIds.add(String(copy.id));
+			// 实例密钥由设置保存按新 id 落库；这里只登记导出侧的 owner 以便统计。
+			if (incomingInstanceId)
+				addedSingleKeyOwners.add(platformInstanceKeyOwner(incomingInstanceId));
 			if (prefix && existingPrefixes.has(prefix)) {
 				let n = 2;
 				let candidate = `${prefix}-${n}`;

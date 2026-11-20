@@ -230,6 +230,8 @@ export interface ModelSelectionSettings {
 	agent?: {
 		reasoningEffortBlocklist?: readonly ReasoningEffortBlocklistEntry[] | null;
 		defaultReasoningEffort?: string;
+		/** 平台实例清单：Codex 的额度指示与思考档位按实例前缀判断。 */
+		platformInstances?: ReadonlyArray<{ prefix: string; platform: string; disabled: boolean }>;
 	};
 }
 
@@ -458,7 +460,15 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		const providerPrefix = resolvedModel?.split(":")[0];
 		return (!!providerPrefix && codexCapableProviders.has(providerPrefix)) || isCodexChannelModel;
 	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
-	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
+	// Codex 额度指示器看的是账号池：默认前缀或任何一个 Codex 实例都算。
+	const isBuiltInCodexModel = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return false;
+		if (prefix === "codex") return true;
+		return (settingsData?.agent?.platformInstances ?? []).some(
+			(entry) => entry.prefix === prefix && entry.platform === "codex",
+		);
+	}, [resolvedModel, settingsData?.agent?.platformInstances]);
 
 	const { supportsReasoningEffort, reasoningEffortOptions } = useMemo(
 		() =>
