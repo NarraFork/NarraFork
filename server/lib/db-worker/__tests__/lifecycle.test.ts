@@ -17,12 +17,20 @@ import {
 	resumeDbWorkerPool,
 	runEphemeralReadTask,
 	runReadTask,
+	runShortReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
 } from "../pool";
-import { DB_WORKER_READY_TIMEOUT_MS } from "../protocol";
+import { DB_WORKER_READY_TIMEOUT_MS, type SelectRowsParams } from "../protocol";
 
 const task = { kind: "storageScanContext" } as const;
+const shortTask: SelectRowsParams = {
+	kind: "selectRows",
+	sql: "SELECT value FROM fixture",
+	params: [],
+	maxRows: 1,
+};
+const shortResult = { columns: ["value"], rows: [[42]] };
 const unusedDb = "/must-not-open-on-main-thread.sqlite";
 const failureOf = (promise: Promise<unknown>) => promise.catch((error: unknown) => error);
 function deferred<T = void>() {
@@ -37,6 +45,7 @@ let handles: WorkerHandle<Worker>[];
 let restores: Array<() => void>;
 let posted: Array<{ type?: string; requestId?: string; traceParent?: string }>;
 let nextSpawn: ReturnType<typeof deferred<void>>;
+let nextTaskPost: ReturnType<typeof deferred<void>>;
 function fixture(body: string, announce = true) {
 	const path = join(dir, `fixture-${Math.random()}.ts`);
 	writeFileSync(
@@ -49,6 +58,26 @@ const success = `parentPort.on("message", data => {
 	if (data.type === "task") parentPort.postMessage({type:"result",requestId:data.requestId,result:42});
 });`;
 const hanging = `parentPort.on("message", () => {});`;
+function shortReadDb() {
+	const dbPath = join(dir, "short-read.sqlite");
+	const db = new Database(dbPath, { create: true });
+	db.run("CREATE TABLE fixture (value INTEGER); INSERT INTO fixture VALUES (42)");
+	db.close();
+	return dbPath;
+}
+function gateWorkerTermination(handle: WorkerHandle<Worker> | undefined) {
+	if (!handle) throw new Error("Expected an owned worker");
+	const gate = deferred();
+	const stopping = deferred();
+	const worker = handle.resource;
+	const terminate = worker.terminate.bind(worker);
+	spyOn(worker, "terminate").mockImplementation(async () => {
+		stopping.resolve();
+		await gate.promise;
+		return terminate();
+	});
+	return { stopping: stopping.promise, release: gate.resolve };
+}
 beforeEach(async () => {
 	await resetDbWorkerPoolForTest();
 	dir = mkdtempSync(join(tmpdir(), "nf-db-lifecycle-"));
@@ -56,6 +85,7 @@ beforeEach(async () => {
 	restores = [];
 	posted = [];
 	nextSpawn = deferred();
+	nextTaskPost = deferred();
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
 	const create = WorkerHandle.thread;
 	const spawns = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
@@ -65,6 +95,7 @@ beforeEach(async () => {
 		spyOn(handle.resource, "postMessage").mockImplementation((message) => {
 			posted.push(message);
 			send(message);
+			if (message.type === "task") nextTaskPost.resolve();
 		});
 		nextSpawn.resolve();
 		return handle;
@@ -186,6 +217,102 @@ test("queue bounds overload and cancellation removes every waiter", async () => 
 	});
 });
 
+test("short reads execute and reuse a worker while the ordinary pool is full", async () => {
+	const dbPath = shortReadDb();
+	fixture(hanging);
+	const controller = new AbortController();
+	const ordinary = () => failureOf(runReadTask(dbPath, task, { signal: controller.signal }));
+	const active = ordinary();
+	const queued = Array.from({ length: DB_WORKER_MAX_QUEUE }, ordinary);
+	try {
+		await nextTaskPost.promise;
+		expect(await ordinary()).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
+		setDbWorkerSpecifiersForTest(null);
+		expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
+		expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
+		expect(getDbWorkerPoolStats()).toMatchObject({ busy: 1, queued: DB_WORKER_MAX_QUEUE });
+		expect(handles).toHaveLength(2);
+		expect(posted.filter((message) => message.type === "task")).toHaveLength(3);
+	} finally {
+		controller.abort();
+		await Promise.all([active, ...queued]);
+	}
+});
+
+test("short-read congestion rejects overflow and drops cancelled or expired waiters", async () => {
+	const dbPath = shortReadDb();
+	fixture(hanging);
+	const activeController = new AbortController();
+	const queuedController = new AbortController();
+	const active = failureOf(
+		runShortReadTask(dbPath, shortTask, { signal: activeController.signal }),
+	);
+	await nextTaskPost.promise;
+	const queued = Array.from({ length: 7 }, () =>
+		failureOf(runShortReadTask(dbPath, shortTask, { signal: queuedController.signal })),
+	);
+	const expiring = failureOf(runShortReadTask(dbPath, shortTask, { timeoutMs: 100 }));
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		code: "DB_READ_TASK_OVERLOADED",
+	});
+	expect(await expiring).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+	queuedController.abort();
+	for (const rejected of await Promise.all(queued)) {
+		expect((rejected as Error).message).toMatch(/abort/i);
+	}
+	activeController.abort();
+	expect(((await active) as Error).message).toMatch(/abort/i);
+	expect(handles).toHaveLength(1);
+	expect(posted.filter((message) => message.type === "task")).toHaveLength(1);
+});
+
+test("short-read startup and execution failures never replay, and disabling blocks reuse", async () => {
+	const dbPath = shortReadDb();
+	fixture('throw new Error("startup failed");', false);
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		reason: "worker_spawn_failed",
+	});
+	expect(handles).toHaveLength(1);
+	expect(typeof (await handles[0]?.exited)).toBe("number");
+	expect(getDbWorkerPoolStats().spawnFailures).toBe(0);
+	for (let i = 0; i < 2; i++) {
+		expect(await failureOf(runReadTask(dbPath, task))).toMatchObject({
+			reason: "worker_spawn_failed",
+		});
+	}
+	expect(await failureOf(runReadTask(dbPath, task))).toMatchObject({
+		reason: "worker_unavailable",
+	});
+	expect(posted.filter((message) => message.type === "task")).toHaveLength(0);
+
+	fixture(`parentPort.on("message", data => {
+		if (data.type === "task") throw new Error("short execution failed");
+	});`);
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		name: "DbReadTaskExecutionError",
+	});
+	expect(handles).toHaveLength(4);
+	expect(typeof (await handles[3]?.exited)).toBe("number");
+	expect(posted.filter((message) => message.type === "task")).toHaveLength(1);
+	setDbWorkerSpecifiersForTest(null);
+	expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
+	expect(await failureOf(runReadTask(dbPath, task))).toMatchObject({
+		reason: "worker_unavailable",
+	});
+
+	process.env.NARRAFORK_DB_WORKER = "off";
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		reason: "disabled_by_env",
+	});
+	delete process.env.NARRAFORK_DB_WORKER;
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "0";
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		reason: "concurrency_zero",
+	});
+	expect(handles).toHaveLength(5);
+	expect(posted.filter((message) => message.type === "task")).toHaveLength(2);
+});
+
 test("deduped subscriptions cancel locally and retain one DB execution", async () => {
 	fixture(success);
 	const controller = new AbortController();
@@ -299,31 +426,59 @@ test("PG ACK watchdog forces actual termination before replacement", async () =>
 test("shutdown disables admission before cancellation and waits for actual termination", async () => {
 	fixture(success);
 	expect(await runReadTask(unusedDb, task)).toBe(42);
-	const gate = deferred();
-	const stopping = deferred();
-	const worker = handles[0]?.resource;
-	if (!worker) throw new Error("Expected an owned worker");
-	const terminate = worker.terminate.bind(worker);
-	spyOn(worker, "terminate").mockImplementation(async () => {
-		stopping.resolve();
-		await gate.promise;
-		return terminate();
-	});
+	const { stopping, release } = gateWorkerTermination(handles[0]);
 	let closed = false;
 	const closing = shutdownDbWorkerPool({ permanent: true }).then(() => {
 		closed = true;
 	});
-	await stopping.promise;
-	expect(closed).toBe(false);
-	expect(getDbWorkerPoolStats().workers).toBe(1);
-	expect(await failureOf(runReadTask(unusedDb, task))).toMatchObject({ reason: "pool_shutdown" });
-	expect(await failureOf(runEphemeralReadTask(unusedDb, task))).toMatchObject({
-		reason: "pool_shutdown",
-	});
-	gate.resolve();
-	await closing;
+	try {
+		await stopping;
+		expect(closed).toBe(false);
+		expect(getDbWorkerPoolStats().workers).toBe(1);
+		expect(await failureOf(runReadTask(unusedDb, task))).toMatchObject({ reason: "pool_shutdown" });
+		expect(await failureOf(runEphemeralReadTask(unusedDb, task))).toMatchObject({
+			reason: "pool_shutdown",
+		});
+	} finally {
+		release();
+		await closing;
+	}
 	expect(getDbWorkerPoolStats().workers).toBe(0);
 	expect(await failureOf(runReadTask(unusedDb, task))).toMatchObject({ reason: "pool_shutdown" });
+});
+
+test("maintenance blocks short reads until the active owner exits and the pool resumes", async () => {
+	const dbPath = shortReadDb();
+	fixture(hanging);
+	const active = failureOf(runShortReadTask(dbPath, shortTask));
+	await nextTaskPost.promise;
+	const owner = handles[0];
+	const { stopping, release } = gateWorkerTermination(owner);
+	let closed = false;
+	const closing = shutdownDbWorkerPool({ pause: true }).then(() => {
+		closed = true;
+	});
+	try {
+		await Promise.race([stopping, closing]);
+		expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+			reason: "pool_shutdown",
+		});
+		expect(resumeDbWorkerPool).toThrow("pool_shutdown");
+		expect(closed).toBe(false);
+		expect(handles).toHaveLength(1);
+	} finally {
+		release();
+		await closing;
+	}
+	expect(await active).toMatchObject({ reason: "pool_shutdown" });
+	expect(typeof (await owner?.exited)).toBe("number");
+	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
+		reason: "pool_shutdown",
+	});
+	resumeDbWorkerPool();
+	setDbWorkerSpecifiersForTest(null);
+	expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
+	expect(handles).toHaveLength(2);
 });
 
 test("maintenance pause blocks both profiles until explicit resume", async () => {

@@ -22,6 +22,7 @@ import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import {
 	canonicalCatalogModelId,
+	getCatalogModelIdsForProvider,
 	getEffectiveModelProfile,
 	identifyModelValue,
 	resolveEffectiveModelCard,
@@ -53,7 +54,9 @@ function s(): NarraForkSettings {
 // Built-in model lists
 // ---------------------------------------------------------------------------
 
-const BUILTIN_CODEX_MODELS = [
+// Compatibility floor for models missing from older/bundled catalogs. New Codex
+// models arrive through catalog updates instead of requiring a narrafork release.
+const FALLBACK_BUILTIN_CODEX_MODELS = [
 	"gpt-6-astra",
 	"gpt-6.1-sol",
 	"gpt-6-sol",
@@ -64,9 +67,11 @@ const BUILTIN_CODEX_MODELS = [
 	"gpt-5.5",
 ];
 
-/** Built-in Codex model IDs (without provider prefix). */
+/** Built-in Codex model IDs (without provider prefix), led by the active catalog. */
 export function getBuiltinCodexModels(): string[] {
-	return [...BUILTIN_CODEX_MODELS];
+	return [
+		...new Set([...getCatalogModelIdsForProvider("codex"), ...FALLBACK_BUILTIN_CODEX_MODELS]),
+	];
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +158,8 @@ registerExtraModelSource("tokendance", {
 });
 
 // Register codex model checker and lister immediately
-registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
-registerCodexModelLister(() => BUILTIN_CODEX_MODELS.map((m) => `codex:${m}`));
+registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
+registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
@@ -1162,7 +1167,7 @@ export function resolveProvider(model?: string): string {
 	if (explicit) return explicit;
 
 	if (bare) {
-		if (BUILTIN_CODEX_MODELS.includes(bare)) return "codex";
+		if (getBuiltinCodexModels().includes(bare)) return "codex";
 
 		const custom = s().agent.customModels ?? [];
 		const found = custom.find((m) => m.value === bare || m.value === model);

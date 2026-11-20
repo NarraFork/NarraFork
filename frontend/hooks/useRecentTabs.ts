@@ -71,7 +71,6 @@ export {
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
-	shouldApplyRecentTabsRuntimeResponse,
 	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -368,6 +368,39 @@ describe("unified workspace modification view", () => {
 		// Zero rows took part, so "no badge" is the correct rendering, not a symptom of a
 		// window that ran out.
 		expect(view.windowCount).toBe(0);
+	});
+});
+
+describe("history read cancellation", () => {
+	test("rejects an already cancelled request even when no paths were requested", async () => {
+		const ws = makeWorkspace("nf-view-cancelled-");
+		const reason = new Error("Request cancelled");
+		await expect(
+			getWorkspaceModificationView(ws, { filePaths: [], signal: AbortSignal.abort(reason) }),
+		).rejects.toBe(reason);
+	});
+
+	test("does not fetch row details when cancellation arrives after the candidate read", async () => {
+		const ws = makeWorkspace("nf-view-cancelled-batch-");
+		const narratorId = await createNarrator("Author", ws);
+		await record({ workspacePath: ws, filePath: "a.ts", narratorId, action: "write" });
+		const controller = new AbortController();
+		const reason = new Error("Request cancelled");
+		const all = db.all.bind(db) as typeof db.all;
+		let reads = 0;
+		const queries = spyOn(db, "all").mockImplementation(<T>(query: Parameters<typeof all>[0]) => {
+			const rows = all<T>(query);
+			if (++reads === 2) controller.abort(reason); // Stored keys, then row candidates.
+			return rows;
+		});
+		try {
+			await expect(
+				getWorkspaceModificationView(ws, { filePaths: ["a.ts"], signal: controller.signal }),
+			).rejects.toBe(reason);
+			expect(queries).toHaveBeenCalledTimes(2);
+		} finally {
+			queries.mockRestore();
+		}
 	});
 });
 

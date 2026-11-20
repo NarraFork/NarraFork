@@ -17,7 +17,8 @@
  *   4. CHANGES OUTSIDE THE PARENT'S WORKSPACE SURVIVE ITS REVERT, and must say so.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { SQLQueryBindings } from "bun:sqlite";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -39,7 +40,7 @@ const { db, sqlite } = getTestDb();
 // every other suite that runs afterwards in the same process — they then query a
 // database with none of their fixtures in it and fail for no visible reason.
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, activeDatabaseBackend: "sqlite", db, sqlite }));
 
 const {
 	appendSubagentFileChanges,
@@ -694,6 +695,44 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		expect(exact.totalFiles).toBe(2);
 	});
 
+	test("reads exact effects by admitted operation even without SQLite statistics", async () => {
+		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
+		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
+		await parentExecutionCall("current");
+		const prepare = spyOn(sqlite, "prepare");
+		try {
+			const changes = await getChildSubagentFileChanges({
+				parentNarratorId: PARENT,
+				childNarratorId: "sub-a",
+				scope: { sourceToolUseId: "parent-tool-use", startedAt: null, completedAt: null },
+				executionBoundary: {
+					sourceToolCallId: "parent-call",
+					executionAttempt: 1,
+					executionIdentityVersion: 1,
+					executionSegmentId: "current",
+				},
+			});
+			expect(changes).toMatchObject({
+				attributionScope: "exact_attempt",
+				totalFiles: 1,
+				files: [{ filePath: "src/current.ts", linesAdded: 4 }],
+				countsTruncated: false,
+			});
+			const lookups = prepare.mock.calls
+				.map(([text]) => text)
+				.filter((text) => text.includes('from "file_change_effects"'));
+			expect(lookups).toHaveLength(1);
+			const plan = sqlite
+				.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${lookups[0]}`)
+				.all("current-op", "apply", "changed", "settled", "measured", 2)
+				.map(({ detail }) => detail);
+			expect(plan).toContainEqual(
+				expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
+			);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
 		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
 		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
