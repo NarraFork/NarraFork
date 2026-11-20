@@ -328,6 +328,33 @@ describe("the scroll container disables the browser's own anchoring", () => {
 	});
 });
 
+describe("queued bottom snap", () => {
+	for (const detach of [true, false]) {
+		it(
+			detach
+				? "leaves the reader's scroll position alone after detaching"
+				: "snaps to the latest bottom while still pinned",
+			async () => {
+				const { createPinnedBottomFrame, getScrollBottomTarget } = await import(
+					"./vlist-exact-scroll"
+				);
+				const pinned = { current: true };
+				const viewport = { scrollTop: 700, scrollHeight: 1000, clientHeight: 300 };
+				const queued = createPinnedBottomFrame(pinned, () => {
+					viewport.scrollTop = getScrollBottomTarget(viewport);
+				});
+				viewport.scrollHeight = 1200;
+				if (detach) {
+					pinned.current = false;
+					viewport.scrollTop = 600;
+				}
+				queued();
+				expect(viewport.scrollTop).toBe(detach ? 600 : 900);
+			},
+		);
+	}
+});
+
 describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 	async function shell() {
 		return Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url).pathname).text();

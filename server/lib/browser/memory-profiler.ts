@@ -530,6 +530,11 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 				state = abortStage === "timeout" ? "failed" : "cancelled";
 				stage = abortStage;
 			}
+			// The caller already has a session. This timer bounds that response, not
+			// worker teardown: on a busy runner close() outran the budget and a
+			// finished cancel was reported as a timeout. A start still blocked in
+			// setup keeps the timer so the caller is not left waiting on it.
+			if (startSettled) clearTimeout(responseTimer);
 			// Startup can finish after cancellation, and publication can complete a late FS operation.
 			// Neither a response timeout nor detach proves the worker has stopped writing.
 			await pendingStartup;

@@ -10,8 +10,8 @@ import {
 	type FileChangeIdentity,
 } from "@shared/file-change-protocol";
 import { and, asc, eq, inArray, like, or, sql } from "drizzle-orm";
-import { alias } from "drizzle-orm/sqlite-core";
-import { db } from "../db";
+import { alias, type SQLiteColumn } from "drizzle-orm/sqlite-core";
+import { activeDatabaseBackend, db } from "../db";
 import {
 	fileAttributions,
 	fileChangeEffects,
@@ -426,20 +426,30 @@ async function addExactChanges(
 	const ownerByOperation = new Map(
 		eligible.map((operation) => [operation.id, operation.narratorId as string]),
 	);
+	// LIMIT only bounds returned rows. On SQLite, seek by the admitted operation IDs
+	// instead of scanning global effect history through the settlement index.
+	const sqlite = activeDatabaseBackend === "sqlite";
+	// Drizzle loses the FROM table metadata for a raw source; retain its column decoders.
+	const effect = <T extends SQLiteColumn>(column: T) =>
+		sqlite ? sql`${column}`.mapWith(column) : column;
 	const effects = await db
 		.select({
-			effectId: fileChangeEffects.id,
-			operationId: fileChangeEffects.operationId,
-			identityJson: fileChangeEffects.identityJson,
-			linesAdded: fileChangeEffects.linesAdded,
-			linesRemoved: fileChangeEffects.linesRemoved,
-			outcome: fileChangeEffects.outcome,
-			phase: fileChangeEffects.phase,
-			settlement: fileChangeEffects.settlement,
-			attributionGrade: fileChangeEffects.attributionGrade,
+			effectId: effect(fileChangeEffects.id),
+			operationId: effect(fileChangeEffects.operationId),
+			identityJson: effect(fileChangeEffects.identityJson),
+			linesAdded: effect(fileChangeEffects.linesAdded),
+			linesRemoved: effect(fileChangeEffects.linesRemoved),
+			outcome: effect(fileChangeEffects.outcome),
+			phase: effect(fileChangeEffects.phase),
+			settlement: effect(fileChangeEffects.settlement),
+			attributionGrade: effect(fileChangeEffects.attributionGrade),
 			workspacePath: fileChangeScopes.displayRoot,
 		})
-		.from(fileChangeEffects)
+		.from(
+			sqlite
+				? sql`${fileChangeEffects} INDEXED BY idx_fc_effect_operation_file`
+				: fileChangeEffects,
+		)
 		.innerJoin(fileChangeScopes, eq(fileChangeScopes.id, fileChangeEffects.scopeId))
 		.where(
 			and(

@@ -2604,14 +2604,18 @@ class BackgroundTaskService {
 		return this.applyLiveness(
 			rows.map((row) => {
 				const activeChildTaskCount = childCounts.get(row.id) ?? 0;
+				const backgroundStatus =
+					row.status === "archived" && row.backgroundStatus === "running"
+						? "cancelled"
+						: row.backgroundStatus;
 				const status =
-					row.backgroundStatus ??
+					backgroundStatus ??
 					(row.status === "working" || row.status === "waiting" ? "running" : "completed");
 				const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
 					taskStatus: status as BackgroundTaskRecord["status"],
 					currentNarratorStatus: row.status,
 					currentNarratorIsBackground: row.isBackground,
-					currentNarratorBackgroundStatus: row.backgroundStatus,
+					currentNarratorBackgroundStatus: backgroundStatus,
 					currentNarratorSubstatus: row.substatus,
 					currentNarratorErrorMessage: row.errorMessage,
 					activeChildTaskCount,

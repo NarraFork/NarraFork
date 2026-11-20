@@ -277,13 +277,6 @@ function recentTabNarratorId(tab: RecentTab): string | null {
 	return null;
 }
 
-export function shouldApplyRecentTabsRuntimeResponse(
-	requestGeneration: number,
-	currentGeneration: number,
-): boolean {
-	return requestGeneration === currentGeneration;
-}
-
 /**
  * Per-narrator, per-field counters of runtime updates delivered over the narrator WS.
  *
@@ -323,14 +316,9 @@ export function snapshotRecentTabRuntimeVersions(
 export function pruneRecentTabsRuntimeVersions(
 	versions: RecentTabRuntimeVersions,
 	liveNarratorIds: ReadonlySet<string>,
-	inFlightNarratorIdSnapshots: Iterable<ReadonlySet<string>>,
 ): void {
-	const retainedNarratorIds = new Set(liveNarratorIds);
-	for (const snapshot of inFlightNarratorIdSnapshots) {
-		for (const narratorId of snapshot) retainedNarratorIds.add(narratorId);
-	}
 	for (const narratorId of versions.keys()) {
-		if (!retainedNarratorIds.has(narratorId)) versions.delete(narratorId);
+		if (!liveNarratorIds.has(narratorId)) versions.delete(narratorId);
 	}
 }
 

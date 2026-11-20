@@ -612,6 +612,17 @@ export function identifyModelValue(model: string): CatalogIdentity {
 	return identifyModel(active, queryForModel(model).query);
 }
 
+/** Current, non-deprecated upstream model IDs declared for one built-in provider. */
+export function getCatalogModelIdsForProvider(providerKey: string): string[] {
+	return [
+		...new Set(
+			active.variants
+				.filter((variant) => variant.providerKey === providerKey && variant.status !== "deprecated")
+				.map((variant) => variant.modelId),
+		),
+	];
+}
+
 /**
  * The catalog model id an `auto:<id>` names, by exact id or alias; null when the catalog
  * does not know it. Suffix and prefix matches are too loose to name a model on purpose.

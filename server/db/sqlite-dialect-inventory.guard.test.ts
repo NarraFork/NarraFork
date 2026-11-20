@@ -695,7 +695,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/narrator-timeline.ts": ["json1"],
 	"server/services/subagent-activity.ts": ["json1"],
-	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
+	// Only the SQLite branch pins the operation-id seek; PostgreSQL still uses Drizzle's table.
+	"server/services/subagent-file-changes.ts": ["drizzleDialect", "indexHint"],
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
