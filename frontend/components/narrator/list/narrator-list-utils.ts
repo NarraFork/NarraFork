@@ -258,10 +258,7 @@ export function applyNarratorListEvent(
 }
 
 /** Write one list WS event onto a row; `updatedAt` keeps the sort order honest locally. */
-function patchNarratorRow(
-	row: NarratorListItem,
-	event: NarratorListUpdateEvent,
-): NarratorListItem {
+function patchNarratorRow(row: NarratorListItem, event: NarratorListUpdateEvent): NarratorListItem {
 	const patched: MutableRow = {
 		...row,
 		...(event.status !== undefined ? { status: event.status } : {}),

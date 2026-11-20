@@ -150,9 +150,9 @@ describe("嵌套的顺便提问拍平到最外层会话", () => {
 	});
 
 	test("源会话本身是顺便提问时挂到它的父会话", () => {
-		expect(askInPassingListParentId({ isAskInPassing: true, parentNarratorId: "root" }, "src")).toBe(
-			"root",
-		);
+		expect(
+			askInPassingListParentId({ isAskInPassing: true, parentNarratorId: "root" }, "src"),
+		).toBe("root");
 	});
 
 	test("源会话没有父时不会挂到自己身上以外的地方", () => {
