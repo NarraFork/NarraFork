@@ -17,7 +17,7 @@ on:
         required: true
 
 # Optional repository/Environment variables: upload concurrency 1–8 (direct=2, DAV=3),
-# total 1–300 minutes; streamed DAV object 1–60.
+# total 1–300 minutes; streamed DAV object 1–100.
 # Empty values retain main=25, helpers/executor/remote-peer=120, object=15 minute defaults.
 permissions:
   contents: read
