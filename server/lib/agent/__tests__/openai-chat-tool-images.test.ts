@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	completionsWireHistory,
-	expandChatToolResults,
-	type OAIMessage,
-} from "../openai-provider";
+import { completionsWireHistory, expandChatToolResults, type OAIMessage } from "../openai-provider";
 import type { NeutralToolResults } from "../projection/turns";
 
 const PNG = { format: "png", mediaType: "image/png", base64: "aGVsbG8=" };
@@ -47,7 +43,10 @@ function imageUrls(message: OAIMessage | undefined): string[] {
 
 describe("历史投影里的工具图片", () => {
 	test("off 保持现状：工具消息只有文本，图片不出现", () => {
-		const history = project("off", toolTurn([{ wireId: "call_1", text: "read ok", images: [PNG] }]));
+		const history = project(
+			"off",
+			toolTurn([{ wireId: "call_1", text: "read ok", images: [PNG] }]),
+		);
 
 		expect(history).toHaveLength(1);
 		expect(history[0]?.role).toBe("tool");
@@ -90,7 +89,10 @@ describe("历史投影里的工具图片", () => {
 	});
 
 	test("separate 单条结果不需要归属说明", () => {
-		const history = project("separate", toolTurn([{ wireId: "call_1", text: "only", images: [PNG] }]));
+		const history = project(
+			"separate",
+			toolTurn([{ wireId: "call_1", text: "only", images: [PNG] }]),
+		);
 
 		expect(history.map((message) => message.role)).toEqual(["tool", "user"]);
 		expect(contentText(history[1])).toBeUndefined();

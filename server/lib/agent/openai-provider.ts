@@ -982,10 +982,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			);
 		} else {
 			messages.push(
-				...expandChatToolResults(
-					params.toolResults as OAIToolResult[],
-					this.toolResultImagesMode,
-				),
+				...expandChatToolResults(params.toolResults as OAIToolResult[], this.toolResultImagesMode),
 			);
 		}
 
@@ -2127,10 +2124,12 @@ function toolMessageContent(
 	if (!images.length) return text;
 	return [
 		...(text ? [{ type: "text" as const, text }] : []),
-		...images.map((image): OAIContentPart => ({
-			type: "image_url",
-			image_url: { url: toolImageDataUrl(image) },
-		})),
+		...images.map(
+			(image): OAIContentPart => ({
+				type: "image_url",
+				image_url: { url: toolImageDataUrl(image) },
+			}),
+		),
 	];
 }
 
@@ -4396,9 +4395,7 @@ export function completionsWireHistory(
 					role: "tool",
 					tool_call_id: result.wireId,
 					// inline 是 DeepSeek 官方对 tool.content 的扩展；其余情况保持纯文本。
-					content: inline
-						? toolMessageContent(result.text, result.images ?? [])
-						: result.text,
+					content: inline ? toolMessageContent(result.text, result.images ?? []) : result.text,
 				});
 			}
 			// All parallel calls must be answered before a media user turn.
