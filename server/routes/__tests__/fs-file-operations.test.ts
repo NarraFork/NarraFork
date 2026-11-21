@@ -16,9 +16,11 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	symlinkSync,
@@ -31,7 +33,8 @@ import { AppError } from "../../lib/errors";
 
 const { fsRoutes } = await import("../fs");
 const { db } = await import("../../db");
-const { narrators, users } = await import("../../db/schema");
+const { fileAttributions, narrators, users } = await import("../../db/schema");
+const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
 
 const USER_ID = "fs-entry-ops-user";
@@ -152,6 +155,26 @@ describe("rename", () => {
 		expect(readFileSync(source, "utf-8")).toBe("a\n");
 	});
 
+	test("refuses a directory, which another session may be working in", async () => {
+		const dir = join(workspace, "docs", "a-folder");
+		mkdirSync(dir);
+		const { status, json } = await post("rename", { narratorId, path: dir, name: "renamed" });
+
+		expect(status).toBe(422);
+		expect(json.code).toBe("UNSUPPORTED_ENTRY");
+		expect(existsSync(dir)).toBe(true);
+	});
+
+	test("a change of case only still renames", async () => {
+		const source = join(workspace, "docs", "Case.md");
+		writeFileSync(source, "case\n");
+		const { status, json } = await post("rename", { narratorId, path: source, name: "case.md" });
+
+		expect(status).toBe(200);
+		expect(json.path).toBe(join(workspace, "docs", "case.md"));
+		expect(readFileSync(join(workspace, "docs", "case.md"), "utf-8")).toBe("case\n");
+	});
+
 	test("refuses a missing entry", async () => {
 		const { status } = await post("rename", {
 			narratorId,
@@ -233,6 +256,35 @@ describe("transfer", () => {
 		// The source of a copy survives the overwrite.
 		expect(readFileSync(source, "utf-8")).toBe("new\n");
 	});
+
+	test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+		"a failed copy leaves the file it was going to replace untouched",
+		async () => {
+			const source = join(workspace, "docs", "unreadable.ts");
+			const target = join(workspace, "src", "unreadable.ts");
+			writeFileSync(source, "new\n");
+			writeFileSync(target, "old\n");
+			chmodSync(source, 0o000);
+			try {
+				const { status, json } = await post("transfer", {
+					narratorId,
+					path: source,
+					targetDir: join(workspace, "src"),
+					mode: "copy",
+					overwrite: true,
+				});
+				expect(status).toBe(422);
+				expect(json.code).toBe("TRANSFER_FAILED");
+			} finally {
+				chmodSync(source, 0o644);
+			}
+			expect(readFileSync(target, "utf-8")).toBe("old\n");
+			// No staging file is left behind next to it.
+			expect(readdirSync(join(workspace, "src")).filter((name) => name.includes(".nf-"))).toEqual(
+				[],
+			);
+		},
+	);
 
 	test("a move may overwrite too, and then removes the original", async () => {
 		const source = join(workspace, "docs", "moved-over.ts");
@@ -335,6 +387,19 @@ describe("delete", () => {
 
 		expect(status).toBe(200);
 		expect(existsSync(target)).toBe(false);
+	});
+
+	test("is recorded as the person's change, so no concurrent Bash call owns it", async () => {
+		const target = join(workspace, "src", "attributed.ts");
+		writeFileSync(target, "mine\n");
+		const { status } = await post("delete", { narratorId, path: target });
+
+		expect(status).toBe(200);
+		const rows = await db
+			.select()
+			.from(fileAttributions)
+			.where(eq(fileAttributions.filePath, "src/attributed.ts"));
+		expect(rows.map((row) => [row.action, row.userId])).toEqual([["human", USER_ID]]);
 	});
 
 	test("refuses a directory instead of removing it recursively", async () => {

@@ -68,7 +68,7 @@ import {
  * way to confirm. Both fields are part of the error's public shape (`ApiError.status`,
  * `ApiError.data`), so reading them works whichever copy threw.
  */
-function apiFailureStatus(error: unknown): number | null {
+export function apiFailureStatus(error: unknown): number | null {
 	if (!error || typeof error !== "object") return null;
 	const status = (error as { status?: unknown }).status;
 	return typeof status === "number" ? status : null;

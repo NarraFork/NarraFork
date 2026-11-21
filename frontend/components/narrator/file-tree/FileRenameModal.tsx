@@ -12,10 +12,11 @@
  * separator — which is refused here as well, before the request.
  */
 
-import { ApiError, api } from "@frontend/lib/api";
+import { api } from "@frontend/lib/api";
 import { Button, Group, Modal, Stack, Text, TextInput } from "@mantine/core";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { apiFailureStatus } from "./FileContextMenu";
 import { type FileMenuTarget, fileMenuRelativeDirectory } from "./file-menu-target";
 
 export interface FileRenameModalProps {
@@ -84,7 +85,7 @@ function RenameForm({
 		} catch (caught) {
 			// Keep the dialog open so nothing typed is lost; say what the server refused.
 			setError(
-				caught instanceof ApiError && caught.status === 409
+				apiFailureStatus(caught) === 409
 					? t("fileTree.renameExists", { name: trimmed })
 					: caught instanceof Error
 						? caught.message

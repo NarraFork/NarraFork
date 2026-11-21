@@ -498,7 +498,7 @@ export function BackgroundTasksPanel({
 										)}
 									</Badge>
 								</Group>
-								{task.kind === "bash" && task.command && !task.title ? (
+								{task.kind === "bash" && task.command && (task.toolUseId || !task.title) ? (
 									<Code className={classes.summary} style={{ fontSize: 11 }}>
 										{task.command}
 									</Code>

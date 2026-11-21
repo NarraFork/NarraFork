@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { copyFile, lstat, open, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -60,6 +60,7 @@ import {
 } from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
+import { recordAttribution } from "../services/file-attribution-service";
 import { LocalFileValidationError } from "../services/file-change-local-io";
 import {
 	EditorFileChangeUncertainError,
@@ -242,19 +243,107 @@ fsRoutes.post("/mkdir", async (c) => {
 // deny-list was never a sandbox. Every operation therefore requires the narrator whose
 // workspace bounds it, and both ends of it (source and destination) are checked.
 //
-// Unlike `/fs/write` these do not take a worktree write claim. A claim exists to tell
-// the shell tool which paths were already someone else's declared work inside an
-// overlapping tool window; `mkdir` above sets the precedent that a plain directory
-// operation carries no attribution, and a rename/delete is the same shape of act.
+// Like `/fs/write`, each operation is bracketed by a worktree write claim and recorded
+// as a `human` change. A rename, delete or paste changes file contents just as a save
+// does: without the claim, a Bash call running at the same time would own the change in
+// its tree delta, and reverting that call would bring back the file the person deleted.
+
+interface WritableScope {
+	cwd: string;
+	roots: readonly string[];
+}
 
 /** The writable roots that bound one human file mutation, after authorizing the caller. */
-async function writableRoots(c: Context, narratorId: string): Promise<readonly string[]> {
+async function writableScope(c: Context, narratorId: string): Promise<WritableScope> {
 	const narrator = await requireNarratorAccess(c, narratorId, "write");
 	const cwd = narrator.cwd?.trim();
 	if (!cwd) throw new ValidationError("This narrator has no workspace to modify");
 	// `?? []` for the same reason as in `/fs/write`: a settings object built without
 	// `deepMerge` would otherwise spread `undefined` and throw on every request.
-	return [cwd, ...(settings.paths.extraWritableDirs ?? [])];
+	return { cwd, roots: [cwd, ...(settings.paths.extraWritableDirs ?? [])] };
+}
+
+/**
+ * Run one human entry operation inside a write claim on the paths it changes.
+ *
+ * `changed` are the entries the person acted on and get a `human` attribution; `scratch`
+ * are temporary names the operation may create and remove, claimed so a concurrent Bash
+ * call cannot own them either. Paths outside the workspace carry no tree claim, as in
+ * `/fs/write`.
+ */
+async function asHumanEntryChange<T>(
+	c: Context,
+	narratorId: string,
+	cwd: string,
+	paths: { changed: readonly string[]; scratch?: readonly string[] },
+	run: () => Promise<T>,
+): Promise<T> {
+	const canonicalCwd = (await localBackend.resolvePathIdentity(cwd)).canonicalPath;
+	const inWorktree = (absPath: string): string[] => {
+		const rel = relative(canonicalCwd, absPath);
+		if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return [];
+		return [rel.split(sep).join("/")];
+	};
+	const changed = paths.changed.flatMap(inWorktree);
+	const claimed = [...changed, ...(paths.scratch ?? []).flatMap(inWorktree)];
+	const claimId = `human-${generateId()}`;
+	if (claimed.length > 0) openClaim(cwd, narratorId, claimId, claimed);
+	let result: T;
+	try {
+		result = await run();
+	} catch (error) {
+		try {
+			if (claimed.length > 0) sealClaim(cwd, claimId);
+		} catch (sealError) {
+			logger.debug("Sealing entry claim failed", { claimId, error: String(sealError) });
+		}
+		throw error;
+	}
+	if (claimed.length === 0) return result;
+	try {
+		closeClaim(cwd, claimId, changed);
+	} catch (error) {
+		logger.debug("Closing entry claim failed", { claimId, error: String(error) });
+	}
+	const userId = c.get("user").sub;
+	await Promise.all(
+		changed.map((filePath) =>
+			recordAttribution({ workspacePath: cwd, filePath, userId, action: "human" }),
+		),
+	);
+	try {
+		const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
+		invalidateWorkspaceTreeCache(cwd);
+	} catch (error) {
+		logger.debug("Tree cache invalidation failed after entry change", { error: String(error) });
+	}
+	return result;
+}
+
+/**
+ * Put `staged` at `target`, replacing a regular file already there.
+ *
+ * A plain `rename` replaces atomically where the platform allows it. Where it refuses an
+ * existing target (Windows with some filesystems), the old file is moved aside first and
+ * put back if the second rename fails, so the replaced file is never lost to a failure.
+ */
+async function replaceEntry(staged: string, target: string): Promise<void> {
+	try {
+		await rename(staged, target);
+		return;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException)?.code;
+		if ((code !== "EEXIST" && code !== "EPERM") || !existsSync(target)) throw error;
+	}
+	const aside = join(dirname(target), `.${basename(target)}.${generateId()}.nf-replaced`);
+	await rename(target, aside);
+	try {
+		await rename(staged, target);
+	} catch (error) {
+		await rename(aside, target).catch(() => {});
+		throw error;
+	}
+	await unlink(aside).catch(() => {});
 }
 
 /**
@@ -297,9 +386,12 @@ async function existingEntry(absPath: string): Promise<Awaited<ReturnType<typeof
  * Body: { narratorId, path, name }
  *
  * Renames one entry IN PLACE: the parent directory is taken from `path`, never from the
- * client, so a rename cannot become a move. Directories and symlinks are accepted here
- * because the operation is a single link rename that traverses nothing — the same act a
- * `git mv` performs — while copy/move/delete below stay file-only (see their own notes).
+ * client, so a rename cannot become a move. Only files and symlinks are accepted, like
+ * the menu that calls it: renaming a directory can pull the working directory out from
+ * under another session or worktree, which needs the retirement path, not a rename.
+ *
+ * A change of case only (`Foo.txt` → `foo.txt`) names the same entry on a case-insensitive
+ * filesystem; it is still renamed, rather than refused as taken or skipped as a no-op.
  */
 fsRoutes.post("/rename", async (c) => {
 	const parsed = fsRenameSchema.safeParse(await readJsonBody(c.req));
@@ -307,30 +399,50 @@ fsRoutes.post("/rename", async (c) => {
 		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
 	}
 	const body = parsed.data;
-	const roots = await writableRoots(c, body.narratorId);
+	const { cwd, roots } = await writableScope(c, body.narratorId);
 
 	const source = authorizeWritablePath(body.path, roots);
-	await existingEntry(source.lexical);
+	const sourceInfo = await existingEntry(source.lexical);
+	if (sourceInfo.isDirectory()) {
+		throw new AppError("Only files can be renamed", 422, "UNSUPPORTED_ENTRY");
+	}
 	const target = authorizeWritablePath(join(dirname(source.lexical), body.name), roots);
-	if (localBackend.paths.equals(target.physical, source.physical))
-		return c.json({ ok: true, path: source.lexical });
-	if (existsSync(target.physical)) {
+	if (basename(source.lexical) === body.name) return c.json({ ok: true, path: source.lexical });
+	// Compared as entries, not resolved paths: a symlink resolves to its target, and a link
+	// renamed onto the name of the file it points at must not be mistaken for itself.
+	const sourceInParent = join(dirname(target.physical), basename(source.lexical));
+	const targetInfo = await lstat(target.physical).catch(() => null);
+	const sameEntry =
+		localBackend.paths.equals(sourceInParent, target.physical) ||
+		(targetInfo !== null &&
+			targetInfo.ino !== 0 &&
+			targetInfo.ino === sourceInfo.ino &&
+			targetInfo.dev === sourceInfo.dev);
+	if (targetInfo && !sameEntry) {
 		throw new AppError(`Already exists: ${body.name}`, 409, "ALREADY_EXISTS");
 	}
 
-	try {
-		await rename(source.lexical, target.physical);
-	} catch (error) {
-		// A cross-device rename cannot be done in one call; saying so beats a raw EXDEV.
-		if ((error as NodeJS.ErrnoException)?.code === "EXDEV") {
-			throw new AppError("Cannot rename across filesystems", 422, "CROSS_DEVICE");
-		}
-		throw new AppError(
-			error instanceof Error ? error.message : String(error),
-			422,
-			"RENAME_FAILED",
-		);
-	}
+	await asHumanEntryChange(
+		c,
+		body.narratorId,
+		cwd,
+		{ changed: [sourceInParent, target.physical] },
+		async () => {
+			try {
+				await rename(source.lexical, target.physical);
+			} catch (error) {
+				// A cross-device rename cannot be done in one call; saying so beats a raw EXDEV.
+				if ((error as NodeJS.ErrnoException)?.code === "EXDEV") {
+					throw new AppError("Cannot rename across filesystems", 422, "CROSS_DEVICE");
+				}
+				throw new AppError(
+					error instanceof Error ? error.message : String(error),
+					422,
+					"RENAME_FAILED",
+				);
+			}
+		},
+	);
 	return c.json({ ok: true, path: target.lexical });
 });
 
@@ -356,6 +468,10 @@ fsRoutes.post("/rename", async (c) => {
  * "replace this file" must not become "delete this subtree" or "unlink the link and drop
  * whatever was behind it".
  *
+ * The new bytes are written under a temporary name in the target directory and renamed
+ * into place, so a failed copy (a full disk, a cross-device move) leaves the file that was
+ * going to be replaced exactly as it was.
+ *
  * `copyFile`/`rename` are the async promises API: a synchronous copy of a large file on
  * the server's only JS thread would stall every other request for its duration.
  */
@@ -365,7 +481,7 @@ fsRoutes.post("/transfer", async (c) => {
 		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
 	}
 	const body = parsed.data;
-	const roots = await writableRoots(c, body.narratorId);
+	const { cwd, roots } = await writableScope(c, body.narratorId);
 
 	const source = authorizeWritablePath(body.path, roots);
 	const sourceInfo = await existingEntry(source.lexical);
@@ -405,33 +521,49 @@ fsRoutes.post("/transfer", async (c) => {
 		if (existing.isDirectory() || existing.isSymbolicLink()) {
 			throw new AppError("Only a regular file can be replaced", 422, "UNSUPPORTED_ENTRY");
 		}
-		// Removed before the transfer rather than overwritten in place: `rename` onto an
-		// existing name fails outright on Windows, and a half-replaced file would be worse
-		// than a missing one.
-		await unlink(target.physical);
 	}
 
-	try {
-		if (body.mode === "copy") {
-			await copyFile(source.physical, target.physical);
-		} else {
+	const staged = join(
+		targetDir.physical,
+		`.${basename(source.physical)}.${generateId()}.nf-partial`,
+	);
+	const copyIntoPlace = async () => {
+		await copyFile(source.physical, staged);
+		await replaceEntry(staged, target.physical);
+	};
+	await asHumanEntryChange(
+		c,
+		body.narratorId,
+		cwd,
+		{
+			changed: body.mode === "move" ? [source.physical, target.physical] : [target.physical],
+			scratch: [staged],
+		},
+		async () => {
 			try {
-				await rename(source.physical, target.physical);
+				if (body.mode === "copy") {
+					await copyIntoPlace();
+				} else {
+					try {
+						await replaceEntry(source.physical, target.physical);
+					} catch (error) {
+						// Same filesystem in practice; across devices rename is impossible, so the
+						// move becomes a copy followed by a delete of the original.
+						if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+						await copyIntoPlace();
+						await unlink(source.physical);
+					}
+				}
 			} catch (error) {
-				// Same filesystem in practice; across devices rename is impossible, so the
-				// move becomes a copy followed by a delete of the original.
-				if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
-				await copyFile(source.physical, target.physical);
-				await unlink(source.physical);
+				await unlink(staged).catch(() => {});
+				throw new AppError(
+					error instanceof Error ? error.message : String(error),
+					422,
+					"TRANSFER_FAILED",
+				);
 			}
-		}
-	} catch (error) {
-		throw new AppError(
-			error instanceof Error ? error.message : String(error),
-			422,
-			"TRANSFER_FAILED",
-		);
-	}
+		},
+	);
 	return c.json({ ok: true, path: target.lexical });
 });
 
@@ -455,7 +587,7 @@ fsRoutes.post("/delete", async (c) => {
 		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
 	}
 	const body = parsed.data;
-	const roots = await writableRoots(c, body.narratorId);
+	const { cwd, roots } = await writableScope(c, body.narratorId);
 
 	const target = authorizeWritablePath(body.path, roots);
 	const info = await existingEntry(target.lexical);
@@ -463,15 +595,17 @@ fsRoutes.post("/delete", async (c) => {
 		throw new AppError("Only regular files can be deleted", 422, "UNSUPPORTED_ENTRY");
 	}
 
-	try {
-		await unlink(target.physical);
-	} catch (error) {
-		throw new AppError(
-			error instanceof Error ? error.message : String(error),
-			422,
-			"DELETE_FAILED",
-		);
-	}
+	await asHumanEntryChange(c, body.narratorId, cwd, { changed: [target.physical] }, async () => {
+		try {
+			await unlink(target.physical);
+		} catch (error) {
+			throw new AppError(
+				error instanceof Error ? error.message : String(error),
+				422,
+				"DELETE_FAILED",
+			);
+		}
+	});
 	return c.json({ ok: true });
 });
 

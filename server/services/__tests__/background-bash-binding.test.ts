@@ -340,12 +340,14 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 
 		test("manual service uses durable startup and a failed dispatch is kept in the task list", async () => {
 			const scheduler = lease();
-			const { id } = await startManual("service", scheduler, async () => {
-				throw new Error("fixture dispatch failed");
-			});
+			await expect(
+				startManual("service", scheduler, async () => {
+					throw new Error("fixture dispatch failed");
+				}),
+			).rejects.toMatchObject({ code: "TASK_START_FAILED" });
 			await bounded(scheduler.released);
 			expect(execCommand).not.toHaveBeenCalled();
-			expect((await backgroundTaskService.getById(id))?.status).toBe("failed");
+			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
 			expect(taskRow().backgroundKind).toBe("service");
 		});
 		test("uses a real in-memory DB and temporary HOME", () => {

@@ -963,7 +963,14 @@ export async function startManualBackgroundBash(input: {
 			taskId,
 		);
 		// Hold workspace admission through dispatch, not through the process lifetime.
-		await task.dispatched;
+		const failure = await task.dispatched;
+		if (failure) {
+			// The failed row stays in the task list; the caller still has to hear that
+			// nothing is running rather than receive a task id as if it had started.
+			if (failure.error instanceof AppError) throw failure.error;
+			const reason = failure.error instanceof Error ? failure.error.message : String(failure.error);
+			throw new AppError(`The task did not start: ${reason}`, 422, "TASK_START_FAILED");
+		}
 		return { id: task.id, alias: task.alias };
 	} finally {
 		execution.cancelUndispatched();
@@ -1005,7 +1012,12 @@ async function launchBackgroundBash(
 	taskId = `bash_${generateShortId()}`,
 ) {
 	const bgAbort = new AbortController();
-	const { promise: dispatched, resolve: didDispatch } = Promise.withResolvers<void>();
+	// Settles once the process has started (`null`) or once starting it failed (the error),
+	// so a caller that waits on dispatch can tell the two apart.
+	const { promise: dispatched, resolve: settleDispatch } = Promise.withResolvers<{
+		error: unknown;
+	} | null>();
+	let dispatchFailure: { error: unknown } | null = null;
 
 	// Register a human-readable alias for this background task
 	const { registerTaskAlias, unregisterTaskAlias } = await import(
@@ -1057,7 +1069,7 @@ async function launchBackgroundBash(
 				bgAbort.signal,
 				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
 			);
-			didDispatch();
+			settleDispatch(null);
 			await monitorBackgroundBash({
 				taskId,
 				handle,
@@ -1072,6 +1084,7 @@ async function launchBackgroundBash(
 				callerSignal: ctx.signal,
 			});
 		} catch (err) {
+			dispatchFailure = { error: err };
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
 			if (
@@ -1087,7 +1100,7 @@ async function launchBackgroundBash(
 			// without holding the lease on filesystem cleanup.
 			if (backgroundKind === "service") void removeServiceArtifacts(taskId);
 		} finally {
-			didDispatch();
+			settleDispatch(dispatchFailure);
 			releaseUpdateLease();
 		}
 	})().catch((error) =>
