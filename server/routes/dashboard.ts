@@ -9,6 +9,7 @@ import {
 	scheduledTasks,
 	terminals,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { narratorPrincipalOf } from "../lib/narrator-access";
 import { projectPrincipalOf } from "../lib/project-access";
 import { narratorReadableWhere } from "../services/narrator-acl";
@@ -20,24 +21,31 @@ export const dashboardRoutes = new Hono();
 /**
  * GET /api/dashboard/summary
  * Read-only aggregated endpoint for the dashboard home page.
- * All COUNT queries use indexed columns; no full-table scans.
  */
 dashboardRoutes.get("/summary", async (c) => {
+	const readOptions = {
+		signal: c.req.raw.signal,
+		diagnosticSource: "dashboard.summary",
+		maxRows: 1,
+	};
 	// ── Projects ──────────────────────────────────────────────────────────
 	// Counted over the projects this user may read. A total that included projects they
 	// cannot open would be both misleading and a disclosure of how much other work
 	// exists on the instance.
 	const projectReadable = projectReadableWhere(projectPrincipalOf(c));
-	const [activeProjectResult] = await db
-		.select({ c: count() })
-		.from(projects)
-		.where(and(eq(projects.status, "active"), projectReadable));
+	const [activeProjectResult] = await readQuery(
+		db
+			.select({ c: count() })
+			.from(projects)
+			.where(and(eq(projects.status, "active"), projectReadable)),
+		readOptions,
+	);
 	const activeProjectCount = activeProjectResult?.c ?? 0;
 
-	const [totalProjectResult] = await db
-		.select({ c: count() })
-		.from(projects)
-		.where(projectReadable);
+	const [totalProjectResult] = await readQuery(
+		db.select({ c: count() }).from(projects).where(projectReadable),
+		readOptions,
+	);
 	const totalProjectCount = totalProjectResult?.c ?? 0;
 
 	// ── Narrators (primary variant only, exclude archived) ────────────────
@@ -51,37 +59,46 @@ dashboardRoutes.get("/summary", async (c) => {
 		narratorReadableWhere(narratorPrincipalOf(c)),
 	);
 
-	const [workingResult] = await db
-		.select({ c: count() })
-		.from(narrators)
-		.where(and(narratorBaseCondition, eq(narrators.status, "working")));
+	const [workingResult] = await readQuery(
+		db
+			.select({ c: count() })
+			.from(narrators)
+			.where(and(narratorBaseCondition, eq(narrators.status, "working"))),
+		readOptions,
+	);
 	const workingNarratorCount = workingResult?.c ?? 0;
 
-	const [waitingResult] = await db
-		.select({ c: count() })
-		.from(narrators)
-		.where(and(narratorBaseCondition, eq(narrators.status, "waiting")));
+	const [waitingResult] = await readQuery(
+		db
+			.select({ c: count() })
+			.from(narrators)
+			.where(and(narratorBaseCondition, eq(narrators.status, "waiting"))),
+		readOptions,
+	);
 	const waitingNarratorCount = waitingResult?.c ?? 0;
 
 	// ── Terminals ─────────────────────────────────────────────────────────
-	const [runningTerminalResult] = await db
-		.select({ c: count() })
-		.from(terminals)
-		.where(eq(terminals.status, "running"));
+	const [runningTerminalResult] = await readQuery(
+		db.select({ c: count() }).from(terminals).where(eq(terminals.status, "running")),
+		readOptions,
+	);
 	const runningTerminalCount = runningTerminalResult?.c ?? 0;
 
 	// ── Containers ────────────────────────────────────────────────────────
-	const [runningContainerResult] = await db
-		.select({ c: count() })
-		.from(containerInstances)
-		.where(eq(containerInstances.status, "running"));
+	const [runningContainerResult] = await readQuery(
+		db
+			.select({ c: count() })
+			.from(containerInstances)
+			.where(eq(containerInstances.status, "running")),
+		readOptions,
+	);
 	const runningContainerCount = runningContainerResult?.c ?? 0;
 
 	// ── Scheduled tasks ───────────────────────────────────────────────────
-	const [enabledTaskResult] = await db
-		.select({ c: count() })
-		.from(scheduledTasks)
-		.where(eq(scheduledTasks.enabled, true));
+	const [enabledTaskResult] = await readQuery(
+		db.select({ c: count() }).from(scheduledTasks).where(eq(scheduledTasks.enabled, true)),
+		readOptions,
+	);
 	const enabledScheduledTaskCount = enabledTaskResult?.c ?? 0;
 
 	// ── Today cost (from api_requests table, not narrators.totalCostUsd) ──
@@ -97,22 +114,28 @@ dashboardRoutes.get("/summary", async (c) => {
 		gte(apiRequests.createdAt, todayStartIso),
 	);
 
-	const [todayCostResult] = await db
-		.select({ total: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)` })
-		.from(apiRequests)
-		.where(ownRequestsToday);
+	const [todayCostResult] = await readQuery(
+		db
+			.select({ total: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)` })
+			.from(apiRequests)
+			.where(ownRequestsToday),
+		readOptions,
+	);
 	const todayCostUsd = todayCostResult?.total ?? 0;
 
 	// ── Today tokens (input + output + reasoning) ─────────────────────────
 	// Same scope and index as the cost aggregate above.
-	const [todayTokensResult] = await db
-		.select({
-			input: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
-			output: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
-			reasoning: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
-		})
-		.from(apiRequests)
-		.where(ownRequestsToday);
+	const [todayTokensResult] = await readQuery(
+		db
+			.select({
+				input: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
+				output: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
+				reasoning: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
+			})
+			.from(apiRequests)
+			.where(ownRequestsToday),
+		readOptions,
+	);
 	const todayTokens = {
 		input: todayTokensResult?.input ?? 0,
 		output: todayTokensResult?.output ?? 0,
@@ -126,11 +149,14 @@ dashboardRoutes.get("/summary", async (c) => {
 	// ── Attention: permission count ───────────────────────────────────────
 	// N+1 pattern: query waiting narrators, then call getPendingPermissions per narrator.
 	// Waiting narrators are typically very few; limit 50 as a safety cap.
-	const waitingNarrators = await db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.where(and(narratorBaseCondition, eq(narrators.status, "waiting")))
-		.limit(50);
+	const waitingNarrators = await readQuery(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(narratorBaseCondition, eq(narrators.status, "waiting")))
+			.limit(50),
+		{ ...readOptions, maxRows: 50 },
+	);
 
 	let permissionCount = 0;
 	for (const n of waitingNarrators) {
@@ -139,10 +165,13 @@ dashboardRoutes.get("/summary", async (c) => {
 	}
 
 	// ── Attention: failed narrator count ──────────────────────────────────
-	const [failedResult] = await db
-		.select({ c: count() })
-		.from(narrators)
-		.where(and(narratorBaseCondition, isNotNull(narrators.errorMessage)));
+	const [failedResult] = await readQuery(
+		db
+			.select({ c: count() })
+			.from(narrators)
+			.where(and(narratorBaseCondition, isNotNull(narrators.errorMessage))),
+		readOptions,
+	);
 	const failedNarratorCount = failedResult?.c ?? 0;
 
 	return c.json({
