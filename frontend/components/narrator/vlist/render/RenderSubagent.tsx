@@ -55,6 +55,7 @@ import {
 	IconRobot,
 } from "@tabler/icons-react";
 import type { CSSProperties, ReactNode } from "react";
+import { useSubagentOutputCount } from "../../subagent-output-count-store";
 import {
 	BLOCK_PADDING_X,
 	badgeRowHeight,
@@ -299,6 +300,10 @@ type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing" | "statusMa
 	Pick<SubagentLabels, "timing" | "statusMark">;
 
 interface RenderSubagentProps {
+	narratorId?: string;
+	toolUseId?: string;
+	toolCallId?: string;
+	executionAttempt?: number;
 	measured: MeasuredSubagent;
 	/** Description line text (collapsed truncate / expanded wrap). */
 	description: string;
@@ -320,6 +325,7 @@ interface RenderSubagentProps {
 	delegation?: SubagentDelegation;
 	/** The child's live reply char count — a badge on the fixed header row. */
 	liveOutputChars?: number;
+	liveOutputActive?: boolean;
 	/** Extra model badge. */
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
@@ -637,8 +643,16 @@ function SubagentModelBadge({
 
 export function RenderSubagent(props: RenderSubagentProps) {
 	const { measured, permissionSlot } = props;
+	const outputCount = useSubagentOutputCount(props.narratorId, props);
 	const labels = { ...DEFAULT_LABELS, ...props.labels };
-	const inner = <SubagentInner {...props} labels={labels} />;
+	const inner = (
+		<SubagentInner
+			{...props}
+			liveOutputChars={outputCount ? outputCount.count : props.liveOutputChars}
+			liveOutputActive={outputCount?.active}
+			labels={labels}
+		/>
+	);
 	const hasPermission = permissionSlot !== undefined;
 
 	// A live permission form is a relative-flow block appended below the absolutely
@@ -767,6 +781,7 @@ function SubagentInner({
 	isTakenOver,
 	delegation,
 	liveOutputChars,
+	liveOutputActive,
 	model,
 	modelInheritance,
 	reasoningEffort,
@@ -849,7 +864,7 @@ function SubagentInner({
 				) : null}
 				{/* Live reply counter (grey, same fixed badge row): the child's streamed
 				    output char count, ticking while it works. */}
-				{active && typeof liveOutputChars === "number" ? (
+				{(liveOutputActive ?? active) && typeof liveOutputChars === "number" ? (
 					<Badge data-testid="subagent-output-chars" size="xs" variant="light" color="gray">
 						{withCount(labels.liveOutputChars, liveOutputChars)}
 					</Badge>
