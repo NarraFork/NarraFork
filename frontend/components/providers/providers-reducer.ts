@@ -213,6 +213,12 @@ function normalizeCustomApiProvider(
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		toolResultImages:
+			provider.toolResultImages === "off" ||
+			provider.toolResultImages === "inline" ||
+			provider.toolResultImages === "separate"
+				? provider.toolResultImages
+				: undefined,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
