@@ -159,7 +159,16 @@ export function FileContextMenu({
 				);
 			}
 		},
-		[localBrowser, narratorId, onClose, report, t, target.absolutePath, target.name],
+		[
+			localBrowser,
+			narratorId,
+			onClose,
+			report,
+			t,
+			target.absolutePath,
+			target.name,
+			target.relativePath,
+		],
 	);
 
 	/** One transfer attempt; `overwrite` is only ever true after the user confirmed. */
