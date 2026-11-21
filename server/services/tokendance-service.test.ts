@@ -740,14 +740,26 @@ describe("TokenDance billing", () => {
 
 describe("TokenDance backend", () => {
 	for (const mode of ["off", "inline", "separate"] as const) {
-		test(`connection persists ${mode} and invalidates cached runtime generation`, async () => {
+		test(`connection persists ${mode} without invalidating requests or checkout`, async () => {
 			fakeSettings.tokendance = { apiKey: "test-key", disabled: false, generation: 100 };
+			const controller = new AbortController();
+			const unregister = service.registerTokenDanceRequest(controller, 100);
+			const fixture = paymentFixture();
+			fetchMock(() => json(fixture));
+			const owner = `image-mode-${mode}`;
+			const input = { amount: 10, generation: 100, requestId: "i".repeat(43) };
+			const payment = await createPayment(owner, input);
 			const result = await service.setTokenDanceDisabled(false, mode);
 			expect(result.toolResultImages).toBe(mode);
-			expect(result.generation).toBe(101);
+			expect(result.generation).toBe(100);
+			expect(controller.signal.aborted).toBe(false);
 			expect(service.getTokenDanceRuntimeConfig()?.toolResultImages).toBe(mode);
-			expect(() => service.assertTokenDanceConnection(100)).toThrow();
+			expect(() => service.assertTokenDanceConnection(100)).not.toThrow();
+			expect((await service.getTokenDancePaymentSession(owner, payment.id)).status).toBe("pending");
 			expect((await service.setTokenDanceDisabled(true)).toolResultImages).toBe(mode);
+			expect(service.getTokenDanceConnection().generation).toBe(101);
+			expect(controller.signal.aborted).toBe(true);
+			unregister();
 		});
 	}
 	test("refresh and reauthorization preserve initialized collection and user visibility choices", async () => {

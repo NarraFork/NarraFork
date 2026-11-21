@@ -645,17 +645,18 @@ export async function setTokenDanceDisabled(
 ): Promise<TokenDancePublicConnection> {
 	return settingsUpdateLock.acquire("settings", async () => {
 		if (!settings.tokendance?.apiKey) throw fail("TokenDance is not connected", 409);
+		const disabledChanged = disabled !== settings.tokendance.disabled;
 		const cached = getTokenDanceCatalogModels();
 		const latest = structuredClone(settings);
 		latest.tokendance = {
 			...settings.tokendance,
 			disabled,
 			toolResultImages: toolResultImages ?? settings.tokendance.toolResultImages,
-			generation: generation() + 1,
+			generation: generation() + (disabledChanged ? 1 : 0),
 		};
 		models = cached;
 		saveSettings(latest);
-		invalidateRequests();
+		if (disabledChanged) invalidateRequests();
 		modelsGeneration = generation();
 		return getTokenDanceConnection();
 	});
