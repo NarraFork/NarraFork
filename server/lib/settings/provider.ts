@@ -763,7 +763,7 @@ export function resolveAllowedModelCandidateMatch(
 export function listConcreteModelsForReference(model: string | null | undefined): string[] {
 	const result: string[] = [];
 	for (const value of expandModelReferenceForMatching(model)) {
-		if (!isMetaModelReference(value)) result.push(value);
+		if (!isMetaModelReference(value) && !isModelProviderDisabled(value)) result.push(value);
 	}
 	return result;
 }

@@ -85,6 +85,26 @@ describe("subagent pool default prefers the parent's provider", () => {
 		).toEqual({ model: "provA:default-model", poolEntry: entry });
 	});
 
+	test("a legacy aggregation never pins a disabled preferred provider", () => {
+		const aggId = `disabled-pref-${crypto.randomUUID()}`;
+		settings.agent.modelAggregations = [
+			{ id: aggId, name: "Mixed", models: ["provA:y", "provB:x"], routingMode: "balanced" },
+		];
+		settings.agent.disabledProviders = ["provA"];
+		const entry = { model: `__agg__:${aggId}`, reasoningEffort: "high" as const };
+		expect(listConcreteModelsForReference(entry.model)).toEqual(["provB:x"]);
+		expect(
+			resolveSubagentModelSelectionFromPolicy({
+				policy: pool([entry]),
+				candidates: ["provA:other"],
+				preferredProvider: "provA",
+			}),
+		).toEqual({ model: entry.model, poolEntry: entry });
+		expect(resolveAggregation(aggId)).toBe("provB:x");
+		settings.agent.disabledProviders = ["provA", "provB"];
+		expect(listConcreteModelsForReference(entry.model)).toEqual([]);
+	});
+
 	test("explicit models and candidate hits ignore the provider preference", () => {
 		const policy = pool([{ model: "provB:m1" }, { model: "provA:m2" }]);
 		expect(
