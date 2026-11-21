@@ -1558,16 +1558,6 @@ if (activeDatabaseBackend === "sqlite") {
 	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
 	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
 	void migrateAggregationsOnStartup();
-	// Stop containers and release ports that removed chapters left behind.
-	retireLegacyChapterResources().catch((err) => {
-		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
-	});
-	// Re-derive which project every session belongs to, in bounded background pages.
-	void scheduleProjectIndexRebuild();
-	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
-	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
-	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
-	void migrateAggregationsOnStartup();
 }
 
 // Establish client-egress relay channels for NUG providers configured with

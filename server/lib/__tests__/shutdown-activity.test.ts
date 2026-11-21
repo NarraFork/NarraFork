@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "../shutdown-activity";
@@ -91,6 +91,38 @@ describe("clean shutdown marker lifecycle", () => {
 
 describe("main shutdown wiring without booting the server", () => {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
+	test.each([
+		"sqlite",
+		"postgres",
+	])("%s startup schedules maintenance only once on SQLite", async (backend) => {
+		const maintenanceStart = main.lastIndexOf(
+			'if (activeDatabaseBackend === "sqlite") {',
+			main.indexOf('startTeamDatabaseMaintenance("status"'),
+		);
+		const maintenanceEnd = main.indexOf(
+			"// Establish client-egress relay channels",
+			maintenanceStart,
+		);
+		expect(maintenanceStart).toBeGreaterThanOrEqual(0);
+		expect(maintenanceEnd).toBeGreaterThan(maintenanceStart);
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+			`async function start() { ${main.slice(maintenanceStart, maintenanceEnd)} }`,
+		);
+		const cleanup = mock(async () => {});
+		const rebuild = mock(async () => {});
+		const migrate = mock(async () => {});
+		await new Function(
+			"activeDatabaseBackend",
+			"startTeamDatabaseMaintenance",
+			"retireLegacyChapterResources",
+			"scheduleProjectIndexRebuild",
+			"migrateAggregationsOnStartup",
+			"logger",
+			`${code}\nreturn start();`,
+		)(backend, () => {}, cleanup, rebuild, migrate, { warn() {} });
+		for (const operation of [cleanup, rebuild, migrate])
+			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" ? 1 : 0);
+	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
 	const position = (label: string) => {
