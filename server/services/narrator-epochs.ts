@@ -327,6 +327,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 				{ signal, preparation: input.preparation },
 			)
 		: undefined;
+	input.preparation?.recordPhase("epoch");
 	const messages = sourceMessages ?? input.messages;
 	const compactMessageId = await currentCompactMessageId(narratorId);
 	if (
