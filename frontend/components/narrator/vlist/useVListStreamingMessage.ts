@@ -24,6 +24,7 @@
 import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { documentWriteInput, receiveWriteDocument } from "../content/document-source";
@@ -33,7 +34,7 @@ import {
 	upsertStreamingImageGenerationBlock,
 	upsertStreamingWebSearchBlock,
 } from "../message/message-segments";
-import { buildTopLevelStreamingChunksMsg } from "../narrator-message-helpers";
+import { buildTopLevelStreamingChunksMsg, getToolOutputPreview } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	contentBlockIdentity,
@@ -75,6 +76,21 @@ export interface UseVListStreamingMessageOptions {
 	/** Actual loaded document: the sole evidence that a block is visible elsewhere. */
 	committedMessages?: readonly HandoffMessage[];
 	fetchTextDocumentRange?: TextDocumentRangeReader;
+	/**
+	 * Live output / progress for a tool whose synthetic card already retired because
+	 * its persisted message landed while the tool was still executing (the normal
+	 * case: the assistant message is persisted right before execution begins). The
+	 * streaming store ignores such frames by design, so without this hand-off a
+	 * long-running tool's committed card showed only its input until it finished.
+	 * The caller owns coalescing; frames still arrive at socket rate here.
+	 */
+	onPersistedToolLive?: (update: PersistedToolLiveUpdate) => void;
+}
+
+export interface PersistedToolLiveUpdate {
+	toolUseId: string;
+	output?: string;
+	progress?: ToolProgressPayload;
 }
 
 /**
@@ -94,6 +110,8 @@ export function useVListStreamingMessage(
 	options: UseVListStreamingMessageOptions,
 ): NarratorMsg | null {
 	const { enabled, isSubagent = false, committedMessages = EMPTY_MESSAGES } = options;
+	const persistedLiveRef = useRef(options.onPersistedToolLive);
+	persistedLiveRef.current = options.onPersistedToolLive;
 	// Raw text never takes a committed (citation-cleaned) value as its seed. A
 	// checkpoint only removes the display copy; later deltas still append here.
 	const blocksRef = useRef<StreamingBlock[]>([]);
@@ -285,6 +303,9 @@ export function useVListStreamingMessage(
 				current.timer = null;
 				current.lastFlushAt = Date.now();
 				if (applyStreamingToolOutput(toolStoreRef.current, toolUseId, current.latest)) flush();
+				// Same trailing window the streaming store keeps for a synthetic card.
+				else if (!toolStoreRef.current.has(toolUseId))
+					persistedLiveRef.current?.({ toolUseId, output: getToolOutputPreview(current.latest) });
 			};
 			if (output.length < OUTPUT_THROTTLE_MIN_CHARS) {
 				if (state.timer) {
@@ -711,6 +732,8 @@ export function useVListStreamingMessage(
 			onToolStructuredProgress: (toolUseId, progress, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;
 				if (applyStreamingToolProgress(toolStoreRef.current, toolUseId, progress)) flush();
+				else if (!toolStoreRef.current.has(toolUseId))
+					persistedLiveRef.current?.({ toolUseId, progress });
 			},
 			onToolLongRunning: (toolUseId, _elapsedMs, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;

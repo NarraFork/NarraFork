@@ -115,6 +115,10 @@ export function toolCompletedPatch(opts: {
 		...(opts.durationMs != null ? { durationMs: opts.durationMs } : {}),
 		...(opts.updatedInput ? { inputJson: opts.updatedInput } : {}),
 		...(opts.metadata ? { _metadata: opts.metadata } : {}),
+		// The live body written by `patchToolLiveOutput` while the call ran. A reloaded
+		// document never carries it, so the finished card must not either.
+		_streamingOutput: undefined,
+		_structuredProgress: undefined,
 	};
 	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields, opts.blockId);
 }

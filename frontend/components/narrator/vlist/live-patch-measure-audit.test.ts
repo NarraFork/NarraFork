@@ -590,6 +590,15 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 		);
 	});
 
+	it("live output on a persisted running card must re-key the card", async () => {
+		// The message persists just before execution; from then on this patch is the
+		// only carrier of the running tool's output (vlist-persisted-tool-live.ts).
+		const { patchToolLiveOutput } = await import("./vlist-live-patch");
+		await auditPatch(toolDoc(), (messages) =>
+			patchToolLiveOutput(messages, "tu-bash", { output: "line 1\nline 2\nline 3\nline 4" }),
+		);
+	});
+
 	it("background-task terminals must re-key the card", async () => {
 		const { backgroundTaskPatch } = await import("./vlist-live-events");
 		await auditPatch(

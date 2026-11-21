@@ -14,6 +14,7 @@ import { measureCache } from "./measure-cache";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
+import { usePersistedToolLive } from "./vlist-persisted-tool-live";
 import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
 
 let nextMountEpoch = 0;
@@ -76,10 +77,13 @@ async function withStream(
 		animateStreaming = false,
 		textExpanded = false,
 		keepEmptyReasoningLive = false,
+		persistedToolLive = false,
 	}: {
 		animateStreaming?: boolean;
 		textExpanded?: boolean;
 		keepEmptyReasoningLive?: boolean;
+		/** Wire the committed-card live channel the shell installs (PretextExactMessageList). */
+		persistedToolLive?: boolean;
 	} = {},
 ) {
 	const build = { ...BUILD, keepEmptyReasoningLive, isTextExpanded: () => textExpanded };
@@ -161,10 +165,14 @@ async function withStream(
 	function Harness() {
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
 		const committed = snapshot.input?.messages ?? [];
+		const onPersistedToolLive = usePersistedToolLive(narratorId, (patch) =>
+			coordinator.applyLivePatch(patch, VIEW),
+		);
 		const streaming = useVListStreamingMessage(narratorId, {
 			enabled: true,
 			isSubagent,
 			committedMessages: committed,
+			...(persistedToolLive ? { onPersistedToolLive } : {}),
 		});
 		latestLive = streaming;
 		useEffect(() => {
@@ -655,6 +663,33 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			expect(h.text()).toContain("Write");
 		});
 	});
+
+	for (const wired of [false, true]) {
+		it(`a tool still running after its message persisted ${wired ? "shows" : "drops"} live output`, async () => {
+			await withStream(
+				async (h) => {
+					await h.frame({
+						type: "tool_use_chunk",
+						toolUseId: "slow-bash",
+						toolName: "Bash",
+						inputCharsTotal: 1,
+					});
+					await h.raf();
+					// The assistant message persists right before execution: the synthetic
+					// card retires and the committed card is the only one left.
+					await h.commit([{ ...tool("slow-bash"), status: "running" }]);
+					await h.raf();
+					await h.frame({ type: "tool_output", toolUseId: "slow-bash", output: "LIVE-LINE-1" });
+					await h.raf();
+					expect(h.text().includes("LIVE-LINE-1")).toBe(wired);
+					expect(h.live()?.toolCalls?.some((call) => call.toolUseId === "slow-bash") ?? false).toBe(
+						false,
+					);
+				},
+				{ persistedToolLive: wired },
+			);
+		});
+	}
 
 	it("ignores child and persisted tools in snapshots but restores tools on their own page", async () => {
 		await withStream(async (h) => {
