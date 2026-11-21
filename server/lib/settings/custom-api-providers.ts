@@ -105,6 +105,7 @@ export function customApiProtocolToOpenAIApiMode(
 
 export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): CustomApiProviderConfig {
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,
