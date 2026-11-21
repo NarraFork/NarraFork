@@ -649,7 +649,7 @@ export async function runReadTask<T>(
 export async function runShortReadTask(
 	dbPath: string,
 	params: SelectRowsParams,
-	options: Pick<RunReadTaskOptions, "signal" | "timeoutMs"> = {},
+	options: Pick<RunReadTaskOptions, "signal" | "timeoutMs" | "diagnosticSource"> = {},
 ): Promise<SelectRowsResult> {
 	const disabled = workersDisabled("shortReads");
 	if (disabled) throw new WorkersUnavailableError(disabled);
