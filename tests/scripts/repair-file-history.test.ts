@@ -206,28 +206,44 @@ describe("offline file-history CLI arguments", () => {
 });
 
 describe("private paths, source and offline identity", () => {
-	test("reproduces runtime length-prefixed bigint namespace and keeps source/blob/database bytes", () => {
-		const args = fixture();
-		const sourcePath = join(args.dataDir, "file-change-source.json");
-		const sourceBytes = readFileSync(sourcePath);
-		const databaseBytes = readFileSync(args.database);
-		const root = join(args.dataDir, "file-change-blobs");
-		writeFileSync(join(root, "physical-blob"), "preserved", { mode: 0o600 });
-		const info = lstatSync(root, { bigint: true });
-		const parts = [
-			JSON.parse(sourceBytes.toString()).id,
-			root,
-			`${info.dev}:${info.ino}:${info.birthtimeNs > 0n ? info.birthtimeNs : 0n}`,
-		];
-		const hash = createHash("sha256");
-		for (const part of parts) hash.update(`${Buffer.byteLength(part)}:`).update(part);
-		const context = prepare(args);
-		expect(context.namespaceKey).toBe(hash.digest("hex"));
-		context.guard("before_transaction", true);
-		expect(readFileSync(sourcePath)).toEqual(sourceBytes);
-		expect(readFileSync(args.database)).toEqual(databaseBytes);
-		expect(readFileSync(join(root, "physical-blob"), "utf8")).toBe("preserved");
-	});
+	test.skipIf(process.geteuid?.() === 0)(
+		"unprivileged prepare and CLI refuse maintenance without root proc visibility",
+		async () => {
+			const args = fixture();
+			const before = readFileSync(args.database);
+			expect(() => prepareFileHistoryRepair(args)).toThrow("root_proc_visibility_required");
+			const result = await childResult([process.execPath, script, ...argv(args)], args.dataDir);
+			expect(result.code).not.toBe(0);
+			expect(result.stderr).toContain("root_proc_visibility_required");
+			expect(readFileSync(args.database)).toEqual(before);
+			expect(existsSync(join(args.dataDir, "narrafork.lock"))).toBe(false);
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"reproduces runtime length-prefixed bigint namespace and keeps source/blob/database bytes",
+		() => {
+			const args = fixture();
+			const sourcePath = join(args.dataDir, "file-change-source.json");
+			const sourceBytes = readFileSync(sourcePath);
+			const databaseBytes = readFileSync(args.database);
+			const root = join(args.dataDir, "file-change-blobs");
+			writeFileSync(join(root, "physical-blob"), "preserved", { mode: 0o600 });
+			const info = lstatSync(root, { bigint: true });
+			const parts = [
+				JSON.parse(sourceBytes.toString()).id,
+				root,
+				`${info.dev}:${info.ino}:${info.birthtimeNs > 0n ? info.birthtimeNs : 0n}`,
+			];
+			const hash = createHash("sha256");
+			for (const part of parts) hash.update(`${Buffer.byteLength(part)}:`).update(part);
+			const context = prepare(args);
+			expect(context.namespaceKey).toBe(hash.digest("hex"));
+			context.guard("before_transaction", true);
+			expect(readFileSync(sourcePath)).toEqual(sourceBytes);
+			expect(readFileSync(args.database)).toEqual(databaseBytes);
+			expect(readFileSync(join(root, "physical-blob"), "utf8")).toBe("preserved");
+		},
+	);
 	test("rejects missing source/root, permissions, symlink, DB hardlink and unrelated database path", () => {
 		const mutations: ((args: RepairArguments) => void)[] = [
 			(a) => unlinkSync(join(a.dataDir, "file-change-source.json")),
@@ -264,144 +280,173 @@ describe("private paths, source and offline identity", () => {
 			prepareFileHistoryRepair({ ...args, dataDir: alias, database: join(alias, "narrafork.db") }),
 		).toThrow();
 	});
-	test("rejects insufficient transaction space without making DB copies", () => {
-		const args = fixture();
-		expect(() => prepareFileHistoryRepair(args, { availableBytes: () => 0n })).toThrow(
-			"insufficient_transaction_space",
-		);
-		expect(readdirSync(args.dataDir).sort()).toEqual([
-			"file-change-blobs",
-			"file-change-source.json",
-			"narrafork.db",
-		]);
-	});
-	test("unknown, empty and live compatible locks are retained", () => {
-		for (const payload of ["", "{}", JSON.stringify({ pid: process.pid, token: "unknown" })]) {
+	test.skipIf(process.geteuid?.() !== 0)(
+		"rejects insufficient transaction space without making DB copies",
+		() => {
 			const args = fixture();
-			const lock = join(args.dataDir, "narrafork.lock");
-			writeFileSync(lock, payload, { mode: 0o600 });
-			expect(() => prepareFileHistoryRepair(args)).toThrow();
-			expect(readFileSync(lock, "utf8")).toBe(payload);
-		}
-		const args = fixture();
-		const context = prepare(args);
-		expect(() => prepareFileHistoryRepair(args)).toThrow("live_or_unknown_lock_holder");
-		context.guard("still_owned");
-	});
-	test("a foreign observation domain and unknown tool mutex never grant authority", () => {
-		const args = fixture();
-		const identity = readRepairProcessIdentity();
-		writeFileSync(
-			join(args.dataDir, "narrafork.lock"),
-			JSON.stringify({
-				version: 2,
-				dbPath: args.database,
-				pid: 2147483647,
-				token: "foreign",
-				uid: process.geteuid?.(),
-				maintenanceQualified: true,
-				maintenanceIdentity: {
-					...identity,
-					pid: 2147483647,
-					domain: { ...identity.domain, machine: "f".repeat(32) },
-				},
-			}),
-			{ mode: 0o600 },
-		);
-		expect(() => prepareFileHistoryRepair(args)).toThrow("live_or_unknown_lock_holder");
-		const empty = fixture();
-		mkdirSync(join(empty.dataDir, ".file-history-repair.lock"), { mode: 0o700 });
-		expect(() => prepareFileHistoryRepair(empty)).toThrow("unknown_existing_tool_lock");
-	});
-	test("a second CLI worker refuses an active tool owner without changing its lock", async () => {
-		const args = fixture();
-		const context = prepare(args);
-		const before = readFileSync(join(args.dataDir, "narrafork.lock"));
-		const second = await childResult([process.execPath, script, ...argv(args)], args.dataDir);
-		expect(second.code, JSON.stringify(second)).not.toBe(0);
-		expect(second.stderr).toContain("other_storage_holder");
-		expect(readFileSync(join(args.dataDir, "narrafork.lock"))).toEqual(before);
-		context.guard("second_worker_refused");
-	});
-	test("normal cold-start acquire positively refuses the published maintenance lock", async () => {
-		const args = fixture();
-		const context = prepare(args);
-		const module = JSON.stringify(resolve("server/lib/instance-lock.ts"));
-		const problems = JSON.stringify(resolve("server/lib/startup-status/startup-problems.ts"));
-		const code = `const {acquireInstanceLock}=await import(${module});const {InstanceLockedError}=await import(${problems});try{acquireInstanceLock(process.argv[1]);process.exitCode=7;}catch(error){if(error instanceof InstanceLockedError && error.pid===${context.processIdentity.pid}){console.log('COLD_START_REFUSED');process.exitCode=0;}else{console.error('UNEXPECTED_STARTUP_ERROR');process.exitCode=8;}}`;
-		const result = await childResult([process.execPath, "-e", code, args.database], args.dataDir);
-		expect(result.code).toBe(0);
-		expect(result.stdout).toContain("COLD_START_REFUSED");
-		context.guard("cold_start_still_owned");
-	});
-	test("another process holding the fixture DB refuses maintenance, without service signals", async () => {
-		const args = fixture();
-		const code = `const fs=await import('node:fs');fs.openSync(process.argv[1],'r');console.log('READY');process.stdin.resume();`;
-		const child = Bun.spawn([process.execPath, "-e", code, args.database], {
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		try {
-			const first = await child.stdout.getReader().read();
-			expect(Buffer.from(first.value ?? []).toString()).toContain("READY");
-			expect(() => prepareFileHistoryRepair(args)).toThrow("other_storage_holder");
-		} finally {
-			child.stdin.end();
-			await child.exited;
-		}
-	});
-	test("source, root and lock replacement are noticed and foreign owners are never released", () => {
-		for (const change of ["source", "root", "lock"]) {
+			expect(() => prepareFileHistoryRepair(args, { availableBytes: () => 0n })).toThrow(
+				"insufficient_transaction_space",
+			);
+			expect(readdirSync(args.dataDir).sort()).toEqual([
+				"file-change-blobs",
+				"file-change-source.json",
+				"narrafork.db",
+			]);
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"unknown, empty and live compatible locks are retained",
+		() => {
+			for (const payload of ["", "{}", JSON.stringify({ pid: process.pid, token: "unknown" })]) {
+				const args = fixture();
+				const lock = join(args.dataDir, "narrafork.lock");
+				writeFileSync(lock, payload, { mode: 0o600 });
+				expect(() => prepareFileHistoryRepair(args)).toThrow();
+				expect(readFileSync(lock, "utf8")).toBe(payload);
+			}
 			const args = fixture();
 			const context = prepare(args);
-			if (change === "source")
-				writeFileSync(
-					join(args.dataDir, "file-change-source.json"),
-					JSON.stringify({ version: 1, id: randomUUID() }),
-				);
-			else if (change === "root") {
-				renameSync(join(args.dataDir, "file-change-blobs"), join(args.dataDir, "old-blobs"));
-				mkdirSync(join(args.dataDir, "file-change-blobs"), { mode: 0o700 });
-			} else {
-				unlinkSync(join(args.dataDir, "narrafork.lock"));
-				writeFileSync(join(args.dataDir, "narrafork.lock"), "foreign-owner", { mode: 0o600 });
+			expect(() => prepareFileHistoryRepair(args)).toThrow("live_or_unknown_lock_holder");
+			context.guard("still_owned");
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"a foreign observation domain and unknown tool mutex never grant authority",
+		() => {
+			const args = fixture();
+			const identity = readRepairProcessIdentity();
+			writeFileSync(
+				join(args.dataDir, "narrafork.lock"),
+				JSON.stringify({
+					version: 2,
+					dbPath: args.database,
+					pid: 2147483647,
+					token: "foreign",
+					uid: process.geteuid?.(),
+					maintenanceQualified: true,
+					maintenanceIdentity: {
+						...identity,
+						pid: 2147483647,
+						domain: { ...identity.domain, machine: "f".repeat(32) },
+					},
+				}),
+				{ mode: 0o600 },
+			);
+			expect(() => prepareFileHistoryRepair(args)).toThrow("live_or_unknown_lock_holder");
+			const empty = fixture();
+			mkdirSync(join(empty.dataDir, ".file-history-repair.lock"), { mode: 0o700 });
+			expect(() => prepareFileHistoryRepair(empty)).toThrow("unknown_existing_tool_lock");
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"a second CLI worker refuses an active tool owner without changing its lock",
+		async () => {
+			const args = fixture();
+			const context = prepare(args);
+			const before = readFileSync(join(args.dataDir, "narrafork.lock"));
+			const second = await childResult([process.execPath, script, ...argv(args)], args.dataDir);
+			expect(second.code, JSON.stringify(second)).not.toBe(0);
+			expect(second.stderr).toContain("other_storage_holder");
+			expect(readFileSync(join(args.dataDir, "narrafork.lock"))).toEqual(before);
+			context.guard("second_worker_refused");
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"normal cold-start acquire positively refuses the published maintenance lock",
+		async () => {
+			const args = fixture();
+			const context = prepare(args);
+			const module = JSON.stringify(resolve("server/lib/instance-lock.ts"));
+			const problems = JSON.stringify(resolve("server/lib/startup-status/startup-problems.ts"));
+			const code = `const {acquireInstanceLock}=await import(${module});const {InstanceLockedError}=await import(${problems});try{acquireInstanceLock(process.argv[1]);process.exitCode=7;}catch(error){if(error instanceof InstanceLockedError && error.pid===${context.processIdentity.pid}){console.log('COLD_START_REFUSED');process.exitCode=0;}else{console.error('UNEXPECTED_STARTUP_ERROR');process.exitCode=8;}}`;
+			const result = await childResult([process.execPath, "-e", code, args.database], args.dataDir);
+			expect(result.code).toBe(0);
+			expect(result.stdout).toContain("COLD_START_REFUSED");
+			context.guard("cold_start_still_owned");
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"another process holding the fixture DB refuses maintenance, without service signals",
+		async () => {
+			const args = fixture();
+			const code = `const fs=await import('node:fs');fs.openSync(process.argv[1],'r');console.log('READY');process.stdin.resume();`;
+			const child = Bun.spawn([process.execPath, "-e", code, args.database], {
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			try {
+				const first = await child.stdout.getReader().read();
+				expect(Buffer.from(first.value ?? []).toString()).toContain("READY");
+				expect(() => prepareFileHistoryRepair(args)).toThrow("other_storage_holder");
+			} finally {
+				child.stdin.end();
+				await child.exited;
 			}
-			expect(() => context.guard("before_commit", true)).toThrow();
-			if (change === "lock") {
-				expect(() => context.close({ status: "succeeded", commitState: "committed" })).toThrow();
-				expect(readFileSync(join(args.dataDir, "narrafork.lock"), "utf8")).toBe("foreign-owner");
-				expect(JSON.parse(readFileSync(context.reportPath, "utf8"))).toMatchObject({
-					status: "failed",
-					startupAllowed: false,
-					commitState: "committed",
-				});
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"source, root and lock replacement are noticed and foreign owners are never released",
+		() => {
+			for (const change of ["source", "root", "lock"]) {
+				const args = fixture();
+				const context = prepare(args);
+				if (change === "source")
+					writeFileSync(
+						join(args.dataDir, "file-change-source.json"),
+						JSON.stringify({ version: 1, id: randomUUID() }),
+					);
+				else if (change === "root") {
+					renameSync(join(args.dataDir, "file-change-blobs"), join(args.dataDir, "old-blobs"));
+					mkdirSync(join(args.dataDir, "file-change-blobs"), { mode: 0o700 });
+				} else {
+					unlinkSync(join(args.dataDir, "narrafork.lock"));
+					writeFileSync(join(args.dataDir, "narrafork.lock"), "foreign-owner", { mode: 0o600 });
+				}
+				expect(() => context.guard("before_commit", true)).toThrow();
+				if (change === "lock") {
+					expect(() => context.close({ status: "succeeded", commitState: "committed" })).toThrow();
+					expect(readFileSync(join(args.dataDir, "narrafork.lock"), "utf8")).toBe("foreign-owner");
+					expect(JSON.parse(readFileSync(context.reportPath, "utf8"))).toMatchObject({
+						status: "failed",
+						startupAllowed: false,
+						commitState: "committed",
+					});
+				}
 			}
-		}
-	});
-	test("small reports stay valid across repeated shorter rewrites and reject oversized output", () => {
-		const context = prepare(fixture());
-		context.writeReport({ phase: "longer", processedRows: 123456789, status: "in_progress" });
-		context.writeReport({ phase: "done" });
-		const raw = readFileSync(context.reportPath, "utf8");
-		expect(raw.includes("\0")).toBe(false);
-		expect(JSON.parse(raw)).toMatchObject({ phase: "done" });
-		expect(lstatSync(context.reportPath).mode & 0o777).toBe(0o600);
-		expect(lstatSync(resolve(context.reportPath, "..")).mode & 0o777).toBe(0o700);
-		expect(() => context.writeReport({ stage: "x".repeat(8192) })).toThrow("report_size_limit");
-		expect(readFileSync(context.reportPath, "utf8")).toBe(raw);
-	});
-	test("report parent failure stops before SQLite is opened", () => {
-		const args = fixture();
-		writeFileSync(join(args.dataDir, "file-history-maintenance"), "not-directory", { mode: 0o600 });
-		const before = readFileSync(args.database);
-		expect(() => prepareFileHistoryRepair(args)).toThrow();
-		expect(readFileSync(args.database)).toEqual(before);
-		expect(existsSync(join(args.dataDir, "narrafork.lock"))).toBe(false);
-	});
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"small reports stay valid across repeated shorter rewrites and reject oversized output",
+		() => {
+			const context = prepare(fixture());
+			context.writeReport({ phase: "longer", processedRows: 123456789, status: "in_progress" });
+			context.writeReport({ phase: "done" });
+			const raw = readFileSync(context.reportPath, "utf8");
+			expect(raw.includes("\0")).toBe(false);
+			expect(JSON.parse(raw)).toMatchObject({ phase: "done" });
+			expect(lstatSync(context.reportPath).mode & 0o777).toBe(0o600);
+			expect(lstatSync(resolve(context.reportPath, "..")).mode & 0o777).toBe(0o700);
+			expect(() => context.writeReport({ stage: "x".repeat(8192) })).toThrow("report_size_limit");
+			expect(readFileSync(context.reportPath, "utf8")).toBe(raw);
+		},
+	);
+	test.skipIf(process.geteuid?.() !== 0)(
+		"report parent failure stops before SQLite is opened",
+		() => {
+			const args = fixture();
+			writeFileSync(join(args.dataDir, "file-history-maintenance"), "not-directory", {
+				mode: 0o600,
+			});
+			const before = readFileSync(args.database);
+			expect(() => prepareFileHistoryRepair(args)).toThrow();
+			expect(readFileSync(args.database)).toEqual(before);
+			expect(existsSync(join(args.dataDir, "narrafork.lock"))).toBe(false);
+		},
+	);
 });
 
-describe("isolated Bun CLI end-to-end", () => {
+describe.skipIf(process.geteuid?.() !== 0)("isolated Bun CLI end-to-end", () => {
 	test("signal cancellation affects only fixture-owned workers and never reports success", async () => {
 		const args = fixture();
 		unlinkSync(args.database);
