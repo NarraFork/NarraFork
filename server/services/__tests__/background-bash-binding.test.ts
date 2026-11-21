@@ -826,8 +826,8 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 
 			test("a service that exited during the restart is settled with its real exit code", async () => {
 				await createService("svc-dead");
-				const { durable } = await spawnRealService("svc-dead", "echo last-words; exit 4");
-				await waitFor(() => false, 300);
+				const { durable, handle } = await spawnRealService("svc-dead", "echo last-words; exit 4");
+				await expect(handle.exited).resolves.toBe(4);
 				expect((await durable.readOrphanedServiceOutcome("svc-dead")).exitCode).toBe(4);
 				expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
 				const row = taskRow();

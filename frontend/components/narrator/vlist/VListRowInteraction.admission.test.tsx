@@ -54,6 +54,14 @@ mock.module("../content/ContentInspector", () => ({
 	),
 }));
 const { VListRowInteraction } = await import("./VListRowInteraction");
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+function clearPendingTimers() {
+	for (const timer of pendingTimers) nativeClearTimeout(timer);
+	pendingTimers.clear();
+}
 
 function createClock() {
 	let time = 0;
@@ -112,8 +120,22 @@ function installDom() {
 		addListener() {},
 		removeListener() {},
 	});
-	const requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(callback, 0);
-	const cancelAnimationFrame = (id: number) => clearTimeout(id);
+	const setTimeout = ((...args: Parameters<typeof globalThis.setTimeout>) => {
+		const [callback, delay, ...callbackArgs] = args;
+		const timer = nativeSetTimeout(() => {
+			pendingTimers.delete(timer);
+			callback(...callbackArgs);
+		}, delay);
+		pendingTimers.add(timer);
+		return timer;
+	}) as typeof globalThis.setTimeout;
+	const clearTimeout = ((timer: Parameters<typeof globalThis.clearTimeout>[0]) => {
+		nativeClearTimeout(timer);
+		pendingTimers.delete(timer as ReturnType<typeof setTimeout>);
+	}) as typeof globalThis.clearTimeout;
+	const requestAnimationFrame = (callback: FrameRequestCallback) =>
+		setTimeout(() => callback(performance.now()), 0);
+	const cancelAnimationFrame = (id: ReturnType<typeof setTimeout>) => clearTimeout(id);
 	Object.defineProperties(window, {
 		innerWidth: { configurable: true, value: 1024 },
 		innerHeight: { configurable: true, value: 768 },
@@ -138,6 +160,8 @@ function installDom() {
 		ResizeObserver,
 		MutationObserver: ResizeObserver,
 		matchMedia,
+		setTimeout,
+		clearTimeout,
 		requestAnimationFrame,
 		cancelAnimationFrame,
 		getComputedStyle: () => ({
@@ -245,19 +269,24 @@ beforeEach(() => {
 	admission.markHistoryIntent();
 });
 afterEach(async () => {
-	await act(async () => {
-		root.unmount();
-	});
-	admission.suspend();
-	container.remove();
-	expect(admission.getDebugSnapshot().active).toBe(0);
-	for (const [key, descriptor] of globalDescriptors) {
-		if (!descriptor) Reflect.deleteProperty(globalThis, key);
-		else if (!descriptor.configurable && "writable" in descriptor && descriptor.writable)
-			Reflect.set(globalThis, key, descriptor.value);
-		else Object.defineProperty(globalThis, key, descriptor);
+	try {
+		clearPendingTimers();
+		await act(async () => {
+			root.unmount();
+		});
+		admission.suspend();
+		container.remove();
+		expect(admission.getDebugSnapshot().active).toBe(0);
+	} finally {
+		clearPendingTimers();
+		for (const [key, descriptor] of globalDescriptors) {
+			if (!descriptor) Reflect.deleteProperty(globalThis, key);
+			else if (!descriptor.configurable && "writable" in descriptor && descriptor.writable)
+				Reflect.set(globalThis, key, descriptor.value);
+			else Object.defineProperty(globalThis, key, descriptor);
+		}
+		globalDescriptors.clear();
 	}
-	globalDescriptors.clear();
 });
 afterAll(() => {
 	mock.module("@mantine/hooks", () => realHooks);
@@ -269,6 +298,19 @@ afterAll(() => {
 });
 
 describe("VList row controller admission — actual DOM", () => {
+	test("DOM teardown cancels delayed state updates and animation frames", async () => {
+		const update = mock(() => window.document);
+		setTimeout(update, 0);
+		window.setTimeout(update, 0);
+		requestAnimationFrame(update);
+		expect(pendingTimers.size).toBe(3);
+		clearPendingTimers();
+		clearPendingTimers();
+		await new Promise((resolve) => nativeSetTimeout(resolve, 0));
+		expect(update).not.toHaveBeenCalled();
+		expect(pendingTimers.size).toBe(0);
+	});
+
 	test("cold history retains DOM and first selection gestures without controller hooks", async () => {
 		await renderRows();
 		const box = boxes()[0];

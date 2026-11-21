@@ -128,6 +128,8 @@ test.each([
 		pageReads = 0;
 	let legacyHost: "missing" | "text-v1" | undefined;
 	let failDraftAnchors = false;
+	const documentSessions = new Set<string>();
+	let activeDocumentRequests = 0;
 	let stopSampling = false;
 	let sampler: Promise<void> | undefined;
 	let samplingFailure: unknown;
@@ -227,7 +229,17 @@ test.each([
 					if (path.endsWith("/content")) contentReads++;
 					if (path.endsWith("/page")) pageReads++;
 					if (path.endsWith("/commit")) commits++;
-					return app.fetch(request);
+					activeDocumentRequests++;
+					try {
+						const response = await app.fetch(request);
+						if (request.method === "POST" && path.endsWith("/editor-documents") && response.ok) {
+							const descriptor = await response.clone().json();
+							documentSessions.add(descriptor.docId);
+						}
+						return response;
+					} finally {
+						activeDocumentRequests--;
+					}
 				}
 				if (path === "/")
 					return new Response(data.html, { headers: { "Content-Type": "text/html" } });
@@ -271,6 +283,38 @@ test.each([
 		await page.waitForFunction(() => !!(window as unknown as RawWindow).rawFixture, {
 			timeout: 30_000,
 		});
+		const waitForDocumentRequests = async () => {
+			const end = Date.now() + 15_000;
+			while (activeDocumentRequests) {
+				if (Date.now() > end)
+					throw new Error(`Editor HTTP requests did not settle: ${activeDocumentRequests}`);
+				await Bun.sleep(10);
+			}
+		};
+		const closeDocumentSessions = async () => {
+			await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());
+			await page.waitForFunction(
+				() => {
+					const state = (window as unknown as RawWindow).rawFixture.state();
+					return state.registry.loads === 0 && state.disk.running === 0;
+				},
+				{ timeout: 15_000 },
+			);
+			await waitForDocumentRequests();
+			// A page reload can abandon a successfully created descriptor before its DELETE.
+			for (const docId of documentSessions) {
+				const response = await app.request(
+					`/api/narrators/${narratorId}/editor-documents/${docId}`,
+					{ method: "DELETE" },
+				);
+				expect([200, 410]).toContain(response.status);
+				documentSessions.delete(docId);
+			}
+			expect(service.diagnostics.documents).toBe(0);
+			expect(service.diagnostics.streams.active).toBe(0);
+			expect(service.diagnostics.streams.queued).toBe(0);
+			expect(service.diagnostics.streams.streams).toBe(0);
+		};
 		const cdp = await page.createCDPSession();
 		await cdp.send("HeapProfiler.collectGarbage");
 		const baseline = await page.evaluate(() => (window as unknown as RawWindow).rawFixture.state());
@@ -500,8 +544,8 @@ test.each([
 			expect(nextSave.dirty).toBe(false);
 			expect(fixture.applies).toBe(3);
 			expect(commits).toBe(3);
+			await closeDocumentSessions();
 			await fixture.reconnect(true);
-			await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());
 			const readonly = await page.evaluate(
 				(path) => (window as unknown as RawWindow).rawFixture.open(path),
 				target,
@@ -513,7 +557,10 @@ test.each([
 				writeUnavailableReason: "durable_executor_unavailable",
 			});
 		}
-		if (device === "remote") await fixture.reconnect(false);
+		if (device === "remote") {
+			await closeDocumentSessions();
+			await fixture.reconnect(false);
+		}
 		const pollTarget = join(workspace, "ignored.txt");
 		await writeFile(pollTarget, "one\n");
 		await page.evaluate(
@@ -645,6 +692,7 @@ test.each([
 					actualGoApplies: fixture.applies,
 				}),
 			);
+			await closeDocumentSessions();
 			await fixture.reconnect(false, true);
 			const legacyTarget = join(workspace, "legacy-only.txt");
 			await writeFile(legacyTarget, "legacy-safe\n");
@@ -678,6 +726,7 @@ test.each([
 					readonly: true,
 				}),
 			);
+			await closeDocumentSessions();
 			await fixture.reconnect(false, false);
 		} else {
 			const legacyTarget = join(workspace, "legacy-large.txt");
@@ -726,9 +775,13 @@ test.each([
 		);
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.restoredTabs());
 		await page.waitForFunction(
-			() => (window as unknown as RawWindow).rawFixture.state().views.views === 2,
+			() => {
+				const state = (window as unknown as RawWindow).rawFixture.state();
+				return state.views.views === 2 && state.registry.loads === 0 && state.disk.running === 0;
+			},
 			{ timeout: 15_000 },
 		);
+		await waitForDocumentRequests();
 		const beforeRevoke = await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.state(),
 		);
