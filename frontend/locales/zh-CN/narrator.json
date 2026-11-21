@@ -1037,6 +1037,7 @@
 	"relaxed_plan_forced_tooltip": "权限模式为全部允许时，宽松规划会被强制开启",
 	"archiveConfirmTitle": "确认归档",
 	"archiveActiveWarning": "确定要归档该会话吗？如果会话正在运行中，归档将中断当前生成并拒绝权限申请。",
+	"archiveAskInPassingWarning": "它的 {{count}} 个顺便提问会话也会一起归档。",
 	"confirmArchive": "确认归档",
 	"cancel": "取消",
 	"confirm": "确认",
