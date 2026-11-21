@@ -301,6 +301,13 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(writes).toEqual([]);
 		});
 
+		test("a placement parent without a registered model source never triggers re-selection", async () => {
+			setParent("provA:m1");
+			setChild("provB:m2", "general", { policySourceNarratorId: null });
+			expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(false);
+			expect(writes).toEqual([]);
+		});
+
 		test("an explicit Send model is kept for the next run, once", async () => {
 			setPool(["provA:m1", "provB:m2"]);
 			setParent("provA:m1");

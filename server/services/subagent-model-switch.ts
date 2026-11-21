@@ -189,7 +189,7 @@ export async function reselectSubagentModelForNewRun(
 		const currentModel = child.model || FOLLOW_DEFAULT_MODEL;
 		if (consumeExplicitSubagentModelPin(narratorId, currentModel)) return false;
 		if (currentModel === FOLLOW_PARENT_MODEL) return false;
-		const sourceId = policySourceIdOf(child) ?? child.parentNarratorId;
+		const sourceId = policySourceIdOf(child);
 		if (!sourceId) return false;
 		const source = await narratorService.getById(sourceId).catch(() => null);
 		if (!source) {
