@@ -57,6 +57,7 @@
 	"dragToSidebar": "Drag into the sidebar, or onto a workspace to add it there",
 	"archive": "Archive",
 	"unarchive": "Unarchive",
+	"askInPassingSessions": "Ask in passing ({{count}})",
 	"archivedNarrators": "Archived Narrators",
 	"viewArchived": "View Archived",
 	"backToNarrators": "Back to Narrators",
