@@ -234,11 +234,15 @@ describe("ModelTrace HTTP entry", () => {
 		const service = await import("../modeltrace-service");
 		const start = spyOn(service, "startModelTrace").mockResolvedValue({ id: "trace-child" });
 		spies.push(start);
-		const response = await post(appFor(), "/narrators/source/modeltrace");
+		const response = await appFor().request("/narrators/source/modeltrace", { method: "POST" });
 		expect(response.status).toBe(201);
 		expect(await response.json()).toEqual({ id: "trace-child" });
 		expect(start).toHaveBeenCalledTimes(1);
-		expect(start.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+		expect(start.mock.calls[0]?.slice(0, 2)).toEqual([
+			"source",
+			{ userId: "owner", isAdmin: false },
+		]);
+		expect(start.mock.calls[0]?.[3]).toEqual({});
 	});
 
 	test("retry requires write access to the diagnostic child", async () => {
@@ -259,7 +263,10 @@ describe("ModelTrace HTTP entry", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ id: "source" });
 		expect(retry).toHaveBeenCalledTimes(1);
-		expect(retry.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+		expect(retry.mock.calls[0]?.slice(0, 2)).toEqual([
+			"source",
+			{ userId: "owner", isAdmin: false },
+		]);
 	});
 });
 

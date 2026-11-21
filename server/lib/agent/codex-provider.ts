@@ -520,7 +520,11 @@ export class CodexProvider implements ProviderAdapter {
 			const chatParams: ChatParams = {
 				...params,
 				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+					params.onRequestStart?.({
+						credentialId: info?.credentialId ?? ctx.id,
+						validateDiagnosticCredential: () =>
+							this.manager.isDiagnosticCredentialCurrent(ctx.credential),
+					}),
 			};
 			let hasStreamedEvents = false;
 			let sawPolicyViolation = false;
@@ -589,9 +593,22 @@ export class CodexProvider implements ProviderAdapter {
 		const ctx = anchorCredential
 			? await this.manager.acquireDiagnosticContext(anchorCredential)
 			: await this.manager.acquireContext(params.stickySessionKey);
+		const fork = params.diagnosticFork;
+		const validateBeforeDispatch = fork
+			? () => {
+					if (
+						!this.manager.isDiagnosticCredentialCurrent(ctx.credential) ||
+						fork.validateCredential?.() === false
+					) {
+						throw new Error("The parent Codex credential is unavailable for diagnostics");
+					}
+					return true;
+				}
+			: undefined;
 		if (!this.useWebSocket) {
 			for await (const event of this.createProvider(ctx).chat({
 				...params,
+				diagnosticFork: fork && { ...fork, validateCredential: validateBeforeDispatch },
 				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
 			}))
 				yield { ...event, credentialId: ctx.id };
@@ -618,7 +635,7 @@ export class CodexProvider implements ProviderAdapter {
 			signal: params.signal,
 			resetSessionBeforeRequest: true,
 			ephemeralSession: true,
-			validateBeforeDispatch: params.diagnosticFork?.validateCredential,
+			validateBeforeDispatch,
 			userAgent: fingerprint.userAgent,
 			extraHeaders: fingerprint.headers,
 			requestDump: params.requestDump,
@@ -649,7 +666,11 @@ export class CodexProvider implements ProviderAdapter {
 				const fingerprint = resolveCodexProviderFingerprint(params.conversationId, ctx.credential);
 
 				await reportInputCharacters(params, request);
-				params.onRequestStart?.({ credentialId: ctx.id });
+				params.onRequestStart?.({
+					credentialId: ctx.id,
+					validateDiagnosticCredential: () =>
+						this.manager.isDiagnosticCredentialCurrent(ctx.credential),
+				});
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,

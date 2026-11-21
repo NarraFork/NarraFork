@@ -842,8 +842,18 @@ export class CodexManager {
 	async acquireDiagnosticContext(credentialId: string): Promise<CallContext> {
 		const entry = this.poolEntries.find((entry) => entry.id === credentialId);
 		const context = entry && !entry.disabled ? await this.tryEnsureToken(entry) : null;
-		if (!context) throw new Error("The parent Codex credential is unavailable for diagnostics");
+		if (!context || !this.isDiagnosticCredentialCurrent(context.credential)) {
+			throw new Error("The parent Codex credential is unavailable for diagnostics");
+		}
 		return context;
+	}
+
+	isDiagnosticCredentialCurrent(credential: CodexCredential): boolean {
+		return (
+			!credential.disabled &&
+			!isArchivedCodexCredential(credential) &&
+			this.entries.includes(credential)
+		);
 	}
 
 	/** Credentials that are still part of the live pool (i.e. not archived). */

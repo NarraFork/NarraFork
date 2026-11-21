@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import type { CallContext, CodexManager } from "../../codex-manager";
 import {
 	buildModelTraceProbeParams,
 	rememberModelTraceRequest,
@@ -13,6 +14,7 @@ mock.module("../codex-websocket", () => ({
 	async *streamCodexResponsesWebSocket(
 		options: Parameters<typeof websocket.streamCodexResponsesWebSocket>[0],
 	) {
+		options.validateBeforeDispatch?.();
 		captured = options;
 		yield { text: "[]", stopReason: "stop" };
 	},
@@ -201,5 +203,68 @@ test("built-in Codex keeps credential affinity while isolating the probe socket"
 		expect(acquire).toHaveBeenCalledWith("parent-credential-affinity");
 	} finally {
 		internals.manager.reportSuccess = oldSuccess;
+	}
+});
+
+test.each([
+	false,
+	true,
+])("built-in Codex blocks a disabled diagnostic credential before dispatch (websocket=%s)", async (useWebSocket) => {
+	const provider = new CodexProvider({
+		useWebSocket,
+		useWebSearch: false,
+		useImageGeneration: false,
+	});
+	const context: CallContext = {
+		id: "test-credential",
+		token: "test-token",
+		authorization: "Bearer test-token",
+		credential: { id: "test-credential", accountId: "test-account" } as CallContext["credential"],
+	};
+	const internals = provider as unknown as {
+		getContext: () => Promise<CallContext>;
+		refreshUsageOnUse: () => void;
+		getMaxFailoverAttempts: () => number;
+		manager: Pick<
+			CodexManager,
+			"acquireDiagnosticContext" | "isDiagnosticCredentialCurrent" | "reportSuccess"
+		>;
+	};
+	internals.getContext = async () => context;
+	internals.refreshUsageOnUse = () => {};
+	internals.getMaxFailoverAttempts = () => 1;
+	internals.manager = {
+		acquireDiagnosticContext: async () => context,
+		isDiagnosticCredentialCurrent: (credential) => !credential.disabled,
+		reportSuccess: () => {},
+	};
+	const fetch = globalThis.fetch;
+	const upstream = mock(async () => new Response("upstream stubbed", { status: 500 }));
+	globalThis.fetch = upstream as unknown as typeof globalThis.fetch;
+	try {
+		let validate: (() => boolean) | undefined;
+		const parent: ChatParams = {
+			...params(),
+			onRequestStart: (info) => {
+				validate = info?.validateDiagnosticCredential;
+			},
+		};
+		if (useWebSocket) await drain(provider, parent);
+		else await expect(drain(provider, parent)).rejects.toThrow();
+		expect(validate?.()).toBe(true);
+		upstream.mockClear();
+		captured = undefined;
+		const diagnostic = fork(provider, parent, context.id);
+		diagnostic.onInputCharacters = () => {
+			context.credential.disabled = true;
+		};
+		await expect(drain(provider, diagnostic)).rejects.toThrow(
+			"The parent Codex credential is unavailable",
+		);
+		expect(validate?.()).toBe(false);
+		expect(upstream).not.toHaveBeenCalled();
+		expect(captured).toBeUndefined();
+	} finally {
+		globalThis.fetch = fetch;
 	}
 });
