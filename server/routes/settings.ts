@@ -242,6 +242,7 @@ const anthropicProviderSchema = z.object({
 });
 
 const nugProviderSchema = z.object({
+	toolResultImages: toolResultImagesSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),

@@ -630,7 +630,55 @@ describe("settings conditional admin guards", () => {
 		}
 	});
 
+	test("NUG rejects invalid image mode", async () => {
+		const response = await appForRole("admin").request("/settings", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				nugProviders: [
+					{
+						id: "nug-images",
+						name: "Test",
+						prefix: "nug-images",
+						apiKey: "test",
+						baseUrl: "https://nug.example.test",
+						defaultModel: "openai:model",
+						toolResultImages: "invalid",
+					},
+				],
+			}),
+		});
+		expect(response.status).toBe(400);
+	});
 	for (const mode of ["off", "inline", "separate"] as const) {
+		test(`NUG image mode ${mode} survives save and reload`, async () => {
+			const original = structuredClone(settings);
+			try {
+				const response = await appForRole("admin").request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						nugProviders: [
+							{
+								id: "nug-images",
+								name: "NUG images",
+								prefix: "nug-images",
+								apiKey: "test-key",
+								baseUrl: "https://nug.example.test",
+								defaultModel: "openai:model",
+								toolResultImages: mode,
+							},
+						],
+					}),
+				});
+				expect(response.status).toBe(200);
+				expect(reloadSettings().nugProviders?.[0]?.toolResultImages).toBe(mode);
+				const loaded = await appForRole("admin").request("/settings");
+				expect((await loaded.json()).nugProviders[0].toolResultImages).toBe(mode);
+			} finally {
+				saveSettings(original);
+			}
+		});
 		test(`legacy OpenAI save retains tool image mode ${mode} across both projections`, async () => {
 			const original = structuredClone(settings);
 			try {

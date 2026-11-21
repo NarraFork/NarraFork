@@ -253,6 +253,10 @@ function SettingsProvidersPage() {
 						...fresh,
 						customApiProviders: recovered.customApiProviders,
 						nugProviders: recovered.nugProviders,
+						tokendance: {
+							...(fresh.tokendance as Record<string, unknown>),
+							toolResultImages: recovered.tokenDanceToolResultImages,
+						},
 						agent: { ...(fresh.agent as Record<string, unknown>), ...createSnapshot(recovered) },
 					});
 					savedSnapshot.current = createSnapshot(freshState);
@@ -413,9 +417,16 @@ function SettingsProvidersPage() {
 			}
 			// 平台集成里 TokenDance 的开关存在它自己的连接记录里，所以先提交它、再存 settings：
 			// 这样 settings 响应里的 tokendance.disabled 已是新值，SYNC 之后草稿不会回退。
-			if (stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled) {
+			if (
+				stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled ||
+				stateToSave.tokenDanceToolResultImages !== savedSnapshot.current.tokenDanceToolResultImages
+			) {
 				try {
-					await api.tokenDanceUpdateConnection(stateToSave.tokenDanceDisabled);
+					await api.tokenDanceUpdateConnection(
+						stateToSave.tokenDanceDisabled,
+						undefined,
+						stateToSave.tokenDanceToolResultImages ?? "off",
+					);
 				} catch {
 					notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
 					throw new Error(t("tokendance.operationFailed"));
@@ -1251,6 +1262,10 @@ function SettingsProvidersPage() {
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
 							connection={tokenDance}
+							toolResultImages={state.tokenDanceToolResultImages}
+							onToolResultImagesChange={(value) =>
+								dispatch({ type: "SET_TOKENDANCE_TOOL_IMAGES", value })
+							}
 							enabled={!tokenDanceDisabled}
 							onToggleEnabled={() =>
 								dispatchers.setPlatformDisabled("tokendance", !tokenDanceDisabled)

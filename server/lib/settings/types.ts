@@ -257,6 +257,7 @@ export interface AnthropicProviderConfig {
 }
 
 export interface NUGProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars). */
 	id: string;
 	/** User-defined display name, e.g. "NUG Production". */
@@ -612,6 +613,7 @@ export function isModelProtocol(value: unknown): value is ModelProtocol {
 }
 
 export interface TokenDanceSettings {
+	toolResultImages?: ToolResultImagesMode;
 	apiKey: string;
 	disabled: boolean;
 	generation: number;

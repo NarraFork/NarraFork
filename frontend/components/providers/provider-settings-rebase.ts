@@ -106,5 +106,9 @@ export function rebaseProviderState(
 			local.tokenDanceDisabled !== baseline.tokenDanceDisabled
 				? local.tokenDanceDisabled
 				: fresh.tokenDanceDisabled,
+		tokenDanceToolResultImages:
+			local.tokenDanceToolResultImages !== baseline.tokenDanceToolResultImages
+				? local.tokenDanceToolResultImages
+				: fresh.tokenDanceToolResultImages,
 	});
 }

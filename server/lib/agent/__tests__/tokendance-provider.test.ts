@@ -34,7 +34,14 @@ let LoopTranscript: typeof import("../loop-transcript").LoopTranscript;
 let home = "";
 let oldHome: string | undefined;
 const apiKey = "test-key-that-must-never-escape-12345";
-let config: { apiKey: string; generation: number; disabled: boolean } | undefined;
+let config:
+	| {
+			apiKey: string;
+			generation: number;
+			disabled: boolean;
+			toolResultImages?: "off" | "inline" | "separate";
+	  }
+	| undefined;
 let models: TokenDanceCatalogModel[] = [];
 let dispose: () => void;
 const controllers = new Set<AbortController>();
@@ -115,6 +122,39 @@ function params(): ChatParams {
 }
 
 describe("strict TokenDance protocol mapping", () => {
+	for (const mode of [undefined, "off", "inline", "separate"] as const) {
+		test(`Chat Completions forwards tool images with mode ${mode}`, async () => {
+			catalog("openai:chat-completions");
+			if (!config) throw new Error("missing config");
+			const provider = new TokenDanceProvider();
+			provider.prepareForModel("tokendance:opaque-model");
+			config = { ...config, toolResultImages: mode, generation: config.generation + 1 };
+			// An unchanged preference does not invalidate an existing connection.
+			if (mode === undefined) config.generation--;
+			let body = "";
+			setFetch(async (_input, init) => {
+				body = String(init?.body);
+				return new Response("data: [DONE]\n\n", {
+					headers: { "content-type": "text/event-stream" },
+				});
+			});
+			for await (const _ of provider.chat({
+				...params(),
+				toolResults: [
+					{
+						tool_call_id: "call-1",
+						content: "read",
+						_images: [{ format: "png", mediaType: "image/png", base64: "aGVsbG8=" }],
+					},
+				],
+			})) {
+			}
+			expect(body).toContain("read");
+			expect(body.includes("data:image/png;base64,aGVsbG8=")).toBe(
+				mode === "inline" || mode === "separate",
+			);
+		});
+	}
 	test("fixed priority and no inference", () => {
 		expect(selectTokenDanceProtocol(protocols.map(([protocol]) => protocol).reverse())).toBe(
 			"anthropic-messages",

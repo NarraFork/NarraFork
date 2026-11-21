@@ -1,9 +1,15 @@
 import type { TokenDanceCatalogModel, TokenDanceRecoveryAction } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 
 /** Dependency-free runtime bridge: service binds it without importing settings into providers. */
 export interface TokenDanceRuntime {
 	getTokenDanceRuntimeConfig():
-		| { apiKey: string; generation: number; disabled: boolean }
+		| {
+				apiKey: string;
+				generation: number;
+				disabled: boolean;
+				toolResultImages?: ToolResultImagesMode;
+		  }
 		| undefined;
 	assertTokenDanceConnection(generation: number): void;
 	registerTokenDanceRequest(controller: AbortController, generation: number): () => void;

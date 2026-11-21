@@ -15,6 +15,7 @@ import {
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
@@ -210,11 +211,21 @@ const cleanupTimer = setInterval(cleanup, 60_000);
 cleanupTimer.unref();
 
 export function getTokenDanceRuntimeConfig():
-	| { apiKey: string; generation: number; disabled: boolean }
+	| {
+			apiKey: string;
+			generation: number;
+			disabled: boolean;
+			toolResultImages?: ToolResultImagesMode;
+	  }
 	| undefined {
 	const config = settings.tokendance;
 	return config?.apiKey
-		? { apiKey: config.apiKey, generation: config.generation, disabled: config.disabled }
+		? {
+				apiKey: config.apiKey,
+				generation: config.generation,
+				disabled: config.disabled,
+				toolResultImages: config.toolResultImages,
+			}
 		: undefined;
 }
 export function getTokenDanceCatalogModels(): TokenDanceCatalogModel[] {
@@ -235,6 +246,7 @@ export function setTokenDanceRecoveryAction(
 export function getTokenDanceConnection(): TokenDancePublicConnection {
 	return {
 		connected: !!settings.tokendance?.apiKey,
+		toolResultImages: settings.tokendance?.toolResultImages,
 		name: "TokenDance",
 		billingInstance,
 		disabled: settings.tokendance?.disabled ?? false,
@@ -536,6 +548,7 @@ export async function completeTokenDanceOAuth(
 			assertNoPrefixConflict();
 			const latest = structuredClone(settings);
 			latest.tokendance = {
+				toolResultImages: latest.tokendance?.toolResultImages,
 				modelCollectionInitialized: latest.tokendance?.modelCollectionInitialized,
 				apiKey: key,
 				disabled: false,
@@ -628,12 +641,18 @@ function invalidateRequests(): void {
 }
 export async function setTokenDanceDisabled(
 	disabled: boolean,
+	toolResultImages?: ToolResultImagesMode,
 ): Promise<TokenDancePublicConnection> {
 	return settingsUpdateLock.acquire("settings", async () => {
 		if (!settings.tokendance?.apiKey) throw fail("TokenDance is not connected", 409);
 		const cached = getTokenDanceCatalogModels();
 		const latest = structuredClone(settings);
-		latest.tokendance = { ...settings.tokendance, disabled, generation: generation() + 1 };
+		latest.tokendance = {
+			...settings.tokendance,
+			disabled,
+			toolResultImages: toolResultImages ?? settings.tokendance.toolResultImages,
+			generation: generation() + 1,
+		};
 		models = cached;
 		saveSettings(latest);
 		invalidateRequests();

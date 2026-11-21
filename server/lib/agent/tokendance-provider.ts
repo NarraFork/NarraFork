@@ -204,12 +204,22 @@ export class TokenDanceProvider implements ProviderAdapter {
 	private delegate?: ProviderAdapter;
 	private model?: string;
 	private protocol?: string;
-	private readonly config = (() => {
+	private config = (() => {
 		const config = getTokenDanceRuntimeConfig();
 		return config ? { ...config } : undefined;
 	})();
 
 	prepareForModel(model: string): void {
+		const current = getTokenDanceRuntimeConfig();
+		if (
+			current &&
+			!current.disabled &&
+			current.apiKey === this.config?.apiKey &&
+			current.toolResultImages !== this.config?.toolResultImages
+		) {
+			this.config = { ...current };
+			this.delegate = undefined;
+		}
 		if (!this.config || this.config.disabled)
 			throw new Error("TokenDance connection is not configured or is disabled.");
 		assertTokenDanceConnection(this.config.generation);
@@ -233,6 +243,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 			return;
 		}
 		const config = {
+			toolResultImages: this.config.toolResultImages,
 			id: "tokendance",
 			name: "TokenDance",
 			prefix: "tokendance",
