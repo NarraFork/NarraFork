@@ -1,6 +1,10 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { logger } from "../../logger";
-import { readPoolTaskSnapshot, warnReadPoolFailure } from "../read-diagnostics";
+import {
+	readPoolDiagnosticSource,
+	readPoolTaskSnapshot,
+	warnReadPoolFailure,
+} from "../read-diagnostics";
 
 afterEach(() => {
 	mockWarn.mockRestore();
@@ -15,6 +19,15 @@ test("empty snapshots contain no fabricated task identity", () => {
 		source: "unattributed",
 		ageMs: null,
 	});
+});
+
+test("recording attribution is preserved but arbitrary source text is discarded", () => {
+	mockWarn = spyOn(logger, "warn").mockImplementation(() => {});
+	const source = readPoolDiagnosticSource("narrator.request-recording");
+	expect(readPoolTaskSnapshot({ kind: "selectRows", source, startedAt: 0 }, 1, 0)).toMatchObject({
+		source: "narrator.request-recording",
+	});
+	expect(readPoolDiagnosticSource("narrator.request-recording:request-id")).toBe("unattributed");
 });
 
 test("queue rejection bursts are bounded independently from timeout evidence", () => {

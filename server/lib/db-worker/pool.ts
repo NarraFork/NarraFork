@@ -20,6 +20,7 @@ import {
 import {
 	logReadSqlDiagnostic,
 	type ReadPoolTaskDiagnostics,
+	readPoolDiagnosticSource,
 	readPoolTaskSnapshot,
 	warnReadPoolFailure,
 } from "./read-diagnostics";
@@ -541,7 +542,7 @@ function execute(
 	const request: ReadRequest = {
 		poolDiagnostic: {
 			kind: params.kind,
-			source: options.diagnosticSource === "auth.session" ? "auth.session" : "unattributed",
+			source: readPoolDiagnosticSource(options.diagnosticSource),
 			startedAt: Date.now(),
 			...(sqlDiagnostic
 				? {
