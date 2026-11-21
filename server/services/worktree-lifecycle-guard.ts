@@ -72,6 +72,8 @@ interface PathFootprint {
 	raw: string;
 	canonical: string;
 	identity: string | null;
+	/** Original freeze evidence survives a confirmed creation or removal. */
+	readonly initialIdentity: string | null;
 	removed?: boolean;
 }
 interface Reservation {
@@ -330,7 +332,15 @@ async function freezeFootprint(
 		return existing;
 	}
 	if (held.footprints.size >= MAX_TARGETS * 3) reject("resource footprint budget", unavailable());
-	const footprint = { raw: path, canonical, identity };
+	const original = [...held.footprints.values()].find((item) => item.canonical === canonical);
+	// A dangling leaf may resolve to a missing canonical destination while the
+	// originally frozen raw path is still present as a symlink.
+	const initialIdentity = original
+		? original.initialIdentity
+		: identity === null && canonical !== key && ports.pathIdentity
+			? await boundedRead(ports.pathIdentity(path), deadline)
+			: identity;
+	const footprint = { raw: path, canonical, identity, initialIdentity };
 	held.footprints.set(key, footprint);
 	// An absent destination has no inode yet. Freeze its nearest real parent so
 	// replacing that directory cannot silently redirect a later trusted creation.

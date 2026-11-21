@@ -5,6 +5,7 @@ import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths"
 import {
 	assertWorkspaceAdmission,
 	canonicalWorkspaceAdmissionTarget,
+	confirmLifecyclePathRemoved,
 	createLifecycleGuard,
 	type LifecycleGuardPorts,
 	type ResourceClaim,
@@ -24,6 +25,25 @@ function fixture(claims: ResourceClaim[] = [], complete = true) {
 	return { ports, guard: createLifecycleGuard(ports) };
 }
 const target = { path: "/real/worktree" };
+
+function shadowIdentityFixture(claims: ResourceClaim[] = [], existing = false) {
+	const shadowTarget = {
+		deviceId: "local" as const,
+		path: "/fixture-home/.narrafork/tree-snapshots/new-shadow",
+	};
+	const identities = new Map([
+		["/", "fixture:root"],
+		["/fixture-home", "fixture:home"],
+		["/fixture-home/.narrafork", "fixture:private-root"],
+	]);
+	if (existing) identities.set(shadowTarget.path, "fixture:existing-shadow");
+	const ports: LifecycleGuardPorts = {
+		canonicalPath: async (path) => path.replace("/fixture-alias/", "/fixture-home/"),
+		pathIdentity: async (path) => identities.get(path) ?? null,
+		readClaims: async () => ({ claims, complete: true }),
+	};
+	return { ports, guard: createLifecycleGuard(ports), shadowTarget, identities };
+}
 
 function latch() {
 	let release!: () => void;
@@ -530,6 +550,202 @@ describe("read-only lifecycle protection", () => {
 			guard.withProtectionReservation([target], "legacy remove", remove),
 		).rejects.toThrow("ordinary git failure");
 		expect(remove).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("shadow publication identity and retirement claims", () => {
+	for (const ancestor of ["/", "/fixture-home", "/fixture-home/.narrafork"]) {
+		test(`ordinary cwd ancestor ${ancestor} permits shared checkout identity use`, async () => {
+			const { ports, shadowTarget } = shadowIdentityFixture([
+				{ kind: "narrator", id: "ordinary-cwd", path: ancestor, state: "idle" },
+			]);
+			const readClaims = mock(ports.readClaims);
+			ports.readClaims = readClaims;
+			await withLifecycleGuardPorts(ports, () =>
+				withLifecycleContext([shadowTarget.path], async () => {
+					expect(await revalidateLifecycleTarget(shadowTarget.path)).toBe(shadowTarget.path);
+				}),
+			);
+			expect(readClaims).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const suffix of ["", "/descendant"]) {
+		test(`an exact or descendant claim ${suffix || "exact"} protects shadow retirement`, async () => {
+			const { guard, shadowTarget } = shadowIdentityFixture([
+				{
+					kind: "narrator",
+					id: "independent-target",
+					path: `/fixture-home/.narrafork/tree-snapshots/new-shadow${suffix}`,
+				},
+			]);
+			const remove = mock(async () => undefined);
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", remove),
+			).rejects.toMatchObject({
+				inspection: { status: "protected", claims: [{ id: "independent-target" }] },
+			});
+			expect(remove).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const claim of [
+		{ kind: "registry", id: "registry-ancestor" },
+		{ kind: "receipt", id: "receipt-ancestor" },
+		{ kind: "narrator", id: "repository-cwd", repositoryKey: "repository" },
+		{ kind: "narrator", id: "shadow-cwd", shadowKey: treeSnapshotKey("local", "/source") },
+		{ kind: "narrator", id: "scoped-cwd", scopeProjectId: "project" },
+	] satisfies Array<Omit<ResourceClaim, "path">>) {
+		test(`${claim.id} protects a missing shadow destination`, async () => {
+			const { guard, shadowTarget } = shadowIdentityFixture([{ ...claim, path: "/fixture-home" }]);
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected", claims: [{ id: claim.id }] } });
+		});
+	}
+
+	test("canonical ancestor aliases protect retirement while remote paths stay remote", async () => {
+		const { ports, guard, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "remote-exact", deviceId: "remote", path: "/fixture-home" },
+			{ kind: "narrator", id: "canonical-ancestor", path: "/fixture-alias/.narrafork" },
+		]);
+		const canonical = ports.canonicalPath;
+		ports.canonicalPath = async (path) => {
+			if (path === "/fixture-home") throw new Error("remote path must not be canonicalized");
+			return canonical(path);
+		};
+		await expect(
+			guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+		).rejects.toMatchObject({
+			inspection: { status: "protected", claims: [{ id: "canonical-ancestor" }] },
+		});
+	});
+
+	test("a missing identity port preserves ancestor retirement protection", async () => {
+		const { ports, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		delete ports.pathIdentity;
+		await expect(
+			createLifecycleGuard(ports).withProtectionReservation(
+				[shadowTarget],
+				"shadow retirement",
+				async () => undefined,
+			),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("a dangling raw alias retains protection at its canonical destination", async () => {
+		const { ports, shadowTarget, identities } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		identities.set(shadowTarget.path, "fixture:dangling-link");
+		const canonical = ports.canonicalPath;
+		ports.canonicalPath = async (path) =>
+			path === shadowTarget.path
+				? "/fixture-home/.narrafork/tree-snapshots/missing-link-target"
+				: canonical(path);
+		await expect(
+			createLifecycleGuard(ports).withProtectionReservation(
+				[shadowTarget],
+				"shadow retirement",
+				async () => undefined,
+			),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("an existing shadow retains ancestor protection", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture(
+			[{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" }],
+			true,
+		);
+		await expect(
+			guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("a prepared private stage retains its frozen inode", async () => {
+		const { ports, shadowTarget, identities } = shadowIdentityFixture([], true);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([shadowTarget.path], async () => {
+				expect(await revalidateLifecycleTarget(shadowTarget.path)).toBe(shadowTarget.path);
+				identities.set(shadowTarget.path, "fixture:replacement");
+				await expect(revalidateLifecycleTarget(shadowTarget.path)).rejects.toMatchObject({
+					inspection: { status: "unavailable" },
+				});
+			}),
+		);
+	});
+
+	test("a recreated path cannot inherit the removed target's identity", async () => {
+		const { ports, guard, shadowTarget, identities } = shadowIdentityFixture([], true);
+		await withLifecycleGuardPorts(ports, () =>
+			guard.withProtectionReservation([shadowTarget], "existing target removal", async () => {
+				identities.delete(shadowTarget.path);
+				await confirmLifecyclePathRemoved(shadowTarget.path);
+				identities.set(shadowTarget.path, "fixture:recreated-shadow");
+				for (const path of [
+					shadowTarget.path,
+					shadowTarget.path.replace("/fixture-home/", "/fixture-alias/"),
+				])
+					await expect(revalidateLifecycleTarget(path)).rejects.toMatchObject({
+						inspection: { status: "unavailable" },
+					});
+			}),
+		);
+	});
+
+	for (const replacement of ["parent inode", "target symlink", "unconfirmed target inode"]) {
+		test(`${replacement} replacement during claim reads fails closed`, async () => {
+			const { ports, shadowTarget, identities } = shadowIdentityFixture();
+			ports.readClaims = async () => {
+				if (replacement === "parent inode")
+					identities.set("/fixture-home/.narrafork", "fixture:replacement-parent");
+				else if (replacement === "target symlink") ports.canonicalPath = async () => "/redirected";
+				else identities.set(shadowTarget.path, "fixture:unconfirmed-birth");
+				return { complete: true, claims: [] };
+			};
+			await expect(
+				createLifecycleGuard(ports).withProtectionReservation(
+					[shadowTarget],
+					"shadow retirement",
+					async () => undefined,
+				),
+			).rejects.toMatchObject({ inspection: { status: "unavailable" } });
+		});
+	}
+
+	test("an independent conflicting reservation protects its descendant shadow", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture();
+		const entered = latch();
+		const finish = latch();
+		const retirement = guard.withProtectionReservation(
+			[{ path: "/fixture-home" }],
+			"independent parent retirement",
+			async () => {
+				entered.release();
+				await finish.promise;
+			},
+		);
+		await entered.promise;
+		try {
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected" } });
+		} finally {
+			finish.release();
+			await retirement;
+		}
+	});
+
+	test("the same ancestor protects deletion and rollback", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		for (const operation of ["shadow destroy", "shadow initialization rollback"])
+			await expect(
+				guard.withProtectionReservation([shadowTarget], operation, async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected" } });
 	});
 });
 
