@@ -211,15 +211,6 @@ export class TokenDanceProvider implements ProviderAdapter {
 
 	prepareForModel(model: string): void {
 		const current = getTokenDanceRuntimeConfig();
-		if (
-			current &&
-			!current.disabled &&
-			current.apiKey === this.config?.apiKey &&
-			current.toolResultImages !== this.config?.toolResultImages
-		) {
-			this.config = { ...current };
-			this.delegate = undefined;
-		}
 		if (!this.config || this.config.disabled)
 			throw new Error("TokenDance connection is not configured or is disabled.");
 		assertTokenDanceConnection(this.config.generation);
@@ -240,8 +231,9 @@ export class TokenDanceProvider implements ProviderAdapter {
 				throw new Error(
 					"TokenDance model protocol changed. Rebuild the conversation before retrying.",
 				);
-			return;
+			if (current?.toolResultImages === this.config.toolResultImages) return;
 		}
+		this.config.toolResultImages = current?.toolResultImages;
 		const config = {
 			toolResultImages: this.config.toolResultImages,
 			id: "tokendance",

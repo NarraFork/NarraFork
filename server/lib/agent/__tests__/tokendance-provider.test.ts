@@ -128,9 +128,7 @@ describe("strict TokenDance protocol mapping", () => {
 			if (!config) throw new Error("missing config");
 			const provider = new TokenDanceProvider();
 			provider.prepareForModel("tokendance:opaque-model");
-			config = { ...config, toolResultImages: mode, generation: config.generation + 1 };
-			// An unchanged preference does not invalidate an existing connection.
-			if (mode === undefined) config.generation--;
+			config = { ...config, toolResultImages: mode };
 			let body = "";
 			setFetch(async (_input, init) => {
 				body = String(init?.body);
@@ -155,6 +153,25 @@ describe("strict TokenDance protocol mapping", () => {
 			);
 		});
 	}
+	test("image preference changes cannot bypass the live protocol guard", () => {
+		catalog("openai:chat-completions");
+		const provider = new TokenDanceProvider();
+		provider.prepareForModel("tokendance:opaque-model");
+		if (!config) throw new Error("missing config");
+		config.toolResultImages = "separate";
+		const previous = settings.agent.modelProtocolOverrides;
+		settings.agent.modelProtocolOverrides = { "tokendance:opaque-model": "anthropic-messages" };
+		try {
+			expect(() => provider.prepareForModel("tokendance:opaque-model")).toThrow(
+				"Rebuild the conversation",
+			);
+			expect(() => provider.prepareForModel("tokendance:opaque-model")).toThrow(
+				"Rebuild the conversation",
+			);
+		} finally {
+			settings.agent.modelProtocolOverrides = previous;
+		}
+	});
 	test("fixed priority and no inference", () => {
 		expect(selectTokenDanceProtocol(protocols.map(([protocol]) => protocol).reverse())).toBe(
 			"anthropic-messages",
