@@ -52,18 +52,22 @@ import type {
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
+import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
 const port = parentPort;
+const sqlDiagnostics = createWorkerSqlDiagnostics((event) => port.postMessage(event));
 
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
 const connections = new Map<string, Database>();
 
 function getConnection(dbPath: string): Database {
 	const existing = connections.get(dbPath);
-	if (existing) return existing;
-	const db = instrumentSqliteConnection(new Database(dbPath, { readonly: true }));
+	if (existing) return sqlDiagnostics.instrument(existing);
+	const db = sqlDiagnostics.instrument(
+		instrumentSqliteConnection(new Database(dbPath, { readonly: true })),
+	);
 	// Match the main connection's read tuning. No write pragmas: this handle is read-only.
 	try {
 		db.run("PRAGMA cache_size = -16000");
@@ -213,54 +217,56 @@ port.on("message", async (message: DbWorkerInbound) => {
 	);
 	try {
 		const params = message.params;
-		const result = await runInSqlTraceSpan(sqlSpan, async () =>
-			params.kind === "storageHistoryRead"
-				? runStorageHistoryRead(getConnection(message.dbPath), params)
-				: params.kind === "storageHistoryBody"
-					? runStorageHistoryBody(getConnection(message.dbPath), params)
-					: params.kind === "displayPageMessagesPostgres"
-						? await runPostgresDisplayPageQuery(
-								message.dbPath,
-								{ ...params, kind: "displayPageMessages" },
-								controller.signal,
-							)
-						: params.kind === "blockBackfillSlice"
-							? runBlockBackfillSlice(getConnection(message.dbPath), params)
-							: params.kind === "blockVerifySlice"
-								? runBlockVerifySlice(getConnection(message.dbPath), params)
-								: params.kind === "blockReindexSlice"
-									? runBlockReindexSlice(getConnection(message.dbPath), params)
-									: params.kind === "blockIndexQueueSlice"
-										? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
-										: params.kind === "blockProjectionSlice"
-											? runBlockProjectionSlice(getConnection(message.dbPath), params)
-											: params.kind === "displayPageMessages"
-												? runDisplayPageQuery(getConnection(message.dbPath), params)
-												: params.kind === "selectRows"
-													? runSelectRows(getConnection(message.dbPath), params)
-													: params.kind === "storageScanContext"
-														? runStorageScanContext(message.dbPath)
-														: params.kind === "storageScanSerial"
-															? runStorageScanSerial(
-																	message.dbPath,
-																	message.requestId,
-																	params.mainBytes,
-																	controller.signal,
-																)
-															: params.kind === "storageScanCleanupSummaries"
-																? runStorageScanCleanupSummaries(message.dbPath, params)
-																: params.kind === "storageScanSessionPreview"
-																	? runStorageScanSessionPreview(
-																			message.dbPath,
-																			params,
-																			controller.signal,
-																		)
-																	: runStorageScanTables(
-																			message.dbPath,
-																			message.requestId,
-																			params,
-																			controller.signal,
-																		),
+		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
+			runInSqlTraceSpan(sqlSpan, async () =>
+				params.kind === "storageHistoryRead"
+					? runStorageHistoryRead(getConnection(message.dbPath), params)
+					: params.kind === "storageHistoryBody"
+						? runStorageHistoryBody(getConnection(message.dbPath), params)
+						: params.kind === "displayPageMessagesPostgres"
+							? await runPostgresDisplayPageQuery(
+									message.dbPath,
+									{ ...params, kind: "displayPageMessages" },
+									controller.signal,
+								)
+							: params.kind === "blockBackfillSlice"
+								? runBlockBackfillSlice(getConnection(message.dbPath), params)
+								: params.kind === "blockVerifySlice"
+									? runBlockVerifySlice(getConnection(message.dbPath), params)
+									: params.kind === "blockReindexSlice"
+										? runBlockReindexSlice(getConnection(message.dbPath), params)
+										: params.kind === "blockIndexQueueSlice"
+											? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
+											: params.kind === "blockProjectionSlice"
+												? runBlockProjectionSlice(getConnection(message.dbPath), params)
+												: params.kind === "displayPageMessages"
+													? runDisplayPageQuery(getConnection(message.dbPath), params)
+													: params.kind === "selectRows"
+														? runSelectRows(getConnection(message.dbPath), params)
+														: params.kind === "storageScanContext"
+															? runStorageScanContext(message.dbPath)
+															: params.kind === "storageScanSerial"
+																? runStorageScanSerial(
+																		message.dbPath,
+																		message.requestId,
+																		params.mainBytes,
+																		controller.signal,
+																	)
+																: params.kind === "storageScanCleanupSummaries"
+																	? runStorageScanCleanupSummaries(message.dbPath, params)
+																	: params.kind === "storageScanSessionPreview"
+																		? runStorageScanSessionPreview(
+																				message.dbPath,
+																				params,
+																				controller.signal,
+																			)
+																		: runStorageScanTables(
+																				message.dbPath,
+																				message.requestId,
+																				params,
+																				controller.signal,
+																			),
+			),
 		);
 		post({
 			type: "result",

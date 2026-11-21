@@ -17,7 +17,22 @@ import {
 	type SelectRowsParams,
 	type SelectRowsResult,
 } from "./protocol";
+import {
+	logReadSqlDiagnostic,
+	type ReadPoolTaskDiagnostics,
+	readPoolTaskSnapshot,
+	warnReadPoolFailure,
+} from "./read-diagnostics";
 import { validateSelectRows } from "./select-rows";
+import {
+	acceptSqlDiagnosticEvent,
+	createHostSqlDiagnosticState,
+	createSqlDiagnosticConfig,
+	getSqlDiagnosticSession,
+	type SqlDiagnosticConfig,
+} from "./sql-diagnostics";
+
+let sqlDiagnosticWorkerCounter = 0;
 
 const DEFAULT_TASK_TIMEOUT_MS = 120_000;
 const MAX_SPAWN_FAILURES = 2;
@@ -53,6 +68,7 @@ export class WorkersUnavailableError extends Error {
 	}
 }
 export interface RunReadTaskOptions {
+	diagnosticSource?: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	onProgress?: (progress: { tableName: string; done: number; total: number }) => void;
@@ -60,6 +76,8 @@ export interface RunReadTaskOptions {
 	dedupeKey?: string;
 }
 interface ReadRequest {
+	poolDiagnostic: ReadPoolTaskDiagnostics;
+	sqlDiagnostic?: SqlDiagnosticConfig;
 	dbPath: string;
 	params: DbReadTaskParams;
 	traceParent?: string;
@@ -269,7 +287,10 @@ async function createReader(
 class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 	private closing?: Promise<void>;
 	private failed = false;
+	private diagnosticWorker?: string;
+	private lastDiagnostic?: ReadPoolTaskDiagnostics;
 	private active?: {
+		request: ReadRequest;
 		requestId: string;
 		pg: boolean;
 		cancel(error: Error): void;
@@ -293,6 +314,22 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 		const active = this.active;
 		if (!active || !message || message.type === "ready" || message.requestId !== active.requestId)
 			return;
+		const request = active.request;
+		if (message.type === "sqlDiagnostic") {
+			const sql = request.poolDiagnostic.sql;
+			if (sql) {
+				const accepted = acceptSqlDiagnosticEvent(sql, message, Date.now());
+				logReadSqlDiagnostic(
+					accepted && message.phase !== "coverageLost"
+						? message.phase === "start"
+							? "sql-start"
+							: "sql-end"
+						: "coverage-lost",
+					request.poolDiagnostic,
+				);
+			}
+			return;
+		}
 		if (message.type === "progress") {
 			try {
 				active.onProgress?.({
@@ -311,6 +348,13 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 					phase: "read",
 					buildId: RUNTIME_BUILD_ID,
 					...workerFailureDetails(message.diagnostic ?? message, false),
+					...(request.poolDiagnostic.sql
+						? readPoolTaskSnapshot(
+								request.poolDiagnostic,
+								Date.now(),
+								request.poolDiagnostic.dispatchedAt,
+							)
+						: {}),
 				});
 			} catch {
 				/* diagnostics cannot prevent settlement */
@@ -334,6 +378,15 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 	};
 	run(request: ReadRequest, context: WorkerTaskContext): Promise<unknown> {
 		if (this.closed) return Promise.reject(new WorkersUnavailableError("worker_unavailable"));
+		request.poolDiagnostic.requestId = context.requestId;
+		request.poolDiagnostic.dispatchedAt = Date.now();
+		this.lastDiagnostic = request.poolDiagnostic.sql ? request.poolDiagnostic : undefined;
+		if (request.poolDiagnostic.sql) {
+			this.diagnosticWorker ??= `dbw-${++sqlDiagnosticWorkerCounter}`;
+			request.poolDiagnostic.sql.worker = this.diagnosticWorker;
+			this.lastDiagnostic = request.poolDiagnostic;
+			logReadSqlDiagnostic("dispatch", request.poolDiagnostic);
+		}
 		return new Promise((resolve, reject) => {
 			let cancelled: Error | undefined;
 			let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -345,6 +398,11 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 				if (this.active !== active) return;
 				clearTimeout(watchdog);
 				context.signal.removeEventListener("abort", abort);
+				if (request.poolDiagnostic.sql) {
+					request.poolDiagnostic.sql.endedAt = Date.now();
+					request.poolDiagnostic.sql.outcome = cancelled || error ? "failed" : "completed";
+					logReadSqlDiagnostic("finish", request.poolDiagnostic);
+				}
 				this.active = undefined;
 				done();
 				if (cancelled || error) reject(cancelled ?? error);
@@ -373,6 +431,7 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 			};
 			const abort = () => cancel(cancellationError(context));
 			const active = {
+				request,
 				requestId: context.requestId,
 				pg: request.params.kind === "displayPageMessagesPostgres",
 				cancel,
@@ -393,6 +452,7 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 					dbPath: request.dbPath,
 					params: request.params,
 					traceParent: request.traceParent,
+					...(request.sqlDiagnostic ? { sqlDiagnostic: request.sqlDiagnostic } : {}),
 				});
 			} catch (error) {
 				this.failed = true;
@@ -404,6 +464,9 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 	close(): Promise<void> {
 		if (!this.closing) {
 			const active = this.active;
+			const diagnostic = this.lastDiagnostic;
+			const closeStartedAt = diagnostic ? Date.now() : undefined;
+			logReadSqlDiagnostic("close-start", diagnostic);
 			this.closing = Promise.resolve().then(async () => {
 				if (active) {
 					active.cancel(new WorkersUnavailableError("pool_shutdown"));
@@ -415,6 +478,11 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown> {
 					/* already gone */
 				}
 				await this.handle.close();
+				logReadSqlDiagnostic(
+					"close-complete",
+					diagnostic,
+					closeStartedAt === undefined ? undefined : Math.max(0, Date.now() - closeStartedAt),
+				);
 				this.worker.off("message", this.onMessage);
 				this.worker.off("error", this.onError);
 				this.worker.off("messageerror", this.onMessageError);
@@ -468,7 +536,23 @@ function execute(
 	const s = state();
 	if (s.permanent || s.paused || s.closing)
 		return Promise.reject(new WorkersUnavailableError("pool_shutdown"));
-	const request = {
+	const session = getSqlDiagnosticSession();
+	const sqlDiagnostic = session ? createSqlDiagnosticConfig(session) : undefined;
+	const request: ReadRequest = {
+		poolDiagnostic: {
+			kind: params.kind,
+			source: options.diagnosticSource === "auth.session" ? "auth.session" : "unattributed",
+			startedAt: Date.now(),
+			...(sqlDiagnostic
+				? {
+						sql: createHostSqlDiagnosticState(
+							sqlDiagnostic,
+							params.kind === "displayPageMessagesPostgres",
+						),
+					}
+				: {}),
+		},
+		sqlDiagnostic,
 		dbPath,
 		params,
 		traceParent: currentSqlTraceSpan()?.id,
@@ -486,6 +570,12 @@ function execute(
 			bytes: requestBytes(request),
 		})
 		.catch((error) => {
+			if (error instanceof TaskQueueError || error instanceof DbReadTaskTimeoutError)
+				warnReadPoolFailure(
+					request.poolDiagnostic,
+					error instanceof DbReadTaskTimeoutError ? "TASK_QUEUE_TIMEOUT" : error.code,
+					runtime(profile).stats,
+				);
 			throw taskError(error);
 		});
 }

@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { logger } from "../../logger";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
@@ -175,4 +176,61 @@ describe("real selectRows read-worker pool", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 		expect(await query("SELECT 42 AS recovered")).toEqual([{ recovered: 42 }]);
 	}, 30_000);
+	test("opt-in SQL start reaches the host while a real worker SELECT is still pending", async () => {
+		const previous = process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+		await query("SELECT 1 AS ready");
+		process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+		let settled = false;
+		let seen = false;
+		let receive!: () => void;
+		const started = new Promise<void>((resolve) => {
+			receive = resolve;
+		});
+		const diagnosticRecords: Record<string, unknown>[] = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
+			if (message !== "Database read worker SQL diagnostic") return;
+			diagnosticRecords.push(fields ?? {});
+			const sql = fields?.sql as { current?: { stage?: string } } | undefined;
+			if (fields?.phase === "sql-start" && sql?.current?.stage === "iterate") {
+				seen = true;
+				expect(settled).toBe(false);
+				receive();
+			}
+		});
+		const pending = query(SLOW_SQL, [1_000_000]).finally(() => {
+			settled = true;
+		});
+		try {
+			await Promise.race([started, pending]);
+			expect(seen).toBe(true);
+			expect(settled).toBe(false);
+			expect(getDbWorkerPoolStats().busy).toBe(1);
+			expect(await pending).toEqual([{ total: 500_000_500_000 }]);
+			const current = diagnosticRecords.find(
+				(record) =>
+					record.phase === "sql-start" &&
+					(record.sql as { current?: { stage: string } })?.current?.stage === "iterate",
+			);
+			expect(current).toMatchObject({
+				kind: "selectRows",
+				sql: {
+					state: "running",
+					worker: expect.stringMatching(/^dbw-\d+$/),
+					hostSite: { file: "server/lib/db-worker/__tests__/select-rows-pool.test.ts" },
+					current: {
+						hashStatus: "collected",
+						sqlHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+						workerSite: { file: "server/lib/db-worker/select-rows.ts" },
+					},
+				},
+			});
+			const text = JSON.stringify(diagnosticRecords);
+			for (const value of [SLOW_SQL, dbPath, home, "1_000_000"]) expect(text).not.toContain(value);
+		} finally {
+			await pending.catch(() => {});
+			if (previous === undefined) delete process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+			else process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = previous;
+			warn.mockRestore();
+		}
+	}, 10_000);
 });
