@@ -77,6 +77,7 @@ import {
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
+import { stallTimeBetween } from "../lib/event-loop-monitor";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
@@ -87,6 +88,7 @@ import {
 	saveUploadedMedia,
 	validateUploadedMedia,
 } from "../lib/media-uploads";
+import { ModelHistoryPreparation } from "../lib/model-history-preparation";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -3158,13 +3160,14 @@ export interface ContextManagementOptions {
 	buildPrefixPrompt?: (
 		identity: RequestModelIdentity,
 		replyContext: ReplyContext,
+		preparation?: ModelHistoryPreparation,
 	) => Promise<{
 		contract: string;
 		parts: import("../../shared/prefix-context").PromptPart[];
 		compactMessageId?: string | null;
 	}>;
 	/** Compatibility path for callers not yet supplying named prompt parts. */
-	rebuildSystemPrompt?: () => Promise<string | null>;
+	rebuildSystemPrompt?: (preparation?: ModelHistoryPreparation) => Promise<string | null>;
 }
 
 /**
@@ -3222,54 +3225,74 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
 		const signal = opts.attachmentSignal;
-		const preparedPrefix = await preparePrefixRequest({
+		const preparation = new ModelHistoryPreparation({
 			narratorId,
-			locale,
-			getReplyContext: opts.getReplyContext,
-			ensureRequestIdentity: opts.ensureRequestIdentity,
-			getModel,
-			getProvider,
+			kind: "rebuild",
 			signal,
-			getToolLoading: opts.getToolLoading,
-			refreshToolLoading: opts.refreshToolLoading,
-			buildPrefixPrompt: opts.buildPrefixPrompt,
+			timeoutMs: null,
+			warn: (message, fields) => logger.warn(message, fields),
+			stallTimeBetween,
 		});
-		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
-		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
-		// The in-memory history is now rebuilt from the latest (post-compact)
-		// messages, so any pending-compact guard can be released.
-		clearActiveHistoryCompactPending(narratorId);
-		const result = await buildRuntimeHistory({
-			narratorId,
-			model: preparedPrefix.model,
-			provider: preparedPrefix.provider,
-			sourceMessages: rawMsgs,
-			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: signal,
-			toolLoading,
-		});
-		if (result.toolLoading && !result.toolCandidates) {
-			throw new Error("A tool-loading history rebuild must include tool candidates");
+		try {
+			preparation.recordPhase("epoch");
+			const preparedPrefix = await preparePrefixRequest({
+				narratorId,
+				locale,
+				preparation,
+				getReplyContext: opts.getReplyContext,
+				ensureRequestIdentity: opts.ensureRequestIdentity,
+				getModel,
+				getProvider,
+				signal,
+				getToolLoading: opts.getToolLoading,
+				refreshToolLoading: opts.refreshToolLoading,
+				buildPrefixPrompt: opts.buildPrefixPrompt,
+			});
+			const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
+			preparation.recordPhase("systemPrompt");
+			let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
+			// The in-memory history is now rebuilt from the latest (post-compact)
+			// messages, so any pending-compact guard can be released.
+			clearActiveHistoryCompactPending(narratorId);
+			const result = await buildRuntimeHistory({
+				narratorId,
+				model: preparedPrefix.model,
+				provider: preparedPrefix.provider,
+				sourceMessages: rawMsgs,
+				attachmentCwd: opts.getAttachmentCwd?.(),
+				attachmentSignal: signal,
+				preparation,
+				toolLoading,
+			});
+			if (result.toolLoading && !result.toolCandidates) {
+				throw new Error("A tool-loading history rebuild must include tool candidates");
+			}
+			if (!prefixPrompt && includeSystemPrompt) {
+				preparation.recordPhase("systemPrompt");
+				systemPrompt = (await rebuildSystemPrompt?.(preparation)) ?? undefined;
+			}
+			signal?.throwIfAborted();
+			return {
+				history: result.history,
+				rows: result.modelMessages,
+				replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+				...(result.mediaFallbackWarnings?.length
+					? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+					: {}),
+				...(result.toolLoading
+					? {
+							toolLoading: result.toolLoading,
+							...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+						}
+					: {}),
+				...(systemPrompt !== undefined ? { systemPrompt } : {}),
+			};
+		} catch (error) {
+			preparation.finish(error);
+			throw error;
+		} finally {
+			preparation.finish();
 		}
-		if (!prefixPrompt && includeSystemPrompt) {
-			systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
-		}
-		signal?.throwIfAborted();
-		return {
-			history: result.history,
-			rows: result.modelMessages,
-			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			...(result.mediaFallbackWarnings?.length
-				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
-				: {}),
-			...(result.toolLoading
-				? {
-						toolLoading: result.toolLoading,
-						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
-					}
-				: {}),
-			...(systemPrompt !== undefined ? { systemPrompt } : {}),
-		};
 	};
 
 	const onReasoningOnlyHighContext: NonNullable<

@@ -44,7 +44,12 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
+import { stallTimeBetween } from "../../lib/event-loop-monitor";
 import { logger } from "../../lib/logger";
+import {
+	historyPreparationFailure,
+	ModelHistoryPreparation,
+} from "../../lib/model-history-preparation";
 import {
 	formatSubagentModelRestrictionDescription,
 	getBlockedSkills,
@@ -973,6 +978,8 @@ export async function runAgentLoopUnlocked(
 		aborted: true,
 	});
 
+	let historyPreparation: ModelHistoryPreparation | undefined;
+	let historyPreparationStarted = false;
 	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
 	// at each pass and tool boundary, and on a timer through long tool calls).
 	let outlineLeases: OutlineLeaseKeeper | undefined;
@@ -1047,6 +1054,19 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
+
+			historyPreparation?.finish();
+			historyPreparation = new ModelHistoryPreparation({
+				narratorId,
+				logicalRunId: run?.logicalRunId,
+				kind: historyPreparationStarted ? "rebuild" : "initial",
+				signal: active.abortController.signal,
+				timeoutMs: null,
+				warn: (message, fields) => logger.warn(message, fields),
+				stallTimeBetween,
+			});
+			historyPreparationStarted = true;
+			historyPreparation.recordPhase("tools");
 
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
@@ -1326,7 +1346,9 @@ export async function runAgentLoopUnlocked(
 			const buildPrefixPrompt = async (
 				model: RequestModelIdentity,
 				{ locale, replyInUserLanguage }: import("@shared/reply-context").ReplyContext,
+				preparation?: ModelHistoryPreparation,
 			) => {
+				preparation?.recordPhase("systemPrompt");
 				active.abortController.signal.throwIfAborted();
 				// A compact racing this read is retried by the shared request preparer.
 				const compactMessageId = await currentCompactMessageId(narratorId);
@@ -1451,7 +1473,9 @@ export async function runAgentLoopUnlocked(
 					summaryChars: built.usedCompactSummary ? (current.contextSummary?.length ?? 0) : 0,
 				};
 			};
+			historyPreparation.recordPhase("epoch");
 			const preparedPrefix = await preparePrefixRequest({
+				preparation: historyPreparation,
 				narratorId,
 				locale,
 				getReplyContext,
@@ -1468,8 +1492,10 @@ export async function runAgentLoopUnlocked(
 			const { prompt: prefixPrompt, reconciled, sourceMessages: rawMessages } = preparedPrefix;
 			if (!prefixPrompt || !reconciled) throw new Error("Runtime prefix was not prepared");
 			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
+			historyPreparation.recordPhase("systemPrompt");
 			clearActiveHistoryCompactPending(narratorId);
 			const historyOptions = {
+				preparation: historyPreparation,
 				narratorId,
 				model: preparedPrefix.model,
 				provider: preparedPrefix.provider,
@@ -1550,7 +1576,7 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal },
+						{ signal: active.abortController.signal, preparation: historyPreparation },
 					),
 				});
 			}
@@ -1559,6 +1585,7 @@ export async function runAgentLoopUnlocked(
 			// won during that work, restart preparation rather than pair it with an old summary.
 			if (prefixPrompt.compactMessageId !== (await currentCompactMessageId(narratorId))) continue;
 
+			historyPreparation.finish();
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
 			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			runState.firstPass = false;
@@ -1676,8 +1703,8 @@ export async function runAgentLoopUnlocked(
 				clearCompactDone: () => {
 					compactDoneFlag = false;
 				},
-				buildPrefixPrompt: async (identity, replyContext) => {
-					const result = await buildPrefixPrompt(identity, replyContext);
+				buildPrefixPrompt: async (identity, replyContext, preparation) => {
+					const result = await buildPrefixPrompt(identity, replyContext, preparation);
 					runtimeSummaryChars = result.summaryChars;
 					return result;
 				},
@@ -3672,6 +3699,7 @@ export async function runAgentLoopUnlocked(
 	} catch (err) {
 		// A child may unwind its foreground parent, but only the parent's own persisted
 		// identity authorizes releasing this owner. Never inherit the child's identity.
+		historyPreparation?.finish(err);
 		rethrowCheckpointPause(err);
 		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
 		// Keep the run active for the next process instead of publishing a false failure.
@@ -3695,6 +3723,7 @@ export async function runAgentLoopUnlocked(
 		} else {
 			const errorMsg = serializeCatalogErrorMessage(err);
 			logger.error("Narrator loop error", {
+				...historyPreparationFailure(err),
 				narratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
@@ -3719,6 +3748,7 @@ export async function runAgentLoopUnlocked(
 		}
 	} finally {
 		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
+		historyPreparation?.finish();
 		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system

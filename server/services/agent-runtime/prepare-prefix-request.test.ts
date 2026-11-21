@@ -4,6 +4,11 @@ import { z } from "zod/v4";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { logger } from "../../lib/logger";
+import {
+	historyPreparationFailure,
+	ModelHistoryPreparation,
+} from "../../lib/model-history-preparation";
 import { settings } from "../../lib/settings";
 import { currentCompactMessageId } from "../narrator-epochs";
 import * as snapshots from "../narrator-prefix-snapshots";
@@ -50,6 +55,93 @@ async function narrator() {
 }
 
 describe("shared prefix request preparation", () => {
+	test("context rebuild observes real source counts past 30s without a timeout", async () => {
+		const narratorId = await narrator();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const realSignature = historyRevision.readSqliteModelHistorySignature;
+		const signature = spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation(
+			(...args) => {
+				const result = realSignature(...args);
+				now += 31_000;
+				return result;
+			},
+		);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+		let captured: ModelHistoryPreparation | undefined;
+		try {
+			const hooks = buildContextManagementHooks({
+				narratorId,
+				locale: "en",
+				getModel: () => "claude-sonnet-4",
+				getProvider: () => provider,
+				isCompactDone: () => true,
+				rebuildSystemPrompt: async (value) => {
+					captured = value;
+					return "rebuilt";
+				},
+			});
+			const result = await hooks.rebuildRequestHistory();
+			expect(result.systemPrompt).toBe("rebuilt");
+			expect(captured).toBeInstanceOf(ModelHistoryPreparation);
+			expect(captured?.deadline).toBe(Infinity);
+			expect(captured?.signal.aborted).toBe(false);
+			expect(read.mock.calls[0]?.[2]?.preparation).toBe(captured);
+			const fields = warn.mock.calls.find(
+				([message]) => message === "Model history preparation finished",
+			)?.[1];
+			expect(fields).toMatchObject({
+				outcome: "success",
+				kind: "rebuild",
+				counts: { sourceBytes: 0 },
+				phaseDurationsMs: { signature: expect.any(Number), systemPrompt: expect.any(Number) },
+			});
+		} finally {
+			read.mockRestore();
+			warn.mockRestore();
+			signature.mockRestore();
+			clock.mockRestore();
+		}
+	});
+	for (const cancelled of [false, true]) {
+		test(`context rebuild records ${cancelled ? "cancellation" : "failure"} from the source`, async () => {
+			const narratorId = await narrator();
+			const controller = new AbortController();
+			const error = new Error("source preparation interrupted");
+			const signature = spyOn(
+				historyRevision,
+				"readSqliteModelHistorySignature",
+			).mockImplementation(() => {
+				if (cancelled) controller.abort(error);
+				throw error;
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				const hooks = buildContextManagementHooks({
+					narratorId,
+					locale: "en",
+					getModel: () => "claude-sonnet-4",
+					getProvider: () => provider,
+					attachmentSignal: controller.signal,
+				});
+				await expect(hooks.rebuildRequestHistory()).rejects.toBe(error);
+				const failure = historyPreparationFailure(error);
+				if (!failure) throw new Error("Missing preparation failure metadata");
+				expect(failure).toMatchObject({
+					preparationId: expect.any(String),
+					outcome: cancelled ? "cancelled" : "failed",
+				});
+				expect(warn).toHaveBeenCalledWith(
+					"Model history preparation finished",
+					expect.objectContaining(failure),
+				);
+			} finally {
+				warn.mockRestore();
+				signature.mockRestore();
+			}
+		});
+	}
 	test("the request entry allows a source read to cross ten seconds and forwards only cancellation", async () => {
 		const narratorId = await narrator();
 		const controller = new AbortController();

@@ -197,6 +197,10 @@ export class ModelHistoryPreparation {
 	}
 	phase(phase: HistoryPreparationPhase): void {
 		this.check();
+		this.recordPhase(phase);
+	}
+	/** Record timing without introducing a cancellation checkpoint. */
+	recordPhase(phase: HistoryPreparationPhase): void {
 		const now = this.clock.monotonic();
 		this.durations[this.currentPhase] =
 			(this.durations[this.currentPhase] ?? 0) + now - this.phaseStartedAt;

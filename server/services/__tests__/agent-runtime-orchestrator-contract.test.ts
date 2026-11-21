@@ -17,12 +17,16 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { logger } from "../../lib/logger";
 import { saveUploadedMedia } from "../../lib/media-uploads";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
+import * as historyRevision from "../agent-runtime/model-history-revision";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { narratorService } from "../narrator-service";
 import type { ActiveNarrator } from "../narrator-session-state";
 
 /**
@@ -248,6 +252,96 @@ function fixture(
 }
 
 describe("context overflow recovery cancellation", () => {
+	test("a stop during pre-prompt Bash runs interruption handling before history preparation", async () => {
+		const f = fixture({ kind: "primary" }, [finished]);
+		const phases = spyOn(ModelHistoryPreparation.prototype, "recordPhase");
+		const service = await import("../narrator-service");
+		const bash = spyOn(service, "handleBashCommand").mockImplementation(async () => {
+			expect(phases).not.toHaveBeenCalled();
+			f.session.abortController.abort(new Error("stop pre-prompt Bash"));
+			return { type: "bash", id: "stopped-bash", output: "stopped", isError: false };
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const result = await f.run("", undefined, "printf stopped");
+		expect(bash).toHaveBeenCalledTimes(1);
+		expect(f.calls).toHaveLength(0);
+		expect(phases).not.toHaveBeenCalled();
+		expect(result.hasError).toBe(false);
+		expect(
+			warn.mock.calls.some(([message]) => message === "Model history preparation finished"),
+		).toBe(false);
+	});
+	test("initial preparation records source and projection counts beyond 30s without cancelling", async () => {
+		const f = fixture({ kind: "primary" }, [finished]);
+		let now = Date.now();
+		spyOn(Date, "now").mockImplementation(() => now);
+		const realSignature = historyRevision.readSqliteModelHistorySignature;
+		spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation((...args) => {
+			const result = realSignature(...args);
+			now += 31_000;
+			return result;
+		});
+		const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		await f.run();
+		const preparation = read.mock.calls.find(([, , opts]) => opts?.preparation)?.[2]?.preparation;
+		expect(preparation).toBeInstanceOf(ModelHistoryPreparation);
+		expect(preparation?.deadline).toBe(Infinity);
+		expect(preparation?.signal.aborted).toBe(false);
+		expect(f.calls).toHaveLength(1);
+		expect(warn).toHaveBeenCalledWith(
+			"Model history preparation finished",
+			expect.objectContaining({
+				preparationId: preparation?.preparationId,
+				kind: "initial",
+				outcome: "success",
+				counts: expect.objectContaining({
+					sourceBytes: expect.any(Number),
+					messages: expect.any(Number),
+					tools: expect.any(Number),
+				}),
+			}),
+		);
+	});
+	for (const cancelled of [false, true]) {
+		test(`initial preparation source ${cancelled ? "cancellation" : "failure"} is observed`, async () => {
+			const f = fixture({ kind: "primary" }, [finished]);
+			const error = new Error("history source failure");
+			const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+			spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation(() => {
+				if (cancelled) f.session.abortController.abort(error);
+				throw error;
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const logError = spyOn(logger, "error").mockImplementation(() => {});
+			await f.run();
+			const preparation = read.mock.calls.find(([, , opts]) => opts?.preparation)?.[2]?.preparation;
+			expect(preparation).toBeInstanceOf(ModelHistoryPreparation);
+			expect(preparation?.deadline).toBe(Infinity);
+			expect(f.calls).toHaveLength(0);
+			expect(warn).toHaveBeenCalledWith(
+				"Model history preparation finished",
+				expect.objectContaining({
+					preparationId: preparation?.preparationId,
+					kind: "initial",
+					outcome: cancelled ? "cancelled" : "failed",
+					phaseDurationsMs: expect.objectContaining({
+						tools: expect.any(Number),
+						signature: expect.any(Number),
+					}),
+				}),
+			);
+			if (!cancelled)
+				expect(logError).toHaveBeenCalledWith(
+					"Narrator loop error",
+					expect.objectContaining({
+						error: "Could not prepare tool and context state. See server logs for details.",
+						preparationId: preparation?.preparationId,
+						outcome: "failed",
+					}),
+				);
+		});
+	}
 	for (const profile of profiles) {
 		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
 			const service = await import("../narrator-service");

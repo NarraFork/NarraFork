@@ -47,6 +47,21 @@ function harness(
 }
 
 describe("model history preparation budget", () => {
+	test("observation-only phases do not introduce cancellation checkpoints", () => {
+		const controller = new AbortController();
+		const error = new Error("already interrupted");
+		controller.abort(error);
+		const h = harness({ signal: controller.signal, timeoutMs: null });
+		expect(() => h.preparation.recordPhase("tools")).not.toThrow();
+		h.advance(12);
+		expect(() => h.preparation.recordPhase("systemPrompt")).not.toThrow();
+		expect(() => h.preparation.phase("epoch")).toThrow(error);
+		h.preparation.finish(error);
+		expect(h.logs[0]?.fields).toMatchObject({
+			outcome: "cancelled",
+			phaseDurationsMs: { tools: 12, systemPrompt: 0 },
+		});
+	});
 	test("10 seconds observes once without cancelling; 10–30 second success closes the same ID", () => {
 		const h = harness();
 		h.preparation.phase("queue");
