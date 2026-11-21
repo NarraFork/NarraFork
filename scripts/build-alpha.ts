@@ -8,6 +8,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
@@ -193,7 +194,7 @@ export async function buildAlpha(options: {
 	version?: string;
 	archiveDir: string;
 	env?: NodeJS.ProcessEnv;
-	renameArchiveFile?: typeof renameSync;
+	installArchiveFile?: typeof renameSync;
 }): Promise<void> {
 	const { root } = options;
 	const requestedVersion = options.version ?? "auto";
@@ -214,7 +215,12 @@ export async function buildAlpha(options: {
 	}
 	const archive = resolve(root, options.archiveDir);
 	const dist = join(root, "dist");
-	if (archive === dist) throw new Error("ARCHIVE_DIR must differ from dist");
+	if (
+		archive === dist ||
+		(existsSync(archive) && existsSync(dist) && realpathSync(archive) === realpathSync(dist))
+	) {
+		throw new Error("ARCHIVE_DIR must differ from dist");
+	}
 	const lock = join(root, ".build-alpha.lock");
 	try {
 		mkdirSync(lock, { mode: 0o700 });
@@ -316,7 +322,7 @@ export async function buildAlpha(options: {
 		if (code !== 0) throw new Error(`Alpha build failed (${code})`);
 		const metadata = await verifyArtifacts(dist, version);
 		checkPackage();
-		mkdirSync(archive, { recursive: true });
+		mkdirSync(archive, { recursive: true, mode: 0o700 });
 		const staging = mkdtempSync(join(archive, ".build-alpha-stage-"));
 		let backup: string | undefined;
 		const replaced: string[] = [];
@@ -332,9 +338,10 @@ export async function buildAlpha(options: {
 			checkPackage();
 			if (automatic) requireNewArtifacts(archive, names);
 			else backup = backupExisting(archive, names, true);
+			const install = options.installArchiveFile ?? (automatic ? linkSync : renameSync);
 			for (const name of names) {
 				checkPackage();
-				(options.renameArchiveFile ?? renameSync)(join(staging, name), join(archive, name));
+				install(join(staging, name), join(archive, name));
 				replaced.push(name);
 			}
 			const archived = await verifyArtifacts(archive, version);
@@ -380,7 +387,7 @@ if (import.meta.main) {
 		await buildAlpha({
 			root: join(import.meta.dir, ".."),
 			version: process.argv[2] ?? "auto",
-			archiveDir: process.argv[3] ?? "/home/project/narrafork",
+			archiveDir: process.argv[3] ?? ".build-alpha-archive",
 		});
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));

@@ -1,5 +1,7 @@
 node_modules
 dist/
+/.build-alpha-archive/
+/.build-alpha.lock/
 # Required bundled model metadata, imported directly by the runtime.
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*

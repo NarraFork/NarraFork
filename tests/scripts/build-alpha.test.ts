@@ -4,6 +4,7 @@ import {
 	closeSync,
 	existsSync,
 	fstatSync,
+	linkSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
@@ -12,6 +13,7 @@ import {
 	renameSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -172,7 +174,7 @@ test("rolls back a partial archive update while preserving existing targets and 
 	await expect(
 		buildAlpha({
 			...options,
-			renameArchiveFile: (source, destination) => {
+			installArchiveFile: (source, destination) => {
 				if (++renames === 1) {
 					for (const name of existing) {
 						expect(readFileSync(join(options.archiveDir, name), "utf8")).toBe(`previous ${name}`);
@@ -200,6 +202,35 @@ test.each(["failure", "corrupt"])("restores package and skips archiving after %s
 	await expect(buildAlpha(options)).rejects.toThrow();
 	expectRestored(options);
 	expect(existsSync(options.archiveDir)).toBe(false);
+});
+
+test("automatic archiving rolls back without overwriting a concurrent artifact", async () => {
+	const options = fixture();
+	const version = "0.9.10-alpha.1";
+	const checksum = `narrafork-${version}-SHA256SUMS`;
+	await expect(
+		buildAlpha({
+			...options,
+			version: "auto",
+			installArchiveFile: (source, destination) => {
+				if (destination === join(options.archiveDir, checksum)) {
+					writeFileSync(destination, "concurrent artifact", { flag: "wx" });
+				}
+				linkSync(source, destination);
+			},
+		}),
+	).rejects.toThrow("EEXIST");
+	expectRestored(options);
+	expect(readdirSync(options.archiveDir)).toEqual([checksum]);
+	expect(readFileSync(join(options.archiveDir, checksum), "utf8")).toBe("concurrent artifact");
+});
+
+test("rejects an archive symlink pointing to dist", async () => {
+	const options = fixture();
+	symlinkSync(join(options.root, "dist"), options.archiveDir, "junction");
+	await expect(buildAlpha(options)).rejects.toThrow("ARCHIVE_DIR must differ from dist");
+	expectRestored(options);
+	expect(existsSync(join(options.root, "invocation.json"))).toBe(false);
 });
 
 test("automatically selects the numeric maximum across dist and archive and restores package bytes", async () => {

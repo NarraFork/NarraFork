@@ -100,6 +100,16 @@ bun scripts/build-cross-platform.ts --platform=linux-arm64
 
 ### 本地 alpha 服务端诊断构建
 
+在 Linux x64 上安装项目依赖后，运行：
+
+```bash
+make build-alpha
+# 可选：指定版本、私有归档目录和 Bun 路径
+make build-alpha VERSION=0.9.16-alpha.2 ARCHIVE_DIR="$HOME/private-builds" BUN=bun
+```
+
+默认自动选择下一个 alpha 版本，并将 Linux x64 baseline 可执行文件、metadata sidecar、SHA256SUMS 与校验报告验证后归档到仓库内的私有 `.build-alpha-archive/`。自动模式跳过已占用的版本；显式重建会备份同名文件。构建会暂时改写并恢复 `package.json`，不要在同一工作区并行构建或发布。此命令不发布任何产物。
+
 正式入口 [scripts/build-cross-platform.ts](../scripts/build-cross-platform.ts) 在启动时冻结一次后端编译配置，并打印配置名称、严格校验状态、编译参数和实际命令参数数组：
 
 - 合法 SemVer 的 `alpha` 预发布版本（例如 `0.9.10-alpha.9`），在本地默认使用 `diagnostic`：`--keep-names --sourcemap --minify-syntax --minify-whitespace`。
