@@ -48,7 +48,7 @@ import type {
 import { resolveCommand } from "../services/command-service";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
-import { getStreamingSnapshot } from "../services/narrator-event-handler";
+import { getStreamingSnapshot, getSubagentOutputCounts } from "../services/narrator-event-handler";
 import {
 	handleBlockAllSkillsCommand,
 	handleBlockSkillCommand,
@@ -1295,10 +1295,6 @@ function sendRuntimeSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: 
 function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
-		if (!snap) continue;
-		const hasStreaming =
-			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
-		if (!hasStreaming) continue;
 		if (
 			!safeSend(
 				ws,
@@ -1306,10 +1302,11 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
-						model: snap.model,
-						provider: snap.provider,
-						streamingBlocks: snap.streamingBlocks,
-						toolChunks: [...snap.toolChunks.values()],
+						model: snap?.model,
+						provider: snap?.provider,
+						streamingBlocks: snap?.streamingBlocks ?? [],
+						toolChunks: [...(snap?.toolChunks.values() ?? [])],
+						subagentOutputCounts: getSubagentOutputCounts(id),
 					},
 					requestId,
 				),

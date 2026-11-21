@@ -177,6 +177,8 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
 		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
 		const sourceUpdates: unknown[] = [];
+		const countUpdates: unknown[] = [];
+		const countSnapshots: unknown[] = [];
 		const warnings: unknown[] = [];
 		const subagentWarnings: unknown[] = [];
 		const errors: unknown[] = [];
@@ -206,8 +208,12 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 					onNarratorError: (...args) => errors.push(args),
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
-					onStreamingSnapshot: (snapshot) =>
-						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument),
+					onToolOutput: (_id, _output, _parent, meta) =>
+						countUpdates.push(meta?.subagentOutputCount),
+					onStreamingSnapshot: (snapshot) => {
+						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument);
+						countSnapshots.push(snapshot.subagentOutputCounts);
+					},
 				},
 				props.cursor || props.messageVersion != null
 					? { cursor: props.cursor, messageVersion: props.messageVersion }
@@ -267,6 +273,48 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			])
 				for (const listener of sourceListeners) listener(frame);
 			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
+			const count = {
+				childNarratorId: "child",
+				logicalRunId: "run",
+				toolUseId: "agent",
+				toolCallId: "pk",
+				attempt: 0,
+				count: 12,
+				active: true,
+			};
+			for (const frame of [
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "agent",
+					output: "12",
+					subagentOutputCount: count,
+				},
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "agent",
+					output: "12",
+					subagentOutputCount: { ...count, count: -1 },
+				},
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "wrong-agent",
+					output: "12",
+					subagentOutputCount: count,
+				},
+				{ type: "tool_output", narratorId: "n1", toolUseId: "shell", output: "12" },
+				{
+					type: "streaming_snapshot",
+					narratorId: "n1",
+					subagentOutputCounts: [count, { ...count, attempt: -1 }],
+				},
+				{ type: "streaming_snapshot", narratorId: "n1", subagentOutputCounts: [] },
+			])
+				for (const listener of sourceListeners) listener(frame);
+			expect(countUpdates).toEqual([count, undefined]);
+			expect(countSnapshots).toEqual([undefined, [count], []]);
 			for (const frame of [
 				{
 					type: "warning",

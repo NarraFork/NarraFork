@@ -1504,6 +1504,19 @@ describe("extractDataRevision", () => {
 			expect(after).toContain("gl:1240");
 		});
 
+		it("a new Agent execution re-keys the row even when its status and geometry are unchanged", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const before = extractDataRevision(
+				traceWith(agentCard({ toolCallId: "pk", executionAttempt: 1 })),
+			);
+			expect(
+				extractDataRevision(traceWith(agentCard({ toolCallId: "pk", executionAttempt: 2 }))),
+			).not.toBe(before);
+			expect(
+				extractDataRevision(traceWith(agentCard({ toolCallId: "new-pk", executionAttempt: 1 }))),
+			).not.toBe(before);
+		});
+
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			expect(
