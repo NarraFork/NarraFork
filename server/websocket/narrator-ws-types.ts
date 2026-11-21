@@ -447,6 +447,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			output: string;
+			/** Present only for the exact Agent destination of a child logical run. */
+			subagentOutputCount?: import("@shared/subagent-output-counts").SubagentOutputCount;
 			parentToolUseId?: string;
 	  }
 	// 看门狗检测到 bash/shell 进程运行 ≥60s 时推送，前端据此显示终止按钮
@@ -705,6 +707,7 @@ export type NarratorServerMessage =
 	  }
 	| {
 			type: "tool_started";
+			executionAttempt?: number;
 			streamingEditOrigin?: StreamingEditOrigin;
 			narratorId: string;
 			toolCallId: string | null;
@@ -984,6 +987,8 @@ export type NarratorServerMessage =
 	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			/** Authoritative live Agent counts, including [] to clear a disconnected terminal run. */
+			subagentOutputCounts?: import("@shared/subagent-output-counts").SubagentOutputCount[];
 			model?: string;
 			provider?: string;
 			streamingBlocks: Array<

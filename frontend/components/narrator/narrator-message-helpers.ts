@@ -93,6 +93,8 @@ export interface TopLevelStreamingChunk {
 	textDocument?: import("@shared/pretext-layout/text-document").TextDocumentRef;
 	toolUseId: string;
 	toolName: string;
+	toolCallId?: string;
+	executionAttempt?: number;
 	inputCharsTotal: number;
 	extractedFilePath?: string;
 	contentCharsReceived?: number;
@@ -288,6 +290,8 @@ export function topLevelStreamingChunkToToolFields(
 	// result metadata would bypass target validation and shadow the actual result.
 	const metadata = chunk._metadata ?? (chunk.toolName === "Edit" ? undefined : chunk.metadata);
 	const receipts = {
+		...(chunk.toolCallId ? { tcId: chunk.toolCallId } : {}),
+		...(chunk.executionAttempt !== undefined ? { executionAttempt: chunk.executionAttempt } : {}),
 		...(chunk.textDocument?.source?.toolCallId
 			? { tcId: chunk.textDocument.source.toolCallId }
 			: {}),
@@ -400,6 +404,22 @@ export function buildTopLevelStreamingChunksMsg(
 					...toolCalls[tcIdx],
 					_metadata: chunk.metadata,
 				} as (typeof toolCalls)[number];
+			}
+		}
+		if (chunk.toolCallId) {
+			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (index >= 0)
+				toolCalls[index] = {
+					...toolCalls[index],
+					tcId: chunk.toolCallId,
+					id: chunk.toolCallId,
+					executionAttempt: chunk.executionAttempt,
+				} as (typeof toolCalls)[number];
+			for (const block of blocks) {
+				if (block.type === "tool_use" && block.id === chunk.toolUseId) {
+					block.tcId = chunk.toolCallId;
+					block.executionAttempt = chunk.executionAttempt;
+				}
 			}
 		}
 		if (chunk.textDocument?.source) {

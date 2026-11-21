@@ -719,6 +719,7 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// from the cached payload and advanced by the streaming channel alone, so it
 	// must re-key or the number freezes at whatever the first measure saw.
 	if (typeof d.liveOutputChars === "number") rev += `|gl:${d.liveOutputChars}`;
+	if (d.toolCallId) rev += `|gid:${d.toolCallId}:${d.executionAttempt}`;
 	if (d.isBackground === true) rev += "|gg:1";
 	// Takeover badge — same fixed badge row as `isBackground`, so height-neutral,
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),

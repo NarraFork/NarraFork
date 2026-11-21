@@ -1424,7 +1424,6 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
-		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -6426,7 +6425,6 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
@@ -8912,6 +8910,7 @@ export function interruptNarrator(narratorId: string): boolean {
 
 /** Gracefully close a narrator. */
 export function closeNarrator(narratorId: string): void {
+	const logicalRunId = getRunControl(narratorId)?.logicalRunId;
 	cancelModelTrace(narratorId);
 	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
@@ -8920,7 +8919,7 @@ export function closeNarrator(narratorId: string): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
+	if (logicalRunId) retireSubagentOutputCharCount(narratorId, logicalRunId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,

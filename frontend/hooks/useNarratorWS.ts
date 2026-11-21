@@ -12,6 +12,7 @@ import {
 	normalizeSubagentNestedSummary,
 	type SubagentNestedSummary,
 } from "@shared/subagent-nested";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -78,6 +79,11 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.executionAttempt === "number" &&
+		Number.isSafeInteger(data.executionAttempt) &&
+		data.executionAttempt >= 0
+			? { executionAttempt: data.executionAttempt }
+			: {}),
 		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
@@ -359,6 +365,7 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
 	blockId?: string | null;
 	toolName?: string | null;
@@ -593,7 +600,12 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
-	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
+	onToolOutput?: (
+		toolUseId: string,
+		output: string,
+		parentToolUseId?: string,
+		meta?: { subagentOutputCount?: SubagentOutputCount },
+	) => void;
 	/**
 	 * A determinate "N of M done" measurement from a running tool (TransferFile),
 	 * rendered as an actual progress bar rather than parsed out of its text output.
@@ -869,6 +881,7 @@ export interface NarratorWSCallbacks {
 		parentToolUseId?: string;
 	}) => void;
 	onStreamingSnapshot?: (snapshot: {
+		subagentOutputCounts?: SubagentOutputCount[];
 		model?: string;
 		provider?: string;
 		streamingBlocks: Array<
@@ -900,6 +913,7 @@ export interface NarratorWSCallbacks {
 		>;
 		toolChunks: Array<{
 			toolUseId: string;
+			executionAttempt?: number;
 			toolName: string;
 			inputCharsTotal: number;
 			parentToolUseId?: string;
@@ -1278,13 +1292,21 @@ export function useNarratorWS(
 							data.timeoutMs as number,
 						);
 						break;
-					case "tool_output":
+					case "tool_output": {
+						const count = parseSubagentOutputCount(data.subagentOutputCount);
+						if (
+							data.subagentOutputCount !== undefined &&
+							(!count || count.toolUseId !== data.toolUseId)
+						)
+							break;
 						callbackOwner.callbacks.onToolOutput?.(
 							data.toolUseId as string,
 							data.output as string,
 							data.parentToolUseId as string | undefined,
+							count ? { subagentOutputCount: count } : undefined,
 						);
 						break;
+					}
 					case "tool_structured_progress": {
 						// Validated rather than cast: a malformed frame must degrade to a
 						// barless card, not to a bar reading `NaN%`.
@@ -1816,6 +1838,14 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
+							...(Array.isArray(data.subagentOutputCounts)
+								? {
+										subagentOutputCounts: data.subagentOutputCounts.flatMap((value) => {
+											const count = parseSubagentOutputCount(value);
+											return count ? [count] : [];
+										}),
+									}
+								: {}),
 							model: nonEmptyString(data.model) ?? undefined,
 							provider: nonEmptyString(data.provider) ?? undefined,
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<

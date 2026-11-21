@@ -1985,6 +1985,22 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect(data.resultBody).toBeUndefined();
 	});
 
+	it("projects the exact Agent tool execution for the keyed run counter", () => {
+		expect(
+			subagentData({ toolName: "Agent", toolUseId: "agent", id: "row-pk", executionAttempt: 3 }),
+		).toMatchObject({ toolUseId: "agent", toolCallId: "row-pk", executionAttempt: 3 });
+		expect(
+			subagentData({
+				toolName: "Agent",
+				toolUseId: "agent",
+				id: "synthetic",
+				tcId: "receipt-pk",
+				executionAttempt: 4,
+			}),
+		).toMatchObject({ toolCallId: "receipt-pk", executionAttempt: 4 });
+		expect(subagentData({ toolName: "Agent", toolUseId: "agent" }).toolCallId).toBeUndefined();
+	});
+
 	it("omits the counter on a terminal card or a non-numeric stream", () => {
 		expect(
 			"liveOutputChars" in
