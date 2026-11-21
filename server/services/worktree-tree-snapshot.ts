@@ -1367,7 +1367,7 @@ async function addAllUnlocked(
 	}
 
 	try {
-		const forced = await trackedButIgnoredPaths(dir, worktreePath);
+		const forced = await trackedButIgnoredPaths(dir, worktreePath, signal);
 		for (const batch of batchArgs(forced)) {
 			const result = await runGit(
 				[...addArgs, "--force", "--", ...batch],
@@ -1414,7 +1414,12 @@ async function addAllUnlocked(
  * Any failed or truncated query leaves coverage unknown and fails the capture.
  * Only a confirmed non-repository has no tracked paths by definition.
  */
-async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promise<string[]> {
+async function trackedButIgnoredPaths(
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	signal?.throwIfAborted();
 	const indexKey = realIndexIdentity(worktreePath);
 	const cached = trackedIgnoredCache.get(dir);
 	if (indexKey !== null && cached?.indexKey === indexKey) return [];
@@ -1425,7 +1430,9 @@ async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promis
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: GIT_MAX_LISTING_BYTES,
 		env: { ...process.env, LC_ALL: "C" },
+		signal,
 	});
+	signal?.throwIfAborted();
 	if (result.stdoutTruncated || result.stderrTruncated) {
 		throw new TreeSnapshotError("snapshot tracked path listing exceeded the size limit");
 	}
