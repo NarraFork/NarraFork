@@ -311,6 +311,7 @@ function fixture(
 		broadcastToUser: (_id: string, event: unknown) => events.push(event),
 		getUserLanguage: async () => "en",
 		getUserReplyInLanguage: async () => false,
+		readMessageLanguagePreferences: async () => ({ locale: "en", replyInUserLanguage: false }),
 		logger: { warn: () => {} },
 		db: {
 			query: {
