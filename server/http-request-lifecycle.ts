@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isUnattendedShutdownFenced } from "./lib/shutdown-activity";
 
 /** Completion is the end/cancellation of the body, not the creation of Response. */
 export function createServerRequestLifecycle() {
@@ -9,7 +10,7 @@ export function createServerRequestLifecycle() {
 	return {
 		context,
 		get accepting() {
-			return accepting;
+			return accepting && !isUnattendedShutdownFenced();
 		},
 		get activeCount() {
 			return active.size;

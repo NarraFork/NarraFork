@@ -1,4 +1,5 @@
 import { Alert, Button, Group, Stack, Text } from "@mantine/core";
+import { UNATTENDED_CHANGED_WS_TYPE, UNATTENDED_IDLE_POLL_INTERVAL_MS } from "@shared/unattended";
 import { IconPower } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
@@ -7,6 +8,7 @@ import { useCurrentUser } from "../hooks/useAuth";
 import { ApiError, api } from "../lib/api";
 import { type UnattendedStatus, unattendedStatusQueryKey } from "../lib/api/unattended";
 import { formatLocaleTime } from "../lib/intl-format";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { TOP_BANNER_SECOND_ROW_STYLE } from "../lib/safe-area";
 import { Z } from "../lib/z-index";
 
@@ -29,7 +31,6 @@ const POLL_INTERVAL_MS = 5_000;
  * somebody armed it — the banner is the only surface that user may be able to reach before
  * the machine goes down, so it must appear without a page reload.
  */
-const IDLE_POLL_INTERVAL_MS = 60_000;
 const URGENT_WINDOW_MS = 60_000;
 
 const BLOCKER_KEYS = [
@@ -70,11 +71,31 @@ export function UnattendedModeBanner() {
 		queryFn: ({ signal }) => api.getUnattendedStatus(signal),
 		enabled: !!user,
 		refetchInterval: (query) =>
-			query.state.data?.enabled ? POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS,
-		refetchOnWindowFocus: false,
-		refetchOnReconnect: false,
+			query.state.data?.enabled ? POLL_INTERVAL_MS : UNATTENDED_IDLE_POLL_INTERVAL_MS,
+		refetchIntervalInBackground: true,
 		retry: false,
 	});
+	const signedIn = !!user;
+	useEffect(() => {
+		if (!signedIn) return;
+		let disposed = false;
+		const refresh = async () => {
+			await client.cancelQueries({ queryKey: unattendedStatusQueryKey });
+			if (!disposed) await client.invalidateQueries({ queryKey: unattendedStatusQueryKey });
+		};
+		const listener = narratorWSManager.addListener(
+			{ types: [UNATTENDED_CHANGED_WS_TYPE] },
+			refresh,
+		);
+		const disconnect = narratorWSManager.onConnectionChange((connected) => {
+			if (connected) void refresh();
+		});
+		return () => {
+			disposed = true;
+			disconnect();
+			narratorWSManager.removeListener(listener);
+		};
+	}, [client, signedIn]);
 	const cancel = useMutation({
 		mutationFn: () => api.cancelUnattendedMode(),
 		onSuccess: ({ status }) => {

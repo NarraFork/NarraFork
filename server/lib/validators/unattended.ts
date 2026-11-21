@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MIN_UNATTENDED_ARM_DELAY_SECONDS } from "../../../shared/unattended";
 
 /**
  * One patch shape for both arming and disarming unattended mode.
@@ -20,6 +21,6 @@ export const unattendedOptionsSchema = z
 			.refine((value) => value == null || !/[\r\n]/.test(value), "must be a single line"),
 		/** 10s floor: shorter windows cannot outlast a single agent turn's tail. */
 		quietSeconds: z.number().int().min(10).max(86_400).optional(),
-		armDelaySeconds: z.number().int().min(0).max(3_600).optional(),
+		armDelaySeconds: z.number().int().min(MIN_UNATTENDED_ARM_DELAY_SECONDS).max(3_600).optional(),
 	})
 	.strict();

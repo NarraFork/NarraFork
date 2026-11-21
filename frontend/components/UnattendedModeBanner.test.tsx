@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { UNATTENDED_CHANGED_WS_TYPE } from "@shared/unattended";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -13,6 +14,19 @@ let admin = false;
 let cancels = 0;
 let cancelError: Error | null = null;
 let status: UnattendedStatus;
+let onStatusChanged: () => void;
+
+mock.module("../lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		addListener: ({ types }: { types: string[] }, listener: () => void) => {
+			expect(types).toEqual([UNATTENDED_CHANGED_WS_TYPE]);
+			onStatusChanged = listener;
+			return {};
+		},
+		removeListener: () => {},
+		onConnectionChange: () => () => {},
+	},
+}));
 
 function fixture(overrides: Partial<UnattendedStatus> = {}): UnattendedStatus {
 	return {
@@ -147,6 +161,27 @@ describe("UnattendedModeBanner", () => {
 		// Mantine injects a <style> node, so assert on our own text, not the container's.
 		expect(container.textContent).not.toContain("unattendedBannerOn");
 		expect(container.querySelector("button")).toBeNull();
+	});
+
+	test("updates on remote arm, countdown and cancel without waiting for a poll", async () => {
+		status = fixture({ enabled: false, phase: "off", shutdownAt: null });
+		await render();
+		expect(banner()).toBeNull();
+
+		status = fixture({ phase: "waiting", shutdownAt: null });
+		await act(async () => onStatusChanged());
+		await flush();
+		expect(container.textContent).toContain("unattendedBannerWaiting");
+
+		status = fixture();
+		await act(async () => onStatusChanged());
+		await flush();
+		expect(container.textContent).toContain("unattendedBannerCountdown");
+
+		status = fixture({ enabled: false, phase: "off", shutdownAt: null });
+		await act(async () => onStatusChanged());
+		await flush();
+		expect(banner()).toBeNull();
 	});
 
 	test("shows the countdown in a fixed second-row banner for ordinary users", async () => {

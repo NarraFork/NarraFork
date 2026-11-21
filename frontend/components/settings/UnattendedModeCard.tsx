@@ -10,6 +10,7 @@ import {
 	Text,
 	TextInput,
 } from "@mantine/core";
+import { MIN_UNATTENDED_ARM_DELAY_SECONDS } from "@shared/unattended";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -63,7 +64,7 @@ function AdminUnattendedModeCard() {
 	const server: Draft = {
 		powerOff: status?.options.powerOff ?? true,
 		quietSeconds: status?.options.quietSeconds ?? 120,
-		armDelaySeconds: status?.options.armDelaySeconds ?? 60,
+		armDelaySeconds: status?.options.armDelaySeconds ?? MIN_UNATTENDED_ARM_DELAY_SECONDS,
 		powerOffCommand: status?.options.powerOffCommand ?? "",
 	};
 	const options = draft ?? server;
@@ -189,7 +190,7 @@ function AdminUnattendedModeCard() {
 					<NumberInput
 						label={t("unattendedArmDelay")}
 						value={options.armDelaySeconds}
-						min={0}
+						min={MIN_UNATTENDED_ARM_DELAY_SECONDS}
 						max={3_600}
 						step={10}
 						disabled={busy}

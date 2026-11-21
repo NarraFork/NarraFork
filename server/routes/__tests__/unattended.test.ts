@@ -197,6 +197,8 @@ describe("unattended mode HTTP surface", () => {
 		expect((await post({ enabled: true, quietSeconds: 1 }, admin)).status).toBe(400);
 		expect((await post({ enabled: true, quietSeconds: 86_401 }, admin)).status).toBe(400);
 		expect((await post({ enabled: true, armDelaySeconds: -1 }, admin)).status).toBe(400);
+		expect((await post({ enabled: true, armDelaySeconds: 60 }, admin)).status).toBe(400);
+		expect((await post({ enabled: true, armDelaySeconds: 70 }, admin)).status).toBe(200);
 		expect((await post({ enabled: true, powerOffCommand: "a\nb" }, admin)).status).toBe(400);
 		expect((await post({ enabled: true, unknownKey: 1 }, admin)).status).toBe(400);
 		expect((await post({}, admin)).status).toBe(400);

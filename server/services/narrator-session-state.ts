@@ -8,6 +8,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import type { ImageRef } from "../lib/uploads";
 import { createRuntimeMapView, executionAdmissions } from "./agent-runtime/ownership";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
@@ -978,6 +979,11 @@ export function withNarratorWorkAdmission<T>(
 		const live = [...(admissionContext.getStore()?.work.values() ?? [])].filter(
 			(work) => work.live,
 		);
+		if (isUnattendedShutdownFenced() && live.length === 0) {
+			return Promise.reject(
+				new AppError("Server is checking shutdown readiness", 503, "SERVER_SHUTTING_DOWN"),
+			);
+		}
 		// A root gate covers the whole team; a subagent gate covers only that subagent,
 		// so its parent and siblings keep running while it is reverted.
 		for (const key of new Set([rootId, narratorId])) {

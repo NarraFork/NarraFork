@@ -199,17 +199,17 @@ export async function probeUnattendedIdle(
 ): Promise<UnattendedBlockers> {
 	const report = emptyUnattendedBlockers();
 	try {
-		readRuntime(report);
-	} catch (error) {
-		report.unknown = true;
-		report.error = `runtime: ${error instanceof Error ? error.message : String(error)}`;
-		return report;
-	}
-	try {
 		await readDurableQueues(report, input);
 	} catch (error) {
 		report.unknown = true;
 		report.error = `database: ${error instanceof Error ? error.message : String(error)}`;
+		return report;
+	}
+	try {
+		readRuntime(report);
+	} catch (error) {
+		report.unknown = true;
+		report.error = `runtime: ${error instanceof Error ? error.message : String(error)}`;
 	}
 	return report;
 }

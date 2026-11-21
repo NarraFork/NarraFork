@@ -24,7 +24,7 @@ function fixture(overrides: Partial<UnattendedStatus> = {}): UnattendedStatus {
 		phase: "off",
 		shutdownAt: null,
 		blocked: false,
-		options: { powerOff: true, quietSeconds: 120, armDelaySeconds: 60, powerOffCommand: null },
+		options: { powerOff: true, quietSeconds: 120, armDelaySeconds: 70, powerOffCommand: null },
 		blockers: {
 			narrators: 0,
 			compacting: 0,
@@ -211,7 +211,7 @@ describe("UnattendedModeCard", () => {
 				enabled: true,
 				powerOff: true,
 				quietSeconds: 120,
-				armDelaySeconds: 60,
+				armDelaySeconds: 70,
 				powerOffCommand: null,
 			},
 		]);

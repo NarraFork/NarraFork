@@ -6,7 +6,7 @@ function fakeSpawn(codes: number[]): { spawn: PowerOffSpawn; calls: string[][] }
 	const spawn: PowerOffSpawn = (command) => {
 		calls.push(command);
 		const code = codes[calls.length - 1] ?? 1;
-		return { exited: Promise.resolve(code), unref: () => {} };
+		return { exited: Promise.resolve(code), kill: () => {}, unref: () => {} };
 	};
 	return { spawn, calls };
 }
@@ -28,12 +28,11 @@ describe("resolvePowerOffPlan", () => {
 		]);
 	});
 
-	test("linux tries systemd, then shutdown, then logind", () => {
+	test("linux tries systemd, then shutdown", () => {
 		const plan = resolvePowerOffPlan("linux");
 		expect(plan.candidates).toEqual([
 			["systemctl", "poweroff"],
 			["shutdown", "-h", "now"],
-			["loginctl", "poweroff"],
 		]);
 	});
 
@@ -72,7 +71,7 @@ describe("runPowerOff", () => {
 			{},
 			{
 				platform: "linux",
-				spawn: () => ({ exited: Promise.resolve(0), unref: () => void unrefs++ }),
+				spawn: () => ({ exited: Promise.resolve(0), kill: () => {}, unref: () => void unrefs++ }),
 			},
 		);
 		return result.then((value) => {
@@ -92,10 +91,10 @@ describe("runPowerOff", () => {
 	});
 
 	test("every candidate failing reports the last outcome and no success", async () => {
-		const { spawn, calls } = fakeSpawn([1, 1, 1]);
+		const { spawn, calls } = fakeSpawn([1, 1]);
 		const result = await runPowerOff({}, { platform: "linux", spawn });
 		expect(result.ok).toBe(false);
-		expect(calls).toHaveLength(3);
+		expect(calls).toHaveLength(2);
 		expect(result.error).toContain("1");
 	});
 
@@ -104,13 +103,44 @@ describe("runPowerOff", () => {
 			{},
 			{
 				platform: "linux",
-				timeoutMs: 5,
-				spawn: () => ({ exited: new Promise<number>(() => {}) }),
+				timeoutMs: 100,
+				spawn: () => ({ exited: new Promise<number>(() => {}), kill: () => {} }),
 			},
 		);
 		expect(result.ok).toBe(false);
 		expect(result.attempts.at(-1)?.code).toBe(-1);
 		expect(result.error).toBe("timed out");
+	});
+
+	test("kills and reaps the timed-out candidate before the Linux fallback", async () => {
+		const first = Promise.withResolvers<number>();
+		const order: string[] = [];
+		const result = await runPowerOff(
+			{},
+			{
+				platform: "linux",
+				timeoutMs: 200,
+				spawn: ([command]) => {
+					order.push(command);
+					if (command === "systemctl") {
+						return {
+							exited: first.promise,
+							kill: () => {
+								order.push("kill");
+								void Bun.sleep(1).then(() => {
+									order.push("reaped");
+									first.resolve(137);
+								});
+							},
+						};
+					}
+					return { exited: Promise.resolve(0), kill: () => {} };
+				},
+			},
+		);
+		expect(result.ok).toBe(true);
+		expect(result.attempts.map(({ code }) => code)).toEqual([-1, 0]);
+		expect(order).toEqual(["systemctl", "kill", "reaped", "shutdown"]);
 	});
 
 	test("a throwing spawn is an attempt failure, never a throw", async () => {

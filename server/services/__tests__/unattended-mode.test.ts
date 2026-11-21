@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { MIN_UNATTENDED_ARM_DELAY_SECONDS } from "@shared/unattended";
 import { createUnattendedMode, UNATTENDED_SHUTDOWN_REASON } from "../unattended-mode";
 import { emptyUnattendedBlockers, type UnattendedBlockers } from "../unattended-probe";
 
 const START = Date.parse("2026-01-01T00:00:00.000Z");
+const ARM_DELAY_MS = MIN_UNATTENDED_ARM_DELAY_SECONDS * 1000;
 
 function busyReport(): UnattendedBlockers {
 	return {
@@ -87,9 +89,9 @@ describe("unattended mode state machine", () => {
 
 	test("shuts down at the later of the quiet window and the arming delay", async () => {
 		const h = harness();
-		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 30 });
+		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 90 });
 		await flush();
-		h.advance(29_999);
+		h.advance(89_999);
 		await h.mode.tick();
 		expect(h.shutdowns).toHaveLength(0);
 		expect(h.mode.status().phase).toBe("quiet");
@@ -106,6 +108,7 @@ describe("unattended mode state machine", () => {
 		const h = harness();
 		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 0 });
 		await flush();
+		h.advance(ARM_DELAY_MS - 10_000);
 		h.advance(9_000);
 		await h.mode.tick();
 		expect(h.shutdowns).toHaveLength(0);
@@ -167,7 +170,7 @@ describe("unattended mode state machine", () => {
 		h.rejectShutdown();
 		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 0 });
 		await flush();
-		h.advance(10_000);
+		h.advance(ARM_DELAY_MS);
 		await h.mode.tick();
 		const status = h.mode.status();
 		expect(status.phase).toBe("waiting");
@@ -192,7 +195,7 @@ describe("unattended mode state machine", () => {
 		const armed = harness();
 		armed.mode.enable({ quietSeconds: 10, armDelaySeconds: 0 });
 		await flush();
-		armed.advance(10_000);
+		armed.advance(ARM_DELAY_MS);
 		await armed.mode.tick();
 		expect(armed.mode.status().phase).toBe("shutting_down");
 		const refused = armed.mode.disable();
@@ -204,7 +207,7 @@ describe("unattended mode state machine", () => {
 		const h = harness();
 		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 0, powerOff: true });
 		await flush();
-		h.advance(10_000);
+		h.advance(ARM_DELAY_MS);
 		await h.mode.tick();
 		await h.hook()?.({ reason: "operator_shutdown" });
 		expect(h.powerOffs).toHaveLength(0);
@@ -216,7 +219,7 @@ describe("unattended mode state machine", () => {
 		const h = harness();
 		h.mode.enable({ quietSeconds: 10, armDelaySeconds: 0, powerOff: false });
 		await flush();
-		h.advance(10_000);
+		h.advance(ARM_DELAY_MS);
 		await h.mode.tick();
 		expect(h.mode.status().phase).toBe("shutting_down");
 		await h.hook()?.({ reason: UNATTENDED_SHUTDOWN_REASON });
@@ -231,7 +234,7 @@ describe("unattended mode state machine", () => {
 			powerOffCommand: "  sudo poweroff  ",
 		});
 		await flush();
-		h.advance(10_000);
+		h.advance(ARM_DELAY_MS);
 		await h.mode.tick();
 		await h.hook()?.({ reason: UNATTENDED_SHUTDOWN_REASON });
 		expect(h.powerOffs).toEqual(["sudo poweroff"]);
@@ -249,6 +252,75 @@ describe("unattended mode state machine", () => {
 		const h = harness();
 		h.mode.enable({ quietSeconds: 45, armDelaySeconds: 0 });
 		await flush();
+		expect(h.mode.status().options.armDelaySeconds).toBe(MIN_UNATTENDED_ARM_DELAY_SECONDS);
 		expect(h.probes[0]?.dueWithinMs).toBe(45_000);
+	});
+
+	test("a cancelled arm's in-flight probe cannot seed the new arm's quiet window", async () => {
+		const stale = Promise.withResolvers<UnattendedBlockers>();
+		const fresh = Promise.withResolvers<UnattendedBlockers>();
+		const windows: number[] = [];
+		let now = START;
+		const mode = createUnattendedMode({
+			now: () => now,
+			probe: ({ dueWithinMs }) => {
+				windows.push(dueWithinMs);
+				return windows.length === 1 ? stale.promise : fresh.promise;
+			},
+			requestShutdown: () => true,
+			powerOff: async () => ({ ok: true }),
+			registerHook: () => {},
+			schedule: () => () => {},
+			log: { info: () => {}, warn: () => {} },
+		});
+		mode.enable({ quietSeconds: 10 });
+		expect(mode.disable().success).toBe(true);
+		now += 20_000;
+		mode.enable({ quietSeconds: 120 });
+		stale.resolve(emptyUnattendedBlockers());
+		await flush();
+		expect(windows).toEqual([10_000, 120_000]);
+		expect(mode.status().quietSince).toBeNull();
+		fresh.resolve(emptyUnattendedBlockers());
+		await flush();
+		expect(mode.status().quietSince).toBe(new Date(now).toISOString());
+	});
+
+	test("a blocker in final validation keeps the mode armed and resets quiet time", async () => {
+		const h = harness();
+		h.mode.enable({ quietSeconds: 10 });
+		await flush();
+		h.advance(ARM_DELAY_MS);
+		await h.mode.tick();
+		expect(h.mode.status().phase).toBe("shutting_down");
+		h.setReport(busyReport());
+		expect(await h.mode.revalidateIdle()).toBe(false);
+		h.mode.deferShutdown();
+		expect(h.mode.status()).toMatchObject({ enabled: true, phase: "waiting", quietSince: null });
+		h.setReport(emptyUnattendedBlockers());
+		await h.mode.tick();
+		expect(h.shutdowns).toHaveLength(1);
+		h.advance(10_000);
+		await h.mode.tick();
+		expect(h.shutdowns).toHaveLength(2);
+	});
+
+	test("notifies listeners when arming, starting a countdown, and cancelling", async () => {
+		const phases: string[] = [];
+		const mode = createUnattendedMode({
+			now: () => START,
+			probe: async () => emptyUnattendedBlockers(),
+			requestShutdown: () => true,
+			powerOff: async () => ({ ok: true }),
+			registerHook: () => {},
+			schedule: () => () => {},
+			changed: () => phases.push(mode.status().phase),
+			log: { info: () => {}, warn: () => {} },
+		});
+		mode.enable();
+		await flush();
+		await mode.tick();
+		mode.disable();
+		expect(phases).toEqual(["waiting", "quiet", "off"]);
 	});
 });

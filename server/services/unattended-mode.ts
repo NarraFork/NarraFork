@@ -16,6 +16,8 @@
  *    which runs after `performGracefulShutdown` returned — issues the power-off command.
  */
 
+import { MIN_UNATTENDED_ARM_DELAY_SECONDS } from "../../shared/unattended";
+import { eventBus } from "../lib/event-bus";
 import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { registerPostShutdownHook } from "../lib/post-shutdown-hooks";
@@ -102,6 +104,7 @@ export interface UnattendedModeDeps {
 	 * unit test never leaves a 5 s interval (or a shared hot-safe timer) behind.
 	 */
 	schedule?(run: () => void): () => void;
+	changed?(): void;
 	log: UnattendedModeLog;
 }
 
@@ -109,7 +112,7 @@ export const DEFAULT_UNATTENDED_OPTIONS: UnattendedOptions = {
 	powerOff: true,
 	powerOffCommand: null,
 	quietSeconds: 120,
-	armDelaySeconds: 60,
+	armDelaySeconds: MIN_UNATTENDED_ARM_DELAY_SECONDS,
 };
 
 interface InternalState {
@@ -140,7 +143,7 @@ function normalizeOptions(patch: Partial<UnattendedOptions>): UnattendedOptions 
 		quietSeconds: clampInt(patch.quietSeconds, 10, 86_400, DEFAULT_UNATTENDED_OPTIONS.quietSeconds),
 		armDelaySeconds: clampInt(
 			patch.armDelaySeconds,
-			0,
+			MIN_UNATTENDED_ARM_DELAY_SECONDS,
 			3_600,
 			DEFAULT_UNATTENDED_OPTIONS.armDelaySeconds,
 		),
@@ -163,6 +166,8 @@ export interface UnattendedMode {
 	disable(): { success: boolean; error?: string; status: UnattendedStatus };
 	/** One evaluation. Tests call it directly; production drives it from the poll timer. */
 	tick(): Promise<void>;
+	revalidateIdle(): Promise<boolean>;
+	deferShutdown(): void;
 	/** Re-create the poll timer after a `bun --hot` module re-evaluation. */
 	resume(): void;
 }
@@ -183,6 +188,7 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 
 	/** Active poll timer's cancel function, when one is running. */
 	let cancelTimer: (() => void) | null = null;
+	let generation = 0;
 
 	function status(): UnattendedStatus {
 		const plan = resolvePowerOffPlan(process.platform, state.options.powerOffCommand);
@@ -278,19 +284,20 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 		stopTimer();
 	}
 
-	/** Re-read the live state (a probe may have been awaited across a cancel). */
-	function stopping(): boolean {
-		return !state.enabled || state.phase === "shutting_down";
+	function probe(): Promise<UnattendedBlockers> {
+		return deps.probe({ dueWithinMs: state.options.quietSeconds * 1000 });
 	}
 
 	async function tick(): Promise<void> {
 		if (!state.enabled || state.phase === "shutting_down" || state.ticking) return;
+		const probeGeneration = generation;
+		const previousPhase = state.phase;
+		const previousShutdownAt = state.shutdownAt;
 		state.ticking = true;
 		try {
+			const report = await probe();
+			if (probeGeneration !== generation) return;
 			const now = deps.now();
-			const report = await deps.probe({ dueWithinMs: state.options.quietSeconds * 1000 });
-			// A human may have cancelled while the probe was in flight.
-			if (stopping()) return;
 			state.checkedAt = now;
 			state.blockers = report;
 			state.blocked = isBlocked(report);
@@ -312,6 +319,7 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			if (now < readyAt) return;
 			trigger();
 		} catch (error) {
+			if (probeGeneration !== generation) return;
 			// `probeUnattendedIdle` never throws, but an injected probe might: treat it as
 			// "cannot prove the instance is quiet" and keep the machine on.
 			state.blockers = {
@@ -329,12 +337,19 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			});
 		} finally {
 			state.ticking = false;
+			if (probeGeneration !== generation) {
+				void tick();
+			} else if (previousPhase !== state.phase || previousShutdownAt !== state.shutdownAt) {
+				deps.changed?.();
+			}
 		}
 	}
 
 	return {
 		status,
 		enable(patch = {}) {
+			if (state.phase === "shutting_down") return status();
+			generation++;
 			state.options = normalizeOptions({ ...state.options, ...patch });
 			state.enabled = true;
 			state.phase = "waiting";
@@ -347,6 +362,7 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			state.lastError = undefined;
 			deps.registerHook(postShutdownHook);
 			ensureTimer();
+			deps.changed?.();
 			deps.log.info("Unattended mode armed", {
 				quietSeconds: state.options.quietSeconds,
 				armDelaySeconds: state.options.armDelaySeconds,
@@ -359,6 +375,8 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			if (state.phase === "shutting_down") {
 				return { success: false, error: "already_shutting_down", status: status() };
 			}
+			generation++;
+			const wasEnabled = state.enabled;
 			state.enabled = false;
 			state.phase = "off";
 			state.armedAt = null;
@@ -370,10 +388,22 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			state.lastError = undefined;
 			stopTimer();
 			deps.registerHook(null);
+			if (wasEnabled) deps.changed?.();
 			deps.log.info("Unattended mode disarmed");
 			return { success: true, status: status() };
 		},
 		tick,
+		async revalidateIdle() {
+			return state.phase === "shutting_down" && !isBlocked(await probe());
+		},
+		deferShutdown() {
+			if (state.phase !== "shutting_down") return;
+			state.phase = "waiting";
+			state.quietSince = null;
+			state.shutdownAt = null;
+			ensureTimer();
+			deps.changed?.();
+		},
 		resume() {
 			if (!state.enabled || state.phase === "shutting_down") return;
 			deps.registerHook(postShutdownHook);
@@ -389,6 +419,7 @@ function realDeps(): UnattendedModeDeps {
 		requestShutdown: (reason) => scheduleOperatorShutdown({ reason }),
 		powerOff: (command) => runPowerOff({ custom: command }),
 		registerHook: (hook) => registerPostShutdownHook(HOOK_KEY, hook),
+		changed: () => eventBus.emit({ type: "system:unattended_changed" }),
 		log: logger,
 	};
 }

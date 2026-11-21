@@ -24,13 +24,14 @@ export interface PowerOffPlan {
 /** A spawned process: only the two things the caller needs. */
 export type PowerOffSpawn = (command: string[]) => {
 	exited: Promise<number>;
+	kill: () => void;
 	unref?: () => void;
 };
 
 export interface RunPowerOffDeps {
 	platform?: NodeJS.Platform;
 	spawn?: PowerOffSpawn;
-	/** Per-candidate bound. `shutdown`/`systemctl` return quickly; a hang must not stall exit. */
+	/** Overall budget, including unsuccessful candidates and reaping. */
 	timeoutMs?: number;
 }
 
@@ -50,7 +51,7 @@ export interface RunPowerOffResult {
 	note?: string;
 }
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 8_000;
 
 /**
  * A custom command is executed through the platform shell, so it is the one place where a
@@ -102,14 +103,11 @@ export function resolvePowerOffPlan(
 		};
 	}
 	if (platform === "linux") {
-		// `systemctl` is the normal path; the other two cover non-systemd hosts and hosts
-		// where the polkit rule only grants the console session.
 		return {
 			supported: true,
 			candidates: [
 				["systemctl", "poweroff"],
 				["shutdown", "-h", "now"],
-				["loginctl", "poweroff"],
 			],
 		};
 	}
@@ -120,6 +118,7 @@ const defaultSpawn: PowerOffSpawn = (command) => {
 	const child = Bun.spawn(command, { stdio: ["ignore", "ignore", "ignore"] });
 	return {
 		exited: child.exited,
+		kill: () => child.kill("SIGKILL"),
 		unref: () => {
 			try {
 				child.unref();
@@ -162,11 +161,34 @@ export async function runPowerOff(
 		return { ok: false, attempts: [], unsupported: true, note: plan.note };
 	}
 	const attempts: PowerOffAttempt[] = [];
-	for (const command of plan.candidates) {
+	const deadline = performance.now() + timeoutMs;
+	for (const [index, command] of plan.candidates.entries()) {
+		const startedAt = performance.now();
+		const remaining = deadline - startedAt;
+		if (remaining <= 0) break;
+		const budget = remaining / (plan.candidates.length - index);
+		const attemptDeadline = startedAt + budget;
 		try {
 			const child = spawn(command);
-			const code = await exitWithin(child.exited, timeoutMs);
+			const code = await exitWithin(
+				child.exited,
+				Math.max(0, attemptDeadline - budget * 0.2 - performance.now()),
+			);
 			attempts.push({ command, code });
+			if (code === -1) {
+				try {
+					child.kill();
+					const reaped = await exitWithin(
+						child.exited,
+						Math.max(0, attemptDeadline - performance.now()),
+					);
+					if (reaped === -1) break;
+				} catch {
+					break;
+				} finally {
+					child.unref?.();
+				}
+			}
 			if (code === 0) {
 				child.unref?.();
 				return { ok: true, command, attempts };

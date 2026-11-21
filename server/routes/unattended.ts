@@ -52,6 +52,7 @@ unattendedRoutes.post("/", requireAdmin, async (c) => {
 	const { enabled, ...options } = parsed.data;
 	if (enabled) {
 		const status = unattendedMode.enable(options);
+		if (status.phase === "shutting_down") return c.json({ success: false, status }, 409);
 		return c.json({ success: true, status });
 	}
 	const result = unattendedMode.disable();

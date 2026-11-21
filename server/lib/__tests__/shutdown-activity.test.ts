@@ -2,7 +2,43 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
-import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "../shutdown-activity";
+import { createServerRequestLifecycle } from "../../http-request-lifecycle";
+import {
+	canRunCleanShutdownHooks,
+	fenceUnattendedShutdown,
+	preservesRecoveryOnShutdown,
+	ShutdownActivityTracker,
+} from "../shutdown-activity";
+
+test("work arriving at the final idle boundary defers shutdown and reopens admission", async () => {
+	const lifecycle = createServerRequestLifecycle();
+	const work = Promise.withResolvers<Response>();
+	let request: Promise<Response | undefined> | undefined;
+	const ready = await fenceUnattendedShutdown(
+		() => lifecycle.activeCount > 0,
+		async () => {
+			expect(lifecycle.accepting).toBe(false);
+			request = lifecycle.track(1, new Request("http://localhost"), work.promise);
+			return true;
+		},
+	);
+	expect(ready).toBe(false);
+	expect(lifecycle.accepting).toBe(true);
+	work.resolve(new Response());
+	await request;
+});
+
+test("post-shutdown hooks require a clean result from the requested teardown", () => {
+	const tracker = new ShutdownActivityTracker();
+	tracker.markDrainComplete();
+	const reason = "unattended_idle";
+	expect(canRunCleanShutdownHooks(reason, { reason, clean: tracker.isCleanShutdown() })).toBe(true);
+	expect(canRunCleanShutdownHooks(reason, { reason: "signal", clean: true })).toBe(false);
+	tracker.recordStep("workspace.persist", "timeout");
+	expect(canRunCleanShutdownHooks(reason, { reason, clean: tracker.isCleanShutdown() })).toBe(
+		false,
+	);
+});
 
 describe("ShutdownActivityTracker", () => {
 	test("is not clean until drain completes even when every step succeeds", () => {
@@ -327,7 +363,10 @@ describe("main shutdown wiring without booting the server", () => {
 		const options: unknown[] = [];
 		const delays: number[] = [];
 		const hookReasons: string[] = [];
-		const result = { success: true };
+		const result = { success: true, reason: "", clean: true };
+		const shutdownReason = "unattended_idle";
+		let idle = false;
+		let deferred = 0;
 		new Function(
 			"registerGracefulShutdownHandler",
 			"registerOperatorShutdownHandler",
@@ -337,6 +376,14 @@ describe("main shutdown wiring without booting the server", () => {
 			"setTimeout",
 			"process",
 			"runPostShutdownHooks",
+			"UNATTENDED_SHUTDOWN_REASON",
+			"canRunCleanShutdownHooks",
+			"fenceUnattendedShutdown",
+			"unattendedMode",
+			"shutdownState",
+			"httpLifecycle",
+			"hasActiveWebSocketHandlers",
+			"isScheduledTaskTickActive",
 			code,
 		)(
 			(handler: Handler) => handlers.push(handler),
@@ -347,8 +394,9 @@ describe("main shutdown wiring without booting the server", () => {
 					if (throws) throw new Error("PRIVATE_SINK_FAILURE");
 				},
 			},
-			async (requested: unknown) => {
+			async (requested: { reason: string }) => {
 				options.push(requested);
+				result.reason = requested.reason;
 				return result;
 			},
 			preservesRecoveryOnShutdown,
@@ -362,10 +410,22 @@ describe("main shutdown wiring without booting the server", () => {
 				},
 			},
 			// Post-shutdown hooks are the seam unattended mode's power-off uses; the operator
-			// path must reach them for every reason it handles (the real signature is a string).
+			// path must reach them for clean shutdowns.
 			async (reason: string) => {
 				hookReasons.push(reason);
 			},
+			shutdownReason,
+			canRunCleanShutdownHooks,
+			(...args: Parameters<typeof fenceUnattendedShutdown>) =>
+				idle ? Promise.resolve(true) : fenceUnattendedShutdown(...args),
+			{
+				revalidateIdle: async () => idle,
+				deferShutdown: () => deferred++,
+			},
+			{ promise: null },
+			{ activeCount: 1 },
+			() => false,
+			() => false,
 		);
 		expect(handlers).toHaveLength(2);
 		expect(await handlers[0]({ pid: 12345, version: "/private/HANDOFF_VERSION_CANARY" })).toBe(
@@ -374,6 +434,8 @@ describe("main shutdown wiring without booting the server", () => {
 		for (const reason of ["operator_shutdown", "system_prepared_shutdown"]) {
 			expect(await handlers[1]({ reason })).toBe(result);
 		}
+		expect(await handlers[1]({ reason: shutdownReason })).toBeNull();
+		expect(deferred).toBe(1);
 		expect(options).toEqual([
 			{
 				reason: "replacement_started",
@@ -396,6 +458,12 @@ describe("main shutdown wiring without booting the server", () => {
 		expect(diagnostics).toHaveLength(3);
 		for (const canary of ["/private/", "HANDOFF_VERSION_CANARY", "PRIVATE_SINK_FAILURE", "12345"])
 			expect(JSON.stringify(diagnostics)).not.toContain(canary);
+
+		idle = true;
+		result.clean = false;
+		expect(await handlers[1]({ reason: shutdownReason })).toBe(result);
+		expect(hookReasons).not.toContain(shutdownReason);
+		expect(delays).toEqual([250, 250, 250, 250]);
 	});
 	test("HMR pins shutdown ownership and registers delegating process hooks only once", () => {
 		expect(main).toContain('"narrafork.mainShutdown"');
