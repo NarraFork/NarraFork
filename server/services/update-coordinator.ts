@@ -1034,7 +1034,9 @@ export function registerNarratorLoop(
 		narratorId,
 		logicalRunId: options.logicalRunId,
 		executionEpoch: options.executionEpoch,
-		parentNarratorId: options.parentNarratorId,
+		get parentNarratorId() {
+			return options.parentNarratorId;
+		},
 		parentIdentity,
 		canPauseForCheckpoint: options.canPauseForCheckpoint,
 		locale,

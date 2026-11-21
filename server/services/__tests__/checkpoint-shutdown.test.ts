@@ -416,6 +416,107 @@ for (const claimTiming of ["none", "before-child-register", "before-stop"] as co
 	});
 }
 
+for (const detached of [false, true]) {
+	test(`background checkpoint survives its parent's turn ending, detached=${detached}`, async () => {
+		const entered = Promise.withResolvers<void>();
+		const park = Promise.withResolvers<void>();
+		const parked = Promise.withResolvers<void>();
+		const unregisterParent = coordinator.registerNarratorLoop(ids[1], "en", {
+			logicalRunId: "finished-parent-run",
+			executionEpoch: "finished-parent-owner",
+		});
+		spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
+			entered.resolve();
+			await park.promise;
+			coordinator.scheduleUpdate(undefined, "system_shutdown");
+			const waiting = coordinator.beginNarratorResponseActivity(config.narratorId, config.signal);
+			parked.resolve();
+			await waiting;
+			return { finalText: "resumed", hasError: false, shouldUpdateTitle: false };
+		});
+		const now = new Date().toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "background-agent-message",
+				narratorId: ids[1],
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "background-agent-ref",
+				narratorId: ids[1],
+				messageId: "background-agent-message",
+				seq: 1,
+			})
+			.run();
+		db.insert(narratorMessages)
+			.values({
+				id: "background-child-input",
+				narratorId: ids[2],
+				parentToolUseId: "background-agent",
+				role: "user",
+				contentJson: [],
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorToolCalls)
+			.values({
+				id: "background-agent-row",
+				narratorId: ids[1],
+				messageId: "background-agent-message",
+				toolUseId: "background-agent",
+				toolName: "Agent",
+				inputJson: {},
+				status: "running",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				executionStartedAt: now,
+				createdAt: now,
+			})
+			.run();
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, ids[2])).run();
+		const child = await runs.startNarratorRun({
+			narratorId: ids[2],
+			active: active(ids[2]),
+			locale: "en",
+			text: "",
+			principal: "checkpoint-user",
+			foreground: detached,
+			binding: {
+				principal: { userId: "checkpoint-user" },
+				deliverTo: {
+					narratorId: ids[1],
+					toolUseId: "background-agent",
+					toolCallId: "background-agent-row",
+					attempt: 1,
+				},
+			},
+		});
+		void child.completion.catch(() => {});
+		try {
+			await entered.promise;
+			if (detached) expect(await runs.controlRun(ids[2], { kind: "detach" })).toBe(true);
+			unregisterParent();
+			park.resolve();
+			await parked.promise;
+			await publishCheckpoint();
+			expect(coordinator.stopCheckpointedNarratorRuns()).toBe(1);
+			const outcome = await child.completion.catch((error) => error);
+			expect(isCheckpointStop(outcome)).toBe(true);
+			expect(outcome.identity.narratorId).toBe(ids[2]);
+			expect(runs.getNarratorRunShutdownSnapshot().pending).toBe(0);
+		} finally {
+			unregisterParent();
+			park.resolve();
+			coordinator.resetUpdateCoordinationForTests();
+			await child.completion.catch(() => {});
+		}
+	});
+}
+
 for (const failPersistence of [false, true]) {
 	test(`real provider Agent and companion settlement preserve checkpoint state, persistenceFailure=${failPersistence}`, async () => {
 		const { agentTool } = await import("../../lib/agent/tools/task");

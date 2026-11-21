@@ -516,19 +516,22 @@ export async function runAgentLoopUnlocked(
 	let deliverTo: RunDeliverTo | undefined;
 	let placement: { parentNarratorId: string; parentToolUseId: string } | undefined;
 	let messageWriters = createRuntimeMessageWriters();
-	const checkpointParentId = run?.deliverTo?.narratorId;
+	const checkpointParentId = () => (run?.waiter ? run.deliverTo?.narratorId : undefined);
 	try {
 		unregisterUpdateLoop = registerNarratorLoop(narratorId, locale, {
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
 			logicalRunId: run?.logicalRunId,
 			executionEpoch: owner.epoch,
-			parentNarratorId: checkpointParentId,
+			get parentNarratorId() {
+				return checkpointParentId();
+			},
 			// A loop-less recovery stage can still own this child's terminal even
 			// after another parent run appears. Its live claim is a consumer fence.
-			canPauseForCheckpoint: checkpointParentId
-				? () => !hasNarratorRuntimeClaim(checkpointParentId)
-				: undefined,
+			canPauseForCheckpoint: () => {
+				const parentId = checkpointParentId();
+				return !parentId || !hasNarratorRuntimeClaim(parentId);
+			},
 		});
 		// A legitimately admitted run is an explicit recovery from a previous stop.
 		if (!active.abortController.signal.aborted)
