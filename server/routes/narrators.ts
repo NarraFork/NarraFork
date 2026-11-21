@@ -1930,7 +1930,10 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 		narrator.workspaceRevision,
 		narratorPrincipalOf(c),
 		c.req.raw.signal,
-	);
+	).catch((error: unknown) => {
+		if (c.req.raw.signal.aborted) throw catalogError("GIT_REQUEST_CANCELLED");
+		throw error;
+	});
 	await requireNarratorAccess(c, id, "read");
 	return c.json(summary);
 });

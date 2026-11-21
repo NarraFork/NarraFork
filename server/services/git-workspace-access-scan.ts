@@ -16,6 +16,7 @@ export class GitAccessScan {
 	pages = 0;
 	rows = 0;
 	private stopped = false;
+	private readonly cancellation = new AbortController();
 	private readonly deadline: number;
 	private readonly failure: Promise<never>;
 	private readonly timer: ReturnType<typeof setTimeout>;
@@ -33,8 +34,12 @@ export class GitAccessScan {
 		// The signal may already be aborted before any operation races this promise.
 		void this.failure.catch(() => {});
 		this.stop = () => {
+			if (this.stopped) return;
 			this.stopped = true;
-			reject(accessCheckUnavailable());
+			const error = accessCheckUnavailable();
+			// Preserve the scan's fail-closed boundary before cancelling its worker reads.
+			reject(error);
+			this.cancellation.abort(error);
 		};
 		this.timer = setTimeout(this.stop, budgetMs);
 		signal?.addEventListener("abort", this.stop, { once: true });
@@ -42,8 +47,19 @@ export class GitAccessScan {
 	}
 
 	check(): void {
-		if (this.stopped || this.signal?.aborted || performance.now() >= this.deadline)
+		if (this.stopped || this.signal?.aborted || performance.now() >= this.deadline) {
+			this.stop();
 			throw accessCheckUnavailable();
+		}
+	}
+
+	/** Queueing and worker execution share the scan's original deadline and cancellation. */
+	readOptions(): { signal: AbortSignal; timeoutMs: number } {
+		this.check();
+		return {
+			signal: this.cancellation.signal,
+			timeoutMs: Math.max(1, Math.ceil(this.deadline - performance.now())),
+		};
 	}
 
 	async run<T>(operation: () => PromiseLike<T>): Promise<T> {

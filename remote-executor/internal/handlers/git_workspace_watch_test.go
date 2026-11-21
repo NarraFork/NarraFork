@@ -12,6 +12,84 @@ import (
 	"time"
 )
 
+func TestGitWorkspaceWatchKeepsInternalFilesSeparate(t *testing.T) {
+	root, h := newGitFixture(t)
+	before := gitCall(t, h, root, "watch", nil)["outputs"].(map[string]string)
+	directory := filepath.Join(root, ".narrafork", "git-staging", "write.lock")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "owner.json"), []byte("preserved"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	after := gitCall(t, h, root, "watch", nil)["outputs"].(map[string]string)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("internal metadata changed ordinary Git observations: %v %v", before, after)
+	}
+	if _, present := after["stagingListsFingerprint"]; present {
+		t.Fatal("remote watch exposed a ChangeList observation")
+	}
+}
+
+func TestGitWorkspaceOrdinaryWritesPreserveInternalData(t *testing.T) {
+	root, h := newGitFixture(t)
+	directory := filepath.Join(root, ".narrafork", "git-staging", "write.lock")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	owner := filepath.Join(directory, "owner.json")
+	if err := os.WriteFile(owner, []byte("preserved owner"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("content\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	if files := gitTestRun(t, root, "ls-files"); files != "file" {
+		t.Fatalf("internal data entered native index: %q", files)
+	}
+	gitCall(t, h, root, "unstage", map[string]any{"all": true})
+	gitCall(t, h, root, "stage", map[string]any{"files": []any{"file"}})
+	gitCall(t, h, root, "commit", map[string]any{"message": "Ordinary", "identity": gitTestIdentity()})
+	gitTestRun(t, root, "update-ref", "refs/narrafork/staging-files/retained", "HEAD")
+	ref := gitTestRun(t, root, "rev-parse", "refs/narrafork/staging-files/retained")
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("changed\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitCall(t, h, root, "stashPush", map[string]any{"identity": gitTestIdentity()})
+	if contents, err := os.ReadFile(owner); err != nil || string(contents) != "preserved owner" {
+		t.Fatalf("internal data changed: %s %v", contents, err)
+	}
+	if after := gitTestRun(t, root, "rev-parse", "refs/narrafork/staging-files/retained"); ref != after {
+		t.Fatal("old private ref changed")
+	}
+	lock := filepath.Join(root, ".git", "index.lock")
+	if err := os.WriteFile(lock, []byte("native writer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{"cwd": root, "expectedRoot": root, "operation": "stage", "files": []any{"file"}}); err == nil {
+		t.Fatal("native index lock was ignored")
+	}
+	if contents, err := os.ReadFile(lock); err != nil || string(contents) != "native writer" {
+		t.Fatalf("native lock changed: %s %v", contents, err)
+	}
+	for _, operation := range []string{"stagingProbe", "stagingPrepare", "stagingStorage", "stagingMetadata"} {
+		if _, err := h.GitWorkspace(context.Background(), map[string]any{"cwd": root, "expectedRoot": root, "operation": operation}); err == nil {
+			t.Fatalf("unexpected ChangeList operation %q", operation)
+		}
+	}
+}
+
+func TestGitWorkspaceWatchReportsUnavailableGitFacts(t *testing.T) {
+	root, h := newGitFixture(t)
+	if err := os.WriteFile(filepath.Join(root, ".git", "index"), []byte("broken index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{"cwd": root, "expectedRoot": root, "operation": "watch"}); err == nil {
+		t.Fatal("damaged native index must fail watch")
+	}
+}
+
 func TestGitWorkspaceWatchDirtyMetadata(t *testing.T) {
 	root, h := newGitFixture(t)
 	path := filepath.Join(root, "file.txt")

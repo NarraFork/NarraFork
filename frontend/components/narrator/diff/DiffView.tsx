@@ -2,7 +2,7 @@ import { createDiffDocument, type DiffLine } from "@shared/pretext-layout/diff-c
 import type { ParsedDiffHunk } from "@shared/pretext-layout/parse-unified-diff";
 import { memo, useId, useMemo } from "react";
 import { AutoFollowScroll, type ContentViewportLayout } from "../scroll/AutoFollowScroll";
-import { DiffContent } from "./DiffContent";
+import { DiffContent, type DiffLineOperations } from "./DiffContent";
 
 export type { DiffLine } from "@shared/pretext-layout/diff-core";
 export { normalizeDiffLineEndings } from "@shared/pretext-layout/diff-core";
@@ -27,6 +27,7 @@ interface DiffViewProps {
 	lineNumberPrefix?: string;
 	gutterMinWidth?: number;
 	onNearBottom?: () => void;
+	lineOperations?: DiffLineOperations;
 }
 
 /** Static entry only. Live tools use the same painter in their permanent host. */
@@ -44,6 +45,7 @@ export const DiffView = memo(function DiffView({
 	lineNumberPrefix,
 	gutterMinWidth,
 	onNearBottom,
+	lineOperations,
 }: DiffViewProps) {
 	const id = useId();
 	const document = useMemo(
@@ -85,6 +87,7 @@ export const DiffView = memo(function DiffView({
 				lineNumberPrefix={lineNumberPrefix}
 				gutterMinWidth={gutterMinWidth}
 				onNearBottom={onNearBottom}
+				lineOperations={lineOperations}
 			/>
 		</AutoFollowScroll>
 	);

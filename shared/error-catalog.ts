@@ -215,6 +215,11 @@ export const ERROR_CATALOG = {
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
 	},
+	GIT_REQUEST_CANCELLED: {
+		status: 499,
+		code: "GIT_REQUEST_CANCELLED",
+		en: "Git request was cancelled",
+	},
 
 	// --- auth / session --------------------------------------------------------
 	AUTH_REQUIRED: {

@@ -26,6 +26,39 @@ func lineStatsByPath(stats gitLineStats) map[string]gitLineStatsFile {
 	return files
 }
 
+func TestGitLineStatsExcludesOnlyProjectStagingMetadata(t *testing.T) {
+	root, h := newGitFixture(t)
+	if err := os.MkdirAll(filepath.Join(root, ".narrafork", "git-staging"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(".narrafork", "git-staging", "private.txt"): "private metadata\nprivate index\n",
+		filepath.Join(".narrafork", "keep.txt"):                   "user\ncontent\n",
+		".gitignore":                                              "!/.narrafork/git-staging/\n!/.narrafork/git-staging/**\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tracked := range []bool{false, true} {
+		if tracked {
+			gitTestRun(t, root, "add", "-f", "--", ".narrafork/git-staging/private.txt")
+		}
+		before, _ := os.ReadFile(filepath.Join(root, ".git", "index"))
+		files := lineStatsByPath(lineStatsCall(t, h, root, nil))
+		if _, ok := files[".narrafork/git-staging/private.txt"]; ok {
+			t.Fatal("staging metadata entered line statistics")
+		}
+		if keep, ok := files[".narrafork/keep.txt"]; !ok || keep.UnstagedAdded == nil || *keep.UnstagedAdded != 2 {
+			t.Fatalf("other .narrafork files were excluded: %+v", files)
+		}
+		after, _ := os.ReadFile(filepath.Join(root, ".git", "index"))
+		if string(before) != string(after) {
+			t.Fatal("line statistics rewrote native index")
+		}
+	}
+}
+
 func TestGitLineStatsRealTrackedStagedUntracked(t *testing.T) {
 	root, h := newGitFixture(t)
 	write := func(path, content string) {

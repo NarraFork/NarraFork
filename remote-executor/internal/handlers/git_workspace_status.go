@@ -58,7 +58,7 @@ func (g *workspaceGit) runStatus() (string, error) {
 	}
 	ctx, stop := context.WithCancel(g.ctx)
 	defer stop()
-	args := []string{"--no-pager", "--literal-pathspecs", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"}
+	args := []string{"--no-pager", "--no-literal-pathspecs", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".", stagingExcludeSpec()}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir, cmd.Env = g.root, g.env
 	configureProcAttr(cmd)
