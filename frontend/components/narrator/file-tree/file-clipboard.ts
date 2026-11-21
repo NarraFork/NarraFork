@@ -33,6 +33,8 @@ export interface FileClipboardEntry {
 	name: string;
 	/** The narrator whose tree the entry came from; pastes must stay inside it. */
 	narratorId: string;
+	/** Tree-relative folder it was taken from, re-read after a move empties that row. */
+	sourceDirectory?: string;
 }
 
 let entry: FileClipboardEntry | null = null;

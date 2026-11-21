@@ -135,7 +135,13 @@ export function FileContextMenu({
 	 */
 	const copyToTree = useCallback(
 		async (mode: "copy" | "move") => {
-			setFileClipboard({ mode, path: target.absolutePath, name: target.name, narratorId });
+			setFileClipboard({
+				mode,
+				path: target.absolutePath,
+				name: target.name,
+				narratorId,
+				sourceDirectory: fileMenuRelativeDirectory(target.relativePath),
+			});
 			onClose();
 			// A cut is a move inside the tree; putting it on the OS clipboard would invite a
 			// file-manager paste that leaves the original in place.
@@ -158,7 +164,10 @@ export function FileContextMenu({
 
 	/** One transfer attempt; `overwrite` is only ever true after the user confirmed. */
 	const transfer = useCallback(
-		async (entry: { path: string; mode: "copy" | "move" }, overwrite: boolean) => {
+		async (
+			entry: { path: string; mode: "copy" | "move"; sourceDirectory?: string },
+			overwrite: boolean,
+		) => {
 			await api.fsTransferFile({
 				narratorId,
 				path: entry.path,
@@ -175,6 +184,13 @@ export function FileContextMenu({
 				}),
 			});
 			onChanged(relativeDirectory);
+			if (
+				entry.mode === "move" &&
+				entry.sourceDirectory !== undefined &&
+				entry.sourceDirectory !== relativeDirectory
+			) {
+				onChanged(entry.sourceDirectory);
+			}
 		},
 		[directory, narratorId, onChanged, relativeDirectory, t],
 	);

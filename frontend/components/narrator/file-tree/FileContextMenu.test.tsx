@@ -227,6 +227,7 @@ test("copy fills the tree clipboard and the system clipboard in one action", asy
 		path: target.absolutePath,
 		name: "a.ts",
 		narratorId: "narrator-a",
+		sourceDirectory: "src/deep",
 	});
 	expect(systemClipboardCalls).toEqual([target.absolutePath]);
 	expect(shown.at(-1)?.message).toBe("fileTree.copyToClipboardDone");
@@ -291,6 +292,7 @@ test("copy and cut fill the clipboard, and a cut is consumed by its paste", asyn
 		path: target.absolutePath,
 		name: "a.ts",
 		narratorId: "narrator-a",
+		sourceDirectory: "src/deep",
 	});
 	expect(closed).toBe(1);
 
@@ -407,6 +409,23 @@ test("pasting a file onto itself still asks, then replaces without touching the 
 	]);
 	expect(changed).toEqual(["src/deep"]);
 	expect(shown.some((notification) => notification.title === "fileTree.pasteFailed")).toBe(false);
+});
+
+test("a move re-reads the folder it came from as well as the one it landed in", async () => {
+	act(() => {
+		setFileClipboard({
+			mode: "move",
+			path: "/repo/docs/y.ts",
+			name: "y.ts",
+			narratorId: "narrator-a",
+			sourceDirectory: "docs",
+		});
+	});
+	render();
+	await act(async () => item("paste")?.click());
+
+	expect(transferCalls).toHaveLength(1);
+	expect(changed).toEqual(["src/deep", "docs"]);
 });
 
 test("delete asks first, then removes the file", async () => {
