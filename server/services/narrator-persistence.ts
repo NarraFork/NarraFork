@@ -12,7 +12,18 @@ import {
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	desc,
+	eq,
+	getTableColumns,
+	inArray,
+	isNull,
+	ne,
+	or,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { activeDatabaseBackend, db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
@@ -101,6 +112,26 @@ import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./na
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+function notifyCommittedWrite(
+	operation: "updateToolCallResult" | "appendBlockToMessage",
+	phase: "context-characters" | "tool-changed",
+	notify: () => void,
+): void {
+	try {
+		notify();
+	} catch (error) {
+		try {
+			logger.warn("Committed write notification failed", {
+				operation,
+				phase,
+				error: error instanceof Error ? error.name : typeof error,
+			});
+		} catch {
+			// The result is committed; even a failed diagnostic must not invite replay.
+		}
+	}
+}
 
 /** Use the durable current-run receipt; provider IDs and creation origins are not execution authority. */
 async function findExecutionSegmentParent(
@@ -3038,10 +3069,12 @@ const sqliteNarratorPersistence = {
 		// A transient BUSY here aborts the whole assistant-content checkpoint, and the
 		// loop treats that as a critical persistence failure. Other writers in this file
 		// already retry the same way; this path must not be the one that gives up first.
+		let contentChanged = false;
 		const persisted = await withDbRetry(
 			async () =>
 				db.transaction(
 					(tx) => {
+						contentChanged = false;
 						const queueMark = syncQueueMark();
 						const existing = fillBody(
 							tx.query.narratorMessages
@@ -3192,7 +3225,7 @@ const sqliteNarratorPersistence = {
 								stamp,
 								rows: writeLedgerRow,
 							});
-							queueContextCharacterRefresh(narratorId, messageId);
+							contentChanged = true;
 						} else {
 							writeLedgerRow();
 							syncEnvelopeNow(messageId, "streaming", stamp);
@@ -3204,6 +3237,11 @@ const sqliteNarratorPersistence = {
 				),
 			{ label: "appendBlockToMessage", maxRetries: 5 },
 		);
+		// A rolled-back or retried attempt never announces; the committed one does once.
+		if (contentChanged)
+			notifyCommittedWrite("appendBlockToMessage", "context-characters", () =>
+				queueContextCharacterRefresh(narratorId, messageId),
+			);
 		if (!persisted) return undefined;
 		const existing = persisted;
 
@@ -4541,8 +4579,10 @@ const sqliteNarratorPersistence = {
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
 			preserveTiming?: boolean;
-			/** Detached completions must atomically match their original execution authority. */
+			/** Completions must atomically match their original execution authority. */
 			expectedBinding?: ToolCallBinding & { narratorId: string };
+			/** Ordinary results keep provider-local parent version fan-out alongside their CAS. */
+			includeLegacyParentVersions?: boolean;
 			/** Persist a permission redirect/sanitized input in the same CAS as the result. */
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
@@ -4585,121 +4625,131 @@ const sqliteNarratorPersistence = {
 				ne(narratorToolCalls.status, "success"),
 				ne(narratorToolCalls.status, "fail"),
 			);
-		const affectedToolCalls = db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				if (
-					sqlite
-						.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
-						.get(exactId)
-				)
-					return [];
-				const updated = tx
-					.update(narratorToolCalls)
-					.set({
-						outputJson: result.output ?? null,
-						outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-						status: result.status,
-						errorMessage: result.errorMessage ?? null,
-						permissionStartedAt:
-							typeof result.permissionStartedAt === "number"
-								? new Date(result.permissionStartedAt).toISOString()
-								: undefined,
-						executionStartedAt:
-							typeof result.executionStartedAt === "number"
-								? new Date(result.executionStartedAt).toISOString()
-								: undefined,
-						...(result.preserveTiming
-							? {}
-							: {
-									durationMs: result.durationMs ?? null,
-									completedAt:
-										typeof result.completedAt === "number"
-											? new Date(result.completedAt).toISOString()
-											: new Date().toISOString(),
-								}),
-						...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-					})
-					.where(and(...conditions))
-					.returning({
-						id: narratorToolCalls.id,
-						narratorId: narratorToolCalls.narratorId,
-						messageId: narratorToolCalls.messageId,
-						toolUseId: narratorToolCalls.toolUseId,
-						toolName: narratorToolCalls.toolName,
-						executionDeviceId: narratorToolCalls.executionDeviceId,
-					})
-					.all();
-				// Another writer already settled or retired this receipt. A recovery
-				// explanation must not replace it or trigger another publication commit.
-				if (result.onlyIfActive && updated.length === 0) return [];
-				if (expected && updated.length !== 1) {
-					throw new ValidationError(
-						"Tool execution binding is stale or belongs to another narrator",
-					);
-				}
-				// A redirected or sanitized input is stored with the result it produced.
-				if (result.input !== undefined)
-					for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
-				result.onPersist?.(tx);
-				// The settled tool block (phase, binding, searchable result) commits with it.
-				flushQueuedSince(queueMark);
-				return updated;
-			},
-			{ behavior: "immediate" },
+		// Only the synchronous transaction retries on a lock; its effects below run once.
+		const affectedToolCalls = await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						if (
+							sqlite
+								.query(
+									`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`,
+								)
+								.get(exactId)
+						)
+							return [];
+						const updated = tx
+							.update(narratorToolCalls)
+							.set({
+								outputJson: result.output ?? null,
+								outputChars: measureSerializedCharacters(
+									result.output ?? result.errorMessage ?? null,
+								),
+								status: result.status,
+								errorMessage: result.errorMessage ?? null,
+								permissionStartedAt:
+									typeof result.permissionStartedAt === "number"
+										? new Date(result.permissionStartedAt).toISOString()
+										: undefined,
+								executionStartedAt:
+									typeof result.executionStartedAt === "number"
+										? new Date(result.executionStartedAt).toISOString()
+										: undefined,
+								...(result.preserveTiming
+									? {}
+									: {
+											durationMs: result.durationMs ?? null,
+											completedAt:
+												typeof result.completedAt === "number"
+													? new Date(result.completedAt).toISOString()
+													: new Date().toISOString(),
+										}),
+								...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+							})
+							.where(and(...conditions))
+							.returning({
+								id: narratorToolCalls.id,
+								narratorId: narratorToolCalls.narratorId,
+								messageId: narratorToolCalls.messageId,
+								toolUseId: narratorToolCalls.toolUseId,
+								toolName: narratorToolCalls.toolName,
+								executionDeviceId: narratorToolCalls.executionDeviceId,
+							})
+							.all();
+						// Another writer already settled or retired this receipt. A recovery
+						// explanation must not replace it or trigger another publication commit.
+						if (result.onlyIfActive && updated.length === 0) return [];
+						if (expected && updated.length !== 1) {
+							throw new ValidationError(
+								"Tool execution binding is stale or belongs to another narrator",
+							);
+						}
+						// A redirected or sanitized input is stored with the result it produced.
+						if (result.input !== undefined)
+							for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
+						result.onPersist?.(tx);
+						// The settled tool block (phase, binding, searchable result) commits with it.
+						flushQueuedSince(queueMark);
+						// Owner and embedding-parent versions commit with the result, so a reconnecting
+						// client never reads the settled row under the version it already holds.
+						if (result.bumpMessageVersion !== false && updated.length > 0) {
+							const ownerIds = [...new Set(updated.map((row) => row.narratorId).filter(Boolean))];
+							const targets = [
+								...new Set(updated.map((row) => row.messageId).filter((id): id is string => !!id)),
+							];
+							// Detached results must not infer a parent from a provider-local tool-use id.
+							const parentCondition =
+								expected && !result.includeLegacyParentVersions
+									? sql`${narrators.id} in (
+								select ${narrators.parentNarratorId} from ${narrators}
+								where ${narrators.id} = ${expected.narratorId} and ${narrators.type} = 'subagent'
+							)`
+									: targets.length > 0
+										? sql`${narrators.id} in (
+									select ${narratorToolCalls.narratorId} from ${narratorToolCalls}
+									where ${narratorToolCalls.toolUseId} in (
+										select ${narratorMessages.parentToolUseId} from ${narratorMessages}
+										where ${inArray(narratorMessages.id, targets)} and ${narratorMessages.parentToolUseId} <> ''
+									)
+								)`
+										: undefined;
+							tx.update(narrators)
+								.set({
+									messageVersion: sql`${narrators.messageVersion} + 1`,
+									updatedAt: new Date().toISOString(),
+								})
+								.where(or(inArray(narrators.id, ownerIds), parentCondition))
+								.run();
+						}
+						return updated;
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "updateToolCallResult", maxRetries: 5 },
 		);
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
 		// "which tool ran on which device, how long it took, did it fail" to follow along; without
 		// this they cannot distinguish "the model is thinking" from "a tool has been running for
-		// two minutes". Input/output payloads are deliberately excluded.
+		// two minutes". Input/output payloads are deliberately excluded. The result is already
+		// committed, so a failed notification is logged and never surfaces as a write failure.
 		for (const toolCall of affectedToolCalls) {
-			queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined);
-			eventBus.emit({
-				type: "narrator:tool_changed",
-				narratorId: toolCall.narratorId,
-				toolUseId: toolCall.toolUseId,
-				toolName: toolCall.toolName,
-				status: result.status,
-				...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
-				executionDeviceId: toolCall.executionDeviceId,
-				...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-			});
-		}
-
-		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
-		const affectedMessageIds = [
-			...new Set(affectedToolCalls.map((tc) => tc.messageId).filter((id): id is string => !!id)),
-		];
-		if (expected) {
-			// Detached results must not infer a parent from a provider-local tool-use id.
-			const owner = await db.query.narrators.findFirst({
-				where: eq(narrators.id, expected.narratorId),
-				columns: { type: true, parentNarratorId: true },
-			});
-			if (owner?.type === "subagent" && owner.parentNarratorId) {
-				affectedNarratorIds.push(owner.parentNarratorId);
-			}
-		} else if (affectedMessageIds.length > 0) {
-			const affectedMessages = await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, affectedMessageIds),
-				columns: { parentToolUseId: true },
-			});
-			const parentToolUseIds = [
-				...new Set(
-					affectedMessages.map((msg) => msg.parentToolUseId).filter((id): id is string => !!id),
-				),
-			];
-			if (parentToolUseIds.length > 0) {
-				const parentToolCalls = await db.query.narratorToolCalls.findMany({
-					where: inArray(narratorToolCalls.toolUseId, parentToolUseIds),
-					columns: { narratorId: true },
-				});
-				affectedNarratorIds.push(...parentToolCalls.map((tc) => tc.narratorId));
-			}
-		}
-		if (result.bumpMessageVersion !== false) {
-			await bumpNarratorMessageVersions(affectedNarratorIds);
+			notifyCommittedWrite("updateToolCallResult", "context-characters", () =>
+				queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined),
+			);
+			notifyCommittedWrite("updateToolCallResult", "tool-changed", () =>
+				eventBus.emit({
+					type: "narrator:tool_changed",
+					narratorId: toolCall.narratorId,
+					toolUseId: toolCall.toolUseId,
+					toolName: toolCall.toolName,
+					status: result.status,
+					...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
+					executionDeviceId: toolCall.executionDeviceId,
+					...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+				}),
+			);
 		}
 		return affectedToolCalls[0];
 	},
