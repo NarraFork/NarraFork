@@ -338,6 +338,35 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			expect((await backgroundTaskService.getById(id))?.status).toBe("completed");
 		});
 
+		test("manual dispatch and process lifetime remain owned by the shutdown drain", async () => {
+			const entered = Promise.withResolvers<void>();
+			const dispatch = Promise.withResolvers<void>();
+			const scheduler = lease();
+			const starting = startManual("task", scheduler, async () => {
+				entered.resolve();
+				await dispatch.promise;
+			});
+			try {
+				await bounded(entered.promise);
+				expect(backgroundTaskService.getBashShutdownSnapshot().collectors).toBe(1);
+				expect(backgroundTaskService.getBashShutdownSnapshot().terminals).toBeGreaterThan(0);
+				dispatch.resolve();
+				await bounded(starting);
+				expect(backgroundTaskService.getBashShutdownSnapshot().collectors).toBe(1);
+				executions[0].finish(0);
+				await bounded(scheduler.released);
+				await flush();
+				expect(backgroundTaskService.getBashShutdownSnapshot()).toMatchObject({
+					collectors: 0,
+					terminals: 0,
+					pending: 0,
+				});
+			} finally {
+				dispatch.resolve();
+				await starting.catch(() => {});
+			}
+		});
+
 		test("manual service uses durable startup and a failed dispatch is kept in the task list", async () => {
 			const scheduler = lease();
 			await expect(

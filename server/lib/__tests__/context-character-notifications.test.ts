@@ -29,9 +29,13 @@ mock.module("../../services/narrator-context-composition", () => ({
 		throw new Error("batch export must be used");
 	},
 }));
-const { queueContextCharacterRefresh, hasPendingContextCharacterRefresh } = await import(
-	"../context-characters"
-);
+const {
+	queueContextCharacterRefresh,
+	hasPendingContextCharacterRefresh,
+	quiesceContextCharacterRefreshes,
+	drainContextCharacterRefreshes,
+	getContextCharacterRefreshStatus,
+} = await import("../context-characters");
 async function drain() {
 	for (let i = 0; i < 100 && hasPendingContextCharacterRefresh(); i++)
 		await new Promise((resolve) => setTimeout(resolve, 1));
@@ -101,3 +105,36 @@ for (const scenario of ["actors", "messages"] as const) {
 		expect(calls).toEqual([]);
 	});
 }
+
+test("quiescing retains scheduled invalidations and the explicit drain awaits callback settlement", async () => {
+	quiesceContextCharacterRefreshes();
+	let release!: () => void;
+	gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	queueContextCharacterRefresh("shutdown", "message");
+	expect(getContextCharacterRefreshStatus()).toMatchObject({
+		pending: 1,
+		scheduled: false,
+		quiescing: true,
+	});
+	let settled = false;
+	const draining = drainContextCharacterRefreshes({ deadlineAt: Date.now() + 1000 }).then(() => {
+		settled = true;
+	});
+	try {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(settled).toBe(false);
+	} finally {
+		release();
+		gate = undefined;
+	}
+	await draining;
+	expect(getContextCharacterRefreshStatus()).toMatchObject({
+		pending: 0,
+		running: false,
+		failed: false,
+		quiescing: true,
+	});
+	expect(calls).toEqual([{ id: "shutdown", ids: ["message"], full: false }]);
+});

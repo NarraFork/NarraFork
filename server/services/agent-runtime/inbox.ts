@@ -22,6 +22,7 @@ import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
+import { trackCommunicationWork } from "./async-work";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -1241,11 +1242,18 @@ export interface InboxWakeOptions {
 }
 
 /** Coalesced control-plane wake; the only payload authority remains the mailbox table. */
+const wakeControl = hotSafe("narrafork:inbox:wake-control", () => ({ stopped: false }));
+
+export function stopInboxWakes(): void {
+	wakeControl.stopped = true;
+}
+
 export function wakeInboxIfEligible(
 	narratorId: string,
 	locale: Locale = "en",
 	options: InboxWakeOptions = {},
 ): Promise<boolean> {
+	if (wakeControl.stopped) return Promise.resolve(false);
 	const pending = pendingWakes.get(narratorId);
 	if (pending) {
 		if (!options.resumeStopped?.length) return pending;
@@ -1254,7 +1262,9 @@ export function wakeInboxIfEligible(
 	}
 	const wake = Promise.resolve()
 		.then(async () => {
+			if (wakeControl.stopped) return false;
 			await flushInboxPublicationBarrier(narratorId);
+			if (wakeControl.stopped) return false;
 			// A held run keeps its owner while parked: queued input wakes that same run.
 			const { wakeHeldRun } = await import("./run");
 			if (wakeHeldRun(narratorId)) return true;
@@ -1354,7 +1364,7 @@ export function wakeInboxIfEligible(
 			if (pendingWakes.get(narratorId) === wake) pendingWakes.delete(narratorId);
 		});
 	pendingWakes.set(narratorId, wake);
-	return wake;
+	return trackCommunicationWork(wake);
 }
 setRuntimePublicationWake(async (narratorId) => {
 	await wakeInboxIfEligible(narratorId);

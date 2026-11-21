@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
 import { createServerRequestLifecycle } from "../../http-request-lifecycle";
@@ -127,6 +127,38 @@ describe("clean shutdown marker lifecycle", () => {
 
 describe("main shutdown wiring without booting the server", () => {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
+	test.each([
+		"sqlite",
+		"postgres",
+	])("%s startup schedules maintenance only once on SQLite", async (backend) => {
+		const maintenanceStart = main.lastIndexOf(
+			'if (activeDatabaseBackend === "sqlite") {',
+			main.indexOf('startTeamDatabaseMaintenance("status"'),
+		);
+		const maintenanceEnd = main.indexOf(
+			"// Establish client-egress relay channels",
+			maintenanceStart,
+		);
+		expect(maintenanceStart).toBeGreaterThanOrEqual(0);
+		expect(maintenanceEnd).toBeGreaterThan(maintenanceStart);
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+			`async function start() { ${main.slice(maintenanceStart, maintenanceEnd)} }`,
+		);
+		const cleanup = mock(async () => {});
+		const rebuild = mock(async () => {});
+		const migrate = mock(async () => {});
+		await new Function(
+			"activeDatabaseBackend",
+			"startTeamDatabaseMaintenance",
+			"retireLegacyChapterResources",
+			"scheduleProjectIndexRebuild",
+			"migrateAggregationsOnStartup",
+			"logger",
+			`${code}\nreturn start();`,
+		)(backend, () => {}, cleanup, rebuild, migrate, { warn() {} });
+		for (const operation of [cleanup, rebuild, migrate])
+			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" ? 1 : 0);
+	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
 	const position = (label: string) => {
@@ -143,10 +175,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
 		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
 		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
-		const cleanupEnd = shutdown.indexOf(
-			'await shutdownStep(tracker, "vnetUdpRendezvous.stop"',
-			cleanupStart,
-		);
+		const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
 		expect(prepareStart).toBeGreaterThanOrEqual(0);
 		expect(prepareEnd).toBeGreaterThan(prepareStart);
 		expect(cleanupStart).toBeGreaterThan(prepareEnd);
@@ -158,7 +187,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const close = new Function(
 			"options",
 			"tracker",
-			"shutdownStep",
+			"step",
 			"prepareSignalRestartRecovery",
 			"markUpdateRestarting",
 			"killAllBashProcesses",
@@ -167,7 +196,7 @@ describe("main shutdown wiring without booting the server", () => {
 		await close(
 			{ reason: "signal" },
 			new ShutdownActivityTracker(),
-			async (_tracker: unknown, label: string, action: () => Promise<unknown>) => {
+			async (label: string, action: () => Promise<unknown>) => {
 				await action();
 				return label === "restartRecovery.prepare" ? outcome : "ok";
 			},
@@ -271,6 +300,25 @@ describe("main shutdown wiring without booting the server", () => {
 		expect(step).toContain("owner.closeMemoryDiagnosticWorkers()");
 		expect(step).toContain("35_000");
 		expect(step).not.toContain("closeAllSessions()");
+	});
+	test.each([
+		"if (storageHistory.pending)",
+		"if (outlineLiveDatabaseWork.size)",
+		"if (getTeamDatabaseMaintenanceStatus().pending)",
+	])("%s retains ownership without authorizing clean-shutdown hooks", (condition) => {
+		const boundary = shutdown.indexOf(condition);
+		expect(boundary).toBeGreaterThanOrEqual(0);
+		const start = shutdown.indexOf("return {", boundary);
+		const end = shutdown.indexOf("\n\t\t\t};", start);
+		expect(end).toBeGreaterThan(start);
+		const reason = "unattended_idle";
+		const result = new Function("options", "process", "startedAt", shutdown.slice(start, end + 6))(
+			{ reason },
+			{ pid: 1 },
+			Date.now(),
+		);
+		expect(result).toMatchObject({ success: false, clean: false, reason });
+		expect(canRunCleanShutdownHooks(reason, result)).toBe(false);
 	});
 	test("real compute close promises are awaited together and failures degrade shutdown", () => {
 		for (const close of [

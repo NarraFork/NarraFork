@@ -22,8 +22,14 @@ import {
 } from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
 import { compileDelegationPolicy } from "./agent-runtime/policy";
-import { controlRun, startNarratorRun } from "./agent-runtime/run";
+import {
+	controlRun,
+	type RegisteredAgentStart,
+	settleRegisteredAgentStartFailure,
+	startNarratorRun,
+} from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
@@ -276,6 +282,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentId: string;
 		delegated: import("./outline/delegation").DelegatedOutlineTask;
 	} | null = null;
+	let registeredStart: RegisteredAgentStart | undefined;
+	let registeredStartFailureEvent: "failed" | "cancelled" = "failed";
 	try {
 		if (input.toolCallBinding) {
 			const { narratorPersistence } = await import("./narrator-persistence");
@@ -379,7 +387,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			: "";
 
 		if (background) {
-			await backgroundTaskService.markNarratorRunning(subagentId);
 			// The task projection registers this run (and its relations) in one start.
 			const task = await backgroundTaskService.createAgentTask({
 				id: subagentId,
@@ -389,6 +396,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				title,
 				binding,
 			});
+			if (!task.logicalRunId) throw new Error("Background agent registration has no logical run");
+			registeredStart = {
+				narratorId: subagentId,
+				logicalRunId: task.logicalRunId,
+				deliverTo: { ...binding.deliverTo, viaTask: true },
+			};
 			eventBus.emit({
 				type: "narrator:background_task_started",
 				narratorId: parentNarratorId,
@@ -410,8 +423,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				try {
 					await controlRun(subagentId, { kind: "hold" });
 				} catch (error) {
-					// The task never mounted a run: settle it so nothing waits on it.
-					await backgroundTaskService.cancel(subagentId).catch(() => false);
+					registeredStartFailureEvent = "cancelled";
 					throw error;
 				}
 				await broadcastSubagentTakeoverChanged({
@@ -427,12 +439,21 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				skipModelReselect: true,
 				locale: locale as Locale,
 				text: "",
-				resumeRunId: task.logicalRunId ?? undefined,
+				resumeRunId: task.logicalRunId,
+				registeredStart,
 			});
+			if (!handle.started && handle.notStartedReason === "admission_closed")
+				throw new ValidationError("Background agent run did not start: admission is closed");
+			// A claimed execution owns all subsequent preparation/finish failures.
+			// An existing owner also owns the registration; never clean up over it.
+			registeredStart = undefined;
 			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 			if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 			delegatedBeforeRun = null;
-			void handle.terminal.finally(() => updateLease.release());
+			void handle.terminal.then(
+				() => updateLease.release(),
+				() => updateLease.release(),
+			);
 			return (
 				(input.takeoverByUser
 					? `<background_task_id>${aliasRegistration.alias}</background_task_id>\n\n` +
@@ -460,7 +481,10 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 		delegatedBeforeRun = null;
-		void handle.terminal.finally(() => updateLease.release());
+		void handle.terminal.then(
+			() => updateLease.release(),
+			() => updateLease.release(),
+		);
 		if (getSearchExecutionScope()) {
 			// A channel failure must reach the search router so the next channel can run.
 			const terminal = await handle.terminal;
@@ -472,6 +496,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		input.onDelegatedResult?.(result.outlineReport ?? null);
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
+		if (registeredStart && !isCheckpointStop(error))
+			await settleRegisteredAgentStartFailure(
+				registeredStart,
+				error,
+				undefined,
+				registeredStartFailureEvent,
+			);
 		updateLease.release();
 		if (delegatedBeforeRun && input.delegation)
 			await giveBackDelegatedTask({

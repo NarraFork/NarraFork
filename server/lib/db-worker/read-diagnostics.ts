@@ -4,17 +4,16 @@ import { type HostSqlDiagnosticState, sqlDiagnosticSnapshot } from "./sql-diagno
 
 export interface ReadPoolTaskDiagnostics {
 	kind: DbReadTaskParams["kind"];
-	source: "auth.session" | "unattributed";
+	source: "auth.session" | "narrator.request-recording" | "unattributed";
 	requestId?: string;
 	startedAt: number;
 	dispatchedAt?: number;
 	sql?: HostSqlDiagnosticState;
 }
-function readPoolTaskLabels(params: { kind?: unknown }, options: { diagnosticSource?: unknown }) {
-	return {
-		kind: params.kind,
-		source: options.diagnosticSource === "auth.session" ? "auth.session" : "unattributed",
-	};
+export function readPoolDiagnosticSource(source: unknown): ReadPoolTaskDiagnostics["source"] {
+	return source === "auth.session" || source === "narrator.request-recording"
+		? source
+		: "unattributed";
 }
 function taskAge(now: number, since: number | undefined): number | null {
 	return typeof since === "number" && Number.isFinite(since)
@@ -28,7 +27,8 @@ export function readPoolTaskSnapshot(
 	requestId = task?.requestId,
 ) {
 	return {
-		...readPoolTaskLabels({ kind: task?.kind }, { diagnosticSource: task?.source }),
+		kind: task?.kind,
+		source: readPoolDiagnosticSource(task?.source),
 		...(typeof requestId === "string" && /^[A-Za-z0-9_-]{21}$/.test(requestId)
 			? { requestId }
 			: {}),

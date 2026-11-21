@@ -31,11 +31,17 @@ import {
 } from "./db";
 import {
 	cancelBackgroundIntegrityCheck,
+	getIntegrityCheckShutdownSnapshot,
 	scheduleBackgroundIntegrityCheck,
 } from "./db/integrity-check";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { claimBrowserShutdownOwnership } from "./lib/browser/pool";
 import { getCodexManager } from "./lib/codex-manager";
+import {
+	drainContextCharacterRefreshes,
+	getContextCharacterRefreshStatus,
+	quiesceContextCharacterRefreshes,
+} from "./lib/context-characters";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
@@ -89,6 +95,27 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
+import {
+	drainCommunicationWork,
+	getCommunicationWorkStatus,
+	trackCommunicationWork,
+} from "./services/agent-runtime/async-work";
+import { stopInboxWakes } from "./services/agent-runtime/inbox";
+import { stopRuntimePublications } from "./services/agent-runtime/publication";
+import {
+	drainNarratorRunCompletions,
+	getNarratorRunShutdownSnapshot,
+	stopNarratorRunAdmission,
+} from "./services/agent-runtime/run";
+import { backgroundTaskService } from "./services/background-task-service";
+import { stopBlockBackgroundJobs } from "./services/narrator-block-backfill";
+import {
+	drainBufferedFilePreparations,
+	getBufferedFilePreparationStatus,
+	hasPendingBufferedFilePreparations,
+	stopBufferedFilePreparations,
+} from "./services/narrator-buffer";
+import { stopOutlineLiveReplay } from "./services/outline/live/replay";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginPlatformServices } from "./services/plugin-platform-services";
 import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
@@ -98,7 +125,12 @@ import {
 	composePostgresStores,
 } from "./services/postgres-composition";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
+import {
+	getResourceProtectionShutdownSnapshot,
+	stopResourceProtectionIndex,
+} from "./services/resource-protection-index";
 import { TOKEN_RECALCULATION_BATCH_TIMEOUT_MS } from "./services/token-recalculation";
+import { stopCheckpointedNarratorRuns } from "./services/update-coordinator";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -107,21 +139,29 @@ import {
 	backgroundOccupancyInitializer,
 	withBackgroundOccupancyInitialization,
 } from "./services/background-occupancy-startup";
+import { stopBackgroundOccupancy } from "./services/background-occupancy-store";
 import { ensureRootlessEnv } from "./services/container-service";
 import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
+	drainNarratorSessionTails,
 	failUnownedStartupRecovery,
+	getNarratorSessionTailStatus,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
-import { scheduleProjectIndexRebuild } from "./services/project-index";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
 	stopNotificationCenterMaintenance,
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
+import {
+	drainNotificationBackgroundWork,
+	getNotificationBackgroundWorkSnapshot,
+	stopNotificationBackgroundWork,
+} from "./services/notification-service";
+import { scheduleProjectIndexRebuild, stopProjectIndexRebuild } from "./services/project-index";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
@@ -146,6 +186,10 @@ import {
 	prepareSignalRestartRecovery,
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
+import {
+	getStorageHistoryShutdownSnapshot,
+	stopStorageHistoryRetention,
+} from "./services/storage-history-runtime";
 import { terminalService } from "./services/terminal-service";
 import { UNATTENDED_SHUTDOWN_REASON, unattendedMode } from "./services/unattended-mode";
 import { markUpdateRestarting } from "./services/update-coordinator";
@@ -153,6 +197,11 @@ import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
+import {
+	drainNarratorWsReadTasks,
+	hasPendingNarratorWsReadTasks,
+	quiesceNarratorWsReadTasks,
+} from "./websocket/narrator-ws";
 import {
 	closeAllConnections,
 	hasActiveWebSocketHandlers,
@@ -1288,7 +1337,7 @@ import { startChallengeCleanupTimer } from "./lib/webauthn";
 startChallengeCleanupTimer();
 
 // Periodically delete expired and revoked login sessions.
-import { startSessionCleanupTimer } from "./lib/auth";
+import { startSessionCleanupTimer, stopSessionCleanupTimer } from "./lib/auth";
 
 startSessionCleanupTimer();
 
@@ -1342,6 +1391,11 @@ void startupReadiness.barrier.then((recovery) => {
 });
 
 // Outline pages edited live when the previous process ended: commit what their logs hold.
+const outlineLiveDatabaseWork = hotSafe(
+	"outline.live.database-work.v1",
+	() => new Set<Promise<unknown>>(),
+);
+let outlineLiveReplay: Promise<unknown> | undefined;
 void startupReadiness.barrier.then(() => {
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
@@ -1421,25 +1475,88 @@ initChatNotify();
 initNotificationFanout();
 startNotificationCenterMaintenance();
 
+const teamDatabaseMaintenance = hotSafe("teams.database-maintenance.v1", () => ({
+	stopped: false,
+	failed: false,
+	pending: new Set<Promise<unknown>>(),
+	started: new Set<string>(),
+	stops: new Set<() => void | Promise<void>>(),
+}));
+
+function trackTeamDatabaseMaintenance<T>(work: Promise<T>): Promise<T> {
+	teamDatabaseMaintenance.pending.add(work);
+	void work.then(
+		() => teamDatabaseMaintenance.pending.delete(work),
+		() => {
+			teamDatabaseMaintenance.failed = true;
+			teamDatabaseMaintenance.pending.delete(work);
+		},
+	);
+	return trackCommunicationWork(work);
+}
+
+function startTeamDatabaseMaintenance(
+	name: string,
+	load: () => Promise<() => () => void | Promise<void>>,
+): void {
+	void trackTeamDatabaseMaintenance(
+		load().then((start) => {
+			if (
+				teamDatabaseMaintenance.stopped ||
+				teamDatabaseMaintenance.started.has(name) ||
+				!httpLifecycle.accepting
+			)
+				return;
+			teamDatabaseMaintenance.stops.add(start());
+			teamDatabaseMaintenance.started.add(name);
+		}),
+	).catch((error) => logger.warn("Team maintenance failed to start", { error: String(error) }));
+}
+
+function getTeamDatabaseMaintenanceStatus() {
+	return {
+		stopped: teamDatabaseMaintenance.stopped,
+		pending: teamDatabaseMaintenance.pending.size,
+		failed: teamDatabaseMaintenance.failed,
+	};
+}
+
+async function stopTeamDatabaseMaintenance(): Promise<void> {
+	teamDatabaseMaintenance.stopped = true;
+	for (const stop of teamDatabaseMaintenance.stops) {
+		try {
+			void trackTeamDatabaseMaintenance(Promise.resolve(stop())).catch(() => {});
+		} catch (error) {
+			teamDatabaseMaintenance.failed = true;
+			logger.warn("Team maintenance failed to stop", { error: String(error) });
+		}
+	}
+	teamDatabaseMaintenance.stops.clear();
+	while (teamDatabaseMaintenance.pending.size)
+		await Promise.allSettled([...teamDatabaseMaintenance.pending]);
+	if (teamDatabaseMaintenance.failed)
+		throw new Error("Team maintenance did not drain successfully");
+}
+
 if (activeDatabaseBackend === "sqlite") {
-	// A project team follows its coordinator session's archive state, whichever path changed it.
-	import("./services/teams/team-service")
-		.then(({ startTeamStatusSync }) => startTeamStatusSync())
-		.catch((err) => logger.warn("Team status sync failed to start", { error: String(err) }));
-	// A coordinator's saved tool outputs go with its session; leftovers are swept once.
-	import("./services/teams/coordinator-maintenance")
-		.then(({ startCoordinatorMaintenance }) => startCoordinatorMaintenance())
-		.catch((err) =>
-			logger.warn("Coordinator output maintenance failed to start", { error: String(err) }),
-		);
-	// Team work items: isolated items settle when their subagent's run ends; check-ins re-arm.
-	import("./services/teams/work-items")
-		.then(({ startTeamWorkLifecycle }) => startTeamWorkLifecycle())
-		.catch((err) => logger.warn("Team work lifecycle failed to start", { error: String(err) }));
-	// Team work items' changed paths stay current in the background (overlaps, exclusive paths).
-	import("./services/teams/team-overlap")
-		.then(({ startTeamOverlapJob }) => startTeamOverlapJob())
-		.catch((err) => logger.warn("Team overlap job failed to start", { error: String(err) }));
+	// Follow coordinator archive changes, saved-output ownership and finite work-item tails.
+	startTeamDatabaseMaintenance("status", () =>
+		import("./services/teams/team-service").then(({ startTeamStatusSync }) => startTeamStatusSync),
+	);
+	startTeamDatabaseMaintenance("outputs", () =>
+		import("./services/teams/coordinator-maintenance").then(
+			({ startCoordinatorMaintenance }) => startCoordinatorMaintenance,
+		),
+	);
+	startTeamDatabaseMaintenance("work", () =>
+		import("./services/teams/work-items").then(
+			({ startTeamWorkLifecycle }) => startTeamWorkLifecycle,
+		),
+	);
+	// Keep changed paths and exclusive-path overlaps current under the same shutdown owner.
+	startTeamDatabaseMaintenance("overlap", () =>
+		import("./services/teams/team-overlap").then(({ startTeamOverlapJob }) => startTeamOverlapJob),
+	);
 	// Stop containers and release ports that removed chapters left behind.
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
@@ -1490,6 +1607,16 @@ const shutdownState = hotSafe<{
 	onExit?: () => void;
 }>("narrafork.mainShutdown", () => ({ promise: null, killWindowsProcessTreeOnExit: true }));
 
+/** Retain real ownership after a stage timeout, including delayed imports and live session writes. */
+function trackOutlineLiveDatabaseWork<T>(work: Promise<T>): Promise<T> {
+	outlineLiveDatabaseWork.add(work);
+	void work.then(
+		() => outlineLiveDatabaseWork.delete(work),
+		() => outlineLiveDatabaseWork.delete(work),
+	);
+	return trackCommunicationWork(work);
+}
+
 /**
  * Run a shutdown teardown step with a hard timeout so one hanging await can't stall the entire
  * graceful-shutdown sequence. On timeout or error we log and continue so the process can still
@@ -1501,38 +1628,263 @@ async function shutdownStep(
 	label: string,
 	fn: () => unknown,
 	timeoutMs = 4000,
+	ownsDeadline = false,
+	globalLimitMs?: number,
 ): Promise<"ok" | "timeout" | "failed"> {
+	const startedAt = performance.now();
+	if (timeoutMs <= 0) {
+		tracker.recordStep(label, "timeout");
+		try {
+			logger.warn("Shutdown step skipped after deadline", { step: label, timeoutMs });
+		} catch {
+			/* diagnostics cannot prevent degraded shutdown */
+		}
+		return "timeout";
+	}
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let expired = false;
 	try {
-		const timeout = new Promise<"timeout">((resolve) => {
-			timer = setTimeout(() => resolve("timeout"), timeoutMs);
-		});
-		const result = await Promise.race([
-			Promise.resolve()
-				.then(fn)
-				.then(() => "ok" as const)
-				.catch(() => {
+		const work = Promise.resolve()
+			.then(fn)
+			.then(() => "ok" as const)
+			.catch(() => {
+				// A timed-out operation remains owned by its subsystem and final audit.
+				// Diagnostic fields are fixed scalars and cannot expose worker inputs or secrets.
+				if (!expired) {
 					try {
 						logger.warn("Shutdown step failed", { step: label, outcome: "failed" });
 					} catch {
-						// Diagnostic sinks must not prevent recording a degraded shutdown.
+						/* diagnostic sinks cannot prevent recording the outcome */
 					}
-					return "failed" as const;
-				}),
-			timeout,
-		]);
-		if (result === "timeout") {
+				}
+				return "failed" as const;
+			});
+		// Self-deadline work owns the business timeout. Only the later, monotonic
+		// global watchdog bounds a broken subsystem; it never races that same deadline.
+		const hardLimitMs = ownsDeadline ? globalLimitMs : timeoutMs;
+		const outcome =
+			hardLimitMs === undefined
+				? await work
+				: await Promise.race([
+						work,
+						new Promise<"timeout">((resolve) => {
+							timer = setTimeout(() => {
+								expired = true;
+								resolve("timeout");
+							}, hardLimitMs);
+						}),
+					]);
+		if (outcome === "timeout") {
 			try {
 				logger.warn("Shutdown step timed out", { step: label, outcome: "timeout", timeoutMs });
 			} catch {
-				// Continue to record the timeout even when diagnostics fail.
+				/* diagnostic sinks cannot prevent recording the outcome */
 			}
 		}
-		tracker.recordStep(label, result);
-		return result;
+		tracker.recordStep(label, outcome);
+		try {
+			logger.info("Shutdown stage settled", {
+				stage: label,
+				outcome,
+				durationMs: Math.round(performance.now() - startedAt),
+			});
+		} catch {
+			/* the outcome remains authoritative when diagnostics fail */
+		}
+		return outcome;
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
+}
+
+/** One monotonic budget; epoch deadlines are converted only at subsystem boundaries. */
+function createShutdownBudget() {
+	const startedAt = performance.now();
+	const globalDeadline = startedAt + 50_000;
+	const businessDeadline = Math.min(startedAt + 30_000, globalDeadline - 10_000);
+	return {
+		businessRemaining: () => Math.max(0, businessDeadline - performance.now()),
+		globalRemaining: () => Math.max(0, globalDeadline - performance.now()),
+		readerRemaining: () => Math.min(10_000, Math.max(0, globalDeadline - performance.now())),
+	};
+}
+
+/** Derived work can enqueue another collection; reach a shared fixed point before reader closure. */
+async function drainShutdownDatabaseWork(deadlineAt: number): Promise<void> {
+	let failure: { error: unknown } | undefined;
+	let websocketFailed = false;
+	let contextFailed = false;
+	const ensureRemaining = () => {
+		if (Date.now() >= deadlineAt) {
+			throw failure?.error ?? new Error("Shutdown database work did not drain");
+		}
+	};
+	for (;;) {
+		ensureRemaining();
+		try {
+			await drainNarratorRunCompletions({ deadlineAt });
+			await drainNarratorSessionTails({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await backgroundTaskService.drainBashCollectors({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainContextCharacterRefreshes({ deadlineAt });
+		} catch (error) {
+			contextFailed = true;
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainNarratorWsReadTasks({ deadlineAt });
+		} catch (error) {
+			websocketFailed = true;
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainBufferedFilePreparations({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainCommunicationWork({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainNotificationBackgroundWork({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		// Retained failures remain audit state, rather than work to retry in a tight loop.
+		const context = getContextCharacterRefreshStatus();
+		const contextPending =
+			context.running ||
+			context.scheduled ||
+			(context.pending > 0 && (!contextFailed || !context.failed));
+		const pending =
+			getNarratorRunShutdownSnapshot().pending > 0 ||
+			getNarratorSessionTailStatus().pending > 0 ||
+			backgroundTaskService.getBashShutdownSnapshot().pending > 0 ||
+			contextPending ||
+			getCommunicationWorkStatus().pending > 0 ||
+			getNotificationBackgroundWorkSnapshot().pending > 0 ||
+			outlineLiveDatabaseWork.size > 0 ||
+			hasPendingBufferedFilePreparations() ||
+			(!websocketFailed && hasPendingNarratorWsReadTasks());
+		if (!pending) break;
+		if (Date.now() >= deadlineAt) {
+			throw failure?.error ?? new Error("Shutdown database work did not drain");
+		}
+	}
+	if (failure) throw failure.error;
+}
+
+/** After reader closure, inspect state only: no query, new work, or renewed deadline. */
+function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "failed" {
+	let outcome: "ok" | "failed" = "failed";
+	try {
+		const narrator = getNarratorSessionTailStatus();
+		const runs = getNarratorRunShutdownSnapshot();
+		const bash = backgroundTaskService.getBashShutdownSnapshot();
+		const context = getContextCharacterRefreshStatus();
+		const communication = getCommunicationWorkStatus();
+		const notification = getNotificationBackgroundWorkSnapshot();
+		const storageHistory = getStorageHistoryShutdownSnapshot();
+		const teamMaintenance = getTeamDatabaseMaintenanceStatus();
+		const buffered = getBufferedFilePreparationStatus();
+		const bufferedPending = Boolean(
+			buffered.pending || buffered.active || buffered.waiting || buffered.batches,
+		);
+		const websocketPending = hasPendingNarratorWsReadTasks();
+		const outlineLivePending = outlineLiveDatabaseWork.size;
+		const maintenance = getResourceProtectionShutdownSnapshot();
+		const integrity = getIntegrityCheckShutdownSnapshot();
+		const maintenancePending =
+			!maintenance.stopped ||
+			maintenance.pendingTasks > 0 ||
+			maintenance.pendingReceiptImports > 0 ||
+			maintenance.maintenanceScheduled;
+		const integrityPending =
+			!integrity.stopped ||
+			integrity.pendingProcesses > 0 ||
+			integrity.pendingTasks > 0 ||
+			integrity.scheduled;
+		if (
+			!runs.stopped ||
+			runs.pending ||
+			runs.failed ||
+			!bash.stopped ||
+			bash.pending ||
+			bash.failed ||
+			narrator.pending ||
+			narrator.failed ||
+			context.pending ||
+			context.running ||
+			context.scheduled ||
+			context.failed ||
+			!context.quiescing ||
+			communication.pending ||
+			communication.failed ||
+			!notification.stopped ||
+			notification.pending ||
+			notification.failed ||
+			!storageHistory.stopped ||
+			storageHistory.pending ||
+			storageHistory.failed ||
+			!teamMaintenance.stopped ||
+			teamMaintenance.pending ||
+			teamMaintenance.failed ||
+			bufferedPending ||
+			buffered.failed ||
+			maintenancePending ||
+			integrityPending ||
+			outlineLivePending ||
+			websocketPending
+		) {
+			logger.warn("Shutdown database work is not quiescent", {
+				runs,
+				bash,
+				narratorSessionPending: narrator.pending,
+				narratorSessionFailed: narrator.failed,
+				contextPending: context.pending,
+				contextRunning: context.running,
+				contextScheduled: context.scheduled,
+				contextFailed: context.failed,
+				contextQuiescing: context.quiescing,
+				communicationPending: communication.pending,
+				communicationFailed: communication.failed,
+				notification,
+				storageHistory,
+				teamMaintenance,
+				bufferedPending,
+				bufferedPreparationPending: buffered.pending,
+				bufferedPreparationActive: buffered.active,
+				bufferedPreparationWaiting: buffered.waiting,
+				bufferedPreparationBatches: buffered.batches,
+				bufferedPreparationFailed: buffered.failed,
+				websocketPending,
+				outlineLivePending,
+				maintenance,
+				integrity,
+			});
+		} else {
+			outcome = "ok";
+		}
+	} catch (error) {
+		logger.warn("Shutdown database work audit failed", { error: String(error) });
+	}
+	tracker.recordStep("databaseWork.finalAudit", outcome);
+	return outcome;
 }
 
 async function performGracefulShutdown(
@@ -1540,6 +1892,7 @@ async function performGracefulShutdown(
 ): Promise<GracefulShutdownResult> {
 	if (shutdownState.promise) return shutdownState.promise;
 	const startedAt = Date.now();
+	const budget = createShutdownBudget();
 	if (options.skipWindowsProcessTreeKill) {
 		shutdownState.killWindowsProcessTreeOnExit = false;
 	}
@@ -1559,6 +1912,15 @@ async function performGracefulShutdown(
 		// we skip the marker and just release the lock (below), so the next startup runs its
 		// integrity check instead of trusting a shutdown we could not prove was consistent.
 		const tracker = new ShutdownActivityTracker();
+		const step = (label: string, fn: () => unknown, limit = 4_000, ownsDeadline = false) =>
+			shutdownStep(
+				tracker,
+				label,
+				fn,
+				Math.min(limit, budget.businessRemaining()),
+				ownsDeadline,
+				budget.globalRemaining(),
+			);
 
 		// Stop accepting work before teardown begins. Bun.Server.stop(true) closes the listener and
 		// terminates in-flight HTTP requests and WebSockets synchronously, so no new work can arrive
@@ -1569,16 +1931,91 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		httpLifecycle.stopAccepting();
-		await shutdownStep(tracker, "remoteAccess.stop", stopRemoteAccess, 5000);
+		quiesceNarratorWsReadTasks();
+		const producerLabel = "databaseProducers.stop";
+		let producerFailure: { error: unknown } | undefined;
+		for (const stop of [
+			() =>
+				backgroundTaskService.stopBashCollectors({
+					preserveProcesses: options.skipBashProcessKill,
+				}),
+			stopNarratorRunAdmission,
+			stopRuntimePublications,
+			stopInboxWakes,
+			stopBufferedFilePreparations,
+			stopOutlineLiveReplay,
+			quiesceContextCharacterRefreshes,
+			stopSessionCleanupTimer,
+		]) {
+			try {
+				stop();
+			} catch (error) {
+				producerFailure ??= { error };
+			}
+		}
+		const producerOutcome = producerFailure ? "failed" : "ok";
+		tracker.recordStep(producerLabel, producerOutcome);
+		if (producerFailure)
+			logger.warn("Shutdown producer admission failed", { error: String(producerFailure.error) });
+		const ownerDeadlineAt = Date.now() + budget.businessRemaining();
+		// Freeze synchronous admission and initiate asynchronous teardown before any await below.
+		const maintenanceStop = stopResourceProtectionIndex({ deadlineAt: ownerDeadlineAt });
+		const integrityStop = cancelBackgroundIntegrityCheck({
+			permanent: true,
+			deadlineAt: ownerDeadlineAt,
+		});
+		const projectIndexStop = stopProjectIndexRebuild();
+		const blockJobsStop = stopBlockBackgroundJobs({ deadlineAt: ownerDeadlineAt });
+		const storageHistoryStop = stopStorageHistoryRetention({ deadlineAt: ownerDeadlineAt });
+		const occupancyStop = stopBackgroundOccupancy();
+		const scheduledStop = stopScheduledTaskScheduler();
+		const teamMaintenanceStop = stopTeamDatabaseMaintenance();
+		const prefixSnapshotsStop = stopPrefixSnapshotMaintenance();
+		const outlineTaskLeasesStop = Promise.all([
+			import("./services/outline/tasks").then(({ stopOutlineTaskLeaseJob }) =>
+				stopOutlineTaskLeaseJob(),
+			),
+			import("./services/outline/in-process").then(({ stopOutlineInProcessRebuild }) =>
+				stopOutlineInProcessRebuild(),
+			),
+			import("./services/outline/digest-job").then(({ stopOutlineDigestJob }) =>
+				stopOutlineDigestJob(),
+			),
+			import("./services/outline/spec-import/triggers").then(({ stopSpecImportJob }) =>
+				stopSpecImportJob(),
+			),
+			import("./services/outline/spec-import/loss-scan").then(({ stopSpecLossScanJob }) =>
+				stopSpecLossScanJob(),
+			),
+		]);
+		const fanoutStop = stopNotificationFanout();
+		const notificationMaintenanceStop = stopNotificationCenterMaintenance();
+		const notificationBackgroundStop = stopNotificationBackgroundWork({
+			deadlineAt: ownerDeadlineAt,
+		});
+		getCodexManager().stopUsageRefreshScheduler();
+		for (const stopping of [
+			maintenanceStop,
+			integrityStop,
+			projectIndexStop,
+			blockJobsStop,
+			storageHistoryStop,
+			occupancyStop,
+			scheduledStop,
+			teamMaintenanceStop,
+			prefixSnapshotsStop,
+			outlineTaskLeasesStop,
+			fanoutStop,
+			notificationMaintenanceStop,
+			notificationBackgroundStop,
+		])
+			void Promise.resolve(stopping).catch(() => {});
+		await step("remoteAccess.stop", stopRemoteAccess, 5_000);
 		httpLifecycle.abortAll();
+		if (producerOutcome === "ok") await step("checkpointRuns.pause", stopCheckpointedNarratorRuns);
 		let preserveAgentRuns = false;
 		if (options.reason === "signal") {
-			const prepared = await shutdownStep(
-				tracker,
-				"restartRecovery.prepare",
-				prepareSignalRestartRecovery,
-				5_000,
-			);
+			const prepared = await step("restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
 			if (prepared === "ok") {
 				preserveAgentRuns = true;
 				// Worker teardown must not turn checkpointed runs into task failures.
@@ -1588,33 +2025,21 @@ async function performGracefulShutdown(
 		const shutdownRequestId = httpRequestContext.getStore();
 		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
 		// are still open, so the editors forget it instead of replaying it after the restart.
-		await shutdownStep(
-			tracker,
-			"outlineLive.persist",
-			async () => {
-				const live = await import("./services/outline/live/registry");
-				await live.persistAllLiveSessions();
-			},
-			2_000,
+		const outlineLivePersist = trackOutlineLiveDatabaseWork(
+			import("./services/outline/live/registry").then((live) => live.persistAllLiveSessions()),
 		);
+		await step("outlineLive.persist", () => outlineLivePersist, 2_000);
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
 		// (it never awaits stop()'s promise), so anything beyond a moment means the
 		// call itself threw or blocked, not that connections are still draining.
-		const serverStopOutcome = await shutdownStep(
-			tracker,
-			"httpServer.stop",
-			() => stopHttpListener(),
-			1_000,
-		);
-		const httpDrainOutcome = await shutdownStep(
-			tracker,
+		const serverStopOutcome = await step("httpServer.stop", () => stopHttpListener(), 1_000);
+		const httpDrainOutcome = await step(
 			"httpHandlers.drain",
 			() => waitForHttpRequestDrain(shutdownRequestId),
 			10_000,
 		);
-		const wsDrainOutcome = await shutdownStep(
-			tracker,
+		const wsDrainOutcome = await step(
 			"websocketHandlers.drain",
 			waitForWebSocketActivityDrain,
 			10_000,
@@ -1623,9 +2048,8 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
-		// Sandboxed host-tool callers must stop before their outline/editor/compute dependencies.
-		await shutdownStep(
-			tracker,
+		// Sandboxed host-tool callers stop before their outline/editor/compute dependencies.
+		await step(
 			"programmaticServices.close",
 			() =>
 				import("./lib/agent/programmatic/service").then((owner) =>
@@ -1633,47 +2057,41 @@ async function performGracefulShutdown(
 				),
 			155_000,
 		);
-		// Outline pages being edited live: commit their text, end the sessions.
-		await shutdownStep(
-			tracker,
-			"outlineLive.close",
-			async () => {
-				const live = await import("./services/outline/live/registry");
-				await live.closeAllLiveSessions("ended");
-			},
-			5_000,
+
+		// Finish startup replay and commit live editor text before closing their dependencies.
+		const outlineLiveClose = trackOutlineLiveDatabaseWork(
+			(async () => {
+				try {
+					await outlineLiveReplay;
+				} finally {
+					const live = await import("./services/outline/live/registry");
+					await live.closeAllLiveSessions("ended");
+				}
+			})(),
 		);
-		await shutdownStep(
-			tracker,
-			"outlineTaskLeases.stop",
-			async () => {
-				const tasks = await import("./services/outline/tasks");
-				const inProcess = await import("./services/outline/in-process");
-				const digests = await import("./services/outline/digest-job");
-				const specImport = await import("./services/outline/spec-import/triggers");
-				const specLoss = await import("./services/outline/spec-import/loss-scan");
-				await Promise.all([
-					specImport.stopSpecImportJob(),
-					specLoss.stopSpecLossScanJob(),
-					inProcess.stopOutlineInProcessRebuild(),
-					tasks.stopOutlineTaskLeaseJob(),
-					digests.stopOutlineDigestJob(),
-				]);
-			},
-			5_000,
+		await step("outlineLive.close", () => outlineLiveClose, 5_000);
+		await step("outlineTaskLeases.stop", () => outlineTaskLeasesStop, 5_000);
+		await step("scheduledTasks.stop", () => scheduledStop);
+		await step("teamMaintenance.stop", () => teamMaintenanceStop, budget.businessRemaining());
+		await step("authSessions.stop", () => {});
+		await step("gateway.stop", () => gateway.shutdown());
+		await step("prefixSnapshots.stop", () => prefixSnapshotsStop);
+		await step("notificationFanout.stop", () => fanoutStop);
+		await step("notificationMaintenance.stop", () => notificationMaintenanceStop);
+		await step(
+			"notificationBackground.stop",
+			() => notificationBackgroundStop,
+			budget.businessRemaining(),
+			true,
 		);
-		await shutdownStep(
-			tracker,
+		await step(
 			"outlineTextWorkers.close",
 			() =>
 				import("./services/outline/edit-text-runner").then((owner) => owner.closeEditTextWorkers()),
 			35_000,
 		);
-		getCodexManager().stopUsageRefreshScheduler();
-		stopScheduledTaskScheduler();
 		// Finish an already-committing token batch through its original owner before closing helpers.
-		await shutdownStep(
-			tracker,
+		await step(
 			"tokenWorkers.close",
 			() =>
 				import("./services/token-recalculation-worker-client").then((owner) =>
@@ -1681,34 +2099,36 @@ async function performGracefulShutdown(
 				),
 			TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000,
 		);
-		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
-		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
-		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		await step("terminalService.shutdownAll", () => terminalService.shutdownAll());
 		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
 		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
 		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
-			await shutdownStep(tracker, "killAllBashProcesses", () =>
+			await step("killAllBashProcesses", () =>
 				killAllBashProcesses({ preserveAgents: preserveAgentRuns }),
 			);
 		}
-		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep(tracker, "pluginPlatformProducers.stop", () =>
+		await step("integrityProbe.cancel", () => integrityStop, budget.businessRemaining(), true);
+		await step(
+			"resourceProtectionIndex.stop",
+			() => maintenanceStop,
+			budget.businessRemaining(),
+			true,
+		);
+		await step("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await step("pluginPlatformProducers.stop", () =>
 			import("./services/plugin-platform-services").then((owner) =>
 				owner.stopPluginPlatformProducers(),
 			),
 		);
-		// A pending startup can use its original 90s phases before drain/exit/tree cleanup.
-		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
+		await step("pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
 		unregisterExternalProviderResolver();
-		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
+		await step("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
 		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
 		// for recovery. A normal shutdown skips this and closes the browser as usual.
 		if (preservesRecoveryOnShutdown(options.reason)) {
-			await shutdownStep(
-				tracker,
+			await step(
 				"browserSessions.persistForUpdate",
 				() =>
 					import("./services/browser-session-recovery").then(
@@ -1718,8 +2138,7 @@ async function performGracefulShutdown(
 			);
 		}
 		// Finalize/cleanup/reply grace and real native exit precede Chrome close or preserve detach.
-		await shutdownStep(
-			tracker,
+		await step(
 			"browserMemoryWorkers.close",
 			() =>
 				import("./lib/browser/memory-job").then((owner) => owner.closeMemoryDiagnosticWorkers()),
@@ -1727,19 +2146,18 @@ async function performGracefulShutdown(
 		);
 		// Close browser pool if it was started. When preserve mode was set above, this disconnects
 		// from Chrome (leaving it running for the replacement process) rather than closing it.
-		await shutdownStep(tracker, "browserPool.close", () =>
+		await step("browserPool.close", () =>
 			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
 		);
 		// Close Codex WebSocket session cache — active outbound WS
 		// connections keep the event loop alive and delay exit.
-		await shutdownStep(tracker, "codexWebSocket.clear", () =>
+		await step("codexWebSocket.clear", () =>
 			import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
 				clearCodexResponsesWebSocketSessions(),
 			),
 		);
 		// Keep the existing 30s IO/ACK phases and still allow actual exit to be observed.
-		await shutdownStep(
-			tracker,
+		await step(
 			"editorDocuments.close",
 			() =>
 				import("./services/editor-document-runtime").then((owner) =>
@@ -1747,7 +2165,7 @@ async function performGracefulShutdown(
 				),
 			70_000,
 		);
-		await shutdownStep(tracker, "computeWorkers.close", async () => {
+		await step("computeWorkers.close", async () => {
 			const results = await Promise.allSettled([
 				import("./services/revert-transaction-worker").then((owner) =>
 					owner.closeRevertManifestWorkers(),
@@ -1773,8 +2191,7 @@ async function performGracefulShutdown(
 			);
 			if (failures.length) throw new AggregateError(failures, "Compute workers did not all close");
 		});
-		await shutdownStep(
-			tracker,
+		await step(
 			"gitWorkers.close",
 			async () => {
 				const results = await Promise.allSettled([
@@ -1792,19 +2209,17 @@ async function performGracefulShutdown(
 			35_000,
 		);
 		// Preserve the existing 65s archive ACK and subsequent 120s download lease, plus cleanup.
-		await shutdownStep(
-			tracker,
+		await step(
 			"requestRecorderWorkers.close",
 			() => import("./lib/request-recorder").then((owner) => owner.closeRequestRecorderWorkers()),
 			200_000,
 		);
-		await shutdownStep(tracker, "modelHistoryWorkers.close", () =>
+		await step("modelHistoryWorkers.close", () =>
 			import("./services/agent-runtime/model-history-source").then((owner) =>
 				owner.closeModelHistoryWorkers(),
 			),
 		);
-		await shutdownStep(
-			tracker,
+		await step(
 			"toolInputHistoryWorkers.close",
 			() =>
 				import("./services/tool-input-stream-source").then((owner) =>
@@ -1812,15 +2227,14 @@ async function performGracefulShutdown(
 				),
 			15_000,
 		);
-		await shutdownStep(tracker, "fsScanWorkers.close", () =>
+		await step("fsScanWorkers.close", () =>
 			import("./lib/fs-scan-worker/client").then((owner) => owner.closeFsScanWorkers()),
 		);
 		// The background integrity probe is a separate PROCESS holding a read-only handle on the
 		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
 		// replacement process may swap the database file (startup recovery) or rewrite it (admin
 		// VACUUM), and its verdict has no parent to report to.
-		await shutdownStep(
-			tracker,
+		await step(
 			"maintenanceWorkers.close",
 			async () => {
 				const results = await Promise.allSettled([
@@ -1837,28 +2251,97 @@ async function performGracefulShutdown(
 			},
 			35_000,
 		);
-		await shutdownStep(tracker, "integrityProbe.cancel", () =>
-			cancelBackgroundIntegrityCheck({ permanent: true }),
-		);
-		// Read workers hold their own read-only SQLite connections; terminate them before the clean
-		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "dbWorkerPool.shutdown", () =>
-			shutdownDbWorkerPool({ permanent: true }),
-		);
-		await shutdownStep(tracker, "prefixSnapshots.close", () =>
-			closePrefixSnapshotStore({ permanent: true }),
-		);
-		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
-		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
-		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
-		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();
 		}
 
+		// All producer admission was frozen before awaiting request teardown.
+		const businessDeadlineAt = ownerDeadlineAt;
+		const remaining = budget.businessRemaining;
+		await step("backgroundOccupancy.stop", () => occupancyStop, remaining());
+		await step("projectIndex.stop", () => projectIndexStop, remaining(), true);
+		await step("blockBackgroundJobs.stop", () => blockJobsStop, remaining(), true);
+		await step("storageHistory.stop", () => storageHistoryStop, remaining(), true);
+		await step(
+			"databaseWork.drain",
+			() => drainShutdownDatabaseWork(businessDeadlineAt),
+			remaining(),
+			true,
+		);
+		// History cleanup may still be finishing its current transaction after cancellation.
+		const storageHistory = getStorageHistoryShutdownSnapshot();
+		if (storageHistory.pending) {
+			tracker.recordStep("storageHistory.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("History cleanup did not drain; retaining database ownership until exit", {
+				pending: storageHistory.pending,
+			});
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		// A timed-out live writer still owns the database. Keep its readers and instance lock
+		// until process exit rather than handing the database to a replacement while it can write.
+		if (outlineLiveDatabaseWork.size) {
+			tracker.recordStep("outlineLive.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Outline live work did not drain; retaining database ownership until exit", {
+				pending: outlineLiveDatabaseWork.size,
+			});
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		if (getTeamDatabaseMaintenanceStatus().pending) {
+			tracker.recordStep("teamMaintenance.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Team maintenance did not drain; retaining database ownership until exit");
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		// Native reader exit owns a separate slice even when the business drain expired.
+		const readerBudget = budget.readerRemaining();
+		await shutdownStep(
+			tracker,
+			"dbWorkerPool.shutdown",
+			async () => {
+				await shutdownDbWorkerPool({ permanent: true });
+			},
+			readerBudget,
+			true,
+			budget.globalRemaining(),
+		);
+		await shutdownStep(
+			tracker,
+			"prefixSnapshots.close",
+			() => closePrefixSnapshotStore({ permanent: true }),
+			Math.min(4_000, budget.globalRemaining()),
+		);
+		await shutdownStep(
+			tracker,
+			"postgresRuntime.close",
+			() => closePostgresRuntime(),
+			Math.min(4_000, budget.globalRemaining()),
+		);
+		auditShutdownDatabaseWork(tracker);
+
 		// Decide the marker now that teardown is finished. A clean shutdown (requests drained AND
 		// every step succeeded) persists the marker and releases the lock; a degraded shutdown skips
 		// the marker but still releases the lock so an update-handoff replacement can start.
+		if (budget.globalRemaining() <= 0) tracker.recordStep("shutdown.deadline", "timeout");
 		const summary = tracker.summary();
 		const cleanMarked = summary.clean ? markDatabaseCleanShutdown() : false;
 		if (!summary.clean) {
@@ -1874,14 +2357,19 @@ async function performGracefulShutdown(
 		}
 
 		const result = {
-			success: true,
+			success: !getTeamDatabaseMaintenanceStatus().failed,
 			clean: summary.clean && (activeDatabaseBackend === "postgres" || cleanMarked),
 			reason: options.reason,
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
 		};
 		try {
-			logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+			logger.info("Graceful shutdown completed", {
+				...result,
+				cleanMarked,
+				outcome: cleanMarked ? "clean" : "degraded",
+				degradedSteps: summary.degradedSteps,
+			});
 		} catch {
 			// Cleanup has completed; keep its result even if diagnostics are unavailable.
 		}

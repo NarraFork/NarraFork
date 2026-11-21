@@ -2,6 +2,7 @@ import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
@@ -353,20 +354,23 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	// the fence. Selecting whole rows pulled `output_json` for every abandoned call in the
 	// database — the one large column this scan never reads — inside a loop that runs up to
 	// CHECKPOINT_MAX_ROUNDS times per fence.
-	const allNonTerminalToolCalls = await db
-		.select({
-			id: narratorToolCalls.id,
-			narratorId: narratorToolCalls.narratorId,
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			status: narratorToolCalls.status,
-			executionStartedAt: narratorToolCalls.executionStartedAt,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
-		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	const allNonTerminalToolCalls = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				inputJson: narratorToolCalls.inputJson,
+				status: narratorToolCalls.status,
+				executionStartedAt: narratorToolCalls.executionStartedAt,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+			.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT),
+		{},
+	);
 	if (allNonTerminalToolCalls.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
 		throw new Error(
 			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
@@ -391,13 +395,16 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	);
 	const subagentByOrigin = new Map<string, string>();
 	if (originToolUseIds.length > 0) {
-		const linkedSubagentMessages = await db
-			.select({
-				narratorId: narratorMessages.narratorId,
-				parentToolUseId: narratorMessages.parentToolUseId,
-			})
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.parentToolUseId, originToolUseIds));
+		const linkedSubagentMessages = await readQuery(
+			db
+				.select({
+					narratorId: narratorMessages.narratorId,
+					parentToolUseId: narratorMessages.parentToolUseId,
+				})
+				.from(narratorMessages)
+				.where(inArray(narratorMessages.parentToolUseId, originToolUseIds)),
+			{},
+		);
 		for (const message of linkedSubagentMessages) {
 			if (message.parentToolUseId && !subagentByOrigin.has(message.parentToolUseId)) {
 				subagentByOrigin.set(message.parentToolUseId, message.narratorId);
@@ -454,15 +461,23 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 		}
 	}
 
-	const runningBackgroundAgents = await db
-		.select()
-		.from(backgroundTasks)
-		.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running")));
+	const runningBackgroundAgents = await readQuery(
+		db
+			.select()
+			.from(backgroundTasks)
+			.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running"))),
+		{},
+	);
 	for (const task of runningBackgroundAgents) {
 		if (!task.toolUseId) continue;
-		const toolCall = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, task.toolUseId),
-		});
+		const [toolCall] = await readQuery(
+			db
+				.select()
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.toolUseId, task.toolUseId))
+				.limit(1),
+			{ maxRows: 1 },
+		);
 		if (!toolCall) continue;
 		const subagentId = task.subagentNarratorId ?? task.id;
 		const runtime =
@@ -496,20 +511,23 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 		const evidence = new Map<string, { toolCallId: string; executionAttempt: number }[]>();
 		for (let offset = 0; offset < checkpointRows.length; offset += 100) {
 			const batch = checkpointRows.slice(offset, offset + 100);
-			const calls = await db
-				.select({
-					id: narratorToolCalls.id,
-					executionAttempt: narratorToolCalls.executionAttempt,
-					executionStartedAt: narratorToolCalls.executionStartedAt,
-					status: narratorToolCalls.status,
-				})
-				.from(narratorToolCalls)
-				.where(
-					inArray(
-						narratorToolCalls.id,
-						batch.map((row) => row.toolCallId),
+			const calls = await readQuery(
+				db
+					.select({
+						id: narratorToolCalls.id,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						status: narratorToolCalls.status,
+					})
+					.from(narratorToolCalls)
+					.where(
+						inArray(
+							narratorToolCalls.id,
+							batch.map((row) => row.toolCallId),
+						),
 					),
-				);
+				{},
+			);
 			for (const call of calls) {
 				if (call.executionStartedAt != null || !["initializing", "pending"].includes(call.status))
 					continue;
@@ -566,7 +584,11 @@ async function loadUpdateSeveredNarrators(
 		if (index > 0 && index % 100 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
 		try {
 			const narrator = await narratorService.getById(target.narratorId);
-			if (UPDATE_SEVERED_STATUSES.has(narrator.status)) severed.add(target.narratorId);
+			if (
+				UPDATE_SEVERED_STATUSES.has(narrator.status) &&
+				(!target.logicalRunId || target.logicalRunId === narrator.logicalRunId)
+			)
+				severed.add(target.narratorId);
 		} catch (error) {
 			if (error instanceof NotFoundError) continue;
 			logger.warn("Could not classify a planned-update narrator before generic recovery", {
@@ -704,26 +726,46 @@ export async function getPlannedUpdateStartupProtection(
 						!snapshot.sources?.some((source) => source.updateEpoch === record.updateEpoch)
 					)
 						continue;
-					const call = await db.query.narratorToolCalls.findFirst({
-						where: eq(narratorToolCalls.id, record.toolCallId),
-						columns: { toolName: true, executionStartedAt: true, executionAttempt: true },
-					});
+					const [call] = await readQuery(
+						db
+							.select({
+								toolName: narratorToolCalls.toolName,
+								executionStartedAt: narratorToolCalls.executionStartedAt,
+								executionAttempt: narratorToolCalls.executionAttempt,
+							})
+							.from(narratorToolCalls)
+							.where(eq(narratorToolCalls.id, record.toolCallId))
+							.limit(1),
+						{ maxRows: 1 },
+					);
 					if (call?.toolName !== "Agent" || call.executionStartedAt == null) continue;
-					const child = await db.query.narrators.findFirst({
-						where: and(
-							eq(narrators.originToolCallId, record.toolCallId),
-							eq(narrators.parentNarratorId, record.narratorId),
-						),
-						columns: { id: true, logicalRunId: true },
-					});
+					const [child] = await readQuery(
+						db
+							.select({ id: narrators.id, logicalRunId: narrators.logicalRunId })
+							.from(narrators)
+							.where(
+								and(
+									eq(narrators.originToolCallId, record.toolCallId),
+									eq(narrators.parentNarratorId, record.narratorId),
+								),
+							)
+							.limit(1),
+						{ maxRows: 1 },
+					);
 					if (!child?.logicalRunId) continue;
-					const background = await db.query.backgroundTasks.findFirst({
-						where: and(
-							eq(backgroundTasks.subagentNarratorId, child.id),
-							eq(backgroundTasks.status, "running"),
-						),
-						columns: { id: true, alias: true },
-					});
+					const [background] = await readQuery(
+						db
+							.select({ id: backgroundTasks.id, alias: backgroundTasks.alias })
+							.from(backgroundTasks)
+							.where(
+								and(
+									eq(backgroundTasks.subagentNarratorId, child.id),
+									eq(backgroundTasks.status, "running"),
+								),
+							)
+							.limit(1),
+						{ maxRows: 1 },
+					);
 					await toolContinuationService.controlledColdReattachAgent(
 						{
 							toolCallId: record.toolCallId,
@@ -1003,10 +1045,17 @@ async function restoreAgent(
 		(await getRuntimePublicationService().getAgentRun(subagentId, record.narratorId)).logicalRunId;
 	// New registrations win. A pre-registration checkpoint still carries its original
 	// absolute deadline: materialize it once, never turn it back into a fresh timeout.
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, subagentId),
-		columns: { runtimeRegistrationJson: true, ownerUserId: true },
-	});
+	const [source] = await readQuery(
+		db
+			.select({
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+				ownerUserId: narrators.ownerUserId,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, subagentId))
+			.limit(1),
+		{ maxRows: 1 },
+	);
 	let legacyBinding: RunBindingInput | undefined;
 	if (!readRuntimeRegistrationColumn(source?.runtimeRegistrationJson)?.run) {
 		const call = await toolContinuationService.getToolCallResult(record.toolCallId);
@@ -1083,9 +1132,10 @@ async function restoreAwait(
 		(awaitDeadlineAt ? Date.parse(awaitDeadlineAt) : Date.now()) - Date.now(),
 		0,
 	);
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, record.toolCallId),
-	});
+	const [toolCall] = await readQuery(
+		db.select().from(narratorToolCalls).where(eq(narratorToolCalls.id, record.toolCallId)).limit(1),
+		{ maxRows: 1 },
+	);
 	if (!toolCall) throw new Error("Legacy Await tool call was deleted before recovery");
 	const { registerRecoveryAgentWatch } = await import("./narrator-subagent-recovery");
 	const result = await withRecoveryAdvance(record.updateEpoch, () =>
@@ -1190,10 +1240,19 @@ async function writeRecoveryToolError(
 	recoveryStatus: "execution_unknown" | "failed",
 	errorMessage: string,
 ): Promise<boolean> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, record.toolCallId),
-		columns: { id: true, toolUseId: true, messageId: true, status: true },
-	});
+	const [toolCall] = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				toolUseId: narratorToolCalls.toolUseId,
+				messageId: narratorToolCalls.messageId,
+				status: narratorToolCalls.status,
+			})
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, record.toolCallId))
+			.limit(1),
+		{ maxRows: 1 },
+	);
 	if (!toolCall) return false;
 	if (toolCall.status === "success" || toolCall.status === "fail") return true;
 	const { narratorPersistence } = await import("./narrator-persistence");
@@ -1303,10 +1362,14 @@ async function claimAndRestoreExecution(
 	// A prior process may have persisted the actual result and died before advancing the
 	// continuation phase. Terminal tool rows win over expired non-idempotent claims.
 	// Background Agent success is only its start receipt, so its child still needs mounting.
-	const persistedCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, current.toolCallId),
-		columns: { status: true },
-	});
+	const [persistedCall] = await readQuery(
+		db
+			.select({ status: narratorToolCalls.status })
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, current.toolCallId))
+			.limit(1),
+		{ maxRows: 1 },
+	);
 	if (
 		current.kind !== "background_agent" &&
 		(persistedCall?.status === "success" || persistedCall?.status === "fail")

@@ -11,6 +11,7 @@ import type { SpeechSettings } from "@shared/speech";
 import type { StorageRetentionSettings } from "@shared/storage-retention";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
@@ -82,6 +83,12 @@ export interface CustomApiProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/**
+	 * Chat Completions：工具返回的图片放哪。缺省 `"off"`（不发）。
+	 * OpenAI 官方只允许 tool content 是文本，DeepSeek 官方扩展了 image_url 内容块，
+	 * Command Code 的 CLI 结构是「工具文本 + 独立 user 图片消息」。见 shared/tool-result-images.ts。
+	 */
+	toolResultImages?: ToolResultImagesMode;
 	/**
 	 * Which User-Agent to present on outbound requests. Absent = provider default
 	 * (Claude CLI UA for official Anthropic, narrafork UA otherwise).
@@ -168,6 +175,11 @@ export interface OpenAIProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/**
+	 * Chat Completions：工具返回的图片放哪。缺省 `"off"`（不发）。
+	 * 只有 `apiMode === "completions"` 生效；Responses / Codex 有自己的路径。
+	 */
+	toolResultImages?: ToolResultImagesMode;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
@@ -188,6 +200,7 @@ export interface OpenAIProviderConfig {
 }
 
 export interface AnthropicProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Anthropic", "Anthropic Proxy". */
@@ -290,6 +303,7 @@ export interface NUGProviderConfig {
 }
 
 export interface GeminiProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Gemini", "Google AI". */

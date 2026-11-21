@@ -8,6 +8,7 @@ import {
 	narratorToolContinuations,
 	runtimePublicationOutbox as outbox,
 } from "../../db/schema";
+import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
@@ -45,6 +46,79 @@ export interface PublicationRun {
 	logicalRunId: string;
 	recipientId: string;
 }
+const publicationFailureMessages = {
+	identity_mismatch: "Publication identity mismatch",
+	terminal_conflict: "Publication terminal conflict",
+	recipient_mismatch: "Publication reservation recipient mismatch",
+	run_mismatch: "Publication reservation run mismatch",
+	missing_reservation: "Publication requires a startup reservation",
+} as const;
+
+/** Bounded identity/status evidence only; never attach an intent or producer result. */
+export class PublicationStateError extends ValidationError {
+	constructor(
+		readonly reason: keyof typeof publicationFailureMessages,
+		phase: "start" | "finish" | "commit",
+		run: PublicationRun & { eventKind?: PublicationEvent },
+		evidence: {
+			producerKind?: string;
+			taskId?: string;
+			logicalRunId?: string | null;
+			recipientId?: string;
+			eventKind?: string;
+			state?: string;
+		} = {},
+	) {
+		const identity = {
+			phase,
+			eventKind: run.eventKind,
+			producerKind: run.producerKind,
+			taskId: run.taskId.slice(0, 256),
+			logicalRunId: run.logicalRunId.slice(0, 256),
+			recipientId: run.recipientId.slice(0, 256),
+			evidence: Object.fromEntries(
+				Object.entries(evidence).map(([key, value]) => [
+					key,
+					typeof value === "string" ? value.slice(0, 256) : value,
+				]),
+			),
+		};
+		super(
+			`${publicationFailureMessages[reason]}: ${JSON.stringify(identity)}`,
+			`PUBLICATION_${reason.toUpperCase()}`,
+		);
+	}
+}
+
+export function assertPublicationTaskIdentity(
+	run: PublicationRun,
+	task:
+		| {
+				id: string;
+				type: string;
+				logicalRunId: string | null;
+				parentNarratorId: string;
+				status: string;
+		  }
+		| undefined
+		| null,
+): void {
+	if (
+		!task ||
+		task.id !== run.taskId ||
+		task.type !== run.producerKind ||
+		task.logicalRunId !== run.logicalRunId ||
+		task.parentNarratorId !== run.recipientId
+	)
+		throw new PublicationStateError("identity_mismatch", "finish", run, {
+			producerKind: task?.type,
+			taskId: task?.id,
+			logicalRunId: task?.logicalRunId,
+			recipientId: task?.parentNarratorId,
+			state: task?.status ?? "missing",
+		});
+}
+
 export type LegacyPublicationSource = Omit<PublicationRun, "logicalRunId">;
 export interface LegacyRuntimeAdmission extends LegacyPublicationSource {
 	/** Obtained from the real runtime registry, not supplied by a tool/request argument. */

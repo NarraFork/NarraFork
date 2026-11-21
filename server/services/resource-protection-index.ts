@@ -141,8 +141,57 @@ function receiptClaim(record: unknown, id: string): ResourceClaim {
 	};
 }
 
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+class ProtectionIndexStoppedError extends Error {
+	constructor() {
+		super("Protection index stopped");
+	}
+}
+function track<T>(pending: Set<Promise<unknown>>, work: Promise<T>): Promise<T> {
+	pending.add(work);
+	void work.then(
+		() => pending.delete(work),
+		() => pending.delete(work),
+	);
+	return work;
+}
+async function waitForShutdown(work: Promise<unknown>, deadlineAt: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			work,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("Resource protection shutdown deadline exceeded")),
+					Math.max(0, deadlineAt - Date.now()),
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /** Injectable handles keep custom fixtures entirely out of the production database. */
 export function createResourceProtectionIndex(database: Database, receiptDirectory: string) {
+	const controller = new AbortController();
+	const pending = new Set<Promise<unknown>>();
+	let stopped = false;
+	let draining: Promise<void> | undefined;
+	const assertOpen = () => {
+		if (stopped) throw new ProtectionIndexStoppedError();
+	};
+	function owned<T>(run: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		try {
+			assertOpen();
+			return track(
+				pending,
+				run(signal ? AbortSignal.any([controller.signal, signal]) : controller.signal),
+			);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
 	let dirtyCursor: [string, string] = ["", ""];
 	let receiptEntries: Dir | undefined;
 	let receiptEntry: Dirent | null | undefined;
@@ -269,12 +318,22 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (!path) return { claim, canonicalPath: null, deviceId, alias: 0 };
 		if (!validText(path)) throw new Error("Invalid resource path");
 		if (deviceId !== "local") return { claim, canonicalPath: path, deviceId, alias: 0 };
-		const canonicalPath = await bounded(canonicalProtectionPath(path), deadline, signal);
+		assertOpen();
+		const canonicalPath = await bounded(
+			track(pending, canonicalProtectionPath(path)),
+			deadline,
+			signal,
+		);
+		assertOpen();
+		check(deadline, signal);
 		const metadata = await bounded(
-			lstat(path).catch((error) => {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-				throw error;
-			}),
+			track(
+				pending,
+				lstat(path).catch((error) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+					throw error;
+				}),
+			),
 			deadline,
 			signal,
 		);
@@ -342,6 +401,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		revision: number,
 		rows: IndexedClaim[],
 	): boolean {
+		assertOpen();
 		return database.transaction(() => {
 			const state = database
 				.query(
@@ -684,7 +744,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		// A timed-out filesystem operation (including close) still owns its handles until it settles.
 		// Pause only legacy import instead of reopening it or blocking the three business sources.
 		if (receiptImport) return;
-		const work = runLegacyImport(deadline, signal);
+		assertOpen();
+		const work = track(pending, runLegacyImport(deadline, signal));
 		receiptImport = work;
 		void work
 			.finally(() => {
@@ -967,20 +1028,87 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		return { complete: true, claims: claims() };
 	}
 
-	return { read, maintain };
+	function stop(options: { deadlineAt?: number } = {}): Promise<void> {
+		stopped = true;
+		controller.abort(new ProtectionIndexStoppedError());
+		draining ??= (async () => {
+			// Bounded callers may have returned while receipt FS and canonicalization still run.
+			while (pending.size) await Promise.allSettled([...pending]);
+			const entries = receiptEntries;
+			receiptEntries = undefined;
+			receiptEntry = undefined;
+			if (entries) await track(pending, entries.close());
+		})();
+		return waitForShutdown(
+			draining,
+			options.deadlineAt ?? Date.now() + DEFAULT_SHUTDOWN_TIMEOUT_MS,
+		);
+	}
+	return {
+		read: (
+			targets: readonly LifecycleTarget[],
+			deadline: number,
+			signal?: AbortSignal,
+			includeLegacyReceipts = true,
+		) =>
+			owned(async (ownedSignal) => {
+				const result = await read(targets, deadline, ownedSignal, includeLegacyReceipts);
+				return {
+					complete: result.complete,
+					claims: {
+						[Symbol.asyncIterator]() {
+							const iterator = result.claims[Symbol.asyncIterator]();
+							return {
+								next: () => owned(() => iterator.next(), ownedSignal),
+								return: () =>
+									iterator.return?.() ?? Promise.resolve({ done: true as const, value: undefined }),
+							};
+						},
+					},
+				};
+			}, signal),
+		maintain: (deadline = performance.now() + 1000, signal?: AbortSignal) =>
+			owned((ownedSignal) => maintain(deadline, ownedSignal), signal),
+		stop,
+		getShutdownSnapshot: () => ({
+			stopped,
+			pendingTasks: pending.size,
+			pendingReceiptImports: receiptImport ? 1 : 0,
+		}),
+	};
 }
 
-let singleton: ReturnType<typeof createResourceProtectionIndex> | undefined;
+const maintenance = hotSafe("resource-protection-index-maintenance", () => ({
+	timer: undefined as ReturnType<typeof setTimeout> | undefined,
+	stopped: false,
+	pending: new Set<Promise<unknown>>(),
+	index: undefined as ReturnType<typeof createResourceProtectionIndex> | undefined,
+}));
+// A hot reload can retain the previous timer-only state shape.
+maintenance.pending ??= new Set();
+maintenance.stopped ??= false;
 async function productionIndex() {
-	if (singleton) return singleton;
+	if (maintenance.stopped) throw new ProtectionIndexStoppedError();
+	if (maintenance.index) return maintenance.index;
 	const { sqlite } = await import("../db");
 	const { narraforkDir } = await import("../lib/settings");
-	singleton = createResourceProtectionIndex(sqlite, join(narraforkDir, "worktree-requests"));
-	return singleton;
+	if (maintenance.stopped) throw new ProtectionIndexStoppedError();
+	maintenance.index ??= createResourceProtectionIndex(
+		sqlite,
+		join(narraforkDir, "worktree-requests"),
+	);
+	return maintenance.index;
 }
 let lastWarning = -Infinity;
 let suppressedWarnings = 0;
 async function warnUnavailable(error: unknown): Promise<void> {
+	if (
+		maintenance.stopped &&
+		(error instanceof ProtectionIndexStoppedError ||
+			(error instanceof Error &&
+				/Protection index (cancelled|budget exceeded)|aborted/i.test(error.message)))
+	)
+		return;
 	if (performance.now() - lastWarning < 60_000) {
 		suppressedWarnings++;
 		return;
@@ -1030,7 +1158,7 @@ export async function readReceiptRequestIdentity(
 		await file.close().catch(() => {});
 	}
 }
-export async function readProtectionClaims(
+async function readProductionProtectionClaims(
 	targets: readonly LifecycleTarget[],
 	deadline: number,
 	signal?: AbortSignal,
@@ -1060,31 +1188,84 @@ export async function readProtectionClaims(
 		throw error;
 	}
 }
-export async function maintainProtectionIndex(
+export function readProtectionClaims(
+	targets: readonly LifecycleTarget[],
+	deadline: number,
+	signal?: AbortSignal,
+	includeLegacyReceipts = true,
+) {
+	if (maintenance.stopped) return Promise.reject(new ProtectionIndexStoppedError());
+	return track(
+		maintenance.pending,
+		readProductionProtectionClaims(targets, deadline, signal, includeLegacyReceipts),
+	);
+}
+export function maintainProtectionIndex(
 	deadline = performance.now() + 1000,
 	signal?: AbortSignal,
-) {
-	try {
-		await (await productionIndex()).maintain(deadline, signal);
-	} catch (error) {
-		await warnUnavailable(error);
-		throw error;
-	}
+): Promise<void> {
+	if (maintenance.stopped) return Promise.reject(new ProtectionIndexStoppedError());
+	return track(
+		maintenance.pending,
+		(async () => {
+			try {
+				await (await productionIndex()).maintain(deadline, signal);
+			} catch (error) {
+				await warnUnavailable(error);
+				throw error;
+			}
+		})(),
+	);
 }
-const maintenance = hotSafe("resource-protection-index-maintenance", () => ({
-	timer: undefined as ReturnType<typeof setTimeout> | undefined,
-}));
 export function startProtectionIndexMaintenance(): void {
-	if (maintenance.timer || process.env.NARRAFORK_TEST === "1") return;
+	if (maintenance.stopped || maintenance.timer || process.env.NARRAFORK_TEST === "1") return;
 	const run = async () => {
+		maintenance.timer = undefined;
+		if (maintenance.stopped) return;
 		try {
 			await maintainProtectionIndex();
 		} catch {
 			/* Backlog or invalid evidence stays dirty; destructive reads fail closed. */
 		}
+		if (maintenance.stopped) return;
 		maintenance.timer = setTimeout(run, 1000);
 		maintenance.timer.unref();
 	};
 	maintenance.timer = setTimeout(run, 0);
 	maintenance.timer.unref();
+}
+
+/** Permanently close production admission before waiting for its real work to settle. */
+export function stopResourceProtectionIndex(options: { deadlineAt?: number } = {}): Promise<void> {
+	maintenance.stopped = true;
+	clearTimeout(maintenance.timer);
+	maintenance.timer = undefined;
+	const deadlineAt = options.deadlineAt ?? Date.now() + DEFAULT_SHUTDOWN_TIMEOUT_MS;
+	const indexStop = maintenance.index?.stop({ deadlineAt });
+	return waitForShutdown(
+		(async () => {
+			await indexStop;
+			while (maintenance.pending.size) await Promise.allSettled([...maintenance.pending]);
+		})(),
+		deadlineAt,
+	);
+}
+export function getResourceProtectionShutdownSnapshot() {
+	const index = maintenance.index?.getShutdownSnapshot();
+	return {
+		stopped: maintenance.stopped,
+		pendingTasks: maintenance.pending.size + (index?.pendingTasks ?? 0),
+		pendingReceiptImports: index?.pendingReceiptImports ?? 0,
+		maintenanceScheduled: maintenance.timer !== undefined,
+	};
+}
+
+/** Test fixtures may reopen admission only after the previous owner really drained. */
+export async function resetResourceProtectionIndexForTests(
+	index?: ReturnType<typeof createResourceProtectionIndex>,
+): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only protection index reset");
+	await stopResourceProtectionIndex();
+	maintenance.index = index;
+	maintenance.stopped = false;
 }

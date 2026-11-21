@@ -105,6 +105,7 @@ export function customApiProtocolToOpenAIApiMode(
 
 export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): CustomApiProviderConfig {
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,
@@ -235,6 +236,7 @@ export function customApiProviderToOpenAI(
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
 		codexImageGeneration: provider.codexImageGeneration,
+		toolResultImages: provider.toolResultImages,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -246,6 +248,7 @@ export function customApiProviderToAnthropic(
 ): AnthropicProviderConfig | undefined {
 	if (!isAnthropicCustomApiProtocol(provider.protocol)) return undefined;
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,
@@ -281,6 +284,7 @@ export function customApiProviderToGemini(
 ): GeminiProviderConfig | undefined {
 	if (!isGeminiCustomApiProtocol(provider.protocol)) return undefined;
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,

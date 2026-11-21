@@ -5,6 +5,7 @@ import { db, sqlite } from "../../db";
 import { narrators, projects, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import { withNarratorMutationAdmission } from "../../services/narrator-session-state";
 import { narratorRoutes } from "../narrators";
 
 const owner = generateId();
@@ -246,6 +247,38 @@ test("checks each child's write permission in both directions", async () => {
 		"acl-read-only": "idle",
 		"acl-writable": "archived",
 	});
+});
+
+test("does not archive the group while a child has a competing runtime mutation", async () => {
+	const parentId = "busy-parent";
+	const childId = "busy-child";
+	await db
+		.insert(narrators)
+		.values([
+			session(parentId),
+			session(childId, { isAskInPassing: true, parentNarratorId: parentId }),
+		]);
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const reservation = withNarratorMutationAdmission(childId, async () => {
+		entered.resolve();
+		await release.promise;
+	});
+	try {
+		await Promise.race([entered.promise, reservation]);
+		const response = await appAs(owner).request(`/narrators/${parentId}/archive`, {
+			method: "PATCH",
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+		expect(await statusesOf([parentId, childId])).toEqual({
+			[parentId]: "idle",
+			[childId]: "idle",
+		});
+	} finally {
+		release.resolve();
+		await reservation;
+	}
 });
 
 for (const { action, before, failedRow } of [

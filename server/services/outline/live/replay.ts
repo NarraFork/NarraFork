@@ -18,7 +18,9 @@
  * epoch are read (a session compacts long before that); an epoch over the bound is left for an
  * operator and logged, never truncated.
  */
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { trackCommunicationWork } from "@server/services/agent-runtime/async-work";
 import { merge3 } from "@shared/outline";
 import * as Y from "yjs";
 import { OUTLINE_LIMITS } from "../model";
@@ -69,16 +71,42 @@ export interface ReplayResult {
 }
 
 const decoder = new TextDecoder();
+const startupReplay = hotSafe("outline.live.replay.shutdown.v1", () => new AbortController());
 
-async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpdateRow[] | null> {
+/** Stop startup admission and interrupt pauses; in-flight database work remains drain-owned. */
+export function stopOutlineLiveReplay(controller: AbortController = startupReplay): void {
+	controller.abort(new Error("Outline live replay stopped"));
+}
+
+async function replayPause(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	await new Promise<void>((resolve) => {
+		const finish = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", finish);
+			resolve();
+		};
+		const timer = setTimeout(finish, OUTLINE_LIVE_REPLAY.pauseMs);
+		signal.addEventListener("abort", finish, { once: true });
+		if (signal.aborted) finish();
+	});
+}
+
+async function readEpoch(
+	pageId: string,
+	epoch: number,
+	signal: AbortSignal,
+): Promise<OutlineLiveUpdateRow[] | null> {
 	const rows: OutlineLiveUpdateRow[] = [];
 	let bytes = 0;
 	let afterSeq: number | undefined;
 	for (;;) {
+		signal.throwIfAborted();
 		const page = await outlineStore.listLiveUpdates(pageId, epoch, {
 			...(afterSeq !== undefined ? { afterSeq } : {}),
 			limit: OUTLINE_LIVE_REPLAY.pageRows,
 		});
+		signal.throwIfAborted();
 		for (const row of page) {
 			rows.push(row);
 			bytes += row.updateB64.length;
@@ -94,17 +122,22 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
  * Replay one epoch: commit what is not committed, then drop the rows. `kept` when the log could
  * not be replayed (too large, unreadable, the commit failed): the rows stay.
  */
-export async function replayLiveEpoch(pageId: string, epoch: number): Promise<ReplayOutcome> {
-	return (await replayLiveEpochDetailed(pageId, epoch)).outcome;
+export async function replayLiveEpoch(
+	pageId: string,
+	epoch: number,
+	signal: AbortSignal = startupReplay.signal,
+): Promise<ReplayOutcome> {
+	return (await replayLiveEpochDetailed(pageId, epoch, signal)).outcome;
 }
 
 /** {@link replayLiveEpoch}, with what a new session of the page needs from it. */
 export async function replayLiveEpochDetailed(
 	pageId: string,
 	epoch: number,
+	signal: AbortSignal = startupReplay.signal,
 ): Promise<ReplayResult> {
 	const keys = new Map<string, number>();
-	const rows = await readEpoch(pageId, epoch);
+	const rows = await readEpoch(pageId, epoch, signal);
 	if (!rows) {
 		logger.warn("Outline live log too large to replay; kept", { pageId, epoch });
 		return { outcome: "kept", keys };
@@ -166,40 +199,46 @@ export async function replayLiveEpochDetailed(
 		return { outcome: "kept", keys };
 	}
 
-	const page = await outlineStore.getBlock(pageId);
-	if (!page || page.deleted) {
-		doc.destroy();
+	try {
+		const page = await outlineStore.getBlock(pageId);
+		signal.throwIfAborted();
+		if (!page || page.deleted) {
+			await outlineStore.deleteLiveUpdates(pageId, epoch);
+			return { outcome: "empty", keys };
+		}
+		const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
+		signal.throwIfAborted();
+		const changes: Array<{ id: string; text: string; actor: string | null }> = [];
+		for (const b of blocks) {
+			const t = texts.get(b.id);
+			if (!(t instanceof Y.Text)) continue;
+			const final = t.toString();
+			// The session committed this just before it ended, and logged nothing after.
+			const intent = intents.get(b.id);
+			if (intent !== undefined && intent === b.content) continue;
+			const from = base.get(b.id) ?? b.content;
+			if (final === from) continue;
+			const merged = merge3(from, final, b.content, { lenient: true });
+			const text = merged.ok ? merged.result : final;
+			if (text !== b.content) changes.push({ id: b.id, text, actor: lastActor.get(b.id) ?? null });
+		}
+		if (changes.length > 0) {
+			const committed = await commitChanges(page.spaceId, changes, blocks, signal);
+			if (!committed) return { outcome: "kept", keys, changes };
+		}
+		signal.throwIfAborted();
 		await outlineStore.deleteLiveUpdates(pageId, epoch);
-		return { outcome: "empty", keys };
+		return { outcome: changes.length > 0 ? "committed" : "empty", keys };
+	} finally {
+		doc.destroy();
 	}
-	const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
-	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
-	for (const b of blocks) {
-		const t = texts.get(b.id);
-		if (!(t instanceof Y.Text)) continue;
-		const final = t.toString();
-		// The session committed this just before it ended, and logged nothing after.
-		const intent = intents.get(b.id);
-		if (intent !== undefined && intent === b.content) continue;
-		const from = base.get(b.id) ?? b.content;
-		if (final === from) continue;
-		const merged = merge3(from, final, b.content, { lenient: true });
-		const text = merged.ok ? merged.result : final;
-		if (text !== b.content) changes.push({ id: b.id, text, actor: lastActor.get(b.id) ?? null });
-	}
-	doc.destroy();
-	if (changes.length > 0) {
-		const committed = await commitChanges(page.spaceId, changes, blocks);
-		if (!committed) return { outcome: "kept", keys, changes };
-	}
-	await outlineStore.deleteLiveUpdates(pageId, epoch);
-	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
 }
 
 async function commitChanges(
 	spaceId: string,
 	changes: Array<{ id: string; text: string; actor: string | null }>,
 	blocks: ReadonlyArray<{ id: string; content: string; parentId: string | null }>,
+	signal: AbortSignal,
 ): Promise<boolean> {
 	const current = new Map(blocks.map((b) => [b.id, b]));
 	// A text past the per-block limit keeps what fits; the log is the only other copy of the
@@ -209,9 +248,11 @@ async function commitChanges(
 	try {
 		normalized = await OUTLINE_LIVE_HOOKS.normalize(cut.flat());
 	} catch (error) {
+		signal.throwIfAborted();
 		logger.warn("Outline live replay could not normalize", { error: String(error) });
 		return false;
 	}
+	signal.throwIfAborted();
 	const plans: ContentPlan[] = [];
 	let at = 0;
 	changes.forEach((c, i) => {
@@ -240,6 +281,7 @@ async function commitChanges(
 			// One block's operations stay in one transaction when they fit (the limits on
 			// operations and content bytes per transaction).
 			for (const [start, end] of planChunks(ops, groups)) {
+				signal.throwIfAborted();
 				await asOwnLiveWrite(() =>
 					OUTLINE_LIVE_HOOKS.write(
 						{
@@ -254,6 +296,7 @@ async function commitChanges(
 				);
 			}
 		} catch (error) {
+			signal.throwIfAborted();
 			logger.warn("Outline live replay commit failed; log kept", { spaceId, error: String(error) });
 			return false;
 		}
@@ -265,32 +308,42 @@ async function commitChanges(
  * The startup job: replay every epoch left in the log, one at a time with a pause between, skipping
  * epochs of sessions open in this process (`isLive`). Resolves when the log was walked once.
  */
-export async function replayAllLiveEpochs(
+export function replayAllLiveEpochs(
 	isLive: (pageId: string, epoch: number) => boolean,
 	replay: (pageId: string, epoch: number) => Promise<ReplayOutcome>,
+	signal: AbortSignal = startupReplay.signal,
 ): Promise<{ committed: number; kept: number }> {
-	let after: { pageBlockId: string; epoch: number } | undefined;
-	let committed = 0;
-	let kept = 0;
-	for (;;) {
-		const epochs = await outlineStore.listLiveEpochs({
-			...(after ? { after } : {}),
-			limit: OUTLINE_LIVE_REPLAY.epochsPerPage,
-		});
-		for (const e of epochs) {
-			if (isLive(e.pageBlockId, e.epoch)) continue;
-			try {
-				const outcome = await replay(e.pageBlockId, e.epoch);
-				if (outcome === "committed") committed++;
-				if (outcome === "kept") kept++;
-			} catch (error) {
-				kept++;
-				logger.warn("Outline live replay failed", { pageId: e.pageBlockId, error: String(error) });
+	return trackCommunicationWork(
+		(async () => {
+			let after: { pageBlockId: string; epoch: number } | undefined;
+			let committed = 0;
+			let kept = 0;
+			while (!signal.aborted) {
+				const epochs = await outlineStore.listLiveEpochs({
+					...(after ? { after } : {}),
+					limit: OUTLINE_LIVE_REPLAY.epochsPerPage,
+				});
+				for (const e of epochs) {
+					if (signal.aborted) break;
+					if (isLive(e.pageBlockId, e.epoch)) continue;
+					try {
+						const outcome = await replay(e.pageBlockId, e.epoch);
+						if (outcome === "committed") committed++;
+						if (outcome === "kept") kept++;
+					} catch (error) {
+						if (signal.aborted) break;
+						kept++;
+						logger.warn("Outline live replay failed", {
+							pageId: e.pageBlockId,
+							error: String(error),
+						});
+					}
+					await replayPause(signal);
+				}
+				if (epochs.length < OUTLINE_LIVE_REPLAY.epochsPerPage) break;
+				after = epochs[epochs.length - 1];
 			}
-			await new Promise((resolve) => setTimeout(resolve, OUTLINE_LIVE_REPLAY.pauseMs));
-		}
-		if (epochs.length < OUTLINE_LIVE_REPLAY.epochsPerPage) break;
-		after = epochs[epochs.length - 1];
-	}
-	return { committed, kept };
+			return { committed, kept };
+		})(),
+	);
 }

@@ -31,6 +31,36 @@ const provider = {
 };
 
 describe("providers reducer server synchronization", () => {
+	for (const mode of ["off", "inline", "separate"] as const) {
+		test(`preserves tool result image mode ${mode} through edits and server synchronization`, () => {
+			const initialized = providersStateFromSettings({
+				customApiProviders: [{ ...provider, protocol: "completions-compatible" }],
+				agent: {},
+			});
+			const updated = providersReducer(initialized, {
+				type: "SET_CUSTOM_API_PROVIDERS",
+				providers: (providers) => providers.map((p) => ({ ...p, toolResultImages: mode })),
+			});
+			expect(updated.customApiProviders[0]?.toolResultImages).toBe(mode);
+			expect(dirtyLabel(updated, createSnapshot(initialized))).toContain("true");
+			const synced = providersReducer(updated, {
+				type: "SYNC_FROM_SETTINGS",
+				settings: JSON.parse(JSON.stringify(createSnapshot(updated))),
+			});
+			expect(synced.customApiProviders[0]?.toolResultImages).toBe(mode);
+		});
+	}
+
+	for (const mode of [undefined, null, "invalid", "", 42]) {
+		test(`defaults missing or invalid tool result image mode ${JSON.stringify(mode)} to undefined`, () => {
+			const initialized = providersStateFromSettings({
+				customApiProviders: [{ ...provider, toolResultImages: mode }],
+				agent: {},
+			});
+			expect(initialized.customApiProviders[0]?.toolResultImages).toBeUndefined();
+		});
+	}
+
 	test("SYNC_FROM_SETTINGS replaces local state with the server-final normalized response", () => {
 		const local = providersStateFromSettings({
 			customApiProviders: [provider],

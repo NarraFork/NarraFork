@@ -34,6 +34,17 @@ const { createAsyncQuestion, answerAsyncQuestion } = await import("../narrator-q
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
+async function expectRejectedMessage(work: PromiseLike<unknown>, message: string): Promise<void> {
+	let rejected = false;
+	try {
+		await work;
+	} catch (error) {
+		rejected = true;
+		expect(String(error)).toContain(message);
+	}
+	expect(rejected).toBe(true);
+}
+
 const recipient = "reply-context-recipient";
 const sender = "reply-context-sender";
 const model = "replycontextfixture:model";
@@ -500,7 +511,8 @@ test("recovery without candidates or with a live owner never adopts the human pa
 	const owner = tryClaimExecution(recipient, "run");
 	if (!owner) throw new Error("Could not claim fixture owner");
 	try {
-		await expect(startRecoveryWatchBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
+		await expectRejectedMessage(
+			startRecoveryWatchBatch({ ...input, aliases: ["missing"] }),
 			"already running",
 		);
 		expect(recipientRow().replyContext).toEqual(zh);
@@ -652,7 +664,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 		const owner = tryClaimExecution(recipient, "run");
 		if (!owner) throw new Error("Could not claim recovery fixture owner");
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"already running",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);
@@ -666,7 +679,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 			throw new Error("fixture registration failed");
 		});
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"fixture registration failed",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);

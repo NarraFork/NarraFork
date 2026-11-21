@@ -4,6 +4,7 @@ import {
 	isOpaqueSessionToken,
 	SESSION_TOKEN_TTL_SECONDS,
 } from "@shared/session-auth";
+import { trackCommunicationWork } from "../services/agent-runtime/async-work";
 import type { AuthSessionRecord } from "../services/auth/session-store";
 import { authMfaStore, authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
@@ -11,7 +12,7 @@ import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-li
 import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
 import { eventBus } from "./event-bus";
-import { hotTimer } from "./hot-safe";
+import { hotTimer, hotTimerClear } from "./hot-safe";
 import { generateId } from "./id";
 import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
@@ -208,12 +209,16 @@ export async function pruneStaleSessions(): Promise<number> {
 
 /** Sweep on startup, then hourly. `hotTimer` keeps --hot reloads from stacking intervals. */
 export function startSessionCleanupTimer(): ReturnType<typeof setInterval> {
-	void pruneStaleSessions();
+	void trackCommunicationWork(pruneStaleSessions());
 	return hotTimer(SESSION_CLEANUP_TIMER_KEY, () =>
 		setInterval(() => {
-			void pruneStaleSessions();
+			void trackCommunicationWork(pruneStaleSessions());
 		}, SESSION_CLEANUP_INTERVAL_MS),
 	);
+}
+
+export function stopSessionCleanupTimer(): void {
+	hotTimerClear(SESSION_CLEANUP_TIMER_KEY);
 }
 
 export interface RegisterUserInput {

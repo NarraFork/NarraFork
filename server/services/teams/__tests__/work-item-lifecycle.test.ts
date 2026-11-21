@@ -7,7 +7,16 @@
  * `planRemoval` / `remove`, its loss measurement and confirmed-loss check) with fixture
  * retirement ports that drop the resource row like production.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	spyOn,
+	test,
+} from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,6 +27,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { LocalBackend } from "../../../lib/agent/execution/local-backend";
+import { eventBus } from "../../../lib/event-bus";
 import { setGitHardeningProbeForTests } from "../../../lib/git-exec-hardening";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
@@ -38,6 +48,7 @@ import {
 	recordReview,
 	settleIsolatedWorkItem,
 	setWorkItemPortsForTests,
+	startTeamWorkLifecycle,
 	syncDeliveryStatus,
 	syncInstruction,
 	syncWorkItem,
@@ -381,6 +392,100 @@ describe("work item lifecycle", () => {
 		for (const event of log) expect([event.actorKind, event.actorId]).toEqual(["agent", LEAD]);
 		expect(log[2]?.detail).toMatchObject({ round: 1, verdict: "blocker", findings: 2 });
 		expect(log[3]?.detail).toMatchObject({ round: 2, verdict: "clear", reviewer: "p3-reviewer-2" });
+	});
+
+	test("lifecycle stop owns a settling item and blocks database work after its suspended lookup", async () => {
+		const item = await create("Stop during settle", TEAM_ISOLATED_WORK_KIND);
+		seedWorker("p3-stopping");
+		attachWorker(LEAD, item.id, "p3-stopping", agent);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		setWorkItemPortsForTests({
+			...fixturePorts(),
+			principalOf: async () => {
+				entered.resolve();
+				await release.promise;
+				return principal;
+			},
+		});
+		const stop = startTeamWorkLifecycle();
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			eventBus.emit({
+				type: "narrator:subagent_completed",
+				narratorId: "p3-stopping",
+				parentNarratorId: LEAD,
+				toolUseId: "stopping-tool",
+			});
+			await entered.promise;
+			let drained = false;
+			const stopping = stop().then(() => {
+				drained = true;
+			});
+			const select = spyOn(db, "select").mockImplementation(() => {
+				throw new Error("No settle SELECT after stop");
+			});
+			const transaction = spyOn(db, "transaction").mockImplementation(() => {
+				throw new Error("No settle write after stop");
+			});
+			try {
+				await Promise.resolve();
+				expect(drained).toBe(false);
+				release.resolve();
+				await stopping;
+				expect(select).not.toHaveBeenCalled();
+				expect(transaction).not.toHaveBeenCalled();
+			} finally {
+				release.resolve();
+				await stopping;
+				select.mockRestore();
+				transaction.mockRestore();
+			}
+			expect(
+				db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()?.state,
+			).toBe("in_progress");
+		} finally {
+			release.resolve();
+			await stop();
+		}
+	});
+
+	test("a removal already committed during cancellation still settles the item transaction", async () => {
+		const item = await create("Finish dispatched removal", TEAM_ISOLATED_WORK_KIND);
+		seedWorker("p3-dispatched");
+		attachWorker(LEAD, item.id, "p3-dispatched", agent);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const ports = fixturePorts();
+		setWorkItemPortsForTests({
+			...ports,
+			removeWorktree: async (input) => {
+				const result = await ports.removeWorktree(input);
+				entered.resolve();
+				await release.promise;
+				return result;
+			},
+		});
+		const controller = new AbortController();
+		const settling = settleIsolatedWorkItem("p3-dispatched", {
+			retry: false,
+			signal: controller.signal,
+		});
+		try {
+			await entered.promise;
+			controller.abort();
+			release.resolve();
+			expect(await settling).toBe("cleaned");
+			const after = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+			expect(after?.state).toBe("cancelled");
+			expect(after?.worktreeResourceId).toBeNull();
+			expect(events(item.id).map((event) => event.kind)).toEqual(
+				expect.arrayContaining(["work.cleanup", "work.cancelled"]),
+			);
+		} finally {
+			release.resolve();
+			await settling;
+		}
 	});
 
 	test("an isolated item whose run made nothing is cleaned and cancelled; its branch stays", async () => {

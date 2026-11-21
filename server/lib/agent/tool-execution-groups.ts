@@ -23,6 +23,7 @@ import {
 	isStrictSerialToolExecution,
 	type ToolExecutionGroupItem,
 } from "@shared/tool-parallel-groups";
+import { isCheckpointStop } from "../../services/agent-runtime/checkpoint-stop";
 import type { ToolExecResult } from "./tool-executor";
 
 export {
@@ -73,10 +74,9 @@ export function selectStreamingToolExecutions<T extends ToolExecutionGroupItem>(
 }
 
 /**
- * Resolve a tool execution promise into a settled ToolExecResult, guaranteeing it never
- * rejects. A genuine rejection thrown from executeTool/executeToolAfterReflections becomes
- * a formal isError result so parallel siblings keep yielding/persisting and the model still
- * receives a tool_result in the original call order.
+ * Convert ordinary execution failures to a formal tool result. A checkpoint pause
+ * remains process control: its caller drains every started sibling before unwinding,
+ * preserving the paused call rather than publishing a synthetic tool result.
  */
 export async function settleToolExecutionResult(
 	run: Promise<ToolExecResult>,
@@ -84,6 +84,7 @@ export async function settleToolExecutionResult(
 	try {
 		return await run;
 	} catch (err) {
+		if (isCheckpointStop(err)) throw err;
 		return {
 			output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
 			isError: true,

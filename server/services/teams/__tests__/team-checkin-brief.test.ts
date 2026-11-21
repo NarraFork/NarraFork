@@ -276,10 +276,83 @@ describe("check-in and the coordinator's lifecycle", () => {
 			const again = startTeamWorkLifecycle();
 			expect(off).toHaveBeenCalledTimes(3);
 			off.mockRestore();
-			again();
+			await again();
 		} finally {
-			stop();
+			await stop();
 		}
+	});
+
+	test("stop cancels timers and rejects late admission before touching the database", async () => {
+		const stop = startTeamWorkLifecycle();
+		scheduleCheckin({ coordinatorId: LEAD, minutes: 20, locale: "en", actor: agent, userId: null });
+		const lateTimer = timers[0];
+		await stop();
+		const select = spyOn(db, "select").mockImplementation(() => {
+			throw new Error("No team SELECT after stop");
+		});
+		try {
+			expect(lateTimer?.cancelled).toBe(true);
+			lateTimer?.fn();
+			expect(rearmCheckins()).toBe(0);
+			expect(() =>
+				scheduleCheckin({
+					coordinatorId: LEAD,
+					minutes: 20,
+					locale: "en",
+					actor: agent,
+					userId: null,
+				}),
+			).toThrow("stopping");
+			expect(select).not.toHaveBeenCalled();
+			expect(wakes).toEqual([]);
+			expect(pendingCheckinCount()).toBe(0);
+		} finally {
+			select.mockRestore();
+		}
+	});
+
+	test("stop waits for an already admitted finite check-in wake", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		setCheckinSeamsForTests({
+			wake: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const stop = startTeamWorkLifecycle();
+		scheduleCheckin({ coordinatorId: LEAD, minutes: 20, locale: "en", actor: agent, userId: null });
+		advance(20 * 60_000);
+		await entered.promise;
+		let drained = false;
+		const stopping = stop().then(() => {
+			drained = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(drained).toBe(false);
+			release.resolve();
+			await stopping;
+			expect(drained).toBe(true);
+		} finally {
+			release.resolve();
+			await stopping;
+		}
+	});
+
+	test("a rejected check-in wake remains a shutdown failure", async () => {
+		const entered = Promise.withResolvers<void>();
+		setCheckinSeamsForTests({
+			wake: async () => {
+				entered.resolve();
+				throw new Error("wake failed");
+			},
+		});
+		const stop = startTeamWorkLifecycle();
+		scheduleCheckin({ coordinatorId: LEAD, minutes: 20, locale: "en", actor: agent, userId: null });
+		advance(20 * 60_000);
+		await entered.promise;
+		await expect(stop()).rejects.toThrow("did not drain successfully");
 	});
 });
 

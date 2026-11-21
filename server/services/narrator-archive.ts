@@ -8,8 +8,9 @@ import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
+import { withNarratorMutationAdmission } from "./narrator-session-state";
 import { rememberArchivedTabPlacement, restoreArchivedTabPlacement } from "./recent-tabs-service";
-import { prepareNarratorArchive } from "./subagent-lifecycle";
+import { prepareNarratorArchive, repairArchivedNarrator } from "./subagent-lifecycle";
 import { closeSubagentResources } from "./subagent-resources";
 import { personActor, runAsTeamStatusActor } from "./teams/team-records";
 
@@ -45,22 +46,55 @@ export async function transitionNarratorArchiveGroup(
 	target: "archived" | "idle",
 ) {
 	const archiving = target === "archived";
-	const parent = await loadNarratorForAccess(parentId, principal, "write");
-	if ((parent.status === "archived") === archiving) return [];
+	return withNarratorMutationAdmission(parentId, async () => {
+		const parent = await loadNarratorForAccess(parentId, principal, "write");
+		if ((parent.status === "archived") === archiving) {
+			if (archiving) {
+				try {
+					await prepareNarratorArchive(parent);
+					await repairArchivedNarrator(parent);
+				} finally {
+					await closeSubagentResources(parentId);
+				}
+			}
+			return [];
+		}
+		const childWhere = and(ne(narrators.id, parentId), cascadeChildWhere(parentId, target));
+		const candidates = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(childWhere)
+			.limit(MAX_CASCADE_CHILDREN + 1);
+		if (candidates.length > MAX_CASCADE_CHILDREN) {
+			throw new ValidationError("Too many linked sessions to update at once");
+		}
+		const childIds: string[] = [];
+		for (const { id } of candidates) {
+			if (await writableChild(id, principal)) childIds.push(id);
+		}
+		const transition = () => transitionAdmittedGroup(principal, parent, target, childIds);
+		// Never wait on a child admission while holding the parent's.
+		return childIds.reduceRight<() => Promise<string[]>>(
+			(next, id) => () => withNarratorMutationAdmission(id, next, { failIfBusy: true }),
+			transition,
+		)();
+	});
+}
 
+async function transitionAdmittedGroup(
+	principal: NarratorPrincipal,
+	parent: typeof narrators.$inferSelect,
+	target: "archived" | "idle",
+	childIds: string[],
+) {
+	const archiving = target === "archived";
+	const parentId = parent.id;
 	const childWhere = cascadeChildWhere(parentId, target);
-	const candidates = await db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.where(childWhere)
-		.limit(MAX_CASCADE_CHILDREN + 1);
-	if (candidates.length > MAX_CASCADE_CHILDREN) {
-		throw new ValidationError("Too many linked sessions to update at once");
-	}
-
 	const userId = principal.userId;
+	const prepared = new Map<string, typeof narrators.$inferSelect>();
 	async function prepare(row: typeof narrators.$inferSelect) {
 		await prepareNarratorArchive(row);
+		prepared.set(row.id, row);
 		await rememberArchivedTabPlacement(userId, row.id).catch((error) =>
 			logger.warn("Could not remember archived tab placement", { narratorId: row.id, error }),
 		);
@@ -68,21 +102,21 @@ export async function transitionNarratorArchiveGroup(
 
 	// Runtime cancellation may await or fail. Do it before committing any archived status.
 	if (archiving) await prepare(parent);
-	const childIds: string[] = [];
-	for (const candidate of candidates) {
-		const child = await writableChild(candidate.id, principal);
+	const eligibleChildIds: string[] = [];
+	for (const id of childIds) {
+		const child = await writableChild(id, principal);
 		if (!child) continue;
 		if (archiving) {
 			if (child.status === "archived") continue;
 			await prepare(child);
 		}
-		childIds.push(child.id);
+		eligibleChildIds.push(child.id);
 	}
 	const now = new Date().toISOString();
 	const changes = await withDbRetry(
 		async () => {
 			const [children] = await Promise.all([
-				Promise.all(childIds.map((id) => writableChild(id, principal))),
+				Promise.all(eligibleChildIds.map((id) => writableChild(id, principal))),
 				loadNarratorForAccess(parentId, principal, "write"),
 			]);
 			return db.transaction((tx) => {
@@ -126,8 +160,14 @@ export async function transitionNarratorArchiveGroup(
 		}
 	});
 	for (const { id, title } of changes) {
-		if (archiving) await closeSubagentResources(id);
-		else {
+		if (archiving) {
+			try {
+				const row = prepared.get(id);
+				if (row) await repairArchivedNarrator(row);
+			} finally {
+				await closeSubagentResources(id);
+			}
+		} else {
 			await restoreArchivedTabPlacement(userId, id, title ?? id).catch((error) =>
 				logger.warn("Could not restore archived tab placement", { narratorId: id, error }),
 			);

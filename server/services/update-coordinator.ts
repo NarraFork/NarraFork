@@ -15,6 +15,11 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import {
+	type CheckpointRunIdentity,
+	CheckpointStop,
+	isCheckpointStopAdmissionFrozen,
+} from "./agent-runtime/checkpoint-stop";
+import {
 	bindRecoveryHandoffEpoch,
 	getRecoveryHandoffSources,
 	getRegisteredRecoveryManifestIdentity,
@@ -72,6 +77,8 @@ export interface UpdateCoordinationStatus {
 
 export interface NarratorRecoveryTarget {
 	narratorId: string;
+	/** Exact durable run, absent on legacy eligibility-only manifests. */
+	logicalRunId?: string;
 	locale: string;
 	userId?: string | null;
 	replyInUserLanguage?: boolean;
@@ -194,6 +201,12 @@ export type UpdateToolStartExecutionTransition = {
 
 interface NarratorLoopRecord {
 	narratorId: string;
+	logicalRunId?: string;
+	executionEpoch?: string;
+	parentNarratorId?: string;
+	parentIdentity?: CheckpointRunIdentity;
+	/** A separate recovery consumer must release its parent-side runtime claim first. */
+	canPauseForCheckpoint?: () => boolean;
 	locale: string;
 	userId?: string | null;
 	replyInUserLanguage?: boolean;
@@ -201,6 +214,7 @@ interface NarratorLoopRecord {
 }
 
 interface GateWaiter {
+	identity?: CheckpointRunIdentity;
 	resolve: () => void;
 	reject: (error: Error) => void;
 	signal?: AbortSignal;
@@ -284,6 +298,166 @@ function notifyLifecycleChanged(includeIdle = false): void {
 		eventBus.emit({ type: "system:lifecycle_changed" });
 	}, 50);
 	lifecycleNotification.timer.unref();
+}
+
+const gateActors = new WeakMap<AbortSignal, CheckpointRunIdentity>();
+let verifiedCheckpoint: { text: string; actors: CheckpointRunIdentity[] } | undefined;
+let checkpointStops:
+	| {
+			epoch: string;
+			actors: Array<CheckpointRunIdentity & { canPauseForCheckpoint?: () => boolean }>;
+	  }
+	| undefined;
+
+/** Bind the real pass signal, including replacement controllers after a fresh boundary. */
+export function bindCheckpointGateActor(
+	signal: AbortSignal,
+	identity: CheckpointRunIdentity,
+): void {
+	gateActors.set(signal, identity);
+}
+
+/** A derived cancellation scope retains only its existing, exact runtime actor. */
+export function inheritCheckpointGateActor(
+	source: AbortSignal,
+	derived: AbortSignal,
+	narratorId: string,
+): void {
+	const actor = gateActors.get(source);
+	if (actor?.narratorId === narratorId) gateActors.set(derived, actor);
+}
+
+/** Called only after durable continuation coverage converged behind the stable fence. */
+export function verifyPreparedCheckpoint(
+	snapshot: PlannedUpdateRecoverySnapshot,
+	durableRuns?: ReadonlySet<string>,
+): void {
+	if (
+		snapshot.updateEpoch !== state.updateEpoch ||
+		!checkpointFenceIsStable() ||
+		countExecutions("ordinary") > 0 ||
+		countExecutions("background_bash") > 0
+	)
+		throw new Error("Checkpoint identity changed before verification");
+	verifiedCheckpoint = {
+		text: JSON.stringify(snapshot),
+		actors: [...narratorLoops.values()].flatMap((record) => {
+			const target = snapshot.narrators.find((item) => item.narratorId === record.narratorId);
+			return target?.logicalRunId &&
+				target.logicalRunId === record.logicalRunId &&
+				(!durableRuns ||
+					durableRuns.has(JSON.stringify([record.narratorId, target.logicalRunId]))) &&
+				record.executionEpoch
+				? [
+						{
+							narratorId: record.narratorId,
+							logicalRunId: target.logicalRunId,
+							executionEpoch: record.executionEpoch,
+						},
+					]
+				: [];
+		}),
+	};
+}
+
+export function checkpointStopForSignal(
+	signal: AbortSignal,
+	narratorId: string,
+): CheckpointStop | undefined {
+	const identity = gateActors.get(signal);
+	return identity?.narratorId === narratorId ? checkpointStopForRun(identity) : undefined;
+}
+
+export function checkpointStopForRun(identity: CheckpointRunIdentity): CheckpointStop | undefined {
+	const stops = checkpointStops;
+	if (state.phase !== "restarting" || !stops || stops.epoch !== state.updateEpoch) return;
+	if (
+		stops.actors.some(
+			(actor) =>
+				actor.narratorId === identity.narratorId &&
+				actor.logicalRunId === identity.logicalRunId &&
+				actor.executionEpoch === identity.executionEpoch &&
+				actor.canPauseForCheckpoint?.() !== false,
+		)
+	)
+		return new CheckpointStop(stops.epoch, identity);
+}
+
+/** Admission must already be frozen. Eligibility-only signal manifests never authorize this. */
+export function stopCheckpointedNarratorRuns(): number {
+	if (!isCheckpointStopAdmissionFrozen()) return 0;
+	const handoff = scheduledHandoff.current;
+	if (
+		state.phase !== "restarting" ||
+		!handoff?.published ||
+		!verifiedCheckpoint ||
+		handoff.epoch !== state.updateEpoch ||
+		readRecoverySnapshotText() !== handoff.published ||
+		!checkpointFenceIsStable()
+	)
+		return 0;
+	const published = parsePlannedUpdateRecoverySnapshot(JSON.parse(handoff.published));
+	const verified = JSON.parse(verifiedCheckpoint.text) as PlannedUpdateRecoverySnapshot;
+	if (
+		!published ||
+		published.evidenceOnly ||
+		published.updateEpoch !== verified.updateEpoch ||
+		JSON.stringify(published.narrators) !== JSON.stringify(verified.narrators)
+	)
+		return 0;
+	const live = new Map([...narratorLoops.values()].map((record) => [record.narratorId, record]));
+	const candidates = new Map(
+		verifiedCheckpoint.actors
+			.filter((actor) => {
+				const record = live.get(actor.narratorId);
+				if (record?.canPauseForCheckpoint?.() === false) return false;
+				if (record?.parentNarratorId) {
+					const parent = live.get(record.parentNarratorId);
+					if (
+						!record.parentIdentity ||
+						parent?.logicalRunId !== record.parentIdentity.logicalRunId ||
+						parent.executionEpoch !== record.parentIdentity.executionEpoch
+					)
+						return false;
+				}
+				return (
+					record?.logicalRunId === actor.logicalRunId &&
+					record.executionEpoch === actor.executionEpoch
+				);
+			})
+			.map((actor) => [
+				actor.narratorId,
+				{ ...actor, canPauseForCheckpoint: live.get(actor.narratorId)?.canPauseForCheckpoint },
+			]),
+	);
+	const approved = new Map<string, boolean>();
+	// Walk the complete foreground ancestry. A covered intermediate owner cannot
+	// launder an uncovered ancestor's continuation into a terminal/error result.
+	for (const id of candidates.keys()) {
+		const path: string[] = [];
+		const visiting = new Set<string>();
+		let cursor: string | undefined = id;
+		while (cursor && candidates.has(cursor) && !approved.has(cursor) && !visiting.has(cursor)) {
+			path.push(cursor);
+			visiting.add(cursor);
+			cursor = live.get(cursor)?.parentNarratorId;
+		}
+		const safe = cursor === undefined || approved.get(cursor) === true;
+		for (const member of path) approved.set(member, safe);
+	}
+	const actors = [...candidates.values()].filter((actor) => approved.get(actor.narratorId));
+	checkpointStops = { epoch: handoff.epoch, actors };
+	let stopped = 0;
+	for (const [token, waiter] of gateWaiters) {
+		const reason = waiter.identity && checkpointStopForRun(waiter.identity);
+		if (!reason || waiter.signal?.aborted) continue;
+		gateWaiters.delete(token);
+		if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+		waiter.reject(reason);
+		stopped++;
+	}
+	if (stopped > 0) notifyLifecycleChanged();
+	return stopped;
 }
 
 function generateToken(prefix: string): string {
@@ -628,7 +802,12 @@ export async function beginNarratorResponseActivity(
 		return { token: generateToken("reflection_response"), release() {}, setReasoningAbort() {} };
 	}
 	while (state.phase !== "idle") {
-		await waitUntilUpdateGateOpens(signal);
+		await waitUntilUpdateGateOpens(
+			signal,
+			signal && gateActors.get(signal)?.narratorId === narratorId
+				? gateActors.get(signal)
+				: undefined,
+		);
 	}
 	const activity = registerCheckpointActivity(responseActivities, "response", { narratorId });
 	return {
@@ -829,12 +1008,37 @@ export function canStartUpdateExecution(narratorId?: string): boolean {
 export function registerNarratorLoop(
 	narratorId: string,
 	locale: string,
-	options: { userId?: string | null; replyInUserLanguage?: boolean } = {},
+	options: {
+		userId?: string | null;
+		replyInUserLanguage?: boolean;
+		logicalRunId?: string;
+		executionEpoch?: string;
+		parentNarratorId?: string;
+		canPauseForCheckpoint?: () => boolean;
+	} = {},
 ): () => void {
 	invalidateRecoveryTarget(narratorId);
 	const token = generateToken("loop");
+	const parent = options.parentNarratorId
+		? [...narratorLoops.values()].find((record) => record.narratorId === options.parentNarratorId)
+		: undefined;
+	const parentIdentity =
+		parent?.logicalRunId && parent.executionEpoch
+			? {
+					narratorId: parent.narratorId,
+					logicalRunId: parent.logicalRunId,
+					executionEpoch: parent.executionEpoch,
+				}
+			: undefined;
 	narratorLoops.set(token, {
 		narratorId,
+		logicalRunId: options.logicalRunId,
+		executionEpoch: options.executionEpoch,
+		get parentNarratorId() {
+			return options.parentNarratorId;
+		},
+		parentIdentity,
+		canPauseForCheckpoint: options.canPauseForCheckpoint,
 		locale,
 		userId: options.userId,
 		replyInUserLanguage: options.replyInUserLanguage,
@@ -965,7 +1169,11 @@ export async function waitForUpdateExecutionDrain(): Promise<void> {
  * Suspend a rejected tool until a failed/cancelled update returns the coordinator to idle.
  * This is a gate wait, not a tool failure result.
  */
-export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<void> {
+export async function waitUntilUpdateGateOpens(
+	signal?: AbortSignal,
+	identity?: CheckpointRunIdentity,
+): Promise<void> {
+	identity ??= signal && gateActors.get(signal);
 	if (state.phase === "idle") return;
 	if (signal?.aborted) {
 		const error = new Error("Waiting for the update gate was aborted");
@@ -973,9 +1181,11 @@ export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<vo
 		throw error;
 	}
 
+	const paused = identity && checkpointStopForRun(identity);
+	if (paused) throw paused;
 	const token = generateToken("paused_tool");
 	await new Promise<void>((resolve, reject) => {
-		const waiter: GateWaiter = { resolve, reject, signal };
+		const waiter: GateWaiter = { resolve, reject, signal, identity };
 		if (signal) {
 			waiter.onAbort = () => settleGateWaiter(token, "abort");
 			signal.addEventListener("abort", waiter.onAbort, { once: true });
@@ -1009,6 +1219,8 @@ export function failScheduledUpdate(
 	error: string,
 	options: { cancelled?: boolean } = {},
 ): UpdateCoordinationStatus {
+	verifiedCheckpoint = undefined;
+	checkpointStops = undefined;
 	const handoff = scheduledHandoff.current;
 	if (handoff) {
 		if (
@@ -1044,6 +1256,7 @@ export function capturePlannedUpdateRecoverySnapshot(): PlannedUpdateRecoverySna
 	for (const record of narratorLoops.values()) {
 		targets.set(record.narratorId, {
 			narratorId: record.narratorId,
+			...(record.logicalRunId ? { logicalRunId: record.logicalRunId } : {}),
 			locale: record.locale,
 			userId: record.userId,
 			replyInUserLanguage: record.replyInUserLanguage,
@@ -1076,6 +1289,8 @@ function parseNarrators(value: unknown): NarratorRecoveryTarget[] | null {
 				typeof entry.narratorId !== "string" ||
 				!entry.narratorId ||
 				typeof entry.locale !== "string" ||
+				(entry.logicalRunId !== undefined &&
+					(typeof entry.logicalRunId !== "string" || !entry.logicalRunId)) ||
 				(entry.userId !== undefined && entry.userId !== null && typeof entry.userId !== "string") ||
 				(entry.replyInUserLanguage !== undefined &&
 					typeof entry.replyInUserLanguage !== "boolean") ||
@@ -1097,6 +1312,7 @@ function parseNarrators(value: unknown): NarratorRecoveryTarget[] | null {
 		return [
 			{
 				narratorId: target.narratorId,
+				...(target.logicalRunId ? { logicalRunId: target.logicalRunId } : {}),
 				locale: target.locale,
 				...(typeof target.userId === "string" || target.userId === null
 					? { userId: target.userId }
@@ -1526,6 +1742,8 @@ export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpoch
 export function resetUpdateCoordinationForTests(): void {
 	clearTimeout(lifecycleNotification.timer);
 	lifecycleNotification.timer = undefined;
+	verifiedCheckpoint = undefined;
+	checkpointStops = undefined;
 	resetRecoveryHandoffForTests();
 	scheduledHandoff.current = undefined;
 	executions.clear();
