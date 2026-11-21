@@ -911,6 +911,22 @@ export const bashTool: ToolDefinition = {
 
 import type { ToolContext } from "../types";
 
+/**
+ * A shell that cannot be spawned (EACCES on the cwd, a missing shell) still yields a handle:
+ * the error arrives on the next tick, with no pid. Catch it before telling a caller that
+ * the task started. A handle with a pid is a running process.
+ */
+async function asyncSpawnFailure(handle: ExecHandle): Promise<{ error: unknown } | null> {
+	if (handle.pid !== undefined) return null;
+	return Promise.race([
+		handle.exited.then(
+			() => null,
+			(error: unknown) => ({ error }),
+		),
+		new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
+	]);
+}
+
 export async function startManualBackgroundBash(input: {
 	backend: ExecutionBackend;
 	target: NonNullable<ToolContext["executionTarget"]>;
@@ -1069,7 +1085,8 @@ async function launchBackgroundBash(
 				bgAbort.signal,
 				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
 			);
-			settleDispatch(null);
+			// Settled beside monitoring, not before it: output must not wait for the check.
+			void asyncSpawnFailure(handle).then(settleDispatch);
 			await monitorBackgroundBash({
 				taskId,
 				handle,

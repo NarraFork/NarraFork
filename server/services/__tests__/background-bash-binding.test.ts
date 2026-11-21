@@ -350,6 +350,26 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
 			expect(taskRow().backgroundKind).toBe("service");
 		});
+		test("a shell that fails to spawn after returning its handle is reported as not started", async () => {
+			execCommand.mockImplementationOnce(async () => {
+				const spawnError = new Error("EACCES: permission denied, posix_spawn '/bin/bash'");
+				return {
+					exited: new Promise<number | null>((_, reject) => {
+						process.nextTick(() => reject(spawnError));
+					}),
+					onData: () => {},
+					isExited: () => true,
+					kill: async () => {},
+				};
+			});
+			const scheduler = lease();
+			await expect(startManual("task", scheduler)).rejects.toMatchObject({
+				code: "TASK_START_FAILED",
+			});
+			await bounded(scheduler.released);
+			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
+		});
+
 		test("uses a real in-memory DB and temporary HOME", () => {
 			const databases = sqlite.query("PRAGMA database_list").all() as Array<{ file: string }>;
 			expect(databases.every((database) => database.file === "")).toBe(true);
