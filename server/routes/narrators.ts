@@ -34,6 +34,7 @@ import {
 	count as countFn,
 	desc,
 	eq,
+	getTableColumns,
 	gt,
 	lt,
 	ne,
@@ -60,6 +61,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
@@ -1182,6 +1184,7 @@ function publicTraitsResponse(traits: unknown): string[] {
 
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
+	const readOptions = { signal: c.req.raw.signal };
 	const userId = c.get("user").sub;
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
@@ -1301,14 +1304,23 @@ narratorRoutes.get("/", async (c) => {
 
 	const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
 
+	const { runtimeRegistrationJson: _runtimeRegistrationJson, ...listColumns } =
+		getTableColumns(narrators);
 	const [list, countResult] = await Promise.all([
-		db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			where: whereClause,
-			orderBy: [orderFn(column), orderFn(narrators.id)],
-			limit: limit + 1,
+		readQuery(
+			db
+				.select(listColumns)
+				.from(narrators)
+				.where(whereClause)
+				.orderBy(orderFn(column), orderFn(narrators.id))
+				.limit(limit + 1),
+			{ ...readOptions, diagnosticSource: "narrators.list.page", maxRows: limit + 1 },
+		),
+		readQuery(db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere), {
+			...readOptions,
+			diagnosticSource: "narrators.list.total",
+			maxRows: 1,
 		}),
-		db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
 	]);
 	const totalCount = countResult[0]?.count ?? 0;
 
@@ -1331,14 +1343,21 @@ narratorRoutes.get("/", async (c) => {
 	// Batch fetch active terminal counts
 	const terminalCounts = new Map<string, number>();
 	if (narratorIds.length > 0) {
-		const termRows = await db
-			.select({
-				narratorId: terminals.narratorId,
-				count: countFn(),
-			})
-			.from(terminals)
-			.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
-			.groupBy(terminals.narratorId);
+		const termRows = await readQuery(
+			db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId),
+			{
+				...readOptions,
+				diagnosticSource: "narrators.list.terminals",
+				maxRows: narratorIds.length,
+			},
+		);
 		for (const row of termRows) {
 			if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
 		}
@@ -1348,19 +1367,26 @@ narratorRoutes.get("/", async (c) => {
 	// worktree resources each narrator owns.
 	const containerCounts = new Map<string, { total: number; running: number }>();
 	if (narratorIds.length > 0) {
-		const containerRows = await db
-			.select({
-				narratorId: narratorWorktreeResources.ownerNarratorId,
-				total: countFn(),
-				running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
-			})
-			.from(containerInstances)
-			.innerJoin(
-				narratorWorktreeResources,
-				eq(narratorWorktreeResources.id, containerInstances.worktreeResourceId),
-			)
-			.where(sql`${narratorWorktreeResources.ownerNarratorId} IN ${narratorIds}`)
-			.groupBy(narratorWorktreeResources.ownerNarratorId);
+		const containerRows = await readQuery(
+			db
+				.select({
+					narratorId: narratorWorktreeResources.ownerNarratorId,
+					total: countFn(),
+					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
+				})
+				.from(containerInstances)
+				.innerJoin(
+					narratorWorktreeResources,
+					eq(narratorWorktreeResources.id, containerInstances.worktreeResourceId),
+				)
+				.where(sql`${narratorWorktreeResources.ownerNarratorId} IN ${narratorIds}`)
+				.groupBy(narratorWorktreeResources.ownerNarratorId),
+			{
+				...readOptions,
+				diagnosticSource: "narrators.list.containers",
+				maxRows: narratorIds.length,
+			},
+		);
 		for (const row of containerRows) {
 			if (row.narratorId === null) continue;
 			containerCounts.set(row.narratorId, {
@@ -1376,7 +1402,10 @@ narratorRoutes.get("/", async (c) => {
 	// conversation would keep reporting its high-water mark. Counting the page's
 	// ids is one grouped, indexed query: 0.8ms for a typical page, 11ms for a
 	// synthetic page of the 20 largest narrators in the database.
-	const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
+	const messageCounts = await countNarratorMessageRefsBatch(narratorIds, {
+		...readOptions,
+		diagnosticSource: "narrators.list.messages",
+	});
 
 	// Batch fetch presence and the current user's private draft markers
 	const presenceMap = getNarratorPresenceBatch(narratorIds);

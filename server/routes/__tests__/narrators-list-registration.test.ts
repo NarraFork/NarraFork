@@ -46,12 +46,16 @@ test("list queries exclude the registration at SQL projection, not only response
 		join(import.meta.dir, "../../services/narrator-service.ts"),
 		"utf-8",
 	);
-	for (const site of [
-		routes.slice(routes.indexOf("const [list, countResult]"), routes.indexOf("const totalCount")),
+	const list = routes.slice(
+		routes.indexOf("const { runtimeRegistrationJson:"),
+		routes.indexOf("const totalCount"),
+	);
+	expect(list).toMatch(/runtimeRegistrationJson:\s*_runtimeRegistrationJson,\s*\.\.\.listColumns/);
+	expect(list).toContain("getTableColumns(narrators)");
+	expect(list).toContain(".select(listColumns)");
+	expect(
 		service.slice(service.indexOf("async listNamed()"), service.indexOf("async setHandle(")),
-	]) {
-		expect(site).toMatch(/columns:\s*\{\s*runtimeRegistrationJson:\s*false\s*\}/);
-	}
+	).toMatch(/columns:\s*\{\s*runtimeRegistrationJson:\s*false\s*\}/);
 });
 test("named list searches by handle instead of scanning every narrator", () => {
 	const service = readFileSync(
