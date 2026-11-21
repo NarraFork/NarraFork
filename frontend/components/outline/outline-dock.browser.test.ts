@@ -1114,49 +1114,45 @@ test("the breadcrumbs stay on one line in a narrow panel: ancestors only, the mi
 			page,
 			(f) => f.outlinePanels()[0]?.title === "Level five is what the panel focuses",
 		);
-		// The seed can show the fold before the live snapshot arrives. Its upgrade briefly
-		// replaces that path before the editor reports its live focus: wait for that path,
-		// not merely the fold's first appearance, and for the narrow layout to be measured.
-		await page.waitForFunction(
-			(parentId) => {
-				const surface = document.querySelector<HTMLElement>("[data-testid=outline-surface]");
-				const nav = surface?.querySelector("[data-testid=outline-crumbs]");
-				const parent = nav?.querySelector<HTMLAnchorElement>("a[data-last]");
-				return (
-					surface?.dataset.compact === "true" &&
-					surface.querySelector("[data-testid=outline-editor][data-status=live]") !== null &&
-					nav?.querySelector("[data-testid=outline-crumbs-more]") !== null &&
-					parent?.pathname.split("/").at(-1) === parentId
-				);
-			},
-			{ timeout: 10_000 },
-			tidy.deep[3],
-		);
-		const bar = () =>
-			page.evaluate(() => {
-				const nav = document.querySelector<HTMLElement>("[data-testid=outline-crumbs]");
-				const surface = document.querySelector<HTMLElement>("[data-testid=outline-surface]");
-				if (!nav || !surface) return null;
-				const items = [...nav.children] as HTMLElement[];
-				const tops = new Set(items.map((el) => Math.round(el.getBoundingClientRect().top / 4)));
-				const first = items[0]?.getBoundingClientRect();
-				return {
-					links: [...nav.querySelectorAll("a")].map((a) => a.textContent?.trim() ?? ""),
-					// One line: every crumb and separator starts on the same row…
-					rows: tops.size,
-					// …and the bar is no taller than a line and a half of its first crumb.
-					oneLine: !!first && nav.getBoundingClientRect().height < first.height * 1.5,
-					// Nothing reaches past the panel.
-					inside: items.every(
-						(el) => el.getBoundingClientRect().right <= surface.getBoundingClientRect().right + 0.5,
-					),
-					panelWidth: Math.round(surface.getBoundingClientRect().width),
-					surfaceScrolls: surface.scrollWidth > surface.clientWidth + 1,
-					// The long crumbs were cut, not wrapped.
-					cut: [...nav.querySelectorAll("a")].filter((a) => a.scrollWidth > a.clientWidth).length,
-				};
-			});
-		const shown = await bar();
+		const readBar = (parentId?: string) => {
+			const surface = document.querySelector<HTMLElement>("[data-testid=outline-surface]");
+			const nav = surface?.querySelector<HTMLElement>("[data-testid=outline-crumbs]");
+			if (!nav || !surface) return null;
+			if (
+				parentId &&
+				(surface.dataset.compact !== "true" ||
+					!surface.querySelector("[data-testid=outline-editor][data-status=live]") ||
+					!nav.querySelector("[data-testid=outline-crumbs-more]") ||
+					nav.querySelector<HTMLAnchorElement>("a[data-last]")?.pathname.split("/").at(-1) !==
+						parentId)
+			) {
+				return null;
+			}
+			const items = [...nav.children] as HTMLElement[];
+			const tops = new Set(items.map((el) => Math.round(el.getBoundingClientRect().top / 4)));
+			const first = items[0]?.getBoundingClientRect();
+			return {
+				links: [...nav.querySelectorAll("a")].map((a) => a.textContent?.trim() ?? ""),
+				// One line: every crumb and separator starts on the same row…
+				rows: tops.size,
+				// …and the bar is no taller than a line and a half of its first crumb.
+				oneLine: !!first && nav.getBoundingClientRect().height < first.height * 1.5,
+				// Nothing reaches past the panel.
+				inside: items.every(
+					(el) => el.getBoundingClientRect().right <= surface.getBoundingClientRect().right + 0.5,
+				),
+				panelWidth: Math.round(surface.getBoundingClientRect().width),
+				surfaceScrolls: surface.scrollWidth > surface.clientWidth + 1,
+				// The long crumbs were cut, not wrapped.
+				cut: [...nav.querySelectorAll("a")].filter((a) => a.scrollWidth > a.clientWidth).length,
+			};
+		};
+		// The live upgrade can replace the seed path between browser calls. Read the
+		// layout in the same browser call that observes the expected live path.
+		const readyBar = await page.waitForFunction(readBar, { timeout: 10_000 }, tidy.deep[3]);
+		const shown = await readyBar.jsonValue();
+		await readyBar.dispose();
+		const bar = () => page.evaluate(readBar);
 		expect(shown?.panelWidth).toBeLessThan(480);
 		// Outline › space › page › [Level one] … [Level four]: the focused block is not among them.
 		expect(shown?.links.slice(0, 1)).toEqual(["Outline"]);
