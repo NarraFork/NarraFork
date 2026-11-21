@@ -233,6 +233,30 @@ test("rejects an archive symlink pointing to dist", async () => {
 	expect(existsSync(join(options.root, "invocation.json"))).toBe(false);
 });
 
+test.each([
+	".build-alpha.lock",
+	".build-alpha.lock/archive",
+	"dist/frontend/archive",
+	"frontend/public/archive",
+])("rejects an archive under %s before running the builder", async (archiveDir) => {
+	const options = fixture();
+	await expect(buildAlpha({ ...options, archiveDir })).rejects.toThrow("build-owned or public");
+	expectRestored(options);
+	expect(existsSync(join(options.root, "invocation.json"))).toBe(false);
+});
+
+test("rejects a new archive below a symlink to the frontend output", async () => {
+	const options = fixture();
+	const frontend = join(options.root, "dist", "frontend");
+	mkdirSync(frontend);
+	symlinkSync(frontend, options.archiveDir, "junction");
+	await expect(
+		buildAlpha({ ...options, archiveDir: join(options.archiveDir, "not-yet-created") }),
+	).rejects.toThrow("build-owned or public");
+	expectRestored(options);
+	expect(existsSync(join(options.root, "invocation.json"))).toBe(false);
+});
+
 test("automatically selects the numeric maximum across dist and archive and restores package bytes", async () => {
 	const options = fixture();
 	const selection = {

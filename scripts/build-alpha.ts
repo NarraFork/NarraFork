@@ -13,7 +13,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import {
@@ -32,6 +32,23 @@ function artifactNames(version: string): string[] {
 		`narrafork-${version}-SHA256SUMS`,
 		`narrafork-${version}-checksums.txt`,
 	];
+}
+
+function resolveArchivePath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch (error) {
+		const parent = dirname(path);
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === path) throw error;
+		return join(resolveArchivePath(parent), basename(path));
+	}
+}
+
+function isWithin(path: string, directory: string): boolean {
+	const fromDirectory = relative(directory, path);
+	return (
+		!isAbsolute(fromDirectory) && fromDirectory !== ".." && !fromDirectory.startsWith(`..${sep}`)
+	);
 }
 
 /** Archive links keep targets in place; dist moves protect backups from compiler writes. */
@@ -215,13 +232,16 @@ export async function buildAlpha(options: {
 	}
 	const archive = resolve(root, options.archiveDir);
 	const dist = join(root, "dist");
-	if (
-		archive === dist ||
-		(existsSync(archive) && existsSync(dist) && realpathSync(archive) === realpathSync(dist))
-	) {
+	const lock = join(root, ".build-alpha.lock");
+	const resolvedArchive = resolveArchivePath(archive);
+	if (resolvedArchive === resolveArchivePath(dist)) {
 		throw new Error("ARCHIVE_DIR must differ from dist");
 	}
-	const lock = join(root, ".build-alpha.lock");
+	for (const reserved of [lock, join(dist, "frontend"), join(root, "frontend", "public")]) {
+		if (isWithin(archive, reserved) || isWithin(resolvedArchive, resolveArchivePath(reserved))) {
+			throw new Error(`ARCHIVE_DIR cannot be inside build-owned or public directory: ${reserved}`);
+		}
+	}
 	try {
 		mkdirSync(lock, { mode: 0o700 });
 	} catch (error) {
