@@ -142,6 +142,7 @@ export function FileTreePanel({
 			key={treeIdentity}
 			contextKey={treeIdentity}
 			root={root}
+			narratorId={narratorId}
 			showHidden={showHidden}
 			onToggleShowHidden={toggleShowHidden}
 			changedPaths={changedPaths}

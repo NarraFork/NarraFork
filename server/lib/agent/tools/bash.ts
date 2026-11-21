@@ -178,14 +178,25 @@ interface BashExecution {
 	cancelUndispatched(): void;
 }
 
+type BashStartContext = Pick<
+	ToolContext,
+	| "narratorId"
+	| "signal"
+	| "executionTarget"
+	| "currentToolUseId"
+	| "toolCallBinding"
+	| "updateExecutionLease"
+>;
+
 /** Admission and lifetime are independent of the legacy attribution mutex and
  * tool/HTTP return. Even an unrecognized/read-only-looking command participates. */
 async function prepareBashExecution(
 	backend: ExecutionBackend,
 	command: string,
 	cwd: string,
-	ctx: ToolContext,
+	ctx: BashStartContext,
 	env?: Record<string, string> | null,
+	captureId?: string,
 ): Promise<BashExecution> {
 	const target = ctx.executionTarget;
 	if (
@@ -220,7 +231,10 @@ async function prepareBashExecution(
 				signal.throwIfAborted();
 				if (backend.kind === "local") {
 					try {
-						bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
+						bashWindow = beginBashCaptureWindow(
+							cwd,
+							ctx.currentToolUseId ?? captureId ?? "__anonymous__",
+						);
 					} catch (error) {
 						logger.warn("Bash snapshot observation unavailable", { error: String(error) });
 					}
@@ -897,6 +911,87 @@ export const bashTool: ToolDefinition = {
 
 import type { ToolContext } from "../types";
 
+/**
+ * A shell that cannot be spawned (EACCES on the cwd, a missing shell) still yields a handle:
+ * the error arrives on the next tick, with no pid. Catch it before telling a caller that
+ * the task started. A handle with a pid is a running process.
+ */
+async function asyncSpawnFailure(handle: ExecHandle): Promise<{ error: unknown } | null> {
+	if (handle.pid !== undefined) return null;
+	return Promise.race([
+		handle.exited.then(
+			() => null,
+			(error: unknown) => ({ error }),
+		),
+		new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
+	]);
+}
+
+export async function startManualBackgroundBash(input: {
+	backend: ExecutionBackend;
+	target: NonNullable<ToolContext["executionTarget"]>;
+	narratorId: string;
+	userId: string;
+	command: string;
+	title?: string;
+	timeoutMs?: number;
+	kind: "task" | "service";
+	signal: AbortSignal;
+	proxyEnv: Record<string, string>;
+	updateExecutionLease: NonNullable<ToolContext["updateExecutionLease"]>;
+	authorizeDispatch: () => Promise<void>;
+}): Promise<{ id: string; alias: string }> {
+	const { backend, target, narratorId, command, signal, updateExecutionLease } = input;
+	if (!(await isExistingDirectory(backend, target.cwd))) {
+		throw new AppError(
+			"The narrator working directory is not available",
+			409,
+			"WORKSPACE_DIRECTORY_REQUIRED",
+		);
+	}
+	const env = await resolveNarratorGitIdentityEnv({ turnUserId: input.userId, narratorId });
+	const context = { narratorId, signal, executionTarget: target, updateExecutionLease };
+	const taskId = `bash_${generateShortId()}`;
+	const execution = await prepareBashExecution(
+		backend,
+		command,
+		target.cwd,
+		context,
+		{
+			...env,
+			...input.proxyEnv,
+		},
+		taskId,
+	);
+	try {
+		const task = await launchBackgroundBash(
+			command,
+			resolveBashTimeoutMs(true, input.timeoutMs),
+			input.title ?? command.trim().slice(0, 80),
+			context,
+			{
+				start: async (taskSignal, options) => {
+					await input.authorizeDispatch();
+					return execution.start(taskSignal, options);
+				},
+			},
+			input.kind,
+			taskId,
+		);
+		// Hold workspace admission through dispatch, not through the process lifetime.
+		const failure = await task.dispatched;
+		if (failure) {
+			// The failed row stays in the task list; the caller still has to hear that
+			// nothing is running rather than receive a task id as if it had started.
+			if (failure.error instanceof AppError) throw failure.error;
+			const reason = failure.error instanceof Error ? failure.error.message : String(failure.error);
+			throw new AppError(`The task did not start: ${reason}`, 422, "TASK_START_FAILED");
+		}
+		return { id: task.id, alias: task.alias };
+	} finally {
+		execution.cancelUndispatched();
+	}
+}
 async function _runInBackground(
 	command: string,
 	timeoutMs: number | undefined,
@@ -905,25 +1000,63 @@ async function _runInBackground(
 	execution: BashExecution,
 	backgroundKind: "task" | "service",
 ): Promise<ToolResult> {
-	const taskId = `bash_${generateShortId()}`;
+	const { alias, conflicted } = await launchBackgroundBash(
+		command,
+		timeoutMs,
+		title,
+		ctx,
+		execution,
+		backgroundKind,
+	);
+	let output =
+		`<background_task_id>${alias}</background_task_id>\n\n` +
+		`Background bash ${backgroundKind} started: ${title}\n` +
+		`Watch({ type: "bash", id: "${alias}" })`;
+	if (conflicted) {
+		output += `\n\nNote: A similar alias was already taken. This task was assigned "${alias}" instead.`;
+	}
+	return { output, title };
+}
+
+async function launchBackgroundBash(
+	command: string,
+	timeoutMs: number | undefined,
+	title: string,
+	ctx: BashStartContext,
+	execution: Pick<BashExecution, "start">,
+	backgroundKind: "task" | "service",
+	taskId = `bash_${generateShortId()}`,
+) {
 	const bgAbort = new AbortController();
+	// Settles once the process has started (`null`) or once starting it failed (the error),
+	// so a caller that waits on dispatch can tell the two apart.
+	const { promise: dispatched, resolve: settleDispatch } = Promise.withResolvers<{
+		error: unknown;
+	} | null>();
+	let dispatchFailure: { error: unknown } | null = null;
 
 	// Register a human-readable alias for this background task
-	const { registerTaskAlias } = await import("@server/services/narrator-subagent");
+	const { registerTaskAlias, unregisterTaskAlias } = await import(
+		"@server/services/subagent-alias"
+	);
 	const { alias, conflicted } = registerTaskAlias(ctx.narratorId, taskId, title);
 
-	// Create the task record in the service (DB-backed)
-	await backgroundTaskService.createBashTask({
-		id: taskId,
-		parentNarratorId: ctx.narratorId,
-		command,
-		backgroundKind,
-		toolUseId: ctx.currentToolUseId ?? undefined,
-		toolCallBinding: ctx.toolCallBinding,
-		executionTarget: ctx.executionTarget,
-		alias,
-		title,
-	});
+	try {
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId: ctx.narratorId,
+			command,
+			backgroundKind,
+			toolUseId: ctx.currentToolUseId ?? undefined,
+			toolCallBinding: ctx.toolCallBinding,
+			executionTarget: ctx.executionTarget,
+			alias,
+			title,
+		});
+	} catch (error) {
+		unregisterTaskAlias(ctx.narratorId, taskId);
+		throw error;
+	}
 	backgroundTaskService.registerAbortController(taskId, bgAbort);
 
 	// The executor owns the lease until the durable task record exists. Transfer it only
@@ -952,6 +1085,8 @@ async function _runInBackground(
 				bgAbort.signal,
 				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
 			);
+			// Settled beside monitoring, not before it: output must not wait for the check.
+			void asyncSpawnFailure(handle).then(settleDispatch);
 			await monitorBackgroundBash({
 				taskId,
 				handle,
@@ -966,6 +1101,7 @@ async function _runInBackground(
 				callerSignal: ctx.signal,
 			});
 		} catch (err) {
+			dispatchFailure = { error: err };
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
 			if (
@@ -981,22 +1117,14 @@ async function _runInBackground(
 			// without holding the lease on filesystem cleanup.
 			if (backgroundKind === "service") void removeServiceArtifacts(taskId);
 		} finally {
+			settleDispatch(dispatchFailure);
 			releaseUpdateLease();
 		}
-	})();
+	})().catch((error) =>
+		logger.error("Failed to settle background Bash task", { taskId, error: String(error) }),
+	);
 
-	let output =
-		`<background_task_id>${alias}</background_task_id>\n\n` +
-		`Background bash ${backgroundKind} started: ${title}\n` +
-		`Watch({ type: "bash", id: "${alias}" })`;
-
-	if (conflicted) {
-		output +=
-			`\n\nNote: A similar alias was already taken. ` +
-			`This task was assigned "${alias}" instead.`;
-	}
-
-	return { output, title };
+	return { id: taskId, alias, conflicted, dispatched };
 }
 
 export interface MonitorBackgroundBashOptions {
