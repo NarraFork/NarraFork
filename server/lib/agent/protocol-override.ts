@@ -28,6 +28,8 @@ export interface ProtocolConnectionFields {
 	geminiTransport?: "generate-content" | "interactions";
 	defaultContextWindow?: number;
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+	/** Chat Completions：工具结果图片的去处，换适配器时必须跟着走。 */
+	toolResultImages?: "off" | "inline" | "separate";
 	apiMode?: "responses" | "completions" | "codex";
 	responsesApi?: boolean;
 }
@@ -86,5 +88,6 @@ export function connectionForProtocolSwitch(
 		geminiTransport: source.geminiTransport,
 		defaultContextWindow: source.defaultContextWindow,
 		defaultReasoningEffort: source.defaultReasoningEffort,
+		toolResultImages: source.toolResultImages,
 	};
 }

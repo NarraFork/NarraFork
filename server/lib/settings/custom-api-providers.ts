@@ -235,6 +235,7 @@ export function customApiProviderToOpenAI(
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
 		codexImageGeneration: provider.codexImageGeneration,
+		toolResultImages: provider.toolResultImages,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
