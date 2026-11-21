@@ -21,13 +21,16 @@ test("empty snapshots contain no fabricated task identity", () => {
 	});
 });
 
-test("recording attribution is preserved but arbitrary source text is discarded", () => {
+test.each([
+	"narrator.request-recording",
+	"narrator.message-language",
+])("attribution is preserved for %s but arbitrary text is discarded", (label) => {
 	mockWarn = spyOn(logger, "warn").mockImplementation(() => {});
-	const source = readPoolDiagnosticSource("narrator.request-recording");
+	const source = readPoolDiagnosticSource(label);
 	expect(readPoolTaskSnapshot({ kind: "selectRows", source, startedAt: 0 }, 1, 0)).toMatchObject({
-		source: "narrator.request-recording",
+		source: label,
 	});
-	expect(readPoolDiagnosticSource("narrator.request-recording:request-id")).toBe("unattributed");
+	expect(readPoolDiagnosticSource(`${label}:request-id`)).toBe("unattributed");
 });
 
 test("queue rejection bursts are bounded independently from timeout evidence", () => {

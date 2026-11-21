@@ -236,9 +236,12 @@ describe("readQuery", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 	});
 
-	test("a real creation failure never executes the query on the main connection", async () => {
+	test.each([
+		false,
+		true,
+	])("creation failure never executes inline (shortRead=%s)", async (shortRead) => {
 		setDbWorkerSpecifiersForTest([pathToFileURL(join(home, "missing-worker.ts")).href]);
-		await rejectsOffThread();
+		await rejectsOffThread({ shortRead });
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 
@@ -248,18 +251,21 @@ describe("readQuery", () => {
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 
-	test("a worker that exits during the task never executes the query on the main connection", async () => {
+	test.each([
+		false,
+		true,
+	])("Worker exit never executes inline (shortRead=%s)", async (shortRead) => {
 		useWorkerFixture(
 			"exits",
 			'self.onmessage = () => process.exit(3); postMessage({ type: "ready" });',
 		);
-		await rejectsOffThread();
+		await rejectsOffThread({ shortRead });
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 	});
 
-	test("a timeout never executes the query on the main connection", async () => {
+	test.each([false, true])("timeout never executes inline (shortRead=%s)", async (shortRead) => {
 		useWorkerFixture("hangs", 'self.onmessage = () => {}; postMessage({ type: "ready" });');
-		await rejectsOffThread({ timeoutMs: 200 });
+		await rejectsOffThread({ shortRead, timeoutMs: 200 });
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 
