@@ -1,6 +1,6 @@
 {
-  "id": "44828ca8-52df-45aa-9c76-905894b958cf",
-  "prevId": "247a3c32-d37e-4ac1-8c2d-f1c176eb47a4",
+  "id": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+  "prevId": "44828ca8-52df-45aa-9c76-905894b958cf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1241,6 +1241,22 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_bg_tasks_active": {
+          "name": "idx_bg_tasks_active",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"status\" IN ('running','paused')",
           "concurrently": false,
           "method": "btree",
           "with": {}

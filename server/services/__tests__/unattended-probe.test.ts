@@ -30,6 +30,16 @@ afterEach(() => {
 });
 
 describe("unattended idle probe", () => {
+	test("the active background task probe uses an index in the no-match case", () => {
+		const plan = sqlite
+			.query<{ detail: string }, []>(
+				`EXPLAIN QUERY PLAN SELECT 1 AS hit FROM background_tasks
+				  WHERE status IN ('running','paused') LIMIT 1`,
+			)
+			.all();
+		expect(plan.map(({ detail }) => detail).join("\n")).toContain("idx_bg_tasks_active");
+	});
+
 	test("an empty instance is idle", async () => {
 		const report = await probeUnattendedIdle({ dueWithinMs: 120_000 });
 		expect(report.unknown).toBe(false);
