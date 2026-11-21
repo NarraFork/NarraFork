@@ -102,8 +102,14 @@ const fsEntryNameSchema = z
 	.min(1, "name is required")
 	.max(255, "name is too long")
 	.refine((name) => !/[/\\<>:"|?*]/.test(name), "The name contains a character a path cannot hold")
-	.refine((name) => ![...name].some((ch) => ch.charCodeAt(0) < 32), "The name contains a control character")
-	.refine((name) => name !== "." && name !== "..", "The name must not be a relative directory reference");
+	.refine(
+		(name) => ![...name].some((ch) => ch.charCodeAt(0) < 32),
+		"The name contains a control character",
+	)
+	.refine(
+		(name) => name !== "." && name !== "..",
+		"The name must not be a relative directory reference",
+	);
 
 /** `POST /api/fs/rename` — rename in place, keeping the entry in its own directory. */
 export const fsRenameSchema = fsEntryTargetSchema.extend({ name: fsEntryNameSchema });

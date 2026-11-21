@@ -24,7 +24,8 @@
 
 import { useSyncExternalStore } from "react";
 
-export interface FileClipboardEntry {	/** `copy` keeps the source; `move` removes it after a successful paste. */
+export interface FileClipboardEntry {
+	/** `copy` keeps the source, `move` removes it after a successful paste. */
 	mode: "copy" | "move";
 	/** Absolute path of the copied file. */
 	path: string;

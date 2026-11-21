@@ -16,7 +16,7 @@ import { ApiError, api } from "@frontend/lib/api";
 import { Button, Group, Modal, Stack, Text, TextInput } from "@mantine/core";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { fileMenuRelativeDirectory, type FileMenuTarget } from "./file-menu-target";
+import { type FileMenuTarget, fileMenuRelativeDirectory } from "./file-menu-target";
 
 export interface FileRenameModalProps {
 	/** The entry being renamed, or null when the dialog is closed. */

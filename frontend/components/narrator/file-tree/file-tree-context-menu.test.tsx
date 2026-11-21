@@ -81,7 +81,9 @@ mock.module("./FileContextMenu", () => ({
  * `onContextMenu` survive — that is the wiring under test.
  */
 mock.module("@mantine/core", () => ({
-	ActionIcon: ({ children, ...rest }: { children?: ReactNode }) => <button {...rest}>{children}</button>,
+	ActionIcon: ({ children, ...rest }: { children?: ReactNode }) => (
+		<button {...rest}>{children}</button>
+	),
 	Box: ({ children, ...rest }: { children?: ReactNode }) => <div {...rest}>{children}</div>,
 	Center: ({ children, ...rest }: { children?: ReactNode }) => <div {...rest}>{children}</div>,
 	Group: ({ children, ...rest }: { children?: ReactNode }) => <div {...rest}>{children}</div>,
@@ -131,12 +133,7 @@ beforeEach(() => {
 	root = createRoot(container);
 	act(() => {
 		root.render(
-			<FileTreeContent
-				root="/repo"
-				narratorId="narrator-a"
-				showHidden
-				onOpenFile={() => {}}
-			/>,
+			<FileTreeContent root="/repo" narratorId="narrator-a" showHidden onOpenFile={() => {}} />,
 		);
 	});
 });

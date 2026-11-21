@@ -52,9 +52,9 @@ import { useTranslation } from "react-i18next";
 import { ContextMenu, type ContextMenuItem } from "../../common/ContextMenu";
 import { clearFileClipboard, setFileClipboard, useFileClipboard } from "./file-clipboard";
 import {
+	type FileMenuTarget,
 	fileMenuDirectory,
 	fileMenuRelativeDirectory,
-	type FileMenuTarget,
 } from "./file-menu-target";
 
 /**
@@ -148,9 +148,7 @@ export function FileContextMenu({
 				});
 			} catch (error) {
 				report(
-					apiFailureStatus(error) === 403
-						? new Error(t("fileTree.copyToClipboardRemote"))
-						: error,
+					apiFailureStatus(error) === 403 ? new Error(t("fileTree.copyToClipboardRemote")) : error,
 					"fileTree.copyToClipboardFailed",
 				);
 			}

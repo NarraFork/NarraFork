@@ -36,7 +36,15 @@ let transferConflictPlainShape = false;
 /** The code every conflict carries: the destination name is taken. */
 const CONFLICT_CODE = "ALREADY_EXISTS";
 
-const keys = ["window", "document", "navigator", "HTMLElement", "Element", "Node", "Event"] as const;
+const keys = [
+	"window",
+	"document",
+	"navigator",
+	"HTMLElement",
+	"Element",
+	"Node",
+	"Event",
+] as const;
 const originals = keys.map(
 	(key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
 );
@@ -383,7 +391,12 @@ test("pasting a file onto itself still asks, then replaces without touching the 
 
 	expect(confirmCalls).toHaveLength(1);
 	expect(transferCalls).toEqual([
-		{ narratorId: "narrator-a", path: target.absolutePath, targetDir: "/repo/src/deep", mode: "copy" },
+		{
+			narratorId: "narrator-a",
+			path: target.absolutePath,
+			targetDir: "/repo/src/deep",
+			mode: "copy",
+		},
 		{
 			narratorId: "narrator-a",
 			path: target.absolutePath,

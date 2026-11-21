@@ -34,7 +34,13 @@ import {
 	IconEyeOff,
 	IconRefresh,
 } from "@tabler/icons-react";
-import { type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+	type MouseEvent as ReactMouseEvent,
+	useCallback,
+	useEffect,
+	useMemo,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import { createFileReferenceId } from "../composer/file-reference-input";

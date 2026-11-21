@@ -325,7 +325,11 @@ fsRoutes.post("/rename", async (c) => {
 		if ((error as NodeJS.ErrnoException)?.code === "EXDEV") {
 			throw new AppError("Cannot rename across filesystems", 422, "CROSS_DEVICE");
 		}
-		throw new AppError(error instanceof Error ? error.message : String(error), 422, "RENAME_FAILED");
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"RENAME_FAILED",
+		);
 	}
 	return c.json({ ok: true, path: target.lexical });
 });
@@ -381,10 +385,7 @@ fsRoutes.post("/transfer", async (c) => {
 	if (!targetDirInfo.isDirectory()) {
 		throw new ValidationError(`Not a directory: ${targetDir.physical}`);
 	}
-	const target = authorizeWritablePath(
-		join(targetDir.physical, basename(source.physical)),
-		roots,
-	);
+	const target = authorizeWritablePath(join(targetDir.physical, basename(source.physical)), roots);
 	// A cut pasted into its own directory names the source itself: same folder, same name.
 	// It is reported like any other taken destination so the caller's overwrite flow runs,
 	// but the replacement must NEVER touch the bytes — an `unlink` here would delete the
@@ -402,11 +403,7 @@ fsRoutes.post("/transfer", async (c) => {
 	if (destinationExists) {
 		const existing = await existingEntry(target.physical);
 		if (existing.isDirectory() || existing.isSymbolicLink()) {
-			throw new AppError(
-				"Only a regular file can be replaced",
-				422,
-				"UNSUPPORTED_ENTRY",
-			);
+			throw new AppError("Only a regular file can be replaced", 422, "UNSUPPORTED_ENTRY");
 		}
 		// Removed before the transfer rather than overwritten in place: `rename` onto an
 		// existing name fails outright on Windows, and a half-replaced file would be worse
@@ -469,7 +466,11 @@ fsRoutes.post("/delete", async (c) => {
 	try {
 		await unlink(target.physical);
 	} catch (error) {
-		throw new AppError(error instanceof Error ? error.message : String(error), 422, "DELETE_FAILED");
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"DELETE_FAILED",
+		);
 	}
 	return c.json({ ok: true });
 });
