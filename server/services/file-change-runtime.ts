@@ -5,7 +5,6 @@ import { constants } from "node:fs";
 import { link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeActor,
@@ -323,22 +322,21 @@ export class LocalFileChangeRuntime {
 		return namespace;
 	}
 
-	async assertAdmission(
+	assertAdmission(
 		request: Pick<LocalFileChangeRequest, "ctx" | "backend" | "toolName" | "filePath">,
-	): Promise<void> {
-		if (request.ctx.toolCallBinding) await this.validateCall(request);
+	): void {
+		if (request.ctx.toolCallBinding) this.validateCall(request);
 	}
-	private async validateCall(
+	private validateCall(
 		request: Pick<
 			LocalFileChangeRequest,
 			"ctx" | "backend" | "toolName" | "filePath" | "exclusiveCreate"
 		>,
 	) {
 		const { ctx, backend, toolName } = request;
-		const binding = ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding });
-		const target = ctx.executionTarget && Object.freeze({ ...ctx.executionTarget });
-		const observedRuntime = this.readRuntime(LOCAL_DEVICE_ID);
-		const runtime = observedRuntime && Object.freeze({ ...observedRuntime });
+		const binding = ctx.toolCallBinding;
+		const target = ctx.executionTarget;
+		const runtime = this.readRuntime(LOCAL_DEVICE_ID);
 		if (
 			backend.kind !== "local" ||
 			backend.deviceId !== LOCAL_DEVICE_ID ||
@@ -354,14 +352,11 @@ export class LocalFileChangeRuntime {
 			backend.runtimeGeneration !== runtime.runtimeGeneration
 		)
 			throw new Error("Trusted local tool-call binding and frozen target required");
-		const row = await readQueryFirst(
-			this.database
-				.select(TOOL_COLUMNS)
-				.from(narratorToolCalls)
-				.where(eq(narratorToolCalls.id, binding.toolCallId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1, signal: ctx.signal },
-		);
+		const row = this.database
+			.select(TOOL_COLUMNS)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
 		if (
 			!row ||
 			row.version !== 1 ||
@@ -383,16 +378,6 @@ export class LocalFileChangeRuntime {
 			((row.status !== "running" || row.startedAt === null) && row.operationId === null)
 		)
 			throw new Error("Tool-call row/attempt does not match its real authorized execution");
-		const currentRuntime = this.readRuntime(LOCAL_DEVICE_ID);
-		if (
-			!currentRuntime ||
-			currentRuntime.runtimeEpoch !== runtime.runtimeEpoch ||
-			currentRuntime.runtimeGeneration !== runtime.runtimeGeneration ||
-			backend.runtimeGeneration !== target.runtimeGeneration ||
-			JSON.stringify(ctx.toolCallBinding) !== JSON.stringify(binding) ||
-			JSON.stringify(ctx.executionTarget) !== JSON.stringify(target)
-		)
-			throw new Error("Trusted tool binding or runtime changed during metadata preflight");
 		const filePath = backend.paths.resolve(target.cwd, request.filePath);
 		if (request.exclusiveCreate) {
 			// The authorized/persisted target remains the UI base. Only the generated
@@ -417,10 +402,10 @@ export class LocalFileChangeRuntime {
 		return { row, target: Object.freeze({ ...target }), runtime: Object.freeze({ ...runtime }) };
 	}
 
-	async prepareHostNoDispatch(
+	prepareHostNoDispatch(
 		ctx: ToolContext,
 		toolName: FileChangeToolName,
-	): Promise<(reason: FileChangeNoDispatchProof["reason"], claimed: boolean) => Promise<void>> {
+	): (reason: FileChangeNoDispatchProof["reason"], claimed: boolean) => Promise<void> {
 		const frozen: ToolContext = {
 			...ctx,
 			toolCallBinding: ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding }),
@@ -429,14 +414,11 @@ export class LocalFileChangeRuntime {
 		const binding = frozen.toolCallBinding;
 		const target = frozen.executionTarget;
 		if (!binding || !target) throw new Error("No-dispatch observation requires a frozen attempt");
-		const row = await readQueryFirst(
-			this.database
-				.select(TOOL_COLUMNS)
-				.from(narratorToolCalls)
-				.where(eq(narratorToolCalls.id, binding.toolCallId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1 },
-		);
+		const row = this.database
+			.select(TOOL_COLUMNS)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
 		if (
 			!row ||
 			row.version !== 1 ||
@@ -473,8 +455,7 @@ export class LocalFileChangeRuntime {
 			this.recordHostNoDispatch(frozen, toolName, reason, claimed, observation);
 	}
 
-	/** Host control-flow fact only: no IO lease, blob, file state or remote receipt.
-	 * Audit metadata reads remain available after execution cancellation. */
+	/** Host control-flow fact only: no IO lease, blob, file state or remote receipt. */
 	async recordHostNoDispatch(
 		ctx: ToolContext,
 		toolName: FileChangeToolName,
@@ -501,14 +482,11 @@ export class LocalFileChangeRuntime {
 			observation.toolUseId === ctx.currentToolUseId &&
 			observation.toolName === toolName &&
 			observation.targetJson === JSON.stringify(target);
-		const row = await readQueryFirst(
-			this.database
-				.select(TOOL_COLUMNS)
-				.from(narratorToolCalls)
-				.where(eq(narratorToolCalls.id, binding.toolCallId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1 },
-		);
+		const row = this.database
+			.select(TOOL_COLUMNS)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
 		if (
 			!row ||
 			row.version !== 1 ||
@@ -532,19 +510,16 @@ export class LocalFileChangeRuntime {
 					row.startedAt !== null)
 		)
 			throw new Error("No-dispatch proof does not match the live host attempt");
-		const actorRow = await readQueryFirst(
-			this.database
-				.select({
-					type: narrators.type,
-					variant: narrators.variant,
-					title: narrators.title,
-					parent: narrators.parentNarratorId,
-				})
-				.from(narrators)
-				.where(eq(narrators.id, ctx.narratorId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1 },
-		);
+		const actorRow = this.database
+			.select({
+				type: narrators.type,
+				variant: narrators.variant,
+				title: narrators.title,
+				parent: narrators.parentNarratorId,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, ctx.narratorId))
+			.get();
 		if (!actorRow) throw new Error("Executing narrator no longer exists");
 		await boundedFileHistory(async () => {
 			const source = await this.initialize();
@@ -618,7 +593,7 @@ export class LocalFileChangeRuntime {
 		const { ctx, backend } = request;
 		if (request.toolName === "GenUI" && !request.exclusiveCreate)
 			throw new Error("GenUI file changes require exclusive creation");
-		const frozen = ctx.toolCallBinding ? await this.validateCall(request) : undefined;
+		const frozen = ctx.toolCallBinding ? this.validateCall(request) : undefined;
 		if (!frozen && (request.toolName === "StructSed" || request.toolName === "GenUI"))
 			throw new Error(`${request.toolName} requires a recorded tool call to write`);
 		if (frozen?.row.operationId) throw new FileRequestReplayError(frozen.row.operationId);
@@ -639,20 +614,17 @@ export class LocalFileChangeRuntime {
 		const runtime = frozen?.runtime ?? this.readRuntime(LOCAL_DEVICE_ID);
 		if (!runtime || !target.lexicalPath || !target.canonicalPath)
 			throw new Error("Local file target is unavailable");
-		const actorRow = await readQueryFirst(
-			this.database
-				.select({
-					title: narrators.title,
-					variant: narrators.variant,
-					type: narrators.type,
-					parent: narrators.parentNarratorId,
-					subtype: narrators.subagentType,
-				})
-				.from(narrators)
-				.where(eq(narrators.id, ctx.narratorId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1, signal: ctx.signal },
-		);
+		const actorRow = this.database
+			.select({
+				title: narrators.title,
+				variant: narrators.variant,
+				type: narrators.type,
+				parent: narrators.parentNarratorId,
+				subtype: narrators.subagentType,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, ctx.narratorId))
+			.get();
 		if (!actorRow && frozen) throw new Error("Executing narrator no longer exists");
 		const isSubagent = actorRow?.variant.startsWith("subagent") || actorRow?.type === "subagent";
 		const completed = await this.executeBound({
@@ -685,51 +657,9 @@ export class LocalFileChangeRuntime {
 			construct: request.construct,
 			exclusiveCreate: request.exclusiveCreate,
 			assertBinding: async () => {
-				if (frozen) await this.validateCall(request);
+				if (frozen) this.validateCall(request);
 				await ctx.recheckAuthorization?.();
-				if (!frozen) {
-					ctx.assertFinalExecutionPermission?.();
-					return;
-				}
-				// Worker metadata is preflight only. Recheck the immutable attempt and
-				// policy fence together at the last synchronous authority boundary.
-				this.database.transaction((tx) => {
-					const current = tx
-						.select(TOOL_COLUMNS)
-						.from(narratorToolCalls)
-						.where(eq(narratorToolCalls.id, frozen.row.id))
-						.limit(1)
-						.get();
-					const identityKeys = [
-						"id",
-						"narratorId",
-						"toolUseId",
-						"toolName",
-						"version",
-						"origin",
-						"checkpoint",
-						"attempt",
-						"device",
-						"cwd",
-						"flavor",
-						"lexical",
-						"canonical",
-						"generation",
-					] as const;
-					const runtime = this.readRuntime(LOCAL_DEVICE_ID);
-					if (
-						!current ||
-						identityKeys.some((key) => current[key] !== frozen.row[key]) ||
-						(request.toolName === "GenUI" && current.segmentId !== frozen.row.segmentId) ||
-						((current.status !== "running" || current.startedAt === null) &&
-							current.operationId === null) ||
-						!runtime ||
-						runtime.runtimeEpoch !== frozen.runtime.runtimeEpoch ||
-						runtime.runtimeGeneration !== frozen.runtime.runtimeGeneration
-					)
-						throw new Error("Tool-call row/attempt changed after metadata preflight");
-					ctx.assertFinalExecutionPermission?.();
-				});
+				ctx.assertFinalExecutionPermission?.();
 			},
 			...(frozen
 				? {
@@ -1489,7 +1419,7 @@ export async function assertLocalFileChangeAdmission(
 	request: Pick<LocalFileChangeRequest, "ctx" | "backend" | "toolName" | "filePath">,
 ): Promise<void> {
 	if (request.backend.kind !== "local") return;
-	await (await currentRuntime()).assertAdmission(request);
+	(await currentRuntime()).assertAdmission(request);
 }
 
 export async function executeLocalFileChange(

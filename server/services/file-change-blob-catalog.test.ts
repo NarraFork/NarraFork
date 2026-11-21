@@ -1,4 +1,4 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -12,8 +12,6 @@ import {
 import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as workerRead from "../db/worker-read";
-import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import {
 	blobCatalogInternals,
 	FILE_CHANGE_BLOB_BUDGET_ID,
@@ -53,7 +51,7 @@ let queries: string[];
 beforeEach(async () => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	root = await mkdtemp(join(await realpath(tmpdir()), "blob-catalog-v3-"));
-	sqlite = openFileWorkerDatabase();
+	sqlite = new Database(":memory:");
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	sqlite.exec(DDL);
 	queries = [];
@@ -61,7 +59,7 @@ beforeEach(async () => {
 	catalog = new FileChangeBlobCatalog({ db, namespaceKey: root });
 });
 afterEach(async () => {
-	await closeFileWorkerDatabase(sqlite);
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
 function refFor(text = "abc"): FileChangeBlobRef {
@@ -397,13 +395,12 @@ describe("independent retryable blob history", () => {
 		"budget",
 		"metadata",
 		"reservations",
-	] as const)("%s mismatch uses only the existing worker snapshot and reports budget_read", async (kind) => {
+	] as const)("%s mismatch uses only the existing bounded budget read and reports budget_read", async (kind) => {
 		catalog.initializeNamespace();
 		db.update(budgets)
 			.set({ namespaceKey: "a".repeat(64) })
 			.run();
-		const read = spyOn(workerRead, "readDomainTask");
-		try {
+		{
 			queries.length = 0;
 			const error = await expectCode(
 				() =>
@@ -418,10 +415,9 @@ describe("independent retryable blob history", () => {
 				catalogStage: "budget_read",
 				reason: "key_mismatch",
 			});
-			expect(read).toHaveBeenCalledTimes(1);
-			expect(queries).toEqual([]);
-		} finally {
-			read.mockRestore();
+			expect(queries).toHaveLength(1);
+			expect(queries[0]).toContain('where "file_change_storage_budgets"."id" = ?');
+			expect(queries[0]).toContain("limit ?");
 		}
 	});
 

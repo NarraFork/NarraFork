@@ -21,10 +21,10 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
 import { FILE_CHANGE_LIMITS } from "../../shared/file-change-protocol";
+import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
-import * as workerRead from "../db/worker-read";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -40,11 +40,9 @@ import type {
 	ToolContext,
 	ToolExecutionTarget,
 } from "../lib/agent/types";
-import { readAborted } from "../lib/db-worker/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import { FileChangeBlobCatalog, FileChangeBlobCatalogError } from "./file-change-blob-catalog";
 import type { FileChangeBlobRelease } from "./file-change-blob-store";
 import * as localIoModule from "./file-change-local-io";
@@ -85,7 +83,7 @@ beforeEach(async () => {
 	// Schema-only copy from the preload's isolated database. No rows, production
 	// directory, migration file or application connection settings are changed.
 	// A byte image built once per process replaces replaying ~550 DDL statements per case.
-	sqlite = openFileWorkerDatabase(isolatedTemplate);
+	sqlite = openSchemaCopyInMemory(isolatedTemplate);
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = database(sqlite);
 	narratorId = generateId();
@@ -105,7 +103,7 @@ afterEach(async () => {
 	await runtime.initialize().catch(() => {});
 	// Drizzle prepares uncached statements; close() alone defers native disposal until GC.
 	// Strict close finalizes them before Windows removes this fixture's directory.
-	await closeFileWorkerDatabase(sqlite);
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -397,96 +395,6 @@ describe("editor providers with independent history", () => {
 });
 
 describe("single-file writes with independent history", () => {
-	test.each([
-		"binding",
-		"actor",
-	] as const)("execution cancellation aborts blocked %s metadata before target IO", async (stage) => {
-		const path = join(workspace, `cancel-${stage}.txt`);
-		await writeFile(path, "before");
-		const controller = new AbortController();
-		const ctx = { ...(await callContext("Write", path)), signal: controller.signal };
-		const entered = Promise.withResolvers<AbortSignal | undefined>();
-		const read = workerRead.readQueryFirst;
-		let release: (() => void) | undefined;
-		let readerCancelled = false;
-		const reader = spyOn(workerRead, "readQueryFirst").mockImplementation(((
-			query: Parameters<typeof read>[0],
-			options?: Parameters<typeof read>[1],
-		) => {
-			const sql = query.toSQL().sql;
-			const selected =
-				stage === "binding"
-					? /\bfrom\s+"narrator_tool_calls"/i.test(sql)
-					: /\bfrom\s+"narrators"/i.test(sql);
-			if (!selected) return read(query, options);
-			entered.resolve(options?.signal);
-			return new Promise<unknown>((_resolve, reject) => {
-				const cancelled = () => {
-					readerCancelled = true;
-					reject(readAborted());
-				};
-				release = () => {
-					options?.signal?.removeEventListener("abort", cancelled);
-					reject(new Error("Metadata test gate released"));
-				};
-				if (options?.signal?.aborted) cancelled();
-				else options?.signal?.addEventListener("abort", cancelled, { once: true });
-			});
-		}) as typeof read);
-		const targetRead = spyOn(io, "read");
-		const targetApply = spyOn(io, "apply");
-		let constructed = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const pending = runtime.execute({
-			ctx,
-			backend: localBackend,
-			toolName: "Write",
-			filePath: path,
-			input: { file_path: path, content: "after" },
-			construct: () => {
-				constructed = true;
-				return { nextBytes: Buffer.from("after"), result: { output: "saved" }, lineStats: null };
-			},
-		});
-		const settled = pending.then(
-			() => ({ status: "fulfilled" as const }),
-			(error: unknown) => ({ status: "rejected" as const, error }),
-		);
-		try {
-			const signal = await Promise.race([
-				entered.promise,
-				settled.then(() => {
-					throw new Error("Execution did not reach the metadata gate");
-				}),
-			]);
-			expect(signal).toBe(controller.signal);
-			controller.abort();
-			const outcome = await Promise.race([
-				settled,
-				new Promise<never>((_resolve, reject) => {
-					timer = setTimeout(
-						() => reject(new Error("Cancelled metadata read did not settle")),
-						1000,
-					);
-				}),
-			]);
-			expect(readerCancelled).toBe(true);
-			expect(outcome).toMatchObject({ status: "rejected", error: { code: "DB_READ_ABORTED" } });
-			expect(constructed).toBe(false);
-			expect(targetRead).not.toHaveBeenCalled();
-			expect(targetApply).not.toHaveBeenCalled();
-			expect(await readFile(path, "utf8")).toBe("before");
-		} finally {
-			if (timer) clearTimeout(timer);
-			controller.abort();
-			release?.();
-			await settled;
-			reader.mockRestore();
-			targetRead.mockRestore();
-			targetApply.mockRestore();
-		}
-	});
-
 	test("cancelled execution retains its independent no-dispatch audit", async () => {
 		const path = join(workspace, "cancelled-audit.txt");
 		await writeFile(path, "before");
@@ -511,35 +419,6 @@ describe("single-file writes with independent history", () => {
 			targetRead.mockRestore();
 			targetApply.mockRestore();
 		}
-	});
-	test("the synchronous execution fence rejects an attempt changed after Worker preflight", async () => {
-		const path = join(workspace, "changed-attempt.txt");
-		await writeFile(path, "before");
-		const ctx = await callContext("Write", path);
-		const binding = ctx.toolCallBinding;
-		if (!binding) throw new Error("Missing test attempt");
-		ctx.recheckAuthorization = async () => {
-			db.update(schema.narratorToolCalls)
-				.set({ executionAttempt: binding.attempt + 1 })
-				.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
-				.run();
-		};
-		await expect(
-			runtime.execute({
-				ctx,
-				backend: localBackend,
-				toolName: "Write",
-				filePath: path,
-				input: { file_path: path, content: "after" },
-				construct: () => ({
-					nextBytes: Buffer.from("after"),
-					result: { output: "saved" },
-					lineStats: null,
-				}),
-			}),
-		).rejects.toThrow("changed after metadata preflight");
-		expect(await readFile(path, "utf8")).toBe("before");
-		expect(operations()).toHaveLength(0);
 	});
 	test("history notice describes only confirmed saves with unavailable history", () => {
 		const result = {
@@ -1242,8 +1121,8 @@ describe("single-file writes with independent history", () => {
 		await writeFile(path, "before");
 		const ns = await runtime.initialize();
 		const reserve = ns.catalog.reserve.bind(ns.catalog);
-		const admission = spyOn(ns.catalog, "reserve").mockImplementation(async (...args) => {
-			const lease = await reserve(...args);
+		const admission = spyOn(ns.catalog, "reserve").mockImplementation((...args) => {
+			const lease = reserve(...args);
 			return {
 				...lease,
 				release: (result: FileChangeBlobRelease) => {
