@@ -146,11 +146,14 @@ function livePayload(session: AuthSessionRecord): SessionPayload {
  * `SessionTokenRevokedError` / `SessionTokenExpiredError` for a known one that is
  * finished, and lets storage failures through unchanged.
  */
-export async function verifyToken(token: string): Promise<SessionPayload> {
+export async function verifyToken(
+	token: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<SessionPayload> {
 	if (!isOpaqueSessionToken(token)) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
-	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token));
+	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token), options);
 	if (!session) {
 		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
 	}
@@ -161,8 +164,11 @@ export async function verifyToken(token: string): Promise<SessionPayload> {
  * Re-resolve a session a long-lived connection was opened with. Null when the session is
  * gone, revoked or expired; storage failures are thrown.
  */
-export async function resolveLiveSession(sessionId: string): Promise<SessionPayload | null> {
-	const session = await authSessionStore.findSessionById(sessionId);
+export async function resolveLiveSession(
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<SessionPayload | null> {
+	const session = await authSessionStore.findSessionById(sessionId, options);
 	if (!session) return null;
 	try {
 		return livePayload(session);

@@ -1,6 +1,10 @@
 import type { ErrorResponsePayload } from "@shared/error-catalog";
 import type { Context } from "hono";
-import { AppError, RateLimitError } from "./errors";
+import {
+	DATABASE_READ_RETRY_AFTER_SECONDS,
+	isDatabaseReadUnavailable,
+} from "./db-reader-readiness";
+import { AppError, catalogError, RateLimitError } from "./errors";
 
 /**
  * Build the localizable wire body for an `AppError`.
@@ -27,6 +31,10 @@ export function buildAppErrorResponse(error: unknown, c: Context): Response | nu
 	if (error instanceof RateLimitError) {
 		c.header("Retry-After", String(error.retryAfterSeconds));
 		return c.json({ ...toErrorPayload(error), retryAfterSeconds: error.retryAfterSeconds }, 429);
+	}
+	if (isDatabaseReadUnavailable(error)) {
+		c.header("Retry-After", String(DATABASE_READ_RETRY_AFTER_SECONDS));
+		return c.json(toErrorPayload(catalogError("DATABASE_READ_UNAVAILABLE")), 503);
 	}
 	if (error instanceof AppError) {
 		// biome-ignore lint/suspicious/noExplicitAny: Hono requires a literal status union

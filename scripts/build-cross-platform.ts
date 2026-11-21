@@ -17,6 +17,7 @@ import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
+import { ALPHA_BUILD_LOCK, frontendBuildDirectory, resolveBuildProfile } from "./lib/build-profile";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
 import {
@@ -37,7 +38,6 @@ const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
 const VERSION: string = pkg.version ?? "0.0.0";
 // Freeze component pins once; application releases do not select new executors.
 const HELPER_DISTRIBUTION = createHelperDistributionDependencies();
-const FRONTEND_DIR = join(ROOT, "dist", "frontend");
 const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.ts");
 const RUNTIME_BUILD_ID = randomUUID();
 const DIST_DIR = join(ROOT, "dist");
@@ -52,6 +52,23 @@ const WINDOWS_ICON_PATH = join(DIST_DIR, "narrafork.ico");
 const args = process.argv.slice(2);
 const skipFrontend = args.includes("--skip-frontend");
 const releaseCi = args.includes("--release-ci");
+// Freeze the backend profile once; --release-ci only enables strict validation.
+const BUILD_PROFILE = resolveBuildProfile(VERSION, process.env);
+const alphaFrontend = args.includes("--alpha-frontend");
+if (
+	alphaFrontend &&
+	(BUILD_PROFILE.name !== "diagnostic" ||
+		skipFrontend ||
+		!existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
+) {
+	throw new Error("--alpha-frontend requires a full local build through make build-alpha");
+}
+const FRONTEND_DIR = frontendBuildDirectory(ROOT, alphaFrontend);
+process.env.NF_BUILD_ALPHA_FRONTEND = alphaFrontend ? "1" : "0";
+console.log(
+	`Backend build profile: ${BUILD_PROFILE.name}; version: ${VERSION}; strict validation: ${releaseCi}`,
+);
+console.log(`Backend compile flags: ${BUILD_PROFILE.compileArgs.join(" ")}`);
 let commitHash = "";
 try {
 	commitHash = execSync(
@@ -141,11 +158,16 @@ if (releaseCi) {
 }
 
 async function runBuildStep(command: string[]): Promise<{ exitCode: number }> {
+	console.log(`Build command: ${JSON.stringify(command)}`);
 	if (releaseCi) {
 		await runCiBuildCommand(command, 30 * 60_000, ROOT);
 		return { exitCode: 0 };
 	}
-	return Bun.spawnSync(command, { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"] });
+	return Bun.spawnSync(command, {
+		cwd: ROOT,
+		env: process.env,
+		stdio: ["inherit", "inherit", "inherit"],
+	});
 }
 
 // Step 1: Build frontend with Vite
@@ -232,7 +254,8 @@ for (const platform of selectedPlatforms) {
 		...Object.entries(runtimeBuildDefines(RUNTIME_BUILD_ID, false)).map(
 			([name, value]) => `--define=${name}=${value}`,
 		),
-		...compiledBuildArguments(),
+		...compiledBuildArguments().filter((argument) => argument !== "--minify"),
+		...BUILD_PROFILE.compileArgs,
 		"--target",
 		platform.target,
 		// Windows：面板自带 UI，编译产物不该再弹控制台；图标由

@@ -1689,6 +1689,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		} as AnthropicMessage);
 	}
 
+	supportsDiagnosticFork(): boolean {
+		return true;
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		rejectNativeMedia("Anthropic Messages", [params.media, params.history, params.toolResults]);
 		const apiKey = this.config.apiKey;
@@ -1886,6 +1890,24 @@ export class AnthropicProvider implements ProviderAdapter {
 			applyFinalCacheBreakpoint(messages);
 		}
 
+		const suffix = params.diagnosticFork?.suffix;
+		if (suffix) {
+			if (tools.some((tool) => !tool.input_schema) || messages.at(-1)?.role === "system") {
+				throw new Error("This Anthropic request cannot safely append a diagnostic suffix");
+			}
+			// Keep the original billing fingerprint, cache breakpoint, and image/tool
+			// result blocks. A continuation of a user turn adds a new content block.
+			const tail = messages.at(-1);
+			const part = { type: "text", text: suffix } as const;
+			if (tail?.role === "user" && Array.isArray(tail.content)) {
+				messages[messages.length - 1] = { role: "user", content: [...tail.content, part] };
+			} else if (tail?.role === "user") {
+				throw new Error("This Anthropic user message cannot safely append a diagnostic block");
+			} else {
+				messages.push({ role: "user", content: [part] });
+			}
+		}
+
 		const body: Record<string, unknown> = {
 			model,
 			messages,
@@ -1950,11 +1972,8 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.tools = cachedTools;
 		}
 
-		const requestMetadata = this.buildRequestMetadata(
-			isOfficial,
-			params.metadata,
-			params.conversationId,
-		);
+		const sessionId = params.diagnosticFork ? params.transportSessionKey : params.conversationId;
+		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata, sessionId);
 		if (requestMetadata) body.metadata = requestMetadata;
 
 		// Request path: official API uses ?beta=true, proxy mode uses plain path.
@@ -1966,7 +1985,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			isOfficial,
 			model,
 			"application/json",
-			params.conversationId,
+			sessionId,
 		);
 		const toolBeta = toolLoadingBetaFlag(params.toolLoadingStrategy);
 		if (toolBeta) {
@@ -1988,6 +2007,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		await reportInputCharacters(params, body);
 		const bodyStr = await stringifyRequestBody(body, params.signal);
 
+		params.diagnosticFork?.validateCredential?.();
 		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(
 			reqPath,

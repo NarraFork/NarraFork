@@ -4,14 +4,13 @@
 
 import { db } from "@server/db";
 import {
-	aclGrants,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "@server/db/schema";
 import { resolveProviderAndModel } from "@server/lib/agent/provider";
-import { addTrait, parseTraits } from "@server/lib/narrator-utils";
+import { generateId } from "@server/lib/id";
 import { and, eq, inArray, ne, notExists, sql } from "drizzle-orm";
 import { aliasedTable } from "drizzle-orm/alias";
 
@@ -28,6 +27,32 @@ export function modelTraceKeyFor(userId: string, model: string, stickyProvider?:
 	return modelTraceKey(userId, resolved.provider, resolved.model);
 }
 
+/** Standalone private diagnostics never copy the parent's row, grants, refs or workspace. */
+export async function createDiagnosticNarrator(input: {
+	userId: string;
+	model: string;
+	title: string;
+	locale: string;
+}): Promise<string> {
+	const id = generateId();
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id,
+		ownerUserId: input.userId,
+		model: input.model,
+		title: input.title,
+		visibility: "private",
+		writeAudience: "owner",
+		hiddenFromLists: true,
+		traits: ["modeltrace"],
+		// Non-reusable key also keeps startup legacy adoption from claiming this row.
+		modeltraceKey: `fork/${id}`,
+		createdAt: now,
+		updatedAt: now,
+	});
+	return id;
+}
+
 async function narratorIdForKey(key: string): Promise<string | null> {
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.modeltraceKey, key),
@@ -36,16 +61,7 @@ async function narratorIdForKey(key: string): Promise<string | null> {
 	return row?.id ?? null;
 }
 
-function isKeyConflict(error: unknown): boolean {
-	return error instanceof Error && error.message.includes("narrators.modeltrace_key");
-}
-
-/**
- * 取该用户这个模型的舱，没有就建一个。
- *
- * 首次创建沿用 `forkNarrator`，带上源会话的工作目录、系统提示词、权限模式与模型。
- * 舱本身收成所有者私有：源会话后来被分享时，诊断记录不跟着公开。
- */
+/** 只复用当前用户和当前模型的私有舱；不从触发会话继承设置、消息或工具。 */
 export async function ensureTraceNarrator(input: {
 	parentId: string;
 	userId: string;
@@ -55,72 +71,28 @@ export async function ensureTraceNarrator(input: {
 	locale: string;
 }): Promise<string> {
 	const key = modelTraceKeyFor(input.userId, input.model, input.provider);
-	const existing = await narratorIdForKey(key);
-	if (existing) {
-		await retarget(existing, input);
-		return existing;
-	}
-
-	const { narratorService } = await import("./narrator-service");
-	const created = await narratorService.forkNarrator(input.parentId, null, {
-		title: input.title,
-		model: input.model,
-		inheritMode: "fresh",
-		specCarryover: "clear",
-		userId: input.userId,
-		locale: input.locale,
-	});
-	try {
-		seal(created.id, key, input.userId, input.parentId, created.traits);
-	} catch (error) {
-		if (!isKeyConflict(error)) throw error;
-		await narratorService.remove(created.id);
-		const winner = await narratorIdForKey(key);
-		if (!winner) throw error;
-		await retarget(winner, input);
-		return winner;
-	}
-	return created.id;
-}
-
-function seal(id: string, key: string, userId: string, parentId: string, traits: unknown): void {
-	db.transaction((tx) => {
-		tx.delete(aclGrants)
-			.where(and(eq(aclGrants.scopeType, "narrator"), eq(aclGrants.scopeId, id)))
-			.run();
-		tx.update(narrators)
-			.set({
-				traits: addTrait(parseTraits(traits), "modeltrace"),
-				parentNarratorId: parentId,
-				ownerUserId: userId,
-				visibility: "private",
-				writeAudience: "owner",
-				hiddenFromLists: true,
-				modeltraceKey: key,
-			})
-			.where(eq(narrators.id, id))
-			.run();
-	});
-}
-
-async function retarget(
-	id: string,
-	input: { parentId: string; model: string; title: string },
-): Promise<void> {
-	const parent = await db.query.narrators.findFirst({
-		where: eq(narrators.id, input.parentId),
-		columns: { cwd: true, contextProjectId: true },
-	});
-	await db
-		.update(narrators)
-		.set({
+	const now = new Date().toISOString();
+	const [row] = await db
+		.insert(narrators)
+		.values({
+			id: generateId(),
+			modeltraceKey: key,
+			ownerUserId: input.userId,
 			model: input.model,
 			title: input.title,
-			parentNarratorId: input.parentId,
-			cwd: parent?.cwd ?? null,
-			contextProjectId: parent?.contextProjectId ?? null,
+			visibility: "private",
+			writeAudience: "owner",
+			hiddenFromLists: true,
+			traits: ["modeltrace"],
+			createdAt: now,
+			updatedAt: now,
 		})
-		.where(eq(narrators.id, id));
+		.onConflictDoUpdate({
+			target: narrators.modeltraceKey,
+			set: { model: input.model, title: input.title },
+		})
+		.returning({ id: narrators.id });
+	return row.id;
 }
 
 /**
@@ -167,6 +139,8 @@ export async function clearTraceHistory(id: string): Promise<void> {
 			.set({
 				nextSeq: 0,
 				apiConversationId: null,
+				systemPrompt: null,
+				enabledTools: null,
 				contextUsageSnapshotJson: null,
 				errorMessage: null,
 				substatus: "[]",

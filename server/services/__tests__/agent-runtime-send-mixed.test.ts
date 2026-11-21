@@ -426,7 +426,7 @@ test("resume and model require control of the target: a child cannot steer its s
 	expect(rows()).toHaveLength(0);
 });
 
-test("model switches a child before delivery and announces it to an idle page", async () => {
+test("an accepted Send switches the child's model and announces it to an idle page", async () => {
 	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
 		"test:model",
 		"test:other",
@@ -449,6 +449,29 @@ test("model switches a child before delivery and announces it to an idle page", 
 		await sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "parent" });
 		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
 			"__parent__",
+		);
+	} finally {
+		visible.mockRestore();
+	}
+});
+
+test("a replayed Send cannot overwrite a later accepted model selection", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	try {
+		const earlier = { ...input("parent-root", ["sibling-a"]), model: "test:model" };
+		await sendSubagentMessageDetailed(earlier);
+		await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:other",
+		});
+		await sendSubagentMessageDetailed(earlier);
+
+		expect(rows("sibling-a")).toHaveLength(2);
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"test:other",
 		);
 	} finally {
 		visible.mockRestore();
