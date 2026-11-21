@@ -139,6 +139,9 @@ export function createServerRequestDispatcher(options: {
 				const headers = new Headers(healthResponse.headers);
 				headers.delete("content-length");
 				headers.set("content-type", "application/json; charset=UTF-8");
+				// Health polling alone must still let a failed verdict be re-probed; the
+				// retry interval bounds how often, and the response never waits for it.
+				void databaseReaders?.wait();
 				const readerState = databaseReaders?.state;
 				return new Response(
 					JSON.stringify({
@@ -311,10 +314,20 @@ export function createServerRequestDispatcher(options: {
 					.from(users)
 					.where(eq(users.id, payload.sub))
 					.limit(1);
-				const [user] =
-					activeDatabaseBackend === "sqlite"
-						? await authRead(userQuery, { signal: req.signal })
-						: await userQuery;
+				let user: Awaited<typeof userQuery>[number] | undefined;
+				try {
+					[user] =
+						activeDatabaseBackend === "sqlite"
+							? await authRead(userQuery, { signal: req.signal })
+							: await userQuery;
+				} catch (error) {
+					if (!isDatabaseReadUnavailable(error)) throw error;
+					return databaseReaderUnavailableResponse({
+						status: "failed",
+						code: "DB_READERS_UNAVAILABLE",
+						reason: (error as Error).message,
+					});
+				}
 				// `verifyToken` already rejected revoked and expired sessions; a user row that
 				// vanished since still fails the upgrade.
 				if (!user) {
