@@ -118,7 +118,6 @@ import {
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
-	usesCodexModel,
 } from "../lib/settings";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../lib/uploads";

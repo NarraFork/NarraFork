@@ -4924,6 +4924,13 @@ async function* agentLoopInMetadataSnapshot(
 				// Every attempt still needs durable identity before dispatch. Keep this
 				// outside transport retry handling: a failed admission is not an API error.
 				await config.beforeProviderRequest?.();
+				const requestServiceTier = config.resolveServiceTier
+					? await config.resolveServiceTier({
+							provider: effectiveProvider,
+							model: effectiveModel,
+							signal: config.signal,
+						})
+					: config.serviceTier;
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -5222,7 +5229,7 @@ async function* agentLoopInMetadataSnapshot(
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,
-						serviceTier: config.serviceTier,
+						serviceTier: requestServiceTier,
 						metadata: config.metadata,
 						requestDump,
 						streamProgress,

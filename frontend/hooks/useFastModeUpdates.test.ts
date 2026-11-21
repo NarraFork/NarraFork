@@ -90,7 +90,10 @@ beforeEach(() => {
 	});
 });
 afterEach(async () => {
-	await act(async () => root.unmount());
+	await act(async () => {
+		await new Promise((resolve) => realSetTimeout(resolve, 0));
+		root.unmount();
+	});
 	for (const release of releases.splice(0)) release();
 	client.clear();
 	scheduled.clear();

@@ -44,7 +44,6 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
-import { resolveFastModeForUser } from "../../lib/fast-mode";
 import { logger } from "../../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,

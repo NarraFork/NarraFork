@@ -18,6 +18,7 @@ let cleared = 0;
 let retries = 0;
 let shellMounts = 0;
 let appearanceCalls = 0;
+const fastModeUpdates = mock(() => {});
 let namespacePromise: Promise<void> = Promise.resolve();
 let auth = {
 	data: { id: "user" } as { id: string } | undefined,
@@ -50,6 +51,9 @@ mock.module("../lib/i18n", () => ({
 }));
 mock.module("../hooks/useUserPreferences", () => ({
 	useUserPreferences: () => ({ data: undefined }),
+}));
+mock.module("../hooks/useFastModeUpdates", () => ({
+	useFastModeUpdates: fastModeUpdates,
 }));
 mock.module("../hooks/useAuthenticatedAppearance", () => ({
 	useAuthenticatedAppearance: () => {
@@ -205,12 +209,14 @@ test("window namespace has a segment boundary", () => {
 });
 
 test("private window renders only target and cleans up viewport ownership", async () => {
+	fastModeUpdates.mockClear();
 	await render("/windows/target");
 	await waitFor(() => !!container.querySelector("[data-target]"));
 	expect(container.querySelector("[data-navigation]")).toBeNull();
 	expect(container.querySelector("[data-standalone-window]")).not.toBeNull();
 	expect(shellMounts).toBe(0);
 	expect(appearanceCalls).toBeGreaterThan(0);
+	expect(fastModeUpdates).toHaveBeenCalled();
 	await waitFor(
 		() => document.documentElement.getAttribute("data-nf-authenticated-app-shell") === "true",
 	);

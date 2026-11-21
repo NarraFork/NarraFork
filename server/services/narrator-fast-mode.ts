@@ -414,34 +414,36 @@ async function createDefaultResolver() {
 			return getRunControl(id)?.principal;
 		},
 		getPersistedPrincipal: (row) => executionPrincipalOf(row)?.userId,
-		loadNarrator: (id, signal) =>
-			readQuery(
-				db.query.narrators.findFirst({
-					where: eq(schema.narrators.id, id),
-					columns: {
-						type: true,
-						fastModeOverride: true,
-						aclRootNarratorId: true,
-						ownerUserId: true,
-						runtimeRegistrationJson: true,
-					},
-				}),
+		loadNarrator: async (id, signal) => {
+			const [row] = await readQuery(
+				db
+					.select({
+						type: schema.narrators.type,
+						fastModeOverride: schema.narrators.fastModeOverride,
+						aclRootNarratorId: schema.narrators.aclRootNarratorId,
+						ownerUserId: schema.narrators.ownerUserId,
+						runtimeRegistrationJson: schema.narrators.runtimeRegistrationJson,
+					})
+					.from(schema.narrators)
+					.where(eq(schema.narrators.id, id))
+					.limit(1),
 				{
 					signal,
-					executionPolicy: "worker-required",
 					maxRows: 1,
 					timeoutMs: DEFAULT_READ_TIMEOUT_MS,
 				},
-			),
+			);
+			return row;
+		},
 		loadUserDefault: async (id, signal) => {
-			const row = await readQuery(
-				db.query.userPreferences.findFirst({
-					where: eq(schema.userPreferences.userId, id),
-					columns: { fastModeDefault: true },
-				}),
+			const [row] = await readQuery(
+				db
+					.select({ fastModeDefault: schema.userPreferences.fastModeDefault })
+					.from(schema.userPreferences)
+					.where(eq(schema.userPreferences.userId, id))
+					.limit(1),
 				{
 					signal,
-					executionPolicy: "worker-required",
 					maxRows: 1,
 					timeoutMs: DEFAULT_READ_TIMEOUT_MS,
 				},

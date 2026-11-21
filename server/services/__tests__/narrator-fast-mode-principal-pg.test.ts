@@ -11,7 +11,11 @@ let invalidations = 0;
 let principalAtEvent: unknown;
 
 const database = {
-	query: { narrators: { findFirst: () => ({ fixture: "narrow narrator registration read" }) } },
+	select: () => ({
+		from: () => ({
+			where: () => ({ limit: () => ({ fixture: "narrow narrator registration read" }) }),
+		}),
+	}),
 	transaction() {
 		throw new Error("PostgreSQL principal updates must not use SQLite transactions");
 	},
@@ -42,7 +46,7 @@ mock.module("../../db", () => ({
 }));
 mock.module("../../db/worker-read", () => ({
 	...realReads,
-	readQuery: async () => structuredClone(stored),
+	readQuery: async () => (stored ? [structuredClone(stored)] : []),
 }));
 const { registerRunPrincipal, setRuntimeRegistration } = await import(
 	"../narrator-runtime-registration"

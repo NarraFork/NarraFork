@@ -13,7 +13,7 @@ import type { MessageOriginOptions } from "@shared/message-origin";
 import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
 	narratorBlocks,
