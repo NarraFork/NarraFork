@@ -2,7 +2,7 @@ import { Alert, Button, Group, Stack, Text } from "@mantine/core";
 import { UNATTENDED_CHANGED_WS_TYPE, UNATTENDED_IDLE_POLL_INTERVAL_MS } from "@shared/unattended";
 import { IconPower } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useReducer } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { ApiError, api } from "../lib/api";
@@ -105,10 +105,10 @@ export function UnattendedModeBanner() {
 	const status = statusQuery.data;
 	const enabled = status?.enabled === true;
 	// One local ticker for the countdown text; status itself still comes from the 5 s poll.
-	const [now, setNow] = useState(() => Date.now());
+	const [, tick] = useReducer((ticks: number) => ticks + 1, 0);
 	useEffect(() => {
 		if (!enabled) return;
-		const timer = setInterval(() => setNow(Date.now()), 1_000);
+		const timer = setInterval(tick, 1_000);
 		return () => clearInterval(timer);
 	}, [enabled]);
 
@@ -116,7 +116,7 @@ export function UnattendedModeBanner() {
 
 	const closing = status.phase === "shutting_down";
 	const shutdownAt = status.shutdownAt ? new Date(status.shutdownAt).getTime() : null;
-	const remainingMs = shutdownAt === null ? 0 : shutdownAt - now;
+	const remainingMs = shutdownAt === null ? 0 : shutdownAt - Date.now();
 	const urgent = !closing && shutdownAt !== null && remainingMs <= URGENT_WINDOW_MS;
 	const key = blockerKey(status);
 	const detail = closing

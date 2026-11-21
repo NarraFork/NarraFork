@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { UNATTENDED_CHANGED_WS_TYPE } from "@shared/unattended";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -192,6 +192,29 @@ describe("UnattendedModeBanner", () => {
 		expect(element).not.toBeNull();
 		expect(element?.getAttribute("style") ?? "").toContain("64px");
 		expect(element?.getAttribute("style") ?? "").toContain("fixed");
+	});
+
+	test("the first countdown uses the current time after the banner has been disarmed", async () => {
+		admin = true;
+		let now = Date.parse("2026-11-21T17:13:10.489Z");
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			status = fixture({ enabled: false, phase: "off", shutdownAt: null });
+			await render();
+			expect(banner()).toBeNull();
+
+			now += 101_000;
+			status = fixture({
+				armedAt: new Date(now).toISOString(),
+				shutdownAt: new Date(now + 70_000).toISOString(),
+				options: { powerOff: false, quietSeconds: 10, armDelaySeconds: 70 },
+			});
+			await act(async () => onStatusChanged());
+			await flush();
+			expect(banner()?.textContent).toContain('"remaining":"1:10"');
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("every signed-in user gets the kill switch, and it cancels the mode", async () => {
