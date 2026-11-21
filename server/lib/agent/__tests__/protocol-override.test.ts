@@ -1,11 +1,48 @@
 import { describe, expect, test } from "bun:test";
+import { normalizeCustomApiProviderSettings, settings } from "../../settings";
+import { OpenAIProvider } from "../openai-provider";
 import {
 	connectionForProtocolSwitch,
 	openAIFamilyProtocol,
 	protocolMatchesConnection,
 } from "../protocol-override";
+import { resolveProviderAndModel } from "../provider";
 
 describe("protocol override keeps the connection", () => {
+	for (const protocol of ["anthropic-messages", "gemini-compatible"] as const) {
+		for (const mode of [undefined, "off", "inline", "separate"] as const) {
+			test(`${protocol} preserves ${mode} tool images when overridden to Chat Completions`, () => {
+				const original = structuredClone(settings);
+				try {
+					settings.customApiProviders = [
+						{
+							id: "image-override",
+							name: "Image override",
+							prefix: "image-override",
+							apiKey: "test-key",
+							baseUrl: "https://example.com/v1",
+							defaultModel: "chat",
+							protocol,
+							toolResultImages: mode,
+						},
+					];
+					normalizeCustomApiProviderSettings(settings);
+					settings.agent.modelProtocolOverrides = {
+						"image-override:chat": "completions-compatible",
+					};
+					const { adapter } = resolveProviderAndModel("image-override:chat");
+					expect(adapter).toBeInstanceOf(OpenAIProvider);
+					const config = (
+						adapter as unknown as { config: { apiMode: string; toolResultImages?: string } }
+					).config;
+					expect(config.apiMode).toBe("completions");
+					expect(config.toolResultImages).toBe(mode);
+				} finally {
+					Object.assign(settings, original);
+				}
+			});
+		}
+	}
 	test("copies proxy, headers and fingerprint onto the switched adapter config", () => {
 		const headers = () => ({ "X-Channel": "live" });
 		const shared = connectionForProtocolSwitch(

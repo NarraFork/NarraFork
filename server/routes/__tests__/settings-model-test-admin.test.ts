@@ -16,7 +16,7 @@ const testHome = mkdtempSync(join(tmpdir(), "narrafork-model-test-admin-"));
 process.env.NARRAFORK_HOME = testHome;
 const { db } = await import("../../db");
 const { narrators } = await import("../../db/schema");
-const { saveSettings, settings } = await import("../../lib/settings");
+const { reloadSettings, saveSettings, settings } = await import("../../lib/settings");
 const { buildServerRestartUrl, settingsRoutes, updateSettingsSchema } = await import("../settings");
 const { getDefaults, deepMerge } = await import("../../lib/settings");
 const { registerServerRestart } = await import("../../lib/server-restart");
@@ -629,6 +629,77 @@ describe("settings conditional admin guards", () => {
 			saveSettings(original);
 		}
 	});
+
+	for (const mode of ["off", "inline", "separate"] as const) {
+		test(`legacy OpenAI save retains tool image mode ${mode} across both projections`, async () => {
+			const original = structuredClone(settings);
+			try {
+				saveSettings({
+					...settings,
+					customApiProviders: [
+						{
+							id: "legacy-images",
+							name: "Legacy images",
+							prefix: "legacy-images",
+							apiKey: "test-key",
+							baseUrl: "https://example.com/v1",
+							defaultModel: "chat",
+							protocol: "completions-compatible",
+							toolResultImages: mode,
+						},
+					],
+				});
+				const before = await appForRole("admin").request("/settings");
+				const split = (await before.json()).openaiProviders;
+				expect(split[0].toolResultImages).toBe(mode);
+				split[0].name = "Renamed via legacy API";
+				const response = await appForRole("admin").request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ openaiProviders: split }),
+				});
+				expect(response.status).toBe(200);
+				expect(reloadSettings().customApiProviders?.[0]?.toolResultImages).toBe(mode);
+				const loaded = await appForRole("admin").request("/settings");
+				const saved = await loaded.json();
+				expect(saved.customApiProviders[0].toolResultImages).toBe(mode);
+				expect(saved.customApiProviders[0].name).toBe("Renamed via legacy API");
+				expect(saved.openaiProviders[0].toolResultImages).toBe(mode);
+			} finally {
+				saveSettings(original);
+			}
+		});
+
+		test(`custom API tool result image mode ${mode} survives save and reload`, async () => {
+			const original = structuredClone(settings);
+			try {
+				const response = await appForRole("admin").request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						customApiProviders: [
+							{
+								id: "tool-images",
+								name: "Tool images",
+								prefix: "tool-images",
+								apiKey: "test-key",
+								baseUrl: "https://example.com/v1",
+								defaultModel: "test-model",
+								protocol: "completions-compatible",
+								toolResultImages: mode,
+							},
+						],
+					}),
+				});
+				expect(response.status).toBe(200);
+				expect(reloadSettings().customApiProviders?.[0]?.toolResultImages).toBe(mode);
+				const loaded = await appForRole("admin").request("/settings");
+				expect((await loaded.json()).customApiProviders[0].toolResultImages).toBe(mode);
+			} finally {
+				saveSettings(original);
+			}
+		});
+	}
 
 	test("masked unified Gemini patches round-trip explicit transport without losing the key", async () => {
 		const original = structuredClone(settings);

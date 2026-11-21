@@ -1,3 +1,4 @@
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { useCallback, useMemo } from "react";
 import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
@@ -26,6 +27,8 @@ export interface CommandCodeState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	/** Chat Completions：工具返回的图片放哪，缺省 `"off"`。 */
+	toolResultImages?: ToolResultImagesMode;
 }
 
 /**
@@ -210,6 +213,12 @@ function normalizeCustomApiProvider(
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		toolResultImages:
+			provider.toolResultImages === "off" ||
+			provider.toolResultImages === "inline" ||
+			provider.toolResultImages === "separate"
+				? provider.toolResultImages
+				: undefined,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -446,6 +455,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					userAgentMode: s.commandCode?.userAgentMode,
 					customUserAgent: s.commandCode?.customUserAgent,
 					extraHeaders: s.commandCode?.extraHeaders,
+					toolResultImages: s.commandCode?.toolResultImages,
 				},
 				tokenDanceDisabled: s.tokendance?.disabled === true,
 				hiddenModels: new Set(hidden),

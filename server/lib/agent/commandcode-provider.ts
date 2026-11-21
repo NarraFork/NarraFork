@@ -6,6 +6,7 @@
  * OpenAIProvider，不写新适配器，只注入凭据与 base。
  */
 
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { getCachedCommandCodeModel } from "../commandcode-models";
 import {
@@ -38,6 +39,8 @@ export interface CommandCodeProviderSettings {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	/** 工具返回图片的去处（Chat Completions 通道），见 shared/tool-result-images.ts。 */
+	toolResultImages?: ToolResultImagesMode;
 }
 
 /** 未登录或已停用时返回 undefined，由上层给出可读提示。 */
@@ -75,5 +78,6 @@ export function buildCommandCodeProvider(
 	return new OpenAIProvider({
 		...shared,
 		apiMode: endpoint === "responses" ? "responses" : "completions",
+		toolResultImages: config?.toolResultImages,
 	});
 }
