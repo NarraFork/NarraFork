@@ -22,6 +22,7 @@ import {
 	projects,
 	users,
 } from "../../db/schema";
+import type { ExecutionBackend } from "../../lib/agent/execution/backend";
 import { localBackend } from "../../lib/agent/execution/local-backend";
 import { writeTool } from "../../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
@@ -83,6 +84,21 @@ beforeEach(async () => {
 		},
 	};
 	runtime = new LocalFileChangeRuntime({ db, privateRoot: getNarraforkHome(), io });
+	// Explicitly exercise retained history algorithms in this injected runtime only.
+	// Tests using production defaults below still take the real metadata-only local policy.
+	const internal = runtime as unknown as {
+		executeBound(request: { backend: ExecutionBackend }): Promise<unknown>;
+	};
+	const executeBound = internal.executeBound.bind(runtime);
+	internal.executeBound = (request) =>
+		executeBound({
+			...request,
+			backend: new Proxy(request.backend, {
+				get(target, property) {
+					return property === "kind" ? "remote" : Reflect.get(target, property);
+				},
+			}),
+		});
 });
 
 afterEach(async () => {
@@ -246,9 +262,10 @@ describe("real editor actual-byte evidence", () => {
 					true,
 				);
 				expect(saved.status).toBe(200);
+				expect(saved.json).toMatchObject({ diskOutcome: "applied", historyStatus: "disabled" });
 				expect(saved.json.fileChangeEvidence).toMatchObject({
 					version: 3,
-					grade: "measured",
+					grade: "unknown",
 					settlement: "settled",
 				});
 				expect(await readFile(path, "utf8")).toBe("human\n");
@@ -268,7 +285,8 @@ describe("real editor actual-byte evidence", () => {
 				expect(effects()).toHaveLength(1);
 				expect(effects()[0]).toMatchObject({
 					executionConfirmed: true,
-					attributionGrade: "measured",
+					diskOutcome: "applied",
+					attributionGrade: "unknown",
 					linesAdded: 1,
 					linesRemoved: 0,
 				});
@@ -296,9 +314,17 @@ describe("real editor actual-byte evidence", () => {
 						.limit(1)
 						.all(),
 				).toEqual([]);
-				expect(await bytes(effects()[0].intendedAfterStateJson)).toEqual(Buffer.from("human\n"));
+				for (const state of [
+					effects()[0].beforeStateJson,
+					effects()[0].intendedAfterStateJson,
+					effects()[0].observedAfterStateJson,
+				]) {
+					expect(state).toEqual({ kind: "unknown", reason: "history_unavailable" });
+				}
 				expect((await lstat(data)).mode & 0o777).toBe(0o775);
-				expect((await lstat(join(data, "file-change-blobs"))).mode & 0o777).toBe(0o700);
+				await expect(lstat(join(data, "file-change-blobs"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
 				expect((await lstat(join(data, "file-change-source.json"))).mode & 0o777).toBe(0o600);
 			} finally {
 				await chmod(home, homeMode);

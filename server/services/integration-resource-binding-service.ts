@@ -1,7 +1,7 @@
 import { and, asc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { integrationResourceBindings, narrators, oauthGrants, remoteDevices } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -453,7 +453,12 @@ export class IntegrationResourceBindingService {
 		);
 	}
 
-	async get(resourceType: IntegrationResourceType, resourceId: string) {
+	async get(
+		resourceType: IntegrationResourceType,
+		resourceId: string,
+		readOptions?: ReadQueryOptions,
+	) {
+		readOptions?.signal?.throwIfAborted();
 		return (
 			(await readQuery(
 				db.query.integrationResourceBindings.findFirst({
@@ -462,7 +467,7 @@ export class IntegrationResourceBindingService {
 						eq(integrationResourceBindings.resourceId, resourceId),
 					),
 				}),
-				{ executionPolicy: "worker-required" },
+				{ ...readOptions, executionPolicy: "worker-required" },
 			)) ?? null
 		);
 	}

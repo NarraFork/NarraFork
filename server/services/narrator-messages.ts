@@ -3,6 +3,7 @@ import {
 	normalizeCompactAttempts,
 	parseCompactMessageBlock,
 } from "@shared/compact-message";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -108,6 +109,7 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { resolveNarratorMessageOnlyRevert } from "./file-history-policy";
 import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
@@ -125,9 +127,7 @@ import {
 	contentJsonSql,
 	envelopeStoredBytesSql,
 	fillBodies,
-	fillBodiesAsync,
 	fillBody,
-	fillBodyAsync,
 	hasStoredElementSql,
 	storedBodyBytesSql,
 } from "./narrator-body-reads";
@@ -378,6 +378,10 @@ type HistoryToolMetadata = Pick<
 	typeof narratorToolCalls.$inferSelect,
 	keyof typeof historyToolMetadataColumns
 >;
+type FileHistoryTargetMetadata = Pick<
+	typeof narratorToolCalls.$inferSelect,
+	"executionDeviceId" | "executionTargetsJson"
+>;
 type DerivedHistorySeed = { call: HistoryToolMetadata; seq: number; shared: boolean };
 
 function createHistoryBudget(): HistoryBudget {
@@ -402,6 +406,8 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	const rows = tx
 		.select({
 			...historyToolMetadataColumns,
+			executionDeviceId: narratorToolCalls.executionDeviceId,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 			bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))),
 		})
 		.from(narratorToolCalls)
@@ -415,12 +421,29 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	return rows;
 }
 
+function hasEnabledFileHistoryTarget(call: FileHistoryTargetMetadata): boolean {
+	// Stored execution endpoints are server-frozen targets, not tool input hints.
+	// Preserve remote evidence even in a local-default, mixed-device selection.
+	const targets = toolCallWithExecutionTargets(call).executionTargets;
+	if (targets.length > 0)
+		return targets.some(
+			(target) => target.backendKind === "remote" && isFileHistoryEnabledForDevice(target.deviceId),
+		);
+	// Legacy calls without a frozen device are local/unknown, never evidence of
+	// the narrator's current default device after a workspace/device switch.
+	return isFileHistoryEnabledForDevice(call.executionDeviceId);
+}
+
 function checkpointGroupsTx(
 	tx: MessageTx,
 	refs: Array<{ messageId: string; seq: number }>,
 	reserve: HistoryBudget,
+	calls: Array<HistoryToolMetadata & FileHistoryTargetMetadata>,
 ): FileHistoryCheckpointGroup[] {
-	if (refs.length === 0) return [];
+	const retainedCallIds = calls
+		.filter((call) => hasEnabledFileHistoryTarget(call))
+		.map((call) => call.id);
+	if (refs.length === 0 || retainedCallIds.length === 0) return [];
 	// loadHistoryToolsTx (or the block planner) already admitted every row's bytes.
 	const rows = tx
 		.select()
@@ -433,6 +456,7 @@ function checkpointGroupsTx(
 				),
 				eq(narratorToolCalls.status, "success"),
 				checkpointWorthyToolCall(),
+				inArray(narratorToolCalls.id, retainedCallIds),
 			),
 		)
 		.orderBy(narratorToolCalls.createdAt, narratorToolCalls.id)
@@ -499,7 +523,12 @@ function planDerivedHistoryCleanup(
 	const subagentNarratorIds: string[] = [];
 	const childNarratorsByParent = new Map<
 		string,
-		Array<{ id: string; type: string; variant: string; originToolCallId: string | null }>
+		Array<{
+			id: string;
+			type: string;
+			variant: string;
+			originToolCallId: string | null;
+		}>
 	>();
 	for (let index = 0; index < pending.length; index++) {
 		const { call, seq, shared, depth } = pending[index];
@@ -640,7 +669,9 @@ function planDerivedHistoryCleanup(
 				messageIds.push(row.id);
 				toolCallIds.push(...childTools.map((tool) => tool.id));
 				if (skipRevert)
-					checkpoints.push(...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve));
+					checkpoints.push(
+						...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve, childTools),
+					);
 				pending.push(
 					...childTools.map((tool) => ({ call: tool, seq, shared: false, depth: depth + 1 })),
 				);
@@ -701,7 +732,10 @@ function planBlockDeletions(
 	opts?: BlockDeleteOptions,
 ) {
 	const narrator = tx.query.narrators
-		.findFirst({ where: eq(narrators.id, narratorId), columns: { messageVersion: true } })
+		.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { messageVersion: true },
+		})
 		.sync();
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	let rowCount = 0;
@@ -819,7 +853,8 @@ function planBlockDeletions(
 			? toolCalls.filter(
 					(call) =>
 						(remaining.length === 0 || removedToolIds.has(call.toolUseId)) &&
-						isCheckpointWorthyCall(call),
+						isCheckpointWorthyCall(call) &&
+						hasEnabledFileHistoryTarget(call),
 				)
 			: [];
 		plans.push({
@@ -1014,6 +1049,14 @@ async function deleteBlockSelection(
 	opts?: BlockDeleteOptions,
 	byBlock?: { retiredRows: readonly string[] },
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
@@ -1478,7 +1521,10 @@ function planMessageRangeDeletion(
 ) {
 	const reserve = createHistoryBudget();
 	const narrator = tx.query.narrators
-		.findFirst({ where: eq(narrators.id, narratorId), columns: { messageVersion: true } })
+		.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { messageVersion: true },
+		})
 		.sync();
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const boundary = tx.query.narratorMessageRefs
@@ -1584,7 +1630,7 @@ function planMessageRangeDeletion(
 		...derived.toolCallIds,
 	];
 	const checkpoints = opts?.skipRevert
-		? [...checkpointGroupsTx(tx, refs, reserve), ...derived.checkpoints]
+		? [...checkpointGroupsTx(tx, refs, reserve, tools), ...derived.checkpoints]
 		: [];
 	const associations = collectHistoryDeleteAssociations(tx, orphanIds, removedTools, reserve);
 	return {
@@ -1614,6 +1660,14 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	const timingId = generateId();
 	const startedAt = new Date().toISOString();
 	const context = { timingId, narratorId, messageId, inclusive, skipRevert: !!opts?.skipRevert };

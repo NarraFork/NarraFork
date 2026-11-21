@@ -9,9 +9,34 @@ const rows = Array.from({ length: 300 }, (_, i) => ({
 const unavailable = { statusCode: 503, code: "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE" };
 
 describe("Git access scan bounds", () => {
+	test("late scans inherit the total remaining deadline and successful cleanup keeps the signal usable", () => {
+		let elapsed = 0;
+		const monotonic = spyOn(performance, "now").mockImplementation(() => elapsed);
+		const wall = spyOn(Date, "now").mockImplementation(() => 1_000_000 + elapsed);
+		const total = new GitAccessScan(undefined, 30_000);
+		let scan: GitAccessScan | undefined;
+		try {
+			elapsed = 28_000;
+			scan = new GitAccessScan(total.signal, 5000, total.deadlineAt);
+			expect(scan.readOptions().deadlineAt).toBe(total.deadlineAt);
+			expect(scan.readOptions().timeoutMs).toBe(2000);
+			elapsed = 29_000;
+			expect(scan.readOptions().timeoutMs).toBe(1000);
+			scan.dispose(false);
+			total.dispose(false);
+			expect(scan.signal.aborted).toBe(false);
+			expect(total.signal.aborted).toBe(false);
+		} finally {
+			scan?.dispose(false);
+			total.dispose(false);
+			monotonic.mockRestore();
+			wall.mockRestore();
+		}
+	});
 	test("worker page budgets decrease from the same deadline and dispose cancels their signal", async () => {
 		let elapsed = 100;
 		const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+		const wallClock = spyOn(Date, "now").mockImplementation(() => 1_000_000 + elapsed);
 		const parent = new AbortController();
 		const added = spyOn(parent.signal, "addEventListener");
 		const removed = spyOn(parent.signal, "removeEventListener");
@@ -37,6 +62,7 @@ describe("Git access scan bounds", () => {
 		} finally {
 			scan.dispose();
 			clock.mockRestore();
+			wallClock.mockRestore();
 			added.mockRestore();
 			removed.mockRestore();
 		}
@@ -81,9 +107,12 @@ describe("Git access scan bounds", () => {
 					elapsed += 5000;
 					expect(() => scan.check()).toThrow();
 				}
-				await expect(work).rejects.toMatchObject(unavailable);
+				await expect(work).rejects.toMatchObject(
+					reason === "abort" ? { name: "AbortError" } : unavailable,
+				);
 				expect(options.signal.aborted).toBe(true);
-				expect(options.timeoutMs).toBe(5000);
+				expect(options.timeoutMs).toBeGreaterThan(0);
+				expect(options.timeoutMs).toBeLessThanOrEqual(5000);
 				expect(aborts).toBe(1);
 				expect(loads).toBe(1);
 				expect(visits).toBe(0);
@@ -194,7 +223,7 @@ describe("Git access scan bounds", () => {
 			})();
 			await setImmediate();
 			controller.abort();
-			await expect(work).rejects.toMatchObject(unavailable);
+			await expect(work).rejects.toMatchObject({ name: "AbortError" });
 			for (const reject of rejects) reject(new Error("late failure"));
 			await setImmediate();
 			expect(rejects).toHaveLength(8);

@@ -2,6 +2,7 @@ import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
 import { lstat, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import {
 	STORAGE_CATEGORY_KEYS,
 	STORAGE_CATEGORY_PROGRESS_MESSAGE,
@@ -11,6 +12,7 @@ import { and, asc, eq, gt, isNotNull, or, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
 import { readQuery, readQueryFirst } from "../db/worker-read";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
@@ -1199,6 +1201,9 @@ export async function repackTreeSnapshots(): Promise<{
 	removed: number;
 	freedBytes: number;
 }> {
+	// These repositories belong to local file history. Preserve their existing
+	// objects without scanning or repacking; other storage maintenance is separate.
+	if (!isFileHistoryEnabledForDevice(LOCAL_DEVICE_ID)) return { removed: 0, freedBytes: 0 };
 	try {
 		await worktreeTreeSnapshot.gcAll();
 	} catch (err) {

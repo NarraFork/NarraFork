@@ -105,7 +105,7 @@ export function MessageEditorPanel({
 		textareaRef: textarea,
 		onOptimized: setEditContent,
 	});
-	// Load while editing so a submit that restores nothing can skip the dialog.
+	// Remote sessions can skip a no-op review; local sessions never request file plans.
 	const previewTarget = useMemo(
 		() => (isUser && narratorId ? { messageId } : null),
 		[isUser, narratorId, messageId],
@@ -124,6 +124,7 @@ export function MessageEditorPanel({
 		async (revertOpts: RevertActionConfirmOptions) => {
 			if (!messageId || !onEditAndRegenerate || !canSubmitEdit || !snapshot || submitting.current)
 				return;
+			if (!preview.contextReady || (preview.messagesOnly && !revertOpts.skipRevert)) return;
 			submitting.current = true;
 			setIsSubmittingEdit(true);
 			try {
@@ -131,7 +132,7 @@ export function MessageEditorPanel({
 				const result: unknown = await onEditAndRegenerate(
 					messageId,
 					snapshot.text,
-					revertOpts,
+					preview.messagesOnly ? { skipRevert: true } : revertOpts,
 					snapshot,
 				);
 				if (shouldClearEditDraft(result)) {
@@ -141,8 +142,10 @@ export function MessageEditorPanel({
 			} finally {
 				// The submitted plan is spent either way. Load a fresh one so a retry
 				// after a failed save is judged against current state, never the old plan.
-				preview.invalidate();
-				preview.reload();
+				if (!preview.messagesOnly) {
+					preview.invalidate();
+					preview.reload();
+				}
 				submitting.current = false;
 				setIsSubmittingEdit(false);
 			}
@@ -155,6 +158,8 @@ export function MessageEditorPanel({
 			onClose,
 			preview.invalidate,
 			preview.reload,
+			preview.messagesOnly,
+			preview.contextReady,
 		],
 	);
 	const confirm = useCallback(() => {
@@ -421,12 +426,16 @@ export function MessageEditorPanel({
 			<RevertScopeConfirmModal
 				opened={showConfirmModal}
 				title={t("editRevertConfirmTitle")}
+				messagesOnly={preview.messagesOnly}
+				confirmationDisabled={!preview.contextReady}
 				description={
-					(preview.historySummary?.deletedMessageCount ?? 0) > 0
-						? t("editRevertConfirmDesc", {
-								messageCount: preview.historySummary?.deletedMessageCount ?? 0,
-							})
-						: t("editRevertConfirmDescNoMessages")
+					preview.messagesOnly
+						? t("editMessagesOnlyConfirmDesc")
+						: (preview.historySummary?.deletedMessageCount ?? 0) > 0
+							? t("editRevertConfirmDesc", {
+									messageCount: preview.historySummary?.deletedMessageCount ?? 0,
+								})
+							: t("editRevertConfirmDescNoMessages")
 				}
 				data={revertPreview}
 				previewKey={preview.previewKey}

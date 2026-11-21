@@ -204,9 +204,9 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 	const preferenceKey = gitTargetKey(target) ?? "";
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
-	const { data: summary, isLoading, error } = useGitStatus(target);
+	const { data: summary, isLoading, error } = useGitStatus(target, "details", { pushOnly: true });
 	const status = summary ?? { staged: 0, branch: "", hasChanges: true };
-	const lineStats = useGitLineStats(target);
+	const lineStats = useGitLineStats(target, "details", { pushOnly: true });
 	const stage = useGitStage(target);
 	const unstage = useGitUnstage(target);
 	const commit = useGitCommit(target);
@@ -248,6 +248,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		config: listConfig,
 		rowHeight,
 		displayScope: pages.displayScope,
+		workspaceIdentity: pages.workspaceIdentity,
 		displayAllowed: pages.displayAllowed && !displayBlocked,
 	});
 	const candidateMatches =
@@ -260,6 +261,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		candidateMatches ? list.candidateWindow.rows : [],
 		{
 			generation: pages.queryGeneration,
+			cache: pages.cache,
 			enabled: pages.displayAllowed,
 			onSnapshotObservation: pages.observeSnapshotStats,
 		},
@@ -328,7 +330,12 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		!list.isRetained &&
 		list.displayGeneration === pages.queryGeneration &&
 		list.displaySnapshotId === pages.pages[0]?.snapshotId;
-	const refreshing = displayAllowed && (list.isRetained || list.window.statsRefreshing === true);
+	const refreshing =
+		displayAllowed &&
+		(pages.updating ||
+			pageStats.updating ||
+			list.isRetained ||
+			list.window.statsRefreshing === true);
 	const [scopeError, setScopeError] = useState<string | null>(null);
 	const generationRef = useRef(pages.queryGeneration);
 	generationRef.current = pages.queryGeneration;
@@ -718,11 +725,25 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 			data-git-native-view
 			style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}
 		>
-			{isLoading && <Loader size="xs" />}
-			{(error || pages.error || pageStats.error || displayError || list.error || scopeError) && (
+			{(isLoading || (pages.isCachePending && !list.window.snapshotId)) && <Loader size="xs" />}
+			{pages.waitingForConnection && (
+				<Text role="status" c="dimmed" size="xs" px="xs">
+					{t("pages.waitingForConnection")}
+				</Text>
+			)}
+			{(error ||
+				pages.error ||
+				pages.statsError ||
+				pageStats.error ||
+				displayError ||
+				list.error ||
+				scopeError) && (
 				<Text c="red" size="xs" px="xs">
 					{scopeError ||
-						(error || pages.error || pageStats.error || displayError || list.error)?.message}
+						(error || pages.error)?.message ||
+						(pages.statsError
+							? t("lineStats.failed")
+							: (pageStats.error || displayError || list.error)?.message)}
 				</Text>
 			)}
 			{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error) && (

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import type { GitStatusPageResult, GitStatusPageStatsResponse } from "@shared/git-status-page";
 import { analyzeShellCommand } from "../lib/agent/bash-analyze";
 import { eventBus } from "../lib/event-bus";
 import type { GitStatusSummary } from "./git-service";
@@ -20,6 +21,12 @@ const summary = (branch = "main"): GitStatusSummary => ({
 	totalFiles: 1,
 });
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+function ready<T extends GitStatusPageResult | GitStatusPageStatsResponse>(
+	value: T,
+): Extract<T, { status: "ready" }> {
+	if (value.status !== "ready") throw new Error(`Expected ready cache: ${JSON.stringify(value)}`);
+	return value as Extract<T, { status: "ready" }>;
+}
 
 afterEach(() => mock.restore());
 
@@ -249,7 +256,10 @@ test("100 read events preserve a real worker's multi-page snapshot and its cache
 	const invalidated = mock(({ queryKey }: { queryKey: string }) => pages.invalidate(queryKey));
 	eventBus.on("git:workspace_invalidated", invalidated);
 	try {
-		const first = await pages.read({ scope, source, query: { limit: 100 } });
+		expect((await pages.read({ scope, source, query: { limit: 100 } })).status).toBe("pending");
+		expect(source.read).not.toHaveBeenCalled();
+		await pages.observe({ queryKey: scope.queryKey, source, readStats });
+		const first = ready(await pages.read({ scope, source, query: { limit: 100 } }));
 		const statsQuery = {
 			snapshotId: first.snapshotId,
 			rows: [{ type: "file" as const, section: "unstaged" as const, path: "file-000" }],
@@ -276,20 +286,24 @@ test("100 read events preserve a real worker's multi-page snapshot and its cache
 				path,
 				`read-${index}`,
 			);
-		const second = await pages.read({
-			scope,
-			source,
-			query: { limit: 100, cursor: first.nextCursor ?? undefined },
-		});
-		const third = await pages.read({
-			scope,
-			source,
-			query: { limit: 100, cursor: second.nextCursor ?? undefined },
-		});
+		const second = ready(
+			await pages.read({
+				scope,
+				source,
+				query: { limit: 100, cursor: first.nextCursor ?? undefined },
+			}),
+		);
+		const third = ready(
+			await pages.read({
+				scope,
+				source,
+				query: { limit: 100, cursor: second.nextCursor ?? undefined },
+			}),
+		);
 		expect(second.snapshotId).toBe(first.snapshotId);
 		expect(third.snapshotId).toBe(first.snapshotId);
 		expect(
-			(await pages.readStats({ scope, source, query: statsQuery, readStats })).rows[0],
+			ready(await pages.readStats({ scope, source, query: statsQuery })).rows[0],
 		).toMatchObject({ added: 2, complete: true });
 		expect(source.read).toHaveBeenCalledTimes(1);
 		expect(readStats).toHaveBeenCalledTimes(1);

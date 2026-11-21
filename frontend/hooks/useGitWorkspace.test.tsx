@@ -33,6 +33,9 @@ mock.module("./useWorkspaceContext", () => ({
 const accessListeners = new Set<() => void>();
 mock.module("../lib/narrator-ws-manager", () => ({
 	narratorWSManager: {
+		connected: false,
+		send: () => true,
+		onConnectionChange: () => () => {},
 		addListener: (_filter: unknown, listener: () => void) => {
 			accessListeners.add(listener);
 			return listener;
@@ -332,6 +335,33 @@ describe("non-blocking Git summaries and operation authority", () => {
 		expect(branch()).toBeNull();
 		expect(latest.displayCounts).toBeUndefined();
 	});
+	test("a background 404 retires old authority and scrubs cached private metadata without reporting denial", async () => {
+		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(
+			workspace("ready", "private-before-404"),
+		);
+		await mount();
+		latest.rememberCounts({ totalFiles: 7, totalFilesExact: true, truncated: false });
+		request.mockRejectedValueOnce(new ApiError("Not found", 404));
+		await latest.refetch();
+		await flush();
+		expect(latest.accessDenied).toBe(false);
+		expect(latest.data).toBeUndefined();
+		expect(latest.authoritativeData).toBeUndefined();
+		expect(latest.displayCounts).toBeUndefined();
+		expect(latest.authorizationState).toBe("refresh_required");
+		for (const [, cached] of client.getQueriesData<GitWorkspace>({
+			queryKey: ["gitWorkspace", "narrator"],
+		})) {
+			expect(cached?.branch).toBeUndefined();
+			expect(cached?.rootPath).toBeNull();
+			expect(cached?.cwd).toBe("");
+		}
+		request.mockResolvedValue(workspace("ready", "recovered"));
+		await latest.refetch();
+		await flush();
+		expect(latest.data?.branch).toBe("recovered");
+	});
+
 	test("summary permission denial rejects a late authority response", async () => {
 		detail("narrator", 3, "ready");
 		const authority = deferred<GitWorkspace>();

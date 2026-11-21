@@ -44,6 +44,8 @@ const {
 	useUpdateExecutionDevice,
 	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
+	isWorkspaceContextIdentity,
+	currentWorkspaceContext,
 } = await import("./useWorkspaceContext");
 const { FileTreePanel } = await import("../components/narrator/file-tree/FileTreePanel");
 const old: WorkspaceContext = {
@@ -149,6 +151,52 @@ test("a refused switch reports which device still needs a directory", () => {
 	expect(workspaceDirectoryRequiredDeviceId(new Error("boom"))).toBeNull();
 	expect(workspaceDirectoryRequiredDeviceId(null)).toBeNull();
 });
+test.each([
+	undefined,
+	null,
+	"",
+	"  ",
+	4,
+])("unverified device identity %s stays unresolved in cache and incoming contexts", (deviceId) => {
+	const invalid = { ...old, deviceId } as unknown as WorkspaceContext;
+	expect(isWorkspaceContextIdentity(invalid)).toBe(false);
+	expect(() => latestWorkspaceContext(old, invalid)).toThrow("Invalid workspace context identity");
+	client.setQueryData(workspaceContextKey("n"), invalid);
+	expect(currentWorkspaceContext(client, "n")).toBeUndefined();
+	expect(workspaceFileTarget(invalid)).toBeNull();
+});
+
+test("invalid WS device identity cannot overwrite the cache or release a pending transition", async () => {
+	(await import("bun:test")).spyOn(api, "getWorkspaceContext").mockResolvedValue(old);
+	await mountDevices();
+	await act(async () => {
+		client.setQueryData(["workspaceContextTransition", "n"], true);
+		listeners.mock.calls[0]?.[1]({
+			type: "workspace_context_changed",
+			current: { ...remote, deviceId: undefined },
+		});
+		await flush();
+	});
+	expect(client.getQueryData(workspaceContextKey("n"))).toEqual(old);
+	expect(client.getQueryData(["workspaceContextTransition", "n"])).toBe(true);
+	expect(container.querySelector("[data-references]")?.textContent).toBe("pending");
+	await act(async () => {
+		listeners.mock.calls[0]?.[1]({ type: "workspace_context_changed", current: remote });
+		await flush();
+	});
+	expect(client.getQueryData(["workspaceContextTransition", "n"])).toBe(false);
+	expect(container.querySelector("[data-references]")?.textContent).toBe(
+		"remote:D:\\remote\\project",
+	);
+});
+
+test("action-boundary context reads revoke an already captured device as soon as switching starts", () => {
+	client.setQueryData(workspaceContextKey("n"), old);
+	expect(currentWorkspaceContext(client, "n")).toEqual(old);
+	client.setQueryData(["workspaceContextTransition", "n"], true);
+	expect(currentWorkspaceContext(client, "n")).toBeUndefined();
+});
+
 test("an older revision can never undo a completed switch", () => {
 	expect(latestWorkspaceContext(next, old)).toBe(next);
 	expect(latestWorkspaceContext(old, next)).toBe(next);

@@ -1,11 +1,9 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
-import { beginBashCaptureWindow } from "@server/services/narrator-tree-snapshot-hooks";
 import { z } from "zod/v4";
 import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
-import { logger } from "../../logger";
 import { getHome } from "../../platform";
 import type { ExecHandle, ExecParams, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
@@ -196,7 +194,6 @@ async function prepareBashExecution(
 	cwd: string,
 	ctx: BashStartContext,
 	env?: Record<string, string> | null,
-	captureId?: string,
 ): Promise<BashExecution> {
 	const target = ctx.executionTarget;
 	if (
@@ -210,56 +207,23 @@ async function prepareBashExecution(
 		throw new Error("Bash execution target does not match its frozen backend/cwd");
 	ctx.signal.throwIfAborted();
 	let started = false;
-	let ended = false;
-	let bashWindow: { end(): void } | undefined;
-	const end = () => {
-		if (ended) return;
-		ended = true;
-		try {
-			bashWindow?.end();
-		} catch (error) {
-			logger.warn("Bash snapshot observation failed", { error: String(error) });
-		}
-		bashWindow = undefined;
-	};
 	return {
 		async start(signal, options) {
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
-			let handle: ExecHandle;
-			try {
-				signal.throwIfAborted();
-				if (backend.kind === "local") {
-					try {
-						bashWindow = beginBashCaptureWindow(
-							cwd,
-							ctx.currentToolUseId ?? captureId ?? "__anonymous__",
-						);
-					} catch (error) {
-						logger.warn("Bash snapshot observation unavailable", { error: String(error) });
-					}
-				}
-				handle = await backend.execCommand({
-					command,
-					cwd,
-					signal,
-					env: env ?? undefined,
-					...(options?.durableService ? { durableService: options.durableService } : {}),
-				});
-			} catch (error) {
-				// LocalBackend rejects dispatch only before spawning. Asynchronous
-				// spawn/process errors always come with a handle and its real barrier.
-				end();
-				throw error;
-			}
-			void (handle.whenSettled ?? handle.exited).then(
-				() => end(),
-				() => end(),
-			);
-			return handle;
+			signal.throwIfAborted();
+			// Execution admission remains independent of file history. Local Bash,
+			// including background commands, does not open tree-capture windows.
+			return backend.execCommand({
+				command,
+				cwd,
+				signal,
+				env: env ?? undefined,
+				...(options?.durableService ? { durableService: options.durableService } : {}),
+			});
 		},
 		cancelUndispatched() {
-			if (!started) end();
+			// No observation resources are allocated before dispatch.
 		},
 	};
 }
@@ -967,17 +931,10 @@ export async function startManualBackgroundBash(input: {
 	const env = await resolveNarratorGitIdentityEnv({ turnUserId: input.userId, narratorId });
 	const context = { narratorId, signal, executionTarget: target, updateExecutionLease };
 	const taskId = `bash_${generateShortId()}`;
-	const execution = await prepareBashExecution(
-		backend,
-		command,
-		target.cwd,
-		context,
-		{
-			...env,
-			...input.proxyEnv,
-		},
-		taskId,
-	);
+	const execution = await prepareBashExecution(backend, command, target.cwd, context, {
+		...env,
+		...input.proxyEnv,
+	});
 	try {
 		const task = await launchBackgroundBash(
 			command,

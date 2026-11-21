@@ -609,6 +609,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		const pending: RevertTransactionOutcome = {
 			...emptyRevertResult(),
 			planId: "pending-plan",
+			historyStatus: "complete",
 			status: "executing",
 			journalStatus: "applying",
 			settling: true,

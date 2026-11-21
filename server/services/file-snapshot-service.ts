@@ -10,6 +10,7 @@
  * would silently rewrite the file's charset. Content that is not representable
  * as text at all is marked binary and excluded from text-based rebuilds.
  */
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorFileSnapshots } from "../db/schema";
@@ -18,7 +19,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 
 export type SnapshotFailureMode = "best-effort" | "required";
-export type EnsureFileSnapshotResult = "existing" | "created" | "failed";
+export type EnsureFileSnapshotResult = "existing" | "created" | "failed" | "disabled";
 
 /** Original file state captured for a snapshot. */
 export interface SnapshotContent {
@@ -51,6 +52,7 @@ export async function ensureFileSnapshot(
 	readContent: () => Promise<string | null | SnapshotContent>,
 	failureMode: SnapshotFailureMode = "best-effort",
 ): Promise<EnsureFileSnapshotResult> {
+	if (!isFileHistoryEnabledForDevice(deviceId)) return "disabled";
 	try {
 		const existing = await readQuery(
 			db.query.narratorFileSnapshots.findFirst({

@@ -163,7 +163,7 @@ beforeEach(async () => {
 	sqlite.run("PRAGMA journal_mode = WAL");
 	store = drizzle(sqlite);
 	repository = new ExecutionPolicyRepository(store);
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 	seed();
 	await assertDbReadersReady(sqlite.filename, { timeoutMs: 30_000 });
 });
@@ -285,7 +285,7 @@ describe("execution policy worker facts", () => {
 		});
 		expect(await pending).toMatchObject({ code: "DB_READ_UNSUPPORTED" });
 		process.env.NARRAFORK_DB_WORKER = "off";
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 		const select = spyOn(store, "select").mockImplementation(() => {
 			throw new Error("main fallback");
 		});

@@ -20,6 +20,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { knowledgeCollections, knowledgeEntries, narrators } from "../../db/schema";
+import { type ReadQueryOptions, readQuery } from "../../db/worker-read";
 import { resolveNarratorProjectId } from "../narrator-project";
 
 /**
@@ -82,7 +83,11 @@ function collectionInheritsProjectGate(collection: Record<string, unknown>): boo
 	return collection.inheritProjectGate === true || collection.inheritProjectGate === 1;
 }
 
-export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]> {
+export async function resolveAncestorChain(
+	scope: AclScope,
+	readOptions?: ReadQueryOptions,
+): Promise<AclScope[]> {
+	readOptions?.signal?.throwIfAborted();
 	switch (scope.type) {
 		case "global":
 			return [];
@@ -92,14 +97,17 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 
 		case "narrator": {
 			if (!scope.id) return [GLOBAL_SCOPE];
-			const narrator = await db.query.narrators.findFirst({
+			const query = db.query.narrators.findFirst({
 				where: eq(narrators.id, scope.id),
 				columns: { id: true, contextProjectId: true },
 			});
+			const narrator = await (readOptions
+				? readQuery(query, { ...readOptions, executionPolicy: "worker-required", maxRows: 1 })
+				: query);
 			if (!narrator) return [GLOBAL_SCOPE];
 			const chain: AclScope[] = [];
 			// Single source of truth for "which project" — see narrator-project.ts.
-			const projectId = await resolveNarratorProjectId(narrator);
+			const projectId = await resolveNarratorProjectId(narrator, readOptions);
 			if (projectId) chain.push({ type: "project", id: projectId });
 			chain.push(GLOBAL_SCOPE);
 			return chain;
@@ -135,7 +143,7 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 				type: "knowledge_collection",
 				id: entry.collectionId,
 			};
-			return [collectionScope, ...(await resolveAncestorChain(collectionScope))];
+			return [collectionScope, ...(await resolveAncestorChain(collectionScope, readOptions))];
 		}
 	}
 }

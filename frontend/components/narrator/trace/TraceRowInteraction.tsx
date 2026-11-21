@@ -155,6 +155,8 @@ export function TraceRowInteraction({
 		toolUseId: tool?.toolUseId,
 		toolDetailRef,
 		filePath: tool?.filePath,
+		fileTarget: tool?.fileTarget,
+		fileNarratorId: tool?.fileNarratorId,
 	});
 	const isSelected = selection.selectedBlockIds.has(blockId);
 
@@ -372,7 +374,7 @@ export function TraceRowInteraction({
 						swipe.closeSwipe();
 					}}
 				>
-					{tNarrator(editNavigation.open ? "editPreview.open" : "contextMenu_openFilePanel")}
+					{tNarrator(editNavigation.open ? editNavigation.labelKey : "contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>

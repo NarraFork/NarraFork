@@ -384,7 +384,7 @@ describe("unresolvable delegation fails closed", () => {
 		const row = await rowOf(sub);
 		const previous = process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER = "off";
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 		try {
 			await expect(canReadNarrator(row, asUser(stranger))).rejects.toMatchObject({
 				code: "DB_READ_UNAVAILABLE",
@@ -395,7 +395,7 @@ describe("unresolvable delegation fails closed", () => {
 		} finally {
 			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = previous;
-			resetDbWorkerPoolForTest();
+			await resetDbWorkerPoolForTest();
 		}
 	});
 

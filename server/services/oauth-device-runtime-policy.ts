@@ -1,7 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { oauthClients, remoteDevices } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 import {
 	intersectOAuthClientPolicies,
 	normalizeOAuthClientPolicy,
@@ -37,8 +37,10 @@ function denied(reason: string): OAuthDeviceRuntimeAuthorization {
  */
 export async function resolveOAuthDeviceRuntimeAuthorization(
 	device: OAuthDeviceRuntimeResource,
+	readOptions?: ReadQueryOptions,
 ): Promise<OAuthDeviceRuntimeAuthorization> {
-	const provenance = await integrationResourceBindingService.get("device", device.id);
+	readOptions?.signal?.throwIfAborted();
+	const provenance = await integrationResourceBindingService.get("device", device.id, readOptions);
 	if (
 		!provenance ||
 		provenance.sourceType !== "oauth_client" ||
@@ -49,6 +51,7 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 	if (provenance.state !== "active") {
 		return denied("OAuth device provenance is inactive");
 	}
+	readOptions?.signal?.throwIfAborted();
 	const liveDevice = await readQuery(
 		db.query.remoteDevices.findFirst({
 			where: eq(remoteDevices.id, device.id),
@@ -60,13 +63,17 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 				revokedAt: true,
 			},
 		}),
-		{ executionPolicy: "worker-required" },
+		{ ...readOptions, executionPolicy: "worker-required" },
 	);
 	if (!liveDevice || liveDevice.revokedAt) return denied("Device revoked");
 	// OAuth grants are no longer project-bound: the resource binding (grant
 	// ownership) is the isolation boundary, so a missing projectId is allowed.
 
-	const authority = await integrationAuthorityService.getSnapshot(provenance.authorityId);
+	const authority = await integrationAuthorityService.getSnapshot(
+		provenance.authorityId,
+		{},
+		readOptions,
+	);
 	if (
 		!authority ||
 		authority.authority.kind !== "oauth_grant" ||
@@ -80,6 +87,7 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		return denied("OAuth device owner no longer matches the authority");
 	}
 
+	readOptions?.signal?.throwIfAborted();
 	const client = await readQuery(
 		db.query.oauthClients.findFirst({
 			where: and(
@@ -87,7 +95,7 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 				isNull(oauthClients.revokedAt),
 			),
 		}),
-		{ executionPolicy: "worker-required" },
+		{ ...readOptions, executionPolicy: "worker-required" },
 	);
 	if (!client?.publicClient) return denied("OAuth client is inactive");
 

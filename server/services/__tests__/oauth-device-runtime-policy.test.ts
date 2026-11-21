@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -11,6 +11,7 @@ import {
 	remoteDevices,
 	users,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
 import { getSessionDevices } from "../device-connection-service";
@@ -189,6 +190,35 @@ afterEach(async () => {
 });
 
 describe("OAuth device runtime authorization", () => {
+	test("device policy preserves one caller signal and deadline through all worker reads", async () => {
+		const { ids } = await createFixture();
+		const request = new AbortController();
+		const deadlineAt = Date.now() + 10_000;
+		const reads = spyOn(workerPool, "runReadTask");
+		try {
+			expect(
+				await resolveOAuthDeviceRuntimeAuthorization(deviceResource(ids), {
+					signal: request.signal,
+					deadlineAt,
+				}),
+			).toMatchObject({ allowed: true, grantId: ids.grant });
+			expect(reads.mock.calls).toHaveLength(4);
+			for (const [, , options] of reads.mock.calls) {
+				expect(options?.signal).toBe(request.signal);
+				expect(options?.deadlineAt).toBe(deadlineAt);
+			}
+			request.abort(new Error("device request cancelled"));
+			expect(
+				await resolveOAuthDeviceRuntimeAuthorization(deviceResource(ids), {
+					signal: request.signal,
+					deadlineAt,
+				}).catch((error: unknown) => error),
+			).toMatchObject({ message: "device request cancelled" });
+			expect(reads.mock.calls).toHaveLength(4);
+		} finally {
+			reads.mockRestore();
+		}
+	});
 	test("leaves ordinary devices unchanged", async () => {
 		const result = await resolveOAuthDeviceRuntimeAuthorization({
 			id: generateId(),

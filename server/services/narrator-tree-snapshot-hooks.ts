@@ -27,6 +27,7 @@
  * own changes instead of the whole workspace delta.
  */
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narratorToolCalls } from "../db/schema";
@@ -68,6 +69,9 @@ export function beginBashCaptureWindow(
 	worktreePath: string,
 	toolUseId = "__anonymous__",
 ): BashCaptureWindow {
+	if (!isFileHistoryEnabledForDevice(LOCAL_DEVICE_ID)) {
+		return { eligible: false, wasOverlapped: () => false, end() {} };
+	}
 	let current = bashWindows.get(worktreePath);
 	if (!current) {
 		current = { ids: new Set(), overlapped: false };
@@ -163,12 +167,8 @@ function worktreeRelativePath(cwd: string, value: unknown): string | null {
  *
  * Never throws. Returns null for a remote target, a non-git cwd, or a git error.
  *
- * Two deliberate degradation valves live here. The `workspace.treeSnapshotsEnabled`
- * setting is the manual escape hatch for worktrees where the whole-tree scan is
- * not viable at all; and the capture itself goes through `tryCaptureHot`, which
- * bounds how long the narrator's event consumer may stall on it and lets an
- * over-budget scan finish in the background instead of blocking the session
- * (the cold-index cycle that froze huge Windows worktrees).
+ * Local file history is disabled before consulting the legacy setting or entering
+ * the hot/warm capture engine. Claims are managed separately by the lifecycle hooks.
  */
 export async function captureSessionTree(
 	session: TreeSnapshotSession,
@@ -178,6 +178,10 @@ export async function captureSessionTree(
 	// Even a failed/disabled capture must not leave a stale observation looking fresh.
 	session._lastTreeHash = undefined;
 	session._lastTreeHashAt = undefined;
+	if (!isFileHistoryEnabledForDevice(session._defaultDeviceId)) {
+		session._treeHashBefore?.clear();
+		return null;
+	}
 	if (!settings.workspace.treeSnapshotsEnabled) return null;
 	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return null;
 	const treeHash = await worktreeTreeSnapshot.tryCaptureHot(session.cwd, LOCAL_DEVICE_ID, {
@@ -220,7 +224,7 @@ export async function recordTreeSnapshotBefore(
 	});
 	// The scan is an observation window, not an atomic timestamp. Include writes
 	// that overlap the scan, but never extend it back to a previous tool's cache.
-	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return;
+	if (session._defaultDeviceId && session._defaultDeviceId !== LOCAL_DEVICE_ID) return;
 	openClaim(session.cwd, narratorId, toolUseId, declared, startedAt);
 	if (!treeHash) return;
 	if (!session._treeHashBefore) session._treeHashBefore = new Map();
@@ -254,6 +258,7 @@ export function abandonTreeSnapshot(
 		// Whatever the tool managed to write before failing is on disk now, so a
 		// cached hash from before it ran no longer describes the workspace.
 		session._lastTreeHash = undefined;
+		session._lastTreeHashAt = undefined;
 		if (sealClaim(session.cwd, toolUseId)) {
 			logger.debug("Sealed an unfinished tool write claim", { narratorId, toolUseId });
 		}
@@ -284,6 +289,7 @@ export function abandonSessionTreeSnapshots(
 	try {
 		session._treeHashBefore?.clear();
 		session._lastTreeHash = undefined;
+		session._lastTreeHashAt = undefined;
 		const sealed = sealNarratorClaims(session.cwd, narratorId);
 		if (sealed > 0) {
 			logger.debug("Sealed unfinished tool write claims after a turn ended", {
@@ -331,10 +337,14 @@ export async function recordTreeSnapshotAfter(
 	toolUseId: string,
 	opts?: { unavailable?: true; binding?: ToolCallBinding },
 ): Promise<TreeSnapshotAfterResult> {
-	const before = opts?.unavailable ? null : (session._treeHashBefore?.get(toolUseId) ?? null);
-	session._treeHashBefore?.delete(toolUseId);
+	const historyDisabled = !isFileHistoryEnabledForDevice(session._defaultDeviceId);
+	const before =
+		historyDisabled || opts?.unavailable ? null : (session._treeHashBefore?.get(toolUseId) ?? null);
+	if (historyDisabled) session._treeHashBefore?.clear();
+	else session._treeHashBefore?.delete(toolUseId);
 	// The tool just wrote, so any cached hash describes a stale state.
 	session._lastTreeHash = undefined;
+	session._lastTreeHashAt = undefined;
 	// A shared in-flight capture is only usable as the *after* boundary when its
 	// scan started no earlier than the tool's completion: one started earlier
 	// (typically the pre-execution hook's own over-budget capture, promoted to a

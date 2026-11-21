@@ -1,0 +1,15 @@
+{
+  "rows": [
+    {
+      "id": "emSxYPqF-FXQ3itysvrXv",
+      "title": "审查账号双模式界面",
+      "status": "idle",
+      "substatus": "[\"unread\"]",
+      "is_background": 1,
+      "background_status": "running",
+      "logical_run_id": "kxhvo7uV82LGaciXrnXyh",
+      "updated_at": "2026-11-16T03:31:32.139Z"
+    }
+  ],
+  "limit_reached": false
+}

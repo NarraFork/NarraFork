@@ -14,7 +14,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narratorProjectLinks, narrators } from "../db/schema";
-import { readQuery, readQueryFirst } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 
 /** The narrator columns this resolution needs — nothing else is read. */
 export interface NarratorProjectRef {
@@ -31,7 +31,9 @@ export interface NarratorProjectRef {
  */
 export async function resolveNarratorProjectId(
 	narrator: NarratorProjectRef,
+	readOptions?: ReadQueryOptions,
 ): Promise<string | null> {
+	readOptions?.signal?.throwIfAborted();
 	if (narrator.contextProjectId) return narrator.contextProjectId;
 	// The link table lives in the SQLite main database; on PostgreSQL only the explicit
 	// project is known until the index is ported there.
@@ -46,7 +48,7 @@ export async function resolveNarratorProjectId(
 					eq(narratorProjectLinks.role, "primary"),
 				),
 			),
-		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
 	);
 	return link?.projectId ?? null;
 }
@@ -58,16 +60,20 @@ export async function resolveNarratorProjectId(
  * "unknown project" contract instead of throwing: callers are gating or layering,
  * not asserting existence.
  */
-export async function resolveProjectIdForNarratorId(narratorId: string): Promise<string | null> {
+export async function resolveProjectIdForNarratorId(
+	narratorId: string,
+	readOptions?: ReadQueryOptions,
+): Promise<string | null> {
+	readOptions?.signal?.throwIfAborted();
 	const narrator = await readQuery(
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { id: true, contextProjectId: true },
 		}),
-		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
 	);
 	if (!narrator) return null;
-	return await resolveNarratorProjectId(narrator);
+	return await resolveNarratorProjectId(narrator, readOptions);
 }
 
 /**

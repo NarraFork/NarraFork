@@ -8,6 +8,7 @@ import { useNarrator } from "../../hooks/useNarrator";
 import { useWorkspaceContext } from "../../hooks/useWorkspaceContext";
 import type { ApiError } from "../../lib/api";
 import { type GitTarget, gitBasePath, gitTargetKey } from "../../lib/api/git";
+import { describeApiError } from "../../lib/api-error";
 import {
 	buildCommitPreviewHref,
 	type CommitPreviewPageMode,
@@ -70,7 +71,7 @@ export function GitCommitPreviewPage(props: Props) {
 }
 
 function PreviewFailure({ error, retry }: { error: unknown; retry: () => void }) {
-	const { t } = useTranslation("git");
+	const { t } = useTranslation(["git", "errors"]);
 	const failure = error as ApiError | null;
 	const unsupported = failure?.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
 	let message = t("workspace.error");
@@ -85,8 +86,10 @@ function PreviewFailure({ error, retry }: { error: unknown; retry: () => void })
 		message = t("commitPreview.page.workspaceChanged", {
 			defaultValue: "The workspace has changed. Open a new preview from its current Git history.",
 		});
-	else if (failure?.status === 503) message = t("workspace.device_offline");
-	else if (failure?.message) message = failure.message;
+	else if (failure?.status === 503) {
+		const described = describeApiError(error, t);
+		message = described.localized ? described.message : t("workspace.refresh_required");
+	} else if (failure?.message) message = failure.message;
 	return (
 		<Alert color={unsupported ? "yellow" : "red"} role="alert">
 			<Stack gap="sm">
@@ -174,12 +177,19 @@ function NarratorWorkspacePreview({
 				<Stack gap="sm">
 					{t(
 						`workspace.${
-							workspace.accessDenied || workspace.data?.state === "ready"
+							workspace.accessDenied || workspace.authorizationState === "denied"
 								? "access_denied"
-								: (workspace.data?.state ?? "error")
+								: workspace.authorizationState === "paused" ||
+										workspace.authorizationState === "workspace_changed"
+									? "recovering"
+									: workspace.authorizationState === "refresh_required"
+										? "refresh_required"
+										: !workspace.data && workspace.authorizationState === "waiting"
+											? "loading"
+											: (workspace.data?.state ?? "error")
 						}`,
 					)}
-					<Button variant="light" size="xs" onClick={() => void refetch()}>
+					<Button variant="light" size="xs" onClick={workspace.refreshAuthorization}>
 						{t("workspace.retry")}
 					</Button>
 				</Stack>

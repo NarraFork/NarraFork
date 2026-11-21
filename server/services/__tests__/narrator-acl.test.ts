@@ -360,13 +360,14 @@ describe("listNarratorAudience", () => {
 	});
 	test("full fan-out reads every bounded grant page", async () => {
 		const id = await makeNarrator({ ownerUserId: ownerId });
+		const principalIds = [friendId, ...Array.from({ length: 499 }, () => generateId()), strangerId];
 		await db.insert(aclGrants).values(
-			Array.from({ length: 501 }, (_, index) => ({
+			principalIds.map((principalId, index) => ({
 				id: `${id}-${String(index).padStart(4, "0")}`,
 				scopeType: "narrator" as const,
 				scopeId: id,
 				principalType: "user" as const,
-				principalId: index === 500 ? strangerId : friendId,
+				principalId,
 				capability: "read" as const,
 				grantedBy: ownerId,
 				createdAt: new Date().toISOString(),
@@ -374,7 +375,7 @@ describe("listNarratorAudience", () => {
 		);
 		const audience = await listNarratorAudience(await rowOf(id));
 		if (audience.everyone) throw new Error("private audience widened");
-		expect(new Set(audience.userIds)).toEqual(new Set([ownerId, friendId, strangerId]));
+		expect(new Set(audience.userIds)).toEqual(new Set([ownerId, ...principalIds]));
 	});
 
 	test("candidate intersections run in workers and retain only their existing audience", async () => {

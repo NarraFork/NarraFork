@@ -1,5 +1,5 @@
 import { db } from "@server/db";
-import { readDomainTask } from "@server/db/worker-read";
+import { type ReadQueryOptions, readDomainTask } from "@server/db/worker-read";
 import {
 	getSourceClient,
 	isPostgresSource,
@@ -34,7 +34,17 @@ function materializeLoadedPolicy(facts: ExecutionPolicyFacts): LoadedExecutionPo
 export class ExecutionPolicyRepository {
 	constructor(private readonly store: ExecutionPolicyFactsStore & SqlReadSource = db) {}
 
-	async load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
+	async load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy>;
+	async load(narratorId: string, readOptions?: ReadQueryOptions): Promise<LoadedExecutionPolicy>;
+	async load(
+		narratorId: string,
+		readOptionsOrSignal?: ReadQueryOptions | AbortSignal,
+	): Promise<LoadedExecutionPolicy> {
+		const readOptions =
+			readOptionsOrSignal instanceof AbortSignal
+				? { signal: readOptionsOrSignal }
+				: readOptionsOrSignal;
+		const signal = readOptions?.signal;
 		signal?.throwIfAborted();
 		// PostgreSQL keeps its native async path; SQLite facts are always isolated in a worker.
 		if (isPostgresSource(this.store)) {
@@ -53,9 +63,10 @@ export class ExecutionPolicyRepository {
 			"executionPolicyFacts",
 			{ narratorId },
 			{
+				...(readOptions ?? {}),
 				executionPolicy: "worker-required",
 				diagnosticSource: "execution-policy-facts",
-				timeoutMs: 5_000,
+				timeoutMs: Math.min(readOptions?.timeoutMs ?? 5_000, 5_000),
 				signal,
 			},
 		);

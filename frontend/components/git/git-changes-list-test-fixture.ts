@@ -1,15 +1,32 @@
+import { spyOn } from "bun:test";
 import { QueryClient, type QueryClientConfig } from "@tanstack/react-query";
 import type { GitLineStats } from "../../../shared/git-line-stats";
 import {
 	GIT_STATUS_FILTER_CHARS,
 	type GitStatusPage,
 	type GitStatusPageQuery,
+	type GitStatusPageResult,
 	gitStatusBadgeChar,
 	gitStatusInSection,
 	gitStatusMatchesSection,
 } from "../../../shared/git-status-page";
 import type { GitStatusSummary } from "../../hooks/useGit";
 import { api } from "../../lib/api";
+import {
+	type ListenerOptions,
+	type MessageCallback,
+	narratorWSManager,
+} from "../../lib/narrator-ws-manager";
+
+let fixtureVersion = 1;
+export const gitChangesFixtureCache = () => ({
+	status: "ready" as const,
+	workerEpoch: "fixture-worker",
+	memberVersion: fixtureVersion,
+	statsVersion: fixtureVersion,
+	updating: false,
+});
+
 import { __setGitChangesWorkerFactory, type GitChangesWorkerPort } from "./git-changes-list-client";
 import { GitChangesListModel } from "./git-changes-list-model";
 import type {
@@ -87,6 +104,7 @@ export async function flushGitChangesTestRender() {
 }
 
 let clients: QueryClient[] = [];
+const statsReadingClients = new WeakSet<QueryClient>();
 export function createGitChangesTestQueryClient(config?: QueryClientConfig) {
 	const client = new QueryClient(config);
 	client.setQueryData(["auth", "me"], { id: "fixture-alice" });
@@ -102,7 +120,8 @@ export function createGitChangesTestQueryClient(config?: QueryClientConfig) {
 		if (
 			event.type === "updated" &&
 			event.query.queryKey[0] === "gitLineStats" &&
-			event.action.type === "success"
+			event.action.type === "success" &&
+			!statsReadingClients.has(client)
 		) {
 			void client.invalidateQueries({ queryKey: ["gitStatusPageStats", event.query.queryKey[1]] });
 		}
@@ -114,7 +133,7 @@ export function createGitChangesTestQueryClient(config?: QueryClientConfig) {
 export function gitChangesFixturePage(
 	status: GitStatusSummary,
 	query: GitStatusPageQuery = {},
-): GitStatusPage {
+): Extract<GitStatusPageResult, { status: "ready" }> {
 	const filter = query.filter ?? [];
 	const matched = status.files.filter(
 		(file) =>
@@ -155,6 +174,8 @@ export function gitChangesFixturePage(
 	const legacyPrefix = filter.length === 0 && counts.totalFiles > status.files.length;
 	const hasMore = offset + files.length < matched.length || legacyPrefix;
 	return {
+		status: "ready",
+		cache: gitChangesFixtureCache(),
 		snapshotId: `fixture:${status.headSha ?? "head"}:${filter.join("")}`,
 		files,
 		counts,
@@ -168,6 +189,60 @@ export function gitChangesFixturePage(
 
 export function installGitChangesTestTransport() {
 	clients = [];
+	fixtureVersion = 1;
+	const callbacks = new Map<MessageCallback, ListenerOptions>();
+	const addListener = narratorWSManager.addListener.bind(narratorWSManager);
+	const connected = Object.getOwnPropertyDescriptor(narratorWSManager, "connected");
+	Object.defineProperty(narratorWSManager, "connected", { configurable: true, value: true });
+	const credential = spyOn(narratorWSManager, "getCredentialIdentity").mockReturnValue(1);
+	const connectionCredential = spyOn(
+		narratorWSManager,
+		"getConnectionCredentialIdentity",
+	).mockReturnValue(1);
+	const listener = spyOn(narratorWSManager, "addListener").mockImplementation(
+		(options, callback) => {
+			callbacks.set(callback, options);
+			return addListener(options, callback);
+		},
+	);
+	const identities = new Map<unknown, Record<string, unknown>>();
+	let messageVersion = 0;
+	const emit = (type: string, data: Record<string, unknown>) => {
+		const frame = { ...data, type, version: messageVersion++ };
+		for (const [callback, options] of callbacks)
+			if (!options.types || options.types.includes(type)) callback(frame);
+	};
+	const send = spyOn(narratorWSManager, "send").mockImplementation((message) => {
+		if (message.type === "git_workspace_subscribe") {
+			const workspace = clients
+				.flatMap((client) =>
+					client.getQueriesData<{ workspaceKey?: string; repositoryKey?: string }>({
+						queryKey: ["gitWorkspace"],
+					}),
+				)
+				.map(([, value]) => value)
+				.find((value) => value?.workspaceKey === message.workspaceKey);
+			const identity = { ...message, repositoryKey: workspace?.repositoryKey };
+			const first = !identities.has(message.subscriptionId);
+			identities.set(message.subscriptionId, identity);
+			if (first) queueMicrotask(() => emit("git_workspace_subscribed", identity));
+		}
+		if (message.type === "git_workspace_refresh") {
+			fixtureVersion++;
+			queueMicrotask(() =>
+				emit("git_workspace_snapshot", {
+					...identities.get(message.subscriptionId),
+					view: "details",
+					snapshot: {
+						revision: messageVersion,
+						updating: false,
+						statusPages: gitChangesFixtureCache(),
+					},
+				}),
+			);
+		}
+		return true;
+	});
 	__setGitChangesWorkerFactory(() => new TestGitChangesWorker());
 	const original = api.getGitStatusPage;
 	const originalStats = api.getGitStatusPageStats;
@@ -192,6 +267,7 @@ export function installGitChangesTestTransport() {
 		const status =
 			client?.getQueryData<GitStatusSummary>(["gitStatus", target.workspaceKey]) ??
 			(await api.getGitStatus(target));
+		if (client) statsReadingClients.add(client);
 		const lines = client
 			? await client.fetchQuery<GitLineStats>({
 					queryKey: ["gitLineStats", target.workspaceKey],
@@ -199,9 +275,12 @@ export function installGitChangesTestTransport() {
 					staleTime: Infinity,
 				})
 			: await api.getGitLineStats(target, signal);
+		if (client) statsReadingClients.delete(client);
 		signal?.throwIfAborted();
 		const measurements = new Map(lines.files.map((file) => [file.path, file]));
 		return {
+			status: "ready",
+			cache: gitChangesFixtureCache(),
 			snapshotId: query.snapshotId,
 			rows: query.rows.map((row) => {
 				const members = status.files.filter(
@@ -243,6 +322,12 @@ export function installGitChangesTestTransport() {
 		return gitChangesFixturePage(await api.getGitStatus(target), query);
 	};
 	return () => {
+		if (connected) Object.defineProperty(narratorWSManager, "connected", connected);
+		else Reflect.deleteProperty(narratorWSManager, "connected");
+		listener.mockRestore();
+		send.mockRestore();
+		credential.mockRestore();
+		connectionCredential.mockRestore();
 		api.getGitStatusPage = original;
 		api.getGitStatusPageStats = originalStats;
 		api.getGitStagingLists = originalStaging;

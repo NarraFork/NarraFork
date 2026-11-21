@@ -322,6 +322,50 @@ afterEach(async () => {
 	else Reflect.deleteProperty(prototype, "clientHeight");
 });
 
+test("list Worker accepts only the active workspace and exact published statistics version", async () => {
+	const cache = {
+		status: "ready" as const,
+		workerEpoch: "worker",
+		memberVersion: 1,
+		statsVersion: 1,
+		updating: false,
+	};
+	const ownedPage = { ...page("snapshot", ["a"]), cache };
+	await render({ pages: [ownedPage], workspaceIdentity: "workspace" });
+	await flush();
+	const base = {
+		...source("g1", "snapshot"),
+		workspaceIdentity: "workspace",
+		workerEpoch: "worker",
+		memberVersion: 1,
+		statsVersion: 1,
+	};
+	const observed = {
+		...result("snapshot", ["a"], 7),
+		cache,
+		workspaceIdentity: "workspace",
+		filterKey: "",
+	};
+	await merge({ ...base, workspaceIdentity: "other" }, observed);
+	await flush();
+	expect(added()).toEqual([undefined]);
+	await merge(base, observed);
+	await flush();
+	expect(added()).toEqual([7]);
+	const next = { ...base, epoch: "two", statsVersion: 2 };
+	await merge(next);
+	await flush();
+	expect(added()).toEqual([7]);
+	const stale = { ...observed, rows: observed.rows.map((row) => ({ ...row, added: 999 })) };
+	await merge(next, stale);
+	await flush();
+	expect(added()).toEqual([7]);
+	const current = { ...stale, cache: { ...cache, statsVersion: 2 } };
+	await merge(next, current);
+	await flush();
+	expect(added()).toEqual([999]);
+});
+
 describe("Git changes display handoff", () => {
 	test("responsive 44px rows keep the same visible row, viewport window and scroll anchor", async () => {
 		const snapshot = page(
