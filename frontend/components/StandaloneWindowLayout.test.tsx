@@ -70,6 +70,12 @@ mock.module("./AuthenticatedAppLayout", () => ({
 		);
 	},
 }));
+mock.module("./UnattendedModeBanner", () => ({
+	UnattendedModeBanner: () => <div data-unattended-mode-banner />,
+}));
+mock.module("../lib/narrator-ws-manager", () => ({
+	narratorWSManager: { connect: () => {}, disconnect: () => {} },
+}));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const { RootLayout } = await import("./AppRootLayout");
 const { StandaloneWindowLayout } = await import("./StandaloneWindowLayout");
@@ -214,6 +220,7 @@ test("private window renders only target and cleans up viewport ownership", asyn
 	await waitFor(() => !!container.querySelector("[data-target]"));
 	expect(container.querySelector("[data-navigation]")).toBeNull();
 	expect(container.querySelector("[data-standalone-window]")).not.toBeNull();
+	expect(container.querySelector("[data-unattended-mode-banner]")).not.toBeNull();
 	expect(shellMounts).toBe(0);
 	expect(appearanceCalls).toBeGreaterThan(0);
 	expect(fastModeUpdates).toHaveBeenCalled();

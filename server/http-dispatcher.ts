@@ -123,7 +123,7 @@ export function createServerRequestDispatcher(options: {
 			});
 		}
 		const requestId = lifecycle.nextRequestId();
-		const execution = lifecycle.context.run(requestId, async () => {
+		const execute = async () => {
 			const url = new URL(req.url);
 
 			// Keep liveness available while exposing whether continuation recovery is still
@@ -378,7 +378,7 @@ export function createServerRequestDispatcher(options: {
 				peerIp,
 				trustedProxy: !remote && isTrustedProxyAddress(peerIp, trustedProxyCidrs),
 			});
-		});
-		return lifecycle.track(requestId, req, execution, !!trustedRemoteRequestContext(req));
+		};
+		return lifecycle.run(requestId, req, execute, !!trustedRemoteRequestContext(req));
 	};
 }

@@ -18,12 +18,14 @@ import { clearToken } from "../lib/api";
 import { useBrowserLayoutEffect } from "../lib/app-shell-scroll";
 import { getCurrentBranding, onBrandingChange } from "../lib/branding";
 import { getNamespacesForPath } from "../lib/i18n";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { installAppViewportTracking, installAuthenticatedAppShellRootLock } from "../lib/safe-area";
 import { isStandaloneWindowPath } from "../lib/standalone-window";
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
 import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import classes from "./StandaloneWindowLayout.module.css";
+import { UnattendedModeBanner } from "./UnattendedModeBanner";
 
 /**
  * Window-title channel between a /windows/* page and the layout's drag strip.
@@ -120,8 +122,11 @@ function StandaloneWindowContent() {
 		document.title = windowTitle ? `${windowTitle} · ${brandName}` : brandName;
 	}, [windowTitle, brandName]);
 
-	// Realtime panels (chat, terminal, …) mount their own WS connection; the
-	// layout only owns chrome. See routes/windows/panel.tsx.
+	useEffect(() => {
+		narratorWSManager.connect();
+		return () => narratorWSManager.disconnect();
+	}, []);
+
 	return (
 		<WindowTitleSetterContext.Provider value={setWindowTitle}>
 			<main className={classes.window} data-standalone-window>
@@ -130,6 +135,11 @@ function StandaloneWindowContent() {
 				<div className="nf-wco-window-strip" aria-hidden>
 					<span className="nf-wco-window-strip-title">{windowTitle ?? brandName}</span>
 				</div>
+				<Suspense fallback={null}>
+					<I18nNamespaceGate namespaces={["settings"]}>
+						<UnattendedModeBanner />
+					</I18nNamespaceGate>
+				</Suspense>
 				<Suspense
 					fallback={
 						<Center h="100%">
