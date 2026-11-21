@@ -1682,6 +1682,23 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 	}
 }
 
+// A separate hot-reload key activates this bridge in already-running development modules.
+if (hotOnce("narrafork.fastModeWs.listenersRegistered")) {
+	eventBus.on("narrator:imported", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("narrator:fast_mode_changed", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("narrator:execution_principal_changed", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("user:fast_mode_default_changed", ({ userId }) => {
+		broadcastToAll({ type: "fast_mode_changed" });
+		broadcastToUser(userId, { type: "fast_mode_changed", refreshPreferences: true });
+	});
+}
+
 /**
  * Broadcast only to admin connections. For frames that only an admin can act on
  * (plugin permission prompts): sending them to everyone leaks which plugins ask

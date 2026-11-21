@@ -168,6 +168,7 @@ import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badge
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
+import { isFastModeSubagent } from "./interaction/fast-mode-state";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
@@ -1211,8 +1212,7 @@ function NarratorPanelBody({
 	}, [isWorkspacePreview, scrollToBottom, suppressAutoFocusOnPromote]);
 
 	// --- WebSocket + real-time state ---
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = !!(fetchedNarrator as any)?.variant?.startsWith("subagent:");
+	const isSubagent = isFastModeSubagent(narrator ?? {});
 
 	// Parse persisted substatus from narrator data to seed the WS hook's reducer
 	const narratorSubstatus = useMemo(() => {
@@ -3812,6 +3812,9 @@ function NarratorPanelBody({
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
+							effectiveFastMode: narrator.effectiveFastMode,
+							fastModeSource: narrator.fastModeSource,
+							isSubagent,
 							fastModeDefault,
 							fastModeUsesTapSettings,
 							fastModeMutation,

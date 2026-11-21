@@ -12,6 +12,7 @@ import {
 	subscribeAppearancePreferences,
 } from "../lib/appearance-preference-store";
 import { useCurrentUser } from "./useCurrentUser";
+import { invalidateFastModeDetails } from "./useFastModeUpdates";
 
 const sessionObservers = new WeakMap<QueryClient, { count: number; stop: () => void }>();
 function observeSession(qc: QueryClient) {
@@ -127,8 +128,11 @@ export function useUpdateUserPreferences() {
 			}
 			return result;
 		},
-		onSuccess: (result) => {
+		onSuccess: (result, variables) => {
 			if (result !== undefined) qc.invalidateQueries({ queryKey: ["user-preferences"] });
+			if (typeof variables.fastModeDefault === "boolean") {
+				void invalidateFastModeDetails(qc);
+			}
 		},
 	});
 }

@@ -18,6 +18,7 @@ process.env.NARRAFORK_HOME = testHome;
 const { sqlite } = await import("../../db");
 const { SNAPSHOT_TABLES } = await import("../../db/snapshot-protocol");
 const { saveSettings, settings } = await import("../../lib/settings");
+const { resolveNarratorFastMode } = await import("../narrator-fast-mode");
 const { getModelOverride, replaceModelOverridesForTests, setModelCatalogAutoUpdate } = await import(
 	"../../lib/model-catalog"
 );
@@ -129,6 +130,21 @@ beforeEach(async () => {
 });
 
 describe("data portability · 全链路", () => {
+	test("overwriting imported sessions refreshes cached primary and inherited fast mode", async () => {
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'off' WHERE id = 'sess-1'");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, acl_root_narrator_id, created_at, updated_at)
+			 VALUES ('fast-child', 'subagent', 'sess-1', '2026-10-01', '2026-10-01')`,
+		);
+		const zip = await readFile((await exportData()).zipPath);
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'on' WHERE id = 'sess-1'");
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(true);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(true);
+		const preview = await previewImport(toArrayBuffer(zip), "fast-mode.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(false);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(false);
+	});
 	test("会话导入覆盖与清空只使本地 workspace 候选失效，不改已有名字", async () => {
 		sqlite.run(
 			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('workspace-owner', 'workspace-owner', 'x', '2026-10-01T00:00:00Z')",

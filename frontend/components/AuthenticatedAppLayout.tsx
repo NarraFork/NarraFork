@@ -11,6 +11,7 @@ import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
 import { useChatUnreadLive } from "../hooks/useChat";
+import { useFastModeUpdates } from "../hooks/useFastModeUpdates";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
@@ -141,6 +142,7 @@ export function AuthenticatedLayout() {
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, fetchStatus, hasToken, sessionLost } = useAuthenticatedSession();
+	useFastModeUpdates(!!user);
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();

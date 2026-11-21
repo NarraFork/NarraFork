@@ -1232,6 +1232,12 @@ export interface AgentConfig {
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** Resolve a fresh tier per attempt; undefined disables the static tier. */
+	resolveServiceTier?: (request: {
+		provider: string;
+		model: string;
+		signal: AbortSignal;
+	}) => string | undefined | Promise<string | undefined>;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**
