@@ -445,6 +445,17 @@ export async function runAgentLoopUnlocked(
 	const checkpointIdentity = run?.logicalRunId
 		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }
 		: undefined;
+	const rethrowCheckpointPause = (error: unknown): void => {
+		if (isCheckpointStop(error) && checkpointIdentity && !run?.cancel.signal.aborted) {
+			const own = checkpointStopForRun(checkpointIdentity);
+			if (own?.updateEpoch === error.updateEpoch) {
+				own.cleanupFailure = error.cleanupFailure;
+				checkpointPause = own;
+				if (run) run.checkpointStop = own;
+				throw own;
+			}
+		}
+	};
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -3660,18 +3671,13 @@ export async function runAgentLoopUnlocked(
 	} catch (err) {
 		// A child may unwind its foreground parent, but only the parent's own persisted
 		// identity authorizes releasing this owner. Never inherit the child's identity.
-		if (isCheckpointStop(err) && checkpointIdentity && !run?.cancel.signal.aborted) {
-			const own = checkpointStopForRun(checkpointIdentity);
-			if (own?.updateEpoch === err.updateEpoch) {
-				own.cleanupFailure = err.cleanupFailure;
-				checkpointPause = own;
-				if (run) run.checkpointStop = own;
-				throw own;
-			}
-		}
+		rethrowCheckpointPause(err);
 		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
 		// Keep the run active for the next process instead of publishing a false failure.
-		await waitForRestartBeforeFailure(active.abortController.signal);
+		await waitForRestartBeforeFailure(active.abortController.signal).catch((error) => {
+			rethrowCheckpointPause(error);
+			throw error;
+		});
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);

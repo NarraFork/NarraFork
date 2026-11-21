@@ -250,6 +250,44 @@ test("one parked loop retains both real session tails until checkpoint unwind fi
 	}
 });
 
+test("a failure-handler checkpoint pause retains Stop hooks and temporary model state", async () => {
+	const entered = Promise.withResolvers<void>();
+	const fail = Promise.withResolvers<void>();
+	releaseCheckpointUnwind = fail.resolve;
+	const stopHooks: string[] = [];
+	const { hookService } = await import("../hook-service");
+	spyOn(hookService, "runHooks").mockImplementation(async (event) => {
+		if (event === "Stop") stopHooks.push(event);
+		return { outcome: "success" };
+	});
+	spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+		entered.resolve();
+		await fail.promise;
+		throw new Error("Provider teardown failed during restart");
+	});
+	db.update(narrators)
+		.set({ pendingModelRestore: "checkpointfixture:original" })
+		.where(eq(narrators.id, ids[0]))
+		.run();
+	await session.acceptUserMessage(ids[0], "checkpoint input", { userId: "checkpoint-user" });
+	await entered.promise;
+	coordinator.scheduleUpdate(undefined, "system_shutdown");
+	await publishCheckpoint();
+	expect(coordinator.stopCheckpointedNarratorRuns()).toBe(0);
+	const running = activeNarrators.get(ids[0]);
+	if (!running) throw new Error("Missing live fixture session");
+	expect(coordinator.checkpointStopForSignal(running.abortController.signal, ids[0])).toBeDefined();
+	fail.resolve();
+	await runs.drainNarratorRunCompletions({ deadlineAt: Date.now() + 2_000 });
+	await session.drainNarratorSessionTails({ deadlineAt: Date.now() + 2_000 });
+	expect(stopHooks).toEqual([]);
+	expect(db.select().from(narrators).where(eq(narrators.id, ids[0])).get()).toMatchObject({
+		status: "working",
+		model: "checkpointfixture:model",
+		pendingModelRestore: "checkpointfixture:original",
+	});
+});
+
 for (const claimTiming of ["none", "before-child-register", "before-stop"] as const) {
 	test(`foreground parent-child checkpoint authority respects recovery claim timing=${claimTiming}`, async () => {
 		const childEntered = Promise.withResolvers<void>();
