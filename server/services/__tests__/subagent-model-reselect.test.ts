@@ -66,6 +66,9 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { settings } = await import("../../lib/settings");
 	const { narratorService } = await import("../narrator-service");
 	const { selectSubagentModel } = await import("../subagent-model");
+	const { activeNarrators, clearNarratorRuntimeModel, recordNarratorRuntimeModel } = await import(
+		"../narrator-session-state"
+	);
 	const {
 		isNewSubagentModelSelectionRun,
 		markExplicitSubagentModelPin,
@@ -128,6 +131,8 @@ if (process.env[CHILD_ENV] !== "1") {
 		settings.agent.subagentModels = {} as never;
 	});
 	afterEach(() => {
+		activeNarrators.delete(PARENT);
+		clearNarratorRuntimeModel(PARENT);
 		settings.agent.subagentAllowedModels = original.allowed;
 		settings.agent.subagentModelReasoningEfforts = original.efforts;
 		settings.agent.subagentModels = original.prefs;
@@ -200,6 +205,26 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(false);
 			expect(writes).toEqual([]);
 		});
+
+		for (const runtime of ["active", "recorded", "unknown"] as const) {
+			test(`a nested helper uses its following worker's ${runtime} provider`, async () => {
+				setPool(["provB:m1", "provA:m2"]);
+				rows.set(PARENT, {
+					id: PARENT,
+					type: "subagent",
+					model: FOLLOW_PARENT_MODEL,
+					traits: [],
+				});
+				setChild("provB:m1");
+				if (runtime === "active") activeNarrators.set(PARENT, { provider: "provA" } as never);
+				if (runtime === "recorded")
+					recordNarratorRuntimeModel(PARENT, FOLLOW_PARENT_MODEL, "provA", "m2");
+				expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(runtime !== "unknown");
+				expect(writes).toEqual(
+					runtime === "unknown" ? [] : [{ id: CHILD, input: { model: "provA:m2" } }],
+				);
+			});
+		}
 
 		test("another provider re-selects: parent model in the pool, with its fixed tier", async () => {
 			setPool(["provB:m1", "provA:m2"], { "provA:m2": "high" });

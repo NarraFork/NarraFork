@@ -192,7 +192,7 @@ export async function reselectSubagentModelForNewRun(
 		const sourceId = policySourceIdOf(child) ?? child.parentNarratorId;
 		if (!sourceId) return false;
 		const source = await narratorService.getById(sourceId).catch(() => null);
-		if (!source || source.model === FOLLOW_PARENT_MODEL) {
+		if (!source) {
 			logger.debug("Subagent model kept: source narrator unavailable", { narratorId, sourceId });
 			return false;
 		}
