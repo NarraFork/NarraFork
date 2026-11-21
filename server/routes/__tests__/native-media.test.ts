@@ -330,7 +330,7 @@ describe("new-session media forwarding", () => {
 				const branch = section(
 					source,
 					"\t\tif (queuedNewCommand && !narratorBusy) {",
-					"\n\t\tconst locale = await getUserLanguage(userId);",
+					"\n\t\tconst { locale, replyInUserLanguage } = await readMessageLanguagePreferences(",
 				);
 				const cleanup = section(source, "\t} finally {\n\t\tif (!uploadsAccepted)", "\n});");
 				const run = execute(
