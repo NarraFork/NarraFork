@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
 import { userPreferences } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -658,9 +659,18 @@ userPreferencesRoutes.patch("/", async (c) => {
 			],
 		);
 
-		return db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		if (
+			d.fastModeDefault !== undefined &&
+			d.fastModeDefault !== (existing?.fastModeDefault ?? DEFAULTS.fastModeDefault)
+		) {
+			eventBus.emit({ type: "user:fast_mode_default_changed", userId });
+		}
+
+		const [saved] = await readQuery(
+			db.select().from(userPreferences).where(eq(userPreferences.userId, userId)).limit(1),
+			{ maxRows: 1 },
+		);
+		return saved;
 	});
 	if (updated) eventBus.emit({ type: "user_preferences:changed", userId });
 	return c.json(updated ? serializeUserPreferences(updated) : updated);

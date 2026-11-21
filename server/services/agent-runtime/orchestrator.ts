@@ -44,7 +44,6 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
-import { resolveFastModeForUser } from "../../lib/fast-mode";
 import { logger } from "../../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -142,6 +141,7 @@ import {
 	retireSubagentOutputCharCount,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
+import { resolveNarratorFastMode } from "../narrator-fast-mode";
 import { deliverInjection } from "../narrator-injection";
 import { isFirstUserTurn } from "../narrator-message-count";
 import { handlePermission } from "../narrator-permission";
@@ -1956,20 +1956,8 @@ export async function runAgentLoopUnlocked(
 
 			const resolvedReasoningEffort = active.reasoningEffort ?? undefined;
 
-			// Resolved per turn, not frozen at creation: an "inherit" override follows
-			// the acting user's fastModeDefault preference, so flipping that default
-			// takes effect on existing narrators from their next turn onward.
-			const resolvedFastMode = await resolveFastModeForUser(
-				freshNarrator.fastModeOverride,
-				actingUserId,
-			);
-
 			// Restrictions come from the same strict per-pass resolution as the ceiling.
 			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
-			const resolvedServiceTier =
-				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
-					? "priority"
-					: undefined;
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
@@ -2116,7 +2104,10 @@ export async function runAgentLoopUnlocked(
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
 				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
-				serviceTier: resolvedServiceTier,
+				resolveServiceTier: async ({ provider, model, signal }) => {
+					const { effectiveFastMode } = await resolveNarratorFastMode(narratorId, { signal });
+					return effectiveFastMode && usesCodexModel(provider, model) ? "priority" : undefined;
+				},
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
 				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,
