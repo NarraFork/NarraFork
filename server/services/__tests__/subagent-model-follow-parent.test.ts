@@ -11,12 +11,15 @@ if (process.env[CHILD_ENV] !== "1") {
 	test("subagent model inheritance: isolated real-DB execution chain", async () => {
 		const env: NodeJS.ProcessEnv = { ...process.env, [CHILD_ENV]: "1" };
 		delete env.NARRAFORK_HOME;
-		const child = Bun.spawn([process.execPath, "test", "--isolate", import.meta.path], {
-			cwd: resolve(import.meta.dir, "../../.."),
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const child = Bun.spawn(
+			[process.execPath, "test", "--no-env-file", "--isolate", import.meta.path],
+			{
+				cwd: resolve(import.meta.dir, "../../.."),
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
 		const timer = setTimeout(() => child.kill(), 45_000);
 		const readBounded = async (stream: ReadableStream<Uint8Array>) => {
 			const reader = stream.getReader();
@@ -56,6 +59,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 	const configs: AgentConfig[] = [];
+	let beforeExecution: ((options: ExecuteLoopOptions) => Promise<void>) | undefined;
 	const executions: ExecuteLoopOptions[] = [];
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 	mock.module("../narrator-executor", () => ({
@@ -66,6 +70,7 @@ if (process.env[CHILD_ENV] !== "1") {
 				configs.push(options.config);
 				executions.push(options);
 			}
+			await beforeExecution?.(options);
 			return {
 				finalText: "isolated follow-parent result",
 				hasError: false,
@@ -124,6 +129,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		clearAliasRegistry(PARENT);
 		agentCalls = 0;
 		configs.length = 0;
+		beforeExecution = undefined;
 		executions.length = 0;
 		broadcasts.length = 0;
 		network.mockClear();
@@ -305,6 +311,67 @@ if (process.env[CHILD_ENV] !== "1") {
 	}
 
 	describe("live parent model through real creation, continuation and executor configuration", () => {
+		for (const mode of ["temporary", "permanent"] as const) {
+			test(`a queued ${mode} override does not pin the next ordinary run`, async () => {
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
+					id: "queued-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				beforeExecution = async (options) => {
+					if (options.config.narratorId !== child.id) return;
+					beforeExecution = undefined;
+					started.resolve();
+					await release.promise;
+				};
+				try {
+					await session.acceptUserMessage(child.id, "Start the run.", { userId: null });
+					await started.promise;
+					const accepted = await session.acceptUserMessage(child.id, "Use the slash model.", {
+						userId: null,
+						executionIntent: { modelOverride: { model: override, mode } },
+					});
+					expect(accepted.buffered).toBe(true);
+					release.resolve();
+					await settled(child.id, 1);
+					expect(configs.at(-1)?.model).toBe(override);
+					await drive(child.id);
+					expect(configs.at(-1)?.model).toBe(A);
+				} finally {
+					release.resolve();
+				}
+			});
+
+			test(`an accepted ${mode} cross-provider override survives new-run selection`, async () => {
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
+					id: "isolated-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				await session.acceptUserMessage(child.id, "Use the explicit slash model.", {
+					userId: null,
+					executionIntent: { modelOverride: { model: override, mode } },
+				});
+				await settled(child.id, 0);
+				expect(configs.at(-1)?.model).toBe(override);
+				expect((await narratorService.getById(child.id)).model).toBe(
+					mode === "temporary" ? A : override,
+				);
+				await drive(child.id);
+				expect(configs.at(-1)?.model).toBe(A);
+			});
+		}
+
 		for (const entry of ["continue", "resume"] as const) {
 			test(`${entry}: real create stores inheritance and re-reads parent A -> B`, async () => {
 				const child = await create();
@@ -442,7 +509,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 		for (const background of [false, true]) {
 			for (const poolSource of ["settings", "traits"] as const) {
-				test(`${background ? "background" : "foreground"}: ${poolSource} pool's first entry beats an allowed parent and type preference`, async () => {
+				test(`${background ? "background" : "foreground"}: ${poolSource} pool's allowed parent model beats its first entry and type preference`, async () => {
 					settings.agent.subagentModels.explore = B;
 					if (poolSource === "settings") {
 						settings.agent.subagentAllowedModels.explore = [C, A, B];
@@ -456,15 +523,16 @@ if (process.env[CHILD_ENV] !== "1") {
 						await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
 					}
 					const child = await spawn({ subagentType: "explore", background });
-					await assertRun(child.id, C, C);
+					await assertRun(child.id, A, A);
+					await narratorService.updateModel(PARENT, B);
+					// Same provider as the parent's new model: the pinned child keeps its model.
+					await drive(child.id, "resume");
+					await assertRun(child.id, A, A);
+					const explicit = await spawn({ subagentType: "explore", background, model: C });
+					await assertRun(explicit.id, C, C);
 					if (poolSource === "traits") {
 						expect(configs.at(-1)?.reasoningEffort).toBe("max");
 					}
-					await narratorService.updateModel(PARENT, B);
-					await drive(child.id, "resume");
-					await assertRun(child.id, C, C);
-					const explicit = await spawn({ subagentType: "explore", background, model: A });
-					await assertRun(explicit.id, A, A);
 					await expect(
 						spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
 					).rejects.toThrow("No candidate model");
