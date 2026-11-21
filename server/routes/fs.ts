@@ -9,7 +9,7 @@ import {
 	readFileSync,
 	statSync,
 } from "node:fs";
-import { copyFile, lstat, open, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, lstat, open, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Context } from "hono";
@@ -335,7 +335,7 @@ async function replaceEntry(staged: string, target: string): Promise<void> {
 		const code = (error as NodeJS.ErrnoException)?.code;
 		if ((code !== "EEXIST" && code !== "EPERM") || !existsSync(target)) throw error;
 	}
-	const aside = join(dirname(target), `.${basename(target)}.${generateId()}.nf-replaced`);
+	const aside = join(dirname(target), `.nf-replaced-${generateId()}`);
 	await rename(target, aside);
 	try {
 		await rename(staged, target);
@@ -408,28 +408,36 @@ fsRoutes.post("/rename", async (c) => {
 	}
 	const target = authorizeWritablePath(join(dirname(source.lexical), body.name), roots);
 	if (basename(source.lexical) === body.name) return c.json({ ok: true, path: source.lexical });
-	// Compared as entries, not resolved paths: a symlink resolves to its target, and a link
-	// renamed onto the name of the file it points at must not be mistaken for itself.
-	const sourceInParent = join(dirname(target.physical), basename(source.lexical));
-	const targetInfo = await lstat(target.physical).catch(() => null);
+	// Everything below names ENTRIES (`lexical`), never resolved paths: a symlink at either
+	// name resolves to its referent, and acting on that would rename or replace a file the
+	// person never selected. The lexical target also keeps the requested spelling, which a
+	// case-only rename needs on a case-insensitive filesystem.
+	const targetInfo = await lstat(target.lexical).catch(() => null);
+	// The only taken name that is not a conflict is the source itself under another case.
+	// A hard link shares the inode too, but under a different name it is a separate entry.
+	const caseOnly = basename(source.lexical).toLowerCase() === body.name.toLowerCase();
 	const sameEntry =
-		localBackend.paths.equals(sourceInParent, target.physical) ||
-		(targetInfo !== null &&
-			targetInfo.ino !== 0 &&
-			targetInfo.ino === sourceInfo.ino &&
-			targetInfo.dev === sourceInfo.dev);
+		caseOnly &&
+		(localBackend.paths.equals(source.lexical, target.lexical) ||
+			(targetInfo !== null &&
+				targetInfo.ino !== 0 &&
+				targetInfo.ino === sourceInfo.ino &&
+				targetInfo.dev === sourceInfo.dev));
 	if (targetInfo && !sameEntry) {
 		throw new AppError(`Already exists: ${body.name}`, 409, "ALREADY_EXISTS");
 	}
 
+	const canonicalParent = await realpath(dirname(source.lexical));
 	await asHumanEntryChange(
 		c,
 		body.narratorId,
 		cwd,
-		{ changed: [sourceInParent, target.physical] },
+		{
+			changed: [join(canonicalParent, basename(source.lexical)), join(canonicalParent, body.name)],
+		},
 		async () => {
 			try {
-				await rename(source.lexical, target.physical);
+				await rename(source.lexical, target.lexical);
 			} catch (error) {
 				// A cross-device rename cannot be done in one call; saying so beats a raw EXDEV.
 				if ((error as NodeJS.ErrnoException)?.code === "EXDEV") {
@@ -506,37 +514,38 @@ fsRoutes.post("/transfer", async (c) => {
 	// It is reported like any other taken destination so the caller's overwrite flow runs,
 	// but the replacement must NEVER touch the bytes — an `unlink` here would delete the
 	// file the transfer is about to read.
-	const sameEntry = localBackend.paths.equals(source.physical, target.physical);
-	const destinationExists = existsSync(target.physical);
+	// The destination is the ENTRY at that name (`lexical`): a symlink there must be
+	// refused below, not followed to overwrite whatever file it points at.
+	const sameEntry = localBackend.paths.equals(source.physical, target.lexical);
+	const destinationInfo = await lstat(target.lexical).catch(() => null);
+	const destinationExists = destinationInfo !== null;
 	if (destinationExists && !body.overwrite) {
-		throw new AppError(`Already exists: ${basename(target.physical)}`, 409, "ALREADY_EXISTS");
+		throw new AppError(`Already exists: ${basename(target.lexical)}`, 409, "ALREADY_EXISTS");
 	}
 	if (sameEntry) {
 		// Confirmed "replace" of a file with itself: the bytes are already what they would
 		// be. Succeeding without a write is the only safe answer — and it is the truth.
 		return c.json({ ok: true, path: target.lexical });
 	}
-	if (destinationExists) {
-		const existing = await existingEntry(target.physical);
-		if (existing.isDirectory() || existing.isSymbolicLink()) {
+	if (destinationInfo) {
+		if (destinationInfo.isDirectory() || destinationInfo.isSymbolicLink()) {
 			throw new AppError("Only a regular file can be replaced", 422, "UNSUPPORTED_ENTRY");
 		}
 	}
 
-	const staged = join(
-		targetDir.physical,
-		`.${basename(source.physical)}.${generateId()}.nf-partial`,
-	);
+	// A short name of its own: deriving it from the file name would push a long but valid
+	// name past the filesystem's 255-byte limit.
+	const staged = join(targetDir.physical, `.nf-partial-${generateId()}`);
 	const copyIntoPlace = async () => {
 		await copyFile(source.physical, staged);
-		await replaceEntry(staged, target.physical);
+		await replaceEntry(staged, target.lexical);
 	};
 	await asHumanEntryChange(
 		c,
 		body.narratorId,
 		cwd,
 		{
-			changed: body.mode === "move" ? [source.physical, target.physical] : [target.physical],
+			changed: body.mode === "move" ? [source.physical, target.lexical] : [target.lexical],
 			scratch: [staged],
 		},
 		async () => {
@@ -545,7 +554,7 @@ fsRoutes.post("/transfer", async (c) => {
 					await copyIntoPlace();
 				} else {
 					try {
-						await replaceEntry(source.physical, target.physical);
+						await replaceEntry(source.physical, target.lexical);
 					} catch (error) {
 						// Same filesystem in practice; across devices rename is impossible, so the
 						// move becomes a copy followed by a delete of the original.

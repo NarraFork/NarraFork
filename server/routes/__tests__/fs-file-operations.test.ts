@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -175,6 +176,21 @@ describe("rename", () => {
 		expect(readFileSync(join(workspace, "docs", "case.md"), "utf-8")).toBe("case\n");
 	});
 
+	test("a hard link under another name is a conflict, not the source itself", async () => {
+		const source = join(workspace, "docs", "linked-a.md");
+		writeFileSync(source, "same inode\n");
+		linkSync(source, join(workspace, "docs", "linked-b.md"));
+		const { status, json } = await post("rename", {
+			narratorId,
+			path: source,
+			name: "linked-b.md",
+		});
+
+		expect(status).toBe(409);
+		expect(json.code).toBe("ALREADY_EXISTS");
+		expect(existsSync(source)).toBe(true);
+	});
+
 	test("refuses a missing entry", async () => {
 		const { status } = await post("rename", {
 			narratorId,
@@ -285,6 +301,43 @@ describe("transfer", () => {
 			);
 		},
 	);
+
+	test("overwrite never follows a symlink to replace the file behind it", async () => {
+		const source = join(workspace, "docs", "via-link.ts");
+		const referent = join(workspace, "src", "referent.ts");
+		const link = join(workspace, "src", "via-link.ts");
+		writeFileSync(source, "new\n");
+		writeFileSync(referent, "referent\n");
+		symlinkSync(referent, link);
+
+		const { status, json } = await post("transfer", {
+			narratorId,
+			path: source,
+			targetDir: join(workspace, "src"),
+			mode: "copy",
+			overwrite: true,
+		});
+
+		expect(status).toBe(422);
+		expect(json.code).toBe("UNSUPPORTED_ENTRY");
+		expect(readFileSync(referent, "utf-8")).toBe("referent\n");
+	});
+
+	test("pastes a file whose name is near the filesystem limit", async () => {
+		const name = `${"n".repeat(240)}.ts`;
+		const source = join(workspace, "docs", name);
+		writeFileSync(source, "long\n");
+
+		const { status } = await post("transfer", {
+			narratorId,
+			path: source,
+			targetDir: join(workspace, "src"),
+			mode: "copy",
+		});
+
+		expect(status).toBe(200);
+		expect(readFileSync(join(workspace, "src", name), "utf-8")).toBe("long\n");
+	});
 
 	test("a move may overwrite too, and then removes the original", async () => {
 		const source = join(workspace, "docs", "moved-over.ts");
