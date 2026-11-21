@@ -132,6 +132,7 @@ interface StateRoot {
 	json: string;
 	digest: string;
 	nullable?: boolean;
+	allowUnpinned?: boolean;
 }
 const STATE_ROOTS: Readonly<Record<string, readonly StateRoot[]>> = {
 	file_change_effects: [
@@ -140,13 +141,19 @@ const STATE_ROOTS: Readonly<Record<string, readonly StateRoot[]>> = {
 		{ json: "observed_after_state_json", digest: "observed_after_blob_digest" },
 	],
 	revert_operation_files: [
-		{ json: "expected_state_json", digest: "before_blob_digest" },
-		{ json: "desired_state_json", digest: "desired_blob_digest" },
-		{ json: "observed_after_state_json", digest: "observed_after_blob_digest", nullable: true },
+		{ json: "expected_state_json", digest: "before_blob_digest", allowUnpinned: true },
+		{ json: "desired_state_json", digest: "desired_blob_digest", allowUnpinned: true },
+		{
+			json: "observed_after_state_json",
+			digest: "observed_after_blob_digest",
+			nullable: true,
+			allowUnpinned: true,
+		},
 		{
 			json: "compensation_after_state_json",
 			digest: "compensation_after_blob_digest",
 			nullable: true,
+			allowUnpinned: true,
 		},
 	],
 };
@@ -757,7 +764,7 @@ function validateState(meter: RepairMeter, row: Row, root: StateRoot, verify: bo
 				ref.algorithm !== "sha256" ||
 				typeof ref.digest !== "string" ||
 				!DIGEST.test(ref.digest) ||
-				ref.digest !== digest
+				(ref.digest !== digest && !(root.allowUnpinned && digest === null))
 			)
 				meter.fail("invalid_state", "Typed state and reverse digest disagree");
 			boundedInteger(ref.sizeBytes, 0, Number.MAX_SAFE_INTEGER);

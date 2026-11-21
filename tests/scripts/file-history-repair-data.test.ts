@@ -127,6 +127,51 @@ describe("bounded offline file history data maintenance", () => {
 		).toBe(false);
 	});
 
+	test.each([
+		"regular",
+		"symlink",
+	] as const)("expires unpinned %s revert fingerprints through check, apply and verify", (kind) => {
+		const state = JSON.stringify(
+			kind === "regular"
+				? { kind, blob: FIXTURE_REF, mode: 0o644 }
+				: { kind, target: FIXTURE_REF, mode: null },
+		);
+		db.query(
+			`UPDATE revert_operation_files SET expected_state_json = ?, desired_state_json = ?,
+			observed_after_state_json = ?, compensation_after_state_json = ?,
+			before_blob_digest = NULL, desired_blob_digest = NULL,
+			observed_after_blob_digest = NULL, compensation_after_blob_digest = NULL
+			WHERE id = 'revert-file'`,
+		).run(state, state, state, state);
+		const before = fixtureSnapshot(db);
+		expect(preflightFileHistoryRepair(db, identity, options).counts.revert_operation_files).toBe(2);
+		expect(fixtureSnapshot(db)).toEqual(before);
+		expect(applyFileHistoryRepair(db, identity, options)).toMatchObject({
+			committed: true,
+			verified: true,
+		});
+		expect(() => verifyFileHistoryRepair(db, identity, options)).not.toThrow();
+		const row = db
+			.query<Record<string, string | null>, []>(
+				"SELECT * FROM revert_operation_files WHERE id = 'revert-file'",
+			)
+			.get();
+		for (const column of [
+			"expected_state_json",
+			"desired_state_json",
+			"observed_after_state_json",
+			"compensation_after_state_json",
+		])
+			expect(JSON.parse(row?.[column] ?? "null")).toEqual(expired);
+		for (const column of [
+			"before_blob_digest",
+			"desired_blob_digest",
+			"observed_after_blob_digest",
+			"compensation_after_blob_digest",
+		])
+			expect(row?.[column]).toBeNull();
+	});
+
 	test("atomically expires all JSON/root references while preserving every unrelated fixture row and physical byte", async () => {
 		const source = join(root, "file-change-source.json");
 		const workspace = join(root, "workspace.txt");
@@ -340,6 +385,22 @@ describe("bounded offline file history data maintenance", () => {
 		db.exec(sql);
 		const before = fixtureSnapshot(db);
 		failure(() => applyFileHistoryRepair(db, identity, options));
+		expect(fixtureSnapshot(db)).toEqual(before);
+	});
+
+	test.each([
+		"expected_state_json",
+		"desired_state_json",
+		"observed_after_state_json",
+		"compensation_after_state_json",
+	])("rejects a non-null reverse digest mismatch for revert %s", (column) => {
+		db.query(
+			`UPDATE revert_operation_files SET ${column} = replace(${column}, ?, ?)
+			WHERE id = 'revert-file'`,
+		).run(FIXTURE_DIGEST, "b".repeat(64));
+		const before = fixtureSnapshot(db);
+		failure(() => preflightFileHistoryRepair(db, identity, options), "invalid_state");
+		failure(() => applyFileHistoryRepair(db, identity, options), "invalid_state");
 		expect(fixtureSnapshot(db)).toEqual(before);
 	});
 
