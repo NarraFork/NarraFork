@@ -35,7 +35,16 @@ import {
 } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
@@ -1177,6 +1186,15 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 		[openFilePanel, props.api.id, narratorId],
 	);
 
+	// The tree's row menu offers "reference in the composer" only when a composer for THIS
+	// narrator is reachable. In the dock it is: the chat panel registers `addFileReference`
+	// here, the same bridge the file editor's quote action uses. A tree torn into its own
+	// window has no dock, so the scope stays empty and the entry is hidden rather than dead.
+	const referenceScope = useMemo(
+		() => ({ narratorId, addReference: dock?.addFileReference ?? undefined }),
+		[dock?.addFileReference, narratorId],
+	);
+
 	return (
 		<ToolPanelShell
 			title={t("fileTree.title")}
@@ -1186,7 +1204,9 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			detachKind="filetree"
 		>
 			<LazyPanelBoundary>
-				<FileTreePanel narratorId={narratorId} onOpenFile={handleOpenFile} />
+				<FileReferenceScopeProvider value={referenceScope}>
+					<FileTreePanel narratorId={narratorId} onOpenFile={handleOpenFile} />
+				</FileReferenceScopeProvider>
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);

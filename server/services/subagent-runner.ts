@@ -12,15 +12,11 @@ import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/typ
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import {
-	resolveEffectiveSubagentModelPolicy,
-	resolveSubagentModelSelectionFromPolicy,
-} from "../lib/narrator-custom-traits";
+import { resolveEffectiveSubagentModelPolicy } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
 	expandAllowedPoolForDisplay,
-	FOLLOW_DEFAULT_MODEL,
 	normalizeAutoModelValueForSave,
 	settings,
 } from "../lib/settings";
@@ -37,7 +33,7 @@ import { agentMarkdownReference } from "./subagent-label";
 import {
 	formatSubagentModelFallbackNote,
 	resolveSubagentModelForRun,
-	subagentStoredModelReference,
+	selectSubagentModel,
 } from "./subagent-model";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { buildDelegationBasePrompt } from "./subagent-tools";
@@ -243,29 +239,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		policySourceId: policySourceIdOf(parent),
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	const candidateModels =
-		modelPolicy.source === "none" ? [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL] : [];
-	const modelSelection = resolveSubagentModelSelectionFromPolicy({
+	const choice = selectSubagentModel({
 		policy: modelPolicy,
 		explicitModel,
-		candidates: candidateModels,
+		parentId: parentNarratorId,
+		parentModel: parent.model,
+		typePreference: subagentPref,
 	});
-	const resolvedModelInput = modelSelection?.model;
-	const preferenceSelection =
-		modelPolicy.source === "none" && !explicitModel && subagentPref
-			? resolveSubagentModelSelectionFromPolicy({
-					policy: modelPolicy,
-					explicitModel: subagentPref,
-					candidates: [],
-				})
-			: undefined;
-	const storedModelInput = subagentStoredModelReference({
-		explicitModel: modelPolicy.source !== "none" ? resolvedModelInput : explicitModel,
-		preferenceSelection,
-		selection: modelSelection,
-	});
+	const modelSelection = choice?.selection;
 	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
-	if (modelPolicy.source !== "none" && !resolvedModelInput) {
+	if (!choice) {
 		const allowedModels = expandAllowedPoolForDisplay(
 			modelPolicy.models.map((entry) => entry.model),
 		);
@@ -277,6 +260,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		);
 	}
 
+	const storedModelInput = choice.storedModel;
 	const updateLease = claimSubagentUpdateExecutionLease(
 		input.updateExecutionLease,
 		"resumable",
@@ -440,6 +424,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// The task projection already registered the run; the run service adopts it.
 			const handle = await startNarratorRun({
 				narratorId: subagentId,
+				skipModelReselect: true,
 				locale: locale as Locale,
 				text: "",
 				resumeRunId: task.logicalRunId ?? undefined,
@@ -465,6 +450,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		const { getSearchExecutionScope } = await import("../lib/search/execution-scope");
 		const handle = await startNarratorRun({
 			narratorId: subagentId,
+			skipModelReselect: true,
 			locale: locale as Locale,
 			text: "",
 			binding,

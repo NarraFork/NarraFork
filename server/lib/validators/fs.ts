@@ -78,6 +78,67 @@ export const fsWriteSchema = z.object({
 export type FsWriteInput = z.infer<typeof fsWriteSchema>;
 
 /**
+ * The two fields every mutating file operation carries.
+ *
+ * `narratorId` has the same job as in {@link fsWriteSchema}: it is what defines the
+ * writable root, so an operation with no session has no workspace to be bounded by.
+ */
+const fsEntryTargetSchema = z.object({
+	narratorId: z.string().trim().min(1, "narratorId is required"),
+	path: z.string().trim().min(1, "path is required").max(4096),
+});
+
+/**
+ * One NAME, never a path.
+ *
+ * Separators, control characters and the Windows-reserved set are refused exactly as
+ * `POST /api/fs/mkdir` refuses them, so a rename cannot walk out of its directory or
+ * produce a name the platform cannot store. `.` and `..` are refused separately: they
+ * contain no separator, yet naming them would rename the entry over its own parent.
+ */
+const fsEntryNameSchema = z
+	.string()
+	.trim()
+	.min(1, "name is required")
+	.max(255, "name is too long")
+	.refine((name) => !/[/\\<>:"|?*]/.test(name), "The name contains a character a path cannot hold")
+	.refine(
+		(name) => ![...name].some((ch) => ch.charCodeAt(0) < 32),
+		"The name contains a control character",
+	)
+	.refine(
+		(name) => name !== "." && name !== "..",
+		"The name must not be a relative directory reference",
+	);
+
+/** `POST /api/fs/rename` — rename in place, keeping the entry in its own directory. */
+export const fsRenameSchema = fsEntryTargetSchema.extend({ name: fsEntryNameSchema });
+
+/** `POST /api/fs/delete` — remove one file entry. */
+export const fsDeleteSchema = fsEntryTargetSchema;
+
+/**
+ * `POST /api/fs/transfer` — copy or move one file into a directory.
+ *
+ * The destination is a DIRECTORY plus the source's own name, rather than a full target
+ * path: the paste gesture this serves means "put this file where that other file lives",
+ * and accepting a full destination path would turn a bounded paste into an arbitrary
+ * write at a client-chosen name.
+ *
+ * `overwrite` is the second half of that gesture: a paste onto a name that is already
+ * taken answers 409 first, and replaces the file only when the user has been shown which
+ * file that is and says yes. Absent means "do not replace anything".
+ */
+export const fsTransferSchema = fsEntryTargetSchema.extend({
+	targetDir: z.string().trim().min(1, "targetDir is required").max(4096),
+	mode: z.enum(["copy", "move"]),
+	overwrite: z.boolean().optional(),
+});
+
+export type FsRenameInput = z.infer<typeof fsRenameSchema>;
+export type FsTransferInput = z.infer<typeof fsTransferSchema>;
+
+/**
  * One project instruction filename (`AGENTS.md` & friends).
  *
  * Constrained to the known filenames rather than accepting a path: the only thing

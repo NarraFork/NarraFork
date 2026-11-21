@@ -7,6 +7,7 @@ import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import enNarrator from "../../../locales/en/narrator.json";
 import zhNarrator from "../../../locales/zh-CN/narrator.json";
+import { BrowserPanel } from "../browser/BrowserPanel";
 import { BackgroundTasksPanel } from "./BackgroundTasksDrawer";
 import classes from "./BackgroundTasksDrawer.module.css";
 
@@ -23,6 +24,10 @@ declare global {
 			copied: string[];
 			refreshes: number;
 			beforeOpen: number;
+			canCreate: boolean;
+			creates: { type: "task" | "browser"; narratorId: string; data: unknown }[];
+			pendingCreate: ((failure?: string) => void) | null;
+			browserReads: number;
 		};
 	}
 }
@@ -65,7 +70,13 @@ await instance.use(initReactI18next).init({
 	react: { useSuspense: false },
 });
 let generation = 0;
-export async function start(language: string, panelWidth: number, chromeless: boolean) {
+export async function start(
+	language: string,
+	panelWidth: number,
+	chromeless: boolean,
+	canCreate = false,
+	panel: "tasks" | "browser" = "tasks",
+) {
 	await instance.changeLanguage(language);
 	generation++;
 	queryClient.clear();
@@ -96,18 +107,26 @@ export async function start(language: string, panelWidth: number, chromeless: bo
 		copied: [],
 		refreshes: 0,
 		beforeOpen: 0,
+		canCreate,
+		creates: [],
+		pendingCreate: null,
+		browserReads: 0,
 	};
 	root.render(
 		<I18nextProvider i18n={instance}>
 			<MantineProvider forceColorScheme="dark">
 				<QueryClientProvider client={queryClient}>
 					<div id="surface" style={{ width: panelWidth, maxWidth: "100%" }}>
-						<BackgroundTasksPanel
-							key={generation}
-							narratorId="parent"
-							chromeless={chromeless}
-							onOpenSubagent={() => window.backgroundTaskFixture.beforeOpen++}
-						/>
+						{panel === "browser" ? (
+							<BrowserPanel key={generation} narratorId="parent" chromeless />
+						) : (
+							<BackgroundTasksPanel
+								key={generation}
+								narratorId="parent"
+								chromeless={chromeless}
+								onOpenSubagent={() => window.backgroundTaskFixture.beforeOpen++}
+							/>
+						)}
 					</div>
 				</QueryClientProvider>
 			</MantineProvider>

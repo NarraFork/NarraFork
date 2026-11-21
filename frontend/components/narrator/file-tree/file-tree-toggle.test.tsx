@@ -51,6 +51,15 @@ mock.module("react-i18next", () => ({
 }));
 
 /**
+ * The row menu and the rename dialog are stubbed rather than mounted: this file is about
+ * the toolbar, and the menu brings Mantine's overlay, notification and portal surfaces in
+ * behind the minimal `@mantine/core` mocked below. Their own behaviour is covered by
+ * `FileContextMenu.test.tsx` and `file-tree-context-menu.test.tsx`.
+ */
+mock.module("./FileContextMenu", () => ({ FileContextMenu: () => null }));
+mock.module("./FileRenameModal", () => ({ FileRenameModal: () => null }));
+
+/**
  * Minimal Mantine surface. `ActionIcon` forwards `onClick` and `aria-pressed`, which
  * are what the assertions read; the rest collapse to their children.
  */
@@ -139,6 +148,7 @@ function render(props: { showHidden: boolean; onToggleShowHidden?: () => void })
 		root.render(
 			<FileTreeContent
 				root="/repo"
+				narratorId="narrator"
 				showHidden={props.showHidden}
 				onOpenFile={() => {}}
 				{...(props.onToggleShowHidden ? { onToggleShowHidden: props.onToggleShowHidden } : {})}
@@ -153,6 +163,7 @@ test("lightweight Git changes keep file markers without fake or stale line stati
 			root.render(
 				<FileTreeContent
 					root="/repo"
+					narratorId="narrator"
 					showHidden
 					onOpenFile={() => {}}
 					changedPaths={new Set(changed ? ["a.txt"] : [])}

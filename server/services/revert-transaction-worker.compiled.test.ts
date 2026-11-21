@@ -42,12 +42,18 @@ async function productionCompileArguments(): Promise<string[]> {
 	});
 	expect(command.elements[1]).toMatchObject({ type: "StringLiteral", value: "build" });
 	expect(command.elements[2]).toMatchObject({ type: "StringLiteral", value: mainEntry });
+	// `...compiledBuildArguments().filter(...)` spreads a method call on the helper's result.
+	const spreadCallee = (node: unknown): string[] => {
+		const call = node as {
+			type?: string;
+			callee?: { type?: string; name?: string; object?: unknown };
+		};
+		if (call?.type !== "CallExpression" || !call.callee) return [];
+		if (call.callee.type === "Identifier" && call.callee.name) return [call.callee.name];
+		return call.callee.type === "MemberExpression" ? spreadCallee(call.callee.object) : [];
+	};
 	const spreadCalls = command.elements.flatMap((node) =>
-		node?.type === "SpreadElement" &&
-		node.argument.type === "CallExpression" &&
-		node.argument.callee.type === "Identifier"
-			? [node.argument.callee.name]
-			: [],
+		node?.type === "SpreadElement" ? spreadCallee(node.argument) : [],
 	);
 	expect(spreadCalls).toContain("compiledWorkerBuildEntrypoints");
 	expect(spreadCalls).toContain("compiledBuildArguments");
