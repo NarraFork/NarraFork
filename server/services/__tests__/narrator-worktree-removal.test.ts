@@ -926,9 +926,11 @@ describe("worktree removal hardening", () => {
 		try {
 			await writeFile(file, receipt("someone-else"));
 			await importReceipts();
-			await expect(
-				service.remove("actor", "narrator", removeRequest(), signal()),
-			).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+			const failure = await service.remove("actor", "narrator", removeRequest(), signal()).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toMatchObject({ code: "RESOURCE_PROTECTED" });
 			await writeFile(file, receipt("request"));
 			sqlite.exec("DELETE FROM resource_protection_paths WHERE source = 'receipt'");
 			sqlite.exec(

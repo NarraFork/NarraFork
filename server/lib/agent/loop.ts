@@ -5241,6 +5241,8 @@ async function* agentLoopInMetadataSnapshot(
 									provider,
 									requestParams,
 									effectiveProvider,
+									info?.credentialId,
+									info?.validateDiagnosticCredential,
 								);
 							}
 							markRequestStarted(info);

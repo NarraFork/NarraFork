@@ -251,6 +251,7 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	deleteBlocksSchema,
+	modelTraceOptionsSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
 	revertPlanIdSchema,
@@ -533,6 +534,7 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
+import { narratorManualResourceRoutes } from "./narrator-manual-resources";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
 import { requestRecordingRoutes } from "./request-recordings";
 
@@ -5872,6 +5874,7 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 });
 
 narratorRoutes.route("/", narratorWorkspaceContextRoutes);
+narratorRoutes.route("/", narratorManualResourceRoutes);
 narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
 	const { listPermissionRuleRequests } = await import(
 		"../services/permission-rule-request-service"
@@ -6045,18 +6048,35 @@ narratorRoutes.get("/modeltrace/lookup", async (c) => {
 	});
 });
 
-// A one-shot sampling fork reuses the parent's frozen upstream request prefix.
+// Start one diagnostic round; no body is the legacy single-sample request.
 narratorRoutes.post("/:id/modeltrace", async (c) => {
 	const userId = c.get("user").sub;
+	let body: unknown;
+	try {
+		body = c.req.raw.body === null ? {} : await c.req.json();
+	} catch {
+		throw new ValidationError("Invalid ModelTrace options JSON");
+	}
+	const parsed = modelTraceOptionsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { startModelTrace } = await import("../services/modeltrace-service");
-	const result = await startModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
+	const result = await startModelTrace(
+		c.req.param("id"),
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+		parsed.data,
+	);
 	return c.json(result, 201);
 });
 // Retry one sampling round in the same diagnostic session.
 narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 	const userId = c.get("user").sub;
 	const { retryModelTrace } = await import("../services/modeltrace-service");
-	const result = await retryModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
+	const result = await retryModelTrace(
+		c.req.param("id"),
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+	);
 	return c.json(result);
 });
 

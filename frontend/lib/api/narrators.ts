@@ -16,6 +16,7 @@ import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
 import type { MediaRef } from "@shared/media-attachments";
+import type { ModelTraceOptions } from "@shared/modeltrace-result";
 import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
@@ -804,9 +805,10 @@ export const narratorsApi = {
 			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
 			{ method: "POST", signal },
 		),
-	startModelTrace: (narratorId: string) =>
+	startModelTrace: (narratorId: string, options?: ModelTraceOptions) =>
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
 			method: "POST",
+			...(options && { body: JSON.stringify(options) }),
 		}),
 	retryModelTrace: (narratorId: string) =>
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
@@ -1273,6 +1275,14 @@ export const narratorsApi = {
 		request<{ stopped: boolean; deferred?: boolean }>(`/narrators/${id}/stop-takeover`, {
 			method: "POST",
 		}),
+	createBackgroundTask: (
+		narratorId: string,
+		data: { kind: "task" | "service"; command: string; title?: string; timeoutMs?: number },
+	) =>
+		request<{ id: string; alias: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/background-tasks`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 	cancelBackgroundTask: (narratorId: string, taskId: string) =>
 		request<{
 			success: boolean;
@@ -2529,6 +2539,11 @@ export const narratorsApi = {
 		),
 
 	// Browser sessions
+	createBrowserSession: (narratorId: string, data: { url: string; ttlMs?: number }) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/browser-sessions`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 	listBrowserSessions: (narratorId: string) =>
 		request<
 			{

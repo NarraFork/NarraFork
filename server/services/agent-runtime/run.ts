@@ -26,7 +26,7 @@ import { withDbRetry } from "../../lib/db-resilience";
 import { AppError } from "../../lib/errors";
 import { eventBus } from "../../lib/event-bus";
 import { logger } from "../../lib/logger";
-import { parseSubstatus } from "../../lib/narrator-utils";
+import { getSubagentType, parseSubstatus } from "../../lib/narrator-utils";
 import type { Locale } from "../../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
@@ -108,6 +108,8 @@ export interface StartNarratorRunRequest {
 	 * synchronously with the execution-owner claim.
 	 */
 	admission?: { check(): void; onAdmitted(): void };
+	/** Delegation creation already selected this run's model. */
+	skipModelReselect?: boolean;
 }
 
 export interface RunHandle {
@@ -397,7 +399,7 @@ async function executeRun(
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
 		syncActiveReplyContext(id, replyContext);
 		const session = active;
-		const source = await readRunSource(id);
+		let source = await readRunSource(id);
 		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
 		// An explicitly anonymous binding must not fall through to an old session user.
@@ -419,6 +421,16 @@ async function executeRun(
 							: "run_start",
 			});
 			return notStarted;
+		}
+		if (getSubagentType(source.variant)) {
+			const { isNewSubagentModelSelectionRun, reselectSubagentModelForNewRun } = await import(
+				"../subagent-model-switch"
+			);
+			if (
+				isNewSubagentModelSelectionRun(req) &&
+				(await reselectSubagentModelForNewRun(id, principal))
+			)
+				source = await readRunSource(id);
 		}
 		const prepared = await prepareLogicalRun(id, source, req, principal);
 		const binding = prepared.binding;

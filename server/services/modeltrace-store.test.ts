@@ -7,7 +7,6 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
-	projects,
 	userRecentTabs,
 	users,
 } from "../db/schema";
@@ -26,47 +25,13 @@ mock.module("@server/lib/agent/provider", () => ({
 	},
 }));
 
-let forkCount = 0;
-const forkNarrator = mock(async (parentId: string) => {
-	forkCount += 1;
-	const parent = db.select().from(narrators).where(eq(narrators.id, parentId)).get();
-	const id = `fork-${forkCount}`;
-	db.insert(narrators)
-		.values({
-			id,
-			title: "fork",
-			ownerUserId: parent?.ownerUserId ?? null,
-			visibility: "public",
-			writeAudience: "public",
-			cwd: parent?.cwd ?? null,
-			contextProjectId: parent?.contextProjectId ?? null,
-			parentNarratorId: parentId,
-			traits: [],
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-	db.insert(aclGrants)
-		.values({
-			id: `grant-${id}`,
-			scopeType: "narrator",
-			scopeId: id,
-			principalType: "user",
-			principalId: "bob",
-			capability: "read",
-			createdAt: NOW,
-		})
-		.run();
-	return { id, traits: [] as string[] };
-});
-const remove = mock(async (id: string) => {
-	db.delete(aclGrants).where(eq(aclGrants.scopeId, id)).run();
-	db.delete(narrators).where(eq(narrators.id, id)).run();
-});
-mock.module("./narrator-service", () => ({ narratorService: { forkNarrator, remove } }));
-
-const { clearTraceHistory, ensureTraceNarrator, findModelTraceNarrator, modelTraceKey } =
-	await import("./modeltrace-store");
+const {
+	clearTraceHistory,
+	createDiagnosticNarrator,
+	ensureTraceNarrator,
+	findModelTraceNarrator,
+	modelTraceKey,
+} = await import("./modeltrace-store");
 const { adoptLegacyModelTraceNarrators } = await import("./modeltrace-compat");
 
 function user(id: string) {
@@ -91,9 +56,6 @@ function narratorRow(id: string) {
 }
 
 beforeEach(() => {
-	forkCount = 0;
-	forkNarrator.mockClear();
-	remove.mockClear();
 	user("alice");
 	user("bob");
 });
@@ -103,18 +65,14 @@ afterEach(() => cleanDb(sqlite));
 describe("modeltrace cabin", () => {
 	test("one private cabin per user and resolved model", async () => {
 		narrator({ id: "p1", ownerUserId: "bob", cwd: "/work/a" });
-		db.insert(projects)
-			.values({
-				id: "proj-b",
-				name: "b",
-				gitPath: "/repo",
-				ownerUserId: "bob",
-				visibility: "private",
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-		narrator({ id: "p2", ownerUserId: "bob", cwd: "/work/b", contextProjectId: "proj-b" });
+		narrator({
+			id: "p2",
+			ownerUserId: "bob",
+			cwd: "/work/b",
+			systemPrompt: "private context",
+			enabledTools: ["Bash"],
+			apiConversationId: "parent-key",
+		});
 
 		const first = await ensureTraceNarrator({
 			parentId: "p1",
@@ -143,13 +101,15 @@ describe("modeltrace cabin", () => {
 
 		expect(again).toBe(first);
 		expect(bobCabin).not.toBe(first);
-		expect(forkNarrator).toHaveBeenCalledTimes(2);
 		const row = narratorRow(first);
 		expect(row).toMatchObject({
-			cwd: "/work/b",
-			contextProjectId: "proj-b",
+			cwd: null,
+			contextProjectId: null,
+			systemPrompt: null,
+			enabledTools: null,
+			apiConversationId: null,
 			title: "T2",
-			parentNarratorId: "p2",
+			parentNarratorId: null,
 			ownerUserId: "alice",
 			visibility: "private",
 			writeAudience: "owner",
@@ -161,6 +121,26 @@ describe("modeltrace cabin", () => {
 		expect(await findModelTraceNarrator("bob", "proxy:cn:x")).toBe(bobCabin);
 		expect(await findModelTraceNarrator("alice", "gone")).toBeNull();
 		expect(db.select().from(aclGrants).where(eq(aclGrants.scopeId, first)).all()).toHaveLength(0);
+	});
+
+	test("fork diagnostics remain isolated and never become the reusable cabin", async () => {
+		const input = { userId: "alice", model: "proxy:x", title: "Diagnostic", locale: "en" };
+		const first = await createDiagnosticNarrator(input);
+		const second = await createDiagnosticNarrator(input);
+		expect(first).not.toBe(second);
+		await adoptLegacyModelTraceNarrators();
+		expect(await findModelTraceNarrator("alice", "proxy:x")).toBeNull();
+		for (const id of [first, second]) {
+			expect(narratorRow(id)).toMatchObject({
+				ownerUserId: "alice",
+				visibility: "private",
+				writeAudience: "owner",
+				hiddenFromLists: true,
+				parentNarratorId: null,
+				apiConversationId: null,
+				modeltraceKey: `fork/${id}`,
+			});
+		}
 	});
 
 	test("clear keeps a shared message and drops the cabin's own history", async () => {

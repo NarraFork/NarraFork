@@ -779,9 +779,32 @@ describe("modeltrace immediate control", () => {
 		expect(options.navigateToNarrator).toHaveBeenCalledWith("trace-child");
 	});
 
-	test("arguments are rejected without any parent send or trace request", async () => {
+	test.each([
+		["--fork", true, false],
+		["--calibrate", false, true],
+		["--calibrate --fork", true, true],
+		["--fork --calibrate", true, true],
+		["-f", true, false],
+		["-c", false, true],
+		["-f -c", true, true],
+		["-c --fork", true, true],
+	] as const)("forwards %s without sending a parent message", async (flags, fork, calibrate) => {
 		await render();
-		(options.composerRef.current as NarratorComposerHandle).getText = () => "/modeltrace extra";
+		(options.composerRef.current as NarratorComposerHandle).getText = () => `/modeltrace ${flags}`;
+		await act(async () => actions.handleSend());
+		expect(start).toHaveBeenCalledWith(options.narratorId, { fork, calibrate });
+		expect(send).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		"extra",
+		"--fork --fork",
+		"-f --fork",
+		"--calibrate -c",
+		"--calibrate=3",
+	])("rejects %s without any parent send or trace request", async (args) => {
+		await render();
+		(options.composerRef.current as NarratorComposerHandle).getText = () => `/modeltrace ${args}`;
 		await act(async () => actions.handleSend());
 		expect(start).not.toHaveBeenCalled();
 		expect(send).not.toHaveBeenCalled();
@@ -893,8 +916,8 @@ describe("save_dump command discovery", () => {
 			});
 			expect(traces[0].description).toBe(
 				language === "en"
-					? "Trace the model's current task in a one-turn child session without interrupting it"
-					: "在单轮子会话中追踪模型当前任务，不中断原会话",
+					? "Sample the model fingerprint. --fork reuses the conversation prefix; --calibrate takes three samples."
+					: "采样模型指纹。--fork 复用当前会话前缀；--calibrate 采样三次。",
 			);
 			const saves = commands.filter((command) => command.name === "save_dump");
 			expect(saves).toHaveLength(1);
