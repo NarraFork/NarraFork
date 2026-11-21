@@ -29,6 +29,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../lib/settings";
+import { listConcreteModelsForReference } from "../lib/settings/provider";
 import { activeNarrators, getNarratorRuntimeModel } from "./narrator-session-state";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 
@@ -158,12 +159,17 @@ export function selectSubagentModel(input: {
 	const { policy, explicitModel } = input;
 	if (policy.source !== "none") {
 		const parentModel = input.parentModel || FOLLOW_DEFAULT_MODEL;
+		const preferredProvider = resolveParentNarratorProvider(input.parentId, input.parentModel);
+		const parentCandidate =
+			listConcreteModelsForReference(parentModel).find(
+				(model) => parseModelId(model).provider === preferredProvider,
+			) ?? parentModel;
 		const selection = resolveSubagentModelSelectionFromPolicy({
 			policy,
 			explicitModel,
-			candidates: parentModel === FOLLOW_PARENT_MODEL ? [] : [parentModel],
+			candidates: parentModel === FOLLOW_PARENT_MODEL ? [] : [parentCandidate],
 			...(!explicitModel && {
-				preferredProvider: resolveParentNarratorProvider(input.parentId, input.parentModel),
+				preferredProvider,
 			}),
 		});
 		return selection ? { storedModel: selection.model, selection } : undefined;

@@ -11,7 +11,7 @@ import {
 	clearNarratorRuntimeModel,
 	recordNarratorRuntimeModel,
 } from "../narrator-session-state";
-import { resolveParentNarratorProvider } from "../subagent-model";
+import { resolveParentNarratorProvider, selectSubagentModel } from "../subagent-model";
 
 const pool: EffectiveSubagentModelPolicy = {
 	source: "settings",
@@ -60,6 +60,56 @@ describe("resolveParentNarratorProvider", () => {
 				preferredProvider: resolveParentNarratorProvider(id, "provB:m1"),
 			}),
 		).toEqual({ model: "provA:m2", poolEntry: pool.models[1] });
+	});
+
+	test("auto parents match the live provider's model before trying other pool entries", () => {
+		const providers = settings.customApiProviders;
+		const models = settings.agent.customModels;
+		const hidden = settings.agent.hiddenModels;
+		const excluded = settings.agent.autoExcludedProviders;
+		try {
+			settings.customApiProviders = ["provA", "provB"].map((prefix) => ({
+				id: prefix,
+				name: prefix,
+				prefix,
+				apiKey: "",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "claude-opus-4-6",
+				protocol: "completions-compatible",
+			}));
+			settings.agent.customModels = ["provA", "provB"].map((provider) => ({
+				value: `${provider}:claude-opus-4-6`,
+				label: provider,
+				provider,
+			}));
+			settings.agent.hiddenModels = [];
+			settings.agent.autoExcludedProviders = [];
+			const id = newId();
+			activeNarrators.set(id, { provider: "provB" } as ActiveNarrator);
+			const input = { parentId: id, parentModel: "auto:claude-opus-4-6" };
+			const other = { model: "provA:claude-opus-4-6" };
+			const live = { model: "provB:claude-opus-4-6", reasoningEffort: "high" as const };
+			expect(selectSubagentModel({ ...input, policy: { ...pool, models: [other, live] } })).toEqual(
+				{ storedModel: live.model, selection: { model: live.model, poolEntry: live } },
+			);
+			const fallback = { model: "provB:other" };
+			expect(
+				selectSubagentModel({ ...input, policy: { ...pool, models: [other, fallback] } })
+					?.storedModel,
+			).toBe(fallback.model);
+			expect(
+				selectSubagentModel({
+					...input,
+					policy: { ...pool, models: [other, live] },
+					explicitModel: other.model,
+				})?.storedModel,
+			).toBe(other.model);
+		} finally {
+			settings.customApiProviders = providers;
+			settings.agent.customModels = models;
+			settings.agent.hiddenModels = hidden;
+			settings.agent.autoExcludedProviders = excluded;
+		}
 	});
 
 	test("a runtime record counts only while it matches the stored model", () => {
