@@ -22,6 +22,11 @@ import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
 import { fileReferencesSchema } from "./file-references";
 
+export const modelTraceOptionsSchema = z.strictObject({
+	fork: z.boolean().optional(),
+	calibrate: z.boolean().optional(),
+});
+
 const composerDocumentSchema = z
 	.unknown()
 	.transform((value, ctx) => {
