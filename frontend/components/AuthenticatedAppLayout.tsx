@@ -63,6 +63,7 @@ import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
 import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
+import { UnattendedModeBanner } from "./UnattendedModeBanner";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
@@ -538,6 +539,12 @@ export function AuthenticatedLayout() {
 				 */}
 				<WSConnectionAlert />
 				<VersionUpdateBanner />
+				{/*
+				 * Last sibling on purpose: this is the kill switch for unattended mode, so it
+				 * must win both paint order and the WCO no-drag rect collection (see the note
+				 * above) when another banner happens to be visible at the same time.
+				 */}
+				<UnattendedModeBanner />
 			</AppShellWithNavWidth>
 		</MobileNavContext.Provider>
 	);

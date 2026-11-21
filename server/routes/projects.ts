@@ -2,9 +2,10 @@ import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
+import { type SSEStreamingApi, streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import { narrators, projects, remoteDevices } from "../db/schema";
+import { trackStreamingRequestWork } from "../http-request-lifecycle";
 import { AppError, GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
@@ -165,7 +166,7 @@ projectRoutes.post("/", async (c) => {
 				? { username: body.cloneUsername, password: body.clonePassword }
 				: undefined;
 
-		return streamSSE(c, async (stream) => {
+		const cloneAndCreate = async (stream: SSEStreamingApi) => {
 			let sseId = 0;
 			try {
 				await gitService.cloneRepoStreaming(
@@ -236,7 +237,8 @@ projectRoutes.post("/", async (c) => {
 						.catch(() => {});
 				}
 			}
-		});
+		};
+		return streamSSE(c, trackStreamingRequestWork(cloneAndCreate));
 	}
 
 	// Associating an existing directory is metadata-only. Git is consulted only for

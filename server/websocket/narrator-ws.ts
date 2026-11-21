@@ -12,6 +12,7 @@ import {
 	type NarratorWsSubscriptionLimitError,
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
+import { UNATTENDED_CHANGED_WS_TYPE } from "@shared/unattended";
 import type { ServerWebSocket } from "bun";
 import {
 	measureSerializedCharacters,
@@ -1818,6 +1819,9 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// No coordinator diagnostics cross the global channel; HTTP retains role checks.
 	eventBus.on("system:lifecycle_changed", () => {
 		broadcastToAll({ type: "system_lifecycle_changed" });
+	});
+	eventBus.on("system:unattended_changed", () => {
+		broadcastToAll({ type: UNATTENDED_CHANGED_WS_TYPE });
 	});
 
 	// Plugin lifecycle is global host state. Broadcast only an invalidation marker;
