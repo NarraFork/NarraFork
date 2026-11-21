@@ -1,7 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { hotSafe } from "../lib/hot-safe";
-import { logger } from "../lib/logger";
 
 export type FileHistoryCatalogStage = "initialize" | "budget_read" | "publication_accounting";
 export type FileHistoryStage =
@@ -319,7 +318,7 @@ export class FileHistoryNamespaceDiagnostics {
 			this.lastEmission = now;
 			this.failures = 0;
 			const bunVersion = typeof Bun === "undefined" ? undefined : Bun.version;
-			(this.options.log ?? ((message, fields) => logger.warn(message, fields)))(
+			(this.options.log ?? ((message, fields) => console.warn(message, fields)))(
 				"File history namespace diagnostic",
 				{
 					diagnosticVersion: 1,

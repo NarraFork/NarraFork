@@ -254,6 +254,7 @@ export class LocalFileChangeRuntime {
 		this.evidence = options.evidence ?? new FileChangeEvidenceService(options.db);
 		this.historyDiagnostics = new FileHistoryNamespaceDiagnostics({
 			now: options.historyDiagnosticClock,
+			log: (message, fields) => logger.warn(message, fields),
 		});
 	}
 
