@@ -88,9 +88,13 @@ describe("fast-mode WS invalidation bridge", () => {
 			{ type: "fast_mode_changed", refreshPreferences: true },
 		]);
 	});
-	test("execution principal invalidation stays internal", () => {
-		const connection = open("viewer", false, new Set(["root"]));
+	test("execution principal changes refresh primary and child-only viewers without exposing identity", () => {
+		const primary = open("viewer", false, new Set(["root"]));
+		const child = open("different-viewer", false, new Set(["child-only"]));
+		const anonymous = open(undefined, true);
 		eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: "root" });
-		expect(connection.sent).toEqual([]);
+		expect(primary.sent).toEqual([{ type: "fast_mode_changed" }]);
+		expect(child.sent).toEqual([{ type: "fast_mode_changed" }]);
+		expect(anonymous.sent).toEqual([]);
 	});
 });

@@ -1690,6 +1690,9 @@ if (hotOnce("narrafork.fastModeWs.listenersRegistered")) {
 	eventBus.on("narrator:fast_mode_changed", () => {
 		broadcastToAll({ type: "fast_mode_changed" });
 	});
+	eventBus.on("narrator:execution_principal_changed", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
 	eventBus.on("user:fast_mode_default_changed", ({ userId }) => {
 		broadcastToAll({ type: "fast_mode_changed" });
 		broadcastToUser(userId, { type: "fast_mode_changed", refreshPreferences: true });
