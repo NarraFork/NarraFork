@@ -208,7 +208,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 		for (const runtime of ["active", "recorded", "unknown"] as const) {
 			test(`a nested helper uses its following worker's ${runtime} provider`, async () => {
-				setPool(["provB:m1", "provA:m2"]);
+				setPool(["provB:m1", "provA:m2", "provA:m3"]);
 				rows.set(PARENT, {
 					id: PARENT,
 					type: "subagent",
@@ -216,12 +216,13 @@ if (process.env[CHILD_ENV] !== "1") {
 					traits: [],
 				});
 				setChild("provB:m1");
-				if (runtime === "active") activeNarrators.set(PARENT, { provider: "provA" } as never);
+				if (runtime === "active")
+					activeNarrators.set(PARENT, { provider: "provA", model: "provA:m3" } as never);
 				if (runtime === "recorded")
-					recordNarratorRuntimeModel(PARENT, FOLLOW_PARENT_MODEL, "provA", "m2");
+					recordNarratorRuntimeModel(PARENT, FOLLOW_PARENT_MODEL, "provA", "m3");
 				expect(await reselectSubagentModelForNewRun(CHILD, null)).toBe(runtime !== "unknown");
 				expect(writes).toEqual(
-					runtime === "unknown" ? [] : [{ id: CHILD, input: { model: "provA:m2" } }],
+					runtime === "unknown" ? [] : [{ id: CHILD, input: { model: "provA:m3" } }],
 				);
 			});
 		}

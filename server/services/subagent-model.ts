@@ -158,7 +158,12 @@ export function selectSubagentModel(input: {
 }): SubagentModelChoice | undefined {
 	const { policy, explicitModel } = input;
 	if (policy.source !== "none") {
-		const parentModel = input.parentModel || FOLLOW_DEFAULT_MODEL;
+		let parentModel = input.parentModel || FOLLOW_DEFAULT_MODEL;
+		if (parentModel === FOLLOW_PARENT_MODEL && input.parentId) {
+			const activeModel = activeNarrators.get(input.parentId)?.model;
+			const runtime = getNarratorRuntimeModel(input.parentId, parentModel);
+			parentModel = activeModel || (runtime ? `${runtime.provider}:${runtime.model}` : parentModel);
+		}
 		const preferredProvider = resolveParentNarratorProvider(input.parentId, input.parentModel);
 		const parentCandidate =
 			listConcreteModelsForReference(parentModel).find(
