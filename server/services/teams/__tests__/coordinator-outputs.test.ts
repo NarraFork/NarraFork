@@ -3,7 +3,7 @@
  * per narrator under the data directory, capped (oldest first), removed with the narrator,
  * swept when orphaned, counted on the storage page; split into parts Read returns whole.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,7 @@ const testHome = mkdtempSync(join(tmpdir(), "narrafork-coordinator-outputs-"));
 process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
-await import("../../../db");
+const { db } = await import("../../../db");
 const { coordinatorOutputsDir, coordinatorOutputsRoot } = await import(
 	"../../../lib/coordinator-outputs-path"
 );
@@ -123,7 +123,76 @@ describe("the directory", () => {
 			expect(existsSync(orphan)).toBe(false);
 			expect(existsSync(coordinatorOutputsDir(narratorId) as string)).toBe(true);
 		} finally {
-			stop();
+			await stop();
+		}
+	});
+
+	test("stopping owns pending directory enumeration and prevents its later database read", async () => {
+		const owners = Promise.withResolvers<string[]>();
+		const list = spyOn(outputs, "listCoordinatorOutputOwners").mockImplementation(
+			() => owners.promise,
+		);
+		const stop = startCoordinatorMaintenance();
+		let drained = false;
+		const stopping = stop().then(() => {
+			drained = true;
+		});
+		const select = spyOn(db, "select").mockImplementation(() => {
+			throw new Error("No coordinator SELECT after stop");
+		});
+		try {
+			await Promise.resolve();
+			expect(drained).toBe(false);
+			owners.resolve(["stopped-orphan"]);
+			await stopping;
+			expect(select).not.toHaveBeenCalled();
+		} finally {
+			owners.resolve([]);
+			await stopping;
+			select.mockRestore();
+			list.mockRestore();
+		}
+	});
+
+	test("stopping during output removal drains it without starting another batch", async () => {
+		const entered = Promise.withResolvers<void>();
+		const removed = Promise.withResolvers<void>();
+		const list = spyOn(outputs, "listCoordinatorOutputOwners").mockResolvedValue(
+			Array.from({ length: 501 }, (_, index) => `stopped-orphan-${index}`),
+		);
+		const remove = spyOn(outputs, "removeCoordinatorOutputs").mockImplementation(() => {
+			entered.resolve();
+			return removed.promise;
+		});
+		const stop = startCoordinatorMaintenance();
+		await entered.promise;
+		const stopping = stop();
+		const select = spyOn(db, "select").mockImplementation(() => {
+			throw new Error("No next coordinator batch after stop");
+		});
+		try {
+			removed.resolve();
+			await stopping;
+			expect(select).not.toHaveBeenCalled();
+			expect(remove).toHaveBeenCalledTimes(1);
+		} finally {
+			removed.resolve();
+			await stopping;
+			select.mockRestore();
+			remove.mockRestore();
+			list.mockRestore();
+		}
+	});
+
+	test("a failed startup sweep remains a shutdown failure", async () => {
+		const list = spyOn(outputs, "listCoordinatorOutputOwners").mockRejectedValue(
+			new Error("list failed"),
+		);
+		try {
+			const stop = startCoordinatorMaintenance();
+			await expect(stop()).rejects.toThrow("did not drain successfully");
+		} finally {
+			list.mockRestore();
 		}
 	});
 

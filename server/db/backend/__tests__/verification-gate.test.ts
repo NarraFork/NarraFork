@@ -43,8 +43,8 @@ let home = "";
 let saved: Record<string, string | undefined> = {};
 
 beforeEach(async () => {
-	const { cancelBackgroundIntegrityCheck } = await import("../../integrity-check");
-	await cancelBackgroundIntegrityCheck();
+	const { resetBackgroundIntegrityCheckForTests } = await import("../../integrity-check");
+	await resetBackgroundIntegrityCheckForTests();
 	saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
 	home = mkdtempSync(join(tmpdir(), "nf-verification-gate-"));
 	process.env.NARRAFORK_HOME = home;
@@ -53,8 +53,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	const { cancelBackgroundIntegrityCheck } = await import("../../integrity-check");
-	await cancelBackgroundIntegrityCheck();
+	const { resetBackgroundIntegrityCheckForTests } = await import("../../integrity-check");
+	await resetBackgroundIntegrityCheckForTests();
 	for (const key of ENV_KEYS) {
 		const value = saved[key];
 		if (value === undefined) delete process.env[key];
@@ -82,7 +82,7 @@ async function decide(options: {
 	isHotReload?: boolean;
 	verification?: DatabaseVerificationPort;
 }) {
-	const { cancelBackgroundIntegrityCheck, scheduleBackgroundIntegrityCheck } = await import(
+	const { resetBackgroundIntegrityCheckForTests, scheduleBackgroundIntegrityCheck } = await import(
 		"../../integrity-check"
 	);
 	const probed: string[] = [];
@@ -96,7 +96,7 @@ async function decide(options: {
 			return { status: "ok", mode, details: "ok", durationMs: 1 };
 		},
 	});
-	await cancelBackgroundIntegrityCheck();
+	await resetBackgroundIntegrityCheckForTests();
 	return { decision, probed };
 }
 

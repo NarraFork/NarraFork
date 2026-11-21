@@ -404,6 +404,192 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					);
 					await queue.outbox.releaseUnusedRunSlots(atomicFailure);
 				}
+				// A new background registration owns its mirror and startup terminal atomically.
+				await db.insert(narrators).values({
+					id: "startup-actor",
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: "parent",
+					traits: ["keep"],
+					backgroundResult: "previous",
+					backgroundCompletedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				});
+				const startupDestination = {
+					narratorId: "parent",
+					toolUseId: "startup-tool",
+					viaTask: true as const,
+				};
+				const startupInput = {
+					narratorId: "startup-actor",
+					binding: { deliverTo: startupDestination },
+					taskRow: {
+						...taskRow(),
+						id: "startup-actor",
+						subagentNarratorId: "startup-actor",
+						toolUseId: "startup-tool",
+					},
+				};
+				const [beforeStartup] = await db
+					.select()
+					.from(narrators)
+					.where(eq(narrators.id, "startup-actor"));
+				await client.sql.unsafe(
+					"CREATE FUNCTION reject_start_task() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = 'startup-actor' THEN RAISE EXCEPTION 'startup task failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_start_task BEFORE INSERT ON background_tasks FOR EACH ROW EXECUTE FUNCTION reject_start_task()",
+				);
+				try {
+					const error = await engine.startRun(startupInput).catch((error) => error);
+					expect(error).toBeInstanceOf(Error);
+					expect(
+						(await db.select().from(narrators).where(eq(narrators.id, "startup-actor")))[0],
+					).toEqual(beforeStartup);
+					expect(
+						await db.select().from(outbox).where(eq(outbox.taskId, "startup-actor")),
+					).toHaveLength(0);
+				} finally {
+					await client.sql.unsafe(
+						"DROP TRIGGER reject_start_task ON background_tasks; DROP FUNCTION reject_start_task()",
+					);
+				}
+				const startup = (await engine.startRun(startupInput)).publication!;
+				expect(
+					(await db.select().from(narrators).where(eq(narrators.id, "startup-actor")))[0],
+				).toMatchObject({
+					logicalRunId: startup.logicalRunId,
+					isBackground: true,
+					backgroundStatus: "running",
+					backgroundResult: null,
+					backgroundCompletedAt: null,
+					traits: ["keep", "background"],
+				});
+				const startupTerminal = {
+					run: startup,
+					eventKind: "failed" as const,
+					delivery: "foreground" as const,
+					text: "startup failed",
+					summary: "startup failed",
+					startupFailure: { deliverTo: startupDestination, assertOwner: () => {} },
+				};
+				await expect(
+					engine.commitAgentTerminal({
+						...startupTerminal,
+						startupFailure: {
+							...startupTerminal.startupFailure,
+							deliverTo: { ...startupDestination, toolUseId: "later-tool" },
+						},
+					}),
+				).rejects.toThrow("Stale agent startup failure");
+				expect(
+					(
+						await db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "startup-actor"))
+					)[0]?.status,
+				).toBe("running");
+				await engine.commitAgentTerminal(startupTerminal);
+				expect(
+					(
+						await db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "startup-actor"))
+					)[0]?.status,
+				).toBe("failed");
+				expect(
+					(await db.select().from(narrators).where(eq(narrators.id, "startup-actor")))[0]
+						?.backgroundStatus,
+				).toBe("failed");
+				expect(
+					await db.select().from(outbox).where(eq(outbox.taskId, "startup-actor")),
+				).toHaveLength(0);
+				await db.insert(narrators).values({
+					id: "held-startup-actor",
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: "parent",
+					createdAt: now,
+					updatedAt: now,
+				});
+				const heldStartup = (
+					await engine.startRun({
+						...startupInput,
+						narratorId: "held-startup-actor",
+						taskRow: {
+							...startupInput.taskRow,
+							id: "held-startup-actor",
+							subagentNarratorId: "held-startup-actor",
+						},
+					})
+				).publication!;
+				await db
+					.update(narrators)
+					.set({ substatus: JSON.stringify(["taken_over"]) })
+					.where(eq(narrators.id, "held-startup-actor"));
+				await engine.commitAgentTerminal({
+					...startupTerminal,
+					run: heldStartup,
+					delivery: "background",
+					startupFailure: { ...startupTerminal.startupFailure, retainHeldResult: true },
+				});
+				expect(
+					(await db.select().from(narrators).where(eq(narrators.id, "held-startup-actor")))[0],
+				).toMatchObject({
+					status: "idle",
+					backgroundStatus: "failed",
+					backgroundResult: "startup failed",
+				});
+				expect(
+					(await db.select().from(narrators).where(eq(narrators.id, "held-startup-actor")))[0]
+						?.substatus,
+				).toContain("taken_over");
+				expect(
+					(
+						await db
+							.select()
+							.from(backgroundTasks)
+							.where(eq(backgroundTasks.id, "held-startup-actor"))
+					)[0]?.status,
+				).toBe("running");
+				expect(await engine.readRunPublicationState(heldStartup)).toEqual({ state: "reserved" });
+				await db.insert(narrators).values({
+					id: "sync-held-startup-actor",
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: "parent",
+					substatus: JSON.stringify(["taken_over"]),
+					createdAt: now,
+					updatedAt: now,
+				});
+				const syncHeldStartup = (
+					await engine.startRun({
+						...startupInput,
+						narratorId: "sync-held-startup-actor",
+						taskRow: {
+							...startupInput.taskRow,
+							id: "sync-held-startup-actor",
+							subagentNarratorId: "sync-held-startup-actor",
+						},
+					})
+				).publication!;
+				await engine.commitAgentTerminal({
+					...startupTerminal,
+					run: syncHeldStartup,
+					startupFailure: { ...startupTerminal.startupFailure, retainHeldResult: true },
+				});
+				expect(
+					(
+						await db
+							.select()
+							.from(backgroundTasks)
+							.where(eq(backgroundTasks.id, "sync-held-startup-actor"))
+					)[0]?.status,
+				).toBe("failed");
+				expect(
+					(await db.select().from(narrators).where(eq(narrators.id, "sync-held-startup-actor")))[0]
+						?.substatus,
+				).toContain("taken_over");
+				expect(await engine.readRunPublicationState(syncHeldStartup)).toMatchObject({
+					state: "settled",
+				});
+				expect(
+					await db.select().from(outbox).where(eq(outbox.taskId, "sync-held-startup-actor")),
+				).toHaveLength(0);
 				return "passed";
 			} catch (error) {
 				callbackError = error;

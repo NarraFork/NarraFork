@@ -385,9 +385,16 @@ describe("ordinary restart with real persisted recovery records", () => {
 			await pub.startRun({
 				narratorId: "child",
 				resumeRunId: "run-child",
-				binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+				binding: {
+					deliverTo: {
+						narratorId: "parent",
+						toolUseId: "use-agent-call",
+						toolCallId: "agent-call",
+					},
+				},
 			})
-		).publication!;
+		).publication;
+		if (!run) throw new Error("Missing recovery fixture Agent publication");
 		await pub.commitAgentTerminal({
 			run,
 			eventKind: "completed",

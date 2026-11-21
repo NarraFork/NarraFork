@@ -1,6 +1,7 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { and, asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -9,10 +10,16 @@ import {
 	narrators,
 	runtimePublicationOutbox,
 } from "../../db/schema";
+import { narratorTraitsLock } from "../../lib/async-mutex";
 import { MAILBOX_LIMITS as L } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher, createRuntimePublicationService } = await import(
@@ -69,6 +76,122 @@ afterAll(() => {
 	publisher.stop();
 	sqlite.close();
 	mock.restore();
+});
+
+describe("atomic background agent registration", () => {
+	const create = () =>
+		tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "atomic-tool" } },
+		});
+	const actor = () => db.select().from(narrators).where(eq(narrators.id, "child")).get();
+
+	test.each([
+		["task", "BEFORE INSERT ON background_tasks"],
+		[
+			"mirror",
+			"BEFORE UPDATE OF background_status ON narrators WHEN NEW.background_status = 'running'",
+		],
+		["outbox", "BEFORE INSERT ON runtime_publication_outbox"],
+	])("%s write failure rolls back the complete registration", async (_point, trigger) => {
+		const before = actor();
+		const refresh = spyOn(backgroundOccupancyStore, "refreshNarrator");
+		sqlite.run(
+			`CREATE TRIGGER atomic_start_failure ${trigger} BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END`,
+		);
+		try {
+			await expect(create()).rejects.toThrow("injected registration failure");
+			expect(actor()).toEqual(before);
+			expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+			expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+			expect(refresh).not.toHaveBeenCalled();
+		} finally {
+			sqlite.run("DROP TRIGGER atomic_start_failure");
+			refresh.mockRestore();
+		}
+	});
+
+	test("a second SQLite connection holding a write lock leaves no running projection", async () => {
+		const before = actor();
+		const blocker = new Database(sqlite.filename);
+		blocker.run("BEGIN IMMEDIATE");
+		try {
+			await expect(create()).rejects.toThrow("locked");
+			expect(actor()).toEqual(before);
+			expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+			expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+		} finally {
+			blocker.run("ROLLBACK");
+			blocker.close();
+		}
+	});
+
+	test("registration merges the latest traits under the existing traits lock", async () => {
+		db.update(narrators)
+			.set({ traits: ["original"], backgroundResult: "old result", backgroundCompletedAt: time })
+			.where(eq(narrators.id, "child"))
+			.run();
+		const gate = Promise.withResolvers<void>();
+		const concurrent = narratorTraitsLock.acquire("child", async () => {
+			await gate.promise;
+			db.update(narrators)
+				.set({ traits: ["original", "concurrent"] })
+				.where(eq(narrators.id, "child"))
+				.run();
+		});
+		const started = create();
+		gate.resolve();
+		await concurrent;
+		const task = await started;
+		expect(actor()).toMatchObject({
+			logicalRunId: task.logicalRunId,
+			isBackground: true,
+			backgroundStatus: "running",
+			backgroundResult: null,
+			backgroundCompletedAt: null,
+			traits: ["original", "concurrent", "background"],
+		});
+		expect(db.select().from(backgroundTasks).get()?.logicalRunId).toBe(task.logicalRunId);
+		expect(db.select().from(runtimePublicationOutbox).get()?.logicalRunId).toBe(task.logicalRunId!);
+	});
+
+	test("a task registration requires its destination before writing any mirror", () => {
+		const before = actor();
+		expect(() =>
+			publisher.startRun({
+				narratorId: "child",
+				binding: {},
+				taskRow: {
+					id: "child",
+					parentNarratorId: "parent",
+					type: "agent",
+					status: "running",
+					startedAt: time,
+					createdAt: time,
+					updatedAt: time,
+				},
+			}),
+		).toThrow("requires a delivery destination");
+		expect(actor()).toEqual(before);
+		expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+	});
+
+	test("a foreground registration keeps its narrator background fields", () => {
+		const before = actor();
+		publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "foreground-tool" } },
+		});
+		expect(actor()).toMatchObject({
+			isBackground: before?.isBackground,
+			backgroundStatus: before?.backgroundStatus,
+			traits: before?.traits,
+		});
+		expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+	});
 });
 
 describe("real task producers use publication outbox", () => {

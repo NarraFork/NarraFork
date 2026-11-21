@@ -19,7 +19,7 @@ import {
 	projectTeams,
 	users,
 } from "../db/schema";
-import { eventBus } from "../lib/event-bus";
+import { eventBus, type NarraForkEvent, type NarraForkEventType } from "../lib/event-bus";
 import type { Locale } from "../lib/i18n";
 import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
@@ -95,6 +95,36 @@ class Gateway {
 	private config: GatewayConfig | null = null;
 	private adapters = new Map<GatewayPlatform, PlatformAdapter>();
 	private started = false;
+	private stopping = false;
+	private shutdownRequested = false;
+	private pendingWork = new Set<Promise<void>>();
+	private unsubscribeEvents: Array<() => void> = [];
+
+	private trackWork(run: () => Promise<void>): Promise<void> {
+		if (this.stopping || this.shutdownRequested) return Promise.resolve();
+		const task = Promise.resolve().then(run);
+		this.pendingWork.add(task);
+		void task.then(
+			() => this.pendingWork.delete(task),
+			() => this.pendingWork.delete(task),
+		);
+		return task;
+	}
+
+	private onEvent<T extends NarraForkEventType>(
+		type: T,
+		handler: (event: Extract<NarraForkEvent, { type: T }>) => Promise<void>,
+	): void {
+		const tracked = (event: Extract<NarraForkEvent, { type: T }>) =>
+			this.trackWork(() => handler(event));
+		eventBus.on(type, tracked);
+		this.unsubscribeEvents.push(() => eventBus.off(type, tracked));
+	}
+
+	async shutdown(): Promise<void> {
+		this.shutdownRequested = true;
+		await this.stop();
+	}
 	private rateLimiter: RateLimiter | null = null;
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -125,9 +155,10 @@ class Gateway {
 	// -----------------------------------------------------------------------
 
 	async start(): Promise<void> {
-		if (this.started) return;
-
+		if (this.started || this.shutdownRequested) return;
+		this.stopping = false;
 		this.config = await loadGatewayConfig();
+		if (this.stopping || this.shutdownRequested) return;
 		if (!this.config.enabled) {
 			logger.info("[gateway] Gateway disabled by configuration");
 			return;
@@ -155,9 +186,13 @@ class Gateway {
 				const adapter = await this.createAdapter(pConfig);
 				if (!adapter) continue;
 
-				adapter.onMessage((msg) => this.handleInboundMessage(msg));
+				adapter.onMessage((msg) => this.trackWork(() => this.handleInboundMessage(msg)));
 
 				const ok = await adapter.connect();
+				if (this.stopping || this.shutdownRequested) {
+					await adapter.disconnect();
+					return;
+				}
 				if (ok) {
 					this.adapters.set(pConfig.platform, adapter);
 					logger.info(`[gateway] ${pConfig.platform} connected`);
@@ -179,7 +214,8 @@ class Gateway {
 	}
 
 	async stop(): Promise<void> {
-		if (!this.started) return;
+		this.stopping = true;
+		for (const unsubscribe of this.unsubscribeEvents.splice(0)) unsubscribe();
 
 		// Abort all active stream consumers
 		for (const [, consumer] of this.streamConsumers) {
@@ -203,6 +239,7 @@ class Gateway {
 			}
 		}
 
+		while (this.pendingWork.size) await Promise.allSettled([...this.pendingWork]);
 		this.adapters.clear();
 		this.started = false;
 		logger.info("[gateway] Stopped");
@@ -267,7 +304,7 @@ class Gateway {
 			try {
 				const adapter = await this.createAdapter(pConfig);
 				if (adapter) {
-					adapter.onMessage((msg) => this.handleInboundMessage(msg));
+					adapter.onMessage((msg) => this.trackWork(() => this.handleInboundMessage(msg)));
 					const ok = await adapter.connect();
 					if (ok) {
 						this.adapters.set(p, adapter);
@@ -996,7 +1033,7 @@ class Gateway {
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
-		eventBus.on("narrator:status_changed", async (event) => {
+		this.onEvent("narrator:status_changed", async (event) => {
 			// Handle the directly-bound narrator (deliver response on idle)
 			if (event.status === "idle") {
 				const consumer = this.streamConsumers.get(event.narratorId);
@@ -1018,7 +1055,7 @@ class Gateway {
 		// their currently-bound narrator). Driven by the semantic attention intent
 		// rather than re-derived from status/substatus, so reflection mid-states
 		// and takeover fallbacks never trigger a spurious IM ping.
-		eventBus.on("narrator:attention", async (event) => {
+		this.onEvent("narrator:attention", async (event) => {
 			// Done with background work still running: the session is not actually
 			// finished, so the recent-tab IM ping is suppressed. The wake-up turn
 			// after the last background task emits a fresh unflagged "done".
@@ -1028,7 +1065,7 @@ class Gateway {
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
-		eventBus.on("narrator:message_broadcast", async (event) => {
+		this.onEvent("narrator:message_broadcast", async (event) => {
 			const msg = event.message;
 
 			// --- Stream consumer: text deltas ---
@@ -1139,7 +1176,7 @@ class Gateway {
 		});
 
 		// Listen for errors
-		eventBus.on("narrator:error", async (event) => {
+		this.onEvent("narrator:error", async (event) => {
 			// Clean up stream consumer
 			this.cleanupStreamConsumer(event.narratorId);
 

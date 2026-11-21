@@ -489,6 +489,7 @@ export function stopHeartbeat() {
  */
 export function closeAllConnections() {
 	acceptingWebSocketMessages = false;
+	stopHeartbeat();
 	closeAllExternalNarratorConnections();
 	for (const ws of getNarratorConnections()) {
 		try {

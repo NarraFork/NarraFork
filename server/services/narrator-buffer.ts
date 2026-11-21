@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	existsSync,
 	mkdirSync,
@@ -204,7 +205,107 @@ export async function reconcileBufferedStaging(
 // These are unaccepted preparation permits, never a second message authority.
 let activePreparations = 0;
 const preparationWaiters: Array<() => void> = [];
+const pendingBufferedPreparations = new Set<Promise<unknown>>();
+const bufferedPreparationScope = new AsyncLocalStorage<{ pending: number }>();
+const acceptedPreparationScopes = new Set<{ pending: number }>();
+let bufferedPreparationFailures = 0;
+let firstBufferedPreparationFailure: unknown;
+let bufferedPreparationAdmissionClosed = false;
+
+function trackBufferedPreparation<T>(
+	work: Promise<T>,
+	scope = bufferedPreparationScope.getStore(),
+): Promise<T> {
+	if (scope) scope.pending++;
+	pendingBufferedPreparations.add(work);
+	const settled = () => {
+		pendingBufferedPreparations.delete(work);
+		if (scope && --scope.pending === 0) acceptedPreparationScopes.delete(scope);
+	};
+	void work.then(settled, (error) => {
+		if (bufferedPreparationAdmissionClosed) {
+			bufferedPreparationFailures++;
+			firstBufferedPreparationFailure ??= error;
+		}
+		settled();
+	});
+	return work;
+}
+
+function withBufferedPreparationAdmission<T>(work: () => Promise<T>): Promise<T> {
+	const inherited = bufferedPreparationScope.getStore();
+	if (bufferedPreparationAdmissionClosed && !inherited?.pending)
+		return Promise.reject(new Error("Buffered file preparation admission is closed"));
+	if (
+		!inherited?.pending &&
+		acceptedPreparationScopes.size >= MAILBOX_LIMITS.prepareConcurrency + MAILBOX_LIMITS.userPending
+	)
+		return Promise.reject(new Error("Buffered preparation is full"));
+	const scope = inherited?.pending ? inherited : { pending: 0 };
+	acceptedPreparationScopes.add(scope);
+	return trackBufferedPreparation(
+		bufferedPreparationScope.run(scope, () => Promise.resolve().then(work)),
+		scope,
+	);
+}
+
+function trackBufferedCleanup<T>(work: () => Promise<T>): Promise<T> {
+	return trackBufferedPreparation(Promise.resolve().then(work));
+}
+
+export function getBufferedFilePreparationStatus() {
+	return {
+		pending: pendingBufferedPreparations.size,
+		active: activePreparations,
+		waiting: preparationWaiters.length,
+		batches: acceptedPreparationScopes.size,
+		failed: bufferedPreparationFailures,
+	};
+}
+export function stopBufferedFilePreparations(): void {
+	bufferedPreparationAdmissionClosed = true;
+}
+export function hasPendingBufferedFilePreparations(): boolean {
+	return (
+		pendingBufferedPreparations.size > 0 || activePreparations > 0 || preparationWaiters.length > 0
+	);
+}
+export async function drainBufferedFilePreparations(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	options.signal?.throwIfAborted();
+	while (hasPendingBufferedFilePreparations()) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Buffered preparation drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingBufferedPreparations]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Buffered preparation drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(
+						() => reject(new Error("Buffered preparation drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (bufferedPreparationFailures)
+		throw new Error("Buffered preparation failed", { cause: firstBufferedPreparationFailure });
+}
 async function acquirePreparation(): Promise<() => void> {
+	if (bufferedPreparationAdmissionClosed && !bufferedPreparationScope.getStore()?.pending)
+		throw new Error("Buffered file preparation admission is closed");
 	if (activePreparations >= MAILBOX_LIMITS.prepareConcurrency) {
 		if (preparationWaiters.length >= MAILBOX_LIMITS.userPending)
 			throw new Error("Buffered preparation is full");
@@ -260,6 +361,7 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 				cleanupBufferedTextFiles(basename(dirname(path)));
 			}
 		});
+	trackBufferedPreparation(write);
 	try {
 		await Promise.race([
 			write,
@@ -345,7 +447,15 @@ function readManagedText(path: string, max = MAX_BUFFERED_PAYLOAD_BYTES): string
 		throw new Error("Invalid buffered payload file");
 	return readFileSync(path, "utf8");
 }
-async function writeStagingText(id: string, prefix: string, text: string): Promise<string> {
+function writeStagingText(id: string, prefix: string, text: string): Promise<string> {
+	return withBufferedPreparationAdmission(() => writeStagingTextUntracked(id, prefix, text));
+}
+
+async function writeStagingTextUntracked(
+	id: string,
+	prefix: string,
+	text: string,
+): Promise<string> {
 	if (Buffer.byteLength(text) > MAX_BUFFERED_PAYLOAD_BYTES)
 		throw new Error("Buffered payload exceeds size limit");
 	const dir = ensureStagingDirectory(id);
@@ -376,7 +486,13 @@ export function releaseStagedFiles(files: readonly File[] | undefined): void {
 }
 
 /** Save attachments once; both primary and subagent producers use this durable representation. */
-export async function persistBufferedTextFiles(
+export function persistBufferedTextFiles(
+	...args: Parameters<typeof persistBufferedTextFilesUntracked>
+): ReturnType<typeof persistBufferedTextFilesUntracked> {
+	return withBufferedPreparationAdmission(() => persistBufferedTextFilesUntracked(...args));
+}
+
+async function persistBufferedTextFilesUntracked(
 	id: string,
 	files: File[],
 	reserved: Iterable<string> = [],
@@ -452,7 +568,11 @@ export function cleanupBufferedTextFiles(id: string): void {
 	rmSync(path, { recursive: true, force: true });
 }
 /** Backend-neutral asynchronous cleanup used after mailbox consumption. */
-export async function cleanupBufferedTextFilesAsync(id: string): Promise<void> {
+export function cleanupBufferedTextFilesAsync(id: string): Promise<void> {
+	return trackBufferedCleanup(() => cleanupBufferedTextFilesUntracked(id));
+}
+
+async function cleanupBufferedTextFilesUntracked(id: string): Promise<void> {
 	const port = pgQueue();
 	if (port) {
 		await cleanupStagingPg(port, id);

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	gatewaySessionMappings,
 	narrators,
@@ -8,9 +8,15 @@ import {
 	userRecentTabsMeta,
 	users,
 } from "../../db/schema";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "../../services/__tests__/agent-runtime-test-database";
 import type { InboundMessage, PlatformAdapter } from "../types";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -25,6 +31,7 @@ const NOW = "2026-07-19T00:00:00.000Z";
 
 interface GatewayTestAccess {
 	adapters: Map<string, PlatformAdapter>;
+	pendingWork: Set<Promise<void>>;
 	subscribeToEvents(): void;
 	notifyRecentTabStatusChange(
 		narratorId: string,
@@ -170,12 +177,21 @@ function seedFixture(): void {
 	});
 }
 
-afterEach(() => {
+async function drainGatewayWork(): Promise<void> {
+	const { pendingWork } = gateway as unknown as GatewayTestAccess;
+	while (pendingWork.size) await Promise.all([...pendingWork]);
+}
+
+afterEach(async () => {
+	await drainGatewayWork();
+	await drainRuntimeTestWork();
 	(gateway as unknown as GatewayTestAccess).adapters.clear();
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await gateway.stop();
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
@@ -230,13 +246,13 @@ describe("gateway normalized recent-tabs consumers", () => {
 			reason: "done",
 			backgroundWorkActive: true,
 		});
-		for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		await drainGatewayWork();
 		expect(sent).toHaveLength(0);
 
 		// The unflagged done (e.g. the wake-up turn after the last background task)
 		// still pings exactly as before.
 		eventBus.emit({ type: "narrator:attention", narratorId: "gateway-target", reason: "done" });
-		for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		await drainGatewayWork();
 		expect(sent).toHaveLength(1);
 		expect(sent[0]?.text).toContain("Target narrator");
 	});
