@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { type BuildProfileEnvironment, resolveBuildProfile } from "../../scripts/lib/build-profile";
+import { runCiBuildCommand } from "../../scripts/lib/ci-build-strict";
 import { safeSpawn } from "../../server/lib/spawn";
 
 const root = resolve(import.meta.dir, "../..");
@@ -86,6 +87,22 @@ describe("backend build profiles", () => {
 		expect(source).toMatch(
 			/env:\s*\{\s*\.\.\.process\.env,[\s\S]*?NF_BUILD_RELEASE_CONTEXT:\s*"1"/,
 		);
+	});
+
+	test("strict subprocesses inherit environment set by the build entry", async () => {
+		const key = "NF_TEST_BUILD_CONTEXT";
+		const previous = process.env[key];
+		try {
+			process.env[key] = "diagnostic";
+			await runCiBuildCommand([
+				process.execPath,
+				"-e",
+				'if (process.env.NF_TEST_BUILD_CONTEXT !== "diagnostic") process.exit(1)',
+			]);
+		} finally {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		}
 	});
 });
 

@@ -163,7 +163,11 @@ async function runBuildStep(command: string[]): Promise<{ exitCode: number }> {
 		await runCiBuildCommand(command, 30 * 60_000, ROOT);
 		return { exitCode: 0 };
 	}
-	return Bun.spawnSync(command, { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"] });
+	return Bun.spawnSync(command, {
+		cwd: ROOT,
+		env: process.env,
+		stdio: ["inherit", "inherit", "inherit"],
+	});
 }
 
 // Step 1: Build frontend with Vite
