@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import * as runtimeHistory from "../agent-runtime/history";
 import * as epochs from "../narrator-epochs";
 import { narratorService } from "../narrator-service";
@@ -205,7 +206,11 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const controller = new AbortController();
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				expect(options).toEqual({ signal: controller.signal });
+				expect(options).toEqual({
+					signal: controller.signal,
+					preparation: expect.any(ModelHistoryPreparation),
+				});
+				expect(options?.preparation?.deadline).toBe(Infinity);
 				return new Promise((_, reject) =>
 					controller.signal.addEventListener("abort", () => reject(new Error("source cancelled")), {
 						once: true,
@@ -233,7 +238,11 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				expect(options).toEqual({ signal: controller.signal });
+				expect(options).toEqual({
+					signal: controller.signal,
+					preparation: expect.any(ModelHistoryPreparation),
+				});
+				expect(options?.preparation?.deadline).toBe(Infinity);
 				now += 11_000;
 				return [];
 			},
