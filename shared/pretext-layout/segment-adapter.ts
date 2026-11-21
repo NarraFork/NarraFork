@@ -4569,6 +4569,9 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
 		...(liveOutputChars != null ? { liveOutputChars } : {}),
+		toolCallId: readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
+		executionAttempt:
+			typeof item.tc.executionAttempt === "number" ? item.tc.executionAttempt : undefined,
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is

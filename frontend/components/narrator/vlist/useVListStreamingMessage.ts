@@ -637,6 +637,8 @@ export function useVListStreamingMessage(
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
+						toolCallId: meta?.toolCallId,
+						executionAttempt: meta?.executionAttempt,
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input
@@ -698,7 +700,8 @@ export function useVListStreamingMessage(
 			},
 			// Live stdout of a running command. Throttled per tool: a build emitting
 			// megabytes would otherwise re-render the row on every socket frame.
-			onToolOutput: (toolUseId, output, rawParentToolUseId) => {
+			onToolOutput: (toolUseId, output, rawParentToolUseId, meta) => {
+				if (meta?.subagentOutputCount) return;
 				if (!isSubagent && rawParentToolUseId) return;
 				pushToolOutput(toolUseId, output);
 			},

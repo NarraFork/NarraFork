@@ -619,11 +619,19 @@
 		},
 		{
 			"idx": 77,
-			"tag": "0077_ask_in_passing_group_archive",
-			"id": "6f74f23b-8f24-4fd5-a418-a4ef3a6396f2",
+			"tag": "0077_index_active_background_tasks",
+			"id": "8d1462cb-1880-4184-bc64-7d1df44424c3",
 			"prevId": "44828ca8-52df-45aa-9c76-905894b958cf",
 			"version": "7",
-			"snapshotDigest": "bd6121fa1469fc33da824eb968c15a60c08ff12f865d2445b3884c22372cac65"
+			"snapshotDigest": "0d51cb0307dae359f6882ca594c4098a11600929137d6328fe6dbe55bf600fe4"
+		},
+		{
+			"idx": 78,
+			"tag": "0078_ask_in_passing_group_archive",
+			"id": "f040e99e-e551-4687-99f8-ee370353a9c1",
+			"prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+			"version": "7",
+			"snapshotDigest": "4b71044913fb107713df639dd40c55de46a62aabfd731cb38bbe3e95431f7eea"
 		}
 	]
 }

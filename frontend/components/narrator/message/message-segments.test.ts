@@ -33,6 +33,68 @@ describe("buildStreamingMsg request identity", () => {
 });
 
 describe("resolveAllToolCallsFromMsg", () => {
+	test.each([-1, "3", Number.NaN])("rejects a malformed Agent attempt %s", (executionAttempt) => {
+		const msg = rowWithElements({ role: "assistant" }, [
+			{
+				type: "tool_use",
+				id: "agent",
+				name: "Agent",
+				tcId: "pk",
+				status: "success",
+				executionAttempt,
+			},
+		]) as unknown as NarratorMsg;
+		expect(resolveAllToolCallsFromMsg(msg)[0]?.executionAttempt).toBeUndefined();
+	});
+	test.each(["history", "row", "live"])("preserves the exact Agent attempt from %s", (path) => {
+		const block = {
+			type: "tool_use" as const,
+			id: "agent",
+			name: "Agent",
+			input: { prompt: "work" },
+		};
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls:
+					path === "history"
+						? []
+						: [
+								{
+									id: "agent-pk",
+									toolUseId: "agent",
+									toolName: "Agent",
+									executionAttempt: 3,
+									status: "success",
+								},
+							],
+			},
+			[
+				{
+					...block,
+					...(path === "row" ? {} : { tcId: "agent-pk", executionAttempt: 3, status: "success" }),
+				},
+			],
+		) as unknown as NarratorMsg;
+		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
+			id: "agent-pk",
+			executionAttempt: 3,
+		});
+	});
+
+	test("never borrows a newer row's attempt for an enriched historical Agent", () => {
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls: [{ id: "new-pk", toolUseId: "agent", toolName: "Agent", executionAttempt: 4 }],
+			},
+			[{ type: "tool_use", id: "agent", name: "Agent", tcId: "old-pk", status: "success" }],
+		) as NarratorMsg;
+		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
+			id: "old-pk",
+			executionAttempt: undefined,
+		});
+	});
 	test("accepts numeric tcCreatedAt values", () => {
 		const createdAt = 1_700_000_000_000;
 		const msg = rowWithElements(

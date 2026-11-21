@@ -77,6 +77,7 @@ import { sqlite } from "../db";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
+import { eventBus } from "../lib/event-bus";
 
 /** Archives without sealed provider keys; every version of this importer reads them. */
 const PLAIN_EXPORT_VERSION = 1;
@@ -1325,6 +1326,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		for (let attempt = 1; ; attempt += 1) {
 			try {
 				Object.assign(result, transaction());
+				if (result.sessionsInserted > 0 || result.sessionsOverwritten > 0) {
+					eventBus.emit({ type: "narrator:imported" });
+				}
 				break;
 			} catch (error) {
 				const code = (error as { code?: string } | null)?.code;

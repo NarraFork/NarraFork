@@ -8,6 +8,7 @@ import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import { currentSqlTraceSpan, runInSqlTraceSpan, startSqlTraceSpan } from "../lib/sql-trace";
 import type { VNetClientMessage } from "../lib/vnet/types";
 import {
@@ -96,6 +97,10 @@ export function narratorWebSocketBackendRefusal(
 
 let acceptingWebSocketMessages = true;
 const activeWebSocketHandlers = new Set<Promise<void>>();
+
+export function hasActiveWebSocketHandlers(): boolean {
+	return activeWebSocketHandlers.size > 0;
+}
 
 function trackWebSocketHandler(work: Promise<void>, onError: (error: unknown) => void): void {
 	const tracked = work.catch(onError);
@@ -593,7 +598,7 @@ function dispatchParsedMessage(
 
 export const wsHandlers = {
 	open(ws: ServerWebSocket<WSData>) {
-		if (!acceptingWebSocketMessages) {
+		if (!acceptingWebSocketMessages || isUnattendedShutdownFenced()) {
 			try {
 				ws.close(1012, "server shutting down");
 			} catch {
@@ -617,6 +622,14 @@ export const wsHandlers = {
 	},
 
 	message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
+		if (isUnattendedShutdownFenced() && acceptingWebSocketMessages) {
+			try {
+				ws.close(1013, "server checking shutdown readiness");
+			} catch {
+				// already dead — ignore
+			}
+			return;
+		}
 		if (!acceptingWebSocketMessages) {
 			try {
 				ws.close(1012, "server shutting down");

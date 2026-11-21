@@ -17,6 +17,7 @@ import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
+import { useSubagentOutputCounts } from "@frontend/hooks/useSubagentOutputCounts";
 import { useNarratorCurrentTask } from "@frontend/hooks/useTaskBoard";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
@@ -1626,6 +1627,7 @@ export const PretextExactMessageList = memo(
 			// deletes the display row server-side, so identity stability matters here for
 			// the same reason as above: every mounted row receives this callback.
 			const dismissSubagentRecovery = useSubagentRecoveryDismiss(narratorId);
+			useSubagentOutputCounts(narratorId);
 
 			// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
 			// owns that panel, and the chunked card reaches it by bubbling a DOM

@@ -448,6 +448,10 @@ async function executeRun(
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
+		if (deliverTo) {
+			const { startSubagentOutputCharCount } = await import("../narrator-event-handler");
+			startSubagentOutputCharCount(id, binding.logicalRunId);
+		}
 		if (deliverTo)
 			await announceRunToDestination(id, source, deliverTo, principal).catch((error) =>
 				logger.debug("Run announcement skipped", { id, error: String(error) }),
@@ -712,6 +716,10 @@ async function executeRun(
 		throw error;
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
+		if (run.logicalRunId) {
+			const { retireSubagentOutputCharCount } = await import("../narrator-event-handler");
+			retireSubagentOutputCharCount(id, run.logicalRunId);
+		}
 		removeCallerListener?.();
 		removeCancelListener?.();
 		const { backgroundTaskService } = await import("../background-task-service");

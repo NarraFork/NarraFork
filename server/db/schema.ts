@@ -4271,6 +4271,7 @@ export const backgroundTasks = sqliteTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active").on(table.status).where(sql`"status" IN ('running','paused')`),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		// The transfer runner reaches the projection by the OWNING row's id (it never

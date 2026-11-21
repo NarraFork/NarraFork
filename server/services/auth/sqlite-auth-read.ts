@@ -14,6 +14,7 @@ export function authRead<T>(
 	return authReadAdmission.run(
 		(context) =>
 			readQuery(query, {
+				diagnosticSource: "auth.session",
 				shortRead: true,
 				maxRows,
 				signal: context.signal,

@@ -56,6 +56,7 @@ import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host"
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { runPostShutdownHooks } from "./lib/post-shutdown-hooks";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
@@ -67,7 +68,12 @@ import {
 import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
-import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
+import {
+	canRunCleanShutdownHooks,
+	fenceUnattendedShutdown,
+	preservesRecoveryOnShutdown,
+	ShutdownActivityTracker,
+} from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
@@ -141,6 +147,7 @@ import {
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
 import { terminalService } from "./services/terminal-service";
+import { UNATTENDED_SHUTDOWN_REASON, unattendedMode } from "./services/unattended-mode";
 import { markUpdateRestarting } from "./services/update-coordinator";
 import {
 	getPlannedUpdateStartupProtection,
@@ -148,6 +155,7 @@ import {
 } from "./services/update-recovery-service";
 import {
 	closeAllConnections,
+	hasActiveWebSocketHandlers,
 	startHeartbeat,
 	stopHeartbeat,
 	waitForWebSocketActivityDrain,
@@ -1305,6 +1313,7 @@ setInterval(
 
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {
+	isScheduledTaskTickActive,
 	startScheduledTaskScheduler,
 	stopScheduledTaskScheduler,
 } from "./services/scheduled-task-scheduler";
@@ -1467,6 +1476,7 @@ type GracefulShutdownOptions = {
 
 type GracefulShutdownResult = {
 	success: boolean;
+	clean: boolean;
 	reason: string;
 	pid: number;
 	durationMs: number;
@@ -1865,6 +1875,7 @@ async function performGracefulShutdown(
 
 		const result = {
 			success: true,
+			clean: summary.clean && (activeDatabaseBackend === "postgres" || cleanMarked),
 			reason: options.reason,
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
@@ -1907,6 +1918,25 @@ registerGracefulShutdownHandler(async () => {
  * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
+	if (reason === UNATTENDED_SHUTDOWN_REASON) {
+		let ready = false;
+		try {
+			ready = await fenceUnattendedShutdown(
+				() =>
+					shutdownState.promise !== null ||
+					httpLifecycle.activeCount > 0 ||
+					hasActiveWebSocketHandlers() ||
+					isScheduledTaskTickActive(),
+				unattendedMode.revalidateIdle,
+			);
+		} catch (error) {
+			logger.warn("Unattended shutdown revalidation failed", { error: String(error) });
+		}
+		if (!ready) {
+			unattendedMode.deferShutdown();
+			return null;
+		}
+	}
 	try {
 		logger.info("Administrator requested shutdown", { phase: "operator", outcome: "requested" });
 	} catch {
@@ -1918,6 +1948,7 @@ registerOperatorShutdownHandler(async ({ reason }) => {
 		skipWindowsProcessTreeKill: preserveForRecovery,
 		skipBashProcessKill: preserveForRecovery,
 	});
+	if (canRunCleanShutdownHooks(reason, result)) await runPostShutdownHooks(reason);
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });
