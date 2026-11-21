@@ -229,6 +229,10 @@ describe("public-share WebSocket scoping", () => {
 		eventBus.emit({ type: "system:lifecycle_changed" });
 		expect(shared.sent).toEqual([]);
 		expect(regular.sent).toEqual([{ type: "system_lifecycle_changed" }]);
+		regular.sent.length = 0;
+		eventBus.emit({ type: "system:unattended_changed" });
+		expect(shared.sent).toEqual([]);
+		expect(regular.sent).toEqual([{ type: "unattended_mode_changed" }]);
 	});
 
 	it("refuses stats and unrelated workspace subscriptions", async () => {

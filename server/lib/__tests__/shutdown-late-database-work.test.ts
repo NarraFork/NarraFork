@@ -100,6 +100,7 @@ function sandbox(options: {
 	};
 	const dependencies = {
 		logger: { info: nothing, warn: nothing },
+		activeDatabaseBackend: "sqlite",
 		process: { pid: 4242 },
 		performance: options.now ? { now: options.now } : performance,
 		setTimeout: (callback: () => void, delay: number) =>

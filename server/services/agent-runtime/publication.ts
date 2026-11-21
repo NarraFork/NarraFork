@@ -17,6 +17,7 @@ import {
 } from "../../db/schema";
 import { readQuery } from "../../db/worker-read";
 import { ValidationError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
@@ -1386,7 +1387,11 @@ function createSqliteAsyncPublicationService(
 		);
 	return {
 		backend: "sqlite",
-		startRun: async (input) => legacy.startRun(input),
+		startRun: async (input) => {
+			const started = legacy.startRun(input);
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		},
 		getAgentRun: async (narratorId, recipientId) => legacy.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => legacy.newBashRun(taskId, recipientId),
 		startBashRun: async (input) => {
@@ -2174,7 +2179,11 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 
 	return {
 		backend: "postgres",
-		startRun: (input) => engine.startRun(input),
+		startRun: async (input) => {
+			const started = await engine.startRun(input);
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		},
 		getAgentRun: (narratorId, recipientId) => engine.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => ({
 			producerKind: "bash",

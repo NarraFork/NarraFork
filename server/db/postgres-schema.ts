@@ -2550,6 +2550,9 @@ export const backgroundTasks = pgTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active")
+			.on(table.status)
+			.where(sql.raw("\"status\" IN ('running','paused')")),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		index("idx_bg_tasks_transfer").on(table.transferTaskId),
@@ -19394,6 +19397,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "status"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_bg_tasks_active",
+          "columns": [
+            "status"
+          ],
+          "unique": false,
+          "predicate": "\"status\" IN ('running','paused')"
         },
         {
           "name": "idx_bg_tasks_subagent",

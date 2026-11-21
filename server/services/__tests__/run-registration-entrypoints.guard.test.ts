@@ -166,8 +166,13 @@ test("run registration is dispatched through both backend adapters, with no PG S
 	const pg = await Bun.file(
 		new URL("../agent-runtime/postgres-runtime-publication.ts", import.meta.url),
 	).text();
-	expect(source).toContain("startRun: async (input) => legacy.startRun(input)");
-	expect(source).toContain("startRun: (input) => engine.startRun(input)");
+	for (const call of ["legacy.startRun(input)", "await engine.startRun(input)"]) {
+		expect(source).toContain(`startRun: async (input) => {
+			const started = ${call};
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		}`);
+	}
 	const method = pg.slice(
 		pg.indexOf("async startRun("),
 		pg.indexOf("async getAgentRun(", pg.indexOf("async startRun(")),

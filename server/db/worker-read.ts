@@ -33,6 +33,7 @@ import {
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface ReadQueryOptions {
+	diagnosticSource?: string;
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	/** Row budget; exceeding it fails the read instead of truncating. */
@@ -78,10 +79,12 @@ export async function readQuery<T>(
 	};
 	const result = options.shortRead
 		? await runShortReadTask(client.filename, params, {
+				diagnosticSource: options.diagnosticSource,
 				signal: options.signal,
 				timeoutMs: options.timeoutMs,
 			})
 		: await runReadTask<SelectRowsResult>(client.filename, params, {
+				diagnosticSource: options.diagnosticSource,
 				signal: options.signal,
 				timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 			});

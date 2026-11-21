@@ -116,7 +116,6 @@ import {
 	ValidationError,
 	zodValidationError,
 } from "../lib/errors";
-import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
@@ -363,6 +362,7 @@ import {
 	resolveSelectedTurns,
 	streamNarratorExport,
 } from "../services/narrator-export";
+import { resolveNarratorFastMode } from "../services/narrator-fast-mode";
 import { getNarratorGitSummary } from "../services/narrator-git-summary";
 import {
 	countNarratorMessageRefs,
@@ -1887,10 +1887,11 @@ narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator =
 		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
-	const [hasDraft, navigationSummary, messageCount] = await Promise.all([
+	const [hasDraft, navigationSummary, messageCount, fastMode] = await Promise.all([
 		narratorHasDraft(c.get("user").sub, id),
 		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c)),
 		countNarratorMessageRefs(id, narrator.messageVersion),
+		resolveNarratorFastMode(id, { signal: c.req.raw.signal }),
 	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
 	// Policy decision only (no routing, so balanced aggregations do not advance).
@@ -1907,6 +1908,7 @@ narratorRoutes.get("/:id", async (c) => {
 		logger.warn("Slow narrator detail hydration", { narratorId: id, elapsedMs, messageCount });
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
+		...fastMode,
 		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
 		gitSummary: null,
 		navigationSummary,
@@ -5706,9 +5708,13 @@ narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateFastModeOverride(id, override);
-	const userId = c.get("user").sub;
-	const effectiveFastMode = await resolveFastModeForUser(override, userId);
-	return c.json({ ok: true, fastModeOverride: override, fastMode: effectiveFastMode });
+	const fastMode = await resolveNarratorFastMode(id, { signal: c.req.raw.signal });
+	return c.json({
+		ok: true,
+		fastModeOverride: override,
+		fastMode: fastMode.effectiveFastMode,
+		...fastMode,
+	});
 });
 
 // Update relaxed plan toggle
