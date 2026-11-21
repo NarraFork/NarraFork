@@ -188,6 +188,11 @@ async function inlineBaseline(params: URLSearchParams) {
 			: null;
 	const items = await Promise.all(
 		page.map(async (n) => {
+			const {
+				askInPassingGroupId: _group,
+				archivedWithNarratorId: _archivedWith,
+				...publicRow
+			} = n;
 			const [refs] = await db
 				.select({ count: sql<number>`count(*)` })
 				.from(schema.narratorMessageRefs)
@@ -208,7 +213,7 @@ async function inlineBaseline(params: URLSearchParams) {
 				)
 				.where(eq(narratorWorktreeResources.ownerNarratorId, n.id));
 			return {
-				...n,
+				...publicRow,
 				traits: redactInternalTraits(n.traits),
 				hasDraft: false,
 				substatus: parseSubstatus(n.substatus),
@@ -289,6 +294,37 @@ test("empty database remains an empty page", async () => {
 	await assertPage(new URLSearchParams("limit=2"));
 });
 
+function seedGroupedList() {
+	seed();
+	db.update(narrators)
+		.set({ isAskInPassing: true, parentNarratorId: "n0" })
+		.where(or(eq(narrators.id, "n1"), eq(narrators.id, "n6")))
+		.run();
+}
+
+test("grouped children load on the read worker with the same ACL and safe projection", async () => {
+	seedGroupedList();
+	const prepare = spyOn(sqlite, "prepare");
+	const query = spyOn(sqlite, "query");
+	const dispatch = spyOn(pool, "runReadTask");
+	const response = await app.request("/api/narrators?groupAskInPassing=true");
+	expect(response.status).toBe(200);
+	const body = await response.json();
+	expect(body.items.map((row: { id: string }) => row.id)).not.toContain("n1");
+	const parent = body.items.find((row: { id: string }) => row.id === "n0");
+	expect(parent?.askInPassingSessions).toEqual([expect.objectContaining({ id: "n1" })]);
+	expect(parent.askInPassingSessions[0]).not.toHaveProperty("runtimeRegistrationJson");
+	const [, task, options] =
+		dispatch.mock.calls.find(
+			([, , opts]) => opts?.diagnosticSource === "narrators.list.ask-in-passing",
+		) ?? [];
+	expect(task).toMatchObject({ kind: "selectRows", maxRows: body.items.length * 20 });
+	if (task?.kind === "selectRows") expect(task.sql).not.toContain("runtime_registration_json");
+	expect(options?.signal).toBeInstanceOf(AbortSignal);
+	expect(prepare).not.toHaveBeenCalled();
+	expect(query).not.toHaveBeenCalled();
+});
+
 test.each([
 	["unavailable", new pool.WorkersUnavailableError("disabled"), 503],
 	["queue full", new pool.DbReadTaskOverloadedError(), 503],
@@ -321,8 +357,9 @@ test.each([
 	"terminals",
 	"containers",
 	"messages",
+	"ask-in-passing",
 ])("a failure in the %s read cannot become a partial successful page", async (stage) => {
-	seed();
+	seedGroupedList();
 	const runReadTask = pool.runReadTask;
 	spyOn(pool, "runReadTask").mockImplementation((path, params, options) => {
 		if (options?.diagnosticSource === `narrators.list.${stage}`)
@@ -331,7 +368,7 @@ test.each([
 	});
 	const prepare = spyOn(sqlite, "prepare");
 	const query = spyOn(sqlite, "query");
-	const response = await app.request("/api/narrators?limit=2");
+	const response = await app.request("/api/narrators?groupAskInPassing=true");
 	expect(response.status).toBe(503);
 	expect(await response.json()).toHaveProperty("error");
 	expect(prepare).not.toHaveBeenCalled();

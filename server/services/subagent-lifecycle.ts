@@ -49,28 +49,14 @@ export async function interruptAndArchiveSubagent(
 			const narrator = await narratorService.getById(subagentId);
 			if (!narrator) return { ...base, error: "not_found" };
 			base.alreadyArchived = narrator.status === "archived";
-			const { closeNarrator, isNarratorActive } = await import("./narrator-session");
-			const { controlRun, stopSubagentHelpers } = await import("./agent-runtime/run");
 			const { closeSubagentResources } = await import("./subagent-resources");
 			try {
-				// Real runs retain their normal cancellation/finalization path. A missing
-				// RunControl alone is never authority to clear a durable projection.
-				base.interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
-				await stopSubagentHelpers(narrator.id, "Parent subagent archived");
-				if (isNarratorActive(narrator.id)) {
-					closeNarrator(narrator.id);
-					base.interrupted = true;
-				}
+				base.interrupted = await prepareNarratorArchive(narrator);
 				if (!base.alreadyArchived) {
-					await giveBackDelegatedTask(narrator);
 					await narratorService.updateStatus(narrator.id, "archived");
 					base.archived = true;
 				}
-				// Repeated archive is also a repair opportunity, under the SAME admission
-				// as the status write, never racing a later start/resume registration.
-				if (narrator.type === "subagent" && narrator.backgroundStatus === "running") {
-					base.interrupted = (await settleArchivedOrphan(narrator.id)) || base.interrupted;
-				}
+				base.interrupted = (await repairArchivedNarrator(narrator)) || base.interrupted;
 				return { ...base, ok: true };
 			} finally {
 				await closeSubagentResources(narrator.id);
@@ -91,6 +77,35 @@ export async function interruptAndArchiveSubagent(
 						: String(err),
 		};
 	}
+}
+
+/** Cancel work before archiving under the same mutation admission as the status write. */
+export async function prepareNarratorArchive(narrator: {
+	id: string;
+	status: string;
+	runtimeRegistrationJson?: unknown;
+}) {
+	const { closeNarrator, isNarratorActive } = await import("./narrator-session");
+	const { controlRun, stopSubagentHelpers } = await import("./agent-runtime/run");
+	let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
+	await stopSubagentHelpers(narrator.id, "Parent subagent archived");
+	if (isNarratorActive(narrator.id)) {
+		closeNarrator(narrator.id);
+		interrupted = true;
+	}
+	if (narrator.status !== "archived") await giveBackDelegatedTask(narrator);
+	return interrupted;
+}
+
+/** Repeated archive can repair legacy claims; callers must still hold mutation admission. */
+export async function repairArchivedNarrator(narrator: {
+	id: string;
+	type: string;
+	backgroundStatus: string | null;
+}) {
+	return narrator.type === "subagent" && narrator.backgroundStatus === "running"
+		? settleArchivedOrphan(narrator.id)
+		: false;
 }
 
 /** Only a projection-less, unregistered legacy claim can be retired without a run terminal. */

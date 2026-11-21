@@ -3,6 +3,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconMessageQuestion,
 	IconRobot,
 	IconServer,
 	IconSubtask,
@@ -76,12 +77,22 @@ export interface NarratorListItem {
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
 	viewers?: NarratorListViewer[] | null;
+	/** 顺便提问会话：挂在来源会话下面，不单独占一行。 */
+	isAskInPassing?: boolean | null;
+	parentNarratorId?: string | null;
+	/** 来源会话上的这一项带着它的顺便提问子会话，由列表接口一并下发。 */
+	askInPassingSessions?: NarratorListItem[] | null;
 }
 
 interface BaseNarratorListCardProps {
 	narrator: NarratorListItem;
 	localQuery: string;
 	defaultModelValue: string;
+	/** 子会话是否展开；父级维护，卡片本身不记状态。 */
+	askInPassingExpanded?: boolean;
+	onToggleAskInPassing?: (narratorId: string) => void;
+	/** 打开某个顺便提问子会话。 */
+	onOpenAskInPassing?: (narratorId: string) => void;
 }
 
 interface ActiveNarratorListCardProps extends BaseNarratorListCardProps {
@@ -376,6 +387,84 @@ function NarratorListStatusIcon({
 	);
 }
 
+/**
+ * 归档按钮左边的折叠按钮：展开这条会话下面的顺便提问子会话。
+ *
+ * 没有子会话时整块不渲染，卡片外观与之前完全一致。收起状态用 `subtle`、展开用
+ * `light`，让「下面那几行现在能看见」有个可见的落点。
+ */
+function AskInPassingToggle({
+	narrator,
+	expanded,
+	onToggle,
+}: {
+	narrator: NarratorListItem;
+	expanded: boolean;
+	onToggle?: (narratorId: string) => void;
+}) {
+	const { t } = useTranslation("narrators");
+	const count = narrator.askInPassingSessions?.length ?? 0;
+	if (!onToggle || count === 0) return null;
+	return (
+		<Group gap={2} wrap="nowrap">
+			<Tooltip label={t("askInPassingSessions", { count })}>
+				<ActionIcon
+					size="sm"
+					color="grape"
+					variant={expanded ? "light" : "subtle"}
+					aria-expanded={expanded}
+					aria-label={t("askInPassingSessions", { count })}
+					onPointerDown={(e: PointerEvent) => {
+						e.stopPropagation();
+					}}
+					onClick={(e: MouseEvent) => {
+						e.preventDefault();
+						e.stopPropagation();
+						onToggle(narrator.id);
+					}}
+				>
+					<IconMessageQuestion size={16} />
+				</ActionIcon>
+			</Tooltip>
+			<Text size="xs" c="dimmed" visibleFrom="sm">
+				{count}
+			</Text>
+		</Group>
+	);
+}
+
+/** 主会话下面缩进的那一行：只要状态、标题和时间，点开就是那条顺便提问会话。 */
+function AskInPassingChildRow({
+	narrator,
+	localQuery,
+	onOpen,
+}: {
+	narrator: NarratorListItem;
+	localQuery: string;
+	onOpen?: (narratorId: string) => void;
+}) {
+	return (
+		<Card
+			component={onOpen ? "button" : "div"}
+			type={onOpen ? "button" : undefined}
+			padding="xs"
+			withBorder
+			style={{ cursor: onOpen ? "pointer" : "default", textAlign: "start" }}
+			onClick={onOpen ? () => onOpen(narrator.id) : undefined}
+		>
+			<Group component="span" gap="xs" wrap="nowrap">
+				<NarratorListStatusIcon narrator={narrator} size={16} />
+				<Text component="span" size="sm" truncate style={{ flex: 1, minWidth: 0 }}>
+					<NarratorTitle narrator={narrator} localQuery={localQuery} />
+				</Text>
+				<Text component="span" size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+					<CreatedLastMessageText narrator={narrator} />
+				</Text>
+			</Group>
+		</Card>
+	);
+}
+
 function ActiveNarratorCard({
 	narrator,
 	localQuery,
@@ -383,6 +472,8 @@ function ActiveNarratorCard({
 	dimmed,
 	onOpen,
 	onArchive,
+	askInPassingExpanded,
+	onToggleAskInPassing,
 }: ActiveNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
 
@@ -423,6 +514,11 @@ function ActiveNarratorCard({
 					</Group>
 					<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 						<ViewerAvatars narrator={narrator} />
+						<AskInPassingToggle
+							narrator={narrator}
+							expanded={!!askInPassingExpanded}
+							onToggle={onToggleAskInPassing}
+						/>
 						<Tooltip label={t("archive")}>
 							<ActionIcon
 								size="sm"
@@ -460,6 +556,11 @@ function ActiveNarratorCard({
 							<NarratorTitle narrator={narrator} localQuery={localQuery} />
 						</Text>
 					</Group>
+					<AskInPassingToggle
+						narrator={narrator}
+						expanded={!!askInPassingExpanded}
+						onToggle={onToggleAskInPassing}
+					/>
 					<Tooltip label={t("archive")}>
 						<ActionIcon
 							size="sm"
@@ -508,6 +609,8 @@ function ArchivedNarratorCard({
 	deleteUnsupportedReason,
 	onUnarchive,
 	onDelete,
+	askInPassingExpanded,
+	onToggleAskInPassing,
 }: ArchivedNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
 	const deleteTooltip = deleteSupported
@@ -545,6 +648,11 @@ function ArchivedNarratorCard({
 						</Group>
 					</Stack>
 					<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+						<AskInPassingToggle
+							narrator={narrator}
+							expanded={!!askInPassingExpanded}
+							onToggle={onToggleAskInPassing}
+						/>
 						<Tooltip label={t("unarchive")}>
 							<ActionIcon
 								size="sm"
@@ -586,6 +694,35 @@ function ArchivedNarratorCard({
 }
 
 export function NarratorListCard(props: NarratorListCardProps) {
-	if (props.variant === "active") return <ActiveNarratorCard {...props} />;
-	return <ArchivedNarratorCard {...props} />;
+	const children = props.narrator.askInPassingSessions ?? [];
+	const expanded = !!props.askInPassingExpanded && children.length > 0;
+	return (
+		<Stack gap={6}>
+			{props.variant === "active" ? (
+				<ActiveNarratorCard {...(props as ActiveNarratorListCardProps)} />
+			) : (
+				<ArchivedNarratorCard {...(props as ArchivedNarratorListCardProps)} />
+			)}
+			{expanded && (
+				// 子项跟主卡分开渲染：归档页的主卡本身是 Link，嵌套链接会让点击落到外层。
+				<Stack
+					gap={4}
+					style={{
+						marginLeft: 10,
+						paddingLeft: 18,
+						borderLeft: "2px solid var(--mantine-color-default-border)",
+					}}
+				>
+					{children.map((child) => (
+						<AskInPassingChildRow
+							key={child.id}
+							narrator={child}
+							localQuery={props.localQuery}
+							onOpen={props.onOpenAskInPassing}
+						/>
+					))}
+				</Stack>
+			)}
+		</Stack>
+	);
 }

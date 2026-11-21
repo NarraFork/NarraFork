@@ -3625,6 +3625,7 @@ const sqliteNarratorPersistence = {
 						.update(narrators)
 						.set({
 							status,
+							archivedWithNarratorId: null,
 							errorMessage: normalizedErrorMessage,
 							// Kept in lockstep with errorMessage: cleared on recovery, set only when the
 							// provider diagnostics actually told us whether a retry is worthwhile.
@@ -3857,8 +3858,8 @@ const sqliteNarratorPersistence = {
 					sqlite
 						.prepare(
 							substatusJson !== undefined
-								? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
-								: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+								? `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
+								: `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
 						)
 						.run(
 							...(substatusJson !== undefined

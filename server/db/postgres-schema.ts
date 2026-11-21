@@ -230,6 +230,13 @@ export const narrators = pgTable(
 		title: text("title"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
+		askInPassingGroupId: text("ask_in_passing_group_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		originToolCallId: text("origin_tool_call_id"),
 		subagentOriginKind: text("subagent_origin_kind"),
 		contextSummary: text("context_summary"),
@@ -327,6 +334,8 @@ export const narrators = pgTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
@@ -4590,7 +4599,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1958,
+  "columnCount": 1960,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5724,6 +5733,38 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "askInPassingGroupId",
+          "name": "ask_in_passing_group_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_ask_in_passing_group_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "archivedWithNarratorId",
+          "name": "archived_with_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_archived_with_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "originToolCallId",
           "name": "origin_tool_call_id",
           "kind": "text",
@@ -6507,6 +6548,20 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_parent",
           "columns": [
             "parentNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_ask_in_passing_group",
+          "columns": [
+            "askInPassingGroupId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_archived_with",
+          "columns": [
+            "archivedWithNarratorId"
           ],
           "unique": false
         },

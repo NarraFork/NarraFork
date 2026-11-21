@@ -1,6 +1,6 @@
 {
-  "id": "8d1462cb-1880-4184-bc64-7d1df44424c3",
-  "prevId": "44828ca8-52df-45aa-9c76-905894b958cf",
+  "id": "f040e99e-e551-4687-99f8-ee370353a9c1",
+  "prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -14914,6 +14914,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "ask_in_passing_group_id": {
+          "name": "ask_in_passing_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "archived_with_narrator_id": {
+          "name": "archived_with_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "origin_tool_call_id": {
           "name": "origin_tool_call_id",
           "type": "text",
@@ -15432,6 +15444,36 @@
           "method": "btree",
           "with": {}
         },
+        "idx_narrators_ask_in_passing_group": {
+          "name": "idx_narrators_ask_in_passing_group",
+          "columns": [
+            {
+              "expression": "ask_in_passing_group_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_archived_with": {
+          "name": "idx_narrators_archived_with",
+          "columns": [
+            {
+              "expression": "archived_with_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_narrators_origin_tool_call": {
           "name": "idx_narrators_origin_tool_call",
           "columns": [
@@ -15797,6 +15839,32 @@
             "id"
           ],
           "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "narrators_ask_in_passing_group_id_narrators_id_fk": {
+          "name": "narrators_ask_in_passing_group_id_narrators_id_fk",
+          "tableFrom": "narrators",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "ask_in_passing_group_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrators_archived_with_narrator_id_narrators_id_fk": {
+          "name": "narrators_archived_with_narrator_id_narrators_id_fk",
+          "tableFrom": "narrators",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "archived_with_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
           "onUpdate": "no action"
         },
         "narrators_refs_inherited_from_narrators_id_fk": {

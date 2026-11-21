@@ -28,17 +28,22 @@ import {
 } from "@shared/text-file-types";
 import { isAbsoluteForFlavor, normalizeWorkspacePathFlavor } from "@shared/workspace-directories";
 import {
+	aliasedTable,
 	and,
 	asc,
 	type Column,
 	count as countFn,
 	desc,
 	eq,
+	exists,
 	getTableColumns,
 	gt,
+	inArray,
+	isNull,
 	lt,
 	ne,
 	or,
+	type SQLWrapper,
 	sql,
 } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -325,8 +330,10 @@ import {
 	canWriteNarrator,
 	filterReadableNarrators,
 	NARRATOR_ACL_COLUMNS,
+	type NarratorPrincipal,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
+import { transitionNarratorArchiveGroup } from "../services/narrator-archive";
 import { toBlockPage, toEnvelopes } from "../services/narrator-block-page";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
@@ -1161,12 +1168,21 @@ function parseAutoContinuationOverride(value: unknown, field: string): AutoConti
 	);
 }
 
-function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown }>(
-	narrator: T,
-	hasDraft = false,
-) {
+function publicNarratorResponse<
+	T extends {
+		traits: unknown;
+		substatus?: unknown;
+		askInPassingGroupId?: unknown;
+		archivedWithNarratorId?: unknown;
+	},
+>(narrator: T, hasDraft = false) {
+	const {
+		askInPassingGroupId: _group,
+		archivedWithNarratorId: _archivedWith,
+		...publicRow
+	} = narrator;
 	return {
-		...narrator,
+		...publicRow,
 		traits: redactInternalTraits(narrator.traits),
 		hasDraft,
 		substatus: parseSubstatus(narrator.substatus),
@@ -1180,6 +1196,122 @@ function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown
  */
 function publicTraitsResponse(traits: unknown): string[] {
 	return redactInternalTraits(traits);
+}
+
+const ASK_IN_PASSING_CHILD_ROWS_PER_PARENT = 20;
+const { runtimeRegistrationJson: _runtimeRegistration, ...narratorListColumns } =
+	getTableColumns(narrators);
+
+function askInPassingGroupMatches(
+	table: Record<"askInPassingGroupId" | "parentNarratorId", Column>,
+	groupId: SQLWrapper | string,
+) {
+	return or(
+		eq(table.askInPassingGroupId, groupId),
+		and(isNull(table.askInPassingGroupId), eq(table.parentNarratorId, groupId)),
+	);
+}
+
+function listableSessions(
+	table: Record<"variant" | "hiddenFromLists" | "status", Column>,
+	archived: boolean,
+) {
+	return and(
+		eq(table.variant, "primary"),
+		eq(table.hiddenFromLists, false),
+		archived ? eq(table.status, "archived") : ne(table.status, "archived"),
+	);
+}
+
+function canHostAskInPassingGroup(
+	table: Record<"isAskInPassing" | "askInPassingGroupId" | "parentNarratorId", Column>,
+) {
+	// Fall back to standalone rows for legacy nested forks without a display root.
+	return or(
+		eq(table.isAskInPassing, false),
+		and(isNull(table.askInPassingGroupId), isNull(table.parentNarratorId)),
+	);
+}
+
+function rankedAskInPassingChildren(
+	hostId: SQLWrapper,
+	principal: NarratorPrincipal,
+	archived: boolean,
+) {
+	const child = aliasedTable(narrators, "ask_child");
+	return db
+		.select({ id: child.id })
+		.from(child)
+		.where(
+			and(
+				eq(child.isAskInPassing, true),
+				askInPassingGroupMatches(child, hostId),
+				listableSessions(child, archived),
+				narratorReadableWhere(principal, child),
+			),
+		)
+		.orderBy(desc(child.updatedAt), desc(child.id))
+		.limit(ASK_IN_PASSING_CHILD_ROWS_PER_PARENT);
+}
+
+function groupedAskInPassingChild(principal: NarratorPrincipal, archived: boolean) {
+	const host = aliasedTable(narrators, "ask_host");
+	return and(
+		eq(narrators.isAskInPassing, true),
+		exists(
+			db
+				.select({ id: host.id })
+				.from(host)
+				.where(
+					and(
+						eq(
+							host.id,
+							sql`coalesce(${narrators.askInPassingGroupId}, ${narrators.parentNarratorId})`,
+						),
+						listableSessions(host, archived),
+						canHostAskInPassingGroup(host),
+						narratorReadableWhere(principal, host),
+						inArray(narrators.id, rankedAskInPassingChildren(host.id, principal, archived)),
+					),
+				),
+		),
+	);
+}
+
+async function askInPassingChildrenByParent(
+	parentIds: string[],
+	principal: NarratorPrincipal,
+	archived: boolean,
+	signal: AbortSignal,
+) {
+	const byParent = new Map<
+		string,
+		Omit<typeof narrators.$inferSelect, "runtimeRegistrationJson">[]
+	>();
+	if (!parentIds.length) return byParent;
+	const host = aliasedTable(narrators, "ask_host");
+	const rows = await readQuery(
+		db
+			.select({ ...narratorListColumns, hostId: host.id })
+			.from(host)
+			.innerJoin(
+				narrators,
+				inArray(narrators.id, rankedAskInPassingChildren(host.id, principal, archived)),
+			)
+			.where(inArray(host.id, parentIds))
+			.orderBy(desc(narrators.updatedAt), desc(narrators.id)),
+		{
+			signal,
+			diagnosticSource: "narrators.list.ask-in-passing",
+			maxRows: parentIds.length * ASK_IN_PASSING_CHILD_ROWS_PER_PARENT,
+		},
+	);
+	for (const { hostId, ...row } of rows) {
+		const siblings = byParent.get(hostId);
+		if (siblings) siblings.push(row);
+		else byParent.set(hostId, [row]);
+	}
+	return byParent;
 }
 
 // List narrators (paginated)
@@ -1211,12 +1343,23 @@ narratorRoutes.get("/", async (c) => {
 	// page: filtering afterwards would break `LIMIT limit + 1` as the "hasMore"
 	// signal and make `totalCount` count narrators the caller cannot see. Returns
 	// undefined for admins, which `and(...)` treats as no extra restriction.
+	const principal = narratorPrincipalOf(c);
+	// Only the session lists render child rows. Filtered requests must match each row independently.
+	const grouped =
+		c.req.query("groupAskInPassing") === "true" &&
+		(!status || status === "archived") &&
+		!projectId &&
+		!hasTerminals &&
+		!hasContainers &&
+		!hasRunningContainers &&
+		!hasViewers;
 	const conditions = [
 		eq(narrators.variant, "primary"),
-		// 系统内部叙述者（ModelTrace 舱）不进列表，只能从自己的入口凭 id 打开。
 		eq(narrators.hiddenFromLists, false),
-		narratorReadableWhere(narratorPrincipalOf(c)),
+		narratorReadableWhere(principal),
 	];
+	if (grouped)
+		conditions.push(sql`not (${groupedAskInPassingChild(principal, status === "archived")})`);
 
 	if (status === "archived") {
 		conditions.push(eq(narrators.status, "archived"));
@@ -1304,12 +1447,10 @@ narratorRoutes.get("/", async (c) => {
 
 	const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
 
-	const { runtimeRegistrationJson: _runtimeRegistrationJson, ...listColumns } =
-		getTableColumns(narrators);
 	const [list, countResult] = await Promise.all([
 		readQuery(
 			db
-				.select(listColumns)
+				.select(narratorListColumns)
 				.from(narrators)
 				.where(whereClause)
 				.orderBy(orderFn(column), orderFn(narrators.id))
@@ -1411,6 +1552,19 @@ narratorRoutes.get("/", async (c) => {
 	const presenceMap = getNarratorPresenceBatch(narratorIds);
 	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
 
+	const askInPassingChildren = grouped
+		? await askInPassingChildrenByParent(
+				rawItems
+					.filter(
+						(row) => !row.isAskInPassing || !(row.askInPassingGroupId ?? row.parentNarratorId),
+					)
+					.map((row) => row.id),
+				principal,
+				status === "archived",
+				readOptions.signal,
+			)
+		: undefined;
+
 	// Batch fetch active background task counts (subagents + bash + transfers).
 	// Lazy import matches the other background-task routes in this file.
 	let backgroundTaskCounts:
@@ -1441,6 +1595,11 @@ narratorRoutes.get("/", async (c) => {
 		containerCount: containerCounts.get(n.id)?.total ?? 0,
 		runningContainerCount: containerCounts.get(n.id)?.running ?? 0,
 		viewers: presenceMap.get(n.id) ?? [],
+		...(grouped && {
+			askInPassingSessions: (askInPassingChildren?.get(n.id) ?? []).map((child) =>
+				publicNarratorResponse(child),
+			),
+		}),
 	}));
 
 	return c.json({ items, hasMore, nextCursor, totalCount });
@@ -5924,31 +6083,17 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 
 // Archive narrator
 narratorRoutes.patch("/:id/archive", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	// 归档会删掉侧栏那一行（连同它所在的文件夹）。先记住位置，撤销归档时才放得回去。
-	const { rememberArchivedTabPlacement } = await import("../services/recent-tabs-service");
-	await rememberArchivedTabPlacement(c.get("user").sub, id);
-	// HTTP write ACL and Agent controller authorization share the same mechanism:
-	// end the complete run (including a hold), then archive any kind of session.
-	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
-	// Only the archive itself runs as the caller (a team coordinator's event names them).
-	const result = await runAsTeamStatusActor(personActor(c.get("user").sub), () =>
-		interruptAndArchiveSubagent(id),
+	const archivedChildIds = await transitionNarratorArchiveGroup(
+		narratorPrincipalOf(c),
+		c.req.param("id"),
+		"archived",
 	);
-	if (!result.ok && result.error === "not_found") throw new NotFoundError("Narrator", id);
-	if (!result.ok) throw new ValidationError(result.error ?? "Failed to archive narrator");
-	return c.json({ ok: true });
+	return c.json({ ok: true, archivedChildIds });
 });
 
 // Unarchive narrator
 narratorRoutes.patch("/:id/unarchive", async (c) => {
-	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	await unarchiveAsCaller(c, id);
-	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
-	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
-	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
+	await transitionNarratorArchiveGroup(narratorPrincipalOf(c), c.req.param("id"), "idle");
 	return c.json({ ok: true });
 });
 
@@ -6231,6 +6376,14 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	// Auto-generate title from the question (truncate to 80 chars, take first line)
 	const title = question.replace(/\n.*/s, "").slice(0, 80);
 
+	const source = await db.query.narrators.findFirst({
+		columns: { isAskInPassing: true, askInPassingGroupId: true, parentNarratorId: true },
+		where: eq(narrators.id, id),
+	});
+	const groupId = source?.isAskInPassing
+		? (source.askInPassingGroupId ?? source.parentNarratorId ?? id)
+		: id;
+
 	// Fork narrator from the source recorded in the pending card (single source of truth)
 	const newNarrator = await narratorService.forkNarrator(id, sourceMessageUuid, {
 		inheritMode: "full",
@@ -6246,7 +6399,12 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const aipTraits = addTrait(parseTraits(newNarrator.traits), "ask-in-passing");
 	await db
 		.update(narrators)
-		.set({ permissionMode: "readOnly", isAskInPassing: true, traits: aipTraits })
+		.set({
+			permissionMode: "readOnly",
+			isAskInPassing: true,
+			traits: aipTraits,
+			askInPassingGroupId: groupId,
+		})
 		.where(eq(narrators.id, newNarrator.id));
 
 	// Send the user's question to the new narrator.

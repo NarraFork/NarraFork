@@ -342,6 +342,16 @@ export const narrators = sqliteTable(
 			.default("fresh"),
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
+		/** Display group for ask-in-passing forks, independent of their actual fork source. */
+		askInPassingGroupId: text("ask_in_passing_group_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
+		/** Only set when a parent archive actually changed this session's status. */
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		/** Immutable actual Agent tool-call PK; retained even if its history is deleted. */
 		originToolCallId: text("origin_tool_call_id"),
 		/** Explicit creation provenance; NULL means unknown legacy origin. */
@@ -700,6 +710,8 @@ export const narrators = sqliteTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		// Startup recovery and legacy backfills look up active/legacy rows by status.
 		index("idx_narrators_status").on(table.status),
