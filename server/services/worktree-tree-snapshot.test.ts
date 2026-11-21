@@ -1961,6 +1961,43 @@ describe("hot-path capture budget", () => {
 		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
 	});
 
+	test("a direct capture cancels the warm-up's tracked-ignored listing", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-preempt-listing-");
+		writeFileSync(join(repo, ".gitignore"), "tracked.txt\n");
+		writeFileSync(join(repo, "tracked.txt"), "keep this\n");
+		const added = await safeSpawn({ cmd: ["git", "add", "-f", "tracked.txt"], cwd: repo });
+		expect(added.exitCode).toBe(0);
+
+		const started = Promise.withResolvers<AbortSignal | undefined>();
+		const exited = Promise.withResolvers<void>();
+		const realSpawn = spawn.safeSpawn;
+		let listed = false;
+		const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			if (!listed && opts.cwd === repo && opts.cmd[1] === "ls-files" && opts.cmd.includes("-i")) {
+				listed = true;
+				started.resolve(opts.signal);
+				await exited.promise;
+				opts.signal?.throwIfAborted();
+			}
+			return realSpawn(opts);
+		});
+		let direct: Promise<string> | undefined;
+		try {
+			await promoteToWarmup(repo);
+			const signal = await started.promise;
+			direct = worktreeTreeSnapshot.capture(repo);
+			expect(signal?.aborted).toBe(true);
+			exited.resolve();
+			expect(await treePaths(repo, await direct)).toContain("tracked.txt");
+		} finally {
+			exited.resolve();
+			await direct?.catch(() => {});
+			dispatch.mockRestore();
+			resetHotPathCaptureStateForTests();
+		}
+	});
+
 	test("gcAll preempts an in-flight warm-up instead of queueing behind it", async () => {
 		resetHotPathCaptureStateForTests();
 		const repo = await createRepo("nf-tree-hot-gc-");
