@@ -9,8 +9,8 @@ import type {
 	GitStagingObservationState,
 	GitWorkspaceEventIdentity,
 } from "../../../shared/git-workspace-events";
-import { serveGitChangesBrowserAssets } from "./git-changes.browser-assets";
 import type { fixture } from "./git-changes.browser-fixture";
+import { serveGitChangesBrowserAssets } from "./git-changes.browser-fixture.assets";
 import {
 	GIT_BROWSER_STAGING_PATHS,
 	type GitBrowserBlockScenario,
@@ -3326,7 +3326,7 @@ test("ChangeLists browser preserves native filtering and stable pages while movi
 			await page.click('[data-git-staging-toggle="B"]');
 			await page.waitForSelector('[data-git-staging-toggle="B"]');
 			// Open B's directory by its list-scoped row, independently of A's open folder.
-			await page.evaluate(() => {
+			await page.waitForFunction(() => {
 				const section = document
 					.querySelector('[data-git-staging-toggle="B"]')
 					?.closest("[data-git-row-type]");
@@ -3335,10 +3335,11 @@ test("ChangeLists browser preserves native filtering and stable pages while movi
 					const directory = row.querySelector<HTMLElement>('[data-git-staging-directory="src"]');
 					if (directory) {
 						if (directory.getAttribute("aria-expanded") !== "true") directory.click();
-						break;
+						return true;
 					}
 					row = row.nextElementSibling;
 				}
+				return false;
 			});
 			await page.waitForSelector('[data-git-staging-file*="long-file-name"]');
 			await page.click('[data-git-staging-file*="long-file-name"]');
