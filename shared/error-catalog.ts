@@ -232,6 +232,11 @@ export const ERROR_CATALOG = {
 		code: "TOKEN_EXPIRED",
 		en: "Session revoked",
 	},
+	DATABASE_READ_UNAVAILABLE: {
+		status: 503,
+		code: "DATABASE_READ_UNAVAILABLE",
+		en: "The database is busy. Try again in a few seconds.",
+	},
 	TOKEN_INVALID: {
 		status: 401,
 		code: "UNAUTHORIZED",

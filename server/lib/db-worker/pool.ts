@@ -625,8 +625,11 @@ export async function resetDbWorkerPoolForTest(): Promise<void> {
 export function setDbWorkerSpecifiersForTest(specifiers: string[] | null): void {
 	state().testSpecifiers = specifiers;
 }
-export function getDbWorkerAvailability(): { available: boolean; reason: string | null } {
-	const reason = workersDisabled();
+export function getDbWorkerAvailability(profile: "pool" | "shortReads" = "pool"): {
+	available: boolean;
+	reason: string | null;
+} {
+	const reason = workersDisabled(profile);
 	return { available: reason === null, reason };
 }
 export function getDbWorkerPoolStats() {

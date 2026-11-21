@@ -282,3 +282,29 @@ describe("readQuery", () => {
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 });
+
+describe("readQuery on the short-read pool", () => {
+	test("decodes rows without touching the ordinary read pool", async () => {
+		const rows = await readQuery(db.select().from(owners).where(eq(owners.id, "o1")), {
+			shortRead: true,
+		});
+		expect(rows).toEqual([{ id: "o1", name: "alice" }]);
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	test("defaults to a one-row budget", async () => {
+		const error = await readQuery(db.select().from(items), { shortRead: true }).then(
+			() => null,
+			(e: unknown) => e as Error,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(await readQuery(db.select().from(items), { shortRead: true, maxRows: 2 })).toHaveLength(
+			2,
+		);
+	});
+
+	test("disabled workers never execute the query on the main connection", async () => {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		await rejectsOffThread({ shortRead: true });
+	});
+});
