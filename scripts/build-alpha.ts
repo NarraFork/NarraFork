@@ -21,7 +21,7 @@ import {
 	formatChecksumsReport,
 	formatSha256Sums,
 } from "./lib/binary-metadata";
-import { resolveBuildProfile } from "./lib/build-profile";
+import { ALPHA_BUILD_LOCK, frontendBuildDirectory, resolveBuildProfile } from "./lib/build-profile";
 import { verifyCiSidecar } from "./lib/ci-build-strict";
 
 function artifactNames(version: string): string[] {
@@ -232,12 +232,16 @@ export async function buildAlpha(options: {
 	}
 	const archive = resolve(root, options.archiveDir);
 	const dist = join(root, "dist");
-	const lock = join(root, ".build-alpha.lock");
+	const lock = join(root, ALPHA_BUILD_LOCK);
 	const resolvedArchive = resolveArchivePath(archive);
 	if (resolvedArchive === resolveArchivePath(dist)) {
 		throw new Error("ARCHIVE_DIR must differ from dist");
 	}
-	for (const reserved of [lock, join(dist, "frontend"), join(root, "frontend", "public")]) {
+	for (const reserved of [
+		lock,
+		frontendBuildDirectory(root, false),
+		join(root, "frontend", "public"),
+	]) {
 		if (isWithin(archive, reserved) || isWithin(resolvedArchive, resolveArchivePath(reserved))) {
 			throw new Error(`ARCHIVE_DIR cannot be inside build-owned or public directory: ${reserved}`);
 		}
@@ -334,6 +338,7 @@ export async function buildAlpha(options: {
 				"scripts/build-cross-platform.ts",
 				"--platform=linux-x64-baseline",
 				"--release-ci",
+				"--alpha-frontend",
 			],
 			{ cwd: root, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" },
 		);

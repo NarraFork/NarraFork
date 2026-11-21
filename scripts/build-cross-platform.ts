@@ -17,7 +17,7 @@ import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
-import { resolveBuildProfile } from "./lib/build-profile";
+import { ALPHA_BUILD_LOCK, frontendBuildDirectory, resolveBuildProfile } from "./lib/build-profile";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
 import {
@@ -38,7 +38,6 @@ const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
 const VERSION: string = pkg.version ?? "0.0.0";
 // Freeze component pins once; application releases do not select new executors.
 const HELPER_DISTRIBUTION = createHelperDistributionDependencies();
-const FRONTEND_DIR = join(ROOT, "dist", "frontend");
 const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.ts");
 const RUNTIME_BUILD_ID = randomUUID();
 const DIST_DIR = join(ROOT, "dist");
@@ -55,6 +54,17 @@ const skipFrontend = args.includes("--skip-frontend");
 const releaseCi = args.includes("--release-ci");
 // Freeze the backend profile once; --release-ci only enables strict validation.
 const BUILD_PROFILE = resolveBuildProfile(VERSION, process.env);
+const alphaFrontend = args.includes("--alpha-frontend");
+if (
+	alphaFrontend &&
+	(BUILD_PROFILE.name !== "diagnostic" ||
+		skipFrontend ||
+		!existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
+) {
+	throw new Error("--alpha-frontend requires a full local build through make build-alpha");
+}
+const FRONTEND_DIR = frontendBuildDirectory(ROOT, alphaFrontend);
+process.env.NF_BUILD_ALPHA_FRONTEND = alphaFrontend ? "1" : "0";
 console.log(
 	`Backend build profile: ${BUILD_PROFILE.name}; version: ${VERSION}; strict validation: ${releaseCi}`,
 );

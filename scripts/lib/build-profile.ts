@@ -1,3 +1,11 @@
+import { join } from "node:path";
+
+export const ALPHA_BUILD_LOCK = ".build-alpha.lock";
+
+export function frontendBuildDirectory(root: string, alphaFrontend: boolean): string {
+	return alphaFrontend ? join(root, ALPHA_BUILD_LOCK, "frontend") : join(root, "dist", "frontend");
+}
+
 export interface BuildProfileEnvironment {
 	readonly CI?: string;
 	readonly GITHUB_ACTIONS?: string;

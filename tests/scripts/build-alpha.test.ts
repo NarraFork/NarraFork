@@ -52,9 +52,10 @@ function fixture(mode = "success") {
 	writeFileSync(
 		join(root, "scripts/build-cross-platform.ts"),
 		`
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeBinaryMetadata, formatMetadataJson } from ${JSON.stringify(join(ROOT, "scripts/lib/binary-metadata.ts"))};
+import { frontendBuildDirectory } from ${JSON.stringify(join(ROOT, "scripts/lib/build-profile.ts"))};
 import { writeBuildAggregates } from ${JSON.stringify(join(ROOT, "scripts/lib/ci-build-strict.ts"))};
 import { createHelperDistributionDependencies } from ${JSON.stringify(join(ROOT, "shared/helper-distribution.ts"))};
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from ${JSON.stringify(join(ROOT, "shared/update-identity.ts"))};
@@ -75,6 +76,9 @@ if (mode === "signal") {
 	setInterval(() => {}, 1000);
 	await new Promise(() => {});
 }
+const frontend = frontendBuildDirectory(root, process.argv.includes("--alpha-frontend"));
+mkdirSync(frontend, { recursive: true });
+writeFileSync(join(frontend, "index.html"), pkg.version);
 const binary = join(root, "dist", "narrafork-" + pkg.version + "-linux-x64-baseline");
 writeFileSync(binary, "#!/bin/sh\\necho alpha fixture\\n");
 chmodSync(binary, 0o751);
@@ -128,6 +132,9 @@ function expectRestored(options: ReturnType<typeof fixture>) {
 
 test("builds once through the strict entry, preserves colliding artifacts and archives all four files", async () => {
 	const options = fixture();
+	const frontend = join(options.root, "dist", "frontend");
+	mkdirSync(frontend);
+	writeFileSync(join(frontend, "index.html"), "regular frontend");
 	mkdirSync(options.archiveDir);
 	for (const directory of [join(options.root, "dist"), options.archiveDir]) {
 		for (const name of NAMES) writeFileSync(join(directory, name), `previous ${name}`);
@@ -138,8 +145,9 @@ test("builds once through the strict entry, preserves colliding artifacts and ar
 		const inode = fstatSync(oldBinary).ino;
 		await buildAlpha(options);
 		expectRestored(options);
+		expect(readFileSync(join(frontend, "index.html"), "utf8")).toBe("regular frontend");
 		expect(JSON.parse(readFileSync(join(options.root, "invocation.json"), "utf8"))).toEqual({
-			args: ["--platform=linux-x64-baseline", "--release-ci"],
+			args: ["--platform=linux-x64-baseline", "--release-ci", "--alpha-frontend"],
 			version: VERSION,
 		});
 		for (const name of NAMES) {

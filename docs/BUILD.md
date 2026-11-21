@@ -108,7 +108,7 @@ make build-alpha
 make build-alpha VERSION=0.9.16-alpha.2 ARCHIVE_DIR="$HOME/private-builds" BUN=bun
 ```
 
-默认自动选择下一个 alpha 版本，并将 Linux x64 baseline 可执行文件、metadata sidecar、SHA256SUMS 与校验报告验证后归档到仓库内的私有 `.build-alpha-archive/`。自动模式跳过已占用的版本；显式重建会备份同名文件。构建会暂时改写并恢复 `package.json`，不要在同一工作区并行构建或发布。此命令不发布任何产物。
+默认自动选择下一个 alpha 版本，并将 Linux x64 baseline 可执行文件、metadata sidecar、SHA256SUMS 与校验报告验证后归档到仓库内的私有 `.build-alpha-archive/`。自动模式跳过已占用的版本；显式重建会备份同名文件。前端资源在构建锁目录内生成并嵌入诊断版，不会覆盖正常启动使用的 `dist/frontend/`。构建会暂时改写并恢复 `package.json`，不要在同一工作区并行构建或发布。此命令不发布任何产物。
 
 正式入口 [scripts/build-cross-platform.ts](../scripts/build-cross-platform.ts) 在启动时冻结一次后端编译配置，并打印配置名称、严格校验状态、编译参数和实际命令参数数组：
 
