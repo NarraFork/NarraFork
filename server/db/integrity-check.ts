@@ -349,7 +349,7 @@ export function runIntegrityProbe(
 	mode: IntegrityProbeMode,
 	options: { timeoutMs?: number; command?: string[]; signal?: AbortSignal } = {},
 ): Promise<IntegrityProbeReport> {
-	if (probeState.cancelled)
+	if (probeState.cancelled && !probeState.restartRequired)
 		return Promise.resolve({
 			status: "unavailable",
 			mode,
@@ -399,9 +399,10 @@ export type BackgroundIntegrityDecision =
 export function scheduleBackgroundIntegrityCheck(
 	options: BackgroundIntegrityCheckOptions,
 ): BackgroundIntegrityDecision {
-	if (probeState.scheduled || probeState.closing || probeState.permanent || probeState.cancelled)
+	if (probeState.scheduled || probeState.closing || probeState.permanent)
 		return "already_scheduled";
 	if (probeState.restartRequired) return "restart_required";
+	if (probeState.cancelled) return "already_scheduled";
 
 	// Gate on the backend's capability BEFORE reading env or markers: a backend with no out-of-band
 	// verification has nothing for any of those knobs to configure. Note what this must never become:
