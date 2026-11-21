@@ -26,7 +26,10 @@ describe("narrators API", () => {
 		}
 	});
 
-	test("modeltrace posts once to the encoded endpoint without a body", async () => {
+	test.each([
+		undefined,
+		{ fork: true, calibrate: true },
+	])("modeltrace posts once with options %j", async (options) => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
 			configurable: true,
@@ -39,11 +42,11 @@ describe("narrators API", () => {
 				return Response.json({ id: "trace-child" });
 			},
 		});
-		expect(await api.startModelTrace("n/a")).toEqual({ id: "trace-child" });
+		expect(await api.startModelTrace("n/a", options)).toEqual({ id: "trace-child" });
 		expect(requests).toHaveLength(1);
 		expect(requests[0].url).toBe("/api/narrators/n%2Fa/modeltrace");
 		expect(requests[0].init.method).toBe("POST");
-		expect(requests[0].init.body).toBeUndefined();
+		expect(requests[0].init.body).toBe(options ? JSON.stringify(options) : undefined);
 	});
 
 	test("modeltrace retry posts to the encoded child endpoint without a body", async () => {

@@ -640,6 +640,30 @@ interface OAIStreamChunk {
  *                       Codex-specific instructions, headers, reasoning config,
  *                       and response stream handling.
  */
+export function diagnosticTransportIdentity(params: ChatParams): string {
+	return params.diagnosticFork
+		? (params.transportSessionKey ?? params.conversationId)
+		: params.conversationId;
+}
+
+export function appendDiagnosticOpenAIInput(
+	body: Record<string, unknown>,
+	params: ChatParams,
+	responses: boolean,
+): void {
+	const fork = params.diagnosticFork;
+	if (!fork) return;
+	if (Array.isArray(body.tools) && body.tools.some((tool) => tool?.type !== "function")) {
+		throw new Error("A diagnostic fork cannot replay upstream-hosted tools");
+	}
+	const history = body[responses ? "input" : "messages"];
+	if (!Array.isArray(history)) throw new Error("No projected diagnostic request prefix");
+	history.push({
+		role: "user",
+		content: responses ? [{ type: "input_text", text: fork.suffix }] : fork.suffix,
+	});
+}
+
 export class OpenAIProvider implements ProviderAdapter {
 	/**
 	 * Which API variant to use. Resolved from config on construction.
@@ -927,6 +951,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 	}
 
+	supportsDiagnosticFork(): boolean {
+		return true;
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		this.assertMediaInput(params.model, [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode for codex if enabled
@@ -1039,12 +1067,15 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
-				body.tools = withCodexNativeTools(tools, params.model, {
-					webSearch:
-						this.codexWebSearchEnabled &&
-						isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
-					imageGeneration: this.codexImageGenerationEnabled,
-				});
+				body.tools =
+					params.diagnostic && !params.diagnosticFork
+						? []
+						: withCodexNativeTools(tools, params.model, {
+								webSearch:
+									this.codexWebSearchEnabled &&
+									isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
+								imageGeneration: this.codexImageGenerationEnabled,
+							});
 			}
 
 			const normalizedCodexReasoningEffort =
@@ -1053,7 +1084,10 @@ export class OpenAIProvider implements ProviderAdapter {
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
-					identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
+					identity: createCodexRequestIdentity(
+						diagnosticTransportIdentity(params),
+						this.codexInstallationId(),
+					),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
 			} else {
@@ -1102,12 +1136,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
-		if (this.apiMode !== "codex" && params.conversationId) {
+		appendDiagnosticOpenAIInput(body, params, usesResponsesEndpoint(this.apiMode));
+		if ((params.diagnosticFork || this.apiMode !== "codex") && params.conversationId) {
 			// OpenAI's prompt cache is per-machine; load-balanced relays need a stable routing key (codex sets its own).
 			body.prompt_cache_key = params.conversationId;
 		}
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
-		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
+		const requestHeaders = this.buildHeaders(apiKey, diagnosticTransportIdentity(params));
 
 		// x-codex-turn-state is per-turn: the server hands it back on the first
 		// response of a turn and expects it replayed on every later request of
@@ -1137,6 +1172,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				bodyText: await encodeDump(body, bodyText, params.signal),
 			});
 
+			params.diagnosticFork?.validateCredential?.();
 			params.onRequestStart?.();
 			params.streamProgress?.beginAttempt();
 			const response = await this.pfetch(endpoint, {
@@ -1832,7 +1868,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		const request = this.buildCodexWebSocketRequest(params);
 		const sessionKey =
 			params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId;
-		const fingerprint = this.resolveFingerprint(params.conversationId);
+		const conversationId = diagnosticTransportIdentity(params);
+		const fingerprint = this.resolveFingerprint(conversationId);
 
 		try {
 			await reportInputCharacters(params, request);
@@ -1844,13 +1881,15 @@ export class OpenAIProvider implements ProviderAdapter {
 				accountId: this.config.codexAccountId,
 				proxy: this.proxy,
 				sessionKey,
-				conversationId: params.conversationId,
-				narratorId: params.stickySessionKey,
+				conversationId,
+				narratorId: params.diagnosticFork ? sessionKey : params.stickySessionKey,
 				credentialId: this.config.id,
 				model: params.model,
 				request,
 				signal: params.signal,
 				resetSessionBeforeRequest: params.resetUpstreamSession,
+				ephemeralSession: params.diagnostic,
+				validateBeforeDispatch: params.diagnosticFork?.validateCredential,
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
 				requestDump: params.requestDump,
@@ -1865,7 +1904,8 @@ export class OpenAIProvider implements ProviderAdapter {
 					status: err.status,
 					error: err.message,
 				});
-				// Disable WebSocket for subsequent calls on this instance
+				// Diagnostics must not change transport selection for the parent.
+				if (params.diagnostic) throw err;
 				this.useWebSocket = false;
 				yield* this.chat(params);
 				return;
@@ -1927,16 +1967,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = withCodexNativeTools(params.tools, params.model, {
-			webSearch:
-				this.codexWebSearchEnabled &&
-				isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
-			imageGeneration: this.codexImageGenerationEnabled,
-		});
+		const tools =
+			params.diagnostic && !params.diagnosticFork
+				? []
+				: withCodexNativeTools(params.tools, params.model, {
+						webSearch:
+							this.codexWebSearchEnabled &&
+							isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
+						imageGeneration: this.codexImageGenerationEnabled,
+					});
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
+			identity: createCodexRequestIdentity(
+				diagnosticTransportIdentity(params),
+				this.codexInstallationId(),
+			),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {
@@ -1944,6 +1990,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		appendDiagnosticOpenAIInput(request, params, true);
+		if (params.diagnosticFork) request.prompt_cache_key = params.conversationId;
 		return request;
 	}
 

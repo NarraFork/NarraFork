@@ -399,8 +399,22 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 
 	const startModelTrace = useCallback(
 		async (command: string) => {
-			if (command.toLowerCase() !== "/modeltrace") throw new Error(t("modelTraceUsage"));
-			const result = await api.startModelTrace(narratorId);
+			const args = command.trim().toLowerCase().split(/\s+/).slice(1);
+			const flags = new Set(
+				args.map((flag) => (flag === "-f" ? "--fork" : flag === "-c" ? "--calibrate" : flag)),
+			);
+			if (
+				flags.size !== args.length ||
+				[...flags].some((flag) => flag !== "--fork" && flag !== "--calibrate")
+			) {
+				throw new Error(t("modelTraceUsage"));
+			}
+			const result = flags.size
+				? await api.startModelTrace(narratorId, {
+						fork: flags.has("--fork"),
+						calibrate: flags.has("--calibrate"),
+					})
+				: await api.startModelTrace(narratorId);
 			if (!isCurrentSendScope()) return;
 			if (onModelTraceStarted) onModelTraceStarted(result.id);
 			else navigateToNarrator(result.id);

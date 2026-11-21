@@ -1,13 +1,13 @@
 [
 	{
-		"name": "ModelTrace fingerprint core and candidate bank",
-		"version": "6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2",
+		"name": "lm-detector reference data",
+		"version": "1e58ed83c1cde17f88cba89560ad4d083042ae92",
 		"license": "MIT",
-		"author": "xqy2006",
-		"repository": "https://github.com/xqy2006/ModelTrace",
-		"textFile": "modeltrace.txt",
-		"distributedVia": "TypeScript port of static/fingerprint-core.js and embedded data/unified_bank.json, compiled into the server binary for local single-sample model fingerprint analysis.",
-		"note": "The full upstream MIT license is reproduced verbatim. Numeric calibration and candidate names are upstream artifacts, not independently verified model identities."
+		"author": "Ikaleio",
+		"repository": "https://github.com/Ikaleio/lm-detector",
+		"textFile": "lm-detector.txt",
+		"distributedVia": "Vendored shared_detector.bin and minimal model metadata derived from unified_bank.json, embedded alongside the local model fingerprint worker. The lmfpd-sdk npm package is catalogued separately.",
+		"note": "The upstream MIT license is reproduced verbatim. Rankings compare answers with a finite reference set and do not verify model identity."
 	},
 	{
 		"name": "Bun runtime",
