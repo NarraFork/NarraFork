@@ -59,6 +59,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 	const configs: AgentConfig[] = [];
+	let beforeExecution: ((options: ExecuteLoopOptions) => Promise<void>) | undefined;
 	const executions: ExecuteLoopOptions[] = [];
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 	mock.module("../narrator-executor", () => ({
@@ -69,6 +70,7 @@ if (process.env[CHILD_ENV] !== "1") {
 				configs.push(options.config);
 				executions.push(options);
 			}
+			await beforeExecution?.(options);
 			return {
 				finalText: "isolated follow-parent result",
 				hasError: false,
@@ -127,6 +129,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		clearAliasRegistry(PARENT);
 		agentCalls = 0;
 		configs.length = 0;
+		beforeExecution = undefined;
 		executions.length = 0;
 		broadcasts.length = 0;
 		network.mockClear();
@@ -309,6 +312,42 @@ if (process.env[CHILD_ENV] !== "1") {
 
 	describe("live parent model through real creation, continuation and executor configuration", () => {
 		for (const mode of ["temporary", "permanent"] as const) {
+			test(`a queued ${mode} override does not pin the next ordinary run`, async () => {
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
+					id: "queued-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				beforeExecution = async (options) => {
+					if (options.config.narratorId !== child.id) return;
+					beforeExecution = undefined;
+					started.resolve();
+					await release.promise;
+				};
+				try {
+					await session.acceptUserMessage(child.id, "Start the run.", { userId: null });
+					await started.promise;
+					const accepted = await session.acceptUserMessage(child.id, "Use the slash model.", {
+						userId: null,
+						executionIntent: { modelOverride: { model: override, mode } },
+					});
+					expect(accepted.buffered).toBe(true);
+					release.resolve();
+					await settled(child.id, 1);
+					expect(configs.at(-1)?.model).toBe(override);
+					await drive(child.id);
+					expect(configs.at(-1)?.model).toBe(A);
+				} finally {
+					release.resolve();
+				}
+			});
+
 			test(`an accepted ${mode} cross-provider override survives new-run selection`, async () => {
 				const provider = settings.anthropicProviders?.[0];
 				if (!provider) throw new Error("Missing test provider");
