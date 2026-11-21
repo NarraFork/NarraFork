@@ -533,6 +533,7 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
+import { narratorManualResourceRoutes } from "./narrator-manual-resources";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
 import { requestRecordingRoutes } from "./request-recordings";
 
@@ -5866,6 +5867,7 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 });
 
 narratorRoutes.route("/", narratorWorkspaceContextRoutes);
+narratorRoutes.route("/", narratorManualResourceRoutes);
 narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
 	const { listPermissionRuleRequests } = await import(
 		"../services/permission-rule-request-service"

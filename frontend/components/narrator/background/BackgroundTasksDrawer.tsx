@@ -41,6 +41,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { useNarratorSubagentsCapability } from "../../../hooks/usePlatform";
+import { useCanOpenTerminals as useNarratorWriteAccess } from "../../../hooks/useTerminals";
 import { api } from "../../../lib/api";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -48,6 +49,7 @@ import {
 } from "../../../lib/safe-area";
 import { ContentViewer } from "../content/ContentViewer";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import { CreateBackgroundTaskForm } from "../ManualResourceForms";
 import { ToolCallInspector } from "../tool-call/ToolCallInspector";
 import classes from "./BackgroundTasksDrawer.module.css";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
@@ -68,6 +70,7 @@ interface UnifiedTask {
 	backgroundKind: "task" | "service";
 	status: string;
 	label: string;
+	title: string | null;
 	command: string | null;
 	output: string | null;
 	exitCode: number | null;
@@ -90,6 +93,7 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 		backgroundKind: task.backgroundKind ?? "task",
 		status: task.effectiveStatus || task.status,
 		label: task.title || task.alias || task.command || task.subagentType || "Task",
+		title: task.title,
 		command: task.command,
 		output: task.output,
 		exitCode: task.exitCode,
@@ -353,6 +357,7 @@ export function BackgroundTasksPanel({
 	const dock = useNarratorDockContext();
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const backgroundTasksSupported = subagentsCapability.supported && subagentsCapability.background;
+	const canCreate = useNarratorWriteAccess(backgroundTasksSupported ? narratorId : "") === true;
 	const canOpenSubagentSessions = subagentsCapability.supported && subagentsCapability.detachAttach;
 	const showReattachFallback = canOpenSubagentSessions && !subagentsCapability.reattachBlocksParent;
 	const reattachFallbackReason =
@@ -426,6 +431,15 @@ export function BackgroundTasksPanel({
 	return (
 		<>
 			<Stack gap="sm" p={chromeless ? "md" : undefined} className={classes.panel}>
+				{canCreate && (
+					<CreateBackgroundTaskForm
+						key={narratorId}
+						create={async (data) => {
+							await api.createBackgroundTask(narratorId, data);
+							refresh();
+						}}
+					/>
+				)}
 				{showReattachFallback && (
 					<Alert color="yellow" variant="light">
 						{reattachFallbackReason}
@@ -484,7 +498,7 @@ export function BackgroundTasksPanel({
 										)}
 									</Badge>
 								</Group>
-								{task.kind === "bash" && task.command ? (
+								{task.kind === "bash" && task.command && !task.title ? (
 									<Code className={classes.summary} style={{ fontSize: 11 }}>
 										{task.command}
 									</Code>

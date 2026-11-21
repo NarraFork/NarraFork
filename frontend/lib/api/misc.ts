@@ -1178,6 +1178,43 @@ export const miscApi = {
 			body: JSON.stringify({ parent, name }),
 		}),
 	/**
+	 * Rename one file-tree entry in place.
+	 *
+	 * `name` is a NAME, not a path: the server derives the parent directory from `path`, so
+	 * a rename can never become a move. 409 `ALREADY_EXISTS` and 403 `WRITE_REFUSED` (the
+	 * path is outside the narrator's writable roots) are the two refusals worth showing as
+	 * they are.
+	 */
+	fsRename: (input: { narratorId: string; path: string; name: string }) =>
+		request<{ ok: true; path: string }>("/fs/rename", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/**
+	 * Copy or move one file into a directory — the file tree's paste.
+	 *
+	 * The destination name is always the source's own; a paste never renames. A taken name
+	 * answers 409 `ALREADY_EXISTS`; repeat the request with `overwrite` once the user has
+	 * confirmed which file is being replaced.
+	 */
+	fsTransferFile: (input: {
+		narratorId: string;
+		path: string;
+		targetDir: string;
+		mode: "copy" | "move";
+		overwrite?: boolean;
+	}) =>
+		request<{ ok: true; path: string }>("/fs/transfer", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/** Delete one file entry. The server refuses directories and symlinks. */
+	fsDeleteFile: (input: { narratorId: string; path: string }) =>
+		request<{ ok: true }>("/fs/delete", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/**
 	 * Open a directory, or select a file, in the server host's file manager.
 	 *
 	 * On Windows the server answers with a one-time `narrafork://` URI instead of launching Explorer

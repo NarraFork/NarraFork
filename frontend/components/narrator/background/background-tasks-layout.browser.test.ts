@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+import { fileURLToPath } from "node:url";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./background-tasks-layout.browser-fixture";
 
@@ -16,11 +17,33 @@ let server: ReturnType<typeof Bun.serve> | undefined;
 type FixtureWindow = Window & { fixture: typeof Fixture };
 const stubs: Record<string, string> = {
 	useBackgroundTaskList: `export const useBackgroundTaskList=()=>({tasks:window.backgroundTaskFixture.tasks,isLoading:false,hasNextPage:false,isFetchingNextPage:false,refresh:()=>window.backgroundTaskFixture.refreshes++});`,
-	usePlatform: `export const useNarratorSubagentsCapability=()=>({supported:true,background:true,detachAttach:true,reattachBlocksParent:true});`,
+	usePlatform: `export const useNarratorSubagentsCapability=()=>({supported:true,background:true,detachAttach:true,reattachBlocksParent:true}); export const useNarratorBrowserSessionsCapability=()=>({supported:true});`,
+	useTerminals: `export const useCanOpenTerminals=id=>id && window.backgroundTaskFixture.canCreate;`,
 	useMobileDrawerHistory: `export const useMobileDrawerHistory=()=>{};`,
 	NarratorDockContext: `export const useNarratorDockContext=()=>({openSubagentPanel:id=>window.backgroundTaskFixture.opened.push(id)});`,
 	"react-router": `export const useNavigate=()=>()=>{throw new Error('Unexpected routing outside dock')};`,
-	api: `export const api={cancelBackgroundTask:async(_parent,id)=>window.backgroundTaskFixture.cancelled.push(id),getBackgroundTaskOutputTail:async()=>({tail:window.backgroundTaskFixture.tasks[0].output,live:true,truncated:false})};`,
+	api: `
+		const create = (type, narratorId, data) => new Promise((resolve, reject) => {
+			const fixture = window.backgroundTaskFixture;
+			fixture.creates.push({type, narratorId, data});
+			fixture.pendingCreate = (failure) => {
+				fixture.pendingCreate = null;
+				if (failure) reject(new Error(failure));
+				else resolve({id:'created', alias:'created'});
+			};
+		});
+		export const ApiError = Error;
+		export const authorizedFetch = fetch;
+		export const getToken = () => null;
+		export const readFetchError = () => { throw new Error('Unexpected fetch'); };
+		export const api = {
+			cancelBackgroundTask: async (_parent, id) => window.backgroundTaskFixture.cancelled.push(id),
+			getBackgroundTaskOutputTail: async () => ({tail:window.backgroundTaskFixture.tasks[0].output,live:true,truncated:false}),
+			createBackgroundTask: (id, data) => create('task', id, data),
+			createBrowserSession: (id, data) => create('browser', id, data),
+			listBrowserSessions: async () => { window.backgroundTaskFixture.browserReads++; return []; },
+			getOptionalToolState: async () => ({loaded:true}),
+		};`,
 	ContentViewer: `export const ContentViewer=({content,bodyId})=><div style={{overflowWrap:'anywhere',whiteSpace:'pre-wrap'}}><pre data-output={bodyId} style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{content}</pre><button data-copy={bodyId} onClick={()=>window.backgroundTaskFixture.copied.push(content)}>Copy</button></div>;`,
 	ToolCallInspector: `export const ToolCallInspector=({toolUseId,opened,onClose})=>opened?<div data-inspector={toolUseId}><button onClick={onClose}>Close inspector</button></div>:null;`,
 };
@@ -29,7 +52,7 @@ beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	const bundle = await Bun.build({
 		entrypoints: [
-			new URL("./background-tasks-layout.browser-fixture.tsx", import.meta.url).pathname,
+			fileURLToPath(new URL("./background-tasks-layout.browser-fixture.tsx", import.meta.url)),
 		],
 		target: "browser",
 		format: "esm",
@@ -41,7 +64,7 @@ beforeAll(async () => {
 					builder.onResolve(
 						{
 							filter:
-								/(?:useBackgroundTaskList|usePlatform|useMobileDrawerHistory|NarratorDockContext|ToolCallInspector|ContentViewer|lib\/api|@tanstack\/react-router)$/,
+								/(?:useBackgroundTaskList|usePlatform|useTerminals|useMobileDrawerHistory|NarratorDockContext|ToolCallInspector|ContentViewer|lib\/api|@tanstack\/react-router)$/,
 						},
 						(args) => ({ path: args.path, namespace: "task-fixture" }),
 					);
@@ -76,6 +99,12 @@ beforeAll(async () => {
 	browser = await puppeteer.launch({
 		executablePath,
 		headless: true,
+		// Puppeteer assigns a separate profile. Windows Chrome needs the real OS
+		// profile path for startup, not the temporary HOME from the Bun preload.
+		env:
+			process.platform === "win32" && process.env.NARRAFORK_ORIGINAL_HOME
+				? { ...process.env, USERPROFILE: process.env.NARRAFORK_ORIGINAL_HOME }
+				: process.env,
 		args: ["--no-sandbox"],
 		timeout: 15_000,
 	});
@@ -212,3 +241,147 @@ test("narrow headers retain expand, inspect, cancel, output interaction and suba
 		await page.close();
 	}
 }, 15_000);
+
+async function openCreationForm(page: Page) {
+	await page.click("#surface button:has(.tabler-icon-plus)");
+	await page.waitForSelector("#surface form");
+}
+
+async function submitCreationForm(page: Page, count = 1) {
+	await page.$eval(
+		"#surface form",
+		(form, times) => {
+			for (let i = 0; i < times; i++) (form as HTMLFormElement).requestSubmit();
+		},
+		count,
+	);
+	await settle(page);
+}
+
+test("manual task and service creation keeps a failed draft, prevents double POST, and refreshes", async () => {
+	if (!browser || !server) throw new Error("Fixture unavailable");
+	const page = await browser.newPage();
+	try {
+		await page.setViewport({ width: 320, height: 844 });
+		await page.goto(server.url.origin, { waitUntil: "networkidle0" });
+		await page.waitForFunction(() => !!(window as unknown as FixtureWindow).fixture);
+		await start(page, "en", 320, false);
+		expect(await page.$("#surface button:has(.tabler-icon-plus)")).toBeNull();
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.start("en", 320, false, true),
+		);
+		await page.waitForSelector("#surface button:has(.tabler-icon-plus)");
+		await openCreationForm(page);
+		await submitCreationForm(page);
+		await page.waitForSelector("form textarea[aria-invalid=true]");
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([]);
+		await page.select("form select", "service");
+		await page.type("form textarea", "bun run dev");
+		await page.type("form input:not([inputmode])", "Preview server");
+		await submitCreationForm(page, 2);
+		const create = {
+			type: "task" as const,
+			narratorId: "parent",
+			data: { kind: "service", command: "bun run dev", title: "Preview server" },
+		};
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([create]);
+		await page.waitForSelector("form fieldset:disabled");
+		await page.evaluate(() => window.backgroundTaskFixture.pendingCreate?.("Start refused"));
+		await page.waitForFunction(() =>
+			document.querySelector("form")?.textContent?.includes("Start refused"),
+		);
+		expect(await page.$eval("form textarea", (input) => input.value)).toBe("bun run dev");
+		expect(await page.$eval("form input:not([inputmode])", (input) => input.value)).toBe(
+			"Preview server",
+		);
+		expect(await page.evaluate(() => window.backgroundTaskFixture.refreshes)).toBe(0);
+		await submitCreationForm(page);
+		await page.evaluate(() => window.backgroundTaskFixture.pendingCreate?.());
+		await page.waitForSelector("#surface form", { hidden: true });
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([
+			create,
+			create,
+		]);
+		expect(await page.evaluate(() => window.backgroundTaskFixture.refreshes)).toBe(1);
+		await openCreationForm(page);
+		expect(await page.$eval("form textarea", (input) => input.value)).toBe("");
+		expect(await page.$eval("form select", (select) => select.value)).toBe("task");
+		await page.type("form textarea", "bun run test");
+		await page.type("form input[inputmode=numeric]", "120000");
+		await submitCreationForm(page);
+		await page.evaluate(() => window.backgroundTaskFixture.pendingCreate?.());
+		await page.waitForSelector("#surface form", { hidden: true });
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates.at(-1))).toEqual({
+			type: "task",
+			narratorId: "parent",
+			data: { kind: "task", command: "bun run test", timeoutMs: 120000 },
+		});
+	} finally {
+		await page.close();
+	}
+}, 20_000);
+
+test("manual browser creation is write-only, validates URL and TTL, and reloads the existing list", async () => {
+	if (!browser || !server) throw new Error("Fixture unavailable");
+	const page = await browser.newPage();
+	try {
+		await page.setViewport({ width: 320, height: 844 });
+		await page.goto(server.url.origin, { waitUntil: "networkidle0" });
+		await page.waitForFunction(() => !!(window as unknown as FixtureWindow).fixture);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.start("zh-CN", 320, true, false, "browser"),
+		);
+		await page.waitForFunction(() => window.backgroundTaskFixture.browserReads === 1);
+		expect(await page.$("#surface button:has(.tabler-icon-plus)")).toBeNull();
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.start("zh-CN", 320, true, true, "browser"),
+		);
+		await page.waitForSelector("#surface button:has(.tabler-icon-plus)");
+		await openCreationForm(page);
+		await page.type("form input[type=url]", "file:///example.html");
+		await page.type("form input[inputmode=numeric]", "999");
+		await submitCreationForm(page);
+		expect(await page.$$("form input[aria-invalid=true]")).toHaveLength(2);
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([]);
+		await page.click("form input[type=url]", { clickCount: 3 });
+		await page.type("form input[type=url]", "https://example.com/");
+		await page.click("form input[inputmode=numeric]", { clickCount: 3 });
+		await page.type("form input[inputmode=numeric]", "86400001");
+		await submitCreationForm(page);
+		expect(await page.$$("form input[aria-invalid=true]")).toHaveLength(1);
+		await page.click("form input[inputmode=numeric]", { clickCount: 3 });
+		await page.type("form input[inputmode=numeric]", "86400000");
+		await submitCreationForm(page, 2);
+		const create = {
+			type: "browser" as const,
+			narratorId: "parent",
+			data: { url: "https://example.com/", ttlMs: 86400000 },
+		};
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([create]);
+		await page.evaluate(() => window.backgroundTaskFixture.pendingCreate?.("Browser unavailable"));
+		await page.waitForFunction(() =>
+			document.querySelector("form")?.textContent?.includes("Browser unavailable"),
+		);
+		expect(await page.$eval("form input[type=url]", (input) => input.value)).toBe(
+			"https://example.com/",
+		);
+		expect(await page.$eval("form input[inputmode=numeric]", (input) => input.value)).toBe(
+			"86400000",
+		);
+		const reads = await page.evaluate(() => window.backgroundTaskFixture.browserReads);
+		await submitCreationForm(page);
+		await page.evaluate(() => window.backgroundTaskFixture.pendingCreate?.());
+		await page.waitForSelector("#surface form", { hidden: true });
+		await page.waitForFunction(
+			(before) => window.backgroundTaskFixture.browserReads > before,
+			{},
+			reads,
+		);
+		expect(await page.evaluate(() => window.backgroundTaskFixture.creates)).toEqual([
+			create,
+			create,
+		]);
+	} finally {
+		await page.close();
+	}
+}, 20_000);

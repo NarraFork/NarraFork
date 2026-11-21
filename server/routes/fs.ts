@@ -9,7 +9,7 @@ import {
 	readFileSync,
 	statSync,
 } from "node:fs";
-import { open, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, open, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import type { Context } from "hono";
@@ -51,6 +51,9 @@ import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { sanitizeSvg } from "../lib/svg-sanitize";
 import {
+	fsDeleteSchema,
+	fsRenameSchema,
+	fsTransferSchema,
 	fsWriteSchema,
 	projectPromptReadSchema,
 	projectPromptWriteSchema,
@@ -228,6 +231,247 @@ fsRoutes.post("/mkdir", async (c) => {
 
 	mkdirSync(newPath);
 	return c.json({ path: newPath });
+});
+
+// ── Human file operations on one entry ───────────────────────────────────────
+//
+// Renaming, deleting, copying and moving are the entry-level actions the file tree's
+// context menu offers. They go through the same WRITE allow-list as `/fs/write`
+// (`checkWriteBoundary`), not through the read deny-list: deleting a `.bashrc` or
+// overwriting a git hook is the same escalation writing one is, and the read path's
+// deny-list was never a sandbox. Every operation therefore requires the narrator whose
+// workspace bounds it, and both ends of it (source and destination) are checked.
+//
+// Unlike `/fs/write` these do not take a worktree write claim. A claim exists to tell
+// the shell tool which paths were already someone else's declared work inside an
+// overlapping tool window; `mkdir` above sets the precedent that a plain directory
+// operation carries no attribution, and a rename/delete is the same shape of act.
+
+/** The writable roots that bound one human file mutation, after authorizing the caller. */
+async function writableRoots(c: Context, narratorId: string): Promise<readonly string[]> {
+	const narrator = await requireNarratorAccess(c, narratorId, "write");
+	const cwd = narrator.cwd?.trim();
+	if (!cwd) throw new ValidationError("This narrator has no workspace to modify");
+	// `?? []` for the same reason as in `/fs/write`: a settings object built without
+	// `deepMerge` would otherwise spread `undefined` and throw on every request.
+	return [cwd, ...(settings.paths.extraWritableDirs ?? [])];
+}
+
+/**
+ * The two spellings of one authorized path.
+ *
+ * `physical` is what `/fs/write` acts on: `writeFile` follows a symlink, so the bytes land
+ * wherever the link points. `lexical` is the path as asked for, and it is what a rename or
+ * an `unlink` must operate on — those act on the LINK itself, and using the resolved path
+ * would move or delete the file the user pointed at instead of the entry they named.
+ *
+ * After an `allowed` decision both are safe to use: `checkWriteBoundary` already refused a
+ * link whose target escapes the allowed roots (`escapes-via-symlink`, which no confirmation
+ * can override), so the parent chain the lexical path walks through is contained.
+ */
+interface AuthorizedPath {
+	lexical: string;
+	physical: string;
+}
+
+function authorizeWritablePath(rawPath: string, roots: readonly string[]): AuthorizedPath {
+	const decision = checkWriteBoundary(rawPath, roots);
+	if (!decision.allowed || !decision.physicalPath) {
+		throw new WriteRefusedError(describeWriteRefusal(decision.reason ?? "unresolvable"));
+	}
+	return { lexical: resolve(rawPath), physical: decision.physicalPath };
+}
+
+/** One existing entry, or a 400 naming what was wrong instead of a bare ENOENT. */
+async function existingEntry(absPath: string): Promise<Awaited<ReturnType<typeof lstat>>> {
+	try {
+		return await lstat(absPath);
+	} catch {
+		throw new ValidationError(`Path does not exist: ${absPath}`);
+	}
+}
+
+/**
+ * POST /api/fs/rename
+ *
+ * Body: { narratorId, path, name }
+ *
+ * Renames one entry IN PLACE: the parent directory is taken from `path`, never from the
+ * client, so a rename cannot become a move. Directories and symlinks are accepted here
+ * because the operation is a single link rename that traverses nothing — the same act a
+ * `git mv` performs — while copy/move/delete below stay file-only (see their own notes).
+ */
+fsRoutes.post("/rename", async (c) => {
+	const parsed = fsRenameSchema.safeParse(await readJsonBody(c.req));
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const body = parsed.data;
+	const roots = await writableRoots(c, body.narratorId);
+
+	const source = authorizeWritablePath(body.path, roots);
+	await existingEntry(source.lexical);
+	const target = authorizeWritablePath(join(dirname(source.lexical), body.name), roots);
+	if (localBackend.paths.equals(target.physical, source.physical))
+		return c.json({ ok: true, path: source.lexical });
+	if (existsSync(target.physical)) {
+		throw new AppError(`Already exists: ${body.name}`, 409, "ALREADY_EXISTS");
+	}
+
+	try {
+		await rename(source.lexical, target.physical);
+	} catch (error) {
+		// A cross-device rename cannot be done in one call; saying so beats a raw EXDEV.
+		if ((error as NodeJS.ErrnoException)?.code === "EXDEV") {
+			throw new AppError("Cannot rename across filesystems", 422, "CROSS_DEVICE");
+		}
+		throw new AppError(error instanceof Error ? error.message : String(error), 422, "RENAME_FAILED");
+	}
+	return c.json({ ok: true, path: target.lexical });
+});
+
+/**
+ * POST /api/fs/transfer
+ *
+ * Body: { narratorId, path, targetDir, mode: "copy" | "move", overwrite?: boolean }
+ *
+ * The paste half of the tree's clipboard. `targetDir` is where the entry lands, and the
+ * destination NAME is always the source's own: paste never renames.
+ *
+ * Only regular files are accepted. Copying a directory means copying a whole subtree in
+ * one request, which needs progress, cancellation and a size budget of its own before it
+ * can exist honestly (see the main-thread rules in CLAUDE.md); a symlink is refused for a
+ * different reason — `copyFile` follows it, so the bytes written would be those of a file
+ * the user pointed at rather than the entry they named.
+ *
+ * A taken destination answers 409 ALREADY_EXISTS and is replaced only when the caller
+ * repeats the request with `overwrite`. That two-step is deliberate: replacing a file is
+ * the one thing a paste can do that a user cannot undo, so the client must have shown
+ * WHICH name is being taken before the bytes are gone. What may be replaced is a regular
+ * file — a directory or a symlink at that name is refused even with `overwrite`, because
+ * "replace this file" must not become "delete this subtree" or "unlink the link and drop
+ * whatever was behind it".
+ *
+ * `copyFile`/`rename` are the async promises API: a synchronous copy of a large file on
+ * the server's only JS thread would stall every other request for its duration.
+ */
+fsRoutes.post("/transfer", async (c) => {
+	const parsed = fsTransferSchema.safeParse(await readJsonBody(c.req));
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const body = parsed.data;
+	const roots = await writableRoots(c, body.narratorId);
+
+	const source = authorizeWritablePath(body.path, roots);
+	const sourceInfo = await existingEntry(source.lexical);
+	if (sourceInfo.isDirectory()) {
+		throw new AppError("Only files can be copied or moved", 422, "UNSUPPORTED_ENTRY");
+	}
+	if (sourceInfo.isSymbolicLink()) {
+		throw new AppError(
+			"Symbolic links cannot be copied or moved through this API",
+			422,
+			"UNSUPPORTED_ENTRY",
+		);
+	}
+
+	const targetDir = authorizeWritablePath(body.targetDir, roots);
+	const targetDirInfo = await existingEntry(targetDir.physical);
+	if (!targetDirInfo.isDirectory()) {
+		throw new ValidationError(`Not a directory: ${targetDir.physical}`);
+	}
+	const target = authorizeWritablePath(
+		join(targetDir.physical, basename(source.physical)),
+		roots,
+	);
+	// A cut pasted into its own directory names the source itself: same folder, same name.
+	// It is reported like any other taken destination so the caller's overwrite flow runs,
+	// but the replacement must NEVER touch the bytes — an `unlink` here would delete the
+	// file the transfer is about to read.
+	const sameEntry = localBackend.paths.equals(source.physical, target.physical);
+	const destinationExists = existsSync(target.physical);
+	if (destinationExists && !body.overwrite) {
+		throw new AppError(`Already exists: ${basename(target.physical)}`, 409, "ALREADY_EXISTS");
+	}
+	if (sameEntry) {
+		// Confirmed "replace" of a file with itself: the bytes are already what they would
+		// be. Succeeding without a write is the only safe answer — and it is the truth.
+		return c.json({ ok: true, path: target.lexical });
+	}
+	if (destinationExists) {
+		const existing = await existingEntry(target.physical);
+		if (existing.isDirectory() || existing.isSymbolicLink()) {
+			throw new AppError(
+				"Only a regular file can be replaced",
+				422,
+				"UNSUPPORTED_ENTRY",
+			);
+		}
+		// Removed before the transfer rather than overwritten in place: `rename` onto an
+		// existing name fails outright on Windows, and a half-replaced file would be worse
+		// than a missing one.
+		await unlink(target.physical);
+	}
+
+	try {
+		if (body.mode === "copy") {
+			await copyFile(source.physical, target.physical);
+		} else {
+			try {
+				await rename(source.physical, target.physical);
+			} catch (error) {
+				// Same filesystem in practice; across devices rename is impossible, so the
+				// move becomes a copy followed by a delete of the original.
+				if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+				await copyFile(source.physical, target.physical);
+				await unlink(source.physical);
+			}
+		}
+	} catch (error) {
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"TRANSFER_FAILED",
+		);
+	}
+	return c.json({ ok: true, path: target.lexical });
+});
+
+/**
+ * POST /api/fs/delete
+ *
+ * Body: { narratorId, path }
+ *
+ * One FILE entry. A directory is refused rather than removed recursively: the menu this
+ * serves is drawn on files only, and "delete this file" must never be able to become
+ * "delete this subtree" because a path happened to name a directory.
+ *
+ * A symlink is refused as well, and for a subtler reason than the directory rule: the
+ * authorized operand here is the RESOLVED path, so unlinking a link would delete the file
+ * it points at — inside the workspace, and quite unlike what the row says. Refusing keeps
+ * the operand and the visible entry the same file.
+ */
+fsRoutes.post("/delete", async (c) => {
+	const parsed = fsDeleteSchema.safeParse(await readJsonBody(c.req));
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const body = parsed.data;
+	const roots = await writableRoots(c, body.narratorId);
+
+	const target = authorizeWritablePath(body.path, roots);
+	const info = await existingEntry(target.lexical);
+	if (info.isDirectory() || info.isSymbolicLink()) {
+		throw new AppError("Only regular files can be deleted", 422, "UNSUPPORTED_ENTRY");
+	}
+
+	try {
+		await unlink(target.physical);
+	} catch (error) {
+		throw new AppError(error instanceof Error ? error.message : String(error), 422, "DELETE_FAILED");
+	}
+	return c.json({ ok: true });
 });
 
 /**
