@@ -739,12 +739,64 @@ describe("TokenDance billing", () => {
 });
 
 describe("TokenDance backend", () => {
+	test("catalog refresh preserves an image preference saved during the fetch", async () => {
+		fakeSettings.tokendance = {
+			apiKey: "test-key",
+			disabled: false,
+			generation: 100,
+			toolResultImages: "off",
+		};
+		let release!: (response: Response) => void;
+		const response = new Promise<Response>((resolve) => {
+			release = resolve;
+		});
+		fetchMock(() => response);
+		const refresh = service.refreshTokenDanceModels();
+		await service.setTokenDanceDisabled(false, "separate");
+		release(
+			json({
+				data: [
+					{ id: "chat-model", name: "Chat", supported_protocols: ["openai:chat-completions"] },
+				],
+			}),
+		);
+		const catalog = await refresh;
+		expect(catalog.map((model) => model.id)).toEqual(["chat-model"]);
+		expect(fakeSettings.tokendance.toolResultImages).toBe("separate");
+		expect(service.getTokenDanceConnection().toolResultImages).toBe("separate");
+		expect(service.getTokenDanceRuntimeConfig()?.toolResultImages).toBe("separate");
+		expect(fakeSettings.tokendance.generation).toBe(100);
+	});
+	for (const mode of ["off", "inline", "separate"] as const) {
+		test(`connection persists ${mode} without invalidating requests or checkout`, async () => {
+			fakeSettings.tokendance = { apiKey: "test-key", disabled: false, generation: 100 };
+			const controller = new AbortController();
+			const unregister = service.registerTokenDanceRequest(controller, 100);
+			const fixture = paymentFixture();
+			fetchMock(() => json(fixture));
+			const owner = `image-mode-${mode}`;
+			const input = { amount: 10, generation: 100, requestId: "i".repeat(43) };
+			const payment = await createPayment(owner, input);
+			const result = await service.setTokenDanceDisabled(false, mode);
+			expect(result.toolResultImages).toBe(mode);
+			expect(result.generation).toBe(100);
+			expect(controller.signal.aborted).toBe(false);
+			expect(service.getTokenDanceRuntimeConfig()?.toolResultImages).toBe(mode);
+			expect(() => service.assertTokenDanceConnection(100)).not.toThrow();
+			expect((await service.getTokenDancePaymentSession(owner, payment.id)).status).toBe("pending");
+			expect((await service.setTokenDanceDisabled(true)).toolResultImages).toBe(mode);
+			expect(service.getTokenDanceConnection().generation).toBe(101);
+			expect(controller.signal.aborted).toBe(true);
+			unregister();
+		});
+	}
 	test("refresh and reauthorization preserve initialized collection and user visibility choices", async () => {
 		fakeSettings.tokendance = {
 			apiKey: "existing-platform-key",
 			disabled: false,
 			generation: 100,
 			modelCollectionInitialized: true,
+			toolResultImages: "separate",
 		};
 		fakeSettings.agent.hiddenModels = ["tokendance:kimi-k3", "other:hidden"];
 		fetchMock((url) =>
@@ -766,6 +818,7 @@ describe("TokenDance backend", () => {
 		expect(fakeSettings.agent.hiddenModels).toEqual(["tokendance:kimi-k3", "other:hidden"]);
 		const flow = start();
 		await service.completeTokenDanceOAuth(flow.owner, flow.flowId, "one-time-code");
+		expect(fakeSettings.tokendance.toolResultImages).toBe("separate");
 		expect(fakeSettings.tokendance.modelCollectionInitialized).toBe(true);
 		expect(fakeSettings.agent.hiddenModels).toEqual(["tokendance:kimi-k3", "other:hidden"]);
 		expect(service.getTokenDanceCatalogModels().map((model) => model.id)).toEqual([

@@ -55,6 +55,7 @@ export interface ProvidersState {
 	commandCode: CommandCodeState;
 	/** TokenDance 的连接开关草稿（它存在自己的连接记录里，保存时单独提交）。 */
 	tokenDanceDisabled: boolean;
+	tokenDanceToolResultImages?: ToolResultImagesMode;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
 	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
@@ -67,6 +68,7 @@ export interface ProvidersState {
 }
 
 export interface SavedSnapshot {
+	tokenDanceToolResultImages?: ToolResultImagesMode;
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
@@ -92,6 +94,7 @@ export type ProvidersAction =
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
 	| { type: "SET_COMMAND_CODE"; config: CommandCodeState }
+	| { type: "SET_TOKENDANCE_TOOL_IMAGES"; value: ToolResultImagesMode }
 	| { type: "SET_PLATFORM_DISABLED"; prefix: PlatformProviderPrefix; disabled: boolean }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
@@ -386,6 +389,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const nug = (s.nugProviders ?? []).map((p: any) => ({
+				toolResultImages:
+					p.toolResultImages === "off" ||
+					p.toolResultImages === "inline" ||
+					p.toolResultImages === "separate"
+						? p.toolResultImages
+						: undefined,
 				id: p.id ?? "",
 				name: p.name ?? "",
 				prefix: p.prefix ?? "nug",
@@ -458,6 +467,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					toolResultImages: s.commandCode?.toolResultImages,
 				},
 				tokenDanceDisabled: s.tokendance?.disabled === true,
+				tokenDanceToolResultImages:
+					s.tokendance?.toolResultImages === "off" ||
+					s.tokendance?.toolResultImages === "inline" ||
+					s.tokendance?.toolResultImages === "separate"
+						? s.tokendance.toolResultImages
+						: undefined,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelProtocols,
@@ -494,6 +509,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 		case "SET_COMMAND_CODE":
 			return { ...state, commandCode: action.config };
+		case "SET_TOKENDANCE_TOOL_IMAGES":
+			return { ...state, tokenDanceToolResultImages: action.value };
 
 		case "SET_PLATFORM_DISABLED": {
 			// 平台 provider 的启用开关只有这一个写入点：它只改草稿，绝不碰后端接口。
@@ -612,6 +629,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
 				commandCode: { ...snap.commandCode },
 				tokenDanceDisabled: snap.tokenDanceDisabled,
+				tokenDanceToolResultImages: snap.tokenDanceToolResultImages,
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
 				modelProtocols: { ...snap.modelProtocols },
@@ -646,6 +664,7 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
 			return true;
 		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
+		if (state.tokenDanceToolResultImages !== savedSnapshot.tokenDanceToolResultImages) return true;
 		// Key order is not meaningful here, so compare sorted entries rather than the raw objects.
 		if (
 			JSON.stringify(Object.entries(state.modelProtocols).sort()) !==
@@ -700,6 +719,7 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
 		commandCode: { ...state.commandCode },
 		tokenDanceDisabled: state.tokenDanceDisabled,
+		tokenDanceToolResultImages: state.tokenDanceToolResultImages,
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelProtocols: { ...state.modelProtocols },

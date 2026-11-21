@@ -31,6 +31,37 @@ const provider = {
 };
 
 describe("providers reducer server synchronization", () => {
+	for (const invalid of [null, "invalid", 42]) {
+		test(`NUG and TokenDance reject invalid mode ${invalid}`, () => {
+			const state = providersStateFromSettings({
+				nugProviders: [{ ...provider, toolResultImages: invalid }],
+				tokendance: { toolResultImages: invalid },
+				agent: {},
+			});
+			expect(state.nugProviders[0]?.toolResultImages).toBeUndefined();
+			expect(state.tokenDanceToolResultImages).toBeUndefined();
+		});
+	}
+	for (const mode of [undefined, "off", "inline", "separate"] as const) {
+		test(`NUG and TokenDance retain image mode ${mode} through snapshots`, () => {
+			const state = providersStateFromSettings({
+				nugProviders: [{ ...provider, toolResultImages: mode }],
+				tokendance: { toolResultImages: mode },
+				agent: {},
+			});
+			expect(state.nugProviders[0]?.toolResultImages).toBe(mode);
+			expect(state.tokenDanceToolResultImages).toBe(mode);
+			const snapshot = createSnapshot(state);
+			const edited = providersReducer(state, {
+				type: "SET_TOKENDANCE_TOOL_IMAGES",
+				value: mode === "inline" ? "off" : "inline",
+			});
+			expect(dirtyLabel(edited, snapshot)).toContain("true");
+			const restored = providersReducer(edited, { type: "RESTORE_FROM_SNAPSHOT", snapshot });
+			expect(restored.tokenDanceToolResultImages).toBe(mode);
+			expect(dirtyLabel(restored, snapshot)).toContain("false");
+		});
+	}
 	for (const mode of ["off", "inline", "separate"] as const) {
 		test(`preserves tool result image mode ${mode} through edits and server synchronization`, () => {
 			const initialized = providersStateFromSettings({

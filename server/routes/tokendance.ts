@@ -134,8 +134,16 @@ tokendanceRoutes.post("/models/refresh", async (c) =>
 	c.json({ models: await refreshTokenDanceModels(c.req.raw.signal) }),
 );
 tokendanceRoutes.patch("/connection", async (c) => {
-	const input = await body(c.req.raw, z.object({ disabled: z.boolean() }).strict());
-	return c.json(await setTokenDanceDisabled(input.disabled));
+	const input = await body(
+		c.req.raw,
+		z
+			.object({
+				disabled: z.boolean(),
+				toolResultImages: z.enum(["off", "inline", "separate"]).optional(),
+			})
+			.strict(),
+	);
+	return c.json(await setTokenDanceDisabled(input.disabled, input.toolResultImages));
 });
 tokendanceRoutes.delete("/connection", async (c) => {
 	await deleteTokenDanceConnection();

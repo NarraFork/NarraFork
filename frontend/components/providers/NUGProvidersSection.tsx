@@ -19,6 +19,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import {
 	IconChevronDown,
 	IconChevronRight,
@@ -54,6 +55,7 @@ import { InlineCustomModels } from "./InlineCustomModels";
 /* ── Types ─────────────────────────────────────────────── */
 
 export interface NUGProviderState {
+	toolResultImages?: ToolResultImagesMode;
 	id: string;
 	name: string;
 	prefix: string;
@@ -1098,6 +1100,21 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 							<ProxyOverrideField
 								value={p.proxy}
 								onChange={(next) => updateProvider(p.id, { proxy: next })}
+							/>
+							<Select
+								label={t("toolResultImages")}
+								description={t("toolResultImagesDesc")}
+								data={[
+									{ value: "off", label: t("toolResultImagesOff") },
+									{ value: "inline", label: t("toolResultImagesInline") },
+									{ value: "separate", label: t("toolResultImagesSeparate") },
+								]}
+								value={p.toolResultImages ?? "off"}
+								onChange={(value) =>
+									updateProvider(p.id, {
+										toolResultImages: (value ?? "off") as ToolResultImagesMode,
+									})
+								}
 							/>
 							{/* Client-egress relay (docs/CODEX_CLIENT_RELAY.md) */}
 							<Select

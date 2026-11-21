@@ -48,6 +48,7 @@ import {
 import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
 import { createProviderAndRefresh } from "../../components/providers/provider-create-flow";
 import { rebaseProviderState } from "../../components/providers/provider-settings-rebase";
+import { saveProviderSettings } from "../../components/providers/provider-settings-save";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -253,6 +254,10 @@ function SettingsProvidersPage() {
 						...fresh,
 						customApiProviders: recovered.customApiProviders,
 						nugProviders: recovered.nugProviders,
+						tokendance: {
+							...(fresh.tokendance as Record<string, unknown>),
+							toolResultImages: recovered.tokenDanceToolResultImages,
+						},
 						agent: { ...(fresh.agent as Record<string, unknown>), ...createSnapshot(recovered) },
 					});
 					savedSnapshot.current = createSnapshot(freshState);
@@ -411,18 +416,29 @@ function SettingsProvidersPage() {
 				});
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
 			}
-			// 平台集成里 TokenDance 的开关存在它自己的连接记录里，所以先提交它、再存 settings：
-			// 这样 settings 响应里的 tokendance.disabled 已是新值，SYNC 之后草稿不会回退。
-			if (stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled) {
-				try {
-					await api.tokenDanceUpdateConnection(stateToSave.tokenDanceDisabled);
-				} catch {
-					notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
-					throw new Error(t("tokendance.operationFailed"));
-				}
-			}
+			const connectionChanged =
+				stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled ||
+				stateToSave.tokenDanceToolResultImages !== savedSnapshot.current.tokenDanceToolResultImages;
 			const { payload } = prepareProviderSettingsSave(stateToSave);
-			const response = await updateMutation.mutateAsync(payload);
+			const response = await saveProviderSettings(
+				() => updateMutation.mutateAsync(payload),
+				connectionChanged
+					? async () => {
+							try {
+								return await api.tokenDanceUpdateConnection(
+									stateToSave.tokenDanceDisabled,
+									undefined,
+									stateToSave.tokenDanceToolResultImages ?? "off",
+								);
+							} catch {
+								notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
+								throw new Error(t("tokendance.operationFailed"));
+							}
+						}
+					: undefined,
+			);
+			qc.setQueryData(["admin", "settings"], response);
+			qc.setQueryData(["settings"], response);
 			// 快照先行、SYNC 随后：快照一变，概览排序（只看快照）在 SYNC 触发的这次
 			// 渲染里就重排 —— 不需要额外的信号 state，也不存在时序窗口。
 			savedSnapshot.current = createSnapshot(
@@ -1251,6 +1267,10 @@ function SettingsProvidersPage() {
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
 							connection={tokenDance}
+							toolResultImages={state.tokenDanceToolResultImages}
+							onToolResultImagesChange={(value) =>
+								dispatch({ type: "SET_TOKENDANCE_TOOL_IMAGES", value })
+							}
 							enabled={!tokenDanceDisabled}
 							onToggleEnabled={() =>
 								dispatchers.setPlatformDisabled("tokendance", !tokenDanceDisabled)
