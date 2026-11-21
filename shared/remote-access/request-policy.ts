@@ -67,7 +67,7 @@ export const REMOTE_REQUEST_POLICY: RemoteRequestRule[] = [
 	rule(
 		"approval",
 		["POST"],
-		`/api/narrators/permissions/${id}/(approve|deny|plan|defer|reflect-question|disarm-question-reflection|stop-question-reflection|stop-reflection|stop-plan-reflection|stop-task-reflection)`,
+		`/api/narrators/permissions/${id}/(approve|deny|plan|defer|reflect-question|reflect-plan|disarm-question-reflection|stop-question-reflection|stop-reflection|stop-plan-reflection|stop-task-reflection)`,
 	),
 	rule("message-send", ["POST"], `${narrator}/messages`, { requestBytes: limits.fileBytes }),
 	rule("message-edit", ["POST"], `${narrator}/(edit-and-regenerate|edit-message)/${id}`, {

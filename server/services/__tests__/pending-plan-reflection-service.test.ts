@@ -1,0 +1,266 @@
+/**
+ * Reflecting on a plan that is ALREADY blocked on its approval card.
+ *
+ * The loop's own gate runs before the permission is raised; once the plan waits, the only way to
+ * review it is the runner that loop published for the length of the wait. These cases pin the
+ * decision mapping this new path adds — approve on confirm, send the feedback back to the model
+ * on revise, and leave the card with the person when the review cannot decide — because those
+ * are the outcomes a person sees instead of their own approve/deny click.
+ */
+
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { getTestDb } from "../../../tests/setup";
+import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import type { PermissionResult } from "../../lib/agent";
+import type { PendingPlanReflectionGateResult } from "../../lib/agent/pending-plan-reflection";
+
+const { db, sqlite } = getTestDb();
+const realDbModule = { ...(await import("../../db")) };
+const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
+const realNarratorServiceModule = { ...(await import("../narrator-service")) };
+
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+const broadcasts: Array<{ target: string; message: Record<string, unknown> }> = [];
+mock.module("../../websocket/narrator-ws", () => ({
+	...realNarratorWsModule,
+	broadcastToNarrator: (narratorId: string, message: Record<string, unknown>) => {
+		broadcasts.push({ target: narratorId, message });
+	},
+}));
+mock.module("../narrator-service", () => ({
+	...realNarratorServiceModule,
+	narratorService: {
+		...realNarratorServiceModule.narratorService,
+		updateStatus: async () => {},
+	},
+}));
+
+const {
+	isPendingPlanReflectionAvailable,
+	reflectPendingExitPlanMode,
+	startAutomaticPlanReflectionForNarrator,
+} = await import("../narrator-permission");
+const { pendingPermissions, pendingPlanApproverSource, pendingPlanCompact } = await import(
+	"../narrator-session-state"
+);
+
+const NARRATOR_ID = "plan-reflection-pending-narrator";
+const MESSAGE_ID = "plan-reflection-pending-message";
+const TOOL_CALL_ID = "plan-reflection-pending-tool-call";
+const TOOL_USE_ID = "plan-reflection-pending-tool-use";
+
+afterAll(() => {
+	mock.module("../../db", () => realDbModule);
+	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
+	mock.module("../narrator-service", () => realNarratorServiceModule);
+	mock.restore();
+});
+
+beforeEach(async () => {
+	broadcasts.length = 0;
+	pendingPlanApproverSource.delete(NARRATOR_ID);
+	pendingPlanCompact.delete(NARRATOR_ID);
+	await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, TOOL_CALL_ID));
+	await db.delete(narratorMessages).where(eq(narratorMessages.id, MESSAGE_ID));
+	await db.delete(narrators).where(eq(narrators.id, NARRATOR_ID));
+	await db.insert(narrators).values({
+		id: NARRATOR_ID,
+		permissionMode: "bypassPermissions",
+		planReflectionAutoApproveOverride: "on",
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+	});
+	await db.insert(narratorMessages).values({
+		id: MESSAGE_ID,
+		narratorId: NARRATOR_ID,
+		role: "assistant",
+		contentJson: [],
+		createdAt: "2026-01-01T00:00:00.000Z",
+	});
+	await db.insert(narratorToolCalls).values({
+		id: TOOL_CALL_ID,
+		narratorId: NARRATOR_ID,
+		messageId: MESSAGE_ID,
+		toolUseId: TOOL_USE_ID,
+		toolName: "ExitPlanMode",
+		status: "pending",
+		inputJson: { plan: "Add the regression test, then run it." },
+		createdAt: "2026-01-01T00:00:00.000Z",
+	});
+});
+
+afterEach(() => {
+	pendingPermissions.delete(TOOL_CALL_ID);
+});
+
+const PLAN_INPUT = { plan: "Add the regression test, then run it." };
+
+interface PendingFixture {
+	resolved: PermissionResult[];
+	setRunner: (
+		run: (input: Record<string, unknown>) => Promise<PendingPlanReflectionGateResult>,
+	) => void;
+}
+
+function registerPending(overrides: { permissionMode?: string } = {}): PendingFixture {
+	const resolved: PermissionResult[] = [];
+	const controller = new AbortController();
+	let runner: (input: Record<string, unknown>) => Promise<PendingPlanReflectionGateResult> =
+		async () => ({
+			decision: { action: "manual" },
+			input: PLAN_INPUT,
+		});
+	pendingPermissions.set(TOOL_CALL_ID, {
+		resolve: (result) => resolved.push(result),
+		cleanup: () => pendingPermissions.delete(TOOL_CALL_ID),
+		input: PLAN_INPUT,
+		narratorId: NARRATOR_ID,
+		toolName: "ExitPlanMode",
+		toolUseId: TOOL_USE_ID,
+		broadcastTargetId: NARRATOR_ID,
+		cwd: "/tmp",
+		locale: "en",
+		signal: controller.signal,
+		planReflection: (input) => runner(input),
+	});
+	return {
+		resolved,
+		setRunner: (run) => {
+			runner = run;
+		},
+	};
+}
+
+async function toolCallRow() {
+	return db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, TOOL_CALL_ID),
+		columns: { status: true, permissionDecidedBy: true, permissionDenyMessage: true },
+	});
+}
+
+describe("reflecting on a pending plan approval", () => {
+	test("reports availability only while a runner is attached", () => {
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(false);
+		registerPending();
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
+	});
+
+	test("confirm approves the waiting plan and attributes the approval to the reflection", async () => {
+		const fixture = registerPending();
+		fixture.setRunner(async () => ({
+			decision: { action: "confirm", reflection: "Ready" },
+			input: PLAN_INPUT,
+		}));
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(outcome).toEqual({ status: "approved", decision: "confirm" });
+		expect(fixture.resolved).toEqual([{ behavior: "allow", updatedInput: PLAN_INPUT }]);
+		expect(pendingPlanApproverSource.get(NARRATOR_ID)).toBe("reflection");
+		const row = await toolCallRow();
+		expect(row?.status).toBe("running");
+		expect(row?.permissionDecidedBy).toBe("reflection");
+	});
+
+	test("confirm_compact also arms the post-approval context reset", async () => {
+		const fixture = registerPending();
+		fixture.setRunner(async () => ({
+			decision: { action: "confirm_compact", reflection: "Ready" },
+			input: PLAN_INPUT,
+		}));
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(outcome).toEqual({ status: "approved", decision: "confirm_compact" });
+		expect(pendingPlanCompact.has(NARRATOR_ID)).toBe(true);
+	});
+
+	test("revise denies the plan with the review's feedback, which the model must act on", async () => {
+		const fixture = registerPending();
+		fixture.setRunner(async () => ({
+			decision: { action: "revise", feedback: "Split step 3 into two steps." },
+			input: PLAN_INPUT,
+		}));
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(outcome).toEqual({ status: "revising" });
+		expect(fixture.resolved).toHaveLength(1);
+		const denial = fixture.resolved[0];
+		expect(denial.behavior).toBe("deny");
+		if (denial.behavior !== "deny") throw new Error("Expected a denial");
+		expect(denial.message).toContain("Split step 3 into two steps.");
+		expect(denial.rawMessage).toBe(true);
+		const row = await toolCallRow();
+		expect(row?.status).toBe("fail");
+		expect(row?.permissionDecidedBy).toBe("reflection");
+	});
+
+	test("an undecidable review leaves the approval with the person", async () => {
+		const fixture = registerPending();
+		fixture.setRunner(async () => ({
+			decision: { action: "human", reason: "Plan reflection could not finish" },
+			input: PLAN_INPUT,
+		}));
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(outcome).toEqual({
+			status: "awaiting_user",
+			reason: "Plan reflection could not finish",
+		});
+		expect(fixture.resolved).toHaveLength(0);
+		expect(pendingPermissions.has(TOOL_CALL_ID)).toBe(true);
+		const row = await toolCallRow();
+		expect(row?.status).toBe("pending");
+	});
+
+	test("a request with no runner is not reflectable", async () => {
+		pendingPermissions.set(TOOL_CALL_ID, {
+			resolve: () => {},
+			cleanup: () => pendingPermissions.delete(TOOL_CALL_ID),
+			input: PLAN_INPUT,
+			narratorId: NARRATOR_ID,
+			toolName: "ExitPlanMode",
+			toolUseId: TOOL_USE_ID,
+			broadcastTargetId: NARRATOR_ID,
+			cwd: "/tmp",
+			locale: "en",
+			signal: new AbortController().signal,
+		});
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(false);
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(outcome.status).toBe("unavailable");
+	});
+
+	test("the automatic path follows the permission-mode gate", async () => {
+		const fixture = registerPending();
+		let calls = 0;
+		fixture.setRunner(async () => {
+			calls += 1;
+			return { decision: { action: "confirm" }, input: PLAN_INPUT };
+		});
+		// `default` is not one of the modes the loop reflects in, so turning the switch on must
+		// not silently approve the plan either.
+		await db
+			.update(narrators)
+			.set({ permissionMode: "default" })
+			.where(eq(narrators.id, NARRATOR_ID));
+		const blocked = await reflectPendingExitPlanMode(TOOL_CALL_ID, { automatic: true });
+		expect(blocked.status).toBe("unavailable");
+		expect(calls).toBe(0);
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
+	});
+
+	test("turning the switch on reflects every blocked plan of the session", async () => {
+		const fixture = registerPending();
+		let calls = 0;
+		let started: (() => void) | undefined;
+		const ran = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		fixture.setRunner(async () => {
+			calls += 1;
+			started?.();
+			return { decision: { action: "confirm" }, input: PLAN_INPUT };
+		});
+		expect(startAutomaticPlanReflectionForNarrator(NARRATOR_ID)).toBe(1);
+		await ran;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(calls).toBe(1);
+		expect(fixture.resolved).toHaveLength(1);
+	});
+});
