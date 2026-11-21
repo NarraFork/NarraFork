@@ -29,7 +29,7 @@ func runGitStatusTestHelper() bool {
 		}
 		os.Exit(9)
 	}
-	if strings.Join(os.Args[1:], " ") != "--no-pager --literal-pathspecs -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all" {
+	if strings.Join(os.Args[1:], " ") != "--no-pager --no-literal-pathspecs -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all -- . "+stagingExcludeSpec() {
 		os.Exit(10)
 	}
 	if mode == "incomplete" {

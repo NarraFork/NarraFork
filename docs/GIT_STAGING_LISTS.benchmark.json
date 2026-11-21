@@ -1,0 +1,2555 @@
+{
+	"version": 1,
+	"measuredAt": "2026-11-13T16:32:18.641Z",
+	"environment": {
+		"bun": "1.3.13",
+		"git": "git version 2.47.3",
+		"platform": "linux",
+		"release": "6.12.73+deb13-amd64",
+		"architecture": "x64",
+		"cpu": "Intel(R) Xeon(R) CPU E5-2696 v2 @ 2.50GHz",
+		"logicalCpus": 48
+	},
+	"fixture": {
+		"files": 48,
+		"groups": 3,
+		"selectedFiles": 16,
+		"baselineBytesPerFile": 438,
+		"targetStartsEmpty": true,
+		"otherGroupsHave16FilesEach": true
+	},
+	"method": {
+		"entry": "IndependentGitStagingKernel.action(stage), then files",
+		"cold": "15 fresh Bun processes, each using an exclusive initialized 48-file/3-list repository; first content mutation on a new kernel",
+		"warm": "one exclusive initialized repository and kernel, 5 discarded warmup iterations then 15 measured iterations; selected paths restored to base outside every measured interval",
+		"timing": "performance.now wall time; repository discovery, module loading, fixture setup, selected-file edits, and reset are outside the timed intervals; cold does not flush operating-system caches",
+		"counting": "spyOn wraps every stagingGit call and forwards to the real bounded executor; every sample including warmups asserts three writes and one raw+numstat files query, per-file text +1/-1 and complete M-bucket +16/-16 statistics",
+		"percentile": "nearest-rank P95; arithmetic middle median (mean of two middle values for even sample counts)",
+		"scope": "explicit core entry only; excludes HTTP authorization, Worker startup and browser refresh"
+	},
+	"sourceHashes": {
+		"server/services/git-staging-kernel.ts": "3bfd7f3dda4a91e88895d42ac1fe149db46d228ce3d7c97370bc59fc35e6a9e5",
+		"server/services/git-staging-process.ts": "1e362f9c90a81677902ff7213b09351a66dc8f300819a76ee47a3b4682fc573f",
+		"server/services/git-staging-stats.ts": "d55c6b59764a4b65a1f473e6716ee4a29491fb6d1ca3bb7139956d20064da6fe",
+		"server/services/git-staging-lists-service.ts": "7db9e4f1c3a62d2b1e4d2090d0d6313c208e45273ecde8fb68ef7bc9db9c93d1",
+		"server/services/git-staging-worker.ts": "67351852bda6a78d52308aa890797edd39ace6ad4be9fbd6b727189574f30c96",
+		"server/lib/compiled-worker.ts": "570ea7f1718e3b2c0252cc6c1250cf8683013f3ab358f2b7ce504946ca9098fc",
+		"server/services/__tests__/git-changelist.benchmark.ts": "33e867de48cef02733efe53a2d94be93376c1a0cafc320e78971c22af65bc9c3",
+		"shared/git-staging-lists.ts": "7150ed0e532d28d3148ccc49aca4c1dd7c573bd5f6e5deba30c09c2a696e1267"
+	},
+	"statistics": {
+		"cold": {
+			"samples": 15,
+			"addGitCalls": 3,
+			"filesGitCalls": 1,
+			"add": {
+				"medianMs": 93.77038399999998,
+				"p95Ms": 106.69613800000002,
+				"minMs": 48.66525399999999,
+				"maxMs": 106.69613800000002
+			},
+			"files": {
+				"medianMs": 38.73395999999997,
+				"p95Ms": 46.778954,
+				"minMs": 17.27426300000002,
+				"maxMs": 46.778954
+			},
+			"combined": {
+				"medianMs": 133.46792200000002,
+				"p95Ms": 146.814507,
+				"minMs": 72.47950999999999,
+				"maxMs": 146.814507
+			}
+		},
+		"warm": {
+			"samples": 15,
+			"addGitCalls": 3,
+			"filesGitCalls": 1,
+			"add": {
+				"medianMs": 50.94977599999993,
+				"p95Ms": 62.86184000000003,
+				"minMs": 17.730303999999705,
+				"maxMs": 62.86184000000003
+			},
+			"files": {
+				"medianMs": 29.80907900000011,
+				"p95Ms": 44.95701400000007,
+				"minMs": 9.244485000000168,
+				"maxMs": 44.95701400000007
+			},
+			"combined": {
+				"medianMs": 86.46628600000008,
+				"p95Ms": 98.41796700000009,
+				"minMs": 26.974788999999873,
+				"maxMs": 98.41796700000009
+			}
+		}
+	},
+	"samples": [
+		{
+			"phase": "cold",
+			"iteration": 1,
+			"addMs": 48.66525399999999,
+			"filesMs": 23.814256,
+			"combinedMs": 72.47950999999999,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 25.068172000000004
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 5.180220999999989
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/cf37004fa1fb4f25653f7cf24c04ee9d6bee61b17e9d6486156d45d8d3aaf8a4/aac68f97-de67-4ab9-ae6c-5a1acdb9e80f/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 6.696843999999999
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.142709999999994
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 2,
+			"addMs": 93.65860599999996,
+			"filesMs": 41.383245000000045,
+			"combinedMs": 135.041851,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 41.37167199999999
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.00985700000001
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/45174d0189ef1edc52dc4e95144225f76265cc5326e18ba05bb905087e56c516/12d0e686-93b1-4403-9288-b33e51d48d94/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 12.90879000000001
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.12944600000003
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 3,
+			"addMs": 95.71265700000001,
+			"filesMs": 37.75526500000001,
+			"combinedMs": 133.46792200000002,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 41.34674500000003
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 13.121338999999978
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/f39b7d8359122c6cd095ffe565b053f748b1476c5bf6a70a1d95a4db9e09067f/3563233a-1c37-4f17-8221-3d8b3fd616bf/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 10.302528999999993
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.994527000000005
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 4,
+			"addMs": 96.25446500000001,
+			"filesMs": 38.79566699999998,
+			"combinedMs": 135.050132,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 44.55926499999998
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.684687999999994
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/8648b3487c6f8682ada536c1e138123d0243d97464c5ec9dcdb15afe4bbbfb64/9dc08987-ff7a-44fd-9c20-1429c3e91a8a/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 7.800190999999984
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.75949300000002
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 5,
+			"addMs": 90.10796700000003,
+			"filesMs": 46.778954,
+			"combinedMs": 136.88692100000003,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 40.26345600000002
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.57276399999995
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/afb6871c52609befa3524f47150d58be49ad992d1d4d0f8c4811db6df945991b/6000dd99-6171-4c0f-b6af-0054d758ee3a/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.05502899999999
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 16.648273000000017
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 6,
+			"addMs": 92.20140100000003,
+			"filesMs": 36.226607,
+			"combinedMs": 128.42800800000003,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 39.800415000000015
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.346038999999962
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/5cd3913569fdd0e5e3841733fea982bfbcb56bc63e4aacf531e2c22d040575e5/e44a23f2-f50f-4760-9808-18fa03a05f6f/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.52693800000003
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.101368999999977
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 7,
+			"addMs": 91.36817999999997,
+			"filesMs": 37.84740700000003,
+			"combinedMs": 129.215587,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 41.75336900000002
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.198831000000041
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/b64063a0884ff4e46ddde37bba26f2023b98e2f7ab5fd8eaac83871f8453b81d/a9fefce8-4dc7-4ce9-9db1-6522aa029a4a/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 7.3308660000000145
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.833717999999976
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 8,
+			"addMs": 106.69613800000002,
+			"filesMs": 40.11836899999997,
+			"combinedMs": 146.814507,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 51.239858
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 13.178563999999994
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/f5e22e89240d5234dddd98ef7f2b35022671ad9039eb743eae352c0b7430f65b/3bfdd29c-785e-4f2f-8e5d-42a5f18f0b6f/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.32674000000003
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.77020299999998
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 9,
+			"addMs": 93.28358500000002,
+			"filesMs": 37.24341899999996,
+			"combinedMs": 130.52700399999998,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 40.925219999999996
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.945377000000008
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/8247798e6b8afa9053762f5f14de56c300b81f099081dadcea4ab7d27b69a1a5/64bc9421-e8a6-4461-a843-cc3e25a78f9d/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.417300000000012
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 15.153038000000038
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 10,
+			"addMs": 93.77038399999998,
+			"filesMs": 38.937640999999985,
+			"combinedMs": 132.70802499999996,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 41.885396999999955
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.065782000000013
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/0985220f2d8b7290c4fa4eaabf117666599b67aa62a9d03c7700d1fc648bed44/463a65ac-66aa-4e0b-9824-37033048a085/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 7.837020999999993
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.904548999999975
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 11,
+			"addMs": 99.41282899999999,
+			"filesMs": 43.46191300000004,
+			"combinedMs": 142.87474200000003,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 44.12995900000004
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 13.773135000000025
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/7218a0b5d9bfd55332c6aa42c9c512f91012c1ac48926faacba77b2c32f99038/5d8ba8f5-a83e-4360-96cc-bd19191545f4/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.442983000000027
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 16.160432000000014
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 12,
+			"addMs": 94.70961400000002,
+			"filesMs": 37.35583099999997,
+			"combinedMs": 132.06544499999998,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 41.39528499999997
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 12.146155000000022
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/ac40f0c5a97a275984d16e565eb24505d80fe63ab535ac4c408d89137cb98c2a/c72705bc-2332-4cf5-933e-d38aef857428/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 10.758276000000023
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.964231999999981
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 13,
+			"addMs": 73.159571,
+			"filesMs": 17.27426300000002,
+			"combinedMs": 90.43383400000002,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 33.91498999999999
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 6.799679999999967
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/9bc7bddc49e779295650416af8274605b2d6712182c0e0c7684da5f65c06e163/6fa317e6-6b6e-4295-ab68-c7a24d2498d2/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 4.586959000000036
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 5.555014000000028
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 14,
+			"addMs": 97.42141900000001,
+			"filesMs": 38.73395999999997,
+			"combinedMs": 136.15537899999998,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 44.80453299999999
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.447399000000019
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/4172255adf0543008a9aad7af156e584fdc218c60cb96a88501153b13f66173f/13e4b840-e40b-4d44-8308-a2d7e06393bd/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 11.098836000000006
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.501739999999984
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "cold",
+			"iteration": 15,
+			"addMs": 98.79601299999999,
+			"filesMs": 42.40727800000002,
+			"combinedMs": 141.203291,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 45.59782099999998
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.986851999999999
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/175edd1178aa2fdbd75ff1a9aaf9cf63a3c59cdc687cca8a28613668935af275/763cd8da-5913-4684-b13d-44c735558684/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					],
+					"index": "native",
+					"elapsedMs": 8.143434999999954
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 16.054836000000023
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 1,
+			"addMs": 50.94977599999993,
+			"filesMs": 39.29450200000008,
+			"combinedMs": 90.24427800000001,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 18.168361000000004
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 9.14829199999997
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"1c22f43086916be7f84dd72f888eb2631395e5ae"
+					],
+					"index": "native",
+					"elapsedMs": 7.795088999999962
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 15.277847999999949
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 2,
+			"addMs": 55.1891619999999,
+			"filesMs": 31.326868999999988,
+			"combinedMs": 86.51603099999988,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 16.22505299999989
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 16.059258
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"de70e4d7044df0f74f06931032e172a0b796f5f5"
+					],
+					"index": "native",
+					"elapsedMs": 7.111989999999878
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.615343000000166
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 3,
+			"addMs": 52.44992500000012,
+			"filesMs": 30.969326999999794,
+			"combinedMs": 83.41925199999991,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 17.730254999999943
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 9.732850999999982
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"179f43cd20cfa35e97edef02e81674819bea0f0e"
+					],
+					"index": "native",
+					"elapsedMs": 7.792676999999912
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 13.679580999999871
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 4,
+			"addMs": 61.31310499999995,
+			"filesMs": 25.527718999999934,
+			"combinedMs": 86.84082399999988,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 22.523954000000003
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 9.838237000000163
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"ce5b58e9e2e030bd1172163bd13cf23a120f6551"
+					],
+					"index": "native",
+					"elapsedMs": 13.26329799999985
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.035755000000108
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 5,
+			"addMs": 53.46095300000002,
+			"filesMs": 44.95701400000007,
+			"combinedMs": 98.41796700000009,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 17.91689599999995
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 12.523223000000144
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"76baa078834316b44709758560e7dfaa52f8b1f1"
+					],
+					"index": "native",
+					"elapsedMs": 8.14607100000012
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 20.930757000000085
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 6,
+			"addMs": 50.06258500000013,
+			"filesMs": 42.109747999999854,
+			"combinedMs": 92.17233299999998,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 17.031991000000062
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 11.523255999999947
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"e59f5b8bcff62567a6179b5de572e0a37fe90277"
+					],
+					"index": "native",
+					"elapsedMs": 7.073145000000068
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 18.55860000000007
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 7,
+			"addMs": 62.86184000000003,
+			"filesMs": 24.398398999999927,
+			"combinedMs": 87.26023899999996,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 27.774537999999893
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 8.628007999999909
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"b7c90c0605c95645510741586c62668e16b43019"
+					],
+					"index": "native",
+					"elapsedMs": 7.757145999999921
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 13.567385000000058
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 8,
+			"addMs": 52.55996100000016,
+			"filesMs": 33.906324999999924,
+			"combinedMs": 86.46628600000008,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 19.319569
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 8.768925000000081
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"dd543bb5dfe76289511a24ed34791e4c4484d974"
+					],
+					"index": "native",
+					"elapsedMs": 8.63928900000019
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 15.52821700000004
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 9,
+			"addMs": 55.75683499999968,
+			"filesMs": 30.77823400000034,
+			"combinedMs": 86.53506900000002,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 19.220413000000008
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 9.489295000000311
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"c61d10c1aa298c8f6adc7c3b4a0d258e12c4fe7b"
+					],
+					"index": "native",
+					"elapsedMs": 8.85239300000012
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 14.510545000000093
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 10,
+			"addMs": 17.730303999999705,
+			"filesMs": 9.244485000000168,
+			"combinedMs": 26.974788999999873,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 6.29862200000025
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 5.155175000000327
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"5ee767526c6a5f6d367b61d494d3bfdfe0d3cd1c"
+					],
+					"index": "native",
+					"elapsedMs": 2.9659770000002936
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 5.768784000000323
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 11,
+			"addMs": 22.124775000000227,
+			"filesMs": 9.405310999999983,
+			"combinedMs": 31.53008600000021,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 6.510826000000179
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 4.128846999999951
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"6b806e3893239c8655d845cf64aa281c76c8ecbb"
+					],
+					"index": "native",
+					"elapsedMs": 7.766649000000143
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 6.074391999999989
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 12,
+			"addMs": 27.329557999999906,
+			"filesMs": 11.067207999999937,
+			"combinedMs": 38.39676599999984,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 8.38576200000034
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 8.288315000000239
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"3cece0098ccc5327fba192a84cff6267f324eedb"
+					],
+					"index": "native",
+					"elapsedMs": 7.395006999999623
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 6.085657000000083
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 13,
+			"addMs": 37.74553500000002,
+			"filesMs": 15.476165999999921,
+			"combinedMs": 53.22170099999994,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 17.82828900000004
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 7.726135999999769
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"ccdf84a217277b666ac875b63d3d26fe0a8e29e7"
+					],
+					"index": "native",
+					"elapsedMs": 3.72611199999983
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 7.254993000000013
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 14,
+			"addMs": 23.925489000000198,
+			"filesMs": 13.64477799999986,
+			"combinedMs": 37.57026700000006,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 7.8526419999998325
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 4.404340999999931
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"79186db9c1b9fe8734ab02b0da7e194db256e6a6"
+					],
+					"index": "native",
+					"elapsedMs": 3.5993060000000696
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 5.538317000000006
+				}
+			],
+			"fileCount": 16
+		},
+		{
+			"phase": "warm",
+			"iteration": 15,
+			"addMs": 28.638087999999698,
+			"filesMs": 29.80907900000011,
+			"combinedMs": 58.44716699999981,
+			"addCommands": [
+				{
+					"args": ["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"],
+					"index": "group",
+					"elapsedMs": 8.522216000000299
+				},
+				{
+					"args": ["write-tree"],
+					"index": "group",
+					"elapsedMs": 4.091370000000097
+				},
+				{
+					"args": [
+						"update-ref",
+						"refs/narrafork/changelists/eceede9c09857847013c7227175c0e8d2267e1a2cad4f80b08b0b035bbb318e6/69eca7c3-0b59-42ce-a12b-d1f17315676b/saved",
+						"98bdc20045490988aaf815ceccf437b3c5ccac14"
+					],
+					"index": "native",
+					"elapsedMs": 3.874688000000333
+				}
+			],
+			"filesCommands": [
+				{
+					"args": [
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					],
+					"index": "group",
+					"elapsedMs": 9.08359500000006
+				}
+			],
+			"fileCount": 16
+		}
+	],
+	"serviceWorker": {
+		"method": {
+			"entry": "createGitStagingListsService with its default executeGitStagingWork, action(stage) then files",
+			"samples": "15 measured iterations with one real service instance; every action and files request starts its own real Worker; selected paths reset to base outside every timed interval",
+			"timing": "complete action(stage) and files Promise wall times, including fixture beforeWrite, Worker startup, messaging, real Git, and awaited teardown; imports, fixture setup, file edits, trace reads, and resets are outside the timed intervals",
+			"authorization": "fixture beforeWrite authorizes only the fixture root by verifying its realpath and runs exactly once per stage; no HTTP authentication or application permission database is measured",
+			"counting": "real Worker GIT_TRACE2_EVENT records exact add/write-tree/update-ref/diff sequence and raw+numstat argv; each sample also asserts per-file text +1/-1 and complete M-bucket +16/-16 statistics",
+			"scope": "service-to-real-Worker measurement only; excludes HTTP and browser behavior and is not end-to-end user latency"
+		},
+		"statistics": {
+			"samples": 15,
+			"addGitCalls": 3,
+			"filesGitCalls": 1,
+			"add": {
+				"medianMs": 230.99452699999983,
+				"p95Ms": 265.8120769999996,
+				"minMs": 214.10392799999954,
+				"maxMs": 265.8120769999996
+			},
+			"files": {
+				"medianMs": 184.09029099999952,
+				"p95Ms": 201.25386400000025,
+				"minMs": 174.8778999999995,
+				"maxMs": 201.25386400000025
+			},
+			"combined": {
+				"medianMs": 414.79729999999995,
+				"p95Ms": 467.06594099999984,
+				"minMs": 397.59285199999977,
+				"maxMs": 467.06594099999984
+			}
+		},
+		"samples": [
+			{
+				"iteration": 1,
+				"addMs": 247.54695499999997,
+				"filesMs": 194.29159500000003,
+				"combinedMs": 441.83855,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"684d6ffbb11dcc24d9edc377fcc67ac993332b1e"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 2,
+				"addMs": 250.37569600000006,
+				"filesMs": 177.58536600000002,
+				"combinedMs": 427.9610620000001,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"4e290e556c1180cc50106aa5b79b6cd03e81c773"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 3,
+				"addMs": 216.733567,
+				"filesMs": 184.74124800000004,
+				"combinedMs": 401.47481500000004,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"2714b9f56cdf092bfb8e2c9c5101a1e34deb4329"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 4,
+				"addMs": 237.54172799999992,
+				"filesMs": 177.25557200000003,
+				"combinedMs": 414.79729999999995,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"e328da0ca80185c53acb41c114ee09cfd8e5e5c4"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 5,
+				"addMs": 217.05303699999968,
+				"filesMs": 182.99731599999996,
+				"combinedMs": 400.05035299999963,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"909a337f54d24a24c15f5883dd3bdbe3fd881306"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 6,
+				"addMs": 246.73483099999976,
+				"filesMs": 186.98854399999982,
+				"combinedMs": 433.7233749999996,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"1c22f43086916be7f84dd72f888eb2631395e5ae"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 7,
+				"addMs": 231.77116000000024,
+				"filesMs": 180.30144999999993,
+				"combinedMs": 412.07261000000017,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"de70e4d7044df0f74f06931032e172a0b796f5f5"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 8,
+				"addMs": 265.8120769999996,
+				"filesMs": 201.25386400000025,
+				"combinedMs": 467.06594099999984,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"179f43cd20cfa35e97edef02e81674819bea0f0e"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 9,
+				"addMs": 222.7487460000002,
+				"filesMs": 192.68074400000023,
+				"combinedMs": 415.42949000000044,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"ce5b58e9e2e030bd1172163bd13cf23a120f6551"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 10,
+				"addMs": 242.65444800000023,
+				"filesMs": 184.09029099999952,
+				"combinedMs": 426.74473899999975,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"76baa078834316b44709758560e7dfaa52f8b1f1"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 11,
+				"addMs": 214.10392799999954,
+				"filesMs": 183.48892400000022,
+				"combinedMs": 397.59285199999977,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"e59f5b8bcff62567a6179b5de572e0a37fe90277"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 12,
+				"addMs": 219.75069399999938,
+				"filesMs": 197.57760700000017,
+				"combinedMs": 417.32830099999956,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"b7c90c0605c95645510741586c62668e16b43019"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 13,
+				"addMs": 230.99452699999983,
+				"filesMs": 174.8778999999995,
+				"combinedMs": 405.87242699999933,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"dd543bb5dfe76289511a24ed34791e4c4484d974"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 14,
+				"addMs": 226.70252299999993,
+				"filesMs": 185.14152300000023,
+				"combinedMs": 411.84404600000016,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"c61d10c1aa298c8f6adc7c3b4a0d258e12c4fe7b"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			},
+			{
+				"iteration": 15,
+				"addMs": 230.1961110000002,
+				"filesMs": 178.85772199999974,
+				"combinedMs": 409.05383299999994,
+				"addCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"add",
+						"--all",
+						"--pathspec-from-file=-",
+						"--pathspec-file-nul"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"write-tree"
+					],
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"update-ref",
+						"refs/narrafork/changelists/82bc999a157fa690169a98c999f12dba78fc48ff0e635c3b86abb7914856429a/5afd9025-d72b-4325-9164-dff4e2546d47/saved",
+						"5ee767526c6a5f6d367b61d494d3bfdfe0d3cd1c"
+					]
+				],
+				"filesCommands": [
+					[
+						"git",
+						"--no-optional-locks",
+						"-c",
+						"core.splitIndex=false",
+						"-c",
+						"core.fsmonitor=false",
+						"diff",
+						"--cached",
+						"--no-ext-diff",
+						"--no-textconv",
+						"--raw",
+						"--numstat",
+						"--no-abbrev",
+						"--find-renames",
+						"--ignore-submodules=none",
+						"-z",
+						"0566b6d1026383a50803a1359375151f3a22bd44",
+						"--"
+					]
+				],
+				"fileCount": 16,
+				"authorizationCalls": 1
+			}
+		]
+	}
+}
