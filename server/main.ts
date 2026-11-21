@@ -653,7 +653,7 @@ const databaseReaders = createDatabaseReaderReadiness({
 			{ kind: "selectRows", sql: "SELECT 1", params: [], maxRows: 1 },
 			{ signal, timeoutMs },
 		),
-	availability: getDbWorkerAvailability,
+	availability: () => getDbWorkerAvailability("shortReads"),
 });
 
 // Try to start the server, with automatic port fallback when the default port is busy.
