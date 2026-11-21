@@ -32,6 +32,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 
 const exactRefCounts = new Map<string, { version: number; count: number }>();
 const EXACT_COUNT_CACHE_LIMIT = 256;
@@ -76,14 +77,22 @@ export async function countNarratorMessageRefs(
  */
 export async function countNarratorMessageRefsBatch(
 	narratorIds: readonly string[],
+	options: Pick<ReadQueryOptions, "signal" | "diagnosticSource"> = {},
 ): Promise<Map<string, number>> {
 	const counts = new Map<string, number>();
 	if (narratorIds.length === 0) return counts;
-	const rows = await db
-		.select({ narratorId: narratorMessageRefs.narratorId, count: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(inArray(narratorMessageRefs.narratorId, [...narratorIds]))
-		.groupBy(narratorMessageRefs.narratorId);
+	const rows = await readQuery(
+		db
+			.select({ narratorId: narratorMessageRefs.narratorId, count: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(inArray(narratorMessageRefs.narratorId, [...narratorIds]))
+			.groupBy(narratorMessageRefs.narratorId),
+		{
+			diagnosticSource: "narrators.message-count.batch",
+			...options,
+			maxRows: narratorIds.length,
+		},
+	);
 	for (const row of rows) counts.set(row.narratorId, row.count);
 	return counts;
 }
