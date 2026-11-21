@@ -34,6 +34,7 @@ import {
 } from "./subagent-label";
 import {
 	applySubagentModelSwitch,
+	markExplicitSubagentModelPin,
 	planSubagentModelSwitch,
 	type SubagentModelSwitchPlan,
 } from "./subagent-model-switch";
@@ -1239,6 +1240,7 @@ export async function sendSubagentMessageDetailed(
 			if (modelPlan && !duplicate) {
 				try {
 					await applySubagentModelSwitch(fresh.id, modelPlan);
+					markExplicitSubagentModelPin(fresh.id, modelPlan.model);
 					appliedModel = modelPlan.model;
 					modelNote =
 						` Model switched to ${appliedModel}` +

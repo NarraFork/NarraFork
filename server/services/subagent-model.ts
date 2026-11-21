@@ -18,7 +18,18 @@ import {
 	RUNTIME_SOURCE_COLUMNS,
 	type RuntimeSourceRow,
 } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_SUMMARY_MODEL,
+	getAggregation,
+	parseAggModelValue,
+	parseModelId,
+	resolveAggregation,
+	resolveEffectiveModel,
+	resolveProvider,
+	settings,
+} from "../lib/settings";
+import { activeNarrators, getNarratorRuntimeModel } from "./narrator-session-state";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 
 /**
@@ -58,20 +69,109 @@ export function resolveSubagentTypePreference(
 	return undefined;
 }
 
+/**
+ * Provider the parent narrator is (or would be) using, for preferring same-provider
+ * pool entries. Reads in-memory session state and settings only: no DB query and
+ * no aggregation round-robin advance. Order: live session provider → runtime
+ * record matching the stored model → derivation from the stored model.
+ * Returns undefined when it cannot be determined (e.g. balanced aggregation).
+ */
+export function resolveParentNarratorProvider(
+	parentId: string | null | undefined,
+	parentModel: string | null | undefined,
+): string | undefined {
+	const storedModel = parentModel?.trim() || FOLLOW_DEFAULT_MODEL;
+	if (parentId) {
+		const activeProvider = activeNarrators.get(parentId)?.provider;
+		if (activeProvider) return activeProvider;
+		const runtimeProvider = getNarratorRuntimeModel(parentId, storedModel)?.provider;
+		if (runtimeProvider) return runtimeProvider;
+	}
+	return deriveProviderFromModelReference(storedModel, new Set());
+}
+
+/** True for the bare sentinel and for an accidental `provider:<sentinel>` value. */
+function isSentinelReference(model: string, sentinel: string): boolean {
+	if (model === sentinel) return true;
+	const parsed = parseModelId(model);
+	return !!parsed.provider && parsed.model === sentinel;
+}
+
+function deriveProviderFromModelReference(model: string, seen: Set<string>): string | undefined {
+	const ref = model.trim();
+	if (!ref || ref === FOLLOW_PARENT_MODEL || seen.has(ref)) return undefined;
+	seen.add(ref);
+	// Meta references must be recognized before parseModelId, which would read
+	// `__agg__` (or a sentinel's prefix) as a provider.
+	if (isSentinelReference(ref, FOLLOW_DEFAULT_MODEL)) {
+		const configured = settings.agent.defaultModel?.trim();
+		return configured ? deriveProviderFromModelReference(configured, seen) : undefined;
+	}
+	if (isSentinelReference(ref, FOLLOW_SUMMARY_MODEL)) {
+		const configured = settings.agent.summaryModel?.trim() || FOLLOW_DEFAULT_MODEL;
+		return deriveProviderFromModelReference(configured, seen);
+	}
+	const agg = parseAggModelValue(ref);
+	if (agg) {
+		if (agg.pinnedModel) return deriveProviderFromModelReference(agg.pinnedModel, seen);
+		const config = getAggregation(agg.aggId);
+		// Balanced routing has no stable member without a runtime record.
+		if (!config || config.routingMode === "balanced") return undefined;
+		// Priority mode returns the first enabled member and keeps no routing state.
+		const first = resolveAggregation(agg.aggId);
+		return first ? deriveProviderFromModelReference(first, seen) : undefined;
+	}
+	return resolveProvider(ref);
+}
+
 /** A concrete provider:model ID — not empty, not `__default__`, not `__parent__`. */
 function hasConcreteModelId(model: string | null | undefined): boolean {
 	return Boolean(model) && model !== FOLLOW_DEFAULT_MODEL && model !== FOLLOW_PARENT_MODEL;
 }
 
-/** Only explicit pins or a successfully selected type preference stop inheritance. */
-export function subagentStoredModelReference(input: {
-	explicitModel?: string;
-	preferenceSelection?: SubagentModelSelection;
+export interface SubagentModelChoice {
+	/** Value stored on the child row: a model reference, or `__parent__` to follow live. */
+	storedModel: string;
+	/** Absent when the child follows its parent; carries the pool entry metadata otherwise. */
 	selection?: SubagentModelSelection;
-}): string {
-	return input.explicitModel || input.preferenceSelection
-		? (input.selection?.model ?? input.explicitModel ?? FOLLOW_DEFAULT_MODEL)
-		: FOLLOW_PARENT_MODEL;
+}
+
+/**
+ * The one model choice for a delegated session, shared by creation and by the
+ * re-selection at the start of a later run.
+ *
+ * - Explicit model: used as is (it must be in the pool when one exists).
+ * - Pool: the parent's current model when the pool allows it → the first entry on
+ *   the parent's provider → the first entry. The pool entry's metadata is kept.
+ * - No pool: a per-type/custom preference pins the child; otherwise it follows
+ *   the parent live (`__parent__`).
+ *
+ * Returns undefined only when a pool exists and nothing in it can be selected.
+ */
+export function selectSubagentModel(input: {
+	policy: EffectiveSubagentModelPolicy;
+	parentId?: string | null;
+	parentModel?: string | null;
+	typePreference?: string;
+	explicitModel?: string;
+}): SubagentModelChoice | undefined {
+	const { policy, explicitModel } = input;
+	if (policy.source !== "none") {
+		const parentModel = input.parentModel || FOLLOW_DEFAULT_MODEL;
+		const selection = resolveSubagentModelSelectionFromPolicy({
+			policy,
+			explicitModel,
+			candidates: parentModel === FOLLOW_PARENT_MODEL ? [] : [parentModel],
+			...(!explicitModel && {
+				preferredProvider: resolveParentNarratorProvider(input.parentId, input.parentModel),
+			}),
+		});
+		return selection ? { storedModel: selection.model, selection } : undefined;
+	}
+	const pinned = explicitModel || input.typePreference;
+	return pinned
+		? { storedModel: pinned, selection: { model: pinned } }
+		: { storedModel: FOLLOW_PARENT_MODEL };
 }
 
 /**
@@ -80,7 +180,8 @@ export function subagentStoredModelReference(input: {
  * Kept separate from `resolveSubagentModelForRun` because `resolveEffectiveModel`
  * advances balanced aggregation round-robin; display paths must not do that.
  *
- * Order is source → first pool entry. The global default is deliberately not a
+ * Order is source → first pool entry reaching the source's provider → first pool
+ * entry. The global default is deliberately not a
  * middle step: once a pool exists, a fallback must be something the pool author
  * chose, not whatever the instance default happens to be. The pool is the one
  * registered at creation (`modelPool`); without one the source's model is used as is.
@@ -150,7 +251,13 @@ export async function resolveSubagentModelInheritance(
 		explicitModel: sourceModel,
 		candidates: [],
 	});
-	const selection = followed ?? resolveSubagentModelSelectionFromPolicy({ policy, candidates: [] });
+	const selection =
+		followed ??
+		resolveSubagentModelSelectionFromPolicy({
+			policy,
+			candidates: [],
+			preferredProvider: resolveParentNarratorProvider(source.id, source.model),
+		});
 	if (!selection) {
 		throw new ValidationError(`No models are allowed for "${policy.poolKey}" subagents`);
 	}

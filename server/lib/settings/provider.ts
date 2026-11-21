@@ -756,6 +756,19 @@ export function resolveAllowedModelCandidateMatch(
 }
 
 /**
+ * List the concrete models a (possibly meta) model reference can reach, in
+ * reference order. Expansion reads settings only and never advances
+ * aggregation routing, so callers can match by provider before selecting.
+ */
+export function listConcreteModelsForReference(model: string | null | undefined): string[] {
+	const result: string[] = [];
+	for (const value of expandModelReferenceForMatching(model)) {
+		if (!isMetaModelReference(value)) result.push(value);
+	}
+	return result;
+}
+
+/**
  * Format a pool of (possibly meta) model references for human/agent display.
  *
  * Meta references are kept as their token to preserve their "follow" semantics,
