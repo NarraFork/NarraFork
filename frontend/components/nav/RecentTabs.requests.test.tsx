@@ -209,6 +209,32 @@ test("membership changes abort and replace the read before a late response can o
 	expect(runtimeRequests).toHaveLength(2);
 });
 
+test("replayed working events do not repeat a tab promotion", async () => {
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: false,
+		baseRevision: 0,
+		revision: 0,
+		operations: [],
+	});
+	await mount([tab("a")]);
+	const status = (value: "idle" | "working") =>
+		onListEvent({ type: "status_change", narratorId: "a", status: value });
+
+	await act(async () => {
+		status("working");
+		status("working"); // The first patch is still waiting for the frame.
+		frame?.(0);
+		status("working"); // The cache updated, but React has not committed yet.
+	});
+	expect(move.mock.calls).toEqual([["narrator:a", { position: "above_idle" }]]);
+
+	await act(async () => {
+		status("idle");
+		status("working");
+	});
+	expect(move).toHaveBeenCalledTimes(2);
+});
+
 test("repeated reconnects with unchanged membership queue exactly one runtime read", async () => {
 	let now = 100_000;
 	spyOn(Date, "now").mockImplementation(() => now);
