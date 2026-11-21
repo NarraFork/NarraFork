@@ -86,6 +86,7 @@ export type NarraForkEvent =
 	| { type: "narrator:fast_mode_changed"; narratorId: string }
 	| { type: "user:fast_mode_default_changed"; userId: string }
 	| { type: "narrator:execution_principal_changed"; narratorId: string }
+	| { type: "narrator:imported" }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }

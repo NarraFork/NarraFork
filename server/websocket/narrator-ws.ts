@@ -1684,6 +1684,9 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 
 // A separate hot-reload key activates this bridge in already-running development modules.
 if (hotOnce("narrafork.fastModeWs.listenersRegistered")) {
+	eventBus.on("narrator:imported", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
 	eventBus.on("narrator:fast_mode_changed", () => {
 		broadcastToAll({ type: "fast_mode_changed" });
 	});

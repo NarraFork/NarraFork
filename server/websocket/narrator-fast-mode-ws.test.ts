@@ -46,6 +46,13 @@ afterEach(() => {
 afterAll(() => mock.module("../db", () => realDbModule));
 
 describe("fast-mode WS invalidation bridge", () => {
+	test("an import refreshes authenticated viewers without exposing imported IDs", () => {
+		const child = open("viewer", false, new Set(["child-only"]));
+		const anonymous = open(undefined, true);
+		eventBus.emit({ type: "narrator:imported" });
+		expect(child.sent).toEqual([{ type: "fast_mode_changed" }]);
+		expect(anonymous.sent).toEqual([]);
+	});
 	test("a configuration edit wakes child-only and unrelated authenticated clients without leaking IDs or values", () => {
 		const child = open("viewer", false, new Set(["child-only"]));
 		const other = open("other-user");

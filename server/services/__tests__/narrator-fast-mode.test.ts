@@ -566,9 +566,9 @@ describe("fast mode cancellation and cleanup", () => {
 
 	test("reset clears facts; request count never adds event listeners; dispose is idempotent", async () => {
 		const h = harness();
-		expect(h.events.listenerCount).toBe(6);
+		expect(h.events.listenerCount).toBe(7);
 		for (let index = 0; index < 100; index++) await h.resolveNarratorFastMode("child");
-		expect(h.events.listenerCount).toBe(6);
+		expect(h.events.listenerCount).toBe(7);
 		h.reset();
 		expect(h.getCacheSizes()).toEqual({ narrators: 0, users: 0 });
 		await h.resolveNarratorFastMode("child");

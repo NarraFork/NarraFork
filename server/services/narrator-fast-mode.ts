@@ -331,6 +331,7 @@ export function createNarratorFastModeResolver(dependencies: NarratorFastModeDep
 	const onNarratorChanged = ({ narratorId }: { narratorId: string }) =>
 		narrators.invalidate(narratorId);
 	const onUserChanged = ({ userId }: { userId: string }) => users.invalidate(userId);
+	const onImported = () => narrators.clear();
 	const onNarratorDeleted = ({ narratorId }: { narratorId: string }) => {
 		narrators.invalidate(narratorId);
 		// Deleting a root also SET NULLs its children's persisted ACL-root column.
@@ -359,6 +360,7 @@ export function createNarratorFastModeResolver(dependencies: NarratorFastModeDep
 	const { events } = dependencies;
 	events.on("narrator:fast_mode_changed", onNarratorChanged);
 	events.on("narrator:execution_principal_changed", onNarratorChanged);
+	events.on("narrator:imported", onImported);
 	events.on("narrator:deleted", onNarratorDeleted);
 	events.on("user:fast_mode_default_changed", onUserChanged);
 	events.on("narrator:access_changed", onAccessChanged);
@@ -375,6 +377,7 @@ export function createNarratorFastModeResolver(dependencies: NarratorFastModeDep
 			disposed = true;
 			events.off("narrator:fast_mode_changed", onNarratorChanged);
 			events.off("narrator:execution_principal_changed", onNarratorChanged);
+			events.off("narrator:imported", onImported);
 			events.off("narrator:deleted", onNarratorDeleted);
 			events.off("user:fast_mode_default_changed", onUserChanged);
 			events.off("narrator:access_changed", onAccessChanged);
