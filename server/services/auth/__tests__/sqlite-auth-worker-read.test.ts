@@ -5,7 +5,7 @@
  * Workers disabled the reads fail instead of quietly running on the main thread.
  */
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,14 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTestDb } from "../../../../tests/setup";
 import * as schema from "../../../db/schema";
 import { userMfaBackupCodes, users, userTotp } from "../../../db/schema";
-import { resetDbWorkerPoolForTest, shutdownDbWorkerPool } from "../../../lib/db-worker/pool";
+import {
+	resetDbWorkerPoolForTest,
+	runShortReadTask,
+	setDbWorkerSpecifiersForTest,
+	shutdownDbWorkerPool,
+} from "../../../lib/db-worker/pool";
+import { logger } from "../../../lib/logger";
+import { WorkerHandle } from "../../../lib/worker-runtime/lifecycle";
 
 const home = mkdtempSync(join(tmpdir(), "narrafork-auth-worker-read-"));
 const dbFile = join(home, "auth.db");
@@ -86,6 +93,62 @@ afterAll(async () => {
 });
 
 describe("SQLite auth reads on the short-read Worker pool", () => {
+	test("session reads label short-pool queue rejection diagnostics", async () => {
+		await resetDbWorkerPoolForTest();
+		const fixture = join(home, "hanging-worker.ts");
+		writeFileSync(
+			fixture,
+			'import { parentPort } from "node:worker_threads"; parentPort.on("message", () => {}); parentPort.postMessage({type: "ready"});',
+		);
+		setDbWorkerSpecifiersForTest([fixture]);
+		const posted = Promise.withResolvers<void>();
+		const create = WorkerHandle.thread;
+		const sends: Array<() => void> = [];
+		const spawn = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
+			const handle = create(entry, options);
+			const send = handle.resource.postMessage.bind(handle.resource);
+			const post = spyOn(handle.resource, "postMessage").mockImplementation((message) => {
+				send(message);
+				if (message.type === "task") posted.resolve();
+			});
+			sends.push(() => post.mockRestore());
+			return handle;
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const controller = new AbortController();
+		const blockers: Promise<unknown>[] = [];
+		const block = () =>
+			runShortReadTask(
+				dbFile,
+				{ kind: "selectRows", sql: "SELECT 1", params: [], maxRows: 1 },
+				{ signal: controller.signal },
+			).catch((error: unknown) => error);
+		try {
+			blockers.push(block());
+			await posted.promise;
+			for (let i = 0; i < 8; i++) blockers.push(block());
+			const error = await sessions
+				.findSessionByTokenHash("token-hash-1")
+				.catch((error: unknown) => error);
+			expect(error).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
+			expect(warn.mock.calls).toContainEqual([
+				"Database read queue admission rejected",
+				expect.objectContaining({
+					source: "auth.session",
+					kind: "selectRows",
+					code: "TASK_QUEUE_FULL",
+				}),
+			]);
+		} finally {
+			controller.abort();
+			await Promise.all(blockers);
+			await resetDbWorkerPoolForTest();
+			for (const restore of sends) restore();
+			spawn.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
 	test("session store reads return the live facts", async () => {
 		expect(await sessions.findLoginCredential("worker-user")).toEqual({
 			id: userId,

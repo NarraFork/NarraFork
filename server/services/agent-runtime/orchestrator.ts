@@ -44,7 +44,6 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
-import { resolveFastModeForUser } from "../../lib/fast-mode";
 import { logger } from "../../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -139,9 +138,10 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
-	retireSubagentOutputCharCount,
+	sealSubagentOutputPass,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
+import { resolveNarratorFastMode } from "../narrator-fast-mode";
 import { deliverInjection } from "../narrator-injection";
 import { isFirstUserTurn } from "../narrator-message-count";
 import { handlePermission } from "../narrator-permission";
@@ -1565,6 +1565,16 @@ export async function runAgentLoopUnlocked(
 				// events to both the parent narrator and the subagent's own page.
 				parentToolUseId: placement?.parentToolUseId,
 				subagentModel: placement ? resolved.model : undefined,
+				subagentOutputIdentity:
+					run?.logicalRunId && deliverTo?.toolCallId && deliverTo.attempt !== undefined
+						? {
+								childNarratorId: narratorId,
+								logicalRunId: run.logicalRunId,
+								toolUseId: deliverTo.toolUseId,
+								toolCallId: deliverTo.toolCallId,
+								attempt: deliverTo.attempt,
+							}
+						: undefined,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
@@ -1956,20 +1966,8 @@ export async function runAgentLoopUnlocked(
 
 			const resolvedReasoningEffort = active.reasoningEffort ?? undefined;
 
-			// Resolved per turn, not frozen at creation: an "inherit" override follows
-			// the acting user's fastModeDefault preference, so flipping that default
-			// takes effect on existing narrators from their next turn onward.
-			const resolvedFastMode = await resolveFastModeForUser(
-				freshNarrator.fastModeOverride,
-				actingUserId,
-			);
-
 			// Restrictions come from the same strict per-pass resolution as the ceiling.
 			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
-			const resolvedServiceTier =
-				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
-					? "priority"
-					: undefined;
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
@@ -2116,7 +2114,10 @@ export async function runAgentLoopUnlocked(
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
 				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
-				serviceTier: resolvedServiceTier,
+				resolveServiceTier: async ({ provider, model, signal }) => {
+					const { effectiveFastMode } = await resolveNarratorFastMode(narratorId, { signal });
+					return effectiveFastMode && usesCodexModel(provider, model) ? "priority" : undefined;
+				},
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
 				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,
@@ -3804,7 +3805,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
-			retireSubagentOutputCharCount(narratorId);
+			if (run?.logicalRunId) sealSubagentOutputPass(narratorId, run.logicalRunId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;

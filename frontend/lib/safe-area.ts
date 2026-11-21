@@ -40,6 +40,18 @@ export const TOP_BANNER_SAFE_AREA_STYLE = {
 } satisfies CSSProperties;
 
 /**
+ * Second row of the fixed top-banner stack.
+ *
+ * `WSConnectionAlert` and `VersionUpdateBanner` own the first row and can legitimately be
+ * visible at the same time as the unattended-mode banner. A fixed second row keeps all three
+ * readable without teaching the other two about vertical offsets: 8px inset + a 56px row plus
+ * the same safe-area inset they use.
+ */
+export const TOP_BANNER_SECOND_ROW_STYLE = {
+	top: `calc(64px + ${SAFE_AREA_INSET_TOP})`,
+} satisfies CSSProperties;
+
+/**
  * The Navbar is the one layer that still names the viewport, because it cannot
  * derive from the shell.
  *

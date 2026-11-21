@@ -24,7 +24,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
 	narratorBlocks,
@@ -3480,14 +3480,19 @@ const sqliteNarratorPersistence = {
 	 */
 	async updateFastModeOverride(narratorId: string, fastModeOverride: BooleanOverride) {
 		const now = new Date().toISOString();
-		await db
+		const write = db
 			.update(narrators)
 			.set({
 				fastModeOverride,
 				fastMode: legacyFastModeMirror(fastModeOverride),
 				updatedAt: now,
 			})
-			.where(eq(narrators.id, narratorId));
+			.where(eq(narrators.id, narratorId))
+			.returning({ id: narrators.id });
+		// SQLite commits synchronously: notify in the same stack, not after an await
+		// that could let another request freeze a previously cached value.
+		const updated = activeDatabaseBackend === "sqlite" ? write.all() : await write;
+		if (updated.length > 0) eventBus.emit({ type: "narrator:fast_mode_changed", narratorId });
 	},
 
 	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean): Promise<boolean> {

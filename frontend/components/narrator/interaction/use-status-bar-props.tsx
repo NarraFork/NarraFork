@@ -63,6 +63,9 @@ export interface UseStatusBarPropsOptions {
 
 	// fast mode
 	narratorFastModeOverride: "inherit" | "on" | "off" | null | undefined;
+	effectiveFastMode: boolean | undefined;
+	fastModeSource: string | undefined;
+	isSubagent: boolean;
 	fastModeDefault: boolean;
 	fastModeUsesTapSettings: boolean;
 	fastModeMutation: Mutate<{ id: string; fastModeOverride: "inherit" | "on" | "off" }>;
@@ -122,6 +125,9 @@ export function useStatusBarProps(
 	const { renderFastModeControl } = useFastModeControl({
 		narratorId: options.narratorId,
 		narratorFastModeOverride: options.narratorFastModeOverride,
+		effectiveFastMode: options.effectiveFastMode,
+		fastModeSource: options.fastModeSource,
+		isSubagent: options.isSubagent,
 		fastModeDefault: options.fastModeDefault,
 		fastModeUsesTapSettings: options.fastModeUsesTapSettings,
 		fastModeMutation: options.fastModeMutation,

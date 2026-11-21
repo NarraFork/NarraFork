@@ -41,6 +41,7 @@ function deferred<T = void>() {
 	return { promise, resolve };
 }
 let dir: string;
+let previousSqlDiagnostics: string | undefined;
 let handles: WorkerHandle<Worker>[];
 let restores: Array<() => void>;
 let posted: Array<{ type?: string; requestId?: string; traceParent?: string }>;
@@ -79,6 +80,8 @@ function gateWorkerTermination(handle: WorkerHandle<Worker> | undefined) {
 	return { stopping: stopping.promise, release: gate.resolve };
 }
 beforeEach(async () => {
+	previousSqlDiagnostics = process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+	delete process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
 	await resetDbWorkerPoolForTest();
 	dir = mkdtempSync(join(tmpdir(), "nf-db-lifecycle-"));
 	handles = [];
@@ -111,6 +114,8 @@ afterEach(async () => {
 	for (const restore of restores.reverse()) restore();
 	delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	delete process.env.NARRAFORK_DB_WORKER;
+	if (previousSqlDiagnostics === undefined) delete process.env.NF_DB_WORKER_SQL_DIAGNOSTICS;
+	else process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = previousSqlDiagnostics;
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -479,6 +484,50 @@ test("maintenance blocks short reads until the active owner exits and the pool r
 	setDbWorkerSpecifiersForTest(null);
 	expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
 	expect(handles).toHaveLength(2);
+});
+
+test("SQL close diagnostics keep the last request and wait for native exit confirmation", async () => {
+	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+	fixture(success);
+	expect(await runReadTask(unusedDb, task, { diagnosticSource: "auth.session" })).toBe(42);
+	const gate = deferred();
+	const stopping = deferred();
+	const worker = handles[0]?.resource;
+	if (!worker) throw new Error("Expected owned worker");
+	const terminate = worker.terminate.bind(worker);
+	spyOn(worker, "terminate").mockImplementation(async () => {
+		stopping.resolve();
+		await gate.promise;
+		return terminate();
+	});
+	const closing = shutdownDbWorkerPool();
+	await stopping.promise;
+	const logs = logger.warn as ReturnType<typeof spyOn<typeof logger, "warn">>;
+	const sqlLogs = () =>
+		logs.mock.calls
+			.filter(([message]) => message === "Database read worker SQL diagnostic")
+			.map(([, fields]) => fields);
+	const start = sqlLogs().find((record) => record?.phase === "close-start");
+	try {
+		expect(start).toMatchObject({
+			source: "auth.session",
+			kind: "storageScanContext",
+			requestId: posted.find((message) => message.type === "task")?.requestId,
+			sql: { state: "settled" },
+		});
+		expect(sqlLogs().some((record) => record?.phase === "close-complete")).toBe(false);
+		expect(getDbWorkerPoolStats().workers).toBe(1);
+	} finally {
+		gate.resolve();
+	}
+	await closing;
+	const complete = sqlLogs().find((record) => record?.phase === "close-complete");
+	expect(complete).toMatchObject({
+		requestId: start?.requestId,
+		source: "auth.session",
+		closeDurationMs: expect.any(Number),
+	});
+	expect(getDbWorkerPoolStats().workers).toBe(0);
 });
 
 test("maintenance pause blocks both profiles until explicit resume", async () => {

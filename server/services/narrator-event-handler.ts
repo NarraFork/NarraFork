@@ -10,6 +10,7 @@ import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -48,6 +49,7 @@ import { saveUploadedImage } from "../lib/uploads";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
+import { getRunControl } from "./agent-runtime/ownership";
 import { FileReferenceContextTracker } from "./file-reference-context";
 import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
@@ -380,6 +382,8 @@ export interface EventHandlerContext {
 	// --- Subagent-specific ---
 	/** Parent tool_use ID that spawned this subagent */
 	parentToolUseId?: string;
+	/** Frozen logical run and exact destination attempt, checked against the live owner. */
+	subagentOutputIdentity?: Omit<SubagentOutputCount, "count" | "active">;
 	/** Subagent's resolved model name (attached to broadcast messages) */
 	subagentModel?: string;
 
@@ -600,6 +604,7 @@ export interface EventHooks {
 
 export interface ToolChunkSnapshot {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
@@ -822,174 +827,228 @@ export function clearStreamingSnapshot(narratorId: string): void {
 }
 
 // === Subagent live output char count ===
-//
-// A running subagent's reply text is invisible on the parent's page beyond the
-// "recent calls" rows: the Agent card shows nothing growing while the child
-// writes. This counter folds every `stream_text` delta into a cumulative total
-// and republishes it to the parent's tool card over the existing `tool_output`
-// channel, reusing ContextAsk's bare-count convention — a numeric
-// `_streamingOutput` renders as "N chars", never as a markdown body of digits.
-//
-// Semantics: the count is the child's reply text across its WHOLE run (every
-// agentic iteration, not just the current one), reasoning excluded — the badge
-// answers "how much has it written", not "how much is on screen".
-//
-// Lifecycle: the counter accumulates across a run's iterations (each
-// `assistant_message` resets only the streaming SNAPSHOT, never this total),
-// resets on a discarded attempt / dead-turn reset (the streamed text is
-// retracted and replayed, so the count starts over with it), and retires at
-// the run's end — `retireSubagentOutputCharCount` is called from the
-// orchestrator's loop finalizer and the narrator-disposal paths, NOT from
-// `clearStreamingSnapshot` (which also fires per iteration via
-// `clearAuthorStreamingSnapshot`).
-//
-// Delivery is gated on the parent's snapshot still tracking the target tool:
-// once the Agent/Await call completes and its turn persists, the chunk is gone
-// and there is no card left to tick, so the broadcast is skipped while the
-// count itself keeps accumulating — a card that (re)appears later (a fresh
-// Await on the same child) resumes from the true total rather than zero.
-
-/** Minimum interval between subagent output-count broadcasts (ms). */
+// The logical run owns this state, independently of parent/child message streams.
+// Only reply-body spans are retained: no reply text, tool input or durable history.
 const SUBAGENT_OUTPUT_COUNT_EMIT_MS = 250;
 
 interface SubagentOutputCharCounter {
-	/** Where the Agent card lives — the subagent's direct parent. */
 	parentNarratorId: string;
-	/** The parent's Agent tool_use this subagent belongs to. */
-	parentToolUseId: string;
-	/**
-	 * Per-block accumulated span (start offset + length), never the text itself:
-	 * a run-long copy of every reply would grow unboundedly for a verbose child.
-	 * The overlap math mirrors appendRawStreamText on lengths alone.
-	 */
-	blocks: Map<string, { start: number; length: number }>;
+	identity: Omit<SubagentOutputCount, "count" | "active">;
+	/** Provider request identity, distinct from the parent's persisted tool execution attempt. */
+	blocks: Map<string, { start: number; length: number; requestId?: string }>;
 	totalChars: number;
 	lastEmitAt: number;
 	timer?: ReturnType<typeof setTimeout>;
 }
 
 const subagentOutputCharCounters = hotSafe<Map<string, SubagentOutputCharCounter>>(
-	"narrafork.subagentOutputCharCounters",
+	"narrafork.subagentOutputCharCounters.v2",
+	() => new Map(),
+);
+// An index into the authoritative counters, not a second store of their totals.
+const subagentOutputTargets = hotSafe<Map<string, Set<string>>>(
+	"narrafork.subagentOutputTargets",
 	() => new Map(),
 );
 
-/** Push the current count to every card still showing it. */
-function emitSubagentOutputCharCount(counter: SubagentOutputCharCounter): void {
+function isCurrentSubagentOutputCounter(counter: SubagentOutputCharCounter): boolean {
+	const { identity } = counter;
+	const run = getRunControl(identity.childNarratorId);
+	return (
+		subagentOutputCharCounters.get(identity.childNarratorId) === counter &&
+		run?.logicalRunId === identity.logicalRunId &&
+		!run.cancel.signal.aborted &&
+		run.deliverTo?.narratorId === counter.parentNarratorId &&
+		run.deliverTo.toolUseId === identity.toolUseId &&
+		run.deliverTo.toolCallId === identity.toolCallId &&
+		run.deliverTo.attempt === identity.attempt
+	);
+}
+
+function projectSubagentOutputCount(
+	counter: SubagentOutputCharCounter,
+	active: boolean,
+): SubagentOutputCount {
+	return { ...counter.identity, count: counter.totalChars, active };
+}
+
+/** Push Agent counts without requiring a transient parent tool chunk. */
+function emitSubagentOutputCharCount(counter: SubagentOutputCharCounter, active = true): void {
+	if (active && !isCurrentSubagentOutputCounter(counter)) return;
 	counter.lastEmitAt = Date.now();
-	const payload = String(counter.totalChars);
-	// Watch registrations have already returned; only the spawning card is live.
-	const targets = [{ narratorId: counter.parentNarratorId, toolUseId: counter.parentToolUseId }];
-	for (const target of targets) {
-		const chunk = streamingSnapshots.get(target.narratorId)?.toolChunks.get(target.toolUseId);
-		// No chunk → the call completed and its turn persisted; nobody is showing
-		// this card, so skip the broadcast but keep counting (see the header note).
-		if (!chunk) continue;
-		// Keep the snapshot current so a reconnecting client restores the count.
-		chunk.streamingOutput = payload;
-		broadcastToNarrator(target.narratorId, {
-			type: "tool_output",
-			narratorId: target.narratorId,
-			toolUseId: target.toolUseId,
-			output: payload,
-		});
-	}
+	const output = String(counter.totalChars);
+	broadcastToNarrator(counter.parentNarratorId, {
+		type: "tool_output",
+		narratorId: counter.parentNarratorId,
+		toolUseId: counter.identity.toolUseId,
+		output,
+		subagentOutputCount: projectSubagentOutputCount(counter, active),
+	});
+	// Watch registrations return immediately; live output belongs to the spawning Agent card.
 }
 
-/**
- * Retire a subagent's output counter at the END of its run: flush the final
- * total so the parent card lands on it, then drop the entry.
- *
- * Called from the orchestrator's loop finalizer and the narrator-disposal
- * paths — deliberately NOT from `clearStreamingSnapshot`, which also fires per
- * agentic iteration (via `clearAuthorStreamingSnapshot`) and would make the
- * badge restart from zero between a child's turns.
- */
-export function retireSubagentOutputCharCount(narratorId: string): void {
-	const counter = subagentOutputCharCounters.get(narratorId);
-	if (!counter) return;
-	if (counter.timer) clearTimeout(counter.timer);
+/** Register the live owner's exact Agent destination before its first text (zero included). */
+export function startSubagentOutputCharCount(narratorId: string, logicalRunId: string): void {
+	const run = getRunControl(narratorId);
+	if (run?.logicalRunId !== logicalRunId || run.cancel.signal.aborted) return;
+	const deliverTo = run.deliverTo;
+	if (!deliverTo) return;
+	const parsed = parseSubagentOutputCount({
+		childNarratorId: narratorId,
+		logicalRunId,
+		toolUseId: deliverTo.toolUseId,
+		toolCallId: deliverTo.toolCallId,
+		attempt: deliverTo.attempt,
+		count: 0,
+		active: true,
+	});
+	if (!parsed) return;
+	const previous = subagentOutputCharCounters.get(narratorId);
+	if (previous) {
+		if (isCurrentSubagentOutputCounter(previous)) return;
+		retireSubagentOutputCharCount(narratorId, previous.identity.logicalRunId);
+	}
+	const { count: _count, active: _active, ...identity } = parsed;
+	const counter: SubagentOutputCharCounter = {
+		parentNarratorId: deliverTo.narratorId,
+		identity,
+		blocks: new Map(),
+		totalChars: 0,
+		lastEmitAt: 0,
+	};
+	subagentOutputCharCounters.set(narratorId, counter);
+	let targets = subagentOutputTargets.get(deliverTo.narratorId);
+	if (!targets) {
+		targets = new Set();
+		subagentOutputTargets.set(deliverTo.narratorId, targets);
+	}
+	targets.add(narratorId);
 	emitSubagentOutputCharCount(counter);
-	subagentOutputCharCounters.delete(narratorId);
+	// Let the first body delta be immediate, independently of the initial zero.
+	counter.lastEmitAt = 0;
 }
 
-/**
- * Reset the running total when the child's in-flight text is retracted (a
- * discarded attempt / dead-turn reset): the replayed stream restarts the count
- * with it. The counter itself survives — the run continues.
- */
-function resetSubagentOutputCharCount(narratorId: string): void {
+/** Only the matching logical run's terminal finalizer (or explicit close) may retire it. */
+export function retireSubagentOutputCharCount(narratorId: string, logicalRunId: string): void {
 	const counter = subagentOutputCharCounters.get(narratorId);
-	if (!counter) return;
-	if (counter.timer) {
-		clearTimeout(counter.timer);
-		counter.timer = undefined;
-	}
-	counter.blocks.clear();
-	counter.totalChars = 0;
+	if (!counter || counter.identity.logicalRunId !== logicalRunId) return;
+	if (counter.timer) clearTimeout(counter.timer);
+	counter.timer = undefined;
+	subagentOutputCharCounters.delete(narratorId);
+	const targets = subagentOutputTargets.get(counter.parentNarratorId);
+	targets?.delete(narratorId);
+	if (targets?.size === 0) subagentOutputTargets.delete(counter.parentNarratorId);
+	emitSubagentOutputCharCount(counter, false);
 }
 
-/**
- * Fold one subagent text delta into the running count (throttled broadcast).
- *
- * Keyed by the subagent's narrator id, which a nested subagent correctly maps
- * to its own direct parent: each level's Agent card counts only its own child's
- * reply text.
- */
+/** Bounded by this destination's live runs; never reads transcript bodies or the database. */
+export function getSubagentOutputCounts(narratorId: string): SubagentOutputCount[] {
+	const counts: SubagentOutputCount[] = [];
+	for (const childId of subagentOutputTargets.get(narratorId) ?? []) {
+		const counter = subagentOutputCharCounters.get(childId);
+		if (!counter) continue;
+		if (!isCurrentSubagentOutputCounter(counter)) {
+			retireSubagentOutputCharCount(childId, counter.identity.logicalRunId);
+			continue;
+		}
+		counts.push(projectSubagentOutputCount(counter, true));
+	}
+	return counts;
+}
+
+function subagentOutputCounterForContext(
+	ctx: EventHandlerContext,
+): SubagentOutputCharCounter | undefined {
+	const identity = ctx.subagentOutputIdentity;
+	const counter = subagentOutputCharCounters.get(ctx.narratorId);
+	if (
+		!identity ||
+		!counter ||
+		!isCurrentSubagentOutputCounter(counter) ||
+		ctx.broadcastTargetId !== counter.parentNarratorId ||
+		ctx.parentToolUseId !== identity.toolUseId ||
+		identity.childNarratorId !== ctx.narratorId ||
+		identity.logicalRunId !== counter.identity.logicalRunId ||
+		identity.toolUseId !== counter.identity.toolUseId ||
+		identity.toolCallId !== counter.identity.toolCallId ||
+		identity.attempt !== counter.identity.attempt
+	)
+		return undefined;
+	return counter;
+}
+
+/** A persisted response makes this request's contribution irreversible; retain only its total. */
+function sealSubagentOutputAttempt(ctx: EventHandlerContext): void {
+	const counter = subagentOutputCounterForContext(ctx);
+	if (!counter) return;
+	for (const [key, span] of counter.blocks) {
+		if (span.requestId === ctx.currentAttemptId) counter.blocks.delete(key);
+	}
+}
+
+/** A closed model pass cannot replay its provider requests; keep its accumulated number only. */
+export function sealSubagentOutputPass(narratorId: string, logicalRunId: string): void {
+	const counter = subagentOutputCharCounters.get(narratorId);
+	if (counter?.identity.logicalRunId !== logicalRunId || !isCurrentSubagentOutputCounter(counter))
+		return;
+	counter.blocks.clear();
+}
+
+/** Retract only body spans owned by the discarded provider request, preserving prior passes. */
+function retractSubagentOutputAttempt(ctx: EventHandlerContext, requestId?: string): void {
+	const counter = subagentOutputCounterForContext(ctx);
+	// Display-only adapters without a provider request cannot identify retractable text.
+	if (!counter || !requestId) return;
+	let removed = 0;
+	for (const [key, span] of counter.blocks) {
+		if (span.requestId !== requestId) continue;
+		removed += span.length;
+		counter.blocks.delete(key);
+	}
+	if (removed === 0) return;
+	if (counter.timer) clearTimeout(counter.timer);
+	counter.timer = undefined;
+	counter.totalChars -= removed;
+	emitSubagentOutputCharCount(counter);
+}
+
+/** Reply body length across every pass of this run, with span-only replay deduplication. */
 function noteSubagentOutputText(
 	ctx: EventHandlerContext,
 	blockKey: string,
 	text: string,
 	textOffset: number,
 ): void {
-	if (!ctx.parentToolUseId || !text) return;
-	const key = ctx.narratorId;
-	let counter = subagentOutputCharCounters.get(key);
-	if (!counter) {
-		counter = {
-			parentNarratorId: ctx.broadcastTargetId,
-			parentToolUseId: ctx.parentToolUseId,
-			blocks: new Map(),
-			totalChars: 0,
-			lastEmitAt: 0,
-		};
-		subagentOutputCharCounters.set(key, counter);
-	}
-	// The snapshot's append rule, on spans alone so no text is retained: a
-	// replayed/overlapping prefix (a resume) must not double-count.
-	const previous = counter.blocks.get(blockKey);
-	let span: { start: number; length: number };
+	if (!text) return;
+	const counter = subagentOutputCounterForContext(ctx);
+	if (!counter) return;
+	const requestId = ctx.currentAttemptId;
+	const countBlockKey = JSON.stringify([requestId ?? null, blockKey]);
+	const previous = counter.blocks.get(countBlockKey);
 	const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
-	if (!previous || textOffset > previousEnd || textOffset < previous.start) {
-		// A gap/missing prefix cannot be invented — the delta becomes the span.
-		span = { start: textOffset, length: text.length };
-	} else {
-		// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
-		// max keeps the old end), one extending past it grows by exactly the
-		// non-overlapping tail — the length-only form of appendRawStreamText.
-		span = {
-			start: previous.start,
-			length: Math.max(previousEnd, textOffset + text.length) - previous.start,
-		};
-	}
-	counter.blocks.set(blockKey, span);
-	let total = 0;
-	for (const block of counter.blocks.values()) total += block.length;
-	if (total === counter.totalChars) return;
-	counter.totalChars = total;
+	const span =
+		!previous || textOffset > previousEnd || textOffset < previous.start
+			? { start: textOffset, length: text.length }
+			: {
+					start: previous.start,
+					length: Math.max(previousEnd, textOffset + text.length) - previous.start,
+				};
+	counter.blocks.set(countBlockKey, { ...span, requestId });
+	const delta = span.length - (previous?.length ?? 0);
+	if (delta === 0) return;
+	counter.totalChars += delta;
 
 	const elapsed = Date.now() - counter.lastEmitAt;
 	if (elapsed >= SUBAGENT_OUTPUT_COUNT_EMIT_MS) {
-		if (counter.timer) {
-			clearTimeout(counter.timer);
-			counter.timer = undefined;
-		}
+		if (counter.timer) clearTimeout(counter.timer);
+		counter.timer = undefined;
 		emitSubagentOutputCharCount(counter);
 	} else if (!counter.timer) {
 		counter.timer = setTimeout(() => {
 			counter.timer = undefined;
-			// The entry may have retired while this timer was pending.
-			const live = subagentOutputCharCounters.get(key);
-			if (live) emitSubagentOutputCharCount(live);
+			// Both the exact counter object and live owner binding must still match.
+			// An old timer never emits the replacement counter's total.
+			emitSubagentOutputCharCount(counter);
 		}, SUBAGENT_OUTPUT_COUNT_EMIT_MS - elapsed);
 	}
 }
@@ -1108,8 +1167,10 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 }
 
 function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
+	const receipt = ctx.toolExecutionReceipts?.get(toolUseId)?.binding;
 	return {
-		toolCallId: ctx.toolCallIdsMap?.get(toolUseId) ?? null,
+		toolCallId: receipt?.toolCallId ?? ctx.toolCallIdsMap?.get(toolUseId) ?? null,
+		...(receipt ? { executionAttempt: receipt.attempt } : {}),
 		...(ctx.parentToolUseId
 			? {
 					parentToolUseId: ctx.parentToolUseId,
@@ -1295,9 +1356,8 @@ async function discardAttemptPersistedBlocks(
 	// retire them. Done regardless of whether a partial row exists: the streaming
 	// blocks are client state and are not conditional on persistence.
 	clearAuthorStreamingSnapshot(ctx);
-	// The retracted text no longer counts toward the child's live output total;
-	// the replay restarts it.
-	resetSubagentOutputCharCount(narratorId);
+	// Retract this provider request only; successful earlier passes still count.
+	retractSubagentOutputAttempt(ctx, requestId);
 	ctx.fileReferenceContexts?.clear();
 	ctx.committedContentSnapshots?.clear();
 	ctx.unpublishedContentBlockIds?.clear();
@@ -2536,6 +2596,7 @@ export async function processEvent(
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
 			clearAuthorStreamingSnapshot(ctx);
+			if (event.outputCompleted !== false) sealSubagentOutputAttempt(ctx);
 			ctx.attemptBlockBaselines?.clear();
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
@@ -3009,7 +3070,7 @@ export async function processEvent(
 			// tell the frontend to drop the streaming blocks it is currently showing.
 			clearAuthorStreamingSnapshot(ctx);
 			// The discarded turn's text stops counting toward the child's output total.
-			resetSubagentOutputCharCount(narratorId);
+			retractSubagentOutputAttempt(ctx, ctx.currentAttemptId);
 			ctx.fileReferenceContexts?.clear();
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();

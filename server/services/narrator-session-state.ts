@@ -8,6 +8,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import type { ImageRef } from "../lib/uploads";
 import { createRuntimeMapView, executionAdmissions } from "./agent-runtime/ownership";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
@@ -797,6 +798,30 @@ export function isNarratorRuntimeBusy(narratorId: string): boolean {
 	return false;
 }
 
+/**
+ * Every narrator that currently holds runtime work, from every authority that can hold it.
+ *
+ * `isNarratorRuntimeBusy` answers the question for ONE id, but callers that must decide "is
+ * anything running at all" cannot enumerate `activeNarrators` alone: permissions, danger
+ * reflections, loop-less runtime claims and admission leases all keep a narrator busy without
+ * a session entry. This is the exhaustive counterpart, and it stays here because this module
+ * owns all of those maps.
+ */
+export function listRuntimeBusyNarratorIds(): string[] {
+	const ids = new Set<string>(activeNarrators.keys());
+	// Loop-less parent-side work: the claim map has no per-narrator view of its own.
+	for (const narratorId of narratorRuntimeClaims.keys()) ids.add(narratorId);
+	for (const pending of pendingPermissions.values()) ids.add(pending.narratorId);
+	for (const pause of pendingDangerReflections.values()) ids.add(pause.narratorId);
+	for (const [rootId, claims] of admissionWork) {
+		ids.add(rootId);
+		for (const work of claims) ids.add(work.narratorId);
+	}
+	return [...ids].filter(
+		(narratorId) => isNarratorRuntimeBusy(narratorId) || hasNarratorAdmissionWork(narratorId),
+	);
+}
+
 /** Deprecated read-only view; the mailbox is the sole queue authority. */
 export const bufferedMessages = {
 	get(narratorId: string): BufferedMessage[] | undefined {
@@ -1022,6 +1047,11 @@ export function withNarratorWorkAdmission<T>(
 		const live = [...(admissionContext.getStore()?.work.values() ?? [])].filter(
 			(work) => work.live,
 		);
+		if (isUnattendedShutdownFenced() && live.length === 0) {
+			return Promise.reject(
+				new AppError("Server is checking shutdown readiness", 503, "SERVER_SHUTTING_DOWN"),
+			);
+		}
 		// A root gate covers the whole team; a subagent gate covers only that subagent,
 		// so its parent and siblings keep running while it is reverted.
 		for (const key of new Set([rootId, narratorId])) {

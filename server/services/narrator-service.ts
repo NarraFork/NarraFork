@@ -2041,8 +2041,8 @@ export const narratorService = {
 						systemPrompt: input.systemPrompt ?? null,
 						permissionMode: resolvedPermMode,
 						reasoningEffort: resolvedReasoningEffort,
-						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-						fastMode: legacyFastModeMirror(parent.fastModeOverride),
+						fastModeOverride: "inherit",
+						fastMode: legacyFastModeMirror("inherit"),
 						relaxedPlan: resolvedRelaxedPlan,
 						planReflectionAutoApproveOverride:
 							input.planReflectionAutoApproveOverride ??

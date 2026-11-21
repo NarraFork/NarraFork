@@ -11,6 +11,7 @@ import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
 import { useChatUnreadLive } from "../hooks/useChat";
+import { useFastModeUpdates } from "../hooks/useFastModeUpdates";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
@@ -63,6 +64,7 @@ import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
 import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
+import { UnattendedModeBanner } from "./UnattendedModeBanner";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
@@ -141,6 +143,7 @@ export function AuthenticatedLayout() {
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, fetchStatus, hasToken, sessionLost } = useAuthenticatedSession();
+	useFastModeUpdates(!!user);
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
@@ -538,6 +541,12 @@ export function AuthenticatedLayout() {
 				 */}
 				<WSConnectionAlert />
 				<VersionUpdateBanner />
+				{/*
+				 * Last sibling on purpose: this is the kill switch for unattended mode, so it
+				 * must win both paint order and the WCO no-drag rect collection (see the note
+				 * above) when another banner happens to be visible at the same time.
+				 */}
+				<UnattendedModeBanner />
 			</AppShellWithNavWidth>
 		</MobileNavContext.Provider>
 	);
