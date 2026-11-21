@@ -28,7 +28,7 @@ const RESUME_DESCRIPTION =
 	"It cannot override a stop the user made.";
 
 const MODEL_DESCRIPTION =
-	"Direct child subagents only: switch each target's model before delivering this message " +
+	"Direct child subagents only: switch each target's model when this Send is newly accepted " +
 	'(use "parent" to follow your own model again). Subject to the same allowed subagent model ' +
 	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
 	"resume=true to retry a subagent that failed on its previous model.";

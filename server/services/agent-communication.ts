@@ -69,7 +69,7 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	 * messages alone never restart such a session; this is the one-call opt-in.
 	 */
 	resume?: boolean;
-	/** Switch each direct child's model before delivery (`"parent"` follows the delegator again). */
+	/** Switch each direct child's model for a newly accepted Send (`"parent"` follows the delegator). */
 	model?: string;
 	toolUseId: string;
 	signal: AbortSignal;
@@ -1198,14 +1198,6 @@ export async function sendSubagentMessageDetailed(
 				: "";
 			const interruptTarget = input.doInterrupt && !takenOver;
 			const running = fresh.status === "working" || fresh.status === "waiting";
-			const modelPlan = modelPlans.get(fresh.id);
-			let modelNote = "";
-			if (modelPlan) {
-				await applySubagentModelSwitch(fresh.id, modelPlan);
-				modelNote =
-					` Model switched to ${modelPlan.model}` +
-					(running ? " (applies from its next model request)." : ".");
-			}
 
 			// Prefix sibling/child-bound messages with a sender label so the recipient
 			// can tell who sent it (user-typed page messages bypass this path entirely).
@@ -1231,30 +1223,49 @@ export async function sendSubagentMessageDetailed(
 				input.toolCallBinding,
 				input.showToUser ?? false,
 			);
-			let deliveryMessageId = delivery.recipientMessageId;
+			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
+				createdBy: input.userId ?? null,
+				...(!running && { userId: input.userId ?? null }),
+			});
+			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
+				throw new Error(
+					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
+				);
+			const deliveryMessageId = delivery.recipientMessageId;
+			const duplicate = accepted.status === "duplicate";
+			const modelPlan = modelPlans.get(fresh.id);
+			let appliedModel: string | undefined;
+			let modelNote = "";
+			if (modelPlan && !duplicate) {
+				try {
+					await applySubagentModelSwitch(fresh.id, modelPlan);
+					appliedModel = modelPlan.model;
+					modelNote =
+						` Model switched to ${appliedModel}` +
+						(running ? " (applies from its next model request)." : ".");
+				} catch (error) {
+					// The message is already queued; still wake the recipient and report the switch separately.
+					modelNote = " Could not complete the model switch.";
+					logger.warn("Accepted Send model switch failed", {
+						narratorId: fresh.id,
+						error: String(error),
+					});
+				}
+			}
 
 			if (running) {
-				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
-					createdBy: input.userId ?? null,
-				});
-				if (enqueued.delivery.state === "cancelled" || enqueued.delivery.state === "failed")
-					throw new Error(
-						`Previous delivery is ${enqueued.delivery.state}; explicit retry is required`,
-					);
-				const buffered = { duplicate: enqueued.status === "duplicate" };
 				// The run may have ended while this was being queued; the ordinary wake
 				// rechecks ownership, so a still-live run simply adopts it at its boundary.
-				if (!buffered.duplicate)
+				if (!duplicate)
 					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
 						logger.warn("Queued Send wake deferred", {
 							narratorId: fresh.id,
 							error: String(error),
 						}),
 					);
-				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = modelNote + takeoverNote;
+				let interruptNote = takeoverNote;
 				let interrupted: boolean | undefined;
-				if (interruptTarget && !buffered.duplicate) {
+				if (interruptTarget && !duplicate) {
 					interrupted = await controlRun(fresh.id, { kind: "stop" });
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
@@ -1262,7 +1273,7 @@ export async function sendSubagentMessageDetailed(
 				} else if (input.doInterrupt && takenOver) {
 					interruptNote += " doInterrupt was ignored because the user is driving this subagent.";
 				}
-				sections.push(`Sent to ${label}; message queued.${interruptNote}`);
+				sections.push(`Sent to ${label}; message queued.${modelNote}${interruptNote}`);
 				targetResults.push({
 					id: fresh.id,
 					label,
@@ -1270,22 +1281,13 @@ export async function sendSubagentMessageDetailed(
 					status: "queued",
 					deliveryMessageId,
 					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
-					...(modelPlan && { model: modelPlan.model }),
+					...(appliedModel && { model: appliedModel }),
 					interrupted,
 				});
 				notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 				continue;
 			}
 
-			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
-				createdBy: input.userId ?? null,
-				userId: input.userId ?? null,
-			});
-			deliveryMessageId = delivery.recipientMessageId;
-			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
-				throw new Error(
-					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
-				);
 			// Agent messages never restart a failed or user-stopped session by themselves;
 			// `resume` is the explicit opt-in, and only for a failure (the user's stop stands).
 			const stopped = takenOver ? null : blockingStopReason(fresh.lastStopReason);
@@ -1328,7 +1330,7 @@ export async function sendSubagentMessageDetailed(
 				title: fresh.title,
 				status: blockedReason ? "blocked" : wakeFailed ? "queued" : "started",
 				...(blockedReason && { blockedReason }),
-				...(modelPlan && { model: modelPlan.model }),
+				...(appliedModel && { model: appliedModel }),
 				...(resumeRequested && !wakeFailed && { resumed: true }),
 				deliveryMessageId,
 				...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
