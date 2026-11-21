@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { db, sqlite } from "../../db";
 import { narrators, projects, users } from "../../db/schema";
+import * as pool from "../../lib/db-worker/pool";
 import { narratorService } from "../../services/narrator-service";
 import { narratorRoutes } from "../narrators";
 
@@ -72,16 +73,19 @@ test("flat, grouped and named lists omit runtime registration from SQL and respo
 	});
 	app.route("/narrators", narratorRoutes);
 	const prepare = spyOn(sqlite, "prepare");
+	const dispatch = spyOn(pool, "runReadTask");
 	function expectSafeProjection() {
-		const queries = prepare.mock.calls
-			.map(([statement]) => statement)
-			.filter((statement) => /\b(?:from|join) "narrators"/i.test(statement));
+		const queries = [
+			...prepare.mock.calls.map(([statement]) => statement),
+			...dispatch.mock.calls.flatMap(([, task]) => (task.kind === "selectRows" ? [task.sql] : [])),
+		].filter((statement) => /\b(?:from|join) "narrators"/i.test(statement));
 		expect(queries.length).toBeGreaterThan(0);
 		for (const query of queries) {
 			expect(query).not.toContain("runtime_registration_json");
 			expect(query).not.toMatch(/^select (?:\*|"[^"]+"\.\*)/i);
 		}
 		prepare.mockClear();
+		dispatch.mockClear();
 	}
 	try {
 		for (const suffix of ["", "?projectId=list-project", "?groupAskInPassing=true", "/named"]) {
@@ -107,5 +111,6 @@ test("flat, grouped and named lists omit runtime registration from SQL and respo
 		expectSafeProjection();
 	} finally {
 		prepare.mockRestore();
+		dispatch.mockRestore();
 	}
 });

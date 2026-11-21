@@ -66,6 +66,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
@@ -1281,6 +1282,7 @@ async function askInPassingChildrenByParent(
 	parentIds: string[],
 	principal: NarratorPrincipal,
 	archived: boolean,
+	signal: AbortSignal,
 ) {
 	const byParent = new Map<
 		string,
@@ -1288,15 +1290,22 @@ async function askInPassingChildrenByParent(
 	>();
 	if (!parentIds.length) return byParent;
 	const host = aliasedTable(narrators, "ask_host");
-	const rows = await db
-		.select({ ...narratorListColumns, hostId: host.id })
-		.from(host)
-		.innerJoin(
-			narrators,
-			inArray(narrators.id, rankedAskInPassingChildren(host.id, principal, archived)),
-		)
-		.where(inArray(host.id, parentIds))
-		.orderBy(desc(narrators.updatedAt), desc(narrators.id));
+	const rows = await readQuery(
+		db
+			.select({ ...narratorListColumns, hostId: host.id })
+			.from(host)
+			.innerJoin(
+				narrators,
+				inArray(narrators.id, rankedAskInPassingChildren(host.id, principal, archived)),
+			)
+			.where(inArray(host.id, parentIds))
+			.orderBy(desc(narrators.updatedAt), desc(narrators.id)),
+		{
+			signal,
+			diagnosticSource: "narrators.list.ask-in-passing",
+			maxRows: parentIds.length * ASK_IN_PASSING_CHILD_ROWS_PER_PARENT,
+		},
+	);
 	for (const { hostId, ...row } of rows) {
 		const siblings = byParent.get(hostId);
 		if (siblings) siblings.push(row);
@@ -1307,6 +1316,7 @@ async function askInPassingChildrenByParent(
 
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
+	const readOptions = { signal: c.req.raw.signal };
 	const userId = c.get("user").sub;
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
@@ -1438,13 +1448,20 @@ narratorRoutes.get("/", async (c) => {
 	const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
 
 	const [list, countResult] = await Promise.all([
-		db
-			.select(narratorListColumns)
-			.from(narrators)
-			.where(whereClause)
-			.orderBy(orderFn(column), orderFn(narrators.id))
-			.limit(limit + 1),
-		db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
+		readQuery(
+			db
+				.select(narratorListColumns)
+				.from(narrators)
+				.where(whereClause)
+				.orderBy(orderFn(column), orderFn(narrators.id))
+				.limit(limit + 1),
+			{ ...readOptions, diagnosticSource: "narrators.list.page", maxRows: limit + 1 },
+		),
+		readQuery(db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere), {
+			...readOptions,
+			diagnosticSource: "narrators.list.total",
+			maxRows: 1,
+		}),
 	]);
 	const totalCount = countResult[0]?.count ?? 0;
 
@@ -1467,14 +1484,21 @@ narratorRoutes.get("/", async (c) => {
 	// Batch fetch active terminal counts
 	const terminalCounts = new Map<string, number>();
 	if (narratorIds.length > 0) {
-		const termRows = await db
-			.select({
-				narratorId: terminals.narratorId,
-				count: countFn(),
-			})
-			.from(terminals)
-			.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
-			.groupBy(terminals.narratorId);
+		const termRows = await readQuery(
+			db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId),
+			{
+				...readOptions,
+				diagnosticSource: "narrators.list.terminals",
+				maxRows: narratorIds.length,
+			},
+		);
 		for (const row of termRows) {
 			if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
 		}
@@ -1484,19 +1508,26 @@ narratorRoutes.get("/", async (c) => {
 	// worktree resources each narrator owns.
 	const containerCounts = new Map<string, { total: number; running: number }>();
 	if (narratorIds.length > 0) {
-		const containerRows = await db
-			.select({
-				narratorId: narratorWorktreeResources.ownerNarratorId,
-				total: countFn(),
-				running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
-			})
-			.from(containerInstances)
-			.innerJoin(
-				narratorWorktreeResources,
-				eq(narratorWorktreeResources.id, containerInstances.worktreeResourceId),
-			)
-			.where(sql`${narratorWorktreeResources.ownerNarratorId} IN ${narratorIds}`)
-			.groupBy(narratorWorktreeResources.ownerNarratorId);
+		const containerRows = await readQuery(
+			db
+				.select({
+					narratorId: narratorWorktreeResources.ownerNarratorId,
+					total: countFn(),
+					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
+				})
+				.from(containerInstances)
+				.innerJoin(
+					narratorWorktreeResources,
+					eq(narratorWorktreeResources.id, containerInstances.worktreeResourceId),
+				)
+				.where(sql`${narratorWorktreeResources.ownerNarratorId} IN ${narratorIds}`)
+				.groupBy(narratorWorktreeResources.ownerNarratorId),
+			{
+				...readOptions,
+				diagnosticSource: "narrators.list.containers",
+				maxRows: narratorIds.length,
+			},
+		);
 		for (const row of containerRows) {
 			if (row.narratorId === null) continue;
 			containerCounts.set(row.narratorId, {
@@ -1512,7 +1543,10 @@ narratorRoutes.get("/", async (c) => {
 	// conversation would keep reporting its high-water mark. Counting the page's
 	// ids is one grouped, indexed query: 0.8ms for a typical page, 11ms for a
 	// synthetic page of the 20 largest narrators in the database.
-	const messageCounts = await countNarratorMessageRefsBatch(narratorIds);
+	const messageCounts = await countNarratorMessageRefsBatch(narratorIds, {
+		...readOptions,
+		diagnosticSource: "narrators.list.messages",
+	});
 
 	// Batch fetch presence and the current user's private draft markers
 	const presenceMap = getNarratorPresenceBatch(narratorIds);
@@ -1527,6 +1561,7 @@ narratorRoutes.get("/", async (c) => {
 					.map((row) => row.id),
 				principal,
 				status === "archived",
+				readOptions.signal,
 			)
 		: undefined;
 
