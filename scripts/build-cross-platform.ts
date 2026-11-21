@@ -254,8 +254,7 @@ for (const platform of selectedPlatforms) {
 		...Object.entries(runtimeBuildDefines(RUNTIME_BUILD_ID, false)).map(
 			([name, value]) => `--define=${name}=${value}`,
 		),
-		...compiledBuildArguments().filter((argument) => argument !== "--minify"),
-		...BUILD_PROFILE.compileArgs,
+		...compiledBuildArguments(BUILD_PROFILE.compileArgs),
 		"--target",
 		platform.target,
 		// Windows：面板自带 UI，编译产物不该再弹控制台；图标由

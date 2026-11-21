@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { type BuildProfileEnvironment, resolveBuildProfile } from "../../scripts/lib/build-profile";
 import { runCiBuildCommand } from "../../scripts/lib/ci-build-strict";
+import { compiledBuildArguments } from "../../scripts/lib/compiled-build";
 import { safeSpawn } from "../../server/lib/spawn";
 
 const root = resolve(import.meta.dir, "../..");
@@ -77,9 +78,21 @@ describe("backend build profiles", () => {
 		);
 		expect(source).toContain('"./server/index.ts"');
 		expect(source).toContain("...compiledWorkerBuildEntrypoints()");
-		expect(source).toContain("...BUILD_PROFILE.compileArgs");
+		expect(source).toContain("...compiledBuildArguments(BUILD_PROFILE.compileArgs)");
 		expect(source).not.toContain('releaseCi ? ["--minify"]');
 		expect(source).toContain("JSON.stringify(command)");
+	});
+
+	test("compiled build profiles replace only the default optimization flags", () => {
+		const defaults = compiledBuildArguments();
+		expect(compiledBuildArguments(profile("1.2.3").compileArgs)).toEqual(defaults);
+		const diagnostic = compiledBuildArguments(profile("1.2.3-alpha.1").compileArgs);
+		expect(diagnostic.filter((argument) => diagnosticArgs.includes(argument))).toEqual(
+			diagnosticArgs,
+		);
+		expect(diagnostic.filter((argument) => !diagnosticArgs.includes(argument))).toEqual(
+			defaults.filter((argument) => argument !== "--minify"),
+		);
 	});
 
 	test("release child overrides inherited context after spreading the environment", async () => {
@@ -172,9 +185,7 @@ test("compiled diagnostic main and worker retain names, original stack lines and
 				"build",
 				entry,
 				worker,
-				"--compile",
-				...profile("1.2.3-alpha.1").compileArgs,
-				"--asset-naming=[dir]/[name].[ext]",
+				...compiledBuildArguments(profile("1.2.3-alpha.1").compileArgs),
 				"--outfile",
 				binary,
 			],

@@ -15,10 +15,10 @@ export function runtimeBuildDefines(buildId: string, local: boolean): Record<str
 	};
 }
 
-export function compiledBuildArguments(): string[] {
+export function compiledBuildArguments(profileArgs: readonly string[] = ["--minify"]): string[] {
 	return [
 		"--compile",
-		"--minify",
+		...profileArgs,
 		`--asset-naming=${COMPILED_BUILD_OPTIONS.naming.asset}`,
 		...COMPILED_BUILD_OPTIONS.external.map((name) => `--external=${name}`),
 		"--no-compile-autoload-bunfig",
