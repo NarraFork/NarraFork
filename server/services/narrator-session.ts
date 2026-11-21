@@ -3837,7 +3837,11 @@ async function feedMessageUnlocked(
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
 		if (accepted.executionIntent?.modelOverride) {
-			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
+			await applyAcceptedModelOverride(
+				narratorId,
+				accepted.executionIntent.modelOverride,
+				!internalOptions?.prepareOnly,
+			);
 		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
@@ -9676,6 +9680,7 @@ export function updateNarratorReasoningEffort(
 async function applyAcceptedModelOverride(
 	narratorId: string,
 	override: NonNullable<BufferedMessage["executionIntent"]>["modelOverride"],
+	startsNewRun: boolean,
 ): Promise<void> {
 	if (!override?.model) return;
 	const narrator = await narratorService.getById(narratorId);
@@ -9693,6 +9698,10 @@ async function applyAcceptedModelOverride(
 		})
 		.where(eq(narrators.id, narratorId));
 	updateNarratorModel(narratorId, override.model);
+	if (narrator.type === "subagent" && startsNewRun) {
+		const { markExplicitSubagentModelPin } = await import("./subagent-model-switch");
+		markExplicitSubagentModelPin(narratorId, override.model);
+	}
 }
 
 /** Persist the original model so the loop finalizer (or startup recovery) can restore it. */

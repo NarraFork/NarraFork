@@ -537,6 +537,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	"server/services/agent-runtime/publication.ts": ["json1"],
 	// The injected occupancy source currently uses the SQLite builder; the maintained
 	// graph is backend-neutral, so this is not a permanently SQLite-only module.
 	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
@@ -550,6 +551,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
 	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/services/file-change-history-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",

@@ -24,6 +24,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
 const inbox = await import("../agent-runtime/inbox");
 const settingsModule = await import("../../lib/settings");
+const modelSwitch = await import("../subagent-model-switch");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
 	"../agent-runtime/ownership"
@@ -474,6 +475,47 @@ test("a replayed Send cannot overwrite a later accepted model selection", async 
 			"test:other",
 		);
 	} finally {
+		visible.mockRestore();
+	}
+});
+
+test("only a newly enqueued Send pins its switched model", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	const mark = modelSwitch.markExplicitSubagentModelPin;
+	const pin = spyOn(modelSwitch, "markExplicitSubagentModelPin").mockImplementation((id, model) => {
+		expect(rows(id)).toHaveLength(1);
+		expect(db.select().from(narrators).where(eq(narrators.id, id)).get()?.model).toBe(model);
+		mark(id, model);
+	});
+	try {
+		const message = { ...input("parent-root", ["sibling-a"]), model: "test:other" };
+		await sendSubagentMessageDetailed(message);
+		await sendSubagentMessageDetailed(message);
+		expect(pin).toHaveBeenCalledTimes(1);
+		pin.mockClear();
+		const previousModel = db
+			.select()
+			.from(narrators)
+			.where(eq(narrators.id, "sibling-b"))
+			.get()?.model;
+		sqlite.exec(
+			"CREATE TEMP TRIGGER reject_model_recipient BEFORE INSERT ON narrator_buffered_messages WHEN NEW.narrator_id = 'sibling-b' BEGIN SELECT RAISE(ABORT, 'recipient disk fault'); END",
+		);
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-b"]),
+			model: "test:other",
+		});
+		expect(result.targets[0]?.status).toBe("failed");
+		expect(pin).not.toHaveBeenCalled();
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-b")).get()?.model).toBe(
+			previousModel,
+		);
+	} finally {
+		sqlite.exec("DROP TRIGGER IF EXISTS reject_model_recipient");
+		pin.mockRestore();
 		visible.mockRestore();
 	}
 });

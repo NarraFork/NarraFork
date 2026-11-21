@@ -42,6 +42,33 @@ import { BUILD_EXECUTOR_DISTRIBUTION, BUILD_REMOTE_PEER_DISTRIBUTION } from "../
 const repository = "offline/fixture";
 const originalFetch = globalThis.fetch;
 const originalUpdate = settings.update;
+
+/**
+ * One retry when the socket is reset before a SETUP request gets a response.
+ *
+ * The server under test runs with `idleTimeout: 1` (a second), which is what makes the
+ * hanging-response cases finish instead of parking the runner. The cost is a keep-alive
+ * race: a pooled connection the server already considers idle is closed while the next
+ * request is reusing it, and the caller sees `ECONNRESET` without any assertion being
+ * involved. A loaded CI shard widens that gap enough to fail this file while it passes
+ * when run alone.
+ *
+ * Only transport-level resets are retried, and only for the fixtures this file uploads
+ * itself: the request is idempotent (same bytes, same descriptor) and every assertion
+ * about the response still runs on the retried attempt, so a server that refuses to store
+ * the object still fails the test.
+ */
+async function fixtureFetch(input: string, init: RequestInit): Promise<Response> {
+	// Bounded: a server that truly cannot answer still fails the test, because a reset that
+	// survives every attempt is rethrown rather than swallowed.
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await fetch(input, init);
+		} catch (error) {
+			if ((error as { code?: string }).code !== "ECONNRESET" || attempt === 3) throw error;
+		}
+	}
+}
 const peer = BUILD_REMOTE_PEER_DISTRIBUTION;
 if (!peer) throw new Error("Offline integration fixture requires the optional peer pin");
 const executor = BUILD_EXECUTOR_DISTRIBUTION;
@@ -208,7 +235,7 @@ beforeEach(async () => {
 	for (const kind of ["helpers", "executor", "remote-peer"] as const) {
 		const value = projection(kind);
 		for (const descriptor of value.binaries) {
-			const uploaded = await fetch(
+			const uploaded = await fixtureFetch(
 				`${url}/api/v3/products/narrafork/mirror/assets/${descriptor.sha256}`,
 				{
 					method: "PUT",
@@ -227,7 +254,7 @@ beforeEach(async () => {
 			expect(uploaded.status).toBe(200);
 			await uploaded.body?.cancel();
 		}
-		const committed = await fetch(
+		const committed = await fixtureFetch(
 			`${url}/api/v3/products/narrafork/mirror/tools/${kind}/${value.tag}`,
 			{
 				method: "POST",

@@ -72,7 +72,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	}));
 
 	const { backgroundTaskService } = await import("../background-task-service");
-	const { bashTool } = await import("../../lib/agent/tools/bash");
+	const { bashTool, startManualBackgroundBash } = await import("../../lib/agent/tools/bash");
 	const { stopTool } = await import("../../lib/agent/tools/stop");
 	const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
 	const { drainPendingInjections } = await import("../parent-injection-queue");
@@ -297,6 +297,108 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	});
 
 	describe("background Bash actual execution provenance", () => {
+		function startManual(
+			kind: "task" | "service",
+			updateExecutionLease = lease(),
+			authorizeDispatch = async () => {},
+		) {
+			return startManualBackgroundBash({
+				backend: {
+					...backend,
+					statFile: async () => ({ isDirectory: true, size: 0, mtimeMs: 0, isFile: false }),
+				},
+				target,
+				narratorId: PARENT,
+				userId: "fixture-user",
+				command: "fixture command",
+				title: "Manual fixture",
+				kind,
+				proxyEnv: { http_proxy: "http://proxy.test:3128", no_proxy: "internal.test" },
+				signal: new AbortController().signal,
+				updateExecutionLease,
+				authorizeDispatch,
+			});
+		}
+
+		test("manual task is discoverable under its narrator and has normal output and completion", async () => {
+			const scheduler = lease();
+			const { id, alias } = await startManual("task", scheduler);
+			const row = await backgroundTaskService.getByAlias(alias, PARENT);
+			expect(row?.id).toBe(id);
+			expect(row?.toolCallId).toBeNull();
+			expect(row?.status).toBe("running");
+			expect(await backgroundTaskService.getByAlias(alias, OTHER)).toBeNull();
+			expect(executions[0].params.env).toMatchObject({
+				http_proxy: "http://proxy.test:3128",
+				no_proxy: "internal.test",
+			});
+			executions[0].send("manual task output");
+			executions[0].finish(0);
+			await bounded(scheduler.released);
+			expect((await backgroundTaskService.getById(id))?.status).toBe("completed");
+		});
+
+		test("manual dispatch and process lifetime remain owned by the shutdown drain", async () => {
+			const entered = Promise.withResolvers<void>();
+			const dispatch = Promise.withResolvers<void>();
+			const scheduler = lease();
+			const starting = startManual("task", scheduler, async () => {
+				entered.resolve();
+				await dispatch.promise;
+			});
+			try {
+				await bounded(entered.promise);
+				expect(backgroundTaskService.getBashShutdownSnapshot().collectors).toBe(1);
+				expect(backgroundTaskService.getBashShutdownSnapshot().terminals).toBeGreaterThan(0);
+				dispatch.resolve();
+				await bounded(starting);
+				expect(backgroundTaskService.getBashShutdownSnapshot().collectors).toBe(1);
+				executions[0].finish(0);
+				await bounded(scheduler.released);
+				await flush();
+				expect(backgroundTaskService.getBashShutdownSnapshot()).toMatchObject({
+					collectors: 0,
+					terminals: 0,
+					pending: 0,
+				});
+			} finally {
+				dispatch.resolve();
+				await starting.catch(() => {});
+			}
+		});
+
+		test("manual service uses durable startup and a failed dispatch is kept in the task list", async () => {
+			const scheduler = lease();
+			await expect(
+				startManual("service", scheduler, async () => {
+					throw new Error("fixture dispatch failed");
+				}),
+			).rejects.toMatchObject({ code: "TASK_START_FAILED" });
+			await bounded(scheduler.released);
+			expect(execCommand).not.toHaveBeenCalled();
+			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
+			expect(taskRow().backgroundKind).toBe("service");
+		});
+		test("a shell that fails to spawn after returning its handle is reported as not started", async () => {
+			execCommand.mockImplementationOnce(async () => {
+				const spawnError = new Error("EACCES: permission denied, posix_spawn '/bin/bash'");
+				return {
+					exited: new Promise<number | null>((_, reject) => {
+						process.nextTick(() => reject(spawnError));
+					}),
+					onData: () => {},
+					isExited: () => true,
+					kill: async () => {},
+				};
+			});
+			const scheduler = lease();
+			await expect(startManual("task", scheduler)).rejects.toMatchObject({
+				code: "TASK_START_FAILED",
+			});
+			await bounded(scheduler.released);
+			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
+		});
+
 		test("uses a real in-memory DB and temporary HOME", () => {
 			const databases = sqlite.query("PRAGMA database_list").all() as Array<{ file: string }>;
 			expect(databases.every((database) => database.file === "")).toBe(true);

@@ -1266,6 +1266,14 @@ export const narratorsApi = {
 		request<{ stopped: boolean; deferred?: boolean }>(`/narrators/${id}/stop-takeover`, {
 			method: "POST",
 		}),
+	createBackgroundTask: (
+		narratorId: string,
+		data: { kind: "task" | "service"; command: string; title?: string; timeoutMs?: number },
+	) =>
+		request<{ id: string; alias: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/background-tasks`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 	cancelBackgroundTask: (narratorId: string, taskId: string) =>
 		request<{
 			success: boolean;
@@ -2518,6 +2526,11 @@ export const narratorsApi = {
 		),
 
 	// Browser sessions
+	createBrowserSession: (narratorId: string, data: { url: string; ttlMs?: number }) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/browser-sessions`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 	listBrowserSessions: (narratorId: string) =>
 		request<
 			{

@@ -166,6 +166,10 @@ drizzle-postgres/meta/_generation_pending.json
 # Full application loading/layout smoke is referenced by the browser regression tests.
 !scripts/smoke-narrator-loading.ts
 !scripts/lib/sqlite-generation-lock.ts
+!scripts/repair-file-history.ts
+!scripts/lib/file-history-repair.ts
+!scripts/lib/file-history-repair-data.ts
+!scripts/lib/file-history-repair-data-schema.ts
 !scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts
 !scripts/lib/__tests__/check-postgres-schema-parity.test.ts
