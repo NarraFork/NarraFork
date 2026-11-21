@@ -3,6 +3,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import { createServerRequestLifecycle } from "../../http-request-lifecycle";
 import {
 	drainCommunicationWork,
@@ -28,13 +29,18 @@ import {
 	quiesceContextCharacterRefreshes,
 } from "../context-characters";
 import {
+	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	resumeDbWorkerPool,
 	runReadTask,
+	runShortReadTask,
 	shutdownDbWorkerPool,
 } from "../db-worker/pool";
+import type { SelectRowsParams } from "../db-worker/protocol";
 import { generateId } from "../id";
+import { logger } from "../logger";
 import { ShutdownActivityTracker } from "../shutdown-activity";
+import { WorkerHandle } from "../worker-runtime/lifecycle";
 
 const source = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 
@@ -55,6 +61,7 @@ function sandbox(options: {
 	onReplayStop?: () => void;
 	onLiveClose?: () => Promise<void>;
 	stageTimeoutMs?: number;
+	scheduleTimeout?: (callback: () => void, delay: number) => () => void;
 	bufferedLifecycle?: {
 		stop: typeof stopBufferedFilePreparations;
 		drain: typeof drainBufferedFilePreparations;
@@ -103,9 +110,13 @@ function sandbox(options: {
 		activeDatabaseBackend: "sqlite",
 		process: { pid: 4242 },
 		performance: options.now ? { now: options.now } : performance,
-		setTimeout: (callback: () => void, delay: number) =>
-			setTimeout(callback, Math.min(delay, options.stageTimeoutMs ?? delay)),
-		clearTimeout,
+		setTimeout:
+			options.scheduleTimeout ??
+			((callback: () => void, delay: number) => {
+				const timer = setTimeout(callback, Math.min(delay, options.stageTimeoutMs ?? delay));
+				return () => clearTimeout(timer);
+			}),
+		clearTimeout: (cancel?: () => void) => cancel?.(),
 		outlineLiveDatabaseWork: new Set<Promise<unknown>>(),
 		trackCommunicationWork,
 		stopOutlineLiveReplay: () => {
@@ -334,6 +345,142 @@ function sandbox(options: {
 		},
 	};
 }
+
+test("shutdown deadline before native reader exit forbids clean marking and pool reuse", async () => {
+	const previous = {
+		disabled: process.env.NARRAFORK_DB_WORKER,
+		concurrency: process.env.NARRAFORK_DB_WORKER_CONCURRENCY,
+		diagnostics: process.env.NF_DB_WORKER_SQL_DIAGNOSTICS,
+	};
+	delete process.env.NARRAFORK_DB_WORKER;
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
+	const directory = mkdtempSync(join(tmpdir(), "nf-shutdown-reader-deadline-"));
+	const path = join(directory, "reader.db");
+	const sqlite = new Database(path);
+	sqlite.run("CREATE TABLE fixture (value INTEGER)");
+	sqlite.close();
+	const task: SelectRowsParams = { kind: "selectRows", sql: "SELECT 1", params: [], maxRows: 1 };
+	const handles: WorkerHandle<Worker>[] = [];
+	const create = WorkerHandle.thread;
+	const spawns = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
+		const handle = create(entry, options);
+		handles.push(handle);
+		return handle;
+	});
+	const logs = spyOn(logger, "warn").mockImplementation(() => {});
+	const sqlLogs = () =>
+		logs.mock.calls
+			.filter(([message]) => message === "Database read worker SQL diagnostic")
+			.map(([, fields]) => fields);
+	const release = Promise.withResolvers<void>();
+	const stopping = Promise.withResolvers<void>();
+	let terminateSpy: ReturnType<typeof spyOn<Worker, "terminate">> | undefined;
+	let operation: Promise<{ success: boolean }> | undefined;
+	let closing: Promise<void> | undefined;
+	try {
+		await runReadTask(path, task, { diagnosticSource: "auth.session" });
+		expect(handles).toHaveLength(1);
+		const handle = handles[0];
+		if (!handle) throw new Error("Expected owned reader");
+		let exitConfirmed = false;
+		void handle.exited.then(() => {
+			exitConfirmed = true;
+		});
+		const terminate = handle.resource.terminate.bind(handle.resource);
+		terminateSpy = spyOn(handle.resource, "terminate").mockImplementation(async () => {
+			stopping.resolve();
+			await release.promise;
+			return terminate();
+		});
+		let now = 0;
+		const timers = new Map<() => void, { callback: () => void; delay: number }>();
+		const trace: string[] = [];
+		const runtime = sandbox({
+			trace,
+			now: () => now,
+			bufferedLifecycle: {
+				stop: () => {},
+				drain: async () => {},
+				hasPending: () => false,
+				status: () => ({ pending: 0, active: 0, waiting: 0, batches: 0, failed: 0 }),
+			},
+			scheduleTimeout(callback, delay) {
+				const cancel = () => {
+					timers.delete(cancel);
+				};
+				timers.set(cancel, { callback, delay });
+				return cancel;
+			},
+			onPluginShutdown: async () => {},
+			onBufferedDrain() {},
+			communicationStatus: () => ({ pending: 0, failed: false }),
+		});
+		operation = runtime.run({
+			reason: "fixture-reader-deadline",
+			skipWindowsProcessTreeKill: true,
+		});
+		await stopping.promise;
+		let closed = false;
+		closing = shutdownDbWorkerPool({ permanent: true }).then(() => {
+			closed = true;
+		});
+		const start = sqlLogs().find((record) => record?.phase === "close-start");
+		expect(start).toMatchObject({ source: "auth.session", requestId: expect.any(String) });
+		expect(timers.size).toBe(1);
+		const deadline = [...timers.values()][0];
+		if (!deadline) throw new Error("Expected shutdown watchdog");
+		expect(deadline.delay).toBe(50_000);
+		now = deadline.delay;
+		deadline.callback();
+		await operation;
+		expect(runtime.tracker?.summary()).toMatchObject({ clean: false, drainComplete: true });
+		expect(runtime.tracker?.summary().degradedSteps).toContainEqual({
+			label: "dbWorkerPool.shutdown",
+			outcome: "timeout",
+		});
+		expect(runtime.cleanMarkers).toBe(0);
+		expect(trace).not.toContain("clean");
+		expect(closed).toBe(false);
+		expect(exitConfirmed).toBe(false);
+		expect(sqlLogs().some((record) => record?.phase === "close-complete")).toBe(false);
+		expect(getDbWorkerPoolStats().workers).toBe(1);
+		for (const read of [runReadTask, runShortReadTask]) {
+			const result = await read(path, task).catch((error: unknown) => error);
+			expect(result).toMatchObject({ reason: "pool_shutdown" });
+		}
+		expect(handles).toHaveLength(1);
+		release.resolve();
+		await closing;
+		expect(typeof (await handle.exited)).toBe("number");
+		expect(exitConfirmed).toBe(true);
+		expect(sqlLogs().find((record) => record?.phase === "close-complete")).toMatchObject({
+			requestId: start?.requestId,
+			source: "auth.session",
+			closeDurationMs: expect.any(Number),
+		});
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+		expect(timers.size).toBe(0);
+		expect(runtime.cleanMarkers).toBe(0);
+	} finally {
+		release.resolve();
+		await operation;
+		await closing;
+		await shutdownDbWorkerPool();
+		terminateSpy?.mockRestore();
+		spawns.mockRestore();
+		logs.mockRestore();
+		for (const [key, value] of Object.entries({
+			NARRAFORK_DB_WORKER: previous.disabled,
+			NARRAFORK_DB_WORKER_CONCURRENCY: previous.concurrency,
+			NF_DB_WORKER_SQL_DIAGNOSTICS: previous.diagnostics,
+		})) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 
 test("team maintenance pending after its budget retains readers and database ownership", async () => {
 	const trace: string[] = [];
