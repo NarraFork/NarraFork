@@ -32,7 +32,7 @@ import {
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
-import { sqliteErrorCode, withDbRetry } from "../lib/db-resilience";
+import { sqliteErrorCode } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -243,23 +243,19 @@ export async function persistDetachedToolResult(
 		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
 	}
 	const output = await toolResultLedgerOutput(narratorId, event);
-	// The generator is already gone, so a transient lock cannot rely on its normal
-	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
-	const affected = await withDbRetry(
-		() =>
-			narratorStore.settleTool(event.toolUseId, {
-				expectedBinding: { ...binding, narratorId },
-				output,
-				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
-				status: event.isError ? "fail" : "success",
-				errorMessage: event.isError ? event.output : undefined,
-				durationMs: event.durationMs,
-				permissionStartedAt: event.permissionStartedAt,
-				executionStartedAt: event.executionStartedAt,
-				completedAt: event.completedAt,
-			}),
-		{ label: "persistDetachedToolResult", maxRetries: 3 },
-	);
+	// Persistence retries only the atomic transaction, retaining this receipt's CAS authority;
+	// committed notifications must never replay through a second settle.
+	const affected = await narratorStore.settleTool(event.toolUseId, {
+		expectedBinding: { ...binding, narratorId },
+		output,
+		input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
+		status: event.isError ? "fail" : "success",
+		errorMessage: event.isError ? event.output : undefined,
+		durationMs: event.durationMs,
+		permissionStartedAt: event.permissionStartedAt,
+		executionStartedAt: event.executionStartedAt,
+		completedAt: event.completedAt,
+	});
 	if (!affected) return;
 
 	// Refresh persisted history, not tool_completed (which mutates live streaming
@@ -2755,16 +2751,18 @@ export async function processEvent(
 							executionStartedAt: event.executionStartedAt,
 							completedAt: event.completedAt,
 							input: settledInput,
+							...(binding && {
+								expectedBinding: { ...binding, narratorId },
+								includeLegacyParentVersions: true,
+							}),
 						},
 						undefined,
 						resultToolCallId,
 					);
 				try {
-					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
-					// 事务本身是 immediate，单次尝试会先忙等一次 busy_timeout；再撞锁就退避
-					// 200+400+800+1600ms 重试，5 次合计约 4.5 秒。只「立即重试一次」会在同一
-					// 个锁窗口里再失败，把瞬时争用升级成 CriticalEventPersistenceError、终止 loop。
-					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 5 });
+					// The persistence transaction owns bounded SQLITE_BUSY retries; committed
+					// notifications and other postcommit effects must never replay from here.
+					await settle();
 					toolResultPersisted = true;
 				} catch (err) {
 					logger.error("CRITICAL: tool_result persist failed", {
