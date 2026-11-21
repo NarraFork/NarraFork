@@ -310,8 +310,10 @@ if (process.env[CHILD_ENV] !== "1") {
 	describe("live parent model through real creation, continuation and executor configuration", () => {
 		for (const mode of ["temporary", "permanent"] as const) {
 			test(`an accepted ${mode} cross-provider override survives new-run selection`, async () => {
-				settings.anthropicProviders.push({
-					...settings.anthropicProviders[0],
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
 					id: "isolated-override",
 					prefix: "override",
 				});
