@@ -205,6 +205,7 @@ import {
 	clearActiveHistoryCompactPending,
 	clearPlanModePromptRebuild,
 	compactLocks,
+	hasNarratorRuntimeClaim,
 	hasPendingHistoryCompact,
 	isNarratorRevertAdmissionBlocked,
 	knowledgeInjectionCycleStates,
@@ -246,8 +247,15 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
+import {
+	bindCheckpointGateActor,
+	checkpointStopForRun,
+	registerNarratorLoop,
+	waitForRestartBeforeFailure,
+} from "../update-coordinator";
+import { trackCommunicationWork } from "./async-work";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
+import { type CheckpointStop, isCheckpointStop } from "./checkpoint-stop";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
@@ -433,6 +441,10 @@ export async function runAgentLoopUnlocked(
 		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
 		// A question a person has yet to answer: their answer wakes the session.
 		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
+	let checkpointPause: CheckpointStop | undefined;
+	const checkpointIdentity = run?.logicalRunId
+		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }
+		: undefined;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -504,10 +516,19 @@ export async function runAgentLoopUnlocked(
 	let deliverTo: RunDeliverTo | undefined;
 	let placement: { parentNarratorId: string; parentToolUseId: string } | undefined;
 	let messageWriters = createRuntimeMessageWriters();
+	const checkpointParentId = run?.deliverTo?.narratorId;
 	try {
 		unregisterUpdateLoop = registerNarratorLoop(narratorId, locale, {
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
+			logicalRunId: run?.logicalRunId,
+			executionEpoch: owner.epoch,
+			parentNarratorId: checkpointParentId,
+			// A loop-less recovery stage can still own this child's terminal even
+			// after another parent run appears. Its live claim is a consumer fence.
+			canPauseForCheckpoint: checkpointParentId
+				? () => !hasNarratorRuntimeClaim(checkpointParentId)
+				: undefined,
 		});
 		// A legitimately admitted run is an explicit recovery from a previous stop.
 		if (!active.abortController.signal.aborted)
@@ -516,7 +537,7 @@ export async function runAgentLoopUnlocked(
 				.where(eq(narrators.id, narratorId))
 				.run();
 		const initNarrator = await narratorService.getById(narratorId);
-		deliverTo = runDeliverToOf(initNarrator);
+		deliverTo = run?.deliverTo ?? runDeliverToOf(initNarrator);
 		placement = deliverTo
 			? { parentNarratorId: deliverTo.narratorId, parentToolUseId: deliverTo.toolUseId }
 			: undefined;
@@ -2385,7 +2406,7 @@ export async function runAgentLoopUnlocked(
 						if (!warnings.length) return;
 						event = { ...event, warnings };
 					}
-					processEvent(event, eventContext, hooks).catch((err) => {
+					trackCommunicationWork(processEvent(event, eventContext, hooks)).catch((err) => {
 						logger.error("Side-channel event processing error", {
 							narratorId,
 							eventType: event.type,
@@ -2672,6 +2693,7 @@ export async function runAgentLoopUnlocked(
 					hooks,
 				);
 			let result: ExecuteLoopResult;
+			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
 				result = await executeAgentLoop({
 					config,
@@ -2688,6 +2710,7 @@ export async function runAgentLoopUnlocked(
 					runState.totalTokens += accountTokenUsageForTurn(active);
 				});
 			} catch (error) {
+				if (isCheckpointStop(error)) throw error;
 				// A held run keeps the user's session: a failed turn reports its error and
 				// parks at the hold like any other turn end, instead of ending the run.
 				if (!run || !getRunHold(narratorId) || getRunHold(narratorId)?.released) throw error;
@@ -3632,6 +3655,17 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// A child may unwind its foreground parent, but only the parent's own persisted
+		// identity authorizes releasing this owner. Never inherit the child's identity.
+		if (isCheckpointStop(err) && checkpointIdentity && !run?.cancel.signal.aborted) {
+			const own = checkpointStopForRun(checkpointIdentity);
+			if (own?.updateEpoch === err.updateEpoch) {
+				own.cleanupFailure = err.cleanupFailure;
+				checkpointPause = own;
+				if (run) run.checkpointStop = own;
+				throw own;
+			}
+		}
 		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
 		// Keep the run active for the next process instead of publishing a false failure.
 		await waitForRestartBeforeFailure(active.abortController.signal);
@@ -3678,24 +3712,46 @@ export async function runAgentLoopUnlocked(
 		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
-		// started that ended by itself are given back with a handoff (not waited for).
-		void outlineLeases?.stop({
-			natural:
-				!freshInput &&
-				!runState.hadError &&
-				!runState.wasInterrupted &&
-				!active.abortController.signal.aborted,
-			// A subagent's run is never a person's hour of its own: its claims pass to its root.
-			person: personRun() && !deliverTo,
-			reply: runState.finalText,
-			forTaskId: runForTaskId,
-			pending: workPendingAtEnd,
-		});
-		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
+		// started that ended by itself are given back with a handoff. Detached work joins the
+		// database shutdown drain; a checkpoint pause is not a natural run end.
+		if (outlineLeases)
+			void trackCommunicationWork(
+				outlineLeases.stop({
+					natural:
+						!checkpointPause &&
+						!freshInput &&
+						!runState.hadError &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted,
+					// A subagent's run is never a person's hour of its own: its claims pass to its root.
+					person: personRun() && !deliverTo,
+					reply: runState.finalText,
+					forTaskId: runForTaskId,
+					pending: workPendingAtEnd,
+				}),
+			);
+		if (
+			!checkpointPause &&
+			run &&
+			!freshInput &&
+			(!getRunHold(narratorId) || getRunHold(narratorId)?.released)
+		)
 			run.finalizing = true;
 		unregisterUpdateLoop();
+		// Pausing ends only this process's execution. Retain pending tools, model override,
+		// turn/status and publication reservations for the replacement owner.
+		if (checkpointPause && owner.isCurrent()) {
+			active._loopRunning = false;
+			active.alive = false;
+			active._resumeBufferedAfterLoop = false;
+			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
+			clearStreamingSnapshot(narratorId);
+			active.events.removeAllListeners();
+			active._bashBeforeStatus?.clear();
+		}
 		// The one session finalizer; result delivery belongs to the run service.
-		if (owner.isCurrent()) {
+		if (!checkpointPause && owner.isCurrent()) {
 			active._loopRunning = false;
 			active.alive = false;
 
@@ -3724,7 +3780,7 @@ export async function runAgentLoopUnlocked(
 			// hooks. Covers every termination path: normal done, error, and user
 			// interrupt. Hook failures never affect narrator state, but their actual
 			// execution must settle before file-revert admission can be granted.
-			if (runState.stopHooks) {
+			if (runState.stopHooks && !checkpointPause) {
 				await (async () => {
 					try {
 						const stopReason = runState.hadError

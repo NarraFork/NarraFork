@@ -637,7 +637,7 @@ export const bashTool: ToolDefinition = {
 					if (detachPending) return detachPending;
 					if (exited || handle.isExited() || timedOut || aborted || ctx.signal.aborted)
 						return Promise.reject(new AppError("Bash is no longer running in foreground", 409));
-					detachPending = (async () => {
+					detachPending = backgroundTaskService.runBashStartup(async () => {
 						const { registerTaskAlias, unregisterTaskAlias } = await import(
 							"@server/services/subagent-alias"
 						);
@@ -695,6 +695,7 @@ export const bashTool: ToolDefinition = {
 						backgroundTaskService.registerAbortController(taskId, processAbort);
 						backgroundTaskService.registerKillHandler(taskId, () => void kill());
 						if (output) backgroundTaskService.appendOutput(taskId, output);
+						backgroundTaskService.trackBashCollector(taskId, processAbort, lifecycle);
 						resolveDetached({
 							output:
 								`<background_task_id>${alias}</background_task_id>\n\n` +
@@ -707,7 +708,7 @@ export const bashTool: ToolDefinition = {
 							},
 						});
 						return detached;
-					})();
+					});
 					void detachPending.catch(() => {
 						detachPending = undefined;
 					});
@@ -794,6 +795,8 @@ export const bashTool: ToolDefinition = {
 						await backgroundTaskService.markFailed(
 							detached.taskId,
 							`${output}\nError: ${error instanceof Error ? error.message : String(error)}`,
+							undefined,
+							processAbort,
 						);
 					}
 					throw error;
@@ -851,12 +854,24 @@ export const bashTool: ToolDefinition = {
 				if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 				if (detached) {
-					if (timedOut) {
-						await backgroundTaskService.markTimedOut(detached.taskId, output, exitCode);
+					if (processAbort.signal.aborted) {
+						await backgroundTaskService.markCancelled(detached.taskId, processAbort);
+					} else if (timedOut) {
+						await backgroundTaskService.markTimedOut(
+							detached.taskId,
+							output,
+							exitCode,
+							processAbort,
+						);
 					} else if (exitCode === 0) {
-						await backgroundTaskService.markCompleted(detached.taskId, output, exitCode);
+						await backgroundTaskService.markCompleted(
+							detached.taskId,
+							output,
+							exitCode,
+							processAbort,
+						);
 					} else {
-						await backgroundTaskService.markFailed(detached.taskId, output, exitCode);
+						await backgroundTaskService.markFailed(detached.taskId, output, exitCode, processAbort);
 					}
 					// The foreground already received its adoption result. The service
 					// owns output spillage now; do not create a second foreground dump.
@@ -897,7 +912,20 @@ export const bashTool: ToolDefinition = {
 
 import type { ToolContext } from "../types";
 
-async function _runInBackground(
+function _runInBackground(
+	command: string,
+	timeoutMs: number | undefined,
+	title: string,
+	ctx: ToolContext,
+	execution: BashExecution,
+	backgroundKind: "task" | "service",
+): Promise<ToolResult> {
+	return backgroundTaskService.runBashStartup(() =>
+		startBackgroundBash(command, timeoutMs, title, ctx, execution, backgroundKind),
+	);
+}
+
+async function startBackgroundBash(
 	command: string,
 	timeoutMs: number | undefined,
 	title: string,
@@ -939,19 +967,24 @@ async function _runInBackground(
 		ctx.updateExecutionLease?.release();
 	};
 
-	// Fire-and-forget: spawn the process and collect output asynchronously
-	(async () => {
+	// Register before dispatch; ownership continues through output, persistence and lease release.
+	const lifecycle = Promise.resolve().then(async () => {
+		let monitoringStarted = false;
 		try {
 			// Frozen backend/cwd/env and activity were captured before task creation.
 			// Do not resolve a second backend after the tool/HTTP request has returned.
 			ctx.signal.throwIfAborted();
+			bgAbort.signal.throwIfAborted();
 			// A service may outlive this server process (planned restart). Where the backend
 			// supports it, it writes to a log file and leaves a manifest so a restarted server
 			// can re-attach instead of reporting it failed.
-			const handle = await execution.start(
-				bgAbort.signal,
-				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
+			const handle = await backgroundTaskService.runBashStartup(() =>
+				execution.start(
+					bgAbort.signal,
+					backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
+				),
 			);
+			monitoringStarted = true;
 			await monitorBackgroundBash({
 				taskId,
 				handle,
@@ -966,6 +999,8 @@ async function _runInBackground(
 				callerSignal: ctx.signal,
 			});
 		} catch (err) {
+			// The shared monitor owns terminal persistence; do not retry its lifecycle failure.
+			if (monitoringStarted) throw err;
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
 			if (
@@ -973,9 +1008,9 @@ async function _runInBackground(
 				ctx.signal.aborted ||
 				backgroundTaskService.isCancellationRequested(taskId)
 			) {
-				await backgroundTaskService.markCancelled(taskId);
+				await backgroundTaskService.markCancelled(taskId, bgAbort);
 			} else {
-				await backgroundTaskService.markFailed(taskId, error);
+				await backgroundTaskService.markFailed(taskId, error, undefined, bgAbort);
 			}
 			// Dispatch failed before any process existed; drop a possibly created directory
 			// without holding the lease on filesystem cleanup.
@@ -983,7 +1018,8 @@ async function _runInBackground(
 		} finally {
 			releaseUpdateLease();
 		}
-	})();
+	});
+	backgroundTaskService.trackBashCollector(taskId, bgAbort, lifecycle, false);
 
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
@@ -1019,6 +1055,7 @@ export interface MonitorBackgroundBashOptions {
 export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
 	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
 	let timedOut = false;
+	let terminalStarted = false;
 	try {
 		let outputBytes = 0;
 		let outputTruncated = false;
@@ -1095,6 +1132,7 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 					}, WATCHDOG_INTERVAL_MS);
 
 		opts.onMonitoring?.();
+		backgroundTaskService.markBashCollectorStarted(taskId);
 
 		let resolvedExitCode: number | null;
 		try {
@@ -1127,36 +1165,65 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 		const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 
+		terminalStarted = true;
+		let terminalCommitted: boolean;
 		if (bgAbort.signal.aborted || backgroundTaskService.isCancellationRequested(taskId)) {
-			await backgroundTaskService.markCancelled(taskId);
+			terminalCommitted = await backgroundTaskService.markCancelled(taskId, bgAbort);
 		} else if (timedOut) {
-			await backgroundTaskService.markTimedOut(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markTimedOut(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		} else if (backgroundKind === "service") {
-			await backgroundTaskService.markFailed(
+			terminalCommitted = await backgroundTaskService.markFailed(
 				taskId,
 				`${finalOutput}\nBackground service exited unexpectedly (exit code: ${exitCode}).`,
 				exitCode,
+				bgAbort,
 			);
 		} else if (exitCode === 0) {
-			await backgroundTaskService.markCompleted(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markCompleted(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		} else {
-			await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markFailed(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		}
-		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+		// Preserved collectors leave their task and manifest for the next server to recover.
+		if (terminalCommitted && handle instanceof DurableServiceHandle)
+			await removeServiceArtifacts(taskId);
 	} catch (err) {
+		// Persistence failure is a lifecycle failure, not a second terminal outcome to retry.
+		if (terminalStarted) throw err;
 		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 		const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
+		let terminalCommitted: boolean;
 		if (
 			bgAbort.signal.aborted ||
 			opts.callerSignal?.aborted ||
 			backgroundTaskService.isCancellationRequested(taskId)
 		) {
-			await backgroundTaskService.markCancelled(taskId);
+			terminalCommitted = await backgroundTaskService.markCancelled(taskId, bgAbort);
 		} else if (timedOut) {
-			await backgroundTaskService.markTimedOut(taskId, error);
+			terminalCommitted = await backgroundTaskService.markTimedOut(
+				taskId,
+				error,
+				undefined,
+				bgAbort,
+			);
 		} else {
-			await backgroundTaskService.markFailed(taskId, error);
+			terminalCommitted = await backgroundTaskService.markFailed(taskId, error, undefined, bgAbort);
 		}
-		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+		if (terminalCommitted && handle instanceof DurableServiceHandle)
+			await removeServiceArtifacts(taskId);
 	}
 }

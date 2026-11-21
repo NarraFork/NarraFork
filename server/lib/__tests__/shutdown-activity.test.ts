@@ -107,10 +107,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
 		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
 		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
-		const cleanupEnd = shutdown.indexOf(
-			'await shutdownStep(tracker, "vnetUdpRendezvous.stop"',
-			cleanupStart,
-		);
+		const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
 		expect(prepareStart).toBeGreaterThanOrEqual(0);
 		expect(prepareEnd).toBeGreaterThan(prepareStart);
 		expect(cleanupStart).toBeGreaterThan(prepareEnd);
@@ -122,7 +119,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const close = new Function(
 			"options",
 			"tracker",
-			"shutdownStep",
+			"step",
 			"prepareSignalRestartRecovery",
 			"markUpdateRestarting",
 			"killAllBashProcesses",
@@ -131,7 +128,7 @@ describe("main shutdown wiring without booting the server", () => {
 		await close(
 			{ reason: "signal" },
 			new ShutdownActivityTracker(),
-			async (_tracker: unknown, label: string, action: () => Promise<unknown>) => {
+			async (label: string, action: () => Promise<unknown>) => {
 				await action();
 				return label === "restartRecovery.prepare" ? outcome : "ok";
 			},

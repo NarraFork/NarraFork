@@ -129,6 +129,70 @@ export type ProjectionReader = (
 
 const workerProjectionReader: ProjectionReader = (params) => readInWorker(params);
 
+const legacyBackgroundJobs = hotSafe("narrator-block-backfill:lifecycle", () => ({
+	stopping: false,
+	controller: new AbortController(),
+	active: new Set<Promise<boolean>>(),
+}));
+const backgroundJobs = hotSafe("narrator-block-backfill:lifecycle:scheduled", () => {
+	const stopping = legacyBackgroundJobs.stopping;
+	// Old closures retain this object, so an unregistered old timer can never read again.
+	legacyBackgroundJobs.stopping = true;
+	legacyBackgroundJobs.controller.abort();
+	return {
+		stopping,
+		controller: new AbortController(),
+		active: new Set<Promise<boolean>>(),
+	};
+});
+async function trackBlockSlice(run: () => Promise<boolean>): Promise<boolean> {
+	if (backgroundJobs.stopping) return false;
+	const pending = run();
+	backgroundJobs.active.add(pending);
+	try {
+		return await pending;
+	} finally {
+		backgroundJobs.active.delete(pending);
+	}
+}
+
+/** Process-local shutdown gate; does not change any persisted job pause/cursor settings. */
+export async function stopBlockBackgroundJobs(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	backgroundJobs.stopping = true;
+	backgroundJobs.controller.abort();
+	cancelProjectionTurn();
+	projection.upgradeResume = false;
+	if (!projection.upgrade) {
+		state.running = false;
+		projection.running = false;
+	}
+	const active = [
+		...legacyBackgroundJobs.active,
+		...backgroundJobs.active,
+		...(projection.upgrade ? [projection.upgrade] : []),
+	];
+	options.signal?.throwIfAborted();
+	await new Promise<void>((resolve, reject) => {
+		const abort = () =>
+			finish(options.signal?.reason ?? new Error("Block background jobs drain cancelled"));
+		const finish = (error?: unknown) => {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+			if (error) reject(error);
+			else resolve();
+		};
+		const timer = setTimeout(
+			() => finish(new Error("Block background jobs drain deadline exceeded")),
+			Math.max(0, options.deadlineAt - Date.now()),
+		);
+		options.signal?.addEventListener("abort", abort, { once: true });
+		Promise.allSettled(active).then(() => finish());
+	});
+}
+
 const state = hotSafe("narrator-block-backfill:state", () => ({
 	running: false,
 	sliceEnvelopes: MAX_SLICE_ENVELOPES,
@@ -142,6 +206,12 @@ const reindexBudget = hotSafe("narrator-block-backfill:reindex-budget", () => ({
 
 /** Back to how a fresh process paces and sizes the jobs. */
 export function resetBlockJobPacingForTests(): void {
+	if (legacyBackgroundJobs.active.size || backgroundJobs.active.size || projection.upgrade)
+		throw new Error("Cannot reset active block background jobs");
+	if (backgroundJobs.stopping) {
+		backgroundJobs.controller = new AbortController();
+		backgroundJobs.stopping = false;
+	}
 	pace.notBefore = 0;
 	reindexBudget.chars = REINDEX_TX_CHARS.initial;
 	state.sliceEnvelopes = MAX_SLICE_ENVELOPES;
@@ -155,12 +225,34 @@ async function applyTurn(): Promise<void> {
 
 const projection = hotSafe("narrator-block-backfill:projection", () => ({
 	running: false,
+	timer: undefined as ReturnType<typeof setTimeout> | undefined,
+	epoch: 0,
+	inFlight: false,
+	pendingRead: undefined as ProjectionReader | undefined,
+	upgrade: undefined as Promise<void> | undefined,
+	upgradeTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+	upgradeResume: false,
+	upgradeBackfill: undefined as
+		| { reader: SliceReader; readProjection: ProjectionReader }
+		| undefined,
 	/**
 	 * The current `restore` pass: whether it began at the first envelope, and how many it
 	 * wrote back. A whole pass that wrote none stops the job.
 	 */
 	pass: { fromStart: false, restored: 0 },
 }));
+const legacyProjectionRunner = projection.inFlight === undefined;
+projection.epoch ??= 0;
+projection.inFlight ??= false;
+
+/** Invalidate queued callbacks, including a timer that already entered the event queue. */
+function cancelProjectionTurn(): void {
+	projection.epoch++;
+	if (projection.timer !== undefined) clearTimeout(projection.timer);
+	projection.timer = undefined;
+	projection.pendingRead = undefined;
+	if (!projection.inFlight && !projection.upgrade) projection.running = false;
+}
 
 let schema: boolean | undefined;
 
@@ -599,7 +691,14 @@ export function startBlockBackfill(
 	reader: SliceReader = workerReader,
 	readProjection: ProjectionReader = workerProjectionReader,
 ): void {
-	if (!hasSchema()) return;
+	if (projection.upgrade) {
+		if (projection.upgradeResume) {
+			projection.upgradeBackfill = { reader, readProjection };
+			if (projection.pendingRead) projection.pendingRead = readProjection;
+		}
+		return;
+	}
+	if (backgroundJobs.stopping || !hasSchema()) return;
 	if (state.running) return;
 	resumeSingleCopyUpgrade();
 	// Resume an interrupted pass without resetting its durable cursor. A completed pass
@@ -613,8 +712,9 @@ export function startBlockBackfill(
 		startProjectionRunner(readProjection);
 	state.running = true;
 	const next = () => {
-		runBlockJobSlice(reader)
+		trackBlockSlice(() => runBlockJobSlice(reader))
 			.then((ran) => {
+				if (backgroundJobs.stopping) return;
 				if (ran) setTimeout(next, 0);
 				else {
 					state.running = false;
@@ -764,6 +864,7 @@ export function startProjectionJob(
 
 /** Shared by the automatic post-backfill upgrade and explicit rollback maintenance. */
 function beginProjectionJob(job: ProjectionJob, read: ProjectionReader): void {
+	cancelProjectionTurn();
 	for (const name of PROJECTION_JOBS) jobState(name);
 	pauseProjection(job === "clear" ? "restore" : "clear");
 	database.sqlite
@@ -779,6 +880,7 @@ function beginProjectionJob(job: ProjectionJob, read: ProjectionReader): void {
 
 /** Stop whichever projection job runs, where it is; starting it again resumes it. */
 export function stopProjectionJobs(): BlockBackfillStatus {
+	cancelProjectionTurn();
 	if (hasSchema()) for (const job of PROJECTION_JOBS) pauseProjection(job);
 	return blockBackfillStatus();
 }
@@ -916,21 +1018,103 @@ export async function runProjectionSlice(
 	return true;
 }
 
+/** Old hot-reload closures have no epoch check: keep their lifecycle gate closed until exit. */
+function upgradeLegacyProjectionRunner(): void {
+	if (
+		!legacyProjectionRunner ||
+		backgroundJobs.stopping ||
+		(!state.running && !projection.running && legacyBackgroundJobs.active.size === 0)
+	)
+		return;
+	projection.upgradeResume = true;
+	projection.upgradeBackfill = state.running
+		? { reader: workerReader, readProjection: workerProjectionReader }
+		: undefined;
+	projection.pendingRead = projection.running ? workerProjectionReader : undefined;
+	const settled = Promise.withResolvers<void>();
+	projection.upgrade = settled.promise;
+	backgroundJobs.stopping = true;
+	legacyBackgroundJobs.stopping = true;
+	legacyBackgroundJobs.controller.abort();
+	const check = () => {
+		// A legacy successful slice can still queue one final turn. Only its false/catch
+		// branch marks running=false; new entry points must not forge those exit markers.
+		if (
+			state.running ||
+			projection.running ||
+			legacyBackgroundJobs.active.size ||
+			backgroundJobs.active.size
+		) {
+			projection.upgradeTimer = setTimeout(check, 500);
+			return;
+		}
+		projection.upgradeTimer = undefined;
+		projection.upgrade = undefined;
+		const resume = projection.upgradeResume;
+		const backfill = projection.upgradeBackfill;
+		const read = projection.pendingRead;
+		projection.upgradeResume = false;
+		projection.upgradeBackfill = undefined;
+		projection.pendingRead = undefined;
+		try {
+			if (resume) {
+				backgroundJobs.controller = new AbortController();
+				backgroundJobs.stopping = false;
+				if (read) startProjectionRunner(read);
+				if (backfill) startBlockBackfill(backfill.reader, backfill.readProjection);
+			}
+		} catch (error) {
+			logger.warn("Block background jobs stopped during runner upgrade", { error: String(error) });
+		} finally {
+			settled.resolve();
+		}
+	};
+	projection.upgradeTimer = setTimeout(check, 500);
+}
+
 function startProjectionRunner(read: ProjectionReader = workerProjectionReader): void {
-	if (projection.running || !hasSchema() || !activeProjection()) return;
+	if (projection.upgrade) {
+		if (projection.upgradeResume) projection.pendingRead = read;
+		return;
+	}
+	if (backgroundJobs.stopping || !hasSchema() || !activeProjection()) return;
+	if (projection.inFlight) {
+		// A changed job waits for the old slice's existing apply/stop gates to drain.
+		projection.pendingRead = read;
+		return;
+	}
+	if (projection.running) return;
 	projection.running = true;
+	const epoch = ++projection.epoch;
+	const schedule = (delay: number) => {
+		projection.timer = setTimeout(next, delay);
+	};
 	const next = () => {
-		runProjectionSlice(read)
+		if (epoch !== projection.epoch || backgroundJobs.stopping || !projection.running) return;
+		projection.timer = undefined;
+		projection.inFlight = true;
+		trackBlockSlice(() => runProjectionSlice(read))
 			.then((ran) => {
-				if (ran) setTimeout(next, 0);
+				if (epoch !== projection.epoch) return;
+				if (ran && activeProjection()) schedule(0);
 				else projection.running = false;
 			})
 			.catch((error) => {
-				projection.running = false;
+				if (epoch === projection.epoch) projection.running = false;
 				logger.warn("Projection job stopped; it resumes at the next start", {
 					error: String(error),
 				});
+			})
+			.finally(() => {
+				projection.inFlight = false;
+				if (epoch === projection.epoch) return;
+				projection.running = false;
+				const pendingRead = projection.pendingRead;
+				projection.pendingRead = undefined;
+				if (pendingRead) startProjectionRunner(pendingRead);
 			});
 	};
-	setTimeout(next, 0);
+	schedule(0);
 }
+
+upgradeLegacyProjectionRunner();

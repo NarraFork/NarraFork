@@ -7,8 +7,10 @@
  * to a managed tool that is no longer loaded even though it is still declared.
  */
 
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
+import { logger } from "../../logger";
+import { ModelHistoryPreparation, ModelHistoryTimeoutError } from "../../model-history-preparation";
 import { settings } from "../../settings";
 import type { ChatParams, ProviderAdapter } from "../provider";
 import { DEFERRED_TOOL_PLACEHOLDER, ToolEpochError, type ToolLoadingState } from "../tool-loading";
@@ -128,6 +130,65 @@ const callTool = (name: string) => () => ({
 });
 
 describe("loop tool loading", () => {
+	test("history timeout falls back to the transcript without logging error text", async () => {
+		const timeout = new ModelHistoryTimeoutError();
+		const preparation = new ModelHistoryPreparation({
+			narratorId: "n-tool-loading",
+			kind: "rebuild",
+		});
+		preparation.finish(timeout);
+		reset([callTool(CORE), () => ({ text: "done" })]);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await drain(
+				makeConfig({
+					toolFilter: (tool) => tool.name === CORE,
+					rebuildRequestHistory: async () => {
+						throw timeout;
+					},
+				}),
+			);
+			expect(requests).toHaveLength(2);
+			const diagnostic = warn.mock.calls.find(
+				([message]) =>
+					message === "Request history rebuild failed; projecting the loop's transcript",
+			)?.[1];
+			expect(diagnostic).toMatchObject({
+				preparationId: preparation.preparationId,
+				outcome: "timeout",
+			});
+			expect(diagnostic).not.toHaveProperty("error");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("user cancellation during history rebuilding never sends a transcript fallback request", async () => {
+		reset([callTool(CORE), () => ({ text: "must not send" })]);
+		const controller = new AbortController();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await drain(
+				makeConfig({
+					signal: controller.signal,
+					toolFilter: (tool) => tool.name === CORE,
+					rebuildRequestHistory: async () => {
+						controller.abort(new Error("user cancellation"));
+						throw controller.signal.reason;
+					},
+				}),
+			);
+			expect(requests).toHaveLength(1);
+			expect(
+				warn.mock.calls.some(
+					([message]) =>
+						message === "Request history rebuild failed; projecting the loop's transcript",
+				),
+			).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
+	});
 	test("MCP auto requires loading and disabled is checked live after declaration", async () => {
 		const original = settings.mcpServers;
 		const name = "mcp__loading_test__run";

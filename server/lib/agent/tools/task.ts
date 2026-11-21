@@ -1,6 +1,7 @@
 import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning-effort";
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
+import { isCheckpointStop } from "../../../services/agent-runtime/checkpoint-stop";
 import { resolvePath } from "../../platform-path";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
@@ -648,6 +649,7 @@ export const agentTool: ToolDefinition = {
 				},
 			};
 		} catch (err) {
+			if (isCheckpointStop(err)) throw err;
 			// The work item of a call whose agent never ran is settled (see `settleFailedStart`):
 			// an untouched isolated worktree is removed, an attached item goes back to the queue.
 			if (workItem && workItemsModule)

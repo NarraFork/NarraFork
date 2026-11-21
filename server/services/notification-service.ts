@@ -1,7 +1,8 @@
 import { db } from "@server/db";
 import { narrators, userPreferences, users } from "@server/db/schema";
 import { ForbiddenError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
@@ -408,17 +409,109 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 // "should I notify?" from raw status/substatus. Reflection mid-states and
 // takeover fallbacks never emit attention, so they can never leak an IM.
 
-eventBus.on("narrator:attention", (event) => {
+type AttentionEvent = Extract<NarraForkEvent, { type: "narrator:attention" }>;
+const backgroundWork = hotSafe("notification.automatic-work.v1", () => ({
+	stopped: false,
+	pending: new Set<Promise<void>>(),
+	failed: 0,
+	listener: undefined as ((event: AttentionEvent) => void) | undefined,
+}));
+const BACKGROUND_WORK_FAILED = "Notification background work failed";
+const BACKGROUND_WORK_TIMEOUT = "Notification background work did not drain before its deadline";
+
+function notificationAttentionListener(event: AttentionEvent): void {
+	if (backgroundWork.stopped) return;
 	// A turn that finished while its background work is still running is not
 	// worth an IM ping — the wake-up turn after the last background task
 	// completes emits a fresh, unflagged "done" which notifies normally. Hooks
 	// still observe the flagged event via the attention-hook-bridge.
 	// The reason check is defensive — the flag is only produced for done.
 	if (event.backgroundWorkActive && event.reason === "done") return;
-	handleAttention(event.narratorId, event.reason).catch((err) => {
-		logger.error("Notification handler error", {
-			narratorId: event.narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	});
-});
+	const work = handleAttention(event.narratorId, event.reason);
+	backgroundWork.pending.add(work);
+	void work.then(
+		() => backgroundWork.pending.delete(work),
+		(error) => {
+			backgroundWork.failed = Math.min(backgroundWork.failed + 1, Number.MAX_SAFE_INTEGER);
+			backgroundWork.pending.delete(work);
+			logger.error("Notification handler error", {
+				narratorId: event.narratorId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		},
+	);
+}
+
+// Replace the closure on hot reload without discarding in-flight handlers or reopening a stop.
+if (backgroundWork.listener) eventBus.off("narrator:attention", backgroundWork.listener);
+backgroundWork.listener = notificationAttentionListener;
+if (!backgroundWork.stopped) eventBus.on("narrator:attention", notificationAttentionListener);
+
+/** Content-free audit; failed handlers remain visible after their promises have settled. */
+export function getNotificationBackgroundWorkSnapshot(): {
+	stopped: boolean;
+	pending: number;
+	failed: number;
+} {
+	return {
+		stopped: backgroundWork.stopped,
+		pending: backgroundWork.pending.size,
+		failed: backgroundWork.failed,
+	};
+}
+
+/** Join whole automatic handlers, including reads or deliveries they start after an await. */
+export async function drainNotificationBackgroundWork(
+	options: { deadlineAt?: number } = {},
+): Promise<void> {
+	const deadlineAt = options.deadlineAt ?? Date.now() + 30_000;
+	if (!Number.isFinite(deadlineAt)) throw new Error("Invalid notification drain deadline");
+	while (backgroundWork.pending.size) {
+		const remaining = deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error(BACKGROUND_WORK_TIMEOUT);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...backgroundWork.pending]),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error(BACKGROUND_WORK_TIMEOUT)), remaining);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	if (backgroundWork.failed) throw new Error(BACKGROUND_WORK_FAILED);
+}
+
+/** Close automatic admission synchronously; manual send APIs remain available. */
+export function stopNotificationBackgroundWork(
+	options: { deadlineAt?: number } = {},
+): Promise<void> {
+	backgroundWork.stopped = true;
+	if (backgroundWork.listener) eventBus.off("narrator:attention", backgroundWork.listener);
+	return drainNotificationBackgroundWork(options);
+}
+
+/** Tests may acknowledge exact injected failures, but must really settle all work before rearming. */
+export async function resetNotificationBackgroundWorkForTests(
+	options: { deadlineAt?: number; expectedFailures?: number } = {},
+): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Notification reset is test-only");
+	const expectedFailures = options.expectedFailures ?? 0;
+	try {
+		await stopNotificationBackgroundWork(options);
+	} catch (error) {
+		if (
+			backgroundWork.pending.size ||
+			backgroundWork.failed !== expectedFailures ||
+			!(error instanceof Error && error.message === BACKGROUND_WORK_FAILED)
+		)
+			throw error;
+	}
+	if (backgroundWork.failed !== expectedFailures)
+		throw new Error("Unexpected notification background failure count");
+	backgroundWork.failed = 0;
+	backgroundWork.stopped = false;
+	eventBus.on("narrator:attention", notificationAttentionListener);
+}

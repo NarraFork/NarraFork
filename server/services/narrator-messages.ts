@@ -2412,6 +2412,7 @@ export interface SubagentActivityToolCallTiming {
 
 export interface SubagentActivityToolCall {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
