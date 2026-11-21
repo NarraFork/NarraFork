@@ -9590,6 +9590,10 @@ async function applyAcceptedModelOverride(
 		})
 		.where(eq(narrators.id, narratorId));
 	updateNarratorModel(narratorId, override.model);
+	if (narrator.type === "subagent") {
+		const { markExplicitSubagentModelPin } = await import("./subagent-model-switch");
+		markExplicitSubagentModelPin(narratorId, override.model);
+	}
 }
 
 /** Persist the original model so the loop finalizer (or startup recovery) can restore it. */

@@ -308,6 +308,29 @@ if (process.env[CHILD_ENV] !== "1") {
 	}
 
 	describe("live parent model through real creation, continuation and executor configuration", () => {
+		for (const mode of ["temporary", "permanent"] as const) {
+			test(`an accepted ${mode} cross-provider override survives new-run selection`, async () => {
+				settings.anthropicProviders.push({
+					...settings.anthropicProviders[0],
+					id: "isolated-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				await session.acceptUserMessage(child.id, "Use the explicit slash model.", {
+					userId: null,
+					executionIntent: { modelOverride: { model: override, mode } },
+				});
+				await settled(child.id, 0);
+				expect(configs.at(-1)?.model).toBe(override);
+				expect((await narratorService.getById(child.id)).model).toBe(
+					mode === "temporary" ? A : override,
+				);
+				await drive(child.id);
+				expect(configs.at(-1)?.model).toBe(A);
+			});
+		}
+
 		for (const entry of ["continue", "resume"] as const) {
 			test(`${entry}: real create stores inheritance and re-reads parent A -> B`, async () => {
 				const child = await create();
