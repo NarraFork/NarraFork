@@ -326,6 +326,7 @@ describe("main shutdown wiring without booting the server", () => {
 		const diagnostics: unknown[] = [];
 		const options: unknown[] = [];
 		const delays: number[] = [];
+		const hookReasons: string[] = [];
 		const result = { success: true };
 		new Function(
 			"registerGracefulShutdownHandler",
@@ -335,6 +336,7 @@ describe("main shutdown wiring without booting the server", () => {
 			"preservesRecoveryOnShutdown",
 			"setTimeout",
 			"process",
+			"runPostShutdownHooks",
 			code,
 		)(
 			(handler: Handler) => handlers.push(handler),
@@ -358,6 +360,11 @@ describe("main shutdown wiring without booting the server", () => {
 				exit() {
 					throw new Error("must not exit a real process");
 				},
+			},
+			// Post-shutdown hooks are the seam unattended mode's power-off uses; the operator
+			// path must reach them for every reason it handles (the real signature is a string).
+			async (reason: string) => {
+				hookReasons.push(reason);
 			},
 		);
 		expect(handlers).toHaveLength(2);
@@ -385,6 +392,7 @@ describe("main shutdown wiring without booting the server", () => {
 			},
 		]);
 		expect(delays).toEqual([250, 250, 250]);
+		expect(hookReasons).toEqual(["operator_shutdown", "system_prepared_shutdown"]);
 		expect(diagnostics).toHaveLength(3);
 		for (const canary of ["/private/", "HANDOFF_VERSION_CANARY", "PRIVATE_SINK_FAILURE", "12345"])
 			expect(JSON.stringify(diagnostics)).not.toContain(canary);
