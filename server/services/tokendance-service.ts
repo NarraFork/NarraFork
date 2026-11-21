@@ -617,7 +617,8 @@ export async function refreshTokenDanceModels(
 			assertGeneration(config.generation);
 			if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
 			const latest = structuredClone(settings);
-			latest.tokendance = { ...latest.tokendance, ...config, models: next };
+			if (!latest.tokendance) throw fail("TokenDance is not connected", 409);
+			latest.tokendance = { ...latest.tokendance, models: next };
 			saveSettings(latest);
 		});
 		models = next;

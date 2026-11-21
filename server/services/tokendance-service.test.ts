@@ -739,6 +739,34 @@ describe("TokenDance billing", () => {
 });
 
 describe("TokenDance backend", () => {
+	test("catalog refresh preserves an image preference saved during the fetch", async () => {
+		fakeSettings.tokendance = {
+			apiKey: "test-key",
+			disabled: false,
+			generation: 100,
+			toolResultImages: "off",
+		};
+		let release!: (response: Response) => void;
+		const response = new Promise<Response>((resolve) => {
+			release = resolve;
+		});
+		fetchMock(() => response);
+		const refresh = service.refreshTokenDanceModels();
+		await service.setTokenDanceDisabled(false, "separate");
+		release(
+			json({
+				data: [
+					{ id: "chat-model", name: "Chat", supported_protocols: ["openai:chat-completions"] },
+				],
+			}),
+		);
+		const catalog = await refresh;
+		expect(catalog.map((model) => model.id)).toEqual(["chat-model"]);
+		expect(fakeSettings.tokendance.toolResultImages).toBe("separate");
+		expect(service.getTokenDanceConnection().toolResultImages).toBe("separate");
+		expect(service.getTokenDanceRuntimeConfig()?.toolResultImages).toBe("separate");
+		expect(fakeSettings.tokendance.generation).toBe(100);
+	});
 	for (const mode of ["off", "inline", "separate"] as const) {
 		test(`connection persists ${mode} without invalidating requests or checkout`, async () => {
 			fakeSettings.tokendance = { apiKey: "test-key", disabled: false, generation: 100 };
