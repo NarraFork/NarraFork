@@ -247,6 +247,7 @@ export function customApiProviderToAnthropic(
 ): AnthropicProviderConfig | undefined {
 	if (!isAnthropicCustomApiProtocol(provider.protocol)) return undefined;
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,
@@ -282,6 +283,7 @@ export function customApiProviderToGemini(
 ): GeminiProviderConfig | undefined {
 	if (!isGeminiCustomApiProtocol(provider.protocol)) return undefined;
 	return {
+		toolResultImages: provider.toolResultImages,
 		id: provider.id,
 		name: provider.name,
 		disabled: provider.disabled,

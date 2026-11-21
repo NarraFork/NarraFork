@@ -200,6 +200,7 @@ export interface OpenAIProviderConfig {
 }
 
 export interface AnthropicProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Anthropic", "Anthropic Proxy". */
@@ -302,6 +303,7 @@ export interface NUGProviderConfig {
 }
 
 export interface GeminiProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Gemini", "Google AI". */
