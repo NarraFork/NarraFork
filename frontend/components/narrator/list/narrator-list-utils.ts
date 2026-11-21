@@ -78,6 +78,7 @@ export function normalizeNarratorListSearchPatch<T extends NarratorListSearchPar
 export function buildNarratorListQueryOptions(state: NarratorListState, status?: string) {
 	return {
 		...(status ? { status } : {}),
+		groupAskInPassing: true,
 		sortBy: state.sortBy,
 		sortOrder: state.sortOrder,
 		hasTerminals: state.hasTerminals || undefined,
@@ -105,7 +106,7 @@ export function filterNarratorsByLocalQuery<T extends NarratorListSearchable>(
 	});
 }
 
-function matchesNarratorSearch(narrator: NarratorListSearchable, localQuery: string) {
+export function matchesNarratorSearch(narrator: NarratorListSearchable, localQuery: string) {
 	return [narrator.title, narrator.id, narrator.cwd, narrator.model, narrator.status]
 		.filter(Boolean)
 		.some((value) => includesSearch(value as string, localQuery));

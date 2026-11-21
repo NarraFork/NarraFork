@@ -76,6 +76,7 @@ export function useNarratorsPaginated(opts?: {
 	hasContainers?: boolean;
 	hasRunningContainers?: boolean;
 	hasViewers?: boolean;
+	groupAskInPassing?: boolean;
 }) {
 	return useInfiniteQuery<PaginatedNarrators>({
 		queryKey: ["narrators", "paginated", { ...opts }],

@@ -44,23 +44,7 @@ export async function interruptAndArchiveSubagent(
 		if (!narrator) {
 			return { ...base, error: "not_found" };
 		}
-		const { closeNarrator, isNarratorActive } = await import("./narrator-session");
-		const { controlRun } = await import("./agent-runtime/run");
-
-		// End the registered run (including any hold/task projection) before closing
-		// the session. This mechanism does not depend on a delegation identity.
-		let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
-		// Its helpers stop too, also when it had no run of its own left.
-		const { stopSubagentHelpers } = await import("./agent-runtime/run");
-		await stopSubagentHelpers(narrator.id, "Parent subagent archived");
-		try {
-			if (isNarratorActive(narrator.id)) {
-				closeNarrator(narrator.id);
-				interrupted = true;
-			}
-		} catch {
-			// closeNarrator is best-effort.
-		}
+		const interrupted = await prepareNarratorArchive(narrator);
 
 		// An archived subagent has no driver: what it left running is closed with it.
 		const { closeSubagentResources } = await import("./subagent-resources");
@@ -68,7 +52,6 @@ export async function interruptAndArchiveSubagent(
 			await closeSubagentResources(narrator.id);
 			return { ...base, ok: true, alreadyArchived: true, interrupted };
 		}
-		await giveBackDelegatedTask(narrator);
 		await narratorService.updateStatus(narrator.id, "archived");
 		await closeSubagentResources(narrator.id);
 		return { ok: true, alreadyArchived: false, archived: true, interrupted, id: narrator.id };
@@ -82,6 +65,28 @@ export async function interruptAndArchiveSubagent(
 			error: err instanceof Error ? err.message : String(err),
 		};
 	}
+}
+
+/** Cancel work before archiving; the caller owns the subsequent durable status write. */
+export async function prepareNarratorArchive(narrator: {
+	id: string;
+	status: string;
+	runtimeRegistrationJson?: unknown;
+}) {
+	const { closeNarrator, isNarratorActive } = await import("./narrator-session");
+	const { controlRun, stopSubagentHelpers } = await import("./agent-runtime/run");
+	let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
+	await stopSubagentHelpers(narrator.id, "Parent subagent archived");
+	try {
+		if (isNarratorActive(narrator.id)) {
+			closeNarrator(narrator.id);
+			interrupted = true;
+		}
+	} catch {
+		// closeNarrator is best-effort.
+	}
+	if (narrator.status !== "archived") await giveBackDelegatedTask(narrator);
+	return interrupted;
 }
 
 /**

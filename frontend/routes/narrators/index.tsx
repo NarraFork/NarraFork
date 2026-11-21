@@ -25,6 +25,7 @@ import {
 	buildNarratorListQueryOptions,
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
+	matchesNarratorSearch,
 	type NarratorListSearchParams,
 	type NarratorsInfiniteData,
 	NO_EXPANDED_IDS,
@@ -164,15 +165,14 @@ function NarratorsPage() {
 		if (!localQuery.trim()) return NO_EXPANDED_IDS;
 		return new Set(
 			filteredNarrators
-				.filter((narrator) => filterNarratorsByLocalQuery([narrator], localQuery).length === 0)
+				.filter((narrator) => !matchesNarratorSearch(narrator, localQuery))
 				.map((narrator) => narrator.id),
 		);
 	}, [filteredNarrators, localQuery]);
 
 	// 归档确认里先说清会连带多少条顺便提问，免得用户以为只收走了一条。
-	const confirmArchiveChildCount =
-		narrators.find((narrator) => narrator.id === confirmArchiveId)?.askInPassingSessions?.length ??
-		0;
+	const hasLinkedQuestions = !!narrators.find((narrator) => narrator.id === confirmArchiveId)
+		?.askInPassingSessions?.length;
 
 	const handleNarratorClick = useCallback(
 		(narratorId: string) => {
@@ -356,9 +356,9 @@ function NarratorsPage() {
 			>
 				<Stack>
 					<Text size="sm">{tn("archiveActiveWarning")}</Text>
-					{confirmArchiveChildCount > 0 && (
+					{hasLinkedQuestions && (
 						<Text size="sm" c="dimmed">
-							{tn("archiveAskInPassingWarning", { count: confirmArchiveChildCount })}
+							{tn("archiveAskInPassingWarning")}
 						</Text>
 					)}
 					<Group justify="flex-end">

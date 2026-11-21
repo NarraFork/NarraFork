@@ -874,6 +874,7 @@ export const narratorsApi = {
 		hasContainers?: boolean;
 		hasRunningContainers?: boolean;
 		hasViewers?: boolean;
+		groupAskInPassing?: boolean;
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.projectId) params.set("projectId", opts.projectId);
@@ -886,6 +887,7 @@ export const narratorsApi = {
 		if (opts?.hasContainers) params.set("hasContainers", "true");
 		if (opts?.hasRunningContainers) params.set("hasRunningContainers", "true");
 		if (opts?.hasViewers) params.set("hasViewers", "true");
+		if (opts?.groupAskInPassing) params.set("groupAskInPassing", "true");
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},

@@ -1038,7 +1038,7 @@
 	"relaxed_plan_forced_tooltip": "Relaxed plan is forced on while permissions are set to Allow All",
 	"archiveConfirmTitle": "Confirm Archive",
 	"archiveActiveWarning": "Are you sure you want to archive this session? If it is currently active, archiving will interrupt generation and reject pending permission requests.",
-	"archiveAskInPassingWarning": "Its {{count}} ask-in-passing sessions will be archived too.",
+	"archiveAskInPassingWarning": "Linked ask-in-passing sessions you can edit will also be archived.",
 	"confirmArchive": "Confirm",
 	"cancel": "Cancel",
 	"confirm": "Confirm",

@@ -445,17 +445,19 @@ function AskInPassingChildRow({
 }) {
 	return (
 		<Card
+			component={onOpen ? "button" : "div"}
+			type={onOpen ? "button" : undefined}
 			padding="xs"
 			withBorder
-			style={{ cursor: onOpen ? "pointer" : "default" }}
-			onClick={() => onOpen?.(narrator.id)}
+			style={{ cursor: onOpen ? "pointer" : "default", textAlign: "start" }}
+			onClick={onOpen ? () => onOpen(narrator.id) : undefined}
 		>
-			<Group gap="xs" wrap="nowrap">
+			<Group component="span" gap="xs" wrap="nowrap">
 				<NarratorListStatusIcon narrator={narrator} size={16} />
-				<Text size="sm" truncate style={{ flex: 1, minWidth: 0 }}>
+				<Text component="span" size="sm" truncate style={{ flex: 1, minWidth: 0 }}>
 					<NarratorTitle narrator={narrator} localQuery={localQuery} />
 				</Text>
-				<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+				<Text component="span" size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
 					<CreatedLastMessageText narrator={narrator} />
 				</Text>
 			</Group>

@@ -395,10 +395,13 @@ describe("archive and delete", () => {
 
 	test("narrator routes change status as the caller only around the status write", async () => {
 		const source = await Bun.file(new URL("../narrators.ts", import.meta.url)).text();
-		// No request-wide actor: every unarchive goes through the bounded helper.
+		// No request-wide actor: interaction and explicit unarchive each use their own bounded helper.
 		expect(source).not.toMatch(/narratorRoutes\.use\([^)]*runAsTeamStatusActor/);
 		expect(source.split('narratorService.updateStatus(id, "idle")').length - 1).toBe(1);
-		expect(source.split("unarchiveAsCaller(c, id)").length - 1).toBeGreaterThanOrEqual(11);
+		expect(source.split("unarchiveAsCaller(c, id)").length - 1).toBeGreaterThanOrEqual(10);
+		expect(source).toContain(
+			'transitionNarratorArchiveGroup(narratorPrincipalOf(c), c.req.param("id"), "idle")',
+		);
 	});
 
 	test("the status people see is the coordinator's, whatever the stored mirror says", async () => {

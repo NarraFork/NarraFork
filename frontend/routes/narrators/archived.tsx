@@ -18,6 +18,7 @@ import {
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
 	isNarratorMutationPendingFor,
+	matchesNarratorSearch,
 	type NarratorListSearchParams,
 	NO_EXPANDED_IDS,
 	normalizeNarratorListSearchPatch,
@@ -133,7 +134,7 @@ function ArchivedNarratorsPage() {
 		if (!localQuery.trim()) return NO_EXPANDED_IDS;
 		return new Set(
 			filteredNarrators
-				.filter((narrator) => filterNarratorsByLocalQuery([narrator], localQuery).length === 0)
+				.filter((narrator) => !matchesNarratorSearch(narrator, localQuery))
 				.map((narrator) => narrator.id),
 		);
 	}, [filteredNarrators, localQuery]);

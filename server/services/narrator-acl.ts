@@ -44,7 +44,7 @@
  */
 
 import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narrator-access";
-import { and, eq, inArray, or, type SQL, sql } from "drizzle-orm";
+import { and, eq, inArray, or, type SQL, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, projects } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
@@ -710,13 +710,16 @@ function bindUserId(text: string, userId: string): SQL {
  * `acl_grants.scope_id` into `narrators.scope_id` and made the story graph fail to
  * prepare.
  */
-export function narratorReadableWhere(principal: NarratorPrincipal) {
+export function narratorReadableWhere(
+	principal: NarratorPrincipal,
+	table: Record<"id" | "type" | "aclRootNarratorId", SQLWrapper> = narrators,
+) {
 	if (principal.isAdmin) return undefined;
 	return sql`exists (
 		select 1 from narrators jn
 		where jn.id = case
-				when ${narrators.type} = 'subagent' then ${narrators.aclRootNarratorId}
-				else ${narrators.id}
+				when ${table.type} = 'subagent' then ${table.aclRootNarratorId}
+				else ${table.id}
 			end
 			and ${bindUserId(judgedReadableSql("jn"), principal.userId)}
 	)`;

@@ -97,7 +97,7 @@ describe("会话卡片上的顺便提问子会话", () => {
 	test("展开后在主会话下面渲染子会话", () => {
 		const html = activeCard(session({ askInPassingSessions: [child("kid-1", "Kid one")] }), true);
 		expect(html.split('aria-expanded="true"').length - 1).toBe(2);
-		expect(html).toContain("Kid one");
+		expect(html).toMatch(/<button[^>]*type="button"[^>]*>(?:(?!<\/button>).)*Kid one/);
 	});
 
 	test("归档页的卡片同样能展开子会话", () => {
