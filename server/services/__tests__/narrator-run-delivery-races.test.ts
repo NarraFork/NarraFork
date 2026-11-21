@@ -11,6 +11,7 @@
  *  D. every run re-announces the destination's tool card with the model it uses.
  *  F. a parked held result is delivered under the run's registered principal.
  */
+import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -52,12 +53,17 @@ const executor = await import("../narrator-executor");
 const { DISABLED_TOOLS_TRAIT_PREFIX, upsertEncodedTrait } = await import(
 	"../../lib/narrator-custom-traits"
 );
-const { awaitRunHold, controlRun, hydrateRunHolds, startNarratorRun, wakeHeldRun } = await import(
-	"../agent-runtime/run"
-);
-const { getExecutionOwner, getRunControl, getRunHold, setRunHold } = await import(
-	"../agent-runtime/ownership"
-);
+const {
+	awaitRunHold,
+	controlRun,
+	hydrateRunHolds,
+	settleRegisteredAgentStartFailure,
+	startNarratorRun,
+	stopNarratorRunAdmission,
+	wakeHeldRun,
+} = await import("../agent-runtime/run");
+const { getExecutionOwner, getRunControl, getRunHold, setRunHold, tryClaimExecution } =
+	await import("../agent-runtime/ownership");
 const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const inbox = await import("../agent-runtime/inbox");
 const session = await import("../narrator-session");
@@ -66,7 +72,9 @@ const { backgroundTaskService } = await import("../background-task-service");
 const { getRuntimePublicationService, runtimePublication } = await import(
 	"../agent-runtime/publication"
 );
-const { activeNarrators } = await import("../narrator-session-state");
+const { activeNarrators, withNarratorMutationAdmission, withNarratorWorkAdmission } = await import(
+	"../narrator-session-state"
+);
 const parentInjection = await import("../parent-injection-queue");
 
 const provider: ProviderAdapter = {
@@ -120,12 +128,13 @@ afterAll(async () => {
 function seed() {
 	db.insert(narrators)
 		.values([
-			{ id: CALLER, variant: "primary", cwd, createdAt: NOW, updatedAt: NOW },
+			{ id: CALLER, variant: "primary", model: "test:model", cwd, createdAt: NOW, updatedAt: NOW },
 			{
 				id: RUN,
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: CALLER,
+				policySourceNarratorId: CALLER,
 				subagentType: "general",
 				cwd,
 				status: "idle",
@@ -1573,6 +1582,488 @@ describe("hold protocol regressions", () => {
 	});
 });
 
+describe("registered startup failure ownership", () => {
+	async function register() {
+		seed();
+		const task = await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			binding: backgroundBinding(),
+		});
+		return {
+			narratorId: RUN,
+			logicalRunId: task.logicalRunId!,
+			deliverTo: backgroundBinding().deliverTo,
+		};
+	}
+
+	test("hold shares the mutation boundary and remains reentrant for its admitted caller", async () => {
+		await register();
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const mutation = withNarratorMutationAdmission(RUN, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const hold = controlRun(RUN, { kind: "hold" });
+		expect(getRunHold(RUN)).toBeUndefined();
+		gate.resolve();
+		await mutation;
+		expect(await hold).toBe(true);
+		expect(await withNarratorMutationAdmission(RUN, () => controlRun(RUN, { kind: "hold" }))).toBe(
+			true,
+		);
+	});
+
+	test("an exact unmounted registration ends once", async () => {
+		const registered = await register();
+		expect(
+			await settleRegisteredAgentStartFailure(registered, new Error("startup preparation failed")),
+		).toBe(true);
+		expect(taskRow()).toMatchObject({
+			status: "failed",
+			output: "startup preparation failed",
+			toolCallId: ORIGIN_ROW,
+			executionAttempt: 1,
+		});
+		expect(sessionRow()).toMatchObject({
+			backgroundStatus: "failed",
+			backgroundResult: "startup preparation failed",
+		});
+		expect(getRunHold(RUN)).toBeUndefined();
+		expect(getExecutionOwner(RUN)).toBeUndefined();
+		const before = taskRow();
+		expect(await settleRegisteredAgentStartFailure(registered, new Error("late"))).toBe(false);
+		expect(taskRow()).toEqual(before);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, `publication-result:${registered.logicalRunId}`))
+				.all(),
+		).toHaveLength(1);
+	});
+
+	test.each([
+		"run",
+		"attempt",
+		"task-parent",
+	])("a changed %s cannot be settled by the old credentials", async (changed) => {
+		const registered = await register();
+		if (changed === "run")
+			await getRuntimePublicationService().startRun({
+				narratorId: RUN,
+				binding: backgroundBinding(),
+			});
+		if (changed === "attempt")
+			db.update(narratorToolCalls)
+				.set({ executionAttempt: 2 })
+				.where(eq(narratorToolCalls.id, ORIGIN_ROW))
+				.run();
+		if (changed === "task-parent") {
+			db.insert(narrators).values({ id: "other-parent", createdAt: NOW, updatedAt: NOW }).run();
+			db.update(backgroundTasks)
+				.set({ parentNarratorId: "other-parent" })
+				.where(eq(backgroundTasks.id, RUN))
+				.run();
+		}
+		const before = taskRow();
+		const actor = sessionRow();
+		expect(await settleRegisteredAgentStartFailure(registered, new Error("old failure"))).toBe(
+			false,
+		);
+		expect(taskRow()).toEqual(before);
+		expect(sessionRow()).toEqual(actor);
+	});
+
+	test("an existing execution owner keeps its task and registration", async () => {
+		const registered = await register();
+		const owner = tryClaimExecution(RUN, "run")!;
+		try {
+			expect(await settleRegisteredAgentStartFailure(registered, new Error("old failure"))).toBe(
+				false,
+			);
+			expect(taskRow()?.status).toBe("running");
+			expect(owner.isCurrent()).toBe(true);
+		} finally {
+			owner.release();
+		}
+	});
+
+	test("a later owner between retry attempts is not cancelled", async () => {
+		const registered = await register();
+		const pub = getRuntimePublicationService();
+		const commit = pub.commitAgentTerminal;
+		const replacement: { owner: ReturnType<typeof tryClaimExecution> } = { owner: null };
+		const attempt = spyOn(pub, "commitAgentTerminal").mockImplementation(async (input) => {
+			if (!replacement.owner) {
+				getExecutionOwner(RUN)!.release();
+				replacement.owner = tryClaimExecution(RUN, "run");
+				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+			}
+			return commit(input);
+		});
+		try {
+			expect(
+				await settleRegisteredAgentStartFailure(registered, new Error("original start failure")),
+			).toBe(false);
+			expect(attempt).toHaveBeenCalledTimes(2);
+			expect(replacement.owner?.isCurrent()).toBe(true);
+			expect(taskRow()?.status).toBe("running");
+		} finally {
+			replacement.owner?.release();
+		}
+	});
+
+	test.each([
+		false,
+		true,
+	])("a real SQLite lock bounds compensation attempts (persistent=%s)", async (persistent) => {
+		const registered = await register();
+		const blocker = new Database(sqlite.filename);
+		blocker.run("BEGIN IMMEDIATE");
+		const pub = getRuntimePublicationService();
+		const commitTerminal = pub.commitAgentTerminal;
+		let locked = true;
+		const commit = spyOn(pub, "commitAgentTerminal").mockImplementation(async (input) => {
+			try {
+				return await commitTerminal(input);
+			} catch (error) {
+				if (!persistent && locked) {
+					blocker.run("ROLLBACK");
+					locked = false;
+				}
+				throw error;
+			}
+		});
+		try {
+			expect(await settleRegisteredAgentStartFailure(registered, new Error("prepare failed"))).toBe(
+				!persistent,
+			);
+			expect(commit).toHaveBeenCalledTimes(persistent ? 3 : 2);
+			expect(taskRow()?.status).toBe(persistent ? "running" : "failed");
+			expect(sessionRow()?.backgroundStatus).toBe(persistent ? "running" : "failed");
+			expect(getExecutionOwner(RUN)).toBeUndefined();
+		} finally {
+			if (locked) blocker.run("ROLLBACK");
+			blocker.close();
+		}
+	});
+
+	test.each([
+		"receipt",
+		"outbox",
+	])("a startup %s write failure rolls back task, mirror, and snapshot together", async (point) => {
+		const registered = await register();
+		const task = taskRow();
+		const actor = sessionRow();
+		const owner = point === "outbox" ? tryClaimExecution(RUN, "run")! : undefined;
+		const trigger =
+			point === "receipt"
+				? "BEFORE INSERT ON runtime_awaited_terminal_consumptions"
+				: "BEFORE UPDATE OF state ON runtime_publication_outbox WHEN NEW.state = 'pending'";
+		sqlite.run(
+			`CREATE TRIGGER reject_startup_terminal ${trigger} BEGIN SELECT RAISE(ABORT, 'injected startup terminal failure'); END`,
+		);
+		try {
+			expect(
+				await settleRegisteredAgentStartFailure(
+					registered,
+					new Error("original prepare error"),
+					owner,
+				),
+			).toBe(false);
+			expect(taskRow()).toEqual(task);
+			expect(sessionRow()).toEqual(actor);
+			expect(
+				db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.id, `publication-result:${registered.logicalRunId}`))
+					.all(),
+			).toHaveLength(0);
+		} finally {
+			sqlite.run("DROP TRIGGER reject_startup_terminal");
+			owner?.release();
+		}
+	});
+
+	test("session preparation failure preserves the original error and releases the owner", async () => {
+		const registered = await register();
+		const original = new Error("session preparation failed");
+		spyOn(session, "ensureNarrator").mockRejectedValue(original);
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: registered.logicalRunId,
+			registeredStart: registered,
+		});
+		await expect(handle.completion).rejects.toBe(original);
+		expect(taskRow()?.status).toBe("failed");
+		expect(getExecutionOwner(RUN)).toBeUndefined();
+		await getRuntimePublicationService().flushRecipient(CALLER);
+		expect(notices()).toHaveLength(1);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, `publication-result:${registered.logicalRunId}`))
+				.all(),
+		).toHaveLength(1);
+	});
+
+	test.each([
+		false,
+		true,
+	])("successful takeover retains a preparation failure until release (cold=%s)", async (cold) => {
+		const registered = await register();
+		await controlRun(RUN, { kind: "hold" });
+		const original = new Error("taken-over session preparation failed");
+		spyOn(session, "ensureNarrator").mockRejectedValue(original);
+		const model = spyOn(executor, "executeAgentLoop");
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: registered.logicalRunId,
+			registeredStart: registered,
+		});
+		await expect(handle.completion).rejects.toBe(original);
+		expect(model).not.toHaveBeenCalled();
+		expect(getExecutionOwner(RUN)).toBeUndefined();
+		expect(getRunHold(RUN)).toMatchObject({
+			released: false,
+			result: {
+				finalText: original.message,
+				hasError: true,
+				logicalRunId: registered.logicalRunId,
+			},
+		});
+		expect(sessionRow()).toMatchObject({
+			status: "idle",
+			backgroundStatus: "failed",
+			backgroundResult: original.message,
+		});
+		expect(String(sessionRow()?.substatus)).toContain("taken_over");
+		expect(String(sessionRow()?.substatus)).toContain(`terminal_run:${registered.logicalRunId}`);
+		expect(taskRow()?.status).toBe("running");
+		expect(
+			await getRuntimePublicationService().readRunPublicationState({
+				producerKind: "agent",
+				taskId: RUN,
+				logicalRunId: registered.logicalRunId,
+				recipientId: CALLER,
+			}),
+		).toEqual({ state: "reserved" });
+		await getRuntimePublicationService().flushRecipient(CALLER);
+		expect(notices()).toHaveLength(0);
+		if (cold) {
+			setRunHold(RUN, undefined);
+			expect((await hydrateRunHolds()).has(RUN)).toBe(true);
+			expect(getRunHold(RUN)?.result).toBeUndefined();
+		}
+		expect(await controlRun(RUN, { kind: "release" })).toBe(true);
+		expect(taskRow()).toMatchObject({ status: "failed", output: original.message });
+		expect(getRunHold(RUN)).toBeUndefined();
+		expect(String(sessionRow()?.substatus)).not.toContain("taken_over");
+		await getRuntimePublicationService().flushRecipient(CALLER);
+		expect(notices()).toHaveLength(1);
+		expect(await controlRun(RUN, { kind: "release" })).toBe(false);
+		await getRuntimePublicationService().flushRecipient(CALLER);
+		expect(notices()).toHaveLength(1);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, `publication-result:${registered.logicalRunId}`))
+				.all(),
+		).toHaveLength(1);
+	});
+
+	test.each([
+		false,
+		true,
+	])("a queued release is refused during startup finalization, then retries once (new hold=%s)", async (replaceHold) => {
+		const registered = await register();
+		await controlRun(RUN, { kind: "hold" });
+		const original = new Error("queued release preparation failure");
+		const preparing = Promise.withResolvers<void>();
+		const failPreparation = Promise.withResolvers<void>();
+		spyOn(session, "ensureNarrator").mockImplementation(async () => {
+			preparing.resolve();
+			await failPreparation.promise;
+			throw original;
+		});
+		const pub = getRuntimePublicationService();
+		const commit = pub.commitAgentTerminal;
+		const committed = Promise.withResolvers<void>();
+		const returnCommit = Promise.withResolvers<void>();
+		spyOn(pub, "commitAgentTerminal").mockImplementation(async (input) => {
+			const result = await commit(input);
+			if (input.startupFailure?.retainHeldResult) {
+				committed.resolve();
+				await returnCommit.promise;
+			}
+			return result;
+		});
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: registered.logicalRunId,
+			registeredStart: registered,
+		});
+		const failure = handle.completion.catch((error) => error);
+		await preparing.promise;
+		const state = await import("../narrator-session-state");
+		const mutate = state.withNarratorMutationAdmission;
+		const admissionReturned = Promise.withResolvers<void>();
+		const returnHelper = Promise.withResolvers<void>();
+		let firstMutation = true;
+		// Keep executeRun before finally, but release its admission so the queued request runs.
+		const gatedMutation: typeof mutate = async (id, fn, options) => {
+			const gate = firstMutation;
+			firstMutation = false;
+			const value = await mutate(id, fn, options);
+			if (gate) {
+				admissionReturned.resolve();
+				await returnHelper.promise;
+			}
+			return value;
+		};
+		spyOn(state, "withNarratorMutationAdmission").mockImplementation(gatedMutation);
+		try {
+			failPreparation.resolve();
+			await committed.promise;
+			const release = withNarratorWorkAdmission(RUN, async () => {
+				const queued = controlRun(RUN, { kind: "release" });
+				returnCommit.resolve();
+				return queued;
+			});
+			await admissionReturned.promise;
+			expect(await release).toBe(false);
+			expect(getRunControl(RUN)?.finalizing).toBe(true);
+			expect(getRunHold(RUN)?.released).toBe(false);
+			const held = getRunHold(RUN)!;
+			const currentHold = replaceHold ? { ...held } : held;
+			if (replaceHold) setRunHold(RUN, currentHold);
+			returnHelper.resolve();
+			expect(await failure).toBe(original);
+			expect(getExecutionOwner(RUN)).toBeUndefined();
+			expect(getRunHold(RUN)).toBe(currentHold);
+			expect(await controlRun(RUN, { kind: "release" })).toBe(true);
+			await pub.flushRecipient(CALLER);
+			expect(notices()).toHaveLength(1);
+			expect(taskRow()).toMatchObject({ status: "failed", output: original.message });
+			expect(getRunHold(RUN)).toBeUndefined();
+			expect(getExecutionOwner(RUN)).toBeUndefined();
+			expect(await controlRun(RUN, { kind: "release" })).toBe(false);
+		} finally {
+			failPreparation.resolve();
+			returnCommit.resolve();
+			returnHelper.resolve();
+		}
+	});
+
+	test("a release accepted before startup finalization delivers the asynchronous failure once", async () => {
+		const registered = await register();
+		await controlRun(RUN, { kind: "hold" });
+		const original = new Error("released preparation failure");
+		const preparing = Promise.withResolvers<void>();
+		const failPreparation = Promise.withResolvers<void>();
+		spyOn(session, "ensureNarrator").mockImplementation(async () => {
+			preparing.resolve();
+			await failPreparation.promise;
+			throw original;
+		});
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: registered.logicalRunId,
+			registeredStart: registered,
+		});
+		const failure = handle.completion.catch((error) => error);
+		try {
+			await preparing.promise;
+			expect(await controlRun(RUN, { kind: "release" })).toBe(true);
+			expect(getRunControl(RUN)?.wake).toBeUndefined();
+			failPreparation.resolve();
+			expect(await failure).toBe(original);
+			await getRuntimePublicationService().flushRecipient(CALLER);
+			expect(notices()).toHaveLength(1);
+			expect(taskRow()).toMatchObject({ status: "failed", output: original.message });
+			expect(getRunHold(RUN)).toBeUndefined();
+			expect(getExecutionOwner(RUN)).toBeUndefined();
+			expect(await controlRun(RUN, { kind: "release" })).toBe(false);
+		} finally {
+			failPreparation.resolve();
+		}
+	});
+
+	test("release uses the current run checkpoint rather than an older held startup result", async () => {
+		const registered = await register();
+		await controlRun(RUN, { kind: "hold" });
+		expect(
+			await settleRegisteredAgentStartFailure(registered, new Error("older startup result")),
+		).toBe(true);
+		const current = await getRuntimePublicationService().startRun({
+			narratorId: RUN,
+			binding: backgroundBinding(),
+		});
+		await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			binding: backgroundBinding(),
+		});
+		db.update(narrators)
+			.set({
+				backgroundStatus: "completed",
+				backgroundResult: "current held result",
+				backgroundCompletedAt: NOW,
+				substatus: JSON.stringify(["taken_over", `terminal_run:${current.binding.logicalRunId}`]),
+			})
+			.where(eq(narrators.id, RUN))
+			.run();
+		expect(await controlRun(RUN, { kind: "release" })).toBe(true);
+		expect(taskRow()).toMatchObject({
+			logicalRunId: current.binding.logicalRunId,
+			status: "completed",
+			output: "current held result",
+		});
+	});
+
+	test("checkpoint stop during preparation retains the registered task", async () => {
+		const registered = await register();
+		const { CheckpointStop } = await import("../agent-runtime/checkpoint-stop");
+		let stop: InstanceType<typeof CheckpointStop> | undefined;
+		spyOn(session, "ensureNarrator").mockImplementation(async () => {
+			stop = new CheckpointStop("update", {
+				narratorId: RUN,
+				logicalRunId: registered.logicalRunId,
+				executionEpoch: getExecutionOwner(RUN)!.epoch,
+			});
+			throw stop;
+		});
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: registered.logicalRunId,
+			registeredStart: registered,
+		});
+		const error = await handle.completion.catch((error) => error);
+		expect(error).toBe(stop);
+		expect(stop).toBeDefined();
+		expect(taskRow()?.status).toBe("running");
+		expect(getExecutionOwner(RUN)).toBeUndefined();
+	});
+});
+
 describe("F. a parked held result", () => {
 	test("release delivers it under the run's registered principal", async () => {
 		seed();
@@ -1609,4 +2100,42 @@ describe("F. a parked held result", () => {
 		expect(getRunHold(RUN)).toBeUndefined();
 		expect(sessionRow()?.substatus ?? []).not.toContain("taken_over");
 	});
+});
+
+test("not-started distinguishes another owner from closed admission", async () => {
+	seed();
+	const task = await backgroundTaskService.createAgentTask({
+		id: RUN,
+		subagentNarratorId: RUN,
+		subagentType: "general",
+		binding: backgroundBinding(),
+	});
+	const request = {
+		narratorId: RUN,
+		locale: "en" as const,
+		text: "",
+		resumeRunId: task.logicalRunId!,
+	};
+	const owner = tryClaimExecution(RUN, "run")!;
+	expect(await startNarratorRun(request)).toMatchObject({
+		started: false,
+		notStartedReason: "owned",
+	});
+	owner.release();
+	stopNarratorRunAdmission();
+	expect(await startNarratorRun(request)).toMatchObject({
+		started: false,
+		notStartedReason: "admission_closed",
+	});
+	expect(
+		await settleRegisteredAgentStartFailure(
+			{
+				narratorId: RUN,
+				logicalRunId: task.logicalRunId!,
+				deliverTo: backgroundBinding().deliverTo,
+			},
+			new Error("admission closed"),
+		),
+	).toBe(true);
+	expect(taskRow()?.status).toBe("failed");
 });

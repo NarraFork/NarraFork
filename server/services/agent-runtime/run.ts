@@ -45,8 +45,13 @@ import {
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
-import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
+import {
+	withNarratorMutationAdmission,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} from "../narrator-session-state";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
+import { freezeCheckpointStopAdmission, matchesCheckpointRun } from "./checkpoint-stop";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -62,7 +67,7 @@ import {
 	tryClaimExecution,
 } from "./ownership";
 import { getRuntimePublicationService, publicationEvent, runtimePublication } from "./publication";
-import type { PublicationRun } from "./publication-outbox";
+import { assertPublicationTaskIdentity, type PublicationRun } from "./publication-outbox";
 
 export type { RunResult } from "./ownership";
 
@@ -90,6 +95,7 @@ export interface StartNarratorRunRequest {
 	binding?: RunBindingInput;
 	/** Run an already registered logical run (adopted task run, or recovery); facts are kept. */
 	resumeRunId?: string;
+	registeredStart?: RegisteredAgentStart;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
 	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
@@ -112,8 +118,15 @@ export interface StartNarratorRunRequest {
 	skipModelReselect?: boolean;
 }
 
+export interface RegisteredAgentStart {
+	narratorId: string;
+	logicalRunId: string;
+	deliverTo: RunDeliverTo;
+}
+
 export interface RunHandle {
 	started: boolean;
+	notStartedReason?: "owned" | "admission_closed";
 	logicalRunId?: string;
 	/** The caller's result: terminal, or a handoff when the run is detached. */
 	foreground: Promise<RunResult>;
@@ -131,6 +144,44 @@ const notStarted: RunResult = {
 	interrupted: false,
 	timedOut: false,
 };
+
+let acceptingRuns = true;
+const pendingRunCompletions = new Set<Promise<RunResult>>();
+let shutdownRunFailures = 0;
+export function stopNarratorRunAdmission(): void {
+	acceptingRuns = false;
+	freezeCheckpointStopAdmission();
+}
+
+export function getNarratorRunShutdownSnapshot() {
+	return {
+		stopped: !acceptingRuns,
+		pending: pendingRunCompletions.size,
+		failed: shutdownRunFailures,
+	};
+}
+
+export async function drainNarratorRunCompletions(options: { deadlineAt: number }): Promise<void> {
+	while (pendingRunCompletions.size) {
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator run cleanup drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingRunCompletions]),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("Narrator run cleanup drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	if (shutdownRunFailures) throw new Error("Narrator run cleanup failed during shutdown");
+}
 
 type Session = typeof import("../narrator-session");
 const session = (): Promise<Session> => import("../narrator-session");
@@ -289,12 +340,27 @@ async function announceRunToDestination(
  */
 export async function startNarratorRun(req: StartNarratorRunRequest): Promise<RunHandle> {
 	const id = req.narratorId;
+	let notStartedReason: RunHandle["notStartedReason"] = "owned";
 	const launch = await withNarratorStartAdmission(id, async () => {
+		if (!acceptingRuns) {
+			notStartedReason = "admission_closed";
+			return null;
+		}
 		req.admission?.check();
 		const owner = tryClaimExecution(id, "run");
 		if (!owner) return null;
-		req.admission?.onAdmitted();
-		const { promise: terminal, resolve: resolveTerminal } = Promise.withResolvers<RunResult>();
+		try {
+			req.admission?.onAdmitted();
+		} catch (error) {
+			owner.release();
+			throw error;
+		}
+		const {
+			promise: terminal,
+			resolve: resolveTerminal,
+			reject: rejectTerminal,
+		} = Promise.withResolvers<RunResult>();
+		void terminal.catch(() => {});
 		const {
 			promise: foreground,
 			resolve: resolveForeground,
@@ -330,6 +396,22 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 				return result;
 			},
 			(error) => {
+				if (run.checkpointStop) {
+					if (error !== run.checkpointStop) run.checkpointStop.cleanupFailure ??= error;
+					if (error !== run.checkpointStop || run.checkpointStop.cleanupFailure !== undefined) {
+						shutdownRunFailures++;
+						logger.warn("Checkpoint run local cleanup failed", {
+							narratorId: id,
+							error: String(run.checkpointStop.cleanupFailure ?? error),
+						});
+					}
+					rejectTerminal(run.checkpointStop);
+					if (!foregroundSettled) {
+						foregroundSettled = true;
+						rejectForeground(run.checkpointStop);
+					}
+					throw run.checkpointStop;
+				}
 				const failed: RunResult = {
 					...notStarted,
 					started: true,
@@ -347,12 +429,19 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 				throw error;
 			},
 		);
-		void completion.catch(() => {});
+		pendingRunCompletions.add(completion);
+		void completion.then(
+			() => pendingRunCompletions.delete(completion),
+			(error) => {
+				pendingRunCompletions.delete(completion);
+				if (!acceptingRuns && run.checkpointStop !== error) shutdownRunFailures++;
+			},
+		);
 		return { run, completion, foreground: req.foreground ? foreground : terminal };
 	});
 	if (!launch) {
 		const idle = Promise.resolve(notStarted);
-		return { started: false, foreground: idle, terminal: idle, completion: idle };
+		return { started: false, notStartedReason, foreground: idle, terminal: idle, completion: idle };
 	}
 	return {
 		started: true,
@@ -361,6 +450,96 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 		terminal: launch.run.terminal,
 		completion: launch.completion,
 	};
+}
+
+/** Settle only this successful registration; a later execution or source attempt wins. */
+export async function settleRegisteredAgentStartFailure(
+	registered: RegisteredAgentStart,
+	error: unknown,
+	existingOwner?: ExecutionOwner,
+	eventKind: "failed" | "cancelled" = "failed",
+): Promise<boolean> {
+	try {
+		return await withNarratorMutationAdmission(registered.narratorId, async () => {
+			const owner = existingOwner ?? tryClaimExecution(registered.narratorId, "run");
+			if (!owner || owner.narratorId !== registered.narratorId || !owner.isCurrent()) return false;
+			const hold = getRunHold(registered.narratorId);
+			try {
+				const live = getRunControl(registered.narratorId);
+				if (live?.checkpointStop) return false;
+				// Release either runs before this claim and is honored by terminal delivery,
+				// or is refused until this failing execution has released its owner.
+				if (existingOwner && hold && live) live.finalizing = true;
+				// Retained answers belong to normal finish/release, not startup failure.
+				if (hold?.result) return false;
+				const retainHeldResult = !!hold && !hold.released;
+				const assertOwner = () => {
+					if (!owner.isCurrent()) throw new Error("Agent startup cleanup owner changed");
+					if (retainHeldResult && (getRunHold(registered.narratorId) !== hold || hold.released))
+						throw new Error("Agent startup cleanup hold changed");
+				};
+				const finalText = error instanceof Error ? error.message : String(error);
+				const pub = getRuntimePublicationService();
+				await withDbRetry(
+					() =>
+						pub.commitAgentTerminal({
+							run: {
+								producerKind: "agent",
+								taskId: registered.narratorId,
+								recipientId: registered.deliverTo.narratorId,
+								logicalRunId: registered.logicalRunId,
+							},
+							eventKind,
+							// Before handoff the Agent call receives the original exception itself.
+							delivery: existingOwner ? "background" : "foreground",
+							text: finalText,
+							summary: `[System] Background agent (ID: ${registered.narratorId}) failed to start.`,
+							startupFailure: { deliverTo: registered.deliverTo, retainHeldResult, assertOwner },
+						}),
+					{ label: "run.failRegisteredAgentStart", maxRetries: 3 },
+				);
+				assertOwner();
+				if (retainHeldResult) {
+					hold.result = {
+						...notStarted,
+						started: true,
+						logicalRunId: registered.logicalRunId,
+						output: finalText,
+						finalText,
+						hasError: eventKind === "failed",
+						interrupted: eventKind === "cancelled",
+					};
+				} else if (getRunHold(registered.narratorId) === hold)
+					setRunHold(registered.narratorId, undefined);
+				const { backgroundTaskService } = await import("../background-task-service");
+				backgroundTaskService.notifyDerivedStatusChanged(
+					registered.deliverTo.narratorId,
+					registered.narratorId,
+				);
+				if (retainHeldResult && existingOwner) return true;
+				await backgroundTaskService.announcePersistedAgentTerminal(
+					registered.narratorId,
+					registered.logicalRunId,
+				);
+				pub.schedule();
+				return true;
+			} finally {
+				if (!existingOwner) owner.release();
+			}
+		});
+	} catch (cleanupError) {
+		try {
+			logger.warn("Registered agent startup cleanup failed", {
+				narratorId: registered.narratorId,
+				logicalRunId: registered.logicalRunId,
+				error: String(error),
+				cleanupError: String(cleanupError),
+			});
+		} catch {
+			// Diagnostics must not replace the caller's original startup exception.
+		}
+		return false;
+	}
 }
 
 async function executeRun(
@@ -659,6 +838,26 @@ async function executeRun(
 		finished = true;
 		return await finishRun(id, run, deliverTo, publicationRun, { ...outcome, delegated }, req);
 	} catch (error) {
+		if (run.checkpointStop) {
+			allowInboxWake = false;
+			if (active) active._resumeBufferedAfterLoop = false;
+			throw error;
+		}
+		const preparingRunId = run.logicalRunId ?? req.registeredStart?.logicalRunId;
+		if (
+			preparingRunId &&
+			!run.cancel.signal.aborted &&
+			matchesCheckpointRun(error, {
+				narratorId: id,
+				logicalRunId: preparingRunId,
+				executionEpoch: owner.epoch,
+			})
+		) {
+			run.checkpointStop = error;
+			allowInboxWake = false;
+			if (active) active._resumeBufferedAfterLoop = false;
+			throw error;
+		}
 		// An exiting process may have closed a worker while this run was preparing.
 		const pausedForRestart = await waitForRestartBeforeFailure(run.cancel.signal);
 		// Infrastructure failure is not a successful turn boundary. In particular,
@@ -677,6 +876,8 @@ async function executeRun(
 				req,
 			);
 		}
+		if (!finished && !deliverToResolved && req.registeredStart && !pausedForRestart)
+			await settleRegisteredAgentStartFailure(req.registeredStart, error, owner);
 		// A run that threw still ends exactly once at its destination (the same
 		// finalizer); the error then reaches the session's own error reporting.
 		if (!finished && deliverTo && publicationRun)
@@ -722,9 +923,12 @@ async function executeRun(
 		}
 		removeCallerListener?.();
 		removeCancelListener?.();
-		const { backgroundTaskService } = await import("../background-task-service");
-		backgroundTaskService.unregisterAbortController(id, run.cancel);
-		if (owner.release()) afterRunRelease(id, active, allowInboxWake);
+		try {
+			const { backgroundTaskService } = await import("../background-task-service");
+			backgroundTaskService.unregisterAbortController(id, run.cancel);
+		} finally {
+			if (owner.release() && !run.checkpointStop) afterRunRelease(id, active, allowInboxWake);
+		}
 	}
 }
 
@@ -733,6 +937,10 @@ async function executeRun(
  * runtime-paused runs keep their input for an explicit retry.
  */
 function afterRunRelease(id: string, active: ActiveNarrator | undefined, allowInboxWake: boolean) {
+	if (!acceptingRuns) {
+		if (active) active._resumeBufferedAfterLoop = false;
+		return;
+	}
 	const resumeBuffered = active?._resumeBufferedAfterLoop === true;
 	if (active) active._resumeBufferedAfterLoop = false;
 	if (!allowInboxWake && !resumeBuffered) return;
@@ -1284,7 +1492,13 @@ export type RunControlAction =
  * Apply one control action to whatever run `narratorId` executes. Authorization is
  * the caller's job (human ACL or `authorizeAgentControl`).
  */
-export async function controlRun(narratorId: string, action: RunControlAction): Promise<boolean> {
+export function controlRun(narratorId: string, action: RunControlAction): Promise<boolean> {
+	return action.kind === "hold"
+		? withNarratorMutationAdmission(narratorId, () => controlRunUnlocked(narratorId, action))
+		: controlRunUnlocked(narratorId, action);
+}
+
+async function controlRunUnlocked(narratorId: string, action: RunControlAction): Promise<boolean> {
 	const run = getRunControl(narratorId);
 	switch (action.kind) {
 		case "hold": {
@@ -1595,7 +1809,13 @@ async function deliverHeldResult(
 	const row = await readRunSource(narratorId);
 	const current = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { substatus: true, logicalRunId: true },
+		columns: {
+			substatus: true,
+			logicalRunId: true,
+			backgroundResult: true,
+			backgroundStatus: true,
+			backgroundCompletedAt: true,
+		},
 	});
 	const registered = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
 	const prepared = registered
@@ -1624,44 +1844,73 @@ async function deliverHeldResult(
 			);
 	run.binding = prepared.binding;
 	run.logicalRunId = prepared.binding.logicalRunId;
+	const checkpoint =
+		current?.logicalRunId === prepared.binding.logicalRunId &&
+		current.backgroundCompletedAt &&
+		current.backgroundResult != null &&
+		parseSubstatus(current.substatus).includes(`terminal_run:${prepared.binding.logicalRunId}`)
+			? {
+					finalText: current.backgroundResult,
+					hasError: current.backgroundStatus === "failed",
+					interrupted: current.backgroundStatus === "cancelled",
+					timedOut: parseSubstatus(current.substatus).includes("timeout"),
+				}
+			: undefined;
+	const heldResult =
+		!hold.result?.logicalRunId || hold.result.logicalRunId === prepared.binding.logicalRunId
+			? hold.result
+			: undefined;
+	const saved = heldResult ?? checkpoint;
 	const { getSubagentFinalText } = await session();
-	const finalText = hold.result?.finalText ?? (await getSubagentFinalText(narratorId));
-	const hasError = hold.result?.hasError ?? parseSubstatus(current?.substatus).includes("error");
+	const finalText = saved?.finalText ?? (await getSubagentFinalText(narratorId));
+	const hasError = saved?.hasError ?? parseSubstatus(current?.substatus).includes("error");
 	const deliverTo = prepared.binding.deliverTo;
 	if (deliverTo && prepared.publicationRun) {
-		const eventKind: TerminalEvent = hold.result?.timedOut
-			? "timed_out"
-			: hold.result?.interrupted
-				? "cancelled"
-				: hasError
-					? "failed"
-					: "completed";
-		const principal = prepared.binding.principal?.userId ?? null;
-		const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
-		await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
-			eventKind,
-			finalText: delegated
-				? (
-						await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
-							delivered: finalText,
-							report: finalText,
-							ending: eventKind,
-							principal,
-						})
-					).text
-				: finalText,
-			hasError,
-			principal,
-		});
+		const state = await getRuntimePublicationService().readRunPublicationState(
+			prepared.publicationRun,
+		);
+		let alreadyDelivered = false;
+		if (state.state === "settled") {
+			const { backgroundTaskService } = await import("../background-task-service");
+			const task = await backgroundTaskService.getById(narratorId);
+			if (task) assertPublicationTaskIdentity(prepared.publicationRun, task);
+			alreadyDelivered = !!task && task.status !== "running";
+		}
+		if (!alreadyDelivered) {
+			const eventKind: TerminalEvent = saved?.timedOut
+				? "timed_out"
+				: saved?.interrupted
+					? "cancelled"
+					: hasError
+						? "failed"
+						: "completed";
+			const principal = prepared.binding.principal?.userId ?? null;
+			const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
+			await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
+				eventKind,
+				finalText: delegated
+					? (
+							await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
+								delivered: finalText,
+								report: finalText,
+								ending: eventKind,
+								principal,
+							})
+						).text
+					: finalText,
+				hasError,
+				principal,
+			});
+		}
 		await getRuntimePublicationService().releaseUnusedRunSlots(prepared.publicationRun);
 	}
 	await clearDeliveredHold(narratorId, hold);
 	await settleStatus(narratorId, deliverTo, {
 		hasError,
-		interrupted: hold.result?.interrupted ?? false,
-		timedOut: hold.result?.timedOut ?? false,
+		interrupted: saved?.interrupted ?? false,
+		timedOut: saved?.timedOut ?? false,
 		finalText,
-		terminalStatus: hold.result?.terminalStatus,
+		terminalStatus: heldResult?.terminalStatus,
 	});
 }
 

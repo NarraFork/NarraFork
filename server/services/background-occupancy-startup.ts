@@ -47,7 +47,7 @@ export class BackgroundOccupancyInitializer {
 		// one timer and do not let repeated callers bypass its backoff.
 		if (this.cancelRetry) return Promise.resolve(false);
 		const work = Promise.resolve()
-			.then(() => this.initialize())
+			.then(() => (this.stopped ? undefined : this.initialize()))
 			.then(() => {
 				if (this.stopped) return false;
 				this.initialized = true;

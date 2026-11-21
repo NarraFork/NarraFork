@@ -143,6 +143,7 @@ import {
 	consumeMailboxDelivery,
 	type MailboxDeliveryConsumption,
 } from "./agent-message-delivery";
+import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
 	claimInboxHead,
@@ -3385,7 +3386,14 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
  * the finalizer — registration rejected, or the run still working/waiting — still
  * report here.
  */
-async function reportUnsettledRunLoopError(
+function reportUnsettledRunLoopError(
+	...args: Parameters<typeof reportUnsettledRunLoopErrorUntracked>
+): Promise<void> {
+	if (isCheckpointStop(args[1])) return Promise.resolve();
+	return withTrackedNarratorSessionCleanup(() => reportUnsettledRunLoopErrorUntracked(...args));
+}
+
+async function reportUnsettledRunLoopErrorUntracked(
 	narratorId: string,
 	err: unknown,
 	diagnostics?: ReturnType<typeof diagnosticsFromError>,
@@ -3412,7 +3420,13 @@ async function reportUnsettledRunLoopError(
  * session — however it was created — runs here; relations (result destination,
  * caller cancellation, deadline, principal) come from the run registration.
  */
-export async function runAgentLoop(
+export function runAgentLoop(
+	...args: Parameters<typeof runAgentLoopUntracked>
+): ReturnType<typeof runAgentLoopUntracked> {
+	return withTrackedNarratorSessionWork(() => runAgentLoopUntracked(...args));
+}
+
+async function runAgentLoopUntracked(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
@@ -3471,6 +3485,8 @@ export async function runAgentLoop(
 		return { started: true };
 	} catch (error) {
 		forget();
+		if (isCheckpointStop(error) && error.identity.narratorId === narratorId)
+			return { started: true };
 		if (recoveryStart?.cancelled()) return { started: false };
 		if (!narratorLoopAdmissions.has(narratorId)) {
 			active._loopRunning = false;
@@ -3480,6 +3496,87 @@ export async function runAgentLoop(
 	} finally {
 		recoveryStart?.resolveAdmission(false);
 	}
+}
+
+const pendingNarratorSessionTails = new Set<Promise<unknown>>();
+let narratorSessionFinalizerFailures = 0;
+let firstNarratorSessionFinalizerFailure: unknown;
+
+function trackNarratorSessionTail<T>(work: Promise<T>): Promise<T> {
+	pendingNarratorSessionTails.add(work);
+	const settled = () => pendingNarratorSessionTails.delete(work);
+	void work.then(settled, settled);
+	return work;
+}
+
+function withTrackedNarratorSessionWork<T>(fn: () => Promise<T>): Promise<T> {
+	let fulfill!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const work = new Promise<T>((resolve, fail) => {
+		fulfill = resolve;
+		reject = fail;
+	});
+	trackNarratorSessionTail(work);
+	try {
+		void fn().then(fulfill, reject);
+	} catch (error) {
+		reject(error);
+	}
+	return work;
+}
+
+function withTrackedNarratorSessionCleanup<T>(fn: () => Promise<T>): Promise<T> {
+	return withTrackedNarratorSessionWork(async () => {
+		try {
+			return await fn();
+		} catch (error) {
+			if (!(error instanceof AppError && error.code === "NARRATOR_REVERT_IN_PROGRESS")) {
+				narratorSessionFinalizerFailures++;
+				firstNarratorSessionFinalizerFailure ??= error;
+			}
+			throw error;
+		}
+	});
+}
+
+export function getNarratorSessionTailStatus(): { pending: number; failed: number } {
+	return { pending: pendingNarratorSessionTails.size, failed: narratorSessionFinalizerFailures };
+}
+
+export async function drainNarratorSessionTails(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	options.signal?.throwIfAborted();
+	while (pendingNarratorSessionTails.size > 0) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator session tail drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingNarratorSessionTails]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Narrator session tail drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(
+						() => reject(new Error("Narrator session tail drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (narratorSessionFinalizerFailures)
+		throw new Error("Narrator session finalization failed", {
+			cause: firstNarratorSessionFinalizerFailure,
+		});
 }
 
 // === Message feeding ===
@@ -3841,11 +3938,17 @@ async function feedMessageUnlocked(
 					? "system"
 					: "person",
 		});
-		terminal.catch(async (err) => {
-			const diagnostics = diagnosticsFromError(err);
-			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
-		});
+		withTrackedNarratorSessionWork(() =>
+			terminal.catch(async (err) => {
+				const diagnostics = diagnosticsFromError(err);
+				logger.error("runAgentLoop unhandled error", {
+					narratorId,
+					error: String(err),
+					diagnostics,
+				});
+				await reportUnsettledRunLoopError(narratorId, err, diagnostics);
+			}),
+		);
 
 		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
 	} catch (error) {
@@ -8997,10 +9100,10 @@ export async function acquireNarratorRevertAdmission(
 		// A loop's one-shot finalizer may already have tried (and been refused by
 		// the waiting gate). Cancellation can also leave admitted cleanup running:
 		// wait for its real settlement, rather than losing the wakeup to busy once.
-		void (async () => {
+		withTrackedNarratorSessionWork(async () => {
 			await waitForNarratorAdmissionWork(narratorId, new AbortController().signal);
 			await resumeBufferedMessagesIfIdle(narratorId, "en");
-		})().catch((error) => {
+		}).catch((error) => {
 			if (!isNarratorRevertAdmissionBlocked(narratorId)) {
 				logger.warn("Could not resume messages after file revert", {
 					narratorId,

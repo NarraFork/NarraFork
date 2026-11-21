@@ -289,6 +289,14 @@ export function registerRecoverySource(
 export function getRegisteredRecoveryManifestIdentity(epoch: string): string | undefined {
 	return registry.entries.get(epoch)?.manifestIdentity;
 }
+/** Current pending targets only; original manifests remain evidence after a target settles. */
+export function isRecoveryTargetPending(narratorId: string): boolean {
+	// Registration/update already enforce MAX_RECOVERY_TARGETS across all sources.
+	for (const entry of registry.entries.values()) {
+		if (entry.source.pendingNarratorIds.includes(narratorId)) return true;
+	}
+	return false;
+}
 export function getRecoverySource(epoch: string): RecoverySource | undefined {
 	const entry = registry.entries.get(epoch);
 	return entry ? structuredClone(entry.source) : undefined;

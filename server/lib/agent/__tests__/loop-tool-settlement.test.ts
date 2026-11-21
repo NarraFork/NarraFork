@@ -103,7 +103,10 @@ const testProvider: ProviderAdapter = {
 				],
 			};
 			await bashStarted.promise;
-			await nextTick();
+			// Eager siblings must actually start while Bash is still held. Worker
+			// preflight may take more than one scheduler tick; serialization times out here.
+			if (bashInput.parallel && !bashInput.strict_serial) await readAfterStarted.promise;
+			else await nextTick();
 			executionWhileBashPending = [...executionOrder];
 			releaseBash.resolve();
 			await readAfterStarted.promise;

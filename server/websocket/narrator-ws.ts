@@ -1374,7 +1374,65 @@ function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
 	if (buffer) buffer.overflowed = true;
 }
 
-async function sendCatchUpForAnchor(
+const narratorWsReads = new Set<Promise<unknown>>();
+let narratorWsReadsStopped = false;
+let narratorWsReadsFailed = false;
+export function quiesceNarratorWsReadTasks(): void {
+	narratorWsReadsStopped = true;
+	for (const timer of pendingTerminalBroadcasts.values()) clearTimeout(timer);
+	pendingTerminalBroadcasts.clear();
+}
+export function hasPendingNarratorWsReadTasks(): boolean {
+	return narratorWsReads.size > 0;
+}
+function trackNarratorWsRead<T>(work: () => Promise<T>): Promise<T> {
+	if (narratorWsReadsStopped) return Promise.reject(new Error("WebSocket reads are stopped"));
+	const promise = Promise.resolve().then(work);
+	narratorWsReads.add(promise);
+	void promise.then(
+		() => narratorWsReads.delete(promise),
+		() => {
+			if (narratorWsReadsStopped) narratorWsReadsFailed = true;
+			narratorWsReads.delete(promise);
+		},
+	);
+	return promise;
+}
+export async function drainNarratorWsReadTasks(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	while (narratorWsReads.size) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("WebSocket reads did not drain");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...narratorWsReads]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("WebSocket read drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(() => reject(new Error("WebSocket reads did not drain")), remaining);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	if (narratorWsReadsFailed) throw new Error("WebSocket read work failed");
+}
+
+function sendCatchUpForAnchor(
+	...args: Parameters<typeof sendCatchUpForAnchorUntracked>
+): ReturnType<typeof sendCatchUpForAnchorUntracked> {
+	return trackNarratorWsRead(() => sendCatchUpForAnchorUntracked(...args));
+}
+
+async function sendCatchUpForAnchorUntracked(
 	ws: NarratorWS,
 	narratorId: string,
 	anchor: CatchUpCursor,
@@ -1736,6 +1794,7 @@ async function broadcastTerminalCount(narratorId: string | null) {
 }
 
 function debouncedTerminalCount(narratorId: string | null) {
+	if (narratorWsReadsStopped) return;
 	if (!narratorId) return;
 	const existing = pendingTerminalBroadcasts.get(narratorId);
 	if (existing) clearTimeout(existing);
@@ -1743,7 +1802,7 @@ function debouncedTerminalCount(narratorId: string | null) {
 		narratorId,
 		setTimeout(() => {
 			pendingTerminalBroadcasts.delete(narratorId);
-			broadcastTerminalCount(narratorId).catch(() => {});
+			trackNarratorWsRead(() => broadcastTerminalCount(narratorId)).catch(() => {});
 		}, 100),
 	);
 }
@@ -2079,7 +2138,7 @@ export const handleNarratorWS = {
 				});
 				// Read before deciding: the team's record of who decided (M1) needs the call,
 				// which deciding takes out of the live registries.
-				readDecisionTarget(msg.requestId)
+				await readDecisionTarget(msg.requestId)
 					.then(async (target) => {
 						const resolved = await resolvePermissionOrDangerReflection(
 							msg.requestId,

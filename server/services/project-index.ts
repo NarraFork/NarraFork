@@ -749,6 +749,13 @@ async function rebuildProjectIndex() {
 
 let rebuildRunning: Promise<void> | null = null;
 let rebuildRequested = false;
+let rebuildStopped = false;
+
+export async function stopProjectIndexRebuild(): Promise<void> {
+	rebuildStopped = true;
+	rebuildRequested = false;
+	await Promise.all([rebuildRunning, rootKeysReady]);
+}
 
 /**
  * Rebuild every narrator's links in the background: paged by id, yielding between
@@ -756,6 +763,7 @@ let rebuildRequested = false;
  * pass instead of starting a second concurrent one.
  */
 export function scheduleProjectIndexRebuild(): Promise<void> {
+	if (rebuildStopped) return Promise.resolve();
 	if (activeDatabaseBackend !== "sqlite") return Promise.resolve();
 	if (rebuildRunning) {
 		rebuildRequested = true;
@@ -771,7 +779,7 @@ export function scheduleProjectIndexRebuild(): Promise<void> {
 			} catch (error) {
 				logger.warn("Project index rebuild failed", { error: String(error) });
 			}
-		} while (rebuildRequested);
+		} while (rebuildRequested && !rebuildStopped);
 	})().finally(() => {
 		rebuildRunning = null;
 	});

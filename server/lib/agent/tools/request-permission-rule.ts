@@ -4,6 +4,7 @@ import {
 	failPermissionRuleRequest,
 	requestPermissionRuleSchema,
 } from "@server/services/permission-rule-request-service";
+import { isCheckpointStop } from "../../../services/agent-runtime/checkpoint-stop";
 import type { ToolDefinition } from "../types";
 
 /**
@@ -125,6 +126,7 @@ export const requestPermissionRuleTool: ToolDefinition = {
 			);
 			return { output: JSON.stringify(result), title: `Permission rule ${result.status}` };
 		} catch (error) {
+			if (isCheckpointStop(error)) throw error;
 			try {
 				failPermissionRuleRequest(
 					`${ctx.toolCallBinding.toolCallId}:${ctx.toolCallBinding.attempt}`,

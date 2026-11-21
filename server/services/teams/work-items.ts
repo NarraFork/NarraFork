@@ -1125,7 +1125,7 @@ export async function settleIsolatedWorkItem(
 	workerNarratorId: string,
 	options: { retry?: boolean; signal?: AbortSignal } = {},
 ): Promise<"cleaned" | "kept" | "skipped" | "none"> {
-	if (activeDatabaseBackend !== "sqlite") return "none";
+	if (activeDatabaseBackend !== "sqlite" || options.signal?.aborted) return "none";
 	const item = db
 		.select()
 		.from(teamWorkItems)
@@ -1198,15 +1198,18 @@ async function settleItem(
 ): Promise<"cleaned" | "kept" | "skipped" | "none"> {
 	const signal = options.signal ?? new AbortController().signal;
 	try {
+		if (signal.aborted) return "kept";
 		const path = worktreePathOf(item);
 		if (!path) return "none";
 		const git = teamGit(path);
 		const baseSha = await git.resolveCommit(item.baseRef ?? "HEAD");
+		if (signal.aborted) return "kept";
 		const head = await git.resolveCommit("HEAD");
-		if (!baseSha || !head) return "kept";
+		if (signal.aborted || !baseSha || !head) return "kept";
 		const commits = await git.countCommitsNotIn(head, [baseSha]);
+		if (signal.aborted) return "kept";
 		const dirty = await git.uncommittedChanges();
-		if (commits > 0 || dirty.count > 0 || !dirty.exact) return "kept";
+		if (signal.aborted || commits > 0 || dirty.count > 0 || !dirty.exact) return "kept";
 		const actor: WorkActor = { kind: "agent", id: item.teamId };
 		if (!item.createdBy) {
 			recordWorkEvent(db, {
@@ -1219,14 +1222,17 @@ async function settleItem(
 			return "skipped";
 		}
 		const port = await ports();
+		if (signal.aborted) return "kept";
 		const principal = await port.principalOf(item.createdBy);
 		for (let attempt = 0; ; attempt++) {
+			if (signal.aborted) return "kept";
 			const plan = await port.planRemoval({
 				coordinatorId: item.teamId,
 				principal,
 				path,
 				signal,
 			});
+			if (signal.aborted) return "kept";
 			const blocker = plan.blockers[0]?.code;
 			if (
 				blocker &&
@@ -1234,7 +1240,16 @@ async function settleItem(
 				SETTLE_BLOCKERS_TO_RETRY.has(blocker) &&
 				attempt < SETTLE_RETRY_DELAYS_MS.length
 			) {
-				await new Promise((resolve) => setTimeout(resolve, SETTLE_RETRY_DELAYS_MS[attempt]));
+				await new Promise<void>((resolve) => {
+					const finish = () => {
+						clearTimeout(timer);
+						signal.removeEventListener("abort", finish);
+						resolve();
+					};
+					const timer = setTimeout(finish, SETTLE_RETRY_DELAYS_MS[attempt]);
+					signal.addEventListener("abort", finish, { once: true });
+					if (signal.aborted) finish();
+				});
 				continue;
 			}
 			if (plan.status !== "ready" || plan.confirmations.length > 0) {
@@ -1258,7 +1273,10 @@ async function settleItem(
 				expectedRevision: plan.expectedRevision,
 				signal,
 			});
+			// A dispatched removal may commit despite cancellation. Its owner drains through
+			// this result transaction before releasing database/reader ownership.
 			if (removed.outcome === "failed") {
+				if (signal.aborted) return "kept";
 				recordWorkEvent(db, {
 					teamId: item.teamId,
 					workItemId: item.id,
@@ -1403,8 +1421,29 @@ const checkins = hotSafe("narrafork.teams.checkins", () => ({
 	/** One pending check-in per team: a new one replaces it. */
 	pending: new Map<string, PendingCheckin>(),
 	/** The running lifecycle subscription's stop function. */
-	stopLifecycle: null as (() => void) | null,
+	stopLifecycle: null as (() => void | Promise<void>) | null,
+	stopped: false,
+	controller: new AbortController(),
+	pendingWork: new Set<Promise<unknown>>(),
+	failed: false,
 }));
+// Hot evaluations can inherit the pre-drain lifecycle state.
+checkins.controller ??= new AbortController();
+checkins.pendingWork ??= new Set();
+checkins.stopped ??= false;
+checkins.failed ??= false;
+
+function trackTeamLifecycleWork<T>(work: Promise<T>): Promise<T> {
+	checkins.pendingWork.add(work);
+	void work.then(
+		() => checkins.pendingWork.delete(work),
+		() => {
+			checkins.failed = true;
+			checkins.pendingWork.delete(work);
+		},
+	);
+	return work;
+}
 
 /** Replace the clock and the wake (tests); nulls restore production. */
 export function setCheckinSeamsForTests(seams: {
@@ -1418,6 +1457,9 @@ export function setCheckinSeamsForTests(seams: {
 export function resetCheckinsForTests(): void {
 	for (const pending of checkins.pending.values()) pending.cancel();
 	checkins.pending.clear();
+	checkins.stopped = false;
+	checkins.controller = new AbortController();
+	checkins.failed = false;
 }
 
 /** Pending check-ins (tests and status). */
@@ -1434,10 +1476,13 @@ export function cancelCheckin(teamId: string): boolean {
 	return true;
 }
 
-async function defaultCheckinWake(input: CheckinWakeInput): Promise<void> {
+async function defaultCheckinWake(input: CheckinWakeInput, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
 	const { checkinText } = await import("../../lib/prompts/team-lead");
+	if (signal.aborted) return;
 	const text = checkinText(input.locale === "zh-CN" ? "zh-CN" : "en", input.minutes, input.note);
 	const { deliverInjection } = await import("../narrator-injection");
+	if (signal.aborted) return;
 	await deliverInjection(input.teamId, {
 		content: text,
 		source: "team_checkin",
@@ -1462,8 +1507,11 @@ function teamIsActive(teamId: string): boolean {
 
 function arm(eventId: string, dueAt: number, input: CheckinWakeInput): void {
 	const { teamId } = input;
+	const signal = checkins.controller.signal;
+	if (checkins.stopped || signal.aborted) return;
 	checkins.pending.get(teamId)?.cancel();
 	const cancel = checkins.clock.after(Math.max(0, dueAt - checkins.clock.now()), () => {
+		if (checkins.stopped || signal.aborted) return;
 		const current = checkins.pending.get(teamId);
 		if (current?.eventId !== eventId) return;
 		checkins.pending.delete(teamId);
@@ -1481,7 +1529,12 @@ function arm(eventId: string, dueAt: number, input: CheckinWakeInput): void {
 			logger.warn("Team check-in could not fire", { teamId, error: String(error) });
 			return;
 		}
-		void (checkins.wake ?? defaultCheckinWake)(input).catch((error) => {
+		void trackTeamLifecycleWork(
+			Promise.resolve().then(() => {
+				if (signal.aborted) return;
+				return checkins.wake ? checkins.wake(input) : defaultCheckinWake(input, signal);
+			}),
+		).catch((error) => {
 			logger.warn("Team check-in wake failed", { teamId, error: String(error) });
 		});
 	});
@@ -1502,6 +1555,8 @@ export function scheduleCheckin(input: {
 	/** The person behind the scheduling turn. */
 	userId: string | null;
 }): { dueAt: string; replaced: boolean } {
+	if (checkins.stopped)
+		throw new AppError("Team maintenance is stopping", 503, "TEAM_MAINTENANCE_STOPPED");
 	const team = requireActiveTeam(input.coordinatorId);
 	if (
 		!Number.isInteger(input.minutes) ||
@@ -1553,7 +1608,8 @@ const CHECKIN_REARM_SCAN = 200;
  * the latest due time wins (then the larger id, only to be deterministic).
  */
 export function rearmCheckin(teamId: string): boolean {
-	if (activeDatabaseBackend !== "sqlite" || checkins.pending.has(teamId)) return false;
+	if (checkins.stopped || activeDatabaseBackend !== "sqlite" || checkins.pending.has(teamId))
+		return false;
 	if (!teamIsActive(teamId)) return false;
 	const since = new Date(checkins.clock.now() - CHECKIN_LOOKBACK_MS).toISOString();
 	const rows = db
@@ -1602,7 +1658,7 @@ export function rearmCheckin(teamId: string): boolean {
  * Bounded: at most 500 teams, and per team a `(team_id, created_at)` range of one day.
  */
 export function rearmCheckins(): number {
-	if (activeDatabaseBackend !== "sqlite") return 0;
+	if (checkins.stopped || activeDatabaseBackend !== "sqlite") return 0;
 	const teams = db
 		.select({ id: projectTeams.narratorId })
 		.from(projectTeams)
@@ -1623,8 +1679,18 @@ export function rearmCheckins(): number {
  * re-arm it on unarchive. Also re-arms pending check-ins. Idempotent across `--hot` reloads
  * (a previous subscription is stopped first). Returns the stop function.
  */
-export function startTeamWorkLifecycle(): () => void {
-	checkins.stopLifecycle?.();
+export function startTeamWorkLifecycle(): () => Promise<void> {
+	const previousStop = checkins.stopLifecycle;
+	void Promise.resolve(previousStop?.()).catch((error) =>
+		logger.warn("Previous team lifecycle did not drain", { error: String(error) }),
+	);
+	if (previousStop) {
+		for (const pending of checkins.pending.values()) pending.cancel();
+		checkins.pending.clear();
+	}
+	checkins.stopped = false;
+	const controller = new AbortController();
+	checkins.controller = controller;
 	let stopped = false;
 	const isTeam = (narratorId: string) => {
 		try {
@@ -1642,7 +1708,10 @@ export function startTeamWorkLifecycle(): () => void {
 	};
 	const onCompleted = (event: { narratorId: string; parentNarratorId: string }) => {
 		if (stopped || activeDatabaseBackend !== "sqlite") return;
-		if (isTeam(event.parentNarratorId)) void settleIsolatedWorkItem(event.narratorId);
+		if (isTeam(event.parentNarratorId))
+			void trackTeamLifecycleWork(
+				settleIsolatedWorkItem(event.narratorId, { signal: controller.signal }),
+			);
 	};
 	const onStatus = (event: { narratorId: string; status: string }) => {
 		if (stopped || activeDatabaseBackend !== "sqlite") return;
@@ -1675,10 +1744,28 @@ export function startTeamWorkLifecycle(): () => void {
 	} catch (error) {
 		logger.warn("Team check-ins could not be re-armed", { error: String(error) });
 	}
-	const stop = () => {
+	const stop = async () => {
 		stopped = true;
-		off();
-		if (checkins.stopLifecycle === stop) checkins.stopLifecycle = null;
+		controller.abort();
+		try {
+			off();
+		} catch {
+			checkins.failed = true;
+		}
+		if (checkins.stopLifecycle === stop) {
+			checkins.stopped = true;
+			for (const pending of checkins.pending.values()) {
+				try {
+					pending.cancel();
+				} catch {
+					checkins.failed = true;
+				}
+			}
+			checkins.pending.clear();
+			checkins.stopLifecycle = null;
+		}
+		while (checkins.pendingWork.size) await Promise.allSettled([...checkins.pendingWork]);
+		if (checkins.failed) throw new Error("Team lifecycle work did not drain successfully");
 	};
 	checkins.stopLifecycle = stop;
 	return stop;
