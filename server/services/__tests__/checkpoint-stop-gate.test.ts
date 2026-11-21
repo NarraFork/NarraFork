@@ -71,6 +71,30 @@ test("durable publication is required; only exact actors unwind and late gates p
 	await expect(blocked).rejects.toMatchObject({ name: "AbortError" });
 });
 
+test("signal-only deferred tool waits inherit checkpoint authority but unbound waits do not", async () => {
+	const known = actor();
+	const unknown = new AbortController();
+	const snapshot = await verified();
+	const pending = gate.waitUntilUpdateGateOpens(known.controller.signal);
+	const blocked = gate.waitUntilUpdateGateOpens(unknown.signal);
+	void pending.catch(() => {});
+	void blocked.catch(() => {});
+	try {
+		await commit(snapshot);
+		expect(gate.stopCheckpointedNarratorRuns()).toBe(1);
+		expect(await pending.catch((error) => error)).toMatchObject({ identity: known.identity });
+		await expect(gate.waitUntilUpdateGateOpens(known.controller.signal)).rejects.toMatchObject({
+			identity: known.identity,
+		});
+		unknown.abort();
+		await expect(blocked).rejects.toMatchObject({ name: "AbortError" });
+	} finally {
+		known.controller.abort();
+		unknown.abort();
+		await Promise.allSettled([pending, blocked]);
+	}
+});
+
 test("failed manifest IO cannot grant process-only stop", async () => {
 	const known = actor();
 	const snapshot = await verified();

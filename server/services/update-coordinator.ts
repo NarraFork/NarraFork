@@ -1171,6 +1171,7 @@ export async function waitUntilUpdateGateOpens(
 	signal?: AbortSignal,
 	identity?: CheckpointRunIdentity,
 ): Promise<void> {
+	identity ??= signal && gateActors.get(signal);
 	if (state.phase === "idle") return;
 	if (signal?.aborted) {
 		const error = new Error("Waiting for the update gate was aborted");
