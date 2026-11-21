@@ -646,23 +646,21 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					/>
 				)}
 
-				{provider.protocol === "completions-compatible" && (
-					<Select
-						label={t("toolResultImages")}
-						description={t("toolResultImagesDesc")}
-						size="xs"
-						data={[
-							{ value: "off", label: t("toolResultImagesOff") },
-							{ value: "inline", label: t("toolResultImagesInline") },
-							{ value: "separate", label: t("toolResultImagesSeparate") },
-						]}
-						value={provider.toolResultImages ?? "off"}
-						allowDeselect={false}
-						onChange={(value) =>
-							updateProvider("toolResultImages", (value ?? "off") as ToolResultImagesMode)
-						}
-					/>
-				)}
+				<Select
+					label={t("toolResultImages")}
+					description={t("toolResultImagesDesc")}
+					size="xs"
+					data={[
+						{ value: "off", label: t("toolResultImagesOff") },
+						{ value: "inline", label: t("toolResultImagesInline") },
+						{ value: "separate", label: t("toolResultImagesSeparate") },
+					]}
+					value={provider.toolResultImages ?? "off"}
+					allowDeselect={false}
+					onChange={(value) =>
+						updateProvider("toolResultImages", (value ?? "off") as ToolResultImagesMode)
+					}
+				/>
 
 				<Divider />
 				<Group gap="xs">

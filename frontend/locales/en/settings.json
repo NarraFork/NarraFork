@@ -1044,7 +1044,7 @@
 	"anthropicNativeSearch": "Native Web Search",
 	"anthropicNativeSearchDesc": "On by default for Claude Code (official API) providers; turn off if this endpoint does not serve Anthropic's server-side web_search tool. Search runs as a separate one-shot request (Claude CLI style), so prompt caching of the main conversation is never affected.",
 	"toolResultImages": "Images returned by tools",
-	"toolResultImagesDesc": "Chat Completions tool messages carry text only by default, so images a tool read never reach the model. The official OpenAI API forbids images in tool content; DeepSeek extends it with image_url blocks. Pick whatever the upstream supports.",
+	"toolResultImagesDesc": "Applies only when a model uses Chat Completions, including via a per-model protocol override. Off by default. The official OpenAI API requires tool images in a separate user message; DeepSeek also supports inline image_url blocks. Choose what the upstream supports.",
 	"toolResultImagesOff": "Do not send (OpenAI-compatible)",
 	"toolResultImagesInline": "Inline in the tool message (DeepSeek extension)",
 	"toolResultImagesSeparate": "Separate image message (official OpenAI shape)",

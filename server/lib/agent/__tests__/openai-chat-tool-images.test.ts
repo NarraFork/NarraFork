@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { normalizeToolResultImagesMode } from "@shared/tool-result-images";
 import { completionsWireHistory, expandChatToolResults, type OAIMessage } from "../openai-provider";
 import type { NeutralToolResults } from "../projection/turns";
 
@@ -42,6 +43,10 @@ function imageUrls(message: OAIMessage | undefined): string[] {
 }
 
 describe("历史投影里的工具图片", () => {
+	test("unconfigured tool result images default to off", () => {
+		expect(normalizeToolResultImagesMode(undefined)).toBe("off");
+		expect(normalizeToolResultImagesMode("invalid")).toBe("off");
+	});
 	test("off 保持现状：工具消息只有文本，图片不出现", () => {
 		const history = project(
 			"off",
@@ -79,13 +84,15 @@ describe("历史投影里的工具图片", () => {
 			]),
 		);
 
-		expect(history.map((message) => message.role)).toEqual(["tool", "tool", "user", "user"]);
+		expect(history.map((message) => message.role)).toEqual(["tool", "tool", "user"]);
 		expect(history[0]?.content).toBe("first");
 		expect(history[1]?.content).toBe("second");
 		expect(contentText(history[2])).toContain('"toolCallId":"call_1"');
-		expect(imageUrls(history[2])).toEqual(["data:image/png;base64,aGVsbG8="]);
-		expect(contentText(history[3])).toContain('"toolCallId":"call_2"');
-		expect(imageUrls(history[3])).toEqual(["data:image/jpeg;base64,d29ybGQ="]);
+		expect(contentText(history[2])).toContain('"toolCallId":"call_2"');
+		expect(imageUrls(history[2])).toEqual([
+			"data:image/png;base64,aGVsbG8=",
+			"data:image/jpeg;base64,d29ybGQ=",
+		]);
 	});
 
 	test("separate 单条结果不需要归属说明", () => {
@@ -141,6 +148,21 @@ describe("当前轮工具结果的图片", () => {
 		expect(imageUrls(messages[1])).toEqual(["data:image/png;base64,aGVsbG8="]);
 	});
 
+	test("separate groups parallel tool images into one attributed user message", () => {
+		const messages = expandChatToolResults(
+			[result("call_1", "first", [PNG]), result("call_2", "second", [JPG])],
+			"separate",
+		);
+		expect(messages.map((message) => message.role)).toEqual(["tool", "tool", "user"]);
+		expect(messages.slice(0, 2).map((message) => message.content)).toEqual(["first", "second"]);
+		expect(contentText(messages[2])).toContain('"toolCallId":"call_1"');
+		expect(contentText(messages[2])).toContain('"toolCallId":"call_2"');
+		expect(imageUrls(messages[2])).toEqual([
+			"data:image/png;base64,aGVsbG8=",
+			"data:image/jpeg;base64,d29ybGQ=",
+		]);
+	});
+
 	test("音频/视频仍然走独立的 user 消息，不受开关影响", () => {
 		const audio = { type: "audio" as const, mediaType: "audio/wav", base64: "UklGRg==" };
 		const withMedia = { tool_call_id: "call_1", content: "ok", _nativeMedia: [audio] };
@@ -152,5 +174,31 @@ describe("当前轮工具结果的图片", () => {
 				input_audio: { data: "UklGRg==", format: "wav" },
 			});
 		}
+	});
+
+	test("separate keeps native media and parallel images in the same trailing user message", () => {
+		const audio = { type: "audio" as const, mediaType: "audio/wav", base64: "UklGRg==" };
+		const turn = toolTurn([
+			{ wireId: "call_1", text: "first", images: [PNG] },
+			{ wireId: "call_2", text: "second", images: [JPG] },
+		]);
+		const first = turn.results[0];
+		if (!first) throw new Error("Missing first tool result");
+		first.media = [audio];
+		const current = expandChatToolResults(
+			[
+				{ ...result("call_1", "first", [PNG]), _nativeMedia: [audio] },
+				result("call_2", "second", [JPG]),
+			],
+			"separate",
+		);
+		const history = project("separate", turn);
+		expect(current).toEqual(history);
+		expect(current.map((message) => message.role)).toEqual(["tool", "tool", "user"]);
+		expect(imageUrls(current[2])).toHaveLength(2);
+		expect(current[2]?.content).toContainEqual({
+			type: "input_audio",
+			input_audio: { data: "UklGRg==", format: "wav" },
+		});
 	});
 });

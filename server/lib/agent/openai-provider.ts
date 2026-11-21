@@ -2094,26 +2094,22 @@ const toolImageDataUrl = (image: { format: string; base64: string }) =>
  * 记录的结构：工具消息保持纯文本，图片紧随其后单独成条。并行调用时带上归属说明，
  * 否则模型无从知道这些图是谁返回的。
  */
-function toolImageUserMessage(
+function toolImageUserParts(
 	images: readonly ResponsesToolImage[],
 	toolCallId: string,
 	attributed: boolean,
-): OAIMessage | null {
-	if (!images.length) return null;
-	return {
-		role: "user",
-		content: images.flatMap((image): OAIContentPart[] => {
-			const parts: OAIContentPart[] = [];
-			if (attributed) {
-				parts.push({
-					type: "text",
-					text: `Tool result image source: ${JSON.stringify({ toolCallId })}`,
-				});
-			}
-			parts.push({ type: "image_url", image_url: { url: toolImageDataUrl(image) } });
-			return parts;
-		}),
-	};
+): OAIContentPart[] {
+	return images.flatMap((image): OAIContentPart[] => {
+		const parts: OAIContentPart[] = [];
+		if (attributed) {
+			parts.push({
+				type: "text",
+				text: `Tool result image source: ${JSON.stringify({ toolCallId })}`,
+			});
+		}
+		parts.push({ type: "image_url", image_url: { url: toolImageDataUrl(image) } });
+		return parts;
+	});
 }
 
 /** Tool images inlined into the tool message itself (DeepSeek's `image_url` extension). */
@@ -2149,17 +2145,14 @@ export function expandChatToolResults(
 	const media = results.flatMap((result) =>
 		(result._nativeMedia ?? []).flatMap((item) => chatNativeMediaParts(item, result.tool_call_id)),
 	);
-	if (media.length) messages.push({ role: "user", content: media });
 	if (mode === "separate") {
 		for (const result of results) {
-			const message = toolImageUserMessage(
-				result._images ?? [],
-				result.tool_call_id,
-				results.length > 1,
+			media.push(
+				...toolImageUserParts(result._images ?? [], result.tool_call_id, results.length > 1),
 			);
-			if (message) messages.push(message);
 		}
 	}
+	if (media.length) messages.push({ role: "user", content: media });
 	return messages;
 }
 
@@ -4402,17 +4395,14 @@ export function completionsWireHistory(
 			const media = turn.results.flatMap((result) =>
 				(result.media ?? []).flatMap((item) => chatNativeMediaParts(item, result.wireId)),
 			);
-			if (media.length) history.push({ role: "user", content: media });
 			if (options.toolResultImages === "separate") {
 				for (const result of turn.results) {
-					const message = toolImageUserMessage(
-						result.images ?? [],
-						result.wireId,
-						turn.results.length > 1,
+					media.push(
+						...toolImageUserParts(result.images ?? [], result.wireId, turn.results.length > 1),
 					);
-					if (message) history.push(message);
 				}
 			}
+			if (media.length) history.push({ role: "user", content: media });
 			continue;
 		}
 		const searches = turn.items.filter((item) => item.kind === "web_search");
