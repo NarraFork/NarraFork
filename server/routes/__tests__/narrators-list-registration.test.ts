@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from "bun:test";
+import { beforeAll, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -28,6 +28,8 @@ beforeAll(async () => {
 			handle: i === 0 ? "list-named" : null,
 			handleFolded: i === 0 ? "list-named" : null,
 			traits: i === 0 ? ["standalone", "named"] : ["standalone"],
+			isAskInPassing: i === 1,
+			parentNarratorId: i === 1 ? "list-0" : null,
 			runtimeRegistrationJson: {
 				version: 1 as const,
 				run: {
@@ -39,19 +41,6 @@ beforeAll(async () => {
 			updatedAt: NOW,
 		})),
 	);
-});
-test("list queries exclude the registration at SQL projection, not only response serialization", () => {
-	const routes = readFileSync(join(import.meta.dir, "../narrators.ts"), "utf-8");
-	const service = readFileSync(
-		join(import.meta.dir, "../../services/narrator-service.ts"),
-		"utf-8",
-	);
-	for (const site of [
-		routes.slice(routes.indexOf("const [list, countResult]"), routes.indexOf("const totalCount")),
-		service.slice(service.indexOf("async listNamed()"), service.indexOf("async setHandle(")),
-	]) {
-		expect(site).toMatch(/columns:\s*\{\s*runtimeRegistrationJson:\s*false\s*\}/);
-	}
 });
 test("named list searches by handle instead of scanning every narrator", () => {
 	const service = readFileSync(
@@ -75,23 +64,48 @@ test("named list searches by handle instead of scanning every narrator", () => {
 	);
 	expect(plan.some((row) => row.detail === "SCAN narrators")).toBe(false);
 });
-test("all, project and named lists never return live runtime registration", async () => {
+test("flat, grouped and named lists omit runtime registration from SQL and responses", async () => {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
 		c.set("user", { sub: "list-owner", role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	app.route("/narrators", narratorRoutes);
-	for (const suffix of ["", "?projectId=list-project", "/named"]) {
-		const response = await app.request(`http://localhost/narrators${suffix}`);
-		expect(response.status).toBe(200);
-		const body = await response.json();
-		const items = Array.isArray(body) ? body : body.items;
-		expect(items.length).toBeGreaterThan(0);
-		for (const item of items) expect(item).not.toHaveProperty("runtimeRegistrationJson");
-		expect(JSON.stringify(body)).not.toContain("private-execution-principal");
+	const prepare = spyOn(sqlite, "prepare");
+	function expectSafeProjection() {
+		const queries = prepare.mock.calls
+			.map(([statement]) => statement)
+			.filter((statement) => /\b(?:from|join) "narrators"/i.test(statement));
+		expect(queries.length).toBeGreaterThan(0);
+		for (const query of queries) {
+			expect(query).not.toContain("runtime_registration_json");
+			expect(query).not.toMatch(/^select (?:\*|"[^"]+"\.\*)/i);
+		}
+		prepare.mockClear();
 	}
-	const named = await narratorService.listNamed();
-	expect(named.length).toBeGreaterThan(0);
-	for (const item of named) expect(item).not.toHaveProperty("runtimeRegistrationJson");
+	try {
+		for (const suffix of ["", "?projectId=list-project", "?groupAskInPassing=true", "/named"]) {
+			const response = await app.request(`http://localhost/narrators${suffix}`);
+			expect(response.status).toBe(200);
+			const body = await response.json();
+			const items = Array.isArray(body) ? body : body.items;
+			expect(items.length).toBeGreaterThan(0);
+			for (const item of items) expect(item).not.toHaveProperty("runtimeRegistrationJson");
+			if (suffix.includes("groupAskInPassing")) {
+				const children = items.find(
+					(item: { id: string }) => item.id === "list-0",
+				)?.askInPassingSessions;
+				expect(children).toEqual([expect.objectContaining({ id: "list-1" })]);
+				expect(children[0]).not.toHaveProperty("runtimeRegistrationJson");
+			}
+			expect(JSON.stringify(body)).not.toContain("private-execution-principal");
+			expectSafeProjection();
+		}
+		const named = await narratorService.listNamed();
+		expect(named.length).toBeGreaterThan(0);
+		for (const item of named) expect(item).not.toHaveProperty("runtimeRegistrationJson");
+		expectSafeProjection();
+	} finally {
+		prepare.mockRestore();
+	}
 });

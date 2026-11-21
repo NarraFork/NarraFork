@@ -28,6 +28,7 @@ import {
 } from "@shared/text-file-types";
 import { isAbsoluteForFlavor, normalizeWorkspacePathFlavor } from "@shared/workspace-directories";
 import {
+	aliasedTable,
 	and,
 	asc,
 	type Column,
@@ -45,7 +46,6 @@ import {
 	type SQLWrapper,
 	sql,
 } from "drizzle-orm";
-import { alias } from "drizzle-orm/sqlite-core";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
@@ -1237,7 +1237,7 @@ function rankedAskInPassingChildren(
 	principal: NarratorPrincipal,
 	archived: boolean,
 ) {
-	const child = alias(narrators, "ask_child");
+	const child = aliasedTable(narrators, "ask_child");
 	return db
 		.select({ id: child.id })
 		.from(child)
@@ -1254,7 +1254,7 @@ function rankedAskInPassingChildren(
 }
 
 function groupedAskInPassingChild(principal: NarratorPrincipal, archived: boolean) {
-	const host = alias(narrators, "ask_host");
+	const host = aliasedTable(narrators, "ask_host");
 	return and(
 		eq(narrators.isAskInPassing, true),
 		exists(
@@ -1287,7 +1287,7 @@ async function askInPassingChildrenByParent(
 		Omit<typeof narrators.$inferSelect, "runtimeRegistrationJson">[]
 	>();
 	if (!parentIds.length) return byParent;
-	const host = alias(narrators, "ask_host");
+	const host = aliasedTable(narrators, "ask_host");
 	const rows = await db
 		.select({ ...narratorListColumns, hostId: host.id })
 		.from(host)
