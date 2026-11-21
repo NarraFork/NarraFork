@@ -23,7 +23,7 @@
 import type { Database } from "bun:sqlite";
 import * as drizzle from "drizzle-orm";
 import { SQLiteSelectBase } from "drizzle-orm/sqlite-core";
-import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import { runReadTask, runShortReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import {
 	SELECT_ROWS_MAX_ROWS,
 	type SelectRowsParams,
@@ -37,6 +37,11 @@ export interface ReadQueryOptions {
 	timeoutMs?: number;
 	/** Row budget; exceeding it fails the read instead of truncating. */
 	maxRows?: number;
+	/**
+	 * Run on the reserved short-read pool (5 s cap, small queue) instead of the ordinary read
+	 * queue. Only for indexed point lookups on a hot path; `maxRows` defaults to 1.
+	 */
+	shortRead?: boolean;
 }
 
 /** Drizzle internals; an unrecognized connection shape must fail, never select inline execution. */
@@ -65,16 +70,21 @@ export async function readQuery<T>(
 		return await query;
 
 	const compiled = query.toSQL();
-	const result = await runReadTask<SelectRowsResult>(
-		client.filename,
-		{
-			kind: "selectRows",
-			sql: compiled.sql,
-			params: compiled.params as SelectRowsParams["params"],
-			maxRows: options.maxRows ?? SELECT_ROWS_MAX_ROWS,
-		},
-		{ signal: options.signal, timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
-	);
+	const params: SelectRowsParams = {
+		kind: "selectRows",
+		sql: compiled.sql,
+		params: compiled.params as SelectRowsParams["params"],
+		maxRows: options.maxRows ?? (options.shortRead ? 1 : SELECT_ROWS_MAX_ROWS),
+	};
+	const result = options.shortRead
+		? await runShortReadTask(client.filename, params, {
+				signal: options.signal,
+				timeoutMs: options.timeoutMs,
+			})
+		: await runReadTask<SelectRowsResult>(client.filename, params, {
+				signal: options.signal,
+				timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			});
 
 	const fields = orderSelectedFields(internals.config.fields);
 	return result.rows.map((row) => mapResultRow(fields, row, internals.joinsNotNullableMap) as T);

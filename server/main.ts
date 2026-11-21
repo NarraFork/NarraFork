@@ -10,8 +10,15 @@ import {
 import { urlHost } from "../shared/server-host";
 import { MAX_IMPORT_BYTES } from "../shared/storage-transfer";
 import { app } from "./app";
+import { getDbPath } from "./db/connection";
 import { createServerRequestDispatcher } from "./http-dispatcher";
 import { createServerRequestLifecycle } from "./http-request-lifecycle";
+import { createDatabaseReaderReadiness } from "./lib/db-reader-readiness";
+import {
+	getDbWorkerAvailability,
+	runShortReadTask,
+	shutdownDbWorkerPool,
+} from "./lib/db-worker/pool";
 import { attachRemoteAccessRuntime } from "./services/remote-access-runtime";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -30,7 +37,6 @@ import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { claimBrowserShutdownOwnership } from "./lib/browser/pool";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
-import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { hotOnce, hotSafe } from "./lib/hot-safe";
@@ -638,6 +644,17 @@ function killOwnWindowsChildProcesses(): void {
 }
 
 const startupReadiness = createStartupReadinessGate();
+// Auth reads run only on the short-read Workers; probe them once before serving requests.
+const databaseReaders = createDatabaseReaderReadiness({
+	backend: activeDatabaseBackend,
+	probe: ({ signal, timeoutMs }) =>
+		runShortReadTask(
+			getDbPath(),
+			{ kind: "selectRows", sql: "SELECT 1", params: [], maxRows: 1 },
+			{ signal, timeoutMs },
+		),
+	availability: getDbWorkerAvailability,
+});
 
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
@@ -655,6 +672,7 @@ const fetchRequest = createServerRequestDispatcher({
 	lifecycle: httpLifecycle,
 	startupReadiness,
 	activeDatabaseBackend,
+	databaseReaders,
 });
 
 /**

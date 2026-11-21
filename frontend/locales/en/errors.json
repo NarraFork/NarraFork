@@ -52,6 +52,7 @@
 	"GIT_AUTH_REQUIRED": "Git authentication is required",
 	"AUTH_REQUIRED": "Sign in to continue",
 	"TOKEN_EXPIRED": "Your session expired. Sign in again.",
+	"DATABASE_READ_UNAVAILABLE": "The database is busy. Try again in a few seconds.",
 	"TOKEN_INVALID": "Your sign-in is no longer valid. Sign in again.",
 	"SESSION_REVOKED": "Your session was revoked. Sign in again.",
 	"SESSION_REQUIRED": "This action requires signing in directly, not an API token",

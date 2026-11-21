@@ -12,11 +12,19 @@ import { users } from "./db/schema";
 import type { ServerRequestLifecycle } from "./http-request-lifecycle";
 import { verifyToken } from "./lib/auth";
 import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
+import {
+	type DatabaseReaderReadiness,
+	databaseReadersAvailable,
+	databaseReaderUnavailableResponse,
+	isDatabaseReadUnavailable,
+	requiresDatabaseReaders,
+} from "./lib/db-reader-readiness";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { trustedRemoteRequestContext } from "./lib/remote-request-context";
 import { settings } from "./lib/settings";
 import { buildHealthPayload, type createStartupReadinessGate } from "./lib/startup-readiness";
 import type { VNetRelayAuth } from "./lib/vnet/types";
+import { authRead } from "./services/auth/sqlite-auth-read";
 import {
 	consumeOAuthWsTicket,
 	EXTERNAL_NARRATORS_WS_CHANNEL,
@@ -103,8 +111,10 @@ export function createServerRequestDispatcher(options: {
 	lifecycle: ServerRequestLifecycle;
 	startupReadiness: ReturnType<typeof createStartupReadinessGate>;
 	activeDatabaseBackend: "sqlite" | "postgres";
+	databaseReaders?: DatabaseReaderReadiness;
 }) {
 	const { app, lifecycle, startupReadiness, activeDatabaseBackend } = options;
+	const databaseReaders = options.databaseReaders;
 	return (req: Request, server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">) => {
 		if (!lifecycle.accepting) {
 			return new Response("Server is shutting down", {
@@ -129,16 +139,18 @@ export function createServerRequestDispatcher(options: {
 				const headers = new Headers(healthResponse.headers);
 				headers.delete("content-length");
 				headers.set("content-type", "application/json; charset=UTF-8");
+				const readerState = databaseReaders?.state;
 				return new Response(
 					JSON.stringify({
 						...buildHealthPayload(healthPayload, startupReadiness.state),
+						...(readerState ? { databaseReaders: readerState } : {}),
 						// Which database backend this process wired at startup. A monitor that
 						// watches a PostgreSQL deployment must be able to tell it actually came
 						// up on PostgreSQL — a silent fallback would report a healthy SQLite.
 						database: { backend: activeDatabaseBackend },
 					}),
 					{
-						status: healthResponse.status,
+						status: readerState?.status === "failed" ? 503 : healthResponse.status,
 						headers,
 					},
 				);
@@ -149,6 +161,13 @@ export function createServerRequestDispatcher(options: {
 				activeDatabaseBackend,
 			);
 			if (narratorWsRefusal) return narratorWsRefusal;
+
+			if (databaseReaders && requiresDatabaseReaders(url.pathname)) {
+				const readerState = await databaseReaders.wait();
+				if (!databaseReadersAvailable(readerState)) {
+					return databaseReaderUnavailableResponse(readerState);
+				}
+			}
 
 			// Wait for recovery to reach a terminal outcome so restored narrators observe a
 			// consistent state. A recovery failure is scoped to its narrator and never
@@ -266,24 +285,36 @@ export function createServerRequestDispatcher(options: {
 				}
 				let payload: Awaited<ReturnType<typeof verifyToken>>;
 				try {
-					payload = await verifyToken(token);
-				} catch {
+					payload = await verifyToken(token, { signal: req.signal });
+				} catch (error) {
+					if (isDatabaseReadUnavailable(error)) {
+						return databaseReaderUnavailableResponse({
+							status: "failed",
+							code: "DB_READERS_UNAVAILABLE",
+							reason: (error as Error).message,
+						});
+					}
 					return new Response("Invalid or expired token", { status: 401 });
 				}
 
 				// Look up user info for presence tracking
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, payload.sub),
-					columns: {
-						id: true,
-						username: true,
-						avatarColor: true,
-						avatarImageId: true,
+				const userQuery = db
+					.select({
+						id: users.id,
+						username: users.username,
+						avatarColor: users.avatarColor,
+						avatarImageId: users.avatarImageId,
 						// Read live, so a demotion applies to the next socket. The narrator
 						// subscribe path uses it for the admin short-circuit.
-						role: true,
-					},
-				});
+						role: users.role,
+					})
+					.from(users)
+					.where(eq(users.id, payload.sub))
+					.limit(1);
+				const [user] =
+					activeDatabaseBackend === "sqlite"
+						? await authRead(userQuery, { signal: req.signal })
+						: await userQuery;
 				// `verifyToken` already rejected revoked and expired sessions; a user row that
 				// vanished since still fails the upgrade.
 				if (!user) {
