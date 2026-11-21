@@ -224,7 +224,17 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					actor?.logicalRunId &&
 					registered?.logicalRunId === actor.logicalRunId &&
 					registered.deliverTo &&
-					!sameDeliveryTarget(registered.deliverTo, input.binding.deliverTo)
+					!sameDeliveryTarget(registered.deliverTo, input.binding.deliverTo) &&
+					(resumeRunId === actor.logicalRunId ||
+						store.readRunPublicationState(
+							{
+								producerKind: "agent",
+								taskId: input.narratorId,
+								logicalRunId: actor.logicalRunId,
+								recipientId: registered.deliverTo.narratorId,
+							},
+							tx,
+						).state !== "settled")
 				)
 					throw new ValidationError("Stale task publication destination");
 				if (resumeRunId === undefined && actor?.logicalRunId) {
@@ -1376,11 +1386,7 @@ function createSqliteAsyncPublicationService(
 		);
 	return {
 		backend: "sqlite",
-		startRun: async (input) => {
-			const started = legacy.startRun(input);
-
-			return started;
-		},
+		startRun: async (input) => legacy.startRun(input),
 		getAgentRun: async (narratorId, recipientId) => legacy.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => legacy.newBashRun(taskId, recipientId),
 		startBashRun: async (input) => {
@@ -2168,11 +2174,7 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 
 	return {
 		backend: "postgres",
-		startRun: async (input) => {
-			const started = await engine.startRun(input);
-
-			return started;
-		},
+		startRun: (input) => engine.startRun(input),
 		getAgentRun: (narratorId, recipientId) => engine.getAgentRun(narratorId, recipientId),
 		newBashRun: (taskId, recipientId) => ({
 			producerKind: "bash",

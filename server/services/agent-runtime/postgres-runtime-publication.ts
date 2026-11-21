@@ -666,14 +666,17 @@ export function createPostgresRuntimePublication(
 		return and(runIdentity(run), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved"));
 	}
 	/** Same three-state authority as the SQLite outbox; recovery never infers it from result reads. */
-	async function readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus> {
-		const reserved = await db
+	async function readRunPublicationState(
+		run: PublicationRun,
+		reader: Pick<PgRuntimeTx, "select"> = db,
+	): Promise<RunPublicationStatus> {
+		const reserved = await reader
 			.select({ id: outbox.id })
 			.from(outbox)
 			.where(reservedTerminalSlot(run))
 			.limit(1);
 		if (reserved[0]) return { state: "reserved" };
-		const committed = await db
+		const committed = await reader
 			.select({ eventKind: outbox.eventKind })
 			.from(outbox)
 			.where(
@@ -693,7 +696,7 @@ export function createPostgresRuntimePublication(
 		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
 			publicationDedupeKey(run, event),
 		);
-		const delivered = await db
+		const delivered = await reader
 			.select({ dedupeKey: mailbox.dedupeKey })
 			.from(mailbox)
 			.where(and(eq(mailbox.narratorId, run.recipientId), inArray(mailbox.dedupeKey, keys)))
@@ -702,7 +705,7 @@ export function createPostgresRuntimePublication(
 			const eventKind = publicationEventFromDedupeKey(delivered[0].dedupeKey);
 			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
 		}
-		const consumed = await db
+		const consumed = await reader
 			.select({ taskId: consumptions.taskId })
 			.from(consumptions)
 			.where(
@@ -876,7 +879,19 @@ export function createPostgresRuntimePublication(
 						(current.narratorId !== expected?.narratorId ||
 							current.toolUseId !== expected?.toolUseId ||
 							current.toolCallId !== expected?.toolCallId ||
-							current.attempt !== expected?.attempt)
+							current.attempt !== expected?.attempt) &&
+						(resumeRunId === currentRunId ||
+							(
+								await readRunPublicationState(
+									{
+										producerKind: "agent",
+										taskId: input.narratorId,
+										logicalRunId: currentRunId,
+										recipientId: current.narratorId,
+									},
+									tx,
+								)
+							).state !== "settled")
 					)
 						throw new ValidationError("Stale task publication destination");
 					if (currentRunId && resumeRunId === undefined) {

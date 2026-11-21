@@ -117,7 +117,7 @@ test("every production run entry supplies identity or explicitly relies on its o
 					// run service also reads the human-prepared active session's identity.
 					const preparedWrapper =
 						path === "server/services/narrator-session.ts" &&
-						context === "runAgentLoop" &&
+						context === "runAgentLoopUntracked" &&
 						name === "startNarratorRun" &&
 						args[0]?.getText(file).includes("...options");
 					// A background projection registered its principal atomically before

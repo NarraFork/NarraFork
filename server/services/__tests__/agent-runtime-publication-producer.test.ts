@@ -253,6 +253,24 @@ describe("real task producers use publication outbox", () => {
 		);
 		expect((await tasks.getById("child"))?.logicalRunId).toBe(second.logicalRunId);
 	});
+	test("a new destination cannot adopt an unsettled registered run", async () => {
+		const run = publisher.startRun({
+			narratorId: "child",
+			binding: { deliverTo: { narratorId: "parent", toolUseId: "first-tool" } },
+		}).publication!;
+		await expect(
+			tasks.createAgentTask({
+				id: "child",
+				subagentNarratorId: "child",
+				subagentType: "general",
+				binding: { deliverTo: { narratorId: "parent", toolUseId: "second-tool" } },
+			}),
+		).rejects.toThrow("Stale task publication destination");
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
+			run.logicalRunId,
+		);
+		expect(db.select().from(backgroundTasks).all()).toHaveLength(0);
+	});
 	test("new task admission does not adopt the actor's old terminal or consumed run", async () => {
 		const old = publisher.startRun({
 			narratorId: "child",

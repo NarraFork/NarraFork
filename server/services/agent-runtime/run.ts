@@ -1866,7 +1866,7 @@ async function deliverHeldResult(
 			const { backgroundTaskService } = await import("../background-task-service");
 			const task = await backgroundTaskService.getById(narratorId);
 			if (task) assertPublicationTaskIdentity(prepared.publicationRun, task);
-			alreadyDelivered = !task || task.status !== "running";
+			alreadyDelivered = !!task && task.status !== "running";
 		}
 		if (!alreadyDelivered) {
 			const eventKind: TerminalEvent = saved?.timedOut
