@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { ValidationError } from "../../errors";
 import { settings } from "../../settings";
 
 const realPuppeteer = { ...(await import("puppeteer-core")) };
@@ -80,6 +81,56 @@ test("new sessions pick up changes without closing an existing session", async (
 	expect(contexts[0]?.options).toMatchObject({ proxyServer: "http://browser:8082" });
 	expect(contexts[1]?.options).toMatchObject({ proxyServer: "direct://" });
 	expect(contexts[0]?.close).not.toHaveBeenCalled();
+});
+
+test("manual Browser uses the browser override and strict context policy only for manual tabs", async () => {
+	settings.proxy = {
+		mode: "custom",
+		url: "http://global:8080",
+		noProxyRules: [{ match: "wildcard", pattern: "bare.example.test" }],
+	};
+	await openTab(true, true);
+	await openTab();
+	await fetchPage("https://unrelated.example.test");
+	expect(contexts[0]?.options).toMatchObject({
+		proxyServer: "http://browser:8082",
+		proxyBypassList: [
+			"<-loopback>",
+			"localhost",
+			"*.localhost",
+			"127.0.0.0/8",
+			"[::1]",
+			"0.0.0.0",
+			"bare.example.test",
+			"*.bare.example.test",
+		],
+	});
+	for (const context of contexts.slice(1)) {
+		expect(context.options).toHaveProperty("proxyBypassList", [
+			"localhost",
+			"*.localhost",
+			"127.0.0.0/8",
+			"[::1]",
+			"0.0.0.0",
+			"bare.example.test",
+		]);
+	}
+});
+
+test("only manual proxied tabs reject unsupported rules and manual tabs cannot be headed", async () => {
+	settings.proxy = {
+		mode: "custom",
+		url: "http://global:8080",
+		noProxyRules: [{ match: "regex", pattern: "^https://test" }],
+	};
+	await expect(openTab(false, true)).rejects.toThrow("require managed headless mode");
+	await expect(openTab(true, true)).rejects.toThrow(ValidationError);
+	expect(contexts).toHaveLength(0);
+	await openTab();
+	settings.agent.browserProxy = { mode: "direct" };
+	await openTab(true, true);
+	expect(contexts[0]?.options).toMatchObject({ proxyServer: "http://browser:8082" });
+	expect(contexts[1]?.options).toEqual({ proxyServer: "direct://" });
 });
 
 test("navigation failure disposes the isolated WebFetch context", async () => {

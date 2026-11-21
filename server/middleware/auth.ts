@@ -130,7 +130,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	if (isOpaqueSessionToken(token)) {
 		let payload: SessionPayload;
 		try {
-			payload = await verifyToken(token);
+			payload = await verifyToken(token, { signal: c.req.raw.signal });
 		} catch (err) {
 			// Error names rather than `instanceof`, to survive duplicated module instances.
 			if (hasErrorName(err, "SessionTokenRevoked")) throw catalogError("SESSION_REVOKED");

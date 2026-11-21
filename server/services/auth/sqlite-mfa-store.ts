@@ -16,7 +16,7 @@
  */
 import { db } from "@server/db";
 import { userMfaBackupCodes, userPasskeys, users, userTotp } from "@server/db/schema";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type {
 	AuthMfaStore,
 	BackupCodeDraft,
@@ -24,6 +24,7 @@ import type {
 	TotpEnrollment,
 	TotpStatus,
 } from "./mfa-store";
+import { authRead } from "./sqlite-auth-read";
 
 /** Transaction handle as produced by `db.transaction((tx) => …)`. SQLite-side only. */
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -84,21 +85,26 @@ function clearFactorsAtomically(tx: DbTransaction, userId: string): void {
 	tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId)).run();
 }
 
+/** A user's backup-code set is small; the budget only bounds a corrupted table. */
+const BACKUP_CODE_READ_MAX_ROWS = 1_000;
+
 export const sqliteAuthMfaStore: AuthMfaStore = {
 	async findTotp(userId: string, status: TotpStatus): Promise<TotpEnrollment | null> {
-		const row = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, status)),
-			columns: { status: true, secret: true },
-		});
+		const [row] = await authRead(
+			db
+				.select({ status: userTotp.status, secret: userTotp.secret })
+				.from(userTotp)
+				.where(and(eq(userTotp.userId, userId), eq(userTotp.status, status)))
+				.limit(1),
+		);
 		if (!row) return null;
 		return { status: row.status === "active" ? "active" : "pending", secret: row.secret };
 	},
 
 	async findMfaEnabled(userId: string): Promise<boolean> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { mfaEnabled: true },
-		});
+		const [row] = await authRead(
+			db.select({ mfaEnabled: users.mfaEnabled }).from(users).where(eq(users.id, userId)).limit(1),
+		);
 		return !!row?.mfaEnabled;
 	},
 
@@ -107,10 +113,13 @@ export const sqliteAuthMfaStore: AuthMfaStore = {
 	},
 
 	async hasAnyPasskey(userId: string): Promise<boolean> {
-		const row = await db.query.userPasskeys.findFirst({
-			where: eq(userPasskeys.userId, userId),
-			columns: { id: true },
-		});
+		const [row] = await authRead(
+			db
+				.select({ id: userPasskeys.id })
+				.from(userPasskeys)
+				.where(eq(userPasskeys.userId, userId))
+				.limit(1),
+		);
 		return !!row;
 	},
 
@@ -134,18 +143,24 @@ export const sqliteAuthMfaStore: AuthMfaStore = {
 	},
 
 	async countUnusedBackupCodes(userId: string): Promise<number> {
-		const rows = await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true },
-		});
-		return rows.length;
+		const [row] = await authRead(
+			db
+				.select({ count: sql<number>`count(*)` })
+				.from(userMfaBackupCodes)
+				.where(and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt))),
+		);
+		return Number(row?.count ?? 0);
 	},
 
 	async findUnusedBackupCodes(userId: string): Promise<StoredBackupCode[]> {
-		return await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true, codeHash: true },
-		});
+		return await authRead(
+			db
+				.select({ id: userMfaBackupCodes.id, codeHash: userMfaBackupCodes.codeHash })
+				.from(userMfaBackupCodes)
+				.where(and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)))
+				.limit(BACKUP_CODE_READ_MAX_ROWS),
+			{ maxRows: BACKUP_CODE_READ_MAX_ROWS },
+		);
 	},
 
 	async markBackupCodeUsed(id: string, nowIso: string): Promise<boolean> {

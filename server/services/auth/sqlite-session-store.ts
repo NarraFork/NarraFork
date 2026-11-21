@@ -15,6 +15,7 @@
  */
 import { db } from "@server/db";
 import { authSessions, userPreferences, users } from "@server/db/schema";
+import type { AuthReadOptions } from "@server/lib/auth-read-admission";
 import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
@@ -26,6 +27,7 @@ import type {
 	SessionProfile,
 	SessionState,
 } from "./session-store";
+import { authRead } from "./sqlite-auth-read";
 
 /** The schema stores role as text; the two role names are all it ever holds. */
 function asRole(role: string): AccountRole {
@@ -33,8 +35,11 @@ function asRole(role: string): AccountRole {
 }
 
 /** One session row joined with its account, by a unique key. */
-async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
-	const rows = await db
+async function findSession(
+	where: SQL,
+	options?: AuthReadOptions,
+): Promise<AuthSessionRecord | null> {
+	const query = db
 		.select({
 			id: authSessions.id,
 			userId: authSessions.userId,
@@ -50,17 +55,20 @@ async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
 		.innerJoin(users, eq(users.id, authSessions.userId))
 		.where(where)
 		.limit(1);
-	const row = rows[0];
+	const [row] = await authRead(query, options);
 	if (!row) return null;
 	return { ...row, role: asRole(row.role) };
 }
 
 export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findLoginCredential(username: string): Promise<LoginCredential | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.username, username),
-			columns: { id: true, passwordHash: true, mfaEnabled: true },
-		});
+		const [row] = await authRead(
+			db
+				.select({ id: users.id, passwordHash: users.passwordHash, mfaEnabled: users.mfaEnabled })
+				.from(users)
+				.where(eq(users.username, username))
+				.limit(1),
+		);
 		return row ?? null;
 	},
 
@@ -76,10 +84,13 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	},
 
 	async findSessionState(userId: string): Promise<SessionState | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, role: true, tokenVersion: true },
-		});
+		const [row] = await authRead(
+			db
+				.select({ id: users.id, role: users.role, tokenVersion: users.tokenVersion })
+				.from(users)
+				.where(eq(users.id, userId))
+				.limit(1),
+		);
 		if (!row) return null;
 		return { id: row.id, role: asRole(row.role), tokenVersion: row.tokenVersion };
 	},
@@ -87,7 +98,7 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findSessionProfile(userId: string): Promise<SessionProfile | null> {
 		// One LEFT JOIN instead of the pre-port pair of findFirsts: the preferences row
 		// belongs to the account, and reading them together is the same observation.
-		const rows = await db
+		const query = db
 			.select({
 				id: users.id,
 				username: users.username,
@@ -104,16 +115,19 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 			.leftJoin(userPreferences, eq(userPreferences.userId, users.id))
 			.where(eq(users.id, userId))
 			.limit(1);
-		const row = rows[0];
+		const [row] = await authRead(query);
 		if (!row) return null;
 		return { ...row, role: asRole(row.role) };
 	},
 
 	async findPasswordHash(userId: string): Promise<string | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { passwordHash: true },
-		});
+		const [row] = await authRead(
+			db
+				.select({ passwordHash: users.passwordHash })
+				.from(users)
+				.where(eq(users.id, userId))
+				.limit(1),
+		);
 		return row?.passwordHash ?? null;
 	},
 
@@ -132,12 +146,18 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 		await db.insert(authSessions).values(session);
 	},
 
-	async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
-		return findSession(eq(authSessions.tokenHash, tokenHash));
+	async findSessionByTokenHash(
+		tokenHash: string,
+		options?: AuthReadOptions,
+	): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.tokenHash, tokenHash), options);
 	},
 
-	async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
-		return findSession(eq(authSessions.id, sessionId));
+	async findSessionById(
+		sessionId: string,
+		options?: AuthReadOptions,
+	): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.id, sessionId), options);
 	},
 
 	async extendSession(sessionId: string, expiresAt: number): Promise<void> {

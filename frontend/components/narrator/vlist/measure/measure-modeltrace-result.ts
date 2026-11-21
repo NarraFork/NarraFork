@@ -45,16 +45,35 @@ export function measureModelTraceResult(
 						row &&
 						typeof row.model === "string" &&
 						typeof row.displayName === "string" &&
-						Number.isFinite(row.probability) &&
-						row.probability >= 0 &&
-						row.probability <= 1,
+						(row.probability === null ||
+							(typeof row.probability === "number" &&
+								row.probability >= 0 &&
+								row.probability <= 1)),
 				)
 				.slice(0, MODELTRACE_LAYOUT.maxResults);
+	const cacheReadTokens = Array.isArray(data.cacheReadTokens)
+		? data.cacheReadTokens
+				.slice(0, 3)
+				.map((tokens) =>
+					typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0 ? tokens : null,
+				)
+		: undefined;
+	const { footnote, gap } = MODELTRACE_LAYOUT;
+	const extraRows =
+		Number(Boolean(cacheReadTokens?.length)) +
+		Number(data.calibrationRequested === true && data.decision !== "scored");
 	const block: PreparedFixedBlock = {
 		kind: "fixed",
 		tag: "modeltrace_result",
-		height: modelTraceResultHeight(results.length),
-		data: { type: "modeltrace_result", results, error: data.error },
+		height: modelTraceResultHeight(results.length) + extraRows * (footnote + gap),
+		data: {
+			type: "modeltrace_result",
+			results,
+			decision: data.decision,
+			error: data.error,
+			calibrationRequested: data.calibrationRequested === true,
+			cacheReadTokens,
+		},
 		marginTop: 0,
 		contentLeft: 0,
 		quoteRailLefts: [],

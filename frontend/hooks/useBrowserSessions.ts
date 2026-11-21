@@ -40,6 +40,23 @@ export function useBrowserSessions(narratorId: string) {
 	});
 }
 
+export function useCreateBrowserSession() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			data,
+		}: {
+			narratorId: string;
+			data: Parameters<typeof api.createBrowserSession>[1];
+		}) => api.createBrowserSession(narratorId, data),
+		retry: false,
+		onSuccess: (_, { narratorId }) => {
+			void qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
+		},
+	});
+}
+
 export function useCloseBrowserSession() {
 	const qc = useQueryClient();
 	return useMutation({

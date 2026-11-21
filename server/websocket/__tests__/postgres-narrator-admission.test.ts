@@ -42,7 +42,7 @@ describe("PostgreSQL narrator WebSocket admission", () => {
 			"await startupReadiness.barrier",
 			"const rollout = getExternalWebSocketRolloutSettings()",
 			'const token = url.searchParams.get("token")',
-			"const user = await db.query.users.findFirst",
+			"const userQuery = db",
 			"const upgraded = server.upgrade(req",
 		]) {
 			expect(source.indexOf(laterEffect, gate)).toBeGreaterThan(gate);
