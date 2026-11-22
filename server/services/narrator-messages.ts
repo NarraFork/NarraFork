@@ -71,7 +71,7 @@ import {
 	storedCompactDetail,
 } from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
-import { runReadTask } from "../lib/db-worker/pool";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -4837,7 +4837,7 @@ const narratorMessageQueriesUnlocked = {
 		}
 		const sqlite = modelHistoryDatabase.sqlite;
 		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
-			return narratorMessageQueriesUnlocked.getCompactSummary(narratorId, messageId);
+			throw new WorkersUnavailableError("requires_committed_file");
 		}
 
 		const result = await runReadTask<CompactSummaryReadResult>(

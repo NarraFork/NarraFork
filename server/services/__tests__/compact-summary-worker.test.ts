@@ -200,6 +200,11 @@ test("cancellation, disablement and Worker failures never retry inline", async (
 	}
 });
 
+test("a committed detail read never opens an inline reader inside an active transaction", async () => {
+	const pending = sqlite.transaction(() => read())();
+	await expect(pending).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+});
+
 test("the HTTP route checks access before dispatch and before releasing the snapshot", async () => {
 	const { narratorRoutes } = await import("../../routes/narrators");
 	const app = new Hono();
