@@ -115,17 +115,22 @@ class VisibleReasoningBodies {
 
 	register(node: Element, target: ReasoningTranslationVisibilityTarget): () => void {
 		if (typeof IntersectionObserver !== "function") return () => {};
-		this.observer ??= new IntersectionObserver((entries) => {
-			for (const entry of entries) {
-				const body = this.bodies.get(entry.target);
-				if (body)
-					body.visible =
-						entry.isIntersecting &&
-						entry.intersectionRect.width > 0 &&
-						entry.intersectionRect.height > 0;
-			}
-			this.schedule();
-		});
+		// An edge-touch has isIntersecting=true but no visible pixels. Observe the
+		// transition from zero to a positive ratio as the expanding body is unclipped.
+		this.observer ??= new IntersectionObserver(
+			(entries) => {
+				for (const entry of entries) {
+					const body = this.bodies.get(entry.target);
+					if (body)
+						body.visible =
+							entry.isIntersecting &&
+							entry.intersectionRect.width > 0 &&
+							entry.intersectionRect.height > 0;
+				}
+				this.schedule();
+			},
+			{ threshold: [0, Number.MIN_VALUE] },
+		);
 		this.bodies.set(node, { target, visible: false });
 		this.observer.observe(node);
 		return () => {
@@ -194,11 +199,27 @@ export function useVisibleReasoningSource<T extends Element>(
 	target: ReasoningTranslationVisibilityTarget | undefined,
 ) {
 	const observer = useContext(ReasoningTranslationVisibilityContext);
+	const { ownerNarratorId, messageId, blockId, blockRevision, elementId } = target ?? {};
 	return useCallback(
 		(node: T | null) => {
-			if (observer && target && node) return observer.register(node, target);
+			if (
+				observer &&
+				node &&
+				ownerNarratorId &&
+				messageId &&
+				blockId &&
+				blockRevision !== undefined &&
+				elementId
+			)
+				return observer.register(node, {
+					ownerNarratorId,
+					messageId,
+					blockId,
+					blockRevision,
+					elementId,
+				});
 		},
-		[observer, target],
+		[observer, ownerNarratorId, messageId, blockId, blockRevision, elementId],
 	);
 }
 
