@@ -1,5 +1,6 @@
 import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
 import {
+	blockAtIndex,
 	filterRowElements,
 	type MessageBodySource,
 	mapRowElements,
@@ -7,6 +8,7 @@ import {
 } from "@shared/narrator-blocks/message-blocks";
 import { isReasoningBlock } from "@shared/pretext-layout/reasoning-segments";
 import { resolveLiveBlockIndex } from "@shared/pretext-layout/streaming-live-blocks";
+import { isReasoningTranslationBoundary } from "@shared/reasoning-translation";
 import type { StreamingBlock } from "../message/message-segments";
 import { isNestedRow } from "../message/nested-rows";
 import { blockSupersedes, contentBlockIdentity } from "../streaming/streaming-block-supersede";
@@ -177,11 +179,10 @@ export function projectStreamingDocument(
 }
 
 /**
- * An empty reasoning block may be sealed while the provider keeps thinking without
- * exposing its body. Only the latest output gets the waiting treatment, and only
- * while the session is active. This is a display projection, never persistence.
+ * Keep the active lane expanded when its last delta has just become a checkpoint.
+ * Empty hidden reasoning also stays live between events, even if already complete.
  */
-export function projectPendingEmptyReasoning(
+export function projectPendingReasoning(
 	messages: readonly TreeMessage[],
 	active: boolean,
 	isSubagent = false,
@@ -196,16 +197,17 @@ export function projectPendingEmptyReasoning(
 		if (blocks.length === 0) continue;
 		const blockIndex = blocks.length - 1;
 		const block = blocks[blockIndex];
-		if (
-			!block ||
-			!isReasoningBlock(block) ||
-			(block.text || block.thinking || "").length > 0 ||
-			(block.translatedText ?? "").length > 0
-		)
-			return messages;
+		if (!block || !isReasoningBlock(block)) return messages;
+		const source = block.thinking ?? block.text ?? "";
+		const end = block.sealedReasoningLength;
+		const openCheckpoint =
+			!!end &&
+			isReasoningTranslationBoundary(source, end) &&
+			blockAtIndex(message, blockIndex)?.phase === "open";
+		if (!openCheckpoint && (source.length || block.translatedText)) return messages;
 		// A synthetic row's arrival-order stamp is authoritative: a tool event
 		// can close its text lane before the tool card is published/persisted.
-		if (message.id === "__streaming__") return messages;
+		if (message.id === "__streaming__" || message.liveContentProjection) return messages;
 		const projected = messages.slice();
 		projected[index] = {
 			...message,

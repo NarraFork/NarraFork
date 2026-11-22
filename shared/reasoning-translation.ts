@@ -9,6 +9,8 @@ export interface ReasoningTranslationPart {
 }
 
 export interface ReasoningTranslationFields {
+	/** Display hint for an open checkpoint; server activity authorizes its source. */
+	sealedReasoningLength?: number;
 	/** Appending source preserves the generation; replacing source does not. */
 	translationGeneration?: string;
 	translationParts?: ReasoningTranslationPart[];

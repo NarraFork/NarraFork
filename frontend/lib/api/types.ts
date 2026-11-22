@@ -1143,6 +1143,8 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/** Client-only row holding a projected streaming block over a persisted checkpoint. */
+	liveContentProjection?: boolean;
 	/**
 	 * Client-only synthetic row: animation baseline of the last accepted text
 	 * snapshot. Travels with this message through the layout commit, so new

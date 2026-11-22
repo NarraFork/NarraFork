@@ -575,6 +575,7 @@ export type AgentEvent =
 	| {
 			type: "block_complete";
 			block: ContentBlock;
+			sealedReasoningLength?: number;
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }

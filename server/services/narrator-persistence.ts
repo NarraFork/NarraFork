@@ -3018,6 +3018,7 @@ const sqliteNarratorPersistence = {
 					revision?: number;
 					rawTextLength?: number;
 					completed?: boolean;
+					sealedReasoningLength?: number;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }

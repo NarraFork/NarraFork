@@ -34,3 +34,61 @@ test("merged runs retain only completed, untranslated named elements", () => {
 		},
 	]);
 });
+
+test("an open checkpoint is requested only until its sealed prefix is translated", () => {
+	const checkpoint = {
+		type: "reasoning",
+		id: "element",
+		text: "First\n\nStill streaming",
+		completed: false,
+		sealedReasoningLength: 5,
+	};
+	const targets = (
+		element: typeof checkpoint & import("../reasoning-translation").ReasoningTranslationFields,
+		phase: "open" | "aborted",
+	) =>
+		reasoningTranslationSources(
+			{
+				id: "message",
+				narratorId: "owner",
+				blocks: [
+					{
+						id: "block",
+						kind: "reasoning",
+						phase,
+						named: true,
+						revision: 7,
+						subtype: null,
+						wireId: null,
+						attemptId: null,
+						hasOriginal: false,
+						elements: [element],
+					},
+				],
+			},
+			[{ index: 0, block: element }],
+		);
+	expect(targets(checkpoint, "open")).toEqual([
+		expect.objectContaining({ elementId: "element", blockRevision: 7 }),
+	]);
+	expect(targets(checkpoint, "aborted")).toEqual([]);
+	expect(
+		targets(
+			{
+				...checkpoint,
+				translationGeneration: "generation",
+				translationParts: [
+					{
+						id: "first",
+						start: 0,
+						end: 5,
+						sourceText: "First",
+						translatedText: "第一",
+						generation: "generation",
+					},
+				],
+			},
+			"open",
+		),
+	).toEqual([]);
+});

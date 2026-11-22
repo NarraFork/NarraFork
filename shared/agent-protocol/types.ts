@@ -244,6 +244,8 @@ export interface ParsedStreamEvent {
 		phase: "start" | "checkpoint" | "complete";
 		blockId?: string;
 		outputIndex?: number;
+		/** UTF-16 end of a contiguous prefix closed by native summary-part events. */
+		reasoningSummaryEnd?: number;
 	};
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;

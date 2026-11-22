@@ -1,6 +1,7 @@
 import { blockAtIndex, type MessageWithBody } from "../narrator-blocks/message-blocks";
 import {
 	getValidReasoningTranslationParts,
+	isReasoningTranslationBoundary,
 	isReasoningTranslationId,
 	MAX_REASONING_TRANSLATION_VISIBLE_TARGETS,
 	type ReasoningTranslationFields,
@@ -13,6 +14,7 @@ interface SourceElement extends ReasoningTranslationFields {
 	text?: string | null;
 	thinking?: string | null;
 	translatedText?: string | null;
+	completed?: boolean;
 }
 
 interface SourceMessage extends MessageWithBody<SourceElement> {
@@ -38,6 +40,15 @@ export function reasoningTranslationSources(
 			block.translatedText
 		)
 			continue;
+		const holder = blockAtIndex(message, index);
+		if (!holder?.named || !isReasoningTranslationId(holder.id)) continue;
+		const end =
+			holder.phase === "done"
+				? source.length
+				: holder.phase === "open" && block.completed === false
+					? block.sealedReasoningLength
+					: 0;
+		if (!end || !isReasoningTranslationBoundary(source, end)) continue;
 		let offset = 0;
 		for (const part of getValidReasoningTranslationParts(
 			source,
@@ -47,9 +58,7 @@ export function reasoningTranslationSources(
 			if (part.start !== offset) break;
 			offset = part.end;
 		}
-		if (offset === source.length) continue;
-		const holder = blockAtIndex(message, index);
-		if (!holder?.named || holder.phase !== "done" || !isReasoningTranslationId(holder.id)) continue;
+		if (offset >= end) continue;
 		targets.push({
 			ownerNarratorId,
 			messageId,
