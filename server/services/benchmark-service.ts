@@ -85,7 +85,11 @@ export async function readBenchmarkResponse(
 ): Promise<Response | null> {
 	if (activeDatabaseBackend === "postgres") {
 		const value = await readBenchmarkData<unknown>(read, signal);
-		return value === null ? null : Response.json(value, { headers: JSON_HEADERS });
+		if (value === null) return null;
+		const body = JSON.stringify(value);
+		if (Buffer.byteLength(body) > BENCHMARK_MAX_RESPONSE_BYTES)
+			throw new BenchmarkBudgetError("Benchmark response exceeds its encoded byte budget");
+		return new Response(body, { headers: JSON_HEADERS });
 	}
 	const stream = await createBenchmarkReadStream(sqlite, read, signal);
 	return stream && new Response(stream, { headers: JSON_HEADERS });

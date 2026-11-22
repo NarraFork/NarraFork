@@ -34,12 +34,13 @@ const sqlite = new Database(path);
 sqlite.run("PRAGMA journal_mode = WAL");
 sqlite.run("PRAGMA foreign_keys = OFF");
 const db = drizzle({ client: sqlite, schema });
-mock.module("../../db", () => ({
+const sqliteFixture = {
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
 	postgresRuntime: null,
-}));
+};
+mock.module("../../db", () => sqliteFixture);
 mock.module("../../services/narrator-service", () => ({ narratorService: {} }));
 mock.module("../../services/narrator-session", () => ({
 	interruptNarrator: mock(),
@@ -230,6 +231,30 @@ test("narrator metrics retain token accounting and the last nonempty assistant a
 		messageCount: 4,
 		lastAssistantText: "full answer",
 	});
+});
+
+test("PostgreSQL read rejects escaped JSON that exceeds the HTTP byte budget", async () => {
+	const row = { id: "pg-suite", description: "small\nvalue" };
+	const unsafe = mock(async () => [{ payload: JSON.stringify(row) }]);
+	mock.module("../../db", () => ({
+		...sqliteFixture,
+		activeDatabaseBackend: "postgres",
+		postgresRuntime: { executor: { unsafe } },
+	}));
+	try {
+		expect(await (await app.request("/benchmarks/suites")).json()).toEqual([row]);
+		const controlCharacter = String.fromCharCode(1);
+		// Each source byte becomes six JSON bytes, so the raw SQL check admits this row.
+		row.description = controlCharacter.repeat(Math.floor(BENCHMARK_MAX_RESPONSE_BYTES / 6) + 1);
+		expect(Buffer.byteLength(row.description)).toBeLessThan(BENCHMARK_MAX_RESPONSE_BYTES);
+		const response = await app.request("/benchmarks/suites");
+		expect(response.status).toBe(413);
+		expect(await response.json()).toEqual({ error: "Benchmark response exceeds its budget" });
+		expect(unsafe).toHaveBeenCalledTimes(2);
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	} finally {
+		mock.module("../../db", () => sqliteFixture);
+	}
 });
 
 test("abort, cancel, and idle timeout release staged streams without fallback", async () => {
