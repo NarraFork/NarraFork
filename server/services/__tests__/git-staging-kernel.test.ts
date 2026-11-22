@@ -1594,6 +1594,60 @@ test("hook tree mutation is an unknown result and preserves the lock and durable
 	}
 });
 
+test("recovery cancels an expired reservation interrupted before Git invocation", async () => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const repo = await resolveGitStagingRepository(root);
+	let reserved: { id: string; evidence_json: string } | undefined;
+	const original = processes.stagingGit;
+	const mock = spyOn(processes, "stagingGit").mockImplementation(async (cwd, args, options) => {
+		if (args[0] === "read-tree" && options?.env?.GIT_INDEX_FILE?.endsWith("/candidate.index")) {
+			const read = await db();
+			try {
+				reserved = read.query("SELECT id,evidence_json FROM commit_operations").get() as {
+					id: string;
+					evidence_json: string;
+				};
+			} finally {
+				read.close();
+			}
+			throw new Error("preparation interruption");
+		}
+		return original(cwd, args, options);
+	});
+	restores.push(() => mock.mockRestore());
+	await expect(commit(await active())).rejects.toThrow("preparation interruption");
+	mock.mockRestore();
+	if (!reserved) throw new Error("Missing reserved-operation fixture");
+	const store = await ChangelistStore.open(repo);
+	if (!store) throw new Error("Missing fixture store");
+	try {
+		const evidence = JSON.parse(reserved.evidence_json);
+		evidence.leaseUntil = Date.now() + 60_000;
+		await store.transaction(() => {
+			store.db
+				.query("UPDATE commit_operations SET status='reserved',evidence_json=? WHERE id=?")
+				.run(JSON.stringify(evidence), reserved?.id as string);
+			store.db.query("UPDATE workspace_state SET state='recovering'").run();
+		});
+		await expect(act({ action: "recover", operationId: reserved.id })).rejects.toMatchObject({
+			code: "GIT_STAGING_LOCKED",
+		});
+		evidence.leaseUntil = 0;
+		await store.transaction(() => {
+			store.db
+				.query("UPDATE commit_operations SET evidence_json=? WHERE id=?")
+				.run(JSON.stringify(evidence), reserved?.id as string);
+		});
+		expect((await act({ action: "recover", operationId: reserved.id })).outcome).toBe("applied");
+		expect(store.pending()).toBeNull();
+		expect((await act({ action: "sync" })).outcome).toBe("applied");
+		expect((await commit(await active())).outcome).toBe("applied");
+	} finally {
+		store.close();
+	}
+});
+
 test("a confirmed commit recovers native index installation without creating another commit", async () => {
 	await file("a", "selected\n");
 	await act({ action: "init" });

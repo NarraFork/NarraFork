@@ -901,6 +901,43 @@ export async function recoverChangelistCommit(
 		join(evidence.directory, `commit-${evidence.fenceToken}.receipt.json`),
 		100 * 1024 * 1024,
 	);
+	if (
+		(operation.status === "reserved" || operation.status === "prepared") &&
+		!operation.commit_oid &&
+		!receiptBytes &&
+		head.head === operation.head_oid &&
+		head.tree === operation.head_tree &&
+		head.headTarget === evidence.headTarget
+	) {
+		const previousFence = operation.fence_token;
+		await store.transaction(() => {
+			const current = store.assertOperationFence(operationId, previousFence);
+			const saved = JSON.parse(current.evidence_json) as Evidence;
+			if (
+				(current.status !== "reserved" && current.status !== "prepared") ||
+				saved.leaseUntil > Date.now()
+			)
+				throw fail("GIT_STAGING_LOCKED", "Another producer owns this operation");
+			assertHeadSync(repo, head.head, head.headFile);
+			if (saved.lockIdentity) {
+				assertOwnedLockSync(repo, saved);
+				unlinkSync(`${repo.index}.lock`);
+			}
+			evidence = { ...saved, fenceToken: randomUUID(), leaseUntil: 0 };
+			store.db
+				.query(
+					"UPDATE commit_operations SET status='rejected',evidence_json=?,fence_token=? WHERE id=?",
+				)
+				.run(evidenceJson(evidence), evidence.fenceToken, operationId);
+			store.db.query("UPDATE workspace_state SET state='stale',reason=NULL WHERE id=1").run();
+		});
+		return result(
+			store,
+			operation,
+			"applied",
+			"The interrupted preparation was cancelled without creating a commit; synchronize before writing",
+		);
+	}
 	if (receiptBytes) {
 		const saved = JSON.parse(receiptBytes.toString()) as {
 			commitOid: string;
