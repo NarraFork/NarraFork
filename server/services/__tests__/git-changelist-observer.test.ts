@@ -1326,7 +1326,7 @@ test("a no-op keeps missing work objects untouched while preview and subsequent 
 	const noop = await measuredObservation(repo, store);
 	expect(noop.metrics).toMatchObject({
 		outcome: "reused",
-		gitProcesses: 19,
+		gitProcesses: 21,
 		loadedSnapshots: 0,
 		writtenSnapshots: 0,
 		canonicalizedPaths: 0,

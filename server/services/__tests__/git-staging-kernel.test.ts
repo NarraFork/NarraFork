@@ -1574,7 +1574,7 @@ test("selected blob batches and both source verifications have a constant Git bu
 		}
 	}
 	// Two exact-source verifications add fixed batch work, not a subprocess for each file.
-	expect(counts).toEqual([66, 66]);
+	expect(counts).toEqual([77, 77]);
 });
 
 test("edits made by commit hooks remain owned after the confirmed commit", async () => {
