@@ -39,6 +39,7 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
 	| "storageScanSerial"
@@ -253,6 +254,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams

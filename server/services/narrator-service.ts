@@ -3517,6 +3517,8 @@ export const narratorService = {
 	getToolCallPreviewMetadata:
 		narratorMessageQueries.getToolCallPreviewMetadata.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
+	readCompactSummaryDetail:
+		narratorMessageQueries.readCompactSummaryDetail.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
 	deleteEmptyRetryPlaceholder:
