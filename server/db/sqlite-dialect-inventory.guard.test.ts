@@ -536,6 +536,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
+	"server/lib/db-worker/compact-summary-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
 	"server/services/agent-runtime/publication.ts": ["json1"],
 	// The injected occupancy source currently uses the SQLite builder; the maintained
