@@ -3,7 +3,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
+import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -517,13 +517,27 @@ type SubagentWaitResult = Pick<
 	"status" | "output" | "terminalResultReceived" | "publicationRun" | "sourceResultRef"
 >;
 
+interface CommittedWatchRead {
+	ownerNarratorId: string;
+	signal?: AbortSignal;
+}
+
 /** Never pair a later run lookup with an earlier assistant result. */
 async function readSubagentTerminal(
 	subagentId: string,
 	recipientId: string,
 	current: Narrator,
 	observedRunningRunId?: string | null,
+	committedObservation?: CommittedWatchRead,
 ): Promise<SubagentWaitResult> {
+	const checkWatchTarget = (target: Narrator) => {
+		if (!committedObservation) return;
+		committedObservation.signal?.throwIfAborted();
+		if (!isTeamMember(target, committedObservation.ownerNarratorId)) {
+			throw new Error("Observation access was revoked.");
+		}
+	};
+	checkWatchTarget(current);
 	const run: PublicationRun | undefined = current.logicalRunId
 		? {
 				producerKind: "agent",
@@ -539,10 +553,13 @@ async function readSubagentTerminal(
 	const terminalObserved = run !== undefined && observedRunningRunId === run.logicalRunId;
 	const terminal = run
 		? await getRuntimePublicationService()
-				.readAgentTerminalResult(run, {
-					settledRunId: terminalObserved ? run.logicalRunId : undefined,
-				})
+				.readAgentTerminalResult(
+					run,
+					{ settledRunId: terminalObserved ? run.logicalRunId : undefined },
+					committedObservation,
+				)
 				.catch((error) => {
+					if (committedObservation) throw error;
 					logger.warn("Failed to read run-bound Await result", { run, error: String(error) });
 					return null;
 				})
@@ -555,9 +572,12 @@ async function readSubagentTerminal(
 				? (current.backgroundResult ?? "(no output)")
 				: await getSubagentFinalText(subagentId));
 	const latest = await narratorService.getById(subagentId);
+	checkWatchTarget(latest);
 	if (
 		current.logicalRunId !== latest.logicalRunId ||
-		(observedRunningRunId && current.logicalRunId !== observedRunningRunId)
+		(observedRunningRunId && current.logicalRunId !== observedRunningRunId) ||
+		(committedObservation &&
+			(runDeliverToOf(latest)?.narratorId ?? committedObservation.ownerNarratorId) !== recipientId)
 	) {
 		return {
 			status: "superseded",
@@ -604,8 +624,11 @@ export async function waitForSubagentResult(opts: {
 	/** Watch follows one run, rather than an unrelated later continuation. */
 	expectedRunId?: string;
 	reportTakenOver?: boolean;
+	watchOwnerNarratorId?: string;
 }): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const committedRead = (signal?: AbortSignal): CommittedWatchRead | undefined =>
+		opts.watchOwnerNarratorId ? { ownerNarratorId: opts.watchOwnerNarratorId, signal } : undefined;
 	const current = await narratorService.getById(opts.subagentId);
 	const lifecycleResult = (narrator: Narrator): SubagentWaitResult | undefined => {
 		if (opts.expectedRunId && narrator.logicalRunId !== opts.expectedRunId) {
@@ -624,18 +647,26 @@ export async function waitForSubagentResult(opts: {
 	const initialLifecycle = lifecycleResult(current);
 	if (initialLifecycle) return initialLifecycle;
 	if (current.status !== "working" && current.status !== "waiting") {
-		return readSubagentTerminal(opts.subagentId, opts.recipientId, current);
+		return readSubagentTerminal(
+			opts.subagentId,
+			opts.recipientId,
+			current,
+			undefined,
+			committedRead(opts.signal),
+		);
 	}
 
 	const observedRunningRunId = current.logicalRunId;
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		const observation = opts.watchOwnerNarratorId ? new AbortController() : undefined;
 
 		const cleanup = () => {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
+			observation?.abort();
 			eventBus.off("narrator:subagent_completed", onCompleted);
 			eventBus.off("narrator:status_changed", onStatusChanged);
 			eventBus.off("narrator:deleted", onDeleted);
@@ -664,6 +695,7 @@ export async function waitForSubagentResult(opts: {
 					opts.recipientId,
 					current,
 					observedRunningRunId,
+					committedRead(observation?.signal),
 				);
 				if (settled) return; // Interrupt/timeout wins while result reads are in flight.
 				cleanup();
@@ -673,6 +705,12 @@ export async function waitForSubagentResult(opts: {
 					onDeleted({ narratorId: opts.subagentId });
 					return;
 				}
+				if (observation && !settled) {
+					cleanup();
+					reject(err);
+					return;
+				}
+				if (settled) return;
 				logger.warn("Failed to read subagent terminal result", {
 					subagentId: opts.subagentId,
 					error: String(err),
@@ -972,7 +1010,13 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		});
 		return build(relabel(waited.status), waited.output, waited);
 	}
-	const terminal = await readSubagentTerminal(target.id, recipientId, target);
+	const terminal = await readSubagentTerminal(
+		target.id,
+		recipientId,
+		target,
+		undefined,
+		opts.snapshotOnly ? { ownerNarratorId: scope.caller.id, signal: opts.signal } : undefined,
+	);
 	return build(terminal.status, terminal.output, terminal);
 }
 
