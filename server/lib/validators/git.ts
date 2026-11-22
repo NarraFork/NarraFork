@@ -239,7 +239,7 @@ const stagingPath = z
 	.refine(
 		(value) =>
 			!value.includes("\0") &&
-			!/^[\\/]|^[a-z]:/i.test(value) &&
+			!/^[\\/]|^[a-z]:[\\/]/i.test(value) &&
 			!value.split(/[\\/]/).some((part) => part === ".." || part === ".") &&
 			!/(^|[\\/])\.git([\\/]|$)/i.test(value) &&
 			!/^\.narrafork[\\/]git-staging([\\/]|$)/i.test(value),

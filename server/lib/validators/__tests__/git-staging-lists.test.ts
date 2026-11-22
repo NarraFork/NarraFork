@@ -106,6 +106,17 @@ test("paths, unit identifiers and versions have bounded structural validation", 
 		).toBe(false);
 });
 
+test("relative colon filenames are accepted without admitting absolute Windows drive paths", () => {
+	for (const path of ["a:b.txt", "src/a:b.txt"]) {
+		expect(gitStagingDiffQuerySchema.safeParse({ ...base, path }).success).toBe(true);
+		expect(gitStagingActionSchema.safeParse({ ...base, ...move, paths: [path] }).success).toBe(
+			true,
+		);
+	}
+	for (const path of ["C:/outside", "C:\\outside", "\\\\server\\share", "/outside"])
+		expect(gitStagingDiffQuerySchema.safeParse({ ...base, path }).success).toBe(false);
+});
+
 test("HTTP clients cannot provide authenticated identity or unknown operation fields", () => {
 	const action = { ...base, ...version, action: "commit", listId: "A", message: "Commit" };
 	for (const extra of [
