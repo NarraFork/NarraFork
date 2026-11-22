@@ -41,6 +41,7 @@ import { validateDomainRead } from "./domain-protocol";
 import { DbReadError, errorFromWorkerFailure, readAborted } from "./errors";
 import { assertWorkerBuildId, workerFailureDetails } from "./failure";
 import {
+	assertSessionPreviewBudget,
 	DB_WORKER_READY_TIMEOUT_MS,
 	type DbReadTaskParams,
 	type DbWorkerOutbound,
@@ -1146,6 +1147,7 @@ async function runReadTaskInternal<T>(
 		);
 		if (deadlineAt <= Date.now())
 			throw new DbReadTaskTimeoutError("database read task timed out before admission");
+		if (params.kind === "storageScanSessionPreview") assertSessionPreviewBudget(params);
 		const identity =
 			params.kind === "displayPageMessagesPostgres" ? undefined : getReadDatabaseIdentity(dbPath);
 		if (identity) assertReadDatabaseOpen(identity);
