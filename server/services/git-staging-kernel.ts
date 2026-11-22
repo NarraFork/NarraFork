@@ -219,6 +219,8 @@ function selectUnits(
 		Number(action.scope !== undefined);
 	if (selectors !== 1)
 		throw invalid("Select paths, units, scope or all changes from the source list");
+	if (action.scope && !action.scope.directory && !action.scope.filter?.length)
+		throw invalid("An empty scope is not an explicit all-files selection");
 	const conditions = ["c.list_id=?"];
 	const parameters: string[] = [action.fromListId];
 	let paths: Set<string> | undefined, ids: Set<string> | undefined;

@@ -508,6 +508,20 @@ test("grouped commits support reftable branches and detached HEAD", async () => 
 	expect(await git("show", "HEAD:a")).toBe("detached");
 });
 
+test("empty move scopes cannot implicitly select the entire source group", async () => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const a = await active();
+	const b = await create("B");
+	for (const scope of [{}, { filter: [] }])
+		await expect(act({ action: "move", fromListId: a, toListId: b, scope })).rejects.toMatchObject({
+			code: "GIT_STAGING_INVALID",
+		});
+	expect((await kernel.files(a)).files.map((entry) => entry.path)).toEqual(["a"]);
+	await act({ action: "move", fromListId: a, toListId: b, all: true });
+	expect((await kernel.files(b)).files.map((entry) => entry.path)).toEqual(["a"]);
+});
+
 test("a mode unit in another group does not invalidate the text group's candidate or cursor", async () => {
 	await file("a", "another text edit\n");
 	await file("f", "FIRST\ncontext1\ncontext2\nlast\n");
