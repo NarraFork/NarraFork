@@ -6,8 +6,10 @@ import type { GitLineStatsFile } from "../../shared/git-line-stats";
 
 export const UNTRACKED_LINE_LIMITS = {
 	files: 200,
+	requestBytes: 1024 * 1024,
 	fileBytes: 1_000_000,
 	totalBytes: 20_000_000,
+	timeoutMs: 30_000,
 	cacheEntries: 512,
 } as const;
 
@@ -16,6 +18,8 @@ export interface UntrackedLineBatch {
 	complete: boolean;
 	/** Internal diagnostic, also used to verify that cache hits do not read contents. */
 	readFiles: number;
+	/** Conservatively charged file sizes, including failed reads and binary samples. */
+	readBytes: number;
 }
 
 interface Measurement {
@@ -31,14 +35,44 @@ function version(stat: BigIntStats): string {
 export class UntrackedLineReader {
 	private readonly cache = new Map<string, { version: string; value: Measurement }>();
 
-	async measure(cwd: string, paths: string[], signal: AbortSignal): Promise<UntrackedLineBatch> {
+	async measure(
+		cwd: string,
+		paths: string[],
+		signal: AbortSignal,
+		remainingBytes: number = UNTRACKED_LINE_LIMITS.totalBytes,
+		deadlineAt = Date.now() + UNTRACKED_LINE_LIMITS.timeoutMs,
+	): Promise<UntrackedLineBatch> {
+		if (
+			!Number.isSafeInteger(remainingBytes) ||
+			remainingBytes < 0 ||
+			remainingBytes > UNTRACKED_LINE_LIMITS.totalBytes ||
+			!Number.isFinite(deadlineAt)
+		) {
+			throw new Error("Invalid Git line statistics budget");
+		}
+		const check = () => {
+			signal.throwIfAborted();
+			if (Date.now() >= deadlineAt) throw new Error("Git line statistics worker timed out");
+		};
+		check();
 		const root = resolve(cwd);
 		const files: GitLineStatsFile[] = [];
-		let remaining = UNTRACKED_LINE_LIMITS.totalBytes as number;
+		let remaining = remainingBytes;
+		let requestBytes = Buffer.byteLength(JSON.stringify(cwd)) + 2;
 		let readFiles = 0;
 		let complete = paths.length <= UNTRACKED_LINE_LIMITS.files;
 		for (const path of paths.slice(0, UNTRACKED_LINE_LIMITS.files)) {
-			signal.throwIfAborted();
+			check();
+			// Bound replies at the source as well: at most 200 DTOs and 1 MiB of path data.
+			if (path.length > UNTRACKED_LINE_LIMITS.requestBytes - requestBytes) {
+				complete = false;
+				break;
+			}
+			requestBytes += Buffer.byteLength(JSON.stringify(path)) + 1;
+			if (requestBytes > UNTRACKED_LINE_LIMITS.requestBytes) {
+				complete = false;
+				break;
+			}
 			let value: Measurement = { complete: false };
 			const absolute = resolve(root, path);
 			if (
@@ -49,6 +83,7 @@ export class UntrackedLineReader {
 			) {
 				try {
 					const stat = await lstat(absolute, { bigint: true });
+					check();
 					if (stat.isFile() && stat.size <= BigInt(UNTRACKED_LINE_LIMITS.fileBytes)) {
 						const stamp = version(stat);
 						const cached = this.cache.get(absolute);
@@ -60,7 +95,8 @@ export class UntrackedLineReader {
 						} else if (stat.size <= BigInt(remaining)) {
 							remaining -= Number(stat.size);
 							readFiles++;
-							value = await this.read(absolute, stat, signal);
+							value = await this.read(absolute, stat, check);
+							check();
 							if (value.complete) {
 								this.cache.delete(absolute);
 								this.cache.set(absolute, { version: stamp, value });
@@ -73,7 +109,7 @@ export class UntrackedLineReader {
 					}
 				} catch {
 					// Disappearing/unreadable/nonregular paths are unknown, not empty files.
-					signal.throwIfAborted();
+					check();
 				}
 			}
 			complete &&= value.complete;
@@ -84,15 +120,11 @@ export class UntrackedLineReader {
 				complete: value.complete,
 			});
 		}
-		signal.throwIfAborted();
-		return { files, complete, readFiles };
+		check();
+		return { files, complete, readFiles, readBytes: remainingBytes - remaining };
 	}
 
-	private async read(
-		path: string,
-		expected: BigIntStats,
-		signal: AbortSignal,
-	): Promise<Measurement> {
+	private async read(path: string, expected: BigIntStats, check: () => void): Promise<Measurement> {
 		const file = await open(
 			path,
 			constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
@@ -105,7 +137,7 @@ export class UntrackedLineReader {
 			let lines = 0;
 			let lastByte = -1;
 			while (bytes < Number(expected.size)) {
-				signal.throwIfAborted();
+				check();
 				const { bytesRead } = await file.read(
 					buffer,
 					0,
@@ -116,7 +148,7 @@ export class UntrackedLineReader {
 				// Like Git, sample only the leading 8 KiB for binary NULs.
 				const sample = Math.min(bytesRead, Math.max(0, 8192 - bytes));
 				if (buffer.subarray(0, sample).includes(0)) {
-					signal.throwIfAborted();
+					check();
 					return version(await file.stat({ bigint: true })) === version(expected)
 						? { lines: 0, complete: true }
 						: { complete: false };
@@ -125,7 +157,7 @@ export class UntrackedLineReader {
 				bytes += bytesRead;
 				lastByte = buffer[bytesRead - 1];
 			}
-			signal.throwIfAborted();
+			check();
 			if (version(await file.stat({ bigint: true })) !== version(expected))
 				return { complete: false };
 			return { lines: lines + (bytes > 0 && lastByte !== 10 ? 1 : 0), complete: true };
@@ -143,7 +175,13 @@ if (port) {
 		"message",
 		async (
 			message:
-				| { action: "read"; cwd: string; paths: string[] }
+				| {
+						action: "read";
+						cwd: string;
+						paths: string[];
+						remainingBytes: number;
+						deadlineAt: number;
+				  }
 				| { action: "cancel" }
 				| { action: "ping" },
 		) => {
@@ -162,7 +200,21 @@ if (port) {
 			const controller = new AbortController();
 			active = controller;
 			try {
-				const value = await reader.measure(message.cwd, message.paths, controller.signal);
+				if (
+					!Array.isArray(message.paths) ||
+					message.paths.length > UNTRACKED_LINE_LIMITS.files ||
+					typeof message.remainingBytes !== "number" ||
+					typeof message.deadlineAt !== "number"
+				) {
+					throw new Error("Invalid Git line statistics request");
+				}
+				const value = await reader.measure(
+					message.cwd,
+					message.paths,
+					controller.signal,
+					message.remainingBytes,
+					message.deadlineAt,
+				);
 				port.postMessage({ value });
 			} catch (error) {
 				port.postMessage({

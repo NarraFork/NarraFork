@@ -1,5 +1,11 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import type { GitLineStats } from "@shared/git-line-stats";
+import * as spawn from "../lib/spawn";
+import { closeGitLineStatsWorkers, getGitLineStats } from "./git-line-stats";
 import {
 	clearGitLineStatsCache,
 	getGitLineStatsCached,
@@ -25,6 +31,7 @@ function deferred<T>() {
 }
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 afterEach(clearGitLineStatsCache);
+afterAll(closeGitLineStatsWorkers);
 
 describe("independent Git line statistics cache", () => {
 	test("defaults to 5s, permits TTL overrides and bounds completed results to 128", async () => {
@@ -97,6 +104,65 @@ describe("independent Git line statistics cache", () => {
 		expect(shared?.aborted).toBe(false);
 		pending.resolve(stats());
 		expect((await results).map((r) => r.status)).toEqual(["rejected", "fulfilled"]);
+	});
+
+	test("shared multi-batch reads survive one cancellation and invalidation publishes only the fresh round", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "nf-git-lines-cache-"));
+		const paths = Array.from({ length: 254 }, (_, index) => `file-${index}`);
+		const batchStarted = deferred<void>();
+		const postMessage = Worker.prototype.postMessage;
+		let held: { worker: Worker; message: unknown } | undefined;
+		const git = spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
+			if (options.cmd.includes("ls-files"))
+				options.stdoutStream?.onChunk(Buffer.from(`${paths.join("\0")}\0`));
+			return { stdout: "", stderr: "", exitCode: 0 };
+		});
+		const post = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			message: unknown,
+		) {
+			const request = message as { action: string; paths: string[] };
+			if (request.action === "read" && request.paths[0] === paths[200] && !held) {
+				held = { worker: this, message };
+				batchStarted.resolve();
+				return;
+			}
+			postMessage.call(this, message);
+		});
+		try {
+			for (const path of paths) await writeFile(join(cwd, path), "one\n");
+			let loads = 0;
+			let shared: AbortSignal | undefined;
+			const load = (signal: AbortSignal) => {
+				loads++;
+				shared = signal;
+				return getGitLineStats(cwd, signal);
+			};
+			const controller = new AbortController();
+			const a = getGitLineStatsCached(cwd, load, controller.signal).catch((error) => error);
+			const b = getGitLineStatsCached(cwd, load);
+			await batchStarted.promise;
+			controller.abort(new Error("cancel one surface"));
+			expect(await a).toBeInstanceOf(Error);
+			expect(shared?.aborted).toBe(false);
+			await writeFile(join(cwd, paths[0]), "one\ntwo\n");
+			invalidateGitLineStats(cwd);
+			const fresh = getGitLineStatsCached(cwd, load);
+			if (!held) throw new Error("Second batch did not start");
+			postMessage.call(held.worker, held.message);
+			expect(await b).toMatchObject({ linesAdded: 254, complete: true });
+			expect(await fresh).toMatchObject({ linesAdded: 255, complete: true });
+			expect(await getGitLineStatsCached(cwd, load)).toMatchObject({
+				linesAdded: 255,
+				complete: true,
+			});
+			expect(loads).toBe(2);
+		} finally {
+			clearGitLineStatsCache();
+			post.mockRestore();
+			git.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	test("the last cancellation aborts underlying work and never caches it", async () => {
