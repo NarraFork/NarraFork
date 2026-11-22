@@ -3517,6 +3517,8 @@ export const narratorService = {
 	getToolCallPreviewMetadata:
 		narratorMessageQueries.getToolCallPreviewMetadata.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
+	readCompactSummaryDetail:
+		narratorMessageQueries.readCompactSummaryDetail.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
 	deleteEmptyRetryPlaceholder:
@@ -3562,6 +3564,8 @@ export const narratorService = {
 	appendBlockToMessage: narratorPersistence.appendBlockToMessage.bind(narratorPersistence),
 	patchReasoningTranslation:
 		narratorPersistence.patchReasoningTranslation.bind(narratorPersistence),
+	patchReasoningTranslationRange:
+		narratorPersistence.patchReasoningTranslationRange.bind(narratorPersistence),
 	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
 	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
 	updateMessageHistoryTokenEstimate:

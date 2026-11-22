@@ -143,6 +143,45 @@ const reasoningStep = [
 ];
 
 describe("patchState", () => {
+	test("reasoning ranges round-trip as state without altering model text or body revisions", async () => {
+		seed("s1", "assistant", reasoningStep);
+		const revisions = rows("s1").map((row) => row.revision);
+		const first = {
+			id: "p1",
+			generation: "g1",
+			start: 0,
+			end: 5,
+			sourceText: "think",
+			translatedText: "思考",
+		};
+		const second = {
+			id: "p2",
+			generation: "g1",
+			start: 5,
+			end: 8,
+			sourceText: "ing",
+			translatedText: "中",
+		};
+		const apply = (part = first, source = "thinking", elementId = "r1") =>
+			narratorPersistence.patchReasoningTranslationRange("s1", elementId, source, part);
+		expect(await measure("s1", () => apply())).toEqual({
+			result: true,
+			bumped: false,
+			stateRevision: 1,
+			queued: 0,
+		});
+		expect(apply(first)).toBe(false);
+		expect(apply(second, "thinkXYZing")).toBe(false);
+		expect(apply(second, "thinking", "other")).toBe(false);
+		expect(apply({ ...second, generation: "g2" })).toBe(false);
+		expect(apply(second)).toBe(true);
+		expect(JSON.parse(rows("s1")[0].payload).raw).toEqual([reasoningStep[0]]);
+		expect(JSON.parse(rows("s1")[0].state ?? "null")).toEqual({
+			raw: [{ translationGeneration: "g1", translationParts: [first, second] }],
+		});
+		expect(rows("s1").map((row) => row.revision)).toEqual(revisions);
+		expectRowsCurrent("s1");
+	});
 	test("a translation changes state only: no bump, no sync, rows stay current", async () => {
 		seed("s1", "assistant", reasoningStep);
 		const revisions = rows("s1").map((row) => row.revision);
