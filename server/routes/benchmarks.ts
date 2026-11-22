@@ -1,22 +1,26 @@
 /**
  * Benchmark API routes.
  */
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
+import { DbReadTaskExecutionError, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { logger } from "../lib/logger";
 import { permissionModeSchema } from "../lib/permission-modes";
 import { requireAdmin } from "../middleware/auth";
+import {
+	BENCHMARK_MAX_COMPARE_RUNS,
+	BENCHMARK_MAX_RESPONSE_BYTES,
+	MAX_SUITE_JSON_CHARS,
+	MAX_TASKS_PER_SUITE,
+} from "../services/benchmark-limits";
 import {
 	cancelRun,
 	compareRuns,
 	createRun,
 	createSuite,
-	getRun,
-	getRunResults,
 	getRunSummary,
-	getSuite,
-	listRuns,
-	listSuites,
+	readBenchmarkResponse,
 	startRun,
 } from "../services/benchmark-service";
 
@@ -27,12 +31,37 @@ benchmarkRoutes.use("*", requireAdmin);
 
 // ── Suite endpoints ─────────────────────────────────────────────────
 
-const MAX_TASKS_PER_SUITE = 1_000;
 const MAX_PROMPT_CHARS = 200_000;
 const MAX_TEST_CODE_CHARS = 500_000;
 const MAX_OUTPUT_CHARS = 500_000;
 const MAX_METADATA_JSON_CHARS = 200_000;
-const MAX_SUITE_JSON_CHARS = 20_000_000;
+
+function readFailure(c: Context, error: unknown): Response | undefined {
+	const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+	if (code === "BENCHMARK_READ_BUDGET")
+		return c.json({ error: "Benchmark response exceeds its budget" }, 413);
+	if (code === "DB_READ_TASK_TIMEOUT") return c.json({ error: "Benchmark read timed out" }, 504);
+	if (
+		error instanceof WorkersUnavailableError ||
+		error instanceof DbReadTaskExecutionError ||
+		code === "DB_READ_TASK_OVERLOADED"
+	)
+		return c.json({ error: "Benchmark reader unavailable" }, 503);
+}
+
+async function readResponse(
+	c: Context,
+	read: Parameters<typeof readBenchmarkResponse>[0],
+	missing = "",
+) {
+	try {
+		return (await readBenchmarkResponse(read, c.req.raw.signal)) ?? c.json({ error: missing }, 404);
+	} catch (error) {
+		const response = readFailure(c, error);
+		if (response) return response;
+		throw error;
+	}
+}
 
 function jsonSize(value: unknown): number {
 	try {
@@ -108,24 +137,26 @@ const createSuiteSchema = z
 		}
 	});
 
-benchmarkRoutes.post("/suites", async (c) => {
-	const body = await c.req.json();
-	const parsed = createSuiteSchema.safeParse(body);
-	if (!parsed.success) return c.json({ error: parsed.error.message }, 400);
-	const suite = await createSuite(parsed.data);
-	return c.json(suite, 201);
-});
+benchmarkRoutes.post(
+	"/suites",
+	bodyLimit({
+		maxSize: BENCHMARK_MAX_RESPONSE_BYTES,
+		onError: (c) => c.json({ error: "Benchmark suite payload exceeds its byte budget" }, 413),
+	}),
+	async (c) => {
+		const body = await c.req.json();
+		const parsed = createSuiteSchema.safeParse(body);
+		if (!parsed.success) return c.json({ error: parsed.error.message }, 400);
+		const suite = await createSuite(parsed.data);
+		return c.json(suite, 201);
+	},
+);
 
-benchmarkRoutes.get("/suites", async (c) => {
-	const suites = await listSuites();
-	return c.json(suites);
-});
+benchmarkRoutes.get("/suites", (c) => readResponse(c, { type: "suites" }));
 
-benchmarkRoutes.get("/suites/:id", async (c) => {
-	const suite = await getSuite(c.req.param("id"));
-	if (!suite) return c.json({ error: "Suite not found" }, 404);
-	return c.json(suite);
-});
+benchmarkRoutes.get("/suites/:id", (c) =>
+	readResponse(c, { type: "suite", id: c.req.param("id") }, "Suite not found"),
+);
 
 // ── Run endpoints ───────────────────────────────────────────────────
 
@@ -146,21 +177,17 @@ benchmarkRoutes.post("/runs", async (c) => {
 		const run = await createRun(parsed.data);
 		return c.json(run, 201);
 	} catch (err) {
-		return c.json({ error: String(err) }, 400);
+		return readFailure(c, err) ?? c.json({ error: String(err) }, 400);
 	}
 });
 
-benchmarkRoutes.get("/runs", async (c) => {
-	const suiteId = c.req.query("suiteId");
-	const runs = await listRuns(suiteId ?? undefined);
-	return c.json(runs);
-});
+benchmarkRoutes.get("/runs", (c) =>
+	readResponse(c, { type: "runs", suiteId: c.req.query("suiteId") }),
+);
 
-benchmarkRoutes.get("/runs/:id", async (c) => {
-	const run = await getRun(c.req.param("id"));
-	if (!run) return c.json({ error: "Run not found" }, 404);
-	return c.json(run);
-});
+benchmarkRoutes.get("/runs/:id", (c) =>
+	readResponse(c, { type: "run", id: c.req.param("id") }, "Run not found"),
+);
 
 benchmarkRoutes.post("/runs/:id/start", async (c) => {
 	const runId = c.req.param("id");
@@ -168,6 +195,8 @@ benchmarkRoutes.post("/runs/:id/start", async (c) => {
 		const run = await startRun(runId);
 		return c.json({ ok: true, message: "Run started", runId: run.id, status: run.status });
 	} catch (err) {
+		const response = readFailure(c, err);
+		if (response) return response;
 		const msg = err instanceof Error ? err.message : String(err);
 		logger.warn("Benchmark run start rejected", { runId, error: msg });
 		if (msg.includes("not found") || msg.includes("Suite not found"))
@@ -187,17 +216,16 @@ benchmarkRoutes.post("/runs/:id/cancel", async (c) => {
 
 // ── Results & summary ───────────────────────────────────────────────
 
-benchmarkRoutes.get("/runs/:id/results", async (c) => {
-	const results = await getRunResults(c.req.param("id"));
-	return c.json(results);
-});
+benchmarkRoutes.get("/runs/:id/results", (c) =>
+	readResponse(c, { type: "results", id: c.req.param("id") }),
+);
 
 benchmarkRoutes.get("/runs/:id/summary", async (c) => {
 	try {
-		const summary = await getRunSummary(c.req.param("id"));
+		const summary = await getRunSummary(c.req.param("id"), c.req.raw.signal);
 		return c.json(summary);
 	} catch (err) {
-		return c.json({ error: String(err) }, 404);
+		return readFailure(c, err) ?? c.json({ error: String(err) }, 404);
 	}
 });
 
@@ -206,10 +234,12 @@ benchmarkRoutes.get("/compare", async (c) => {
 	if (!runIdsParam) return c.json({ error: "runIds query parameter required" }, 400);
 	const runIds = runIdsParam.split(",").filter(Boolean);
 	if (runIds.length < 2) return c.json({ error: "At least 2 run IDs required" }, 400);
+	if (runIds.length > BENCHMARK_MAX_COMPARE_RUNS)
+		return c.json({ error: `At most ${BENCHMARK_MAX_COMPARE_RUNS} run IDs allowed` }, 400);
 	try {
-		const comparison = await compareRuns(runIds);
+		const comparison = await compareRuns(runIds, c.req.raw.signal);
 		return c.json(comparison);
 	} catch (err) {
-		return c.json({ error: String(err) }, 400);
+		return readFailure(c, err) ?? c.json({ error: String(err) }, 400);
 	}
 });

@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { PathIdentity } from "@server/lib/agent/execution/backend";
 import { targetPathSemantics } from "@server/lib/agent/execution/path-semantics";
 import type { ToolExecutionTarget } from "@server/lib/agent/types";
 import { getSettingsRevision } from "@server/lib/settings";
 import { ExecutionPolicyEngine } from "../engine";
 import { normalizeExecutionPolicyRuleSet } from "../normalize";
+import { executionPolicyRepository, type LoadedExecutionPolicy } from "../repository";
 import type { ExecutionTargetContext } from "../types";
 
 /**
@@ -24,7 +25,7 @@ function currentSettingsRevision(): number {
 	return getSettingsRevision();
 }
 
-function makeMinimalPolicy(overrides: Partial<any> = {}) {
+function makeMinimalPolicy(overrides: Partial<LoadedExecutionPolicy> = {}): LoadedExecutionPolicy {
 	return {
 		narratorId: "test-narrator",
 		ownerNarratorId: "test-narrator",
@@ -101,6 +102,9 @@ describe("execution policy engine cache eviction on failure", () => {
 			ownerNarratorId: policy.ownerNarratorId ?? narratorId,
 			settingsRevision: currentSettingsRevision(),
 			promise: Promise.resolve(policy),
+			controller: new AbortController(),
+			waiters: 0,
+			settled: true,
 		};
 		(engine as any).loadedCache.set(narratorId, entry);
 	}
@@ -220,36 +224,77 @@ describe("execution policy engine cache eviction on failure", () => {
 		expect(result.narratorId).toBe(narratorId);
 	});
 
+	test("a project edit retries affected snapshots for existing and new tool checks", async () => {
+		const unrelated = Promise.withResolvers<LoadedExecutionPolicy>();
+		const inherited = Promise.withResolvers<LoadedExecutionPolicy>();
+		const load = spyOn(executionPolicyRepository, "load")
+			.mockReturnValueOnce(unrelated.promise)
+			.mockReturnValueOnce(inherited.promise)
+			.mockResolvedValueOnce(
+				makeMinimalPolicy({
+					narratorId: "child",
+					projectId: "unrelated",
+					projectIds: ["unrelated", "edited"],
+					projectGitPath: "/new",
+				}),
+			);
+		try {
+			const unaffected = engine.compile("other", null);
+			const affected = engine.compile("child", null);
+			engine.invalidateProject("edited");
+			const afterEdit = engine.compile("child", null);
+			const result = Promise.all([unaffected, affected, afterEdit]);
+			unrelated.resolve(makeMinimalPolicy({ narratorId: "other", projectIds: ["unrelated"] }));
+			inherited.resolve(
+				makeMinimalPolicy({
+					narratorId: "child",
+					projectId: "unrelated",
+					projectIds: ["unrelated", "edited"],
+					projectGitPath: "/old",
+				}),
+			);
+			expect(await result).toEqual([
+				expect.objectContaining({ narratorId: "other" }),
+				expect.objectContaining({ narratorId: "child", projectGitPath: "/new" }),
+				expect.objectContaining({ narratorId: "child", projectGitPath: "/new" }),
+			]);
+			await expect(engine.compile("child", null)).resolves.toMatchObject({ narratorId: "child" });
+			await expect(engine.compile("other", null)).resolves.toMatchObject({ narratorId: "other" });
+			expect(load).toHaveBeenCalledTimes(3);
+		} finally {
+			load.mockRestore();
+		}
+	});
+
 	test("load failure is evicted from loadedCache on next call", async () => {
 		const narratorId = "load-fail-narrator";
-		const loadedCache = (engine as any).loadedCache as Map<string, any>;
+		const load = spyOn(executionPolicyRepository, "load")
+			.mockRejectedValueOnce(new Error("DB connection lost"))
+			.mockResolvedValueOnce(makeMinimalPolicy({ narratorId }));
+		try {
+			await expect(engine.compile(narratorId, null)).rejects.toThrow("DB connection lost");
+			expect((await engine.compile(narratorId, null)).narratorId).toBe(narratorId);
+			expect(load).toHaveBeenCalledTimes(2);
+		} finally {
+			load.mockRestore();
+		}
+	});
 
-		// Manually insert a rejected load entry to simulate repository.load() failure.
-		// In the real code, the .catch handler on load() evicts the entry. Here we
-		// simulate the end state after that handler runs.
-		const rejectedPromise = Promise.reject(new Error("DB connection lost"));
-		rejectedPromise.catch(() => {}); // Suppress unhandled rejection
-		const failEntry = {
-			narratorId,
-			settingsRevision: currentSettingsRevision(),
-			promise: rejectedPromise,
-		};
-		loadedCache.set(narratorId, failEntry);
-
-		// compile propagates the load failure
-		await expect(engine.compile(narratorId, null)).rejects.toThrow("DB connection lost");
-
-		// Now seed a working entry (simulating that the DB recovered)
-		const entry = {
-			narratorId,
-			ownerNarratorId: narratorId,
-			settingsRevision: currentSettingsRevision(),
-			promise: Promise.resolve(makeMinimalPolicy({ narratorId })),
-		};
-		loadedCache.set(narratorId, entry);
-
-		const result = await engine.compile(narratorId, null);
-		expect(result).toBeDefined();
-		expect(result.narratorId).toBe(narratorId);
+	test("a policy invalidated while the Worker is reading cannot repopulate the cache", async () => {
+		const narratorId = "pending-narrator";
+		const pending = Promise.withResolvers<LoadedExecutionPolicy>();
+		const load = spyOn(executionPolicyRepository, "load")
+			.mockReturnValueOnce(pending.promise)
+			.mockResolvedValueOnce(makeMinimalPolicy({ narratorId, ownerNarratorId: "parent" }));
+		try {
+			const first = engine.compile(narratorId, null);
+			engine.invalidate("parent");
+			pending.resolve(makeMinimalPolicy({ narratorId, ownerNarratorId: "old-parent" }));
+			await expect(first).rejects.toThrow("changed while loading");
+			expect((await engine.compile(narratorId, null)).ownerNarratorId).toBe("parent");
+			expect(load).toHaveBeenCalledTimes(2);
+		} finally {
+			load.mockRestore();
+		}
 	});
 });

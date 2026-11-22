@@ -1,5 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { generateSQLiteDrizzleJson, generateSQLiteMigration } from "drizzle-kit/api";
 import { eq } from "drizzle-orm";
@@ -12,11 +15,14 @@ import { OutputContentAccumulator } from "../../lib/agent/output-content";
 import { toolRegistry } from "../../lib/agent/tool-registry";
 import type { AgentEvent } from "../../lib/agent/types";
 import { measureMessageCharacters } from "../../lib/context-characters";
+import { resetDbWorkerPoolForTest } from "../../lib/db-worker/pool";
 import type { EventHandlerContext } from "../narrator-event-handler";
 
 // This fixture follows the current schema without depending on gitignored migration
 // artifacts, and never writes to drizzle/ or opens a production database.
-const sqlite = new Database(":memory:");
+const databaseDirectory = await mkdtemp(join(tmpdir(), "output-recovery-fixture-"));
+const sqlite = new Database(join(databaseDirectory, "fixture.sqlite"));
+sqlite.run("PRAGMA journal_mode = WAL");
 const statements = await generateSQLiteMigration(
 	await generateSQLiteDrizzleJson({}),
 	await generateSQLiteDrizzleJson(schema),
@@ -104,7 +110,10 @@ beforeEach(() => {
 	cleanDb();
 	seed();
 });
-afterAll(() => {
+afterAll(async () => {
+	await resetDbWorkerPoolForTest();
+	sqlite.close();
+	await rm(databaseDirectory, { recursive: true, force: true });
 	mock.restore();
 });
 
@@ -329,9 +338,6 @@ describe("cold recovery output boundary", () => {
 		const { pendingPermissions } = await import("../narrator-session-state");
 		const { resolvePermission } = await import("../narrator-permission");
 		const { getNarraforkHome } = await import("../../lib/narrafork-home");
-		const { mkdtemp, rm } = await import("node:fs/promises");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
 		const directory = await mkdtemp(join(tmpdir(), "output-restart-cow-"));
 		const previousHome = process.env.NARRAFORK_HOME;
 		const realAgent = { ...(await import("../../lib/agent")) };

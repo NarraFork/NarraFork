@@ -102,7 +102,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		model: nonEmptyString(data.model),
 		// Re-normalized rather than trusted: the same cap and key whitelist the server
 		// applied, so a hand-crafted frame cannot widen the payload the row renders.
-		inputSummary: normalizeSubagentToolInputSummary(data.inputSummary),
+		...(data.inputSummary !== undefined
+			? { inputSummary: normalizeSubagentToolInputSummary(data.inputSummary) }
+			: {}),
 	};
 }
 
@@ -113,6 +115,7 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	const eventMeta = subagentToolEventMeta(record);
 	return {
 		toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+		...(eventMeta.executionAttempt != null ? { executionAttempt: eventMeta.executionAttempt } : {}),
 		toolUseId: record.toolUseId,
 		toolName: record.toolName,
 		status: typeof record.status === "string" ? record.status : "initializing",
@@ -124,7 +127,9 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
 		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
 		// moment a reconnect snapshot replaced the fetched activity.
-		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
+		...(eventMeta.inputSummary != null || record.inputSummary === null
+			? { inputSummary: eventMeta.inputSummary }
+			: {}),
 	};
 }
 
@@ -958,7 +963,11 @@ export interface NarratorWSCallbacks {
 	 * persisted, so nothing else will retire them — drop them or they stay
 	 * "running" forever with a live elapsed timer.
 	 */
-	onToolUseDiscarded?: (toolUseIds: string[], parentToolUseId?: string) => void;
+	onToolUseDiscarded?: (
+		toolUseIds: string[],
+		parentToolUseId?: string,
+		subagentNarratorId?: string,
+	) => void;
 }
 
 export function useNarratorWS(
@@ -1950,6 +1959,7 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onToolUseDiscarded?.(
 							(data.toolUseIds ?? []) as string[],
 							data.parentToolUseId as string | undefined,
+							nonEmptyString(data.subagentNarratorId) ?? undefined,
 						);
 						break;
 				}

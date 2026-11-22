@@ -21,6 +21,9 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { PublicationRun } from "../../services/agent-runtime/publication-outbox";
+import type { AgentTerminalResultReadOptions } from "../../services/agent-runtime/publication-result";
+import type { BenchmarkReadParams } from "../../services/benchmark-read";
 import type {
 	BlockBackfillSliceParams,
 	BlockIndexQueueSliceParams,
@@ -28,7 +31,12 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { ComposerDocumentParams } from "./composer-document-query";
+import type { RecallConversationParams } from "./recall-conversation-query";
+import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { SubagentActivityParams } from "./subagent-activity-query";
+import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -39,12 +47,20 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "composerDocument"
+	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "revertSelectionBody"
+	| "databaseCleanupContext"
+	| "toolDetailSnapshot"
 	| "selectRows"
+	| "executionPolicyFacts"
+	| "toolEditPreview"
+	| "knowledgeEntryDetail"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
@@ -52,8 +68,13 @@ export type DbReadTaskName =
 	| "blockReindexSlice"
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
+	| "recallToolCall"
+	| "recallConversation"
 	| "storageHistoryRead"
-	| "storageHistoryBody";
+	| "subagentActivity"
+	| "storageHistoryBody"
+	| "publicationTerminalResult"
+	| "benchmarkRead";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
 export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
@@ -74,6 +95,20 @@ export interface SelectRowsParams {
 export interface SelectRowsResult {
 	columns: string[];
 	rows: unknown[][];
+}
+
+export interface RevertSelectionInspectionSource {
+	id: string;
+	refId: string;
+	narratorId: string;
+	contentBytes: number;
+	bodyRevision: number | null;
+	stateRevision: number | null;
+}
+
+export interface RevertSelectionBodyParams extends RevertSelectionInspectionSource {
+	kind: "revertSelectionBody";
+	blockReads: boolean;
 }
 
 export interface StorageScanContextParams {
@@ -253,8 +288,20 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| BenchmarkReadParams
+	| ComposerDocumentParams
+	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
+	| RecallToolCallParams
+	| RecallConversationParams
 	| StorageHistoryReadParams
+	| SubagentActivityParams
 	| StorageHistoryBodyParams
+	| {
+			kind: "publicationTerminalResult";
+			run: PublicationRun;
+			options: AgentTerminalResultReadOptions;
+			fromBlocks: boolean;
+	  }
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
@@ -265,7 +312,13 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| RevertSelectionBodyParams
+	| { kind: "databaseCleanupContext" }
+	| ToolDetailSnapshotParams
 	| SelectRowsParams
+	| { kind: "executionPolicyFacts"; narratorId: string }
+	| { kind: "toolEditPreview"; toolCallId: string }
+	| { kind: "knowledgeEntryDetail"; entryId: string }
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 

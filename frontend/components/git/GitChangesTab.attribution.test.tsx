@@ -13,7 +13,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
@@ -33,6 +33,11 @@ import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import zhGitLocale from "../../locales/zh-CN/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
+import {
+	createGitChangesTestQueryClient,
+	flushGitChangesTestRender,
+	installGitChangesTestTransport,
+} from "./git-changes-list-test-fixture";
 
 // Isolated i18next instance, for the same reason as GitPanel.test.tsx: sibling suites
 // mutate the process-global default and would leave this one rendering raw keys.
@@ -62,6 +67,7 @@ class TestResizeObserver {
 }
 
 let root: Root | undefined;
+let restoreChangesTransport: (() => void) | undefined;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -290,7 +296,7 @@ function currentView(
 }
 
 function flushRender() {
-	return new Promise((resolve) => setTimeout(resolve, 0));
+	return flushGitChangesTestRender();
 }
 
 /**
@@ -303,7 +309,7 @@ async function renderBadge(
 	path = "src/one.ts",
 	statusOverride?: GitStatusSummary,
 ): Promise<HTMLElement> {
-	const queryClient = new QueryClient({
+	const queryClient = createGitChangesTestQueryClient({
 		defaultOptions: {
 			queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 			mutations: { retry: false },
@@ -379,12 +385,15 @@ async function hoverAttribution(container: HTMLElement): Promise<string> {
 describe("GitChangesTab attribution hover card", () => {
 	beforeEach(async () => {
 		installDom();
+		restoreChangesTransport = installGitChangesTestTransport();
 		__resetGitFolderPrefsCache();
 		await initTestI18n();
 		await i18n.changeLanguage("en");
 	});
 
 	afterEach(() => {
+		restoreChangesTransport?.();
+		restoreChangesTransport = undefined;
 		if (!root) return;
 		root.unmount();
 		root = undefined;
@@ -408,6 +417,34 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(statusBadge(container).textContent).toBe("M");
 		expect(row.textContent).not.toContain("Refactor auth");
 		expect(attributionTarget(container).getAttribute("title")).toBeNull();
+	});
+
+	test("brief hover and virtual-row removal cancel a pending attribution open", async () => {
+		const g = globalThis as { fetch?: typeof fetch };
+		const originalFetch = g.fetch;
+		let reads = 0;
+		g.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+			reads++;
+			return Response.json({ error: "unexpected attribution read" }, { status: 500 });
+		}) as typeof fetch;
+		try {
+			const container = await renderBadge("git-attr-pending-open", null);
+			const target = attributionTarget(container);
+			target.dispatchEvent(new Event("mouseover", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			target.dispatchEvent(new Event("mouseout", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 160));
+			expect(reads).toBe(0);
+			expect(document.querySelector(".mantine-HoverCard-dropdown")).toBeNull();
+			target.dispatchEvent(new Event("mouseover", { bubbles: true }));
+			root?.unmount();
+			root = undefined;
+			await new Promise((resolve) => setTimeout(resolve, 160));
+			expect(reads).toBe(0);
+			expect(document.querySelector(".mantine-HoverCard-dropdown")).toBeNull();
+		} finally {
+			g.fetch = originalFetch;
+		}
 	});
 
 	test("shows current evidence and a compact timeline only on hover", async () => {
@@ -603,11 +640,13 @@ describe("GitChangesTab attribution hover card", () => {
 		}
 	});
 
-	test("hiding the page aborts the read, and returning reads again", async () => {
+	test("hiding aborts attribution and the refreshed row reads on hover", async () => {
 		const g = globalThis as { fetch?: typeof fetch };
 		const originalFetch = g.fetch;
 		const signals: AbortSignal[] = [];
-		g.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+		const urls: string[] = [];
+		g.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+			urls.push(String(input));
 			if (init?.signal) signals.push(init.signal);
 			return new Promise<Response>((_, reject) =>
 				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
@@ -623,11 +662,20 @@ describe("GitChangesTab attribution hover card", () => {
 			document.dispatchEvent(new Event("visibilitychange"));
 			await flushRender();
 			expect(signals[0]?.aborted).toBe(true);
+			expect(signals).toHaveLength(1);
 
 			Object.defineProperty(doc, "visibilityState", { configurable: true, value: "visible" });
 			document.dispatchEvent(new Event("visibilitychange"));
 			await flushRender();
 			expect(signals).toHaveLength(2);
+			// Foreground catch-up acquires one live observation; the hidden request
+			// remains cancelled, independently of virtual row DOM identity.
+			expect(signals[0]?.aborted).toBe(true);
+			expect(signals[1]?.aborted).toBe(false);
+			await hoverAttribution(container);
+			expect(signals).toHaveLength(2);
+			expect(signals[1]?.aborted).toBe(false);
+			expect(urls.every((url) => url.includes("/modifications?"))).toBe(true);
 			expect(document.querySelector(".mantine-HoverCard-dropdown")?.textContent).toContain(
 				gitLocale.attributionLoadingShort,
 			);

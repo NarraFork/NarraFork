@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -10,7 +10,7 @@ import {
 } from "../../db/schema";
 import type { AgentConfig, ToolContext } from "../../lib/agent/types";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { executeTool } = await import("../../lib/agent/tool-executor");
@@ -133,7 +133,7 @@ afterAll(() => {
 	for (const tool of originals) if (tool) toolRegistry.register(tool);
 	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	dispose();
 });
 
 test("内部Read持久行关联真实父attempt，不修改模型消息", async () => {

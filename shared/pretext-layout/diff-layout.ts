@@ -61,6 +61,8 @@ export interface DiffRowsLayout extends ListLayout {
 	wordWrap: boolean;
 	typography: DiffTypography;
 	maxWidth: number;
+	/** Sorted full-row indexes with cumulative minimum-height additions. */
+	rowHeightExtras?: readonly { row: number; bottom: number }[];
 }
 
 export interface DiffLayoutOptions {
@@ -72,6 +74,8 @@ export interface DiffLayoutOptions {
 	totalRows?: number;
 	hunks?: readonly ParsedDiffHunk[];
 	typography?: DiffTypography;
+	/** Minimum row boxes keyed by full diff index; wrapping keeps its natural line height. */
+	rowMinHeights?: ReadonlyMap<number, number>;
 }
 
 /** Monospace gutter advance through the same pretext engine used for wrapping. */
@@ -213,12 +217,39 @@ export function layoutDiffRows(
 		previous.typography.lineHeight === typography.lineHeight &&
 		previous.typography.letterSpacing === typography.letterSpacing;
 	const reusable = new Map(canReuse ? previous.rows.map((row) => [row.content, row]) : []);
-	const rows = lines.map(
-		(line) => reusable.get(line.content) ?? layoutRow(line.content, width, wordWrap, typography),
-	);
+	const rows = lines.map((line, index) => {
+		const measured =
+			reusable.get(line.content) ?? layoutRow(line.content, width, wordWrap, typography);
+		// Reused rows may belong to another control anchor. Only their text geometry
+		// is reusable; the minimum belongs to this full diff index, not the content.
+		const height = Math.max(
+			Math.max(1, measured.visualLines.length) * typography.lineHeight,
+			options.rowMinHeights?.get(startRow + index) ?? 0,
+		);
+		return height === measured.height ? measured : { ...measured, height };
+	});
+	let extraHeight = 0;
+	const rowHeightExtras = [...(options.rowMinHeights ?? [])]
+		.filter(
+			([row, height]) =>
+				Number.isInteger(row) &&
+				row >= 0 &&
+				row < totalRows &&
+				Number.isFinite(height) &&
+				height > typography.lineHeight,
+		)
+		.sort(([left], [right]) => left - right)
+		.map(([row, height]) => {
+			extraHeight += height - typography.lineHeight;
+			return { row, bottom: extraHeight };
+		});
 	const hunks = new Map<number, ParsedDiffHunk>();
-	let beforeHeight = startRow * typography.lineHeight;
-	let afterHeight = Math.max(0, totalRows - startRow - lines.length) * typography.lineHeight;
+	let beforeHeight =
+		startRow * typography.lineHeight + rowExtraHeightBefore(rowHeightExtras, startRow);
+	let afterHeight =
+		Math.max(0, totalRows - startRow - lines.length) * typography.lineHeight +
+		extraHeight -
+		rowExtraHeightBefore(rowHeightExtras, startRow + lines.length);
 	const hunkHeight = typography.lineHeight + 2;
 	for (const hunk of options.hunks ?? []) {
 		if (hunk.rowIndex < startRow) beforeHeight += hunkHeight;
@@ -245,7 +276,20 @@ export function layoutDiffRows(
 		wordWrap,
 		typography,
 		maxWidth: Math.max(contentWidth, ...rows.map((row) => row.width + gutterWidth)),
+		...(rowHeightExtras.length ? { rowHeightExtras } : {}),
 	};
+}
+
+/** Known control boxes also occupy space outside the measured projection. */
+function rowExtraHeightBefore(extras: DiffRowsLayout["rowHeightExtras"], row: number): number {
+	let low = 0;
+	let high = extras?.length ?? 0;
+	while (low < high) {
+		const mid = (low + high) >>> 1;
+		if ((extras?.[mid]?.row ?? 0) < row) low = mid + 1;
+		else high = mid;
+	}
+	return extras?.[low - 1]?.bottom ?? 0;
 }
 
 export function diffRowBodyTop(layout: DiffRowsLayout, index: number): number {
@@ -317,7 +361,8 @@ export function estimatedDiffRowTop(layout: DiffRowsLayout, row: number, body = 
 		return body ? diffRowBodyTop(layout, local) : (layout.items[local]?.top ?? 0);
 	const estimate = (at: number) =>
 		at * layout.typography.lineHeight +
-		hunkCountBefore(layout, at) * (layout.typography.lineHeight + 2);
+		hunkCountBefore(layout, at) * (layout.typography.lineHeight + 2) +
+		rowExtraHeightBefore(layout.rowHeightExtras, at);
 	const end = layout.startRow + layout.rows.length;
 	const last = layout.items[layout.items.length - 1];
 	const correction = row >= end && last ? last.bottom - estimate(end) : 0;

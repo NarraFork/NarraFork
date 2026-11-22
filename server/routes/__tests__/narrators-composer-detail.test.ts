@@ -1,10 +1,8 @@
 import { expect, test } from "bun:test";
-import { isMediaContentBlock } from "@shared/media-attachments";
-import { and, eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { getFileReferenceSnapshots } from "../../lib/agent/file-reference-projection";
+import { projectComposerDocument } from "../../lib/db-worker/composer-document-query";
 import { NotFoundError, ValidationError } from "../../lib/errors";
 
 const source = await Bun.file(new URL("../narrators.ts", import.meta.url)).text();
@@ -164,26 +162,27 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 	];
 	const bindings = {
 		narratorRoutes: app,
-		narratorMessageRefs,
-		narratorMessages,
-		and,
-		eq,
-		sql,
 		NotFoundError,
-		ValidationError,
 		getFileReferenceSnapshots,
-		isMediaContentBlock,
-		// Block reads off: the plain column, as before block storage.
-		storedBodyBytesSql: () => sql`length(CAST(${narratorMessages.contentJson} AS BLOB))`,
-		contentJsonSql: () => narratorMessages.contentJson,
-		blockBody: () => [],
-		db: {
-			query: {
-				narratorMessageRefs: {
-					findFirst: async () => (options.member === false ? undefined : { id: "member" }),
-				},
-			},
-			select: () => ({ from: () => ({ where: () => ({ get: async () => message }) }) }),
+		requireNarratorAccess: async () => {},
+		readCommittedComposerDocument: async (
+			narratorId: string,
+			id: string,
+			signal: AbortSignal,
+			authorize: () => Promise<unknown>,
+		) => {
+			expect(signal).toBeInstanceOf(AbortSignal);
+			await authorize();
+			if (options.member === false) throw new NotFoundError("Message", id);
+			if (message.content === null) throw new ValidationError("Over budget");
+			return JSON.stringify(
+				projectComposerDocument(
+					narratorId,
+					JSON.stringify(message.composerDocument),
+					message.bodyRevision,
+					JSON.parse(message.content),
+				),
+			);
 		},
 		locateBufferedMessage: async () =>
 			options.member === false

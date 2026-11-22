@@ -1238,6 +1238,7 @@ function broadcastToolCompleted(
 		type: "tool_completed",
 		narratorId: ctx.broadcastTargetId,
 		toolCallId: message.toolCallId,
+		...(message.executionAttempt != null ? { executionAttempt: message.executionAttempt } : {}),
 		toolUseId: message.toolUseId,
 		toolName: message.toolName,
 		status: message.status,
@@ -2980,6 +2981,7 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				...subagentToolRouting(ctx, event.toolUseId),
 				...(resultToolCallId ? { toolCallId: resultToolCallId } : {}),
+				...(binding ? { executionAttempt: binding.attempt } : {}),
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
@@ -3201,7 +3203,10 @@ export async function processEvent(
 				type: "tool_use_discarded",
 				narratorId: broadcastTargetId,
 				toolUseIds: event.toolUseIds,
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				...(ctx.parentToolUseId && {
+					parentToolUseId: ctx.parentToolUseId,
+					subagentNarratorId: narratorId,
+				}),
 			});
 			return null;
 		}

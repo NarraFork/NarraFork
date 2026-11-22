@@ -24,8 +24,8 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
-test("local and release builds share all 20 unique, existing worker entries", () => {
-	expect(COMPILED_WORKER_ENTRIES).toHaveLength(20);
+test("local and release builds share all 22 unique, existing worker entries", () => {
+	expect(COMPILED_WORKER_ENTRIES).toHaveLength(22);
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
 	expect(compiledWorkerBuildEntrypoints()).toEqual(
 		COMPILED_WORKER_ENTRIES.map((entry) => `./server/${entry}`),
@@ -163,7 +163,9 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"services/editor-document-stream-worker.ts": ["services/editor-document-streams.ts"],
 	"services/outline/edit-text-worker.ts": ["services/outline/edit-text-runner.ts"],
 	"services/git-untracked-line-worker.ts": ["services/git-line-stats.ts"],
+	"services/git-status-page-worker.ts": ["services/git-status-page.ts"],
 	"services/git-current-baseline-worker.ts": ["services/git-current-baseline.ts"],
+	"services/git-staging-worker.ts": ["services/git-staging-lists-service.ts"],
 	"services/agent-runtime/model-history-worker.ts": [
 		"services/agent-runtime/model-history-source.ts",
 	],
@@ -225,11 +227,11 @@ function ownerText(paths: readonly string[]): string {
 }
 const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
-test("all 31 families have explicit common-runtime coverage: 20 entries, 6 trusted evals, 5 processes", () => {
-	expect(Object.keys(entryOwners)).toHaveLength(20);
+test("all 33 families have explicit common-runtime coverage: 22 entries, 6 trusted evals, 5 processes", () => {
+	expect(Object.keys(entryOwners)).toHaveLength(22);
 	expect(evalOwners).toHaveLength(6);
 	expect(processOwners).toHaveLength(5);
-	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(31);
+	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(33);
 	for (const entry of COMPILED_WORKER_ENTRIES) {
 		const text = ownerText(entryOwners[entry]);
 		expect(text.includes(entry), entry).toBe(true);

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorBlacklistDirs,
 	narratorMessages,
@@ -19,7 +19,7 @@ import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -80,6 +80,7 @@ afterEach(() => {
 });
 afterAll(() => {
 	mock.module("../../db", () => realDb);
+	dispose();
 });
 /** An ordinary project session working in the review worktree, with no boundary of its own. */
 async function plain() {

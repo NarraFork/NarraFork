@@ -2121,6 +2121,58 @@ describe("子代理工具事件向父级携带输入摘要", () => {
 		expect(parent).not.toHaveProperty("updatedInput");
 	});
 
+	test("reduced completion retains the receipt identity of the child tool that started", async () => {
+		const child = "bound-child-activity";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: child, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: child,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (id) => {
+				partialId = id;
+			},
+		};
+		const toolUseId = "bound-child-read";
+		const input = { file_path: "notes.md" };
+		try {
+			await processEvent(
+				{ type: "block_complete", block: { type: "tool_use", toolUseId, name: "Read", input } },
+				ctx,
+			);
+			await processEvent({ type: "tool_call", toolUseId, toolName: "Read", input }, ctx);
+			const binding = ctx.toolExecutionReceipts?.get(toolUseId)?.binding;
+			if (!binding) throw new Error("missing persisted tool receipt");
+			expect(subagentBroadcasts("tool_started").parent).toMatchObject({
+				toolCallId: binding.toolCallId,
+				executionAttempt: binding.attempt,
+			});
+			await processEvent(
+				{
+					type: "tool_result",
+					toolUseId,
+					toolName: "Read",
+					output: "child-only file contents",
+					isError: false,
+					durationMs: 50,
+					toolCallBinding: binding,
+				},
+				ctx,
+			);
+			const { parent } = subagentBroadcasts("tool_completed");
+			expect(parent).toMatchObject({
+				toolCallId: binding.toolCallId,
+				executionAttempt: binding.attempt,
+				status: "success",
+				durationMs: 50,
+			});
+			expect(parent).not.toHaveProperty("output");
+		} finally {
+			await cleanupFileContextNarrator(child);
+		}
+	});
+
 	test("主叙述者不带摘要（它本来就收到完整 input）", async () => {
 		const mainCtx: EventHandlerContext = {
 			...makeSubagentContext(),

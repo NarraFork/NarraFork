@@ -6,11 +6,12 @@
  *  - "unrelated": two ordinary narrators, no parent link, given the same registrations.
  * Same configuration, same observed behaviour — nothing may depend on parent/variant.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq, inArray } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import { narratorBlacklistCmds, narrators, users } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { settings } from "../../lib/settings";
@@ -20,6 +21,7 @@ import {
 } from "../../lib/validators/runtime-registration";
 import { setRunHold } from "../agent-runtime/ownership";
 import { compileDelegationPolicy, isRuntimeToolAllowed } from "../agent-runtime/policy";
+import { executionPolicyEngine } from "../execution-policy/engine";
 import { executionPolicyRepository } from "../execution-policy/repository";
 import { materializeLegacyDelegations } from "../legacy-delegation-materializer";
 import { authorizeAgentControl } from "../narrator-control";
@@ -139,6 +141,7 @@ describe.each(shapes)("%s session: permissions follow the registered source", (s
 		});
 		const after = executionPolicyRepository.loadNow(dependent);
 		expect(after.commandBlacklist.some((rule) => rule.pattern === "rm*")).toBe(true);
+		expect(await executionPolicyRepository.load(dependent)).toEqual(after);
 	});
 
 	test("a capability tightening on the source reaches the dependent", async () => {
@@ -176,6 +179,59 @@ describe.each(shapes)("%s session: permissions follow the registered source", (s
 			false,
 		);
 	});
+});
+
+test("committed policy rejects Worker failures without reading policy inline", async () => {
+	const id = await primary();
+	const inline = spyOn(executionPolicyRepository, "loadNow");
+	const dispatch = spyOn(workerPool, "runReadTask");
+	const original = process.env.NARRAFORK_DB_WORKER;
+	try {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		await expect(executionPolicyRepository.load(id)).rejects.toThrow("disabled_by_env");
+		for (const message of ["worker creation failed", "worker crashed", "worker timed out"]) {
+			dispatch.mockRejectedValueOnce(new Error(message));
+			await expect(executionPolicyRepository.load(id)).rejects.toThrow(message);
+		}
+		expect(dispatch).toHaveBeenCalledTimes(4);
+		expect(inline).not.toHaveBeenCalled();
+		expect((await executionPolicyEngine.compileCurrent(id, null, [])).narratorId).toBe(id);
+		expect(dispatch).toHaveBeenCalledTimes(4);
+	} finally {
+		if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
+		else process.env.NARRAFORK_DB_WORKER = original;
+		dispatch.mockRestore();
+		inline.mockRestore();
+	}
+});
+
+test("committed policy never dispatches inside an active transaction or after cancellation", async () => {
+	const id = await primary();
+	const dispatch = spyOn(workerPool, "runReadTask");
+	try {
+		const inTransaction = sqlite.transaction(() => executionPolicyRepository.load(id))();
+		await expect(inTransaction).rejects.toThrow("requires_committed_file");
+		await expect(
+			executionPolicyRepository.load(id, AbortSignal.abort(new Error("turn cancelled"))),
+		).rejects.toThrow("turn cancelled");
+		expect(dispatch).not.toHaveBeenCalled();
+	} finally {
+		dispatch.mockRestore();
+	}
+});
+
+test("the Worker rejects a policy over the per-table limit, rather than dropping rules", async () => {
+	const id = await primary();
+	sqlite
+		.query(
+			`WITH RECURSIVE rules(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM rules WHERE n < 2001)
+			INSERT INTO narrator_blacklist_cmds (id, narrator_id, pattern, created_at)
+			SELECT ? || '-' || n, ?, 'command-' || n, ? FROM rules`,
+		)
+		.run(id, id, new Date().toISOString());
+	await expect(executionPolicyRepository.load(id)).rejects.toThrow(
+		"Permission rule budget exceeded",
+	);
 });
 
 describe.each(shapes)("%s session: model follows the registered source", (shape) => {

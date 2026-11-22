@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessages,
 	narratorQuestions,
@@ -10,7 +10,7 @@ import {
 } from "../../db/schema";
 import type { NarraForkEvent } from "../../lib/event-bus";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { eventBus } = await import("../../lib/event-bus");
@@ -128,6 +128,7 @@ afterAll(() => {
 	setQuestionServiceSeam(null);
 	mock.restore();
 	mock.module("../../db", () => realDb);
+	dispose();
 });
 
 async function startPermission() {

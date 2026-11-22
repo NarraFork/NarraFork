@@ -62,6 +62,7 @@ import {
 	type RevertPlannerRequest,
 	RevertPlannerService,
 } from "./revert-planner-service";
+import { readCommittedRevertSelectionBody } from "./revert-selection-service";
 import {
 	type RevertTransactionRequest,
 	RevertTransactionService,
@@ -367,6 +368,7 @@ async function services(signal: AbortSignal) {
 			namespace,
 			planner: new RevertPlannerService(db, {
 				access,
+				readInspectionBody: readCommittedRevertSelectionBody,
 				blobStore: namespace.store,
 				blobCatalog: namespace.catalog,
 				generation: namespace.generation,
@@ -523,7 +525,7 @@ export async function listLocalRevertPlanFiles(
 ) {
 	const owner = await access.owner(principal, narratorId, options.signal);
 	const { plans } = await services(options.signal);
-	const page = plans.listFiles(owner, planId, options);
+	const page = await plans.readFilePage(owner, planId, options);
 	// Stored paths are sensitive too. A preview created before file permission revocation
 	// must not leak target identities under the weaker GET/read-only narrator gate.
 	for (const item of page.items) {

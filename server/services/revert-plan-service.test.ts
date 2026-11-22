@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
@@ -15,6 +18,7 @@ import {
 	revertOperationFiles,
 	revertOperations,
 } from "../db/schema";
+import * as pool from "../lib/db-worker/pool";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import { createFileChangeIdentity } from "./file-change-identity";
 import {
@@ -280,6 +284,106 @@ async function appendAll(input: BeginRevertPlan, files: AppendRevertPlanFile[]) 
 		);
 	return result;
 }
+
+async function withFileBackedReader(run: (reader: RevertPlanService) => Promise<void>) {
+	const directory = mkdtempSync(join(tmpdir(), "narrafork-revert-file-page-"));
+	const path = join(directory, "plans.db");
+	sqlite.prepare("VACUUM INTO ?").run(path);
+	const fileDb = new Database(path);
+	const workerSetting = process.env.NARRAFORK_DB_WORKER;
+	const concurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	try {
+		await pool.resetDbWorkerPoolForTest();
+		delete process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		fileDb.exec("PRAGMA foreign_keys = ON");
+		const reader = new RevertPlanService(drizzle(fileDb), { namespaceKey });
+		const prepare = spyOn(fileDb, "prepare").mockImplementation(() => {
+			throw new Error("Unexpected main-thread revert file read");
+		});
+		try {
+			await run(reader);
+			expect(prepare).not.toHaveBeenCalled();
+		} finally {
+			prepare.mockRestore();
+		}
+	} finally {
+		await pool.resetDbWorkerPoolForTest();
+		if (workerSetting === undefined) delete process.env.NARRAFORK_DB_WORKER;
+		else process.env.NARRAFORK_DB_WORKER = workerSetting;
+		if (concurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = concurrency;
+		fileDb.close();
+		rmSync(directory, { recursive: true, force: true });
+	}
+}
+
+describe("off-thread revert file pages", () => {
+	test("matches local cursor pages and distinguishes empty pages from forbidden plans", async () => {
+		const files = [file(0), file(1), file(2)];
+		const prepared = await appendAll(plan(files), files);
+		const empty = service.begin(plan());
+		const signal = new AbortController().signal;
+		await withFileBackedReader(async (reader) => {
+			const first = await reader.readFilePage(owner, prepared.id, { limit: 2, signal });
+			expect(first).toEqual(service.listFiles(owner, prepared.id, { limit: 2 }));
+			expect(first.items).toHaveLength(2);
+			expect(first.hasMore).toBe(true);
+			const cursor = first.nextCursor ?? undefined;
+			expect(await reader.readFilePage(owner, prepared.id, { cursor, signal })).toEqual(
+				service.listFiles(owner, prepared.id, { cursor }),
+			);
+			const emptyPage = { items: [], hasMore: false, nextCursor: null };
+			expect(await reader.readFilePage(owner, empty.id, { signal })).toEqual(emptyPage);
+			expect(
+				await reader.readFilePage(owner, prepared.id, {
+					cursor: { fileKey: "f".repeat(64) },
+					signal,
+				}),
+			).toEqual(emptyPage);
+			for (const wrong of [
+				{ ...owner, subjectKey: "human:bob" },
+				{ ...owner, narratorId: "narrator-b" },
+				{ ...owner, projectId: "project-b" },
+			]) {
+				const result = await reader
+					.readFilePage(wrong, prepared.id, { signal })
+					.catch((error: unknown) => error);
+				expect(result).toMatchObject({ code: "REVERT_PLAN_NOT_FOUND" });
+			}
+		});
+	}, 30_000);
+
+	test("rejects aborted, disabled, failed and timed-out reads without an inline retry", async () => {
+		const prepared = service.begin(plan());
+		await withFileBackedReader(async (reader) => {
+			const controller = new AbortController();
+			controller.abort(new Error("revert file page cancelled"));
+			await expect(
+				reader.readFilePage(owner, prepared.id, { signal: controller.signal }),
+			).rejects.toThrow("revert file page cancelled");
+			const signal = new AbortController().signal;
+			process.env.NARRAFORK_DB_WORKER = "off";
+			await expect(reader.readFilePage(owner, prepared.id, { signal })).rejects.toBeInstanceOf(
+				pool.WorkersUnavailableError,
+			);
+			delete process.env.NARRAFORK_DB_WORKER;
+			for (const error of [
+				new pool.WorkersUnavailableError("spawn failed"),
+				new Error("read worker crashed"),
+				new pool.DbReadTaskTimeoutError("read timed out"),
+			]) {
+				const worker = spyOn(pool, "runReadTask").mockRejectedValueOnce(error);
+				try {
+					await expect(reader.readFilePage(owner, prepared.id, { signal })).rejects.toBe(error);
+					expect(worker.mock.calls[0]?.[2]).toMatchObject({ signal, timeoutMs: 30_000 });
+				} finally {
+					worker.mockRestore();
+				}
+			}
+		});
+	}, 30_000);
+});
 
 describe("fixed manifest journal and owner boundary", () => {
 	test("begin pins original refs, declares expected count and is idempotent without preparing", () => {

@@ -7,9 +7,10 @@ import {
 	STORAGE_CATEGORY_PROGRESS_MESSAGE,
 	type StorageCategoryKey,
 } from "@shared/storage-categories";
-import { eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
@@ -17,6 +18,7 @@ import {
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
 import { coordinatorOutputsRoot } from "../lib/coordinator-outputs-path";
+import { DbReadTaskTimeoutError } from "../lib/db-worker/pool";
 import {
 	DirectoryMeasureAbortedError,
 	measureDirectoriesOffThread,
@@ -470,17 +472,45 @@ async function scanCoordinatorOutputs(
 	};
 }
 
+async function readWorktreeProjects(signal?: AbortSignal) {
+	const pageSize = 200;
+	const deadline = performance.now() + 30_000;
+	const rows: Pick<typeof projects.$inferSelect, "id" | "name" | "gitPath">[] = [];
+	let cursor: string | undefined;
+	do {
+		throwIfAborted(signal);
+		const timeoutMs = Math.ceil(deadline - performance.now());
+		if (timeoutMs <= 0) throw new DbReadTaskTimeoutError("Worktree project lookup timed out");
+		const page = await readQuery(
+			db
+				.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
+				.from(projects)
+				.where(
+					and(
+						isNotNull(projects.gitPath),
+						cursor === undefined ? undefined : gt(projects.id, cursor),
+					),
+				)
+				.orderBy(asc(projects.id))
+				.limit(pageSize),
+			{ signal, maxRows: pageSize, timeoutMs },
+		).catch((error) => {
+			throwIfAborted(signal);
+			throw error;
+		});
+		rows.push(...page);
+		cursor = page.length === pageSize ? page.at(-1)?.id : undefined;
+	} while (cursor !== undefined);
+	return rows;
+}
+
 async function scanWorktrees(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
 	let truncated = false;
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
-	throwIfAborted(options.signal);
-	const allProjects = db
-		.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
-		.from(projects)
-		.all();
+	const allProjects = await readWorktreeProjects(options.signal);
 
 	for (const proj of allProjects) {
 		throwIfAborted(options.signal);

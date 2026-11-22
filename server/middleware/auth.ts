@@ -117,9 +117,9 @@ function hasErrorName(err: unknown, name: string): boolean {
  * Subsequent auth middleware in the same Hono chain reuses `c.get("auth")`
  * instead of re-verifying or replacing context state.
  */
-async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
+async function authenticateRequest(c: Context, forceFresh = false): Promise<AuthPrincipal> {
 	const existing = getStoredAuthPrincipal(c);
-	if (existing) return existing;
+	if (existing && !forceFresh) return existing;
 
 	const header = c.req.header("Authorization");
 	if (!header?.startsWith("Bearer ")) {
@@ -175,6 +175,30 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	};
 	setAuthPrincipal(c, principal);
 	return principal;
+}
+
+/** Recheck a queued write's existing credential through the normal live auth path. */
+export async function revalidateAuthPrincipal(c: Context): Promise<AuthPrincipal> {
+	const previous = getAuthPrincipal(c);
+	if (!previous) throw catalogError("AUTH_REQUIRED");
+	const fresh = await authenticateRequest(c, true);
+	if (fresh.type !== previous.type || fresh.user.sub !== previous.user.sub)
+		throw catalogError("TOKEN_INVALID");
+	if (fresh.type === "oauth" && previous.type === "oauth") {
+		if (
+			fresh.oauth.tokenId !== previous.oauth.tokenId ||
+			fresh.oauth.grantId !== previous.oauth.grantId ||
+			fresh.oauth.clientId !== previous.oauth.clientId
+		)
+			throw catalogError("TOKEN_INVALID");
+		if (previous.oauth.scopes.some((scope) => !fresh.oauth.scopes.includes(scope)))
+			throw new AppError(
+				"OAuth permissions changed while this write was queued",
+				403,
+				"INSUFFICIENT_SCOPE",
+			);
+	}
+	return fresh;
 }
 
 /**
