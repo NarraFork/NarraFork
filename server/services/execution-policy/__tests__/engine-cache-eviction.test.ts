@@ -224,34 +224,39 @@ describe("execution policy engine cache eviction on failure", () => {
 		expect(result.narratorId).toBe(narratorId);
 	});
 
-	test("project changes only invalidate snapshots that depend on that project", async () => {
+	test("a project edit retries affected snapshots for existing and new tool checks", async () => {
 		const unrelated = Promise.withResolvers<LoadedExecutionPolicy>();
 		const inherited = Promise.withResolvers<LoadedExecutionPolicy>();
 		const load = spyOn(executionPolicyRepository, "load")
 			.mockReturnValueOnce(unrelated.promise)
 			.mockReturnValueOnce(inherited.promise)
-			.mockResolvedValueOnce(makeMinimalPolicy({ narratorId: "child", projectId: "unrelated" }));
+			.mockResolvedValueOnce(
+				makeMinimalPolicy({
+					narratorId: "child",
+					projectId: "unrelated",
+					projectIds: ["unrelated", "edited"],
+					projectGitPath: "/new",
+				}),
+			);
 		try {
 			const unaffected = engine.compile("other", null);
 			const affected = engine.compile("child", null);
-			const settled = Promise.allSettled([unaffected, affected]);
 			engine.invalidateProject("edited");
+			const afterEdit = engine.compile("child", null);
+			const result = Promise.all([unaffected, affected, afterEdit]);
 			unrelated.resolve(makeMinimalPolicy({ narratorId: "other", projectIds: ["unrelated"] }));
 			inherited.resolve(
 				makeMinimalPolicy({
 					narratorId: "child",
 					projectId: "unrelated",
 					projectIds: ["unrelated", "edited"],
+					projectGitPath: "/old",
 				}),
 			);
-			expect(await settled).toEqual([
-				{ status: "fulfilled", value: expect.objectContaining({ narratorId: "other" }) },
-				{
-					status: "rejected",
-					reason: expect.objectContaining({
-						message: expect.stringContaining("Execution policy changed while loading"),
-					}),
-				},
+			expect(await result).toEqual([
+				expect.objectContaining({ narratorId: "other" }),
+				expect.objectContaining({ narratorId: "child", projectGitPath: "/new" }),
+				expect.objectContaining({ narratorId: "child", projectGitPath: "/new" }),
 			]);
 			await expect(engine.compile("child", null)).resolves.toMatchObject({ narratorId: "child" });
 			await expect(engine.compile("other", null)).resolves.toMatchObject({ narratorId: "other" });

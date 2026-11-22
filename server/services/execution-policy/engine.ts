@@ -39,6 +39,12 @@ interface LoadedCacheEntry extends PolicyCacheEntry<LoadedExecutionPolicy> {
 }
 type CompiledCacheEntry = PolicyCacheEntry<ResolvedExecutionPolicy>;
 
+class ProjectPolicyChangedError extends Error {
+	constructor() {
+		super("Project execution policy changed while loading; retry the operation");
+	}
+}
+
 /** One waiter may leave without cancelling another caller's shared work. */
 function waitForPolicy<T>(entry: PolicyCacheEntry<T>, signal?: AbortSignal): Promise<T> {
 	entry.waiters++;
@@ -191,6 +197,15 @@ export class ExecutionPolicyEngine {
 	private readonly compiledCache = new Map<string, CompiledCacheEntry>();
 
 	private load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
+		return this.loadCached(narratorId, signal).catch((error) => {
+			if (!(error instanceof ProjectPolicyChangedError)) throw error;
+			signal?.throwIfAborted();
+			// Retry once after a confirmed invalidation. All waiters share the new Worker read.
+			return this.loadCached(narratorId, signal);
+		});
+	}
+
+	private loadCached(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
 		const settingsRevision = getSettingsRevision();
 		const cached = this.loadedCache.get(narratorId);
 		if (cached?.settingsRevision === settingsRevision && !cached.controller.signal.aborted) {
@@ -212,10 +227,12 @@ export class ExecutionPolicyEngine {
 				const projectIds = policy.projectIds ?? (policy.projectId ? [policy.projectId] : []);
 				if (
 					this.loadedCache.get(narratorId) !== entry ||
-					settingsRevision !== getSettingsRevision() ||
-					projectIds.some((id) => entry.changedProjects?.has(id))
+					settingsRevision !== getSettingsRevision()
 				) {
 					throw new Error("Execution policy changed while loading; retry the operation");
+				}
+				if (projectIds.some((id) => entry.changedProjects?.has(id))) {
+					throw new ProjectPolicyChangedError();
 				}
 				entry.ownerNarratorId = policy.ownerNarratorId;
 				entry.inheritedNarratorIds = policy.inheritedNarratorIds;
