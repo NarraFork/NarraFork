@@ -1536,6 +1536,84 @@ test("empty, short text and regular chips use a compact single line; long conten
 	}
 }, 15_000);
 
+test("mobile placeholder stays compact without overflow across repeated measurements", async () => {
+	const page = await open({ width: 390, height: 844 });
+	try {
+		await page.$eval('[role="textbox"]', (textbox) => {
+			textbox.setAttribute(
+				"data-placeholder",
+				"A long placeholder that cannot fit beside the controls".repeat(4),
+			);
+		});
+		await layoutSettled(page);
+		const frames = await page.evaluate(async () => {
+			const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+			const content = root?.querySelector<HTMLElement>("[data-composer-scroll]");
+			const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
+			if (!root || !content || !textbox) throw new Error("Missing composer layout");
+			const frames = [];
+			for (let index = 0; index < 30; index++) {
+				window.dispatchEvent(new Event("resize"));
+				await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				frames.push({
+					mode: root.dataset.layout,
+					height: root.style.height,
+					overflow: content.scrollHeight > content.clientHeight,
+					whiteSpace: getComputedStyle(textbox, "::before").whiteSpace,
+					ellipsis: getComputedStyle(textbox, "::before").textOverflow,
+				});
+			}
+			return frames;
+		});
+		expect(new Set(frames.map((frame) => frame.height)).size).toBe(1);
+		for (const frame of frames) {
+			expect(frame.mode).toBe("compact");
+			expect(frame.overflow).toBe(false);
+			expect(frame.whiteSpace).toBe("nowrap");
+			expect(frame.ellipsis).toBe("ellipsis");
+		}
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.load(doc),
+			longLayoutDocument,
+		);
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).mode).toBe("expanded");
+		await page.click('[role="textbox"]');
+		await page.keyboard.down("Control");
+		await page.keyboard.press("a");
+		await page.keyboard.up("Control");
+		await page.keyboard.press("Backspace");
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).mode).toBe("compact");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("empty mobile layout ignores placeholder-only scroll height", async () => {
+	const page = await open({ width: 390, height: 844 });
+	try {
+		await layoutSettled(page);
+		await page.$eval('[role="textbox"]', (textbox) => {
+			Object.defineProperty(textbox, "scrollHeight", { configurable: true, get: () => 100 });
+		});
+		const modes = await page.evaluate(async () => {
+			const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+			if (!root) throw new Error("Missing composer layout");
+			const modes = [];
+			for (let index = 0; index < 20; index++) {
+				window.dispatchEvent(new Event("resize"));
+				await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				modes.push(root.dataset.layout);
+			}
+			return modes;
+		});
+		expect(modes.every((mode) => mode === "compact")).toBe(true);
+	} finally {
+		await close(page);
+	}
+});
+
 test("height transitions reverse in flight without remounting the editor or queuing stale targets", async () => {
 	const page = await open();
 	try {
