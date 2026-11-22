@@ -571,6 +571,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
+	"server/services/git-changelist-store.ts": ["driver", "pragma", "sqliteCatalog", "errorCode"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
