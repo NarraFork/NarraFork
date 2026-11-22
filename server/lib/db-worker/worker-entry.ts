@@ -18,6 +18,7 @@
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
 import { readPublicationTerminalSnapshot } from "../../services/agent-runtime/publication-reader";
+import { runBenchmarkRead } from "../../services/benchmark-read";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -231,6 +232,8 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "benchmarkRead")
+					return runBenchmarkRead(getConnection(message.dbPath), params, controller.signal);
 				if (params.kind === "toolDetailSnapshot") {
 					return readToolDetailSnapshot(getConnection(message.dbPath), params, controller.signal);
 				}

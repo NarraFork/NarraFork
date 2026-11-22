@@ -7,16 +7,9 @@ import { cpSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
-import {
-	benchmarkRuns,
-	benchmarkSuites,
-	benchmarkTaskResults,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { and, eq, inArray } from "drizzle-orm";
+import { activeDatabaseBackend, db, postgresRuntime, sqlite } from "../db";
+import { benchmarkRuns, benchmarkSuites, benchmarkTaskResults, narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -30,6 +23,20 @@ import { agencybenchEvaluator } from "./benchmark-evaluators/agencybench";
 import { humanevalEvaluator } from "./benchmark-evaluators/humaneval";
 import { swebenchEvaluator } from "./benchmark-evaluators/swe-bench";
 import type { BenchmarkEvaluator, BenchmarkTask, EvalResult } from "./benchmark-evaluators/types";
+import {
+	BENCHMARK_MAX_RESPONSE_BYTES,
+	BenchmarkBudgetError,
+	MAX_SUITE_JSON_CHARS,
+	MAX_TASKS_PER_SUITE,
+} from "./benchmark-limits";
+import {
+	type BenchmarkNarratorMetrics,
+	type BenchmarkRead,
+	type BenchmarkTaskMetrics,
+	benchmarkReadPlan,
+	benchmarkReadRowLimit,
+} from "./benchmark-read";
+import { createBenchmarkReadStream, readSqliteBenchmark } from "./benchmark-suite-stream";
 import { narratorService } from "./narrator-service";
 import { interruptNarrator, sendMessage } from "./narrator-session";
 
@@ -42,6 +49,51 @@ const evaluators = new Map<string, BenchmarkEvaluator>([
 ]);
 
 type BenchmarkRun = typeof benchmarkRuns.$inferSelect;
+type BenchmarkSuite = typeof benchmarkSuites.$inferSelect;
+
+type TableRead = Exclude<BenchmarkRead, { type: "narratorMetrics" }>;
+type RunSummaryIdentity = Pick<BenchmarkRun, "suiteId" | "status" | "model">;
+const JSON_HEADERS = { "Content-Type": "application/json; charset=UTF-8" };
+
+async function readBenchmarkData<T>(read: TableRead, signal?: AbortSignal): Promise<T> {
+	if (activeDatabaseBackend !== "postgres") return readSqliteBenchmark<T>(sqlite, read, signal);
+	if (!postgresRuntime) throw new Error("Benchmark PostgreSQL reader unavailable");
+	signal?.throwIfAborted();
+	const { table, projection, filter, order, size, single, decode } = benchmarkReadPlan(read);
+	const where = filter ? ` WHERE ${filter[0]} = $1` : "";
+	const limit = benchmarkReadRowLimit(read);
+	const result = await postgresRuntime.executor.unsafe(
+		`WITH selected AS MATERIALIZED (
+			SELECT ${projection}, (${size}) AS __bytes, row_number() OVER (${order.trim()}) AS __position
+			FROM ${table}${where}${order} LIMIT ${limit + 1}
+		)
+		SELECT CASE WHEN sum(__bytes) OVER () <= ${BENCHMARK_MAX_RESPONSE_BYTES}
+			THEN (to_jsonb(selected) - '__bytes' - '__position')::text END AS payload
+		FROM selected ORDER BY __position`,
+		filter ? [filter[1]] : [],
+	);
+	signal?.throwIfAborted();
+	if (result.length > limit || result.some((row) => typeof row.payload !== "string"))
+		throw new BenchmarkBudgetError("Benchmark response exceeds its budget");
+	const rows = result.map((row) => decode(JSON.parse(row.payload as string)));
+	return (single ? (rows[0] ?? null) : rows) as T;
+}
+
+export async function readBenchmarkResponse(
+	read: TableRead,
+	signal: AbortSignal,
+): Promise<Response | null> {
+	if (activeDatabaseBackend === "postgres") {
+		const value = await readBenchmarkData<unknown>(read, signal);
+		if (value === null) return null;
+		const body = JSON.stringify(value);
+		if (Buffer.byteLength(body) > BENCHMARK_MAX_RESPONSE_BYTES)
+			throw new BenchmarkBudgetError("Benchmark response exceeds its encoded byte budget");
+		return new Response(body, { headers: JSON_HEADERS });
+	}
+	const stream = await createBenchmarkReadStream(sqlite, read, signal);
+	return stream && new Response(stream, { headers: JSON_HEADERS });
+}
 
 type CancelRunResult = "cancelled" | "not_found" | "not_cancellable";
 
@@ -57,6 +109,11 @@ export async function createSuite(input: {
 	description?: string;
 	tasks: BenchmarkTask[];
 }) {
+	if (
+		input.tasks.length > MAX_TASKS_PER_SUITE ||
+		JSON.stringify(input).length > MAX_SUITE_JSON_CHARS
+	)
+		throw new BenchmarkBudgetError("Benchmark suite exceeds its producer budget");
 	const id = generateId();
 	const now = new Date().toISOString();
 	const [suite] = await db
@@ -74,12 +131,8 @@ export async function createSuite(input: {
 	return suite;
 }
 
-export async function listSuites() {
-	return db.select().from(benchmarkSuites).orderBy(benchmarkSuites.createdAt);
-}
-
-export async function getSuite(id: string) {
-	return db.query.benchmarkSuites.findFirst({ where: eq(benchmarkSuites.id, id) });
+async function getSuite(id: string) {
+	return readBenchmarkData<BenchmarkSuite | null>({ type: "suite", id });
 }
 
 // ── Run CRUD ────────────────────────────────────────────────────────
@@ -130,23 +183,12 @@ export async function createRun(input: {
 	return run;
 }
 
-export async function listRuns(suiteId?: string) {
-	if (suiteId) {
-		return db
-			.select()
-			.from(benchmarkRuns)
-			.where(eq(benchmarkRuns.suiteId, suiteId))
-			.orderBy(benchmarkRuns.createdAt);
-	}
-	return db.select().from(benchmarkRuns).orderBy(benchmarkRuns.createdAt);
+function getRun(id: string, signal?: AbortSignal) {
+	return readBenchmarkData<BenchmarkRun | null>({ type: "run", id }, signal);
 }
 
-export async function getRun(id: string) {
-	return db.query.benchmarkRuns.findFirst({ where: eq(benchmarkRuns.id, id) });
-}
-
-export async function getRunResults(runId: string) {
-	return db.select().from(benchmarkTaskResults).where(eq(benchmarkTaskResults.runId, runId));
+function getRunResultMetrics(id: string, signal?: AbortSignal) {
+	return readBenchmarkData<BenchmarkTaskMetrics[]>({ type: "resultMetrics", id }, signal);
 }
 
 // ── Run execution ───────────────────────────────────────────────────
@@ -194,47 +236,12 @@ async function waitForNarratorIdle(
 }
 
 /** Collect metrics from narrator messages and tool calls. */
-async function collectMetrics(narratorId: string) {
-	// Usage columns only: the bodies are never read here.
-	const messages = await db
-		.select({
-			role: narratorMessages.role,
-			contentText: narratorMessages.contentText,
-			tokensIn: narratorMessages.tokensIn,
-			outputTokens: narratorMessages.outputTokens,
-			reasoningTokens: narratorMessages.reasoningTokens,
-			costUsd: narratorMessages.costUsd,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.narratorId, narratorId));
-
-	const toolCalls = await db
-		.select()
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.narratorId, narratorId));
-
-	let tokensIn = 0;
-	let tokensOut = 0;
-	let costUsd = 0;
-	let lastAssistantText = "";
-
-	for (const msg of messages) {
-		tokensIn += msg.tokensIn ?? 0;
-		tokensOut += (msg.outputTokens ?? 0) + (msg.reasoningTokens ?? 0);
-		costUsd += msg.costUsd ?? 0;
-		if (msg.role === "assistant" && msg.contentText) {
-			lastAssistantText = msg.contentText;
-		}
-	}
-
-	return {
-		tokensIn,
-		tokensOut,
-		costUsd: Math.round(costUsd * 1_000_000) / 1_000_000,
-		toolCallCount: toolCalls.length,
-		messageCount: messages.length,
-		lastAssistantText,
-	};
+function collectMetrics(id: string, signal: AbortSignal) {
+	return readSqliteBenchmark<BenchmarkNarratorMetrics>(
+		sqlite,
+		{ type: "narratorMetrics", id },
+		signal,
+	);
 }
 
 function copySourceWorkspace(sourcePath: string, workDir: string): void {
@@ -255,6 +262,7 @@ function copySourceWorkspace(sourcePath: string, workDir: string): void {
 /** Execute a single benchmark task. */
 async function executeTask(
 	run: BenchmarkRun,
+	suiteName: string,
 	task: BenchmarkTask,
 	taskResultId: string,
 	signal: AbortSignal,
@@ -267,8 +275,7 @@ async function executeTask(
 	let containerId: string | undefined;
 
 	// Determine if this is a SWE-bench task that needs container isolation
-	const suite = run.suiteId ? await getSuite(run.suiteId) : null;
-	const isSWEBench = suite?.name === "swe-bench";
+	const isSWEBench = suiteName === "swe-bench";
 	const meta = (task.metadata ?? {}) as Record<string, unknown>;
 
 	try {
@@ -399,12 +406,11 @@ async function executeTask(
 		}
 
 		// Collect metrics
-		const metrics = await collectMetrics(narrator.id);
+		if (!completed) interruptNarrator(narrator.id);
+		const metrics = await collectMetrics(narrator.id, signal);
 		const durationMs = Date.now() - startTime;
 
 		if (!completed) {
-			// Timeout — interrupt the narrator before recording
-			interruptNarrator(narrator.id);
 			await db
 				.update(benchmarkTaskResults)
 				.set({
@@ -424,7 +430,6 @@ async function executeTask(
 		}
 
 		// Run evaluator — check suite name, then task metadata, then fallback
-		const suiteName = suite?.name;
 		const evaluatorName =
 			suiteName && evaluators.has(suiteName)
 				? suiteName
@@ -474,7 +479,7 @@ async function executeTask(
 			.update(benchmarkTaskResults)
 			.set({
 				status: "error",
-				errorMessage: String(err).slice(0, 5000),
+				errorMessage: signal.aborted ? "Run cancelled" : String(err).slice(0, 5000),
 				durationMs: Date.now() - startTime,
 				completedAt: new Date().toISOString(),
 			})
@@ -543,14 +548,17 @@ function reconcileStaleBenchmarkRuns(): void {
 
 // Run once at module load
 cleanupStaleBenchmarkDirs();
-reconcileStaleBenchmarkRuns();
+if (activeDatabaseBackend !== "postgres") reconcileStaleBenchmarkRuns();
 
-async function claimRun(runId: string): Promise<BenchmarkRun> {
+async function claimRun(runId: string) {
 	const run = await getRun(runId);
 	if (!run) throw new Error(`Run not found: ${runId}`);
+	if (run.status !== "pending")
+		throw new Error(`Run ${runId} is not pending (current: ${run.status})`);
 
 	const suite = await getSuite(run.suiteId);
 	if (!suite) throw new Error(`Suite not found: ${run.suiteId}`);
+	const taskResults = await getRunResultMetrics(runId);
 
 	const now = new Date().toISOString();
 	const claimed = sqlite
@@ -559,37 +567,34 @@ async function claimRun(runId: string): Promise<BenchmarkRun> {
 		)
 		.run(now, runId);
 	if (claimed.changes === 0) {
-		const current = await getRun(runId);
-		throw new Error(`Run ${runId} is not pending (current: ${current?.status ?? run.status})`);
+		const current = await getRunStatus(runId);
+		throw new Error(`Run ${runId} is not pending (current: ${current ?? run.status})`);
 	}
 
-	const claimedRun = await getRun(runId);
-	if (!claimedRun) throw new Error(`Run not found after claim: ${runId}`);
-	return claimedRun;
+	const claimedRun: BenchmarkRun = { ...run, status: "running", startedAt: now, completedAt: null };
+	return { run: claimedRun, suite, taskResults };
 }
 
 /** Start a benchmark run in the background after synchronously claiming it. */
 export async function startRun(runId: string): Promise<BenchmarkRun> {
-	const run = await claimRun(runId);
-	executeClaimedRun(run).catch((err) => {
+	const claim = await claimRun(runId);
+	executeClaimedRun(claim).catch((err) => {
 		logger.error("Benchmark run execution failed", { runId, error: String(err) });
 	});
-	return run;
+	return claim.run;
 }
 
 /** Execute all tasks in a benchmark run sequentially after it has been claimed. */
-async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
+async function executeClaimedRun({
+	run,
+	suite,
+	taskResults,
+}: Awaited<ReturnType<typeof claimRun>>): Promise<void> {
 	const runId = run.id;
-	const suite = await getSuite(run.suiteId);
-	if (!suite) throw new Error(`Suite not found: ${run.suiteId}`);
-
 	const tasks = (suite.tasksJson ?? []) as BenchmarkTask[];
-	const taskResults = await getRunResults(runId);
 
 	const abortController = new AbortController();
 	activeRuns.set(runId, abortController);
-	const currentRun = await getRun(runId);
-	if (currentRun?.status === "cancelled") abortController.abort();
 
 	logger.info("Benchmark run started", { runId, model: run.model, tasks: tasks.length });
 
@@ -601,6 +606,8 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 	let totalTokensOut = 0;
 
 	try {
+		const current = await getRunStatus(runId);
+		if (current !== "running") return;
 		for (const task of tasks) {
 			if (abortController.signal.aborted) break;
 
@@ -618,11 +625,12 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 				progress: `${completedCount + 1}/${tasks.length}`,
 			});
 
-			await executeTask(run, task, taskResult.id, abortController.signal);
+			await executeTask(run, suite.name, task, taskResult.id, abortController.signal);
 
 			// Refresh task result
 			const updated = await db.query.benchmarkTaskResults.findFirst({
 				where: eq(benchmarkTaskResults.id, taskResult.id),
+				columns: { status: true, costUsd: true, tokensIn: true, tokensOut: true },
 			});
 
 			completedCount++;
@@ -660,7 +668,7 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 				totalDurationMs: Date.now() - new Date(run.startedAt ?? run.createdAt).getTime(),
 				completedAt: new Date().toISOString(),
 			})
-			.where(eq(benchmarkRuns.id, runId));
+			.where(and(eq(benchmarkRuns.id, runId), eq(benchmarkRuns.status, "running")));
 
 		logger.info("Benchmark run completed", {
 			runId,
@@ -674,7 +682,7 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 		await db
 			.update(benchmarkRuns)
 			.set({ status: failureStatus, completedAt: new Date().toISOString() })
-			.where(eq(benchmarkRuns.id, runId));
+			.where(and(eq(benchmarkRuns.id, runId), eq(benchmarkRuns.status, "running")));
 		logger.error("Benchmark run failed", { runId, status: failureStatus, error: String(err) });
 		throw err;
 	} finally {
@@ -684,35 +692,50 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 
 /** Execute all tasks in a benchmark run sequentially and wait for completion. */
 export async function executeRun(runId: string): Promise<void> {
-	const run = await claimRun(runId);
-	await executeClaimedRun(run);
+	await executeClaimedRun(await claimRun(runId));
+}
+
+async function getRunStatus(id: string) {
+	const row = await db.query.benchmarkRuns.findFirst({
+		where: eq(benchmarkRuns.id, id),
+		columns: { status: true },
+	});
+	return row?.status;
 }
 
 /** Cancel a pending or running benchmark. */
 export async function cancelRun(runId: string): Promise<CancelRunResult> {
-	const run = await getRun(runId);
-	if (!run) return "not_found";
-	if (run.status !== "pending" && run.status !== "running") return "not_cancellable";
+	const status = await getRunStatus(runId);
+	if (!status) return "not_found";
+	if (status !== "pending" && status !== "running") return "not_cancellable";
 
-	const controller = activeRuns.get(runId);
-	if (controller) controller.abort();
-
-	await db
+	const [cancelled] = await db
 		.update(benchmarkRuns)
 		.set({ status: "cancelled", completedAt: new Date().toISOString() })
-		.where(eq(benchmarkRuns.id, runId));
+		.where(and(eq(benchmarkRuns.id, runId), inArray(benchmarkRuns.status, ["pending", "running"])))
+		.returning({ id: benchmarkRuns.id });
 
+	if (!cancelled) return "not_cancellable";
+	activeRuns.get(runId)?.abort();
 	return "cancelled";
 }
 
 // ── Summary / comparison ────────────────────────────────────────────
 
-export async function getRunSummary(runId: string) {
-	const run = await getRun(runId);
+export async function getRunSummary(runId: string, signal?: AbortSignal) {
+	const run = await readBenchmarkData<RunSummaryIdentity | null>(
+		{ type: "runSummary", id: runId },
+		signal,
+	);
 	if (!run) throw new Error(`Run not found: ${runId}`);
 
-	const results = await getRunResults(runId);
-	const suite = run.suiteId ? await getSuite(run.suiteId) : null;
+	const results = await getRunResultMetrics(runId, signal);
+	const suite = run.suiteId
+		? await readBenchmarkData<{ name: string } | null>(
+				{ type: "suiteName", id: run.suiteId },
+				signal,
+			)
+		: null;
 
 	const passed = results.filter((r) => r.status === "passed").length;
 	const failed = results.filter((r) => r.status === "failed").length;
@@ -752,7 +775,7 @@ export async function getRunSummary(runId: string) {
 	};
 }
 
-export async function compareRuns(runIds: string[]) {
-	const summaries = await Promise.all(runIds.map((id) => getRunSummary(id)));
+export async function compareRuns(runIds: string[], signal?: AbortSignal) {
+	const summaries = await Promise.all(runIds.map((id) => getRunSummary(id, signal)));
 	return summaries;
 }
