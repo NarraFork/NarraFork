@@ -449,6 +449,102 @@ describe("viewport-local diff layout", () => {
 		expect(layout.totalHeight).toBe(1_500 * rowHeight);
 	});
 
+	test("only control anchors enlarge their row boxes and real blank rows remain", () => {
+		const parsed = parseUnifiedDiff("@@ -1 +1,5 @@\n same\n+first\n+\n+last\n+tail");
+		const layout = layoutDiffRows(parsed.lines, {
+			contentWidth: 400,
+			rowMinHeights: new Map([
+				[1, 28],
+				[2, 28],
+			]),
+		});
+		const natural = layout.typography.lineHeight;
+		expect(layout.rows.map((row) => row.height)).toEqual([natural, 28, 28, natural, natural]);
+		expect(parsed.lines[2]).toEqual({ type: "added", content: "", newLineNo: 3 });
+		expect(layout.rows[2]?.visualLines).toEqual([{ start: 0, end: 0, width: 0 }]);
+		expect(layout.items[2]?.top).toBe(natural + 28);
+		expect(layout.totalHeight).toBe(3 * natural + 56);
+	});
+
+	test("same-content reuse never carries a previous anchor minimum to another row", () => {
+		const rows = [line("same"), line("same"), line("")];
+		const options = { contentWidth: 400 };
+		const first = layoutDiffRows(rows, { ...options, rowMinHeights: new Map([[1, 28]]) });
+		const second = layoutDiffRows(rows, { ...options, rowMinHeights: new Map([[0, 28]]) }, first);
+		const natural = first.typography.lineHeight;
+		expect(second.rows.map((row) => row.height)).toEqual([28, natural, natural]);
+		expect(second.rows[0]?.visualLines).toBe(first.rows[1]?.visualLines);
+		expect(second.rows[1]?.visualLines).toBe(first.rows[1]?.visualLines);
+		const ordinary = layoutDiffRows(rows, options, second);
+		expect(ordinary.rows.map((row) => row.height)).toEqual([natural, natural, natural]);
+		expect(first.rows.map((row) => row.height)).toEqual([natural, 28, natural]);
+	});
+
+	test("anchor minimum is a maximum against natural wraps, not each visual line", () => {
+		const rows = [line("word ".repeat(40)), line("short")];
+		const layout = layoutDiffRows(rows, {
+			contentWidth: 110,
+			wordWrap: true,
+			rowMinHeights: new Map([
+				[0, 28],
+				[1, 28],
+			]),
+		});
+		const wrapped = layout.rows[0];
+		expect(wrapped?.visualLines.length).toBeGreaterThan(2);
+		expect(wrapped?.height).toBe((wrapped?.visualLines.length ?? 0) * layout.typography.lineHeight);
+		expect(layout.rows[1]?.height).toBe(28);
+		expect(diffRowTarget(layout, 0, 1_000)?.bottom).toBe(wrapped?.height);
+	});
+
+	test("full-index control minima remain exact before and after moving projections", () => {
+		const rows = Array.from({ length: 2_000 }, (_, index) => line(`row ${index}`));
+		const rowMinHeights = new Map([0, 199, 500, 999, 1_500, 1_999].map((row) => [row, 28]));
+		const hunks = parseUnifiedDiff("@@ -1 +1 @@\n row").hunks.map((hunk) => hunk);
+		const options = { contentWidth: 400, totalRows: rows.length, rowMinHeights, hunks };
+		const full = layoutDiffRows(rows, options);
+		let previous: DiffRowsLayout | undefined;
+		for (const startRow of [0, 450, 1_400, 150]) {
+			const layout = layoutDiffRows(
+				rows.slice(startRow, startRow + 500),
+				{ ...options, startRow },
+				previous,
+			);
+			expect(layout.totalHeight).toBe(full.totalHeight);
+			expect(layout.beforeHeight).toBe(estimatedDiffRowTop(full, startRow));
+			for (const row of [0, 198, 199, 200, 500, 999, 1_200, 1_500, 1_999]) {
+				const expected = estimatedDiffRowTop(full, row, true);
+				expect(estimatedDiffRowTop(layout, row, true)).toBe(expected);
+				expect(diffRowAtOffset(layout, expected + 1)).toBe(row);
+				if (rowMinHeights.has(row)) expect(diffRowAtOffset(layout, expected + 27)).toBe(row);
+			}
+			previous = layout;
+		}
+	});
+
+	test("wrapped anchor growth corrects later estimates without counting its minimum twice", () => {
+		const rows = Array.from({ length: 12 }, (_, index) =>
+			line(index === 2 ? "long word ".repeat(30) : "short"),
+		);
+		const options = {
+			contentWidth: 110,
+			wordWrap: true,
+			totalRows: rows.length,
+			rowMinHeights: new Map([
+				[2, 28],
+				[8, 28],
+			]),
+		};
+		const full = layoutDiffRows(rows, options);
+		const projection = layoutDiffRows(rows.slice(0, 5), options);
+		expect(projection.rows[2]?.height).toBeGreaterThan(28);
+		expect(projection.totalHeight).toBe(full.totalHeight);
+		for (const index of [5, 8, 9, 11]) {
+			expect(estimatedDiffRowTop(projection, index)).toBe(estimatedDiffRowTop(full, index));
+			expect(diffRowAtOffset(projection, estimatedDiffRowTop(full, index) + 1)).toBe(index);
+		}
+	});
+
 	test("empty rows and empty documents have finite geometry", () => {
 		expect(layoutDiffRows([], { contentWidth: 0 }).totalHeight).toBe(0);
 		const layout = layoutDiffRows([line("")], { contentWidth: 1, wordWrap: true });
