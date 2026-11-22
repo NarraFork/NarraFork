@@ -213,7 +213,9 @@ describe("reasoning translation output boundary", () => {
 		test(`${boundary} translates the latest reasoning once, never intermediate prefixes`, async () => {
 			const { settings } = await import("../../lib/settings");
 			const agent = await import("../../lib/agent");
-			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "" });
+			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({
+				text: boundary === "stream_text" ? "翻译" : "",
+			});
 			const original = settings.agent.translateReasoning;
 			settings.agent.translateReasoning = true;
 			const id = `translation-boundary-${boundary}`;
@@ -272,6 +274,25 @@ describe("reasoning translation output boundary", () => {
 				await Bun.sleep(10);
 				expect(generate).toHaveBeenCalledTimes(1);
 				expect(generate.mock.calls[0]?.[0]).toBe("A+B+C");
+				if (boundary === "stream_text") {
+					expect(broadcastMessages).toContainEqual(
+						expect.objectContaining({
+							type: "reasoning_translation_patch",
+							narratorId: id,
+							ownerNarratorId: id,
+							messageId: partialId,
+							blockId: expect.any(String),
+							elementId: "reason",
+							stateRevision: expect.any(Number),
+							part: expect.objectContaining({
+								start: 0,
+								end: 5,
+								sourceText: "A+B+C",
+								translatedText: "翻译",
+							}),
+						}),
+					);
+				}
 				await checkpoint("A+B+C", 4);
 				await processEvent(event, ctx);
 				await Bun.sleep(10);
