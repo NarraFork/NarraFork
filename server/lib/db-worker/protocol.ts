@@ -28,6 +28,7 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { ComposerDocumentParams } from "./composer-document-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
@@ -40,6 +41,7 @@ import type {
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
 	| "storageScanContext"
+	| "composerDocument"
 	| "storageScanTables"
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
@@ -253,6 +255,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| ComposerDocumentParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams

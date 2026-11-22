@@ -624,6 +624,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
 	// Retention fences consult the SQLite body projection before accepting late writes.
 	"server/services/narrator-body-writes.ts": ["handle"],
+	"server/services/narrator-composer-document.ts": ["handle"],
+	"server/lib/db-worker/composer-document-query.ts": ["driver"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
