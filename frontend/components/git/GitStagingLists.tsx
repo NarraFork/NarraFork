@@ -455,9 +455,14 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 					disabled={!staging.writable || destination.id === selected?.fromListId}
 					onClick={() => {
 						if (!selected || !staging.writable || destination.id === selected.fromListId) return;
-						const { owner: _owner, ...request } = selected;
+						const { owner: _owner, scope, ...request } = selected;
+						const selector = scope
+							? scope.directory || scope.filter?.length
+								? { scope }
+								: { all: true as const }
+							: {};
 						staging.mutation.mutate(
-							{ action: "move", ...request, toListId: destination.id },
+							{ action: "move", ...request, ...selector, toListId: destination.id },
 							{
 								onSuccess: () => {
 									setMoving(false);

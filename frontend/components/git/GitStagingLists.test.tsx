@@ -1173,7 +1173,7 @@ test("group moves offer only other destinations regardless of compatibility coun
 	expect(actions).toEqual([]);
 	await click(document.querySelector("[data-git-staging-target='B']") as Element);
 	expect(actions).toEqual([
-		{ action: "move", fromListId: "A", toListId: "B", scope: { filter: [] }, ...version },
+		{ action: "move", fromListId: "A", toListId: "B", all: true, ...version },
 	]);
 });
 test("a changed observation disables an already-open confirmation", async () => {
