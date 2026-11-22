@@ -187,19 +187,20 @@ export function gitChangesFixturePage(
 	};
 }
 
-export function installGitChangesTestTransport() {
+export function installGitChangesTestTransport({ mockWorkspace = true } = {}) {
 	clients = [];
 	fixtureVersion = 1;
 	const callbacks = new Map<MessageCallback, ListenerOptions>();
 	const addListener = narratorWSManager.addListener.bind(narratorWSManager);
+	const originalSend = narratorWSManager.send.bind(narratorWSManager);
 	const connected = Object.getOwnPropertyDescriptor(narratorWSManager, "connected");
 	Object.defineProperty(narratorWSManager, "connected", { configurable: true, value: true });
 	const credential =
-		typeof narratorWSManager.getCredentialIdentity === "function"
+		mockWorkspace && typeof narratorWSManager.getCredentialIdentity === "function"
 			? spyOn(narratorWSManager, "getCredentialIdentity").mockReturnValue(1)
 			: undefined;
 	const connectionCredential =
-		typeof narratorWSManager.getConnectionCredentialIdentity === "function"
+		mockWorkspace && typeof narratorWSManager.getConnectionCredentialIdentity === "function"
 			? spyOn(narratorWSManager, "getConnectionCredentialIdentity").mockReturnValue(1)
 			: undefined;
 	const listener = spyOn(narratorWSManager, "addListener").mockImplementation(
@@ -217,6 +218,7 @@ export function installGitChangesTestTransport() {
 			if (!options.types || options.types.includes(type)) callback(frame);
 	};
 	const send = spyOn(narratorWSManager, "send").mockImplementation((message) => {
+		if (!mockWorkspace) return originalSend(message);
 		if (message.type === "git_workspace_subscribe") {
 			const previous = priorFacts.get(message.workspaceKey);
 			const facts =

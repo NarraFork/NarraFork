@@ -295,6 +295,7 @@ export function useGitStagingLists(target: GitTarget) {
 		selectionKey,
 		refused,
 		scopeKey,
+		preferenceKey: JSON.stringify([target.narratorId, target.workspaceKey, principal]),
 		notice: readable && notice?.scopeKey === scopeKey ? notice : undefined,
 		refresh,
 	};

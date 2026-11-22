@@ -322,7 +322,9 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 		summary?.observationId,
 		[...filter.selected].sort(),
 	]);
-	const { groups, folders, toggleGroup, toggleFolder } = useGitStagingFolderPrefs(staging.scopeKey);
+	const { groups, folders, toggleGroup, toggleFolder } = useGitStagingFolderPrefs(
+		staging.preferenceKey,
+	);
 	const [reports, setReports] = useState<Record<string, GitStagingPageReport>>({});
 	const report = useCallback(
 		(value: GitStagingPageReport) =>
