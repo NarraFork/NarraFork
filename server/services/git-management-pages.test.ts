@@ -22,6 +22,18 @@ import type { GitWorkspaceTarget } from "./git-workspace";
 import { GitWorkspaceWatchPool } from "./git-workspace-watch";
 
 let nextFixture = 0;
+test("Unix colon filenames survive authorization while Windows drive paths remain rejected", async () => {
+	const { target } = fixture(complete(0));
+	await validateGitFileTargets(target, ["a:b.txt"]);
+	for (const path of ["C:/outside", "C:\\outside", "../outside"])
+		await expect(validateGitFileTargets(target, [path])).rejects.toThrow("Invalid file path");
+	const windows = {
+		...target,
+		backend: { ...target.backend, pathFlavor: "windows" },
+	} as GitWorkspaceTarget;
+	await expect(validateGitFileTargets(windows, ["a:b.txt"])).rejects.toThrow("Invalid file path");
+});
+
 test("whole observation authorization admits 1001 paths without raising the ordinary write limit", async () => {
 	const { target } = fixture(complete(0));
 	const paths = Array.from({ length: 1001 }, (_, index) => `file-${index}`);
@@ -50,6 +62,7 @@ function fixture(response: GitWorkspaceResult, modern = true) {
 	const calls: { request: GitWorkspaceRequest; signal?: AbortSignal }[] = [];
 	const backend = {
 		kind: "remote",
+		pathFlavor: "posix",
 		deviceId: `page-device-${id}`,
 		runtimeGeneration: 7,
 		paths: targetPathSemantics("posix"),

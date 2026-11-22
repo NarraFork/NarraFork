@@ -269,14 +269,19 @@ export function gitAttributionScopes(target: GitWorkspaceTarget, files: string[]
 	return { scopes: [...scopes.values()], truncated };
 }
 
-export function validateFilePaths(files: string[], maxPaths = 1000): void {
+export function validateFilePaths(
+	files: string[],
+	maxPaths = 1000,
+	pathFlavor: "posix" | "windows" = process.platform === "win32" ? "windows" : "posix",
+): void {
 	if (files.length > maxPaths) throw new ValidationError("Too many file paths");
 	for (const path of files) {
 		if (
 			!path ||
 			path.length > 4096 ||
 			path.split(/[\\/]/).some((part) => part === ".." || part.toLowerCase() === ".git") ||
-			/^[\\/]|^[a-z]:/i.test(path) ||
+			/^[\\/]|^[a-z]:[\\/]/i.test(path) ||
+			(pathFlavor === "windows" && path.includes(":")) ||
 			path.includes("\0")
 		)
 			throw new ValidationError(`Invalid file path: ${path}`);
@@ -289,7 +294,7 @@ export async function validateGitFileTargets(
 	files: string[],
 	maxPaths = 1000,
 ): Promise<void> {
-	validateFilePaths(files, maxPaths);
+	validateFilePaths(files, maxPaths, target.backend?.pathFlavor);
 	if (!target.backend || !target.workspace.rootPath)
 		throw new ValidationError("Git workspace unavailable");
 	if (target.backend.kind === "remote") return; // Atomic executor guards use the target OS and path policy.
