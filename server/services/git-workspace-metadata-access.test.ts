@@ -265,11 +265,10 @@ for (const phase of ["narrator", "grants", "oauth", "policy"] as const) {
 				expect(actual?.signal?.aborted).toBe(true);
 				expect(actual?.deadlineAt).toBeDefined();
 				expect(actual?.timeoutMs).toBeLessThanOrEqual(30_000);
-				expect(error).toMatchObject(
-					failure === "cancel"
-						? { message: "caller cancelled authorization" }
-						: { statusCode: 503, code: "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE" },
-				);
+				expect(error).toMatchObject({
+					statusCode: 503,
+					code: "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE",
+				});
 				expect(await cancelled).toMatchObject({ code: "DB_READ_ABORTED" });
 				expect(readsAfterCancellation).toBe(0);
 			} finally {

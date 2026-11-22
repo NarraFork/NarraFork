@@ -182,6 +182,13 @@ export async function authorizeGitTargetForPrincipal(
 	recoverWorktreeList = false,
 	metadataDiscovery: boolean | GitWorkspaceTarget = false,
 ): Promise<GitWorkspaceTarget> {
+	if (signal.aborted) {
+		await loadNarratorForAccess(source.narratorId, principal, need, {
+			deadlineAt: Date.now() + 30_000,
+			executionPolicy: "worker-required",
+		});
+		throw catalogError("GIT_REQUEST_CANCELLED");
+	}
 	const budget = new GitAccessScan(signal, 30_000);
 	let completed = false;
 	try {
@@ -350,7 +357,8 @@ async function authorizeGitTargetWithinBudget(
 		return target;
 	}
 	const root = workspace.rootPath;
-	const scan = new GitAccessScan(signal, 5000, budget.deadlineAt);
+	const scan = budget;
+	scan.limitRemaining(5000);
 	try {
 		for (const project of await relatedProjects(target, scan, principal)) {
 			if (!(await scan.run(() => hasProjectAccess(project, principal, "read", scan.readOptions()))))
@@ -399,7 +407,6 @@ async function authorizeGitTargetWithinBudget(
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
 		redactDeniedTarget(target);
 	} finally {
-		scan.dispose();
 		const elapsedMs = Math.round(performance.now() - scan.started);
 		if (elapsedMs >= 1000)
 			logger.warn("Slow Git workspace access check", {
@@ -515,16 +522,13 @@ async function authorizeGitDestinationWithinBudget(
 		// The source common directory was already authorized; don't treat it as a destination grant.
 		repositoryPath: undefined,
 	};
-	const scan = new GitAccessScan(signal, 5000, budget.deadlineAt);
-	try {
-		for (const project of await relatedProjects(scopedTarget, scan, principal)) {
-			if (!(await scan.run(() => hasProjectAccess(project, principal, need, scan.readOptions()))))
-				throw denied();
-		}
-		scan.check();
-	} finally {
-		scan.dispose();
+	const scan = budget;
+	scan.limitRemaining(5000);
+	for (const project of await relatedProjects(scopedTarget, scan, principal)) {
+		if (!(await scan.run(() => hasProjectAccess(project, principal, need, scan.readOptions()))))
+			throw denied();
 	}
+	scan.check();
 	signal.throwIfAborted();
 	return target;
 }

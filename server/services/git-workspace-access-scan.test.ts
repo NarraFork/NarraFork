@@ -9,6 +9,31 @@ const rows = Array.from({ length: 300 }, (_, i) => ({
 const unavailable = { statusCode: 503, code: "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE" };
 
 describe("Git access scan bounds", () => {
+	test("a reused scan tightens its remaining budget without extending the shared deadline", () => {
+		let elapsed = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+		const wall = spyOn(Date, "now").mockImplementation(() => 1_000_000 + elapsed);
+		const scan = new GitAccessScan(undefined, 30_000);
+		const signal = scan.signal;
+		try {
+			elapsed = 1000;
+			scan.limitRemaining(5000);
+			expect(scan.readOptions().timeoutMs).toBe(5000);
+			expect(scan.deadlineAt).toBe(1_006_000);
+			elapsed = 5000;
+			scan.limitRemaining(5000);
+			expect(scan.readOptions().timeoutMs).toBe(1000);
+			expect(scan.signal).toBe(signal);
+			elapsed = 6000;
+			expect(() => scan.check()).toThrow();
+			expect(signal.reason).toMatchObject(unavailable);
+		} finally {
+			scan.dispose();
+			clock.mockRestore();
+			wall.mockRestore();
+		}
+	});
+
 	test("late scans inherit the total remaining deadline and successful cleanup keeps the signal usable", () => {
 		let elapsed = 0;
 		const monotonic = spyOn(performance, "now").mockImplementation(() => elapsed);
@@ -107,9 +132,7 @@ describe("Git access scan bounds", () => {
 					elapsed += 5000;
 					expect(() => scan.check()).toThrow();
 				}
-				await expect(work).rejects.toMatchObject(
-					reason === "abort" ? { name: "AbortError" } : unavailable,
-				);
+				await expect(work).rejects.toMatchObject(unavailable);
 				expect(options.signal.aborted).toBe(true);
 				expect(options.timeoutMs).toBeGreaterThan(0);
 				expect(options.timeoutMs).toBeLessThanOrEqual(5000);
@@ -223,7 +246,7 @@ describe("Git access scan bounds", () => {
 			})();
 			await setImmediate();
 			controller.abort();
-			await expect(work).rejects.toMatchObject({ name: "AbortError" });
+			await expect(work).rejects.toMatchObject(unavailable);
 			for (const reject of rejects) reject(new Error("late failure"));
 			await setImmediate();
 			expect(rejects).toHaveLength(8);

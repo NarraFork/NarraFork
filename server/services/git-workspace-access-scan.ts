@@ -17,12 +17,12 @@ export class GitAccessScan {
 	rows = 0;
 	private stopped = false;
 	private readonly cancellation = new AbortController();
-	private readonly deadline: number;
+	private deadline: number;
 	private readonly failure: Promise<never>;
-	private readonly timer: ReturnType<typeof setTimeout>;
+	private timer: ReturnType<typeof setTimeout>;
 	private readonly stop: () => void;
 	private failureReason: unknown;
-	readonly deadlineAt: number;
+	deadlineAt: number;
 
 	get signal(): AbortSignal {
 		return this.cancellation.signal;
@@ -45,9 +45,7 @@ export class GitAccessScan {
 		this.stop = () => {
 			if (this.stopped) return;
 			this.stopped = true;
-			const error = this.parentSignal?.aborted
-				? this.parentSignal.reason
-				: accessCheckUnavailable();
+			const error = accessCheckUnavailable();
 			this.failureReason = error;
 			// Preserve the scan's fail-closed boundary before cancelling its worker reads.
 			reject(error);
@@ -68,6 +66,14 @@ export class GitAccessScan {
 			this.stop();
 			throw this.failureReason;
 		}
+	}
+
+	limitRemaining(budgetMs: number): void {
+		this.check();
+		this.deadline = Math.min(this.deadline, performance.now() + budgetMs);
+		this.deadlineAt = Math.min(this.deadlineAt, Date.now() + budgetMs);
+		clearTimeout(this.timer);
+		this.timer = setTimeout(this.stop, Math.max(0, this.deadlineAt - Date.now()));
 	}
 
 	/** Queueing and worker execution share the scan's original deadline and cancellation. */
