@@ -39,6 +39,7 @@ import {
 import { readCompactSummary } from "./compact-summary-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
+import { readExecutionPolicySnapshot } from "./execution-policy-query";
 import { workerFailureDetails } from "./failure";
 import { readKnowledgeEntryDetail } from "./knowledge-entry-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
@@ -231,6 +232,13 @@ port.on("message", async (message: DbWorkerInbound) => {
 				}
 				if (params.kind === "compactSummary") {
 					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "executionPolicyFacts") {
+					return readExecutionPolicySnapshot(
+						getConnection(message.dbPath),
+						params.narratorId,
+						controller.signal,
+					);
 				}
 				if (params.kind === "toolEditPreview") {
 					return readToolEditPreviewSnapshot(

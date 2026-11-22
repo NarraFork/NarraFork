@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -23,7 +23,7 @@ function delegated(parent: string, pool = "general") {
 	};
 }
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const questionService = await import("../narrator-question-service");
@@ -128,6 +128,7 @@ afterAll(() => {
 	activeNarrators.delete(PARENT);
 	cleanDb(sqlite);
 	mock.module("../../db", () => realDb);
+	dispose();
 });
 
 async function seedCall(

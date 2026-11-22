@@ -52,6 +52,7 @@ export type DbReadTaskName =
 	| "databaseCleanupContext"
 	| "toolDetailSnapshot"
 	| "selectRows"
+	| "executionPolicyFacts"
 	| "toolEditPreview"
 	| "knowledgeEntryDetail"
 	| "displayPageMessages"
@@ -287,6 +288,7 @@ export type DbReadTaskParams =
 	| { kind: "databaseCleanupContext" }
 	| ToolDetailSnapshotParams
 	| SelectRowsParams
+	| { kind: "executionPolicyFacts"; narratorId: string }
 	| { kind: "toolEditPreview"; toolCallId: string }
 	| { kind: "knowledgeEntryDetail"; entryId: string }
 	| DisplayPageMessagesParams

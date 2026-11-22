@@ -17,10 +17,11 @@ import type { AgentConfig, ToolCallBinding } from "../../lib/agent/types";
 import { narraforkDir, saveSettings, settings } from "../../lib/settings";
 import { createExecutionTargetContext } from "../execution-policy/target-context";
 
-const sqlite = new Database(":memory:");
+const databaseDirectory = mkdtempSync(join(tmpdir(), "permission-rule-request-db-"));
+const sqlite = new Database(join(databaseDirectory, "test.sqlite"));
 const dialect = new SQLiteSyncDialect();
 const tableNames: string[] = [];
-// Build a test-only in-memory schema from the typed declarations. This worktree
+// Build a test-only schema from the typed declarations. This worktree
 // intentionally has no migration directory; never generate or migrate the real DB.
 for (const table of Object.values(schema)) {
 	let config: ReturnType<typeof getTableConfig>;
@@ -734,6 +735,7 @@ afterEach(() => {
 afterAll(() => {
 	mock.restore();
 	sqlite.close();
+	rmSync(databaseDirectory, { recursive: true, force: true });
 });
 
 async function waitForManual(id: string) {
