@@ -409,7 +409,56 @@ describe("VListRowInteraction — idle mounting cost", () => {
 		expect(translateMock).not.toHaveBeenCalled();
 	});
 });
-test("Edit right-click prefers the persisted tool ref over the render id and current-file action", async () => {
+test.each([
+	"Edit",
+	"StructSed",
+])("local %s opens the current scoped file, not its history", async (toolName) => {
+	const target = { deviceId: "local", path: "/original/a.ts" };
+	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+	try {
+		const openFilePanel = mock((..._args: unknown[]) => {});
+		await renderRow({
+			narratorId: "row-reader",
+			toolUseId: "tool-1",
+			toolMeta: {
+				toolName,
+				filePath: target.path,
+				isFileTool: true,
+				fileTarget: target,
+				fileNarratorId: "actual-child",
+			},
+			dock: { narratorId: "remote-host", openFilePanel } as unknown as NarratorDockContextValue,
+		});
+		expect(menuLabels()).not.toContain("editPreview.open");
+		await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+		expect(resolve).toHaveBeenCalledWith("actual-child", [target], expect.any(AbortSignal));
+		expect(openFilePanel).toHaveBeenCalledTimes(1);
+		expect(openFilePanel).toHaveBeenCalledWith(target.path, undefined, {
+			deviceId: "local",
+			fileNarratorId: "actual-child",
+			referenceOrigin: true,
+			selection: undefined,
+		});
+	} finally {
+		resolve.mockRestore();
+	}
+});
+
+test("an Edit without a captured execution target offers no history or host-path fallback", async () => {
+	const openFilePanel = mock((..._args: unknown[]) => {});
+	await renderRow({
+		narratorId: "reader",
+		toolUseId: "tool",
+		toolMeta: { toolName: "Edit", filePath: "/unknown/a.ts", isFileTool: true },
+		handlers: { onOpenFilePanel: openFilePanel },
+		dock: { narratorId: "host", openFilePanel } as unknown as NarratorDockContextValue,
+	});
+	expect(menuLabels()).not.toContain("editPreview.open");
+	expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+	expect(openFilePanel).not.toHaveBeenCalled();
+});
+
+test("remote Edit right-click prefers the persisted tool ref over the render id and current-file action", async () => {
 	const openFilePanel = mock((..._args: unknown[]) => {});
 	const legacyOpen = mock((_path: string) => {});
 	const ref = {
@@ -422,14 +471,20 @@ test("Edit right-click prefers the persisted tool ref over the render id and cur
 		narratorId: "row-reader",
 		toolUseId: "render-only-index",
 		toolDetailRef: ref,
-		toolMeta: { toolName: "Edit", filePath: "/work/a.ts", isFileTool: true },
+		toolMeta: {
+			toolName: "Edit",
+			filePath: "/work/a.ts",
+			isFileTool: true,
+			fileTarget: { deviceId: "RemoteCase", path: "/work/a.ts" },
+			fileNarratorId: "row-reader",
+		},
 		handlers: { onOpenFilePanel: legacyOpen },
 		dock: { narratorId: "different-host", openFilePanel } as unknown as NarratorDockContextValue,
 	});
 	expect(menuLabels()).toContain("editPreview.open");
 	clickMenuItem("editPreview.open");
 	expect(openFilePanel).toHaveBeenCalledWith("/work/a.ts", undefined, {
-		toolEdit: { ...ref, narratorId: "row-reader" },
+		toolEdit: { ...ref, narratorId: "row-reader", deviceId: "RemoteCase" },
 	});
 	expect(legacyOpen).not.toHaveBeenCalled();
 });

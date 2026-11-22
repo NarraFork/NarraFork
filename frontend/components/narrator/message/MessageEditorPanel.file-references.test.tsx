@@ -228,6 +228,13 @@ beforeEach(async () => {
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
+	for (const narratorId of ["narrator", "layout-owner", "fork-context"]) {
+		qc.setQueryData(["workspaceContext", narratorId], {
+			deviceId: "remote-history",
+			contextKey: `remote-context-${narratorId}`,
+			revision: 1,
+		});
+	}
 	// A reviewed plan that restores nothing and removes no later messages: submit
 	// tests go straight through without a rollback dialog.
 	spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
@@ -666,6 +673,44 @@ describe("message reference attachment editor", () => {
 		await click(button(en.editSubmit));
 		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
 	});
+
+	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+		test(`${language}: local edits confirm message deletion without loading file evidence`, async () => {
+			await i18n.changeLanguage(language);
+			qc.setQueryData(["workspaceContext", "narrator"], {
+				deviceId: "local",
+				contextKey: "local-context",
+				revision: 2,
+			});
+			const preview = spyOn(api, "previewRevertAction").mockRejectedValue(
+				new Error("history offline"),
+			);
+			const files = spyOn(api, "getRevertPlanFiles").mockRejectedValue(
+				new Error("history offline"),
+			);
+			const save = mock(
+				async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+					false,
+			);
+			await render(editor({ initialText: "keep text", onEditAndRegenerate: save }));
+			expect(preview).not.toHaveBeenCalled();
+			expect(files).not.toHaveBeenCalled();
+			await click(button(locale.editSubmit));
+			expect(save).not.toHaveBeenCalled();
+			expect(document.body.textContent).toContain(locale.editMessagesOnlyConfirmDesc);
+			expect(document.body.textContent).toContain(locale.revertMessagesOnlyKeepFiles);
+			expect(document.body.textContent).not.toContain(locale.revertScopeUnavailableTitle);
+			await click(button(locale.cancel));
+			expect(save).not.toHaveBeenCalled();
+			await click(button(locale.editSubmit));
+			await click(button(locale.editRevertConfirmNoFiles));
+			expect(save).toHaveBeenCalledTimes(1);
+			expect(save.mock.calls[0]?.[2]).toEqual({ skipRevert: true });
+			expect(preview).not.toHaveBeenCalled();
+			expect(files).not.toHaveBeenCalled();
+			expect(document.body.textContent).toContain("keep text");
+		});
+	}
 
 	test.each([
 		["a plan that restores files", 1, 0],

@@ -82,6 +82,7 @@ const defaults: UiToolDependencies = {
 			throw uiError("Read authorization identity changed", 409);
 	},
 	async snapshot(ctx, backend, path) {
+		if (backend.kind === "local") return;
 		const { ensureFileSnapshot } = await import("@server/services/file-snapshot-service");
 		await ensureFileSnapshot(
 			ctx.narratorId,
@@ -280,9 +281,12 @@ export async function executeGenUiTool(
 			};
 		}
 		try {
-			await deps.track(ctx, backend, entry, Boolean(recorded));
+			await deps.track(ctx, backend, entry, Boolean(recorded?.metadata?.fileChangeEvidence));
 		} catch {
-			fileMetadata = { ...fileMetadata, historyStatus: "unavailable" };
+			fileMetadata = {
+				...fileMetadata,
+				historyStatus: backend.kind === "local" ? "disabled" : "unavailable",
+			};
 		}
 	}
 	if (appPath) await check();
