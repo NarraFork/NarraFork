@@ -17,12 +17,805 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { resolveOlderHistoryAutoLoad } from "../history/older-history-auto-load";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { sliceBracketedRegion } from "./source-slice";
 
 beforeAll(() => {
 	installCanvasStub();
+});
+
+function shellScrollCallback<T>(
+	source: string,
+	name: string,
+	bindings: Record<string, unknown>,
+): T {
+	const declaration = sliceBracketedRegion(source, `const ${name} = useCallback(`);
+	if (!declaration) throw new Error(`Missing ${name}`);
+	const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${declaration};`);
+	return new Function("useCallback", ...Object.keys(bindings), `${code}\nreturn ${name};`)(
+		(callback: unknown) => callback,
+		...Object.values(bindings),
+	) as T;
+}
+
+async function loadedTopHarness(itemCount = 40, narratorId = "loaded-top") {
+	const scroll = await import("./vlist-exact-scroll");
+	const { buildPretextLayoutIndex, resolveVisibleWindow } = await import("@shared/pretext-layout");
+	const { createVListVisibleViewport } = await import("./vlist-visible-viewport");
+	const { buildExactListLayout } = await import("./vlist-exact-layout");
+	const source = await Bun.file(
+		new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+	).text();
+	const index = buildPretextLayoutIndex({
+		layoutRevision: "loaded-top",
+		documentRevision: 1,
+		lod: 5,
+		widthBucket: "800",
+		metrics: { topPadding: 16, itemGap: 4, bottomPadding: 16 },
+		items: Array.from({ length: itemCount }, (_, index) => ({
+			itemKey: `top-${index}`,
+			firstSeq: index,
+			lastSeq: index,
+			sourceMessageIds: [`top-m${index}`],
+			kind: "markdown",
+			height: 80,
+		})),
+	});
+	const initialLayout = buildExactListLayout(index);
+	if (!initialLayout) throw new Error("Missing loaded-history layout");
+	let layout = initialLayout;
+	const node = {
+		offsetWidth: 800,
+		clientHeight: 600,
+		scrollHeight: layout.totalHeight,
+		scrollTop: Math.max(0, layout.totalHeight - 600),
+		getBoundingClientRect: () => ({ top: 0 }),
+	};
+	const events: string[] = [];
+	const jumpTokenRef = { current: 7 };
+	const loadedTopNarratorRef = { current: null as string | null };
+	const olderHistoryIntentAtRef = { current: 10_000 as number | null };
+	const pinnedToBottomRef = { current: true };
+	const textReadingDetachedRef = { current: false };
+	const scrollTopRef = { current: node.scrollTop };
+	const suppressScrollStateRef = { current: false };
+	const suppressedScrollTopRef = { current: null as number | null };
+	const visible = createVListVisibleViewport();
+	let following = true;
+	let stateTop = node.scrollTop;
+	let window = resolveVisibleWindow(layout, stateTop, node.clientHeight, 0);
+	const follower = {
+		cancel: () => {
+			events.push(`cancel:jump=${jumpTokenRef.current}`);
+			following = false;
+		},
+		ensure: () => {
+			events.push("follow");
+			following = true;
+		},
+		isActive: () => following,
+		snapToTarget: () => {},
+	};
+	const bindings = {
+		narratorId,
+		jumpTokenRef,
+		loadedTopNarratorRef,
+		viewportRef: { current: node },
+		pinnedToBottomRef,
+		textReadingDetachedRef,
+		scrollTopRef,
+		suppressScrollStateRef,
+		suppressedScrollTopRef,
+		scrollViewportHeightRef: { current: node.clientHeight },
+		visibleViewportRef: {
+			current: {
+				...visible,
+				setPinned: (pinned: boolean) => {
+					expect(pinnedToBottomRef.current).toBe(pinned);
+					events.push(`visible-pin:${pinned}`);
+					visible.setPinned(pinned);
+				},
+			},
+		},
+		interactionAdmissionRef: {
+			current: {
+				markHistoryIntent: () => events.push("history-intent"),
+				observeScroll: () => {},
+				setAtBottom: () => {},
+			},
+		},
+		setPinnedToBottom: (pinned: boolean) => {
+			expect(pinnedToBottomRef.current).toBe(pinned);
+			events.push(`state-pin:${pinned}`);
+		},
+		morphScrollOrigin: { invalidate: () => {} },
+		smoothFollowerRef: { current: follower },
+		getSmoothFollower: () => follower,
+		setScrollTop: (top: number) => {
+			stateTop = top;
+			window = resolveVisibleWindow(layout, top, node.clientHeight, 0);
+			events.push(`window:${top}`);
+		},
+		requestAnimationFrame: () => 1,
+	};
+	const writeCore = shellScrollCallback<(top: number, advance: boolean) => void>(
+		source,
+		"writeScrollTopCore",
+		bindings,
+	);
+	const writeScrollTop = (top: number) => {
+		events.push(`write:${top}`);
+		writeCore(top, true);
+	};
+	const readViewportView = () =>
+		visible.read(
+			node,
+			{
+				scrollTop: scrollTopRef.current,
+				viewportHeight: node.clientHeight,
+				pinnedToBottom: pinnedToBottomRef.current,
+			},
+			following,
+		);
+	readViewportView();
+	const detachFromBottom = shellScrollCallback<() => void>(source, "detachFromBottom", bindings);
+	const toTop = () =>
+		scroll.scrollExactListToLoadedTop({
+			jumpTokenRef,
+			detachFromBottom,
+			textReadingDetachedRef,
+			loadedTopNarratorRef,
+			narratorId,
+			olderHistoryIntentAtRef,
+			writeScrollTop,
+		});
+	const liveBindings = { ...bindings, writeScrollTop, readViewportView };
+	const readCurrentView = shellScrollCallback<
+		() => {
+			scrollTop: number;
+			viewportHeight: number;
+			pinnedToBottom: boolean;
+		}
+	>(source, "readCurrentView", {
+		...liveBindings,
+		lodFocusRef: { current: null },
+		resolveLodFocusOffset: () => undefined,
+	});
+	const correction = shellScrollCallback<
+		(top: number, kind: "bottom" | "item", smooth?: boolean) => void
+	>(source, "onScrollTopCorrection", {
+		...liveBindings,
+		applyExactScrollCorrection: scroll.applyExactScrollCorrection,
+		footerHeightRef: { current: 0 },
+	});
+	const processScrollFrame = shellScrollCallback<() => void>(source, "processScrollFrame", {
+		...scroll,
+		...liveBindings,
+		scrollRafRef: { current: 0 },
+		BOTTOM_DISTANCE_EPSILON: 1,
+		maybeAutoLoadOlder: () => {},
+		olderHistoryIntentAtRef,
+		onUnreadCountChange: undefined,
+		onAtBottomChange: undefined,
+		resizeControllerRef: { current: null },
+		exactLayoutRef: { current: null },
+		viewportHeight: node.clientHeight,
+		tailFooter: null,
+	});
+	return {
+		source,
+		bindings: liveBindings,
+		node,
+		events,
+		toTop,
+		olderHistoryIntentAtRef,
+		readCurrentView,
+		correction,
+		readerScrollTo: (top: number) => {
+			node.scrollTop = top;
+			processScrollFrame();
+		},
+		setLayout: (nextIndex: typeof index) => {
+			const next = buildExactListLayout(nextIndex);
+			if (!next) throw new Error("Missing committed layout");
+			layout = next;
+			node.scrollHeight = next.totalHeight;
+		},
+		readState: () => ({ stateTop, window, following }),
+	};
+}
+
+describe("loaded-history scroll-to-top action", () => {
+	it("invalidates jumps, cancels the follower and synchronously unpins before writing the window", async () => {
+		const harness = await loadedTopHarness();
+		harness.toTop();
+		expect(harness.events).toEqual([
+			"cancel:jump=8",
+			"history-intent",
+			"visible-pin:false",
+			"state-pin:false",
+			"write:0",
+			"window:0",
+		]);
+		expect(harness.node.scrollTop).toBe(0);
+		expect(harness.bindings.scrollTopRef.current).toBe(0);
+		expect(harness.readState().stateTop).toBe(0);
+		expect(harness.readState().window.start).toBe(0);
+		expect(harness.readState().following).toBe(false);
+		expect(harness.bindings.textReadingDetachedRef.current).toBe(true);
+	});
+
+	it("clears a recent history intent without loading another page on either scroll echo", async () => {
+		const harness = await loadedTopHarness();
+		const { isSuppressedScrollEcho, isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
+		harness.toTop();
+		expect(harness.olderHistoryIntentAtRef.current).toBeNull();
+		let olderLoads = 0;
+		const maybeAutoLoadOlder = shellScrollCallback<(top: number, atBottom: boolean) => void>(
+			harness.source,
+			"maybeAutoLoadOlder",
+			{
+				olderHistoryIntentAtRef: harness.olderHistoryIntentAtRef,
+				autoLoadEnabledRef: { current: true },
+				hasPrevRef: { current: true },
+				loadingOlderRef: { current: false },
+				loadOlderRef: { current: () => olderLoads++ },
+				resolveOlderHistoryAutoLoad,
+				OLDER_LOAD_TRIGGER_PX: 400,
+				Date: { now: () => 10_001 },
+			},
+		);
+		for (const suppressing of [true, false]) {
+			const echo = isSuppressedScrollEcho(
+				suppressing,
+				harness.bindings.suppressedScrollTopRef.current,
+				harness.node.scrollTop,
+			);
+			if (
+				isUpwardHistoryScroll(harness.bindings.scrollTopRef.current, harness.node.scrollTop, echo)
+			)
+				harness.olderHistoryIntentAtRef.current = 10_001;
+			maybeAutoLoadOlder(harness.node.scrollTop, false);
+			expect(harness.olderHistoryIntentAtRef.current).toBeNull();
+		}
+		expect(olderLoads).toBe(0);
+	});
+
+	it("cancels actual message jumps awaiting either search resolution or an older page", async () => {
+		for (const stage of ["search", "page"]) {
+			const harness = await loadedTopHarness();
+			const ready = Promise.withResolvers<void>();
+			const search = Promise.withResolvers<{ seq: number }>();
+			const page = Promise.withResolvers<number>();
+			let olderLoads = 0;
+			const jump = shellScrollCallback<
+				(target: { domIds: string[]; targetIds: string[] }) => Promise<boolean>
+			>(harness.source, "scrollToMessageTarget", {
+				...harness.bindings,
+				mountedJumpTarget: () => null,
+				pretextDocumentRef: { current: { readWindow: () => ({ index: null, hasPrev: true }) } },
+				messageIdFromTarget: (id: string) => id,
+				resolveJumpTargetSeq: () => {
+					if (stage === "search") ready.resolve();
+					return stage === "search" ? search.promise : Promise.resolve({ seq: 1 });
+				},
+				resolveJumpWindowDecision: ({ expansions }: { expansions: number }) =>
+					expansions === 0
+						? { kind: "load-older" }
+						: { kind: "unreachable", reason: "budget-exhausted" },
+				notifications: { show: () => {} },
+				loadOlderAsyncRef: {
+					current: () => {
+						olderLoads++;
+						ready.resolve();
+						return page.promise;
+					},
+				},
+				narratorId: "loaded-top",
+				dataSource: undefined,
+				t: (key: string) => key,
+			});
+			const pendingJump = jump({ domIds: ["missing"], targetIds: ["missing"] });
+			await ready.promise;
+			harness.toTop();
+			const eventsAfterTop = [...harness.events];
+			search.resolve({ seq: 1 });
+			page.resolve(10);
+			expect(await pendingJump).toBe(false);
+			expect(olderLoads).toBe(stage === "page" ? 1 : 0);
+			expect(harness.events).toEqual(eventsAfterTop);
+			expect(harness.node.scrollTop).toBe(0);
+		}
+	});
+
+	it("keeps an explicit top across a real in-flight prepend and restores item anchors after reader navigation", async () => {
+		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
+		for (const navigation of [
+			"hold",
+			"scroll",
+			"scroll-before-frame",
+			"search",
+			"upward",
+			"manual",
+		]) {
+			const narratorId = `loaded-top-prepend-${navigation}`;
+			const harness = await loadedTopHarness(40, narratorId);
+			const older = Promise.withResolvers<PretextDocumentPageResult>();
+			let fetches = 0;
+			const makePage = (firstSeq: number, hasPrev: boolean): PretextDocumentPageResult => ({
+				messages: [firstSeq, firstSeq + 1].map((seq) => {
+					const text = `message ${seq}\n\n${"reading line\n".repeat(80)}`;
+					return rowWithElements(
+						{
+							id: `${narratorId}-m${seq}`,
+							narratorId,
+							parentToolUseId: null,
+							role: "assistant",
+							contentText: text,
+							toolCalls: [],
+							createdAt: "2026-07-23T00:00:00.000Z",
+							seq,
+						},
+						[{ type: "text", text }],
+					) as TreeMessage;
+				}),
+				minSeq: firstSeq,
+				maxSeq: firstSeq + 1,
+				hasNext: firstSeq === 0,
+				hasPrev,
+				messageVersion: 3,
+			});
+			const buildOptions = {
+				lod: 5 as const,
+				widthBucket: "800",
+				contentWidth: 800,
+				viewportHeight: 600,
+				topPadding: 16,
+				bottomPadding: 16,
+				gap: 4,
+			};
+			const coordinator = new PretextLayoutCoordinator();
+			const initial = await coordinator.load(narratorId, buildOptions, {
+				fetchPage: async (_id, options) => {
+					fetches++;
+					return options.beforeSeq == null ? makePage(2, true) : older.promise;
+				},
+			});
+			if (!initial.index) throw new Error("Missing tail layout");
+			harness.setLayout(initial.index);
+			let revision = initial.resizeRevision;
+			const unsubscribe = coordinator.subscribe(() => {
+				const snapshot = coordinator.getSnapshot();
+				if (!snapshot.index || snapshot.resizeRevision === revision) return;
+				revision = snapshot.resizeRevision;
+				harness.setLayout(snapshot.index);
+				if (snapshot.scrollTop != null && snapshot.scrollTopAnchorKind)
+					harness.correction(snapshot.scrollTop, snapshot.scrollTopAnchorKind);
+			});
+			const loadOlder = () => coordinator.loadOlder(buildOptions, harness.readCurrentView);
+			let pending: Promise<number>;
+			if (navigation === "manual") {
+				harness.toTop();
+				const button = harness.source.match(/<ManualOlderHistoryLoad\b[^>]*onLoad=\{(\w+)\}/);
+				if (!button?.[1]) throw new Error("Missing manual history loader");
+				let requested: Promise<number> | undefined;
+				const startLoad = () => {
+					requested = loadOlder();
+				};
+				const onLoad =
+					button[1] === "loadOlder"
+						? startLoad
+						: shellScrollCallback<() => void>(harness.source, button[1], {
+								...harness.bindings,
+								loadOlder: startLoad,
+							});
+				onLoad();
+				if (!requested) throw new Error("Manual history load did not request a page");
+				pending = requested;
+			} else {
+				pending = loadOlder();
+				harness.toTop();
+			}
+			expect(fetches).toBe(2);
+			if (navigation === "scroll") harness.readerScrollTo(72);
+			if (navigation === "scroll-before-frame") harness.node.scrollTop = 72;
+			if (navigation === "search") {
+				const jump = shellScrollCallback<
+					(target: { domIds: string[]; targetIds: string[] }) => Promise<boolean>
+				>(harness.source, "scrollToMessageTarget", {
+					...harness.bindings,
+					mountedJumpTarget: () => null,
+					pretextDocumentRef: { current: { readWindow: () => ({ index: null }) } },
+					messageIdFromTarget: (id: string) => id,
+					resolveJumpTargetSeq: async () => null,
+					dataSource: undefined,
+					t: (key: string) => key,
+				});
+				expect(await jump({ domIds: ["missing"], targetIds: ["missing"] })).toBe(false);
+			}
+			if (navigation === "upward") {
+				const intent = sliceBracketedRegion(harness.source, "const markUpwardIntent = () => {");
+				if (!intent) throw new Error("Missing upward history intent callback");
+				const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${intent};`);
+				new Function(
+					"olderHistoryIntentAtRef",
+					"loadedTopNarratorRef",
+					`${code}\nmarkUpwardIntent();`,
+				)(harness.olderHistoryIntentAtRef, harness.bindings.loadedTopNarratorRef);
+				// The auto-load gate consumes the new gesture before the page commits.
+				harness.olderHistoryIntentAtRef.current = null;
+			}
+			older.resolve(makePage(0, false));
+			expect(await pending).toBe(2);
+			const snapshot = coordinator.getSnapshot();
+			if (!snapshot.index) throw new Error("Missing prepended layout");
+			const addedHeight = snapshot.index.totalHeight - initial.index.totalHeight;
+			expect(addedHeight).toBeGreaterThan(0);
+			expect(snapshot.scrollTopAnchorKind).toBe("item");
+			if (snapshot.scrollTop == null) throw new Error("Missing prepend scroll correction");
+			expect(snapshot.scrollTop).toBeCloseTo(
+				addedHeight + (navigation.startsWith("scroll") ? 72 : 0),
+				5,
+			);
+			const expected = navigation === "hold" ? 0 : snapshot.scrollTop;
+			expect(harness.node.scrollTop).toBeCloseTo(expected, 5);
+			expect(harness.readState().stateTop).toBeCloseTo(expected, 5);
+			if (navigation === "hold") expect(harness.readState().window.start).toBe(0);
+			expect(fetches).toBe(2);
+			unsubscribe();
+			coordinator.reset();
+		}
+	});
+
+	it("honors a real LOD focus correction after returning to top without scrolling first", async () => {
+		const { captureCoordinatorAnchor, PretextLayoutCoordinator } = await import(
+			"./pretext-layout-coordinator"
+		);
+		const { createLodFocusPoint, createLodStepThrottle, resolveLodFocusOffset } = await import(
+			"./vlist-lod-gesture"
+		);
+		for (const origin of ["gesture", "toolbar"]) {
+			const narratorId = `loaded-top-lod-${origin}`;
+			const harness = await loadedTopHarness(40, narratorId);
+			const toolUseId = `${narratorId}-tool`;
+			const inputJson = { command: "printf 'geometry details'" };
+			const toolMessage = rowWithElements(
+				{
+					id: `${narratorId}-m0`,
+					narratorId,
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							id: `${narratorId}-tc`,
+							narratorId,
+							messageId: `${narratorId}-m0`,
+							toolUseId,
+							toolName: "Bash",
+							status: "completed",
+							inputJson,
+							outputJson: { stdout: "geometry details\n".repeat(8), exitCode: 0 },
+							createdAt: "2026-07-23T00:00:00.000Z",
+						},
+					],
+					createdAt: "2026-07-23T00:00:00.000Z",
+					seq: 0,
+				},
+				[
+					{
+						type: "tool_use",
+						id: toolUseId,
+						name: "Bash",
+						input: inputJson,
+						inputJson,
+						status: "completed",
+					},
+				],
+			) as unknown as TreeMessage;
+			const textId = `${narratorId}-m1`;
+			const focusedText = "focused text\n\n".repeat(40);
+			const textMessage = rowWithElements(
+				{
+					id: textId,
+					narratorId,
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: focusedText,
+					toolCalls: [],
+					createdAt: "2026-07-23T00:00:00.000Z",
+					seq: 1,
+				},
+				[{ type: "text", text: focusedText }],
+			) as TreeMessage;
+			const buildOptions = {
+				lod: 4 as const,
+				widthBucket: "800",
+				contentWidth: 800,
+				viewportHeight: 600,
+				topPadding: 16,
+				bottomPadding: 16,
+				gap: 4,
+				recentMessageIds: new Set<string>(),
+			};
+			const coordinator = new PretextLayoutCoordinator();
+			const initial = await coordinator.load(narratorId, buildOptions, {
+				fetchPage: async () => ({
+					messages: [toolMessage, textMessage],
+					minSeq: 0,
+					maxSeq: 1,
+					hasNext: false,
+					hasPrev: false,
+					messageVersion: 3,
+				}),
+			});
+			if (!initial.index) throw new Error("Missing LOD source layout");
+			expect(initial.index.totalHeight).toBeGreaterThan(600);
+			harness.setLayout(initial.index);
+			const targetIndex = initial.index.manifest.items.findIndex((item) =>
+				item.sourceMessageIds.includes(textId),
+			);
+			if (targetIndex < 0) throw new Error("Missing focused text item");
+			const focusY = initial.index.itemStart(targetIndex) + 3;
+			const lodFocusRef = { current: null as ReturnType<typeof createLodFocusPoint> | null };
+			const focusBindings = {
+				...harness.bindings,
+				lodFocusRef,
+				createLodFocusPoint,
+				resolveLodFocusOffset,
+			};
+			const readCurrentView = shellScrollCallback<
+				() => {
+					scrollTop: number;
+					viewportHeight: number;
+					pinnedToBottom: boolean;
+					focusOffset?: number;
+				}
+			>(harness.source, "readCurrentView", focusBindings);
+			harness.toTop();
+			expect(harness.node.scrollTop).toBe(0);
+			if (origin === "toolbar") {
+				shellScrollCallback<(clientY: number) => void>(
+					harness.source,
+					"prepareLodChange",
+					focusBindings,
+				)(focusY);
+			} else {
+				const emit = sliceBracketedRegion(
+					harness.source,
+					"const emit = (dir: 1 | -1, clientY: number | null) => {",
+				);
+				if (!emit) throw new Error("Missing gesture LOD emitter");
+				const emitBindings = {
+					...focusBindings,
+					node: harness.node,
+					throttle: createLodStepThrottle(),
+					onLodStepRef: { current: () => {} },
+				};
+				const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${emit};`);
+				const emitStep = new Function(...Object.keys(emitBindings), `${code}\nreturn emit;`)(
+					...Object.values(emitBindings),
+				) as (dir: 1 | -1, clientY: number) => void;
+				emitStep(1, focusY);
+			}
+			expect(harness.bindings.loadedTopNarratorRef.current).toBeNull();
+			const view = readCurrentView();
+			expect(view.scrollTop).toBe(0);
+			expect(view.focusOffset).toBeCloseTo(focusY, 5);
+			const anchor = captureCoordinatorAnchor(initial.index, view);
+			const rebuilt = coordinator.rebuild({ ...buildOptions, lod: 5 }, anchor, 600);
+			if (!rebuilt.index || rebuilt.scrollTop == null || !rebuilt.scrollTopAnchorKind)
+				throw new Error("Missing LOD focus correction");
+			const nextTarget = rebuilt.index.manifest.items.findIndex((item) =>
+				item.sourceMessageIds.includes(textId),
+			);
+			if (nextTarget < 0) throw new Error("Missing rebuilt focused text");
+			expect(rebuilt.scrollTop).toBeGreaterThan(0);
+			expect(rebuilt.scrollTop).toBeLessThanOrEqual(rebuilt.index.totalHeight - 600);
+			harness.setLayout(rebuilt.index);
+			harness.correction(rebuilt.scrollTop, rebuilt.scrollTopAnchorKind);
+			expect(harness.node.scrollTop).toBeCloseTo(rebuilt.scrollTop, 5);
+			expect(harness.readState().stateTop).toBeCloseTo(rebuilt.scrollTop, 5);
+			expect(rebuilt.index.itemStart(nextTarget) + 3 - harness.node.scrollTop).toBeCloseTo(
+				focusY,
+				5,
+			);
+			coordinator.reset();
+		}
+	});
+
+	it("releases loaded-top reading before normal and reduced-motion folds capture their geometry", async () => {
+		for (const reducedMotion of [false, true]) {
+			const harness = await loadedTopHarness();
+			harness.toTop();
+			const capture = shellScrollCallback<(key: string) => void>(
+				harness.source,
+				"captureFoldBefore",
+				{
+					...harness.bindings,
+					foldCaptureRef: { current: null },
+					prefersReducedMotion: () => reducedMotion,
+					readFoldGeometryRef: {
+						current: () => ({ geometry: new Map([["row", {}]]), documentRevision: 1, lod: 5 }),
+					},
+				},
+			);
+			capture("row");
+			expect(harness.bindings.loadedTopNarratorRef.current).toBeNull();
+			harness.correction(24, "item");
+			expect(harness.node.scrollTop).toBe(24);
+		}
+	});
+
+	it("releases the loaded-top intent for marker and bottom navigation", async () => {
+		const { getScrollBottomTarget } = await import("./vlist-exact-scroll");
+		for (const name of ["handleUserMarkerJump", "handleCompactMarkerJump", "scrollToBottom"]) {
+			const harness = await loadedTopHarness();
+			harness.toTop();
+			const navigate = shellScrollCallback<(target: { top: number } | boolean) => void>(
+				harness.source,
+				name,
+				{
+					...harness.bindings,
+					getScrollBottomTarget,
+					resolveVListUserMarkerScrollTop: (top: number) => top,
+					VLIST_USER_MARKER_JUMP_LEAD: 0,
+				},
+			);
+			navigate(name === "scrollToBottom" ? true : { top: 12 });
+			expect(harness.bindings.loadedTopNarratorRef.current).toBeNull();
+			harness.correction(24, "item");
+			expect(harness.node.scrollTop).toBe(24);
+		}
+	});
+
+	it("scopes the top intent to its narrator and clears it when a session changes", async () => {
+		const harness = await loadedTopHarness();
+		const { applyExactScrollCorrection } = await import("./vlist-exact-scroll");
+		harness.toTop();
+		const nextNarratorCorrection = shellScrollCallback<(top: number, kind: "item") => void>(
+			harness.source,
+			"onScrollTopCorrection",
+			{
+				...harness.bindings,
+				narratorId: "next-narrator",
+				applyExactScrollCorrection,
+				footerHeightRef: { current: 0 },
+			},
+		);
+		nextNarratorCorrection(12, "item");
+		expect(harness.node.scrollTop).toBe(12);
+		harness.toTop();
+		const resetStart = harness.source.lastIndexOf(
+			"useEffect(",
+			harness.source.indexOf("appliedMessageRevisionRef.current = 0;"),
+		);
+		const reset = sliceBracketedRegion(harness.source.slice(resetStart), "useEffect(");
+		if (!reset) throw new Error("Missing narrator reset effect");
+		const resetBindings = {
+			narratorId: "next-narrator",
+			loadedTopNarratorRef: harness.bindings.loadedTopNarratorRef,
+			textReadingDetachedRef: harness.bindings.textReadingDetachedRef,
+			appliedMessageRevisionRef: { current: 3 },
+			initialRevisionSyncRef: { current: false },
+			setMessageRevision: () => {},
+			setClosingRows: () => {},
+			unknownHeightReporterCacheRef: { current: new Map() },
+			togglesCacheRef: { current: new Map() },
+			reflectionTakeOverCacheRef: { current: new Map() },
+			permissionHeightReportersRef: { current: new Map() },
+			heightOverrideWidthsRef: { current: new Map() },
+			resizeDirtyKeysRef: { current: new Set() },
+			useEffect: (callback: () => void) => callback(),
+		};
+		const resetCode = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${reset};`);
+		new Function(...Object.keys(resetBindings), resetCode)(...Object.values(resetBindings));
+		expect(harness.bindings.loadedTopNarratorRef.current).toBeNull();
+		harness.correction(24, "item");
+		expect(harness.node.scrollTop).toBe(24);
+	});
+
+	it("cancels a queued bottom landing and a stale short-window fill effect", async () => {
+		const harness = await loadedTopHarness(1);
+		const { getScrollBottomTarget } = await import("./vlist-exact-scroll");
+		const landing = { callback: undefined as (() => void) | undefined };
+		const toBottom = shellScrollCallback<() => void>(harness.source, "scrollToBottom", {
+			...harness.bindings,
+			getScrollBottomTarget,
+			requestAnimationFrame: (callback: () => void) => {
+				landing.callback = callback;
+				return 1;
+			},
+		});
+		toBottom();
+		harness.toTop();
+		let olderLoads = 0;
+		const fill = sliceBracketedRegion(
+			harness.source.slice(harness.source.indexOf("// First-screen fill:")),
+			"useEffect(",
+		);
+		if (!fill) throw new Error("Missing first-screen fill effect");
+		const fillBindings = {
+			pinnedToBottomRef: harness.bindings.pinnedToBottomRef,
+			pinnedToBottom: true,
+			pretextDocument: { status: "ready" },
+			hasPrev: true,
+			loadingOlder: false,
+			viewportHeight: harness.node.clientHeight,
+			exactLayout: { totalHeight: 100 },
+			ITEM_OVERSCAN: 400,
+			getLastTrimAt: () => 0,
+			loadOlder: () => olderLoads++,
+			useEffect: (callback: () => void) => callback(),
+		};
+		const fillCode = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${fill};`);
+		new Function(...Object.keys(fillBindings), fillCode)(...Object.values(fillBindings));
+		const eventsAfterTop = [...harness.events];
+		landing.callback?.();
+		expect(harness.node.scrollTop).toBe(0);
+		expect(harness.events).toEqual(eventsAfterTop);
+		expect(olderLoads).toBe(0);
+	});
+
+	it("ignores old bottom anchors and a queued pin frame, and keeps short or long content detached as it grows", async () => {
+		const { applyExactScrollCorrection, createPinnedBottomFrame, getScrollBottomTarget } =
+			await import("./vlist-exact-scroll");
+		for (const itemCount of [1, 40]) {
+			const harness = await loadedTopHarness(itemCount);
+			const bindings = {
+				...harness.bindings,
+				applyExactScrollCorrection,
+				getScrollBottomTarget,
+				footerHeightRef: { current: 0 },
+			};
+			const correction = shellScrollCallback<
+				(top: number, kind: "bottom" | "item", smooth?: boolean) => void
+			>(harness.source, "onScrollTopCorrection", bindings);
+			const pinEffect = harness.source.slice(
+				harness.source.indexOf("const scrollGeometryRevision ="),
+				harness.source.indexOf("// First-screen fill:"),
+			);
+			const frame = sliceBracketedRegion(pinEffect, "const frame = requestAnimationFrame(");
+			const snap = sliceBracketedRegion(pinEffect, "const snap = () => {");
+			if (!frame || !snap) throw new Error("Missing bottom-pin frame");
+			const queuedPin = { callback: undefined as (() => void) | undefined };
+			const frameCode = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${snap};${frame};`);
+			const frameBindings = {
+				...bindings,
+				createPinnedBottomFrame,
+				requestAnimationFrame: (callback: () => void) => {
+					queuedPin.callback = callback;
+					return 1;
+				},
+			};
+			new Function(...Object.keys(frameBindings), frameCode)(...Object.values(frameBindings));
+			harness.toTop();
+			queuedPin.callback?.();
+			correction(3000, "bottom", false);
+			correction(3000, "bottom", true);
+			expect(harness.node.scrollTop).toBe(0);
+			expect(harness.readState().following).toBe(false);
+			const readCurrentView = shellScrollCallback<
+				() => { scrollTop: number; pinnedToBottom: boolean }
+			>(harness.source, "readCurrentView", {
+				...harness.bindings,
+				lodFocusRef: { current: null },
+				resolveLodFocusOffset: () => undefined,
+			});
+			expect(readCurrentView().pinnedToBottom).toBe(false);
+			harness.node.scrollHeight += 5000;
+			expect(readCurrentView()).toMatchObject({ scrollTop: 0, pinnedToBottom: false });
+			correction(5000, "bottom", true);
+			expect(harness.node.scrollTop).toBe(0);
+			// A fresh item correction still preserves geometry after the reader moves.
+			harness.readerScrollTo(12);
+			correction(24, "item", false);
+			expect(harness.node.scrollTop).toBe(24);
+		}
+	});
 });
 
 describe("isSuppressedScrollEcho — telling our own write from the reader", () => {
@@ -387,7 +1180,7 @@ describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 		const source = await shell();
 		const pinEffect = source.slice(
 			source.indexOf("const scrollGeometryRevision ="),
-			source.indexOf("const scrollGeometryRevision =") + 1800,
+			source.indexOf("// First-screen fill:"),
 		);
 		// Yields to a chase (an unconditional write would land at the bottom on the
 		// next frame and cut every streaming glide short)…
@@ -403,8 +1196,8 @@ describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 		// Anchored rebuilds / fold / LOD / removals keep their committed-geometry
 		// semantics: same instant write as before, and no chase survives them.
 		expect(correction).toContain("getSmoothFollower().cancel();");
-		expect(correction).toContain(
-			"writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));",
+		expect(correction).toMatch(
+			/writeScrollTop\(\s*applyExactScrollCorrection\(correctionTop, anchorKind, footerHeightRef\.current\),?\s*\);/,
 		);
 	});
 

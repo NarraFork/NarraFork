@@ -177,6 +177,7 @@ describe("fold transition: reduced-motion drill retention", () => {
 			const prefersReducedMotion = () => reduced;
 			const smoothFollowerRef = { current: null };
 			const foldCaptureRef = { current: { stale: true } };
+			const loadedTopNarratorRef = { current: "narrator" };
 			const scrollTopRef = { current: 0 };
 			const readFoldGeometryRef = { current: () => (${geometryAvailable ? '{ geometry: new Map([["trace", {}]]), documentRevision: 1, lod: 1 }' : "null"}) };
 			const useCallback = (fn) => fn;
@@ -194,6 +195,7 @@ describe("fold transition: reduced-motion drill retention", () => {
 				toggle: () => toggles.onToggleRow(0, "tool"),
 				closing: () => closingRows.get(key)?.has("tool") ?? false,
 				capture: () => foldCaptureRef.current,
+				loadedTop: () => loadedTopNarratorRef.current,
 				hasCard: () => hasCard,
 			};
 		`);
@@ -201,6 +203,7 @@ describe("fold transition: reduced-motion drill retention", () => {
 			toggle(): void;
 			closing(): boolean;
 			capture(): unknown;
+			loadedTop(): string | null;
 			hasCard(): boolean;
 		};
 	}
@@ -224,6 +227,7 @@ describe("fold transition: reduced-motion drill retention", () => {
 		expect(h.hasCard()).toBe(false);
 		expect(h.closing()).toBe(true);
 		expect(h.capture()).not.toBeNull();
+		expect(h.loadedTop()).toBeNull();
 	});
 
 	it("does not retain a card when geometry cannot be captured", () => {
