@@ -199,6 +199,29 @@ export function useReasoningTranslationVisibility(narratorId: string | undefined
 	return observer;
 }
 
+export function* reasoningTranslationNodes(
+	node: Element,
+	evidence: readonly ReasoningTranslationEvidence[],
+	showSource?: boolean,
+	step?: number,
+) {
+	const lines = node.querySelectorAll(
+		showSource ? "[data-vlist-source-line]" : "[data-vlist-line], [data-vlist-code-line]",
+	);
+	for (let i = 0; i < Math.min(512, lines.length); i++) {
+		const line = lines[i];
+		const origin = line.closest("[data-vlist-source-start][data-vlist-source-end]");
+		if (!origin || !node.contains(origin) || !line.textContent?.trim()) continue;
+		const target = reasoningTranslationTargetForRange(
+			evidence,
+			Number(origin.getAttribute("data-vlist-source-start")),
+			Number(origin.getAttribute("data-vlist-source-end")),
+			step,
+		);
+		if (target) yield { line, target };
+	}
+}
+
 export function useVisibleReasoningSource<T extends Element>(
 	target: ReasoningTranslationVisibilityTarget | undefined,
 	evidence?: readonly ReasoningTranslationEvidence[],
@@ -213,20 +236,13 @@ export function useVisibleReasoningSource<T extends Element>(
 			if (!observer || !node) return;
 			if (evidence && contentVersion) {
 				const cleanups: (() => void)[] = [];
-				const lines = node.querySelectorAll(
-					showSource ? "[data-vlist-source-line]" : "[data-vlist-line]",
-				);
-				for (let i = 0; i < Math.min(512, lines.length); i++) {
-					const line = lines[i];
-					const origin = line.closest("[data-vlist-source-start][data-vlist-source-end]");
-					if (!origin || !node.contains(origin) || !line.textContent?.trim()) continue;
-					const match = reasoningTranslationTargetForRange(
-						evidence,
-						Number(origin.getAttribute("data-vlist-source-start")),
-						Number(origin.getAttribute("data-vlist-source-end")),
-						step,
-					);
-					if (match) cleanups.push(observer.register(line, match));
+				for (const { line, target } of reasoningTranslationNodes(
+					node,
+					evidence,
+					showSource,
+					step,
+				)) {
+					cleanups.push(observer.register(line, target));
 				}
 				return () => {
 					for (const cleanup of cleanups) cleanup();
