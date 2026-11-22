@@ -11,7 +11,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { alias } from "drizzle-orm/sqlite-core";
 import {
@@ -21,6 +21,7 @@ import {
 	revertOperationFiles,
 	revertOperations,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
@@ -647,23 +648,47 @@ export class RevertPlanService {
 		const limit = pageLimit(options.limit);
 		if (options.cursor) sha256(options.cursor.fileKey);
 		const rows = selectFiles(this.database, planId, options.cursor, limit + 1);
-		const page = boundedPage(rows, limit, fileCursor);
-		return {
-			...page,
-			items: page.items.map((row) => ({
-				id: row.id,
-				fileKey: row.fileKey,
-				sequence: row.sequence,
-				identityJson: row.identityJson,
-				expectedStateJson: row.expectedStateJson,
-				desiredStateJson: row.desiredStateJson,
-				applyMutationId: row.applyMutationId,
-				applyRequestDigest: row.applyRequestDigest,
-				compensateMutationId: row.compensateMutationId,
-				compensateRequestDigest: row.compensateRequestDigest,
-				status: row.status,
-			})),
-		};
+		return planFilePage(rows, limit);
+	}
+
+	async readFilePage(
+		owner: RevertPlanOwner,
+		planId: string,
+		options: { cursor?: RevertPlanFileCursor; limit?: number; signal: AbortSignal },
+	): Promise<RevertPlanPage<RevertPlanFileMetadata, RevertPlanFileCursor>> {
+		options.signal.throwIfAborted();
+		const context = normalizeOwner(owner);
+		text(planId, "planId");
+		const limit = pageLimit(options.limit);
+		if (options.cursor) sha256(options.cursor.fileKey);
+		// Authorize and page in the same statement. A left join distinguishes an
+		// owned empty page from a missing/foreign plan, even at the end of a cursor.
+		const rows = await readQuery(
+			this.database
+				.select({
+					plan: getTableColumns(revertOperations),
+					file: getTableColumns(revertOperationFiles),
+				})
+				.from(revertOperations)
+				.leftJoin(
+					revertOperationFiles,
+					and(
+						eq(revertOperationFiles.revertOperationId, revertOperations.id),
+						afterFileCursor(options.cursor),
+					),
+				)
+				.where(ownedPlan(context, planId))
+				.orderBy(asc(revertOperationFiles.fileKey))
+				.limit(limit + 1),
+			{ signal: options.signal, maxRows: limit + 1, timeoutMs: 30_000 },
+		);
+		options.signal.throwIfAborted();
+		if (!rows.length) throw fail("NOT_FOUND", "Plan not found in the owning context");
+		metadata(rows[0].plan);
+		return planFilePage(
+			rows.flatMap(({ file }) => (file ? [file] : [])),
+			limit,
+		);
 	}
 
 	private summary(row: PlanRecord): RevertPlanSummary {
@@ -1029,21 +1054,18 @@ function assertSameRevision(before: PlanRecord, after: PlanRecord) {
 }
 function requireOwner(tx: Executor, owner: RevertPlanOwner, planId: string): PlanRecord {
 	text(planId, "planId");
-	const row = tx
-		.select()
-		.from(revertOperations)
-		.where(
-			and(
-				eq(revertOperations.id, planId),
-				eq(revertOperations.requestedBySubjectKey, owner.subjectKey),
-				sql`${revertOperations.narratorId} IS ${owner.narratorId}`,
-				sql`${revertOperations.projectId} IS ${owner.projectId}`,
-			),
-		)
-		.get();
+	const row = tx.select().from(revertOperations).where(ownedPlan(owner, planId)).get();
 	if (!row) throw fail("NOT_FOUND", "Plan not found in the owning context");
 	metadata(row);
 	return row;
+}
+function ownedPlan(owner: RevertPlanOwner, planId: string) {
+	return and(
+		eq(revertOperations.id, planId),
+		eq(revertOperations.requestedBySubjectKey, owner.subjectKey),
+		sql`${revertOperations.narratorId} IS ${owner.narratorId}`,
+		sql`${revertOperations.projectId} IS ${owner.projectId}`,
+	);
 }
 function catalogRef(tx: Executor, digestValue: string | null): FileChangeBlobRef {
 	if (!digestValue) throw fail("LEGACY_UNVERIFIED", "Original manifest references are required");
@@ -1116,15 +1138,33 @@ function selectFiles(
 	return tx
 		.select()
 		.from(revertOperationFiles)
-		.where(
-			and(
-				eq(revertOperationFiles.revertOperationId, planId),
-				cursor ? sql`${revertOperationFiles.fileKey} > ${cursor.fileKey}` : undefined,
-			),
-		)
+		.where(and(eq(revertOperationFiles.revertOperationId, planId), afterFileCursor(cursor)))
 		.orderBy(asc(revertOperationFiles.fileKey))
 		.limit(limit)
 		.all();
+}
+function afterFileCursor(cursor: RevertPlanFileCursor | undefined) {
+	return cursor ? sql`${revertOperationFiles.fileKey} > ${cursor.fileKey}` : undefined;
+}
+
+function planFilePage(rows: FileRecord[], limit: number) {
+	const page = boundedPage(rows, limit, fileCursor);
+	return {
+		...page,
+		items: page.items.map((row) => ({
+			id: row.id,
+			fileKey: row.fileKey,
+			sequence: row.sequence,
+			identityJson: row.identityJson,
+			expectedStateJson: row.expectedStateJson,
+			desiredStateJson: row.desiredStateJson,
+			applyMutationId: row.applyMutationId,
+			applyRequestDigest: row.applyRequestDigest,
+			compensateMutationId: row.compensateMutationId,
+			compensateRequestDigest: row.compensateRequestDigest,
+			status: row.status,
+		})),
+	};
 }
 function fileCursor(row: FileRecord): RevertPlanFileCursor {
 	return { fileKey: row.fileKey };
