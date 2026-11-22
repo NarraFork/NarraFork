@@ -572,7 +572,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"collate",
 	],
 	"server/services/git-current-diff-view.ts": ["rowid"],
-	"server/services/integration-authority-service.ts": ["errorCode"],
+	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
