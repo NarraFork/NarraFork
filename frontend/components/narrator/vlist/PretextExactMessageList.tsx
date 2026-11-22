@@ -2244,6 +2244,10 @@ export const PretextExactMessageList = memo(
 			);
 			const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq, getLastTrimAt } =
 				pretextDocument;
+			const loadOlderManually = useCallback(() => {
+				loadedTopNarratorRef.current = null;
+				loadOlder();
+			}, [loadOlder]);
 			const hasPrevRef = useRef(hasPrev);
 			hasPrevRef.current = hasPrev;
 			const loadingOlderRef = useRef(loadingOlder);
@@ -5576,7 +5580,7 @@ export const PretextExactMessageList = memo(
 											hasOlder={hasPrev}
 											loading={loadingOlder}
 											label={t("loadOlderMessages")}
-											onLoad={loadOlder}
+											onLoad={loadOlderManually}
 										/>
 									</div>
 								) : null}

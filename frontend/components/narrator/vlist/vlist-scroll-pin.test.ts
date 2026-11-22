@@ -333,7 +333,14 @@ describe("loaded-history scroll-to-top action", () => {
 
 	it("keeps an explicit top across a real in-flight prepend and restores item anchors after reader navigation", async () => {
 		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
-		for (const navigation of ["hold", "scroll", "scroll-before-frame", "search", "upward"]) {
+		for (const navigation of [
+			"hold",
+			"scroll",
+			"scroll-before-frame",
+			"search",
+			"upward",
+			"manual",
+		]) {
 			const narratorId = `loaded-top-prepend-${navigation}`;
 			const harness = await loadedTopHarness(40, narratorId);
 			const older = Promise.withResolvers<PretextDocumentPageResult>();
@@ -388,9 +395,31 @@ describe("loaded-history scroll-to-top action", () => {
 				if (snapshot.scrollTop != null && snapshot.scrollTopAnchorKind)
 					harness.correction(snapshot.scrollTop, snapshot.scrollTopAnchorKind);
 			});
-			const pending = coordinator.loadOlder(buildOptions, harness.readCurrentView);
+			const loadOlder = () => coordinator.loadOlder(buildOptions, harness.readCurrentView);
+			let pending: Promise<number>;
+			if (navigation === "manual") {
+				harness.toTop();
+				const button = harness.source.match(/<ManualOlderHistoryLoad\b[^>]*onLoad=\{(\w+)\}/);
+				if (!button?.[1]) throw new Error("Missing manual history loader");
+				let requested: Promise<number> | undefined;
+				const startLoad = () => {
+					requested = loadOlder();
+				};
+				const onLoad =
+					button[1] === "loadOlder"
+						? startLoad
+						: shellScrollCallback<() => void>(harness.source, button[1], {
+								...harness.bindings,
+								loadOlder: startLoad,
+							});
+				onLoad();
+				if (!requested) throw new Error("Manual history load did not request a page");
+				pending = requested;
+			} else {
+				pending = loadOlder();
+				harness.toTop();
+			}
 			expect(fetches).toBe(2);
-			harness.toTop();
 			if (navigation === "scroll") harness.readerScrollTo(72);
 			if (navigation === "scroll-before-frame") harness.node.scrollTop = 72;
 			if (navigation === "search") {
