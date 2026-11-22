@@ -6,6 +6,7 @@ import {
 	dropStatus,
 	getStatusSummaryCached,
 	invalidateStatus,
+	markStatusDirty,
 	peekStatusSummary,
 	STATUS_CACHE_MAX_ENTRIES,
 	statusCacheSize,
@@ -81,6 +82,29 @@ describe("status facade and shared result cache", () => {
 		expect((await getStatusSummaryCached(path)).branch).toBe("1");
 		expect((await getStatusSummaryCached(path, { ttlMs: 0 })).branch).toBe("2");
 		expect((await gitService.getStatusSummary(path)).branch).toBe("2");
+	});
+
+	test("tool dirtiness is lazy and silent; the next read and explicit refresh remain fresh", async () => {
+		let calls = 0;
+		loadWith(async () => summary(String(++calls)));
+		const path = "/tmp/nf-status/lazy-dirty";
+		expect((await getStatusSummaryCached(path)).branch).toBe("1");
+		const events: string[] = [];
+		const listener = ({ queryKey }: { queryKey: string }) => events.push(queryKey);
+		eventBus.on("git:workspace_invalidated", listener);
+		try {
+			for (let index = 0; index < 100; index++) markStatusDirty(path);
+			expect(calls).toBe(1);
+			expect(events).toEqual([]);
+			expect(peekStatusSummary(path)?.branch).toBe("1");
+			expect((await getStatusSummaryCached(path)).branch).toBe("2");
+			expect((await getStatusSummaryCached(path, { ttlMs: 0 })).branch).toBe("3");
+			invalidateStatus(path);
+			expect(events).toEqual([getLocalGitStatusQueryKey(path)]);
+			expect((await getStatusSummaryCached(path)).branch).toBe("4");
+		} finally {
+			eventBus.off("git:workspace_invalidated", listener);
+		}
 	});
 
 	test("failed shared reads leave no result and can retry", async () => {

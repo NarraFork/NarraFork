@@ -48,6 +48,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"services/git-untracked-line-worker.ts",
 	"services/git-status-page-worker.ts",
 	"services/git-current-baseline-worker.ts",
+	"services/git-staging-worker.ts",
 	"services/agent-runtime/model-history-worker.ts",
 	"services/narrator-prefix-snapshots-worker.ts",
 	"services/revert-transaction-manifest-worker.ts",
