@@ -6,6 +6,7 @@ export interface ReadPoolTaskDiagnostics {
 	kind: DbReadTaskParams["kind"];
 	source:
 		| "auth.session"
+		| "knowledge.keyword-signature"
 		| "narrator.request-recording"
 		| "narrator.message-language"
 		| "unattributed";
@@ -16,6 +17,7 @@ export interface ReadPoolTaskDiagnostics {
 }
 export function readPoolDiagnosticSource(source: unknown): ReadPoolTaskDiagnostics["source"] {
 	return source === "auth.session" ||
+		source === "knowledge.keyword-signature" ||
 		source === "narrator.request-recording" ||
 		source === "narrator.message-language"
 		? source
