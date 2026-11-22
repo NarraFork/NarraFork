@@ -2586,7 +2586,11 @@ class BackgroundTaskService {
 					activeChildTaskCount > 0,
 			};
 		});
-		readMetric(observation, "reconcileMapSyncMs", readClock() - mappingStarted);
+		readMetric(
+			observation,
+			"reconcileMapSyncMs",
+			Number(observation?.reconcileMapSyncMs ?? 0) + readClock() - mappingStarted,
+		);
 		return result;
 	}
 
