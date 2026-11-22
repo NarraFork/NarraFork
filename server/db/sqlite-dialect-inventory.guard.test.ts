@@ -719,6 +719,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
 	"server/services/tool-input-stream-source.ts": ["handle"],
+	"server/lib/db-worker/tool-detail-query.ts": ["driver"],
+	"server/services/narrator-tool-detail.ts": ["handle"],
 	// The trusted read-only eval program now belongs to the worker adapter, not the source owner.
 	"server/services/tool-input-stream-source-worker.ts": ["driver", "pragma"],
 	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
