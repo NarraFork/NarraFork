@@ -1,11 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+	FanoutCounter,
+	type FanoutRound,
+	fanoutCoverageComplete,
+	fanoutHttpCategory,
+	fanoutWsType,
 	historyRequestCounts,
 	phaseSuccess,
+	redactEvidence,
 	requestKind,
+	SERVER_READ_METRICS,
 	stableViewport,
 	summarize,
+	summarizeFanout,
+	writePrivateEvidence,
 } from "../../scripts/smoke-narrator-loading";
 
 // CI guards run unconditionally. The real full-app browser script is separately executable
@@ -152,5 +163,128 @@ describe("full-app narrator loading browser evidence", () => {
 		expect(script).toContain("paintBeforeFailure");
 		expect(script).toContain("-failed.png");
 		expect(script).not.toContain("bun run start:dev");
+	});
+});
+
+describe("--read-fanout browser-observed evidence", () => {
+	test("HTTP and WS frames reduce to fixed labels without IDs, queries or payloads", () => {
+		const base = "http://127.0.0.1:9/api";
+		expect(fanoutHttpCategory(`${base}/narrators/secret-id/pretext-document?afterSeq=4`)).toBe(
+			"narrators.window",
+		);
+		expect(fanoutHttpCategory(`${base}/narrators/secret-id/message-location/77`)).toBe(
+			"narrators.locate",
+		);
+		expect(fanoutHttpCategory(`${base}/narrators`)).toBe("narrators");
+		expect(fanoutHttpCategory(`${base}/Weird_Group/x`)).toBe("unknown");
+		expect(fanoutHttpCategory("http://127.0.0.1:9/assets/app.js")).toBeNull();
+		expect(fanoutHttpCategory("not a url")).toBeNull();
+		expect(fanoutWsType('{"type":"subscribe","kind":"panel","id":"secret-id"}')).toBe(
+			"subscribe:panel",
+		);
+		expect(fanoutWsType('{"type":"subscribe","kind":"secret-id"}')).toBe("subscribe:unknown");
+		expect(fanoutWsType('{"type":"secret-id/../x"}')).toBe("unknown");
+		expect(fanoutWsType("{")).toBe("invalid-json");
+		expect(fanoutWsType("AAEC", 2)).toBe("non-text");
+		expect(fanoutWsType(JSON.stringify({ type: "x".repeat(70_000) }))).toBe("oversized");
+	});
+
+	test("counter attributes completions to the finishing window and keeps a bounded histogram", () => {
+		let now = 0;
+		const counter = new FanoutCounter(() => now);
+		const carried = {};
+		counter.begin("cold");
+		counter.request(carried, "http://h/api/narrators/n1/pretext-document", "GET");
+		counter.request({}, "http://h/static/app.js", "GET");
+		now = 40;
+		counter.end(35);
+		counter.begin("A_to_B");
+		counter.wsSent('{"type":"subscribe","kind":"messages"}');
+		counter.wsReceived("12345");
+		counter.response(carried, 200);
+		now = 700;
+		counter.finish(carried);
+		counter.end(650);
+		const [, cold, , switchB] = counter.windows;
+		expect(cold?.http).toMatchObject({ started: 1, completed: 0, inflightAtEnd: 1 });
+		expect(cold?.firstVisibleMs).toBe(35);
+		expect(switchB?.http).toMatchObject({
+			started: 0,
+			completed: 1,
+			inflightAtStart: 1,
+			inflightAtEnd: 0,
+			statuses: { "2xx": 1 },
+		});
+		expect(switchB?.http.durationMs).toMatchObject({ count: 1, maxMs: 700 });
+		expect(switchB?.http.durationMs.buckets[7]).toBe(1);
+		expect(switchB?.ws).toEqual({
+			sent: { "subscribe:messages": 1 },
+			received: 1,
+			receivedBytes: 5,
+		});
+		expect(JSON.stringify(counter.windows)).not.toContain("n1");
+		for (let i = 0; i < 11; i++) counter.begin("between");
+		expect(() => counter.begin("idle")).toThrow("Fanout window budget exceeded");
+	});
+
+	test("summary and coverage use only measured rounds with complete phase windows", () => {
+		const window = (label: "cold" | "A_to_B" | "B_to_A", firstVisibleMs?: number) => {
+			const counter = new FanoutCounter(() => 0);
+			const opened = counter.begin(label);
+			counter.request({}, "http://h/api/narrators/n/pretext-document", "GET");
+			counter.end(firstVisibleMs);
+			return opened;
+		};
+		const round = (kind: FanoutRound["kind"], visible?: number): FanoutRound => ({
+			viewport: "desktop",
+			iteration: 1,
+			kind,
+			windows: [window("cold", 10), window("A_to_B", 20), window("B_to_A", visible)],
+		});
+		const rounds = [round("functional", 1), round("measured", 5), round("measured", 7)];
+		expect(fanoutCoverageComplete(rounds, 2)).toBe(true);
+		expect(fanoutCoverageComplete(rounds, 3)).toBe(false);
+		expect(fanoutCoverageComplete([...rounds, round("measured")], 3)).toBe(false);
+		const hot = summarizeFanout(rounds).find((row) => row.phase === "B_to_A");
+		expect(hot).toMatchObject({
+			viewport: "desktop",
+			windows: 2,
+			firstVisibleMs: { n: 2, p50: 5, p95: 7, max: 7 },
+			requestsByCategory: { "GET narrators.tail": 2 },
+		});
+	});
+
+	test("server read metrics are declared unavailable, never fabricated", () => {
+		expect(SERVER_READ_METRICS.status).toBe("unavailable");
+		expect(SERVER_READ_METRICS.blockedOn).toContain("/api/admin/diagnostics/read-fanout");
+		const script = readFileSync(
+			new URL("../../scripts/smoke-narrator-loading.ts", import.meta.url),
+			"utf8",
+		);
+		expect(script).not.toMatch(/read-fanout\/(start|stop)/);
+		expect(script).toContain("--read-fanout");
+		expect(script).toContain("Network.webSocketFrameSent");
+		expect(script).toContain('"contenteditable"');
+		expect(script).toContain("probe.failure");
+	});
+
+	test("evidence writer fails closed on fixture secrets and writes mode 0600", () => {
+		const dir = mkdtempSync(join(tmpdir(), "nf-fanout-evidence-"));
+		try {
+			const path = join(dir, "fanout.json");
+			expect(() => writePrivateEvidence(path, { leaked: "x/token-123/y" }, ["token-123"])).toThrow(
+				"privacy guard",
+			);
+			writePrivateEvidence(path, { ok: 1 }, ["token-123", ""]);
+			expect(statSync(path).mode & 0o777).toBe(0o600);
+			expect(
+				redactEvidence('{"id":"n-1","home":"/h/x/n-1"}', [
+					["/h/x", "<home>"],
+					["n-1", "<narrator-A>"],
+				]),
+			).toBe('{"id":"<narrator-A>","home":"<home>/<narrator-A>"}');
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
