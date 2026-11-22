@@ -93,6 +93,12 @@ function useStagingScope(target: GitTarget) {
 	current.current = owner;
 	const refused = subscriptions.isDenied(target);
 	const readable = typeof principal === "string" && subscriptions.canRead(target);
+	const displayAllowed =
+		readable ||
+		(typeof principal === "string" &&
+			subscriptions.getState(target) === "waiting" &&
+			!subscriptions.needsWorkspaceProbe(target.narratorId) &&
+			!subscriptions.getReadError(target));
 	async function read<T>(signal: AbortSignal, load: () => Promise<T>, shared = false): Promise<T> {
 		const authorized = subscriptions.getWriteResultGuard(target);
 		if (!authorized() || signal.aborted) throw new GitStagingGuardError();
@@ -115,7 +121,18 @@ function useStagingScope(target: GitTarget) {
 			throw error;
 		}
 	}
-	return { qc, subscriptions, principal, scopeKey, owner, current, refused, readable, read };
+	return {
+		qc,
+		subscriptions,
+		principal,
+		scopeKey,
+		owner,
+		current,
+		refused,
+		readable,
+		displayAllowed,
+		read,
+	};
 }
 
 export function useGitStagingLists(target: GitTarget) {
@@ -135,7 +152,7 @@ export function useGitStagingLists(target: GitTarget) {
 		// Recheck offline CLI observations on return, without a permanent polling loop.
 		refetchOnWindowFocus: "always",
 	});
-	const summary = readable ? query.data : undefined;
+	const summary = scope.displayAllowed ? query.data : undefined;
 	const supported = summary?.capability.supported === true;
 	const canManage =
 		supported && readable && subscriptions.canWrite(target) && target.canWrite && !query.error;
@@ -295,6 +312,12 @@ export function useGitStagingLists(target: GitTarget) {
 		selectionKey,
 		refused,
 		scopeKey,
+		displayScope: JSON.stringify([
+			target.narratorId,
+			target.workspaceKey,
+			principal,
+			subscriptions.getPrincipalKey(),
+		]),
 		preferenceKey: JSON.stringify([target.narratorId, target.workspaceKey, principal]),
 		notice: readable && notice?.scopeKey === scopeKey ? notice : undefined,
 		refresh,

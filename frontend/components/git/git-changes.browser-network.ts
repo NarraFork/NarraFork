@@ -158,6 +158,7 @@ export function createGitBrowserNetwork(
 	let holdFirst = false;
 	let holdStats = false;
 	let expireNextCursor = false;
+	let expireNextPage = false;
 	const stagingReads: string[] = [];
 	const stagingSummaryReads: Array<{ generation: number; settled: boolean }> = [];
 	let holdSummary = false;
@@ -606,8 +607,9 @@ export function createGitBrowserNetwork(
 		}
 		const denial = denied.get("page");
 		if (denial) denied.delete("page");
-		if (expireNextCursor && cursor) {
+		if (expireNextPage || (expireNextCursor && cursor)) {
 			expireNextCursor = false;
+			expireNextPage = false;
 			record.expired = true;
 			snapshots.delete(snapshotId);
 		}
@@ -1029,6 +1031,9 @@ export function createGitBrowserNetwork(
 		},
 		expireNextCursor() {
 			expireNextCursor = true;
+		},
+		expireNextPage() {
+			expireNextPage = true;
 		},
 		holdNextPage() {
 			holdNext = true;

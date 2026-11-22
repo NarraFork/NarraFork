@@ -1,12 +1,13 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
-import { Profiler, useState } from "react";
+import { Profiler, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { GitStatusPage } from "../../../shared/git-status-page";
 import { setTypography } from "../../../shared/pretext-layout/typography";
+import { useGitWorkspaceSubscription } from "../../hooks/useGit";
 import { useGitStagingLists } from "../../hooks/useGitStagingLists";
 import type { GitTarget } from "../../lib/api/git";
 import { type MessageCallback, narratorWSManager } from "../../lib/narrator-ws-manager";
@@ -42,6 +43,8 @@ if (params.get("staging") !== "1") {
 	let id = 0;
 	let version = 0;
 	Object.defineProperty(narratorWSManager, "connected", { configurable: true, value: true });
+	narratorWSManager.getCredentialIdentity = () => 1;
+	narratorWSManager.getConnectionCredentialIdentity = () => 1;
 	narratorWSManager.addListener = (_options, callback) => {
 		const handle = { _id: ++id };
 		callbacks.set(handle._id, callback);
@@ -56,6 +59,14 @@ if (params.get("staging") !== "1") {
 			queueMicrotask(() => {
 				for (const callback of callbacks.values())
 					callback({ ...message, type: "git_workspace_subscribed", version: ++version });
+				for (const callback of callbacks.values())
+					callback({
+						...message,
+						type: "git_workspace_snapshot",
+						version: ++version,
+						view: "details",
+						snapshot: { revision: version, updating: false, statusPages: network.publishCache() },
+					});
 			});
 		} else if (message.type === "git_workspace_refresh") {
 			const subscription = subscriptions.get(message.subscriptionId);
@@ -96,6 +107,17 @@ function ExtraStagingReader({ target }: { target: GitTarget }) {
 	useGitStagingLists(target);
 	return null;
 }
+function WorkspaceAuthorization({ target }: { target: GitTarget }) {
+	const subscriptions = useGitWorkspaceSubscription(target);
+	const workspace = useQuery({
+		queryKey: ["gitWorkspace", target.narratorId, target.workspaceKey],
+		queryFn: async () => target,
+	});
+	useEffect(() => {
+		if (workspace.data && workspace.dataUpdatedAt) subscriptions.confirmWorkspace(workspace.data);
+	}, [subscriptions, workspace.data, workspace.dataUpdatedAt]);
+	return null;
+}
 network.warm(currentTarget.workspaceKey);
 localStorage.setItem(
 	GIT_VIEW_PREFS_KEY,
@@ -127,6 +149,7 @@ function App() {
 	return (
 		<I18nextProvider i18n={i18n}>
 			<QueryClientProvider client={queryClient}>
+				{params.get("staging") === "1" && <WorkspaceAuthorization target={target} />}
 				<MantineProvider forceColorScheme="dark">
 					<ConfirmDialogProvider>
 						<div
@@ -605,6 +628,8 @@ export const fixture = {
 		return version;
 	},
 	expireSnapshot() {
+		// Exhaust automatic lease renewal so the retained range needs an explicit refresh.
+		network.expireNextPage();
 		for (const query of queryClient.getQueryCache().getAll()) {
 			if (query.getObserversCount() === 0) continue;
 			const data = query.state.data as { pages?: GitStatusPage[] } | undefined;

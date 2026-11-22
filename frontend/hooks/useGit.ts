@@ -254,7 +254,7 @@ function workspaceSubscriptions(qc: QueryClient) {
 			},
 			(target) => {
 				clearGitDisplay(qc, target.narratorId);
-				void qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+				void qc.resetQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 			},
 			(target, renewed) => {
 				const denied = deniedGitSummaries.get(qc)?.delete(target.narratorId);
@@ -526,7 +526,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	const subscriptions = workspaceSubscriptions(qc);
 	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	const principal = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
-	useEffect(() => subscriptions.retainSubject(), [subscriptions]);
+	useEffect(() => (!REMOTE_BUILD ? subscriptions.retainSubject() : undefined), [subscriptions]);
 	const { data: narrator, isError: narratorError } = useNarrator(narratorId ?? "");
 	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	useEffect(
@@ -998,7 +998,8 @@ function useAuthorizedGitQuery<T>(
 	const subscriptions = useGitWorkspaceSubscription(target);
 	const readable = !!target && subscriptions.canRead(target);
 	const query = useQuery({ ...options, enabled: readable && options.enabled !== false });
-	return { ...query, data: readable ? query.data : undefined };
+	const error = (target ? subscriptions.getReadError(target) : undefined) ?? query.error;
+	return { ...query, data: readable ? query.data : undefined, error, isError: !!error };
 }
 
 export function useGitBranches(target: GitTarget | undefined | null, enabled = true) {

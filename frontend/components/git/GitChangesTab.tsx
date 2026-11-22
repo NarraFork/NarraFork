@@ -366,7 +366,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		pages.isComplete &&
 		pages.snapshotValid &&
 		list.window.loadedFiles === pages.counts?.filteredFiles;
-	const snapshotNeedsRefresh = pages.pages.length > 0 && !pages.snapshotValid;
+	const snapshotNeedsRefresh = !!displayWindow?.snapshotId && !pages.snapshotValid;
 	const partialReason =
 		pages.pages[0]?.complete === false
 			? t("pages.partial", {
