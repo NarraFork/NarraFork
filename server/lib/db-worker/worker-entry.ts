@@ -55,6 +55,7 @@ import { readRevertSelectionBody } from "./revert-selection-body-query";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
 const port = parentPort;
@@ -220,6 +221,13 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "toolEditPreview") {
+					return readToolEditPreviewSnapshot(
+						getConnection(message.dbPath),
+						params.toolCallId,
+						controller.signal,
+					);
+				}
 				if (params.kind === "revertSelectionBody") {
 					return readRevertSelectionBody(getConnection(message.dbPath), params, controller.signal);
 				}

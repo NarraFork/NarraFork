@@ -9,8 +9,10 @@ import {
 } from "@shared/integrations/resources";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import { integrationAuthorities, integrationCapabilityGrants } from "../db/schema";
+import { readQuery } from "../db/worker-read";
+import { WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -192,11 +194,23 @@ function inspectBoundedJson(
  * Every reader parses rows strictly, so one such row would make the whole authority fail
  * to load. They grant nothing now and are left out; the next grant replacement revokes them.
  */
-function isDescribableGrant(grant: IntegrationCapabilityGrant): boolean {
+function isDescribableGrant(
+	grant: Pick<IntegrationCapabilityGrant, "capabilityId" | "scopeType">,
+): boolean {
 	return (
 		grant.capabilityId in CANONICAL_CAPABILITY_DESCRIPTORS &&
 		(grant.scopeType === "global" || resourceTypeIsCanonical(grant.scopeType))
 	);
+}
+
+function assertGrantCount(count: number): void {
+	if (count > MAX_GRANTS_PER_AUTHORITY) {
+		throw new AppError(
+			"Integration authority grant limit was exceeded",
+			500,
+			"INTEGRATION_GRANT_LIMIT_EXCEEDED",
+		);
+	}
 }
 
 function normalizeScope(scope: ResourceScope): ResourceScope {
@@ -612,14 +626,56 @@ export class IntegrationAuthorityService {
 			],
 			limit: MAX_GRANTS_PER_AUTHORITY + 1,
 		});
-		if (grants.length > MAX_GRANTS_PER_AUTHORITY) {
-			throw new AppError(
-				"Integration authority grant limit was exceeded",
-				500,
-				"INTEGRATION_GRANT_LIMIT_EXCEEDED",
-			);
-		}
+		assertGrantCount(grants.length);
 		return { authority, grants: grants.filter(isDescribableGrant) };
+	}
+
+	async getCommittedDisplaySnapshot(authorityId: string, signal?: AbortSignal) {
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		const id = normalizeId(authorityId, "authorityId");
+		const grant = integrationCapabilityGrants;
+		const order = sql`${grant.capabilityId}, ${grant.scopeKey}, ${grant.id}`;
+		const rows = await readQuery(
+			db
+				.select({
+					// Send the policy once even if the authority has many grants.
+					policyJson: sql<IntegrationAuthority["policyJson"]>`case
+					when row_number() over (order by ${order}) = 1 then ${integrationAuthorities.policyJson}
+				end`.mapWith(integrationAuthorities.policyJson),
+					grant: {
+						capabilityId: grant.capabilityId,
+						scopeType: grant.scopeType,
+						scopeId: grant.scopeId,
+					},
+				})
+				.from(integrationAuthorities)
+				.leftJoin(
+					grant,
+					and(
+						eq(grant.authorityId, integrationAuthorities.id),
+						isNull(grant.revokedAt),
+						or(isNull(grant.expiresAt), gt(grant.expiresAt, new Date().toISOString())),
+					),
+				)
+				.where(eq(integrationAuthorities.id, id))
+				.orderBy(order)
+				.limit(MAX_GRANTS_PER_AUTHORITY + 1),
+			{
+				diagnosticSource: "oauth-grant-detail",
+				maxRows: MAX_GRANTS_PER_AUTHORITY + 1,
+				signal,
+				timeoutMs: 5_000,
+			},
+		);
+		if (!rows[0]) return null;
+		assertGrantCount(rows.length);
+		return {
+			policyJson: rows[0].policyJson,
+			grants: rows.flatMap(({ grant }) => (grant && isDescribableGrant(grant) ? [grant] : [])),
+		};
 	}
 
 	async requireSnapshot(
