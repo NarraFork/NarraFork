@@ -5584,11 +5584,11 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
-									<ReasoningTranslationVisibilityContext.Provider value={translationVisibility}>
+								<ReasoningTranslationVisibilityContext.Provider value={translationVisibility}>
+									<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
 										{windowRowElements}
-									</ReasoningTranslationVisibilityContext.Provider>
-								</VListInteractionAdmissionContext.Provider>
+									</VListInteractionAdmissionContext.Provider>
+								</ReasoningTranslationVisibilityContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and
