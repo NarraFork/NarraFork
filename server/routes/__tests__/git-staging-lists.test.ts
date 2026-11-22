@@ -16,6 +16,7 @@ await import("../../services/narrator-service");
 const staging = await import("../../services/git-staging-lists-service");
 const realStagingService = staging.getGitStagingListsService;
 const management = await import("../../services/git-management-service");
+const realValidateGitFileTargets = management.validateGitFileTargets;
 const watch = await import("../../services/git-workspace-watch");
 const auth = await import("../../lib/auth");
 const oauthProvider = await import("../../lib/oauth-provider");
@@ -517,3 +518,72 @@ test("real HTTP unit selection validates complete resolved paths and preserves o
 	expect((await post(app, { workspaceKey, ...action })).status).toBe(200);
 	expect((await post(app, { workspaceKey, ...action })).status).toBe(409);
 }, 30_000);
+
+test.skipIf(process.platform === "win32")(
+	"real HTTP observations exceed 1000 paths and Unix colon files support preview and moves",
+	async () => {
+		const largeRoot = await realpath(
+			await mkdtemp(join(testEnvironment.isolatedHome, "large-git-")),
+		);
+		try {
+			const initialized = await realSafeSpawn({
+				cmd: ["git", "-C", largeRoot, "init", "--quiet", "--initial-branch=main"],
+				timeout: 10_000,
+				maxOutputBytes: 32_768,
+			});
+			expect(initialized.exitCode).toBe(0);
+			sqlite.query("UPDATE narrators SET cwd=? WHERE id='n1'").run(largeRoot);
+			await Promise.all(
+				Array.from({ length: 1000 }, (_, index) => writeFile(join(largeRoot, `file-${index}`), "")),
+			);
+			await writeFile(join(largeRoot, "a:b.txt"), "colon content\n");
+			spyOn(spawn, "safeSpawn").mockImplementation(realSafeSpawn);
+			spyOn(staging, "getGitStagingListsService").mockImplementation(realStagingService);
+			const app = appFor();
+			const workspaceKey = await key(app);
+			const oldBudget = spyOn(management, "validateGitFileTargets").mockImplementation(
+				(target, paths) => realValidateGitFileTargets(target, paths),
+			);
+			expect((await post(app, { workspaceKey, action: "init" })).status).toBe(400);
+			oldBudget.mockRestore();
+			for (const action of ["init", "sync"]) {
+				const response = await post(app, { workspaceKey, action });
+				expect(response.status).toBe(200);
+				expect(await response.json()).toMatchObject({ outcome: "applied" });
+			}
+			const getSummary = async () =>
+				(await app.request(`${BASE}/staging-lists?workspaceKey=${workspaceKey}`)).json();
+			let current = await getSummary();
+			const fromListId = current.activeListId;
+			const preview = await app.request(
+				`${BASE}/staging-lists/${fromListId}/diff?workspaceKey=${workspaceKey}&path=a%3Ab.txt`,
+			);
+			expect(preview.status).toBe(200);
+			expect((await preview.json()).diff).toContain("+colon content");
+			const created = await post(app, {
+				workspaceKey,
+				action: "create",
+				name: "B",
+				expectedGeneration: current.generation,
+				observationId: current.observationId,
+			});
+			expect(created.status).toBe(200);
+			const { listId } = await created.json();
+			current = await getSummary();
+			const moved = await post(app, {
+				workspaceKey,
+				action: "move",
+				fromListId,
+				toListId: listId,
+				paths: ["a:b.txt"],
+				expectedGeneration: current.generation,
+				observationId: current.observationId,
+			});
+			expect(moved.status).toBe(200);
+			expect(await moved.json()).toMatchObject({ outcome: "applied" });
+		} finally {
+			await rm(largeRoot, { recursive: true, force: true });
+		}
+	},
+	30_000,
+);
