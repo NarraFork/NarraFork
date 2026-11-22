@@ -3323,6 +3323,7 @@ async function* agentLoopInMetadataSnapshot(
 					knowledgeInjectedEntryIds,
 					{
 						projectId: config.projectId ?? undefined,
+						signal: config.signal,
 					},
 				);
 				if (scan) {

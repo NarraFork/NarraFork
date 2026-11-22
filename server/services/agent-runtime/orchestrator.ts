@@ -1522,6 +1522,7 @@ export async function runAgentLoopUnlocked(
 					const hits = await knowledgeInjection.resolveInjections(actingUserId, knowledgeQuery, {
 						already: knowledgeInjectedIds,
 						projectId: active._projectId ?? undefined,
+						signal: active.abortController.signal,
 					});
 					if (hits.length > 0) {
 						const block = knowledgeInjection.formatInjections(

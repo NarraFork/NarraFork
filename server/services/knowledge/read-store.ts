@@ -445,6 +445,7 @@ export interface KnowledgeReadStore {
 		userId: string;
 		collectionId?: string;
 		projectId?: string;
+		signal?: AbortSignal;
 	}): Promise<string>;
 	personalInjectionSnippets(
 		userId: string,
@@ -469,6 +470,7 @@ export interface KnowledgeReadStore {
 	keywordInjectionCandidatesSignature(opts: {
 		collectionId?: string;
 		projectId?: string;
+		signal?: AbortSignal;
 	}): Promise<string>;
 	/** Bounded body prefixes for the final injected hits only. */
 	snippetsByEntryIds(
