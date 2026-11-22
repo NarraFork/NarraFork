@@ -1564,7 +1564,12 @@ export const knowledgeInjectionReads = {
 			.filter((row) => row.keywords.length > 0);
 	},
 	async keywordInjectionCandidatesSignature(
-		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			userId?: string | null;
+			signal?: AbortSignal;
+		} = {},
 	) {
 		const global = await knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
 		const personal = opts.userId
