@@ -182,7 +182,10 @@ export class GitWorkspaceSubscriptions {
 			: undefined;
 	}
 	/** Capture before dispatch: a response cannot replace a newer connection or Worker notice. */
-	statusPageReadPublisher(target: GitTarget): (state: GitStatusPageCacheState) => boolean {
+	statusPageReadPublisher(
+		target: GitTarget,
+		{ membershipOnly = false } = {},
+	): (state: GitStatusPageCacheState) => boolean {
 		const key = authorizationKey(target);
 		const entry = this.entries.get(key);
 		const id = entry?.id;
@@ -205,6 +208,13 @@ export class GitWorkspaceSubscriptions {
 				previous?.workerEpoch === state.workerEpoch &&
 				previous.memberVersion === state.memberVersion &&
 				previous.statsVersion === state.statsVersion;
+			if (
+				membershipOnly &&
+				previous?.workerEpoch === state.workerEpoch &&
+				previous.memberVersion === state.memberVersion &&
+				previous.statsVersion > state.statsVersion
+			)
+				return true;
 			// Equal versions do not order scheduling/error transitions. Keep the latest
 			// authorized notice instead of letting an older HTTP read clear it.
 			return samePublished || this.publishStatusPageState(target, state);

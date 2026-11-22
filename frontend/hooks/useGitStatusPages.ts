@@ -201,7 +201,9 @@ export function useGitStatusPages(
 			// QueryClient may schedule an old chain's refetch in the same invalidation
 			// turn that retires its generation. Do not dispatch that obsolete request.
 			requestSignal.throwIfAborted();
-			const publish = subscriptions.statusPageReadPublisher(target as GitTarget);
+			const publish = subscriptions.statusPageReadPublisher(target as GitTarget, {
+				membershipOnly: pageParam !== undefined,
+			});
 			const baseline = subscriptions.getStatusPageState(target as GitTarget);
 			const result = await readWorkspace(
 				qc,

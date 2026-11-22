@@ -195,6 +195,40 @@ afterEach(async () => {
 	mock.restore();
 });
 
+test("new statistics preserve an in-flight continuation for the same membership", async () => {
+	const pending = deferred<GitStatusPageResult>();
+	const read = spyOn(api, "getGitStatusPage")
+		.mockResolvedValueOnce({ ...page(), hasMore: true, nextCursor: "second" })
+		.mockImplementationOnce(() => pending.promise)
+		.mockResolvedValue({ ...page(state(1, 2)), files: [{ path: "src/c", status: " M" }] });
+	spyOn(api, "getGitStatusPageStats").mockImplementation(async (_target, query) => measured(query));
+	await render();
+	const continuation = latest.fetchNextPage();
+	await flush();
+	publish(state(1, 2));
+	await flush();
+	pending.resolve({
+		...page(),
+		files: [{ path: "src/b", status: " M" }],
+		hasMore: true,
+		nextCursor: "third",
+	});
+	await continuation;
+	await flush();
+	expect(latest.pages).toHaveLength(2);
+	expect(latest.hasNextPage).toBe(true);
+	expect(latest.cache?.statsVersion).toBe(2);
+	await latest.fetchNextPage();
+	await flush();
+	expect(read.mock.calls.at(-1)?.[1]?.cursor).toBe("third");
+	expect(latest.pages).toHaveLength(3);
+	expect(latest.pages.flatMap((page) => page.files.map((file) => file.path))).toEqual([
+		"src/a",
+		"src/b",
+		"src/c",
+	]);
+});
+
 test("cached files cannot authorize range writes until their workspace subscription is acknowledged", async () => {
 	acknowledge = false;
 	const read = spyOn(api, "getGitStatusPage").mockResolvedValue(page());
