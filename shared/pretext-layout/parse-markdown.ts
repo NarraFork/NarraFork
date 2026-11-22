@@ -269,7 +269,17 @@ function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece 
 export function parseMarkdownToPreparedBlocks(
 	markdown: string,
 	math?: MathSupport,
+	sourceRanges = false,
 ): PreparedBlock[] {
+	if (sourceRanges)
+		return parseMarkdownUnits(markdown, math).flatMap(({ raw, consumedLength, blocks }) => {
+			// A token can consume the newline separating two source owners.
+			const range = {
+				start: consumedLength - raw.length + (raw.length - raw.trimStart().length),
+				end: consumedLength - (raw.length - raw.trimEnd().length),
+			};
+			return blocks.map((block) => ({ ...block, sourceRange: range }));
+		});
 	// `prepareMarkdownEmphasis` only rewrites pairs CommonMark would refuse
 	// (`**注意：**说明`); legal `**bold**` is byte-identical.
 	if (!math) {

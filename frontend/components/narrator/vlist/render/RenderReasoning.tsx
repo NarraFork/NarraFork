@@ -373,6 +373,7 @@ function ExpandedView({
 					measured={bodyMeasured}
 					showSource={showSource}
 					sourceText={sourceText}
+					observeSourceRanges={!!translationEvidence && sourceText === measured.displayText}
 					onUnknownHeight={
 						measured.textPreview?.expanded && hasUnpredictableBlock(measured.blocks)
 							? undefined

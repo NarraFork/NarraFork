@@ -85,59 +85,71 @@ export function reasoningTranslationSources(
 const MAX_EVIDENCE_CHARS = 64 * 1024;
 
 export interface ReasoningTranslationEvidence {
-	source: string;
-	display?: string;
-	target?: ReasoningTranslationVisibilityTarget;
+	start: number;
+	end: number;
+	step?: number;
+	target: ReasoningTranslationVisibilityTarget;
 }
 
-function normalized(text: string): string {
-	return text.trim().replace(/\s+/g, " ");
-}
-
-/** Include ineligible blocks in matching so their repeated text can't prove visibility. */
+/** These are offsets in the exact string produced by the adapter's two-newline join. */
 export function mergedReasoningTranslationEvidence(
 	message: SourceMessage,
 	entries: readonly SourceEntry[],
+	showOriginal = false,
 ): ReasoningTranslationEvidence[] | undefined {
 	if (entries.length > 64) return;
 	const evidence: ReasoningTranslationEvidence[] = [];
 	let chars = 0;
-	let targets = 0;
+	let end = 0;
 	for (const entry of entries) {
 		const source = entry.block.thinking ?? entry.block.text ?? "";
+		if (!source.length) continue;
 		chars += source.length;
 		if (chars > MAX_EVIDENCE_CHARS) return;
-		if (!source.trim()) continue;
 		const display = reasoningBlockDisplayText(entry.block);
 		chars += display?.length ?? 0;
 		if (chars > MAX_EVIDENCE_CHARS) return;
+		const start = end ? end + 2 : 0;
+		end = start + (showOriginal ? source : display || source).length;
 		const target =
-			targets < MAX_REASONING_TRANSLATION_VISIBLE_TARGETS
+			evidence.length < MAX_REASONING_TRANSLATION_VISIBLE_TARGETS
 				? reasoningTranslationSources(message, [entry])[0]
 				: undefined;
-		if (target) targets++;
-		evidence.push({
-			source: normalized(source),
-			display: display ? normalized(display) : undefined,
-			target,
-		});
+		if (target) evidence.push({ start, end, target });
 	}
-	if (targets) return evidence;
+	if (evidence.length) return evidence;
 }
 
-/** Ambiguous lines and rendered fragments that have no exact source match fail closed. */
-export function reasoningTranslationTargetForLine(
+/** Map an expanded step's reconstructed paragraph back into the run. */
+export function appendReasoningTranslationParagraph(
 	evidence: readonly ReasoningTranslationEvidence[],
-	text: string,
-): ReasoningTranslationVisibilityTarget | undefined {
-	if (text.length > 512) return;
-	const line = normalized(text);
-	if (!line) return;
-	let match: ReasoningTranslationEvidence | undefined;
-	for (const entry of evidence) {
-		if (!entry.source.includes(line) && !entry.display?.includes(line)) continue;
-		if (match) return;
-		match = entry;
+	result: ReasoningTranslationEvidence[],
+	step: number,
+	bodyStart: number,
+	runStart: number,
+	length: number,
+): void {
+	for (const { start, end, target } of evidence) {
+		const from = Math.max(runStart, start);
+		const to = Math.min(runStart + length, end);
+		if (from >= to) continue;
+		const startInBody = bodyStart + from - runStart;
+		const endInBody = bodyStart + to - runStart;
+		const previous = result.at(-1);
+		if (previous?.step === step && previous.target === target && previous.end + 2 === startInBody)
+			previous.end = endInBody;
+		else result.push({ step, start: startInBody, end: endInBody, target });
 	}
-	return match?.target;
+}
+
+/** A Markdown token spanning multiple source owners cannot prove visibility for either. */
+export function reasoningTranslationTargetForRange(
+	evidence: readonly ReasoningTranslationEvidence[],
+	start: number,
+	end: number,
+	step?: number,
+): ReasoningTranslationVisibilityTarget | undefined {
+	if (start >= end) return;
+	return evidence.find((entry) => entry.step === step && start >= entry.start && end <= entry.end)
+		?.target;
 }

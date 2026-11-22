@@ -2,7 +2,7 @@ import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { Loader } from "@mantine/core";
 import {
 	type ReasoningTranslationEvidence,
-	reasoningTranslationTargetForLine,
+	reasoningTranslationTargetForRange,
 } from "@shared/pretext-layout/reasoning-translation-sources";
 import {
 	MAX_REASONING_TRANSLATION_VISIBLE_TARGETS,
@@ -204,6 +204,7 @@ export function useVisibleReasoningSource<T extends Element>(
 	evidence?: readonly ReasoningTranslationEvidence[],
 	contentVersion?: unknown,
 	showSource?: boolean,
+	step?: number,
 ) {
 	const observer = useContext(ReasoningTranslationVisibilityContext);
 	const { ownerNarratorId, messageId, blockId, blockRevision, elementId } = target ?? {};
@@ -217,9 +218,14 @@ export function useVisibleReasoningSource<T extends Element>(
 				);
 				for (let i = 0; i < Math.min(512, lines.length); i++) {
 					const line = lines[i];
-					const text =
-						line.querySelector("[data-vlist-line-frags]")?.textContent ?? line.textContent;
-					const match = reasoningTranslationTargetForLine(evidence, text ?? "");
+					const origin = line.closest("[data-vlist-source-start][data-vlist-source-end]");
+					if (!origin || !node.contains(origin) || !line.textContent?.trim()) continue;
+					const match = reasoningTranslationTargetForRange(
+						evidence,
+						Number(origin.getAttribute("data-vlist-source-start")),
+						Number(origin.getAttribute("data-vlist-source-end")),
+						step,
+					);
 					if (match) cleanups.push(observer.register(line, match));
 				}
 				return () => {
@@ -245,6 +251,7 @@ export function useVisibleReasoningSource<T extends Element>(
 			evidence,
 			contentVersion,
 			showSource,
+			step,
 		],
 	);
 }

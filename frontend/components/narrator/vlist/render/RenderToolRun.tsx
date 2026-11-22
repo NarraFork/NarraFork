@@ -934,6 +934,8 @@ function TraceRowView({
 		translationSource,
 		translationEvidence,
 		translationEvidence ? row.body : undefined,
+		undefined,
+		row.itemIndex,
 	);
 	/**
 	 * The card node from the last render that HAD one, kept so a closing drill-down can

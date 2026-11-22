@@ -1,9 +1,14 @@
-import { expect, test } from "bun:test";
+import { beforeAll, expect, test } from "bun:test";
+import { installCanvasStub } from "../../frontend/components/narrator/vlist/measure/test-canvas-stub";
+import { parseMarkdownToPreparedBlocks } from "./parse-markdown";
 import {
 	mergedReasoningTranslationEvidence,
 	reasoningTranslationSources,
-	reasoningTranslationTargetForLine,
+	reasoningTranslationTargetForRange,
 } from "./reasoning-translation-sources";
+import { adaptSegment } from "./segment-adapter";
+
+beforeAll(() => installCanvasStub());
 
 test("merged runs retain only completed, untranslated named elements", () => {
 	const elements = [
@@ -39,11 +44,11 @@ test("merged runs retain only completed, untranslated named elements", () => {
 	]);
 });
 
-test("merged rows match only the block whose prose is visible", () => {
+test("formatted and repeated prose are attributed by source position, not painted text", () => {
 	const elements = [
-		{ type: "reasoning", id: "first", text: "First paragraph.\n\nRepeated sentence." },
-		{ type: "reasoning", id: "second", text: "Second paragraph.\n\nRepeated sentence." },
-		{ type: "reasoning", id: "old", text: "Old paragraph.", translatedText: "旧的段落。" },
+		{ type: "reasoning", id: "first", text: "Compare **these** plans.\n\nRepeated sentence." },
+		{ type: "reasoning", id: "second", text: "Compare these plans.\n\nRepeated sentence." },
+		{ type: "reasoning", id: "old", text: "Old paragraph.", translatedText: "已翻译。" },
 		{ type: "reasoning", id: "live", text: "Unsealed paragraph.", completed: false },
 	];
 	const blocks = elements.map((element, i) => ({
@@ -62,14 +67,78 @@ test("merged rows match only the block whose prose is visible", () => {
 		{ id: "message", narratorId: "owner", blocks },
 		elements.map((block, index) => ({ block, index })),
 	);
-	expect(evidence).toHaveLength(4);
-	const match = (text: string) => reasoningTranslationTargetForLine(evidence ?? [], text);
-	expect(match("First   paragraph.")).toMatchObject({ elementId: "first", blockRevision: 1 });
-	expect(match("Second paragraph.")).toMatchObject({ elementId: "second", blockRevision: 2 });
-	expect(match("Repeated sentence.")).toBeUndefined();
-	expect(match("旧的段落。")).toBeUndefined();
-	expect(match("Unsealed paragraph.")).toBeUndefined();
-	expect(match("Repeated sentence. Second paragraph.")).toBeUndefined();
+	expect(evidence).toHaveLength(2);
+	const text = elements.map((element) => element.translatedText ?? element.text).join("\n\n");
+	const parsed = parseMarkdownToPreparedBlocks(text, undefined, true);
+	expect(
+		parsed.map((block) => {
+			const range = block.sourceRange;
+			return (
+				range &&
+				reasoningTranslationTargetForRange(evidence ?? [], range.start, range.end)?.elementId
+			);
+		}),
+	).toEqual(["first", "first", "second", "second", undefined, undefined]);
+	expect(reasoningTranslationTargetForRange(evidence ?? [], 0, text.length)).toBeUndefined();
+});
+
+test("step provenance follows the rendered paragraphs across titles and translation updates", () => {
+	const elements = [
+		{ type: "reasoning", id: "first", text: "**First**\r\nCompare **these** plans.\n\nAgain." },
+		{ type: "reasoning", id: "second", text: "**Second**\n\nCompare these plans." },
+	];
+	const message = {
+		id: "message",
+		narratorId: "owner",
+		role: "assistant" as const,
+		model: "gpt-5.6",
+		blocks: elements.map((element, i) => ({
+			id: `block-${i}`,
+			kind: "reasoning",
+			subtype: null,
+			phase: "done" as const,
+			named: true,
+			revision: i + 1,
+			wireId: null,
+			attemptId: null,
+			hasOriginal: false,
+			elements: [element],
+		})),
+	};
+	const getSpec = (msg = message) => adaptSegment({ kind: "message", msg }, { lod: 5 })[0];
+	const spec = getSpec();
+	expect(spec.kind).toBe("reasoning-steps");
+	const firstLength = "Compare **these** plans.\n\nAgain.".length;
+	const secondLength = "Compare these plans.".length;
+	expect(
+		reasoningTranslationTargetForRange(spec.reasoningTranslationEvidence ?? [], 0, firstLength, 0),
+	).toMatchObject({ elementId: "first" });
+	expect(
+		reasoningTranslationTargetForRange(spec.reasoningTranslationEvidence ?? [], 0, secondLength, 1),
+	).toMatchObject({ elementId: "second" });
+	const translated = getSpec({
+		...message,
+		blocks: [
+			{
+				...message.blocks[0],
+				elements: [
+					{ ...elements[0], translatedText: "**第一**\n\n检查。" } as (typeof elements)[number],
+				],
+			},
+			message.blocks[1],
+		],
+	});
+	expect(
+		reasoningTranslationTargetForRange(translated.reasoningTranslationEvidence ?? [], 0, 3, 0),
+	).toBeUndefined();
+	expect(
+		reasoningTranslationTargetForRange(
+			translated.reasoningTranslationEvidence ?? [],
+			0,
+			secondLength,
+			1,
+		),
+	).toMatchObject({ elementId: "second" });
 });
 
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {
