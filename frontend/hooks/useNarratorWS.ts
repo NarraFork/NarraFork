@@ -9,7 +9,9 @@ import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-docum
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	type ReasoningTranslationPatch,
+	type ReasoningTranslationStatusFrame,
 	readReasoningTranslationPatch,
+	readReasoningTranslationStatus,
 } from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
@@ -877,6 +879,7 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onMessageUpdated?: (message: TreeMessage, replacement?: MessageReplacementAliases) => void;
 	onReasoningTranslationPatch?: (patch: ReasoningTranslationPatch) => void;
+	onReasoningTranslationStatus?: (frame: ReasoningTranslationStatusFrame) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -1046,6 +1049,11 @@ export function useNarratorWS(
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
+					case "reasoning_translation_status": {
+						const frame = readReasoningTranslationStatus(data);
+						if (frame) callbackOwner.callbacks.onReasoningTranslationStatus?.(frame);
+						break;
+					}
 					case "reasoning_translation_patch": {
 						const patch = readReasoningTranslationPatch(data);
 						if (patch) callbackOwner.callbacks.onReasoningTranslationPatch?.(patch);

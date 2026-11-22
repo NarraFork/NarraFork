@@ -78,6 +78,10 @@ import {
 import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
 import {
+	ReasoningTranslationIndicator,
+	useVisibleReasoningSource,
+} from "../reasoning-translation-visibility";
+import {
 	applyTraceUnknownHeights,
 	isExpandedUnknownTraceBody,
 	retainTraceUnknownHeights,
@@ -240,6 +244,7 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
 	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
 	onUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
@@ -390,6 +395,7 @@ function UnknownHeightTrace(props: RenderToolRunProps) {
 }
 
 function RenderMeasuredToolRun({
+	translationSource,
 	measured,
 	labels = {},
 	rowIcon,
@@ -505,6 +511,7 @@ function RenderMeasuredToolRun({
 			{/* ── Rows (+ expanded bodies) ── */}
 			{rows.map((row) => (
 				<TraceRowView
+					translationSource={translationSource}
 					key={row.key}
 					row={row}
 					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
@@ -868,6 +875,7 @@ function LiveTailText({
 }
 
 function TraceRowView({
+	translationSource,
 	row,
 	rowIcon,
 	onToggleRow,
@@ -888,6 +896,7 @@ function TraceRowView({
 	onToggleTextExpanded,
 	onBodyUnknownHeight,
 }: {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
 	onBodyUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
@@ -912,6 +921,7 @@ function TraceRowView({
 	animKeyBase?: string;
 	animScope?: string;
 }) {
+	const visibleRef = useVisibleReasoningSource<HTMLDivElement>(translationSource);
 	/**
 	 * The card node from the last render that HAD one, kept so a closing drill-down can
 	 * be animated shut around it (see `closingRowKeys`).
@@ -1175,6 +1185,7 @@ function TraceRowView({
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
 				<div
+					ref={visibleRef}
 					style={{
 						paddingBlock: rowSpacing(TRACE_BODY_PADDING_Y),
 						position: "absolute",
@@ -1186,6 +1197,7 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
+					{translationSource ? <ReasoningTranslationIndicator target={translationSource} /> : null}
 					<RenderTextPreview
 						textPreviewLabels={textPreviewLabels}
 						onToggleTextExpanded={onToggleTextExpanded}

@@ -108,6 +108,10 @@ import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
+import {
+	ReasoningTranslationVisibilityContext,
+	useReasoningTranslationVisibility,
+} from "./reasoning-translation-visibility";
 import { resolveRenderExtra } from "./render-registry";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
@@ -2459,7 +2463,12 @@ export const PretextExactMessageList = memo(
 			// control stream once a complete document exists. Realtime mutations reload
 			// the full exact input; reconnect catch-up reloads only when it reports data.
 			const externalSubscribeMessages = dataSource?.subscribeMessages;
+			const translationVisibility = useReasoningTranslationVisibility(
+				dataSource ? undefined : revisionSubscriptionId,
+			);
 			const messageWsCallbacks: NarratorWSCallbacks = {
+				onStreamingSnapshot: translationVisibility?.resume,
+				onReasoningTranslationStatus: translationVisibility?.receive,
 				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 					upsertOrReload(wsData.message),
 				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
@@ -2515,6 +2524,7 @@ export const PretextExactMessageList = memo(
 					if (messageId) compactProgressKeysRef.current.delete(messageId);
 				},
 				onFullReload: () => {
+					translationVisibility?.resume();
 					clearAllCompactProgress();
 					compactProgressKeysRef.current.clear();
 					bumpMessageRevision();
@@ -2542,6 +2552,7 @@ export const PretextExactMessageList = memo(
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
 				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
+					translationVisibility?.resume();
 					const initialSync = initialRevisionSyncRef.current;
 					initialRevisionSyncRef.current = false;
 					let applied = false;
@@ -2559,6 +2570,7 @@ export const PretextExactMessageList = memo(
 					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
 				},
 				onSyncOk: () => {
+					translationVisibility?.resume();
 					initialRevisionSyncRef.current = false;
 				},
 				// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
@@ -2566,6 +2578,7 @@ export const PretextExactMessageList = memo(
 				// receive, and refetch — the REST call now answers 404 and the surrounding
 				// route renders its "not found" state instead of an endless spinner.
 				onSubscribeDenied: () => {
+					translationVisibility?.pause();
 					initialRevisionSyncRef.current = false;
 					bumpMessageRevision();
 				},
@@ -5623,9 +5636,11 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
-									{windowRowElements}
-								</VListInteractionAdmissionContext.Provider>
+								<ReasoningTranslationVisibilityContext.Provider value={translationVisibility}>
+									<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+										{windowRowElements}
+									</VListInteractionAdmissionContext.Provider>
+								</ReasoningTranslationVisibilityContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

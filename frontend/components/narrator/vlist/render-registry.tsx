@@ -17,6 +17,7 @@ import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { SubagentDelegation } from "@shared/outline-report-note";
+import type { ReasoningTranslationVisibilityTarget } from "@shared/reasoning-translation";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
@@ -359,6 +360,9 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
 						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
@@ -519,6 +523,9 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
