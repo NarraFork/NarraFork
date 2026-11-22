@@ -30,6 +30,7 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { RecallConversationParams } from "./recall-conversation-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
@@ -60,6 +61,7 @@ export type DbReadTaskName =
 	| "blockReindexSlice"
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
+	| "recallConversation"
 	| "storageHistoryRead"
 	| "storageHistoryBody"
 	| "publicationTerminalResult";
@@ -263,6 +265,7 @@ export interface StorageScanTablesResult {
 
 export type DbReadTaskParams =
 	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
+	| RecallConversationParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| {
