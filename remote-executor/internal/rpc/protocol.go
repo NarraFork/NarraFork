@@ -5,6 +5,7 @@ package rpc
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/narrafork/remote-executor/internal/handlers"
 	"github.com/narrafork/remote-executor/internal/wire"
@@ -172,7 +173,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 	// Never let an arbitrary Features entry advertise unsupported os.Root semantics.
 	filtered := features[:0]
 	for _, feature := range features {
-		if feature != FeatureFsCreateBoundParentV1 {
+		if feature != FeatureFsCreateBoundParentV1 && !strings.HasPrefix(feature, "git.workspace.staging-") {
 			filtered = append(filtered, feature)
 		}
 	}
