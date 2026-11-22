@@ -43,6 +43,7 @@ import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
 	composeReasoningTranslation,
 	type ReasoningTranslationFields,
+	type ReasoningTranslationVisibilityTarget,
 } from "../reasoning-translation";
 import {
 	escapeMarkdown,
@@ -106,6 +107,7 @@ import {
 	parseStreamingReasoningSegments,
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
+import { reasoningTranslationSources } from "./reasoning-translation-sources";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -877,6 +879,8 @@ export interface ElementSpec {
 	key: string;
 	/** Measure input `data` for `measureElement(kind, data, …)`. */
 	data: unknown;
+	/** Persisted source coordinates for the transcript's visibility observer. */
+	reasoningTranslationSources?: ReasoningTranslationVisibilityTarget[];
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
 	/**
@@ -2313,6 +2317,13 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
+			const translationSources =
+				streamingMessage || reasoningBlocks.length !== 1
+					? []
+					: reasoningTranslationSources(
+							msg,
+							runIndices.map((index, position) => ({ block: reasoningBlocks[position], index })),
+						);
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -2340,6 +2351,7 @@ function adaptMessage(
 				specs.push({
 					kind: "reasoning-steps",
 					key,
+					...(translationSources.length && { reasoningTranslationSources: translationSources }),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2373,6 +2385,7 @@ function adaptMessage(
 				specs.push({
 					kind,
 					key,
+					...(translationSources.length && { reasoningTranslationSources: translationSources }),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {

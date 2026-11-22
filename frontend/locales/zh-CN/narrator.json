@@ -553,6 +553,8 @@
 	"narrator": "叙述者",
 	"thinking": "正在思考",
 	"reasoning": "推理",
+	"reasoningTranslationQueued": "推理翻译已排队",
+	"reasoningTranslating": "正在翻译推理",
 	"reasoningEncryptedPlaceholder": "推理内容已加密",
 	"reasoningChars": "{{formatted}} 字符",
 	"reasoningTranslationStatus": "正在翻译思考内容",

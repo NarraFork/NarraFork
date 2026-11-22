@@ -6,6 +6,7 @@ import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
 } from "@shared/pretext-layout/text-document";
+import type { ReasoningTranslationVisibilityReport } from "@shared/reasoning-translation";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
@@ -84,6 +85,7 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { reasoningTranslationScheduler } from "../services/reasoning-translation-runtime";
 import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
@@ -167,6 +169,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 // Client → Server messages
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
+	| ReasoningTranslationVisibilityReport
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
 	| { type: "pong" }
@@ -215,6 +218,83 @@ export type NarratorClientMessage =
 
 type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
 
+const translationHolders = new WeakMap<NarratorWS, Map<string, { narratorId: string }>>();
+
+function releaseTranslationDemand(ws: NarratorWS, narratorId?: string): void {
+	const holders = translationHolders.get(ws);
+	for (const [id, holder] of holders ?? []) {
+		if (narratorId && holder.narratorId !== narratorId) continue;
+		reasoningTranslationScheduler.replace(holder, []);
+		holders?.delete(id);
+	}
+}
+
+function setTranslationDemand(ws: NarratorWS, report: ReasoningTranslationVisibilityReport): void {
+	const { narratorId, visibilityId, targets } = report;
+	const userId = ws.data.userId;
+	if (
+		!userId ||
+		!connections.has(ws) ||
+		!ws.data.subscribedNarrators.has(narratorId) ||
+		ws.data.activityOnlyNarrators?.has(narratorId)
+	)
+		return;
+	const holders = translationHolders.get(ws) ?? new Map<string, { narratorId: string }>();
+	const previous = holders.get(visibilityId);
+	if (previous && previous.narratorId !== narratorId) return;
+	if (!targets.length) {
+		if (previous) reasoningTranslationScheduler.replace(previous, []);
+		holders.delete(visibilityId);
+		return;
+	}
+	if (!previous && holders.size >= 8) return;
+	const holder = previous ?? { narratorId };
+	holders.set(visibilityId, holder);
+	translationHolders.set(ws, holders);
+	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
+	const viewer = {
+		narratorId,
+		userId,
+		authorize: async (owner: string) => {
+			return (
+				(await authorizeNarratorId(narratorId, principal, "write")) &&
+				(owner === narratorId || (await authorizeNarratorId(owner, principal, "write")))
+			);
+		},
+	};
+	reasoningTranslationScheduler.replace(
+		holder,
+		targets.map((target) => ({
+			viewer,
+			target,
+			publish: (patch) => {
+				broadcastToNarrator(narratorId, patch);
+				if (patch.ownerNarratorId !== narratorId)
+					broadcastToNarrator(patch.ownerNarratorId, {
+						...patch,
+						narratorId: patch.ownerNarratorId,
+					});
+			},
+		})),
+		({ target }, status) =>
+			queueMicrotask(() => {
+				if (
+					!connections.has(ws) ||
+					!ws.data.subscribedNarrators.has(narratorId) ||
+					ws.data.activityOnlyNarrators?.has(narratorId)
+				)
+					return;
+				safeSend(ws, {
+					type: "reasoning_translation_status",
+					narratorId,
+					visibilityId,
+					target,
+					status,
+				});
+			}),
+	);
+}
+
 type ViewerInfo = {
 	userId: string;
 	username: string;
@@ -256,6 +336,7 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	releaseTranslationDemand(ws);
 	toolInputLaneSender.close(ws);
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
@@ -1577,6 +1658,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 			verdicts.set(cacheKey, allowed);
 		}
 		if (allowed) continue;
+		releaseTranslationDemand(ws, narratorId);
 		ws.data.subscribedNarrators.delete(narratorId);
 		toolInputLaneSender.clearNarrator(ws, narratorId);
 		safeSend(ws, { type: "subscribe_denied", narratorId });
@@ -2013,6 +2095,9 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "reasoning_translation_visibility":
+				setTranslationDemand(ws, msg);
+				break;
 			case "editor_file_subscribe":
 			case "editor_file_unsubscribe":
 				await handleEditorFileMessage(ws, msg);
@@ -2063,7 +2148,10 @@ export const handleNarratorWS = {
 				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
 				if (kind === "activity") {
 					ws.data.activityOnlyNarrators ??= new Set();
-					for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
+					for (const id of activityLevelIds) {
+						releaseTranslationDemand(ws, id);
+						ws.data.activityOnlyNarrators.add(id);
+					}
 				} else {
 					for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
 				}
@@ -2123,6 +2211,7 @@ export const handleNarratorWS = {
 			}
 			case "unsubscribe": {
 				for (const id of msg.narratorIds) {
+					releaseTranslationDemand(ws, id);
 					ws.data.subscribedNarrators.delete(id);
 					ws.data.activityOnlyNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);

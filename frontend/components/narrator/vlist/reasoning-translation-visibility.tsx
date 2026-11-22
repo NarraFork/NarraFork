@@ -1,0 +1,213 @@
+import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { Loader } from "@mantine/core";
+import {
+	MAX_REASONING_TRANSLATION_VISIBLE_TARGETS,
+	type ReasoningTranslationStatusFrame,
+	type ReasoningTranslationVisibilityTarget,
+	reasoningTranslationTargetKey,
+} from "@shared/reasoning-translation";
+import {
+	createContext,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useSyncExternalStore,
+} from "react";
+import { useTranslation } from "react-i18next";
+
+class VisibleReasoningBodies {
+	private readonly bodies = new Map<
+		Element,
+		{
+			target: ReasoningTranslationVisibilityTarget;
+			visible: boolean;
+		}
+	>();
+	private observer?: IntersectionObserver;
+	private frame?: number;
+	private ready = false;
+	private id?: string;
+	private sent = "";
+	private targets = new Map<string, ReasoningTranslationVisibilityTarget>();
+	private states = new Map<string, "queued" | "running">();
+	private listeners = new Set<() => void>();
+
+	constructor(private readonly narratorId: string) {}
+
+	subscribe = (listener: () => void) => {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	};
+
+	status(key: string) {
+		return this.states.get(key);
+	}
+
+	receive = (frame: ReasoningTranslationStatusFrame) => {
+		const key = reasoningTranslationTargetKey(frame.target);
+		if (frame.visibilityId !== this.id || !this.targets.has(key)) return;
+		if (frame.status === "idle") this.states.delete(key);
+		else this.states.set(key, frame.status);
+		this.emit();
+	};
+
+	private emit() {
+		for (const listener of this.listeners) listener();
+	}
+
+	resume = () => {
+		this.ready = true;
+		this.sent = "";
+		this.schedule();
+	};
+
+	pause = () => {
+		this.ready = false;
+		this.sent = "";
+		this.targets.clear();
+		this.states.clear();
+		this.emit();
+	};
+
+	stop = () => {
+		this.cancel();
+		this.report(new Map());
+		this.pause();
+	};
+
+	private report(targets: Map<string, ReasoningTranslationVisibilityTarget>) {
+		if (!this.ready) return;
+		const signature = JSON.stringify([...targets.keys()]);
+		if (signature === this.sent || (!this.id && !targets.size)) return;
+		this.id ??= crypto.randomUUID();
+		if (
+			!narratorWSManager.send({
+				type: "reasoning_translation_visibility",
+				narratorId: this.narratorId,
+				visibilityId: this.id,
+				targets: [...targets.values()],
+			})
+		)
+			return;
+		this.sent = signature;
+		this.targets = targets;
+		for (const key of this.states.keys()) if (!targets.has(key)) this.states.delete(key);
+		this.emit();
+	}
+
+	register(node: Element, target: ReasoningTranslationVisibilityTarget): () => void {
+		if (typeof IntersectionObserver !== "function") return () => {};
+		this.observer ??= new IntersectionObserver((entries) => {
+			for (const entry of entries) {
+				const body = this.bodies.get(entry.target);
+				if (body)
+					body.visible =
+						entry.isIntersecting &&
+						entry.intersectionRect.width > 0 &&
+						entry.intersectionRect.height > 0;
+			}
+			this.schedule();
+		});
+		this.bodies.set(node, { target, visible: false });
+		this.observer.observe(node);
+		return () => {
+			this.observer?.unobserve(node);
+			this.bodies.delete(node);
+			this.schedule();
+		};
+	}
+
+	schedule = () => {
+		if (this.frame !== undefined) return;
+		this.frame = requestAnimationFrame(() => {
+			this.frame = undefined;
+			const visible = new Map<string, ReasoningTranslationVisibilityTarget>();
+			if (document.visibilityState === "visible") {
+				for (const { target, visible: intersects } of this.bodies.values()) {
+					if (intersects) visible.set(reasoningTranslationTargetKey(target), target);
+					if (visible.size >= MAX_REASONING_TRANSLATION_VISIBLE_TARGETS) break;
+				}
+			}
+			this.report(visible);
+		});
+	};
+
+	cancel(): void {
+		if (this.frame !== undefined) cancelAnimationFrame(this.frame);
+		this.frame = undefined;
+	}
+
+	visibilityChanged = () => {
+		if (document.visibilityState === "visible") this.schedule();
+		else {
+			this.cancel();
+			this.report(new Map());
+		}
+	};
+}
+
+export const ReasoningTranslationVisibilityContext = createContext<VisibleReasoningBodies | null>(
+	null,
+);
+
+export function useReasoningTranslationVisibility(narratorId: string | undefined) {
+	const observer = useMemo(
+		() => (narratorId ? new VisibleReasoningBodies(narratorId) : null),
+		[narratorId],
+	);
+	useEffect(() => {
+		if (!observer) return;
+		const unsubscribe = narratorWSManager.onConnectionChange((connected) => {
+			if (!connected) observer.pause();
+		});
+		document.addEventListener("visibilitychange", observer.visibilityChanged);
+		return () => {
+			unsubscribe();
+			document.removeEventListener("visibilitychange", observer.visibilityChanged);
+			observer.stop();
+		};
+	}, [observer]);
+	return observer;
+}
+
+export function useVisibleReasoningSource<T extends Element>(
+	target: ReasoningTranslationVisibilityTarget | undefined,
+) {
+	const observer = useContext(ReasoningTranslationVisibilityContext);
+	return useCallback(
+		(node: T | null) => {
+			if (observer && target && node) return observer.register(node, target);
+		},
+		[observer, target],
+	);
+}
+
+const noSubscribe = () => () => {};
+
+export function ReasoningTranslationIndicator({
+	target,
+}: {
+	target: ReasoningTranslationVisibilityTarget;
+}) {
+	const observer = useContext(ReasoningTranslationVisibilityContext);
+	const key = reasoningTranslationTargetKey(target);
+	const status = useSyncExternalStore(observer?.subscribe ?? noSubscribe, () =>
+		observer?.status(key),
+	);
+	const { t } = useTranslation("narrator");
+	if (!status) return null;
+	const label = t(status === "queued" ? "reasoningTranslationQueued" : "reasoningTranslating");
+	return (
+		<span
+			role="status"
+			aria-label={label}
+			title={label}
+			style={{ position: "absolute", top: 4, right: 4 }}
+		>
+			<Loader size={12} color="grape" aria-hidden />
+		</span>
+	);
+}

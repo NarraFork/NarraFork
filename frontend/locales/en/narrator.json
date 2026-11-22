@@ -553,6 +553,8 @@
 	"narrator": "Narrator",
 	"thinking": "Thinking",
 	"reasoning": "Reasoning",
+	"reasoningTranslationQueued": "Reasoning translation queued",
+	"reasoningTranslating": "Translating reasoning",
 	"reasoningEncryptedPlaceholder": "Reasoning content is encrypted",
 	"reasoningChars": "{{formatted}} chars",
 	"reasoningTranslationStatus": "Translating reasoning",

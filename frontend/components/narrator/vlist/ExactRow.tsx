@@ -407,6 +407,8 @@ export const ExactRow = memo(
 		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
+		const translationSource = item.spec.reasoningTranslationSources?.[0];
+		if (translationSource) extra.reasoningTranslationSource = translationSource;
 		const resolveContentTarget: ContentTargetResolver = (target) =>
 			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;
