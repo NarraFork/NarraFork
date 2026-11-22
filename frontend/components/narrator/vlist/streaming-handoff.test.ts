@@ -3,7 +3,7 @@ import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isLiveStreamingBlock } from "@shared/pretext-layout/streaming-live-blocks";
 import {
-	projectPendingEmptyReasoning,
+	projectPendingReasoning,
 	projectStreamingDocument,
 	projectStreamingMessage,
 } from "./streaming-handoff";
@@ -132,13 +132,31 @@ describe("block identity/revision handoff projection", () => {
 	});
 });
 
-describe("pending empty reasoning display projection", () => {
+describe("pending reasoning display projection", () => {
 	const empty = { type: "reasoning", text: "" };
 	const isLive = (msg: TreeMessage, index = 0) => isLiveStreamingBlock(false, msg, index);
 
+	it("keeps an open, sealed summary expanded through the streaming handoff", () => {
+		const summary = { ...empty, id: "r1", revision: 2, text: "First", sealedReasoningLength: 5 };
+		const row = message([summary]);
+		const checkpoint = {
+			...row,
+			blocks: row.blocks.map((block) => ({ ...block, phase: "open" as const })),
+		};
+		expect(isLive(projectPendingReasoning([checkpoint], true)[0])).toBe(true);
+		expect(isLive(projectPendingReasoning([checkpoint], false)[0])).toBe(false);
+		const done = {
+			...row,
+			blocks: row.blocks.map((block) => ({ ...block, phase: "done" as const })),
+		};
+		expect(isLive(projectPendingReasoning([done], true)[0])).toBe(false);
+		const following = message([text("answer", 1)], "next");
+		expect(isLive(projectPendingReasoning([checkpoint, following], true)[0])).toBe(false);
+	});
+
 	it("keeps only the last empty block live after persistence without changing stored messages", () => {
 		const committed = [message([empty], "r1"), message([empty], "r2")];
-		const projected = projectPendingEmptyReasoning(committed, true);
+		const projected = projectPendingReasoning(committed, true);
 		expect(projected).toHaveLength(2);
 		expect(projected[0]).toBe(committed[0]);
 		expect(isLive(projected[0])).toBe(false);
@@ -149,7 +167,7 @@ describe("pending empty reasoning display projection", () => {
 
 	it("stops on idle, interruption or failure (inactive session)", () => {
 		const committed = [message([empty])];
-		expect(projectPendingEmptyReasoning(committed, false)).toBe(committed);
+		expect(projectPendingReasoning(committed, false)).toBe(committed);
 	});
 
 	it("stops when text or a tool follows in the same or a later message", () => {
@@ -158,7 +176,7 @@ describe("pending empty reasoning display projection", () => {
 				[message([empty, output])],
 				[message([empty]), message([output], "next")],
 			]) {
-				expect(projectPendingEmptyReasoning(committed, true)).toBe(committed);
+				expect(projectPendingReasoning(committed, true)).toBe(committed);
 			}
 		}
 	});
@@ -170,10 +188,10 @@ describe("pending empty reasoning display projection", () => {
 			{ ...empty, translatedText: "translation" },
 		]) {
 			const committed = [message([block])];
-			expect(projectPendingEmptyReasoning(committed, true)).toBe(committed);
+			expect(projectPendingReasoning(committed, true)).toBe(committed);
 		}
 		const nextTurn = [message([empty]), message([], "user", { role: "user" })];
-		expect(projectPendingEmptyReasoning(nextTurn, true)).toBe(nextTurn);
+		expect(projectPendingReasoning(nextTurn, true)).toBe(nextTurn);
 	});
 
 	it("supports hidden/encrypted and thinking blocks on reconnect without a live row", () => {
@@ -182,10 +200,7 @@ describe("pending empty reasoning display projection", () => {
 			{ ...empty, providerMetadata: { hasEncryptedReasoning: true } },
 		]) {
 			const committed = [message([block])];
-			const projected = projectPendingEmptyReasoning(
-				projectStreamingDocument(committed, null),
-				true,
-			);
+			const projected = projectPendingReasoning(projectStreamingDocument(committed, null), true);
 			expect(isLive(projected[0])).toBe(true);
 		}
 	});
@@ -195,14 +210,14 @@ describe("pending empty reasoning display projection", () => {
 			message([empty]),
 			message([text("child", 1)], "child", { parentToolUseId: "agent" }),
 		];
-		expect(isLive(projectPendingEmptyReasoning(committed, true)[0])).toBe(true);
+		expect(isLive(projectPendingReasoning(committed, true)[0])).toBe(true);
 		const child = [message([empty], "child", { parentToolUseId: "agent" })];
-		expect(projectPendingEmptyReasoning(child, true)).toBe(child);
-		expect(isLive(projectPendingEmptyReasoning(child, true, true)[0])).toBe(true);
+		expect(projectPendingReasoning(child, true)).toBe(child);
+		expect(isLive(projectPendingReasoning(child, true, true)[0])).toBe(true);
 	});
 
 	it("does not revive a synthetic lane already closed by a tool event", () => {
 		const messages = [message([empty]), live([empty], -1)];
-		expect(projectPendingEmptyReasoning(messages, true)).toBe(messages);
+		expect(projectPendingReasoning(messages, true)).toBe(messages);
 	});
 });
