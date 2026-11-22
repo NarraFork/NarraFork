@@ -552,6 +552,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
 	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
+	"server/lib/db-worker/file-revert-selection-body-query.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/lib/db-worker/execution-policy-query.ts": ["driver", "json1"],
 	"server/services/execution-policy/repository.ts": ["handle"],

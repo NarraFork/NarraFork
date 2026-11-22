@@ -41,6 +41,7 @@ import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { readExecutionPolicySnapshot } from "./execution-policy-query";
 import { workerFailureDetails } from "./failure";
+import { readRevertSelectionBody } from "./file-revert-selection-body-query";
 import { readKnowledgeEntryDetail } from "./knowledge-entry-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
@@ -253,6 +254,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 				}
 				if (params.kind === "recallConversation") {
 					return readRecallConversation(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "revertSelectionBody") {
+					return readRevertSelectionBody(getConnection(message.dbPath), params, controller.signal);
 				}
 				if (params.kind === "publicationTerminalResult") {
 					return readPublicationTerminalSnapshot(

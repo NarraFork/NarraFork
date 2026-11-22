@@ -50,6 +50,7 @@ export type DbReadTaskName =
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "revertSelectionBody"
 	| "databaseCleanupContext"
 	| "toolDetailSnapshot"
 	| "selectRows"
@@ -88,6 +89,20 @@ export interface SelectRowsParams {
 export interface SelectRowsResult {
 	columns: string[];
 	rows: unknown[][];
+}
+
+export interface RevertSelectionInspectionSource {
+	id: string;
+	refId: string;
+	narratorId: string;
+	contentBytes: number;
+	bodyRevision: number | null;
+	stateRevision: number | null;
+}
+
+export interface RevertSelectionBodyParams extends RevertSelectionInspectionSource {
+	kind: "revertSelectionBody";
+	blockReads: boolean;
 }
 
 export interface StorageScanContextParams {
@@ -288,6 +303,7 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| RevertSelectionBodyParams
 	| { kind: "databaseCleanupContext" }
 	| ToolDetailSnapshotParams
 	| SelectRowsParams
