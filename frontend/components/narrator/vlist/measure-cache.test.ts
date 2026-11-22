@@ -71,6 +71,28 @@ describe("text preview cache keys", () => {
 		const data = (body: string) => ({ steps: [{ key: "seg0", title: "step", body }] });
 		expect(extractDataRevision(data("first"))).not.toBe(extractDataRevision(data("other")));
 	});
+
+	it("remeasures an open reasoning card as translations arrive at the same document revision", async () => {
+		const { measureElementCached } = await import("./registry");
+		const text = "First.\n\nSecond.";
+		const measure = (translatedText?: string) =>
+			measureElementCached(
+				"reasoning",
+				{ text, translatedText },
+				420,
+				5,
+				{ expanded: true },
+				"reasoning-translation-cache",
+				1,
+			);
+		const original = measure();
+		const partial = measure("第一。\n\nSecond.");
+		const complete = measure("第一。\n\n第二。");
+		expect(original).toMatchObject({ displayText: text, hasTranslationToggle: false });
+		expect(partial).toMatchObject({ displayText: "第一。\n\nSecond.", hasTranslationToggle: true });
+		expect(complete).toMatchObject({ displayText: "第一。\n\n第二。", hasTranslationToggle: true });
+		expect(measure("第一。\n\n第二。")).toBe(complete);
+	});
 });
 
 describe("mixed action-card append cache locality", () => {
