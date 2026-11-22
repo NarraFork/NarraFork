@@ -30,6 +30,7 @@ const CODE_PADDING_X = 12;
 export interface MeasureMarkdownOptions {
 	/** Reuse already-parsed blocks (skip the marked.lexer pass). */
 	preparedBlocks?: PreparedBlock[];
+	sourceRanges?: boolean;
 }
 
 /**
@@ -45,7 +46,7 @@ export function measureMarkdown(
 	// Cross-width memo: the parse is width-independent and dominates this measure,
 	// so a resize must not re-run it (see prepared-markdown-cache). The streaming
 	// path still passes its own incrementally prepared blocks via `opts`.
-	const blocks = opts.preparedBlocks ?? preparedMarkdownBlocks(markdown);
+	const blocks = opts.preparedBlocks ?? preparedMarkdownBlocks(markdown, opts.sourceRanges);
 	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics, {
 		codePaddingX: CODE_PADDING_X,
 		codePaddingY: CODE_PADDING_Y,
