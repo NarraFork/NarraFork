@@ -36,6 +36,7 @@ import {
 	runBlockReindexSlice,
 	runBlockVerifySlice,
 } from "./block-backfill-query";
+import { readCompactSummary } from "./compact-summary-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { workerFailureDetails } from "./failure";
@@ -222,6 +223,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "compactSummary") {
+					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
+				}
 				if (params.kind === "toolEditPreview") {
 					return readToolEditPreviewSnapshot(
 						getConnection(message.dbPath),
