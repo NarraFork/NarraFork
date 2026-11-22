@@ -234,10 +234,7 @@ describe("execution policy engine cache eviction on failure", () => {
 		try {
 			const unaffected = engine.compile("other", null);
 			const affected = engine.compile("child", null);
-			const [unaffectedResult, affectedResult] = [
-				expect(unaffected).resolves.toMatchObject({ narratorId: "other" }),
-				expect(affected).rejects.toThrow("Execution policy changed while loading"),
-			];
+			const settled = Promise.allSettled([unaffected, affected]);
 			engine.invalidateProject("edited");
 			unrelated.resolve(makeMinimalPolicy({ narratorId: "other", projectIds: ["unrelated"] }));
 			inherited.resolve(
@@ -247,7 +244,15 @@ describe("execution policy engine cache eviction on failure", () => {
 					projectIds: ["unrelated", "edited"],
 				}),
 			);
-			await Promise.all([unaffectedResult, affectedResult]);
+			expect(await settled).toEqual([
+				{ status: "fulfilled", value: expect.objectContaining({ narratorId: "other" }) },
+				{
+					status: "rejected",
+					reason: expect.objectContaining({
+						message: expect.stringContaining("Execution policy changed while loading"),
+					}),
+				},
+			]);
 			await expect(engine.compile("child", null)).resolves.toMatchObject({ narratorId: "child" });
 			await expect(engine.compile("other", null)).resolves.toMatchObject({ narratorId: "other" });
 			expect(load).toHaveBeenCalledTimes(3);
