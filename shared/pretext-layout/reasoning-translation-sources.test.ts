@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { reasoningTranslationSources } from "./reasoning-translation-sources";
+import {
+	mergedReasoningTranslationEvidence,
+	reasoningTranslationSources,
+	reasoningTranslationTargetForLine,
+} from "./reasoning-translation-sources";
 
 test("merged runs retain only completed, untranslated named elements", () => {
 	const elements = [
@@ -33,6 +37,39 @@ test("merged runs retain only completed, untranslated named elements", () => {
 			elementId: "done",
 		},
 	]);
+});
+
+test("merged rows match only the block whose prose is visible", () => {
+	const elements = [
+		{ type: "reasoning", id: "first", text: "First paragraph.\n\nRepeated sentence." },
+		{ type: "reasoning", id: "second", text: "Second paragraph.\n\nRepeated sentence." },
+		{ type: "reasoning", id: "old", text: "Old paragraph.", translatedText: "旧的段落。" },
+		{ type: "reasoning", id: "live", text: "Unsealed paragraph.", completed: false },
+	];
+	const blocks = elements.map((element, i) => ({
+		id: `block-${i}`,
+		kind: "reasoning",
+		subtype: null,
+		phase: i === 3 ? "open" : "done",
+		named: true,
+		revision: i + 1,
+		wireId: null,
+		attemptId: null,
+		hasOriginal: false,
+		elements: [element],
+	}));
+	const evidence = mergedReasoningTranslationEvidence(
+		{ id: "message", narratorId: "owner", blocks },
+		elements.map((block, index) => ({ block, index })),
+	);
+	expect(evidence).toHaveLength(4);
+	const match = (text: string) => reasoningTranslationTargetForLine(evidence ?? [], text);
+	expect(match("First   paragraph.")).toMatchObject({ elementId: "first", blockRevision: 1 });
+	expect(match("Second paragraph.")).toMatchObject({ elementId: "second", blockRevision: 2 });
+	expect(match("Repeated sentence.")).toBeUndefined();
+	expect(match("旧的段落。")).toBeUndefined();
+	expect(match("Unsealed paragraph.")).toBeUndefined();
+	expect(match("Repeated sentence. Second paragraph.")).toBeUndefined();
 });
 
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {

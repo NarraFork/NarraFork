@@ -409,6 +409,8 @@ export const ExactRow = memo(
 		const extra = resolveRenderExtra(item.spec);
 		const translationSource = item.spec.reasoningTranslationSources?.[0];
 		if (translationSource) extra.reasoningTranslationSource = translationSource;
+		if (item.spec.reasoningTranslationEvidence)
+			extra.reasoningTranslationEvidence = item.spec.reasoningTranslationEvidence;
 		const resolveContentTarget: ContentTargetResolver = (target) =>
 			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;

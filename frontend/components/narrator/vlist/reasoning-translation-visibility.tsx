@@ -1,6 +1,10 @@
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { Loader } from "@mantine/core";
 import {
+	type ReasoningTranslationEvidence,
+	reasoningTranslationTargetForLine,
+} from "@shared/pretext-layout/reasoning-translation-sources";
+import {
 	MAX_REASONING_TRANSLATION_VISIBLE_TARGETS,
 	type ReasoningTranslationStatusFrame,
 	type ReasoningTranslationVisibilityTarget,
@@ -197,20 +201,32 @@ export function useReasoningTranslationVisibility(narratorId: string | undefined
 
 export function useVisibleReasoningSource<T extends Element>(
 	target: ReasoningTranslationVisibilityTarget | undefined,
+	evidence?: readonly ReasoningTranslationEvidence[],
+	contentVersion?: unknown,
+	showSource?: boolean,
 ) {
 	const observer = useContext(ReasoningTranslationVisibilityContext);
 	const { ownerNarratorId, messageId, blockId, blockRevision, elementId } = target ?? {};
 	return useCallback(
 		(node: T | null) => {
-			if (
-				observer &&
-				node &&
-				ownerNarratorId &&
-				messageId &&
-				blockId &&
-				blockRevision !== undefined &&
-				elementId
-			)
+			if (!observer || !node) return;
+			if (evidence && contentVersion) {
+				const cleanups: (() => void)[] = [];
+				const lines = node.querySelectorAll(
+					showSource ? "[data-vlist-source-line]" : "[data-vlist-line]",
+				);
+				for (let i = 0; i < Math.min(512, lines.length); i++) {
+					const line = lines[i];
+					const text =
+						line.querySelector("[data-vlist-line-frags]")?.textContent ?? line.textContent;
+					const match = reasoningTranslationTargetForLine(evidence, text ?? "");
+					if (match) cleanups.push(observer.register(line, match));
+				}
+				return () => {
+					for (const cleanup of cleanups) cleanup();
+				};
+			}
+			if (ownerNarratorId && messageId && blockId && blockRevision !== undefined && elementId)
 				return observer.register(node, {
 					ownerNarratorId,
 					messageId,
@@ -219,7 +235,17 @@ export function useVisibleReasoningSource<T extends Element>(
 					elementId,
 				});
 		},
-		[observer, ownerNarratorId, messageId, blockId, blockRevision, elementId],
+		[
+			observer,
+			ownerNarratorId,
+			messageId,
+			blockId,
+			blockRevision,
+			elementId,
+			evidence,
+			contentVersion,
+			showSource,
+		],
 	);
 }
 
@@ -227,14 +253,23 @@ const noSubscribe = () => () => {};
 
 export function ReasoningTranslationIndicator({
 	target,
+	evidence,
 }: {
-	target: ReasoningTranslationVisibilityTarget;
+	target?: ReasoningTranslationVisibilityTarget;
+	evidence?: readonly ReasoningTranslationEvidence[];
 }) {
 	const observer = useContext(ReasoningTranslationVisibilityContext);
-	const key = reasoningTranslationTargetKey(target);
-	const status = useSyncExternalStore(observer?.subscribe ?? noSubscribe, () =>
-		observer?.status(key),
-	);
+	const status = useSyncExternalStore(observer?.subscribe ?? noSubscribe, () => {
+		if (target) return observer?.status(reasoningTranslationTargetKey(target));
+		let queued = false;
+		for (const entry of evidence ?? []) {
+			if (!entry.target) continue;
+			const current = observer?.status(reasoningTranslationTargetKey(entry.target));
+			if (current === "running") return current;
+			if (current === "queued") queued = true;
+		}
+		return queued ? "queued" : undefined;
+	});
 	const { t } = useTranslation("narrator");
 	if (!status) return null;
 	const label = t(status === "queued" ? "reasoningTranslationQueued" : "reasoningTranslating");

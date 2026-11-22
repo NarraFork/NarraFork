@@ -1,5 +1,6 @@
 import { blockAtIndex, type MessageWithBody } from "../narrator-blocks/message-blocks";
 import {
+	composeReasoningTranslation,
 	getValidReasoningTranslationParts,
 	isReasoningTranslationBoundary,
 	isReasoningTranslationId,
@@ -22,10 +23,20 @@ interface SourceMessage extends MessageWithBody<SourceElement> {
 	narratorId?: string | null;
 }
 
+type SourceEntry = { index: number; block: SourceElement };
+
+export function reasoningBlockDisplayText(block: SourceElement): string | undefined | null {
+	const source = block.thinking ?? block.text ?? "";
+	if (!source.length) return null;
+	return block.translationGeneration !== undefined || block.translationParts !== undefined
+		? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
+		: block.translatedText;
+}
+
 /** Keep the original named-block identity when adjacent reasoning is rendered as one run. */
 export function reasoningTranslationSources(
 	message: SourceMessage,
-	entries: readonly { index: number; block: SourceElement }[],
+	entries: readonly SourceEntry[],
 ): ReasoningTranslationVisibilityTarget[] {
 	const { id: messageId, narratorId: ownerNarratorId } = message;
 	if (!isReasoningTranslationId(messageId) || !isReasoningTranslationId(ownerNarratorId)) return [];
@@ -69,4 +80,64 @@ export function reasoningTranslationSources(
 		if (targets.length >= MAX_REASONING_TRANSLATION_VISIBLE_TARGETS) break;
 	}
 	return targets;
+}
+
+const MAX_EVIDENCE_CHARS = 64 * 1024;
+
+export interface ReasoningTranslationEvidence {
+	source: string;
+	display?: string;
+	target?: ReasoningTranslationVisibilityTarget;
+}
+
+function normalized(text: string): string {
+	return text.trim().replace(/\s+/g, " ");
+}
+
+/** Include ineligible blocks in matching so their repeated text can't prove visibility. */
+export function mergedReasoningTranslationEvidence(
+	message: SourceMessage,
+	entries: readonly SourceEntry[],
+): ReasoningTranslationEvidence[] | undefined {
+	if (entries.length > 64) return;
+	const evidence: ReasoningTranslationEvidence[] = [];
+	let chars = 0;
+	let targets = 0;
+	for (const entry of entries) {
+		const source = entry.block.thinking ?? entry.block.text ?? "";
+		chars += source.length;
+		if (chars > MAX_EVIDENCE_CHARS) return;
+		if (!source.trim()) continue;
+		const display = reasoningBlockDisplayText(entry.block);
+		chars += display?.length ?? 0;
+		if (chars > MAX_EVIDENCE_CHARS) return;
+		const target =
+			targets < MAX_REASONING_TRANSLATION_VISIBLE_TARGETS
+				? reasoningTranslationSources(message, [entry])[0]
+				: undefined;
+		if (target) targets++;
+		evidence.push({
+			source: normalized(source),
+			display: display ? normalized(display) : undefined,
+			target,
+		});
+	}
+	if (targets) return evidence;
+}
+
+/** Ambiguous lines and rendered fragments that have no exact source match fail closed. */
+export function reasoningTranslationTargetForLine(
+	evidence: readonly ReasoningTranslationEvidence[],
+	text: string,
+): ReasoningTranslationVisibilityTarget | undefined {
+	if (text.length > 512) return;
+	const line = normalized(text);
+	if (!line) return;
+	let match: ReasoningTranslationEvidence | undefined;
+	for (const entry of evidence) {
+		if (!entry.source.includes(line) && !entry.display?.includes(line)) continue;
+		if (match) return;
+		match = entry;
+	}
+	return match?.target;
 }

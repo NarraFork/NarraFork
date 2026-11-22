@@ -40,10 +40,9 @@ import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
-import {
-	composeReasoningTranslation,
-	type ReasoningTranslationFields,
-	type ReasoningTranslationVisibilityTarget,
+import type {
+	ReasoningTranslationFields,
+	ReasoningTranslationVisibilityTarget,
 } from "../reasoning-translation";
 import {
 	escapeMarkdown,
@@ -107,7 +106,12 @@ import {
 	parseStreamingReasoningSegments,
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
-import { reasoningTranslationSources } from "./reasoning-translation-sources";
+import {
+	mergedReasoningTranslationEvidence,
+	type ReasoningTranslationEvidence,
+	reasoningBlockDisplayText,
+	reasoningTranslationSources,
+} from "./reasoning-translation-sources";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -881,6 +885,7 @@ export interface ElementSpec {
 	data: unknown;
 	/** Persisted source coordinates for the transcript's visibility observer. */
 	reasoningTranslationSources?: ReasoningTranslationVisibilityTarget[];
+	reasoningTranslationEvidence?: ReasoningTranslationEvidence[];
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
 	/**
@@ -1402,10 +1407,7 @@ function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]
 	const parts = blocks.map((block) => {
 		const source = block.thinking ?? block.text ?? "";
 		if (!source.length) return source;
-		const replacement =
-			block.translationGeneration !== undefined || block.translationParts !== undefined
-				? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
-				: block.translatedText;
+		const replacement = reasoningBlockDisplayText(block);
 		if (!replacement) return source;
 		translated = true;
 		return replacement;
@@ -2317,13 +2319,20 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
+			const entries = runIndices.map((index, position) => ({
+				block: reasoningBlocks[position],
+				index,
+			}));
 			const translationSources =
-				streamingMessage || reasoningBlocks.length !== 1
-					? []
-					: reasoningTranslationSources(
-							msg,
-							runIndices.map((index, position) => ({ block: reasoningBlocks[position], index })),
-						);
+				!streamingMessage && entries.length === 1 ? reasoningTranslationSources(msg, entries) : [];
+			const translationEvidence =
+				!streamingMessage && entries.length > 1
+					? mergedReasoningTranslationEvidence(msg, entries)
+					: undefined;
+			const translationVisibility = {
+				...(translationSources.length ? { reasoningTranslationSources: translationSources } : {}),
+				...(translationEvidence ? { reasoningTranslationEvidence: translationEvidence } : {}),
+			};
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -2351,7 +2360,7 @@ function adaptMessage(
 				specs.push({
 					kind: "reasoning-steps",
 					key,
-					...(translationSources.length && { reasoningTranslationSources: translationSources }),
+					...translationVisibility,
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2385,7 +2394,7 @@ function adaptMessage(
 				specs.push({
 					kind,
 					key,
-					...(translationSources.length && { reasoningTranslationSources: translationSources }),
+					...translationVisibility,
 					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {
