@@ -551,15 +551,16 @@ async function readSubagentTerminal(
 	// Require this run's immutable terminal source, or a post-boundary assistant
 	// after the waiter observed this same run transition from running to settled.
 	const terminalObserved = run !== undefined && observedRunningRunId === run.logicalRunId;
+	const workerRead = current.isBackground ? undefined : committedObservation;
 	const terminal = run
 		? await getRuntimePublicationService()
 				.readAgentTerminalResult(
 					run,
 					{ settledRunId: terminalObserved ? run.logicalRunId : undefined },
-					committedObservation,
+					workerRead,
 				)
 				.catch((error) => {
-					if (committedObservation) throw error;
+					if (workerRead) throw error;
 					logger.warn("Failed to read run-bound Await result", { run, error: String(error) });
 					return null;
 				})
