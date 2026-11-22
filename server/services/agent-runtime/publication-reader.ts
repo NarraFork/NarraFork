@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { boundedBodyText } from "../../lib/narrator-bodies";
+import { boundedBodyText, hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { MAILBOX_LIMITS as L } from "./limits";
 import { publicationDedupeKey } from "./publication-key";
 import type { PublicationRun } from "./publication-outbox";
@@ -13,6 +13,24 @@ import {
 	decodeRunAssistantProjection,
 	parseRunSourceBoundary,
 } from "./publication-result";
+
+export function readPublicationTerminalSnapshot(
+	sqlite: Database,
+	run: PublicationRun,
+	options: AgentTerminalResultReadOptions,
+	fromBlocks: boolean,
+	signal: AbortSignal,
+): AgentTerminalResult | null {
+	return sqlite.transaction(() =>
+		readPublicationTerminalResult(
+			sqlite,
+			run,
+			options,
+			fromBlocks || hasRowsOnlyBodies(sqlite),
+			signal,
+		),
+	)();
+}
 
 /** Read the bounded result for this exact run, never the actor's latest result. */
 export function readPublicationTerminalResult(

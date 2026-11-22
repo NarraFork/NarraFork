@@ -17,7 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
-import { readPublicationTerminalResult } from "../../services/agent-runtime/publication-reader";
+import { readPublicationTerminalSnapshot } from "../../services/agent-runtime/publication-reader";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -27,7 +27,6 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
-import { hasRowsOnlyBodies } from "../narrator-bodies";
 import { RUNTIME_BUILD_ID } from "../runtime-target";
 import { instrumentSqliteConnection, runInSqlTraceSpan, startSqlTraceSpan } from "../sql-trace";
 import {
@@ -222,16 +221,13 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
 				if (params.kind === "publicationTerminalResult") {
-					const sqlite = getConnection(message.dbPath);
-					return sqlite.transaction(() =>
-						readPublicationTerminalResult(
-							sqlite,
-							params.run,
-							params.options,
-							params.fromBlocks || hasRowsOnlyBodies(sqlite),
-							controller.signal,
-						),
-					)();
+					return readPublicationTerminalSnapshot(
+						getConnection(message.dbPath),
+						params.run,
+						params.options,
+						params.fromBlocks,
+						controller.signal,
+					);
 				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
