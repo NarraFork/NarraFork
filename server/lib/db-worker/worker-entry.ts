@@ -40,6 +40,7 @@ import { readCompactSummary } from "./compact-summary-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { workerFailureDetails } from "./failure";
+import { readKnowledgeEntryDetail } from "./knowledge-entry-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -239,6 +240,13 @@ port.on("message", async (message: DbWorkerInbound) => {
 						params.run,
 						params.options,
 						params.fromBlocks,
+						controller.signal,
+					);
+				}
+				if (params.kind === "knowledgeEntryDetail") {
+					return readKnowledgeEntryDetail(
+						getConnection(message.dbPath),
+						params.entryId,
 						controller.signal,
 					);
 				}

@@ -50,6 +50,7 @@ export type DbReadTaskName =
 	| "databaseCleanupContext"
 	| "selectRows"
 	| "toolEditPreview"
+	| "knowledgeEntryDetail"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
@@ -281,6 +282,7 @@ export type DbReadTaskParams =
 	| { kind: "databaseCleanupContext" }
 	| SelectRowsParams
 	| { kind: "toolEditPreview"; toolCallId: string }
+	| { kind: "knowledgeEntryDetail"; entryId: string }
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 

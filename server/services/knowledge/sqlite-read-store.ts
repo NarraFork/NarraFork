@@ -34,7 +34,7 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import {
 	aclEvents,
 	aclGrants,
@@ -51,6 +51,9 @@ import {
 	users,
 } from "../../db/schema";
 import { readQuery } from "../../db/worker-read";
+import { KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE } from "../../lib/db-worker/knowledge-entry-query";
+import { runReadTask, WorkersUnavailableError } from "../../lib/db-worker/pool";
+import { AppError } from "../../lib/errors";
 import type {
 	AclEventReadRow,
 	KeywordInjectionCandidateRow,
@@ -342,6 +345,25 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			where: eq(knowledgeEntries.id, entryId),
 		});
 		return (row as KnowledgeEntryRow | undefined) ?? null;
+	},
+
+	async getEntryDetailById(entryId, signal) {
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		try {
+			return await runReadTask<KnowledgeEntryRow | null>(
+				sqlite.filename,
+				{ kind: "knowledgeEntryDetail", entryId },
+				{ signal, timeoutMs: 10_000 },
+			);
+		} catch (err) {
+			if (err instanceof Error && "code" in err && err.code === KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE) {
+				throw new AppError(err.message, 413, KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE);
+			}
+			throw err;
+		}
 	},
 
 	async getEntryAclById(entryId) {
