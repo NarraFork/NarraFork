@@ -5,6 +5,7 @@ import {
 	replaceCurrentHistoryState,
 	resolveAppShellHistoryEntryKey,
 } from "./history-entry";
+import { IOS_SCROLL_TO_TOP_ROUTE_EVENT } from "./ios-scroll-to-top";
 import { APP_SHELL_MAIN_ID } from "./safe-area";
 
 export const useBrowserLayoutEffect = typeof document === "undefined" ? useEffect : useLayoutEffect;
@@ -79,8 +80,17 @@ export function enterAppShellMainScrollEntry(
 	const main = targetDocument.getElementById(APP_SHELL_MAIN_ID);
 	if (!main) return;
 
+	const notifyRootBridge = () => {
+		const event = targetDocument.createEvent("Event");
+		event.initEvent(IOS_SCROLL_TO_TOP_ROUTE_EVENT, false, false);
+		targetDocument.dispatchEvent(event);
+	};
+	notifyRootBridge();
 	store.restore(locationKey, main);
-	return () => store.capture(locationKey, main);
+	return () => {
+		notifyRootBridge();
+		store.capture(locationKey, main);
+	};
 }
 
 /** Restore after route DOM commits and capture immediately before it is replaced. */
