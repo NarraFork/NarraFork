@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
+import { readPublicationTerminalSnapshot } from "../../services/agent-runtime/publication-reader";
 import { runBenchmarkRead } from "../../services/benchmark-read";
 import {
 	collectSessionAggregateStats,
@@ -54,6 +55,7 @@ import type {
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
+import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
@@ -230,6 +232,15 @@ port.on("message", async (message: DbWorkerInbound) => {
 						controller.signal,
 					);
 				}
+				if (params.kind === "publicationTerminalResult") {
+					return readPublicationTerminalSnapshot(
+						getConnection(message.dbPath),
+						params.run,
+						params.options,
+						params.fromBlocks,
+						controller.signal,
+					);
+				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
 					: params.kind === "storageHistoryBody"
@@ -271,12 +282,17 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				params,
 																				controller.signal,
 																			)
-																		: runStorageScanTables(
-																				message.dbPath,
-																				message.requestId,
-																				params,
-																				controller.signal,
-																			);
+																		: params.kind === "databaseCleanupContext"
+																			? readDatabaseCleanupContext(
+																					getConnection(message.dbPath),
+																					controller.signal,
+																				)
+																			: runStorageScanTables(
+																					message.dbPath,
+																					message.requestId,
+																					params,
+																					controller.signal,
+																				);
 			}),
 		);
 		post({

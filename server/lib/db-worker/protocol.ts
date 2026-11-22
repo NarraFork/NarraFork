@@ -21,6 +21,8 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { PublicationRun } from "../../services/agent-runtime/publication-outbox";
+import type { AgentTerminalResultReadOptions } from "../../services/agent-runtime/publication-result";
 import type { BenchmarkReadParams } from "../../services/benchmark-read";
 import type {
 	BlockBackfillSliceParams,
@@ -45,6 +47,7 @@ export type DbReadTaskName =
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "databaseCleanupContext"
 	| "selectRows"
 	| "toolEditPreview"
 	| "displayPageMessages"
@@ -56,6 +59,7 @@ export type DbReadTaskName =
 	| "blockProjectionSlice"
 	| "storageHistoryRead"
 	| "storageHistoryBody"
+	| "publicationTerminalResult"
 	| "benchmarkRead";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -259,6 +263,12 @@ export type DbReadTaskParams =
 	| BenchmarkReadParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
+	| {
+			kind: "publicationTerminalResult";
+			run: PublicationRun;
+			options: AgentTerminalResultReadOptions;
+			fromBlocks: boolean;
+	  }
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
@@ -269,6 +279,7 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| { kind: "databaseCleanupContext" }
 	| SelectRowsParams
 	| { kind: "toolEditPreview"; toolCallId: string }
 	| DisplayPageMessagesParams
