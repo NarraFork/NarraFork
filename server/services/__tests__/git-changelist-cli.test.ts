@@ -7,6 +7,14 @@ import { isGitChangelistCli, parseGitChangelistCli } from "../git-changelist-cli
 
 const workspace = ["--workspace", "/fixture"];
 const version = ["--generation", "2", "--observation", "observed"];
+test("an empty workspace is rejected rather than resolving to the current directory", async () => {
+	await expect(parseGitChangelistCli(["--workspace", "", "list"])).rejects.toThrow("workspace");
+	expect(await parseGitChangelistCli(["--workspace", ".", "list"])).toMatchObject({
+		cwd: process.cwd(),
+		method: "summary",
+	});
+});
+
 test("source and compiled argument layouts select the offline entry without matching option values", () => {
 	expect(isGitChangelistCli(["bun", "server/index.ts", "changelists", ...workspace, "list"])).toBe(
 		true,

@@ -122,6 +122,7 @@ export async function parseGitChangelistCli(args: readonly string[]): Promise<Gi
 		return value;
 	};
 	const workspace = take("workspace", true) as string;
+	if (!workspace) throw new CliError("--workspace must not be empty");
 	const base = { cwd: resolve(workspace), workspaceKey: "offline" };
 	const done = <T extends GitStagingWork>(work: T): T => {
 		if (flags.size)
