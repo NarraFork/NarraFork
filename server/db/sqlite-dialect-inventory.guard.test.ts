@@ -577,6 +577,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Visible translation reads format-2 block history; PG envelopes are still legacy-format.
+	"server/services/reasoning-translation-runtime.ts": ["handle", "glob"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	// The broken-call flag of a tool result is read in SQL so the result itself is not.
 	"server/services/narrator-block-sync.ts": [

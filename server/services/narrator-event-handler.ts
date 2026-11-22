@@ -25,8 +25,14 @@ import {
 } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import { and, eq } from "drizzle-orm";
-import { activeDatabaseBackend, db, sqlite } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { activeDatabaseBackend, db } from "../db";
+import {
+	apiRequests,
+	narratorBlocks,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+} from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -1678,14 +1684,25 @@ function translateReasoningBlock(
 			if (useRange) {
 				const blockId = knownBlockIdForElement(narratorId, elementId);
 				const receipt = blockId
-					? sqlite
-							.query<{ blockRevision: number; stateRevision: number }, [string, string, string]>(
-								`SELECT b.revision AS blockRevision, m.state_revision AS stateRevision
-								FROM narrator_blocks b JOIN narrator_messages m ON m.id = b.message_id
-								WHERE b.id = ? AND b.message_id = ? AND m.narrator_id = ?
-								  AND b.kind = 'reasoning' AND m.body_format = 2`,
-							)
-							.get(blockId, messageId, narratorId)
+					? (
+							await db
+								.select({
+									blockRevision: narratorBlocks.revision,
+									stateRevision: narratorMessages.stateRevision,
+								})
+								.from(narratorBlocks)
+								.innerJoin(narratorMessages, eq(narratorBlocks.messageId, narratorMessages.id))
+								.where(
+									and(
+										eq(narratorBlocks.id, blockId),
+										eq(narratorBlocks.messageId, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+										eq(narratorBlocks.kind, "reasoning"),
+										eq(narratorMessages.bodyFormat, 2),
+									),
+								)
+								.limit(1)
+						)[0]
 					: null;
 				if (receipt && blockId) {
 					dualBroadcast(ctx, {
