@@ -18,6 +18,7 @@ import { db } from "@server/db";
 import { narrators, narratorToolCalls, projects } from "@server/db/schema";
 import { readQuery } from "@server/db/worker-read";
 import { toolRegistry } from "@server/lib/agent/tool-registry";
+import { DbReadError } from "@server/lib/db-worker/errors";
 import { SELECT_ROWS_MAX_ROWS } from "@server/lib/db-worker/protocol";
 import {
 	type ExecutionLogCursor,
@@ -501,7 +502,8 @@ export class ExecutionLogService {
 					ORDER BY ${narratorToolCalls.startedAt} DESC, ${narratorToolCalls.id} DESC
 					LIMIT ${FACET_WINDOW_ROWS}) AS recent`,
 				)
-				.groupBy(sql`tool_name`, sql`provider`),
+				.groupBy(sql`tool_name`, sql`provider`)
+				.limit(SELECT_ROWS_MAX_ROWS + 1),
 			{
 				signal: options.signal,
 				diagnosticSource: "execution-log.facets",
@@ -509,6 +511,8 @@ export class ExecutionLogService {
 			},
 		);
 
+		if (observed.length > SELECT_ROWS_MAX_ROWS)
+			throw new DbReadError("DB_READ_BUDGET", "Read query exceeded its row budget");
 		const providers = new Set<string>();
 		for (const row of observed) {
 			if (row.toolName) registered.add(row.toolName);

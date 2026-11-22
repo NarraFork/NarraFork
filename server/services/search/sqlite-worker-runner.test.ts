@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+	SELECT_ROWS_MAX_PARAMS,
+	SELECT_ROWS_MAX_SQL_BYTES,
+} from "../../lib/db-worker/protocol";
+import {
 	createSqliteSearchQueryExecutor,
 	SEARCH_MAX_OUTSTANDING,
 	SEARCH_QUERY_TIMEOUT_MS,
@@ -27,7 +31,24 @@ describe("search worker admission and cancellation", () => {
 		await expect(execute("DELETE FROM narrator_messages", [])).rejects.toMatchObject({
 			code: "SEARCH_QUERY_BUDGET_EXCEEDED",
 		});
-		expect(calls).toBe(1);
+		 expect(calls).toBe(1);
+	});
+
+	test.each([
+		{ query: sql, params: Array(SELECT_ROWS_MAX_PARAMS + 1).fill(1) as number[] },
+		{ query: `SELECT 1 ${" ".repeat(SELECT_ROWS_MAX_SQL_BYTES)}`, params: [] },
+	])("rejects oversized query inputs before transport dispatch: %j", async ({ query, params }) => {
+		let calls = 0;
+		const execute = createSqliteSearchQueryExecutor("/isolated/fixture.db", {
+			runTask: async () => {
+				calls++;
+				return { columns: [], rows: [] };
+			},
+		});
+		await expect(execute(query, params)).rejects.toMatchObject({
+			code: "SEARCH_QUERY_BUDGET_EXCEEDED",
+		});
+		expect(calls).toBe(0);
 	});
 
 	test("bounds outstanding work and releases admission after success", async () => {
