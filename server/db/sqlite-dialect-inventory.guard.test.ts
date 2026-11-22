@@ -488,6 +488,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
 	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
+	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
 	"server/lib/db-worker/failure.ts": ["errorCode"],
