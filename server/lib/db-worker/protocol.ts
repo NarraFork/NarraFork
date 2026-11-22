@@ -30,6 +30,7 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { ComposerDocumentParams } from "./composer-document-query";
 import type { RecallConversationParams } from "./recall-conversation-query";
 import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
@@ -45,6 +46,7 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "composerDocument"
 	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
@@ -284,6 +286,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| ComposerDocumentParams
 	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
 	| RecallToolCallParams
 	| RecallConversationParams

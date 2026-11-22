@@ -37,6 +37,7 @@ import {
 	runBlockVerifySlice,
 } from "./block-backfill-query";
 import { readCompactSummary } from "./compact-summary-query";
+import { readComposerDocument } from "./composer-document-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { readExecutionPolicySnapshot } from "./execution-policy-query";
@@ -232,6 +233,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 			runInSqlTraceSpan(sqlSpan, async () => {
 				if (params.kind === "toolDetailSnapshot") {
 					return readToolDetailSnapshot(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "composerDocument") {
+					return readComposerDocument(getConnection(message.dbPath), params, controller.signal);
 				}
 				if (params.kind === "compactSummary") {
 					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
