@@ -141,6 +141,20 @@ test("step provenance follows the rendered paragraphs across titles and translat
 	).toMatchObject({ elementId: "second" });
 });
 
+test("a Markdown list formed by two reasoning blocks retains per-item provenance", () => {
+	const left = "- [x] **First** item\r\n  continued";
+	const right = "- [ ] Second item";
+	const text = `${left}\r\n\r\n${right}`;
+	const parsed = parseMarkdownToPreparedBlocks(text, undefined, true);
+	expect(parsed.map(({ sourceRange }) => sourceRange)).toEqual([
+		{ start: 0, end: left.length },
+		{ start: left.length + 4, end: text.length },
+	]);
+	expect(parsed.map(({ sourceRange: _range, ...block }) => block)).toEqual(
+		parseMarkdownToPreparedBlocks(text),
+	);
+});
+
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {
 	const checkpoint = {
 		type: "reasoning",

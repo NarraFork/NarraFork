@@ -114,6 +114,7 @@ interface MarkState {
 }
 
 interface ParseContext {
+	listItemRanges?: ReadonlyMap<Tokens.ListItem, SourceRange>;
 	listDepth: number;
 	quoteDepth: number;
 	/** Present when KaTeX is available; absent means math stays literal text. */
@@ -121,6 +122,8 @@ interface ParseContext {
 	/** Inline formulas lifted out before lexing, indexed by sentinel number. */
 	formulas?: readonly string[];
 }
+
+type SourceRange = NonNullable<PreparedBlock["sourceRange"]>;
 
 interface InlinePiece {
 	text: string;
@@ -272,14 +275,7 @@ export function parseMarkdownToPreparedBlocks(
 	sourceRanges = false,
 ): PreparedBlock[] {
 	if (sourceRanges)
-		return parseMarkdownUnits(markdown, math).flatMap(({ raw, consumedLength, blocks }) => {
-			// A token can consume the newline separating two source owners.
-			const range = {
-				start: consumedLength - raw.length + (raw.length - raw.trimStart().length),
-				end: consumedLength - (raw.length - raw.trimEnd().length),
-			};
-			return blocks.map((block) => ({ ...block, sourceRange: range }));
-		});
+		return parseMarkdownUnits(markdown, math, { sourceRanges }).flatMap(({ blocks }) => blocks);
 	// `prepareMarkdownEmphasis` only rewrites pairs CommonMark would refuse
 	// (`**注意：**说明`); legal `**bold**` is byte-identical.
 	if (!math) {
@@ -309,11 +305,13 @@ function prepareSingleToken(
 	isFirst: boolean,
 	math: MathSupport | undefined,
 	formulas: readonly string[] | undefined,
+	listItemRanges?: ReadonlyMap<Tokens.ListItem, SourceRange>,
 ): PreparedBlock[] {
 	const ctx: ParseContext = {
 		listDepth: 0,
 		quoteDepth: 0,
 		...(math ? { math, formulas } : {}),
+		...(listItemRanges ? { listItemRanges } : {}),
 	};
 	if (isFirst) return parseBlockTokens([token], ctx);
 	// Any preceding block makes the next one "non-first"; a plain paragraph is the
@@ -407,6 +405,33 @@ export interface ParseMarkdownUnitsOptions {
 	continuation?: boolean;
 	/** Reuse hook, consulted per unit as `(raw, isFirst)`. */
 	reuse?: (raw: string, isFirst: boolean) => PreparedBlock[] | undefined;
+	sourceRanges?: boolean;
+}
+
+function trimmedSourceRange(text: string, start: number, end: number): SourceRange {
+	const raw = text.slice(start, end);
+	// A token can consume a newline separating two source owners.
+	return {
+		start: end - raw.trimStart().length,
+		end: start + raw.trimEnd().length,
+	};
+}
+
+function listItemSourceRanges(
+	token: Tokens.List,
+	start: number,
+	text: string,
+	originalOffset: (offset: number) => number,
+): ReadonlyMap<Tokens.ListItem, SourceRange> | undefined {
+	// Only use item offsets when their raw slices tile the unchanged lexer token.
+	if (token.items.map((item) => item.raw).join("") !== token.raw) return;
+	const ranges = new Map<Tokens.ListItem, SourceRange>();
+	for (const item of token.items) {
+		const end = start + item.raw.length;
+		ranges.set(item, trimmedSourceRange(text, originalOffset(start), originalOffset(end)));
+		start = end;
+	}
+	return ranges;
 }
 
 export function parseMarkdownUnits(
@@ -414,7 +439,7 @@ export function parseMarkdownUnits(
 	math?: MathSupport,
 	options: ParseMarkdownUnitsOptions = {},
 ): PreparedMarkdownUnit[] {
-	const { continuation = false, reuse } = options;
+	const { continuation = false, reuse, sourceRanges = false } = options;
 	// Lexer offsets belong to transformed text, but the streaming cache slices the
 	// ORIGINAL input. Carry boundaries through math lifting, inserted emphasis
 	// sentinels and marked's CRLF normalization. No second Markdown parse is needed.
@@ -447,8 +472,16 @@ export function parseMarkdownUnits(
 	const units: PreparedMarkdownUnit[] = [];
 	let isFirst = !continuation;
 	let consumed = 0;
+	let precise = sourceRanges;
+	const normalized = sourceRanges && lexerOffsets ? text.replace(/\r\n?/g, "\n") : text;
 	for (const token of tokens) {
+		const tokenStart = consumed;
 		const start = originalOffset(consumed);
+		precise &&= normalized.startsWith(token.raw, tokenStart);
+		const itemRanges =
+			precise && token.type === "list"
+				? listItemSourceRanges(token as Tokens.List, tokenStart, markdown, originalOffset)
+				: undefined;
 		consumed += token.raw.length;
 		const end = originalOffset(consumed);
 		// `space` / `def` produce no blocks; skipping them here keeps unit identity
@@ -456,8 +489,12 @@ export function parseMarkdownUnits(
 		// above so `consumedLength` tracks the real source offset.
 		if (token.type === "space" || token.type === "def") continue;
 		const raw = markdown.slice(start, end);
-		const cached = reuse?.(raw, isFirst);
-		const blocks = cached ?? prepareSingleToken(token, isFirst, math, formulas);
+		const cached = sourceRanges ? undefined : reuse?.(raw, isFirst);
+		const prepared = cached ?? prepareSingleToken(token, isFirst, math, formulas, itemRanges);
+		const sourceRange = precise ? trimmedSourceRange(markdown, start, end) : undefined;
+		const blocks = sourceRange
+			? prepared.map((block) => (block.sourceRange ? block : { ...block, sourceRange }))
+			: prepared;
 		units.push({ raw, isFirst, blocks, consumedLength: end });
 		isFirst = false;
 	}
@@ -715,6 +752,8 @@ function buildListBlocks(token: Tokens.List, ctx: ParseContext): PreparedBlock[]
 				taskMarker: { checked: !!item.checked, label: item.text },
 			};
 		}
+		const range = ctx.listItemRanges?.get(item);
+		if (range) for (const block of itemBlocks) block.sourceRange = range;
 		appendGroup(blocks, itemBlocks, 0);
 	}
 	return blocks;
