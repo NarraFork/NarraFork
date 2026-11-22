@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StorageCategoryKey } from "@shared/storage-categories";
-import { eq } from "drizzle-orm";
-import { db } from "../../db";
+import { eq, inArray } from "drizzle-orm";
+import { db, sqlite } from "../../db";
 import { projects } from "../../db/schema";
+import { getDbWorkerPoolStats, WorkersUnavailableError } from "../../lib/db-worker/pool";
 import * as fsWorker from "../../lib/fs-scan-worker/client";
 import * as measurementCore from "../../lib/fs-scan-worker/measure-tree";
 import { generateId } from "../../lib/id";
@@ -139,6 +140,60 @@ describe("storage categories preserve filesystem worker failures", () => {
 			expect(measurement).toHaveBeenCalledTimes(2);
 		} finally {
 			db.delete(projects).where(eq(projects.id, secondId)).run();
+		}
+	});
+
+	test("worktree project metadata crosses Worker pages without dropping the last project", async () => {
+		expect(sqlite.filename).not.toBe(":memory:");
+		const now = new Date().toISOString();
+		const extra = Array.from({ length: 201 }, (_, i) => {
+			const id = `worktree-page-${String(i).padStart(3, "0")}`;
+			return {
+				id,
+				name: id,
+				gitPath: i === 200 ? join(root, "repo") : join(root, "missing"),
+				createdAt: now,
+				updatedAt: now,
+			};
+		});
+		db.insert(projects).values(extra).run();
+		try {
+			measurement.mockResolvedValue([{ sizeBytes: 40, entriesScanned: 1, truncated: false }]);
+			const result = await scanStorageCategory("worktrees");
+			expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
+			expect(result).toMatchObject({
+				sizeBytes: 80,
+				details: {
+					worktreeCount: 2,
+					projects: expect.arrayContaining([
+						{ name: projectId, sizeBytes: 40, worktreeCount: 1 },
+						{ name: "worktree-page-200", sizeBytes: 40, worktreeCount: 1 },
+					]),
+				},
+			});
+		} finally {
+			db.delete(projects)
+				.where(
+					inArray(
+						projects.id,
+						extra.map(({ id }) => id),
+					),
+				)
+				.run();
+		}
+	});
+
+	test("worktrees rejects database Worker unavailability before measuring directories", async () => {
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		try {
+			await expect(scanStorageCategory("worktrees")).rejects.toBeInstanceOf(
+				WorkersUnavailableError,
+			);
+			expect(measurement).not.toHaveBeenCalled();
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
 		}
 	});
 

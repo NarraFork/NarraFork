@@ -216,7 +216,14 @@ export const recallTool: ToolDefinition = {
 			const timeFilter = timeFilterResult.filter;
 			const queries = Array.isArray(query) ? query : [query];
 			if (queries.length === 1) {
-				return handleSearch(queries[0], limit, timeFilter, currentNarratorId, allNarrators);
+				return handleSearch(
+					queries[0],
+					limit,
+					timeFilter,
+					currentNarratorId,
+					allNarrators,
+					ctx.signal,
+				);
 			}
 			if (queries.length > MAX_BATCH_QUERIES) {
 				return {
@@ -230,7 +237,14 @@ export const recallTool: ToolDefinition = {
 			const queryList: string[] = [];
 			let errorCount = 0;
 			for (const q of queries) {
-				const result = await handleSearch(q, limit, timeFilter, currentNarratorId, allNarrators);
+				const result = await handleSearch(
+					q,
+					limit,
+					timeFilter,
+					currentNarratorId,
+					allNarrators,
+					ctx.signal,
+				);
 				if (result.isError) errorCount++;
 				sections.push(result.output);
 				// Collect structured results from each sub-search
@@ -481,7 +495,9 @@ async function handleSearch(
 	timeFilter: TimeFilter | undefined,
 	currentNarratorId: string,
 	allNarrators: boolean,
+	signal: AbortSignal,
 ): Promise<ToolResult> {
+	signal.throwIfAborted();
 	if (!query) {
 		return { output: 'Parameter "query" is required for action "search".', isError: true };
 	}
@@ -505,7 +521,9 @@ async function handleSearch(
 		...(filter.from ? { createdFrom: filter.from } : {}),
 		...(filter.to ? { createdTo: filter.to } : {}),
 		previewChars: SNIPPET_CHARS,
+		signal,
 	});
+	signal.throwIfAborted();
 
 	if (rows.length === 0) {
 		return {

@@ -46,6 +46,7 @@ export type DbReadTaskName =
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
 	| "selectRows"
+	| "toolEditPreview"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
@@ -268,6 +269,7 @@ export type DbReadTaskParams =
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
 	| SelectRowsParams
+	| { kind: "toolEditPreview"; toolCallId: string }
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 
