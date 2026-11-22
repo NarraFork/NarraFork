@@ -548,6 +548,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
 	"server/services/execution-log-service.ts": ["json1"],
+	"server/lib/db-worker/execution-policy-query.ts": ["driver", "json1"],
+	"server/services/execution-policy/repository.ts": ["handle"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
 	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
