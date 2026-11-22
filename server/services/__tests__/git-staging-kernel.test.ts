@@ -1760,6 +1760,38 @@ test.each([
 	}
 });
 
+test("a recovered preparation cannot publish its native lock after losing the fence", async () => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const repo = await resolveGitStagingRepository(root);
+	let recovered = false;
+	const transaction = ChangelistStore.prototype.transaction;
+	const mock = spyOn(ChangelistStore.prototype, "transaction").mockImplementation(async function <
+		T,
+	>(this: ChangelistStore, fn: () => T, signal?: AbortSignal, checkpoint?: () => void): Promise<T> {
+		const value = (await transaction.call(this, fn, signal, checkpoint)) as T;
+		const row = this.db
+			.query("SELECT id,evidence_json FROM commit_operations WHERE status='prepared'")
+			.get() as { id: string; evidence_json: string } | null;
+		if (!recovered && row && !(await lstat(`${repo.index}.lock`).catch(() => null))) {
+			recovered = true;
+			const evidence = JSON.parse(row.evidence_json);
+			evidence.leaseUntil = 0;
+			await transaction.call(this, () =>
+				this.db
+					.query("UPDATE commit_operations SET evidence_json=? WHERE id=?")
+					.run(JSON.stringify(evidence), row.id),
+			);
+			expect((await act({ action: "recover", operationId: row.id })).outcome).toBe("applied");
+		}
+		return value;
+	});
+	restores.push(() => mock.mockRestore());
+	await expect(commit(await active())).rejects.toMatchObject({ code: "GIT_STAGING_FENCED" });
+	expect(recovered).toBe(true);
+	await expect(lstat(`${repo.index}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("finished commits remove private projection artifacts and remain recoverable idempotently", async () => {
 	await file("a", "selected\n");
 	await act({ action: "init" });

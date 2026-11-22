@@ -5,13 +5,14 @@ import {
 	constants,
 	fstatSync,
 	fsyncSync,
+	linkSync,
 	lstatSync,
 	openSync,
 	readSync,
 	renameSync,
 	unlinkSync,
 } from "node:fs";
-import { link, lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { GitStagingAction, GitStagingActionResult } from "../../shared/git-staging-lists";
 import {
@@ -688,7 +689,10 @@ export async function commitChangelist(
 		evidence.lockIdentity = `${lockInfo.dev}:${lockInfo.ino}`;
 		await updateOperation(store, id, { status: "prepared", tree: expectedTree, evidence });
 		try {
-			await link(privateLock, lockPath);
+			await store.transaction(() => {
+				store.assertOperationFence(id, evidence.fenceToken);
+				linkSync(privateLock, lockPath);
+			});
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "EEXIST")
 				throw fail("GIT_STAGING_LOCKED", "The native index is locked");
