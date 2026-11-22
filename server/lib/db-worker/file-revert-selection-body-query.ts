@@ -6,20 +6,7 @@ import {
 	hasBodyRevisions,
 	hasRowsOnlyBodies,
 } from "../narrator-bodies";
-
-export interface RevertSelectionInspectionSource {
-	id: string;
-	refId: string;
-	narratorId: string;
-	contentBytes: number;
-	bodyRevision: number | null;
-	stateRevision: number | null;
-}
-
-export interface RevertSelectionBodyParams extends RevertSelectionInspectionSource {
-	kind: "revertSelectionBody";
-	blockReads: boolean;
-}
+import type { RevertSelectionBodyParams } from "./protocol";
 
 export function readRevertSelectionBody(
 	sqlite: Database,

@@ -31,7 +31,7 @@ import {
 } from "@shared/file-change-protocol";
 import { connectCompiledWorker } from "../lib/compiled-worker";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
-import type { RevertSelectionInspectionSource } from "../lib/db-worker/revert-selection-body-query";
+import type { RevertSelectionInspectionSource } from "../lib/db-worker/protocol";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";

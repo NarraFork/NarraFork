@@ -28,9 +28,7 @@ export interface GitOptions {
 	strictUtf8?: boolean;
 }
 
-/** Worker-only execution. Configuration overrides are process-local, including full indexes. */
-export async function stagingGit(cwd: string, args: string[], options: GitOptions = {}) {
-	options.signal?.throwIfAborted();
+export function gitStagingEnvironment(overrides?: GitOptions["env"]) {
 	const env = { ...process.env };
 	for (const name of [
 		"GIT_INDEX_FILE",
@@ -47,7 +45,13 @@ export async function stagingGit(cwd: string, args: string[], options: GitOption
 		"GIT_ICASE_PATHSPECS",
 	])
 		delete env[name];
-	Object.assign(env, { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1" }, options.env);
+	return Object.assign(env, { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1" }, overrides);
+}
+
+/** Worker-only execution. Configuration overrides are process-local, including full indexes. */
+export async function stagingGit(cwd: string, args: string[], options: GitOptions = {}) {
+	options.signal?.throwIfAborted();
+	const env = gitStagingEnvironment(options.env);
 	const child = spawn(
 		"git",
 		[

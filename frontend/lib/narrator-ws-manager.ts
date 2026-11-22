@@ -259,6 +259,7 @@ export function limitNarratorSubscriptionIds(
 
 /** Persisted history events advance the live-event epoch before any listener runs. */
 const REALTIME_HISTORY_EVENT_TYPES = new Set([
+	"reasoning_translation_patch",
 	"message",
 	"user_message",
 	"catch_up",
