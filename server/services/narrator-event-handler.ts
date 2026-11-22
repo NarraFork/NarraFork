@@ -3101,7 +3101,10 @@ export async function processEvent(
 				type: "tool_use_discarded",
 				narratorId: broadcastTargetId,
 				toolUseIds: event.toolUseIds,
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				...(ctx.parentToolUseId && {
+					parentToolUseId: ctx.parentToolUseId,
+					subagentNarratorId: narratorId,
+				}),
 			});
 			return null;
 		}

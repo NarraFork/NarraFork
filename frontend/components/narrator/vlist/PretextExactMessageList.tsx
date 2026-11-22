@@ -2598,6 +2598,7 @@ export const PretextExactMessageList = memo(
 			// browsing history still sees tool/reflection state advance correctly.
 			useVListLivePatches(revisionSubscriptionId, {
 				enabled: !!revisionSubscriptionId,
+				messages: pretextDocument.messages,
 				isSubagent: !!isSubagent,
 				applyLivePatch: pretextDocument.applyLivePatch,
 				// A terminal event can race the initial exact-document load: the synthetic

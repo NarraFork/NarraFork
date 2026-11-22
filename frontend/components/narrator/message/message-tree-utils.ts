@@ -13,6 +13,10 @@ import type {
 } from "@frontend/lib/api";
 import { mapRowElements, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { copyStreamingEditInput, handoffStreamingEditOrigin } from "@shared/streaming-edit-origin";
+import {
+	normalizeSubagentToolInputSummary,
+	SUBAGENT_SUMMARY_INPUT_KEYS,
+} from "@shared/subagent-tool-summary";
 import { mergeToolLifecycleRecord, type ToolLifecycleRecord } from "@shared/tool-row-status";
 
 interface ToolCall {
@@ -69,7 +73,7 @@ function sameSubagentToolCall(
 	incoming: SubagentToolCallHeader,
 ): boolean {
 	if (existing.toolCallId && incoming.toolCallId)
-		return existing.toolCallId === incoming.toolCallId;
+		return existing.toolCallId === incoming.toolCallId && existing.toolUseId === incoming.toolUseId;
 	return existing.toolUseId === incoming.toolUseId;
 }
 
@@ -79,19 +83,62 @@ function mergeSubagentToolCallHeader(
 ): SubagentToolCallHeader {
 	const preventTerminalRegression =
 		isTerminalToolStatus(existing.status) && !isTerminalToolStatus(incoming.status);
+	const timing = { ...(existing.timing ?? {}), ...(incoming.timing ?? {}) };
+	if (preventTerminalRegression) {
+		// Late argument chunks may fill missing stamps, but cannot replace the
+		// completed call's measured duration or timestamps.
+		for (const key of SUBAGENT_TIMING_KEYS) {
+			const value = existing.timing?.[key];
+			if (value != null) Object.assign(timing, { [key]: value });
+		}
+	}
 	return {
 		...existing,
 		...incoming,
 		toolCallId: incoming.toolCallId ?? existing.toolCallId,
+		createdAt: existing.createdAt ?? incoming.createdAt,
 		status: preventTerminalRegression ? existing.status : incoming.status,
-		timing: {
-			...(existing.timing ?? {}),
-			...(incoming.timing ?? {}),
-			...(preventTerminalRegression && existing.timing?.completedAt != null
-				? { completedAt: existing.timing.completedAt }
-				: {}),
-		},
+		// Undefined is a sparse projection, not evidence that clears a label.
+		...(preventTerminalRegression || incoming.inputSummary === undefined
+			? { inputSummary: existing.inputSummary }
+			: {}),
+		timing,
 	};
+}
+
+const SUBAGENT_TIMING_KEYS = [
+	"startedAt",
+	"streamStartedAt",
+	"streamCompletedAt",
+	"permissionStartedAt",
+	"executionStartedAt",
+	"completedAt",
+	"durationMs",
+] as const;
+
+/** The projected header is bounded: seven stamps and ten short summary keys. */
+function sameSubagentHeader(a: SubagentToolCallHeader, b: SubagentToolCallHeader): boolean {
+	return (
+		a.toolCallId === b.toolCallId &&
+		a.executionAttempt === b.executionAttempt &&
+		a.toolUseId === b.toolUseId &&
+		a.toolName === b.toolName &&
+		a.status === b.status &&
+		a.createdAt === b.createdAt &&
+		(a.inputSummary === undefined) === (b.inputSummary === undefined) &&
+		(a.inputSummary === null) === (b.inputSummary === null) &&
+		SUBAGENT_TIMING_KEYS.every((key) => a.timing?.[key] === b.timing?.[key]) &&
+		SUBAGENT_SUMMARY_INPUT_KEYS.every((key) => a.inputSummary?.[key] === b.inputSummary?.[key])
+	);
+}
+
+/** Stable timestamps keep a delayed old call from displacing newer recent activity. */
+export function subagentToolCallOrder(header: SubagentToolCallHeader): number | null {
+	const value = header.createdAt ?? header.timing?.streamStartedAt ?? header.timing?.startedAt;
+	if (typeof value === "number") return Number.isFinite(value) ? value : null;
+	if (typeof value !== "string") return null;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : null;
 }
 
 /** Upsert one lightweight child tool header and retain only the newest three. */
@@ -99,12 +146,37 @@ export function upsertSubagentToolCallHeader(
 	activity: SubagentActivitySummary | null | undefined,
 	header: SubagentToolCallHeader,
 ): SubagentActivitySummary {
+	if (header.inputSummary !== undefined)
+		header = { ...header, inputSummary: normalizeSubagentToolInputSummary(header.inputSummary) };
 	const latest = [...(activity?.latestToolCalls ?? [])];
 	const existingIndex = latest.findIndex((item) => sameSubagentToolCall(item, header));
+	const existing = latest[existingIndex];
+	if (
+		activity &&
+		existing?.executionAttempt != null &&
+		(header.executionAttempt == null || header.executionAttempt < existing.executionAttempt)
+	)
+		return activity;
 	const merged =
-		existingIndex >= 0 ? mergeSubagentToolCallHeader(latest[existingIndex], header) : header;
-	if (existingIndex >= 0) latest.splice(existingIndex, 1);
-	latest.push(merged);
+		existing && existing.executionAttempt === header.executionAttempt
+			? mergeSubagentToolCallHeader(existing, header)
+			: header;
+	if (activity && existingIndex >= 0 && sameSubagentHeader(latest[existingIndex], merged))
+		return activity;
+	if (existingIndex >= 0) latest[existingIndex] = merged;
+	else {
+		const order = subagentToolCallOrder(merged);
+		const nextIndex =
+			order == null
+				? -1
+				: latest.findIndex((call) => {
+						const existingOrder = subagentToolCallOrder(call);
+						return existingOrder != null && existingOrder > order;
+					});
+		if (nextIndex >= 0) latest.splice(nextIndex, 0, merged);
+		else latest.push(merged);
+		if (activity && latest.length > 3 && latest[0] === merged) return activity;
+	}
 	const reasoningEffort = normalizeSubagentReasoningEffort(activity?.reasoningEffort);
 	return {
 		subagentNarratorId: activity?.subagentNarratorId ?? null,
@@ -116,6 +188,7 @@ export function upsertSubagentToolCallHeader(
 		// flag on every such event would make the badge flicker off the moment the
 		// taken-over child ran anything.
 		...(activity?.takenOver ? { takenOver: true } : {}),
+		...(activity?.nested ? { nested: activity.nested } : {}),
 		// Tool headers carry no file evidence; keep the last aggregate until a
 		// snapshot actually supplies a replacement (including an explicit empty one).
 		...(activity && Object.hasOwn(activity, "fileChanges")
@@ -176,7 +249,36 @@ export function replaceSubagentActivitySnapshot(
 		latestToolCalls: [],
 	};
 	for (const header of activity.latestToolCalls ?? []) {
-		normalized = upsertSubagentToolCallHeader(normalized, header);
+		// A sparse reconnect projection may omit a label already delivered live.
+		// Reuse it only with exact child + persisted call identity; a retry/new child
+		// must not inherit it. Explicit null (including rejected input) still clears.
+		const existing =
+			activity.subagentNarratorId &&
+			sameChild?.subagentNarratorId === activity.subagentNarratorId &&
+			header.toolCallId
+				? sameChild.latestToolCalls.find(
+						(call) => call.toolCallId === header.toolCallId && call.toolUseId === header.toolUseId,
+					)
+				: undefined;
+		const staleAttempt =
+			existing?.executionAttempt != null &&
+			(header.executionAttempt == null || header.executionAttempt < existing.executionAttempt);
+		const merged =
+			staleAttempt && existing
+				? existing
+				: existing && existing.executionAttempt === header.executionAttempt
+					? mergeSubagentToolCallHeader(existing, header)
+					: header;
+		// An authoritative snapshot can revoke a label independently of lifecycle
+		// status. A stale/unknown attempt cannot revoke a newer attempt's evidence.
+		const explicitClear =
+			!staleAttempt &&
+			header.inputSummary !== undefined &&
+			normalizeSubagentToolInputSummary(header.inputSummary) === null;
+		normalized = upsertSubagentToolCallHeader(
+			normalized,
+			explicitClear ? { ...merged, inputSummary: null } : merged,
+		);
 	}
 	return normalized;
 }
