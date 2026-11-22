@@ -167,10 +167,11 @@ export async function checkPathParents(repo: ChangelistRepository, path: string)
 			if (missing(e)) return null;
 			throw e;
 		});
-		if (!info) break;
+		if (!info || (!info.isDirectory() && !info.isSymbolicLink())) return false;
 		if (!info.isDirectory() || info.isSymbolicLink())
 			throw fail("GIT_STAGING_INVALID", "Repository paths cannot traverse symlinks");
 	}
+	return true;
 }
 export async function currentChangelistHead(repo: ChangelistRepository, signal?: AbortSignal) {
 	const headFile = (await readBoundedFile(join(repo.gitDir, "HEAD"), 8192))?.toString("utf8");
@@ -285,7 +286,7 @@ const fileIdentity = (info: Stats | null) =>
 		? `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.mode}`
 		: "missing";
 async function pathInfo(repo: ChangelistRepository, path: string) {
-	await checkPathParents(repo, path);
+	if (!(await checkPathParents(repo, path))) return null;
 	return lstat(join(repo.root, path)).catch((e) => {
 		if (missing(e)) return null;
 		throw e;
@@ -1045,7 +1046,7 @@ async function observeWithDiagnostics(
 				info &&
 				!info.isFile() &&
 				!info.isSymbolicLink() &&
-				!(info.isDirectory() && base?.mode === "160000")
+				!(info.isDirectory() && base)
 			)
 				throw fail("GIT_STAGING_UNSUPPORTED", `Unsupported working file type: ${path}`);
 			if (info && !info.isDirectory()) {

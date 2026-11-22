@@ -66,3 +66,32 @@ test("publication rejects a draft whose ownership exceeds the next observation's
 	expect((await observeChangelists(repo, store)).state).toBe("ready");
 	expect(store.fileIds()).toEqual([]);
 });
+
+for (const directoryFirst of [false, true]) {
+	test(`observation publishes ${directoryFirst ? "directory-to-file" : "file-to-directory"} replacements`, async () => {
+		const original = directoryFirst ? "entry/child" : "entry";
+		const replacement = directoryFirst ? "entry" : "entry/child";
+		if (directoryFirst) await mkdir(join(root, "entry"));
+		await writeFile(join(root, original), "original\n");
+		await git("add", "--", original);
+		await git("commit", "--quiet", "-m", "Base");
+		await writeFile(join(root, original), "local edit\n");
+		await observeChangelists(repo, store);
+		await rm(join(root, "entry"), { recursive: true });
+		if (!directoryFirst) await mkdir(join(root, "entry"));
+		await writeFile(join(root, replacement), "replacement\n");
+		expect((await observeChangelists(repo, store)).state).toBe("ready");
+		const files = store.fileIds().map((row) => store.loadFile(row.file_id));
+		expect(files.find((file) => file?.path === original)).toMatchObject({
+			baseMode: "100644",
+			workMode: "000000",
+			workBytes: Buffer.alloc(0),
+		});
+		expect(files.find((file) => file?.path === replacement)).toMatchObject({
+			baseMode: "000000",
+			workMode: "100644",
+			workBytes: Buffer.from("replacement\n"),
+		});
+		expect((await observeChangelists(repo, store)).state).toBe("ready");
+	});
+}
