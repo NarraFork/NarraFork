@@ -487,7 +487,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
+	"server/lib/agent/tools/recall.ts": ["handle"],
 	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
@@ -498,6 +498,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成

@@ -56,6 +56,7 @@ import type {
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
 import { readRecallConversation } from "./recall-conversation-query";
+import { readRecallToolCall } from "./recall-tool-call-query";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
@@ -246,6 +247,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 						params.toolCallId,
 						controller.signal,
 					);
+				}
+				if (params.kind === "recallToolCall") {
+					return readRecallToolCall(getConnection(message.dbPath), params, controller.signal);
 				}
 				if (params.kind === "recallConversation") {
 					return readRecallConversation(getConnection(message.dbPath), params, controller.signal);

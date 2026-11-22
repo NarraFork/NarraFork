@@ -1,4 +1,3 @@
-import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
 import { searchStore } from "../../../services/search/backend";
@@ -6,7 +5,6 @@ import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
 import type { RecallMessageRow } from "../../../services/search/types";
 import { runReadTask, WorkersUnavailableError } from "../../db-worker/pool";
 import type { RecallConversationSnapshot } from "../../db-worker/recall-conversation-query";
-import { getToolCallSummary } from "../recall-tool-summary";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
@@ -15,7 +13,7 @@ import type { ToolDefinition, ToolResult } from "../types";
  *
  * The message SEARCH runs through the search port (`services/search/`), so its FTS5
  * expression, snippet markup and time filtering live with the other search statements rather
- * than in a second copy here. Conversation browsing uses one committed Worker snapshot.
+ * than in a second copy here. Conversation browsing and tool-call payloads use committed SQLite Worker snapshots.
  */
 
 const MAX_SEARCH_LIMIT = 50;
@@ -24,39 +22,6 @@ const MAX_BATCH_QUERIES = 10;
 const MAX_READ_LIMIT = 50;
 const DEFAULT_READ_LIMIT = 20;
 const SNIPPET_CHARS = 300;
-const MAX_TOOL_CALL_OUTPUT = 4000;
-
-// --- Cached prepared statements (lazy-initialized) ---
-// Avoids creating a new Statement object on every Recall tool invocation.
-
-let _getToolCall: Statement | null = null;
-let _getToolCallAny: Statement | null = null;
-function getToolCallStmt() {
-	if (!_getToolCall) {
-		_getToolCall = sqlite.prepare(
-			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
-			        tc.duration_ms, tc.error_message, tc.created_at,
-			        tc.narrator_id, n.title AS narrator_title
-			 FROM narrator_tool_calls tc
-			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ? AND tc.narrator_id = ?`,
-		);
-	}
-	return _getToolCall;
-}
-function getToolCallAnyStmt() {
-	if (!_getToolCallAny) {
-		_getToolCallAny = sqlite.prepare(
-			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
-			        tc.duration_ms, tc.error_message, tc.created_at,
-			        tc.narrator_id, n.title AS narrator_title
-			 FROM narrator_tool_calls tc
-			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ?`,
-		);
-	}
-	return _getToolCallAny;
-}
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
@@ -222,7 +187,7 @@ export const recallTool: ToolDefinition = {
 			};
 		}
 		if (action === "read_tool_call") {
-			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators);
+			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators, ctx.signal);
 		}
 		return handleReadConversation(
 			narrator_id,
@@ -567,117 +532,35 @@ async function handleReadConversation(
 // read_tool_call
 // ---------------------------------------------------------------------------
 
-function handleReadToolCall(
-	toolCallId: string | undefined,
+async function handleReadToolCall(
+	toolUseId: string | undefined,
 	currentNarratorId: string,
 	allNarrators: boolean,
-): ToolResult {
-	if (!toolCallId) {
+	signal: AbortSignal,
+): Promise<ToolResult> {
+	signal.throwIfAborted();
+	if (!toolUseId) {
 		return {
 			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
 			isError: true,
 		};
 	}
-
-	const tc = (
-		allNarrators
-			? getToolCallAnyStmt().get(toolCallId)
-			: getToolCallStmt().get(toolCallId, currentNarratorId)
-	) as
-		| {
-				tool_use_id: string;
-				tool_name: string;
-				status: string;
-				input_json: string | null;
-				output_json: string | null;
-				duration_ms: number | null;
-				error_message: string | null;
-				created_at: string;
-				narrator_id: string;
-				narrator_title: string | null;
-		  }
-		| undefined;
-
-	if (!tc) {
-		return {
+	if (sqlite.filename === ":memory:" || sqlite.inTransaction) {
+		throw new WorkersUnavailableError("requires_committed_file");
+	}
+	const result = await runReadTask<ToolResult | null>(
+		sqlite.filename,
+		{ kind: "recallToolCall", toolUseId, narratorId: allNarrators ? null : currentNarratorId },
+		{ signal, timeoutMs: 15_000 },
+	);
+	signal.throwIfAborted();
+	return (
+		result ?? {
 			output: allNarrators
-				? `Tool call "${toolCallId}" not found.`
-				: `Tool call "${toolCallId}" not found in the current narrator. ` +
+				? `Tool call "${toolUseId}" not found.`
+				: `Tool call "${toolUseId}" not found in the current narrator. ` +
 					"Pass `all_narrators: true` to look it up across all narrators (may require user approval).",
 			isError: true,
-		};
-	}
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	let inputParsed: any = null;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	let outputParsed: any = null;
-	try {
-		inputParsed = tc.input_json ? JSON.parse(tc.input_json) : null;
-	} catch {
-		// keep raw
-	}
-	try {
-		outputParsed = tc.output_json ? JSON.parse(tc.output_json) : null;
-	} catch {
-		// keep raw
-	}
-
-	const summary = getToolCallSummary(tc.tool_name, inputParsed);
-
-	const lines: string[] = [
-		`Tool: ${tc.tool_name} — ${summary}`,
-		`Status: ${tc.status}${tc.duration_ms != null ? ` (${tc.duration_ms}ms)` : ""}`,
-		`Narrator: ${tc.narrator_title ?? tc.narrator_id}`,
-		`Created: ${tc.created_at}`,
-	];
-
-	if (tc.error_message) {
-		lines.push(`\nError: ${tc.error_message}`);
-	}
-
-	// Input
-	lines.push("\n--- Input ---");
-	const inputStr = inputParsed ? JSON.stringify(inputParsed, null, 2) : (tc.input_json ?? "(none)");
-	lines.push(
-		inputStr.length > MAX_TOOL_CALL_OUTPUT
-			? `${inputStr.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${inputStr.length} chars total)`
-			: inputStr,
+		}
 	);
-
-	// Output
-	lines.push("\n--- Output ---");
-	if (outputParsed) {
-		// outputJson may have _text (common for bash/read results)
-		const textContent = typeof outputParsed._text === "string" ? outputParsed._text : null;
-		const outputStr = textContent ?? JSON.stringify(outputParsed, null, 2);
-		lines.push(
-			outputStr.length > MAX_TOOL_CALL_OUTPUT
-				? `${outputStr.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${outputStr.length} chars total)`
-				: outputStr,
-		);
-	} else {
-		const raw = tc.output_json ?? "(none)";
-		lines.push(
-			raw.length > MAX_TOOL_CALL_OUTPUT
-				? `${raw.slice(0, MAX_TOOL_CALL_OUTPUT)}\n... (truncated, ${raw.length} chars total)`
-				: raw,
-		);
-	}
-
-	return {
-		output: lines.join("\n"),
-		title: `${tc.tool_name}: ${summary}`,
-		metadata: {
-			action: "read_tool_call",
-			toolUseId: tc.tool_use_id,
-			toolName: tc.tool_name,
-			status: tc.status,
-			durationMs: tc.duration_ms,
-			narratorId: tc.narrator_id,
-			narratorTitle: tc.narrator_title,
-			input: inputParsed,
-			output: outputParsed,
-		},
-	};
 }
