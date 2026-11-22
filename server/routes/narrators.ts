@@ -497,6 +497,7 @@ import {
 	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
+import { readCommittedToolDetail } from "../services/narrator-tool-detail";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
 import {
@@ -4593,11 +4594,14 @@ narratorRoutes.get("/:id/text-documents/:refId", async (c) => {
 narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const id = c.req.param("id");
 	const toolUseId = c.req.param("toolUseId");
-	const tc = await narratorService.getToolCallDetail(id, toolUseId, {
-		toolCallId: c.req.query("toolCallId"),
-		messageId: c.req.query("messageId"),
-	});
-	return c.json(tc);
+	const json = await readCommittedToolDetail(
+		id,
+		toolUseId,
+		{ toolCallId: c.req.query("toolCallId"), messageId: c.req.query("messageId") },
+		c.req.raw.signal,
+		() => requireNarratorAccess(c, id, "read"),
+	);
+	return c.body(json, 200, { "Content-Type": "application/json; charset=UTF-8" });
 });
 
 // Stream live compact text only after the detail modal has explicitly opened.

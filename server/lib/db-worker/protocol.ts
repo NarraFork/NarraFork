@@ -29,6 +29,7 @@ import type {
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -53,7 +54,8 @@ export type DbReadTaskName =
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
 	| "storageHistoryRead"
-	| "storageHistoryBody";
+	| "storageHistoryBody"
+	| "toolDetailSnapshot";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
 export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
@@ -253,6 +255,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| ToolDetailSnapshotParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams
