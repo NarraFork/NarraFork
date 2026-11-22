@@ -17,12 +17,14 @@ import {
 	users,
 	worktreeTreeSnapshots,
 } from "../../db/schema";
+import * as pool from "../../lib/db-worker/pool";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { normalizePathForComparison } from "../../lib/platform-path";
 import { safeSpawn } from "../../lib/spawn";
 import { narratorRoutes } from "../../routes/narrators";
 import { FileChangeBlobStore } from "../file-change-blob-store";
+import { FileChangeEvidenceService } from "../file-change-evidence";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "../file-change-identity";
 import { narratorService } from "../narrator-service";
 import { getToolEditPreview, readToolEditPreviewState } from "../tool-edit-preview";
@@ -423,6 +425,98 @@ describe("exact tool file edit preview", () => {
 });
 
 describe("preview authorization and exact attempt binding", () => {
+	test("reads committed evidence in the Worker only after the tool is visible", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("committed after"));
+		const dispatch = spyOn(pool, "runReadTask");
+		expect((await appFor(narrator().ownerUserId).request(url(owner.id, call))).status).toBe(404);
+		expect(dispatch.mock.calls.some(([, params]) => params.kind === "toolEditPreview")).toBe(false);
+		expect((await preview(owner.id, call)).after).toEqual({
+			status: "available",
+			content: "committed after",
+		});
+		expect(dispatch).toHaveBeenCalledWith(
+			sqlite.filename,
+			{ kind: "toolEditPreview", toolCallId: call.id },
+			{ signal: expect.any(AbortSignal), timeoutMs: 5_000 },
+		);
+	});
+
+	test("rejects oversized ledger metadata before reading file bytes", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		const { effectId, identity } = evidence(call, absent, await stored("not returned"));
+		db.update(fileChangeEffects)
+			.set({
+				identityJson: { ...identity, displayPath: "x".repeat(FILE_CHANGE_LIMITS.summaryBytes) },
+			})
+			.where(eq(fileChangeEffects.id, effectId))
+			.run();
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		expect((await preview(owner.id, call)).after).toEqual({
+			status: "unavailable",
+			reason: "too_large",
+		});
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("rejects a different execution binding in the Worker snapshot", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("other execution"));
+		const row = await narratorService.getToolCallPreviewMetadata(owner.id, call.toolUseId, {
+			toolCallId: call.id,
+		});
+		db.update(narratorToolCalls)
+			.set({ executionAttempt: 2 })
+			.where(eq(narratorToolCalls.id, call.id))
+			.run();
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		expect((await getToolEditPreview(row)).after).toEqual({
+			status: "unavailable",
+			reason: "identity_unverified",
+		});
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("does not read evidence or blobs inline when the Worker fails", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("not a fallback"));
+		const row = await narratorService.getToolCallPreviewMetadata(owner.id, call.toolUseId, {
+			toolCallId: call.id,
+		});
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		const inline = spyOn(FileChangeEvidenceService.prototype, "getOperation");
+		const dispatch = spyOn(pool, "runReadTask");
+		try {
+			process.env.NARRAFORK_DB_WORKER = "off";
+			await expect(getToolEditPreview(row)).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+			await expect(sqlite.transaction(() => getToolEditPreview(row))()).rejects.toBeInstanceOf(
+				pool.WorkersUnavailableError,
+			);
+			expect((await getToolEditPreview(row, AbortSignal.abort())).after).toEqual({
+				status: "unavailable",
+				reason: "cancelled",
+			});
+			for (const error of [
+				new pool.WorkersUnavailableError("worker_create_failed"),
+				new pool.DbReadTaskExecutionError("worker exited"),
+				new pool.DbReadTaskTimeoutError("timed out"),
+			]) {
+				dispatch.mockRejectedValueOnce(error);
+				await expect(getToolEditPreview(row)).rejects.toBe(error);
+			}
+			expect(read).not.toHaveBeenCalled();
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
+
 	test("real route denies private narrator ACL and foreign tool PKs before blob reads", async () => {
 		const own = narrator();
 		const foreign = narrator();

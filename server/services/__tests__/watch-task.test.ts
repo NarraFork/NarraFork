@@ -835,13 +835,20 @@ describe("Watch follows an agent's registered current run", () => {
 	});
 
 	test("an observation failing its terminal read does not replace the source completion notice", async () => {
-		const dispatch = spyOn(workerPool, "runReadTask").mockRejectedValueOnce(
-			new workerPool.DbReadTaskExecutionError("worker exited"),
+		const read = workerPool.runReadTask;
+		const dispatch = spyOn(workerPool, "runReadTask").mockImplementation(
+			async <T>(...args: Parameters<typeof read>) => {
+				if (args[1].kind === "publicationTerminalResult")
+					throw new workerPool.DbReadTaskExecutionError("worker exited");
+				return read<T>(...args);
+			},
 		);
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
 		completeAgent("source output");
 		const done = await settled(watchId(result));
-		expect(dispatch).toHaveBeenCalled();
+		expect(dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult")).toBe(
+			true,
+		);
 		expect(done?.status).toBe("failed");
 		expect(done?.output).toContain("worker exited");
 		expect(done?.output).not.toContain("source output");
@@ -876,7 +883,9 @@ describe("Watch follows an agent's registered current run", () => {
 				status: "completed",
 				output: expect.stringContaining("fulfilled by the ordinary agent completion notice"),
 			});
-			expect(dispatch).not.toHaveBeenCalled();
+			expect(
+				dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult"),
+			).toBe(false);
 			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(1);
 		} finally {
 			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
