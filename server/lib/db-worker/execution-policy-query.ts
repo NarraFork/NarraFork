@@ -30,7 +30,15 @@ const ruleColumns = `id, enabled, narrator_id AS narratorId,
 	created_at AS createdAt, updated_at AS updatedAt`;
 const pathColumns = "path, path_flavor AS pathFlavor, path_key AS pathKey";
 
-export function readExecutionPolicyFacts(
+export function readExecutionPolicySnapshot(
+	db: Database,
+	narratorId: string,
+	signal: AbortSignal,
+): ExecutionPolicyFacts {
+	return db.transaction(() => readExecutionPolicyFacts(db, narratorId, signal))();
+}
+
+function readExecutionPolicyFacts(
 	db: Database,
 	narratorId: string,
 	signal: AbortSignal,

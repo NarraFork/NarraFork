@@ -37,7 +37,7 @@ import {
 } from "./block-backfill-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
-import { readExecutionPolicyFacts } from "./execution-policy-query";
+import { readExecutionPolicySnapshot } from "./execution-policy-query";
 import { workerFailureDetails } from "./failure";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
@@ -221,10 +221,11 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
 				if (params.kind === "executionPolicyFacts") {
-					const sqlite = getConnection(message.dbPath);
-					return sqlite.transaction(() =>
-						readExecutionPolicyFacts(sqlite, params.narratorId, controller.signal),
-					)();
+					return readExecutionPolicySnapshot(
+						getConnection(message.dbPath),
+						params.narratorId,
+						controller.signal,
+					);
 				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
