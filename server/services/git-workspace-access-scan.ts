@@ -21,11 +21,20 @@ export class GitAccessScan {
 	private readonly failure: Promise<never>;
 	private readonly timer: ReturnType<typeof setTimeout>;
 	private readonly stop: () => void;
+	private failureReason: unknown;
+	readonly deadlineAt: number;
+
+	get signal(): AbortSignal {
+		return this.cancellation.signal;
+	}
 
 	constructor(
-		private readonly signal?: AbortSignal,
+		private readonly parentSignal?: AbortSignal,
 		budgetMs = 5000,
+		deadlineAt = Number.POSITIVE_INFINITY,
 	) {
+		budgetMs = Math.max(0, Math.min(budgetMs, deadlineAt - Date.now()));
+		this.deadlineAt = Math.min(deadlineAt, Date.now() + budgetMs);
 		this.deadline = this.started + budgetMs;
 		let reject!: (error: Error) => void;
 		this.failure = new Promise<never>((_, fail) => {
@@ -36,29 +45,47 @@ export class GitAccessScan {
 		this.stop = () => {
 			if (this.stopped) return;
 			this.stopped = true;
-			const error = accessCheckUnavailable();
+			const error = this.parentSignal?.aborted
+				? this.parentSignal.reason
+				: accessCheckUnavailable();
+			this.failureReason = error;
 			// Preserve the scan's fail-closed boundary before cancelling its worker reads.
 			reject(error);
 			this.cancellation.abort(error);
 		};
 		this.timer = setTimeout(this.stop, budgetMs);
-		signal?.addEventListener("abort", this.stop, { once: true });
-		if (signal?.aborted) this.stop();
+		parentSignal?.addEventListener("abort", this.stop, { once: true });
+		if (parentSignal?.aborted) this.stop();
 	}
 
 	check(): void {
-		if (this.stopped || this.signal?.aborted || performance.now() >= this.deadline) {
+		if (
+			this.stopped ||
+			this.parentSignal?.aborted ||
+			performance.now() >= this.deadline ||
+			Date.now() >= this.deadlineAt
+		) {
 			this.stop();
-			throw accessCheckUnavailable();
+			throw this.failureReason;
 		}
 	}
 
 	/** Queueing and worker execution share the scan's original deadline and cancellation. */
-	readOptions(): { signal: AbortSignal; timeoutMs: number } {
+	readOptions(): {
+		signal: AbortSignal;
+		timeoutMs: number;
+		deadlineAt: number;
+		executionPolicy: "worker-required";
+	} {
 		this.check();
 		return {
 			signal: this.cancellation.signal,
-			timeoutMs: Math.max(1, Math.ceil(this.deadline - performance.now())),
+			timeoutMs: Math.max(
+				1,
+				Math.ceil(Math.min(this.deadline - performance.now(), this.deadlineAt - Date.now())),
+			),
+			deadlineAt: this.deadlineAt,
+			executionPolicy: "worker-required",
 		};
 	}
 
@@ -119,9 +146,9 @@ export class GitAccessScan {
 		);
 	}
 
-	dispose(): void {
-		this.stop();
+	dispose(cancelPending = true): void {
+		if (cancelPending) this.stop();
 		clearTimeout(this.timer);
-		this.signal?.removeEventListener("abort", this.stop);
+		this.parentSignal?.removeEventListener("abort", this.stop);
 	}
 }

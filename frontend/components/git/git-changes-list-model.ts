@@ -8,6 +8,7 @@ import type {
 import {
 	type GitStatusFilterChar,
 	type GitStatusPage,
+	type GitStatusPageCacheState,
 	type GitStatusPageFile,
 	type GitStatusPageSection,
 	type GitStatusPageStatsResult,
@@ -26,7 +27,17 @@ export interface GitChangesStatsSource {
 	pageGeneration?: string;
 	filterKey: string;
 	epoch: string;
+	workspaceIdentity?: string;
+	workerEpoch?: string;
+	memberVersion?: number;
+	statsVersion?: number;
+	updating?: boolean;
 }
+export type GitChangesPageStatsResult = GitStatusPageStatsResult & {
+	cache?: GitStatusPageCacheState;
+	workspaceIdentity?: string;
+	filterKey?: string;
+};
 export interface GitChangesStatsSettlement {
 	settled?: boolean;
 	failed?: boolean;
@@ -218,6 +229,7 @@ export class GitChangesListModel {
 	private roots = new Map<GitStatusPageSection, Directory>();
 	private sectionFiles = new Map<GitStatusPageSection, GitChangesDisplayFile[]>();
 	private page: GitStatusPage | undefined;
+	private pageCache: GitStatusPageCacheState | undefined;
 	private snapshotId: string | undefined;
 	private viewportStart = 0;
 	private viewportCount = 20;
@@ -239,6 +251,15 @@ export class GitChangesListModel {
 		for (const page of pages) {
 			if (this.snapshotId && page.snapshotId !== this.snapshotId)
 				throw new Error("Git snapshot changed; refresh the file list");
+			const cache = (page as GitStatusPage & { cache?: GitStatusPageCacheState }).cache;
+			if (
+				this.pageCache &&
+				(!cache ||
+					cache.workerEpoch !== this.pageCache.workerEpoch ||
+					cache.memberVersion !== this.pageCache.memberVersion)
+			)
+				throw new Error("Git membership changed; refresh the file list");
+			this.pageCache = cache;
 			this.snapshotId = page.snapshotId;
 			for (const file of page.files) this.files.set(file.path, file);
 			this.page = page;
@@ -286,7 +307,10 @@ export class GitChangesListModel {
 				this.pageGeneration !== undefined &&
 				source.pageGeneration !== this.pageGeneration) ||
 			source.snapshotId !== this.snapshotId ||
-			source.filterKey !== this.filterKey
+			source.filterKey !== this.filterKey ||
+			(this.pageCache &&
+				(source.workerEpoch !== this.pageCache.workerEpoch ||
+					source.memberVersion !== this.pageCache.memberVersion))
 		)
 			return;
 		const previousSource = this.statsSource;
@@ -294,7 +318,12 @@ export class GitChangesListModel {
 			previousSource?.epoch === source.epoch &&
 			previousSource.snapshotId === source.snapshotId &&
 			previousSource.pageGeneration === source.pageGeneration &&
-			previousSource.filterKey === source.filterKey
+			previousSource.filterKey === source.filterKey &&
+			previousSource.workspaceIdentity === source.workspaceIdentity &&
+			previousSource.workerEpoch === source.workerEpoch &&
+			previousSource.memberVersion === source.memberVersion &&
+			previousSource.statsVersion === source.statsVersion &&
+			previousSource.updating === source.updating
 		)
 			return;
 		const previous = [...this.stats.values()];
@@ -304,7 +333,10 @@ export class GitChangesListModel {
 			!previousSource ||
 			previousSource.snapshotId !== source.snapshotId ||
 			previousSource.pageGeneration !== source.pageGeneration ||
-			previousSource.filterKey !== source.filterKey
+			previousSource.filterKey !== source.filterKey ||
+			previousSource.workspaceIdentity !== source.workspaceIdentity ||
+			previousSource.workerEpoch !== source.workerEpoch ||
+			previousSource.memberVersion !== source.memberVersion
 		)
 			this.stats.clear();
 		this.statsSource = source;
@@ -313,7 +345,7 @@ export class GitChangesListModel {
 
 	mergePageStats(
 		source: GitChangesStatsSource,
-		result?: GitStatusPageStatsResult,
+		result?: GitChangesPageStatsResult,
 		options?: GitChangesStatsSettlement,
 	) {
 		if (
@@ -322,6 +354,17 @@ export class GitChangesListModel {
 			source.snapshotId !== this.statsSource.snapshotId ||
 			source.pageGeneration !== this.statsSource.pageGeneration ||
 			source.filterKey !== this.statsSource.filterKey ||
+			source.workspaceIdentity !== this.statsSource.workspaceIdentity ||
+			source.workerEpoch !== this.statsSource.workerEpoch ||
+			source.memberVersion !== this.statsSource.memberVersion ||
+			source.statsVersion !== this.statsSource.statsVersion ||
+			(result &&
+				source.workerEpoch !== undefined &&
+				(result.cache?.workerEpoch !== source.workerEpoch ||
+					result.cache?.memberVersion !== source.memberVersion ||
+					result.cache?.statsVersion !== source.statsVersion ||
+					result.workspaceIdentity !== source.workspaceIdentity ||
+					result.filterKey !== source.filterKey)) ||
 			source.snapshotId !== this.snapshotId ||
 			source.filterKey !== this.filterKey ||
 			(result && result.snapshotId !== source.snapshotId)
@@ -373,7 +416,10 @@ export class GitChangesListModel {
 			removed: complete ? stats.removed : undefined,
 			statsComplete: complete,
 			statsEpoch: measurement?.epoch,
-			statsRefreshing: !measurement || measurement.epoch !== this.statsSource?.epoch,
+			statsRefreshing:
+				this.statsSource?.updating === true ||
+				!measurement ||
+				measurement.epoch !== this.statsSource?.epoch,
 		};
 	}
 
@@ -712,7 +758,8 @@ export class GitChangesListModel {
 			statsFailed: measurements.some(
 				(measurement) => measurement?.epoch === this.statsSource?.epoch && measurement?.failed,
 			),
-			statsRefreshing: !this.config.stagingOnly && !statsReady,
+			statsRefreshing:
+				!this.config.stagingOnly && (!statsReady || this.statsSource?.updating === true),
 			rows,
 			start: Math.max(0, this.viewportStart - GIT_CHANGES_OVERSCAN),
 			totalRows: this.rows.length,

@@ -149,6 +149,7 @@ function push(type: string, extra: Record<string, unknown> = {}) {
 			type,
 			subscriptionId: subscribe?.subscriptionId,
 			workspaceKey: "workspace",
+			narratorId: subscribe?.narratorId,
 			repositoryKey: "r",
 			...extra,
 		});
@@ -223,7 +224,7 @@ test("healthy push shares one grant, keeps summary out of details and performs z
 	expect(lineGet).not.toHaveBeenCalled();
 });
 
-test("hidden consumers stop subscriptions and refresh; reconnect resumes via push, disconnected mode shares HTTP", async () => {
+test("hidden consumers stop subscriptions and refresh; reconnect resumes push and disconnect never starts HTTP fallback", async () => {
 	transport.connected = true;
 	const statusGet = spyOn(api, "getGitStatus");
 	const lineGet = spyOn(api, "getGitLineStats").mockResolvedValue(stats(5));
@@ -262,15 +263,15 @@ test("hidden consumers stop subscriptions and refresh; reconnect resumes via pus
 	await flush();
 	expect(statusGet).not.toHaveBeenCalled();
 	expect(lineGet).not.toHaveBeenCalled();
-	// A disconnected page reads HTTP once per workspace/projection, not once per dock.
+	// Losing a confirmed push grant withholds facts instead of starting HTTP scans.
 	client.invalidateQueries({ queryKey: ["gitStatus", "workspace"] });
 	client.invalidateQueries({ queryKey: ["gitLineStats", "workspace"] });
 	transport.connected = false;
 	for (const callback of connections) callback(false, false);
 	await flush();
-	expect(statusGet).toHaveBeenCalledTimes(1);
-	expect(lineGet).toHaveBeenCalledTimes(1);
-	expect(container.textContent).toBe("main:5main:5");
+	expect(statusGet).not.toHaveBeenCalled();
+	expect(lineGet).not.toHaveBeenCalled();
+	expect(container.textContent).toBe("::");
 });
 
 test("HTTP summary and detail consumers share a read; only explicit manual refresh bypasses the server cache", async () => {

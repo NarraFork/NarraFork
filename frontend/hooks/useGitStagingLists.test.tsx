@@ -140,6 +140,10 @@ async function renderFiles(probes: FilesProbeProps[] = [{}]) {
 		</QueryClientProvider>,
 	);
 	await flush();
+	if (connected && autoObservation) {
+		emit("git_workspace_subscribed", { version: 0 });
+		await flush();
+	}
 }
 function stagingPage(cursor?: string, nextCursor: string | null = null): GitStagingFilesPage {
 	return {
@@ -161,14 +165,23 @@ function deferredPage() {
 	});
 	return { promise, resolve };
 }
+const messageVersions = new Map<unknown, number>();
 function emit(type: string, extra: Record<string, unknown> = {}) {
+	const subscription = sent.filter((m) => m.type === "git_workspace_subscribe").at(-1);
+	const subscriptionId = extra.subscriptionId ?? subscription?.subscriptionId;
+	const version = extra.version ?? (messageVersions.get(subscriptionId) ?? -1) + 1;
+	if (typeof version === "number")
+		messageVersions.set(
+			subscriptionId,
+			Math.max(messageVersions.get(subscriptionId) ?? -1, version),
+		);
 	for (const callback of listeners)
 		callback({
 			type,
-			subscriptionId: sent.filter((m) => m.type === "git_workspace_subscribe").at(-1)
-				?.subscriptionId,
-			workspaceKey: "w",
-			narratorId: "n",
+			subscriptionId,
+			version,
+			workspaceKey: subscription?.workspaceKey,
+			narratorId: subscription?.narratorId,
 			...extra,
 		});
 }
@@ -320,9 +333,13 @@ test("summary is read-only; expansion and preview read only their own data", asy
 	await render(true, true);
 	expect(diffReads).toBe(1);
 });
-test("unknown or disconnected observations keep cached content readable but block ownership writes", async () => {
+test("authorization waits before reading; an acknowledged unknown observation blocks ownership writes", async () => {
 	autoObservation = false;
 	await render(true, true);
+	expect(summaryReads).toBe(0);
+	expect(latest.summary).toBeUndefined();
+	emit("git_workspace_subscribed", { version: 0 });
+	await flush();
 	expect(latest.summary?.state).toBe("ready");
 	expect(latest.writable).toBe(false);
 	expect(document.body.textContent).toBe("same.txt");
@@ -359,6 +376,36 @@ test("pending epochs retire captured mutation closures even after an unchanged o
 	).rejects.toThrow("observation changed");
 	expect(actions).toEqual([]);
 	expect({ summaryReads, files: fileReads, diffReads }).toEqual(before);
+});
+
+test.each([
+	503, 409,
+])("staging HTTP %s suspends authorization only for transient or explicit identity errors", async (status) => {
+	await render(true, true);
+	const id = sent.find((message) => message.type === "git_workspace_subscribe")?.subscriptionId;
+	const captured = latest.mutation.mutateAsync;
+	const before = { files: fileReads.length, diff: diffReads };
+	api.getGitStagingLists = async () => {
+		summaryReads++;
+		throw new ApiError("Temporary", status, {
+			code: status === 503 ? "DB_READ_WORKER_UNAVAILABLE" : "GIT_WORKSPACE_CHANGED",
+			messageCode: status === 503 ? "DATABASE_READ_UNAVAILABLE" : undefined,
+		});
+	};
+	await latest.query.refetch();
+	await flush();
+	expect(latest.refused).toBe(false);
+	expect(latest.summary).toBeUndefined();
+	expect(latest.writable).toBe(false);
+	const reads = summaryReads;
+	await latest.query.refetch();
+	await latest.refresh();
+	await expect(captured({ action: "sync" })).rejects.toThrow("observation changed");
+	expect(summaryReads).toBe(reads);
+	expect({ files: fileReads.length, diff: diffReads }).toEqual(before);
+	expect(actions).toEqual([]);
+	if (status === 503)
+		expect(sent.at(-1)).toEqual({ type: "git_workspace_refresh", subscriptionId: id });
 });
 
 test("one explicit unchanged refresh sends one HTTP sync and no WS refresh or content rereads", async () => {
@@ -509,7 +556,7 @@ test("one WS observation invalidates summary and every affected group, once", as
 		lists: summary.lists.map((entry) => ({ ...entry, snapshotVersion: "v2" })),
 	};
 	emit("git_workspace_staging_lists_changed", {
-		version: 1,
+		version: 2,
 		affectedListIds: ["A", "B"],
 		generation: 2,
 		observationId: "o2",
@@ -924,9 +971,10 @@ test("a hidden page chain pauses manual reads and resumes its cached prefix on r
 	pending.resolve(stagingPage("late"));
 	await flush();
 	expect(calls).toBe(2);
-	expect(readers.first.pages).toHaveLength(1);
+	expect(readers.first.pages).toHaveLength(0);
 	Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
 	document.dispatchEvent(new window.Event("visibilitychange"));
+	emit("git_workspace_subscribed", { version: 0 });
 	await flush();
 	expect(calls).toBe(3);
 	expect(readers.first.pages.map((page) => page.files[0].path)).toEqual([
@@ -1073,11 +1121,11 @@ test.each([
 	await captured.fetchNextPage();
 	pending.resolve(stagingPage("late", "never"));
 	await flush();
-	expect(calls).toHaveLength(3);
+	expect(calls).toHaveLength(kind === "account" ? 2 : 3);
 	expect((oldQuery?.state.data as { pages: GitStagingFilesPage[] }).pages).toHaveLength(1);
-	expect(readers.first.pages.flatMap((page) => page.files).map((entry) => entry.path)).toEqual([
-		"first.txt",
-	]);
+	expect(readers.first.pages.flatMap((page) => page.files).map((entry) => entry.path)).toEqual(
+		kind === "account" ? [] : ["first.txt"],
+	);
 	expect(readers.first.error).toBeNull();
 });
 
