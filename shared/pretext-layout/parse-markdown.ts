@@ -474,13 +474,47 @@ export function parseMarkdownUnits(
 	let consumed = 0;
 	let precise = sourceRanges;
 	const normalized = sourceRanges && lexerOffsets ? text.replace(/\r\n?/g, "\n") : text;
-	for (const token of tokens) {
+	// Marked can rewrite a blockquote's raw slice. Never guess its extent or
+	// search for repeated text: recover only the exact suffix anchored at EOF.
+	let suffixIndex = tokens.length;
+	let suffixOffset = normalized.length;
+	if (sourceRanges) {
+		while (suffixIndex > 0) {
+			const raw = tokens[suffixIndex - 1].raw;
+			const start = suffixOffset - raw.length;
+			if (start < 0 || !normalized.startsWith(raw, start)) break;
+			suffixIndex--;
+			suffixOffset = start;
+		}
+	}
+	const exactOriginalOffset = (offset: number) => {
+		const boundary = lexerOffsets?.[offset] ?? offset;
+		let lo = 0;
+		let hi = insertions.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			if (insertions[mid] < boundary) lo = mid + 1;
+			else hi = mid;
+		}
+		return sourceOffsets?.[boundary - lo] ?? boundary - lo;
+	};
+	let prefixEnd = 0;
+	for (const [index, token] of tokens.entries()) {
 		const tokenStart = consumed;
 		const start = originalOffset(consumed);
 		precise &&= normalized.startsWith(token.raw, tokenStart);
+		let rangeStart: number | undefined;
+		if (precise) {
+			rangeStart = tokenStart;
+			prefixEnd = tokenStart + token.raw.length;
+		}
+		if (index >= suffixIndex) {
+			if (!precise && suffixOffset >= prefixEnd) rangeStart = suffixOffset;
+			suffixOffset += token.raw.length;
+		}
 		const itemRanges =
-			precise && token.type === "list"
-				? listItemSourceRanges(token as Tokens.List, tokenStart, markdown, originalOffset)
+			rangeStart !== undefined && token.type === "list"
+				? listItemSourceRanges(token as Tokens.List, rangeStart, markdown, exactOriginalOffset)
 				: undefined;
 		consumed += token.raw.length;
 		const end = originalOffset(consumed);
@@ -491,7 +525,14 @@ export function parseMarkdownUnits(
 		const raw = markdown.slice(start, end);
 		const cached = sourceRanges ? undefined : reuse?.(raw, isFirst);
 		const prepared = cached ?? prepareSingleToken(token, isFirst, math, formulas, itemRanges);
-		const sourceRange = precise ? trimmedSourceRange(markdown, start, end) : undefined;
+		const sourceRange =
+			rangeStart === undefined
+				? undefined
+				: trimmedSourceRange(
+						markdown,
+						exactOriginalOffset(rangeStart),
+						exactOriginalOffset(rangeStart + token.raw.length),
+					);
 		const blocks = sourceRange
 			? prepared.map((block) => (block.sourceRange ? block : { ...block, sourceRange }))
 			: prepared;

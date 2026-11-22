@@ -155,6 +155,19 @@ test("a Markdown list formed by two reasoning blocks retains per-item provenance
 	);
 });
 
+test("an inexact blockquote cannot mask the exact source of a following paragraph", () => {
+	const quote = "> - item\n>\n> - next\nwrapped";
+	const tail = "Repeated prose.";
+	const text = `${tail}\n\n${quote}\n\n${tail}`;
+	const parsed = parseMarkdownToPreparedBlocks(text, undefined, true);
+	expect(parsed[0]?.sourceRange).toEqual({ start: 0, end: tail.length });
+	expect(parsed.slice(1, -1).every(({ sourceRange }) => !sourceRange)).toBe(true);
+	expect(parsed.at(-1)?.sourceRange).toEqual({
+		start: text.length - tail.length,
+		end: text.length,
+	});
+});
+
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {
 	const checkpoint = {
 		type: "reasoning",
