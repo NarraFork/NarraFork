@@ -14,6 +14,19 @@ export interface ReasoningTranslationFields {
 	translationParts?: ReasoningTranslationPart[];
 }
 
+export interface ReasoningTranslationPatch {
+	type: "reasoning_translation_patch";
+	narratorId: string;
+	ownerNarratorId: string;
+	messageId: string;
+	blockId: string;
+	elementId: string;
+	blockRevision: number;
+	stateRevision: number;
+	translationGeneration: string;
+	part: ReasoningTranslationPart;
+}
+
 export const MAX_REASONING_TRANSLATION_ID_LENGTH = 256;
 export const MAX_REASONING_TRANSLATION_SOURCE_BYTES = 32 * 1024;
 export const MAX_REASONING_TRANSLATION_OUTPUT_BYTES = 64 * 1024;
@@ -32,6 +45,60 @@ export function isReasoningTranslationBoundary(text: string, offset: number): bo
 	const before = text.charCodeAt(offset - 1);
 	const after = text.charCodeAt(offset);
 	return !(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff);
+}
+
+/** Normalize and bound a wire patch before it can enter a retained client queue. */
+export function readReasoningTranslationPatch(value: unknown): ReasoningTranslationPatch | null {
+	if (!value || typeof value !== "object") return null;
+	const frame = value as ReasoningTranslationPatch;
+	if (
+		frame.type !== "reasoning_translation_patch" ||
+		![
+			frame.narratorId,
+			frame.ownerNarratorId,
+			frame.messageId,
+			frame.blockId,
+			frame.elementId,
+			frame.translationGeneration,
+		].every(isReasoningTranslationId) ||
+		![frame.blockRevision, frame.stateRevision].every(
+			(rev) => Number.isSafeInteger(rev) && rev >= 0,
+		)
+	)
+		return null;
+	const part = frame.part;
+	if (
+		!part ||
+		typeof part !== "object" ||
+		typeof part.sourceText !== "string" ||
+		!Number.isSafeInteger(part.start) ||
+		part.start < 0 ||
+		!Number.isSafeInteger(part.end) ||
+		part.end - part.start !== part.sourceText.length ||
+		!getValidReasoningTranslationParts(part.sourceText, frame.translationGeneration, [
+			{ ...part, start: 0, end: part.sourceText.length },
+		]).length
+	)
+		return null;
+	return {
+		type: frame.type,
+		narratorId: frame.narratorId,
+		ownerNarratorId: frame.ownerNarratorId,
+		messageId: frame.messageId,
+		blockId: frame.blockId,
+		elementId: frame.elementId,
+		blockRevision: frame.blockRevision,
+		stateRevision: frame.stateRevision,
+		translationGeneration: frame.translationGeneration,
+		part: {
+			id: part.id,
+			generation: part.generation,
+			start: part.start,
+			end: part.end,
+			sourceText: part.sourceText,
+			translatedText: part.translatedText,
+		},
+	};
 }
 
 /** Discard stale or ambiguous ranges; accepted ranges never overlap. */
