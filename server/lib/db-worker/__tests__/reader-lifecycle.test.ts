@@ -128,7 +128,10 @@ describe("owned ephemeral readers", () => {
 			params: [],
 			maxRows: 1,
 		});
-		await expect(failure.result).rejects.toMatchObject({ code: "DB_READ_FAILED" });
+		await expect(failure.result).rejects.toMatchObject({
+			name: "DbReadTaskExecutionError",
+			code: "SQLITE_ERROR",
+		});
 		await failure.released;
 		expect(getDbWorkerPoolStats().tracked).toBe(0);
 		expect(getDbWorkerAvailability().available).toBe(true);

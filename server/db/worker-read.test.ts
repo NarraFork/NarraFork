@@ -384,7 +384,7 @@ describe("strict and extended read bridge", () => {
 			await readNativeRows(sqlite, "SELECT private_column FROM private_table", [], strict);
 			throw new Error("expected rejection");
 		} catch (error) {
-			expect(error).toMatchObject({ code: "DB_READ_FAILED" });
+			expect(error).toMatchObject({ name: "DbReadTaskExecutionError", code: "SQLITE_ERROR" });
 			expect(String(error)).not.toContain("private_");
 		}
 	});
@@ -1245,7 +1245,7 @@ describe("read query rejection diagnostics", () => {
 			[],
 			strict,
 		).catch((error: unknown) => error);
-		expect(failure).toMatchObject({ code: "DB_READ_FAILED" });
+		expect(failure).toMatchObject({ name: "DbReadTaskExecutionError", code: "SQLITE_ERROR" });
 		expect(warn.mock.calls.map(([message]) => message)).toEqual([
 			"Database read worker query failed",
 		]);
