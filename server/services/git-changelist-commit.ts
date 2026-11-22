@@ -11,7 +11,7 @@ import {
 	renameSync,
 	unlinkSync,
 } from "node:fs";
-import { lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { GitStagingAction, GitStagingActionResult } from "../../shared/git-staging-lists";
 import {
@@ -677,21 +677,23 @@ export async function commitChangelist(
 			undefined,
 			{ signal },
 		);
+		const privateLock = join(directory, "native.lock");
+		nativeLock = await open(
+			privateLock,
+			constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		await nativeLock.sync();
+		const lockInfo = await nativeLock.stat();
+		evidence.lockIdentity = `${lockInfo.dev}:${lockInfo.ino}`;
 		await updateOperation(store, id, { status: "prepared", tree: expectedTree, evidence });
 		try {
-			nativeLock = await open(
-				lockPath,
-				constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
-				0o600,
-			);
+			await link(privateLock, lockPath);
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "EEXIST")
 				throw fail("GIT_STAGING_LOCKED", "The native index is locked");
 			throw e;
 		}
-		await nativeLock.sync();
-		const lockInfo = await nativeLock.stat();
-		evidence.lockIdentity = `${lockInfo.dev}:${lockInfo.ino}`;
 		const nativeNow = await readBoundedFile(repo.index, 64 * 1024 * 1024),
 			headNow = await currentChangelistHead(repo, signal);
 		if (
@@ -927,7 +929,7 @@ export async function recoverChangelistCommit(
 			)
 				throw fail("GIT_STAGING_LOCKED", "Another producer owns this operation");
 			assertHeadSync(repo, head.head, head.headFile, head.headTarget);
-			if (saved.lockIdentity) {
+			if (saved.lockIdentity && lockInfoSync(`${repo.index}.lock`)) {
 				assertOwnedLockSync(repo, saved);
 				unlinkSync(`${repo.index}.lock`);
 			}

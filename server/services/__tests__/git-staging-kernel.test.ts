@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "b
 import { execFile } from "node:child_process";
 import {
 	chmod,
+	link,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -1690,6 +1691,70 @@ test("recovery cancels an expired reservation interrupted before Git invocation"
 		expect(store.pending()).toBeNull();
 		expect((await act({ action: "sync" })).outcome).toBe("applied");
 		expect((await commit(await active())).outcome).toBe("applied");
+	} finally {
+		store.close();
+	}
+});
+
+test.each([
+	"unpublished",
+	"published",
+	"foreign",
+])("pre-invocation recovery respects durable native lock ownership (%s)", async (phase) => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const repo = await resolveGitStagingRepository(root);
+	const lockPath = `${repo.index}.lock`;
+	const retainedLock = join(root, "retained-native.lock");
+	let saved: { id: string; evidence_json: string } | undefined;
+	const original = processes.stagingGit;
+	const mock = spyOn(processes, "stagingGit").mockImplementation(async (cwd, args, options) => {
+		if (!saved && args[0] === "rev-parse" && (await lstat(lockPath).catch(() => null))) {
+			const read = await db();
+			try {
+				saved = read
+					.query("SELECT id,evidence_json FROM commit_operations WHERE status='prepared'")
+					.get() as typeof saved;
+			} finally {
+				read.close();
+			}
+			await link(lockPath, retainedLock);
+			throw new Error("interrupted after native lock publication");
+		}
+		return original(cwd, args, options);
+	});
+	restores.push(() => mock.mockRestore());
+	await expect(commit(await active())).rejects.toThrow("interrupted after native lock publication");
+	mock.mockRestore();
+	if (!saved) throw new Error("Missing durable preparation evidence");
+	if (phase === "published") await link(retainedLock, lockPath);
+	else if (phase === "foreign") await writeFile(lockPath, "foreign writer");
+	await rm(retainedLock);
+	const store = await ChangelistStore.open(repo);
+	if (!store) throw new Error("Missing fixture store");
+	try {
+		const evidence = JSON.parse(saved.evidence_json);
+		evidence.leaseUntil = 0;
+		await store.transaction(() => {
+			store.db
+				.query("UPDATE commit_operations SET status='prepared',evidence_json=? WHERE id=?")
+				.run(JSON.stringify(evidence), saved?.id as string);
+			store.db.query("UPDATE workspace_state SET state='recovering'").run();
+		});
+		if (phase === "foreign") {
+			await expect(act({ action: "recover", operationId: saved.id })).rejects.toMatchObject({
+				code: "GIT_STAGING_LOCKED",
+			});
+			expect(await readFile(lockPath, "utf8")).toBe("foreign writer");
+		} else {
+			expect((await act({ action: "recover", operationId: saved.id })).outcome).toBe("applied");
+			await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(store.pending()).toBeNull();
+			await git("add", "--", "a");
+			await git("reset", "--quiet", "--", "a");
+			expect((await act({ action: "sync" })).outcome).toBe("applied");
+			expect((await commit(await active())).outcome).toBe("applied");
+		}
 	} finally {
 		store.close();
 	}
