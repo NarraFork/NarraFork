@@ -72,6 +72,12 @@ import {
 } from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import {
+	selectVisibleToolDetail,
+	TOOL_DETAIL_CANDIDATE_LIMIT,
+	TOOL_DETAIL_PAYLOAD_BYTE_LIMIT,
+	type ToolDetailReference,
+} from "../lib/db-worker/tool-detail-selection";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -150,6 +156,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { toolDetailSelectionRequired, validateToolDetailReference } from "./narrator-tool-detail";
 import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
@@ -3320,22 +3327,6 @@ export {
 	TAKEN_OVER_FIELD,
 };
 
-// Tool-use IDs come from providers and are not unique across attempts/sessions.
-// Metadata is bounded before visibility filtering, never mistaken for a full set.
-const TOOL_DETAIL_CANDIDATE_LIMIT = 200;
-const TOOL_DETAIL_METADATA_ROW_LIMIT = 1_000;
-const TOOL_DETAIL_PAYLOAD_BYTE_LIMIT = 32 * 1024 * 1024;
-
-type ToolDetailReference = { toolCallId?: string; messageId?: string };
-
-function toolDetailSelectionRequired(): AppError {
-	return new AppError(
-		"Tool detail selection is ambiguous or exceeds the metadata budget; specify toolCallId or messageId.",
-		409,
-		"TOOL_CALL_DETAIL_SELECTION_REQUIRED",
-	);
-}
-
 function toolMessageRefExists(narratorId: string | AnyColumn): SQL<boolean> {
 	// Keep the outer table qualification literal. Drizzle strips Column qualifiers
 	// in single-table projections, which would correlate message_id to detail_ref
@@ -3354,23 +3345,7 @@ function selectVisibleToolCallTx(
 	toolUseId: string,
 	reference?: ToolDetailReference,
 ) {
-	for (const value of [reference?.toolCallId, reference?.messageId]) {
-		if (
-			value !== undefined &&
-			(typeof value !== "string" || value.length === 0 || value.length > 128)
-		) {
-			throw new ValidationError(
-				"Tool detail references must be non-empty IDs of at most 128 characters",
-			);
-		}
-	}
-	let metadataRows = 0;
-	const admit = (length: number) => {
-		metadataRows += length;
-		if (length > TOOL_DETAIL_CANDIDATE_LIMIT || metadataRows > TOOL_DETAIL_METADATA_ROW_LIMIT) {
-			throw toolDetailSelectionRequired();
-		}
-	};
+	validateToolDetailReference(reference);
 	const parentColumns = {
 		...historyToolMetadataColumns,
 		executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
@@ -3403,74 +3378,21 @@ function selectVisibleToolCallTx(
 		)
 		.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
 		.all();
-	admit(candidates.length);
-	const childVisibility = new Map<string, boolean>();
-	const visible = candidates.filter((candidate) => {
-		if (candidate.directRef) return true;
-		// A provider-supplied parentToolUseId is only a consistency check after the
-		// real subagent identity and original tool-call PK have established ancestry.
-		if (
-			candidate.authorType !== "subagent" ||
-			!isSubagentVariant(candidate.authorVariant) ||
-			!candidate.authorOriginToolCallId ||
-			!candidate.authorParentNarratorId ||
-			!candidate.parentToolUseId ||
-			!candidate.authorRef ||
-			candidate.narratorId !== candidate.messageNarratorId
-		)
-			return false;
-		const originId = candidate.authorOriginToolCallId;
-		const key = JSON.stringify([candidate.messageNarratorId, originId, candidate.parentToolUseId]);
-		const cached = childVisibility.get(key);
-		if (cached !== undefined) return cached;
-		const isAgent = (call: {
-			toolName: string;
-			executionIdentityVersion: number;
-			isFileHistoryCheckpoint: boolean;
-		}) =>
-			(call.toolName === "Agent" || call.toolName === "Task") &&
-			call.executionIdentityVersion === 1 &&
-			!call.isFileHistoryCheckpoint;
-		const original = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, originId))
-			.get();
-		admit(original ? 1 : 0);
-		if (
-			original &&
-			(!isAgent(original) ||
-				original.executionOriginToolCallId !== null ||
-				original.narratorId !== candidate.authorParentNarratorId ||
-				original.toolUseId !== candidate.parentToolUseId)
-		) {
-			childVisibility.set(key, false);
-			return false;
-		}
-		if (original?.directRef) {
-			childVisibility.set(key, true);
-			return true;
-		}
-		// The original may have been removed after COW. Its immutable PK survives
-		// in the copy; neither a shared provider ID nor an author's identity alone
-		// is enough. The requesting narrator must still reference that exact copy.
-		const parentCopies = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.toolUseId, candidate.parentToolUseId))
-			.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
-			.all();
-		admit(parentCopies.length);
-		const allowed = parentCopies.some(
-			(parent) =>
-				parent.directRef && isAgent(parent) && parent.executionOriginToolCallId === originId,
-		);
-		childVisibility.set(key, allowed);
-		return allowed;
-	});
-	if (visible.length === 0) throw new NotFoundError("ToolCall", toolUseId);
-	if (visible.length !== 1) throw toolDetailSelectionRequired();
-	return visible[0];
+	const selected = selectVisibleToolDetail(
+		candidates,
+		(id) =>
+			tx.select(parentColumns).from(narratorToolCalls).where(eq(narratorToolCalls.id, id)).get(),
+		(useId) =>
+			tx
+				.select(parentColumns)
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.toolUseId, useId))
+				.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
+				.all(),
+	);
+	if (selected.kind === "notFound") throw new NotFoundError("ToolCall", toolUseId);
+	if (selected.kind !== "selected") throw toolDetailSelectionRequired();
+	return selected;
 }
 
 function getToolCallDetailTx(

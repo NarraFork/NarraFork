@@ -58,6 +58,7 @@ import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readToolDetailSnapshot } from "./tool-detail-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
@@ -224,6 +225,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "toolDetailSnapshot") {
+					return readToolDetailSnapshot(getConnection(message.dbPath), params, controller.signal);
+				}
 				if (params.kind === "compactSummary") {
 					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
 				}

@@ -9,6 +9,7 @@ export interface ReadPoolTaskDiagnostics {
 		| "knowledge.keyword-signature"
 		| "narrator.request-recording"
 		| "narrator.message-language"
+		| "narrator.tool-detail"
 		| "unattributed";
 	requestId?: string;
 	startedAt: number;
@@ -19,7 +20,8 @@ export function readPoolDiagnosticSource(source: unknown): ReadPoolTaskDiagnosti
 	return source === "auth.session" ||
 		source === "knowledge.keyword-signature" ||
 		source === "narrator.request-recording" ||
-		source === "narrator.message-language"
+		source === "narrator.message-language" ||
+		source === "narrator.tool-detail"
 		? source
 		: "unattributed";
 }

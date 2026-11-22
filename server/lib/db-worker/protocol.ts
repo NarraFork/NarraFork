@@ -31,6 +31,7 @@ import type {
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -48,6 +49,7 @@ export type DbReadTaskName =
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
 	| "databaseCleanupContext"
+	| "toolDetailSnapshot"
 	| "selectRows"
 	| "toolEditPreview"
 	| "knowledgeEntryDetail"
@@ -280,6 +282,7 @@ export type DbReadTaskParams =
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
 	| { kind: "databaseCleanupContext" }
+	| ToolDetailSnapshotParams
 	| SelectRowsParams
 	| { kind: "toolEditPreview"; toolCallId: string }
 	| { kind: "knowledgeEntryDetail"; entryId: string }
