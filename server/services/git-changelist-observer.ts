@@ -182,6 +182,12 @@ export async function currentChangelistHead(repo: ChangelistRepository, signal?:
 	if (result.exitCode !== 0 && result.exitCode !== 1)
 		throw fail("GIT_STAGING_GIT_FAILED", "Cannot read HEAD");
 	const head = result.exitCode === 0 ? result.stdout.trim() : null;
+	const symbolic = await stagingGit(repo.root, ["symbolic-ref", "--quiet", "HEAD"], {
+		allowFailure: true,
+		signal,
+	});
+	if (symbolic.exitCode !== 0 && symbolic.exitCode !== 1)
+		throw fail("GIT_STAGING_GIT_FAILED", "Cannot read HEAD reference");
 	const tree = (
 		await stagingGit(repo.root, head ? ["rev-parse", `${head}^{tree}`] : ["mktree"], {
 			input: "",
@@ -192,7 +198,7 @@ export async function currentChangelistHead(repo: ChangelistRepository, signal?:
 		head,
 		tree,
 		headFile,
-		headTarget: headFile?.startsWith("ref:") ? headFile.trim() : null,
+		headTarget: symbolic.exitCode === 0 ? `ref: ${symbolic.stdout.trim()}` : null,
 	};
 }
 interface Entry {

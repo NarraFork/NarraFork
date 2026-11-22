@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { observeChangelists } from "../git-changelist-observer";
+import { currentChangelistHead, observeChangelists } from "../git-changelist-observer";
 import {
 	CHANGELIST_SNAPSHOT_LIMITS,
 	type ChangelistRepository,
@@ -101,3 +101,22 @@ for (const directoryFirst of [false, true]) {
 		expect((await observeChangelists(repo, store)).state).toBe("ready");
 	});
 }
+
+test("reftable HEAD identity names the actual symbolic branch rather than its compatibility stub", async () => {
+	const refRoot = join(root, "reftable");
+	await exec(
+		"git",
+		["init", "--quiet", "--ref-format=reftable", "--initial-branch=main", refRoot],
+		{
+			timeout: 10_000,
+			maxBuffer: 4096,
+		},
+	);
+	const head = await currentChangelistHead({
+		...repo,
+		root: refRoot,
+		gitDir: join(refRoot, ".git"),
+	});
+	expect(head.head).toBeNull();
+	expect(head.headTarget).toBe("ref: refs/heads/main");
+});
