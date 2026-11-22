@@ -1,5 +1,6 @@
 import {
 	getValidReasoningTranslationParts,
+	isReasoningTranslationBoundary,
 	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
 	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
 	type ReasoningTranslationPatch,
@@ -13,6 +14,7 @@ import { getUserLanguage } from "../lib/prompt-i18n";
 import { resolveTranslationModelOverride, settings } from "../lib/settings";
 import { isEnvelopeHistoryProtected } from "./narrator-block-sync";
 import { narratorPersistence } from "./narrator-persistence";
+import { reasoningTranslationActivity } from "./reasoning-translation-activity";
 import { ReasoningTranslationScheduler } from "./reasoning-translation-scheduler";
 
 interface VisibleViewer {
@@ -31,6 +33,7 @@ interface SourceRow {
 	payload: string;
 	state: string | null;
 	stateRevision: number;
+	phase: string;
 	ownerUserId: string | null;
 }
 
@@ -39,11 +42,12 @@ function readVisibleSource(viewer: VisibleViewer, target: ReasoningTranslationVi
 		return null;
 	return sqlite
 		.query<SourceRow, [string, string, string, number, string]>(
-			`SELECT b.payload, b.state, m.state_revision AS stateRevision, owner.owner_user_id AS ownerUserId
+			`SELECT b.payload, b.state, b.phase, m.state_revision AS stateRevision, owner.owner_user_id AS ownerUserId
 			 FROM narrator_blocks b JOIN narrator_messages m ON m.id = b.message_id
 			 JOIN narrators owner ON owner.id = m.narrator_id
 			 WHERE b.id = ? AND b.message_id = ? AND m.narrator_id = ? AND b.revision = ?
-			   AND m.role = 'assistant' AND m.body_format = 2 AND b.kind = 'reasoning' AND b.phase = 'done'
+			   AND m.role = 'assistant' AND m.body_format = 2 AND b.kind = 'reasoning'
+			   AND b.phase IN ('done', 'open')
 			   AND m.body_bytes BETWEEN 1 AND 524288
 			   AND octet_length(b.payload) <= 262144 AND coalesce(octet_length(b.state), 0) <= 262144
 			   AND (EXISTS (
@@ -76,6 +80,37 @@ function readVisibleSource(viewer: VisibleViewer, target: ReasoningTranslationVi
 		);
 }
 
+function sourceRange(row: SourceRow, target: ReasoningTranslationVisibilityTarget) {
+	const raw = JSON.parse(row.payload)?.raw as Array<{
+		type?: string;
+		id?: string;
+		text?: string;
+		revision?: number;
+		completed?: boolean;
+	}>;
+	if (!Array.isArray(raw)) return null;
+	const index = raw.findIndex(
+		(element) => element?.type === "reasoning" && element.id === target.elementId,
+	);
+	const source = raw[index];
+	const text = source?.text;
+	if (
+		typeof text !== "string" ||
+		!text.trim() ||
+		text.length > MAX_REASONING_TRANSLATION_SOURCE_BYTES
+	)
+		return null;
+	const eligibleEnd =
+		row.phase === "done"
+			? text.length
+			: source.completed === false
+				? reasoningTranslationActivity.end(target, source.revision)
+				: 0;
+	if (!eligibleEnd || !isReasoningTranslationBoundary(text, eligibleEnd)) return null;
+	const fields = row.state ? JSON.parse(row.state).raw?.[index] : undefined;
+	return { text, eligibleEnd, fields };
+}
+
 export async function translateDemand(
 	{ viewer, target, publish }: TranslationDemand,
 	signal: AbortSignal,
@@ -99,14 +134,9 @@ export async function translateDemand(
 		return;
 	const row = readVisibleSource(viewer, target);
 	if (!row || row.ownerUserId !== owner.ownerUserId) return;
-	const raw = JSON.parse(row.payload)?.raw as Array<{ type?: string; id?: string; text?: string }>;
-	if (!Array.isArray(raw)) return;
-	const index = raw.findIndex(
-		(element) => element?.type === "reasoning" && element.id === target.elementId,
-	);
-	const text = raw[index]?.text;
-	if (!text?.trim() || text.length > MAX_REASONING_TRANSLATION_SOURCE_BYTES) return;
-	const fields = row.state ? JSON.parse(row.state).raw?.[index] : undefined;
+	const source = sourceRange(row, target);
+	if (!source) return;
+	const { text, eligibleEnd, fields } = source;
 	if (fields?.translatedText) return;
 	const generation = fields?.translationGeneration ?? crypto.randomUUID();
 	const existing = getValidReasoningTranslationParts(text, generation, fields?.translationParts);
@@ -115,7 +145,10 @@ export async function translateDemand(
 		if (part.start !== start) break;
 		start = part.end;
 	}
-	const end = existing.find((part) => part.start > start)?.start ?? text.length;
+	const end = Math.min(
+		eligibleEnd,
+		existing.find((part) => part.start > start)?.start ?? text.length,
+	);
 	const sourceText = text.slice(start, end);
 	if (!sourceText.trim() || Buffer.byteLength(sourceText) > MAX_REASONING_TRANSLATION_SOURCE_BYTES)
 		return;
@@ -137,10 +170,13 @@ export async function translateDemand(
 		signal.aborted ||
 		!settings.agent.translateReasoning ||
 		!(await viewer.authorize(target.ownerNarratorId)) ||
-		signal.aborted ||
-		readVisibleSource(viewer, target)?.ownerUserId !== row.ownerUserId
+		signal.aborted
 	)
 		return;
+	const current = readVisibleSource(viewer, target);
+	if (!current || current.ownerUserId !== row.ownerUserId) return;
+	const currentSource = sourceRange(current, target);
+	if (!currentSource || currentSource.text !== text || currentSource.eligibleEnd < end) return;
 	const part = { id: crypto.randomUUID(), generation, start, end, sourceText, translatedText };
 	if (
 		!narratorPersistence.patchReasoningTranslationRange(

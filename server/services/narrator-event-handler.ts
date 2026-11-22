@@ -74,6 +74,7 @@ import {
 import { narratorStore } from "./narrator-store";
 import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
+import { reasoningTranslationActivity } from "./reasoning-translation-activity";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
 /** Maps are scoped to this consumer/session, not globally to provider tool ids. */
@@ -1064,6 +1065,7 @@ function noteSubagentOutputText(
 
 /** Reset one author's stream without deleting concurrently running relatives. */
 function clearAuthorStreamingSnapshot(ctx: EventHandlerContext): void {
+	reasoningTranslationActivity.clear(ctx.narratorId);
 	const ownerId = ctx.parentToolUseId ? ctx.narratorId : ctx.broadcastTargetId;
 	const owner = streamingSnapshots.get(ownerId);
 	// A narrator's snapshot also holds its children's tool summaries. Those children
@@ -2218,6 +2220,25 @@ export async function processEvent(
 				});
 				retireCompletedSnapshot();
 			} else if (block.type === "reasoning") {
+				let sealedReasoningLength = 0;
+				if (
+					settings.agent.translateReasoning &&
+					block.completed === false &&
+					block.id &&
+					block.revision !== undefined &&
+					event.sealedReasoningLength &&
+					event.sealedReasoningLength <= block.text.length &&
+					block.text.length === block.rawTextLength
+				) {
+					sealedReasoningLength = event.sealedReasoningLength;
+					reasoningTranslationActivity.seal(
+						narratorId,
+						partialId,
+						block.id,
+						block.revision,
+						event.sealedReasoningLength,
+					);
+				}
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
 					text: block.text,
@@ -2225,6 +2246,7 @@ export async function processEvent(
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
 					...(block.completed != null ? { completed: block.completed } : {}),
+					...(block.completed === false ? { sealedReasoningLength } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
 				});

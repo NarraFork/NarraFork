@@ -2521,6 +2521,7 @@ export interface ResponsesReasoningAccum {
 	nativeParts?: Map<number, string>;
 	/** Summary bytes are separate from the rendered text and its inserted boundaries. */
 	summaryParts?: Map<number, string>;
+	sealedSummaryParts?: Set<number>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	/** Last terminal snapshot, so completed.output may enrich it without duplicating text. */
 	replayMetadata?: ReasoningProviderMetadata["openai"];
@@ -2598,6 +2599,7 @@ function pushReasoningTextEvent(
 		acc.summaryParts ??= new Map();
 		const index = chunk.summary_index ?? 0;
 		const previous = acc.summaryParts.get(index) ?? "";
+		if (!options.emitOnlyIfAccumulatorEmpty) acc.sealedSummaryParts?.delete(index);
 		if (options.emitOnlyIfAccumulatorEmpty) rememberReasoningPart(acc.summaryParts, index, text);
 		else acc.summaryParts.set(index, previous + text);
 		if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
@@ -3224,10 +3226,29 @@ export function parseResponsesAPIEvent(
 		type === "response.reasoning_summary_part.done"
 	) {
 		const text = chunk.text ?? chunk.part?.text;
+		const initial = resolveReasoningAccum(chunk, reasoningAccum);
+		const index = chunk.summary_index;
+		const seen = index === undefined ? undefined : initial?.summaryParts?.get(index);
 		if (typeof text === "string") {
 			pushReasoningTextEvent(results, chunk, reasoningAccum, text, {
 				emitOnlyIfAccumulatorEmpty: true,
 			});
+		}
+		const acc = resolveReasoningAccum(chunk, reasoningAccum);
+		let reasoningSummaryEnd: number | undefined;
+		if (
+			type !== "response.reasoning_text.done" &&
+			typeof index === "number" &&
+			Number.isSafeInteger(index) &&
+			index >= 0 &&
+			acc?.textFormat === "summary_text" &&
+			acc.summaryParts?.get(index) &&
+			(typeof text !== "string" || !seen || text === seen)
+		) {
+			acc.sealedSummaryParts ??= new Set();
+			acc.sealedSummaryParts.add(index);
+			if (acc.summaryParts.size === acc.sealedSummaryParts.size)
+				reasoningSummaryEnd = acc.emittedText?.length;
 		}
 		// A summary is not an independently replayable reasoning item. Final
 		// encrypted_content arrives only on output_item.done.
@@ -3237,6 +3258,7 @@ export function parseResponsesAPIEvent(
 				phase: "checkpoint",
 				blockId: responsesBlockId(chunk, "reasoning"),
 				outputIndex: chunk.output_index,
+				...(reasoningSummaryEnd ? { reasoningSummaryEnd } : {}),
 			},
 		});
 		return results;
