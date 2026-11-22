@@ -11,6 +11,7 @@ import {
 	isGitStatusFilterChar,
 } from "../../shared/git-status-page";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
+import { logger } from "../lib/logger";
 import { WorkerCleanupError, type WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import { TaskQueue, TaskQueueError, type TaskQueuePermit } from "../lib/worker-runtime/queue";
 import {
@@ -65,6 +66,7 @@ interface TaskOptions extends ReadGitStatusPageOptions {
 	files?: string[];
 }
 interface Pending {
+	startedAt: number;
 	options: TaskOptions;
 	controller: AbortController;
 	resolve: (value: GitStatusPageWorkerValue) => void;
@@ -204,6 +206,7 @@ export class GitStatusPageService {
 				} else this.finish(id, undefined, new GitStatusPageError("GIT_STATUS_PAGE_CANCELLED"));
 			};
 			this.pending.set(id, {
+				startedAt: performance.now(),
 				options,
 				controller,
 				resolve,
@@ -475,6 +478,16 @@ export class GitStatusPageService {
 			);
 		else pending.permit?.release();
 		const reason = pending.controller.signal.reason;
+		const durationMs = Math.round(performance.now() - pending.startedAt);
+		if (durationMs >= 2_000) {
+			try {
+				logger.warn("Slow Git status page operation", {
+					operation: pending.options.operation ?? "read",
+					durationMs,
+					success: !this.closed && !reason && !error && value !== undefined,
+				});
+			} catch {}
+		}
 		pending.controller.abort();
 		if (this.closed) pending.reject(new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
 		else if (reason) pending.reject(reason);

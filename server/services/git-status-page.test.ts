@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { GitLineStats } from "../../shared/git-line-stats";
 import type { GitStatusPageStatsRow } from "../../shared/git-status-page";
+import { logger } from "../lib/logger";
 import type { GitStatusPageRawResult, GitStatusPageScope } from "./git-status-page";
 import { GitStatusPageService } from "./git-status-page";
 
@@ -49,6 +50,50 @@ async function git(cwd: string, ...args: string[]) {
 afterEach(async () => {
 	await Promise.all(services.splice(0).map((value) => value.close()));
 	await Promise.all(fixtures.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+test("slow page requests log bounded metadata on success and failure but fast reads stay quiet", async () => {
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	let clock = 0;
+	const now = spyOn(performance, "now").mockImplementation(() => clock);
+	try {
+		for (const fail of [false, true]) {
+			const pages = service();
+			const read = pages.read({
+				scope,
+				query: {},
+				source: {
+					kind: "remote",
+					identity: "secret repository identity",
+					read: async () => {
+						clock += 2_500;
+						if (fail) throw new Error("secret transport failure");
+						return { stdout: sourceRows(1), complete: true };
+					},
+				},
+			});
+			if (fail) expect(await rejected(read)).toBeInstanceOf(Error);
+			else expect((await read).files).toHaveLength(1);
+		}
+		expect(warn.mock.calls).toEqual([
+			["Slow Git status page operation", { operation: "read", durationMs: 2500, success: true }],
+			["Slow Git status page operation", { operation: "read", durationMs: 2500, success: false }],
+		]);
+		const page = await service().read({
+			scope,
+			query: {},
+			source: {
+				kind: "remote",
+				identity: "fast",
+				read: async () => ({ stdout: sourceRows(1), complete: true }),
+			},
+		});
+		expect(page.files).toHaveLength(1);
+		expect(warn).toHaveBeenCalledTimes(2);
+	} finally {
+		now.mockRestore();
+		warn.mockRestore();
+	}
 });
 
 describe("real statistics worker service", () => {
