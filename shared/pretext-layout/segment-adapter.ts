@@ -41,6 +41,10 @@ import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
+	composeReasoningTranslation,
+	type ReasoningTranslationFields,
+} from "../reasoning-translation";
+import {
 	escapeMarkdown,
 	rawSideCarToMarkdown,
 	readSideCarBody,
@@ -141,7 +145,7 @@ import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } 
 // satisfy these.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface AdapterContentBlock {
+export interface AdapterContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
@@ -1388,17 +1392,21 @@ function joinRunText(parts: readonly string[]): string {
 	return parts.filter((value) => value.length > 0).join("\n\n");
 }
 
-/**
- * A run's translation, or null when it is not fully translated.
- *
- * All-or-nothing on purpose: a partially translated run would otherwise render some
- * steps in one language and some in another. The denominator counts only NON-EMPTY
- * blocks, matching what `joinRunText` keeps.
- */
+/** Keep untranslated source visible until its own translation is ready. */
 function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
-	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
-	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
+	let translated = false;
+	const parts = blocks.map((block) => {
+		const source = block.thinking ?? block.text ?? "";
+		if (!source.length) return source;
+		const replacement =
+			block.translationGeneration !== undefined || block.translationParts !== undefined
+				? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
+				: block.translatedText;
+		if (!replacement) return source;
+		translated = true;
+		return replacement;
+	});
+	return translated ? joinRunText(parts) : null;
 }
 
 /**
