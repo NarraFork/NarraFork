@@ -547,6 +547,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
+	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],

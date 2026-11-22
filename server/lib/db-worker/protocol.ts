@@ -44,6 +44,7 @@ export type DbReadTaskName =
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "databaseCleanupContext"
 	| "selectRows"
 	| "toolEditPreview"
 	| "displayPageMessages"
@@ -266,6 +267,7 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| { kind: "databaseCleanupContext" }
 	| SelectRowsParams
 	| { kind: "toolEditPreview"; toolCallId: string }
 	| DisplayPageMessagesParams

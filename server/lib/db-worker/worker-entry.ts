@@ -53,6 +53,7 @@ import type {
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
+import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
@@ -268,12 +269,17 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				params,
 																				controller.signal,
 																			)
-																		: runStorageScanTables(
-																				message.dbPath,
-																				message.requestId,
-																				params,
-																				controller.signal,
-																			);
+																		: params.kind === "databaseCleanupContext"
+																			? readDatabaseCleanupContext(
+																					getConnection(message.dbPath),
+																					controller.signal,
+																				)
+																			: runStorageScanTables(
+																					message.dbPath,
+																					message.requestId,
+																					params,
+																					controller.signal,
+																				);
 			}),
 		);
 		post({
