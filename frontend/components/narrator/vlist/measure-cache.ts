@@ -381,6 +381,7 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	if (typeof d.translatedText === "string") rev += `|rt:${textSignature(d.translatedText)}`;
 	// Chat regrouping can add/remove the fixed header without editing the message.
 	// Body format also changes geometry while text/id/document version stay equal.
 	// Normalize the narrator defaults so omitted and explicit defaults share a key.
