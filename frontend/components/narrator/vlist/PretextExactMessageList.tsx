@@ -398,6 +398,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Chat rooms have no narrator identity for error diagnostics or model actions. */
+	enableNarratorErrorActions?: boolean;
 	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
 	deferInteractions?: boolean;
 	isSubagent?: boolean;
@@ -529,6 +531,7 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				enableNarratorErrorActions = true,
 				deferInteractions = true,
 				isSubagent,
 				isActive = false,
@@ -1646,7 +1649,7 @@ export const PretextExactMessageList = memo(
 			// close button deletes the notice. The dialog is one shell-level instance
 			// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
 			// callbacks.
-			const errorNotice = useVListErrorNoticeActions(narratorId);
+			const errorNotice = useVListErrorNoticeActions(narratorId, enableNarratorErrorActions);
 
 			// Interrupt task-guard reminder cards: the heading-row close button deletes
 			// the notice. No dialog, so the resolver alone is all the shell needs.

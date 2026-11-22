@@ -117,7 +117,10 @@ export interface VListErrorNoticeActions {
  * until the in-flight dismissal changes, so unchanged rows keep referential props
  * and the ExactRow memo can keep skipping them during scroll.
  */
-export function useVListErrorNoticeActions(narratorId: string): VListErrorNoticeActions {
+export function useVListErrorNoticeActions(
+	narratorId: string,
+	enabled = true,
+): VListErrorNoticeActions {
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	// The error text the rule dialog is currently open for (null → closed).
@@ -142,11 +145,11 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 	// The provider-settings fix is per-narrator (it disables the tool for the
 	// provider this narrator resolved to and retries its last turn), but whether a
 	// given ROW may offer it depends on that row's error text, hence `canFix`.
-	const imageGenFix = useCodexImageGenerationFix(narratorId);
+	const imageGenFix = useCodexImageGenerationFix(narratorId, enabled);
 	// The model probe, restored from the deleted chunked card. Same per-narrator /
 	// per-row-text split as the fix above: eligibility depends on the user's role and
 	// the narrator's resolved model, the error text decides which rows offer it.
-	const modelTest = useNarratorModelTest(narratorId);
+	const modelTest = useNarratorModelTest(narratorId, enabled);
 	// Read at click time so a second click is rejected without making the handler
 	// depend on the in-flight state.
 	const dismissingRef = useRef(dismissingId);
@@ -186,7 +189,7 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 			errorText: string,
 			diagnostics?: ApiRequestDiagnostics,
 		) => {
-			if (!messageId) return undefined;
+			if (!enabled || !messageId) return undefined;
 			const cached = cache.get(messageId);
 			if (cached) return cached;
 			// Whether the fix BUTTON exists was already decided during adaptation (it
@@ -225,6 +228,7 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 		// applicability or busy state changes, so a row cannot keep serving a stale
 		// loading flag — same reason `dismissingId` is a dependency.
 	}, [
+		enabled,
 		dismiss,
 		dismissingId,
 		markRetryableLabel,
@@ -269,7 +273,7 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 
 	return {
 		resolve,
-		ruleModal,
+		ruleModal: enabled ? ruleModal : null,
 		canOfferProviderFix: imageGenFix.canFix,
 		canOfferModelTest: modelTest.canTest,
 	};
