@@ -299,6 +299,10 @@ export const gitStagingActionSchema = z.discriminatedUnion("action", [
 			scope: z
 				.object({ filter: stagingFilter.optional(), directory: stagingPath.optional() })
 				.strict()
+				.refine(
+					(scope) => scope.directory !== undefined || !!scope.filter?.length,
+					"An empty scope is not an explicit all-files selection",
+				)
 				.optional(),
 		})
 		.strict()

@@ -45,6 +45,7 @@ test("move has exactly one source-bound complete selection", () => {
 		{ unitIds: ["f:unit:1"] },
 		{ all: true },
 		{ scope: { filter: ["M"], directory: "src" } },
+		{ scope: { directory: "src", filter: [] } },
 	])
 		expect(gitStagingActionSchema.safeParse({ ...base, ...move, ...selection }).success).toBe(true);
 	for (const selection of [
@@ -52,6 +53,8 @@ test("move has exactly one source-bound complete selection", () => {
 		{ paths: [] },
 		{ unitIds: [] },
 		{ all: false },
+		{ scope: {} },
+		{ scope: { filter: [] } },
 		{ paths: ["a"], unitIds: ["id"] },
 		{ all: true, scope: {} },
 		{ paths: ["a", "a"] },
