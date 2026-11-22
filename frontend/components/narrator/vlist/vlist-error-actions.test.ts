@@ -136,7 +136,8 @@ describe("error notice actions — shell wiring", () => {
 	it("hosts exactly one retry-rule dialog for the whole list", () => {
 		// Rows are zero-DOM copies and cannot own a modal, so the shell mounts it
 		// once — the same pattern as the compact cancel dialog.
-		expect(SHELL).toContain("useVListErrorNoticeActions(narratorId)");
+		expect(SHELL).toContain("enableNarratorErrorActions = true");
+		expect(SHELL).toContain("useVListErrorNoticeActions(narratorId, enableNarratorErrorActions)");
 		expect(SHELL).toContain("{errorNotice.ruleModal}");
 	});
 
@@ -174,7 +175,8 @@ describe("error notice actions — shell wiring", () => {
 		// The fix action is per-narrator (one provider, one retry), but eligibility is
 		// per-row: attaching it unconditionally would put a "turn off image generation"
 		// button on unrelated failures.
-		expect(ACTIONS).toContain("useCodexImageGenerationFix(narratorId)");
+		expect(ACTIONS).toContain("useCodexImageGenerationFix(narratorId, enabled)");
+		expect(ACTIONS).toContain("useNarratorModelTest(narratorId, enabled)");
 		expect(ACTIONS).toContain("imageGenFix.canFix(errorText)");
 		expect(ACTIONS).toContain("onDisableImageGen: imageGenFix.run");
 		// The resolver caches one object per message id, so the in-flight flag must be
