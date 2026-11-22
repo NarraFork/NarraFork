@@ -4706,7 +4706,12 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 narratorRoutes.get("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const detail = await narratorService.getCompactSummary(narratorId, messageId);
+	const signal = c.req.raw.signal;
+	const detail = await narratorService
+		.readCompactSummaryDetail(narratorId, messageId, signal)
+		.finally(async () => {
+			if (!signal.aborted) await requireNarratorAccess(c, narratorId, "read");
+		});
 	return c.json(detail);
 });
 

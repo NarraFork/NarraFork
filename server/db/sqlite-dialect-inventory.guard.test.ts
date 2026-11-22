@@ -536,8 +536,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
+	"server/lib/db-worker/compact-summary-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
-	"server/services/agent-runtime/publication.ts": ["json1"],
+	"server/services/agent-runtime/publication.ts": ["json1", "nativeClient"],
+	"server/services/agent-runtime/publication-reader.ts": ["driver"],
 	// The injected occupancy source currently uses the SQLite builder; the maintained
 	// graph is backend-neutral, so this is not a permanently SQLite-only module.
 	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
@@ -547,6 +549,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
+	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
@@ -571,6 +574,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
+	"server/services/git-changelist-store.ts": ["driver", "pragma", "sqliteCatalog", "errorCode"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],

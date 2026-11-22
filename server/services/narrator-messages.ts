@@ -1,4 +1,8 @@
-import { normalizeCompactAttempts, parseCompactMessageBlock } from "@shared/compact-message";
+import {
+	type CompactMessageDetail,
+	normalizeCompactAttempts,
+	parseCompactMessageBlock,
+} from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -61,7 +65,13 @@ import {
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import {
+	COMPACT_SUMMARY_BUDGET_EXCEEDED,
+	type CompactSummaryReadResult,
+	storedCompactDetail,
+} from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import {
 	selectVisibleToolDetail,
 	TOOL_DETAIL_CANDIDATE_LIMIT,
@@ -98,6 +108,7 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
 	newEnvelopeColumns,
@@ -3430,6 +3441,27 @@ function getToolCallDetailTx(
 
 // ── narratorMessages object ────────────────────────────────────────────────
 
+function withLiveCompactDetail(
+	messageId: string,
+	detail: CompactMessageDetail,
+): CompactMessageDetail {
+	const live = detail.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+	if (!live) return detail;
+	return {
+		...detail,
+		model: live.model || detail.model,
+		startedAt: live.startedAt,
+		finishedAt: undefined,
+		reasoningEffort: live.reasoningEffort,
+		output: live.output,
+		thinking: live.thinking,
+		outputChars: live.outputChars,
+		thinkingChars: live.thinkingChars,
+		outputTruncated: live.outputTruncated,
+		thinkingTruncated: live.thinkingTruncated,
+	};
+}
+
 const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		const refRows = await db
@@ -4722,6 +4754,31 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
+	async readCompactSummaryDetail(narratorId: string, messageId: string, signal: AbortSignal) {
+		signal.throwIfAborted();
+		if (modelHistoryDatabase.activeDatabaseBackend !== "sqlite") {
+			return narratorMessageQueriesUnlocked.getCompactSummary(narratorId, messageId);
+		}
+		const sqlite = modelHistoryDatabase.sqlite;
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+
+		const result = await runReadTask<CompactSummaryReadResult>(
+			sqlite.filename,
+			{ kind: "compactSummary", narratorId, messageId, fromBlocks: blockReadsEnabled() },
+			{ timeoutMs: 10_000, signal },
+		).catch((err: unknown) => {
+			if (err instanceof Error && "code" in err && err.code === COMPACT_SUMMARY_BUDGET_EXCEEDED) {
+				throw new AppError(err.message, 413, COMPACT_SUMMARY_BUDGET_EXCEEDED);
+			}
+			throw err;
+		});
+		signal.throwIfAborted();
+		if ("notFound" in result) throw new NotFoundError(result.notFound, messageId);
+		return withLiveCompactDetail(messageId, result.detail);
+	},
+
 	async getCompactSummary(narratorId: string, messageId: string) {
 		return db.transaction((tx) => {
 			const msg = fillBody(
@@ -4765,10 +4822,6 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.status === "failed" &&
 				ref.isCompact === 0 &&
 				(latestCompactSeq == null || ref.seq > latestCompactSeq);
-			const latestAttempt = compactBlock.attempts?.at(-1);
-			const live =
-				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
-
 			// Display fallbacks for markers written before both ends of the occupancy pair
 			// were recorded. A marker without `before` inherits the last real occupancy its
 			// history carried; a marker without `after` inherits its own row only when that
@@ -4821,39 +4874,10 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.contextPercentAfter ??
 				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
 
-			return {
-				status: compactBlock.status,
-				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
-				...(live
-					? {
-							model: live.model || latestAttempt?.model,
-							reasoningEffort: live.reasoningEffort,
-							startedAt: live.startedAt,
-							output: live.output,
-							thinking: live.thinking,
-							outputChars: live.outputChars,
-							thinkingChars: live.thinkingChars,
-							outputTruncated: live.outputTruncated,
-							thinkingTruncated: live.thinkingTruncated,
-						}
-					: {
-							model: latestAttempt?.model,
-							startedAt: latestAttempt?.startedAt,
-							finishedAt: latestAttempt?.finishedAt,
-						}),
-				error:
-					typeof compactBlock.error === "string"
-						? compactBlock.error
-						: latestAttempt?.status === "failed"
-							? latestAttempt.error
-							: undefined,
-				mode: compactBlock.mode,
-				trigger: compactBlock.trigger,
-				contextPercentBefore,
-				contextPercentAfter,
-				attempts: compactBlock.attempts ?? [],
-				canRetry,
-			};
+			return withLiveCompactDetail(
+				messageId,
+				storedCompactDetail(compactBlock, { contextPercentBefore, contextPercentAfter, canRetry }),
+			);
 		});
 	},
 

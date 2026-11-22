@@ -24,6 +24,11 @@ import {
 	type StorageScanSessionPreviewResult,
 } from "@server/lib/db-worker/protocol";
 import {
+	CLEANUP_CONTEXT_BUDGET_EXCEEDED,
+	type CleanupContextRow,
+	NARRATOR_CLEANUP_COLUMNS,
+} from "@server/lib/db-worker/storage-cleanup-context-query";
+import {
 	type ParallelScanOutcome,
 	runParallelObjectStorageScan,
 } from "@server/lib/db-worker/storage-scan-runner";
@@ -363,27 +368,12 @@ function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorC
 	};
 }
 
-const NARRATOR_CLEANUP_COLUMNS = `
-	id,
-	parent_narrator_id AS parentNarratorId,
-	type,
-	variant,
-	traits,
-	title,
-	status,
-	COALESCE(message_count, 0) AS messageCount,
-	created_at AS createdAt,
-	updated_at AS updatedAt,
-	last_message_at AS lastMessageAt,
-	COALESCE(is_background, 0) AS isBackground,
-	background_status AS backgroundStatus`;
-
 /** Team coordinators among the loaded rows: the only candidates for `teamLiveWork`. */
 function coordinatorIdsOf(rows: NarratorCleanupRecord[]): string[] {
 	return rows.filter((row) => row.traits?.includes(TEAM_TRAIT)).map((row) => row.id);
 }
 
-async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
+function loadCleanupNarratorContextForExecution(): CleanupNarratorContext {
 	const narratorRows = sqlite
 		.prepare(`SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators`)
 		.all() as Record<string, unknown>[];
@@ -398,6 +388,26 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	return {
 		narrators,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
+	};
+}
+
+async function readCleanupNarratorContext(
+	signal?: AbortSignal,
+	deadlineAt = Date.now() + 30_000,
+): Promise<CleanupNarratorContext> {
+	const rows = await runCleanupReadTask<CleanupContextRow[]>(
+		{ kind: "databaseCleanupContext" },
+		signal,
+		deadlineAt,
+	);
+	signal?.throwIfAborted();
+	const narrators = rows.map(normalizeNarratorCleanupRecord);
+	return {
+		narrators,
+		runningTerminalIds: new Set(
+			rows.filter((row) => row.hasRunningTerminal === 1).map((row) => row.id),
+		),
 		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
 	};
 }
@@ -453,7 +463,10 @@ function isCleanupRootStillEligible(
 
 /** Never scan payload columns on the HTTP/agent thread, even when both worker paths fail. */
 async function runCleanupReadTask<T>(
-	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
+	params:
+		| StorageScanCleanupSummariesParams
+		| StorageScanSessionPreviewParams
+		| { kind: "databaseCleanupContext" },
 	signal?: AbortSignal,
 	deadlineAt?: number,
 ): Promise<T> {
@@ -485,6 +498,9 @@ async function runCleanupReadTask<T>(
 	} catch (err) {
 		if (signal?.aborted) throw err;
 		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
+		if (err instanceof Error && "code" in err && err.code === CLEANUP_CONTEXT_BUDGET_EXCEEDED) {
+			throw new AppError(err.message, 413, CLEANUP_CONTEXT_BUDGET_EXCEEDED);
+		}
 		logger.warn("Database cleanup read workers unavailable", {
 			task: params.kind,
 			reason: err instanceof Error ? err.message : String(err),
@@ -525,6 +541,8 @@ function isStatisticsOnlyFailure(err: unknown): boolean {
 async function buildSessionPreview(
 	sessionPlan: SessionCleanupPlan,
 	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<SessionPreviewData> {
 	const { target, normalizedDays, plan } = sessionPlan;
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
@@ -532,12 +550,16 @@ async function buildSessionPreview(
 	const limitedRoots = plan.safeRoots.slice(0, limit);
 	let measured: StorageScanSessionPreviewResult | null = null;
 	try {
-		measured = await runCleanupReadTask<StorageScanSessionPreviewResult>({
-			kind: "storageScanSessionPreview",
-			narratorIds: allNarratorIds,
-			sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
-			relations: SESSION_OWNED_TABLES,
-		});
+		measured = await runCleanupReadTask<StorageScanSessionPreviewResult>(
+			{
+				kind: "storageScanSessionPreview",
+				narratorIds: allNarratorIds,
+				sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
+				relations: SESSION_OWNED_TABLES,
+			},
+			signal,
+			deadlineAt,
+		);
 	} catch (err) {
 		if (!isStatisticsOnlyFailure(err)) throw err;
 		logger.warn("Session cleanup statistics unavailable; plan counts only", {
@@ -781,7 +803,7 @@ async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
 	deadlineAt?: number,
 ): Promise<DatabaseStorageBreakdown["cleanupCandidates"]> {
-	const cleanupContext = await loadCleanupNarratorContext();
+	const cleanupContext = await readCleanupNarratorContext(signal, deadlineAt);
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
 		runningTerminalIds: cleanupContext.runningTerminalIds,
 		liveTeamIds: cleanupContext.liveTeamIds,
@@ -874,7 +896,7 @@ export const databaseCleanupService = {
 
 	async previewCleanup(
 		target: DatabaseCleanupTarget,
-		options: { olderThanDays?: number; sampleLimit?: number } = {},
+		options: { olderThanDays?: number; sampleLimit?: number; signal?: AbortSignal } = {},
 	): Promise<DatabaseCleanupPreviewResult> {
 		const startedAt = performance.now();
 		try {
@@ -885,12 +907,15 @@ export const databaseCleanupService = {
 					sampleLimit,
 				);
 			}
-			const sessionPlan = planSessionCleanup(
-				target,
-				options.olderThanDays,
-				await loadCleanupNarratorContext(),
+			const deadlineAt = Date.now() + 30_000;
+			const context = await readCleanupNarratorContext(options.signal, deadlineAt);
+			const sessionPlan = planSessionCleanup(target, options.olderThanDays, context);
+			const { preview } = await buildSessionPreview(
+				sessionPlan,
+				sampleLimit,
+				options.signal,
+				deadlineAt,
 			);
-			const { preview } = await buildSessionPreview(sessionPlan, sampleLimit);
 			return preview;
 		} finally {
 			logSlowDatabaseStep("previewCleanup", startedAt, { target });
@@ -937,7 +962,7 @@ export const databaseCleanupService = {
 					const sessionPlan = planSessionCleanup(
 						target,
 						options.olderThanDays,
-						await loadCleanupNarratorContext(),
+						loadCleanupNarratorContextForExecution(),
 					);
 					// Statistics are best effort here: deleting never depends on a read worker.
 					preview = (await buildSessionPreview(sessionPlan, 0)).preview;

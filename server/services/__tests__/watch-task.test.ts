@@ -11,6 +11,7 @@ import {
 import { stopTool } from "../../lib/agent/tools/stop";
 import { watchTool } from "../../lib/agent/tools/watch";
 import type { ToolContext, ToolResult } from "../../lib/agent/types";
+import * as workerPool from "../../lib/db-worker/pool";
 import { eventBus } from "../../lib/event-bus";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { MAILBOX_LIMITS } from "../agent-runtime/limits";
@@ -771,11 +772,144 @@ describe("Watch follows an agent's registered current run", () => {
 
 	test("already completed agent results remain readable without registering or consuming notices", async () => {
 		completeAgent("saved agent output");
+		const dispatch = spyOn(workerPool, "runReadTask");
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("saved agent output");
+		expect(dispatch).toHaveBeenCalledWith(
+			sqlite.filename,
+			expect.objectContaining({
+				kind: "publicationTerminalResult",
+				run: { producerKind: "agent", taskId: CHILD, logicalRunId: AGENT_RUN, recipientId: PARENT },
+			}),
+			{ signal: expect.any(AbortSignal), timeoutMs: 5_000 },
+		);
 		expect(observations()).toHaveLength(0);
 		expect(await notices()).toHaveLength(1);
+	});
+
+	test("terminal read failures never fall back to a main-thread result", async () => {
+		completeAgent("not an inline result");
+		const publication = getRuntimePublicationService();
+		const run = {
+			producerKind: "agent" as const,
+			taskId: CHILD,
+			recipientId: PARENT,
+			logicalRunId: AGENT_RUN,
+		};
+		const inline = spyOn(runtimePublication, "readAgentTerminalResult");
+		const dispatch = spyOn(workerPool, "runReadTask");
+		const setting = process.env.NARRAFORK_DB_WORKER;
+		try {
+			process.env.NARRAFORK_DB_WORKER = "off";
+			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBeInstanceOf(
+				workerPool.WorkersUnavailableError,
+			);
+		} finally {
+			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = setting;
+		}
+		for (const error of [
+			new workerPool.WorkersUnavailableError("worker_create_failed"),
+			new workerPool.DbReadTaskExecutionError("worker exited"),
+			new workerPool.DbReadTaskTimeoutError("timed out"),
+		]) {
+			dispatch.mockRejectedValueOnce(error);
+			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBe(error);
+		}
+		const interrupted = AbortSignal.abort();
+		await expect(
+			publication.readAgentTerminalResult(run, {}, { signal: interrupted }),
+		).rejects.toBe(interrupted.reason);
+		await expect(
+			sqlite.transaction(() => publication.readAgentTerminalResult(run, {}, {}))(),
+		).rejects.toBeInstanceOf(workerPool.WorkersUnavailableError);
+		expect(inline).not.toHaveBeenCalled();
+
+		dispatch.mockRejectedValueOnce(new workerPool.DbReadTaskExecutionError("worker exited"));
+		const watch = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(watch.isError).toBe(true);
+		expect(watch.output).toContain("worker exited");
+		expect(watch.output).not.toContain("not an inline result");
+		expect(inline).not.toHaveBeenCalled();
+	});
+
+	test("an observation failing its terminal read does not replace the source completion notice", async () => {
+		const read = workerPool.runReadTask;
+		const dispatch = spyOn(workerPool, "runReadTask").mockImplementation(
+			async <T>(...args: Parameters<typeof read>) => {
+				if (args[1].kind === "publicationTerminalResult")
+					throw new workerPool.DbReadTaskExecutionError("worker exited");
+				return read<T>(...args);
+			},
+		);
+		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		completeAgent("source output");
+		const done = await settled(watchId(result));
+		expect(dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult")).toBe(
+			true,
+		);
+		expect(done?.status).toBe("failed");
+		expect(done?.output).toContain("worker exited");
+		expect(done?.output).not.toContain("source output");
+		expect((await notices()).some((notice) => notice.noticeKind === "agent")).toBe(true);
+	});
+
+	test("a running background agent can still be watched with SQLite Workers disabled", async () => {
+		await backgroundTaskService.createAgentTask({
+			id: CHILD,
+			subagentNarratorId: CHILD,
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "background-agent" } },
+		});
+		await backgroundTaskService.markNarratorRunning(CHILD);
+		const setting = process.env.NARRAFORK_DB_WORKER;
+		const dispatch = spyOn(workerPool, "runReadTask");
+		try {
+			process.env.NARRAFORK_DB_WORKER = "off";
+			const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
+			expect(result.metadata).toMatchObject({ status: "watching" });
+			expect(await backgroundTaskService.markCompleted(CHILD, "background agent output")).toBe(
+				true,
+			);
+			db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, CHILD)).run();
+			eventBus.emit({
+				type: "narrator:status_changed",
+				narratorId: CHILD,
+				status: "idle",
+				substatus: [],
+			});
+			expect(await settled(watchId(result))).toMatchObject({
+				status: "completed",
+				output: expect.stringContaining("fulfilled by the ordinary agent completion notice"),
+			});
+			expect(
+				dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult"),
+			).toBe(false);
+			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(1);
+		} finally {
+			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = setting;
+		}
+	});
+
+	test("an already settled Watch rechecks team ownership after the Worker responds", async () => {
+		completeAgent("must stay private after reassignment");
+		const read = workerPool.runReadTask;
+		spyOn(workerPool, "runReadTask").mockImplementationOnce(
+			async <T>(...args: Parameters<typeof read>) => {
+				const result = await read<T>(...args);
+				db.update(narrators)
+					.set({ runtimeRegistrationJson: delegationRegistration(OTHER, "general") })
+					.where(eq(narrators.id, CHILD))
+					.run();
+				return result;
+			},
+		);
+		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("access was revoked");
+		expect(result.output).not.toContain("must stay private after reassignment");
 	});
 
 	test("agent completion during registration is not missed", async () => {
