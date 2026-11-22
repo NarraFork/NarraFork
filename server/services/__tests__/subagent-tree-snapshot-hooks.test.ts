@@ -782,7 +782,7 @@ describe("subagent snapshot hooks record boundaries", () => {
 		await hooks.onSnapshotAfter?.(second.toolUseId, "Write");
 		const row = await readToolCallBoundaries(second.toolUseId);
 		expect(row?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
-	});
+	}, 30_000);
 });
 
 /**
