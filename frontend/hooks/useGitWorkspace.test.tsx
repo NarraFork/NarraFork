@@ -344,6 +344,7 @@ describe("non-blocking Git summaries and operation authority", () => {
 		latest.rememberCounts({ totalFiles: 7, totalFilesExact: true, truncated: false });
 		const target = gitWorkspaceTarget("narrator", latest.data);
 		expect(target).not.toBeNull();
+		const authorizationState = latest.authorizationState;
 		const failure = new ApiError("Missing preview resource", 404, { code });
 		await expect(
 			readWorkspace(
@@ -356,7 +357,7 @@ describe("non-blocking Git summaries and operation authority", () => {
 			),
 		).rejects.toBe(failure);
 		await flush();
-		expect(latest.authorizationState).toBe("authorized");
+		expect(latest.authorizationState).toBe(authorizationState);
 		expect(branch()).toBe("valid-branch");
 		expect(latest.displayCounts?.totalFiles).toBe(7);
 		expect(gitWorkspaceTarget("narrator", latest.data)).toEqual(target);
