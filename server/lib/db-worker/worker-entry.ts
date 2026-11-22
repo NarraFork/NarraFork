@@ -38,6 +38,7 @@ import {
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { workerFailureDetails } from "./failure";
+import { readKnowledgeEntryDetail } from "./knowledge-entry-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -260,12 +261,18 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				params,
 																				controller.signal,
 																			)
-																		: runStorageScanTables(
-																				message.dbPath,
-																				message.requestId,
-																				params,
-																				controller.signal,
-																			),
+																		: params.kind === "knowledgeEntryDetail"
+																			? readKnowledgeEntryDetail(
+																					getConnection(message.dbPath),
+																					params.entryId,
+																					controller.signal,
+																				)
+																			: runStorageScanTables(
+																					message.dbPath,
+																					message.requestId,
+																					params,
+																					controller.signal,
+																				),
 			),
 		);
 		post({

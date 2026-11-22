@@ -786,12 +786,8 @@ export async function entryViewerCaps(
 	};
 }
 
-/**
- * `GET /entries/:id` for the UI: the full entry (with content) plus `viewerCaps`. Same read gate
- * as {@link getEntry} (unreadable or missing collection → NotFound); caps resolved once.
- */
-async function getEntryForViewer(id: string, principal: Principal) {
-	const entry = await knowledgeReadStore.getEntryById(id);
+async function requireReadableEntryAcl(id: string, principal: Principal) {
+	const entry = await knowledgeReadStore.getEntryAclById(id);
 	if (!entry) throw new NotFoundError("Knowledge entry", id);
 	const collection = await knowledgeReadStore.getCollectionById(entry.collectionId);
 	if (!collection) throw new NotFoundError("Knowledge entry", id);
@@ -801,17 +797,36 @@ async function getEntryForViewer(id: string, principal: Principal) {
 	if (!(await canRead(caps, aclEntry, aclCol))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
+	return { caps, aclEntry, aclCol };
+}
+
+/** Full entry for the UI, with capabilities from the current ACL, not the body snapshot. */
+async function getEntryForViewer(id: string, principal: Principal, signal?: AbortSignal) {
+	signal?.throwIfAborted();
+	await requireReadableEntryAcl(id, principal);
+	const entry = await knowledgeReadStore.getEntryDetailById(id, signal);
+	if (!entry) throw new NotFoundError("Knowledge entry", id);
+	signal?.throwIfAborted();
+	const { caps, aclEntry, aclCol } = await requireReadableEntryAcl(id, principal);
+	if (
+		entry.collectionId !== aclEntry.collectionId ||
+		!(await canRead(caps, toAclEntry(entry), aclCol))
+	) {
+		throw new NotFoundError("Knowledge entry", id);
+	}
 	const [owner, latest] = await Promise.all([
 		entry.ownerUserId ? knowledgeReadStore.getUsernameById(entry.ownerUserId) : null,
 		// Newest revision's metadata only (version-descending, limit 1, no body).
 		knowledgeReadStore.listRevisionMeta(entry.id, 1),
 	]);
+	const viewerCaps = await entryViewerCaps(caps, aclEntry, aclCol);
+	signal?.throwIfAborted();
 	return {
 		...entry,
 		// Display only: the owner id is already on the row; the read page shows the name.
 		ownerUsername: owner?.username ?? null,
 		currentVersion: latest[0]?.version ?? null,
-		viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol),
+		viewerCaps,
 	};
 }
 
