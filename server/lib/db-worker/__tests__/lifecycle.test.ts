@@ -931,7 +931,7 @@ test("real SQLite diagnostics omit query bodies and database paths while retaini
 			maxRows: 10,
 		}),
 	);
-	expect(error).toMatchObject({ name: "DbReadError", code: "DB_READ_FAILED" });
+	expect(error).toMatchObject({ name: "DbReadTaskExecutionError", code: "SQLITE_ERROR" });
 	expect((error as Error).message).not.toContain("PRIVATE_QUERY_BODY");
 	expect(
 		await runReadTask(dbPath, {
