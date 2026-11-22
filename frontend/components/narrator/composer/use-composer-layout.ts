@@ -56,9 +56,11 @@ export function useComposerLayout({
 			// same 8px above them so single-line gaps around the buttons are symmetric.
 			const compactHeight = Math.max(singleHeight, controlsHeight + 16) + 2;
 			const available = root.clientWidth - 24 - leadingSpace - trailingSpace;
-			const oneLine = editable.scrollHeight <= Math.ceil(singleHeight) + 1;
-			let nextExpanded = available < MIN_INPUT_WIDTH || !oneLine;
-			if (expanded && oneLine && available >= MIN_INPUT_WIDTH) {
+			const empty =
+				editor.state.doc.childCount === 1 && editor.state.doc.firstChild?.content.size === 0;
+			const oneLine = empty || editable.scrollHeight <= Math.ceil(singleHeight) + 1;
+			let nextExpanded = !empty && (available < MIN_INPUT_WIDTH || !oneLine);
+			if (!empty && expanded && oneLine && available >= MIN_INPUT_WIDTH) {
 				// Only measure an inline range when the visible document already fits one line.
 				// Large documents take the scrollHeight fast path, not a full text measurement.
 				const paragraph = editable.firstElementChild;

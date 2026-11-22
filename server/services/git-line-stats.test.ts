@@ -1,17 +1,24 @@
-import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
+import * as compiledWorker from "../lib/compiled-worker";
 import type { SafeSpawnOptions } from "../lib/spawn";
 import * as spawn from "../lib/spawn";
 import {
+	closeGitLineStatsWorkers,
 	getGitLineStats,
 	gitLineStatsWorkerSpecifiers,
 	parseGitLineNumstat,
+	resetGitLineStatsWorkersForTests,
 } from "./git-line-stats";
-import { UntrackedLineReader } from "./git-untracked-line-worker";
+import {
+	UNTRACKED_LINE_LIMITS,
+	type UntrackedLineBatch,
+	UntrackedLineReader,
+} from "./git-untracked-line-worker";
 
 setDefaultTimeout(30_000);
 const roots: string[] = [];
@@ -54,6 +61,26 @@ function mockGit(
 	);
 }
 
+async function measureRound(reader: UntrackedLineReader, cwd: string, paths: string[]) {
+	const result: UntrackedLineBatch = { files: [], complete: true, readFiles: 0, readBytes: 0 };
+	const deadlineAt = Date.now() + UNTRACKED_LINE_LIMITS.timeoutMs;
+	for (let start = 0; start < paths.length; start += UNTRACKED_LINE_LIMITS.files) {
+		const batch = await reader.measure(
+			cwd,
+			paths.slice(start, start + UNTRACKED_LINE_LIMITS.files),
+			new AbortController().signal,
+			UNTRACKED_LINE_LIMITS.totalBytes - result.readBytes,
+			deadlineAt,
+		);
+		result.files.push(...batch.files);
+		result.complete &&= batch.complete;
+		result.readFiles += batch.readFiles;
+		result.readBytes += batch.readBytes;
+	}
+	return result;
+}
+
+afterAll(closeGitLineStatsWorkers);
 afterEach(() => {
 	for (const spy of spies.splice(0)) spy.mockRestore();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -211,17 +238,18 @@ describe("independent Git line statistics", () => {
 		expect(result.files[0].path).toBe("known");
 	});
 
-	test("final DTO stays within 1 MiB and totals describe only its measured prefix", async () => {
+	test("final DTO stays within 1 MiB and totals include measured rows beyond its prefix", async () => {
 		mockGit(({ cmd }) =>
 			cmd.includes("--cached")
-				? { text: Array.from({ length: 9000 }, (_, i) => `1\t0\tfile-${i}\0`).join("") }
+				? { text: Array.from({ length: 9000 }, (_, i) => `1\t2\tfile-${i}\0`).join("") }
 				: {},
 		);
 		const result = await getGitLineStats("/unused");
 		expect(result.complete).toBe(false);
 		expect(result.files.length).toBeGreaterThan(0);
 		expect(result.files.length).toBeLessThan(9000);
-		expect(result.linesAdded).toBe(result.files.length);
+		expect(result.linesAdded).toBe(9000);
+		expect(result.linesRemoved).toBe(18000);
 		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1024 * 1024);
 	});
 
@@ -235,16 +263,82 @@ describe("independent Git line statistics", () => {
 		const result = await getGitLineStats("/unused");
 		expect(result.complete).toBe(false);
 		expect(result.files).toHaveLength(10000);
-		expect(result.linesAdded).toBe(10000);
+		expect(result.linesAdded).toBe(10001);
 		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1024 * 1024);
 	});
 
-	test("more than 200 untracked paths returns a useful bounded partial measurement", async () => {
+	test.each([
+		201, 254, 513,
+	])("measures all %i untracked files in bounded batches", async (count) => {
 		const cwd = await repo();
-		for (let i = 0; i < 201; i++) writeFileSync(join(cwd, `${i}.txt`), "one\n");
+		for (let i = 0; i < count; i++) writeFileSync(join(cwd, `${i}.txt`), "one\ntwo");
+		const post = spyOn(Worker.prototype, "postMessage");
+		spies.push(post);
 		const result = await getGitLineStats(cwd);
-		expect(result).toMatchObject({ linesAdded: 200, complete: false });
-		expect(result.files).toHaveLength(200);
+		expect(result).toMatchObject({ linesAdded: count * 2, linesRemoved: 0, complete: true });
+		expect(result.files).toHaveLength(count);
+		expect(result.files.every((file) => file.complete && file.unstagedLinesAdded === 2)).toBe(true);
+		const batches = post.mock.calls
+			.map(([message]) => message as { action: string; paths: string[]; deadlineAt: number })
+			.filter((message) => message.action === "read");
+		expect(batches).toHaveLength(Math.ceil(count / 200));
+		expect(batches.every((message) => message.paths.length <= 200)).toBe(true);
+		expect(new Set(batches.map((message) => message.deadlineAt)).size).toBe(1);
+	});
+
+	test("all batches share the 20 MB content budget while retaining unknown rows", async () => {
+		const cwd = await repo();
+		for (let i = 0; i < 254; i++) {
+			writeFileSync(
+				join(cwd, `${String(i).padStart(3, "0")}.txt`),
+				i < 200 ? Buffer.alloc(100_000, 10) : "one\n",
+			);
+		}
+		const post = spyOn(Worker.prototype, "postMessage");
+		spies.push(post);
+		const result = await getGitLineStats(cwd);
+		expect(result).toMatchObject({ linesAdded: 20_000_000, linesRemoved: 0, complete: false });
+		expect(result.files).toHaveLength(254);
+		expect(result.files.filter((file) => file.complete)).toHaveLength(200);
+		expect(result.files[253].unstagedLinesAdded).toBeUndefined();
+		const batches = post.mock.calls
+			.map(([message]) => message as { action: string; remainingBytes: number })
+			.filter((message) => message.action === "read");
+		expect(batches.map((message) => message.remainingBytes)).toEqual([20_000_000, 0]);
+	});
+
+	test("untracked path admission bounds the whole round to 10000 paths", async () => {
+		const cwd = directory();
+		writeFileSync(join(cwd, "file"), "one\n");
+		mockGit(({ cmd }) => (cmd.includes("ls-files") ? { text: "file\0".repeat(10001) } : {}));
+		const post = spyOn(Worker.prototype, "postMessage");
+		spies.push(post);
+		const result = await getGitLineStats(cwd);
+		const batches = post.mock.calls
+			.map(([message]) => message as { action: string; paths: string[] })
+			.filter((message) => message.action === "read");
+		expect(batches).toHaveLength(50);
+		expect(batches.reduce((sum, batch) => sum + batch.paths.length, 0)).toBe(10000);
+		expect(result).toMatchObject({ linesAdded: 1, complete: false });
+	});
+
+	test("escaped untracked paths share a 1 MiB serialized request budget", async () => {
+		const cwd = directory();
+		writeFileSync(join(cwd, "known"), "one\n");
+		const longPath = "\u0001".repeat(200_000);
+		mockGit(({ cmd }) =>
+			cmd.includes("ls-files") ? { text: `known\0${longPath}\0not-retained\0` } : {},
+		);
+		const post = spyOn(Worker.prototype, "postMessage");
+		spies.push(post);
+		const result = await getGitLineStats(cwd);
+		const batches = post.mock.calls
+			.map(([message]) => message as { action: string; paths: string[] })
+			.filter((message) => message.action === "read");
+		expect(batches).toHaveLength(1);
+		expect(batches[0].paths).toEqual(["known"]);
+		expect(Buffer.byteLength(JSON.stringify(batches[0]))).toBeLessThanOrEqual(1024 * 1024);
+		expect(result).toMatchObject({ linesAdded: 1, complete: false });
 	});
 
 	test("ordinary concurrent repositories serialize their batches on the same worker", async () => {
@@ -321,6 +415,47 @@ describe("independent Git line statistics", () => {
 		expect(terminated).toBe(true);
 	});
 
+	test("the round deadline does not restart after a completed batch", async () => {
+		const cwd = directory();
+		writeFileSync(join(cwd, "file"), "one\n");
+		mockGit(({ cmd }) => (cmd.includes("ls-files") ? { text: "file\0".repeat(254) } : {}));
+		let now = Date.now();
+		spies.push(spyOn(Date, "now").mockImplementation(() => now));
+		const emit = Worker.prototype.emit;
+		spies.push(
+			spyOn(Worker.prototype, "emit").mockImplementation(function (
+				this: Worker,
+				event: string | symbol,
+				...args: unknown[]
+			) {
+				if (event === "message" && args[0] && typeof args[0] === "object" && "value" in args[0])
+					now += 30_001;
+				return emit.call(this, event, ...args);
+			}),
+		);
+		const post = spyOn(Worker.prototype, "postMessage");
+		spies.push(post);
+		await expect(getGitLineStats(cwd)).rejects.toThrow("deadline");
+		expect(
+			post.mock.calls.filter(([message]) => (message as { action: string }).action === "read"),
+		).toHaveLength(1);
+	});
+
+	test("worker startup failure does not read file contents on the main thread", async () => {
+		await resetGitLineStatsWorkersForTests();
+		const cwd = directory();
+		writeFileSync(join(cwd, "file"), "one\n");
+		mockGit(({ cmd }) => (cmd.includes("ls-files") ? { text: "file\0" } : {}));
+		const open = spyOn(fs, "open");
+		const connect = spyOn(compiledWorker, "connectCompiledWorker").mockRejectedValueOnce(
+			new Error("injected worker startup failure"),
+		);
+		spies.push(open, connect);
+		await expect(getGitLineStats(cwd)).rejects.toThrow("injected worker startup failure");
+		expect(connect).toHaveBeenCalledTimes(1);
+		expect(open).not.toHaveBeenCalled();
+	});
+
 	test("real Git failure rejects instead of returning an empty complete summary", async () => {
 		await expect(getGitLineStats(directory())).rejects.toThrow();
 	});
@@ -381,19 +516,23 @@ describe("bounded worker file measurements and metadata cache", () => {
 		expect(result.files.map((file) => file.unstagedLinesAdded)).toEqual([0, 2, 2, 2, 0]);
 	});
 
-	test("cache hits do not reread, while same-size content edits invalidate the cache", async () => {
+	test("254 cached files need no rereads and one same-size edit rereads only that file", async () => {
 		const cwd = directory();
-		const path = join(cwd, "file");
-		writeFileSync(path, "a\nb\n");
+		const paths = Array.from({ length: 254 }, (_, index) => `file-${index}`);
+		for (const path of paths) writeFileSync(join(cwd, path), "a\nb\n");
 		const reader = new UntrackedLineReader();
-		const measure = () => reader.measure(cwd, ["file"], new AbortController().signal);
-		expect((await measure()).readFiles).toBe(1);
-		expect((await measure()).readFiles).toBe(0);
+		const measure = () => measureRound(reader, cwd, paths);
+		expect(await measure()).toMatchObject({ complete: true, readFiles: 254, readBytes: 1016 });
+		expect(await measure()).toMatchObject({ complete: true, readFiles: 0, readBytes: 0 });
+		const path = join(cwd, paths[201]);
 		writeFileSync(path, "abcd");
 		utimesSync(path, new Date(), new Date(Date.now() + 2000));
 		const updated = await measure();
+		expect(updated.complete).toBe(true);
 		expect(updated.readFiles).toBe(1);
-		expect(updated.files[0].unstagedLinesAdded).toBe(1);
+		expect(updated.readBytes).toBe(4);
+		expect(updated.files[201].unstagedLinesAdded).toBe(1);
+		expect(updated.files.reduce((sum, file) => sum + (file.unstagedLinesAdded ?? 0), 0)).toBe(507);
 	});
 
 	test("oversize/missing/nonregular files are unknown, never complete zero", async () => {
@@ -442,7 +581,7 @@ describe("bounded worker file measurements and metadata cache", () => {
 		expect(result.files[0].unstagedLinesAdded).toBeUndefined();
 	});
 
-	test("20 MB total read budget and 200 file cap retain measured prefixes", async () => {
+	test("20 MB content allowance and 200-file batch cap retain measured prefixes", async () => {
 		const cwd = directory();
 		const paths = Array.from({ length: 21 }, (_, index) => `${index}.txt`);
 		for (const path of paths) writeFileSync(join(cwd, path), Buffer.alloc(1_000_000, 10));
@@ -471,6 +610,87 @@ describe("bounded worker file measurements and metadata cache", () => {
 		}
 		const result = await reader.measure(cwd, ["0", "512"], new AbortController().signal);
 		expect(result.readFiles).toBe(1);
+		expect(result.complete).toBe(true);
+		const repeated = await measureRound(
+			reader,
+			cwd,
+			Array.from({ length: 513 }, (_, index) => String(index)),
+		);
+		expect(repeated.complete).toBe(true);
+		expect(repeated.files).toHaveLength(513);
+		expect(repeated.files.every((file) => file.unstagedLinesAdded === 1)).toBe(true);
+		expect(repeated.readFiles).toBeGreaterThan(0);
+		expect(repeated.readFiles).toBeLessThanOrEqual(513);
+	});
+
+	test("reads changed between open and either version check stay unknown and uncached", async () => {
+		const cwd = directory();
+		const path = join(cwd, "file");
+		const originalOpen = fs.open;
+		for (const phase of ["before", "after"] as const) {
+			writeFileSync(path, "a\nb\n");
+			const reader = new UntrackedLineReader();
+			const open = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+				const file = await originalOpen(...args);
+				if (phase === "before") {
+					writeFileSync(path, "changed\n");
+				} else {
+					const read = file.read;
+					spies.push(
+						spyOn(file, "read").mockImplementationOnce(async (...readArgs) => {
+							const result = await Reflect.apply(read, file, readArgs);
+							writeFileSync(path, "changed\n");
+							return result;
+						}),
+					);
+				}
+				return file;
+			});
+			spies.push(open);
+			const result = await reader.measure(cwd, ["file"], new AbortController().signal);
+			expect(result.complete).toBe(false);
+			expect(result.files[0].unstagedLinesAdded).toBeUndefined();
+			open.mockRestore();
+			const recovered = await reader.measure(cwd, ["file"], new AbortController().signal);
+			expect(recovered).toMatchObject({ complete: true, readFiles: 1 });
+			expect(recovered.files[0].unstagedLinesAdded).toBe(1);
+		}
+	});
+
+	test("cache hits remain usable with zero remaining content allowance", async () => {
+		const cwd = directory();
+		writeFileSync(join(cwd, "file"), "one\n");
+		const reader = new UntrackedLineReader();
+		await reader.measure(cwd, ["file"], new AbortController().signal);
+		const result = await reader.measure(cwd, ["file"], new AbortController().signal, 0);
+		expect(result).toMatchObject({ complete: true, readFiles: 0, readBytes: 0 });
+		expect(result.files[0].unstagedLinesAdded).toBe(1);
+	});
+
+	test("an expired deadline aborts before filesystem IO and does not cache a result", async () => {
+		const cwd = directory();
+		writeFileSync(join(cwd, "file"), "one\n");
+		const reader = new UntrackedLineReader();
+		const open = spyOn(fs, "open");
+		spies.push(open);
+		await expect(
+			reader.measure(cwd, ["file"], new AbortController().signal, 20_000_000, Date.now() - 1),
+		).rejects.toThrow("timed out");
+		expect(open).not.toHaveBeenCalled();
+		expect(await reader.measure(cwd, ["file"], new AbortController().signal)).toMatchObject({
+			complete: true,
+			readFiles: 1,
+		});
+	});
+
+	test("worker reply path data is bounded before reading or creating DTOs", async () => {
+		const cwd = directory();
+		const result = await new UntrackedLineReader().measure(
+			cwd,
+			["\u0001".repeat(200_000)],
+			new AbortController().signal,
+		);
+		expect(result).toEqual({ files: [], complete: false, readFiles: 0, readBytes: 0 });
 	});
 
 	test("cancellation remains an error, not an incomplete zero", async () => {

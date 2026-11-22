@@ -305,6 +305,41 @@ describe("mobile safe-area layout contract", () => {
 		expect(root.hasAttribute(AUTHENTICATED_APP_SHELL_ATTRIBUTE)).toBe(false);
 	});
 
+	test("root lock supports documents without a defaultView and keeps their existing styles", () => {
+		const { document: domDocument } = parseHTML("<!doctype html><html><body></body></html>");
+		const targetDocument = domDocument as unknown as Document;
+		Object.defineProperty(targetDocument, "defaultView", { configurable: true, value: null });
+		targetDocument.documentElement.style.setProperty("--app-viewport-bottom", "557px");
+		const cleanup = installAuthenticatedAppShellRootLock(targetDocument);
+		expect(targetDocument.documentElement.getAttribute(AUTHENTICATED_APP_SHELL_ATTRIBUTE)).toBe(
+			"true",
+		);
+		expect(targetDocument.documentElement.hasAttribute("data-nf-ios-scroll-to-top")).toBe(false);
+		cleanup();
+		expect(targetDocument.documentElement.style.getPropertyValue("--app-viewport-bottom")).toBe(
+			"557px",
+		);
+	});
+
+	test("iOS root bridge CSS adds only a compensating body offset, preserving viewport heights", async () => {
+		const css = stripCssComments(
+			await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text(),
+		);
+		const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter((match) =>
+			match[1]?.includes('data-nf-ios-scroll-to-top="true"'),
+		);
+		expect(rules).toHaveLength(2);
+		const rootRule = rules.find((match) => !match[1]?.trim().endsWith("body"));
+		const bodyRule = rules.find((match) => match[1]?.trim().endsWith("body"));
+		expect(rootRule?.[2]).toContain("overflow-y: auto");
+		expect(bodyRule?.[2]).toContain("position: relative");
+		expect(bodyRule?.[2]).toContain("top: 1px");
+		for (const rule of rules) {
+			expect(rule[1]).toContain('data-nf-authenticated-app-shell="true"');
+			expect(rule[2]).not.toMatch(/(?:height|transform|position:\s*fixed)\s*:/);
+		}
+	});
+
 	test("top viewport banners preserve their desktop gap above the physical safe area", async () => {
 		expect(TOP_BANNER_SAFE_AREA_STYLE.top).toBe(`calc(8px + ${SAFE_AREA_INSET_TOP})`);
 
@@ -1042,9 +1077,7 @@ describe("mobile safe-area layout contract", () => {
 			"@media (display-mode: standalone), (display-mode: window-controls-overlay) ",
 			`@media ${MOBILE_VIEWPORT_MEDIA_QUERY} `,
 		]);
-		// The shell chain itself never positions; the one `position: fixed` layer in the
-		// app (Mantine's overlay inner) is Mantine's own declaration, and this stylesheet
-		// only re-sizes it.
+		// The bridge offsets body relatively. Mantine owns the overlay's fixed positioning.
 		expect(declarations).not.toContain("position: fixed");
 		expect(declarations).not.toContain("touch-action");
 		expect(declarations).not.toContain("overflow-x");

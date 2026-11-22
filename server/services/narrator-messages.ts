@@ -2502,6 +2502,7 @@ async function loadLatestSubagentToolCalls(
 			const rows = await db
 				.select({
 					toolCallId: narratorToolCalls.id,
+					executionAttempt: narratorToolCalls.executionAttempt,
 					toolUseId: narratorToolCalls.toolUseId,
 					toolName: narratorToolCalls.toolName,
 					status: narratorToolCalls.status,

@@ -608,6 +608,7 @@ export interface SubagentToolCallTiming {
 
 export interface SubagentToolCallHeader {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -631,7 +632,7 @@ export interface SubagentToolCallHeader {
 	 * feed the normal tool card rather than an activity row and need no summary.
 	 * See `SubagentActivityRow`.
 	 */
-	inputSummary?: SubagentToolInputSummary;
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface SubagentFileChanges {

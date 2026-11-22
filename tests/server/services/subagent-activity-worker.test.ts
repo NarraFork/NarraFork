@@ -99,7 +99,11 @@ function fixture() {
 			.run();
 		const rows = [
 			{ toolUseId: "too-old", inputJson: { description: "old" } },
-			{ toolUseId: "label", inputJson: { file_path: "src/main.ts", private: "not returned" } },
+			{
+				toolUseId: "label",
+				executionAttempt: 2,
+				inputJson: { file_path: "src/main.ts", private: "not returned" },
+			},
 			{ toolUseId: "invalid" },
 			{
 				toolUseId: "cleared",
@@ -140,7 +144,11 @@ test("history snapshots return only the latest referenced public child call summ
 		(block: { type: string }) => block.type === "tool_use",
 	);
 	expect(call?._subagentActivity?.latestToolCalls).toEqual([
-		expect.objectContaining({ toolUseId: "label", inputSummary: { file_path: "src/main.ts" } }),
+		expect.objectContaining({
+			toolUseId: "label",
+			executionAttempt: 2,
+			inputSummary: { file_path: "src/main.ts" },
+		}),
 		expect.objectContaining({ toolUseId: "invalid" }),
 		expect.objectContaining({ toolUseId: "cleared" }),
 	]);

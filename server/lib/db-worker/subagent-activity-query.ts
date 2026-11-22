@@ -24,6 +24,7 @@ export const SUBAGENT_ACTIVITY_SUMMARY_SQL = `CASE
 
 interface ActivityRow {
 	toolCallId: string;
+	executionAttempt: number | null;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -48,6 +49,7 @@ function parseSummary(encoded: string | null): SubagentToolInputSummary | null {
 export function projectActivityRow(row: ActivityRow): SubagentActivityToolCall {
 	const {
 		toolCallId,
+		executionAttempt,
 		toolUseId,
 		toolName,
 		status,
@@ -58,6 +60,7 @@ export function projectActivityRow(row: ActivityRow): SubagentActivityToolCall {
 	const inputSummary = parseSummary(encoded);
 	return {
 		toolCallId: toolCallId ?? null,
+		...(executionAttempt != null ? { executionAttempt } : {}),
 		toolUseId,
 		toolName,
 		status,
@@ -75,6 +78,7 @@ export function readSubagentActivity(
 	if (narratorIds.length > MAX_OWNERS) throw new Error("Subagent activity owner budget exceeded");
 	const query = sqlite.query<ActivityRow, [string]>(`
 		SELECT id AS toolCallId, tool_use_id AS toolUseId, tool_name AS toolName, status,
+			execution_attempt AS executionAttempt,
 			created_at AS createdAt, stream_started_at AS streamStartedAt,
 			stream_completed_at AS streamCompletedAt, permission_started_at AS permissionStartedAt,
 			execution_started_at AS executionStartedAt, completed_at AS completedAt,
