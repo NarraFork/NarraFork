@@ -475,6 +475,25 @@ test("per-list content versions ignore other list metadata and independent same-
 	expect((await kernel.diff(a, { path: "f" })).snapshotVersion).toBe(snapshot);
 });
 
+test("earlier insertions owned by another group preserve later unit versions and pagination", async () => {
+	await file("a", "another edit\n");
+	await file("f", "FIRST\ncontext1\ncontext2\nLAST\n");
+	await act({ action: "init" });
+	const a = await active();
+	const b = await create();
+	const units = (await kernel.diff(a, { path: "f" })).units;
+	await act({ action: "move", fromListId: a, toListId: b, unitIds: [units[0].id] });
+	await act({ action: "activate", listId: b });
+	const first = await kernel.files(a, { limit: 1 });
+	expect(first.nextCursor).toBeDefined();
+	await file("f", "FIRST\nextra line\ncontext1\ncontext2\nLAST\n");
+	await act({ action: "sync" });
+	expect((await kernel.files(a)).snapshotVersion).toBe(first.snapshotVersion);
+	expect(
+		(await kernel.files(a, { cursor: first.nextCursor as string })).files.map((file) => file.path),
+	).toEqual(["f"]);
+});
+
 test("a mode unit in another group does not invalidate the text group's candidate or cursor", async () => {
 	await file("a", "another text edit\n");
 	await file("f", "FIRST\ncontext1\ncontext2\nlast\n");

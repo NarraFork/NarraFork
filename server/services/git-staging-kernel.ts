@@ -176,7 +176,7 @@ function version(store: ChangelistStore, listId: string) {
 				FROM observation_files m JOIN change_units u ON u.version_id=m.version_id
 				WHERE m.observation_id=? AND u.list_id=? GROUP BY u.version_id
 			)
-			SELECT u.id,u.kind,u.path,u.old_path,u.base_start,u.base_end,u.work_start,u.work_end,
+			SELECT u.id,u.kind,u.path,u.old_path,u.base_start,u.base_end,
 				u.added,u.removed,u.needs_review,u.review_reason,u.content_hash,f.base_oid,f.base_mode,
 				CASE WHEN modes.deletes_path THEN '000000'
 					WHEN modes.uses_work_mode OR (modes.renames_path AND f.base_mode='000000')
