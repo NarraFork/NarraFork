@@ -168,6 +168,21 @@ test("an inexact blockquote cannot mask the exact source of a following paragrap
 	});
 });
 
+test("exact paragraphs between rewritten quotes keep their positional provenance", () => {
+	const quote = "> - item\r\n>\r\n> - next\r\nwrapped";
+	const copy = "Repeated **prose**.";
+	const separator = "\r\n\r\n";
+	const text = [copy, quote, copy, quote, copy].join(separator);
+	const paragraphStride = copy.length + quote.length + 2 * separator.length;
+	const parsed = parseMarkdownToPreparedBlocks(text, undefined, true);
+	expect(parsed.flatMap(({ sourceRange }) => (sourceRange ? [sourceRange] : []))).toEqual(
+		[0, paragraphStride, 2 * paragraphStride].map((start) => ({
+			start,
+			end: start + copy.length,
+		})),
+	);
+});
+
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {
 	const checkpoint = {
 		type: "reasoning",
