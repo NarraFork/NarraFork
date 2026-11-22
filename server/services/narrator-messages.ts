@@ -1,4 +1,8 @@
-import { normalizeCompactAttempts, parseCompactMessageBlock } from "@shared/compact-message";
+import {
+	type CompactMessageDetail,
+	normalizeCompactAttempts,
+	parseCompactMessageBlock,
+} from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -55,6 +59,11 @@ import {
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import {
+	COMPACT_SUMMARY_BUDGET_EXCEEDED,
+	type CompactSummaryReadResult,
+	storedCompactDetail,
+} from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import {
@@ -63,6 +72,12 @@ import {
 	SUBAGENT_ACTIVITY_SUMMARY_SQL,
 	type SubagentActivityRows,
 } from "../lib/db-worker/subagent-activity-query";
+import {
+	selectVisibleToolDetail,
+	TOOL_DETAIL_CANDIDATE_LIMIT,
+	TOOL_DETAIL_PAYLOAD_BYTE_LIMIT,
+	type ToolDetailReference,
+} from "../lib/db-worker/tool-detail-selection";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -93,6 +108,7 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
 	newEnvelopeColumns,
@@ -140,6 +156,7 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { toolDetailSelectionRequired, validateToolDetailReference } from "./narrator-tool-detail";
 import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
@@ -3288,22 +3305,6 @@ export {
 	TAKEN_OVER_FIELD,
 };
 
-// Tool-use IDs come from providers and are not unique across attempts/sessions.
-// Metadata is bounded before visibility filtering, never mistaken for a full set.
-const TOOL_DETAIL_CANDIDATE_LIMIT = 200;
-const TOOL_DETAIL_METADATA_ROW_LIMIT = 1_000;
-const TOOL_DETAIL_PAYLOAD_BYTE_LIMIT = 32 * 1024 * 1024;
-
-type ToolDetailReference = { toolCallId?: string; messageId?: string };
-
-function toolDetailSelectionRequired(): AppError {
-	return new AppError(
-		"Tool detail selection is ambiguous or exceeds the metadata budget; specify toolCallId or messageId.",
-		409,
-		"TOOL_CALL_DETAIL_SELECTION_REQUIRED",
-	);
-}
-
 function toolMessageRefExists(narratorId: string | AnyColumn): SQL<boolean> {
 	// Keep the outer table qualification literal. Drizzle strips Column qualifiers
 	// in single-table projections, which would correlate message_id to detail_ref
@@ -3322,23 +3323,7 @@ function selectVisibleToolCallTx(
 	toolUseId: string,
 	reference?: ToolDetailReference,
 ) {
-	for (const value of [reference?.toolCallId, reference?.messageId]) {
-		if (
-			value !== undefined &&
-			(typeof value !== "string" || value.length === 0 || value.length > 128)
-		) {
-			throw new ValidationError(
-				"Tool detail references must be non-empty IDs of at most 128 characters",
-			);
-		}
-	}
-	let metadataRows = 0;
-	const admit = (length: number) => {
-		metadataRows += length;
-		if (length > TOOL_DETAIL_CANDIDATE_LIMIT || metadataRows > TOOL_DETAIL_METADATA_ROW_LIMIT) {
-			throw toolDetailSelectionRequired();
-		}
-	};
+	validateToolDetailReference(reference);
 	const parentColumns = {
 		...historyToolMetadataColumns,
 		executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
@@ -3371,74 +3356,21 @@ function selectVisibleToolCallTx(
 		)
 		.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
 		.all();
-	admit(candidates.length);
-	const childVisibility = new Map<string, boolean>();
-	const visible = candidates.filter((candidate) => {
-		if (candidate.directRef) return true;
-		// A provider-supplied parentToolUseId is only a consistency check after the
-		// real subagent identity and original tool-call PK have established ancestry.
-		if (
-			candidate.authorType !== "subagent" ||
-			!isSubagentVariant(candidate.authorVariant) ||
-			!candidate.authorOriginToolCallId ||
-			!candidate.authorParentNarratorId ||
-			!candidate.parentToolUseId ||
-			!candidate.authorRef ||
-			candidate.narratorId !== candidate.messageNarratorId
-		)
-			return false;
-		const originId = candidate.authorOriginToolCallId;
-		const key = JSON.stringify([candidate.messageNarratorId, originId, candidate.parentToolUseId]);
-		const cached = childVisibility.get(key);
-		if (cached !== undefined) return cached;
-		const isAgent = (call: {
-			toolName: string;
-			executionIdentityVersion: number;
-			isFileHistoryCheckpoint: boolean;
-		}) =>
-			(call.toolName === "Agent" || call.toolName === "Task") &&
-			call.executionIdentityVersion === 1 &&
-			!call.isFileHistoryCheckpoint;
-		const original = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, originId))
-			.get();
-		admit(original ? 1 : 0);
-		if (
-			original &&
-			(!isAgent(original) ||
-				original.executionOriginToolCallId !== null ||
-				original.narratorId !== candidate.authorParentNarratorId ||
-				original.toolUseId !== candidate.parentToolUseId)
-		) {
-			childVisibility.set(key, false);
-			return false;
-		}
-		if (original?.directRef) {
-			childVisibility.set(key, true);
-			return true;
-		}
-		// The original may have been removed after COW. Its immutable PK survives
-		// in the copy; neither a shared provider ID nor an author's identity alone
-		// is enough. The requesting narrator must still reference that exact copy.
-		const parentCopies = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.toolUseId, candidate.parentToolUseId))
-			.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
-			.all();
-		admit(parentCopies.length);
-		const allowed = parentCopies.some(
-			(parent) =>
-				parent.directRef && isAgent(parent) && parent.executionOriginToolCallId === originId,
-		);
-		childVisibility.set(key, allowed);
-		return allowed;
-	});
-	if (visible.length === 0) throw new NotFoundError("ToolCall", toolUseId);
-	if (visible.length !== 1) throw toolDetailSelectionRequired();
-	return visible[0];
+	const selected = selectVisibleToolDetail(
+		candidates,
+		(id) =>
+			tx.select(parentColumns).from(narratorToolCalls).where(eq(narratorToolCalls.id, id)).get(),
+		(useId) =>
+			tx
+				.select(parentColumns)
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.toolUseId, useId))
+				.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
+				.all(),
+	);
+	if (selected.kind === "notFound") throw new NotFoundError("ToolCall", toolUseId);
+	if (selected.kind !== "selected") throw toolDetailSelectionRequired();
+	return selected;
 }
 
 function getToolCallDetailTx(
@@ -3486,6 +3418,27 @@ function getToolCallDetailTx(
 }
 
 // ── narratorMessages object ────────────────────────────────────────────────
+
+function withLiveCompactDetail(
+	messageId: string,
+	detail: CompactMessageDetail,
+): CompactMessageDetail {
+	const live = detail.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+	if (!live) return detail;
+	return {
+		...detail,
+		model: live.model || detail.model,
+		startedAt: live.startedAt,
+		finishedAt: undefined,
+		reasoningEffort: live.reasoningEffort,
+		output: live.output,
+		thinking: live.thinking,
+		outputChars: live.outputChars,
+		thinkingChars: live.thinkingChars,
+		outputTruncated: live.outputTruncated,
+		thinkingTruncated: live.thinkingTruncated,
+	};
+}
 
 const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
@@ -4779,6 +4732,31 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
+	async readCompactSummaryDetail(narratorId: string, messageId: string, signal: AbortSignal) {
+		signal.throwIfAborted();
+		if (modelHistoryDatabase.activeDatabaseBackend !== "sqlite") {
+			return narratorMessageQueriesUnlocked.getCompactSummary(narratorId, messageId);
+		}
+		const sqlite = modelHistoryDatabase.sqlite;
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+
+		const result = await runReadTask<CompactSummaryReadResult>(
+			sqlite.filename,
+			{ kind: "compactSummary", narratorId, messageId, fromBlocks: blockReadsEnabled() },
+			{ timeoutMs: 10_000, signal },
+		).catch((err: unknown) => {
+			if (err instanceof Error && "code" in err && err.code === COMPACT_SUMMARY_BUDGET_EXCEEDED) {
+				throw new AppError(err.message, 413, COMPACT_SUMMARY_BUDGET_EXCEEDED);
+			}
+			throw err;
+		});
+		signal.throwIfAborted();
+		if ("notFound" in result) throw new NotFoundError(result.notFound, messageId);
+		return withLiveCompactDetail(messageId, result.detail);
+	},
+
 	async getCompactSummary(narratorId: string, messageId: string) {
 		return db.transaction((tx) => {
 			const msg = fillBody(
@@ -4822,10 +4800,6 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.status === "failed" &&
 				ref.isCompact === 0 &&
 				(latestCompactSeq == null || ref.seq > latestCompactSeq);
-			const latestAttempt = compactBlock.attempts?.at(-1);
-			const live =
-				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
-
 			// Display fallbacks for markers written before both ends of the occupancy pair
 			// were recorded. A marker without `before` inherits the last real occupancy its
 			// history carried; a marker without `after` inherits its own row only when that
@@ -4878,39 +4852,10 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.contextPercentAfter ??
 				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
 
-			return {
-				status: compactBlock.status,
-				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
-				...(live
-					? {
-							model: live.model || latestAttempt?.model,
-							reasoningEffort: live.reasoningEffort,
-							startedAt: live.startedAt,
-							output: live.output,
-							thinking: live.thinking,
-							outputChars: live.outputChars,
-							thinkingChars: live.thinkingChars,
-							outputTruncated: live.outputTruncated,
-							thinkingTruncated: live.thinkingTruncated,
-						}
-					: {
-							model: latestAttempt?.model,
-							startedAt: latestAttempt?.startedAt,
-							finishedAt: latestAttempt?.finishedAt,
-						}),
-				error:
-					typeof compactBlock.error === "string"
-						? compactBlock.error
-						: latestAttempt?.status === "failed"
-							? latestAttempt.error
-							: undefined,
-				mode: compactBlock.mode,
-				trigger: compactBlock.trigger,
-				contextPercentBefore,
-				contextPercentAfter,
-				attempts: compactBlock.attempts ?? [],
-				canRetry,
-			};
+			return withLiveCompactDetail(
+				messageId,
+				storedCompactDetail(compactBlock, { contextPercentBefore, contextPercentAfter, canRetry }),
+			);
 		});
 	},
 

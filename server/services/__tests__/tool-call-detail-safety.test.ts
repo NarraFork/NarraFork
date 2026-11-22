@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { clearedToolOutput } from "@shared/storage-retention";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { testEnvironment } from "../../../tests/preload";
@@ -11,6 +12,7 @@ import {
 	runtimePublicationOutbox,
 	users,
 } from "../../db/schema";
+import * as readPool from "../../lib/db-worker/pool";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
@@ -21,6 +23,7 @@ import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
 import { narratorStore } from "../narrator-store";
+import { readCommittedToolDetail } from "../narrator-tool-detail";
 import * as subagentFileChanges from "../subagent-file-changes";
 
 const createdUsers: string[] = [];
@@ -641,7 +644,17 @@ describe("tool detail references and durable child origins", () => {
 		db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, parentCall.id)).run();
 		db.delete(narratorMessages).where(eq(narratorMessages.id, parentCall.messageId)).run();
 		expect((await narratorService.getToolCallDetail(fork.id, stored.toolUseId)).id).toBe(stored.id);
-		removeRef(copiedMessageId, fork.id);
+		await expect(
+			readCommittedToolDetail(
+				fork.id,
+				stored.toolUseId,
+				{},
+				new AbortController().signal,
+				async () => {
+					removeRef(copiedMessageId, fork.id);
+				},
+			),
+		).rejects.toBeInstanceOf(NotFoundError);
 		await expect(
 			narratorService.getToolCallDetail(fork.id, stored.toolUseId),
 		).rejects.toBeInstanceOf(NotFoundError);
@@ -853,6 +866,11 @@ describe("tool detail unique selection and bounded payload reads", () => {
 			narratorService.getToolCallDetail(own.id, allowed.toolUseId),
 		).rejects.toMatchObject({ code: "TOOL_CALL_DETAIL_TOO_LARGE" });
 		expect(trace.payloadReads()).toHaveLength(0);
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${allowed.toolUseId}`,
+		);
+		expect(response.status).toBe(413);
+		expect(trace.payloadReads()).toHaveLength(0);
 	});
 
 	test("route selectors are bounded and do not bypass the caller narrator ACL", async () => {
@@ -868,6 +886,118 @@ describe("tool detail unique selection and bounded payload reads", () => {
 			);
 			expect(response.status).toBe(400);
 		}
+	});
+});
+
+describe("committed tool detail reads", () => {
+	test("preserves the response shape and never loads cleared input on the main thread", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "redacted", { outputJson: clearedToolOutput(now) });
+		sqlite.run("UPDATE narrator_tool_calls SET input_json = 'malformed' WHERE id = ?", [stored.id]);
+		const expected = await narratorService.getToolCallDetail(own.id, stored.toolUseId);
+		const trace = traceToolReads();
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(JSON.parse(JSON.stringify(expected)));
+		expect(expected.inputJson).toBeNull();
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
+	test("rejects a snapshot when retention clears the tool payload before delivery", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "changed-detail");
+		await expect(
+			readCommittedToolDetail(
+				own.id,
+				stored.toolUseId,
+				{},
+				new AbortController().signal,
+				async () => {
+					db.update(narratorToolCalls)
+						.set({ inputJson: null, outputJson: clearedToolOutput(now) })
+						.where(eq(narratorToolCalls.id, stored.id))
+						.run();
+				},
+			),
+		).rejects.toBeInstanceOf(NotFoundError);
+	});
+
+	test("the route rechecks narrator ACL after the Worker returns", async () => {
+		const own = narrator();
+		const other = user();
+		const stored = tool(own.id, "acl-changed-detail");
+		const read = readPool.runReadTask;
+		spyOn(readPool, "runReadTask").mockImplementation(async (...args) => {
+			const snapshot = await read(...args);
+			db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, own.id)).run();
+			return snapshot as never;
+		});
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(404);
+		expect(await response.text()).not.toContain("allowed output");
+	});
+
+	test("worker creation, execution, and timeout failures propagate without loading payloads inline", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "worker-failure");
+		const trace = traceToolReads();
+		const worker = spyOn(readPool, "runReadTask");
+		const authorize = mock(async () => {});
+		for (const error of [
+			new readPool.WorkersUnavailableError("creation_failed"),
+			new readPool.DbReadTaskExecutionError("execution failed"),
+			new readPool.DbReadTaskTimeoutError("timed out"),
+		]) {
+			worker.mockRejectedValueOnce(error);
+			const signal = new AbortController().signal;
+			await expect(
+				readCommittedToolDetail(own.id, stored.toolUseId, {}, signal, authorize),
+			).rejects.toBe(error);
+			expect(worker.mock.lastCall?.[2]?.signal).toBe(signal);
+		}
+		expect(authorize).not.toHaveBeenCalled();
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
+	test("a disabled Worker does not fall back to a main-thread detail read", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "worker-disabled");
+		const trace = traceToolReads();
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		try {
+			await expect(
+				readCommittedToolDetail(
+					own.id,
+					stored.toolUseId,
+					{},
+					new AbortController().signal,
+					async () => {},
+				),
+			).rejects.toMatchObject({ reason: "disabled_by_env" });
+			expect(trace.payloadReads()).toHaveLength(0);
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
+
+	test("cancellation before delivery discards the snapshot without loading payloads inline", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "cancelled-detail");
+		const trace = traceToolReads();
+		const controller = new AbortController();
+		const cancelReason = new Error("request cancelled");
+		await expect(
+			readCommittedToolDetail(own.id, stored.toolUseId, {}, controller.signal, async () => {
+				controller.abort(cancelReason);
+			}),
+		).rejects.toBe(cancelReason);
+		expect(trace.payloadReads()).toHaveLength(0);
 	});
 });
 

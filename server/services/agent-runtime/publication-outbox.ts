@@ -21,6 +21,7 @@ import {
 } from "./mailbox";
 import { AWAITED_TERMINAL_CONSUMED_REASON } from "./mailbox-shared";
 import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
+import { publicationDedupeKey } from "./publication-key";
 import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
 import { runAtomicWrite } from "./runtime-write";
 
@@ -249,19 +250,7 @@ export interface PublicationIntent extends PublicationRun {
 	resultRef: string;
 	summary: string;
 }
-export function publicationDedupeKey(
-	run: PublicationRun,
-	eventKind: PublicationEvent | "terminal",
-) {
-	return JSON.stringify([
-		"publication",
-		run.producerKind,
-		run.taskId,
-		run.logicalRunId,
-		eventKind,
-		run.recipientId,
-	]);
-}
+export { publicationDedupeKey } from "./publication-key";
 /** Inverse of the event slot in publicationDedupeKey, for delivered mailbox receipts. */
 export function publicationEventFromDedupeKey(
 	dedupeKey: string | null,
