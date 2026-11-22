@@ -434,6 +434,41 @@ function listItemSourceRanges(
 	return ranges;
 }
 
+function lexWithSourceRanges(text: string, normalizedLength: number) {
+	const ranges = new Map<Token, SourceRange>();
+	let cursor = 0;
+	let previous: Token | undefined;
+	let previousRaw: string | undefined;
+	const record = (token: Token | undefined, end: number) => {
+		if (token && token !== previous) ranges.set(token, { start: cursor, end });
+		else if (token && token.raw !== previousRaw) {
+			const range = ranges.get(token);
+			if (range?.end === cursor) range.end = end;
+			else ranges.delete(token);
+		}
+		cursor = end;
+		previous = token;
+		previousRaw = token?.raw;
+	};
+	const tokens = marked.lexer(text, {
+		gfm: true,
+		extensions: {
+			renderers: {},
+			childTokens: {},
+			block: [
+				function (src, tokens) {
+					// Observe the top-level lexer cursor without consuming input. Marked
+					// can rewrite token.raw or consume definitions without emitting them.
+					if (tokens === this.lexer.tokens) record(tokens.at(-1), normalizedLength - src.length);
+					return undefined;
+				},
+			],
+		},
+	});
+	record(tokens.at(-1), normalizedLength);
+	return { tokens, ranges };
+}
+
 export function parseMarkdownUnits(
 	markdown: string,
 	math?: MathSupport,
@@ -468,12 +503,12 @@ export function parseMarkdownUnits(
 		return sourceOffsets?.[beforeEmphasis] ?? beforeEmphasis;
 	};
 	const formulas = source?.formulas;
-	const tokens = marked.lexer(text, { gfm: true });
+	const normalized = sourceRanges && lexerOffsets ? text.replace(/\r\n?/g, "\n") : text;
+	const lexed = sourceRanges ? lexWithSourceRanges(text, normalized.length) : undefined;
+	const tokens = lexed?.tokens ?? marked.lexer(text, { gfm: true });
 	const units: PreparedMarkdownUnit[] = [];
 	let isFirst = !continuation;
 	let consumed = 0;
-	let precise = sourceRanges;
-	const normalized = sourceRanges && lexerOffsets ? text.replace(/\r\n?/g, "\n") : text;
 	const exactOriginalOffset = (offset: number) => {
 		const boundary = lexerOffsets?.[offset] ?? offset;
 		let lo = 0;
@@ -486,13 +521,14 @@ export function parseMarkdownUnits(
 		return sourceOffsets?.[boundary - lo] ?? boundary - lo;
 	};
 	for (const token of tokens) {
-		const tokenStart = consumed;
 		const start = originalOffset(consumed);
-		const exact = precise && normalized.startsWith(token.raw, tokenStart);
-		// Marked advances its input by raw.length even for rewritten quotes.
-		// Skip their evidence, but keep checking subsequent tokens at the lexer cursor.
-		precise &&= exact || token.type === "blockquote";
-		const rangeStart = exact ? tokenStart : undefined;
+		const range = lexed?.ranges.get(token);
+		const rangeStart =
+			range &&
+			range.end - range.start === token.raw.length &&
+			normalized.startsWith(token.raw, range.start)
+				? range.start
+				: undefined;
 		const itemRanges =
 			rangeStart !== undefined && token.type === "list"
 				? listItemSourceRanges(token as Tokens.List, rangeStart, markdown, exactOriginalOffset)

@@ -183,6 +183,19 @@ test("exact paragraphs between rewritten quotes keep their positional provenance
 	);
 });
 
+test("duplicate link definitions do not shift later source ranges", () => {
+	const definitions = "[same]: /first\r\n[same]: /second\r\n\r\n";
+	const paragraph = "Use [the link][same].";
+	const text = definitions + paragraph;
+	const parsed = parseMarkdownToPreparedBlocks(text, undefined, true);
+	expect(parsed.map(({ sourceRange }) => sourceRange)).toEqual([
+		{ start: definitions.length, end: text.length },
+	]);
+	expect(parsed.map(({ sourceRange: _range, ...block }) => block)).toEqual(
+		parseMarkdownToPreparedBlocks(text),
+	);
+});
+
 test("an open checkpoint is requested only until its sealed prefix is translated", () => {
 	const checkpoint = {
 		type: "reasoning",
