@@ -83,6 +83,27 @@ function legacy(snapshot = twoGroups()): TextOwnershipSnapshot {
 	};
 }
 
+test("an external append after an unterminated local replacement uses the HEAD conflict policy", () => {
+	for (const newline of ["\n", "\r\n"]) {
+		const previous = create(`a${newline}b${newline}`, `a${newline}B`);
+		const input = {
+			baseText: `a${newline}b${newline}c${newline}`,
+			workText: `a${newline}B${newline}c${newline}`,
+			activeGroupId: "active",
+		};
+		expect(rebaseTextOwnership(previous, input).status).toBe("headConflict");
+		const result = rebaseTextOwnership(previous, {
+			...input,
+			headConflictGroupId: "unassigned",
+		});
+		expect(result.status).toBe("ok");
+		expect(result.headRebuilt).toBe(true);
+		expect(result.snapshot.workText).toBe(input.workText);
+		expect(result.snapshot.units.map((unit) => unit.groupId)).toEqual(["unassigned"]);
+		expectCurrent(result.snapshot);
+	}
+});
+
 describe("observed edit attribution", () => {
 	test("line terminators, Unicode and missing EOF remain byte-exact", () => {
 		for (const value of ["", "a", "a\n", "a\r\n", "a\r\nb\r", "\n\n", "中文\r\n尾行"]) {

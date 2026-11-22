@@ -1209,8 +1209,16 @@ function rangesIntersect(unit: TextChangeUnit, edit: Edit): boolean {
 		return unit.baseStart === edit.oldStart;
 	if (unit.baseStart === unit.baseEnd)
 		return edit.oldStart < unit.baseStart && unit.baseStart < edit.oldEnd;
-	if (edit.oldStart === edit.oldEnd)
-		return unit.baseStart < edit.oldStart && edit.oldStart < unit.baseEnd;
+	if (edit.oldStart === edit.oldEnd) {
+		const lastInserted = unit.insertedLines.at(-1);
+		return (
+			unit.baseStart < edit.oldStart &&
+			(edit.oldStart < unit.baseEnd ||
+				(edit.oldStart === unit.baseEnd &&
+					lastInserted !== undefined &&
+					!lastInserted.endsWith("\n")))
+		);
+	}
 	return unit.baseStart < edit.oldEnd && edit.oldStart < unit.baseEnd;
 }
 
