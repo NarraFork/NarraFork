@@ -51,6 +51,7 @@ import type {
 	StorageScanTablesResult,
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
+import { readRecallConversation } from "./recall-conversation-query";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
@@ -260,12 +261,18 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				params,
 																				controller.signal,
 																			)
-																		: runStorageScanTables(
-																				message.dbPath,
-																				message.requestId,
-																				params,
-																				controller.signal,
-																			),
+																		: params.kind === "recallConversation"
+																			? readRecallConversation(
+																					getConnection(message.dbPath),
+																					params,
+																					controller.signal,
+																				)
+																			: runStorageScanTables(
+																					message.dbPath,
+																					message.requestId,
+																					params,
+																					controller.signal,
+																				),
 			),
 		);
 		post({
