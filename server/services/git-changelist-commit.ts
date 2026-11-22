@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
@@ -11,7 +12,7 @@ import {
 	unlinkSync,
 } from "node:fs";
 import { lstat, mkdir, open, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import type { GitStagingAction, GitStagingActionResult } from "../../shared/git-staging-lists";
 import {
 	assertChangelistSourcesCurrent,
@@ -27,7 +28,7 @@ import type {
 	CommitOperation,
 	StoredFile,
 } from "./git-changelist-store";
-import { GitStagingKernelError, stagingGit } from "./git-staging-process";
+import { GitStagingKernelError, gitStagingEnvironment, stagingGit } from "./git-staging-process";
 
 const fail = (code: string, message: string) => new GitStagingKernelError(code, message);
 interface Evidence {
@@ -97,43 +98,28 @@ function assertHeadSync(
 	repo: ChangelistRepository,
 	head: string | null,
 	headFile: string | undefined,
+	headTarget: string | null,
 ) {
 	const raw = readSyncBounded(join(repo.gitDir, "HEAD"), 8192)?.bytes.toString("utf8");
 	if (raw !== headFile)
 		throw fail("GIT_STAGING_CONCURRENT_CHANGE", "HEAD identity changed before index publication");
-	const commonPointer = readSyncBounded(join(repo.gitDir, "commondir"), 8192)
-		?.bytes.toString("utf8")
-		.replace(/\r?\n$/, "");
-	if (commonPointer && /[\0\r\n]/.test(commonPointer))
-		throw fail("GIT_STAGING_INVALID", "Invalid Git common-dir pointer");
-	const commonDir = commonPointer ? resolve(repo.gitDir, commonPointer) : repo.gitDir;
-	let value = raw?.trim() ?? "";
-	for (let depth = 0; depth < 16; depth++) {
-		if (!value.startsWith("ref: ")) {
-			if ((value || null) !== head)
-				throw fail("GIT_STAGING_CONCURRENT_CHANGE", "HEAD changed before index publication");
-			return;
-		}
-		const ref = value.slice(5);
-		if (
-			!ref.startsWith("refs/") ||
-			/[\0\r\n\\]/.test(ref) ||
-			ref.split("/").some((part) => !part || part === "." || part === "..")
-		)
-			throw fail("GIT_STAGING_INVALID", "Invalid HEAD reference");
-		const local = /^refs\/(?:bisect|worktree|rewritten)\//.test(ref),
-			loose = readSyncBounded(join(local ? repo.gitDir : commonDir, ref), 8192);
-		if (loose) {
-			value = loose.bytes.toString("utf8").trim();
-			continue;
-		}
-		const packed =
-			readSyncBounded(join(commonDir, "packed-refs"), 8 * 1024 * 1024)?.bytes.toString("utf8") ??
-			"";
-		const match = packed.split("\n").find((line) => line.slice(line.indexOf(" ") + 1) === ref);
-		value = match ? match.slice(0, match.indexOf(" ")) : "";
-	}
-	throw fail("GIT_STAGING_INVALID", "HEAD reference chain exceeded its depth budget");
+	const read = (args: string[]) => {
+		const result = spawnSync("git", ["--no-optional-locks", ...args], {
+			cwd: repo.root,
+			env: gitStagingEnvironment(),
+			timeout: 2_000,
+			maxBuffer: 8192,
+			encoding: "utf8",
+			windowsHide: true,
+		});
+		if (result.error || (result.status !== 0 && result.status !== 1))
+			throw fail("GIT_STAGING_GIT_FAILED", "Cannot validate the protected HEAD reference");
+		return result.status === 0 ? result.stdout.trim() : null;
+	};
+	const currentHead = read(["rev-parse", "--verify", "-q", "HEAD"]);
+	const symbolic = read(["symbolic-ref", "--quiet", "HEAD"]);
+	if (currentHead !== head || (symbolic === null ? null : `ref: ${symbolic}`) !== headTarget)
+		throw fail("GIT_STAGING_CONCURRENT_CHANGE", "HEAD changed before index publication");
 }
 function lockInfoSync(path: string) {
 	try {
@@ -173,11 +159,11 @@ async function installNativeIndex(
 	installed: Buffer,
 	prepared: string,
 	original: Buffer | null,
-	head: { head: string | null; headFile: string | undefined },
+	head: { head: string | null; headFile: string | undefined; headTarget: string | null },
 ) {
 	await store.transaction(() => {
 		store.assertOperationFence(operationId, evidence.fenceToken);
-		assertHeadSync(repo, head.head, head.headFile);
+		assertHeadSync(repo, head.head, head.headFile, head.headTarget);
 		const current = readSyncBounded(repo.index, 64 * 1024 * 1024),
 			alreadyInstalled = !!current?.bytes.equals(installed) && current.mode === evidence.nativeMode;
 		let lockIdentity = lockInfoSync(`${repo.index}.lock`);
@@ -726,7 +712,7 @@ export async function commitChangelist(
 		const started = await store.transaction(() => {
 			store.assertOperationFence(id, evidence.fenceToken);
 			assertOwnedLockSync(repo, evidence);
-			assertHeadSync(repo, before.head, before.headFile);
+			assertHeadSync(repo, before.head, before.headFile, before.headTarget);
 			const native = readSyncBounded(repo.index, 64 * 1024 * 1024);
 			if (
 				!(nativeBefore === null ? native === null : native?.bytes.equals(nativeBefore)) ||
@@ -940,7 +926,7 @@ export async function recoverChangelistCommit(
 				saved.leaseUntil > Date.now()
 			)
 				throw fail("GIT_STAGING_LOCKED", "Another producer owns this operation");
-			assertHeadSync(repo, head.head, head.headFile);
+			assertHeadSync(repo, head.head, head.headFile, head.headTarget);
 			if (saved.lockIdentity) {
 				assertOwnedLockSync(repo, saved);
 				unlinkSync(`${repo.index}.lock`);
@@ -1002,7 +988,7 @@ export async function recoverChangelistCommit(
 		const old = JSON.parse(current.evidence_json) as Evidence;
 		if (old.leaseUntil > Date.now())
 			throw fail("GIT_STAGING_LOCKED", "Another producer owns recovery");
-		assertHeadSync(repo, head.head, head.headFile);
+		assertHeadSync(repo, head.head, head.headFile, head.headTarget);
 		evidence = { ...old, fenceToken: newFence, leaseUntil: Date.now() + 5 * 60_000 };
 		operation = { ...current, commit_oid: head.head, status: "recovering", fence_token: newFence };
 		store.db

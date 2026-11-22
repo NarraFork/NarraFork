@@ -494,6 +494,20 @@ test("earlier insertions owned by another group preserve later unit versions and
 	).toEqual(["f"]);
 });
 
+test("grouped commits support reftable branches and detached HEAD", async () => {
+	await git("refs", "migrate", "--ref-format=reftable");
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const a = await active();
+	expect((await commit(a)).outcome).toBe("applied");
+	expect(await git("show", "HEAD:a")).toBe("selected");
+	await git("switch", "--detach");
+	await file("a", "detached\n");
+	await act({ action: "sync" });
+	expect((await commit(a)).outcome).toBe("applied");
+	expect(await git("show", "HEAD:a")).toBe("detached");
+});
+
 test("a mode unit in another group does not invalidate the text group's candidate or cursor", async () => {
 	await file("a", "another text edit\n");
 	await file("f", "FIRST\ncontext1\ncontext2\nlast\n");
