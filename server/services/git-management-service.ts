@@ -269,8 +269,8 @@ export function gitAttributionScopes(target: GitWorkspaceTarget, files: string[]
 	return { scopes: [...scopes.values()], truncated };
 }
 
-export function validateFilePaths(files: string[]): void {
-	if (files.length > 1000) throw new ValidationError("Too many file paths");
+export function validateFilePaths(files: string[], maxPaths = 1000): void {
+	if (files.length > maxPaths) throw new ValidationError("Too many file paths");
 	for (const path of files) {
 		if (
 			!path ||
@@ -287,8 +287,9 @@ export function validateFilePaths(files: string[]): void {
 export async function validateGitFileTargets(
 	target: GitWorkspaceTarget,
 	files: string[],
+	maxPaths = 1000,
 ): Promise<void> {
-	validateFilePaths(files);
+	validateFilePaths(files, maxPaths);
 	if (!target.backend || !target.workspace.rootPath)
 		throw new ValidationError("Git workspace unavailable");
 	if (target.backend.kind === "remote") return; // Atomic executor guards use the target OS and path policy.

@@ -1,3 +1,4 @@
+import { GIT_STAGING_LIMITS } from "@shared/git-staging-lists";
 import type {
 	GitStagingListsChanged,
 	GitStagingObservationState,
@@ -288,7 +289,11 @@ export async function handleGitWorkspaceMessage(
 									"GIT_WORKSPACE_ACCESS_DENIED",
 								);
 							const { validateGitFileTargets } = await import("../services/git-management-service");
-							await validateGitFileTargets(writeTarget, paths);
+							await validateGitFileTargets(
+								writeTarget,
+								paths,
+								GIT_STAGING_LIMITS.maxRowsPerList * 4,
+							);
 							await writeTarget.authorizeFilePaths(paths, "write");
 						},
 						observation: (state) => {

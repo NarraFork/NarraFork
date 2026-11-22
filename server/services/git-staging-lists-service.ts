@@ -419,14 +419,14 @@ export async function getGitStagingListsService(
 			supported: target.backend?.kind === "local",
 			authorizePaths: async (paths) => {
 				const { validateGitFileTargets } = await import("./git-management-service");
-				await validateGitFileTargets(target, paths);
+				await validateGitFileTargets(target, paths, GIT_STAGING_LIMITS.maxRowsPerList * 4);
 				if (!target.authorizeFilePaths)
 					throw new AppError("File authorization is required", 403, "FORBIDDEN");
 				await target.authorizeFilePaths(paths, "write");
 			},
 			authorizeReadPaths: async (paths) => {
 				const { validateGitFileTargets } = await import("./git-management-service");
-				await validateGitFileTargets(target, paths);
+				await validateGitFileTargets(target, paths, GIT_STAGING_LIMITS.maxRowsPerList * 4);
 				if (!target.authorizeFilePaths)
 					throw new AppError("File authorization is required", 403, "FORBIDDEN");
 				await target.authorizeFilePaths(paths, "read");

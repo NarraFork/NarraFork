@@ -14,12 +14,31 @@ import {
 	invalidateGitWorkspace,
 	invalidateGitWorkspaceFacts,
 	validateGitWorkspaceStatusPages,
+	validateFilePaths,
+	validateGitFileTargets,
 } from "./git-management-service";
 import { closeGitStatusPages } from "./git-status-page";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import { GitWorkspaceWatchPool } from "./git-workspace-watch";
 
 let nextFixture = 0;
+test("whole observation authorization admits 1001 paths without raising the ordinary write limit", async () => {
+	const { target } = fixture(complete(0));
+	const paths = Array.from({ length: 1001 }, (_, index) => `file-${index}`);
+	await validateGitFileTargets(target, paths, 20_000);
+	expect(() => validateFilePaths(paths)).toThrow("Too many file paths");
+	await expect(validateGitFileTargets(target, [...paths, "../escape"], 20_000)).rejects.toThrow(
+		"Invalid file path",
+	);
+	await expect(
+		validateGitFileTargets(
+			target,
+			Array.from({ length: 20_001 }, (_, index) => `file-${index}`),
+			20_000,
+		),
+	).rejects.toThrow("Too many file paths");
+});
+
 async function rejected(promise: Promise<unknown>): Promise<unknown> {
 	return promise.then(
 		() => null,
