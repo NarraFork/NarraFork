@@ -582,7 +582,7 @@ export class GitStatusPageEngine {
 			}
 		}
 		for (const scan of this.scans)
-			if (!scan.onDemand && gitStatusPageScopesOverlap(scan.queryKey, queryKey))
+			if (scan.producer && !scan.onDemand && gitStatusPageScopesOverlap(scan.queryKey, queryKey))
 				scan.invalidated = true;
 	}
 

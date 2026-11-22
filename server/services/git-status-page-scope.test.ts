@@ -77,6 +77,34 @@ describe("background membership validation", () => {
 });
 
 describe("worker verified batch scope", () => {
+	test("statistics-only refresh preserves a matching write-time membership scan", async () => {
+		for (const onDemand of [false, true]) {
+			const engine = new GitStatusPageEngine();
+			const first = onDemand
+				? await engine.readOnDemand(request(), signal, async () => raw(status))
+				: await warm(engine);
+			const source = deferred<GitStatusPageRawResult>();
+			const pending = engine.assertScope(
+				{
+					...request(),
+					proof: {
+						snapshotId: first.snapshotId,
+						filter: ["M"],
+						section: "unstaged",
+						directory: "dir",
+					},
+					files: ["dir/a", "dir/b"],
+				},
+				signal,
+				() => source.promise,
+			);
+			engine.invalidateStats(request().scope.queryKey);
+			source.resolve(raw(status));
+			expect(await pending).toBe(true);
+			engine.close();
+		}
+	});
+
 	test("directory and filter prove the complete section, not only the loaded page", async () => {
 		const engine = new GitStatusPageEngine();
 		const first = await warm(engine);
@@ -247,6 +275,39 @@ describe("worker verified batch scope", () => {
 			engine.close();
 		}
 	});
+});
+
+test("parent statistics invalidation preserves an in-flight scoped write assertion", async () => {
+	const pages = new GitStatusPageService();
+	const entered = deferred<void>();
+	const scan = deferred<GitStatusPageRawResult>();
+	let checking = false;
+	const source = {
+		kind: "remote" as const,
+		identity: "device:7:/root",
+		read: async () => {
+			if (!checking) return raw(status);
+			entered.resolve();
+			return scan.promise;
+		},
+	};
+	try {
+		const first = await pages.readOnDemand({ ...request(), source });
+		checking = true;
+		const pending = pages.assertScope({
+			scope: request().scope,
+			source,
+			proof: { snapshotId: first.snapshotId, filter: ["M"], section: "unstaged", directory: "dir" },
+			files: ["dir/a", "dir/b"],
+		});
+		await entered.promise;
+		pages.invalidateStats(request().scope.queryKey);
+		scan.resolve(raw(status));
+		await pending;
+	} finally {
+		scan.resolve(raw(status));
+		await pages.close();
+	}
 });
 
 test("parent service transports background validation and scope proofs to the isolated Worker", async () => {

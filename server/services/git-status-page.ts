@@ -310,10 +310,9 @@ export class GitStatusPageService {
 	private dirtyPending(queryKey: string, includePages = true): void {
 		for (const pending of this.pending.values())
 			if (
-				(["observe", "validate", "assert", "stats-on-demand"].includes(
-					pending.options.operation ?? "",
-				) ||
-					(includePages && pending.options.operation === "read-on-demand")) &&
+				(["observe", "validate", "stats-on-demand"].includes(pending.options.operation ?? "") ||
+					(includePages &&
+						["assert", "read-on-demand"].includes(pending.options.operation ?? ""))) &&
 				gitStatusPageScopesOverlap(pending.options.scope.queryKey, queryKey)
 			)
 				pending.invalidated = true;
