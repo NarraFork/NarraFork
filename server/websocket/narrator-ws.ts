@@ -27,7 +27,7 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, narratorToolCalls, terminals } from "../db/schema";
+import { narrators, narratorToolCalls, terminals, users } from "../db/schema";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { eventBus } from "../lib/event-bus";
@@ -251,11 +251,16 @@ function setTranslationDemand(ws: NarratorWS, report: ReasoningTranslationVisibi
 	const holder = previous ?? { narratorId };
 	holders.set(visibilityId, holder);
 	translationHolders.set(ws, holders);
-	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
 	const viewer = {
 		narratorId,
 		userId,
 		authorize: async (owner: string) => {
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { role: true },
+			});
+			if (!user) return false;
+			const principal = { userId, isAdmin: user.role === "admin" };
 			return (
 				(await authorizeNarratorId(narratorId, principal, "write")) &&
 				(owner === narratorId || (await authorizeNarratorId(owner, principal, "write")))
