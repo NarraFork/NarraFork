@@ -141,6 +141,7 @@ import {
 } from "./services/background-occupancy-startup";
 import { stopBackgroundOccupancy } from "./services/background-occupancy-store";
 import { ensureRootlessEnv } from "./services/container-service";
+import { cpuProfiler } from "./services/cpu-profiler";
 import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
 	drainNarratorSessionTails,
@@ -1931,6 +1932,7 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		httpLifecycle.stopAccepting();
+		const cpuProfilerStop = cpuProfiler.shutdown();
 		quiesceNarratorWsReadTasks();
 		const producerLabel = "databaseProducers.stop";
 		let producerFailure: { error: unknown } | undefined;
@@ -2029,6 +2031,7 @@ async function performGracefulShutdown(
 			import("./services/outline/live/registry").then((live) => live.persistAllLiveSessions()),
 		);
 		await step("outlineLive.persist", () => outlineLivePersist, 2_000);
+		await step("cpuProfiler.stop", () => cpuProfilerStop);
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
 		// (it never awaits stop()'s promise), so anything beyond a moment means the
