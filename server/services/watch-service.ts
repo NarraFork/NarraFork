@@ -183,6 +183,8 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 	});
 	const { id, label } = snapshot;
 	if (snapshot.status !== "running") {
+		ctx.signal.throwIfAborted();
+		await checkObservationAuthorization(ctx, input.type);
 		return {
 			output: await resultText("agent", label, snapshot),
 			metadata: {
@@ -213,6 +215,7 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 				recipientId: snapshot.publicationRun?.recipientId ?? ctx.narratorId,
 				expectedRunId: snapshot.publicationRun?.logicalRunId,
 				reportTakenOver: true,
+				watchOwnerNarratorId: ctx.narratorId,
 				timeoutMs: input.timeout,
 				signal: observation.signal,
 			});
