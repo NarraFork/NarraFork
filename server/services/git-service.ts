@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import {
 	GIT_BRANCH_LIST_LIMIT,
 	type GitBranches,
@@ -60,6 +61,7 @@ import {
 	resolveCommit,
 	uncommittedChanges,
 } from "./git-ref-queries";
+import { GIT_STAGING_EXCLUDE_PATHSPEC, isGitStagingInternalPath } from "./git-staging-files";
 import { coordinateGitStatusQuery, getLocalGitStatusQueryKey } from "./git-status-query";
 import { GIT_STATUS_TIMEOUT_MS, readGitStatusStream } from "./git-status-stream";
 import { lifecycleCreationPath } from "./worktree-lifecycle-guard";
@@ -225,7 +227,7 @@ function toUtcIso(raw: string): string | null {
  * tried for 500 ms: a busy worktree answers 409 `GIT_WORKSPACE_BUSY` instead of
  * queueing the request behind a long-running write.
  */
-async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
+export async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
 	const request = gitRequestContext.getStore();
 	if (!request) return worktreeLock.acquire(worktreePath, fn);
 	const result = await worktreeLock.tryAcquire(
@@ -244,6 +246,33 @@ async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): 
 			"GIT_WORKSPACE_BUSY",
 		);
 	return result.value;
+}
+
+/** Resolve the target index before taking either cross-process or in-process ownership. */
+async function ordinaryGitRoot(worktreePath: string): Promise<string> {
+	let path = await realpath(worktreePath);
+	for (let depth = 0; depth < 128; depth++) {
+		// A nested repository/submodule has a distinct index; do not inherit its parent's guard.
+		const marker = await lstat(join(path, ".git")).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+			throw error;
+		});
+		if (marker) break;
+		const parent = dirname(path);
+		if (parent === path) break;
+		path = parent;
+		if (depth === 127)
+			throw new ValidationError("Git working directory exceeds the path-depth budget");
+	}
+	return path;
+}
+
+/** Ordinary Git owns only the native worktree/index lock. */
+async function withOrdinaryGitWrite<T>(
+	worktreePath: string,
+	run: (root: string) => Promise<T>,
+): Promise<T> {
+	return withWorktreeLock(worktreePath, async () => run(await ordinaryGitRoot(worktreePath)));
 }
 
 export interface GitStatusFile {
@@ -1163,22 +1192,40 @@ export const gitService = {
 
 	async stageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "--", ...files], worktreePath);
+		return withOrdinaryGitWrite(worktreePath, async (root) => {
+			if (
+				files.some((file) => isGitStagingInternalPath(relative(root, resolve(worktreePath, file))))
+			)
+				throw new ValidationError(
+					"The .narrafork/git-staging directory is internal state and cannot be staged",
+				);
+			const result = await exec(
+				[
+					"--no-literal-pathspecs",
+					"add",
+					"--",
+					...files.map((file) => `:(literal)${file}`),
+					GIT_STAGING_EXCLUDE_PATHSPEC,
+				],
+				worktreePath,
+			);
 			if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
 		});
 	},
 
 	async stageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "-A"], worktreePath);
+		return withOrdinaryGitWrite(worktreePath, async (root) => {
+			const result = await exec(
+				["--no-literal-pathspecs", "add", "-A", "--", GIT_STAGING_EXCLUDE_PATHSPEC],
+				root,
+			);
 			if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
 		});
 	},
 
 	async unstageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const args = (await hasNoCommits(worktreePath))
 				? ["rm", "--cached", "-r", "--ignore-unmatch", "--", ...files]
 				: ["reset", "HEAD", "--", ...files];
@@ -1188,7 +1235,7 @@ export const gitService = {
 	},
 
 	async unstageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const result = await exec(
 				(await hasNoCommits(worktreePath)) ? ["read-tree", "--empty"] : ["reset", "HEAD"],
 				worktreePath,
@@ -1202,7 +1249,7 @@ export const gitService = {
 		message: string,
 		identity?: GitCommitIdentity,
 	): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const result = await exec(["commit", "-m", message], worktreePath, {
 				identity: identity ?? null,
 			});
@@ -1213,7 +1260,7 @@ export const gitService = {
 
 	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			// `-uall` is a SAFETY requirement here, not just a display one. Collapsed
 			// output would report `?? newdir/` for a request to discard
 			// `newdir/one.txt`, and the `git clean` below would then delete the entire
@@ -1244,7 +1291,7 @@ export const gitService = {
 	},
 
 	async discardAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
 			if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
 			const r2 = await exec(["clean", "-fd"], worktreePath);
@@ -1254,16 +1301,20 @@ export const gitService = {
 
 	/** Stash the working tree. `identity` authors the underlying stash commit objects. */
 	async stash(worktreePath: string, message?: string, identity?: GitCommitIdentity): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const args = ["stash", "push", "--include-untracked"];
+		return withOrdinaryGitWrite(worktreePath, async (root) => {
+			const args = ["--no-literal-pathspecs", "stash", "push", "--include-untracked"];
 			if (message) args.push("-m", message);
-			const result = await exec(args, worktreePath, { identity: identity ?? null });
+			args.push(
+				"--",
+				`:(top,exclude,glob${process.platform === "win32" ? ",icase" : ""})[.]narrafork/git-staging/**`,
+			);
+			const result = await exec(args, root, { identity: identity ?? null });
 			if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 		});
 	},
 
 	async stashPop(worktreePath: string): Promise<{ hasConflicts: boolean }> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const result = await exec(["stash", "pop"], worktreePath, true);
 			if (result.exitCode !== 0) {
 				const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
@@ -1540,7 +1591,7 @@ export const gitService = {
 		worktreePath: string,
 		options: { branch: string; create?: boolean; startPoint?: string },
 	): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const format = await exec(
 				["check-ref-format", "--branch", options.branch],
 				worktreePath,
@@ -1712,14 +1763,14 @@ export const gitService = {
 	// === Reset ===
 
 	async resetSoft(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const result = await exec(["reset", "--soft", target], worktreePath);
 			if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
 		});
 	},
 
 	async resetHard(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
+		return withOrdinaryGitWrite(worktreePath, async () => {
 			const result = await exec(["reset", "--hard", target], worktreePath);
 			if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
 		});

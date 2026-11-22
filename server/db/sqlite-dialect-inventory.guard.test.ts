@@ -547,7 +547,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
-	"server/lib/db-worker/database-cleanup-context.ts": ["driver"],
+	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
@@ -573,7 +573,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"collate",
 	],
 	"server/services/git-current-diff-view.ts": ["rowid"],
-	"server/services/integration-authority-service.ts": ["errorCode"],
+	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
@@ -703,7 +703,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1"],
+	"server/services/tool-edit-preview.ts": ["json1", "handle"],
+	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions.

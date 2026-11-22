@@ -8,11 +8,6 @@ import {
 } from "@server/db/legacy-request-storage";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import {
-	CLEANUP_CONTEXT_BUDGET_EXCEEDED,
-	type CleanupContextRow,
-	NARRATOR_CLEANUP_COLUMNS,
-} from "@server/lib/db-worker/database-cleanup-context";
-import {
 	resumeDbWorkerPool,
 	runEphemeralReadTask,
 	runReadTask,
@@ -28,6 +23,11 @@ import {
 	type StorageScanSessionPreviewParams,
 	type StorageScanSessionPreviewResult,
 } from "@server/lib/db-worker/protocol";
+import {
+	CLEANUP_CONTEXT_BUDGET_EXCEEDED,
+	type CleanupContextRow,
+	NARRATOR_CLEANUP_COLUMNS,
+} from "@server/lib/db-worker/storage-cleanup-context-query";
 import {
 	type ParallelScanOutcome,
 	runParallelObjectStorageScan,
