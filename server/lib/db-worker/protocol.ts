@@ -29,6 +29,7 @@ import type {
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { SubagentActivityParams } from "./subagent-activity-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -53,6 +54,7 @@ export type DbReadTaskName =
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
 	| "storageHistoryRead"
+	| "subagentActivity"
 	| "storageHistoryBody";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -253,6 +255,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| SubagentActivityParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams

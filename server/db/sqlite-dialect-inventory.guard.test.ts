@@ -573,7 +573,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/narrator-messages.ts": ["handle", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
@@ -728,6 +728,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// History retention has an explicit SQLite capability boundary; a PG implementation
 	// needs its own async candidate/read/write adapter, rather than opening a second DB.
 	"server/lib/db-worker/storage-history-query.ts": ["driver", "rowid", "json1", "timeFn"],
+	"server/lib/db-worker/subagent-activity-query.ts": ["driver"],
 	"server/services/storage-history-runtime.ts": ["connectionModule"],
 	"server/services/storage-history-mutations.ts": [
 		"handle",

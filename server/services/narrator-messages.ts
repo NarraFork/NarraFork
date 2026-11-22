@@ -16,13 +16,7 @@ import {
 } from "@shared/reasoning-content";
 import { isClearedToolOutput } from "@shared/storage-retention";
 import type { SubagentNestedSummary } from "@shared/subagent-nested";
-import {
-	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
-	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
-	normalizeSubagentToolInputSummary,
-	SUBAGENT_SUMMARY_INPUT_KEYS,
-	type SubagentToolInputSummary,
-} from "@shared/subagent-tool-summary";
+import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	type AnyColumn,
 	and,
@@ -62,6 +56,13 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import {
+	projectActivityRow,
+	SUBAGENT_ACTIVITY_LIMIT,
+	SUBAGENT_ACTIVITY_SUMMARY_SQL,
+	type SubagentActivityRows,
+} from "../lib/db-worker/subagent-activity-query";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -2400,8 +2401,6 @@ export function stripProviderMetadata(tree: any[]): any[] {
 	});
 }
 
-const SUBAGENT_ACTIVITY_LIMIT = 3;
-
 export interface SubagentActivityToolCallTiming {
 	streamStartedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
@@ -2479,66 +2478,6 @@ interface SubagentActivityOwner {
 }
 
 /**
- * SQL projection of the whitelisted short input keys for one activity row.
- *
- * WHY IN SQL AND NOT IN JS
- * `input_json` is deliberately NOT selected by this query: for Write/Edit it can
- * hold a whole file (observed max 180KB across 835k rows). Selecting it to read a
- * 40-char path would pull the blob into JS and re-parse it on the main thread,
- * which CLAUDE.md forbids on summary paths. `json_extract` keeps the parse inside
- * SQLite and returns only the short leaves.
- *
- * TWO GUARDS, BOTH LOAD-BEARING:
- *
- *  1. `json_valid` — NOT a nicety. A single malformed row makes `json_extract`
- *     raise "malformed JSON" and abort the ENTIRE statement, so one bad row would
- *     blank every card's activity list rather than just its own. (Measured: the
- *     unguarded query throws; the guarded one returns all rows.)
- *
- *  2. `octet_length` — bounds the parse for a pathological blob. The ceiling is
- *     256KB rather than a tighter number on purpose: a 32KB cap would have
- *     suppressed the summary for a large-file `Write`, i.e. exactly the case where
- *     `file_path` is the only useful label. Both guards sit in front of the
- *     extract so an oversized row costs a length check, not a parse.
- *
- * Each value is capped with `substr` so a multi-KB `description` cannot inflate
- * the response.
- */
-function subagentSummarySql(): SQL<string | null> {
-	const paths = SUBAGENT_SUMMARY_INPUT_KEYS.map(
-		(key) =>
-			sql`substr(json_extract(${narratorToolCalls.inputJson}, ${`$.${key}`}), 1, ${MAX_SUBAGENT_SUMMARY_VALUE_CHARS})`,
-	);
-	// json_object(k1, v1, k2, v2, ...) — one row-shaped JSON string instead of ten
-	// result columns, so adding a key later does not reshape the row type.
-	const pairs: SQL[] = [];
-	SUBAGENT_SUMMARY_INPUT_KEYS.forEach((key, index) => {
-		pairs.push(sql`${key}, ${paths[index]}`);
-	});
-	return sql<string | null>`CASE
-		WHEN NOT (${sql.raw(CLEARED_TOOL_OUTPUT_SQL)}) AND ${narratorToolCalls.inputJson} IS NOT NULL
-			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
-			AND json_valid(${narratorToolCalls.inputJson})
-		THEN json_object(${sql.join(pairs, sql`, `)})
-	END`;
-}
-
-/**
- * Parse the `json_object(...)` projection back into a summary.
- *
- * The payload is bounded by construction (10 keys × 200 chars), so this parse is
- * not the big-field read the query avoids.
- */
-function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
-	if (typeof raw !== "string" || !raw) return null;
-	try {
-		return normalizeSubagentToolInputSummary(JSON.parse(raw));
-	} catch {
-		return null;
-	}
-}
-
-/**
  * Latest tool calls of each narrator, oldest first, as short summary rows — the
  * dashboard activity cards' snapshot. Same bounded projection as a subagent
  * card's recent calls: never reads `input_json` or outputs into JS.
@@ -2574,7 +2513,7 @@ async function loadLatestSubagentToolCalls(
 					completedAt: narratorToolCalls.completedAt,
 					durationMs: narratorToolCalls.durationMs,
 					// Short whitelisted input keys only — never the `input_json` blob.
-					inputSummary: subagentSummarySql(),
+					inputSummary: sql<string | null>`${sql.raw(SUBAGENT_ACTIVITY_SUMMARY_SQL)}`,
 				})
 				.from(narratorToolCalls)
 				.where(
@@ -2591,35 +2530,40 @@ async function loadLatestSubagentToolCalls(
 	);
 
 	for (const { narratorId, rows } of rowsByNarrator) {
-		result.set(
-			narratorId,
-			rows.map((row) => {
-				const timing: SubagentActivityToolCallTiming = {
-					streamStartedAt: row.streamStartedAt,
-					permissionStartedAt: row.permissionStartedAt,
-					executionStartedAt: row.executionStartedAt,
-					completedAt: row.completedAt,
-					durationMs: row.durationMs,
-				};
-				const inputSummary = parseSubagentSummary(row.inputSummary);
-				return {
-					toolCallId: row.toolCallId ?? null,
-					toolUseId: row.toolUseId,
-					toolName: row.toolName,
-					status: row.status,
-					createdAt: row.createdAt ?? null,
-					timing: Object.values(timing).some((value) => value != null) ? timing : null,
-					...(inputSummary ? { inputSummary } : {}),
-				};
-			}),
-		);
+		result.set(narratorId, rows.map(projectActivityRow));
 	}
 	return result;
+}
+
+async function loadHistorySubagentToolCalls(
+	narratorIds: string[],
+	signal?: AbortSignal,
+	deadlineAt?: number,
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	if (!narratorIds.length) return new Map();
+	assertDisplayReadActive(signal, deadlineAt);
+	const { sqlite, activeDatabaseBackend } = modelHistoryDatabase;
+	if (
+		activeDatabaseBackend === "postgres" ||
+		(process.env.NODE_ENV === "test" && sqlite.filename === ":memory:")
+	)
+		return loadLatestSubagentToolCalls(narratorIds);
+	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction)
+		throw new WorkersUnavailableError("requires_committed_file");
+	const rows = await runReadTask<SubagentActivityRows>(
+		sqlite.filename,
+		{ kind: "subagentActivity", narratorIds },
+		{ signal, timeoutMs: deadlineAt === undefined ? 15_000 : Math.max(1, deadlineAt - Date.now()) },
+	);
+	assertDisplayReadActive(signal, deadlineAt);
+	return new Map(rows);
 }
 
 async function buildSubagentActivities(
 	owners: SubagentActivityOwner[],
 	expectedToolUseIds: string[] = [],
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<Map<string, SubagentActivity>> {
 	const activities = new Map<string, SubagentActivity>();
 	for (const toolUseId of expectedToolUseIds) {
@@ -2631,13 +2575,13 @@ async function buildSubagentActivities(
 		});
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
-	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
 	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
 	// Same one-aggregate rule for the nested level: one bounded read for every card.
 	const nestedByNarrator = await loadNestedSubagentSummaries(narratorIds);
+	const toolCallsByNarrator = await loadHistorySubagentToolCalls(narratorIds, signal, deadlineAt);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -3089,16 +3033,50 @@ async function loadSubagentActivitiesForToolUseIds(
 	toolUseIds: string[],
 	initialScope?: ReturnType<typeof resolveAggregateScopeTx>,
 	scopeToolUseIds = toolUseIds,
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<Map<string, SubagentActivity>> {
 	if (toolUseIds.length === 0 && !initialScope) return new Map();
 	const scope =
 		initialScope ??
 		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
-	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
+	const activities = await buildSubagentActivities(scope.owners, toolUseIds, signal, deadlineAt);
+	assertDisplayReadActive(signal, deadlineAt);
 	// Summary/file aggregation can await other services. A removed caller/child
 	// ref must revoke this response too, rather than publishing a stale owner.
-	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
-	assertAggregateScopeUnchanged(scope, current);
+	db.transaction((tx) => {
+		assertAggregateScopeUnchanged(scope, resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+		const ownerByCall = new Map<string, string>();
+		for (const activity of activities.values()) {
+			if (!activity.subagentNarratorId) continue;
+			for (const call of activity.latestToolCalls) {
+				if (call.toolCallId) ownerByCall.set(call.toolCallId, activity.subagentNarratorId);
+			}
+		}
+		const ids = [...ownerByCall.keys()];
+		for (let offset = 0; offset < ids.length; offset += 200) {
+			const batch = ids.slice(offset, offset + 200);
+			const visible = tx
+				.select({ id: narratorToolCalls.id, owner: narratorToolCalls.narratorId })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						inArray(narratorToolCalls.id, batch),
+						toolMessageRefExists(narratorToolCalls.narratorId),
+					),
+				)
+				.all();
+			if (
+				visible.length !== batch.length ||
+				visible.some(({ id, owner }) => ownerByCall.get(id) !== owner)
+			)
+				throw new AppError(
+					"History activity references changed; reload the history window.",
+					409,
+					"HISTORY_AGGREGATE_UNAVAILABLE",
+				);
+		}
+	});
 	return activities;
 }
 
@@ -3195,6 +3173,8 @@ async function buildTreeFromTopLevelRefs(
 		subagentToolUseIds,
 		scope,
 		aggregateToolUseIds,
+		signal,
+		deadlineAt,
 	);
 	assertDisplayReadActive(signal, deadlineAt);
 	const summarizedAt = performance.now();

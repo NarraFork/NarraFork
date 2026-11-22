@@ -54,6 +54,7 @@ import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readSubagentActivity } from "./subagent-activity-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
 const port = parentPort;
@@ -218,8 +219,11 @@ port.on("message", async (message: DbWorkerInbound) => {
 	try {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
-			runInSqlTraceSpan(sqlSpan, async () =>
-				params.kind === "storageHistoryRead"
+			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "subagentActivity") {
+					return readSubagentActivity(getConnection(message.dbPath), params, controller.signal);
+				}
+				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
 					: params.kind === "storageHistoryBody"
 						? runStorageHistoryBody(getConnection(message.dbPath), params)
@@ -265,8 +269,8 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				message.requestId,
 																				params,
 																				controller.signal,
-																			),
-			),
+																			);
+			}),
 		);
 		post({
 			type: "result",
