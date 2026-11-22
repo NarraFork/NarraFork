@@ -6,9 +6,10 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -41,10 +42,10 @@ afterEach(() => {
 	settings.narratorBlocks.read = true;
 	scans.noteRowsOnlyEnvelopes(undefined);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await disposeWorkerDb();
 });
 
 async function conversation() {
