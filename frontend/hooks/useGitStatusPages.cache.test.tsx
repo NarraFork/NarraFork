@@ -49,6 +49,7 @@ mock.module("../lib/narrator-ws-manager", () => ({ narratorWSManager: transport 
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { createRoot } = await import("react-dom/client");
 const { api } = await import("../lib/api");
+const { ApiError } = await import("../lib/api/client");
 const { useGitStatusPages } = await import("./useGitStatusPages");
 const { useGitStatusPageStats } = await import("./useGitStatusPageStats");
 const { useGitStatus, useGitLineStats, useGitLog, useGitStage } = await import("./useGit");
@@ -299,6 +300,56 @@ test("paused pages issue no fallback GET and a pre-pause HTTP result cannot publ
 		).not.toBe(true);
 	}
 	expect(sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+});
+
+test.each([
+	401, 403, 404,
+])("automatic reauthorization retires an HTTP %s history refusal", async (status) => {
+	let history!: ReturnType<typeof useGitLog>;
+	function History() {
+		history = useGitLog(target);
+		return null;
+	}
+	const refusal = new ApiError("History read refused", status);
+	const commits = [
+		{
+			sha: "a".repeat(40),
+			shortSha: "aaaaaaa",
+			message: "Recovered commit",
+			author: "Alice",
+			date: "2026-06-10",
+		},
+	];
+	const read = spyOn(api, "getGitLog").mockRejectedValueOnce(refusal).mockResolvedValue(commits);
+	root.render(
+		<QueryClientProvider client={client}>
+			<History />
+		</QueryClientProvider>,
+	);
+	await flush();
+	expect(history.error).toBe(refusal);
+	expect(history.data).toBeUndefined();
+	transport.connected = false;
+	for (const callback of connections) callback(false, false);
+	await flush();
+	transport.connected = true;
+	for (const callback of connections) callback(true, true);
+	await flush();
+	expect(read).toHaveBeenCalledTimes(2);
+	expect(history.data).toEqual(commits);
+	expect(history.error).toBeNull();
+	expect(history.isError).toBe(false);
+	read.mockResolvedValue([]);
+	await history.refetch();
+	await flush();
+	expect(history.data).toEqual([]);
+	expect(history.error).toBeNull();
+	const nextRefusal = new ApiError("New history refusal", status);
+	read.mockRejectedValue(nextRefusal);
+	await history.refetch();
+	await flush();
+	expect(history.error).toBe(nextRefusal);
+	expect(history.data).toBeUndefined();
 });
 
 test("ordinary facts and mutations cannot dispatch while paused or publish a pre-pause result after a new ack", async () => {

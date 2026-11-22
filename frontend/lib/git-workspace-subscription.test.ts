@@ -420,6 +420,29 @@ test.each([
 });
 
 test.each([
+	"ack",
+	"http",
+])("successful %s authorization clears a retained read refusal", (grant) => {
+	const s = setup();
+	if (grant === "http") s.connect(false);
+	const off = s.subscriptions.subscribe(s.target);
+	if (grant === "ack") s.emit("git_workspace_subscribed", { version: 0 });
+	else s.subscriptions.confirmWorkspace(s.target);
+	const refusal = new Error("Git read refused");
+	s.subscriptions.unavailable(s.target, false, refusal);
+	expect(s.subscriptions.getReadError(s.target)).toBe(refusal);
+	if (grant === "ack") {
+		s.emit("git_workspace_subscribed", { version: 0 });
+		expect(s.subscriptions.getReadError(s.target)).toBe(refusal);
+		s.emit("git_workspace_subscribed", { version: 1 });
+	} else s.subscriptions.confirmWorkspace(s.target);
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	expect(s.subscriptions.getReadError(s.target)).toBeUndefined();
+	off();
+	s.qc.clear();
+});
+
+test.each([
 	"probe-first",
 	"connection-first",
 ])("principal replacement requires both a matching credential connection and a fresh workspace probe (%s)", (order) => {

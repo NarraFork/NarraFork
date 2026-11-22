@@ -729,7 +729,12 @@ export class GitWorkspaceSubscriptions {
 			entry.state = "authorized";
 		}
 		if (entry?.state === "authorized") {
-			if (entry.writeConfirmed === false || entry.confirmedCanWrite !== target.canWrite) {
+			if (
+				entry.readError ||
+				entry.writeConfirmed === false ||
+				entry.confirmedCanWrite !== target.canWrite
+			) {
+				entry.readError = undefined;
 				entry.confirmedCanWrite = target.canWrite;
 				entry.writeConfirmed = true;
 				this.notify();
@@ -1111,6 +1116,7 @@ export class GitWorkspaceSubscriptions {
 			this.trustedCredential = this.transport.getCredentialIdentity?.();
 			this.trustedPrincipal = entry.principal;
 			entry.state = "authorized";
+			entry.readError = undefined;
 			entry.workspaceReprobed = false;
 			entry.errorCode = undefined;
 			entry.version = data.version as number;
