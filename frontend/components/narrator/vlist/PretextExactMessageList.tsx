@@ -24,6 +24,7 @@ import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { subscribeAskInPassingEvents } from "@frontend/lib/ask-in-passing-events";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
@@ -186,6 +187,7 @@ import {
 	isBottomLostToViewportResize,
 	isSuppressedScrollEcho,
 	isUpwardHistoryScroll,
+	scrollExactListToLoadedTop,
 } from "./vlist-exact-scroll";
 import {
 	type FoldRowGeometry,
@@ -601,6 +603,8 @@ export const PretextExactMessageList = memo(
 			 * navigating away) and stop scrolling instead of fighting the new target.
 			 */
 			const jumpTokenRef = useRef(0);
+			// An explicit loaded-top destination outlives pages already fetching for an older intent.
+			const loadedTopNarratorRef = useRef<string | null>(null);
 			/**
 			 * Compact-progress keys this panel has written into the module store.
 			 * `compact_done` often carries no marker id (non-retry path), so cleanup
@@ -842,10 +846,16 @@ export const PretextExactMessageList = memo(
 
 			const onScrollTopCorrection = useCallback(
 				(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+					// A correction captured before an explicit history navigation cannot re-pin it.
+					if (anchorKind === "bottom" && !pinnedToBottomRef.current) return;
+					// Native reader movement can precede its coalesced scroll frame.
+					if (viewportRef.current && viewportRef.current.scrollTop !== scrollTopRef.current)
+						loadedTopNarratorRef.current = null;
+					const correctionTop = loadedTopNarratorRef.current === narratorId ? 0 : nextTop;
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) {
 						getSmoothFollower().cancel();
 						visibleViewportRef.current.deferCorrection(
-							applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current),
+							applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
 							anchorKind,
 							readViewportView(),
 						);
@@ -867,9 +877,11 @@ export const PretextExactMessageList = memo(
 					// Every other correction owns geometry (anchored rebuild, fold, LOD,
 					// removal): it must land in the same commit, so a chase in flight dies here.
 					getSmoothFollower().cancel();
-					writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
+					writeScrollTop(
+						applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
+					);
 				},
-				[getSmoothFollower, readViewportView, writeScrollTop],
+				[getSmoothFollower, narratorId, readViewportView, writeScrollTop],
 			);
 			const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 				createVListInteractionState(lod),
@@ -1391,6 +1403,7 @@ export const PretextExactMessageList = memo(
 			 * force a synchronous layout for information we already have.
 			 */
 			const captureFoldBefore = useCallback((key: string) => {
+				loadedTopNarratorRef.current = null;
 				// A fold owns its own FLIP geometry, planned (while pinned) against the
 				// PREDICTED bottom scrollTop — a chase still gliding towards it would
 				// move the rows under the running animation. Land the chase first.
@@ -2231,6 +2244,10 @@ export const PretextExactMessageList = memo(
 			);
 			const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq, getLastTrimAt } =
 				pretextDocument;
+			const loadOlderManually = useCallback(() => {
+				loadedTopNarratorRef.current = null;
+				loadOlder();
+			}, [loadOlder]);
 			const hasPrevRef = useRef(hasPrev);
 			hasPrevRef.current = hasPrev;
 			const loadingOlderRef = useRef(loadingOlder);
@@ -2272,6 +2289,7 @@ export const PretextExactMessageList = memo(
 				appliedMessageRevisionRef.current = 0;
 				initialRevisionSyncRef.current = true;
 				textReadingDetachedRef.current = false;
+				loadedTopNarratorRef.current = null;
 				setMessageRevision(0);
 				// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
 				// per-row handler caches keyed by spec.key would otherwise accumulate every
@@ -2598,6 +2616,7 @@ export const PretextExactMessageList = memo(
 			// browsing history still sees tool/reflection state advance correctly.
 			useVListLivePatches(revisionSubscriptionId, {
 				enabled: !!revisionSubscriptionId,
+				messages: pretextDocument.messages,
 				isSubagent: !!isSubagent,
 				applyLivePatch: pretextDocument.applyLivePatch,
 				// A terminal event can race the initial exact-document load: the synthetic
@@ -4212,7 +4231,7 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				if (pretextDocument.status !== "ready") return;
 				if (!hasPrev || loadingOlder) return;
-				if (!pinnedToBottom) return;
+				if (!pinnedToBottom || !pinnedToBottomRef.current) return;
 				if (viewportHeight <= 0) return;
 				const totalHeight = exactLayout?.totalHeight ?? 0;
 				if (totalHeight > viewportHeight + ITEM_OVERSCAN) return;
@@ -4312,6 +4331,7 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				if (!isEcho && nextTop !== previousTop) loadedTopNarratorRef.current = null;
 				// Classify before React mounts a new band. Only optional cold controllers
 				// subscribe to admission; this never invalidates the body/row element cache.
 				interactionAdmissionRef.current?.observeScroll({
@@ -4437,11 +4457,13 @@ export const PretextExactMessageList = memo(
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
+					loadedTopNarratorRef.current = null;
 					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
 					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
 					const land = () => {
+						if (!pinnedToBottomRef.current) return;
 						const node = viewportRef.current;
 						if (!node || !visibleViewportRef.current.isVisible(node)) {
 							visibleViewportRef.current.deferCorrection(0, "bottom", readViewportView());
@@ -4464,6 +4486,30 @@ export const PretextExactMessageList = memo(
 				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
+			const handleIOSScrollToTop = useCallback(() => {
+				scrollExactListToLoadedTop({
+					jumpTokenRef,
+					detachFromBottom,
+					textReadingDetachedRef,
+					loadedTopNarratorRef,
+					narratorId,
+					olderHistoryIntentAtRef,
+					writeScrollTop,
+				});
+			}, [detachFromBottom, narratorId, writeScrollTop]);
+			useLayoutEffect(() => {
+				if (!viewportNode) return;
+				return registerIOSScrollToTopTarget(
+					viewportNode,
+					() => {
+						if (viewportRef.current !== viewportNode) return;
+						handleIOSScrollToTop();
+					},
+					// Writes update scrollTopRef immediately; momentum moves the DOM first.
+					() =>
+						viewportRef.current !== viewportNode || viewportNode.scrollTop !== scrollTopRef.current,
+				);
+			}, [viewportNode, handleIOSScrollToTop]);
 
 			// Quick index of user turns beside the scrollbar (parity with the chunked
 			// path's ScrollbarUserMarkers). Positions come from the exact layout's real
@@ -4499,6 +4545,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleUserMarkerJump = useCallback(
 				(marker: VListUserMarker) => {
+					loadedTopNarratorRef.current = null;
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
@@ -4512,6 +4559,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
+					loadedTopNarratorRef.current = null;
 					getSmoothFollower().cancel();
 					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
@@ -4550,6 +4598,7 @@ export const PretextExactMessageList = memo(
 				const emit = (dir: 1 | -1, clientY: number | null) => {
 					const now = Date.now();
 					if (!throttle.tryStep(now)) return;
+					loadedTopNarratorRef.current = null;
 					// The LOD morph diffs viewport geometry across the level switch; a chase
 					// still gliding through the rebuild would move rows under the morph.
 					smoothFollowerRef.current?.snapToTarget();
@@ -4563,6 +4612,7 @@ export const PretextExactMessageList = memo(
 				// when it reaches the top. Intent expires (chunk-list parity) so momentum
 				// alone never keeps paging.
 				const markUpwardIntent = () => {
+					loadedTopNarratorRef.current = null;
 					olderHistoryIntentAtRef.current = Date.now();
 				};
 				const onWheel = (event: WheelEvent) => {
@@ -4644,6 +4694,7 @@ export const PretextExactMessageList = memo(
 					// first is still paging through history) invalidates the first, which must
 					// then stop scrolling and stop paging rather than fight the new target.
 					const token = ++jumpTokenRef.current;
+					loadedTopNarratorRef.current = null;
 					const cancelled = () => token !== jumpTokenRef.current;
 					// A jump navigates AWAY from the bottom: any chase still gliding towards
 					// it would fight the reveal's scrollIntoView / layout writes.
@@ -4799,6 +4850,7 @@ export const PretextExactMessageList = memo(
 			// the wheel/pinch handlers, so they publish their focus point here instead —
 			// same field the gesture writes, same TTL, so the rebuild path is identical.
 			const prepareLodChange = useCallback((clientY: number) => {
+				loadedTopNarratorRef.current = null;
 				const node = viewportRef.current;
 				if (!node) return;
 				// Same landing the gesture path does: the morph diffs viewport geometry
@@ -5529,7 +5581,7 @@ export const PretextExactMessageList = memo(
 											hasOlder={hasPrev}
 											loading={loadingOlder}
 											label={t("loadOlderMessages")}
-											onLoad={loadOlder}
+											onLoad={loadOlderManually}
 										/>
 									</div>
 								) : null}

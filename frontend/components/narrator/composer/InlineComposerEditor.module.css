@@ -93,8 +93,19 @@
 }
 
 .root[data-adaptive]:not([data-layout="expanded"]) .editable {
+	position: relative;
 	padding-inline-start: calc(12px + var(--composer-leading-space, 0px));
 	padding-inline-end: calc(12px + var(--composer-trailing-space, 0px));
+}
+
+.root[data-adaptive]:not([data-layout="expanded"]) .editable[data-empty="true"]::before {
+	position: absolute;
+	inset-inline-start: calc(12px + var(--composer-leading-space, 0px));
+	inset-inline-end: calc(12px + var(--composer-trailing-space, 0px));
+	height: auto;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .root[data-adaptive] .controls {

@@ -21,6 +21,34 @@ export function createPinnedBottomFrame(
 	};
 }
 
+/** Navigate within the loaded window without carrying a jump or paging intent forward. */
+export function scrollExactListToLoadedTop({
+	jumpTokenRef,
+	detachFromBottom,
+	textReadingDetachedRef,
+	loadedTopNarratorRef,
+	narratorId,
+	olderHistoryIntentAtRef,
+	writeScrollTop,
+}: {
+	jumpTokenRef: { current: number };
+	detachFromBottom: () => void;
+	textReadingDetachedRef: { current: boolean };
+	loadedTopNarratorRef: { current: string | null };
+	narratorId: string;
+	olderHistoryIntentAtRef: { current: number | null };
+	writeScrollTop: (top: number) => void;
+}): void {
+	jumpTokenRef.current++;
+	detachFromBottom();
+	// A short loaded window can be geometrically at both ends. Keep this explicit
+	// reading intent detached until a later downward gesture opts back into following.
+	textReadingDetachedRef.current = true;
+	loadedTopNarratorRef.current = narratorId;
+	olderHistoryIntentAtRef.current = null;
+	writeScrollTop(0);
+}
+
 /** Scroll position at which a container is scrolled fully to the bottom. */
 export function getScrollBottomTarget(
 	node: Pick<HTMLElement, "scrollHeight" | "clientHeight"> | null,

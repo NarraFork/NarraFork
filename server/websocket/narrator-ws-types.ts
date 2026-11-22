@@ -1070,6 +1070,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseIds: string[];
 			parentToolUseId?: string;
+			subagentNarratorId?: string;
 	  }
 	| {
 			type: "model_switched";
