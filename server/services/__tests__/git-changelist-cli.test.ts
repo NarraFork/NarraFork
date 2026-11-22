@@ -67,11 +67,20 @@ test("source-group move selectors remain structured and versioned", async () => 
 	).toMatchObject({ request: { scope: { filter: ["M"], directory: "dir" } } });
 	for (const flags of [
 		[],
+		["--filter", ""],
 		["--all", "--path", "file"],
 		["--path", "../outside"],
 		["--unit", "a", "--unit", "a"],
 	])
 		await expect(parseGitChangelistCli([...base, ...flags])).rejects.toThrow();
+	expect(await parseGitChangelistCli([...base, "--path", "a:b.txt"])).toMatchObject({
+		request: { paths: ["a:b.txt"] },
+	});
+	expect(
+		await parseGitChangelistCli([...workspace, "diff", "--list", "A", "--path", "a:b.txt"]),
+	).toMatchObject({
+		options: { path: "a:b.txt" },
+	});
 });
 test("automatic grouping uses sync and validated versioned same-list moves", async () => {
 	expect(await parseGitChangelistCli([...workspace, "sync"])).toMatchObject({

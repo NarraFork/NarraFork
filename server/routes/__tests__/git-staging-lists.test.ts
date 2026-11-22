@@ -214,6 +214,23 @@ test("all dynamic actions forward explicit source selectors and versions", async
 	}
 });
 
+test("HTTP moves reject empty scopes before dispatch instead of implicitly selecting all files", async () => {
+	const app = appFor();
+	const workspaceKey = await key(app);
+	for (const scope of [{}, { filter: [] }]) {
+		const response = await post(app, {
+			workspaceKey,
+			...version,
+			action: "move",
+			fromListId: "A",
+			toListId: "B",
+			scope,
+		});
+		expect(response.status).toBe(400);
+	}
+	expect(calls.action).not.toHaveBeenCalled();
+});
+
 test("HTTP returns its covered target without waiting for a newer watch tail", async () => {
 	const app = appFor();
 	const workspaceKey = await key(app);
