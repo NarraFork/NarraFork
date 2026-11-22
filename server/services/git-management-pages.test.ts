@@ -13,9 +13,9 @@ import {
 	getGitWorkspaceStatusPageStats,
 	invalidateGitWorkspace,
 	invalidateGitWorkspaceFacts,
-	validateGitWorkspaceStatusPages,
 	validateFilePaths,
 	validateGitFileTargets,
+	validateGitWorkspaceStatusPages,
 } from "./git-management-service";
 import { closeGitStatusPages } from "./git-status-page";
 import type { GitWorkspaceTarget } from "./git-workspace";

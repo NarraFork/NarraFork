@@ -4,6 +4,7 @@ import type {
 	GitStatusPageScopeProof,
 	GitStatusPageStatsQuery,
 } from "@shared/git-status-page";
+import type { PathFlavor } from "../lib/agent/execution/path-semantics";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { gitDiscoveryCache } from "./git-discovery-cache";
@@ -272,7 +273,7 @@ export function gitAttributionScopes(target: GitWorkspaceTarget, files: string[]
 export function validateFilePaths(
 	files: string[],
 	maxPaths = 1000,
-	pathFlavor: "posix" | "windows" = process.platform === "win32" ? "windows" : "posix",
+	pathFlavor: PathFlavor = process.platform === "win32" ? "windows" : "posix",
 ): void {
 	if (files.length > maxPaths) throw new ValidationError("Too many file paths");
 	for (const path of files) {
