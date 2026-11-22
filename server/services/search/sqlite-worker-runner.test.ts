@@ -1,8 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	SELECT_ROWS_MAX_PARAMS,
-	SELECT_ROWS_MAX_SQL_BYTES,
-} from "../../lib/db-worker/protocol";
+import { SELECT_ROWS_MAX_PARAMS, SELECT_ROWS_MAX_SQL_BYTES } from "../../lib/db-worker/protocol";
 import {
 	createSqliteSearchQueryExecutor,
 	SEARCH_MAX_OUTSTANDING,
@@ -31,7 +28,7 @@ describe("search worker admission and cancellation", () => {
 		await expect(execute("DELETE FROM narrator_messages", [])).rejects.toMatchObject({
 			code: "SEARCH_QUERY_BUDGET_EXCEEDED",
 		});
-		 expect(calls).toBe(1);
+		expect(calls).toBe(1);
 	});
 
 	test.each([
