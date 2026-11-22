@@ -10,28 +10,34 @@ import type {
 	ToolEditPreviewUnavailableReason,
 } from "@shared/tool-edit-preview";
 import { type AnyColumn, and, eq, inArray, sql } from "drizzle-orm";
-import { db } from "../db";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import { narratorToolCalls, worktreeTreeSnapshots } from "../db/schema";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import {
+	sameToolEditBinding,
+	type ToolEditBinding,
+	type ToolEditEffect,
+	type ToolEditOperation,
+	type ToolEditPreviewSnapshot,
+} from "../lib/db-worker/tool-edit-preview-query";
 import { logger } from "../lib/logger";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
+import { FileChangeEvidenceService } from "./file-change-evidence";
 import {
-	type FileChangeEffectRecord,
-	FileChangeEvidenceService,
-	type FileChangeOperationRecord,
-	type FileChangeScopeRecord,
-} from "./file-change-evidence";
-import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
+	createFileChangeIdentity,
+	type FileChangeScopeIdentity,
+	fileChangeIdentityKey,
+} from "./file-change-identity";
 import { snapshotPathIdentity } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 const PREVIEW_TIMEOUT_MS = 5_000;
-const METADATA_BYTES = FILE_CHANGE_LIMITS.metadataBytes;
 
 function boundedText(column: AnyColumn) {
 	return sql<
 		string | null
-	>`CASE WHEN octet_length(${column}) <= ${METADATA_BYTES} THEN ${column} ELSE NULL END`;
+	>`CASE WHEN octet_length(${column}) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN ${column} ELSE NULL END`;
 }
 
 // Never load inputJson/outputJson: the model's edit strings are not historical evidence.
@@ -71,6 +77,41 @@ function readOrigin(id: string) {
 }
 type ToolRow = NonNullable<ToolEditPreviewMetadata>;
 
+async function readEvidence(row: ToolRow, signal: AbortSignal): Promise<ToolEditPreviewSnapshot> {
+	const operationId = row.fileChangeOperationId;
+	if (!operationId) return { status: "missing" };
+	if (activeDatabaseBackend === "sqlite") {
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		return runReadTask<ToolEditPreviewSnapshot>(
+			sqlite.filename,
+			{ kind: "toolEditPreview", toolCallId: row.id },
+			{ signal, timeoutMs: PREVIEW_TIMEOUT_MS },
+		);
+	}
+	const evidence = new FileChangeEvidenceService(db);
+	const operation = evidence.getOperation(operationId);
+	if (!operation) return { status: "missing" };
+	const original = row.executionOriginToolCallId
+		? readOrigin(row.executionOriginToolCallId)
+		: undefined;
+	if (!operationMatches(row, operation, original))
+		return { status: "ok", row, original, operation, effect: undefined, scope: null };
+	const page = evidence.listEffects(operation.id, { limit: 2 });
+	if (page.hasMore || page.items.length > 1)
+		return { status: "ambiguous", row, original, operation };
+	const effect = page.items[0];
+	return {
+		status: "ok",
+		row,
+		original,
+		operation,
+		effect,
+		scope: effect ? evidence.getScope(effect.scopeId) : null,
+	};
+}
+
 function unavailable(reason: ToolEditPreviewUnavailableReason): ToolEditPreviewSide {
 	return { status: "unavailable", reason };
 }
@@ -93,7 +134,11 @@ function locationOf(value: string | null): ToolEditPreview["location"] {
 	return undefined;
 }
 
-function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): boolean {
+function operationMatches(
+	row: ToolEditBinding,
+	operation: ToolEditOperation,
+	original?: ToolEditBinding,
+): boolean {
 	const originId = row.executionOriginToolCallId ?? row.id;
 	if (
 		row.executionIdentityVersion !== 1 ||
@@ -113,7 +158,6 @@ function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): b
 	// COW retains the immutable original PK even after the original row is deleted.
 	// If it still exists, verify the whole frozen source binding, not just a SDK ID.
 	if (row.executionOriginToolCallId) {
-		const original = readOrigin(originId);
 		if (
 			original &&
 			(original.executionOriginToolCallId !== null ||
@@ -131,9 +175,9 @@ function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): b
 
 function effectMatches(
 	row: ToolRow,
-	operation: FileChangeOperationRecord,
-	effect: FileChangeEffectRecord,
-	scope: FileChangeScopeRecord | null,
+	operation: ToolEditOperation,
+	effect: ToolEditEffect,
+	scope: FileChangeScopeIdentity | null,
 ) {
 	const identity = effect.identityJson;
 	if (
@@ -306,19 +350,19 @@ export async function getToolEditPreview(
 		if (row.toolName !== "Edit" && row.toolName !== "Write") return reject("unsupported");
 		if (row.executionPathFlavor === "spec" || row.resolvedFilePath?.startsWith("spec://"))
 			return reject("unsupported");
-		if (signal.aborted) return reject("cancelled");
+		signal.throwIfAborted();
 		if (!row.fileChangeOperationId) return { ...result, ...(await treePreview(row, signal)) };
-		const evidence = new FileChangeEvidenceService(db);
-		const operation = evidence.getOperation(row.fileChangeOperationId);
-		if (!operation) return reject("missing_evidence");
-		if (!operationMatches(row, operation)) return reject("identity_unverified");
-		// Edit/Write mutate one file. Fail closed rather than choosing the first effect
-		// or traversing an arbitrarily large operation (including compensation phases).
-		const page = evidence.listEffects(operation.id, { limit: 2 });
-		if (page.hasMore || page.items.length > 1) return reject("ambiguous");
-		const effect = page.items[0];
+		const snapshot = await readEvidence(row, signal);
+		signal.throwIfAborted();
+		if (snapshot.status === "missing") return reject("missing_evidence");
+		if (snapshot.status === "too_large") return reject("too_large");
+		const { operation, original } = snapshot;
+		if (!sameToolEditBinding(row, snapshot.row) || !operationMatches(row, operation, original))
+			return reject("identity_unverified");
+		if (snapshot.status === "ambiguous") return reject("ambiguous");
+		const { effect, scope } = snapshot;
 		if (!effect) return reject("missing_evidence");
-		if (!effectMatches(row, operation, effect, evidence.getScope(effect.scopeId))) {
+		if (!effectMatches(row, operation, effect, scope)) {
 			return reject("identity_unverified");
 		}
 		const blobs = new FileChangeBlobStore();
@@ -328,6 +372,10 @@ export async function getToolEditPreview(
 			readToolEditPreviewState(effect.observedAfterStateJson, blobs, signal),
 		]);
 		return { ...result, source: "evidence", before, after };
+	} catch (error) {
+		if (signal.aborted)
+			return reject(signal.reason?.name === "TimeoutError" ? "timeout" : "cancelled");
+		throw error;
 	} finally {
 		if (performance.now() - started >= 1_000)
 			logger.warn("Slow tool edit preview", {
