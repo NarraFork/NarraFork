@@ -4,14 +4,20 @@ import { type HostSqlDiagnosticState, sqlDiagnosticSnapshot } from "./sql-diagno
 
 export interface ReadPoolTaskDiagnostics {
 	kind: DbReadTaskParams["kind"];
-	source: "auth.session" | "narrator.request-recording" | "unattributed";
+	source:
+		| "auth.session"
+		| "narrator.request-recording"
+		| "narrator.message-language"
+		| "unattributed";
 	requestId?: string;
 	startedAt: number;
 	dispatchedAt?: number;
 	sql?: HostSqlDiagnosticState;
 }
 export function readPoolDiagnosticSource(source: unknown): ReadPoolTaskDiagnostics["source"] {
-	return source === "auth.session" || source === "narrator.request-recording"
+	return source === "auth.session" ||
+		source === "narrator.request-recording" ||
+		source === "narrator.message-language"
 		? source
 		: "unattributed";
 }

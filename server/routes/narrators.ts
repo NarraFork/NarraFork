@@ -135,6 +135,7 @@ import {
 	saveUploadedMedia,
 	validateUploadedMedia,
 } from "../lib/media-uploads";
+import { readMessageLanguagePreferences } from "../lib/message-language-read";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -3133,8 +3134,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
 		}
 
-		const locale = await getUserLanguage(userId);
-		const replyInUserLanguage = await getUserReplyInLanguage(userId);
+		const { locale, replyInUserLanguage } = await readMessageLanguagePreferences(
+			userId,
+			c.req.raw.signal,
+		);
 
 		// Every session takes the same admission: a running one (including a run the
 		// user holds) queues the input for its next safe boundary, an idle one starts.
