@@ -27,6 +27,8 @@ test("compiled paging and statistics worker loads with deleted sources and an un
 			"server/services/git-status-page-engine.ts",
 			"server/services/git-status-page-worker.ts",
 			"server/lib/compiled-worker.ts",
+			"server/lib/logger.ts",
+			"server/lib/narrafork-home.ts",
 			"server/lib/worker-runtime/lifecycle.ts",
 			"server/lib/worker-runtime/queue.ts",
 			"server/lib/runtime-target.ts",
