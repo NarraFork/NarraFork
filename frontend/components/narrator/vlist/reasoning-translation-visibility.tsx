@@ -129,7 +129,7 @@ class VisibleReasoningBodies {
 				}
 				this.schedule();
 			},
-			{ threshold: [0, Number.MIN_VALUE] },
+			{ threshold: [0, 0.001] },
 		);
 		this.bodies.set(node, { target, visible: false });
 		this.observer.observe(node);
