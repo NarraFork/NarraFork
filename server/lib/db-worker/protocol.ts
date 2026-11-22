@@ -28,6 +28,7 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
@@ -52,6 +53,7 @@ export type DbReadTaskName =
 	| "blockReindexSlice"
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
+	| "recallToolCall"
 	| "storageHistoryRead"
 	| "storageHistoryBody";
 
@@ -255,6 +257,7 @@ export interface StorageScanTablesResult {
 export type DbReadTaskParams =
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
+	| RecallToolCallParams
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
