@@ -2411,7 +2411,6 @@ export interface SubagentActivityToolCallTiming {
 }
 
 export interface SubagentActivityToolCall {
-	executionAttempt?: number;
 	toolCallId: string | null;
 	executionAttempt?: number;
 	toolUseId: string;

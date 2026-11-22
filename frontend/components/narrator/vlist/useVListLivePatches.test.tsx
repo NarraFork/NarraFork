@@ -20,7 +20,6 @@ function row(narratorId = "n1"): TreeMessage {
 		contentText: null,
 		toolCalls: [],
 		createdAt: "2026-10-01T00:00:00Z",
-		stateRevision: 0,
 		blocks: [
 			{
 				id: "persistent-b",
@@ -611,7 +610,7 @@ test("reduced child frames reach the parent adapter, cached measure and rendered
 				},
 			],
 		});
-		expect(probe().measured.recentCallSummaries).toEqual([null, null, "restored-3"]);
+		expect(probe().measured.recentCallSummaries).toEqual([null, "restored-2", "restored-3"]);
 		await frame({
 			type: "background_task_completed",
 			taskNarratorId: "child",

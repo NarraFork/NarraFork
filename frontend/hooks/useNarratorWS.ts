@@ -121,7 +121,9 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
 		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
 		// moment a reconnect snapshot replaced the fetched activity.
-		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
+		...(eventMeta.inputSummary != null || record.inputSummary === null
+			? { inputSummary: eventMeta.inputSummary }
+			: {}),
 	};
 }
 
