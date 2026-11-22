@@ -926,14 +926,15 @@ export class LocalFileChangeRuntime {
 										? Number(request.input.snapshotRevision)
 										: null,
 								actor: request.actor,
-								executionBinding: request.remote
-									? {
-											deviceId: backend.deviceId,
-											runtimeEpoch: request.runtime.runtimeEpoch,
-											runtimeGeneration: request.runtime.runtimeGeneration,
-											fencingToken: request.runtime.runtimeGeneration,
-										}
-									: null,
+								executionBinding:
+									request.remote || request.sourceKind === "editor"
+										? {
+												deviceId: backend.deviceId,
+												runtimeEpoch: request.runtime.runtimeEpoch,
+												runtimeGeneration: request.runtime.runtimeGeneration,
+												fencingToken: request.runtime.runtimeGeneration,
+											}
+										: null,
 								toolCallId:
 									request.sourceKind === "tool" && request.linkOperation ? request.sourceId : null,
 								toolUseId: request.toolUseId,

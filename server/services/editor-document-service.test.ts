@@ -2008,6 +2008,18 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			});
 			expect(dispatches).toBe(1);
 			expect(await readFile(target, "utf8")).toBe("mine");
+			expect(operations()[0]?.executionBindingJson).toMatchObject({ deviceId: "local" });
+			await service.dispose();
+			service = new EditorDocumentService({
+				root: join(root, "transfers"),
+				execute: (request) => runtime.executeEditor(request),
+				queryOperation: queryEditorOperation,
+			});
+			expect(await service.operation(actor, result.operationId)).toMatchObject({
+				status: "uncertain",
+				operationId: result.operationId,
+			});
+			expect(dispatches).toBe(1);
 		} finally {
 			runtime.evidence.recordEffect = prepare;
 		}
