@@ -166,7 +166,7 @@ async function liveRevision(
 		backend: context.backend,
 		target: { ...context.target },
 	});
-	const policy = await executionPolicyRepository.load(identity.narratorId);
+	const policy = executionPolicyRepository.loadNow(identity.narratorId);
 	return {
 		narrator,
 		revision: hash({

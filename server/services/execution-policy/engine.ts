@@ -22,30 +22,22 @@ export interface ResolvedExecutionPolicy extends CompiledExecutionPolicy {
 	readonly revision: string;
 }
 
-interface LoadedCacheEntry {
+interface PolicyCacheEntry<T> {
 	narratorId: string;
 	ownerNarratorId?: string;
 	inheritedNarratorIds?: string[];
 	settingsRevision: number;
-	promise: Promise<LoadedExecutionPolicy>;
-}
-
-interface CompiledCacheEntry {
-	narratorId: string;
-	ownerNarratorId?: string;
-	inheritedNarratorIds?: string[];
-	settingsRevision: number;
-	promise: Promise<ResolvedExecutionPolicy>;
+	promise: Promise<T>;
 	controller: AbortController;
 	waiters: number;
 	settled: boolean;
 }
 
-/** One waiter may leave without cancelling another caller's shared compilation. */
-function waitForCompilation(
-	entry: CompiledCacheEntry,
-	signal?: AbortSignal,
-): Promise<ResolvedExecutionPolicy> {
+type LoadedCacheEntry = PolicyCacheEntry<LoadedExecutionPolicy>;
+type CompiledCacheEntry = PolicyCacheEntry<ResolvedExecutionPolicy>;
+
+/** One waiter may leave without cancelling another caller's shared work. */
+function waitForPolicy<T>(entry: PolicyCacheEntry<T>, signal?: AbortSignal): Promise<T> {
 	entry.waiters++;
 	return new Promise((resolve, reject) => {
 		let finished = false;
@@ -155,36 +147,86 @@ async function canonicalizeCompiledRules(
 	};
 }
 
+function compiledRevision(
+	policy: LoadedExecutionPolicy,
+	presets: readonly ExecutionPolicyPreset[],
+): string {
+	return createHash("sha256")
+		.update(`${executionPolicyRevision(policy)}:${presetsKey(presets)}`)
+		.digest("hex");
+}
+
+async function compileLoadedPolicy(
+	loaded: LoadedExecutionPolicy,
+	context: ExecutionTargetContext | null,
+	presets: readonly ExecutionPolicyPreset[],
+	revision: string,
+	signal: AbortSignal,
+): Promise<ResolvedExecutionPolicy> {
+	const effectiveRules =
+		presets.length === 0
+			? loaded
+			: mergeExecutionPolicyRuleSets(
+					loaded,
+					...[...new Set(presets)].map((preset) => presetRuleSet(preset)),
+				);
+	const selected = compileExecutionPolicy(effectiveRules, context);
+	const canonicalRules = await canonicalizeCompiledRules(selected, context, signal);
+	const compiled = compileExecutionPolicy(canonicalRules, context);
+	return Object.freeze({
+		...compiled,
+		narratorId: loaded.narratorId,
+		ownerNarratorId: loaded.ownerNarratorId,
+		projectId: loaded.projectId,
+		projectGitPath: loaded.projectGitPath,
+		revision,
+	});
+}
+
 export class ExecutionPolicyEngine {
 	private readonly loadedCache = new Map<string, LoadedCacheEntry>();
 	private readonly compiledCache = new Map<string, CompiledCacheEntry>();
 
-	private load(narratorId: string): Promise<LoadedExecutionPolicy> {
+	private load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
 		const settingsRevision = getSettingsRevision();
 		const cached = this.loadedCache.get(narratorId);
-		if (cached && cached.settingsRevision === settingsRevision) return cached.promise;
+		if (cached?.settingsRevision === settingsRevision && !cached.controller.signal.aborted) {
+			return waitForPolicy(cached, signal);
+		}
 		if (cached) this.invalidate(narratorId);
 
 		const entry: LoadedCacheEntry = {
 			narratorId,
 			settingsRevision,
 			promise: Promise.resolve(undefined as never),
+			controller: new AbortController(),
+			waiters: 0,
+			settled: false,
 		};
-		entry.promise = executionPolicyRepository.load(narratorId).then(
-			(policy) => {
+		entry.promise = executionPolicyRepository
+			.load(narratorId, entry.controller.signal)
+			.then((policy) => {
+				if (
+					this.loadedCache.get(narratorId) !== entry ||
+					settingsRevision !== getSettingsRevision()
+				) {
+					throw new Error("Execution policy changed while loading; retry the operation");
+				}
 				entry.ownerNarratorId = policy.ownerNarratorId;
 				entry.inheritedNarratorIds = policy.inheritedNarratorIds;
 				return policy;
-			},
-			(error) => {
+			})
+			.catch((error) => {
 				if (this.loadedCache.get(narratorId) === entry) {
 					this.loadedCache.delete(narratorId);
 				}
 				throw error;
-			},
-		);
+			})
+			.finally(() => {
+				entry.settled = true;
+			});
 		this.loadedCache.set(narratorId, entry);
-		return entry.promise;
+		return waitForPolicy(entry, signal);
 	}
 
 	async compile(
@@ -194,20 +236,15 @@ export class ExecutionPolicyEngine {
 		signal?: AbortSignal,
 	): Promise<ResolvedExecutionPolicy> {
 		signal?.throwIfAborted();
-		const loaded = await this.load(narratorId);
+		const loaded = await this.load(narratorId, signal);
 		signal?.throwIfAborted();
-		const appliedPresets = presetsKey(presets);
-		// Presets join the revision, not just the cache key: enabling or disabling one changes
-		// the effective rule set, and a stale entry would otherwise be reused across the switch.
-		const revision = createHash("sha256")
-			.update(`${executionPolicyRevision(loaded)}:${appliedPresets}`)
-			.digest("hex");
+		const revision = compiledRevision(loaded, presets);
 		const contextKey = context ? executionTargetContextKey(context) : "unrouted";
 		const cacheKey = `${narratorId}:${revision}:${contextKey}`;
 		const settingsRevision = getSettingsRevision();
 		const cached = this.compiledCache.get(cacheKey);
 		if (cached?.settingsRevision === settingsRevision && !cached.controller.signal.aborted) {
-			return waitForCompilation(cached, signal);
+			return waitForPolicy(cached, signal);
 		}
 		if (cached) this.compiledCache.delete(cacheKey);
 
@@ -221,30 +258,13 @@ export class ExecutionPolicyEngine {
 			waiters: 0,
 			settled: false,
 		};
-		entry.promise = (async () => {
-			const effectiveRules =
-				presets.length === 0
-					? loaded
-					: mergeExecutionPolicyRuleSets(
-							loaded,
-							...[...new Set(presets)].map((preset) => presetRuleSet(preset)),
-						);
-			const selected = compileExecutionPolicy(effectiveRules, context);
-			const canonicalRules = await canonicalizeCompiledRules(
-				selected,
-				context,
-				entry.controller.signal,
-			);
-			const compiled = compileExecutionPolicy(canonicalRules, context);
-			return Object.freeze({
-				...compiled,
-				narratorId: loaded.narratorId,
-				ownerNarratorId: loaded.ownerNarratorId,
-				projectId: loaded.projectId,
-				projectGitPath: loaded.projectGitPath,
-				revision,
-			});
-		})().then(
+		entry.promise = compileLoadedPolicy(
+			loaded,
+			context,
+			presets,
+			revision,
+			entry.controller.signal,
+		).then(
 			(policy) => {
 				entry.settled = true;
 				return policy;
@@ -259,7 +279,19 @@ export class ExecutionPolicyEngine {
 			},
 		);
 		this.compiledCache.set(cacheKey, entry);
-		return waitForCompilation(entry, signal);
+		return waitForPolicy(entry, signal);
+	}
+
+	/** Final authorization uses a fresh local policy and never reuses advisory cache entries. */
+	async compileCurrent(
+		narratorId: string,
+		context: ExecutionTargetContext | null,
+		presets: readonly ExecutionPolicyPreset[],
+		signal = new AbortController().signal,
+	): Promise<ResolvedExecutionPolicy> {
+		signal.throwIfAborted();
+		const loaded = executionPolicyRepository.loadNow(narratorId);
+		return compileLoadedPolicy(loaded, context, presets, compiledRevision(loaded, presets), signal);
 	}
 
 	/** Invalidate a narrator and every cached subagent whose rules are owned by it. */
