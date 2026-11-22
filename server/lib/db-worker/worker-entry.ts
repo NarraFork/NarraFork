@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
+import { readPublicationTerminalSnapshot } from "../../services/agent-runtime/publication-reader";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -35,6 +36,7 @@ import {
 	runBlockReindexSlice,
 	runBlockVerifySlice,
 } from "./block-backfill-query";
+import { readCompactSummary } from "./compact-summary-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { readExecutionPolicySnapshot } from "./execution-policy-query";
@@ -54,6 +56,7 @@ import type {
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
+import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
@@ -221,6 +224,16 @@ port.on("message", async (message: DbWorkerInbound) => {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
 			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "compactSummary") {
+					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "executionPolicyFacts") {
+					return readExecutionPolicySnapshot(
+						getConnection(message.dbPath),
+						params.narratorId,
+						controller.signal,
+					);
+				}
 				if (params.kind === "toolEditPreview") {
 					return readToolEditPreviewSnapshot(
 						getConnection(message.dbPath),
@@ -228,10 +241,12 @@ port.on("message", async (message: DbWorkerInbound) => {
 						controller.signal,
 					);
 				}
-				if (params.kind === "executionPolicyFacts") {
-					return readExecutionPolicySnapshot(
+				if (params.kind === "publicationTerminalResult") {
+					return readPublicationTerminalSnapshot(
 						getConnection(message.dbPath),
-						params.narratorId,
+						params.run,
+						params.options,
+						params.fromBlocks,
 						controller.signal,
 					);
 				}
@@ -276,12 +291,17 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				params,
 																				controller.signal,
 																			)
-																		: runStorageScanTables(
-																				message.dbPath,
-																				message.requestId,
-																				params,
-																				controller.signal,
-																			);
+																		: params.kind === "databaseCleanupContext"
+																			? readDatabaseCleanupContext(
+																					getConnection(message.dbPath),
+																					controller.signal,
+																				)
+																			: runStorageScanTables(
+																					message.dbPath,
+																					message.requestId,
+																					params,
+																					controller.signal,
+																				);
 			}),
 		);
 		post({
