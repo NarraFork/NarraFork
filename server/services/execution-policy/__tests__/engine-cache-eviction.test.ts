@@ -25,7 +25,7 @@ function currentSettingsRevision(): number {
 	return getSettingsRevision();
 }
 
-function makeMinimalPolicy(overrides: Partial<any> = {}) {
+function makeMinimalPolicy(overrides: Partial<LoadedExecutionPolicy> = {}): LoadedExecutionPolicy {
 	return {
 		narratorId: "test-narrator",
 		ownerNarratorId: "test-narrator",
@@ -222,6 +222,38 @@ describe("execution policy engine cache eviction on failure", () => {
 		const result = await engine.compile(narratorId, failingCtx);
 		expect(result).toBeDefined();
 		expect(result.narratorId).toBe(narratorId);
+	});
+
+	test("project changes only invalidate snapshots that depend on that project", async () => {
+		const unrelated = Promise.withResolvers<LoadedExecutionPolicy>();
+		const inherited = Promise.withResolvers<LoadedExecutionPolicy>();
+		const load = spyOn(executionPolicyRepository, "load")
+			.mockReturnValueOnce(unrelated.promise)
+			.mockReturnValueOnce(inherited.promise)
+			.mockResolvedValueOnce(makeMinimalPolicy({ narratorId: "child", projectId: "unrelated" }));
+		try {
+			const unaffected = engine.compile("other", null);
+			const affected = engine.compile("child", null);
+			const [unaffectedResult, affectedResult] = [
+				expect(unaffected).resolves.toMatchObject({ narratorId: "other" }),
+				expect(affected).rejects.toThrow("Execution policy changed while loading"),
+			];
+			engine.invalidateProject("edited");
+			unrelated.resolve(makeMinimalPolicy({ narratorId: "other", projectIds: ["unrelated"] }));
+			inherited.resolve(
+				makeMinimalPolicy({
+					narratorId: "child",
+					projectId: "unrelated",
+					projectIds: ["unrelated", "edited"],
+				}),
+			);
+			await Promise.all([unaffectedResult, affectedResult]);
+			await expect(engine.compile("child", null)).resolves.toMatchObject({ narratorId: "child" });
+			await expect(engine.compile("other", null)).resolves.toMatchObject({ narratorId: "other" });
+			expect(load).toHaveBeenCalledTimes(3);
+		} finally {
+			load.mockRestore();
+		}
 	});
 
 	test("load failure is evicted from loadedCache on next call", async () => {

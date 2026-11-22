@@ -29,6 +29,7 @@ export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	ownerNarratorId: string;
 	/** This narrator and its registered policy-source chain, never siblings. */
 	inheritedNarratorIds?: string[];
+	projectIds?: readonly string[];
 	projectId: string | null;
 	projectGitPath: string | null;
 	settingsRevision: number;
@@ -138,6 +139,7 @@ export class ExecutionPolicyRepository {
 		return materializeExecutionPolicy(narratorId, {
 			inheritedNarratorIds,
 			projectId,
+			projectIds: [...contextProjects],
 			projectGitPath,
 			projectRuleSets,
 			whitelistDirs,
@@ -155,6 +157,7 @@ function materializeExecutionPolicy(
 	const {
 		inheritedNarratorIds,
 		projectId,
+		projectIds,
 		projectGitPath,
 		projectRuleSets,
 		whitelistDirs,
@@ -178,6 +181,7 @@ function materializeExecutionPolicy(
 		ownerNarratorId: inheritedNarratorIds.at(-1) ?? narratorId,
 		inheritedNarratorIds,
 		projectId,
+		projectIds,
 		projectGitPath,
 		settingsRevision: getSettingsRevision(),
 		...mergeExecutionPolicyRuleSets(

@@ -16,6 +16,7 @@ const MAX_FACTS_BYTES = 256 * 1024 * 1024;
 export interface ExecutionPolicyFacts {
 	inheritedNarratorIds: string[];
 	projectId: string | null;
+	projectIds: string[];
 	projectGitPath: string | null;
 	projectRuleSets: (LegacyExecutionPolicyRuleSet | null)[];
 	whitelistDirs: NonNullable<LegacyExecutionPolicyRuleSet["whitelistDirs"]>;
@@ -120,6 +121,7 @@ export function readExecutionPolicyFacts(
 	return {
 		inheritedNarratorIds,
 		projectId,
+		projectIds: [...contextProjects],
 		projectGitPath,
 		projectRuleSets,
 		whitelistDirs: rules<"whitelistDirs">(

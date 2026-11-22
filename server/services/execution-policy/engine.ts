@@ -26,6 +26,7 @@ interface PolicyCacheEntry<T> {
 	narratorId: string;
 	ownerNarratorId?: string;
 	inheritedNarratorIds?: string[];
+	projectIds?: readonly string[];
 	settingsRevision: number;
 	promise: Promise<T>;
 	controller: AbortController;
@@ -33,7 +34,9 @@ interface PolicyCacheEntry<T> {
 	settled: boolean;
 }
 
-type LoadedCacheEntry = PolicyCacheEntry<LoadedExecutionPolicy>;
+interface LoadedCacheEntry extends PolicyCacheEntry<LoadedExecutionPolicy> {
+	changedProjects?: Set<string>;
+}
 type CompiledCacheEntry = PolicyCacheEntry<ResolvedExecutionPolicy>;
 
 /** One waiter may leave without cancelling another caller's shared work. */
@@ -206,14 +209,18 @@ export class ExecutionPolicyEngine {
 		entry.promise = executionPolicyRepository
 			.load(narratorId, entry.controller.signal)
 			.then((policy) => {
+				const projectIds = policy.projectIds ?? (policy.projectId ? [policy.projectId] : []);
 				if (
 					this.loadedCache.get(narratorId) !== entry ||
-					settingsRevision !== getSettingsRevision()
+					settingsRevision !== getSettingsRevision() ||
+					projectIds.some((id) => entry.changedProjects?.has(id))
 				) {
 					throw new Error("Execution policy changed while loading; retry the operation");
 				}
 				entry.ownerNarratorId = policy.ownerNarratorId;
 				entry.inheritedNarratorIds = policy.inheritedNarratorIds;
+				entry.projectIds = projectIds;
+				entry.changedProjects = undefined;
 				return policy;
 			})
 			.catch((error) => {
@@ -252,6 +259,7 @@ export class ExecutionPolicyEngine {
 			narratorId,
 			ownerNarratorId: loaded.ownerNarratorId,
 			inheritedNarratorIds: loaded.inheritedNarratorIds,
+			projectIds: loaded.projectIds ?? (loaded.projectId ? [loaded.projectId] : []),
 			settingsRevision,
 			promise: Promise.resolve(undefined as never),
 			controller: new AbortController(),
@@ -305,6 +313,21 @@ export class ExecutionPolicyEngine {
 		for (const [key, entry] of this.loadedCache) if (affected(entry)) this.loadedCache.delete(key);
 		for (const [key, entry] of this.compiledCache)
 			if (affected(entry)) this.compiledCache.delete(key);
+	}
+
+	invalidateProject(projectId: string): void {
+		for (const [key, entry] of this.loadedCache) {
+			// The Worker discovers the complete set of inherited projects in its snapshot.
+			if (!entry.projectIds) {
+				entry.changedProjects ??= new Set();
+				entry.changedProjects.add(projectId);
+			} else if (entry.projectIds.includes(projectId)) {
+				this.loadedCache.delete(key);
+			}
+		}
+		for (const [key, entry] of this.compiledCache) {
+			if (entry.projectIds?.includes(projectId)) this.compiledCache.delete(key);
+		}
 	}
 
 	clear(): void {

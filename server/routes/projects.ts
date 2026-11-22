@@ -381,7 +381,9 @@ projectRoutes.patch("/:id", async (c) => {
 		.where(eq(projects.id, id))
 		.returning();
 	if (!updated) throw new NotFoundError("Project", id);
-	if (mergedSettings !== undefined || rest.gitPath !== undefined) executionPolicyEngine.clear();
+	if (mergedSettings !== undefined || rest.gitPath !== undefined) {
+		executionPolicyEngine.invalidateProject(id);
+	}
 	if (rest.gitPath !== undefined) await indexNewProjectRoot(id);
 
 	return c.json(updated);
