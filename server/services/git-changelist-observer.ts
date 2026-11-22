@@ -82,6 +82,22 @@ export const OBSERVATION_LIMITS = {
 	maxLines: 100_000,
 	diffTimeoutMs: 500,
 };
+function assertSnapshotBudget(files: readonly StoredFileMetadata[]) {
+	let contentBytes = 0;
+	let ownershipBytes = 0;
+	for (const file of files) {
+		contentBytes += file.base_size + file.work_size;
+		ownershipBytes += file.ownership_size;
+		if (
+			file.base_size > OBSERVATION_LIMITS.maxFileBytes ||
+			file.work_size > OBSERVATION_LIMITS.maxFileBytes ||
+			file.ownership_size > CHANGELIST_SNAPSHOT_LIMITS.maxOwnershipFileBytes ||
+			ownershipBytes > CHANGELIST_SNAPSHOT_LIMITS.maxOwnershipBytes ||
+			contentBytes > OBSERVATION_LIMITS.maxTotalBytes
+		)
+			throw fail("GIT_STAGING_LIMIT", "Observation snapshots exceed their byte budget");
+	}
+}
 const fail = (code: string, message: string) => new GitStagingKernelError(code, message);
 const missing = (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOENT";
 export async function readBoundedFile(path: string, maxBytes: number): Promise<Buffer | null> {
@@ -1047,20 +1063,7 @@ async function observeWithDiagnostics(
 		const context = await phase("canonicalize", () => canonicalContext(repo, contextPaths, signal));
 		for (const input of inputs.values())
 			input.identity += `:${context.identities.get(input.path) ?? ""}`;
-		let previousBytes = 0;
-		let previousOwnershipBytes = 0;
-		for (const file of previousIds) {
-			previousBytes += file.base_size + file.work_size;
-			previousOwnershipBytes += file.ownership_size;
-			if (
-				file.base_size > OBSERVATION_LIMITS.maxFileBytes ||
-				file.work_size > OBSERVATION_LIMITS.maxFileBytes ||
-				file.ownership_size > CHANGELIST_SNAPSHOT_LIMITS.maxOwnershipFileBytes ||
-				previousOwnershipBytes > CHANGELIST_SNAPSHOT_LIMITS.maxOwnershipBytes ||
-				previousBytes > OBSERVATION_LIMITS.maxTotalBytes
-			)
-				throw fail("GIT_STAGING_LIMIT", "Previous observation exceeds its byte budget");
-		}
+		assertSnapshotBudget(previousIds);
 		if (previousIds.length > LIMITS.maxRowsPerList)
 			throw fail("GIT_STAGING_LIMIT", "Too many previous changelist files");
 		const legacyFiles = rebase
@@ -1435,6 +1438,7 @@ async function observeWithDiagnostics(
 			return state;
 		}
 		if (!draft) throw fail("GIT_STAGING_INVALID", "Missing complete observation draft");
+		assertSnapshotBudget(store.fileIds(draft));
 		await phase("publish", () =>
 			store.publish(
 				draft as string,
