@@ -247,6 +247,54 @@ export const BACKGROUND_TASK_LIST_EPOCH = hotSafe("narrafork:bg-task:listEpoch",
  * later frame would be dropped too and the panel would freeze with no signal.
  */
 const MAX_TRACKED_LIST_VERSIONS = 500;
+const SLOW_READ_MS = 250;
+const SLOW_READ_INTERVAL_MS = 60_000;
+type ReadPath = "page" | "legacy-snapshot" | "team-bash" | "summaries";
+type ReadObservation = Record<string, number | boolean>;
+
+function readClock(): number {
+	try {
+		return performance.now();
+	} catch {
+		return 0;
+	}
+}
+
+function readMetric(
+	observation: ReadObservation | undefined,
+	field: string,
+	value: number | boolean,
+) {
+	try {
+		if (observation)
+			observation[field] =
+				typeof value === "boolean"
+					? value
+					: Math.min(1_000_000_000, Math.max(0, Math.round(value) || 0));
+	} catch {}
+}
+
+async function readStage<T>(
+	observation: ReadObservation | undefined,
+	field: string,
+	work: () => T | PromiseLike<T>,
+): Promise<T> {
+	const started = readClock();
+	try {
+		return await work();
+	} finally {
+		readMetric(observation, field, Number(observation?.[field] ?? 0) + readClock() - started);
+	}
+}
+
+function readSync<T>(observation: ReadObservation | undefined, field: string, work: () => T): T {
+	const started = readClock();
+	try {
+		return work();
+	} finally {
+		readMetric(observation, field, Number(observation?.[field] ?? 0) + readClock() - started);
+	}
+}
 
 /**
  * Truncate a string so that its UTF-8 byte length does not exceed `maxBytes`.
@@ -360,6 +408,64 @@ function boundedOutputTail(column: Column, limit: number) {
 }
 
 class BackgroundTaskService {
+	private slowReads = new Map<ReadPath, { at: number; suppressed: number }>();
+
+	resetReadTimingForTests(): void {
+		this.slowReads.clear();
+	}
+
+	private async observeRead<T>(
+		path: ReadPath,
+		work: (observation: ReadObservation) => Promise<T>,
+	): Promise<T> {
+		const observation: ReadObservation = { returnedRows: 0 };
+		const started = readClock();
+		let failed = false;
+		let errorName = "Error";
+		try {
+			return await work(observation);
+		} catch (error) {
+			failed = true;
+			try {
+				errorName =
+					error instanceof Error &&
+					[
+						"Error",
+						"TypeError",
+						"RangeError",
+						"SyntaxError",
+						"ReferenceError",
+						"URIError",
+						"EvalError",
+						"AggregateError",
+					].includes(error.name)
+						? error.name
+						: "Error";
+			} catch {}
+			throw error;
+		} finally {
+			try {
+				const now = readClock();
+				if (now - started >= SLOW_READ_MS) {
+					const previous = this.slowReads.get(path);
+					if (previous && now - previous.at < SLOW_READ_INTERVAL_MS) {
+						previous.suppressed = Math.min(1_000_000_000, previous.suppressed + 1);
+					} else {
+						readMetric(observation, "elapsedMs", now - started);
+						this.slowReads.set(path, { at: now, suppressed: 0 });
+						logger.warn("Slow background task read", {
+							path,
+							...observation,
+							failed,
+							...(failed ? { errorName } : {}),
+							suppressed: previous?.suppressed ?? 0,
+						});
+					}
+				}
+			} catch {}
+		}
+	}
+
 	private bashLifecycle = hotSafe(
 		"narrafork:bg-task:bash-lifecycle",
 		() => new BackgroundBashLifecycle(),
@@ -2250,13 +2356,24 @@ class BackgroundTaskService {
 		/** `omitted` hit TEAM_OMITTED_COUNT_CAP and is a lower bound. */
 		omittedCapped: boolean;
 	}> {
+		return this.observeRead("team-bash", (observation) =>
+			this.readTeamBashTasks(input, observation),
+		);
+	}
+
+	private async readTeamBashTasks(
+		input: Parameters<BackgroundTaskService["listTeamBashTasks"]>[0],
+		observation: ReadObservation,
+	): Promise<{ tasks: BackgroundTaskSummary[]; omitted: number; omittedCapped: boolean }> {
 		const parentIds = [...new Set(input.parentNarratorIds)].filter(Boolean);
+		readMetric(observation, "parentCount", parentIds.length);
 		const teamRootId = input.teamRootId || undefined;
 		if (parentIds.length === 0 && !teamRootId) {
 			return { tasks: [], omitted: 0, omittedCapped: false };
 		}
 
 		const limit = Math.max(1, Math.trunc(input.limit));
+		readMetric(observation, "pageLimit", limit);
 		const needle = escapeLikeNeedle(input.query);
 		const owners = or(
 			parentIds.length > 0 ? inArray(backgroundTasks.parentNarratorId, parentIds) : undefined,
@@ -2284,24 +2401,29 @@ class BackgroundTaskService {
 		// budget for terminal rows instead of the short tail.
 		const terminalLimit = needle ? limit : Math.max(0, Math.trunc(input.recentTerminalLimit));
 
-		const [runningRows, terminalRows] = await Promise.all([
-			db
-				.select(selection)
-				.from(backgroundTasks)
-				.where(and(...scope, eq(backgroundTasks.status, "running")))
-				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-				.limit(limit + 1)
-				.all(),
-			terminalLimit === 0
-				? Promise.resolve([])
-				: db
+		const [runningRows, terminalRows] = await readStage(
+			observation,
+			"parallelTeamReadsAwaitMs",
+			() =>
+				Promise.all([
+					db
 						.select(selection)
 						.from(backgroundTasks)
-						.where(and(...scope, ne(backgroundTasks.status, "running")))
+						.where(and(...scope, eq(backgroundTasks.status, "running")))
 						.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-						.limit(terminalLimit + 1)
+						.limit(limit + 1)
 						.all(),
-		]);
+					terminalLimit === 0
+						? Promise.resolve([])
+						: db
+								.select(selection)
+								.from(backgroundTasks)
+								.where(and(...scope, ne(backgroundTasks.status, "running")))
+								.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+								.limit(terminalLimit + 1)
+								.all(),
+				]),
+		);
 
 		// Running rows keep their priority even when they overflow the budget: a
 		// truncated running set is still the most useful answer available.
@@ -2313,10 +2435,15 @@ class BackgroundTaskService {
 		// `offset` counts rows in the scope, not the specific ones shown, so skipping
 		// `rows.length` yields the correct remainder even though the shown set
 		// reorders running rows ahead of newer terminal ones.
-		const omitted = await this.countTeamBashTasks(scope, rows.length);
+		readMetric(observation, "runningRows", runningRows.length);
+		readMetric(observation, "terminalRows", terminalRows.length);
+		readMetric(observation, "returnedRows", rows.length);
+		const omitted = await readStage(observation, "teamCountAwaitMs", () =>
+			this.countTeamBashTasks(scope, rows.length),
+		);
 
 		return {
-			tasks: await this.reconcileSummaries(rows as BackgroundTaskRecord[]),
+			tasks: await this.reconcileSummaries(rows as BackgroundTaskRecord[], observation),
 			omitted: Math.min(omitted, TEAM_OMITTED_COUNT_CAP),
 			omittedCapped: omitted > TEAM_OMITTED_COUNT_CAP,
 		};
@@ -2347,18 +2474,34 @@ class BackgroundTaskService {
 	}
 
 	async listSummariesByParents(parentNarratorIds: string[]): Promise<BackgroundTaskSummary[]> {
-		const parentIds = [...new Set(parentNarratorIds)].filter(Boolean);
-		if (parentIds.length === 0) return [];
-		return this.reconcileSummaries(await this.listByParents(parentIds));
+		return this.observeRead("summaries", async (observation) => {
+			const parentIds = [...new Set(parentNarratorIds)].filter(Boolean);
+			readMetric(observation, "parentCount", parentIds.length);
+			if (parentIds.length === 0) return [];
+			const rows = await readStage(observation, "taskReadAwaitMs", () =>
+				this.listByParents(parentIds),
+			);
+			readMetric(observation, "taskRows", rows.length);
+			const result = await this.reconcileSummaries(rows, observation);
+			readMetric(observation, "returnedRows", result.length);
+			return result;
+		});
 	}
 
 	/** Read the maintained active closure; never discover historical descendants here. */
-	private async descendantOccupancy(rootIds: string[]): Promise<{
+	private async descendantOccupancy(
+		rootIds: string[],
+		observation?: ReadObservation,
+	): Promise<{
 		childCounts: Map<string, number>;
 		occupied: Set<string>;
 	}> {
-		await backgroundOccupancyStore.flush();
-		return backgroundOccupancyStore.snapshot(rootIds);
+		await readStage(observation, "parallelOccupancyFlushAwaitMs", () =>
+			backgroundOccupancyStore.flush(),
+		);
+		return readSync(observation, "occupancySnapshotSyncMs", () =>
+			backgroundOccupancyStore.snapshot(rootIds),
+		);
 	}
 
 	/**
@@ -2371,6 +2514,7 @@ class BackgroundTaskService {
 	 */
 	private async reconcileSummaries(
 		tasks: BackgroundTaskRecord[],
+		observation?: ReadObservation,
 	): Promise<BackgroundTaskSummary[]> {
 		const agentIds = [
 			...new Set(
@@ -2380,33 +2524,36 @@ class BackgroundTaskService {
 			),
 		];
 		if (agentIds.length === 0) {
-			return tasks.map((task) => ({
-				...task,
-				effectiveStatus: task.status,
-				currentNarratorStatus: null,
-				activeChildTaskCount: 0,
-				canCancelActiveWork: isCancellableTaskStatus(task.status),
-			}));
+			return readSync(observation, "reconcileMapSyncMs", () =>
+				tasks.map((task) => ({
+					...task,
+					effectiveStatus: task.status,
+					currentNarratorStatus: null,
+					activeChildTaskCount: 0,
+					canCancelActiveWork: isCancellableTaskStatus(task.status),
+				})),
+			);
 		}
 
+		const narratorQuery = db
+			.select({
+				id: narrators.id,
+				status: narrators.status,
+				isBackground: narrators.isBackground,
+				backgroundStatus: narrators.backgroundStatus,
+				substatus: narrators.substatus,
+				errorMessage: narrators.errorMessage,
+			})
+			.from(narrators)
+			.where(inArray(narrators.id, agentIds));
 		const [narratorRows, { childCounts }] = await Promise.all([
-			db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					isBackground: narrators.isBackground,
-					backgroundStatus: narrators.backgroundStatus,
-					substatus: narrators.substatus,
-					errorMessage: narrators.errorMessage,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, agentIds))
-				.all(),
-			this.descendantOccupancy(agentIds),
+			readStage(observation, "parallelNarratorReadAwaitMs", () => narratorQuery.all()),
+			this.descendantOccupancy(agentIds, observation),
 		]);
+		const mappingStarted = readClock();
 		const narratorState = new Map(narratorRows.map((row) => [row.id, row]));
 
-		return tasks.map((task) => {
+		const result = tasks.map((task) => {
 			const subagentNarratorId =
 				task.type === "agent" ? (task.subagentNarratorId ?? task.id) : null;
 			const currentNarrator = subagentNarratorId
@@ -2439,6 +2586,8 @@ class BackgroundTaskService {
 					activeChildTaskCount > 0,
 			};
 		});
+		readMetric(observation, "reconcileMapSyncMs", readClock() - mappingStarted);
+		return result;
 	}
 
 	// ── Paged list surface ──────────────────────────────────────────────
@@ -2650,6 +2799,7 @@ class BackgroundTaskService {
 			/** Skip the preview column entirely; for count-only callers. */
 			omitOutput?: boolean;
 		},
+		observation?: ReadObservation,
 	): Promise<BackgroundTaskListItem[]> {
 		if (opts.activeOnly) await backgroundOccupancyStore.flush();
 		const activeIds = opts.activeOnly
@@ -2681,7 +2831,7 @@ class BackgroundTaskService {
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, narrators.createdAt, narrators.id)
 			: undefined;
-		const rows = await db
+		const query = db
 			.select({
 				id: narrators.id,
 				subagentType: narrators.subagentType,
@@ -2703,10 +2853,13 @@ class BackgroundTaskService {
 			.from(narrators)
 			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
 			.orderBy(desc(narrators.createdAt), desc(narrators.id))
-			.limit(opts.limit)
-			.all();
+			.limit(opts.limit);
 
-		const { childCounts } = await this.descendantOccupancy(rows.map((row) => row.id));
+		const rows = await readStage(observation, "parallelLegacyDbAwaitMs", () => query.all());
+		const { childCounts } = await this.descendantOccupancy(
+			rows.map((row) => row.id),
+			observation,
+		);
 		return this.applyLiveness(
 			rows.map((row) => {
 				const activeChildTaskCount = childCounts.get(row.id) ?? 0;
@@ -2771,6 +2924,7 @@ class BackgroundTaskService {
 			serviceOnly?: boolean;
 			omitOutput?: boolean;
 		},
+		observation?: ReadObservation,
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [eq(backgroundTasks.parentNarratorId, parentNarratorId)];
 		if (opts.activeOnly) {
@@ -2792,7 +2946,7 @@ class BackgroundTaskService {
 			? listCursorCondition(opts.cursor, backgroundTasks.createdAt, backgroundTasks.id)
 			: undefined;
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
-		const rows = await db
+		const query = db
 			.select({
 				...columns,
 				output: opts.omitOutput
@@ -2804,9 +2958,10 @@ class BackgroundTaskService {
 			.from(backgroundTasks)
 			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
 			.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-			.limit(opts.limit)
-			.all();
-		const summaries = await this.reconcileSummaries(rows);
+			.limit(opts.limit);
+
+		const rows = await readStage(observation, "parallelUnifiedDbAwaitMs", () => query.all());
+		const summaries = await this.reconcileSummaries(rows, observation);
 		return this.applyLiveness(summaries.map((summary) => this.toListItem(summary)));
 	}
 
@@ -2869,6 +3024,7 @@ class BackgroundTaskService {
 	private async listActiveItems(
 		parentNarratorId: string,
 		opts?: { omitOutput?: boolean },
+		observation?: ReadObservation,
 	): Promise<{ items: BackgroundTaskListItem[]; truncated: boolean }> {
 		const limit = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
 		await backgroundOccupancyStore.flush();
@@ -2911,7 +3067,7 @@ class BackgroundTaskService {
 				omitOutput: opts?.omitOutput,
 			}),
 		]);
-		const summaries = await this.reconcileSummaries(candidateRows);
+		const summaries = await this.reconcileSummaries(candidateRows, observation);
 		const unifiedActive = await this.applyLiveness(
 			summaries.map((summary) => this.toListItem(summary)),
 		);
@@ -2946,23 +3102,48 @@ class BackgroundTaskService {
 		parentNarratorId: string,
 		opts?: { cursor?: string; limit?: number },
 	): Promise<BackgroundTaskListPage> {
+		return this.observeRead("page", (observation) =>
+			this.readPageByParent(parentNarratorId, opts, observation),
+		);
+	}
+
+	private async readPageByParent(
+		parentNarratorId: string,
+		opts: { cursor?: string; limit?: number } | undefined,
+		observation: ReadObservation,
+	): Promise<BackgroundTaskListPage> {
+		readMetric(observation, "parentCount", 1);
 		const limit = clampListLimit(opts?.limit);
+		readMetric(observation, "pageLimit", limit);
 		const cursor = decodeBackgroundTaskListCursor(opts?.cursor);
 		const isFirstPage = !cursor;
+		readMetric(observation, "isFirstPage", isFirstPage);
 
 		// limit + 1 on each stream: the merge may take all of its rows from one
 		// side, so both must be able to supply a full page plus the lookahead that
 		// decides `nextCursor`.
 		const [unified, legacy, active] = await Promise.all([
-			this.listUnifiedItems(parentNarratorId, { cursor, limit: limit + 1 }),
-			this.listLegacyRows(parentNarratorId, { cursor, limit: limit + 1 }),
+			readStage(observation, "parallelUnifiedPipelineAwaitMs", () =>
+				this.listUnifiedItems(parentNarratorId, { cursor, limit: limit + 1 }, observation),
+			),
+			readStage(observation, "parallelLegacyPipelineAwaitMs", () =>
+				this.listLegacyRows(parentNarratorId, { cursor, limit: limit + 1 }, observation),
+			),
 			isFirstPage
-				? this.listActiveItems(parentNarratorId)
+				? readStage(observation, "parallelActivePipelineAwaitMs", () =>
+						this.listActiveItems(parentNarratorId, undefined, observation),
+					)
 				: Promise.resolve({ items: [] as BackgroundTaskListItem[], truncated: false }),
 		]);
 
-		const merged = [...unified, ...legacy].sort(compareBackgroundTaskListItemsDesc);
+		readMetric(observation, "unifiedRows", unified.length);
+		readMetric(observation, "legacyRows", legacy.length);
+		readMetric(observation, "activeRows", active.items.length);
+		const merged = readSync(observation, "mergeSortSyncMs", () =>
+			[...unified, ...legacy].sort(compareBackgroundTaskListItemsDesc),
+		);
 		const hasMore = merged.length > limit;
+		readMetric(observation, "hasMore", hasMore);
 		const tasks = hasMore ? merged.slice(0, limit) : merged;
 		const last = tasks.at(-1);
 
@@ -2977,7 +3158,10 @@ class BackgroundTaskService {
 					activeWorkCount: active.items.length - serviceCount,
 					activeServiceCount: serviceCount,
 				}
-			: await this.countActiveKindsByParent(parentNarratorId);
+			: await readStage(observation, "countActiveKindsAwaitMs", () =>
+					this.countActiveKindsByParent(parentNarratorId),
+				);
+		readMetric(observation, "returnedRows", tasks.length);
 		return {
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.getListVersion(parentNarratorId),
@@ -3004,15 +3188,20 @@ class BackgroundTaskService {
 	async listLegacySnapshotByParent(
 		parentNarratorId: string,
 	): Promise<BackgroundTaskListPage & { legacySubagentTasks: never[] }> {
-		const page = await this.listPageByParent(parentNarratorId);
-		const byId = new Map(page.tasks.map((task) => [task.id, task]));
-		// The active read is fresher and wins if a row appears in both sets.
-		for (const task of page.activeTasks ?? []) byId.set(task.id, task);
-		return {
-			...page,
-			tasks: [...byId.values()].sort(compareBackgroundTaskListItemsDesc),
-			legacySubagentTasks: [],
-		};
+		return this.observeRead("legacy-snapshot", async (observation) => {
+			const page = await this.readPageByParent(parentNarratorId, undefined, observation);
+			return readSync(observation, "snapshotMergeSortSyncMs", () => {
+				const byId = new Map(page.tasks.map((task) => [task.id, task]));
+				// The active read is fresher and wins if a row appears in both sets.
+				for (const task of page.activeTasks ?? []) byId.set(task.id, task);
+				readMetric(observation, "returnedRows", byId.size);
+				return {
+					...page,
+					tasks: [...byId.values()].sort(compareBackgroundTaskListItemsDesc),
+					legacySubagentTasks: [],
+				};
+			});
+		});
 	}
 
 	/**
