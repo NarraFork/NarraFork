@@ -523,6 +523,33 @@ test("manual refresh queues background work and waits for publication without re
 	expect(latest.snapshotValid).toBe(true);
 });
 
+test("explicit refresh replenishes automatic paging after the previous limit", async () => {
+	let cache = state();
+	const read = spyOn(api, "getGitStatusPage").mockImplementation(async (_target, query) => ({
+		...page(cache),
+		files: [{ path: `${cache.memberVersion}/${query?.cursor ?? "first"}`, status: " M" }],
+		hasMore: true,
+		nextCursor: `${Number(query?.cursor ?? 0) + 1}`,
+	}));
+	spyOn(api, "getGitStatusPageStats").mockImplementation(async (_target, query) =>
+		measured(query, cache),
+	);
+	await render(undefined, 3);
+	expect(latest.pages).toHaveLength(3);
+	expect(read).toHaveBeenCalledTimes(3);
+	const generation = latest.queryGeneration;
+	latest.refresh();
+	await flush();
+	expect(read).toHaveBeenCalledTimes(3);
+	cache = state(2, 2);
+	publish(cache);
+	await flush();
+	expect(latest.queryGeneration).not.toBe(generation);
+	expect(latest.pages).toHaveLength(3);
+	expect(read).toHaveBeenCalledTimes(6);
+	expect(latest.pages.every((page) => page.snapshotId === "worker:2")).toBe(true);
+});
+
 test("a Worker replacement cancels its old statistics and rejects a late old-Worker completion", async () => {
 	const old = deferred<GitStatusPageStatsResponse>();
 	let current = state();

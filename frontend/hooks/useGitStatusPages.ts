@@ -593,6 +593,7 @@ export function useGitStatusPages(
 	]);
 	const reset = useCallback(() => restart("cycle"), [restart]);
 	const refresh = useCallback(() => {
+		autoCycle.current.intent = "automatic";
 		autoCycle.current.recoveryUsed = false;
 		autoCycle.current.recoveryTimes = [];
 		if (target) subscriptions.refresh(target);
