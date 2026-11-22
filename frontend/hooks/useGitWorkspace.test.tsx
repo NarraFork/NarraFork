@@ -46,7 +46,7 @@ mock.module("../lib/narrator-ws-manager", () => ({
 const { QueryClient, QueryClientProvider, useQuery } = await import("@tanstack/react-query");
 const { createRoot } = await import("react-dom/client");
 const { api, ApiError } = await import("../lib/api");
-const { useGitWorkspace, gitWorkspaceTarget } = await import("./useGit");
+const { useGitWorkspace, gitWorkspaceTarget, readWorkspace } = await import("./useGit");
 const nativeSetInterval = globalThis.setInterval;
 const nativeClearInterval = globalThis.clearInterval;
 const intervals = new Map<ReturnType<typeof setInterval>, { delay: number; tick: () => void }>();
@@ -334,6 +334,32 @@ describe("non-blocking Git summaries and operation authority", () => {
 		expect(container.textContent).toBe("error");
 		expect(branch()).toBeNull();
 		expect(latest.displayCounts).toBeUndefined();
+	});
+	test.each([
+		"GIT_COMMIT_NOT_FOUND",
+		"GIT_COMMIT_FILE_NOT_FOUND",
+	])("preview %s preserves authorized workspace facts", async (code) => {
+		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "valid-branch"));
+		await mount();
+		latest.rememberCounts({ totalFiles: 7, totalFilesExact: true, truncated: false });
+		const target = gitWorkspaceTarget("narrator", latest.data);
+		expect(target).not.toBeNull();
+		const failure = new ApiError("Missing preview resource", 404, { code });
+		await expect(
+			readWorkspace(
+				client,
+				target,
+				async () => {
+					throw failure;
+				},
+				true,
+			),
+		).rejects.toBe(failure);
+		await flush();
+		expect(latest.authorizationState).toBe("authorized");
+		expect(branch()).toBe("valid-branch");
+		expect(latest.displayCounts?.totalFiles).toBe(7);
+		expect(gitWorkspaceTarget("narrator", latest.data)).toEqual(target);
 	});
 	test("a background 404 retires old authority and scrubs cached private metadata without reporting denial", async () => {
 		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(

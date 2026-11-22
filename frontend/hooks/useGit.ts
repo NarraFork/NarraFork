@@ -474,9 +474,13 @@ export async function readWorkspace<T>(
 			(failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED) ||
 			(failure?.status === 409 && failure.data?.code === "GIT_BRANCHES_UNSUPPORTED") ||
 			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
+		const previewNotFound =
+			failure?.status === 404 &&
+			["GIT_COMMIT_NOT_FOUND", "GIT_COMMIT_FILE_NOT_FOUND"].includes(String(failure.data?.code));
 		if (
 			target &&
 			!unsupportedOperation &&
+			!previewNotFound &&
 			([401, 403, 404].includes(failure?.status) ||
 				(failure?.status === 409 &&
 					["GIT_WORKSPACE_CHANGED", "WORKSPACE_KEY_MISMATCH"].includes(
