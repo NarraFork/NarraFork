@@ -112,7 +112,7 @@ const TERMINAL_TOOL_STATUSES = new Set([
 	"timeout",
 ]);
 
-function isTerminalToolStatus(status: unknown): boolean {
+export function isTerminalToolStatus(status: unknown): boolean {
 	return typeof status === "string" && TERMINAL_TOOL_STATUSES.has(status.toLowerCase());
 }
 

@@ -3909,7 +3909,11 @@ export const PretextExactMessageList = memo(
 			}, [narratorId]);
 			// A tool still executing after its message persisted has no synthetic card
 			// left; its live output reaches the committed card through a coalesced patch.
-			const onPersistedToolLive = usePersistedToolLive(narratorId, pretextDocument.applyLivePatch);
+			const onPersistedToolLive = usePersistedToolLive(
+				narratorId,
+				pretextDocument.applyLivePatch,
+				pretextDocument.messages,
+			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,

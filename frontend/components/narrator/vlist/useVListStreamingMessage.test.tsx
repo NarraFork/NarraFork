@@ -165,8 +165,10 @@ async function withStream(
 	function Harness() {
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
 		const committed = snapshot.input?.messages ?? [];
-		const onPersistedToolLive = usePersistedToolLive(narratorId, (patch) =>
-			coordinator.applyLivePatch(patch, VIEW),
+		const onPersistedToolLive = usePersistedToolLive(
+			narratorId,
+			(patch) => coordinator.applyLivePatch(patch, VIEW),
+			committed,
 		);
 		const streaming = useVListStreamingMessage(narratorId, {
 			enabled: true,
@@ -727,6 +729,43 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			);
 		});
 	}
+
+	it("a canonical row replacement keeps a running tool's live body, but not once it finished", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+				await h.raf();
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [],
+					toolChunks: [
+						{
+							toolUseId: "quiet-bash",
+							toolName: "Bash",
+							inputCharsTotal: 1,
+							started: true,
+							executing: true,
+							streamingOutput: "Waiting for build",
+						},
+					],
+				});
+				await h.raf();
+				expect(h.text()).toContain("Waiting for build");
+				// Revalidation swaps in fresh page rows that never carry live fields; the
+				// tool is still running and sends nothing more.
+				await h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+				await h.raf();
+				await h.raf();
+				expect(h.text()).toContain("Waiting for build");
+				// A finished occurrence must not get the stale live body back.
+				await h.commit([{ ...tool("quiet-bash"), status: "success", outputJson: "BUILD-DONE" }]);
+				await h.raf();
+				await h.raf();
+				expect(h.text()).not.toContain("Waiting for build");
+			},
+			{ persistedToolLive: true },
+		);
+	});
 
 	it("ignores child and persisted tools in snapshots but restores tools on their own page", async () => {
 		await withStream(async (h) => {

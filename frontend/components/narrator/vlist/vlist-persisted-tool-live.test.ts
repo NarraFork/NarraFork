@@ -4,7 +4,11 @@ import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-bl
 import type { PersistedToolLiveUpdate } from "./useVListStreamingMessage";
 import { toolCompletedPatch } from "./vlist-live-events";
 import { patchToolLiveOutput } from "./vlist-live-patch";
-import { PersistedToolLiveCoalescer } from "./vlist-persisted-tool-live";
+import {
+	PersistedToolLiveCoalescer,
+	pruneRetainedLive,
+	retainedLivePatch,
+} from "./vlist-persisted-tool-live";
 
 function runningToolDoc(status = "running"): TreeMessage[] {
 	const input = { command: "bun run build" };
@@ -41,6 +45,35 @@ function liveFields(messages: readonly TreeMessage[]) {
 	const block = blocks.find((b) => b.type === "tool_use");
 	return { tc, block };
 }
+
+describe("retained live bodies across a window replacement", () => {
+	const live = { output: "Waiting for build", progress: { completed: 1, total: 3 }, rowId: "tc-1" };
+
+	it("re-writes a dropped body, then is a no-op on the patched document", () => {
+		const retained = new Map([["tu-1", { ...live }]]);
+		const restored = retainedLivePatch(retained)(runningToolDoc());
+		expect(restored.changed).toBe(true);
+		expect(liveFields(restored.messages).block?._streamingOutput).toBe("Waiting for build");
+		const again = retainedLivePatch(retained)(restored.messages);
+		expect(again.changed).toBe(false);
+		expect(again.messages).toBe(restored.messages);
+	});
+
+	it("prunes finished and re-attempted occurrences, keeps tools that are not loaded", () => {
+		const retained = new Map([
+			["tu-1", { ...live }],
+			["tu-unloaded", { output: "x" }],
+		]);
+		pruneRetainedLive(runningToolDoc("success"), retained);
+		expect([...retained.keys()]).toEqual(["tu-unloaded"]);
+
+		const reattempted = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		const doc = runningToolDoc();
+		(doc[0]?.toolCalls?.[0] as unknown as Record<string, unknown>).executionAttempt = 2;
+		pruneRetainedLive(doc, reattempted);
+		expect(reattempted.size).toBe(0);
+	});
+});
 
 describe("patchToolLiveOutput", () => {
 	it("writes the live body onto a running committed card (row + block)", () => {
