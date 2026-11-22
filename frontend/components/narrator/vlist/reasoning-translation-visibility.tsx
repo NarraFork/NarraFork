@@ -73,8 +73,8 @@ class VisibleReasoningBodies {
 	}
 
 	resume = () => {
+		if (this.ready) return;
 		this.ready = true;
-		this.sent = "";
 		this.schedule();
 	};
 

@@ -2449,6 +2449,7 @@ export const PretextExactMessageList = memo(
 				dataSource ? undefined : revisionSubscriptionId,
 			);
 			const messageWsCallbacks: NarratorWSCallbacks = {
+				onStreamingSnapshot: translationVisibility?.resume,
 				onReasoningTranslationStatus: translationVisibility?.receive,
 				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 					upsertOrReload(wsData.message),
