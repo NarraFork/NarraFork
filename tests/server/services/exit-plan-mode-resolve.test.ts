@@ -10,9 +10,10 @@ import type {
 } from "../../../server/lib/agent/execution/backend";
 import { targetPathSemantics } from "../../../server/lib/agent/execution/path-semantics";
 import type { ToolExecutionTarget } from "../../../server/lib/agent/types";
-import { cleanDb, getTestDb } from "../../setup";
+import { resetDbWorkerPoolForTest } from "../../../server/lib/db-worker/pool";
+import { cleanDb, getFileTestDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
@@ -40,6 +41,8 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+	await resetDbWorkerPoolForTest();
+	dispose();
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });

@@ -10,11 +10,7 @@ import {
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 } from "@shared/file-reference";
-import {
-	isMediaContentBlock,
-	MAX_MEDIA_ATTACHMENTS,
-	type MediaRef,
-} from "@shared/media-attachments";
+import { MAX_MEDIA_ATTACHMENTS, type MediaRef } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
@@ -343,13 +339,7 @@ import {
 	resolveBlockTargets,
 	toolElementIndex,
 } from "../services/narrator-block-targets";
-import {
-	blockBody,
-	bodyColumns,
-	contentJsonSql,
-	fillBody,
-	storedBodyBytesSql,
-} from "../services/narrator-body-reads";
+import { bodyColumns, fillBody } from "../services/narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-writes";
 import {
 	deleteBufferedTextFile,
@@ -358,6 +348,7 @@ import {
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { readCommittedComposerDocument } from "../services/narrator-composer-document";
 import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
 	getNarratorDraft,
@@ -497,6 +488,7 @@ import {
 	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
+import { readCommittedToolDetail } from "../services/narrator-tool-detail";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
 import {
@@ -2122,7 +2114,10 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 		narrator.workspaceRevision,
 		narratorPrincipalOf(c),
 		c.req.raw.signal,
-	);
+	).catch((error: unknown) => {
+		if (c.req.raw.signal.aborted) throw catalogError("GIT_REQUEST_CANCELLED");
+		throw error;
+	});
 	await requireNarratorAccess(c, id, "read");
 	return c.json(summary);
 });
@@ -2164,72 +2159,10 @@ narratorRoutes.get("/:id/panel-state", async (c) => {
 
 narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	const id = c.req.param("id");
-	const mid = c.req.param("mid");
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(eq(narratorMessageRefs.narratorId, id), eq(narratorMessageRefs.messageId, mid)),
-		columns: { id: true },
-	});
-	if (!ref) throw new NotFoundError("Message", mid);
-	// A user message within the size limit; its body from block rows when they hold it.
-	const admitted = sql`${narratorMessages.role} = 'user' AND ${storedBodyBytesSql()} <= ${4 * 1024 * 1024}`;
-	const message = await db
-		.select({
-			composerDocument: narratorMessages.composerDocument,
-			bodyRevision: narratorMessages.bodyRevision,
-			admitted: sql<number>`CASE WHEN ${admitted} THEN 1 ELSE 0 END`,
-			content: sql<string | null>`CASE WHEN ${admitted} THEN ${contentJsonSql()} ELSE NULL END`,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, mid))
-		.get();
-	if (!message) throw new NotFoundError("Message", mid);
-	if (!message.admitted)
-		throw new ValidationError("Message attachment metadata exceeds the composer detail limit");
-	const blocks: Record<string, unknown>[] =
-		message.content === null
-			? (blockBody(mid) as Record<string, unknown>[])
-			: JSON.parse(message.content);
-	const images = Array.isArray(blocks)
-		? blocks
-				.filter((block) => block.type === "image" && typeof block.imageId === "string")
-				.map((block) => ({
-					imageId: block.imageId,
-					filename: block.filename,
-					mediaType: block.mediaType,
-					width: block.width,
-					height: block.height,
-					uploadNarratorId: block.uploadNarratorId ?? id,
-					size: block.size,
-					sourceMimeType: block.sourceMimeType,
-				}))
-		: [];
-	const textFiles = Array.isArray(blocks)
-		? blocks
-				.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
-				.map((block) => ({ filename: block.filename, filePath: block.filePath, size: block.size }))
-		: [];
-	return c.json({
-		composerDocument: message.composerDocument ?? undefined,
-		images,
-		media: Array.isArray(blocks)
-			? blocks.filter(isMediaContentBlock).map((media) => ({
-					mediaId: media.mediaId,
-					filename: media.filename,
-					mediaType: media.mediaType,
-					size: media.size,
-					uploadNarratorId: media.uploadNarratorId ?? id,
-				}))
-			: [],
-		textFiles,
-		bodyRevision: message.bodyRevision,
-		text: Array.isArray(blocks)
-			? blocks
-					.filter((block) => block.type === "text" && typeof block.text === "string")
-					.map((block) => block.text)
-					.join("")
-			: "",
-		fileReferences: getFileReferenceSnapshots(blocks).map((snapshot) => snapshot.reference),
-	});
+	const json = await readCommittedComposerDocument(id, c.req.param("mid"), c.req.raw.signal, () =>
+		requireNarratorAccess(c, id, "read"),
+	);
+	return c.body(json, 200, { "Content-Type": "application/json; charset=UTF-8" });
 });
 
 narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
@@ -4593,11 +4526,14 @@ narratorRoutes.get("/:id/text-documents/:refId", async (c) => {
 narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const id = c.req.param("id");
 	const toolUseId = c.req.param("toolUseId");
-	const tc = await narratorService.getToolCallDetail(id, toolUseId, {
-		toolCallId: c.req.query("toolCallId"),
-		messageId: c.req.query("messageId"),
-	});
-	return c.json(tc);
+	const json = await readCommittedToolDetail(
+		id,
+		toolUseId,
+		{ toolCallId: c.req.query("toolCallId"), messageId: c.req.query("messageId") },
+		c.req.raw.signal,
+		() => requireNarratorAccess(c, id, "read"),
+	);
+	return c.body(json, 200, { "Content-Type": "application/json; charset=UTF-8" });
 });
 
 // Stream live compact text only after the detail modal has explicitly opened.
@@ -4702,7 +4638,12 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 narratorRoutes.get("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const detail = await narratorService.getCompactSummary(narratorId, messageId);
+	const signal = c.req.raw.signal;
+	const detail = await narratorService
+		.readCompactSummaryDetail(narratorId, messageId, signal)
+		.finally(async () => {
+			if (!signal.aborted) await requireNarratorAccess(c, narratorId, "read");
+		});
 	return c.json(detail);
 });
 

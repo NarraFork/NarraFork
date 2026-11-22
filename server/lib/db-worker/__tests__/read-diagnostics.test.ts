@@ -22,6 +22,8 @@ test("empty snapshots contain no fabricated task identity", () => {
 });
 
 test.each([
+	"knowledge.keyword-signature",
+	"execution-policy-facts",
 	"narrator.request-recording",
 	"narrator.message-language",
 ])("attribution is preserved for %s but arbitrary text is discarded", (label) => {

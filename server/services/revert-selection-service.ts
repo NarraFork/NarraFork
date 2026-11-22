@@ -30,6 +30,8 @@ import {
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
 import { connectCompiledWorker } from "../lib/compiled-worker";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import type { RevertSelectionInspectionSource } from "../lib/db-worker/protocol";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -79,6 +81,7 @@ export interface RevertSelectionOptions {
 		signal: AbortSignal,
 	): Promise<void>;
 	timeoutMs?: number;
+	readInspectionBody?: typeof readCommittedRevertSelectionBody;
 	/** Structured timing only. No bodies, paths, actor names or selected IDs are logged. */
 	onSlow?: (event: { service: "revert-selection"; durationMs: number; queries: number }) => void;
 }
@@ -767,7 +770,9 @@ export class RevertSelectionService {
 			REVERT_SELECTION_LIMITS.inspectedBodyBytes,
 			"total body inspection bytes",
 		);
-		const content = this.readBody(state, ref);
+		const content = this.options.readInspectionBody
+			? await this.readPreviewBody(state, ref, this.options.readInspectionBody)
+			: this.readBody(state, ref);
 		const summary = await inspectBody(state, ref.id, content);
 		this.check(state);
 		const old = state.bodies.get(ref.id);
@@ -779,6 +784,20 @@ export class RevertSelectionService {
 		});
 		return summary;
 	}
+
+	private async readPreviewBody(
+		state: ScopeState,
+		ref: RefRow,
+		read: typeof readCommittedRevertSelectionBody,
+	): Promise<string> {
+		this.check(state);
+		state.queries++;
+		const body = await read(this.database.$client, ref, state.signal, state.deadlineAt);
+		this.check(state);
+		if (body === null) throw fail("STALE", "Message changed before bounded inspection");
+		return body;
+	}
+
 	private readBody(state: ScopeState, ref: RefRow): string {
 		this.check(state);
 		state.queries++;
@@ -1418,6 +1437,33 @@ export class RevertSelectionService {
 			}
 		}
 	}
+}
+
+/** Preview hydration only; this does not replace the fresh source and commit fences. */
+export async function readCommittedRevertSelectionBody(
+	sqlite: Database,
+	source: RevertSelectionInspectionSource,
+	signal: AbortSignal,
+	deadlineAt: number,
+): Promise<string | null> {
+	signal.throwIfAborted();
+	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction)
+		throw new WorkersUnavailableError("requires_committed_file");
+	const { id, refId, narratorId, contentBytes, bodyRevision, stateRevision } = source;
+	return runReadTask<string | null>(
+		sqlite.filename,
+		{
+			kind: "revertSelectionBody",
+			id,
+			refId,
+			narratorId,
+			contentBytes,
+			bodyRevision,
+			stateRevision,
+			blockReads: settings.narratorBlocks.read,
+		},
+		{ signal, timeoutMs: Math.max(1, deadlineAt - Date.now()) },
+	);
 }
 
 function sourceRowsDigest(rows: unknown[]): string {

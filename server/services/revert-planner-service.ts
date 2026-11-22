@@ -113,6 +113,7 @@ export interface RevertPlannerOptions {
 	/** Separate cumulative physical read/processing cap, default 1 GiB (four 256 MiB passes). */
 	maxProcessedBytes?: number;
 	timeoutMs?: number;
+	readInspectionBody?: RevertSelectionOptions["readInspectionBody"];
 	onSlow?: (event: {
 		service: "revert-planner";
 		durationMs: number;
@@ -207,6 +208,7 @@ export class RevertPlannerService {
 		this.selection = new RevertSelectionService(database, {
 			authorize: (principal, row, need, signal) =>
 				options.access.authorizeNarrator(principal, row, need, signal),
+			readInspectionBody: options.readInspectionBody,
 		});
 		this.plans = new RevertPlanService(database, options.planOptions);
 		const context = () => {

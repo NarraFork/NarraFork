@@ -688,9 +688,9 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// Recent calls: the ROW COUNT is what drives the block height (capped at 3).
 	if (typeof d.recentCallCount === "number") rev += `|gn:${d.recentCallCount}`;
 	if (Array.isArray(d.recentCallNames)) {
-		rev += `|gk:${d.recentCallNames.length}`;
-		for (const name of d.recentCallNames) {
-			if (typeof name === "string") rev += `|gm:${name}`;
+		rev += `|gk:${Math.min(3, d.recentCallNames.length)}`;
+		for (const [index, name] of d.recentCallNames.slice(0, 3).entries()) {
+			rev += `|gm:${index}:${typeof name === "string" ? textSignature(name) : "-"}`;
 		}
 	}
 	// Row label detail + category chip. Height-neutral, but PAINTED from the cached
@@ -700,13 +700,22 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// names and status all stay put — without this the row keeps its bare tool name
 	// until the next full rebuild. Bounded: at most 3 short strings each.
 	if (Array.isArray(d.recentCallSummaries)) {
-		for (const summary of d.recentCallSummaries) {
-			if (typeof summary === "string") rev += `|gs:${textSignature(summary)}`;
+		for (const [index, summary] of d.recentCallSummaries.slice(0, 3).entries()) {
+			rev += `|gs:${index}:${typeof summary === "string" ? textSignature(summary) : "-"}`;
 		}
 	}
 	if (Array.isArray(d.recentCallCategories)) {
-		for (const category of d.recentCallCategories) {
-			if (typeof category === "string") rev += `|gc:${category}`;
+		for (const [index, category] of d.recentCallCategories.slice(0, 3).entries()) {
+			rev += `|gc:${index}:${typeof category === "string" ? textSignature(category) : "-"}`;
+		}
+	}
+	if (Array.isArray(d.recentCallTimings)) {
+		for (const [index, timing] of d.recentCallTimings.slice(0, 3).entries()) {
+			rev += `|gr:${index}`;
+			if (!timing || typeof timing !== "object") continue;
+			const row = timing as Record<string, unknown>;
+			if (typeof row.status === "string") rev += `:${row.status}`;
+			rev += toolTimingRevision(row);
 		}
 	}
 	if (d.hasRecentCallsButton === true) rev += "|gb:1";

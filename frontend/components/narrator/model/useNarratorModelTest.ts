@@ -36,10 +36,10 @@ export interface NarratorModelTest {
 	label: string;
 }
 
-export function useNarratorModelTest(narratorId: string): NarratorModelTest {
+export function useNarratorModelTest(narratorId: string, enabled = true): NarratorModelTest {
 	const { t } = useTranslation("narrator");
 	const { data: currentUser } = useCurrentUser();
-	const { data: narrator } = useNarrator(narratorId);
+	const { data: narrator } = useNarrator(enabled ? narratorId : "");
 	const { defaultModelValue } = useAllModels();
 	const [target, setTarget] = useState<string | null>(null);
 
@@ -52,7 +52,7 @@ export function useNarratorModelTest(narratorId: string): NarratorModelTest {
 	// Admin-only, and only when there is something to probe. Both were conditions of
 	// the chunked action too: the dialog reports provider-level reachability, which is
 	// operator information, and it needs a resolved model to aim at.
-	const eligible = currentUser?.role === "admin" && modelValue.length > 0;
+	const eligible = enabled && currentUser?.role === "admin" && modelValue.length > 0;
 
 	const canTest = useMemo(
 		() => (errorText: string) => eligible && isModelNetworkError(errorText),

@@ -28,6 +28,7 @@
  */
 
 import { type SQL, sql } from "drizzle-orm";
+import { narratorProjectIdSql } from "../../lib/narrator-project-sql";
 
 /**
  * Bind `value` at every `?` of a neutral fragment, producing a Drizzle SQL node.
@@ -92,7 +93,7 @@ export function projectReadableForIdText(projectIdExpression: string): string {
  * lookup on the partial unique primary-link index).
  */
 export function narratorProjectIdText(alias: string): string {
-	return `coalesce(${alias}.context_project_id, (select npl.project_id from narrator_project_links npl where npl.narrator_id = ${alias}.id and npl.role = 'primary'))`;
+	return narratorProjectIdSql(alias);
 }
 
 /**

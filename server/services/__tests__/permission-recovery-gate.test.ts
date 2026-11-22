@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -18,7 +18,7 @@ import {
 import { toolRegistry } from "../../lib/agent/tool-registry";
 import type { AgentConfig, PermissionHandlerOptions } from "../../lib/agent/types";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 const realService = { ...(await import("../narrator-service")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
@@ -66,7 +66,7 @@ afterAll(() => {
 	mock.module("../narrator-service", () => realService);
 	mock.module("../../lib/agent/provider", () => realProvider);
 	mock.restore();
-	sqlite.close();
+	dispose();
 });
 
 async function seed() {

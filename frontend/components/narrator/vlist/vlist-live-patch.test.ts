@@ -971,9 +971,25 @@ describe("subagent file changes survive live updates", () => {
 		const { patchSubagentIdentity } = await import("./vlist-live-patch");
 		const identity = { subagentNarratorId: "sub-2" };
 		const { fileChanges: _files, ...omitted } = activity;
+		const before = seed();
+		const identified = patchSubagentIdentity(before, "tu-parent", identity);
+		const unconfirmed = patchSubagentActivity(
+			before,
+			"tu-parent",
+			header("new-child", "running"),
+			identity,
+		);
+		expect(unconfirmed.changed).toBe(false);
+		expect(read(unconfirmed.messages).subagentNarratorId).toBe("sub-1");
+		expect(read(unconfirmed.messages).fileChanges).toEqual(fileChanges);
 		const results = [
-			patchSubagentIdentity(seed(), "tu-parent", identity),
-			patchSubagentActivity(seed(), "tu-parent", header("new-child", "running"), identity),
+			identified,
+			patchSubagentActivity(
+				identified.messages,
+				"tu-parent",
+				header("new-child", "running"),
+				identity,
+			),
 			patchSubagentActivitySnapshots(seed(), [
 				{ parentToolUseId: "tu-parent", activity: { ...omitted, ...identity } },
 			]),
@@ -982,6 +998,18 @@ describe("subagent file changes survive live updates", () => {
 			expect(read(result.messages).subagentNarratorId).toBe("sub-2");
 			expect(read(result.messages).fileChanges).toBeUndefined();
 		}
+		expect(results[1].changed).toBe(true);
+		expect(read(results[1].messages).latestToolCalls.map((call) => call.toolUseId)).toEqual([
+			"new-child",
+		]);
+		const stale = patchSubagentActivity(
+			results[1].messages,
+			"tu-parent",
+			header("old-child", "success"),
+			{ subagentNarratorId: "sub-1" },
+		);
+		expect(stale.changed).toBe(false);
+		expect(stale.messages).toBe(results[1].messages);
 	});
 });
 describe("composeLivePatches", () => {

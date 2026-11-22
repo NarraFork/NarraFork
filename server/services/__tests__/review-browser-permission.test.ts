@@ -9,7 +9,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { narraforkDir } from "../../lib/settings";
@@ -20,7 +20,7 @@ import {
 	withDelegationDepth,
 } from "../agent-runtime/policy";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { handlePermission, recheckFinalToolExecutionPermission, REVIEW_BROWSER_READ_ONLY_REASON } =
@@ -59,7 +59,7 @@ afterEach(async () => {
 afterAll(() => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	dispose();
 });
 
 async function persistedCall(

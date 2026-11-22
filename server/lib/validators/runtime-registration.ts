@@ -10,6 +10,7 @@ import { z } from "zod";
 
 /** Hard ceiling on the serialized registration (UTF-8 bytes). */
 export const RUNTIME_REGISTRATION_MAX_BYTES = 64 * 1024;
+export const MAX_POLICY_SOURCE_DEPTH = 16;
 
 const narratorId = z.string().min(1).max(64);
 const recordId = z.string().min(1).max(128);

@@ -15,8 +15,7 @@ import {
 	readRuntimeRegistrationColumn,
 } from "./validators/runtime-registration";
 
-/** Source chains longer than this are refused rather than walked. */
-export const MAX_POLICY_SOURCE_DEPTH = 16;
+export { MAX_POLICY_SOURCE_DEPTH } from "./validators/runtime-registration";
 
 export interface RuntimeSourceRow {
 	policySourceNarratorId?: string | null;

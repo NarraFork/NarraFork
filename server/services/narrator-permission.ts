@@ -5152,8 +5152,7 @@ export async function recheckFinalToolExecutionPermission(
 			finalPermissionDeny("OAuth device capability ceiling");
 		}
 	}
-	executionPolicyEngine.invalidate(check.narratorId);
-	const policy = await executionPolicyEngine.compile(
+	const policy = await executionPolicyEngine.compileCurrent(
 		check.narratorId,
 		context,
 		constraint?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],

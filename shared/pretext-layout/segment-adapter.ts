@@ -4553,7 +4553,9 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		resultValue !== undefined &&
 		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
 	const resultContent =
-		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+		(resultValue === undefined && !Array.isArray(outputJson)) || resultIsLiveCount
+			? undefined
+			: subagentResultText(outputJson);
 	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.

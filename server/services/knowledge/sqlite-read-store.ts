@@ -34,7 +34,7 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import {
 	aclEvents,
 	aclGrants,
@@ -50,6 +50,10 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
+import { KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE } from "../../lib/db-worker/knowledge-entry-query";
+import { runReadTask, WorkersUnavailableError } from "../../lib/db-worker/pool";
+import { AppError } from "../../lib/errors";
 import type {
 	AclEventReadRow,
 	KeywordInjectionCandidateRow,
@@ -219,6 +223,25 @@ function personalInjectionWhere(opts: {
 	);
 }
 
+function keywordSignatureQuery(opts: { collectionId?: string; projectId?: string }) {
+	return db
+		.select({
+			cnt: sql<number>`count(*)`,
+			maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
+		})
+		.from(knowledgeEntries)
+		.where(
+			and(
+				eq(knowledgeEntries.status, "active"),
+				isNotNull(knowledgeEntries.currentKeywords),
+				opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+				projectScopeClause(opts.projectId),
+			),
+		);
+}
+
+const signatureReadOptions = { maxRows: 1, diagnosticSource: "knowledge.keyword-signature" };
+
 // Compatibility for callers whose contract is still synchronous. These methods are
 // reachable only through the binding's explicit SQLite capability check.
 export const sqliteKnowledgeInjectionReads = {
@@ -251,21 +274,7 @@ export const sqliteKnowledgeInjectionReads = {
 			.all();
 	},
 	keywordInjectionCandidatesSignature(opts: { collectionId?: string; projectId?: string }) {
-		const row = db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			)
-			.get();
+		const row = keywordSignatureQuery(opts).get();
 		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},
 	snippetsByEntryIds(ids: string[], maxChars: number) {
@@ -336,6 +345,25 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			where: eq(knowledgeEntries.id, entryId),
 		});
 		return (row as KnowledgeEntryRow | undefined) ?? null;
+	},
+
+	async getEntryDetailById(entryId, signal) {
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		try {
+			return await runReadTask<KnowledgeEntryRow | null>(
+				sqlite.filename,
+				{ kind: "knowledgeEntryDetail", entryId },
+				{ signal, timeoutMs: 10_000 },
+			);
+		} catch (err) {
+			if (err instanceof Error && "code" in err && err.code === KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE) {
+				throw new AppError(err.message, 413, KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE);
+			}
+			throw err;
+		}
 	},
 
 	async getEntryAclById(entryId) {
@@ -813,14 +841,17 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			.limit(opts.limit);
 	},
 	async personalKeywordInjectionSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
-			})
-			.from(knowledgeDrafts)
-			.where(personalInjectionWhere(opts));
-		return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
+		const [row] = await readQuery(
+			db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts)),
+			{ ...signatureReadOptions, signal: opts.signal },
+		);
+		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},
 	async personalInjectionSnippets(userId, ids, maxChars) {
 		if (!ids.length) return [];
@@ -866,21 +897,10 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 	},
 
 	async keywordInjectionCandidatesSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			);
-		const row = rows[0];
+		const [row] = await readQuery(keywordSignatureQuery(opts), {
+			...signatureReadOptions,
+			signal: opts.signal,
+		});
 		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},
 

@@ -10,6 +10,7 @@ import {
 	type ReasoningTranslationVisibilityTarget,
 	reasoningTranslationTargetKey,
 } from "@shared/reasoning-translation";
+import { nanoid } from "nanoid";
 import {
 	createContext,
 	useCallback,
@@ -101,7 +102,7 @@ class VisibleReasoningBodies {
 		if (!this.ready) return;
 		const signature = JSON.stringify([...targets.keys()]);
 		if (signature === this.sent || (!this.id && !targets.size)) return;
-		this.id ??= crypto.randomUUID();
+		this.id ??= nanoid();
 		if (
 			!narratorWSManager.send({
 				type: "reasoning_translation_visibility",
