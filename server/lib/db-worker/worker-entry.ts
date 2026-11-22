@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
+import { readPublicationTerminalSnapshot } from "../../services/agent-runtime/publication-reader";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -225,6 +226,15 @@ port.on("message", async (message: DbWorkerInbound) => {
 					return readToolEditPreviewSnapshot(
 						getConnection(message.dbPath),
 						params.toolCallId,
+						controller.signal,
+					);
+				}
+				if (params.kind === "publicationTerminalResult") {
+					return readPublicationTerminalSnapshot(
+						getConnection(message.dbPath),
+						params.run,
+						params.options,
+						params.fromBlocks,
 						controller.signal,
 					);
 				}
