@@ -217,8 +217,8 @@ function realm(
 			cleanups.push(cleanup);
 			return cleanup;
 		},
-		register(element = list, callback = () => {}) {
-			const cleanup = registerIOSScrollToTopTarget(element, callback);
+		register(element = list, callback = () => {}, hasUnprocessedScroll?: () => boolean) {
+			const cleanup = registerIOSScrollToTopTarget(element, callback, hasUnprocessedScroll);
 			cleanups.push(cleanup);
 			return cleanup;
 		},
@@ -613,6 +613,61 @@ describe("iOS native root-scroll bridge", () => {
 		env.settle();
 		env.rootTop();
 		expect(calls).toBe(1);
+	});
+
+	test("continuous smooth following does not postpone rearming after a touch", async () => {
+		const { createSmoothFollower } = await import("./smooth-scroll");
+		const env = realm();
+		let calls = 0;
+		let committedTop = env.list.scrollTop;
+		let target = committedTop + 100;
+		let writes = 0;
+		const follower = createSmoothFollower({
+			readCurrent: () => env.list.scrollTop,
+			readTarget: () => target,
+			getViewportHeight: () => 500,
+			writeInstant: () => {},
+			writeChase: (top) => {
+				env.list.scrollTop = committedTop = top;
+				writes++;
+				env.interact(env.list, "scroll");
+			},
+			canAnimate: () => true,
+			isReducedMotion: () => false,
+			now: () => 0,
+			raf: env.window.requestAnimationFrame,
+			cancelRaf: env.window.cancelAnimationFrame,
+		});
+		env.register(
+			env.list,
+			() => calls++,
+			() => env.list.scrollTop !== committedTop,
+		);
+		env.install();
+		env.frames();
+		env.interact(env.list, "touchstart");
+		env.interact(env.list, "touchend");
+		follower.ensure();
+		for (let i = 0; i < 32; i++) {
+			target += 5;
+			env.settle(16, 1);
+		}
+		expect(writes).toBe(32);
+		expect(env.window.scrollY).toBe(1);
+		env.rootTop();
+		expect(calls).toBe(1);
+
+		// A distinct position from the same target is still treated as momentum.
+		env.interact(env.list, "touchstart");
+		env.interact(env.list, "touchend");
+		env.settle(200, 1);
+		env.list.scrollTop -= 10;
+		env.interact(env.list, "scroll");
+		env.settle(200, 1);
+		expect(env.window.scrollY).toBe(0);
+		env.rootTop();
+		expect(calls).toBe(1);
+		follower.cancel();
 	});
 
 	test("focus, existing keyboard state and zoom pause recognition until a settled reset", () => {

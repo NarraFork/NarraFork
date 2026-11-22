@@ -16,18 +16,19 @@ const SETTLE_MS = 350;
 const OFFSET = 1;
 const TOLERANCE = 0.25;
 
-type Registration = { callback: () => void };
+type Registration = { callback: () => void; hasUnprocessedScroll?: () => boolean };
 const registrations = new WeakMap<Document, Map<HTMLElement, Registration>>();
 
 /** A replacement registration owns its cleanup, even if the previous effect cleans up later. */
 export function registerIOSScrollToTopTarget(
 	element: HTMLElement,
 	onScrollToTop: () => void,
+	hasUnprocessedScroll?: () => boolean,
 ): () => void {
 	const owner = element.ownerDocument;
 	const targets = registrations.get(owner) ?? new Map<HTMLElement, Registration>();
 	registrations.set(owner, targets);
-	const registration = { callback: onScrollToTop };
+	const registration = { callback: onScrollToTop, hasUnprocessedScroll };
 	targets.set(element, registration);
 	return () => {
 		if (targets.get(element) !== registration) return;
@@ -498,8 +499,15 @@ export function installIOSScrollToTopBridge(
 		)
 			endGesture();
 	};
-	const onContentScroll = () => {
-		if (gestureSettling && !touching) settle();
+	const onContentScroll = (event: Event) => {
+		if (!gestureSettling || touching) return;
+		const target = eventElement(event);
+		if (
+			target &&
+			registrations.get(targetDocument)?.get(target)?.hasUnprocessedScroll?.() === false
+		)
+			return;
+		settle();
 	};
 	const onFocus = (event: Event) => {
 		remember(event);

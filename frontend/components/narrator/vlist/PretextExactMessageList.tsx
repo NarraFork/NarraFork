@@ -4494,10 +4494,16 @@ export const PretextExactMessageList = memo(
 			}, [detachFromBottom, narratorId, writeScrollTop]);
 			useLayoutEffect(() => {
 				if (!viewportNode) return;
-				return registerIOSScrollToTopTarget(viewportNode, () => {
-					if (viewportRef.current !== viewportNode) return;
-					handleIOSScrollToTop();
-				});
+				return registerIOSScrollToTopTarget(
+					viewportNode,
+					() => {
+						if (viewportRef.current !== viewportNode) return;
+						handleIOSScrollToTop();
+					},
+					// Writes update scrollTopRef immediately; momentum moves the DOM first.
+					() =>
+						viewportRef.current !== viewportNode || viewportNode.scrollTop !== scrollTopRef.current,
+				);
 			}, [viewportNode, handleIOSScrollToTop]);
 
 			// Quick index of user turns beside the scrollbar (parity with the chunked
