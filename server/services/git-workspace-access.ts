@@ -3,7 +3,7 @@ import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { projects, remoteDevices } from "../db/schema";
-import { AppError } from "../lib/errors";
+import { AppError, catalogError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf } from "../lib/narrator-access";
@@ -158,8 +158,17 @@ export async function authorizeGitTarget(
 	c: Context,
 	source: { narratorId: string },
 	need: "read" | "write",
+	discoveryMode?: "metadata",
 ): Promise<GitWorkspaceTarget> {
-	return authorizeGitTargetForPrincipal(narratorPrincipalOf(c), source, need, c.req.raw.signal);
+	return authorizeGitTargetForPrincipal(
+		narratorPrincipalOf(c),
+		source,
+		need,
+		c.req.raw.signal,
+		false,
+		false,
+		discoveryMode === "metadata",
+	);
 }
 
 /** Shared by HTTP and authenticated workspace WebSocket subscriptions. */
@@ -170,6 +179,7 @@ export async function authorizeGitTargetForPrincipal(
 	signal: AbortSignal,
 	cachedDiscovery = false,
 	recoverWorktreeList = false,
+	metadataDiscovery: boolean | GitWorkspaceTarget = false,
 ): Promise<GitWorkspaceTarget> {
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
@@ -180,6 +190,7 @@ export async function authorizeGitTargetForPrincipal(
 	} = { context: null, policy: null };
 	let target: GitWorkspaceTarget;
 	const narrator = await loadNarratorForAccess(source.narratorId, principal, need);
+	if (signal.aborted) throw catalogError("GIT_REQUEST_CANCELLED");
 	canWrite = await canWriteNarrator(narrator, principal);
 	policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId);
 	target = await resolveNarratorGitTarget(
@@ -268,6 +279,7 @@ export async function authorizeGitTargetForPrincipal(
 		},
 		cachedDiscovery && need === "read",
 		recoverWorktreeList && need === "read",
+		metadataDiscovery,
 	);
 	const { workspace, backend } = target;
 	if (
@@ -304,6 +316,18 @@ export async function authorizeGitTargetForPrincipal(
 			canWrite &&= compiled.evaluatePath({ path: root, operation: "write" }).decision === "allow";
 		}
 		if (need === "write" && !canWrite) throw denied();
+		target.authorizeFilePaths = async (files, operation) => {
+			signal.throwIfAborted();
+			if (operation === "write" && !canWrite) throw denied();
+			for (const file of files) {
+				const absolute = backend.paths.resolve(root, file);
+				if (
+					!backend.paths.contains(root, absolute) ||
+					!gitPathPolicyAllows(compiled, context, absolute, operation)
+				)
+					throw denied();
+			}
+		};
 		scan.check();
 		workspace.capabilities = target.worktreeListOnly
 			? { read: false, write: false }

@@ -16,12 +16,12 @@ import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { RuntimePermissionConstraint } from "../narrator-permission";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const realNarratorService = { ...(await import("../narrator-service")) };
@@ -161,6 +161,7 @@ afterEach(async () => {
 afterAll(() => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
+	dispose();
 });
 
 const cleanup = { action: "cleanup", item: "item" };

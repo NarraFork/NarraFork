@@ -109,7 +109,7 @@ import {
 	type RunDeliverTo,
 	readRuntimeRegistrationColumn,
 } from "../../lib/validators/runtime-registration";
-import { broadcastToNarrator } from "../../websocket/narrator-ws";
+import { broadcastToNarrator, getNarratorConnections } from "../../websocket/narrator-ws";
 import { consumeAgentMessageHistory, isLastModelInputMailbox } from "../agent-message-delivery";
 import {
 	claimInboxHead,
@@ -122,7 +122,8 @@ import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
-import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
+import { getStatusSummaryCached, markStatusDirty, peekStatusSummary } from "../git-status-cache";
+import { classifyGitToolRefresh, GitToolRefreshQueue } from "../git-tool-refresh-policy";
 import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
@@ -243,7 +244,7 @@ import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
-import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
+import { buildTreeSnapshotExecutionHooks } from "../tree-snapshot-loop-hooks";
 import {
 	computeContinuationStallState,
 	createSpecContinuationState,
@@ -983,6 +984,31 @@ export async function runAgentLoopUnlocked(
 	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
 	// at each pass and tool boundary, and on a timer through long tool calls).
 	let outlineLeases: OutlineLeaseKeeper | undefined;
+	const gitRefresh = new GitToolRefreshQueue({
+		state: active,
+		markDirty: markStatusDirty,
+		peek: peekStatusSummary,
+		read: getStatusSummaryCached,
+		hasReaders: () =>
+			[...getNarratorConnections()].some((connection) =>
+				connection.data.subscribedNarrators.has(narratorId),
+			),
+		isCurrent: (path) => gitTrackPathForSession(active) === path,
+		publish: (gitStatus, toolUseId) => {
+			const { files: _files, ...statusWithoutFiles } = gitStatus;
+			broadcastToNarrator(narratorId, {
+				type: "git_status",
+				narratorId,
+				toolUseId,
+				status: statusWithoutFiles as typeof gitStatus,
+				linesAdded: gitStatus.linesAdded,
+				linesRemoved: gitStatus.linesRemoved,
+			});
+		},
+		onError: (error) => {
+			logger.debug("Git status tracking failed", { narratorId, error: String(error) });
+		},
+	});
 	try {
 		outlineLeases = keepOutlineTaskLeases(narratorId);
 		// An outline session moves its old fence text to its behavior page once, before its first
@@ -1902,64 +1928,15 @@ export async function runAgentLoopUnlocked(
 				// gitTrackPathForSession decides per tool call, not per session: a
 				// mid-session cwd switch re-evaluates _isInGitRepo. Without this hook a
 				// standalone narrator's git bar never moved until a foreground refetch.
-				onGitTrack: (toolName, toolUseId, input) => {
-					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+				onGitTrack: async (toolName, toolUseId, input) => {
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
-					// Mark the directory dirty at the tool boundary, not in the narrator's
-					// trailing timer. The directory pool owns throttled live refreshes;
-					// this timer only pushes the session's status line.
-					invalidateStatus(worktreePath);
-					const scheduleRefresh = (delayMs: number) => {
-						// Collapse rapid successive calls into one trailing query. Git commands
-						// use delay 0 so branch/commit-only changes are visible immediately.
-						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-						active._gitTrackTimer = setTimeout(() => {
-							active._gitTrackTimer = undefined;
-							// Reuse the directory pool's result (or another narrator's query).
-							// A late timer must not invalidate the same completed write again.
-							getStatusSummaryCached(worktreePath).then(
-								(gitStatus) => {
-									// Strip files array from WS broadcast to avoid
-									// sending huge payloads when many files are changed.
-									// The Git panel fetches the full list via API.
-									const { files: _files, ...statusWithoutFiles } = gitStatus;
-									broadcastToNarrator(narratorId, {
-										type: "git_status",
-										narratorId,
-										toolUseId,
-										status: statusWithoutFiles as typeof gitStatus,
-										linesAdded: gitStatus.linesAdded,
-										linesRemoved: gitStatus.linesRemoved,
-									});
-								},
-								(err) => {
-									logger.debug("Git status tracking failed", {
-										narratorId,
-										error: String(err),
-									});
-								},
-							);
-						}, delayMs);
-					};
-
-					if (toolName !== SHELL_TOOL_NAME) {
-						scheduleRefresh(800);
-						return;
-					}
-
 					const shellCwd =
 						typeof input?.workdir === "string" ? resolve(active.cwd, input.workdir) : active.cwd;
-					void isGitCommandToolResult(toolName, input, shellCwd).then(
-						(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
-						(error) => {
-							logger.debug("Git command detection failed; using normal status tracking", {
-								narratorId,
-								error: String(error),
-							});
-							scheduleRefresh(800);
-						},
+					const intent = await classifyGitToolRefresh(toolName, input, (command) =>
+						analyzeShellCommand(command, shellCwd, detectShell().type),
 					);
+					gitRefresh.track(intent, worktreePath, toolUseId);
 				},
 
 				onContextUsage: ctxMgmt.onContextUsage,

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { getFileTestDb } from "../../../tests/setup";
 import {
 	narratorBlacklistDirs,
 	narratorMessages,
@@ -18,7 +18,7 @@ import type { ToolExecutionTarget } from "../../lib/agent/types";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 import type { PendingDangerReflection, PendingExecutionTarget } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 
 // The branch intentionally does not generate a migration while permission schema work is under
 // review. Keep this focused test database aligned with the current typed schema without touching
@@ -336,6 +336,7 @@ afterAll(() => {
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.module("../narrator-service", () => realNarratorServiceModule);
 	mock.restore();
+	dispose();
 });
 
 describe("confirmDangerReflection ordering", () => {

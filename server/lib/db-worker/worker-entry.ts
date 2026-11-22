@@ -37,9 +37,14 @@ import {
 	runBlockReindexSlice,
 	runBlockVerifySlice,
 } from "./block-backfill-query";
+import { readCompactSummary } from "./compact-summary-query";
+import { readComposerDocument } from "./composer-document-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
+import { readExecutionPolicySnapshot } from "./execution-policy-query";
 import { workerFailureDetails } from "./failure";
+import { readRevertSelectionBody } from "./file-revert-selection-body-query";
+import { readKnowledgeEntryDetail } from "./knowledge-entry-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -53,10 +58,14 @@ import type {
 	StorageScanTablesResult,
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
+import { readRecallConversation } from "./recall-conversation-query";
+import { readRecallToolCall } from "./recall-tool-call-query";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readSubagentActivity } from "./subagent-activity-query";
+import { readToolDetailSnapshot } from "./tool-detail-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
@@ -225,12 +234,37 @@ port.on("message", async (message: DbWorkerInbound) => {
 			runInSqlTraceSpan(sqlSpan, async () => {
 				if (params.kind === "benchmarkRead")
 					return runBenchmarkRead(getConnection(message.dbPath), params, controller.signal);
+				if (params.kind === "toolDetailSnapshot") {
+					return readToolDetailSnapshot(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "composerDocument") {
+					return readComposerDocument(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "compactSummary") {
+					return readCompactSummary(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "executionPolicyFacts") {
+					return readExecutionPolicySnapshot(
+						getConnection(message.dbPath),
+						params.narratorId,
+						controller.signal,
+					);
+				}
 				if (params.kind === "toolEditPreview") {
 					return readToolEditPreviewSnapshot(
 						getConnection(message.dbPath),
 						params.toolCallId,
 						controller.signal,
 					);
+				}
+				if (params.kind === "recallToolCall") {
+					return readRecallToolCall(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "recallConversation") {
+					return readRecallConversation(getConnection(message.dbPath), params, controller.signal);
+				}
+				if (params.kind === "revertSelectionBody") {
+					return readRevertSelectionBody(getConnection(message.dbPath), params, controller.signal);
 				}
 				if (params.kind === "publicationTerminalResult") {
 					return readPublicationTerminalSnapshot(
@@ -240,6 +274,16 @@ port.on("message", async (message: DbWorkerInbound) => {
 						params.fromBlocks,
 						controller.signal,
 					);
+				}
+				if (params.kind === "knowledgeEntryDetail") {
+					return readKnowledgeEntryDetail(
+						getConnection(message.dbPath),
+						params.entryId,
+						controller.signal,
+					);
+				}
+				if (params.kind === "subagentActivity") {
+					return readSubagentActivity(getConnection(message.dbPath), params, controller.signal);
 				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)

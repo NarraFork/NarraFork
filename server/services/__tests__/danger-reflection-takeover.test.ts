@@ -15,14 +15,14 @@
 
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { getFileTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 import type { DangerInfo } from "../../lib/agent";
 import { localPathSemantics } from "../../lib/agent/execution/path-semantics";
 import { localBackend } from "../../lib/agent/execution/registry";
 import type { PendingDangerReflection } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
@@ -154,6 +154,7 @@ afterAll(() => {
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.module("../narrator-service", () => realNarratorServiceModule);
 	mock.restore();
+	dispose();
 });
 
 describe("stopDangerReflectionLoop (live runtime pause)", () => {

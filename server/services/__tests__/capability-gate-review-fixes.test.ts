@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -36,7 +36,7 @@ import {
 	runDeliverToOf,
 } from "../../lib/runtime-source";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -92,7 +92,10 @@ afterEach(async () => {
 	cleanDb(sqlite);
 	await rm(cwd, { recursive: true, force: true });
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(() => {
+	mock.module("../../db", () => realDb);
+	dispose();
+});
 
 async function actor(extra: Partial<typeof narrators.$inferInsert> = {}) {
 	const id = generateId();

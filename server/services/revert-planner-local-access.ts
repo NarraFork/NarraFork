@@ -62,6 +62,7 @@ import {
 	type RevertPlannerRequest,
 	RevertPlannerService,
 } from "./revert-planner-service";
+import { readCommittedRevertSelectionBody } from "./revert-selection-service";
 import {
 	type RevertTransactionRequest,
 	RevertTransactionService,
@@ -367,6 +368,7 @@ async function services(signal: AbortSignal) {
 			namespace,
 			planner: new RevertPlannerService(db, {
 				access,
+				readInspectionBody: readCommittedRevertSelectionBody,
 				blobStore: namespace.store,
 				blobCatalog: namespace.catalog,
 				generation: namespace.generation,

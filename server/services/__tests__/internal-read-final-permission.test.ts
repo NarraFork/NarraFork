@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	fileChangeExecutionSegments,
 	fileChangeOperations,
@@ -17,7 +17,7 @@ import type { ToolCallBinding, ToolExecutionTarget } from "../../lib/agent/types
 import { generateId } from "../../lib/id";
 import type { FinalToolPermissionCheck } from "../narrator-permission";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { handlePermission, recheckFinalToolExecutionPermission } = await import(
@@ -85,7 +85,7 @@ afterAll(() => {
 	for (const tool of originals) if (tool) toolRegistry.register(tool);
 	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	dispose();
 });
 
 async function persistedCall(toolName: string, toolUseId: string, args: Record<string, unknown>) {

@@ -125,6 +125,10 @@ make build-alpha VERSION=0.9.16-alpha.2 ARCHIVE_DIR="$HOME/private-builds" BUN=b
 
 需要 CPU 采样时，仅在隔离数据目录、独立 loopback 端口的有界调试进程上，通过 `BUN_OPTIONS` 临时设置 `--cpu-prof --cpu-prof-dir=<私有目录> --cpu-prof-name=<名称>.cpuprofile`，正常退出后解析结果；不把采样参数嵌入交付二进制，不增加调试端口或常驻 profiler。保留名称不保证所有匿名函数都有业务名称，嵌入 map 也不保证 Linux perf 自动解析全部 JIT 原生地址。
 
+对正在运行的服务，管理员可用自己的会话 Bearer 令牌调用 `POST /api/diagnostics/cpu-profile`。发送空正文或 JSON `{"durationMs":5000}`（正文最多 1 KiB，默认 15 秒，范围 1–30000 毫秒）。请求等待采样完成并下载 `.cpuprofile`，只采样 HTTP 服务的 JS 线程，不包含独立 Worker 或子进程。每个服务进程同时只接受一次采样（忙时返回 409）；断开请求或正常关闭服务会停止本次采样。
+
+接口不开放调试端口。Bun 1.4.3 不支持与启动时的 `--cpu-prof` / `--cpu-prof-md` 或已启用的 Inspector 调试监听器并用（返回 503）；请勿同时运行其他进程内采样器。采样有开销，建议先用短窗口并在窗口内复现目标负载；空闲线程可能没有样本。文件可能包含函数名和本机源码路径，请存入私有目录，不要公开分享。
+
 ### fork 的默认更新仓库
 
 构建时按显式 `NF_BUILD_GITHUB_REPOSITORY=owner/repo`、可信 Actions 仓库、源码 GitHub origin 的顺序确定仓库，无法推导时才使用官方默认值。Actions 中显式值必须等于当前仓库；本地 `release.ts --target=github --github-repository=owner/repo` 会自动传递该构建身份。

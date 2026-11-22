@@ -1076,69 +1076,93 @@ export class NarratorWorktreeService<Principal> {
 		input: unknown,
 		signal: AbortSignal,
 	): Promise<WorktreeListResult> {
-		const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
-		signal.throwIfAborted();
-		const target = await (this.ports.authorizeList ?? this.ports.authorize)(
-			principal,
-			narratorId,
-			"read",
-			signal,
-		);
-		if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
-			if (target.workspace.workspaceKey !== workspaceKey)
-				error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
-			if (
-				!target.repositoryPath ||
-				!target.workspace.repositoryKey ||
-				!target.backend ||
-				target.backend.kind !== "local"
-			)
-				error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
-		} else assertReady(target, "read", workspaceKey);
-		const binding = JSON.stringify([
-			this.actorKey(principal),
-			narratorId,
-			target.workspace.repositoryKey,
-			target.workspace.deviceId,
-			target.repositoryPath,
-			target.workspace.rootPath,
-			workspaceKey,
-			sort,
-			order,
-			search,
-		]);
-		this.pruneListSnapshots(Date.now());
-		let snapshot: ListSnapshot;
-		let id: string | undefined;
-		let offset = 0;
-		if (cursor) {
-			const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
-			if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
-			id = match[1] ?? "";
-			offset = Number(match[2]);
-			const cached = this.listSnapshots.get(id);
-			if (!cached)
-				error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
-			if (cursor !== this.listCursor(id, offset))
-				error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
-			if (cached.binding !== binding)
-				error(
-					"WORKTREE_CURSOR_MISMATCH",
-					"Cursor does not match actor, workspace or list query",
-					409,
-				);
-			if (offset >= cached.entries.length)
-				error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
-			snapshot = cached;
-		} else {
-			const started = performance.now();
-			const listSignal = AbortSignal.any([
+		const started = performance.now();
+		const timings = {
+			authorizationMs: 0,
+			enumerationMs: 0,
+			metadataMs: 0,
+			snapshotMs: 0,
+			pageMs: 0,
+		};
+		let stage: keyof typeof timings = "authorizationMs";
+		let stageStarted = started;
+		let cursorPage: boolean | null = null;
+		let completed = false;
+		const recordStage = (now: number) => {
+			timings[stage] += Math.round(now - stageStarted);
+			stageStarted = now;
+		};
+		const startStage = (next: keyof typeof timings) => {
+			recordStage(performance.now());
+			stage = next;
+		};
+		try {
+			const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
+			cursorPage = !!cursor;
+			signal.throwIfAborted();
+			const target = await (this.ports.authorizeList ?? this.ports.authorize)(
+				principal,
+				narratorId,
+				"read",
 				signal,
-				AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
+			);
+			if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
+				if (target.workspace.workspaceKey !== workspaceKey)
+					error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
+				if (
+					!target.repositoryPath ||
+					!target.workspace.repositoryKey ||
+					!target.backend ||
+					target.backend.kind !== "local"
+				)
+					error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
+			} else assertReady(target, "read", workspaceKey);
+			const binding = JSON.stringify([
+				this.actorKey(principal),
+				narratorId,
+				target.workspace.repositoryKey,
+				target.workspace.deviceId,
+				target.repositoryPath,
+				target.workspace.rootPath,
+				workspaceKey,
+				sort,
+				order,
+				search,
 			]);
-			try {
+			startStage("snapshotMs");
+			this.pruneListSnapshots(Date.now());
+			let snapshot: ListSnapshot;
+			let id: string | undefined;
+			let offset = 0;
+			if (cursor) {
+				const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
+				if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
+				id = match[1] ?? "";
+				offset = Number(match[2]);
+				const cached = this.listSnapshots.get(id);
+				if (!cached)
+					error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
+				if (cursor !== this.listCursor(id, offset))
+					error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
+				if (cached.binding !== binding)
+					error(
+						"WORKTREE_CURSOR_MISMATCH",
+						"Cursor does not match actor, workspace or list query",
+						409,
+					);
+				if (offset >= cached.entries.length)
+					error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
+				snapshot = cached;
+			} else {
+				startStage("enumerationMs");
+				const listSignal = AbortSignal.any([
+					signal,
+					AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
+				]);
 				const result = await this.entries(target, listSignal, true);
+				startStage("metadataMs");
 				await this.enrichListEntries(target, result.entries, listSignal);
+				startStage("snapshotMs");
 				const needle = search.toLowerCase();
 				const name = (entry: WorktreeEntry) =>
 					entry.branch?.replace(/^refs\/heads\//, "") ??
@@ -1173,39 +1197,55 @@ export class NarratorWorktreeService<Principal> {
 					bytes: Buffer.byteLength(JSON.stringify(entries)) + Buffer.byteLength(binding) + 256,
 				};
 				if (entries.length > limit) id = this.rememberListSnapshot(snapshot);
-			} finally {
-				const elapsedMs = Math.round(performance.now() - started);
-				if (elapsedMs >= 1000) logger.warn("Slow worktree listing", { elapsedMs });
+			}
+			signal.throwIfAborted();
+			startStage("pageMs");
+			const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
+			const hasMore = offset + entries.length < snapshot.entries.length;
+			// Removal needs both a wired retirement adapter and a healthy local checkout to
+			// inspect; the write ACL itself is enforced on the removal call, not claimed here.
+			const canRemove =
+				!!this.ports.retirement &&
+				target.workspace.state === "ready" &&
+				target.workspace.deviceId === "local" &&
+				target.backend?.kind === "local";
+			const page: WorktreeListResult = {
+				repositoryKey: target.workspace.repositoryKey,
+				hasMore,
+				nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
+				truncated: snapshot.truncated,
+				entries,
+				capabilities: {
+					list: true,
+					create: target.workspace.capabilities.write,
+					switch: false,
+					delete: canRemove,
+					prune: false,
+					remote: false,
+					reason: canRemove
+						? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
+						: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
+				},
+			};
+			completed = true;
+			return page;
+		} finally {
+			const now = performance.now();
+			const elapsedMs = Math.round(now - started);
+			if (elapsedMs >= 1000) {
+				recordStage(now);
+				try {
+					logger.warn("Slow worktree listing", {
+						elapsedMs,
+						...timings,
+						cursorPage,
+						outcome: completed ? "complete" : signal.aborted ? "cancelled" : "error",
+					});
+				} catch {
+					// Diagnostics must not replace the result or original error.
+				}
 			}
 		}
-		signal.throwIfAborted();
-		const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
-		const hasMore = offset + entries.length < snapshot.entries.length;
-		// Removal needs both a wired retirement adapter and a healthy local checkout to
-		// inspect; the write ACL itself is enforced on the removal call, not claimed here.
-		const canRemove =
-			!!this.ports.retirement &&
-			target.workspace.state === "ready" &&
-			target.workspace.deviceId === "local" &&
-			target.backend?.kind === "local";
-		return {
-			repositoryKey: target.workspace.repositoryKey,
-			hasMore,
-			nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
-			truncated: snapshot.truncated,
-			entries,
-			capabilities: {
-				list: true,
-				create: target.workspace.capabilities.write,
-				switch: false,
-				delete: canRemove,
-				prune: false,
-				remote: false,
-				reason: canRemove
-					? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
-					: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
-			},
-		};
 	}
 
 	/**
