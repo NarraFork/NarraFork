@@ -112,6 +112,26 @@ export function useVListStreamingMessage(
 	const { enabled, isSubagent = false, committedMessages = EMPTY_MESSAGES } = options;
 	const persistedLiveRef = useRef(options.onPersistedToolLive);
 	persistedLiveRef.current = options.onPersistedToolLive;
+	/**
+	 * Hand an already-buffered live body to the committed card: the snapshot a
+	 * client receives on subscribe, or what a synthetic card held when it retired.
+	 * Without this a tool that prints once and then runs silently stays blank on
+	 * its committed card until it completes.
+	 */
+	const forwardPersistedLive = useCallback(
+		(toolUseId: string, output: unknown, progress: ToolProgressPayload | undefined) => {
+			const sink = persistedLiveRef.current;
+			if (!sink) return;
+			const text = typeof output === "string" ? getToolOutputPreview(output) : undefined;
+			if (text === undefined && !progress) return;
+			sink({
+				toolUseId,
+				...(text !== undefined ? { output: text } : {}),
+				...(progress ? { progress } : {}),
+			});
+		},
+		[],
+	);
 	// Raw text never takes a committed (citation-cleaned) value as its seed. A
 	// checkpoint only removes the display copy; later deltas still append here.
 	const blocksRef = useRef<StreamingBlock[]>([]);
@@ -237,6 +257,7 @@ export function useVListStreamingMessage(
 		[committedMessages],
 	);
 	useEffect(() => {
+		const before = new Map(toolStoreRef.current);
 		if (
 			dropPersistedStreamingTools(
 				toolStoreRef.current,
@@ -246,10 +267,16 @@ export function useVListStreamingMessage(
 					isTextDocumentPersisted(chunk.textDocument, persistedDocumentPins),
 			)
 		) {
+			// A retiring card's live body moves to its committed card (which refuses it
+			// once terminal), so output that arrived before the document loaded is kept.
+			for (const [toolUseId, chunk] of before) {
+				if (toolStoreRef.current.has(toolUseId)) continue;
+				forwardPersistedLive(toolUseId, chunk._streamingOutput, chunk._structuredProgress);
+			}
 			retireMissingDocuments();
 			setVersion((value) => value + 1);
 		}
-	}, [persistedToolUseIds, persistedDocumentPins, retireMissingDocuments]);
+	}, [persistedToolUseIds, persistedDocumentPins, retireMissingDocuments, forwardPersistedLive]);
 
 	// Final message events seal ids, but only the actual document may release their
 	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
@@ -405,8 +432,12 @@ export function useVListStreamingMessage(
 						chunk.inputDocument
 							? isTextDocumentPersisted(chunk.inputDocument.ref, persistedDocumentPins)
 							: persistedToolUseIds.has(chunk.toolUseId)
-					)
+					) {
+						// The committed card owns this tool: give it the snapshot's buffered body,
+						// since a quiet tool may send no further frame before it completes.
+						forwardPersistedLive(chunk.toolUseId, chunk.streamingOutput, chunk.structuredProgress);
 						continue;
+					}
 					if (
 						chunk.inputDocument &&
 						isRetiredStreamingDocument(

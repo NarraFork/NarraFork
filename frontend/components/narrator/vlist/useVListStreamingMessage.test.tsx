@@ -691,6 +691,43 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 		});
 	}
 
+	for (const snapshotFirst of [false, true]) {
+		it(`opening a session restores a quiet running tool's buffered output (${snapshotFirst ? "snapshot → document" : "document → snapshot"})`, async () => {
+			await withStream(
+				async (h) => {
+					const chunk = {
+						toolUseId: "quiet-bash",
+						toolName: "Bash",
+						inputCharsTotal: 1,
+						started: true,
+						executing: true,
+						streamingOutput: "Waiting for build",
+					};
+					const snapshot = { type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] };
+					const commit = () => h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+					if (snapshotFirst) {
+						// Snapshot lands before the page: the output sits on a synthetic card that
+						// then retires and must hand it to the committed card.
+						await h.frame(snapshot);
+						await h.raf();
+						await commit();
+					} else {
+						await commit();
+						await h.raf();
+						await h.frame(snapshot);
+					}
+					await h.raf();
+					// No further tool_output frame: the command is silent from here on.
+					expect(h.text()).toContain("Waiting for build");
+					expect(
+						h.live()?.toolCalls?.some((call) => call.toolUseId === "quiet-bash") ?? false,
+					).toBe(false);
+				},
+				{ persistedToolLive: true },
+			);
+		});
+	}
+
 	it("ignores child and persisted tools in snapshots but restores tools on their own page", async () => {
 		await withStream(async (h) => {
 			const chunk = {
