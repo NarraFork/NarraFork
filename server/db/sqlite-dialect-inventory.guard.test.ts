@@ -702,7 +702,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1"],
+	"server/services/tool-edit-preview.ts": ["json1", "handle"],
+	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions.
