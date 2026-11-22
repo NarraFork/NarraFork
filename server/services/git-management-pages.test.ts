@@ -101,6 +101,53 @@ const complete = (count: number): GitWorkspaceResult => ({
 });
 afterAll(closeGitStatusPages);
 
+test("actors and filters share one coherent source and statistics index without changing HTTP DTOs", async () => {
+	const { target, calls } = fixture({
+		outputs: { status: " M src/modified.ts\0?? src/new.ts\0" },
+		totalFilesExact: true,
+		truncated: false,
+		lineStats: {
+			files: [
+				{ path: "src/modified.ts", unstagedLinesAdded: 3, unstagedLinesRemoved: 1, complete: true },
+				{ path: "src/new.ts", unstagedLinesAdded: 7, unstagedLinesRemoved: 0, complete: true },
+			],
+			linesAdded: 10,
+			linesRemoved: 1,
+			complete: true,
+		},
+	});
+	const [modified, added] = await Promise.all([
+		getGitWorkspaceStatusPage(target, "reader", { filter: ["M"] }),
+		getGitWorkspaceStatusPage(target, "other", { filter: ["A"] }),
+	]);
+	expect(modified.files.map(({ path }) => path)).toEqual(["src/modified.ts"]);
+	expect(added.files.map(({ path }) => path)).toEqual(["src/new.ts"]);
+	expect(modified.snapshotId).not.toBe(added.snapshotId);
+	for (const page of [modified, added]) {
+		expect(page).not.toHaveProperty("status");
+		expect(page).not.toHaveProperty("cache");
+	}
+	const rows = [{ type: "directory", section: "unstaged", path: "src" }] as const;
+	const [modifiedStats, addedStats] = await Promise.all([
+		getGitWorkspaceStatusPageStats(target, "reader", {
+			snapshotId: modified.snapshotId,
+			filter: ["M"],
+			rows: [...rows],
+		}),
+		getGitWorkspaceStatusPageStats(target, "other", {
+			snapshotId: added.snapshotId,
+			filter: ["A"],
+			rows: [...rows],
+		}),
+	]);
+	expect(modifiedStats.rows[0]).toMatchObject({ added: 3, removed: 1, complete: true });
+	expect(addedStats.rows[0]).toMatchObject({ added: 7, removed: 0, complete: true });
+	expect(modifiedStats).not.toHaveProperty("status");
+	expect(addedStats).not.toHaveProperty("cache");
+	expect(calls.filter(({ request }) => request.operation === "status")).toHaveLength(1);
+	expect(calls.filter(({ request }) => request.operation === "lineStats")).toHaveLength(1);
+});
+
 function measured(count: number, added: number): GitWorkspaceResult {
 	return {
 		...complete(count),
@@ -572,7 +619,7 @@ test("scope proof requires every matching path and rejects eviction and external
 	respond(complete(3));
 	first = await getGitWorkspaceStatusPage(target, "reader", { filter: ["A"] });
 	for (let index = 0; index < 8; index++)
-		await getGitWorkspaceStatusPage(target, "reader", { filter: ["A"] });
+		await getGitWorkspaceStatusPage(target, `reader-${index}`, { filter: ["A"] });
 	expect(
 		await rejected(assertGitWorkspaceStatusPageScope(target, "reader", proof(), files)),
 	).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
