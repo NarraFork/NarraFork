@@ -1189,7 +1189,10 @@ test("a changed observation disables an already-open confirmation", async () => 
 	await click(document.querySelector("[data-git-staging-confirm-delete]") as Element);
 	expect(actions).toEqual([]);
 });
-test("commit errors preserve the message; a committed result offers operation recovery", async () => {
+test.each([
+	"ready",
+	"recovering",
+] as const)("commit errors preserve messages and recovery remains available in %s state", async (state) => {
 	await render();
 	await menu("B", "Commit Beta");
 	await inputValue(document.querySelector("[role='dialog'] input") as Element, "beta commit");
@@ -1208,6 +1211,10 @@ test("commit errors preserve the message; a committed result offers operation re
 	};
 	await click(button("Commit"));
 	expect(document.body.textContent).toContain("Committed commit-1");
+	summary = { ...summary, state };
+	client.setQueryData(["gitStagingLists", "w", "ui", "fixture-alice"], summary);
+	await flush();
+	expect(button("Recover operation").disabled).toBe(false);
 	await click(button("Recover operation"));
 	expect(actions.map((action) => action.action)).toEqual(["commit", "commit", "recover"]);
 	expect(actions[2]).toEqual({ action: "recover", operationId: "op-1", ...version });

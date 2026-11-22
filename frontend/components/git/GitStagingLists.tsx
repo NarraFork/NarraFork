@@ -192,7 +192,7 @@ export function useGitStagingManagement({ staging }: Props) {
 							<Button
 								size="compact-xs"
 								variant="light"
-								disabled={!staging.writable || !staging.version}
+								disabled={!staging.initializable || !staging.version}
 								onClick={() => {
 									if (staging.version && staging.notice?.result.operationId)
 										mutation.mutate({
