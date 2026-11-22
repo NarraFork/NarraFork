@@ -101,7 +101,7 @@ const SHORT_READ_MAX_QUEUE = 8;
 const SHORT_READ_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 export class DbReadTaskOverloadedError extends Error {
-	readonly code = "DB_READ_OVERLOADED";
+	readonly code = "DB_READ_TASK_OVERLOADED";
 	constructor(readonly reason?: TaskQueueError["reason"]) {
 		super("Database read worker queue is full");
 		this.name = "DbReadTaskOverloadedError";

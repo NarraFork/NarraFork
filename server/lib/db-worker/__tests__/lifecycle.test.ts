@@ -192,11 +192,11 @@ test("no-ready startup uses the bounded startup budget and a failed owner exits"
 	]);
 });
 
-test("count overload retains the public error class and shared admission code", () => {
+test("count overload retains the public error class and legacy admission code", () => {
 	const error = new DbReadTaskOverloadedError();
 	expect(error).toBeInstanceOf(Error);
 	expect(error).toMatchObject({
-		code: "DB_READ_OVERLOADED",
+		code: "DB_READ_TASK_OVERLOADED",
 		name: "DbReadTaskOverloadedError",
 		message: "Database read worker queue is full",
 	});
@@ -223,10 +223,10 @@ test("queue bounds overload and cancellation removes every waiter", async () => 
 	);
 	const error = await failureOf(runReadTask(unusedDb, task));
 	expect(error).toBeInstanceOf(DbReadTaskOverloadedError);
-	expect(error).toMatchObject({ code: "DB_READ_OVERLOADED" });
+	expect(error).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
 	expect(getDbWorkerPoolStats().queued).toBe((DB_WORKER_MAX_QUEUE * 3) / 4);
 	const repeated = await failureOf(runReadTask(unusedDb, task));
-	expect(repeated).toMatchObject({ code: "DB_READ_OVERLOADED" });
+	expect(repeated).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
 	controller.abort();
 	await Promise.all(jobs);
 	expect(getDbWorkerPoolStats()).toMatchObject({
@@ -248,7 +248,7 @@ test("short reads execute and reuse a worker while the ordinary pool is full", a
 	const queued = Array.from({ length: normalMaxQueued }, ordinary);
 	try {
 		await nextTaskPost.promise;
-		expect(await ordinary()).toMatchObject({ code: "DB_READ_OVERLOADED" });
+		expect(await ordinary()).toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
 		setDbWorkerSpecifiersForTest(null);
 		expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
 		expect(await runShortReadTask(dbPath, shortTask)).toEqual(shortResult);
@@ -284,7 +284,7 @@ test("short-read congestion rejects overflow and drops cancelled or expired wait
 	);
 	const expiring = failureOf(runShortReadTask(dbPath, shortTask, { timeoutMs: 100 }));
 	expect(await failureOf(runShortReadTask(dbPath, shortTask))).toMatchObject({
-		code: "DB_READ_OVERLOADED",
+		code: "DB_READ_TASK_OVERLOADED",
 	});
 	expect(await expiring).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 	queuedController.abort();

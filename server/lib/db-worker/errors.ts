@@ -1,5 +1,6 @@
 import type { ErrorMessageCode, ErrorMessageParams } from "@shared/error-catalog";
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
+import { workerFailureDetails } from "./failure";
 
 /** Stable, content-free infrastructure errors shared by the pool and its worker. */
 export class DbReadError extends Error {
@@ -53,6 +54,8 @@ export function workerFailure(error: unknown): SerializedReadError {
 				: {}),
 		};
 	}
+	const { code } = workerFailureDetails(error, false);
+	if (code?.startsWith("SQLITE_")) return { code, message: "database read worker query failed" };
 	const message = error instanceof Error ? error.message : "";
 	if (message === "Invalid or oversized read query") return { code: "DB_READ_INVALID", message };
 	if (/^Read query exceeded its (row|byte) budget$/.test(message))

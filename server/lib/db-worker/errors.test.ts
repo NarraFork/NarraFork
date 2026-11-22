@@ -242,6 +242,27 @@ describe("host read-abort diagnostics", () => {
 });
 
 describe("read worker error transport", () => {
+	test("SQLite execution codes survive without exposing driver messages", () => {
+		const database = new Database(":memory:");
+		try {
+			let error: unknown;
+			try {
+				database.query("SELECT private_column FROM private_table").all();
+			} catch (failure) {
+				error = failure;
+			}
+			expect(error).toBeInstanceOf(Error);
+			expect(workerFailure(error)).toEqual({
+				code: "SQLITE_ERROR",
+				message: "database read worker query failed",
+			});
+			expect(
+				workerFailure(Object.assign(new Error("private"), { code: "SQLITE_PRIVATE" })),
+			).toEqual({ code: "DB_READ_FAILED", message: "database read worker query failed" });
+		} finally {
+			database.close();
+		}
+	});
 	test("known not-found errors retain prototype status code and localization", () => {
 		const original = new NotFoundError("Message", "missing");
 		const wire = workerFailure(original);

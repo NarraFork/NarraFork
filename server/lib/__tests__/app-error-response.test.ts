@@ -58,6 +58,7 @@ describe("database reader HTTP error boundary", () => {
 	for (const code of [
 		"DB_READ_UNAVAILABLE",
 		"DB_READ_OVERLOADED",
+		"DB_READ_TASK_OVERLOADED",
 		"DB_READ_BUSY",
 		"DB_READ_DATABASE_CLOSED",
 		"DB_READ_WORKER_EXITED",
