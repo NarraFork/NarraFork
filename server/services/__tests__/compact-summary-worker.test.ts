@@ -211,7 +211,7 @@ test("the HTTP route checks access before dispatch and before releasing the snap
 				id,
 				username: id,
 				passwordHash: "unused",
-				role: "user",
+				role: "user" as const,
 				createdAt: now,
 			})),
 		)
@@ -221,7 +221,7 @@ test("the HTTP route checks access before dispatch and before releasing the snap
 		.where(eq(narrators.id, narratorId))
 		.run();
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: c.req.header("x-test-user") ?? owner, role: "user" });
+		c.set("user", { sub: c.req.header("x-test-user") ?? owner, role: "user", iat: 1, exp: 2 });
 		await next();
 	});
 	app.route("/", narratorRoutes);
