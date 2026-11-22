@@ -28,6 +28,7 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { RevertSelectionBodyParams } from "./revert-selection-body-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
@@ -53,6 +54,7 @@ export type DbReadTaskName =
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
 	| "storageHistoryRead"
+	| "revertSelectionBody"
 	| "storageHistoryBody";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -253,6 +255,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| RevertSelectionBodyParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams

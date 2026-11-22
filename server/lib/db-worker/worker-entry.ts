@@ -51,6 +51,7 @@ import type {
 	StorageScanTablesResult,
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
+import { readRevertSelectionBody } from "./revert-selection-body-query";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
@@ -218,8 +219,11 @@ port.on("message", async (message: DbWorkerInbound) => {
 	try {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
-			runInSqlTraceSpan(sqlSpan, async () =>
-				params.kind === "storageHistoryRead"
+			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "revertSelectionBody") {
+					return readRevertSelectionBody(getConnection(message.dbPath), params, controller.signal);
+				}
+				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
 					: params.kind === "storageHistoryBody"
 						? runStorageHistoryBody(getConnection(message.dbPath), params)
@@ -265,8 +269,8 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				message.requestId,
 																				params,
 																				controller.signal,
-																			),
-			),
+																			);
+			}),
 		);
 		post({
 			type: "result",
