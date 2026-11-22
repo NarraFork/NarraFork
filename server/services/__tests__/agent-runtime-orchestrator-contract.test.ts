@@ -449,7 +449,43 @@ describe("Bash Git command detection for status refresh", () => {
 });
 
 describe("tool Git status refresh", () => {
-	test("invalidates at the write boundary and shares cached status in the trailing broadcast", async () => {
+	test("100 read completions do no Git work; unobserved writes only mark lazy facts dirty", async () => {
+		const statusCache = await import("../git-status-cache");
+		const ws = await import("../../websocket/narrator-ws");
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const markDirty = spyOn(statusCache, "markStatusDirty");
+		const read = spyOn(statusCache, "getStatusSummaryCached");
+		spyOn(ws, "getNarratorConnections").mockReturnValue(new Set());
+		let verified = false;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				h.session.cwd = "/git-track-read-fixture";
+				h.session._isInGitRepo = true;
+				const spawn = spyOn(Bun, "spawn");
+				for (let index = 0; index < 100; index++)
+					await options.hooks?.onGitTrack?.("Bash", `read-${index}`, {
+						command: "git status && git diff && git log -1",
+					});
+				expect(markDirty).not.toHaveBeenCalled();
+				expect(read).not.toHaveBeenCalled();
+				expect(spawn).not.toHaveBeenCalled();
+				for (let index = 0; index < 100; index++)
+					await options.hooks?.onGitTrack?.("Write", `write-${index}`, { file_path: "changed" });
+				expect(markDirty).toHaveBeenCalledTimes(100);
+				expect(invalidate).not.toHaveBeenCalled();
+				expect(read).not.toHaveBeenCalled();
+				expect(spawn).not.toHaveBeenCalled();
+				expect(h.session._gitTrackTimer).toBeUndefined();
+				spawn.mockRestore();
+				verified = true;
+				return { ...finished };
+			},
+		]);
+		await h.run();
+		expect(verified).toBe(true);
+	});
+
+	test("marks writes lazily and shares one delayed status read for the subscribed header", async () => {
 		const statusCache = await import("../git-status-cache");
 		const { gitService } = await import("../git-service");
 		const ws = await import("../../websocket/narrator-ws");
@@ -473,6 +509,12 @@ describe("tool Git status refresh", () => {
 			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
 		);
 		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const markDirty = spyOn(statusCache, "markStatusDirty");
+		spyOn(ws, "getNarratorConnections").mockReturnValue(
+			new Set([{ data: { subscribedNarrators: new Set(["contract-primary"]) } }]) as ReturnType<
+				typeof ws.getNarratorConnections
+			>,
+		);
 		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		let verified = false;
@@ -490,13 +532,14 @@ describe("tool Git status refresh", () => {
 				}) as typeof setTimeout);
 				const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
 				try {
-					options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
-					expect(invalidate).toHaveBeenCalledTimes(1);
-					options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
-					expect(invalidate).toHaveBeenCalledTimes(2);
+					await options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
+					expect(markDirty).toHaveBeenCalledTimes(1);
+					await options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
+					expect(markDirty).toHaveBeenCalledTimes(2);
+					expect(invalidate).not.toHaveBeenCalled();
 					expect(query).not.toHaveBeenCalled();
-					expect(clear).toHaveBeenCalledTimes(1);
-					expect(scheduled).toHaveLength(2);
+					expect(clear).not.toHaveBeenCalled();
+					expect(scheduled).toHaveLength(1);
 				} finally {
 					timer.mockRestore();
 					clear.mockRestore();
@@ -506,9 +549,9 @@ describe("tool Git status refresh", () => {
 				await statusCache.getStatusSummaryCached(repo);
 				expect(query).toHaveBeenCalledTimes(1);
 				cachedRead.mockClear();
-				scheduled[1]();
+				scheduled[0]();
 				await new Promise<void>((resolve) => setImmediate(resolve));
-				expect(invalidate).toHaveBeenCalledTimes(2);
+				expect(invalidate).not.toHaveBeenCalled();
 				expect(query).toHaveBeenCalledTimes(1);
 				expect(cachedRead).toHaveBeenCalledWith(repo);
 				expect(
