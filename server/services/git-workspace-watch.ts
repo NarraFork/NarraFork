@@ -819,7 +819,7 @@ export class GitWorkspaceWatchPool {
 						// Uncertain fingerprints retain conservative statistics refreshes. The
 						// Worker independently compares full bounded file membership before
 						// expiring a cursor, so large unchanged trees can keep paging.
-						this.invalidate(target, !(related && (!this.reads.validatePages || !uncertain)));
+						this.invalidate(target, !!this.reads.validatePages || !related);
 						this.markDirty(entry);
 						entry.lastValidatedAt = Date.now();
 					} else if (entry.previous && !entry.dirty) {

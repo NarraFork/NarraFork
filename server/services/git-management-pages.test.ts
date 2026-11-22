@@ -262,7 +262,10 @@ test("request cancellation reaches the shared statistics source", async () => {
 	}
 });
 
-test("an uncertain content-only watch change refreshes statistics without expiring its page chain", async () => {
+test.each([
+	false,
+	true,
+])("content-only watch changes preserve page chains (uncertain: %s)", async (uncertain) => {
 	const { target, calls, respond } = fixture(measured(3, 2));
 	const first = await getGitWorkspaceStatusPage(target, "reader", { limit: 1 });
 	let fingerprint = "baseline";
@@ -276,7 +279,10 @@ test("an uncertain content-only watch change refreshes statistics without expiri
 	});
 	const lineStats: GitLineStats = { files: [], linesAdded: 0, linesRemoved: 0, complete: true };
 	const pool = new GitWorkspaceWatchPool(
-		async () => ({ fingerprints: { worktree: fingerprint }, uncertain: ["worktree"] }),
+		async () => ({
+			fingerprints: { worktree: fingerprint },
+			uncertain: uncertain ? ["worktree"] : [],
+		}),
 		5,
 		{
 			status: async () => ({
