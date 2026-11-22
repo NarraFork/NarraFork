@@ -13,6 +13,7 @@ import {
 } from "../lib/agent/tools/worktree";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
 import type { WorktreeCreateRequest } from "../lib/validators/narrator-worktrees";
 import { createNarratorWorktreeRoutes } from "../routes/narrator-worktrees";
@@ -934,6 +935,144 @@ describe("bounded worktree snapshot pagination", () => {
 			service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
 		).rejects.toThrow("cancelled read");
 		expect(calls).toBe(1);
+	});
+});
+
+describe("slow worktree list diagnostics", () => {
+	let time: number;
+	let warnings: Parameters<typeof logger.warn>[];
+	let restore: () => void;
+
+	beforeEach(() => {
+		time = 0;
+		warnings = [];
+		const clock = spyOn(performance, "now").mockImplementation(() => time++);
+		const warn = spyOn(logger, "warn").mockImplementation((...args) => {
+			warnings.push(args);
+		});
+		restore = () => {
+			warn.mockRestore();
+			clock.mockRestore();
+		};
+	});
+
+	afterEach(() => restore());
+
+	test("attributes a slow initial and cursor page without logging request or Git data", async () => {
+		await git(["worktree", "add", "-b", "private-topic", join(source, ".worktrees", "private")]);
+		const request = {
+			workspaceKey: "workspace",
+			limit: 1,
+			sort: "name",
+			order: "asc",
+			search: "worktree-test",
+		};
+		const authorize = ports.authorize;
+		const realGit = ports.runGit;
+		if (!realGit) throw new Error("Missing fixture Git runner");
+		let authorizationDelay = 0;
+		let slowGit = false;
+		const commands: string[] = [];
+		ports.authorizeList = async (...args) => {
+			time += authorizationDelay;
+			return authorize(...args);
+		};
+		ports.runGit = async (...args) => {
+			const command = args[1][0] ?? "";
+			commands.push(command);
+			if (slowGit) time += command === "worktree" ? 350 : 200;
+			return realGit(...args);
+		};
+
+		await service.list("private-actor", "private-narrator", request, signal());
+		expect(warnings).toEqual([]);
+		commands.length = 0;
+		authorizationDelay = 500;
+		slowGit = true;
+		const first = await service.list("private-actor", "private-narrator", request, signal());
+		expect(first.entries.map(({ branch }) => branch)).toEqual(["refs/heads/main"]);
+		expect(first.nextCursor).toBeString();
+		expect(commands).toEqual(["worktree", "show"]);
+		const initialTimings = warnings[0]?.[1];
+		expect(initialTimings?.authorizationMs).toBeGreaterThanOrEqual(500);
+		expect(initialTimings?.enumerationMs).toBeGreaterThanOrEqual(350);
+		expect(initialTimings?.metadataMs).toBeGreaterThanOrEqual(200);
+		expect(initialTimings?.snapshotMs).toBeGreaterThan(0);
+		expect(initialTimings?.pageMs).toBeGreaterThan(0);
+		expect(warnings.splice(0)).toEqual([
+			[
+				"Slow worktree listing",
+				{
+					elapsedMs: expect.any(Number),
+					authorizationMs: expect.any(Number),
+					enumerationMs: expect.any(Number),
+					metadataMs: expect.any(Number),
+					snapshotMs: expect.any(Number),
+					pageMs: expect.any(Number),
+					cursorPage: false,
+					outcome: "complete",
+				},
+			],
+		]);
+
+		authorizationDelay = 1100;
+		const second = await service.list(
+			"private-actor",
+			"private-narrator",
+			{ ...request, cursor: first.nextCursor },
+			signal(),
+		);
+		expect(second.entries.map(({ branch }) => branch)).toEqual(["refs/heads/private-topic"]);
+		expect(second.nextCursor).toBeNull();
+		expect(commands).toEqual(["worktree", "show"]);
+		expect(authorizations).toEqual(["read", "read", "read"]);
+		expect(warnings[0]?.[1]?.authorizationMs).toBeGreaterThanOrEqual(1100);
+		expect(warnings).toEqual([
+			[
+				"Slow worktree listing",
+				{
+					elapsedMs: expect.any(Number),
+					authorizationMs: expect.any(Number),
+					enumerationMs: 0,
+					metadataMs: 0,
+					snapshotMs: expect.any(Number),
+					pageMs: expect.any(Number),
+					cursorPage: true,
+					outcome: "complete",
+				},
+			],
+		]);
+	});
+
+	test("preserves a slow Git error while keeping stderr out of the warning", async () => {
+		const stderr = `fatal: fixture error at ${source}`;
+		ports.runGit = async () => {
+			time += 1100;
+			return { exitCode: 128, stderr, stdout: "" };
+		};
+		await expect(
+			service.list("private-actor", "private-narrator", { workspaceKey: "workspace" }, signal()),
+		).rejects.toMatchObject({
+			code: "WORKTREE_LIST_FAILED",
+			statusCode: 409,
+			message: `Unable to list Git worktrees: ${stderr}`,
+		});
+		expect(warnings[0]?.[1]?.enumerationMs).toBeGreaterThanOrEqual(1100);
+		expect(warnings).toEqual([
+			[
+				"Slow worktree listing",
+				{
+					elapsedMs: expect.any(Number),
+					authorizationMs: expect.any(Number),
+					enumerationMs: expect.any(Number),
+					metadataMs: 0,
+					snapshotMs: expect.any(Number),
+					pageMs: 0,
+					cursorPage: false,
+					outcome: "error",
+				},
+			],
+		]);
 	});
 });
 
