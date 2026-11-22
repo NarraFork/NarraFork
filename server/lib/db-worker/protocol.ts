@@ -21,6 +21,8 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { PublicationRun } from "../../services/agent-runtime/publication-outbox";
+import type { AgentTerminalResultReadOptions } from "../../services/agent-runtime/publication-result";
 import type {
 	BlockBackfillSliceParams,
 	BlockIndexQueueSliceParams,
@@ -28,8 +30,10 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
+import type { RecallConversationParams } from "./recall-conversation-query";
 import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -40,13 +44,17 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "databaseCleanupContext"
+	| "toolDetailSnapshot"
 	| "selectRows"
 	| "toolEditPreview"
+	| "knowledgeEntryDetail"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
@@ -55,8 +63,10 @@ export type DbReadTaskName =
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
 	| "recallToolCall"
+	| "recallConversation"
 	| "storageHistoryRead"
-	| "storageHistoryBody";
+	| "storageHistoryBody"
+	| "publicationTerminalResult";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
 export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
@@ -256,9 +266,17 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
+	| RecallToolCallParams
+	| RecallConversationParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
-	| RecallToolCallParams
+	| {
+			kind: "publicationTerminalResult";
+			run: PublicationRun;
+			options: AgentTerminalResultReadOptions;
+			fromBlocks: boolean;
+	  }
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
@@ -269,8 +287,11 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| { kind: "databaseCleanupContext" }
+	| ToolDetailSnapshotParams
 	| SelectRowsParams
 	| { kind: "toolEditPreview"; toolCallId: string }
+	| { kind: "knowledgeEntryDetail"; entryId: string }
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 

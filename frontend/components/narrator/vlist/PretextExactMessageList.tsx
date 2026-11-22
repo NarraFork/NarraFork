@@ -111,6 +111,7 @@ import type { RenderLod } from "./prepared-block";
 import { resolveRenderExtra } from "./render-registry";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
+import { useReasoningTranslationLivePatches } from "./useReasoningTranslationLivePatches";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
@@ -2626,6 +2627,11 @@ export const PretextExactMessageList = memo(
 				// the pre-completion empty detail.
 				onUnappliedToolCompletion: bumpMessageRevision,
 			});
+			useReasoningTranslationLivePatches(
+				revisionSubscriptionId,
+				pretextDocument.messages,
+				pretextDocument.applyLivePatch,
+			);
 
 			// Structural reload gate — now the FALLBACK, not the normal path.
 			//

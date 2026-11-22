@@ -74,6 +74,7 @@ beforeEach(async () => {
 			last_message_at TEXT, is_background INTEGER DEFAULT 0, background_status TEXT
 		);
 		CREATE TABLE terminals (id TEXT PRIMARY KEY, narrator_id TEXT, status TEXT);
+		CREATE INDEX idx_terminals_narrator ON terminals (narrator_id);
 		CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, content_json TEXT);
 		CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT);
 		CREATE TABLE narrator_tool_calls (
@@ -97,6 +98,43 @@ afterAll(() => {
 });
 
 describe("session cleanup read workers", () => {
+	test("preview reads beyond one context page and honors running terminals without inline scans", async () => {
+		sqlite.transaction(() => {
+			for (let i = 0; i < 258; i++) seedNarrator(`session-${String(i).padStart(3, "0")}`);
+			sqlite.run("INSERT INTO terminals VALUES ('live', 'session-257', 'running')");
+		})();
+		const prepare = spyOn(sqlite, "prepare").mockImplementation(() => {
+			throw new Error("unexpected inline cleanup context read");
+		});
+		const preview = await databaseCleanupService.previewCleanup("archivedSessions");
+		expect(preview.counts.sessions).toBe(257);
+		expect(preview.blockedCount).toBe(1);
+		expect(prepare).not.toHaveBeenCalled();
+	}, 30_000);
+
+	test("context byte cap fails the preview rather than returning plan counts", async () => {
+		seedNarrator("archived");
+		sqlite.prepare("UPDATE narrators SET title = ?").run("x".repeat(8 * 1024 * 1024));
+		const result = await databaseCleanupService
+			.previewCleanup("archivedSessions")
+			.catch((error: unknown) => error);
+		expect(result).toMatchObject({ code: "DATABASE_CLEANUP_CONTEXT_BUDGET_EXCEEDED" });
+	}, 30_000);
+
+	test("cancelled preview skips both context and statistics reads", async () => {
+		const mainReads = spyOn(sqlite, "prepare");
+		const shared = spyOn(pool, "runReadTask");
+		const ephemeral = spyOn(pool, "runEphemeralReadTask");
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			databaseCleanupService.previewCleanup("archivedSessions", { signal: controller.signal }),
+		).rejects.toThrow();
+		expect(shared.mock.calls.map(([, params]) => params.kind)).toEqual(["databaseCleanupContext"]);
+		expect(ephemeral).not.toHaveBeenCalled();
+		expect(mainReads).not.toHaveBeenCalled();
+	});
+
 	test("worker measures counts, legacy dump bytes and samples without main-thread payload reads", async () => {
 		seedNarrator("root");
 		seedNarrator("child", "archived", "root");
@@ -273,14 +311,19 @@ describe("session cleanup read workers", () => {
 		expect(result.changed).toBe(true);
 		expect(result.warningCodes).toContain("statisticsUnavailable");
 		expect(remove).toHaveBeenCalledTimes(1);
-		expect(shared).not.toHaveBeenCalled();
+		expect(shared.mock.calls.map(([, params]) => params.kind)).toEqual(["databaseCleanupContext"]);
 		expect(ephemeral).not.toHaveBeenCalled();
 	});
 
 	test("both workers unavailable degrades preview statistics and never scans synchronously", async () => {
 		seedNarrator("archived");
 		const mainReads = forbidMainThreadPayloadReads();
-		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
+		const run = pool.runReadTask;
+		spyOn(pool, "runReadTask").mockImplementation((...args) =>
+			args[1].kind === "databaseCleanupContext"
+				? run(...args)
+				: Promise.reject(new pool.WorkersUnavailableError("disabled")),
+		);
 		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockRejectedValue(
 			new Error("spawn failed"),
 		);
@@ -319,14 +362,20 @@ describe("session cleanup read workers", () => {
 	test("cleanup watchdog does not restart the payload scan and preview still degrades", async () => {
 		seedNarrator("archived");
 		forbidMainThreadPayloadReads();
-		const read = spyOn(pool, "runReadTask").mockRejectedValue(
-			new pool.DbReadTaskTimeoutError("cleanup read timed out"),
+		const run = pool.runReadTask;
+		const read = spyOn(pool, "runReadTask").mockImplementation((...args) =>
+			args[1].kind === "databaseCleanupContext"
+				? run(...args)
+				: Promise.reject(new pool.DbReadTaskTimeoutError("cleanup read timed out")),
 		);
 		const ephemeral = spyOn(pool, "runEphemeralReadTask");
 		const preview = await databaseCleanupService.previewCleanup("archivedSessions");
 		expect(preview.warningCodes).toContain("statisticsUnavailable");
 		expect(preview.counts.sessions).toBe(1);
-		expect(read).toHaveBeenCalledTimes(1);
+		expect(read.mock.calls.map(([, params]) => params.kind)).toEqual([
+			"databaseCleanupContext",
+			"storageScanSessionPreview",
+		]);
 		expect(ephemeral).not.toHaveBeenCalled();
 	});
 
@@ -337,7 +386,8 @@ describe("session cleanup read workers", () => {
 		forbidMainThreadPayloadReads();
 		let now = 1000;
 		spyOn(Date, "now").mockImplementation(() => now);
-		const read = spyOn(pool, "runReadTask").mockImplementation(() => {
+		const read = spyOn(pool, "runReadTask").mockImplementation((_path, params) => {
+			if (params.kind === "databaseCleanupContext") return Promise.resolve([] as never);
 			now += 40_000;
 			return Promise.reject(new pool.WorkersUnavailableError("disabled"));
 		});
@@ -360,7 +410,7 @@ describe("session cleanup read workers", () => {
 			readFailures: { tableCount: 0, tableNames: [] },
 		});
 		await databaseCleanupService.scanDatabaseBreakdown();
-		expect(read.mock.calls[0][2]?.timeoutMs).toBe(300_000);
+		expect(read.mock.calls.map(([, , options]) => options?.timeoutMs)).toEqual([300_000, 300_000]);
 		expect(ephemeral.mock.calls[0][2]?.timeoutMs).toBe(260_000);
 		expect(objects.mock.calls[0][0].budgetMs).toBe(260_000);
 	});

@@ -279,6 +279,7 @@ export interface KnowledgeReadStore {
 	// ── entries ──
 	/** Full row by id, or null. The caller decides whether the content blob is needed. */
 	getEntryById(entryId: string): Promise<KnowledgeEntryRow | null>;
+	getEntryDetailById(entryId: string, signal?: AbortSignal): Promise<KnowledgeEntryRow | null>;
 	/** The ACL gate fields of one entry, or null. */
 	getEntryAclById(entryId: string): Promise<KnowledgeEntryAclRow | null>;
 	/** The ACL + display fields of one entry (link/graph endpoint), or null. */

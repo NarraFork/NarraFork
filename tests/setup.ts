@@ -87,8 +87,8 @@ export function applyMigrations(sqlite: Database): void {
 	})();
 }
 
-export function getTestDb() {
-	const sqlite = new Database(":memory:");
+export function getTestDb(filename = ":memory:") {
+	const sqlite = new Database(filename);
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	applyMigrations(sqlite);
 	ensureColumns(sqlite);
