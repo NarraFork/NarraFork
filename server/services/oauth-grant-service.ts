@@ -259,13 +259,24 @@ async function getRevokedGrantDisplayAccess(
 	};
 }
 
-async function toGrantView(row: typeof oauthGrants.$inferSelect): Promise<OAuthGrantView> {
+async function toGrantView(
+	row: typeof oauthGrants.$inferSelect,
+	displayRead?: { signal?: AbortSignal },
+): Promise<OAuthGrantView> {
 	const [client, authority, revokedDisplayAccess] = await Promise.all([
 		db.query.oauthClients.findFirst({
 			where: eq(oauthClients.id, row.oauthClientId),
 			columns: { clientId: true, name: true },
 		}),
-		integrationAuthorityService.getSnapshot(row.id),
+		displayRead
+			? integrationAuthorityService.getCommittedDisplaySnapshot(row.id, displayRead.signal)
+			: integrationAuthorityService
+					.getSnapshot(row.id)
+					.then((snapshot) =>
+						snapshot
+							? { policyJson: snapshot.authority.policyJson, grants: snapshot.grants }
+							: null,
+					),
 		row.revokedAt ? getRevokedGrantDisplayAccess(row) : null,
 	]);
 	if (!client) throw new NotFoundError("OAuth client", row.oauthClientId);
@@ -293,7 +304,7 @@ async function toGrantView(row: typeof oauthGrants.$inferSelect): Promise<OAuthG
 		clientName: client.name,
 		scopes,
 		projectIds,
-		policyJson: authority?.authority.policyJson ?? null,
+		policyJson: authority?.policyJson ?? null,
 		legacyUnscoped: row.legacyUnscoped,
 		consentedAt: row.consentedAt,
 		lastTokenIssuedAt: row.lastTokenIssuedAt,
@@ -879,11 +890,13 @@ export const createGrant = createOAuthGrant;
 export async function getUserOAuthGrant(
 	userId: string,
 	grantId: string,
+	displayRead?: { signal?: AbortSignal },
 ): Promise<OAuthGrantView | null> {
-	const row = await db.query.oauthGrants.findFirst({
+	const query = db.query.oauthGrants.findFirst({
 		where: and(eq(oauthGrants.id, grantId), eq(oauthGrants.userId, userId)),
 	});
-	return row ? toGrantView(row) : null;
+	const row = displayRead ? query.sync() : await query;
+	return row ? toGrantView(row, displayRead) : null;
 }
 
 export const getUserGrant = getUserOAuthGrant;
@@ -917,7 +930,7 @@ export async function listUserOAuthGrants(
 	const hasMore = rows.length > limit;
 	const pageRows = hasMore ? rows.slice(0, limit) : rows;
 	return {
-		items: await Promise.all(pageRows.map(toGrantView)),
+		items: await Promise.all(pageRows.map((row) => toGrantView(row))),
 		nextCursor: hasMore
 			? encodeCursor({
 					createdAt: pageRows[pageRows.length - 1].createdAt,

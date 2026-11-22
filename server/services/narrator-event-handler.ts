@@ -9,6 +9,14 @@ import {
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
+import {
+	getValidReasoningTranslationParts,
+	isReasoningTranslationId,
+	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
+	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
+	type ReasoningTranslationFields,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
@@ -17,8 +25,14 @@ import {
 } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import { and, eq } from "drizzle-orm";
-import { db } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { activeDatabaseBackend, db } from "../db";
+import {
+	apiRequests,
+	narratorBlocks,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+} from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -51,6 +65,7 @@ import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { getRunControl } from "./agent-runtime/ownership";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { knownBlockIdForElement } from "./narrator-block-ids";
 import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { completeAssistantOutput } from "./narrator-output-recovery";
@@ -1221,6 +1236,7 @@ function broadcastToolCompleted(
 		type: "tool_completed",
 		narratorId: ctx.broadcastTargetId,
 		toolCallId: message.toolCallId,
+		...(message.executionAttempt != null ? { executionAttempt: message.executionAttempt } : {}),
 		toolUseId: message.toolUseId,
 		toolName: message.toolName,
 		status: message.status,
@@ -1455,7 +1471,7 @@ const LOCALE_NAMES: Record<string, string> = {
 	ko: "한국어",
 };
 
-type PersistedReasoningBlock = {
+type PersistedReasoningBlock = ReasoningTranslationFields & {
 	type?: string;
 	id?: string;
 	text?: string;
@@ -1594,8 +1610,20 @@ function translateReasoningBlock(
 			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
 			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
 			if (!isSameReasoningBlock(beforeBlock, reasoningText) || beforeBlock?.translatedText) return;
-			const result = await summaryGenerate(
+			let start = 0;
+			const generation = beforeBlock?.translationGeneration ?? randomUUID();
+			for (const part of getValidReasoningTranslationParts(
 				reasoningText,
+				generation,
+				beforeBlock?.translationParts,
+			)) {
+				if (part.start !== start) break;
+				start = part.end;
+			}
+			if (start === reasoningText.length) return;
+			const sourceText = reasoningText.slice(start);
+			const result = await summaryGenerate(
+				sourceText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
 				{ narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
 				undefined,
@@ -1629,18 +1657,69 @@ function translateReasoningBlock(
 			// See isSameReasoningBlock.
 			if (!isSameReasoningBlock(blocks[targetIdx], reasoningText)) return;
 
-			const patched = await narratorService.patchReasoningTranslation(
-				messageId,
-				targetIdx,
-				translated,
-				{
-					id: locator?.id,
-					text: reasoningText,
-				},
-			);
+			const elementId = locator?.id;
+			const part: ReasoningTranslationPart = {
+				id: randomUUID(),
+				generation,
+				start,
+				end: reasoningText.length,
+				sourceText,
+				translatedText: translated,
+			};
+			const useRange =
+				activeDatabaseBackend === "sqlite" &&
+				isReasoningTranslationId(elementId) &&
+				Buffer.byteLength(sourceText) <= MAX_REASONING_TRANSLATION_SOURCE_BYTES &&
+				Buffer.byteLength(translated) <= MAX_REASONING_TRANSLATION_OUTPUT_BYTES;
+			const patched = useRange
+				? narratorService.patchReasoningTranslationRange(messageId, elementId, reasoningText, part)
+				: start === 0 &&
+					(await narratorService.patchReasoningTranslation(messageId, targetIdx, translated, {
+						id: elementId,
+						text: reasoningText,
+					}));
 			if (!patched) return;
 
-			// Broadcast updated message so frontend picks up the translation
+			if (useRange) {
+				const blockId = knownBlockIdForElement(narratorId, elementId);
+				const receipt = blockId
+					? (
+							await db
+								.select({
+									blockRevision: narratorBlocks.revision,
+									stateRevision: narratorMessages.stateRevision,
+								})
+								.from(narratorBlocks)
+								.innerJoin(narratorMessages, eq(narratorBlocks.messageId, narratorMessages.id))
+								.where(
+									and(
+										eq(narratorBlocks.id, blockId),
+										eq(narratorBlocks.messageId, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+										eq(narratorBlocks.kind, "reasoning"),
+										eq(narratorMessages.bodyFormat, 2),
+									),
+								)
+								.limit(1)
+						)[0]
+					: null;
+				if (receipt && blockId) {
+					dualBroadcast(ctx, {
+						type: "reasoning_translation_patch",
+						narratorId: broadcastTargetId,
+						ownerNarratorId: narratorId,
+						messageId,
+						blockId,
+						elementId,
+						...receipt,
+						translationGeneration: generation,
+						part,
+					});
+					return;
+				}
+			}
+
+			// Legacy/unnamed blocks do not have a persistent identity for a compact frame.
 			const fullMessage = fillBody(
 				await db.query.narratorMessages.findFirst({
 					...bodyColumns(),
@@ -2880,6 +2959,7 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				...subagentToolRouting(ctx, event.toolUseId),
 				...(resultToolCallId ? { toolCallId: resultToolCallId } : {}),
+				...(binding ? { executionAttempt: binding.attempt } : {}),
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
@@ -3101,7 +3181,10 @@ export async function processEvent(
 				type: "tool_use_discarded",
 				narratorId: broadcastTargetId,
 				toolUseIds: event.toolUseIds,
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				...(ctx.parentToolUseId && {
+					parentToolUseId: ctx.parentToolUseId,
+					subagentNarratorId: narratorId,
+				}),
 			});
 			return null;
 		}

@@ -82,6 +82,7 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/reasoning-translation").ReasoningTranslationPatch
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
 	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
@@ -1070,6 +1071,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseIds: string[];
 			parentToolUseId?: string;
+			subagentNarratorId?: string;
 	  }
 	| {
 			type: "model_switched";

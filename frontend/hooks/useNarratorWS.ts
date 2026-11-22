@@ -7,6 +7,10 @@ import {
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	type ReasoningTranslationPatch,
+	readReasoningTranslationPatch,
+} from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	normalizeSubagentNestedSummary,
@@ -96,7 +100,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		model: nonEmptyString(data.model),
 		// Re-normalized rather than trusted: the same cap and key whitelist the server
 		// applied, so a hand-crafted frame cannot widen the payload the row renders.
-		inputSummary: normalizeSubagentToolInputSummary(data.inputSummary),
+		...(data.inputSummary !== undefined
+			? { inputSummary: normalizeSubagentToolInputSummary(data.inputSummary) }
+			: {}),
 	};
 }
 
@@ -107,6 +113,7 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	const eventMeta = subagentToolEventMeta(record);
 	return {
 		toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+		...(eventMeta.executionAttempt != null ? { executionAttempt: eventMeta.executionAttempt } : {}),
 		toolUseId: record.toolUseId,
 		toolName: record.toolName,
 		status: typeof record.status === "string" ? record.status : "initializing",
@@ -118,7 +125,9 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
 		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
 		// moment a reconnect snapshot replaced the fetched activity.
-		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
+		...(eventMeta.inputSummary != null || record.inputSummary === null
+			? { inputSummary: eventMeta.inputSummary }
+			: {}),
 	};
 }
 
@@ -867,6 +876,7 @@ export interface NarratorWSCallbacks {
 		replacement?: MessageReplacementAliases,
 	) => void;
 	onMessageUpdated?: (message: TreeMessage, replacement?: MessageReplacementAliases) => void;
+	onReasoningTranslationPatch?: (patch: ReasoningTranslationPatch) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -950,7 +960,11 @@ export interface NarratorWSCallbacks {
 	 * persisted, so nothing else will retire them — drop them or they stay
 	 * "running" forever with a live elapsed timer.
 	 */
-	onToolUseDiscarded?: (toolUseIds: string[], parentToolUseId?: string) => void;
+	onToolUseDiscarded?: (
+		toolUseIds: string[],
+		parentToolUseId?: string,
+		subagentNarratorId?: string,
+	) => void;
 }
 
 export function useNarratorWS(
@@ -1032,6 +1046,11 @@ export function useNarratorWS(
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
+					case "reasoning_translation_patch": {
+						const patch = readReasoningTranslationPatch(data);
+						if (patch) callbackOwner.callbacks.onReasoningTranslationPatch?.(patch);
+						break;
+					}
 					case "message":
 						callbackOwner.callbacks.onMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },
@@ -1932,6 +1951,7 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onToolUseDiscarded?.(
 							(data.toolUseIds ?? []) as string[],
 							data.parentToolUseId as string | undefined,
+							nonEmptyString(data.subagentNarratorId) ?? undefined,
 						);
 						break;
 				}

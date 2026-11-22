@@ -1,6 +1,7 @@
 import { desc, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 
 const RECENT_ACTIVITY_LIMIT = 3;
 const MAX_ACTIVITY_ROWS = 5;
@@ -168,8 +169,10 @@ export async function getRecentSubagentToolActivity(
 	narratorId: string,
 	limit = RECENT_ACTIVITY_LIMIT,
 ): Promise<SubagentToolActivity[]> {
-	const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), MAX_ACTIVITY_ROWS);
-	const rows = await db
+	const boundedLimit = Number.isFinite(limit)
+		? Math.min(Math.max(Math.trunc(limit), 1), MAX_ACTIVITY_ROWS)
+		: RECENT_ACTIVITY_LIMIT;
+	const query = db
 		.select({
 			toolName: narratorToolCalls.toolName,
 			status: narratorToolCalls.status,
@@ -205,6 +208,11 @@ export async function getRecentSubagentToolActivity(
 		.where(eq(narratorToolCalls.narratorId, narratorId))
 		.orderBy(desc(narratorToolCalls.createdAt))
 		.limit(boundedLimit);
+	const rows = await readQuery(query, {
+		diagnosticSource: "await.recent-subagent-activity",
+		maxRows: boundedLimit,
+		timeoutMs: 5_000,
+	});
 
 	return rows.map((row) => ({
 		at: selectActivityTimestamp(row),

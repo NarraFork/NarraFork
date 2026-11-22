@@ -3562,6 +3562,8 @@ export const narratorService = {
 	appendBlockToMessage: narratorPersistence.appendBlockToMessage.bind(narratorPersistence),
 	patchReasoningTranslation:
 		narratorPersistence.patchReasoningTranslation.bind(narratorPersistence),
+	patchReasoningTranslationRange:
+		narratorPersistence.patchReasoningTranslationRange.bind(narratorPersistence),
 	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
 	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
 	updateMessageHistoryTokenEstimate:

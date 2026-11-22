@@ -13,6 +13,12 @@ import type { MessageOriginOptions } from "@shared/message-origin";
 import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import {
+	getValidReasoningTranslationParts,
+	isReasoningTranslationId,
+	type ReasoningTranslationFields,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
+import {
 	and,
 	desc,
 	eq,
@@ -3170,7 +3176,13 @@ const sqliteNarratorPersistence = {
 									block.providerMetadata,
 								);
 							}
-							if (previous.text !== block.text) delete next.translatedText;
+							if (previous.text !== block.text) {
+								delete next.translatedText;
+								if (typeof previous.text !== "string" || !block.text.startsWith(previous.text)) {
+									delete next.translationGeneration;
+									delete next.translationParts;
+								}
+							}
 							if (stale || isDeepStrictEqual(previous, next)) {
 								content = current;
 							} else {
@@ -3320,6 +3332,47 @@ const sqliteNarratorPersistence = {
 			if (expected && block.text !== expected.text) return null;
 			if (block.translatedText === translatedText) return null;
 			block.translatedText = translatedText;
+			return content;
+		});
+	},
+
+	/** Keep display ranges in reader state, independently of the provider's reasoning. */
+	patchReasoningTranslationRange(
+		messageId: string,
+		elementId: string,
+		source: string,
+		part: ReasoningTranslationPart,
+	): boolean {
+		if (!isReasoningTranslationId(elementId)) return false;
+		if (!getValidReasoningTranslationParts(source, part.generation, [part]).length) return false;
+		return patchEnvelopeState(messageId, (content) => {
+			const block = content.find(
+				(entry) =>
+					(entry as { type?: unknown; id?: unknown } | null)?.type === "reasoning" &&
+					(entry as { id?: unknown }).id === elementId,
+			) as (ReasoningTranslationFields & { text?: unknown; translatedText?: unknown }) | undefined;
+			if (
+				!block ||
+				block.text !== source ||
+				block.translatedText ||
+				(block.translationGeneration !== undefined &&
+					block.translationGeneration !== part.generation)
+			)
+				return null;
+			const existing = getValidReasoningTranslationParts(
+				source,
+				part.generation,
+				block.translationParts,
+			);
+			if (
+				existing.length >= 64 ||
+				existing.some(
+					(range) => range.id === part.id || (range.start < part.end && part.start < range.end),
+				)
+			)
+				return null;
+			block.translationGeneration = part.generation;
+			block.translationParts = [...existing, part].sort((a, b) => a.start - b.start);
 			return content;
 		});
 	},

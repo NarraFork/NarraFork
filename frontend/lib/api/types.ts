@@ -10,6 +10,7 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { ReasoningTranslationFields } from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
@@ -608,6 +609,7 @@ export interface SubagentToolCallTiming {
 
 export interface SubagentToolCallHeader {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -631,7 +633,7 @@ export interface SubagentToolCallHeader {
 	 * feed the normal tool card rather than an activity row and need no summary.
 	 * See `SubagentActivityRow`.
 	 */
-	inputSummary?: SubagentToolInputSummary;
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface SubagentFileChanges {
@@ -696,7 +698,7 @@ export interface ExecutionTargetIdentity {
 	selectionSource?: "explicit" | "session_default" | "local_default";
 }
 
-export interface BaseContentBlock {
+export interface BaseContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string;
 	thinking?: string;
@@ -1075,6 +1077,7 @@ export interface TreeMessage {
 	provider?: string | null;
 	id: string;
 	narratorId: string;
+	stateRevision?: number;
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;

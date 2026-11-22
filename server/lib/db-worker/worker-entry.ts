@@ -55,6 +55,7 @@ import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
 const port = parentPort;
@@ -222,6 +223,13 @@ port.on("message", async (message: DbWorkerInbound) => {
 			runInSqlTraceSpan(sqlSpan, async () => {
 				if (params.kind === "benchmarkRead")
 					return runBenchmarkRead(getConnection(message.dbPath), params, controller.signal);
+				if (params.kind === "toolEditPreview") {
+					return readToolEditPreviewSnapshot(
+						getConnection(message.dbPath),
+						params.toolCallId,
+						controller.signal,
+					);
+				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
 					: params.kind === "storageHistoryBody"
