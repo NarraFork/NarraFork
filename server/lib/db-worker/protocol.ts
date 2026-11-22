@@ -44,6 +44,7 @@ export type DbReadTaskName =
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
 	| "storageScanSessionPreview"
+	| "databaseCleanupContext"
 	| "selectRows"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
@@ -265,6 +266,7 @@ export type DbReadTaskParams =
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
 	| StorageScanSessionPreviewParams
+	| { kind: "databaseCleanupContext" }
 	| SelectRowsParams
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
