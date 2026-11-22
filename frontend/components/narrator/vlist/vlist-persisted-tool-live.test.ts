@@ -59,6 +59,34 @@ describe("retained live bodies across a window replacement", () => {
 		expect(again.messages).toBe(restored.messages);
 	});
 
+	it("matches a WS-shaped card to its page-shaped replacement through the block's tcId", () => {
+		// Exact-history pages drop the toolCalls relation; enrichment copied its id onto
+		// the block as tcId.
+		const pageShaped = (tcId: string, executionAttempt?: number): TreeMessage[] => {
+			const doc = runningToolDoc();
+			const message = doc[0] as unknown as Record<string, unknown>;
+			message.toolCalls = [];
+			const block = (messageBody(doc[0] as never) as Record<string, unknown>[]).find(
+				(b) => b.type === "tool_use",
+			) as Record<string, unknown>;
+			block.tcId = tcId;
+			if (executionAttempt !== undefined) block.executionAttempt = executionAttempt;
+			return doc;
+		};
+		const same = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		pruneRetainedLive(pageShaped("tc-1", 1), same);
+		expect(same.size).toBe(1);
+		const restored = retainedLivePatch(same)(pageShaped("tc-1", 1));
+		expect(liveFields(restored.messages).block?._streamingOutput).toBe("Waiting for build");
+
+		const otherId = new Map([["tu-1", { ...live }]]);
+		pruneRetainedLive(pageShaped("tc-2"), otherId);
+		expect(otherId.size).toBe(0);
+		const otherAttempt = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		pruneRetainedLive(pageShaped("tc-1", 2), otherAttempt);
+		expect(otherAttempt.size).toBe(0);
+	});
+
 	it("prunes finished and re-attempted occurrences, keeps tools that are not loaded", () => {
 		const retained = new Map([
 			["tu-1", { ...live }],

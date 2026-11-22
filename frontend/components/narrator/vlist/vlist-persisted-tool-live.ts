@@ -45,6 +45,8 @@ export interface RetainedLive {
 
 interface ToolRowView {
 	id?: unknown;
+	/** Tool-call id copied onto the enriched block (page-shaped rows drop `toolCalls`). */
+	tcId?: unknown;
 	status?: unknown;
 	executionAttempt?: unknown;
 	_streamingOutput?: unknown;
@@ -77,8 +79,12 @@ export function newestToolRow(
 		}
 		if (!block && !row) continue;
 		const live = block ?? row;
+		// Exact-history pages strip the `toolCalls` relation after enrichment copied the
+		// tool-call id onto the block as `tcId`; read it there so a WS-shaped card and
+		// its page-shaped replacement resolve to the same occurrence.
+		const id = row?.id ?? block?.tcId;
 		return {
-			...(row?.id !== undefined ? { id: row.id } : {}),
+			...(id !== undefined ? { id } : {}),
 			executionAttempt: row?.executionAttempt ?? block?.executionAttempt,
 			status: block?.status ?? row?.status,
 			_streamingOutput: live?._streamingOutput,
@@ -99,9 +105,13 @@ export function pruneRetainedLive(
 	for (const [toolUseId, live] of retained) {
 		const row = newestToolRow(messages, toolUseId);
 		if (!row) continue;
-		const sameRow = live.rowId === undefined || row.id === live.rowId;
+		// Only a KNOWN mismatch is a different occurrence: a side that lacks the field
+		// (older payload shape) says nothing either way.
+		const sameRow = live.rowId === undefined || row.id === undefined || row.id === live.rowId;
 		const sameAttempt =
-			live.executionAttempt === undefined || row.executionAttempt === live.executionAttempt;
+			live.executionAttempt === undefined ||
+			row.executionAttempt === undefined ||
+			row.executionAttempt === live.executionAttempt;
 		if (isTerminalToolStatus(row.status) || !sameRow || !sameAttempt) retained.delete(toolUseId);
 	}
 }
