@@ -10,7 +10,7 @@ import {
 	renameSync,
 	unlinkSync,
 } from "node:fs";
-import { lstat, mkdir, open, rename } from "node:fs/promises";
+import { lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { GitStagingAction, GitStagingActionResult } from "../../shared/git-staging-lists";
 import {
@@ -411,6 +411,33 @@ function candidateFile(file: StoredFile, listId: string, evidence: Evidence): Pr
 		bytes,
 	};
 }
+async function cleanupCompletedCommit(
+	repo: ChangelistRepository,
+	operation: CommitOperation,
+	evidence: Evidence,
+	signal?: AbortSignal,
+) {
+	try {
+		await git(
+			repo,
+			["update-ref", "-d", `refs/narrafork/changelist-operations/${repo.key}/${operation.id}`],
+			undefined,
+			{ signal },
+		);
+		const parent = join(repo.directory, "operations");
+		if (
+			!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(operation.id) ||
+			evidence.directory !== join(parent, operation.id)
+		)
+			throw fail("GIT_STAGING_STORAGE_UNSAFE", "Invalid completed operation directory");
+		const info = await lstat(parent);
+		if (!info.isDirectory() || info.isSymbolicLink())
+			throw fail("GIT_STAGING_STORAGE_UNSAFE", "Operation storage must be a real directory");
+		await rm(evidence.directory, { recursive: true, force: true });
+	} catch {
+		return "Commit and changelist projection are complete; private operation cleanup needs retry";
+	}
+}
 async function finish(
 	repo: ChangelistRepository,
 	store: ChangelistStore,
@@ -441,18 +468,7 @@ async function finish(
 		},
 		authorizedPaths,
 	);
-	let cleanupReason: string | undefined;
-	try {
-		await git(
-			repo,
-			["update-ref", "-d", `refs/narrafork/changelist-operations/${repo.key}/${operation.id}`],
-			undefined,
-			{ signal },
-		);
-	} catch {
-		cleanupReason =
-			"Commit and changelist projection are complete; the operation protection ref is retained";
-	}
+	const cleanupReason = await cleanupCompletedCommit(repo, operation, evidence, signal);
 	return result(store, { ...operation, status: "finished" }, "applied", cleanupReason);
 }
 export async function commitChangelist(
@@ -884,7 +900,13 @@ export async function recoverChangelistCommit(
 		.get(operationId) as CommitOperation | null;
 	if (!operation) throw fail("GIT_STAGING_NOT_FOUND", "Commit recovery operation does not exist");
 	let evidence = JSON.parse(operation.evidence_json) as Evidence;
-	if (operation.status === "finished") return result(store, operation, "applied");
+	if (operation.status === "finished")
+		return result(
+			store,
+			operation,
+			"applied",
+			await cleanupCompletedCommit(repo, operation, evidence, signal),
+		);
 	if (operation.status === "rejected")
 		throw fail("GIT_STAGING_COMMIT_REJECTED", "This operation did not create a commit");
 	if (!evidence.fenceToken || evidence.fenceToken !== operation.fence_token)

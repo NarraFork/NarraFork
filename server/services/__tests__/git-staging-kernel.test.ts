@@ -1648,6 +1648,52 @@ test("recovery cancels an expired reservation interrupted before Git invocation"
 	}
 });
 
+test("finished commits remove private projection artifacts and remain recoverable idempotently", async () => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const outcome = await commit(await active());
+	const read = await db();
+	try {
+		const row = read
+			.query("SELECT status,evidence_json FROM commit_operations WHERE id=?")
+			.get(outcome.operationId as string) as { status: string; evidence_json: string };
+		expect(row.status).toBe("finished");
+		await expect(lstat(JSON.parse(row.evidence_json).directory)).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		expect(
+			(await act({ action: "recover", operationId: outcome.operationId as string })).commitOid,
+		).toBe(outcome.commitOid);
+	} finally {
+		read.close();
+	}
+});
+
+test("completed artifact cleanup failures preserve success and recovery retries cleanup", async () => {
+	await file("a", "selected\n");
+	await act({ action: "init" });
+	const original = processes.stagingGit;
+	const mock = spyOn(processes, "stagingGit").mockImplementation(async (cwd, args, options) => {
+		if (args[0] === "update-ref" && args[1] === "-d") throw new Error("cleanup unavailable");
+		return original(cwd, args, options);
+	});
+	restores.push(() => mock.mockRestore());
+	const outcome = await commit(await active());
+	expect(outcome).toMatchObject({ outcome: "applied", reason: expect.stringContaining("cleanup") });
+	const read = await db();
+	const row = read
+		.query("SELECT evidence_json FROM commit_operations WHERE id=?")
+		.get(outcome.operationId as string) as { evidence_json: string };
+	read.close();
+	const directory = JSON.parse(row.evidence_json).directory;
+	expect((await lstat(directory)).isDirectory()).toBe(true);
+	mock.mockRestore();
+	expect(
+		(await act({ action: "recover", operationId: outcome.operationId as string })).outcome,
+	).toBe("applied");
+	await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("a confirmed commit recovers native index installation without creating another commit", async () => {
 	await file("a", "selected\n");
 	await act({ action: "init" });
@@ -1767,8 +1813,7 @@ test("legacy receipt recovery preserves strict sources and refuses a merge witho
 	expect(remaining[0]).toMatchObject({ listId: other, needsReview: false });
 	expect(remaining[0].reviewReason).toBeUndefined();
 	expect((await kernel.diff(other, { path: "f" })).diff).toContain("+LAST edited during recovery");
-	expect(await readFile(evidence.mappingFile)).toEqual(mapping);
-	expect(await readFile(receiptPath)).toEqual(receipt);
+	await expect(lstat(evidence.directory)).rejects.toMatchObject({ code: "ENOENT" });
 	const store = await ChangelistStore.open(repo);
 	if (!store) throw new Error("Missing recovery store");
 	try {
