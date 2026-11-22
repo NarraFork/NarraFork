@@ -18,11 +18,15 @@ let store: ChangelistStore;
 const restores: (() => void)[] = [];
 async function git(...args: string[]) {
 	return (
-		await exec("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", ...args], {
-			cwd: root,
-			timeout: 15_000,
-			maxBuffer: 1024 * 1024,
-		})
+		await exec(
+			"git",
+			["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", ...args],
+			{
+				cwd: root,
+				timeout: 15_000,
+				maxBuffer: 1024 * 1024,
+			},
+		)
 	).stdout.trim();
 }
 beforeEach(async () => {
@@ -59,7 +63,9 @@ test("publication rejects a draft whose ownership exceeds the next observation's
 			: files;
 	});
 	restores.push(() => ids.mockRestore());
-	await expect(observeChangelists(repo, store)).rejects.toMatchObject({ code: "GIT_STAGING_LIMIT" });
+	await expect(observeChangelists(repo, store)).rejects.toMatchObject({
+		code: "GIT_STAGING_LIMIT",
+	});
 	expect(store.state().observation_id).toBeNull();
 	ids.mockRestore();
 	for (let index = 0; index < 5; index++) await rm(join(root, `file-${index}`));

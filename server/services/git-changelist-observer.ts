@@ -1042,12 +1042,7 @@ async function observeWithDiagnostics(
 			checkpoint();
 			const base = start.entries.get(path);
 			const info = await pathInfo(repo, path);
-			if (
-				info &&
-				!info.isFile() &&
-				!info.isSymbolicLink() &&
-				!(info.isDirectory() && base)
-			)
+			if (info && !info.isFile() && !info.isSymbolicLink() && !(info.isDirectory() && base))
 				throw fail("GIT_STAGING_UNSUPPORTED", `Unsupported working file type: ${path}`);
 			if (info && !info.isDirectory()) {
 				if (info.size > OBSERVATION_LIMITS.maxFileBytes)

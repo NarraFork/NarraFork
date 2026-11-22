@@ -96,8 +96,7 @@ test("an external append after an unterminated local replacement uses the HEAD c
 			...input,
 			headConflictGroupId: "unassigned",
 		});
-		expect(result.status).toBe("ok");
-		expect(result.headRebuilt).toBe(true);
+		expect(result).toMatchObject({ status: "ok", headRebuilt: true });
 		expect(result.snapshot.workText).toBe(input.workText);
 		expect(result.snapshot.units.map((unit) => unit.groupId)).toEqual(["unassigned"]);
 		expectCurrent(result.snapshot);
