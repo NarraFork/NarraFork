@@ -157,6 +157,7 @@ function sandbox(options: {
 		},
 		httpRequestContext: { getStore: () => undefined },
 		httpLifecycle: createServerRequestLifecycle(),
+		cpuProfiler: { shutdown: settled },
 		stopRemoteAccess: settled,
 		closeAllConnections: () => {
 			trace.push("ws.close");
