@@ -62,6 +62,7 @@ import { runSelectRows } from "./select-rows";
 import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
+import { readSubagentActivity } from "./subagent-activity-query";
 import { readToolDetailSnapshot } from "./tool-detail-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
@@ -273,6 +274,9 @@ port.on("message", async (message: DbWorkerInbound) => {
 						params.entryId,
 						controller.signal,
 					);
+				}
+				if (params.kind === "subagentActivity") {
+					return readSubagentActivity(getConnection(message.dbPath), params, controller.signal);
 				}
 				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)

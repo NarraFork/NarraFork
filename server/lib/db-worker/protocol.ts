@@ -33,6 +33,7 @@ import type {
 import type { RecallConversationParams } from "./recall-conversation-query";
 import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
+import type { SubagentActivityParams } from "./subagent-activity-query";
 import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
@@ -67,6 +68,7 @@ export type DbReadTaskName =
 	| "recallToolCall"
 	| "recallConversation"
 	| "storageHistoryRead"
+	| "subagentActivity"
 	| "storageHistoryBody"
 	| "publicationTerminalResult";
 
@@ -286,6 +288,7 @@ export type DbReadTaskParams =
 	| RecallToolCallParams
 	| RecallConversationParams
 	| StorageHistoryReadParams
+	| SubagentActivityParams
 	| StorageHistoryBodyParams
 	| {
 			kind: "publicationTerminalResult";
