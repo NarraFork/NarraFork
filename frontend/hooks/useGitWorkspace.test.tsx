@@ -342,6 +342,9 @@ describe("non-blocking Git summaries and operation authority", () => {
 		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "valid-branch"));
 		await mount();
 		latest.rememberCounts({ totalFiles: 7, totalFilesExact: true, truncated: false });
+		render("narrator");
+		await flush();
+		expect(latest.displayCounts?.totalFiles).toBe(7);
 		const target = gitWorkspaceTarget("narrator", latest.data);
 		expect(target).not.toBeNull();
 		const authorizationState = latest.authorizationState;
