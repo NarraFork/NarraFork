@@ -21,6 +21,7 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { BenchmarkReadParams } from "../../services/benchmark-read";
 import type {
 	BlockBackfillSliceParams,
 	BlockIndexQueueSliceParams,
@@ -53,7 +54,8 @@ export type DbReadTaskName =
 	| "blockIndexQueueSlice"
 	| "blockProjectionSlice"
 	| "storageHistoryRead"
-	| "storageHistoryBody";
+	| "storageHistoryBody"
+	| "benchmarkRead";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
 export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
@@ -253,6 +255,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| BenchmarkReadParams
 	| StorageHistoryReadParams
 	| StorageHistoryBodyParams
 	| BlockBackfillSliceParams

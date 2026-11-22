@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
+import { runBenchmarkRead } from "../../services/benchmark-read";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -218,8 +219,10 @@ port.on("message", async (message: DbWorkerInbound) => {
 	try {
 		const params = message.params;
 		const result = await sqlDiagnostics.run(message.sqlDiagnostic, message.requestId, () =>
-			runInSqlTraceSpan(sqlSpan, async () =>
-				params.kind === "storageHistoryRead"
+			runInSqlTraceSpan(sqlSpan, async () => {
+				if (params.kind === "benchmarkRead")
+					return runBenchmarkRead(getConnection(message.dbPath), params, controller.signal);
+				return params.kind === "storageHistoryRead"
 					? runStorageHistoryRead(getConnection(message.dbPath), params)
 					: params.kind === "storageHistoryBody"
 						? runStorageHistoryBody(getConnection(message.dbPath), params)
@@ -265,8 +268,8 @@ port.on("message", async (message: DbWorkerInbound) => {
 																				message.requestId,
 																				params,
 																				controller.signal,
-																			),
-			),
+																			);
+			}),
 		);
 		post({
 			type: "result",
