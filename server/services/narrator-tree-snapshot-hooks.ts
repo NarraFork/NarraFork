@@ -390,7 +390,9 @@ export async function recordTreeSnapshotAfter(
 	// tree only asks "what does the directory look like now". A neighbour's concurrent
 	// write is not this call's responsibility but it IS on disk, so filtering it out
 	// would leave the tree showing a state that no longer exists.
-	if (deltaStatuses.length > 0) {
+	if (historyDisabled) {
+		emitWorkspacePathChanges(session.cwd, narratorId, [], true);
+	} else if (deltaStatuses.length > 0) {
 		emitWorkspacePathChanges(session.cwd, narratorId, deltaStatuses);
 	}
 
@@ -449,13 +451,14 @@ export async function recordTreeSnapshotAfter(
 }
 
 /**
- * Publish a tool call's workspace delta to the session that made it.
+ * Publish a tool call's workspace delta or invalidate its directory listings.
  *
  * Fires from the code that just performed the write, so its paths come from a real
  * `diff-tree` between two boundaries rather than from OS notifications, and it is
  * inherently deduplicated: one event per tool call, describing the net effect of that
  * call. Writes from the user's own editor or a terminal have no tool boundary and are
  * not reported here.
+ * With history disabled, an empty truncated frame requests a refresh without scanning.
  *
  * Never throws: a failed broadcast must not fail the tool call that succeeded.
  */
@@ -463,6 +466,7 @@ function emitWorkspacePathChanges(
 	worktreePath: string,
 	actingNarratorId: string,
 	changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[],
+	invalidate = false,
 ): void {
 	try {
 		// Paths from `diff-tree` are already worktree-relative and `/`-separated, which
@@ -470,7 +474,7 @@ function emitWorkspacePathChanges(
 		// deliberately no absolute form (that would disclose the host's directory layout
 		// to every subscriber).
 		const bounded = changes.slice(0, MAX_BROADCAST_PATHS);
-		const truncated = bounded.length < changes.length;
+		const truncated = invalidate || bounded.length < changes.length;
 		eventBus.emit({
 			type: "narrator:ws_broadcast",
 			narratorId: actingNarratorId,

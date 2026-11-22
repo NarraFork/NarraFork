@@ -773,6 +773,42 @@ describe("workspace path change broadcast", () => {
 		return frames;
 	}
 
+	test.each([
+		"Write",
+		"Bash",
+	])("history-disabled %s invalidates listings without capturing history", async (toolName) => {
+		restorePolicy();
+		settings.workspace.treeSnapshotsEnabled = false;
+		const cwd = mkdtempSync(join(tmpdir(), "nf-hook-disabled-broadcast-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const { toolUseId } = await seedToolCall(narratorId, toolName, 1);
+		const session = makeSession(cwd);
+		writeFileSync(join(cwd, "gone.txt"), "old file");
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		const diff = spyOn(worktreeTreeSnapshot, "diffPathStatuses");
+		try {
+			const frames = await captureBroadcasts(async () => {
+				await recordTreeSnapshotBefore(session, narratorId, toolUseId);
+				writeFileSync(join(cwd, "new.txt"), "new file");
+				rmSync(join(cwd, "gone.txt"));
+				await recordTreeSnapshotAfter(
+					session,
+					narratorId,
+					toolUseId,
+					toolName === "Bash" ? { unavailable: true } : undefined,
+				);
+			});
+			expect(frames).toEqual([{ narratorId, changes: [], truncated: true }]);
+			expect(hot).not.toHaveBeenCalled();
+			expect(diff).not.toHaveBeenCalled();
+			expect(session._lastTreeHash).toBeUndefined();
+		} finally {
+			hot.mockRestore();
+			diff.mockRestore();
+		}
+	});
+
 	test("announces the whole workspace delta, not just the acting call's owned set", async () => {
 		const repo = await createRepo("nf-hook-broadcast-delta-");
 		const narratorId = await createNarrator(repo);
