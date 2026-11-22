@@ -59,3 +59,25 @@ test("reports status per viewer and releases completed jobs for a later request"
 	expect(calls).toHaveLength(2);
 	calls[1].finish();
 });
+
+test("signals capacity backpressure and admits a still-visible target on retry", async () => {
+	const { scheduler, calls } = harness();
+	const holders = Array.from({ length: 4 }, () => ({}));
+	holders.forEach((holder, i) => {
+		scheduler.replace(
+			holder,
+			Array.from({ length: 16 }, (_, j) => `${i}:${j}`),
+		);
+	});
+	const viewer = {};
+	const statuses: string[] = [];
+	const onState = (_: string, state: string) => statuses.push(state);
+	scheduler.replace(viewer, ["still-visible"], onState);
+	expect(statuses).toEqual(["deferred"]);
+	scheduler.replace(holders[3], []);
+	scheduler.replace(viewer, ["still-visible"], onState);
+	expect(statuses).toEqual(["deferred", "queued"]);
+	for (const holder of [...holders, viewer]) scheduler.replace(holder, []);
+	await Promise.resolve();
+	for (const call of calls) call.finish();
+});

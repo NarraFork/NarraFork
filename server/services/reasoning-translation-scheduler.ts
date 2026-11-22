@@ -35,12 +35,15 @@ export class ReasoningTranslationScheduler<T> {
 		onState?: (target: T, state: ReasoningTranslationStatus) => void,
 	): void {
 		const previous = this.holders.get(holder);
-		if (!previous && this.holders.size >= MAX_HOLDERS) return;
 		const proposed = new Map(
 			targets
 				.slice(0, MAX_REASONING_TRANSLATION_VISIBLE_TARGETS)
 				.map((target) => [this.keyOf(target), target]),
 		);
+		if (!previous && this.holders.size >= MAX_HOLDERS) {
+			for (const target of proposed.values()) onState?.(target, "deferred");
+			return;
+		}
 		for (const key of previous ?? []) {
 			if (proposed.has(key)) continue;
 			const job = this.jobs.get(key);
@@ -59,7 +62,10 @@ export class ReasoningTranslationScheduler<T> {
 				continue;
 			}
 			if (!job) {
-				if (this.jobs.size >= MAX_JOBS) continue;
+				if (this.jobs.size >= MAX_JOBS) {
+					onState?.(target, "deferred");
+					continue;
+				}
 				job = { target, holders: new Map() };
 				this.jobs.set(key, job);
 			}

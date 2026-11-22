@@ -44,7 +44,7 @@ export interface ReasoningTranslationVisibilityReport {
 	targets: ReasoningTranslationVisibilityTarget[];
 }
 
-export type ReasoningTranslationStatus = "queued" | "running" | "idle";
+export type ReasoningTranslationStatus = "queued" | "running" | "idle" | "deferred";
 
 export interface ReasoningTranslationStatusFrame {
 	type: "reasoning_translation_status";
@@ -76,7 +76,10 @@ export function readReasoningTranslationStatus(
 		frame.type !== "reasoning_translation_status" ||
 		!isReasoningTranslationId(frame.narratorId) ||
 		!isReasoningTranslationId(frame.visibilityId) ||
-		(frame.status !== "queued" && frame.status !== "running" && frame.status !== "idle") ||
+		(frame.status !== "queued" &&
+			frame.status !== "running" &&
+			frame.status !== "idle" &&
+			frame.status !== "deferred") ||
 		!target ||
 		typeof target !== "object" ||
 		![target.ownerNarratorId, target.messageId, target.blockId, target.elementId].every(

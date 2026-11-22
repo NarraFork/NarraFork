@@ -26,6 +26,7 @@ class VisibleReasoningBodies {
 	>();
 	private observer?: IntersectionObserver;
 	private frame?: number;
+	private retryTimer?: ReturnType<typeof setTimeout>;
 	private ready = false;
 	private id?: string;
 	private sent = "";
@@ -49,6 +50,19 @@ class VisibleReasoningBodies {
 	receive = (frame: ReasoningTranslationStatusFrame) => {
 		const key = reasoningTranslationTargetKey(frame.target);
 		if (frame.visibilityId !== this.id || !this.targets.has(key)) return;
+		if (frame.status === "deferred") {
+			if (this.retryTimer === undefined) {
+				this.retryTimer = setTimeout(
+					() => {
+						this.retryTimer = undefined;
+						this.sent = "";
+						this.schedule();
+					},
+					2000 + Math.random() * 1000,
+				);
+			}
+			return;
+		}
 		if (frame.status === "idle") this.states.delete(key);
 		else this.states.set(key, frame.status);
 		this.emit();
@@ -65,6 +79,7 @@ class VisibleReasoningBodies {
 	};
 
 	pause = () => {
+		this.cancel();
 		this.ready = false;
 		this.sent = "";
 		this.targets.clear();
@@ -138,6 +153,8 @@ class VisibleReasoningBodies {
 	cancel(): void {
 		if (this.frame !== undefined) cancelAnimationFrame(this.frame);
 		this.frame = undefined;
+		clearTimeout(this.retryTimer);
+		this.retryTimer = undefined;
 	}
 
 	visibilityChanged = () => {
