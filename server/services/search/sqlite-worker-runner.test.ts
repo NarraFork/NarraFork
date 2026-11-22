@@ -42,7 +42,7 @@ describe("search worker admission and cancellation", () => {
 				return { columns: [], rows: [] };
 			},
 		});
-		await expect(execute(query, params)).rejects.toMatchObject({
+		await expect(execute(query, [...params])).rejects.toMatchObject({
 			code: "SEARCH_QUERY_BUDGET_EXCEEDED",
 		});
 		expect(calls).toBe(0);
