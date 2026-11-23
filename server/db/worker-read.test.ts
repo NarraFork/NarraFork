@@ -18,6 +18,7 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { integer as pgInteger, pgTable } from "drizzle-orm/pg-core";
 import { drizzle as drizzlePg } from "drizzle-orm/pg-proxy";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { DOMAIN_READ_STREAM_CHUNK_BYTES } from "../lib/db-worker/domain-protocol";
 import { DbReadError } from "../lib/db-worker/errors";
 import {
 	drainDbWorkerPool,
@@ -36,6 +37,7 @@ import {
 import { sourceRowsCommitment } from "../lib/db-worker/select-digest-batch";
 import { logger } from "../lib/logger";
 import {
+	consumeReadDomainTask,
 	consumeReadSqlValues,
 	readDbAll,
 	readDomainTask,
@@ -135,6 +137,121 @@ afterAll(async () => {
 	await drainDbWorkerPool({ timeoutMs: 20_000 });
 	sqlite.close();
 	rmSync(home, { recursive: true, force: true });
+});
+
+describe("registered domain streaming", () => {
+	const input = { narratorId: "n1", messageId: "m1", blockReads: false };
+	const content =
+		"a".repeat(Math.floor(DOMAIN_READ_STREAM_CHUNK_BYTES / 3) - 1) + "🙂界".repeat(30_000);
+	beforeAll(() => {
+		sqlite.exec(`
+			CREATE TABLE narrator_messages (
+				id TEXT PRIMARY KEY, role TEXT, body_revision INTEGER, state_revision INTEGER,
+				composer_document TEXT, content_json TEXT
+			);
+			CREATE TABLE narrator_message_refs (id TEXT, narrator_id TEXT, message_id TEXT);
+			INSERT INTO narrator_message_refs VALUES ('r1', 'n1', 'm1');
+		`);
+		sqlite.run("INSERT INTO narrator_messages VALUES ('m1', 'user', 1, 2, NULL, ?)", [
+			JSON.stringify([{ type: "text", text: content }]),
+		]);
+	});
+
+	test("streams a file-backed payload in order and waits for the consumer ACK", async () => {
+		const first = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const parts: Uint8Array[] = [];
+		let settled = false;
+		const read = consumeReadDomainTask(sqlite, "composerDocument", input, async (bytes) => {
+			parts.push(bytes);
+			if (parts.length === 1) {
+				first.resolve();
+				await release.promise;
+			}
+		}).finally(() => {
+			settled = true;
+		});
+		try {
+			await Promise.race([first.promise, read]);
+			await Bun.sleep(30);
+			expect(parts).toHaveLength(1);
+			expect(settled).toBe(false);
+		} finally {
+			release.resolve();
+		}
+		const result = await read;
+		const payload = Buffer.concat(parts);
+		expect(parts.length).toBeGreaterThan(1);
+		expect(parts.every((bytes) => bytes.byteLength <= DOMAIN_READ_STREAM_CHUNK_BYTES)).toBe(true);
+		expect(JSON.parse(payload.toString()).text).toBe(content);
+		expect(result).toEqual({
+			metadata: { kind: "found", refId: "r1", bodyRevision: 1, stateRevision: 2 },
+			bytes: payload.byteLength,
+			chunks: parts.length,
+		});
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+	});
+
+	test.each([
+		"cancel",
+		"consumer",
+		"timeout",
+	])("%s releases a stream without reading on the caller connection", async (failure) => {
+		const controller = new AbortController();
+		const gate = Promise.withResolvers<void>();
+		const query = spyOn(sqlite, "query");
+		let frames = 0;
+		try {
+			const error = await consumeReadDomainTask(
+				sqlite,
+				"composerDocument",
+				input,
+				() => {
+					frames++;
+					if (failure === "consumer") throw new Error("injected consumer failure");
+					if (failure === "cancel") controller.abort();
+					return gate.promise;
+				},
+				{ signal: controller.signal, timeoutMs: failure === "timeout" ? 1_000 : 10_000 },
+			).then(
+				() => null,
+				(error: unknown) => error,
+			);
+			expect(error).toMatchObject({
+				code:
+					failure === "cancel"
+						? "DB_READ_ABORTED"
+						: failure === "consumer"
+							? "DB_READ_CONSUMER_FAILED"
+							: "DB_READ_TASK_TIMEOUT",
+			});
+			expect(frames).toBe(1);
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			gate.resolve();
+			query.mockRestore();
+		}
+	});
+
+	test("rejects terminal counts that do not match the ACKed frames", async () => {
+		useWorkerFixture(
+			"mismatched-stream-counts",
+			`
+			self.onmessage = ({ data }) => {
+				if (data.type === "task") postMessage({
+					type: "result", requestId: data.requestId, durationMs: 0,
+					result: { metadata: { kind: "missing" }, bytes: 1, chunks: 1 },
+				});
+			};
+			postMessage({ type: "ready" });
+		`,
+		);
+		const error = await consumeReadDomainTask(sqlite, "composerDocument", input, () => {}).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(error).toMatchObject({ code: "DB_READ_PROTOCOL" });
+	});
 });
 
 describe("strict and extended read bridge", () => {

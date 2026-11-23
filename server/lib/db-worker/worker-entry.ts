@@ -38,10 +38,10 @@ import {
 	runBlockVerifySlice,
 } from "./block-backfill-query";
 import { readCompactSummary } from "./compact-summary-query";
-import { readComposerDocument } from "./composer-document-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
-import { runDomainRead } from "./domain-task-registry";
+import { isDomainReadStreamTask } from "./domain-protocol";
+import { runDomainRead, runDomainReadStream } from "./domain-task-registry";
 import { DbReadError, readAborted, workerFailure } from "./errors";
 import { readExecutionPolicySnapshot } from "./execution-policy-query";
 import { workerFailureDetails } from "./failure";
@@ -70,7 +70,6 @@ import { createWorkerSqlDiagnostics } from "./sql-diagnostics";
 import { readDatabaseCleanupContext } from "./storage-cleanup-context-query";
 import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 import { readSubagentActivity } from "./subagent-activity-query";
-import { readToolDetailSnapshot } from "./tool-detail-query";
 import { readToolEditPreviewSnapshot } from "./tool-edit-preview-query";
 
 if (!parentPort) throw new Error("Database reader requires a worker thread");
@@ -348,23 +347,25 @@ port.on("message", async (message: DbWorkerInbound) => {
 							meter,
 						);
 						break;
-					case "domainRead":
-						result = await runDomainRead(
-							connection(),
-							params,
-							controller.signal,
-							deadlineAt,
-							meter,
-						);
+					case "domainRead": {
+						let sequence = 0;
+						result = isDomainReadStreamTask(params)
+							? await runDomainReadStream(
+									connection(),
+									params,
+									{
+										signal: controller.signal,
+										deadlineAt,
+										emit: (bytes) =>
+											emit({ columns: ["bytes"], rows: [[bytes]], sequence: sequence++ }),
+									},
+									meter,
+								)
+							: await runDomainRead(connection(), params, controller.signal, deadlineAt, meter);
 						break;
+					}
 					case "benchmarkRead":
 						result = runBenchmarkRead(connection(), params, controller.signal);
-						break;
-					case "toolDetailSnapshot":
-						result = readToolDetailSnapshot(connection(), params, controller.signal);
-						break;
-					case "composerDocument":
-						result = readComposerDocument(connection(), params, controller.signal);
 						break;
 					case "compactSummary":
 						result = readCompactSummary(connection(), params, controller.signal);
