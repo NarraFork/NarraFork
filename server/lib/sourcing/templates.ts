@@ -100,7 +100,7 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		authKinds: ["api_key"],
 		multiCredential: true,
 		subscription: true,
-		// The plan preset's creation default (provider-connection-presets.ts).
+		// Token Plan keys present NarraFork's own User-Agent (presets.ts).
 		defaults: { userAgentMode: "narrafork" },
 		personal: true,
 	},
