@@ -510,16 +510,17 @@ async function getMineForViewer(
 	let drift: { drifted: boolean; versionsBehind: number } | null = null;
 	let entryReadable = false;
 	if (draft.entryId) {
-		const entry = await readQueryFirst(
-			db.query.knowledgeEntries.findMany({
-				limit: 1,
-				where: eq(knowledgeEntries.id, draft.entryId),
-			}),
+		const snapshot = await readQueryFirst(
+			db
+				.select({ entry: knowledgeEntries, collection: knowledgeCollections })
+				.from(knowledgeEntries)
+				.innerJoin(knowledgeCollections, eq(knowledgeCollections.id, knowledgeEntries.collectionId))
+				.where(eq(knowledgeEntries.id, draft.entryId))
+				.limit(1),
 			{ ...readOptions, executionPolicy: "worker-required" },
 		);
-		const col = entry
-			? (await loadCollectionAclRows([entry.collectionId], readOptions)).get(entry.collectionId)
-			: null;
+		const entry = snapshot?.entry;
+		const col = snapshot?.collection;
 		entryReadable =
 			!!entry && !!col && (await canRead(caps, toAclEntry(entry), toAclCollection(col)));
 		if (entry && entryReadable) {
