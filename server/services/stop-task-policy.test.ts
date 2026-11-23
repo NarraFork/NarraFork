@@ -371,8 +371,9 @@ describe("Stop OAuth task-device authority", () => {
 		expect(result.behavior).toBe("allow");
 		const access = { ...policy.deviceAccess, host: "denied" as const };
 		await setAccess(access);
-		await expect(
-			recheckFinalToolExecutionPermission({
+		let rejection: unknown;
+		try {
+			await recheckFinalToolExecutionPermission({
 				narratorId: ids.narrator,
 				toolName: "Stop",
 				input,
@@ -380,8 +381,12 @@ describe("Stop OAuth task-device authority", () => {
 				binding: receipt.binding,
 				cwd: ctx().cwd,
 				runtimeConstraint: constraint(access),
-			}),
-		).rejects.toThrow("denies this device group");
+			});
+		} catch (error) {
+			rejection = error;
+		}
+		expect(rejection).toBeInstanceOf(Error);
+		expect((rejection as Error).message).toContain("denies this device group");
 		expect(cancel).not.toHaveBeenCalled();
 	});
 	test("tool body rechecks live policy after final admission", async () => {
