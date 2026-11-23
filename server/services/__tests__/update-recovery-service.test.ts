@@ -859,6 +859,7 @@ describe("planned update recovery snapshot", () => {
 	test("a sibling mount failure keeps a live owner's interrupt controller until it finishes", async () => {
 		loadMode = "idle";
 		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
 		const live = continuationRecord("live-permission", "live", { kind: "pending_permission" });
 		const failed = continuationRecord("bad-agent", "failed", { kind: "foreground_agent" });
 		continuationRows = [live, failed];
@@ -867,15 +868,28 @@ describe("planned update recovery snapshot", () => {
 			recoveryItem(failed, "failed-message", 0),
 		];
 		executePersistedToolCallImpl = async () => {
+			entered.resolve();
 			await gate.promise;
 			return { ok: true, shouldContinue: true };
 		};
 		const startup = await prepareRecovery();
-		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow("missing subagentId");
-		expect(executePersistedCalls).toBe(1);
-		expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
-		gate.resolve();
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		try {
+			await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow(
+				"missing subagentId",
+			);
+			await entered.promise;
+			expect(executePersistedCalls).toBe(1);
+			expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
+		} finally {
+			gate.resolve();
+		}
+		const deadlineAt = Date.now() + 2_000;
+		while (
+			continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state !== "cancelled" &&
+			Date.now() < deadlineAt
+		) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
 		expect(continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state).toBe(
 			"cancelled",
 		);
