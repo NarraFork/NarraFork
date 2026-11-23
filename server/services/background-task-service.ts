@@ -118,13 +118,20 @@ type RestartTaskObservation = Omit<
 	command?: string | null;
 };
 function observeRestartTask(task: BackgroundTaskRecord): RestartTaskObservation {
+	let command = task.command ?? null;
+	if (command !== null) {
+		let prefix = "";
+		let length = 0;
+		for (const character of command) {
+			if (length++ === Math.max(TERMINAL_WATCH_COMMAND_PREFIX.length, WATCH_COMMAND_PREFIX.length))
+				break;
+			prefix += character;
+		}
+		command = prefix;
+	}
 	return {
 		...task,
-		command:
-			task.command?.slice(
-				0,
-				Math.max(TERMINAL_WATCH_COMMAND_PREFIX.length, WATCH_COMMAND_PREFIX.length),
-			) ?? null,
+		command,
 	};
 }
 type RestartTerminal = Pick<

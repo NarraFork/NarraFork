@@ -163,6 +163,24 @@ test("cancel does not abort a run changed after its Worker snapshot", async () =
 	expect(stored()?.logicalRunId).toBe("winner");
 });
 
+for (const command of [`😀${"x".repeat(100)}`, "a😀".repeat(50), "", null]) {
+	test(`cancel signals an unchanged task with command ${JSON.stringify(command)}`, async () => {
+		await service.createBashTask({
+			id: "task",
+			parentNarratorId: "parent",
+			command: command ?? "",
+		});
+		if (command === null)
+			db.update(backgroundTasks).set({ command }).where(eq(backgroundTasks.id, "task")).run();
+		await drain();
+		const controller = new AbortController();
+		service.registerAbortController("task", controller);
+		expect(await service.cancel("task")).toBe(true);
+		expect(controller.signal.aborted).toBe(true);
+		expect(stored()?.status).toBe("cancelled");
+	});
+}
+
 test("cancel tolerates output and renewal-only metadata changes", async () => {
 	await service.createBashTask({ id: "task", parentNarratorId: "parent", command: "build" });
 	await drain();
