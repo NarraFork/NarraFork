@@ -255,6 +255,21 @@ describe("MCP OAuth", () => {
 		);
 	});
 
+	test("a later challenge without scope keeps the challenged scope", async () => {
+		await mcpManager.testConnection(config);
+		oauth.noteMcpOAuthChallenge(
+			config,
+			config.id,
+			new Response(null, {
+				status: 401,
+				headers: { "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/custom-prm"` },
+			}),
+		);
+		const started = await oauth.startMcpOAuth(config, redirectUrl);
+		if (!("authorizationUrl" in started)) throw new Error("expected a redirect");
+		expect(new URL(started.authorizationUrl).searchParams.get("scope")).toBe("mcp:tools");
+	});
+
 	test("re-authorization always asks for consent and an abandoned one keeps the old grant", async () => {
 		await authorize();
 		const again = await oauth.startMcpOAuth(config, "https://other.example/api/mcp/oauth/callback");

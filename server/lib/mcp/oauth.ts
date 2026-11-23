@@ -169,8 +169,16 @@ export function noteMcpOAuthChallenge(
 	response: Response,
 ): void {
 	const { scope, resourceMetadataUrl } = extractWWWAuthenticateParams(response);
-	if (scope || resourceMetadataUrl)
-		challenges.set(storeKey, { binding: bindingOf(config), scope, resourceMetadataUrl });
+	if (!scope && !resourceMetadataUrl) return;
+	const binding = bindingOf(config);
+	const previous = challenges.get(storeKey);
+	const kept = previous?.binding === binding ? previous : undefined;
+	// A challenge missing a parameter (e.g. from a discovery endpoint) keeps the one seen before.
+	challenges.set(storeKey, {
+		binding,
+		scope: scope ?? kept?.scope,
+		resourceMetadataUrl: resourceMetadataUrl ?? kept?.resourceMetadataUrl,
+	});
 }
 
 function latestChallenge(config: McpServerConfig): McpOAuthChallenge | undefined {
