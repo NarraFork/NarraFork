@@ -1371,6 +1371,10 @@
 	"pwaUpdating": "Updating...",
 	"unsavedSave": "Save Changes",
 	"unsavedDiscard": "Discard",
+	"credentialMigrationConflict": {
+		"title": "Credentials have not moved to the new storage yet",
+		"description": "These credentials share an id. Delete or re-add one of each pair, then restart NarraFork to finish the move. Until then everything keeps working as before."
+	},
 	"providersTitle": "AI Providers",
 	"providersTabPlatforms": "Platforms",
 	"providersTabCustom": "Custom Providers",

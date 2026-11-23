@@ -432,6 +432,8 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 P2 收尾已随 PR #461 合并（`main@384cc950e`）。
 
+S1（统一凭据，§15.9）：拒读名单（#644）、显式上报 `credentialId`（#645 / #654）、运行时状态拆到 `credential-state.json`（#646）已合并；`credentials.json` 与一次性启动迁移（`server/lib/credential-store.ts`、`credential-migration.ts`）已实现。`ProviderKeyStore` 尚未收窄为搜索专用：模型 Key 的外观仍在，S2 以来源组取代投影时再删。
+
 架构说明页（可分享）：设计 https://claude.ai/artifact/19BW1ReTRShtDynQHXJDUE ，现状梳理 https://claude.ai/artifact/HJfhaWMvFtFjxhFDaN8S8E （以本文为准）。
 
 ### 14.2 下一步，按顺序
@@ -674,12 +676,13 @@ resolveRoute({
   - Codex 账号 → `codex` 组；TokenDance、Command Code → 各自的单例组；NUG → `nug` 模板的组；插件不动（15.7）。
   - 多个旧连接指向同一已知服务时仍是多个组，不自动合并。用户以后想合到一个池里，可以把凭据移到同一组，空组自动消失（S5 提供入口）。
 - **过渡期新建**：S5 之前前端仍用旧的“添加供应商”页，新建的连接一律按上面的规则一对一建组，不并入已有组。
-- **一次性启动迁移**（S1）：
-  - 输入：`codex-credentials.json`、`codex-stats.json`、`provider-keys.json` 中的模型凭据（`search:` 条目不动）、settings 各数组（含已投影的 Key）。
-  - 输出：`credentials.json`、`credential-state.json`（`settings.sourceGroups[]` 在 S2 生成，见 15.9 的实施收窄），最后写标记 `sourcing.version = 1`。
-  - 顺序：先把 `settings.json`、`codex-credentials.json`、`codex-stats.json`、`provider-keys.json` 复制到 `credential-backups/pre-sourcing-<时间>/`（整个目录在拒读名单里）；再写新文件；再改写 `provider-keys.json`（只留搜索 Key）、删 `codex-credentials.json` / `codex-stats.json`；最后保存 settings 并写标记。
-  - 崩溃恢复：以标记为准。没有标记时，忽略并覆盖上次写出一半的新文件，从备份或原文件重新迁移；整个流程可重复执行。
-  - 任一来源解不开（`secret-store` 不可读）时整体放弃，旧体系照常运行，下次启动重试。id 冲突不会自愈，所以不静默重试：放弃迁移、记日志，并在设置页的来源页顶部显示冲突的 id 与所属来源，管理员删除或重新添加其中一个后，下次启动再迁移。
+- **一次性启动迁移**（S1，已实现，`server/lib/credential-migration.ts`）：
+  - 模式由文件决定，不用 settings 标记：`credentials.json` 存在即统一模式，CodexManager 与 `ProviderKeyStore` 都从它读写（`credential-store.ts` 每个 home 一个实例，两者各交自己的一段——按登录方式区分，`api_key` 归 Key 段、其余归 Codex 段——写文件时拼上另一段最近保存的内容，互不覆盖）；不存在时两者照旧读写 `codex-credentials.json` / `provider-keys.json`。`search:` 条目两种模式都留在 `provider-keys.json`。
+  - 时机：首次加载设置时，`secrets.encrypt` 生效之后、任何凭据所有者创建之前（旧的 per-provider `codexOAuth` 迁移随之挪到加密开关之后）；热重载和加载设置的 Worker 线程（如请求录制）不跑。只在没有 `credentials.json` 且旧文件里有模型凭据时执行，新装实例在有凭据后的下一次启动迁移。不读 settings：Key 的归属 id 已带连接 id 与命名空间。
+  - 步骤：读两个旧文件（任一不可读 → 放弃，零写入）→ 按 15.3 定 id（id 重复，或两类连接共用一个组 id，如 NUG 与自定义 API 同 id、自定义 API 的 id 为 `codex` → 放弃，零写入）→ 把 `settings.json`、`codex-credentials.json`、`provider-keys.json`、`credential-state.json`、`codex-stats.json` 中存在的复制到 `credential-backups/pre-sourcing-<时间>/`（目录 0700、文件 0600）→ 旧 Codex 文件里仍内嵌的运行时状态写进 `credential-state.json`（`codex-stats.json` 仍由 CodexManager 加载时迁走）→ 原子写出完整的 `credentials.json` → 清理：`provider-keys.json` 只留搜索 Key（没有就删除），删 `codex-credentials.json`。
+  - 崩溃恢复：写出 `credentials.json` 之前崩溃，下次从旧文件重做（多一份备份）；之后崩溃，下次以统一模式启动并重做清理（幂等，所有者忽略残留的非搜索条目）。
+  - 放弃时旧体系照常可用、可编辑，下次启动重试。id 冲突不会自愈：记日志，`GET /api/settings` 只对管理员带 `credentialMigrationConflicts`（id、所属来源组与类别、标签），供应商设置页顶部显示一条提示，管理员删除或重新添加其中一个后重启即可完成迁移。
+  - 文件中 Key 归属按组：`nug:<id>` → `<id>`，`builtin:tokendance` / `builtin:CommandCode` → `tokendance` / `CommandCode`；`quota:<id>` / `nug-oauth:<id>` 成为 `groupSecrets[<id>]` 的 `quotaAccessToken` / `oauthClientSecret`。旧命名空间只留在 `ProviderKeyStore` 外观里，调用方语义不变。
 - **过渡投影**：设置页重组（S5）之前，内存里的 `settings` 继续由来源组 + 凭据投影出 `customApiProviders` / `nugProviders` / `tokendance` / `commandCode` 及派生的三个数组；因为迁移是一对一，投影出的连接 id、前缀与迁移前完全相同。`GET /api/settings` 与整数组 `PATCH` 照旧，写入翻译成来源组与凭据。这沿用了 Key 迁出时 `provider-keys-projection.ts` 的做法。
   - 记账：所有适配器路径（含只有一个普通 Key 的直连路径）都显式上报 `credentialId`，`defaultRequestSourceId` 只留给旧数据。这样单凭据组的记账 id 不再依赖“按前缀找连接 id”，网络身份下沉到凭据后也不会变。
   - 依赖完整对象的约 25 个读方（适配器构造、额度缓存、各家模型列表与测试路由）先读投影，逐步迁走；只读前缀 / 名称的读方收窄成 `SourceGroupView`（参照 `token-recalculation-protocol.ts` 的窄接口）。
@@ -704,7 +707,7 @@ resolveRoute({
 
 每阶段独立发布。S1、S2 没有明显的用户可见收益，但跳过它们直接做 S4 / S5 会再次在旧结构上双份打补丁。
 
-**2026-11-14 实施收窄**：因为迁移一对一，S1 不需要改 settings 结构——凭据的 `target.groupId` 直接用现有连接 id，settings 里的各数组在 S1 期间继续充当来源组。因此 `sourceGroups[]`、过渡投影翻译层和导出 / 凭据迁移的格式变化一起移到 S2：S1 不动设置 PATCH、前端与整数组写入方，旧导出包和凭据迁移包经兼容视图照常读写。Key 冷却继续只在内存，不新增持久化。S1 拆成五个 PR：拒读名单与备份目录 → 显式上报 `credentialId` → 运行时状态拆分 → `CredentialStore` 单一所有者 → `credentials.json` 与启动迁移。
+**2026-11-14 实施收窄**：因为迁移一对一，S1 不需要改 settings 结构——凭据的 `target.groupId` 直接用现有连接 id，settings 里的各数组在 S1 期间继续充当来源组。因此 `sourceGroups[]`、过渡投影翻译层和导出 / 凭据迁移的格式变化一起移到 S2：S1 不动设置 PATCH、前端与整数组写入方，旧导出包和凭据迁移包经兼容视图照常读写。Key 冷却继续只在内存，不新增持久化。S1 拆成五个 PR：拒读名单与备份目录 → 显式上报 `credentialId` → 运行时状态拆分 → `CredentialStore` 单一所有者 → `credentials.json` 与启动迁移。实际实现把后两步合在最后一个 PR：`CredentialStore` 只负责一个文件的读写与加密重写，CodexManager 与 `ProviderKeyStore` 各自保留内存数据与原有 API，按段交给它写出；迁移与模式切换见 15.8。
 
 ### 15.10 不做 / 推迟
 

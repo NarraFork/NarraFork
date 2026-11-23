@@ -15,6 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
@@ -23,6 +24,7 @@ import { z } from "zod";
 import { getBuiltinToolRoutines } from "../builtin-routines";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
+import { migrateCredentialFiles } from "../credential-migration";
 import { ValidationError } from "../errors";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
@@ -647,6 +649,16 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	// Credential files are written in the form `secrets.encrypt` asks for. A hot reload leaves
+	// the switch to the change listener, which also rewrites existing files.
+	if (!_cache.current) {
+		setSecretEncryption(merged.secrets?.encrypt !== false);
+		// Before anything creates a credential owner, which picks its files from the result.
+		// Only the server's own thread: a worker that loads settings must not move files
+		// under owners the server already created.
+		if (isMainThread) migrateCredentialFiles();
+	}
+
 	// Migrate legacy per-provider codexOAuth to centralized credential pool
 	// biome-ignore lint/suspicious/noExplicitAny: migration needs to read removed fields
 	const legacyProviders = merged.openaiProviders?.filter((p: any) => p.codexOAuth) as
@@ -680,9 +692,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeCustomApiProviderSettings(merged)) {
 		needsSave = true;
 	}
-	// Keys move to provider-keys.json, written in the form `secrets.encrypt` asks for. A hot
-	// reload leaves the switch to the change listener, which also rewrites existing files.
-	if (!_cache.current) setSecretEncryption(merged.secrets?.encrypt !== false);
+	// Keys still in settings.json move to the provider key store.
 	if (absorbProviderKeys(merged)) {
 		needsSave = true;
 	}
