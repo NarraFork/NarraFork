@@ -145,6 +145,7 @@ export interface ReasoningExpandState {
 	 * (`resolveReasoningDisplayText`), otherwise the height describes other content.
 	 */
 	preparedBlocks?: PreparedBlock[];
+	sourceRanges?: boolean;
 }
 
 /**
@@ -280,6 +281,7 @@ export function measureReasoning(
 	// Expanded: header row + body (markdown at sm, see file header note).
 	const innerWidth = reasoningBodyInnerWidth(contentWidth);
 	const md = measureTextPreview(displayText, innerWidth, {
+		sourceRanges: expandState.sourceRanges,
 		textExpanded: expandState.textExpanded,
 		direction: data.isStreaming ? "tail" : "head",
 		...(expandState.preparedBlocks ? { preparedBlocks: expandState.preparedBlocks } : {}),

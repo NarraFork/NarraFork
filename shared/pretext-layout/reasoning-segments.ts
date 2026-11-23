@@ -87,7 +87,10 @@ function bodyIsEmpty(body: string): boolean {
  * into a title-only header. This mirrors the way codex treats each streamed
  * part independently, reconstructed from the joined string persisted here.
  */
-export function parseReasoningSegments(text: string): ReasoningSegment[] {
+export function parseReasoningSegments(
+	text: string,
+	onBodyParagraph?: (step: number, bodyStart: number, runStart: number, length: number) => void,
+): ReasoningSegment[] {
 	if (!text) return [];
 	// Split on blank lines (two-or-more consecutive newlines, tolerating CRLF
 	// and trailing spaces on the blank line).
@@ -100,6 +103,8 @@ export function parseReasoningSegments(text: string): ReasoningSegment[] {
 	// Accumulates body paragraphs for the current (possibly untitled) step.
 	let currentTitle: string | null = null;
 	let currentBody: string[] = [];
+	let currentBodyLength = 0;
+	let runCursor = 0;
 	let started = false;
 	// True once a standalone `<!-- -->` placeholder sealed the current step.
 	let sealed = false;
@@ -111,19 +116,30 @@ export function parseReasoningSegments(text: string): ReasoningSegment[] {
 		segments.push({ title: currentTitle, body, isEmpty: bodyIsEmpty(body) });
 	};
 
-	const openStep = (title: string | null, body: string[]) => {
+	const openStep = (title: string | null) => {
 		currentTitle = title;
-		currentBody = body;
+		currentBody = [];
+		currentBodyLength = 0;
 		started = true;
 		sealed = false;
 	};
 
+	const appendBody = (body: string, runStart: number) => {
+		if (currentBody.length) currentBodyLength += 2;
+		onBodyParagraph?.(segments.length, currentBodyLength, runStart, body.length);
+		currentBody.push(body);
+		currentBodyLength += body.length;
+	};
+
 	for (const paragraph of paragraphs) {
+		const runStart = onBodyParagraph ? text.indexOf(paragraph, runCursor) : 0;
+		runCursor = runStart + paragraph.length;
 		const titleSplit = splitBoldTitle(paragraph);
 		if (titleSplit) {
 			flush();
 			const rest = titleSplit.rest.trim();
-			openStep(titleSplit.title, rest.length > 0 ? [rest] : []);
+			openStep(titleSplit.title);
+			if (rest.length) appendBody(rest, runStart + paragraph.length - rest.length);
 			continue;
 		}
 		if (paragraph === EMPTY_PLACEHOLDER) {
@@ -133,14 +149,14 @@ export function parseReasoningSegments(text: string): ReasoningSegment[] {
 		}
 		// Real content paragraph.
 		if (!started) {
-			openStep(null, []);
+			openStep(null);
 		} else if (sealed) {
 			// The previous step was sealed by a placeholder — begin a new
 			// untitled step rather than appending to a title-only header.
 			flush();
-			openStep(null, []);
+			openStep(null);
 		}
-		currentBody.push(paragraph);
+		appendBody(paragraph, runStart);
 	}
 	flush();
 
