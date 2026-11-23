@@ -39,7 +39,8 @@ function isEnvelope(value: unknown): value is Envelope {
 	);
 }
 
-function writePrivate(path: string, contents: string): void {
+/** Atomically write an owner-only (0600) file. */
+export function writePrivate(path: string, contents: string): void {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const tmp = `${path}.${process.pid}.tmp`;
 	writeFileSync(tmp, contents, { mode: 0o600 });
