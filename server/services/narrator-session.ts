@@ -425,7 +425,7 @@ import {
 	removeBufferedMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
-	withCurrentBufferedMessages,
+	withCurrentBufferedGuidance,
 } from "./narrator-buffer";
 import {
 	awaitCompactCompletion,
@@ -9616,21 +9616,12 @@ export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator)
 		}
 		return;
 	}
-	await withCurrentBufferedMessages(active.narratorId, (messages) => {
-		if (!active._bufferSoftStopTaken || !messages.some(isPendingGuidance)) return undefined;
+	await withCurrentBufferedGuidance(active.narratorId, (pending) => {
+		if (!active._bufferSoftStopTaken || !pending) return undefined;
 		active._bufferSoftStopTaken = false;
 		active._bufferSoftStop = true;
 		return undefined;
 	});
-}
-
-function isPendingGuidance(
-	message: Pick<BufferedMessage, "state" | "queueMode" | "priority">,
-): boolean {
-	return (
-		message.state !== "failed" &&
-		resolveBufferQueueMode(message.queueMode, message.priority) !== "turn"
-	);
 }
 
 export async function abortPendingBufferedGuidance(active: ActiveNarrator): Promise<void> {
@@ -9644,9 +9635,7 @@ export async function abortPendingBufferedGuidance(active: ActiveNarrator): Prom
 		apply(active._bufferGuidancePending === true);
 		return;
 	}
-	await withCurrentBufferedMessages(active.narratorId, (messages) =>
-		apply(messages.some(isPendingGuidance)),
-	);
+	await withCurrentBufferedGuidance(active.narratorId, apply);
 }
 
 export async function consumeBufferedSoftStopRequest(active: ActiveNarrator): Promise<boolean> {
@@ -9661,11 +9650,10 @@ export async function consumeBufferedSoftStopRequest(active: ActiveNarrator): Pr
 		if (decision.softStopTaken) active._bufferSoftStopTaken = true;
 		return decision.stop;
 	};
+	if (active._feedbackSoftStop || !active._bufferSoftStop) return apply(false);
 	if (resolveRuntimeQueueBackend() === "postgres")
 		return apply(active._bufferGuidancePending === true);
-	return withCurrentBufferedMessages(active.narratorId, (messages) =>
-		apply(messages.some(isPendingGuidance)),
-	);
+	return withCurrentBufferedGuidance(active.narratorId, apply);
 }
 
 export async function clearBufferedMessageSoftStopIfIdle(
@@ -9682,8 +9670,8 @@ export async function clearBufferedMessageSoftStopIfIdle(
 		apply(pendingGuidance ?? active._bufferGuidancePending === true);
 		return;
 	}
-	await withCurrentBufferedMessages(narratorId, (messages) => {
-		apply(messages.some(isPendingGuidance));
+	await withCurrentBufferedGuidance(narratorId, (pending) => {
+		apply(pending);
 		return undefined;
 	});
 }

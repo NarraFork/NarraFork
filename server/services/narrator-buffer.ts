@@ -797,11 +797,11 @@ export function getBufferedMessages(
 }
 
 /** The callback must not suspend between validation and its dependent decision. */
-export async function withCurrentBufferedMessages<T extends boolean | undefined>(
+export async function withCurrentBufferedGuidance<T extends boolean | undefined>(
 	narratorId: string,
-	apply: (messages: Pick<BufferedMessage, "state" | "queueMode" | "priority">[]) => T,
+	apply: (pending: boolean) => T,
 ): Promise<T> {
-	assertSqliteBufferRead("withCurrentBufferedMessages");
+	assertSqliteBufferRead("withCurrentBufferedGuidance");
 	const columns = {
 		id: mailbox.id,
 		state: mailbox.state,
@@ -825,11 +825,16 @@ export async function withCurrentBufferedMessages<T extends boolean | undefined>
 			.limit(MAILBOX_LIMITS.userPending),
 		bufferReadOptions(),
 	);
-	const messages = rows.map((row) => ({
-		state: row.state === "failed" ? ("failed" as const) : ("queued" as const),
-		priority: row.priority,
-		queueMode: json<{ queueMode?: BufferQueueMode }>(row.metadataJson, {}).queueMode,
-	}));
+	const hasGuidance = (snapshot: typeof rows) =>
+		snapshot.some(
+			(row) =>
+				row.state !== "failed" &&
+				resolveBufferQueueMode(
+					json<{ queueMode?: BufferQueueMode }>(row.metadataJson, {}).queueMode,
+					row.priority,
+				) !== "turn",
+		);
+	const pendingGuidance = hasGuidance(rows);
 	return db.transaction((tx) => {
 		const current = tx
 			.select(columns)
@@ -838,8 +843,8 @@ export async function withCurrentBufferedMessages<T extends boolean | undefined>
 			.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
 			.limit(MAILBOX_LIMITS.userPending)
 			.all();
-		if (JSON.stringify(current) !== JSON.stringify(rows)) throw new RuntimeReadConflictError();
-		return apply(messages);
+		if (hasGuidance(current) !== pendingGuidance) throw new RuntimeReadConflictError();
+		return apply(pendingGuidance);
 	});
 }
 

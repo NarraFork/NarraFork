@@ -256,6 +256,34 @@ test("a concurrent enqueue cannot be erased by an empty soft-stop observation", 
 	expect(await buffer.getBufferedMessages("actor")).toHaveLength(1);
 });
 
+test("a tool boundary without a soft stop never waits on the buffer Worker", async () => {
+	const active = register();
+	const probe = spyOn(pool, "runReadTask").mockRejectedValue(new Error("must not read"));
+	expect(await session.consumeBufferedSoftStopRequest(active)).toBe(false);
+	active._feedbackSoftStop = true;
+	expect(await session.consumeBufferedSoftStopRequest(active)).toBe(true);
+	expect(probe).not.toHaveBeenCalled();
+});
+
+test("an ordinary enqueue does not conflict with an unchanged guidance decision", async () => {
+	const active = register();
+	active._bufferSoftStop = true;
+	const gate = gateRead("narrator_buffered_messages");
+	const outcome = session.consumeBufferedSoftStopRequest(active);
+	try {
+		await gate.entered;
+		await buffer.enqueueBufferedMessage("actor", "ordinary next step");
+	} finally {
+		gate.release();
+	}
+	expect(await outcome).toBe(false);
+	gate.restore();
+	expect(active._bufferSoftStop).toBe(false);
+	expect((await buffer.getBufferedMessages("actor")).map((row) => row.text)).toEqual([
+		"ordinary next step",
+	]);
+});
+
 test("pre-prompt guidance cancellation rejects a removed Worker observation before aborting", async () => {
 	const active = register();
 	active._bufferSoftStop = true;
