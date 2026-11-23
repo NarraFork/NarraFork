@@ -1901,6 +1901,7 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 			buffered.failed ||
 			maintenancePending ||
 			integrityPending ||
+			databaseStartup.pending ||
 			outlineLivePending ||
 			websocketPending
 		) {
@@ -1929,6 +1930,7 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 				outlineLivePending,
 				maintenance,
 				integrity,
+				databaseStartupPending: databaseStartup.pending,
 			});
 		} else {
 			outcome = "ok";
@@ -2103,6 +2105,7 @@ async function performGracefulShutdown(
 		if (serverStopOutcome === "ok" && httpDrainOutcome === "ok" && wsDrainOutcome === "ok") {
 			tracker.markDrainComplete();
 		}
+		await step("databaseStartup.drain", () => databaseStartup.drain(), budget.businessRemaining());
 
 		// Sandboxed host-tool callers stop before their outline/editor/compute dependencies.
 		await step(
@@ -2360,6 +2363,18 @@ async function performGracefulShutdown(
 			tracker.recordStep("teamMaintenance.quiescence", "failed");
 			auditShutdownDatabaseWork(tracker);
 			logger.warn("Team maintenance did not drain; retaining database ownership until exit");
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		if (databaseStartup.pending) {
+			tracker.recordStep("databaseStartup.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Startup initialization did not drain; retaining database ownership until exit");
 			return {
 				success: false,
 				clean: false,

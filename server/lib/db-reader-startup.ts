@@ -16,6 +16,8 @@ export function createDatabaseReaderStartup(options: {
 		throw new Error("Invalid database startup retry interval");
 	let stopped = false;
 	let initialized = false;
+	let pending = false;
+	let initialization: Promise<void> | undefined;
 	let initialAttempt: Promise<void> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let reportedUnavailable = false;
@@ -23,7 +25,15 @@ export function createDatabaseReaderStartup(options: {
 	async function initializeOnce(): Promise<void> {
 		if (stopped || initialized) return;
 		initialized = true;
-		await options.initialize();
+		pending = true;
+		initialization = (async () => {
+			try {
+				await options.initialize();
+			} finally {
+				pending = false;
+			}
+		})();
+		await initialization;
 	}
 
 	async function attempt(): Promise<void> {
@@ -51,6 +61,12 @@ export function createDatabaseReaderStartup(options: {
 	}
 
 	return {
+		get pending(): boolean {
+			return pending;
+		},
+		async drain(): Promise<void> {
+			await initialization;
+		},
 		start(): Promise<void> {
 			initialAttempt ??= attempt();
 			return initialAttempt;

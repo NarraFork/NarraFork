@@ -28,6 +28,7 @@ import {
 	queueContextCharacterRefresh,
 	quiesceContextCharacterRefreshes,
 } from "../context-characters";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
@@ -86,6 +87,11 @@ function sandbox(options: {
 	teamMaintenance?: {
 		stop(): Promise<void>;
 		snapshot(): { stopped: boolean; pending: number; failed: boolean };
+	};
+	databaseStartup?: {
+		stop(): void;
+		drain(): Promise<void>;
+		readonly pending: boolean;
 	};
 }) {
 	let tracker: ShutdownActivityTracker | undefined;
@@ -148,7 +154,11 @@ function sandbox(options: {
 		getTeamDatabaseMaintenanceStatus: () =>
 			options.teamMaintenance?.snapshot() ?? { stopped: true, pending: 0, failed: false },
 		backgroundOccupancyInitializer: { stop: nothing },
-		databaseStartup: { stop: () => trace.push("databaseStartup.stop") },
+		databaseStartup: options.databaseStartup ?? {
+			stop: () => trace.push("databaseStartup.stop"),
+			drain: settled,
+			pending: false,
+		},
 		stopBackgroundOccupancy: async () => {
 			trace.push("occupancy.stop");
 		},
@@ -347,6 +357,69 @@ function sandbox(options: {
 		},
 	};
 }
+
+test("a pending recovered startup backfill retains database ownership after the shutdown budget", async () => {
+	const trace: string[] = [];
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let attempts = 0;
+	let now = 0;
+	const startup = createDatabaseReaderStartup({
+		readiness: {
+			state: { status: "waiting" },
+			wait: async () =>
+				++attempts === 1 ? { ok: false, code: "DB_READERS_UNAVAILABLE" } : { ok: true },
+		},
+		initialize: async () => {
+			entered.resolve();
+			await release.promise;
+			trace.push("startup.backfill.write");
+		},
+		onUnavailable() {},
+		onError(error) {
+			throw error;
+		},
+		retryIntervalMs: 1,
+	});
+	await startup.start();
+	await entered.promise;
+	const runtime = sandbox({
+		trace,
+		databaseStartup: startup,
+		bufferedLifecycle: {
+			stop() {},
+			drain: async () => {},
+			hasPending: () => false,
+			status: () => ({ pending: 0, active: 0, waiting: 0, batches: 0, failed: 0 }),
+		},
+		now: () => now,
+		onHttpDrain: () => {
+			now = 30_000;
+		},
+		onPluginShutdown: async () => {},
+		onBufferedDrain() {},
+		communicationStatus: () => ({ pending: 0, failed: false }),
+	});
+	try {
+		const result = await runtime.run({
+			reason: "fixture-startup-deadline",
+			skipWindowsProcessTreeKill: true,
+		});
+		for (const released of [
+			"reader.close.begin",
+			"prefixSnapshots.close",
+			"postgres.close",
+			"clean",
+			"dirty",
+		])
+			expect(trace).not.toContain(released);
+		expect(result.success).toBe(false);
+		expect(trace).not.toContain("startup.backfill.write");
+	} finally {
+		startup.stop();
+		release.resolve();
+	}
+});
 
 test("shutdown deadline before native reader exit forbids clean marking and pool reuse", async () => {
 	const previous = {

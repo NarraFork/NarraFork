@@ -17,6 +17,43 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("database reader startup recovery", () => {
+	test("shutdown drains an in-flight initializer before relinquishing ownership", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const startup = createDatabaseReaderStartup({
+			readiness: { state: { status: "ready" }, wait: async () => ({ ok: true }) },
+			initialize: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+			onUnavailable() {},
+			onError(error) {
+				throw error;
+			},
+		});
+		try {
+			expect(startup.pending).toBe(false);
+			await startup.drain();
+			const first = startup.start();
+			await entered.promise;
+			startup.stop();
+			let drained = false;
+			const draining = startup.drain().then(() => {
+				drained = true;
+			});
+			await Bun.sleep(5);
+			expect(startup.pending).toBe(true);
+			expect(drained).toBe(false);
+			release.resolve();
+			await Promise.all([first, draining]);
+			expect(startup.pending).toBe(false);
+			expect(drained).toBe(true);
+		} finally {
+			startup.stop();
+			release.resolve();
+		}
+	});
+
 	test("a failed first probe stays closed, then initializes once and settles readiness", async () => {
 		let probes = 0;
 		const probe = mock(async () => {
@@ -192,6 +229,8 @@ describe("database reader startup recovery", () => {
 			expect(initialize).toHaveBeenCalledTimes(1);
 			expect(onError).toHaveBeenCalledTimes(1);
 			expect(onError).toHaveBeenCalledWith(error);
+			expect(startup.pending).toBe(false);
+			expect(await startup.drain().catch((failure: unknown) => failure)).toBe(error);
 		} finally {
 			startup.stop();
 		}
