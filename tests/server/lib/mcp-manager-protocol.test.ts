@@ -266,10 +266,10 @@ describe("MCP uses one published directory without output-schema compilation", (
 		const response = await mcpManager.callTool(config.id, "plain", {});
 		expect(response.content).toEqual([{ type: "text", text: '{"value":42,"nested":{"ok":true}}' }]);
 		expect(response.isError).toBeUndefined();
-		result = { content: [], structuredContent: { value: "x".repeat(200_000) } };
-		const truncated = (await mcpManager.callTool(config.id, "plain", {})).content[0].text ?? "";
-		expect(truncated.length).toBeLessThan(100_100);
-		expect(truncated).toContain("[structured content truncated:");
+		const large = { value: "x".repeat(200_000) };
+		result = { content: [], structuredContent: large };
+		const full = (await mcpManager.callTool(config.id, "plain", {})).content[0].text;
+		expect(full).toBe(JSON.stringify(large));
 		expect(calls).toEqual(["plain", "plain"]);
 	});
 
