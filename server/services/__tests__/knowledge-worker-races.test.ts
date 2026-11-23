@@ -56,11 +56,11 @@ function interleave(table: string, ids: string[], write: () => Promise<unknown>)
 	};
 	spyOn(bridge, "readQueryFirst").mockImplementation((async (query, options) => {
 		await before(query);
-		return original(query, options);
+		return original(query as Parameters<typeof original>[0], options);
 	}) as typeof bridge.readQueryFirst);
 	spyOn(bridge, "readQuery").mockImplementation((async (query, options) => {
 		await before(query);
-		return originalMany(query, options);
+		return originalMany(query as Parameters<typeof originalMany>[0], options);
 	}) as typeof bridge.readQuery);
 	return () => expect(injected).toBe(true);
 }

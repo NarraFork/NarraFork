@@ -15,7 +15,6 @@ export type KnowledgeEntryDetailRaw = Omit<
 
 // Preserve the existing metadata request allowance and one-million-character body contract.
 export const KNOWLEDGE_ENTRY_DETAIL_BYTES = 132 * 1024 * 1024;
-const CHUNK_BYTES = 128 * 1024;
 const FIELDS = {
 	id: "id",
 	collectionId: "collection_id",
@@ -64,31 +63,24 @@ export function readKnowledgeEntryDetail(
 		const bytes = Object.values(lengths).reduce<number>((sum, size) => sum + (size ?? 0), 1024);
 		if (!Number.isSafeInteger(bytes) || bytes > KNOWLEDGE_ENTRY_DETAIL_BYTES)
 			throw new DbReadError("DB_READ_BUDGET", "Knowledge entry exceeds its detail byte budget");
-		const result: Record<string, string | null> = {};
-		for (const [name, column] of Object.entries(FIELDS)) {
+		check();
+		const statement = database.prepare(
+			`SELECT ${Object.entries(FIELDS)
+				.map(([name, column]) => `CAST(${column} AS BLOB) AS "${name}"`)
+				.join(", ")} FROM knowledge_entries WHERE id = ? LIMIT 1`,
+		);
+		try {
+			const row = statement.get(input.entryId) as Record<string, Uint8Array | null>;
 			check();
-			const size = lengths[name];
-			if (size === null) {
-				result[name] = null;
-				continue;
+			const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+			const result: Record<string, string | null> = {};
+			for (const [name, value] of Object.entries(row)) {
+				check();
+				result[name] = value === null ? null : decoder.decode(value);
 			}
-			const statement = database.prepare(
-				`SELECT substr(CAST(${column} AS BLOB), ?, ?) AS chunk FROM knowledge_entries WHERE id = ? LIMIT 1`,
-			);
-			const decoder = new TextDecoder();
-			const parts: string[] = [];
-			try {
-				for (let offset = 1; offset <= size; offset += CHUNK_BYTES) {
-					check();
-					const row = statement.get(offset, CHUNK_BYTES, input.entryId) as { chunk: Uint8Array };
-					parts.push(decoder.decode(row.chunk, { stream: true }));
-				}
-				parts.push(decoder.decode());
-				result[name] = parts.join("");
-			} finally {
-				statement.finalize();
-			}
+			return result as KnowledgeEntryDetailRaw;
+		} finally {
+			statement.finalize();
 		}
-		return result as unknown as KnowledgeEntryDetailRaw;
 	})();
 }
