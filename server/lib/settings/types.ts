@@ -683,7 +683,7 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
-	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	/** How credential files (e.g. credentials.json) are stored. See lib/secret-store.ts. */
 	secrets?: {
 		/** Encrypt credential files with the instance key in secret.key. Default true. */
 		encrypt?: boolean;
@@ -1102,7 +1102,7 @@ export interface NarraForkSettings {
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.
-	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
+	 * Credentials are managed separately (credentials.json; codex-credentials.json before it).
 	 */
 	codex?: {
 		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */

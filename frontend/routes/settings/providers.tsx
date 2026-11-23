@@ -29,6 +29,7 @@ import { useConfirmDialog } from "../../components/common/confirm-dialog-context
 import { AutoParticipationSwitch } from "../../components/providers/AutoParticipationSwitch";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
+import { CredentialMigrationAlert } from "../../components/providers/CredentialMigrationAlert";
 import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
 	CustomApiProviderSection,
@@ -1369,6 +1370,7 @@ function SettingsProvidersPage() {
 					<Group gap="xs">
 						<Title order={2}>{t("providersTitle")}</Title>
 					</Group>
+					<CredentialMigrationAlert settings={settings} />
 					{!settingsFeatureCapability.patchSupported && (
 						<Alert color="yellow" variant="light" title={t("settingsPatchUnsupportedWarning")}>
 							{t("settingsPatchUnsupportedWarningDesc")}

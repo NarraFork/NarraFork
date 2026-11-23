@@ -67,6 +67,13 @@ import {
 	type CredentialState,
 	CredentialStateStore,
 } from "./credential-state";
+import {
+	CODEX_GROUP,
+	type Credential,
+	type CredentialAuth,
+	type CredentialStore,
+	getCredentialStore,
+} from "./credential-store";
 import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -82,7 +89,7 @@ import {
 
 const MAX_FAILURES_PER_CREDENTIAL = 3;
 const USAGE_TTL_MS = 5 * 60_000;
-const CREDENTIALS_FILE = "codex-credentials.json";
+export const CODEX_CREDENTIALS_FILE = "codex-credentials.json";
 const STATS_FILE = "codex-stats.json";
 const SESSION_AFFINITY_TTL_MS = 6 * 60 * 60_000; // 6h
 const MAX_SESSION_AFFINITY_ENTRIES = 2_000;
@@ -178,6 +185,8 @@ export interface CodexCredential {
 	network?: CredentialNetwork;
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
+	/** Set when the credential is first written to credentials.json; older entries lack it. */
+	createdAt?: number;
 }
 
 /** Archived credentials are retired from the pool but keep all of their data. */
@@ -383,7 +392,7 @@ function getCodexDataDir(baseDir?: string): string {
 }
 
 function getCredentialsPath(baseDir?: string): string {
-	return resolve(getCodexDataDir(baseDir), CREDENTIALS_FILE);
+	return resolve(getCodexDataDir(baseDir), CODEX_CREDENTIALS_FILE);
 }
 
 /** Legacy request counts, moved into credential-state.json on load. */
@@ -412,6 +421,107 @@ function storedCredential(entry: CodexCredential): CodexCredential {
 		delete rest.disabledReason;
 	}
 	return rest;
+}
+
+/** Runtime state an older codex-credentials.json still carries inside a credential. */
+export function legacyCodexRuntimeState(entry: CodexCredential): CredentialState | undefined {
+	if (!hasRuntimeFields(entry)) return undefined;
+	return {
+		usage: entry.usage,
+		usageHistory: entry.usageHistory,
+		blocked:
+			entry.disabled && isBlockReason(entry.disabledReason)
+				? { reason: entry.disabledReason, resetsAt: entry.quotaResetsAt }
+				: undefined,
+	};
+}
+
+/** A stored Codex account as a credentials.json entry; runtime state is left out. */
+export function codexToCredential(entry: CodexCredential, now = Date.now()): Credential {
+	const c = storedCredential(entry);
+	const mode = getCodexAuthMode(c);
+	const auth: CredentialAuth =
+		mode === "agent_identity"
+			? {
+					kind: "agent_identity",
+					agentRuntimeId: c.agentRuntimeId ?? "",
+					agentPrivateKey: c.agentPrivateKey ?? "",
+					...(c.taskId ? { taskId: c.taskId } : {}),
+				}
+			: mode === "personal_access_token"
+				? { kind: "pat", accessToken: c.accessToken ?? "" }
+				: {
+						kind: "oauth",
+						...(c.refreshToken ? { refreshToken: c.refreshToken } : {}),
+						...(c.accessToken ? { accessToken: c.accessToken } : {}),
+						...(c.expiresAt !== undefined ? { expiresAt: c.expiresAt } : {}),
+					};
+	const account = {
+		...(c.accountId ? { accountId: c.accountId } : {}),
+		...(c.email ? { email: c.email } : {}),
+		...(c.sub ? { sub: c.sub } : {}),
+		...(c.fedramp !== undefined ? { fedramp: c.fedramp } : {}),
+	};
+	return {
+		id: c.id,
+		target: { groupId: CODEX_GROUP },
+		ownerUserId: null,
+		...(c.displayName ? { label: c.displayName } : {}),
+		priority: c.priority,
+		createdAt: c.createdAt ?? now,
+		...(c.archivedAt !== undefined ? { archivedAt: c.archivedAt } : {}),
+		...(c.disabled ? { disabled: true } : {}),
+		...(c.disabled && c.disabledReason
+			? { disabledReason: c.disabledReason as "manual" | "banned" }
+			: {}),
+		...(c.network ? { network: c.network } : {}),
+		auth,
+		...(Object.keys(account).length ? { account } : {}),
+		...(c.useCreditQuota !== undefined ? { options: { useCreditQuota: c.useCreditQuota } } : {}),
+	};
+}
+
+/** The inverse of `codexToCredential`. */
+export function codexFromCredential(c: Credential): CodexCredential {
+	const auth = c.auth;
+	const tokens: Partial<CodexCredential> =
+		auth.kind === "agent_identity"
+			? {
+					authMode: "agent_identity",
+					agentRuntimeId: auth.agentRuntimeId,
+					agentPrivateKey: auth.agentPrivateKey,
+					...(auth.taskId ? { taskId: auth.taskId } : {}),
+				}
+			: auth.kind === "pat"
+				? { authMode: "personal_access_token", accessToken: auth.accessToken }
+				: auth.kind === "oauth"
+					? {
+							...(auth.refreshToken ? { refreshToken: auth.refreshToken } : {}),
+							...(auth.accessToken ? { accessToken: auth.accessToken } : {}),
+							...(auth.expiresAt !== undefined ? { expiresAt: auth.expiresAt } : {}),
+						}
+					: {};
+	const account = c.account ?? {};
+	return {
+		id: c.id,
+		...(c.label ? { displayName: c.label } : {}),
+		...tokens,
+		...(account.accountId ? { accountId: account.accountId } : {}),
+		...(account.email ? { email: account.email } : {}),
+		...(account.sub ? { sub: account.sub } : {}),
+		...(account.fedramp !== undefined ? { fedramp: account.fedramp } : {}),
+		priority: c.priority,
+		...(c.options?.useCreditQuota !== undefined
+			? { useCreditQuota: c.options.useCreditQuota }
+			: {}),
+		disabled: !!c.disabled,
+		...(c.disabled && c.disabledReason
+			? { disabledReason: c.disabledReason as DisabledReason }
+			: {}),
+		...(c.archivedAt !== undefined ? { archivedAt: c.archivedAt } : {}),
+		...(c.network ? { network: c.network } : {}),
+		createdAt: c.createdAt,
+	};
 }
 
 // === Helpers ===
@@ -650,6 +760,29 @@ function normalizeStoredCredential(c: unknown): CodexCredential | null {
 	return credential;
 }
 
+/**
+ * The accounts of a stored credential list, as loading keeps them: normalized, one per
+ * account, each with an id, a priority and a switch.
+ */
+export function parseStoredCodexCredentials(raw: unknown): CodexCredential[] {
+	const entries: CodexCredential[] = [];
+	const seen = new Set<string>();
+	for (const c of Array.isArray(raw) ? raw : []) {
+		const credential = normalizeStoredCredential(c);
+		if (!credential) continue;
+
+		const keys = getCredentialDedupeKeys(credential);
+		if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;
+		for (const key of keys) seen.add(key);
+
+		if (!credential.id) credential.id = generateShortId();
+		if (credential.priority === undefined) credential.priority = entries.length;
+		if (credential.disabled === undefined) credential.disabled = false;
+		entries.push(credential);
+	}
+	return entries;
+}
+
 function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
@@ -797,6 +930,9 @@ export class CodexManager {
 	/** Set when the stored credentials could not be decrypted; saving is refused. */
 	private credentialsUnreadable = false;
 	private unsubscribeSecretRewrite?: () => void;
+	private readonly credentialStore: CredentialStore;
+	/** Accounts live in credentials.json rather than codex-credentials.json; fixed at load. */
+	private readonly unified: boolean;
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -805,6 +941,8 @@ export class CodexManager {
 		this.loadBalancingMode = "tier-balanced";
 		this.tierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 		this.state = new CredentialStateStore(getStatePath(options?.homeDir));
+		this.credentialStore = getCredentialStore(getCodexDataDir(options?.homeDir));
+		this.unified = this.credentialStore.unified;
 
 		this.loadCredentials();
 		const initialRetryAt = Date.now() + USAGE_RESET_RETRY_DELAY_MS;
@@ -817,8 +955,11 @@ export class CodexManager {
 		this.exitHandler = () => this.state.dispose();
 		if (this.options?.registerProcessHooks ?? true) {
 			process.on("exit", this.exitHandler);
-			// Turning credential encryption on or off rewrites the file in the new form.
-			this.unsubscribeSecretRewrite = onSecretEncryptionChange(() => this.saveCredentials());
+			// Turning credential encryption on or off rewrites the file in the new form; the
+			// credential store does that for credentials.json.
+			if (!this.unified) {
+				this.unsubscribeSecretRewrite = onSecretEncryptionChange(() => this.saveCredentials());
+			}
 		}
 	}
 
@@ -2436,7 +2577,11 @@ export class CodexManager {
 				result.replaced++;
 				return;
 			}
-			if (!credential.id || this.entries.some((entry) => entry.id === credential.id)) {
+			if (
+				!credential.id ||
+				this.entries.some((entry) => entry.id === credential.id) ||
+				(this.unified && this.credentialStore.hasId(credential.id))
+			) {
 				credential.id = generateShortId();
 			}
 			credential.priority = this.entries.length;
@@ -2462,34 +2607,30 @@ export class CodexManager {
 	private loadCredentials(): void {
 		try {
 			const baseDir = this.options?.homeDir;
-			const path = getCredentialsPath(baseDir);
 			let raw: unknown;
-			try {
-				raw = readSecretJSON(path);
-			} catch (error) {
-				if (!(error instanceof SecretStoreError)) throw error;
-				// Never write over a file we could not read: it is the only copy.
-				this.credentialsUnreadable = true;
-				logger.error("Codex credentials are unreadable; leaving the file untouched", {
-					error: error.message,
-				});
-				return;
+			if (this.unified) {
+				// The credential store has already logged why it could not read the file.
+				if (!this.credentialStore.readable) {
+					this.credentialsUnreadable = true;
+					return;
+				}
+				raw = this.credentialStore.codexCredentials().map(codexFromCredential);
+			} else {
+				try {
+					raw = readSecretJSON(getCredentialsPath(baseDir));
+				} catch (error) {
+					if (!(error instanceof SecretStoreError)) throw error;
+					// Never write over a file we could not read: it is the only copy.
+					this.credentialsUnreadable = true;
+					logger.error("Codex credentials are unreadable; leaving the file untouched", {
+						error: error.message,
+					});
+					return;
+				}
 			}
 
 			let legacyFields = false;
-			const seen = new Set<string>();
-			for (const c of Array.isArray(raw) ? raw : []) {
-				const credential = normalizeStoredCredential(c);
-				if (!credential) continue;
-
-				const keys = getCredentialDedupeKeys(credential);
-				if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;
-				for (const key of keys) seen.add(key);
-
-				if (!credential.id) credential.id = generateShortId();
-				if (credential.priority === undefined) credential.priority = this.entries.length;
-				if (credential.disabled === undefined) credential.disabled = false;
-
+			for (const credential of parseStoredCodexCredentials(raw)) {
 				// Runtime state still inside the credential predates credential-state.json and wins.
 				legacyFields ||= hasRuntimeFields(credential);
 				this.applyState(credential);
@@ -2579,8 +2720,14 @@ export class CodexManager {
 			return;
 		}
 		try {
-			const baseDir = this.options?.homeDir;
-			writeSecretJSON(getCredentialsPath(baseDir), this.entries.map(storedCredential));
+			if (this.unified) {
+				const now = Date.now();
+				for (const entry of this.entries) entry.createdAt ??= now;
+				this.credentialStore.saveCodex(this.entries.map((entry) => codexToCredential(entry)));
+			} else {
+				const baseDir = this.options?.homeDir;
+				writeSecretJSON(getCredentialsPath(baseDir), this.entries.map(storedCredential));
+			}
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
 				error: err instanceof Error ? err.message : String(err),

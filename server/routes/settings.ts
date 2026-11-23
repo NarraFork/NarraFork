@@ -25,6 +25,7 @@ import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import { peekCommandCodeModels } from "../lib/commandcode-models";
+import { getCredentialMigrationConflicts } from "../lib/credential-migration";
 import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
@@ -1004,6 +1005,8 @@ async function buildSettingsResponse(
 		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
 		// know whether it is on before rendering the site-quota inputs and the balance row.
 		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
+		// Credentials that stopped the move to credentials.json; the providers page lists them.
+		credentialMigrationConflicts: getCredentialMigrationConflicts(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,

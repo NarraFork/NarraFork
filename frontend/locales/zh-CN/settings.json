@@ -1371,6 +1371,10 @@
 	"pwaUpdating": "更新中...",
 	"unsavedSave": "保存更改",
 	"unsavedDiscard": "放弃更改",
+	"credentialMigrationConflict": {
+		"title": "凭据尚未迁移到新存储",
+		"description": "以下凭据的 id 重复。每组删除或重新添加其中一个后重启 NarraFork，即可完成迁移；在此之前一切照常可用。"
+	},
 	"providersTitle": "AI 供应商",
 	"providersTabPlatforms": "平台集成",
 	"providersTabCustom": "自定义供应商",
