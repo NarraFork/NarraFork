@@ -9,11 +9,13 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 mock.module("../../db", () => ({ db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
@@ -81,9 +83,9 @@ beforeEach(async () => {
 	narratorId = await makeNarrator();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	invalidateGitIdentityCache();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 
 describe("legacy profile compatibility", () => {

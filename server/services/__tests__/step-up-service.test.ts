@@ -6,13 +6,15 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { Secret, TOTP } from "otpauth";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { userIdentities, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { LDAP_PROVIDER_ID } from "../../lib/ldap/protocol";
 import { settings } from "../../lib/settings";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -22,7 +24,8 @@ const { consumeStepUp, resetStepUpForTests, STEP_UP_PURPOSES, stepUpMethods, ver
 	await import("../step-up-service");
 const { stepUpSchema } = await import("../../lib/validators/auth");
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
