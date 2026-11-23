@@ -107,7 +107,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		let compactCalls = 0;
 		for await (const event of agentLoop(
 			makeConfig(new AbortController().signal, {
-				shouldIdleOnReasoningOnly: async () => true,
+				hasPendingWake: async () => true,
 				onReasoningOnlyHighContext: async () => {
 					compactCalls++;
 					return null;
@@ -136,7 +136,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const events: AgentEvent[] = [];
 		for await (const event of agentLoop(
 			makeConfig(new AbortController().signal, {
-				shouldIdleOnReasoningOnly: () => {
+				hasPendingWake: () => {
 					idleChecks++;
 					return false;
 				},
@@ -157,7 +157,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const events: AgentEvent[] = [];
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, {
-				shouldIdleOnReasoningOnly: async () => {
+				hasPendingWake: async () => {
 					ac.abort();
 					return true;
 				},

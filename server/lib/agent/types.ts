@@ -1310,8 +1310,8 @@ export interface AgentConfig {
 	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
 	/** Whether the initial history ends with tool results the model has not answered. */
 	historyEndsWithToolResults?: boolean;
-	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
-	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
+	/** Pending input or external work will wake this session; empty/reasoning-only replies may idle. */
+	hasPendingWake?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
