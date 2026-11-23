@@ -12,8 +12,13 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
-import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
 const databaseFixture = getNarratorWorkerTestDb();
 const { db, sqlite } = databaseFixture;
@@ -92,6 +97,92 @@ const request = {
 };
 const binding = { toolCallId: "call", attempt: 1, executionSegmentId: "parent-segment" };
 describe("subagent logical-run receipts", () => {
+	for (const mutation of ["attempt", "receipt"] as const) {
+		test(`a concurrent ${mutation} change rejects with 409 instead of committing a stale run receipt`, async () => {
+			await fixture();
+			const read = workerPool.runReadTask;
+			let changed = false;
+			const reader = spyOn(workerPool, "runReadTask").mockImplementation(
+				async <T>(...args: Parameters<typeof workerPool.runReadTask>) => {
+					const result = await read<T>(...args);
+					const task = args[1];
+					if (
+						!changed &&
+						task.kind === "selectRows" &&
+						task.sql.includes('from "file_change_execution_segments"')
+					) {
+						changed = true;
+						if (mutation === "attempt") {
+							db.update(narratorToolCalls)
+								.set({ executionAttempt: 2 })
+								.where(eq(narratorToolCalls.id, "call"))
+								.run();
+						} else {
+							db.insert(fileChangeExecutionSegments)
+								.values({
+									id: "concurrent-receipt",
+									narratorId: "child",
+									sourceInputId: "subagent-run:run-1",
+									parentSegmentId: null,
+									createdAt: now,
+								})
+								.run();
+						}
+					}
+					return result;
+				},
+			);
+			try {
+				const error = await captureWorkerRejection(
+					establishSubagentExecutionSegment({ ...request, binding }),
+				);
+				expect(changed).toBe(true);
+				expect(error).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+				const receipts = db
+					.select()
+					.from(fileChangeExecutionSegments)
+					.where(eq(fileChangeExecutionSegments.narratorId, "child"))
+					.all();
+				expect(receipts.map((row) => row.id)).toEqual(
+					mutation === "receipt" ? ["concurrent-receipt"] : [],
+				);
+			} finally {
+				reader.mockRestore();
+			}
+		});
+	}
+	test("absent receipts and Worker failures remain distinct without main-thread fallback", async () => {
+		await fixture();
+		expect(await readSubagentExecutionBoundary("child")).toBeNull();
+		const failure = new Error("injected Worker failure");
+		const reader = spyOn(workerPool, "runReadTask").mockRejectedValue(failure);
+		const local = spyOn(sqlite, "query");
+		try {
+			expect(await captureWorkerRejection(readSubagentExecutionBoundary("child"))).toBe(failure);
+			expect(await captureWorkerRejection(establishSubagentExecutionSegment(request))).toBe(
+				failure,
+			);
+			expect(local).not.toHaveBeenCalled();
+		} finally {
+			local.mockRestore();
+			reader.mockRestore();
+		}
+	});
+	test("cancelled and expired reads fail before receipt creation", async () => {
+		await fixture();
+		for (const options of [{ signal: AbortSignal.abort() }, { deadlineAt: Date.now() - 1 }]) {
+			expect(
+				await captureWorkerRejection(establishSubagentExecutionSegment({ ...request, ...options })),
+			).toBeInstanceOf(Error);
+		}
+		expect(
+			db
+				.select()
+				.from(fileChangeExecutionSegments)
+				.where(eq(fileChangeExecutionSegments.narratorId, "child"))
+				.all(),
+		).toEqual([]);
+	});
 	test("verified initial run survives recovery, detach and result reread without a new binding", async () => {
 		await fixture();
 		const first = await establishSubagentExecutionSegment({ ...request, binding });

@@ -2634,7 +2634,10 @@ async function buildSubagentActivities(
 		});
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
-	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds, undefined, {
+		signal,
+		deadlineAt,
+	});
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);

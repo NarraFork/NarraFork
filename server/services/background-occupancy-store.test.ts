@@ -1,6 +1,10 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { testEnvironment } from "../../tests/preload";
+import * as workerPool from "../lib/db-worker/pool";
 import {
 	BackgroundOccupancyIndex,
 	type OccupancyNarrator,
@@ -135,7 +139,9 @@ describe("background occupancy coordinator", () => {
 	});
 
 	test("real SQL correlates projection existence to the outer narrator, not background task itself", async () => {
-		const client = new Database(":memory:");
+		const directory = mkdtempSync(join(testEnvironment.narraforkHome, "occupancy-"));
+		const client = new Database(join(directory, "fixture.sqlite"));
+		client.run("PRAGMA journal_mode = WAL");
 		client.exec(`
 			CREATE TABLE narrators (
 				id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT, status TEXT,
@@ -156,6 +162,8 @@ describe("background occupancy coordinator", () => {
 		try {
 			const db = drizzle({ client });
 			const source = createDatabaseBackgroundOccupancySource(async () => db);
+			expect(await source.getNarrators(["absent"])).toEqual([]);
+			expect(await source.getTasks(["absent"])).toEqual([]);
 			const rows = await source.getNarrators(["legacy", "projected", "same-id"]);
 			expect(new Map(rows.map((row) => [row.id, row.hasProjection]))).toEqual(
 				new Map([
@@ -178,8 +186,41 @@ describe("background occupancy coordinator", () => {
 				activeWorkCount: 2,
 				activeServiceCount: 1,
 			});
+			await store.stop();
+			const failure = new Error("injected Worker failure");
+			const worker = spyOn(workerPool, "runReadTask").mockRejectedValue(failure);
+			const local = spyOn(client, "query");
+			try {
+				for (const read of [
+					() => source.scanNarrators(null, 1),
+					() => source.scanTasks(null, 1),
+					() => source.getNarrators(["root"]),
+					() => source.getTasks(["unrelated"]),
+					() => source.getProjections("projected", null, 1),
+				]) {
+					const result = await read().then(
+						() => null,
+						(error: unknown) => error,
+					);
+					expect(result).toBe(failure);
+				}
+				expect(local).not.toHaveBeenCalled();
+			} finally {
+				worker.mockRestore();
+				local.mockRestore();
+			}
+			for (const options of [{ signal: AbortSignal.abort() }, { deadlineAt: Date.now() - 1 }]) {
+				const budgeted = createDatabaseBackgroundOccupancySource(async () => db, options);
+				const result = await budgeted.scanNarrators(null, 1).then(
+					() => null,
+					(error: unknown) => error,
+				);
+				expect(result).toBeInstanceOf(Error);
+			}
 		} finally {
+			await workerPool.shutdownDbWorkerPool();
 			client.close();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 	test("explicit startup scans paged metadata only once; all steady reads are SQL-free", async () => {

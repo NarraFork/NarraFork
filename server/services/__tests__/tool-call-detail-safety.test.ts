@@ -503,6 +503,24 @@ describe("outbound aggregation positive scope and metadata budgets", () => {
 		).not.toContain(realChild.id);
 	});
 
+	test("activity evidence inherits the display cancellation signal and total deadline", async () => {
+		const own = narrator();
+		const parent = tool(own.id, "evidence-read-budget", { toolName: "Agent" });
+		const realChild = child(own, parent);
+		tool(realChild.id, "evidence-budget-child", { parentToolUseId: parent.toolUseId });
+		const current = spyOn(subagentFileChanges, "getCurrentSubagentFileChangeOptions");
+		const evidence = spyOn(subagentFileChanges, "getFileChangesBySubagent");
+		const signal = new AbortController().signal;
+		const before = Date.now();
+		await narratorService.getPretextDocumentPage(own.id, { limit: 20, signal });
+		expect(current).toHaveBeenCalled();
+		const options = current.mock.calls[0]?.[2];
+		expect(options?.signal).toBe(signal);
+		expect(options?.deadlineAt).toBeGreaterThanOrEqual(before);
+		expect(options?.deadlineAt).toBeLessThanOrEqual(Date.now() + 10_000);
+		expect(evidence.mock.calls[0]?.[1]).toMatchObject(options ?? {});
+	});
+
 	test("revoking a parent ref during async activity aggregation prevents the response", async () => {
 		const own = narrator();
 		const parent = tool(own.id, "revoke-during-aggregate", { toolName: "Agent" });
