@@ -746,6 +746,8 @@ export async function executeQueuedNewCommand(
 					await resolveSubagentModelForRun(
 						sourceNarrator,
 						buffered.createdBy ?? sourceNarrator.ownerUserId,
+						undefined,
+						{ signal: active.abortController.signal },
 					)
 				).model
 			: (sourceNarrator.model ?? undefined);
@@ -1603,7 +1605,9 @@ async function createNarrator(
 	const stickyProvider = await lastServedProvider(narratorId);
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider)
+			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider, {
+					signal: abortController.signal,
+				})
 			: null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const narratorModel =

@@ -127,6 +127,8 @@ export async function generateAskUserQuestionAnswers(
 					await resolveSubagentModelForRun(
 						await narratorService.getById(narratorId),
 						options.actingUserId,
+						undefined,
+						{ signal: options.signal },
 					)
 				).model
 			: (options.model ?? undefined);

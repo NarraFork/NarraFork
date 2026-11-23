@@ -351,12 +351,14 @@ export const teamStatusTool: ToolDefinition = {
 				const resolvedId = target_id
 					? await resolveTeamMemberId(ctx.narratorId, target_id)
 					: undefined;
-				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId);
+				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId, {
+					signal: ctx.signal,
+				});
 				// Only ids are tracked here, so labels need the async resolver.
 				const { resolveAgentLabel } = await import("@server/services/subagent-label");
 				if (resolvedId) {
 					const files = changes.get(resolvedId);
-					const label = await resolveAgentLabel(scopeId, resolvedId);
+					const label = await resolveAgentLabel(scopeId, resolvedId, { signal: ctx.signal });
 					if (!files?.size) {
 						return { output: `No file changes recorded for ${label}.` };
 					}
@@ -370,7 +372,7 @@ export const teamStatusTool: ToolDefinition = {
 				const sections: string[] = [];
 				for (const [subId, files] of changes) {
 					const isSelf = subId === ctx.narratorId ? " (you)" : "";
-					const label = await resolveAgentLabel(scopeId, subId);
+					const label = await resolveAgentLabel(scopeId, subId, { signal: ctx.signal });
 					sections.push(
 						`${label}${isSelf} (${files.size} files):\n${[...files].map((f) => `  ${f}`).join("\n")}`,
 					);

@@ -14,12 +14,15 @@
  * in-memory registries, which is exactly what the recovery manifest is built from.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -28,6 +31,11 @@ const { checkpointPlannedUpdateContinuations, isLiveNarratorForCheckpoint } = aw
 	"../update-recovery-service"
 );
 const { toolContinuationService } = await import("../tool-continuation-service");
+
+afterAll(async () => {
+	mock.module("../../db", () => realDbModule);
+	await fixture.close();
+});
 
 const LIVE_NARRATOR = "narrator-live";
 const ABANDONED_NARRATOR = "narrator-abandoned";
