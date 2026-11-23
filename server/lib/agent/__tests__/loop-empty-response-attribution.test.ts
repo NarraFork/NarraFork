@@ -605,6 +605,19 @@ describe("an empty reply after handing work off is a finish", () => {
 		expect(lastType(await quietRun({ bot: true }, { stopReason: "stop" }))).toBe("done");
 	});
 
+	test("an uppercase Gemini STOP after a hand-off finishes quietly", async () => {
+		const events = await quietRun(
+			{},
+			{ stopReason: "STOP" },
+			{
+				name: "Watch",
+				input: '{"type":"terminal","id":"term-1"}',
+			},
+		);
+		expect(events.at(-1)).toEqual({ type: "done" });
+		expect(providerAttempts).toBe(2);
+	});
+
 	test.each([
 		["Send", '{"id":"parent","message":"done"}'],
 		["Agent", '{"prompt":"look into it"}'],

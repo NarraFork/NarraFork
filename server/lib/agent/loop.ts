@@ -372,7 +372,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
 	if (kind === "empty_response_usage_only") return true;
 	return (
 		kind === "empty_response_stop_without_content" &&
-		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+		QUIET_STOP_REASONS.has(signals.stopReason?.toLowerCase() ?? "")
 	);
 }
 
