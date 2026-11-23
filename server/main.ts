@@ -11,15 +11,33 @@ import { urlHost } from "../shared/server-host";
 import { MAX_IMPORT_BYTES } from "../shared/storage-transfer";
 import { app } from "./app";
 import { getDbPath } from "./db/connection";
+import { gateway } from "./gateway/gateway";
 import { createServerRequestDispatcher } from "./http-dispatcher";
 import { createServerRequestLifecycle } from "./http-request-lifecycle";
+import { sweepStagedAttachments } from "./lib/attachment-staging";
+import { startSessionCleanupTimer, stopSessionCleanupTimer } from "./lib/auth";
 import { createDatabaseReaderReadiness, databaseReadersAvailable } from "./lib/db-reader-readiness";
+import { createDatabaseReaderStartup } from "./lib/db-reader-startup";
 import {
 	assertDbReadersReady,
 	getDbWorkerAvailability,
 	shutdownDbWorkerPool,
 } from "./lib/db-worker/pool";
+import { cleanupStaleShares } from "./lib/shares";
+import { startChallengeCleanupTimer } from "./lib/webauthn";
+import { packActivationService } from "./services/knowledge-pack-activation-service";
+import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
+import {
+	closePrefixSnapshotStore,
+	startPrefixSnapshotMaintenance,
+} from "./services/narrator-prefix-snapshots";
 import { attachRemoteAccessRuntime } from "./services/remote-access-runtime";
+import {
+	isScheduledTaskTickActive,
+	startScheduledTaskScheduler,
+	stopScheduledTaskScheduler,
+} from "./services/scheduled-task-scheduler";
+import { startSkillCacheCleanupTimer } from "./services/skill-service";
 import "./db"; // Ensure DB is initialized early
 import {
 	activeDatabaseBackend,
@@ -1024,505 +1042,12 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	openFrontendOnce(url);
 }
 
-// Verify database integrity in the background, now that the port is bound and requests are being
-// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
-// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
-// probe now runs in a read-only subprocess and only records a repair marker; the repair itself
-// happens on the next startup, before any request is accepted.
-//
-// SQLite-only: the probe spawns a `bun:sqlite` read-only subprocess against the local database
-// file, which does not exist on the PostgreSQL backend (and `startupShutdownState.wasClean`
-// there is the "cannot skip verification" answer). A server-managed engine verifies itself.
-const readerStartupAdmission = await databaseReaderReadiness.wait();
-if (readerStartupAdmission.ok) {
-	if (activeDatabaseBackend === "sqlite") {
-		scheduleBackgroundIntegrityCheck(startupShutdownState);
-	}
-
-	// Start WebSocket heartbeat (ping/pong) to detect stale connections
-	startHeartbeat();
-
-	// Wire the remote-executor backend resolver + device lifecycle listeners.
-	initDeviceConnectionService();
-	// Wire the file-transfer chunk-frame receiver.
-	initDeviceTransferService();
-	// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
-	// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
-	await import("./services/modeltrace-compat")
-		.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
-		.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
-	// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
-	// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
-	// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
-	if (activeDatabaseBackend === "postgres") {
-		logger.warn(
-			"OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated",
-		);
-	} else {
-		// Narrators written before runtime registrations store their relations from now on.
-		await materializeLegacyDelegations().catch((error) =>
-			logger.warn("Legacy delegation materialization failed", { error: String(error) }),
-		);
-		// The server is already serving here, so a failure is logged rather than thrown. It fails
-		// closed: a grant without its authority row is rejected as invalid_grant, and a resource
-		// without its binding is not listed for the client. The next startup retries the backfill.
-		try {
-			await backfillOAuthGrantAuthoritiesOnStartup();
-			await backfillIntegrationResourceBindingsOnStartup();
-		} catch (error) {
-			logger.error(
-				"OAuth/integration startup backfill failed; affected legacy grants stay denied",
-				{
-					error: String(error),
-				},
-			);
-		}
-	}
-
-	startVNetUdpRendezvous(settings.vnet).catch((err) => {
-		logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
-	});
-
-	try {
-		getCodexManager().startUsageRefreshScheduler();
-	} catch (err) {
-		logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
-	}
-
-	try {
-		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-		// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
-		// refresh when provider settings change).
-		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
-		void refreshAllKimiUsages().catch(() => {});
-	} catch (err) {
-		logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-	}
-
-	try {
-		// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
-		// restart re-reads it rather than trusting numbers from the previous process.
-		const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
-		void refreshAllOpencodeUsages().catch(() => {});
-	} catch (err) {
-		logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
-	}
-
-	try {
-		// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
-		const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
-		void refreshAllDeepSeekBalances().catch(() => {});
-	} catch {
-		logger.warn("DeepSeek balance startup refresh failed");
-	}
-
-	// A user's template in a built-in's directory moves aside without losing its contents.
-	void import("./services/custom-subagent-service")
-		.then(({ moveAsideReservedTemplates }) => moveAsideReservedTemplates())
-		.catch((err) => logger.warn("Reserved subagent template check failed", { error: String(err) }));
-
-	// Mark any stale terminals from a previous run as exited
-	terminalService.recoverOnStartup().catch((err) => {
-		logger.error("Terminal recovery failed", { error: String(err) });
-	});
-
-	// Prepare tools before publishing each initialized MCP server's capabilities.
-	mcpManager.prepareTools = prepareMcpTools;
-	mcpManager.initialize().catch((err) => {
-		logger.error("MCP server initialization failed", { error: String(err) });
-	});
-
-	// Initialize the plugin control plane after core services are available. Plugin
-	// activation is feature-flagged and must never prevent the core server from starting.
-	pluginManager
-		.initialize()
-		.then((statuses) => {
-			logger.info("Plugin manager initialized", {
-				enabled: pluginManager.isEnabled(),
-				pluginCount: statuses.length,
-			});
-		})
-		.catch((err) => {
-			logger.error("Plugin manager initialization failed", { error: String(err) });
-		});
-}
-
-function startQuestionAnswerRecovery(): void {
-	if (!automaticResumeEnabled()) return;
-	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
-		logger.error("Pending question answer recovery failed", { error: String(error) });
-	});
-}
-
-// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
-// never compensate by scanning every narrator or interrupting another queue's live owner.
-const startupRecoveryNarratorIds = new Set<string>();
-const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
-	for (const id of ids) startupRecoveryNarratorIds.add(id);
-};
-
-// Read planned-update protection before generic cleanup can mutate process-owned rows. The
-// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
-// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
-// the background after that queue is mounted.
-if (readerStartupAdmission.ok) {
-	withBackgroundOccupancyInitialization(
-		async () => {
-			const plannedUpdate = await getPlannedUpdateStartupProtection({
-				claimAuthorization: automaticResumeEnabled(),
-				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
-			});
-			for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
-			for (const target of plannedUpdate.snapshot?.narrators ?? [])
-				startupRecoveryNarratorIds.add(target.narratorId);
-			for (const source of plannedUpdate.snapshot?.sources ?? [])
-				for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
-			// The instance lock is already held. Release only previous-process mailbox claims
-			// before planned recovery mounts owners; hot reload preserves the process marker.
-			await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
-				recoverInboxClaimsOnColdStartup(),
-			);
-			const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
-				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
-			});
-			for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
-			for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
-				startupRecoveryNarratorIds.add(target.narratorId);
-			for (const target of ordinaryRestart.manifest?.targets ?? [])
-				startupRecoveryNarratorIds.add(target.narratorId);
-			const protection = mergeStartupProtection(
-				plannedUpdate.protection,
-				ordinaryRestart.protection,
-			);
-			await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
-			return { plannedUpdate, ordinaryRestart };
-		},
-		activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
-	)
-		.then(async ({ plannedUpdate, ordinaryRestart }) => {
-			await restorePendingModelOverrides();
-			// Browser-backed narrators must see their restored sessions before planned-update continuation
-			// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
-			await import("./services/browser-session-recovery")
-				.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
-				.catch((err) => {
-					logger.error("Browser session recovery failed", {
-						error: err instanceof Error ? err.message : String(err),
-					});
-				});
-			// All sources are now registered. New preparation can reserve them without
-			// waiting for an Agent, Await, or human approval to finish (or even mount).
-			finishRecoveryDiscovery();
-			const recoveryHandles = automaticResumeEnabled()
-				? await Promise.all([
-						restoreNarratorsAfterPlannedUpdate(plannedUpdate),
-						restoreOrdinaryRestartRecovery(ordinaryRestart),
-					])
-				: [];
-			const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
-			if (completions.length) startupReadiness.markRecovering();
-			else startupReadiness.markReady();
-			startupReadiness.settle({ ok: true });
-			// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
-			void import("./services/narrator-block-backfill")
-				.then(({ startBlockBackfill }) => startBlockBackfill())
-				.catch((err) =>
-					logger.warn("Block backfill did not start", {
-						error: err instanceof Error ? err.message : String(err),
-					}),
-				);
-			void import("./services/storage-history-runtime")
-				.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
-				.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
-			if (completions.length) {
-				Promise.all(completions)
-					.then(() => {
-						startupReadiness.markReady();
-						startQuestionAnswerRecovery();
-						logger.info("Planned-update background continuation recovery completed");
-					})
-					.catch(async (err) => {
-						const error = err instanceof Error ? err.message : String(err);
-						startupReadiness.markFailed(error);
-						logger.error("Planned-update background continuation recovery failed", { error });
-						await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
-					});
-			} else {
-				startQuestionAnswerRecovery();
-			}
-		})
-		.catch(async (err) => {
-			const error = err instanceof Error ? err.message : String(err);
-			startupReadiness.markFailed(error);
-			logger.error("Narrator state recovery failed", { error });
-			startupReadiness.settle({ ok: false, error });
-			await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
-			// A recovery failure caused by an unusable provider is almost always a persisted
-			// narrator pointing at a prefix the user has since removed. Surface which narrators
-			// are affected instead of leaving the reason buried in this log line.
-			if (isProviderUnavailableError(err)) void reportBrokenModelNarrators(error);
-		});
-} else {
-	finishRecoveryDiscovery();
-	logger.error("Database readers unavailable; database startup work is gated", {
-		code: readerStartupAdmission.code,
-	});
-	startupReadiness.settle({ ok: false, error: readerStartupAdmission.code });
-}
-
-/**
- * Scan for narrators stuck on an unusable model and announce a summary.
- *
- * Only counts and provider prefixes are broadcast — the full narrator list is fetched
- * on demand through `GET /api/narrators/broken-models`, so this never pushes a large
- * payload to every connected client.
- */
-async function reportBrokenModelNarrators(recoveryError: string): Promise<void> {
-	try {
-		const { scanBrokenModelNarrators } = await import("./services/broken-model-migration-service");
-		const scan = await scanBrokenModelNarrators();
-		if (scan.totalBroken === 0 && scan.totalSuspect === 0) return;
-
-		const providerPrefixes = [
-			...new Set(
-				scan.groups
-					.filter((group) => group.reason === "provider_missing")
-					.map((group) => group.providerPrefix)
-					.filter((prefix): prefix is string => !!prefix),
-			),
-		];
-		logger.warn("Narrators are pinned to an unusable model", {
-			recoveryError,
-			totalBroken: scan.totalBroken,
-			totalSuspect: scan.totalSuspect,
-			providerPrefixes,
-			truncated: scan.truncated,
-		});
-		const { broadcastToAll } = await import("./websocket/narrator-ws");
-		broadcastToAll({
-			type: "broken_model_narrators_detected",
-			totalBroken: scan.totalBroken,
-			totalSuspect: scan.totalSuspect,
-			providerPrefixes,
-			truncated: scan.truncated,
-		});
-	} catch (scanError) {
-		logger.error("Failed to report narrators pinned to an unusable model", {
-			error: scanError instanceof Error ? scanError.message : String(scanError),
-		});
-	}
-}
-
-// Clean up leftover share directories from previous server runs
-import { cleanupStaleShares } from "./lib/shares";
-
-if (readerStartupAdmission.ok) cleanupStaleShares();
-
-// Request dumps and token repair data from before request evidence unification are discarded.
-import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
-
-void removeLegacyRequestDumpDirs();
-
-// Clean up leftover pack extraction directories from previous server runs and mark any
-// still-"active" pack activations as released (their temp dirs don't survive a restart).
-import { packActivationService } from "./services/knowledge-pack-activation-service";
-
-if (readerStartupAdmission.ok) packActivationService.cleanupStalePacks();
-
-// Periodically remove old per-directory skill summary caches.
-import { startSkillCacheCleanupTimer } from "./services/skill-service";
-
-startSkillCacheCleanupTimer();
-
-// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
-import {
-	closePrefixSnapshotStore,
-	startPrefixSnapshotMaintenance,
-} from "./services/narrator-prefix-snapshots";
-
-const stopPrefixSnapshotMaintenance = readerStartupAdmission.ok
-	? startPrefixSnapshotMaintenance()
-	: () => Promise.resolve();
-
-// Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
-import { startChallengeCleanupTimer } from "./lib/webauthn";
-
-startChallengeCleanupTimer();
-
-// Periodically delete expired and revoked login sessions.
-import { startSessionCleanupTimer, stopSessionCleanupTimer } from "./lib/auth";
-
-if (readerStartupAdmission.ok) startSessionCleanupTimer();
-
-// Reclaim abandoned uploads without overlapping sweeps.
-import { sweepStagedAttachments } from "./lib/attachment-staging";
-
-let attachmentSweepRunning = false;
-setInterval(
-	async () => {
-		if (attachmentSweepRunning) return;
-		attachmentSweepRunning = true;
-		try {
-			await sweepStagedAttachments();
-		} catch (error) {
-			logger.warn("Attachment staging sweep failed", { error: String(error) });
-		} finally {
-			attachmentSweepRunning = false;
-		}
-	},
-	30 * 60 * 1000,
-).unref();
-
-// Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
-import {
-	isScheduledTaskTickActive,
-	startScheduledTaskScheduler,
-	stopScheduledTaskScheduler,
-} from "./services/scheduled-task-scheduler";
-
-void startupReadiness.barrier.then((recovery) => {
-	if (
-		!readerStartupAdmission.ok ||
-		!httpLifecycle.accepting ||
-		!databaseReadersAvailable(databaseReaderReadiness.state)
-	)
-		return;
-	if (!recovery.ok) {
-		// The scheduler owns its own persisted records and skips narrators it cannot start, so a
-		// failed recovery pass must not silently disable every future scheduled task.
-		logger.warn("Starting scheduled task scheduler despite a failed startup recovery", {
-			error: recovery.error,
-		});
-	}
-	startScheduledTaskScheduler();
-	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
-	// must not keep update checkpoint scans or UI recovery cards looking "busy".
-	import("./services/abandoned-tool-cleanup")
-		.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
-		.then((result) => {
-			if (result.cleaned > 0) {
-				logger.info("Startup abandoned tool-call cleanup finished", result);
-			}
-		})
-		.catch((err) => {
-			logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
-		});
-});
-
 // Outline pages edited live when the previous process ended: commit what their logs hold.
 const outlineLiveDatabaseWork = hotSafe(
 	"outline.live.database-work.v1",
 	() => new Set<Promise<unknown>>(),
 );
 let outlineLiveReplay: Promise<unknown> | undefined;
-void startupReadiness.barrier.then(() => {
-	if (
-		!readerStartupAdmission.ok ||
-		!httpLifecycle.accepting ||
-		!databaseReadersAvailable(databaseReaderReadiness.state)
-	)
-		return;
-	outlineLiveReplay = trackOutlineLiveDatabaseWork(
-		import("./services/outline/live/registry").then(({ startLiveReplay }) => {
-			if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
-				return;
-			return startLiveReplay();
-		}),
-	);
-	void outlineLiveReplay.catch((err) =>
-		logger.warn("Outline live log replay failed", { error: String(err) }),
-	);
-	// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
-	// session was archived or deleted (on those events), and derive the in-process flag of
-	// blocks written before it existed (once, page by page).
-	import("./services/outline/tasks")
-		.then(({ startOutlineTaskLeaseJob }) => {
-			if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
-				return;
-			startOutlineTaskLeaseJob();
-		})
-		.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
-	import("./services/outline/in-process")
-		.then(({ scheduleOutlineInProcessRebuild }) => {
-			if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
-				return;
-			return scheduleOutlineInProcessRebuild();
-		})
-		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
-	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
-	// in bounded slices), and "today so far" when asked.
-	import("./services/outline/digest-job")
-		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
-		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
-	// Outline team events: a session is told when a task is assigned to it by name, when a
-	// prerequisite of its task ends, and when a task it created ends. The commits of the last
-	// minutes are pushed again in the background (what a stop between a commit and its rows left
-	// untold; a row written before is found and not written twice).
-	import("./services/outline/team-events")
-		.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
-			startOutlineTeamEvents();
-			return repushRecentOutlineTeamEvents();
-		})
-		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
-	// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
-	// they are idle (a pass a minute after start, then at intervals; one session at a time).
-	import("./services/outline/spec-import/triggers")
-		.then(({ startSpecImportJob }) => startSpecImportJob())
-		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
-	// What the old Spec panel may have swallowed is looked for in the background (read-only; a
-	// pass a while after start, then at intervals) and shown to people, never repaired.
-	import("./services/outline/spec-import/loss-scan")
-		.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
-		.catch((err) => logger.warn("Swallowed-content scan failed to start", { error: String(err) }));
-	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
-	import("./services/outline/plugin-task-events")
-		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
-		.catch((err) =>
-			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
-		);
-});
-
-// Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
-// process-wide singleton before querying the authoritative indexes.
-if (readerStartupAdmission.ok)
-	ensureAllRecentTabsMigrated()
-		.then(() => logger.info("RecentTabs legacy migration scan completed"))
-		.catch((err) => logger.warn("RecentTabs legacy migration scan failed", { error: String(err) }));
-
-// Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
-import { gateway } from "./gateway/gateway";
-
-void startupReadiness.barrier.then((recovery) => {
-	if (
-		!readerStartupAdmission.ok ||
-		!httpLifecycle.accepting ||
-		!databaseReadersAvailable(databaseReaderReadiness.state)
-	)
-		return;
-	if (!recovery.ok) {
-		logger.warn("Starting IM Gateway despite a failed startup recovery", {
-			error: recovery.error,
-		});
-	}
-	gateway.start().catch((err) => {
-		logger.error("IM Gateway startup failed", { error: String(err) });
-	});
-});
-
-// No startup workspace cleanup: workspaces used to be deleted when no sidebar tab
-// referenced them, but the sidebar no longer lists workspaces at all (folders replaced
-// that grouping), so every workspace would look orphaned. They are deleted explicitly.
-// Register knowledge notification bridge (push publish/review state to reviewers + submitters)
-initKnowledgeNotify();
-
-// Register chat notification bridge (room messages to viewers, unread badges to the rest)
-initChatNotify();
-
-// Activity projections consume source events independently of WebSocket delivery.
-if (readerStartupAdmission.ok) {
-	initNotificationFanout();
-	startNotificationCenterMaintenance();
-}
 
 const teamDatabaseMaintenance = hotSafe("teams.database-maintenance.v1", () => ({
 	stopped: false,
@@ -1588,36 +1113,523 @@ async function stopTeamDatabaseMaintenance(): Promise<void> {
 		throw new Error("Team maintenance did not drain successfully");
 }
 
-if (readerStartupAdmission.ok && activeDatabaseBackend === "sqlite") {
-	// Follow coordinator archive changes, saved-output ownership and finite work-item tails.
-	startTeamDatabaseMaintenance("status", () =>
-		import("./services/teams/team-service").then(({ startTeamStatusSync }) => startTeamStatusSync),
-	);
-	startTeamDatabaseMaintenance("outputs", () =>
-		import("./services/teams/coordinator-maintenance").then(
-			({ startCoordinatorMaintenance }) => startCoordinatorMaintenance,
-		),
-	);
-	startTeamDatabaseMaintenance("work", () =>
-		import("./services/teams/work-items").then(
-			({ startTeamWorkLifecycle }) => startTeamWorkLifecycle,
-		),
-	);
-	// Keep changed paths and exclusive-path overlaps current under the same shutdown owner.
-	startTeamDatabaseMaintenance("overlap", () =>
-		import("./services/teams/team-overlap").then(({ startTeamOverlapJob }) => startTeamOverlapJob),
-	);
-	// Stop containers and release ports that removed chapters left behind.
-	retireLegacyChapterResources().catch((err) => {
-		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
-	});
-	// Re-derive which project every session belongs to, in bounded background pages.
-	void scheduleProjectIndexRebuild();
-	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
-	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
-	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
-	void migrateAggregationsOnStartup();
+let stopPrefixSnapshotMaintenance = () => Promise.resolve();
+
+// Request dumps and token repair data from before request evidence unification are discarded.
+void removeLegacyRequestDumpDirs();
+
+// Periodically remove old per-directory skill summary caches.
+startSkillCacheCleanupTimer();
+
+// Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
+startChallengeCleanupTimer();
+
+// Reclaim abandoned uploads without overlapping sweeps.
+let attachmentSweepRunning = false;
+setInterval(
+	async () => {
+		if (attachmentSweepRunning) return;
+		attachmentSweepRunning = true;
+		try {
+			await sweepStagedAttachments();
+		} catch (error) {
+			logger.warn("Attachment staging sweep failed", { error: String(error) });
+		} finally {
+			attachmentSweepRunning = false;
+		}
+	},
+	30 * 60 * 1000,
+).unref();
+
+// No startup workspace cleanup: workspaces used to be deleted when no sidebar tab
+// referenced them, but the sidebar no longer lists workspaces at all (folders replaced
+// that grouping), so every workspace would look orphaned. They are deleted explicitly.
+// Register knowledge notification bridge (push publish/review state to reviewers + submitters)
+initKnowledgeNotify();
+
+// Register chat notification bridge (room messages to viewers, unread badges to the rest)
+initChatNotify();
+
+function cancelDatabaseStartup(): void {
+	const error = "SERVER_SHUTTING_DOWN";
+	startupReadiness.markFailed(error);
+	startupReadiness.settle({ ok: false, error });
 }
+
+async function initializeDatabaseStartup(): Promise<void> {
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	// Verify database integrity in the background, now that the port is bound and requests are being
+	// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
+	// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
+	// probe now runs in a read-only subprocess and only records a repair marker; the repair itself
+	// happens on the next startup, before any request is accepted.
+	//
+	// SQLite-only: the probe spawns a `bun:sqlite` read-only subprocess against the local database
+	// file, which does not exist on the PostgreSQL backend (and `startupShutdownState.wasClean`
+	// there is the "cannot skip verification" answer). A server-managed engine verifies itself.
+	if (activeDatabaseBackend === "sqlite") {
+		scheduleBackgroundIntegrityCheck(startupShutdownState);
+	}
+
+	// Start WebSocket heartbeat (ping/pong) to detect stale connections
+	startHeartbeat();
+
+	// Wire the remote-executor backend resolver + device lifecycle listeners.
+	initDeviceConnectionService();
+	// Wire the file-transfer chunk-frame receiver.
+	initDeviceTransferService();
+	// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+	// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+	await import("./services/modeltrace-compat")
+		.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+		.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
+	// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
+	// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
+	if (activeDatabaseBackend === "postgres") {
+		logger.warn(
+			"OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated",
+		);
+	} else {
+		// Narrators written before runtime registrations store their relations from now on.
+		await materializeLegacyDelegations().catch((error) =>
+			logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+		);
+		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+		// The server is already serving here, so a failure is logged rather than thrown. It fails
+		// closed: a grant without its authority row is rejected as invalid_grant, and a resource
+		// without its binding is not listed for the client. The next startup retries the backfill.
+		try {
+			await backfillOAuthGrantAuthoritiesOnStartup();
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+			await backfillIntegrationResourceBindingsOnStartup();
+		} catch (error) {
+			logger.error(
+				"OAuth/integration startup backfill failed; affected legacy grants stay denied",
+				{
+					error: String(error),
+				},
+			);
+		}
+	}
+
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	startVNetUdpRendezvous(settings.vnet).catch((err) => {
+		logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
+	});
+
+	try {
+		getCodexManager().startUsageRefreshScheduler();
+	} catch (err) {
+		logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
+	}
+
+	try {
+		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
+		// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
+		// refresh when provider settings change).
+		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
+		void refreshAllKimiUsages().catch(() => {});
+	} catch (err) {
+		logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	try {
+		// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+		// restart re-reads it rather than trusting numbers from the previous process.
+		const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+		void refreshAllOpencodeUsages().catch(() => {});
+	} catch (err) {
+		logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	try {
+		// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
+		const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
+		void refreshAllDeepSeekBalances().catch(() => {});
+	} catch {
+		logger.warn("DeepSeek balance startup refresh failed");
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	// A user's template in a built-in's directory moves aside without losing its contents.
+	void import("./services/custom-subagent-service")
+		.then(({ moveAsideReservedTemplates }) => moveAsideReservedTemplates())
+		.catch((err) => logger.warn("Reserved subagent template check failed", { error: String(err) }));
+
+	// Mark any stale terminals from a previous run as exited
+	terminalService.recoverOnStartup().catch((err) => {
+		logger.error("Terminal recovery failed", { error: String(err) });
+	});
+
+	// Prepare tools before publishing each initialized MCP server's capabilities.
+	mcpManager.prepareTools = prepareMcpTools;
+	mcpManager.initialize().catch((err) => {
+		logger.error("MCP server initialization failed", { error: String(err) });
+	});
+
+	// Initialize the plugin control plane after core services are available. Plugin
+	// activation is feature-flagged and must never prevent the core server from starting.
+	pluginManager
+		.initialize()
+		.then((statuses) => {
+			logger.info("Plugin manager initialized", {
+				enabled: pluginManager.isEnabled(),
+				pluginCount: statuses.length,
+			});
+		})
+		.catch((err) => {
+			logger.error("Plugin manager initialization failed", { error: String(err) });
+		});
+
+	function startQuestionAnswerRecovery(): void {
+		if (!automaticResumeEnabled()) return;
+		void recoverPendingQuestionAnswerDeliveries().catch((error) => {
+			logger.error("Pending question answer recovery failed", { error: String(error) });
+		});
+	}
+
+	// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
+	// never compensate by scanning every narrator or interrupting another queue's live owner.
+	const startupRecoveryNarratorIds = new Set<string>();
+	const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
+		for (const id of ids) startupRecoveryNarratorIds.add(id);
+	};
+
+	// Read planned-update protection before generic cleanup can mutate process-owned rows. The
+	// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
+	// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
+	// the background after that queue is mounted.
+	const narratorRecovery = withBackgroundOccupancyInitialization(
+		async () => {
+			const plannedUpdate = await getPlannedUpdateStartupProtection({
+				claimAuthorization: automaticResumeEnabled(),
+				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+			});
+			for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+			for (const target of plannedUpdate.snapshot?.narrators ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			for (const source of plannedUpdate.snapshot?.sources ?? [])
+				for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
+			// The instance lock is already held. Release only previous-process mailbox claims
+			// before planned recovery mounts owners; hot reload preserves the process marker.
+			await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
+				recoverInboxClaimsOnColdStartup(),
+			);
+			const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
+				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+			});
+			for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+			for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			for (const target of ordinaryRestart.manifest?.targets ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			const protection = mergeStartupProtection(
+				plannedUpdate.protection,
+				ordinaryRestart.protection,
+			);
+			await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
+			return { plannedUpdate, ordinaryRestart };
+		},
+		activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
+	)
+		.then(async ({ plannedUpdate, ordinaryRestart }) => {
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+			await restorePendingModelOverrides();
+			// Browser-backed narrators must see their restored sessions before planned-update continuation
+			// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
+			await import("./services/browser-session-recovery")
+				.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
+				.catch((err) => {
+					logger.error("Browser session recovery failed", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+			// All sources are now registered. New preparation can reserve them without
+			// waiting for an Agent, Await, or human approval to finish (or even mount).
+			finishRecoveryDiscovery();
+			const recoveryHandles = automaticResumeEnabled()
+				? await Promise.all([
+						restoreNarratorsAfterPlannedUpdate(plannedUpdate),
+						restoreOrdinaryRestartRecovery(ordinaryRestart),
+					])
+				: [];
+			const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
+			if (completions.length) startupReadiness.markRecovering();
+			else startupReadiness.markReady();
+			startupReadiness.settle({ ok: true });
+			// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
+			void import("./services/narrator-block-backfill")
+				.then(({ startBlockBackfill }) => startBlockBackfill())
+				.catch((err) =>
+					logger.warn("Block backfill did not start", {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+			void import("./services/storage-history-runtime")
+				.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+				.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
+			if (completions.length) {
+				Promise.all(completions)
+					.then(() => {
+						startupReadiness.markReady();
+						startQuestionAnswerRecovery();
+						logger.info("Planned-update background continuation recovery completed");
+					})
+					.catch(async (err) => {
+						const error = err instanceof Error ? err.message : String(err);
+						startupReadiness.markFailed(error);
+						logger.error("Planned-update background continuation recovery failed", { error });
+						await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
+					});
+			} else {
+				startQuestionAnswerRecovery();
+			}
+		})
+		.catch(async (err) => {
+			const error = err instanceof Error ? err.message : String(err);
+			startupReadiness.markFailed(error);
+			logger.error("Narrator state recovery failed", { error });
+			startupReadiness.settle({ ok: false, error });
+			await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
+			// A recovery failure caused by an unusable provider is almost always a persisted
+			// narrator pointing at a prefix the user has since removed. Surface which narrators
+			// are affected instead of leaving the reason buried in this log line.
+			if (isProviderUnavailableError(err)) void reportBrokenModelNarrators(error);
+		});
+
+	/**
+	 * Scan for narrators stuck on an unusable model and announce a summary.
+	 *
+	 * Only counts and provider prefixes are broadcast — the full narrator list is fetched
+	 * on demand through `GET /api/narrators/broken-models`, so this never pushes a large
+	 * payload to every connected client.
+	 */
+	async function reportBrokenModelNarrators(recoveryError: string): Promise<void> {
+		try {
+			const { scanBrokenModelNarrators } = await import(
+				"./services/broken-model-migration-service"
+			);
+			const scan = await scanBrokenModelNarrators();
+			if (scan.totalBroken === 0 && scan.totalSuspect === 0) return;
+
+			const providerPrefixes = [
+				...new Set(
+					scan.groups
+						.filter((group) => group.reason === "provider_missing")
+						.map((group) => group.providerPrefix)
+						.filter((prefix): prefix is string => !!prefix),
+				),
+			];
+			logger.warn("Narrators are pinned to an unusable model", {
+				recoveryError,
+				totalBroken: scan.totalBroken,
+				totalSuspect: scan.totalSuspect,
+				providerPrefixes,
+				truncated: scan.truncated,
+			});
+			const { broadcastToAll } = await import("./websocket/narrator-ws");
+			broadcastToAll({
+				type: "broken_model_narrators_detected",
+				totalBroken: scan.totalBroken,
+				totalSuspect: scan.totalSuspect,
+				providerPrefixes,
+				truncated: scan.truncated,
+			});
+		} catch (scanError) {
+			logger.error("Failed to report narrators pinned to an unusable model", {
+				error: scanError instanceof Error ? scanError.message : String(scanError),
+			});
+		}
+	}
+
+	// Clean up leftover share directories from previous server runs
+	cleanupStaleShares();
+
+	// Clean up leftover pack extraction directories from previous server runs and mark any
+	// still-"active" pack activations as released (their temp dirs don't survive a restart).
+	packActivationService.cleanupStalePacks();
+
+	// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
+	stopPrefixSnapshotMaintenance = startPrefixSnapshotMaintenance();
+
+	// Periodically delete expired and revoked login sessions.
+	startSessionCleanupTimer();
+
+	// Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
+	void startupReadiness.barrier.then((recovery) => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		if (!recovery.ok) {
+			// The scheduler owns its own persisted records and skips narrators it cannot start, so a
+			// failed recovery pass must not silently disable every future scheduled task.
+			logger.warn("Starting scheduled task scheduler despite a failed startup recovery", {
+				error: recovery.error,
+			});
+		}
+		startScheduledTaskScheduler();
+		// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
+		// must not keep update checkpoint scans or UI recovery cards looking "busy".
+		import("./services/abandoned-tool-cleanup")
+			.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
+			.then((result) => {
+				if (result.cleaned > 0) {
+					logger.info("Startup abandoned tool-call cleanup finished", result);
+				}
+			})
+			.catch((err) => {
+				logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
+			});
+	});
+
+	void startupReadiness.barrier.then(() => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		outlineLiveReplay = trackOutlineLiveDatabaseWork(
+			import("./services/outline/live/registry").then(({ startLiveReplay }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				return startLiveReplay();
+			}),
+		);
+		void outlineLiveReplay.catch((err) =>
+			logger.warn("Outline live log replay failed", { error: String(err) }),
+		);
+		// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
+		// session was archived or deleted (on those events), and derive the in-process flag of
+		// blocks written before it existed (once, page by page).
+		import("./services/outline/tasks")
+			.then(({ startOutlineTaskLeaseJob }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				startOutlineTaskLeaseJob();
+			})
+			.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
+		import("./services/outline/in-process")
+			.then(({ scheduleOutlineInProcessRebuild }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				return scheduleOutlineInProcessRebuild();
+			})
+			.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+		// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
+		// in bounded slices), and "today so far" when asked.
+		import("./services/outline/digest-job")
+			.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
+			.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
+		// Outline team events: a session is told when a task is assigned to it by name, when a
+		// prerequisite of its task ends, and when a task it created ends. The commits of the last
+		// minutes are pushed again in the background (what a stop between a commit and its rows left
+		// untold; a row written before is found and not written twice).
+		import("./services/outline/team-events")
+			.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
+				startOutlineTeamEvents();
+				return repushRecentOutlineTeamEvents();
+			})
+			.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
+		// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
+		// they are idle (a pass a minute after start, then at intervals; one session at a time).
+		import("./services/outline/spec-import/triggers")
+			.then(({ startSpecImportJob }) => startSpecImportJob())
+			.catch((err) =>
+				logger.warn("Dynamic Spec import job failed to start", { error: String(err) }),
+			);
+		// What the old Spec panel may have swallowed is looked for in the background (read-only; a
+		// pass a while after start, then at intervals) and shown to people, never repaired.
+		import("./services/outline/spec-import/loss-scan")
+			.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
+			.catch((err) =>
+				logger.warn("Swallowed-content scan failed to start", { error: String(err) }),
+			);
+		// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+		import("./services/outline/plugin-task-events")
+			.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
+			.catch((err) =>
+				logger.warn("Outline plugin task events failed to start", { error: String(err) }),
+			);
+	});
+
+	// Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
+	// process-wide singleton before querying the authoritative indexes.
+	ensureAllRecentTabsMigrated()
+		.then(() => logger.info("RecentTabs legacy migration scan completed"))
+		.catch((err) => logger.warn("RecentTabs legacy migration scan failed", { error: String(err) }));
+
+	// Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
+	void startupReadiness.barrier.then((recovery) => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		if (!recovery.ok) {
+			logger.warn("Starting IM Gateway despite a failed startup recovery", {
+				error: recovery.error,
+			});
+		}
+		gateway.start().catch((err) => {
+			logger.error("IM Gateway startup failed", { error: String(err) });
+		});
+	});
+
+	// Activity projections consume source events independently of WebSocket delivery.
+	initNotificationFanout();
+	startNotificationCenterMaintenance();
+
+	if (activeDatabaseBackend === "sqlite") {
+		// Follow coordinator archive changes, saved-output ownership and finite work-item tails.
+		startTeamDatabaseMaintenance("status", () =>
+			import("./services/teams/team-service").then(
+				({ startTeamStatusSync }) => startTeamStatusSync,
+			),
+		);
+		startTeamDatabaseMaintenance("outputs", () =>
+			import("./services/teams/coordinator-maintenance").then(
+				({ startCoordinatorMaintenance }) => startCoordinatorMaintenance,
+			),
+		);
+		startTeamDatabaseMaintenance("work", () =>
+			import("./services/teams/work-items").then(
+				({ startTeamWorkLifecycle }) => startTeamWorkLifecycle,
+			),
+		);
+		// Keep changed paths and exclusive-path overlaps current under the same shutdown owner.
+		startTeamDatabaseMaintenance("overlap", () =>
+			import("./services/teams/team-overlap").then(
+				({ startTeamOverlapJob }) => startTeamOverlapJob,
+			),
+		);
+		// Stop containers and release ports that removed chapters left behind.
+		retireLegacyChapterResources().catch((err) => {
+			logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
+		});
+		// Re-derive which project every session belongs to, in bounded background pages.
+		void scheduleProjectIndexRebuild();
+		// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+		// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+		// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+		void migrateAggregationsOnStartup();
+	}
+	await narratorRecovery;
+}
+
+const databaseStartup = createDatabaseReaderStartup({
+	readiness: databaseReaderReadiness,
+	initialize: initializeDatabaseStartup,
+	onStop: cancelDatabaseStartup,
+	onUnavailable: (result) => {
+		logger.error("Database readers unavailable; database startup work is gated", {
+			code: result.code,
+		});
+	},
+	onError: (error) => {
+		const message = error instanceof Error ? error.message : String(error);
+		startupReadiness.markFailed(message);
+		startupReadiness.settle({ ok: false, error: message });
+		logger.error("Database startup initialization failed", { error: message });
+	},
+});
+const databaseStartupPromise = databaseStartup.start();
 
 // Establish client-egress relay channels for NUG providers configured with
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
@@ -1887,6 +1899,7 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 			buffered.failed ||
 			maintenancePending ||
 			integrityPending ||
+			databaseStartup.pending ||
 			outlineLivePending ||
 			websocketPending
 		) {
@@ -1915,6 +1928,7 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 				outlineLivePending,
 				maintenance,
 				integrity,
+				databaseStartupPending: databaseStartup.pending,
 			});
 		} else {
 			outcome = "ok";
@@ -1942,6 +1956,7 @@ async function performGracefulShutdown(
 		} catch {
 			// Observational sinks cannot prevent producers from stopping.
 		}
+		databaseStartup.stop();
 		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
@@ -2088,6 +2103,7 @@ async function performGracefulShutdown(
 		if (serverStopOutcome === "ok" && httpDrainOutcome === "ok" && wsDrainOutcome === "ok") {
 			tracker.markDrainComplete();
 		}
+		await step("databaseStartup.drain", () => databaseStartup.drain(), budget.businessRemaining());
 
 		// Sandboxed host-tool callers stop before their outline/editor/compute dependencies.
 		await step(
@@ -2353,6 +2369,18 @@ async function performGracefulShutdown(
 				durationMs: Date.now() - startedAt,
 			};
 		}
+		if (databaseStartup.pending) {
+			tracker.recordStep("databaseStartup.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Startup initialization did not drain; retaining database ownership until exit");
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
 		// Native reader exit owns a separate slice even when the business drain expired.
 		const readerBudget = budget.readerRemaining();
 		await shutdownStep(
@@ -2531,3 +2559,4 @@ shutdownState.onExit = () => {
 if (hotOnce("narrafork.mainShutdown.exit")) {
 	process.on("exit", () => shutdownState.onExit?.());
 }
+await databaseStartupPromise;

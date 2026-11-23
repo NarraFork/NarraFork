@@ -95,7 +95,10 @@ export function createDatabaseReaderReadiness(options: {
 		try {
 			const pool = options.availability?.();
 			const database = includeDatabase ? options.databaseAvailability?.() : undefined;
-			return (!pool || pool.available) && (!database || database.available);
+			return (
+				(!pool || pool.available || (!includeDatabase && pool.reason === "worker_unavailable")) &&
+				(!database || database.available)
+			);
 		} catch {
 			return false;
 		}
@@ -151,8 +154,10 @@ export function createDatabaseReaderReadiness(options: {
 			if (options.backend === "postgres") return { ok: true };
 			const current = liveState();
 			if (current.status === "ready") return { ok: true };
-			if (state.status === "ready" && current.status === "failed")
-				return { ok: false, code: current.code };
+			if (state.status === "ready" && current.status === "failed") {
+				if (!available(false)) return { ok: false, code: current.code };
+				state = current;
+			}
 			if (inFlight) return inFlight;
 			if (state.status === "failed" && now() - lastProbeAt < retryIntervalMs)
 				return { ok: false, code: state.code };

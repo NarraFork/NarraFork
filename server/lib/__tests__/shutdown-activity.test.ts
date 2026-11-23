@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
 import { createServerRequestLifecycle } from "../../http-request-lifecycle";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
 import {
 	canRunCleanShutdownHooks,
 	fenceUnattendedShutdown,
@@ -134,13 +135,10 @@ describe("main shutdown wiring without booting the server", () => {
 		["postgres", false],
 	] as const)("%s startup with reader admission=%s schedules maintenance only once on SQLite", async (backend, admitted) => {
 		const maintenanceStart = main.lastIndexOf(
-			'if (readerStartupAdmission.ok && activeDatabaseBackend === "sqlite") {',
+			'if (activeDatabaseBackend === "sqlite") {',
 			main.indexOf('startTeamDatabaseMaintenance("status"'),
 		);
-		const maintenanceEnd = main.indexOf(
-			"// Establish client-egress relay channels",
-			maintenanceStart,
-		);
+		const maintenanceEnd = main.indexOf("\n}\n\nconst databaseStartup =", maintenanceStart);
 		expect(maintenanceStart).toBeGreaterThanOrEqual(0);
 		expect(maintenanceEnd).toBeGreaterThan(maintenanceStart);
 		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
@@ -149,18 +147,50 @@ describe("main shutdown wiring without booting the server", () => {
 		const cleanup = mock(async () => {});
 		const rebuild = mock(async () => {});
 		const migrate = mock(async () => {});
-		await new Function(
+		const initialize = new Function(
 			"activeDatabaseBackend",
-			"readerStartupAdmission",
 			"startTeamDatabaseMaintenance",
 			"retireLegacyChapterResources",
 			"scheduleProjectIndexRebuild",
 			"migrateAggregationsOnStartup",
 			"logger",
-			`${code}\nreturn start();`,
-		)(backend, { ok: admitted }, () => {}, cleanup, rebuild, migrate, { warn() {} });
+			"narratorRecovery",
+			`${code}\nreturn start;`,
+		)(
+			backend,
+			() => {},
+			cleanup,
+			rebuild,
+			migrate,
+			{ warn() {} },
+			Promise.resolve(),
+		) as () => Promise<void>;
+		const startup = createDatabaseReaderStartup({
+			readiness: {
+				state: admitted
+					? { status: "ready" }
+					: { status: "failed", code: "DB_READERS_UNAVAILABLE" },
+				wait: async () => (admitted ? { ok: true } : { ok: false, code: "DB_READERS_UNAVAILABLE" }),
+			},
+			initialize,
+			onUnavailable: () => {},
+			onError: (error) => {
+				throw error;
+			},
+		});
+		await startup.start();
+		startup.stop();
 		for (const operation of [cleanup, rebuild, migrate])
 			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" && admitted ? 1 : 0);
+	});
+	test("shutdown cancels reader startup before stopping its producers", () => {
+		const stop = main.indexOf(
+			"databaseStartup.stop();",
+			main.indexOf("async function performGracefulShutdown("),
+		);
+		expect(stop).toBeGreaterThanOrEqual(0);
+		expect(stop).toBeLessThan(main.indexOf("backgroundOccupancyInitializer.stop();", stop));
+		expect(stop).toBeLessThan(main.indexOf("stopHeartbeat();", stop));
 	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
