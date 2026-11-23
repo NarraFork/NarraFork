@@ -31,25 +31,28 @@ interface RuntimeCallLog {
 function fakeRuntime(
 	log: RuntimeCallLog,
 	mediaCapabilities: { inputAudio?: boolean; inputVideo?: boolean } = {},
+	/** Sent before `done`, e.g. a `request_started` carrying the plugin's own credential id. */
+	startEvent?: Record<string, unknown>,
 ): ProviderRuntimeLike {
 	// The RPC client consumes stream events as notifications, so the fake plugin has
 	// to push a terminal `done` for every accepted operation or the adapter waits
 	// forever for output.
 	const notificationHandlers = new Set<(notification: unknown, bytes?: number) => void>();
 	const emitDone = (operationId: string): void => {
-		const notification = {
-			jsonrpc: "2.0" as const,
-			method: "provider.event" as const,
-			params: {
-				protocolVersion: "1.0",
-				operationId,
-				seq: 1,
-				event: { type: "done", status: "completed", stopReason: "end_turn" },
-			},
-		};
-		// Omit the byte count so the RPC client measures the frame itself; a literal 0
-		// is rejected as a frame-limit violation.
-		for (const handler of notificationHandlers) handler(notification);
+		const events = [
+			...(startEvent ? [startEvent] : []),
+			{ type: "done", status: "completed", stopReason: "end_turn" },
+		];
+		events.forEach((event, index) => {
+			const notification = {
+				jsonrpc: "2.0" as const,
+				method: "provider.event" as const,
+				params: { protocolVersion: "1.0", operationId, seq: index + 1, event },
+			};
+			// Omit the byte count so the RPC client measures the frame itself; a literal 0
+			// is rejected as a frame-limit violation.
+			for (const handler of notificationHandlers) handler(notification);
+		});
 	};
 	return {
 		request: async <T>(method: string, params?: unknown): Promise<T> => {
@@ -105,6 +108,7 @@ function registryWithLazyProvider(
 	options: {
 		failActivation?: boolean;
 		mediaCapabilities?: { inputAudio?: boolean; inputVideo?: boolean };
+		startEvent?: Record<string, unknown>;
 	} = {},
 ) {
 	const registry = new PluginProviderRegistry();
@@ -113,7 +117,7 @@ function registryWithLazyProvider(
 			resolveRuntime: async (id) => {
 				log.activations.push(id);
 				if (options.failActivation) throw new Error("runtime refused to start");
-				return fakeRuntime(log, options.mediaCapabilities);
+				return fakeRuntime(log, options.mediaCapabilities, options.startEvent);
 			},
 		}),
 	);
@@ -221,6 +225,31 @@ describe("plugin provider adapter factory", () => {
 		expect(log.activations).toEqual([]);
 		expect(log.requests).toEqual([]);
 	});
+	test("bills every request to the plugin provider's credential, whatever the plugin reports", async () => {
+		const billed = `plugin:${pluginId}:lazy`;
+		for (const reported of ["plugin-own-account", undefined]) {
+			const log: RuntimeCallLog = { activations: [], requests: [] };
+			const registry = registryWithLazyProvider(log, {
+				startEvent: { type: "request_started", ...(reported ? { credentialId: reported } : {}) },
+			});
+			const adapter = registry.resolveProvider("lazy:lazy/base").adapter;
+			if (!adapter) throw new Error("adapter was not created");
+
+			const starts: Array<string | undefined> = [];
+			const events: Array<string | undefined> = [];
+			for await (const event of adapter.chat({
+				...chatParams(),
+				onRequestStart: (info) => starts.push(info?.credentialId),
+			})) {
+				events.push(event.credentialId);
+			}
+			expect(starts).toEqual([billed]);
+			expect(events.length).toBeGreaterThan(0);
+			expect(new Set(events)).toEqual(new Set([billed]));
+			expect((await adapter.generateWithMeta("hi", "lazy:lazy/base")).credentialId).toBe(billed);
+		}
+	});
+
 	test("builds an adapter without starting the plugin runtime", () => {
 		const log: RuntimeCallLog = { activations: [], requests: [] };
 		const registry = registryWithLazyProvider(log);

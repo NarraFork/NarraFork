@@ -14,12 +14,14 @@
  * `PluginAgentToolBridge.ensureActivated()` defers activation to first invocation.
  */
 
+import { reportCredentialId } from "@server/lib/agent/credential-report";
 import type { ProviderAdapter } from "@server/lib/agent/provider";
 import {
 	RemoteProviderAdapter,
 	type RemoteProviderRpcClient,
 } from "@server/lib/agent/remote-provider-adapter";
 import { logger } from "@server/lib/logger";
+import { pluginCredentialId } from "@server/lib/plugin-credentials";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import {
 	type DeferredProviderClient,
@@ -191,7 +193,9 @@ export function createPluginProviderAdapterFactory(
 			modelCount: modelCatalog.size,
 		});
 		const resolveConfig = options.resolveConfig;
-		return new RemoteProviderAdapter({
+		// One credential per plugin provider (§15.7): whatever the plugin reports, requests are
+		// billed to it.
+		const adapter = new RemoteProviderAdapter({
 			rpc,
 			providerTypeId: entry.providerTypeId,
 			providerInstanceId: entry.providerInstanceId,
@@ -201,6 +205,7 @@ export function createPluginProviderAdapterFactory(
 			modelCatalog: cloneCatalog(modelCatalog),
 			descriptor: descriptorFor(entry),
 		});
+		return reportCredentialId(adapter, pluginCredentialId(entry.pluginId, entry.localId));
 	};
 }
 

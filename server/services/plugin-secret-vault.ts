@@ -22,13 +22,23 @@
  *
  * Writes are serialized through a promise chain and go through a temp file + rename, so
  * a crash mid-write cannot leave a truncated vault.
+ *
+ * Once the instance is on `credentials.json`, provider secrets (`provider.<contributionId>.<field>`)
+ * are kept there instead, one `opaque` credential per provider (docs/PROVIDER-SOURCING-DESIGN.md
+ * §15.7); the startup migration moves the old ones. Plugins address them by the same keys.
  */
 
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { type CredentialStore, getCredentialStore } from "@server/lib/credential-store";
 import { ValidationError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
+import {
+	parseProviderSecretKey,
+	pluginProviderSecrets,
+	savePluginProviderSecrets,
+} from "@server/lib/plugin-credentials";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -39,6 +49,8 @@ const MAX_ENTRIES = 2_000;
 export interface PluginSecretVaultOptions {
 	root?: string;
 	fileName?: string;
+	/** Where provider secrets go when it is unified; without it every secret stays here. */
+	credentials?: () => CredentialStore;
 }
 
 interface VaultDocument {
@@ -96,10 +108,57 @@ export class PluginSecretVault {
 	readonly path: string;
 	private document?: VaultDocument;
 	private writeChain: Promise<unknown> = Promise.resolve();
+	private readonly credentials?: () => CredentialStore;
 
 	constructor(options: PluginSecretVaultOptions = {}) {
 		const root = resolve(options.root ?? getNarraforkPath("plugins"));
 		this.path = join(root, options.fileName ?? "secrets.json");
+		this.credentials = options.credentials;
+	}
+
+	/** The store holding provider secrets, on an instance that uses `credentials.json`. */
+	private providerStore(): CredentialStore | undefined {
+		const store = this.credentials?.();
+		return store?.unified ? store : undefined;
+	}
+
+	/** Where a provider secret lives when it is not in this file. */
+	private providerSecret(pluginId: string, key: string) {
+		const store = this.providerStore();
+		const parsed = store && parseProviderSecretKey(key);
+		if (!store || !parsed) return undefined;
+		const fields = pluginProviderSecrets(store, pluginId).get(parsed.contributionId) ?? {};
+		const save = (next: Record<string, string>) =>
+			savePluginProviderSecrets(store, [
+				{ pluginId, contributionId: parsed.contributionId, fields: next },
+			]);
+		return { field: parsed.field, fields, save };
+	}
+
+	/** Remove the credentials of a plugin's providers that `keep` rejects; returns the fields removed. */
+	private dropProviderCredentials(pluginId: string, keep: (contributionId: string) => boolean) {
+		const store = this.providerStore();
+		if (!store) return 0;
+		const dropped = [...pluginProviderSecrets(store, pluginId)].filter(([id]) => !keep(id));
+		if (dropped.length) {
+			savePluginProviderSecrets(
+				store,
+				dropped.map(([contributionId]) => ({ pluginId, contributionId, fields: {} })),
+			);
+		}
+		return dropped.reduce((count, [, fields]) => count + Object.keys(fields).length, 0);
+	}
+
+	/** This file's keys, with provider secrets taken from `credentials.json` when it holds them. */
+	private keysOf(pluginId: string, document: VaultDocument): string[] {
+		const keys = Object.keys(document.secrets[pluginId] ?? {});
+		const store = this.providerStore();
+		if (!store) return keys;
+		const own = keys.filter((key) => !parseProviderSecretKey(key));
+		for (const [contributionId, fields] of pluginProviderSecrets(store, pluginId)) {
+			for (const field of Object.keys(fields)) own.push(`provider.${contributionId}.${field}`);
+		}
+		return own;
 	}
 
 	private async load(): Promise<VaultDocument> {
@@ -151,6 +210,11 @@ export class PluginSecretVault {
 		if (Buffer.byteLength(input.value, "utf8") > MAX_VALUE_BYTES) {
 			throw new ValidationError("Secret value is too large");
 		}
+		const provider = this.providerSecret(input.pluginId, input.key);
+		if (provider) {
+			provider.save({ ...provider.fields, [provider.field]: input.value });
+			return;
+		}
 		await this.enqueue(async () => {
 			const document = await this.load();
 			const bucket = { ...(document.secrets[input.pluginId] ?? {}) };
@@ -169,6 +233,13 @@ export class PluginSecretVault {
 
 	async deleteSecret(input: { pluginId: string; key: string }): Promise<boolean> {
 		assertKey(input.key);
+		const provider = this.providerSecret(input.pluginId, input.key);
+		if (provider) {
+			if (!Object.hasOwn(provider.fields, provider.field)) return false;
+			const { [provider.field]: _removed, ...rest } = provider.fields;
+			provider.save(rest);
+			return true;
+		}
 		return this.enqueue(async () => {
 			const document = await this.load();
 			const bucket = document.secrets[input.pluginId];
@@ -187,17 +258,18 @@ export class PluginSecretVault {
 
 	/** Remove every secret for a plugin. Used when a plugin is uninstalled. */
 	async deletePlugin(pluginId: string): Promise<number> {
+		const credentials = this.dropProviderCredentials(pluginId, () => false);
 		return this.enqueue(async () => {
 			const document = await this.load();
 			const bucket = document.secrets[pluginId];
 			const count = bucket ? Object.keys(bucket).length : 0;
-			if (count === 0) return 0;
+			if (count === 0) return credentials;
 			const secrets = { ...document.secrets };
 			delete secrets[pluginId];
 			const next: VaultDocument = { version: 1, secrets };
 			await this.persist(next);
 			this.document = next;
-			return count;
+			return credentials + count;
 		});
 	}
 
@@ -218,12 +290,13 @@ export class PluginSecretVault {
 		keepContributionIds: readonly string[],
 	): Promise<number> {
 		const keep = new Set(keepContributionIds);
+		const credentials = this.dropProviderCredentials(pluginId, (id) => keep.has(id));
 		return this.enqueue(async () => {
 			const document = await this.load();
 			const bucket = document.secrets[pluginId];
-			if (!bucket) return 0;
+			if (!bucket) return credentials;
 			const nextBucket: Record<string, string> = {};
-			let removed = 0;
+			let removed = credentials;
 			for (const [key, value] of Object.entries(bucket)) {
 				const match = /^provider\.([^.]+)\./.exec(key);
 				if (match && !keep.has(match[1])) {
@@ -232,7 +305,7 @@ export class PluginSecretVault {
 				}
 				nextBucket[key] = value;
 			}
-			if (removed === 0) return 0;
+			if (removed === credentials) return removed;
 			const next: VaultDocument = {
 				version: 1,
 				secrets: { ...document.secrets, [pluginId]: nextBucket },
@@ -245,6 +318,12 @@ export class PluginSecretVault {
 
 	async getSecret(input: { pluginId: string; key: string }): Promise<string | undefined> {
 		assertKey(input.key);
+		const provider = this.providerSecret(input.pluginId, input.key);
+		if (provider) {
+			return Object.hasOwn(provider.fields, provider.field)
+				? provider.fields[provider.field]
+				: undefined;
+		}
 		const document = await this.load();
 		return document.secrets[input.pluginId]?.[input.key];
 	}
@@ -255,8 +334,7 @@ export class PluginSecretVault {
 
 	/** Key names only — never values, so this is safe to surface to an admin UI. */
 	async listKeys(pluginId: string): Promise<string[]> {
-		const document = await this.load();
-		return Object.keys(document.secrets[pluginId] ?? {}).sort();
+		return this.keysOf(pluginId, await this.load()).sort();
 	}
 
 	/**
@@ -273,7 +351,7 @@ export class PluginSecretVault {
 	 */
 	peekKeys(pluginId: string): string[] | undefined {
 		if (!this.document) return undefined;
-		return Object.keys(this.document.secrets[pluginId] ?? {});
+		return this.keysOf(pluginId, this.document);
 	}
 
 	/** Load the vault into memory so `peekKeys` can answer. Safe to call repeatedly. */
@@ -283,4 +361,4 @@ export class PluginSecretVault {
 }
 
 /** Shared vault instance used by the platform services graph. */
-export const pluginSecretVault = new PluginSecretVault();
+export const pluginSecretVault = new PluginSecretVault({ credentials: () => getCredentialStore() });

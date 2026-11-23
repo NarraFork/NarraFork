@@ -10,9 +10,20 @@
  * `provider-keys.json`). A file that cannot be read, or two credentials that would share
  * an id, stop the migration before anything is written: the old files stay in use and
  * the next start tries again. Settings are not read: every owner id names its connection.
+ *
+ * On a unified instance, plugin provider secrets then move out of the plugin vault (§15.7).
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, resolve } from "node:path";
 import {
 	CODEX_CREDENTIALS_FILE,
 	codexToCredential,
@@ -20,9 +31,15 @@ import {
 	parseStoredCodexCredentials,
 } from "./codex-manager";
 import { CREDENTIAL_STATE_FILE, CredentialStateStore } from "./credential-state";
-import { CODEX_GROUP, getCredentialStore } from "./credential-store";
+import { CODEX_GROUP, type CredentialStore, getCredentialStore } from "./credential-store";
 import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
+import {
+	type PluginProviderSecretsChange,
+	parseProviderSecretKey,
+	pluginProviderSecrets,
+	savePluginProviderSecrets,
+} from "./plugin-credentials";
 import {
 	isSearchKeyOwner,
 	keyOwnerGroup,
@@ -134,21 +151,22 @@ function findConflicts(sources: ReadonlyArray<CredentialSource & { id: string }>
 const sourceKind = (owner: string): CredentialSourceKind =>
 	owner.startsWith("nug:") ? "nug" : owner.startsWith("builtin:") ? "builtin" : "api";
 
-/** Copy the files the migration reads or changes; owner-only, like the originals. */
-function backUp(home: string): string {
+/** Copy the files a migration reads or changes; owner-only, like the originals. */
+function backUp(home: string, label: string, files: readonly string[]): string {
 	const root = resolve(home, CREDENTIAL_BACKUPS_DIR);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	// A retry after a failed attempt never writes into an earlier backup.
-	let dir = resolve(root, `pre-sourcing-${stamp}`);
-	for (let n = 2; existsSync(dir); n++) dir = resolve(root, `pre-sourcing-${stamp}-${n}`);
+	let dir = resolve(root, `${label}-${stamp}`);
+	for (let n = 2; existsSync(dir); n++) dir = resolve(root, `${label}-${stamp}-${n}`);
 	mkdirSync(dir, { mode: 0o700 });
 	for (const path of [root, dir]) chmodPrivate(path, 0o700);
-	for (const name of BACKED_UP_FILES) {
+	for (const name of files) {
 		const source = resolve(home, name);
 		if (!existsSync(source)) continue;
-		copyFileSync(source, resolve(dir, name));
-		chmodPrivate(resolve(dir, name), 0o600);
+		const target = resolve(dir, basename(name));
+		copyFileSync(source, target);
+		chmodPrivate(target, 0o600);
 	}
 	return dir;
 }
@@ -206,12 +224,91 @@ function cleanUp(home: string): void {
 	if (existsSync(codexPath)) unlinkSync(codexPath);
 }
 
+export const PLUGIN_SECRETS_FILE = "plugins/secrets.json";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	!!value && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * Move the plugin vault's provider secrets into `credentials.json`, other plugin secrets
+ * stay. Backup, then credentials, then the vault without them: a crash in between is
+ * finished next start, where a credential already present wins over the vault's copy.
+ */
+export function movePluginProviderSecrets(home: string, store: CredentialStore): number {
+	const path = resolve(home, PLUGIN_SECRETS_FILE);
+	if (!existsSync(path)) return 0;
+	let vault: Record<string, unknown>;
+	try {
+		vault = JSON.parse(readFileSync(path, "utf8"));
+		if (!isRecord(vault) || !isRecord(vault.secrets)) throw new Error("not a plugin vault");
+	} catch (error) {
+		logger.error("Plugin provider secrets stay in the plugin vault: it could not be read", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return 0;
+	}
+	const secrets = vault.secrets as Record<string, unknown>;
+	const found = new Map<string, PluginProviderSecretsChange>();
+	const kept: Record<string, Record<string, unknown>> = {};
+	for (const [pluginId, bucket] of Object.entries(secrets)) {
+		if (!isRecord(bucket)) continue;
+		const rest: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(bucket)) {
+			const parsed = parseProviderSecretKey(key);
+			if (!parsed || typeof value !== "string") {
+				rest[key] = value;
+				continue;
+			}
+			const id = `${pluginId}/${parsed.contributionId}`;
+			const change = found.get(id) ?? {
+				pluginId,
+				contributionId: parsed.contributionId,
+				fields: {},
+			};
+			change.fields[parsed.field] = value;
+			found.set(id, change);
+		}
+		kept[pluginId] = rest;
+	}
+	if (!found.size) return 0;
+
+	const backup = backUp(home, "pre-plugin-credentials", [PLUGIN_SECRETS_FILE]);
+	const changes = [...found.values()].filter(
+		(c) => !pluginProviderSecrets(store, c.pluginId).has(c.contributionId),
+	);
+	if (changes.length) savePluginProviderSecrets(store, changes);
+	const temp = `${path}.${process.pid}.tmp`;
+	writeFileSync(temp, JSON.stringify({ ...vault, secrets: { ...secrets, ...kept } }), {
+		mode: 0o600,
+	});
+	chmodPrivate(temp, 0o600);
+	renameSync(temp, path);
+	logger.info("Moved plugin provider secrets to credentials.json", {
+		providers: changes.length,
+		backup,
+	});
+	return changes.length;
+}
+
+function movePluginSecretsSafely(home: string, store: CredentialStore): void {
+	try {
+		movePluginProviderSecrets(home, store);
+	} catch (error) {
+		logger.error("Moving plugin provider secrets failed; they stay in the plugin vault", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
 export function migrateCredentialFiles(home = getNarraforkHome()): CredentialMigrationResult {
 	lastConflicts = [];
 	try {
 		const store = getCredentialStore(home);
 		if (store.unified) {
-			if (store.readable) cleanUp(home);
+			if (store.readable) {
+				cleanUp(home);
+				movePluginSecretsSafely(home, store);
+			}
 			return "unified";
 		}
 
@@ -262,10 +359,11 @@ export function migrateCredentialFiles(home = getNarraforkHome()): CredentialMig
 			...accounts.map((account) => codexToCredential(account, now)),
 			...part.credentials,
 		];
-		const backup = backUp(home);
+		const backup = backUp(home, "pre-sourcing", BACKED_UP_FILES);
 		moveCodexRuntimeState(home, accounts);
 		store.create({ version: 1, credentials, groupSecrets: part.groupSecrets });
 		cleanUp(home);
+		movePluginSecretsSafely(home, store);
 		logger.info("Moved model credentials to credentials.json", {
 			codex: credentials.filter((c) => c.target.groupId === CODEX_GROUP).length,
 			keys: part.credentials.length,

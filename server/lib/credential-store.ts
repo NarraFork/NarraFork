@@ -2,10 +2,11 @@
  * `credentials.json`: every model credential of this instance in one encrypted file
  * (docs/PROVIDER-SOURCING-DESIGN.md §15.3).
  *
- * Two owners keep credentials in memory: CodexManager (the `codex` group's accounts) and the
- * provider key store (API keys of every other group, plus the group secrets). Each hands its part here when it
- * saves; the file is written from both parts as they were last saved, so neither can write
- * over the other's changes. One instance per NarraFork home.
+ * Three owners keep credentials in memory: CodexManager (the `codex` group's accounts), the
+ * provider key store (API keys of every other group, plus the group secrets) and the plugin
+ * secret vault (each plugin provider's secret fields, §15.7). Each hands its part here when
+ * it saves; the file is written from every part as it was last saved, so none can write
+ * over another's changes. One instance per NarraFork home.
  *
  * The file existing is the mode switch: without it both owners keep reading and writing
  * their old files (`codex-credentials.json`, `provider-keys.json`), and the startup
@@ -32,11 +33,18 @@ export type CredentialAuth =
 	| { kind: "api_key"; apiKey: string }
 	| { kind: "oauth"; refreshToken?: string; accessToken?: string; expiresAt?: number }
 	| { kind: "pat"; accessToken: string }
-	| { kind: "agent_identity"; agentRuntimeId: string; agentPrivateKey: string; taskId?: string };
+	| { kind: "agent_identity"; agentRuntimeId: string; agentPrivateKey: string; taskId?: string }
+	| { kind: "opaque"; fields: Record<string, string> };
 
 export interface Credential {
 	id: string;
-	target: { groupId: string };
+	/**
+	 * A plugin provider is not a source group of its own record: its group id (the provider
+	 * instance id) changes with every plugin upgrade, so it is named by `<pluginId>/<contributionId>`.
+	 */
+	target:
+		| { groupId: string; pluginContributionId?: never }
+		| { pluginContributionId: string; groupId?: never };
 	/** null = team credential; nothing else exists before personal sources. */
 	ownerUserId: null;
 	label?: string;
@@ -69,12 +77,19 @@ export interface KeyPart {
 	groupSecrets: Record<string, GroupSecrets>;
 }
 
+type Part = "codex" | "keys" | "plugins";
+
 /**
- * Codex accounts sign in; every other credential is an API key. Telling them apart by
- * sign-in kind rather than group id keeps a connection that happens to be called `codex`
- * with the keys.
+ * Codex accounts sign in, plugin providers hold a field bag, every other credential is an
+ * API key. Telling them apart by sign-in kind rather than group id keeps a connection that
+ * happens to be called `codex` with the keys.
  */
-const isCodex = (credential: Credential) => credential.auth.kind !== "api_key";
+const partOf = (credential: Credential): Part =>
+	credential.auth.kind === "api_key"
+		? "keys"
+		: credential.auth.kind === "opaque"
+			? "plugins"
+			: "codex";
 
 function parseFile(raw: unknown): CredentialsFile {
 	const value = (raw ?? {}) as Partial<CredentialsFile>;
@@ -84,7 +99,8 @@ function parseFile(raw: unknown): CredentialsFile {
 					!!c &&
 					typeof c.id === "string" &&
 					!!c.id &&
-					typeof c.target?.groupId === "string" &&
+					(typeof c.target?.groupId === "string" ||
+						typeof c.target?.pluginContributionId === "string") &&
 					!!c.auth &&
 					typeof c.auth === "object",
 			)
@@ -98,6 +114,7 @@ export class CredentialStore {
 	readonly path: string;
 	private codexPart: Credential[] = [];
 	private keyPart: KeyPart = { credentials: [], groupSecrets: {} };
+	private pluginPart: Credential[] = [];
 	private exists: boolean;
 	private unreadable = false;
 
@@ -106,12 +123,7 @@ export class CredentialStore {
 		this.exists = existsSync(this.path);
 		if (!this.exists) return;
 		try {
-			const file = parseFile(readSecretJSON(this.path));
-			this.codexPart = file.credentials.filter(isCodex);
-			this.keyPart = {
-				credentials: file.credentials.filter((c) => !isCodex(c)),
-				groupSecrets: file.groupSecrets,
-			};
+			this.split(parseFile(readSecretJSON(this.path)));
 		} catch (error) {
 			// Never write over a file we could not read: it is the only copy.
 			this.unreadable = true;
@@ -138,33 +150,48 @@ export class CredentialStore {
 		return structuredClone(this.keyPart);
 	}
 
-	/** Ids are unique across both parts; an owner adding a given id asks here first. */
+	pluginCredentials(): Credential[] {
+		return structuredClone(this.pluginPart);
+	}
+
+	/** Ids are unique across every part; an owner adding a given id asks here first. */
 	hasId(id: string): boolean {
-		return (
-			this.codexPart.some((c) => c.id === id) || this.keyPart.credentials.some((c) => c.id === id)
+		return [...this.codexPart, ...this.keyPart.credentials, ...this.pluginPart].some(
+			(c) => c.id === id,
 		);
 	}
 
 	saveCodex(credentials: Credential[]): void {
+		this.assertReadable();
 		this.codexPart = structuredClone(credentials);
 		this.write();
 	}
 
 	saveKeys(part: KeyPart): void {
+		this.assertReadable();
 		this.keyPart = structuredClone(part);
+		this.write();
+	}
+
+	savePlugins(credentials: Credential[]): void {
+		this.assertReadable();
+		this.pluginPart = structuredClone(credentials);
 		this.write();
 	}
 
 	/** The migration's single write: from here on the instance uses this file. */
 	create(file: CredentialsFile): void {
 		if (this.exists) throw new Error(`${CREDENTIALS_FILE} already exists`);
-		this.codexPart = file.credentials.filter(isCodex);
-		this.keyPart = {
-			credentials: file.credentials.filter((c) => !isCodex(c)),
-			groupSecrets: file.groupSecrets,
-		};
+		this.split(file);
 		this.write();
 		this.exists = true;
+	}
+
+	private split(file: CredentialsFile): void {
+		const parts = Map.groupBy(file.credentials, partOf);
+		this.codexPart = parts.get("codex") ?? [];
+		this.keyPart = { credentials: parts.get("keys") ?? [], groupSecrets: file.groupSecrets };
+		this.pluginPart = parts.get("plugins") ?? [];
 	}
 
 	/** Rewrite in the current encryption form. */
@@ -172,15 +199,19 @@ export class CredentialStore {
 		if (this.exists && this.readable && existsSync(this.path)) this.write();
 	}
 
-	private write(): void {
+	private assertReadable(): void {
 		if (this.unreadable) {
 			throw new SecretStoreError(
 				"Credentials on this server could not be read; nothing was changed",
 			);
 		}
+	}
+
+	private write(): void {
+		this.assertReadable();
 		const file: CredentialsFile = {
 			version: 1,
-			credentials: [...this.codexPart, ...this.keyPart.credentials],
+			credentials: [...this.codexPart, ...this.keyPart.credentials, ...this.pluginPart],
 			groupSecrets: this.keyPart.groupSecrets,
 		};
 		writeSecretJSON(this.path, file);

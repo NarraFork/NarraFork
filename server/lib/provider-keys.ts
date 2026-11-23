@@ -139,7 +139,7 @@ function keyToCredential(key: ProviderKey, groupId = key.providerId): Credential
 function keysFromPart(part: KeyPart): ProviderKey[] {
 	const keys: ProviderKey[] = [];
 	for (const c of part.credentials) {
-		if (c.auth.kind !== "api_key") continue;
+		if (c.auth.kind !== "api_key" || !c.target.groupId) continue;
 		keys.push({
 			id: c.id,
 			providerId: c.target.groupId,
