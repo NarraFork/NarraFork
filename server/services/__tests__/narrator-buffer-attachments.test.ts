@@ -26,7 +26,7 @@
  * see the authoritative green result.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -798,8 +798,8 @@ describe("persistent staging ownership", () => {
 		expect(message._stagingId).not.toBe(message.id);
 		const path = message._savedFiles?.[0].path as string;
 		expect(await message.textFiles?.[0].text()).toBe("durable");
-		// SQLite's synchronous ownership lookup must still find the row by staging id
-		// when the marker is missing, and must retain a pending payload.
+		// A staging id without its marker cannot establish ownership. Retain the
+		// payload without scanning mailbox metadata; cancellation uses the row id.
 		rmSync(join(HOME, "buffered-files", message._stagingId as string, ".mailbox-owner.json"), {
 			force: true,
 		});
@@ -817,6 +817,122 @@ describe("persistent staging ownership", () => {
 			.where(eq(narratorBufferedMessages.id, pushed.id))
 			.get();
 		expect(row?.state).toBe("cancelled");
+	});
+
+	test("cleanup of an absent directory performs only a narrow primary-key lookup", () => {
+		const prepare = spyOn(sqlite, "prepare");
+		try {
+			cleanupBufferedTextFiles("absent-staging-directory");
+			expect(prepare.mock.calls.map(([sql]) => sql)).toEqual([
+				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
+			]);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	test.each(
+		(["queued", "claimed", "failed", "materialized", "cancelled"] as const).flatMap((state) =>
+			(["row", "staging"] as const).map((identity) => [state, identity] as const),
+		),
+	)("cleanup of %s by %s id uses only owner primary keys and respects leases", async (state, identity) => {
+		const pushed = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"cleanup",
+			undefined,
+			null,
+			null,
+			null,
+			[textFile("cleanup.md", "leased payload")],
+		);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		const stagingId = message._stagingId as string;
+		const directory = join(HOME, "buffered-files", stagingId);
+		db.update(narratorBufferedMessages)
+			.set({ state })
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.run();
+		const prepare = spyOn(sqlite, "prepare");
+		try {
+			cleanupBufferedTextFiles(identity === "row" ? pushed.id : stagingId);
+			expect(prepare.mock.calls.map(([sql]) => sql)).toEqual([
+				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
+				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
+			]);
+			expect(existsSync(directory)).toBe(["queued", "claimed", "failed"].includes(state));
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	test.each([
+		"missing",
+		"null",
+	])("cleanup retains unknown %s-marker staging, but a terminal row id still cleans it", async (marker) => {
+		const pushed = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"legacy",
+			undefined,
+			null,
+			null,
+			null,
+			[textFile("legacy.md", "retained until owner is known")],
+		);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		const stagingId = message._stagingId as string;
+		const directory = join(HOME, "buffered-files", stagingId);
+		const markerPath = join(directory, ".mailbox-owner.json");
+		if (marker === "missing") rmSync(markerPath);
+		else writeFileSync(markerPath, JSON.stringify({ rowId: null }));
+		db.update(narratorBufferedMessages)
+			.set({ state: "materialized" })
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.run();
+
+		cleanupBufferedTextFiles(stagingId);
+		expect(existsSync(directory)).toBe(true);
+		cleanupBufferedTextFiles(pushed.id);
+		expect(existsSync(directory)).toBe(false);
+	});
+
+	test("legacy row-id staging without a marker still cleans after consumption", async () => {
+		const pushed = await enqueueBufferedMessage(NARRATOR_ID, "legacy without attachments");
+		db.update(narratorBufferedMessages)
+			.set({ state: "materialized", metadataJson: null })
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.run();
+		const directory = join(HOME, "buffered-files", pushed.id);
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(join(directory, "legacy.md"), "old payload");
+		cleanupBufferedTextFiles(pushed.id);
+		expect(existsSync(directory)).toBe(false);
+	});
+
+	test.each([
+		"not-json",
+		"null",
+		"{}",
+		'{"rowId":false}',
+		'{"rowId":""}',
+	])("cleanup retains staging with an invalid owner marker: %s", (marker) => {
+		const stagingId = "invalid-owner-staging";
+		const directory = join(HOME, "buffered-files", stagingId);
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(join(directory, ".mailbox-owner.json"), marker);
+		cleanupBufferedTextFiles(stagingId);
+		expect(existsSync(directory)).toBe(true);
+	});
+
+	test("cleanup removes marked staging after its owner row has been removed", () => {
+		const stagingId = "removed-owner-staging";
+		const directory = join(HOME, "buffered-files", stagingId);
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			join(directory, ".mailbox-owner.json"),
+			JSON.stringify({ rowId: "removed-owner" }),
+		);
+		cleanupBufferedTextFiles(stagingId);
+		expect(existsSync(directory)).toBe(false);
 	});
 
 	test("PG admission rollback removes staging only after DB confirms no row", async () => {

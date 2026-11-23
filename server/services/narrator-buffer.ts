@@ -404,12 +404,18 @@ function json<T>(value: string | null, fallback: T): T {
 function rowById(id: string): MailboxRow | undefined {
 	return db.select().from(mailbox).where(eq(mailbox.id, id)).get();
 }
-/** SQLite's synchronous ownership probe mirrors the bounded PostgreSQL adapter lookup. */
-function rowByStagingId(stagingId: string): MailboxRow | undefined {
-	const candidates = db.select().from(mailbox).where(eq(mailbox.kind, "user_input")).all();
-	return candidates.find(
-		(candidate) => json<{ stagingId?: string }>(candidate.metadataJson, {}).stagingId === stagingId,
-	);
+/** Cleanup needs only the ownership fields, never the buffered payload. */
+function stagingOwnerById(id: string) {
+	return db
+		.select({
+			id: mailbox.id,
+			kind: mailbox.kind,
+			state: mailbox.state,
+			metadataJson: mailbox.metadataJson,
+		})
+		.from(mailbox)
+		.where(eq(mailbox.id, id))
+		.get();
 }
 function writeStagingOwnerMarker(stagingId: string, rowId: string | null): void {
 	const dir = stagingPath(stagingId);
@@ -538,7 +544,7 @@ async function persistBufferedTextFilesUntracked(
 /** Only clean a known, unreferenced mailbox staging directory, never uploads/history. */
 export function cleanupBufferedTextFiles(id: string): void {
 	assertSqliteBufferRead("cleanupBufferedTextFiles");
-	const row = rowById(id) ?? rowByStagingId(id);
+	const row = stagingOwnerById(id);
 	const stagingId = row
 		? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
 		: id;
@@ -556,14 +562,15 @@ export function cleanupBufferedTextFiles(id: string): void {
 		try {
 			const markerOwner = JSON.parse(readFileSync(marker, "utf8")).rowId;
 			if (markerOwner === null) stagingPending = true;
-			else ownerId = markerOwner ?? ownerId;
+			else if (typeof markerOwner === "string" && markerOwner) ownerId = markerOwner;
+			else return;
 		} catch {
 			return;
 		}
-		if (ownerId !== null && typeof ownerId !== "string") return;
 	}
+	// A null marker without a row-id match is unknown ownership, not an orphan.
 	if (stagingPending && !row) return;
-	const owner = ownerId ? rowById(ownerId) : undefined;
+	const owner = ownerId ? stagingOwnerById(ownerId) : undefined;
 	if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
 	rmSync(path, { recursive: true, force: true });
 }
