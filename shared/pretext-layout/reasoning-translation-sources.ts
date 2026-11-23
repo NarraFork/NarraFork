@@ -1,5 +1,6 @@
 import { blockAtIndex, type MessageWithBody } from "../narrator-blocks/message-blocks";
 import {
+	composeReasoningTranslation,
 	getValidReasoningTranslationParts,
 	isReasoningTranslationBoundary,
 	isReasoningTranslationId,
@@ -22,10 +23,20 @@ interface SourceMessage extends MessageWithBody<SourceElement> {
 	narratorId?: string | null;
 }
 
+type SourceEntry = { index: number; block: SourceElement };
+
+export function reasoningBlockDisplayText(block: SourceElement): string | undefined | null {
+	const source = block.thinking ?? block.text ?? "";
+	if (!source.length) return null;
+	return block.translationGeneration !== undefined || block.translationParts !== undefined
+		? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
+		: block.translatedText;
+}
+
 /** Keep the original named-block identity when adjacent reasoning is rendered as one run. */
 export function reasoningTranslationSources(
 	message: SourceMessage,
-	entries: readonly { index: number; block: SourceElement }[],
+	entries: readonly SourceEntry[],
 ): ReasoningTranslationVisibilityTarget[] {
 	const { id: messageId, narratorId: ownerNarratorId } = message;
 	if (!isReasoningTranslationId(messageId) || !isReasoningTranslationId(ownerNarratorId)) return [];
@@ -69,4 +80,76 @@ export function reasoningTranslationSources(
 		if (targets.length >= MAX_REASONING_TRANSLATION_VISIBLE_TARGETS) break;
 	}
 	return targets;
+}
+
+const MAX_EVIDENCE_CHARS = 64 * 1024;
+
+export interface ReasoningTranslationEvidence {
+	start: number;
+	end: number;
+	step?: number;
+	target: ReasoningTranslationVisibilityTarget;
+}
+
+/** These are offsets in the exact string produced by the adapter's two-newline join. */
+export function mergedReasoningTranslationEvidence(
+	message: SourceMessage,
+	entries: readonly SourceEntry[],
+	showOriginal = false,
+): ReasoningTranslationEvidence[] | undefined {
+	if (entries.length > 64) return;
+	const evidence: ReasoningTranslationEvidence[] = [];
+	let chars = 0;
+	let end = 0;
+	for (const entry of entries) {
+		const source = entry.block.thinking ?? entry.block.text ?? "";
+		if (!source.length) continue;
+		chars += source.length;
+		if (chars > MAX_EVIDENCE_CHARS) return;
+		const display = reasoningBlockDisplayText(entry.block);
+		chars += display?.length ?? 0;
+		if (chars > MAX_EVIDENCE_CHARS) return;
+		const start = end ? end + 2 : 0;
+		end = start + (showOriginal ? source : display || source).length;
+		const target =
+			evidence.length < MAX_REASONING_TRANSLATION_VISIBLE_TARGETS
+				? reasoningTranslationSources(message, [entry])[0]
+				: undefined;
+		if (target) evidence.push({ start, end, target });
+	}
+	if (evidence.length) return evidence;
+}
+
+/** Map an expanded step's reconstructed paragraph back into the run. */
+export function appendReasoningTranslationParagraph(
+	evidence: readonly ReasoningTranslationEvidence[],
+	result: ReasoningTranslationEvidence[],
+	step: number,
+	bodyStart: number,
+	runStart: number,
+	length: number,
+): void {
+	for (const { start, end, target } of evidence) {
+		const from = Math.max(runStart, start);
+		const to = Math.min(runStart + length, end);
+		if (from >= to) continue;
+		const startInBody = bodyStart + from - runStart;
+		const endInBody = bodyStart + to - runStart;
+		const previous = result.at(-1);
+		if (previous?.step === step && previous.target === target && previous.end + 2 === startInBody)
+			previous.end = endInBody;
+		else result.push({ step, start: startInBody, end: endInBody, target });
+	}
+}
+
+/** A Markdown token spanning multiple source owners cannot prove visibility for either. */
+export function reasoningTranslationTargetForRange(
+	evidence: readonly ReasoningTranslationEvidence[],
+	start: number,
+	end: number,
+	step?: number,
+): ReasoningTranslationVisibilityTarget | undefined {
+	if (start >= end) return;
+	return evidence.find((entry) => entry.step === step && start >= entry.start && end <= entry.end)
+		?.target;
 }
