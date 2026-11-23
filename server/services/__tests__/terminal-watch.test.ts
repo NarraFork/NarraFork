@@ -334,9 +334,9 @@ describe("repeated terminal watches", () => {
 		const lifecycle = await startLifecycle(buffer);
 		expect(new Set([ready, done, lifecycle]).size).toBe(3);
 		await endWatchesForBuffer(TERMINAL, buffer, "the terminal was detached from the server");
+		// Duplicates settle silently but keep their own outcome: an unmatched pattern is not a match.
 		for (const id of [ready, done, lifecycle])
-			expect((await waitForStatus(id))?.status).not.toBe("running");
-		expect((await row(lifecycle))?.status).toBe("failed");
+			expect((await waitForStatus(id))?.status).toBe("failed");
 		expect(await notices()).toHaveLength(1);
 	});
 

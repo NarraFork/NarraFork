@@ -293,7 +293,11 @@ export async function createWatchObservation(
 		attempts++;
 		try {
 			if (frozen.silent) {
-				await service.finishObservationSilently(taskId, frozen.output);
+				await service.finishObservationSilently(
+					taskId,
+					frozen.output,
+					frozen.status === "failed" ? "failed" : "completed",
+				);
 			} else if (frozen.status === "failed") {
 				await service.markFailed(taskId, frozen.output);
 			} else {

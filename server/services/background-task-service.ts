@@ -1477,13 +1477,17 @@ class BackgroundTaskService {
 	}
 
 	/** Settle only an observation's own projection, without publishing another result. */
-	async finishObservationSilently(taskId: string, output: string): Promise<boolean> {
+	async finishObservationSilently(
+		taskId: string,
+		output: string,
+		status: "completed" | "failed" = "completed",
+	): Promise<boolean> {
 		const now = new Date().toISOString();
 		const outputBytes = Buffer.byteLength(output, "utf-8");
 		const task = await getRuntimePublicationService().commitTerminalTransition({
 			taskId,
 			setFields: {
-				status: "completed",
+				status,
 				output: truncateToBytes(output, MAX_OUTPUT_BYTES),
 				outputBytes,
 				outputTruncated: outputBytes > MAX_OUTPUT_BYTES,
@@ -1493,11 +1497,11 @@ class BackgroundTaskService {
 			},
 			fullOutput: output,
 			summary: "",
-			eventKind: "completed",
+			eventKind: status,
 			silentObservation: true,
 		});
 		if (!task) return false;
-		this.broadcastStatus(task.parentNarratorId, taskId, "completed", task.output, task.toolUseId);
+		this.broadcastStatus(task.parentNarratorId, taskId, status, task.output, task.toolUseId);
 		this.cleanupRuntime(taskId);
 		return true;
 	}
