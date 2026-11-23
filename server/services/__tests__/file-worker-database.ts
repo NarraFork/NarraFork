@@ -27,3 +27,13 @@ export async function closeFileWorkerDatabase(database: Database): Promise<void>
 		rmSync(root, { recursive: true, force: true });
 	}
 }
+
+export async function settleWorkerRead<T>(pending: Promise<T>) {
+	// Settle Worker I/O before entering Bun's synchronous rejection matcher.
+	try {
+		const value = await pending;
+		return { result: () => Promise.resolve(value) };
+	} catch (error) {
+		return { result: () => Promise.reject(error) };
+	}
+}

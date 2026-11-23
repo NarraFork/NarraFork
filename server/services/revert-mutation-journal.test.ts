@@ -1,6 +1,7 @@
-import { describe, expect } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	db,
 	journalFiles,
@@ -19,6 +20,23 @@ async function fixture() {
 	return { journal, ctx, files, plan };
 }
 describe("revert result journal", () => {
+	test("history failure only settles admitted execution and never certifies its files", async () => {
+		const { journal, ctx, files } = await fixture();
+		expect(journal.failHistory(ctx, "DB_READ_UNAVAILABLE").status).toBe("prepared");
+		await journal.startExecution(ctx);
+		journal.startFile(ctx, files[0].id);
+		const failed = journal.failHistory(ctx, "DB_READ_UNAVAILABLE");
+		expect(failed.status).toBe("partial");
+		expect(failed.reason).toBe("DB_READ_UNAVAILABLE");
+		expect(failed.appliedFileCount).toBe(0);
+		expect((await journal.listFiles(ctx)).items.map((file) => file.status).sort()).toEqual([
+			"applying",
+			"prepared",
+		]);
+		expect(journal.failHistory(ctx, "another failure")).toEqual(failed);
+		expect(() => journal.commit(ctx, { db, apply: () => {} })).toThrow("Every required file");
+	});
+
 	test("execution and each file dispatch are one-shot", async () => {
 		const { journal, ctx, files } = await fixture();
 		expect((await journal.startExecution(ctx)).started).toBe(true);
@@ -42,7 +60,7 @@ describe("revert result journal", () => {
 			historyStatus: "complete",
 		});
 		expect((await journal.finishFiles(ctx)).status).toBe("partial");
-		expect(journal.getOperation(ctx).appliedFileCount).toBe(1);
+		expect((await journal.getOperation(ctx)).appliedFileCount).toBe(1);
 		let called = false;
 		expect(() =>
 			journal.commit(ctx, {
@@ -159,12 +177,56 @@ describe("revert result journal", () => {
 	});
 	test("authorized owner and plan hash are required for every query", async () => {
 		const { journal, ctx } = await fixture();
-		expect(() =>
-			journal.getOperation({ ...ctx, owner: { ...owner, subjectKey: "human:bob" } }),
-		).toThrow("authorized context");
-		expect(() => journal.listFiles({ ...ctx, planHash: "0".repeat(64) })).toThrow(
+		await expect(
+			(
+				await settleWorkerRead(
+					journal.getOperation({ ...ctx, owner: { ...owner, subjectKey: "human:bob" } }),
+				)
+			).result(),
+		).rejects.toThrow("authorized context");
+		await expect(
+			(await settleWorkerRead(journal.listFiles({ ...ctx, planHash: "0".repeat(64) }))).result(),
+		).rejects.toThrow("Confirmed plan changed");
+	});
+	test("a Worker snapshot grants no authority after the confirmed plan hash changes", async () => {
+		const { journal, ctx, files } = await fixture();
+		expect((await journal.getOperation(ctx)).status).toBe("prepared");
+		db.update(schema.revertOperations)
+			.set({ planHash: "f".repeat(64) })
+			.where(eq(schema.revertOperations.id, ctx.planId))
+			.run();
+		await expect((await settleWorkerRead(journal.startExecution(ctx))).result()).rejects.toThrow(
 			"Confirmed plan changed",
 		);
+		expect(() => journal.startFile(ctx, files[0].id)).toThrow("Confirmed plan changed");
+		expect(
+			db
+				.select()
+				.from(schema.revertOperationFiles)
+				.where(eq(schema.revertOperationFiles.id, files[0].id))
+				.get()?.status,
+		).toBe("prepared");
+	});
+	test("file result changes after the Worker page reject the final status transition", async () => {
+		const { journal, ctx } = await fixture();
+		await journal.startExecution(ctx);
+		const list = journal.listFiles.bind(journal);
+		const pageRead = spyOn(journal, "listFiles").mockImplementation(async (...args) => {
+			const page = await list(...args);
+			db.update(schema.revertOperations)
+				.set({ updatedAt: "2099-01-01T00:00:00.000Z" })
+				.where(eq(schema.revertOperations.id, ctx.planId))
+				.run();
+			return page;
+		});
+		try {
+			await expect((await settleWorkerRead(journal.finishFiles(ctx))).result()).rejects.toThrow(
+				"File results changed",
+			);
+			expect((await journal.getOperation(ctx)).status).toBe("applying");
+		} finally {
+			pageRead.mockRestore();
+		}
 	});
 	test("legacy pending journals stay read-only and fresh plans stay writable", async () => {
 		const { journal, ctx, plan } = await fixture();
@@ -172,16 +234,16 @@ describe("revert result journal", () => {
 			.set({ protocolVersion: 2, status: "recovery_required" })
 			.where(eq(schema.revertOperations.id, plan.id))
 			.run();
-		expect(journal.getOperation(ctx).status).toBe("recovery_required");
+		expect((await journal.getOperation(ctx)).status).toBe("recovery_required");
 		expect((await journal.startExecution(ctx)).started).toBe(false);
 		const next = await fixture();
 		expect((await next.journal.startExecution(next.ctx)).started).toBe(true);
 	});
 	test("paginated files remain complete and expose no fabricated compensation identity", async () => {
 		const { journal, ctx } = await fixture();
-		const first = journal.listFiles(ctx, { limit: 1 });
+		const first = await journal.listFiles(ctx, { limit: 1 });
 		expect(first.hasMore).toBe(true);
-		const second = journal.listFiles(ctx, { limit: 1, cursor: first.nextCursor as string });
+		const second = await journal.listFiles(ctx, { limit: 1, cursor: first.nextCursor as string });
 		expect(second.hasMore).toBe(false);
 		expect(first.items[0].id).not.toBe(second.items[0].id);
 		for (const row of [...first.items, ...second.items]) {

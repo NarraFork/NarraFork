@@ -223,27 +223,29 @@ app.post("/fixture-revoke", (c) => {
 			.run();
 	return c.json({ revoked: true });
 });
-app.get("/fixture-info", (c) =>
+app.get("/fixture-info", async (c) =>
 	c.json({
-		operations: db
-			.select({
-				id: fileChangeOperations.id,
-				sourceId: fileChangeOperations.sourceId,
-				settlement: fileChangeOperations.settlement,
-				workspaceLeaseId: fileChangeOperations.workspaceLeaseId,
-				snapshotRevision: fileChangeOperations.editorRawSnapshotRevision,
-			})
-			.from(fileChangeOperations)
-			.where(eq(fileChangeOperations.sourceKind, "editor"))
-			.limit(4)
-			.all()
-			.map((operation) => ({
-				...operation,
-				effects: evidence.listEffects(operation.id, { limit: 2 }).items.map((effect) => ({
-					diskOutcome: effect.diskOutcome,
-					intendedAfter: effect.intendedAfterStateJson,
+		operations: await Promise.all(
+			db
+				.select({
+					id: fileChangeOperations.id,
+					sourceId: fileChangeOperations.sourceId,
+					settlement: fileChangeOperations.settlement,
+					workspaceLeaseId: fileChangeOperations.workspaceLeaseId,
+					snapshotRevision: fileChangeOperations.editorRawSnapshotRevision,
+				})
+				.from(fileChangeOperations)
+				.where(eq(fileChangeOperations.sourceKind, "editor"))
+				.limit(4)
+				.all()
+				.map(async (operation) => ({
+					...operation,
+					effects: (await evidence.listEffects(operation.id, { limit: 2 })).items.map((effect) => ({
+						diskOutcome: effect.diskOutcome,
+						intendedAfter: effect.intendedAfterStateJson,
+					})),
 				})),
-			})),
+		),
 		leases: db
 			.select({ id: workspaceWriteLeases.leaseId, status: workspaceWriteLeases.status })
 			.from(workspaceWriteLeases)
