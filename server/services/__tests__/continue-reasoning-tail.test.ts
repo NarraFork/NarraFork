@@ -21,10 +21,11 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 for (const statement of [
 	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
@@ -85,10 +86,11 @@ function reasoningOnly(text: string) {
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await disposeWorkerDb();
 });
 
 describe("resolveContinuationTail", () => {

@@ -40,10 +40,9 @@ import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
-import {
-	composeReasoningTranslation,
-	type ReasoningTranslationFields,
-	type ReasoningTranslationVisibilityTarget,
+import type {
+	ReasoningTranslationFields,
+	ReasoningTranslationVisibilityTarget,
 } from "../reasoning-translation";
 import {
 	escapeMarkdown,
@@ -107,7 +106,13 @@ import {
 	parseStreamingReasoningSegments,
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
-import { reasoningTranslationSources } from "./reasoning-translation-sources";
+import {
+	appendReasoningTranslationParagraph,
+	mergedReasoningTranslationEvidence,
+	type ReasoningTranslationEvidence,
+	reasoningBlockDisplayText,
+	reasoningTranslationSources,
+} from "./reasoning-translation-sources";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -881,6 +886,7 @@ export interface ElementSpec {
 	data: unknown;
 	/** Persisted source coordinates for the transcript's visibility observer. */
 	reasoningTranslationSources?: ReasoningTranslationVisibilityTarget[];
+	reasoningTranslationEvidence?: ReasoningTranslationEvidence[];
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
 	/**
@@ -1402,10 +1408,7 @@ function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]
 	const parts = blocks.map((block) => {
 		const source = block.thinking ?? block.text ?? "";
 		if (!source.length) return source;
-		const replacement =
-			block.translationGeneration !== undefined || block.translationParts !== undefined
-				? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
-				: block.translatedText;
+		const replacement = reasoningBlockDisplayText(block);
 		if (!replacement) return source;
 		translated = true;
 		return replacement;
@@ -1489,6 +1492,7 @@ function reasoningStepsData(
 	isStreaming: boolean,
 	ctx: AdapterContext,
 	unitSource?: ReasoningStepUnitSource,
+	translationSteps?: ReadonlySet<number>,
 ) {
 	return {
 		steps: segments.map((segment, index) => ({
@@ -1496,6 +1500,7 @@ function reasoningStepsData(
 			body: segment.isEmpty ? null : segment.body,
 			shimmer: isStreaming && index === segments.length - 1,
 			key: `seg${index}`,
+			...(translationSteps?.has(index) ? { sourceRanges: true } : {}),
 			// Same string the folded row of this step carries at L1/L2, so the two
 			// renderings pair across the level switch. Height-neutral passthrough.
 			...(unitSource
@@ -2317,13 +2322,16 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
+			const entries = runIndices.map((index, position) => ({
+				block: reasoningBlocks[position],
+				index,
+			}));
 			const translationSources =
-				streamingMessage || reasoningBlocks.length !== 1
-					? []
-					: reasoningTranslationSources(
-							msg,
-							runIndices.map((index, position) => ({ block: reasoningBlocks[position], index })),
-						);
+				!streamingMessage && entries.length === 1 ? reasoningTranslationSources(msg, entries) : [];
+			const translationEvidence =
+				!streamingMessage && entries.length > 1
+					? mergedReasoningTranslationEvidence(msg, entries)
+					: undefined;
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -2337,21 +2345,53 @@ function adaptMessage(
 			const displayText = data.translatedText ?? data.text;
 			const lifecycleId = contentBlockLifecycleId(block);
 			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
+			const stepEvidence: ReasoningTranslationEvidence[] = [];
+			const parseStepsWithProvenance = (text: string, evidence: ReasoningTranslationEvidence[]) => {
+				const single = longSingleReasoningStep(key, text);
+				if (single) {
+					const body = single[0].body;
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						0,
+						0,
+						text.trimEnd().length - body.length,
+						body.length,
+					);
+					return single;
+				}
+				return parseReasoningSegments(text, (step, bodyStart, runStart, length) => {
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						step,
+						bodyStart,
+						runStart,
+						length,
+					);
+				});
+			};
 			const parsed =
 				!usesStructuredReasoning(msg.model) ||
 				(!textExpanded && isLongPlainReasoning(key, displayText))
 					? []
-					: (longSingleReasoningStep(key, displayText) ??
-						(streaming && !ctx.resolveReasoningSegments
-							? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
-							: parseReasoning(displayText)));
+					: translationEvidence && !ctx.resolveReasoningSegments
+						? parseStepsWithProvenance(displayText, translationEvidence)
+						: (longSingleReasoningStep(key, displayText) ??
+							(streaming && !ctx.resolveReasoningSegments
+								? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
+								: parseReasoning(displayText)));
+			const directTranslation = translationSources.length
+				? { reasoningTranslationSources: translationSources }
+				: {};
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
 					key,
-					...(translationSources.length && { reasoningTranslationSources: translationSources }),
+					...directTranslation,
+					...(stepEvidence.length ? { reasoningTranslationEvidence: stepEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2369,6 +2409,9 @@ function adaptMessage(
 						msg.id && msg.id !== STREAMING_MESSAGE_ID
 							? { messageId: msg.id, runStartBlockIndex: bi }
 							: undefined,
+						stepEvidence.length
+							? new Set(stepEvidence.map(({ step }) => step as number))
+							: undefined,
 					),
 					// No LOD input: a step trace has ONE shape at every level — titles
 					// visible, each step's body openable. A level that showed titles whose
@@ -2382,16 +2425,22 @@ function adaptMessage(
 					},
 				});
 			} else {
+				const bodyEvidence =
+					showOriginal && translationEvidence
+						? mergedReasoningTranslationEvidence(msg, entries, true)
+						: translationEvidence;
 				specs.push({
 					kind,
 					key,
-					...(translationSources.length && { reasoningTranslationSources: translationSources }),
+					...directTranslation,
+					...(bodyEvidence ? { reasoningTranslationEvidence: bodyEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
 						textExpanded,
 						showOriginal,
+						...(bodyEvidence ? { sourceRanges: true } : {}),
 						// A live reasoning body (synthetic streaming row or checkpoint
 						// projection) must go through the incremental prepared-block path
 						// in the measure registry — the same flag markdown already carries.

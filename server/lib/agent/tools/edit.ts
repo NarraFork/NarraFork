@@ -672,10 +672,17 @@ export const editTool: ToolDefinition = {
 				},
 			});
 			if (recorded) {
-				const hint = await trackFileChange(ctx, ioPath, "edit", backend, null, {
-					evidenceRecorded: true,
-					hint: true,
-				});
+				const { linesAdded, linesRemoved } = recorded.metadata ?? {};
+				const hint = await trackFileChange(
+					ctx,
+					ioPath,
+					"edit",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
+					{ evidenceRecorded: Boolean(recorded.metadata?.fileChangeEvidence), hint: true },
+				);
 				return withOverlapHint(recorded, hint);
 			}
 			// An explicit runtime decline guarantees that no local IO was performed.
@@ -697,8 +704,8 @@ export const editTool: ToolDefinition = {
 					canonicalPath: queuePath,
 				},
 				async () => {
-					// Both replacement and overwrite mode use one complete read. The decoded
-					// content is then reused for the required snapshot and the replacement.
+					// Replacement and overwrite share one complete read. Remote history and
+					// replacement reuse the same decoded content.
 					const stat = await backend.statFile(ioPath);
 					if (stat && !stat.isFile)
 						throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
@@ -718,19 +725,22 @@ export const editTool: ToolDefinition = {
 					const decoded = existingBytes
 						? decodeFileBytes(existingBytes)
 						: { text: "", encoding: "utf-8" };
-					const snapshot = await boundedFileHistory(() =>
-						ensureFileSnapshot(
-							ctx.narratorId,
-							backend.deviceId,
-							ioPath,
-							async () => ({
-								content: existingBytes ? decoded.text : null,
-								encoding: decoded.encoding,
-								isBinary: existingBytes ? looksBinary(existingBytes) : false,
-							}),
-							"best-effort",
-						),
-					).catch(() => "failed" as const);
+					const snapshot =
+						backend.kind === "local"
+							? "disabled"
+							: await boundedFileHistory(() =>
+									ensureFileSnapshot(
+										ctx.narratorId,
+										backend.deviceId,
+										ioPath,
+										async () => ({
+											content: existingBytes ? decoded.text : null,
+											encoding: decoded.encoding,
+											isBinary: existingBytes ? looksBinary(existingBytes) : false,
+										}),
+										"best-effort",
+									),
+								).catch(() => "failed" as const);
 
 					// Create-new-file mode: old_string is empty. Preserve an existing file's
 					// encoding AND its line endings; a genuinely new file keeps whatever the
@@ -766,7 +776,12 @@ export const editTool: ToolDefinition = {
 							metadata: {
 								...lineStatsMetadata(overwriteStats),
 								diskOutcome: "applied",
-								historyStatus: snapshot === "failed" ? "unavailable" : "complete",
+								historyStatus:
+									snapshot === "disabled"
+										? "disabled"
+										: snapshot === "failed"
+											? "unavailable"
+											: "complete",
 								fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
 							},
 						};
@@ -811,7 +826,12 @@ export const editTool: ToolDefinition = {
 							newEndLine: result.startLine + newLines - 1,
 							...lineStatsMetadata(editStats),
 							diskOutcome: "applied",
-							historyStatus: snapshot === "failed" ? "unavailable" : "complete",
+							historyStatus:
+								snapshot === "disabled"
+									? "disabled"
+									: snapshot === "failed"
+										? "unavailable"
+										: "complete",
 							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
 						},
 					};
@@ -842,7 +862,7 @@ export const editTool: ToolDefinition = {
 				isError: true,
 				metadata: {
 					diskOutcome: remoteDispatched ? "unknown" : "not_applied",
-					historyStatus: "unavailable",
+					historyStatus: backend.kind === "local" ? "disabled" : "unavailable",
 					...fileChangeDiagnosticMetadata(err),
 					...fileWriteOutcomeMetadata(err),
 				},

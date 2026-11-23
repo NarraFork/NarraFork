@@ -1,5 +1,14 @@
-import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	mock,
+	spyOn,
+	test,
+} from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -16,13 +25,16 @@ import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attac
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
+import { workerRejection } from "../../../tests/fixtures/worker-rejection";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import { assertDbReadersReady } from "../../lib/db-worker/pool";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
 
-// In-memory DB from real migrations (mirrors tests/setup.ts).
+// File/WAL DB from real migrations (mirrors tests/setup.ts).
 const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
-const sqlite = new Database(":memory:");
+const sqlite = openFileWorkerDatabase();
 sqlite.run("PRAGMA foreign_keys = OFF");
 for (const file of readdirSync(DRIZZLE_DIR)
 	.filter((f) => f.endsWith(".sql"))
@@ -56,9 +68,13 @@ const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
-afterAll(() => {
+beforeAll(async () => {
+	await assertDbReadersReady(sqlite.filename);
+});
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await closeFileWorkerDatabase(sqlite);
 });
 afterEach(async () => {
 	closeNarrator("n1");
@@ -160,12 +176,14 @@ test("history editing persists semantic layout and legacy editing clears stale l
 		deferContinuation: true,
 	});
 	expect((await read())?.composerDocument).toBeNull();
-	await expect(
-		editAndRegenerate("n1", "m1", "mismatch", "en", false, {
-			composerDocument: document,
-			deferContinuation: true,
-		}),
-	).rejects.toThrow("does not match");
+	expect(
+		await workerRejection(
+			editAndRegenerate("n1", "m1", "mismatch", "en", false, {
+				composerDocument: document,
+				deferContinuation: true,
+			}),
+		),
+	).toThrow("does not match");
 });
 
 describe("resolveRequestedAttachmentKeys", () => {
@@ -261,12 +279,14 @@ describe("editAndRegenerate native media history", () => {
 		const before = await blocks();
 		expect(before.filter(isMediaContentBlock)).toHaveLength(10);
 		const saved = readdirSync(join(cwd, "uploads", "n1", "media"));
-		await expect(
-			editAndRegenerate("n1", "m1", "", "en", false, {
-				...editOptions,
-				newMedia: [wavFile("eleventh.wav")],
-			}),
-		).rejects.toThrow("Maximum 10");
+		expect(
+			await workerRejection(
+				editAndRegenerate("n1", "m1", "", "en", false, {
+					...editOptions,
+					newMedia: [wavFile("eleventh.wav")],
+				}),
+			),
+		).toThrow("Maximum 10");
 		expect(await blocks()).toEqual(before);
 		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual(saved);
 		expect(getMediaPath("n1", original.mediaId)).not.toBeNull();
@@ -292,12 +312,14 @@ describe("editAndRegenerate native media history", () => {
 		bytes.writeUInt32LE(bytes.length - 8, 4);
 		bytes.writeUInt32LE(bytes.length - 44, 40);
 		const added = new File([bytes], "added.wav", { type: "audio/wav" });
-		await expect(
-			editAndRegenerate("n1", "m1", "after", "en", false, {
-				...editOptions,
-				newMedia: [added],
-			}),
-		).rejects.toThrow("Combined attachments exceed the 128 MiB limit");
+		expect(
+			await workerRejection(
+				editAndRegenerate("n1", "m1", "after", "en", false, {
+					...editOptions,
+					newMedia: [added],
+				}),
+			),
+		).toThrow("Combined attachments exceed the 128 MiB limit");
 		expect(await blocks()).toEqual(before);
 		expect(readdirSync(mediaDir)).toEqual(saved);
 		expect(
@@ -348,9 +370,9 @@ describe("editAndRegenerate native media history", () => {
 		writeFileSync(otherPath, wavBytes());
 		truncateSync(otherPath, 65 * 1024 * 1024);
 		seed(cwd, [{ ...block }, { ...block, uploadNarratorId: "n2" }]);
-		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
-			"Combined attachments exceed the 128 MiB limit",
-		);
+		expect(
+			await workerRejection(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)),
+		).toThrow("Combined attachments exceed the 128 MiB limit");
 	});
 	test("a large retained text file does not consume the inline media budget", async () => {
 		// Text files reach the model as paths, media as inline base64. A retained
@@ -396,9 +418,9 @@ describe("editAndRegenerate native media history", () => {
 			{ type: "text", text: "before" },
 		]);
 		const before = await blocks();
-		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
-			"Combined attachments exceed the 128 MiB limit",
-		);
+		expect(
+			await workerRejection(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)),
+		).toThrow("Combined attachments exceed the 128 MiB limit");
 		expect(await blocks()).toEqual(before);
 	});
 	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
@@ -412,13 +434,15 @@ describe("editAndRegenerate native media history", () => {
 			return Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>;
 		});
 		try {
-			await expect(
-				editAndRegenerate("n1", "m1", "after", "en", false, {
-					...editOptions,
-					newMedia: [wavFile()],
-					newTextFiles: [failing],
-				}),
-			).rejects.toThrow("media rollback");
+			expect(
+				await workerRejection(
+					editAndRegenerate("n1", "m1", "after", "en", false, {
+						...editOptions,
+						newMedia: [wavFile()],
+						newTextFiles: [failing],
+					}),
+				),
+			).toThrow("media rollback");
 		} finally {
 			write.mockRestore();
 		}
@@ -545,14 +569,16 @@ describe("editAndRegenerate text_file management", () => {
 			{ length: 9 },
 			(_, index) => new File([String(index)], `new-${index}.txt`, { type: "text/plain" }),
 		);
-		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, {
-				userId: "attachment-user",
-				revertFiles: false,
-				keepTextFilePaths: ["legacy/a", "legacy/b"],
-				newTextFiles,
-			}),
-		).rejects.toThrow("Maximum 10 text files");
+		expect(
+			await workerRejection(
+				editAndRegenerate("n1", "m1", "new", "en", false, {
+					userId: "attachment-user",
+					revertFiles: false,
+					keepTextFilePaths: ["legacy/a", "legacy/b"],
+					newTextFiles,
+				}),
+			),
+		).toThrow("Maximum 10 text files");
 		expect(existsSync(join(cwd, ".narrafork"))).toBe(false);
 	});
 
@@ -581,16 +607,18 @@ describe("editAndRegenerate text_file management", () => {
 			return result;
 		});
 		try {
-			await expect(
-				editAndRegenerate("n1", "m1", "new", "en", false, {
-					userId: "attachment-user",
-					revertFiles: false,
-					keepImageIds: [],
-					keepTextFilePaths: [],
-					newImages: [image],
-					newTextFiles: [firstText, failingText],
-				}),
-			).rejects.toThrow("synthetic write failure");
+			expect(
+				await workerRejection(
+					editAndRegenerate("n1", "m1", "new", "en", false, {
+						userId: "attachment-user",
+						revertFiles: false,
+						keepImageIds: [],
+						keepTextFilePaths: [],
+						newImages: [image],
+						newTextFiles: [firstText, failingText],
+					}),
+				),
+			).toThrow("synthetic write failure");
 			expect(failingWriteEntered).toBe(true);
 			const imageDir = join(uploadsRoot, "n1");
 			expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
@@ -742,13 +770,15 @@ describe("editAndRegenerate text_file management", () => {
 			},
 			{ type: "text", text: "old" },
 		]);
-		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, {
-				userId: "attachment-user",
-				revertFiles: false,
-				keepTextFilePaths: [sourcePath],
-			}),
-		).rejects.toThrow("attachments exceed the 2 GiB limit");
+		expect(
+			await workerRejection(
+				editAndRegenerate("n1", "m1", "new", "en", false, {
+					userId: "attachment-user",
+					revertFiles: false,
+					keepTextFilePaths: [sourcePath],
+				}),
+			),
+		).toThrow("attachments exceed the 2 GiB limit");
 		expect(existsSync(join(childCwd, ".narrafork"))).toBe(false);
 	});
 });
