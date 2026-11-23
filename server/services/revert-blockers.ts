@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
@@ -22,27 +23,34 @@ export function boundedDetail(value: unknown, max = 160): string | undefined {
 	return trimmed ? trimmed.slice(0, max) : undefined;
 }
 /** Only live work affecting this narrator's selected history is relevant. Archived scopes and attempts are diagnostic history. */
-export function collectRevertBlockers(narratorId: string, code?: string): RevertBlocker[] {
+export async function collectRevertBlockers(
+	narratorId: string,
+	code?: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<RevertBlocker[]> {
+	options.signal?.throwIfAborted();
 	if (/PLANNER_BUSY/.test(code ?? ""))
 		return [{ kind: "planner_busy", detail: "Another preview is running" }];
-	const tools = db
-		.select({
-			id: narratorToolCalls.id,
-			toolName: narratorToolCalls.toolName,
-			messageId: narratorToolCalls.messageId,
-		})
-		.from(narratorToolCalls)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				// COW snapshots retain the source status, but own no running execution.
-				isNull(narratorToolCalls.executionOriginToolCallId),
-				sql`${narratorToolCalls.status} IN ('initializing','pending','running')`,
-			),
-		)
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-		.limit(12)
-		.all();
+	const tools = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				toolName: narratorToolCalls.toolName,
+				messageId: narratorToolCalls.messageId,
+			})
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					// COW snapshots retain the source status, but own no running execution.
+					isNull(narratorToolCalls.executionOriginToolCallId),
+					sql`${narratorToolCalls.status} IN ('initializing','pending','running')`,
+				),
+			)
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+			.limit(12),
+		{ executionPolicy: "worker-required", maxRows: 12, signal: options.signal },
+	);
 	const blockers: RevertBlocker[] = tools.map((tool) => ({
 		kind: "running_tool",
 		toolCallId: tool.id,

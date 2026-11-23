@@ -364,7 +364,10 @@ export const queryEditorOperation: NonNullable<
 			404,
 		);
 	}
-	const operation = runtime.evidence.getEditorOperation(sourceInstanceId, operationId);
+	const snapshot = await runtime.evidence.getEditorSnapshot(sourceInstanceId, operationId, {
+		signal: actor.signal,
+	});
+	const operation = snapshot.operation;
 	if (
 		!operation ||
 		operation.ownerUserId !== actor.userId ||
@@ -375,7 +378,7 @@ export const queryEditorOperation: NonNullable<
 			"No owned durable receipt is available; verify before retrying",
 			404,
 		);
-	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
+	const effects = snapshot.effects;
 	const effect = effects.length === 1 ? effects[0] : undefined;
 	const deviceId = operation.executionBindingJson?.deviceId ?? effect?.identityJson.deviceId;
 	if (

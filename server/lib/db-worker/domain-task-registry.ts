@@ -27,6 +27,12 @@ interface DomainReadModule<K extends SyncDomainReadTaskKind> {
 	validate?: (input: unknown) => boolean;
 }
 const loaders: { [K in SyncDomainReadTaskKind]: () => Promise<DomainReadModule<K>> } = {
+	editorOperationEvidence: async () => ({
+		read: (await import("./file-read-snapshots")).readEditorOperationEvidence,
+	}),
+	revertPlanSnapshot: async () => ({
+		read: (await import("./file-read-snapshots")).readRevertPlan,
+	}),
 	readerProbe: async () => ({
 		read: (sqlite) => {
 			sqlite.query("SELECT 1").get();

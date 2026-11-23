@@ -159,6 +159,18 @@ describe("resolveParentNarratorProvider", () => {
 		expect(resolveAggregation(aggId)).toBe("provA:y");
 	});
 
+	test("a following parent's record is read under its stored sentinel, not what it resolves to", () => {
+		const id = newId();
+		recordNarratorRuntimeModel(id, "__parent__", "provA", "m2");
+		expect(resolveParentNarratorProvider(id, "__parent__", "provB:m1")).toBe("provA");
+		// The lookup keeps the record for later calls.
+		expect(resolveParentNarratorProvider(id, "__parent__", "provB:m1")).toBe("provA");
+	});
+
+	test("a following parent without a record derives from what it resolves to", () => {
+		expect(resolveParentNarratorProvider(newId(), "__parent__", "provB:m1")).toBe("provB");
+	});
+
 	test("the follow-parent sentinel yields no provider", () => {
 		expect(resolveParentNarratorProvider(newId(), "__parent__")).toBeUndefined();
 	});

@@ -500,6 +500,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/worker-read-adapter.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/lib/db-worker/database-identity.ts": ["driver"],
 	"server/lib/db-worker/domain-task-registry.ts": ["driver"],
+	"server/lib/db-worker/file-read-snapshots.ts": ["driver"],
+	"server/services/tool-edit-preview-reader.ts": ["json1"],
 	"server/lib/db-worker/integration-authority-read-task.ts": ["driver"],
 	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
 	"server/lib/db-worker/select-extended.ts": ["driver"],
@@ -693,7 +695,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",
 		"nativeClient",
@@ -726,7 +727,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/knowledge/sqlite-read-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1", "handle"],
+	"server/services/tool-edit-preview.ts": ["handle"],
 	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent

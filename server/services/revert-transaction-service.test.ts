@@ -3,6 +3,9 @@ import * as fs from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
+import * as workerReads from "../db/worker-read";
+import * as workerPool from "../lib/db-worker/pool";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	db,
 	execution,
@@ -24,9 +27,98 @@ import {
 	write,
 } from "./__tests__/revert-transaction.fixture";
 
+import { RevertMutationJournal } from "./revert-mutation-journal";
 import { RevertSelectionService } from "./revert-selection-service";
 
 describe("independent file restoration", () => {
+	for (const failAt of [1, 2]) {
+		test(`finishFiles Worker read ${failAt} failure settles saved file results without rewriting history`, async () => {
+			const { a, b, plan } = await twoFiles();
+			const before = history();
+			const finishFiles = RevertMutationJournal.prototype.finishFiles;
+			let injected = false;
+			const finish = spyOn(RevertMutationJournal.prototype, "finishFiles").mockImplementation(
+				async function (this: RevertMutationJournal, ctx, options) {
+					const runRead = workerPool.runReadTask;
+					let reads = 0;
+					const read = spyOn(workerPool, "runReadTask").mockImplementation((...args) => {
+						if (++reads === failAt) {
+							injected = true;
+							return Promise.reject(new workerPool.WorkersUnavailableError("injected finish read"));
+						}
+						return runRead(...args);
+					});
+					try {
+						return await finishFiles.call(this, ctx, options);
+					} finally {
+						read.mockRestore();
+					}
+				},
+			);
+			try {
+				const result = await execution(plan).whenSettled;
+				expect(injected).toBe(true);
+				expect(journalFiles(plan).map((file) => file.status)).toEqual(["applied", "applied"]);
+				expect(operation(plan)?.status).toBe("partial");
+				expect(operation(plan)?.reason).toBe("DB_READ_UNAVAILABLE");
+				expect(result.status).toBe("partial");
+				expect(result.historyCommitted).toBe(false);
+				expect(result.historyStatus).toBe("unavailable");
+				expect(result.reason).toBe("DB_READ_UNAVAILABLE");
+				expect(history()).toBe(before);
+				for (const path of [a, b]) expect(await fs.readFile(path, "utf8")).toBe("original");
+			} finally {
+				finish.mockRestore();
+			}
+			await fs.writeFile(a, "later user work");
+			setFileHook(() => {
+				throw new Error("replay must not authorize target IO");
+			});
+			const replay = await execution(plan).whenSettled;
+			expect(replay.status).toBe("partial");
+			expect(replay.settling).toBe(false);
+			expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+			expect(history()).toBe(before);
+			expect(await fs.readFile(a, "utf8")).toBe("later user work");
+		});
+	}
+
+	test("a failed post-restore Worker lookup still durably records the applied file", async () => {
+		const { a, b, plan } = await twoFiles();
+		const readFirst = workerReads.readQueryFirst;
+		let injected = false;
+		const read = spyOn(workerReads, "readQueryFirst").mockImplementation((query, options) => {
+			if (
+				!injected &&
+				query.toSQL().sql.includes('select "size_bytes", "status" from "file_change_blobs"') &&
+				journalFiles(plan).some((file) => file.status === "applying")
+			) {
+				injected = true;
+				return Promise.reject(new Error("injected post-restore Worker failure"));
+			}
+			return readFirst(query, options);
+		});
+		try {
+			const result = await execution(plan).whenSettled;
+			expect(injected).toBe(true);
+			expect(await fs.readFile(a, "utf8")).toBe("original");
+			expect(await fs.readFile(b, "utf8")).toBe("original");
+			expect(result.historyStatus).toBe("unavailable");
+			expect(journalFiles(plan).map((file) => file.status)).toEqual(["applied", "applied"]);
+			expect(journalFiles(plan)[0].receiptJson).toMatchObject({ historyStatus: "unavailable" });
+		} finally {
+			read.mockRestore();
+		}
+		await fs.writeFile(a, "later user work");
+		setFileHook(() => {
+			throw new Error("replay must not dispatch restored files");
+		});
+		const replay = await execution(plan).whenSettled;
+		expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+		expect(replay.historyStatus).toBe("unavailable");
+		expect(await fs.readFile(a, "utf8")).toBe("later user work");
+	});
+
 	test("history-changing success uses five collector scans including preview and history.prepare", async () => {
 		const collect = spyOn(RevertSelectionService.prototype, "collect");
 		try {
@@ -73,7 +165,7 @@ describe("independent file restoration", () => {
 		const ref = row.desiredStateJson.kind === "regular" ? row.desiredStateJson.blob : null;
 		if (!ref) throw new Error("Missing measured B");
 		expect(
-			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+			await namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
 		).toBeNull();
 		const result = await execution(plan).whenSettled;
 		expect(result.status).toBe("committed");
@@ -82,7 +174,7 @@ describe("independent file restoration", () => {
 		expect(result.files.map((file) => file.status)).toEqual(["unchanged"]);
 		expect(await fs.readFile(path, "utf8")).toBe(external);
 		expect(
-			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+			await namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
 		).toBeNull();
 	});
 	test("A to A no-op still conflicts if the target changes after preview", async () => {
@@ -106,13 +198,17 @@ describe("independent file restoration", () => {
 		await write(path, "after");
 		const current = Buffer.from("human content".repeat(32 * 1024));
 		await fs.writeFile(path, current);
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.getBudget();
 		if (!budget) throw new Error("Missing budget");
 		db.update(schema.fileChangeStorageBudgets)
 			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
 			.run();
 		await expect(
-			namespace.store.putBytes(current, { expectedSize: current.byteLength }),
+			(
+				await settleWorkerRead(
+					namespace.store.putBytes(current, { expectedSize: current.byteLength }),
+				)
+			).result(),
 		).rejects.toThrow();
 		const plan = await prepare({
 			kind: "revert",
@@ -163,7 +259,7 @@ describe("independent file restoration", () => {
 			});
 			// Mutating the caller's object after dispatch must not change its captured consent.
 			Object.assign(wrong, selector);
-			await expect(result.whenSettled).rejects.toMatchObject({
+			await expect((await settleWorkerRead(result.whenSettled)).result()).rejects.toMatchObject({
 				code: "REVERT_TRANSACTION_ACTION_MISMATCH",
 			});
 			expect(operation(plan)?.status).toBe("prepared");
@@ -197,7 +293,9 @@ describe("independent file restoration", () => {
 			[{ ...selector, messageId: "different-message" }, "edit_and_regenerate"],
 			[selector, "rollback_to_block"],
 		] as const)
-			await expect(run(wrongSelector, action)).rejects.toMatchObject({
+			await expect(
+				(await settleWorkerRead(run(wrongSelector, action))).result(),
+			).rejects.toMatchObject({
 				code: "REVERT_TRANSACTION_ACTION_MISMATCH",
 			});
 		expect(history()).toBe(terminalHistory);
@@ -399,7 +497,7 @@ describe("independent file restoration", () => {
 			.set({ messageVersion: 8 })
 			.where(eq(schema.narrators.id, "narrator"))
 			.run();
-		await expect(execution(plan).whenSettled).rejects.toThrow();
+		await expect((await settleWorkerRead(execution(plan).whenSettled)).result()).rejects.toThrow();
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
 	});
@@ -495,7 +593,7 @@ describe("independent file restoration", () => {
 			.set({ messageVersion: 8 })
 			.where(eq(schema.narrators.id, "narrator"))
 			.run();
-		await expect(execution(plan).whenSettled).rejects.toThrow();
+		await expect((await settleWorkerRead(execution(plan).whenSettled)).result()).rejects.toThrow();
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
 	});
@@ -527,6 +625,99 @@ describe("independent file restoration", () => {
 		expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
 		expect(replay.status).toBe("committed");
 		expect(replay.settling).toBe(false);
+	});
+
+	test("duplicate response keeps file results and history status in one execution snapshot", async () => {
+		const { b, plan } = await twoFiles();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let authorizations = 0;
+		setFileHook(async (path) => {
+			// The restore guard runs after the durable attempt and its unknown live result.
+			if (path === b && ++authorizations === 2) {
+				entered.resolve();
+				await release.promise;
+			}
+		});
+		const first = execution(plan);
+		await entered.promise;
+		expect(journalFiles(plan).map((file) => file.status)).toEqual(["applied", "applying"]);
+		const getOperation = RevertMutationJournal.prototype.getOperation;
+		let samplingDuplicate = true;
+		const operationRead = spyOn(RevertMutationJournal.prototype, "getOperation").mockImplementation(
+			async function (this: RevertMutationJournal, ctx, readOptions) {
+				// Interleave completion if a response attempts an unpaired final status refresh.
+				if (samplingDuplicate && !readOptions?.signal) {
+					samplingDuplicate = false;
+					release.resolve();
+					await first.whenSettled;
+				}
+				return getOperation.call(this, ctx, readOptions);
+			},
+		);
+		try {
+			const duplicate = await execution(plan).whenSettled;
+			samplingDuplicate = false;
+			if (duplicate.status === "committed") {
+				expect(duplicate.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+				expect(duplicate.settling).toBe(false);
+				expect(duplicate.historyCommitted).toBe(true);
+			} else {
+				expect(duplicate.status).toBe("executing");
+				expect(duplicate.files.map((file) => file.status)).toEqual(["applied", "unknown"]);
+				expect(duplicate.settling).toBe(true);
+				expect(duplicate.historyCommitted).toBe(false);
+			}
+		} finally {
+			samplingDuplicate = false;
+			release.resolve();
+			operationRead.mockRestore();
+			await first.whenSettled;
+		}
+		expect(operation(plan)?.status).toBe("committed");
+		expect(db.select().from(schema.narratorMessageRefs).all()).toHaveLength(0);
+	});
+
+	test("cancellation after the history commit returns its settled file results", async () => {
+		setService(makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 1 }));
+		const { plan } = await twoFiles();
+		const committed = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		const commit = RevertMutationJournal.prototype.commit;
+		const historyCommit = spyOn(RevertMutationJournal.prototype, "commit").mockImplementation(
+			function (this: RevertMutationJournal, ...args) {
+				const result = commit.call(this, ...args);
+				committed.resolve();
+				return result;
+			},
+		);
+		const getOperation = RevertMutationJournal.prototype.getOperation;
+		const operationRead = spyOn(RevertMutationJournal.prototype, "getOperation").mockImplementation(
+			async function (this: RevertMutationJournal, ctx, readOptions) {
+				const result = await getOperation.call(this, ctx, readOptions);
+				if (result.status === "committed" && !readOptions?.signal) await releaseRead.promise;
+				return result;
+			},
+		);
+		const attempt = execution(plan, controller.signal);
+		try {
+			await committed.promise;
+			expect(operation(plan)?.status).toBe("committed");
+			controller.abort();
+			const result = await attempt.result;
+			expect(result.status).toBe("committed");
+			expect(result.historyCommitted).toBe(true);
+			expect(result.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+			expect(result.settling).toBe(false);
+			expect(result.reason).toBeNull();
+			expect(db.select().from(schema.narratorMessageRefs).all()).toHaveLength(0);
+		} finally {
+			releaseRead.resolve();
+			historyCommit.mockRestore();
+			operationRead.mockRestore();
+			await attempt.whenSettled;
+		}
 	});
 
 	test("lost-result pending attempt is read-only after a new service request", async () => {

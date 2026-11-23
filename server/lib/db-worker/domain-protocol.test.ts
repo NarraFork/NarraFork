@@ -10,6 +10,45 @@ import { runDomainRead } from "./domain-task-registry";
 import { ReadBudgetMeter } from "./read-budget";
 
 describe("registered database read domains", () => {
+	test("file snapshot inputs bound identifiers, owner context and page size", () => {
+		const editor = { sourceInstanceId: "source", sourceId: "operation" };
+		const revert = {
+			owner: { subjectKey: "user:alice", narratorId: null, projectId: null },
+			planId: "plan",
+			cursor: null,
+			limit: 101,
+		};
+		expect(createDomainReadParams("editorOperationEvidence", editor).input).toEqual(editor);
+		expect(createDomainReadParams("revertPlanSnapshot", revert).input).toEqual(revert);
+		for (const id of ["", "a".repeat(257), "界".repeat(100), "a\0b"]) {
+			expect(() =>
+				createDomainReadParams("editorOperationEvidence", { ...editor, sourceId: id }),
+			).toThrow();
+			expect(() =>
+				createDomainReadParams("editorOperationEvidence", { ...editor, sourceInstanceId: id }),
+			).toThrow();
+			expect(() =>
+				createDomainReadParams("revertPlanSnapshot", { ...revert, planId: id }),
+			).toThrow();
+			expect(() =>
+				createDomainReadParams("revertPlanSnapshot", {
+					...revert,
+					owner: { ...revert.owner, subjectKey: id },
+				}),
+			).toThrow();
+		}
+		for (const limit of [-1, 102, 0.5, NaN]) {
+			expect(() => createDomainReadParams("revertPlanSnapshot", { ...revert, limit })).toThrow();
+		}
+		expect(() => createDomainReadParams("revertPlanSnapshot", { ...revert, cursor: "" })).toThrow();
+		expect(() =>
+			createDomainReadParams("revertPlanSnapshot", {
+				...revert,
+				owner: { ...revert.owner, narratorId: "" },
+			}),
+		).toThrow();
+	});
+
 	test("only registered read tasks cross the fixed registry", () => {
 		expect(createDomainReadParams("readerProbe", null)).toEqual({
 			kind: "domainRead",

@@ -1,5 +1,6 @@
 import type { ComposerDocumentMetadata, ComposerDocumentParams } from "./composer-document-query";
 import { DbReadError } from "./errors";
+import type { readEditorOperationEvidence, readRevertPlan } from "./file-read-snapshots";
 import type { readIntegrationAuthoritySnapshotTask } from "./integration-authority-read-task";
 import type { ReadBudgetMeter } from "./read-budget";
 import type { ToolDetailMetadata, ToolDetailSnapshotParams } from "./tool-detail-query";
@@ -10,6 +11,14 @@ export const DOMAIN_READ_STREAM_TIMEOUT_MS = 30_000;
 export const COMPOSER_DOCUMENT_RESULT_BYTES = 24 * 1024 * 1024;
 
 interface SyncDomainReadTaskMap {
+	editorOperationEvidence: {
+		params: Parameters<typeof readEditorOperationEvidence>[1];
+		result: ReturnType<typeof readEditorOperationEvidence>;
+	};
+	revertPlanSnapshot: {
+		params: Parameters<typeof readRevertPlan>[1];
+		result: ReturnType<typeof readRevertPlan>;
+	};
 	readerProbe: { params: null; result: { ready: true } };
 	platformIntegrationAuthoritySnapshot: {
 		params: Parameters<typeof readIntegrationAuthoritySnapshotTask>[1];
@@ -70,6 +79,12 @@ export function validateIntegrationAuthorityInput(
 		) && Number.isFinite(Date.parse(value.now))
 	);
 }
+const boundedId = (value: unknown): value is string =>
+	typeof value === "string" &&
+	value.length > 0 &&
+	Buffer.byteLength(value) <= 256 &&
+	!value.includes("\0");
+const nullableId = (value: unknown) => value === null || boundedId(value);
 const isId = (value: unknown) => typeof value === "string" && value.length > 0;
 const record = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === "object" && !Array.isArray(value);
@@ -96,6 +111,29 @@ export function isDomainReadStreamTask(params: {
 }
 
 export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinition } = {
+	editorOperationEvidence: {
+		maxInputBytes: 2048,
+		maxResultBytes: SNAPSHOT_BYTES,
+		maxArrayItems: 10000,
+		validate: (input) =>
+			record(input) && boundedId(input.sourceInstanceId) && boundedId(input.sourceId),
+	},
+	revertPlanSnapshot: {
+		maxInputBytes: 4096,
+		maxResultBytes: SNAPSHOT_BYTES,
+		maxArrayItems: 10000,
+		validate: (input) =>
+			record(input) &&
+			record(input.owner) &&
+			boundedId(input.owner.subjectKey) &&
+			nullableId(input.owner.narratorId) &&
+			nullableId(input.owner.projectId) &&
+			boundedId(input.planId) &&
+			nullableId(input.cursor) &&
+			Number.isInteger(input.limit) &&
+			Number(input.limit) >= 0 &&
+			Number(input.limit) <= 101,
+	},
 	readerProbe: {
 		maxInputBytes: 128 * 1024,
 		maxResultBytes: SNAPSHOT_BYTES,

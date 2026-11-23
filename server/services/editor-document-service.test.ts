@@ -32,6 +32,7 @@ import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import { EditorDocumentJobs, editorWorkerSpecifierCandidates } from "./editor-document-jobs";
 import { queryEditorOperation } from "./editor-document-runtime";
 import {
@@ -1523,7 +1524,9 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			result: saved,
 		});
 		await expect(
-			service.operation({ ...actor, userId: "other" }, saved.operationId),
+			(
+				await settleWorkerRead(service.operation({ ...actor, userId: "other" }, saved.operationId))
+			).result(),
 		).rejects.toThrow("owned durable receipt");
 		await service.dispose();
 		await unlink(join(root, "transfers", `ed-${saved.operationId}.json`));
@@ -1572,7 +1575,11 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		const saved = await service.commit(actor, doc.docId, id, {});
 		if (saved.status !== "saved") throw new Error("Expected settled save");
 		await expect(
-			queryEditorOperation({ ...actor, narratorId: "wrong-narrator" }, saved.operationId),
+			(
+				await settleWorkerRead(
+					queryEditorOperation({ ...actor, narratorId: "wrong-narrator" }, saved.operationId),
+				)
+			).result(),
 		).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
 	});
 
@@ -1585,14 +1592,18 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		const retainedSource = join(root, "retained-source.json");
 		await rename(sourcePath, retainedSource);
 		try {
-			await expect(queryEditorOperation(actor, saved.operationId)).rejects.toMatchObject({
+			await expect(
+				(await settleWorkerRead(queryEditorOperation(actor, saved.operationId))).result(),
+			).rejects.toMatchObject({
 				code: "EDITOR_OPERATION_UNKNOWN",
 			});
 			await expect(lstat(sourcePath)).rejects.toMatchObject({ code: "ENOENT" });
 			await writeFile(sourcePath, JSON.stringify({ version: 1, id: randomUUID() }), {
 				mode: 0o600,
 			});
-			await expect(queryEditorOperation(actor, saved.operationId)).rejects.toMatchObject({
+			await expect(
+				(await settleWorkerRead(queryEditorOperation(actor, saved.operationId))).result(),
+			).rejects.toMatchObject({
 				code: "EDITOR_OPERATION_UNKNOWN",
 			});
 		} finally {
