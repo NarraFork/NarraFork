@@ -22,8 +22,8 @@ import {
 	type GitStatusPageSource,
 	invalidateGitStatusPageStats,
 	invalidateGitStatusPages,
-	readGitStatusPage,
-	readGitStatusPageStats,
+	readGitStatusPageOnDemand,
+	readGitStatusPageStatsOnDemand,
 	validateGitStatusPages,
 } from "./git-status-page";
 import {
@@ -110,7 +110,12 @@ export function getGitWorkspaceStatusPage(
 	signal?: AbortSignal,
 ) {
 	const { queryKey, source, workspaceKey } = gitStatusPageTarget(target);
-	return readGitStatusPage({ scope: { actorId, workspaceKey, queryKey }, source, query, signal });
+	return readGitStatusPageOnDemand({
+		scope: { actorId, workspaceKey, queryKey },
+		source,
+		query,
+		signal,
+	});
 }
 
 /** Statistics share the authorized page identity and its pinned execution transport. */
@@ -122,7 +127,7 @@ export function getGitWorkspaceStatusPageStats(
 ) {
 	const pinnedTarget = { ...target, workspace: { ...target.workspace } };
 	const { queryKey, source, workspaceKey } = gitStatusPageTarget(pinnedTarget);
-	return readGitStatusPageStats({
+	return readGitStatusPageStatsOnDemand({
 		scope: { actorId, workspaceKey, queryKey },
 		source,
 		query,
