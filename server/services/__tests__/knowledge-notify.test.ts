@@ -92,7 +92,9 @@ const pushes: Array<{ userId: string; message: Record<string, unknown> }> = [];
 const pendingReads = new Set<Promise<unknown>>();
 const originalReadStore = knowledgeReadStore;
 
-function trackRead<T>(work: Promise<T>): Promise<T> {
+function trackRead(result: unknown): unknown {
+	if (!(result instanceof Promise)) return result;
+	const work = result;
 	pendingReads.add(work);
 	void work.then(
 		() => pendingReads.delete(work),
