@@ -45,6 +45,8 @@ export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 /** Common fields shared by every prepared block. */
 export interface PreparedBlockBase {
+	/** Original Markdown coordinates when source provenance was requested. */
+	sourceRange?: { start: number; end: number };
 	/** Top margin (px) applied before this block within its element. First
 	 * block in an element typically uses 0. */
 	marginTop: number;
