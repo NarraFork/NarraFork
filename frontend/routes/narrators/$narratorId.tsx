@@ -312,22 +312,11 @@ function NarratorDetailPage() {
 		createTerminal,
 		openDrawer,
 	});
-	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
 	// Terminal → Chat: append selected text to chat input (mobile drawer)
 	const handleSendToChat = useCallback((text: string) => {
 		appendInputRef.current?.(text);
-	}, []);
-
-	// Chat → Terminal: write selected text to terminal (mobile drawer)
-	const handleSendToTerminal = useCallback((text: string) => {
-		writeToTerminalRef.current?.(text);
-	}, []);
-
-	// Receive write function from NarratorTerminal (mobile drawer)
-	const handleWriteRef = useCallback((fn: ((text: string) => void) | null) => {
-		writeToTerminalRef.current = fn;
 	}, []);
 
 	const { t: tn } = useTranslation("narrator");
@@ -577,7 +566,6 @@ function NarratorDetailPage() {
 								onViewSubagentSession={onViewSubagentSession}
 								highlightMessageId={highlightMessageId}
 								highlightNeedle={highlightNeedle}
-								onSendToTerminal={isMobile && !isSubagent ? handleSendToTerminal : undefined}
 								appendInputRef={isMobile && !isSubagent ? appendInputRef : undefined}
 								terminalOpen={isMobile && !isSubagent ? drawerOpened : undefined}
 								onToggleTerminal={
@@ -623,7 +611,6 @@ function NarratorDetailPage() {
 									<NarratorTerminal
 										narratorId={narratorId}
 										onSendToChat={handleSendToChat}
-										onWriteRef={handleWriteRef}
 										onExit={handleTerminalExit}
 									/>
 								</Suspense>

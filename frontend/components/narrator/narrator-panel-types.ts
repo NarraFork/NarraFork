@@ -162,7 +162,6 @@ export interface NarratorPanelProps {
 	highlightRequestId?: string;
 	/** Text that picks which row of a multi-row message the jump lands on. */
 	highlightNeedle?: string;
-	onSendToTerminal?: (text: string) => void;
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
 	terminalOpen?: boolean;
 	onToggleTerminal?: () => void;

@@ -100,7 +100,6 @@ const EMPTY_SHARD: NarratorDockShard = emptyShard();
 /** Chat↔tool imperative bridges, kept per narrator (refs, not reactive). */
 interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
-	writeTerminalStdin: ((text: string) => void) | null;
 	scrollToMessage: ScrollToMessageFn | null;
 	/**
 	 * Submit text as a real user message through the narrator's own composer path
@@ -255,7 +254,6 @@ export class WorkspaceDockStore {
 		if (!b) {
 			b = {
 				appendChatInput: null,
-				writeTerminalStdin: null,
 				scrollToMessage: null,
 				submitToNarrator: null,
 				addFileReference: null,
@@ -292,18 +290,6 @@ export class WorkspaceDockStore {
 
 	appendChatInput(narratorId: string, text: string) {
 		this.getBridges(narratorId).appendChatInput?.(text);
-	}
-
-	registerWriteTerminalStdin(narratorId: string, fn: (text: string) => void): () => void {
-		const b = this.getBridges(narratorId);
-		b.writeTerminalStdin = fn;
-		return () => {
-			if (b.writeTerminalStdin === fn) b.writeTerminalStdin = null;
-		};
-	}
-
-	writeTerminalStdin(narratorId: string, text: string) {
-		this.getBridges(narratorId).writeTerminalStdin?.(text);
 	}
 
 	registerScrollToMessage(narratorId: string, fn: ScrollToMessageFn): () => void {
@@ -1237,9 +1223,6 @@ export function useWorkspaceNarratorDockValue(
 			registerAppendChatInput: (fn: (text: string) => void) =>
 				store.registerAppendChatInput(narratorId, fn),
 			appendChatInput: (text: string) => store.appendChatInput(narratorId, text),
-			registerWriteTerminalStdin: (fn: (text: string) => void) =>
-				store.registerWriteTerminalStdin(narratorId, fn),
-			writeTerminalStdin: (text: string) => store.writeTerminalStdin(narratorId, text),
 			registerScrollToMessage: (fn: ScrollToMessageFn) =>
 				store.registerScrollToMessage(narratorId, fn),
 			scrollToMessage: (messageId: string, options?: MessageJumpOptions) =>
