@@ -282,7 +282,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentId: string;
 		delegated: import("./outline/delegation").DelegatedOutlineTask;
 	} | null = null;
-	/** Created but its run not yet handed to the run service: a failure archives it. */
+	/** Created but not yet registered as a run: a failure archives it. */
 	let unstartedSubagentId: string | null = null;
 	let registeredStart: RegisteredAgentStart | undefined;
 	let registeredStartFailureEvent: "failed" | "cancelled" = "failed";
@@ -515,7 +515,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				delegation: input.delegation,
 				userId: userId ?? null,
 			});
-		else if (unstartedSubagentId && !isCheckpointStop(error))
+		else if (unstartedSubagentId && !registeredStart && !isCheckpointStop(error))
 			await archiveUnstartedSubagent(unstartedSubagentId);
 		throw error;
 	}
