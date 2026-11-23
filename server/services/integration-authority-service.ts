@@ -11,7 +11,7 @@ import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db, sqlite } from "../db";
 import { integrationAuthorities, integrationCapabilityGrants } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -592,11 +592,17 @@ export class IntegrationAuthorityService {
 	async getSnapshot(
 		authorityId: string,
 		options: { includeExpired?: boolean } = {},
+		readOptions?: ReadQueryOptions,
 	): Promise<IntegrationAuthoritySnapshot | null> {
+		readOptions?.signal?.throwIfAborted();
 		const id = normalizeId(authorityId, "authorityId");
-		const storedAuthority = await db.query.integrationAuthorities.findFirst({
+		const authorityQuery = db.query.integrationAuthorities.findMany({
+			limit: 1,
 			where: eq(integrationAuthorities.id, id),
 		});
+		const storedAuthority = readOptions
+			? await readQueryFirst(authorityQuery, { ...readOptions, executionPolicy: "worker-required" })
+			: (await authorityQuery)[0];
 		if (!storedAuthority) return null;
 		const now = new Date().toISOString();
 		const authority =
@@ -605,7 +611,8 @@ export class IntegrationAuthorityService {
 			storedAuthority.expiresAt <= now
 				? { ...storedAuthority, state: "expired" as const }
 				: storedAuthority;
-		const grants = await db.query.integrationCapabilityGrants.findMany({
+		readOptions?.signal?.throwIfAborted();
+		const grantsQuery = db.query.integrationCapabilityGrants.findMany({
 			where: options.includeExpired
 				? and(
 						eq(integrationCapabilityGrants.authorityId, id),
@@ -626,6 +633,9 @@ export class IntegrationAuthorityService {
 			],
 			limit: MAX_GRANTS_PER_AUTHORITY + 1,
 		});
+		const grants = await (readOptions
+			? readQuery(grantsQuery, { ...readOptions, executionPolicy: "worker-required" })
+			: grantsQuery);
 		assertGrantCount(grants.length);
 		return { authority, grants: grants.filter(isDescribableGrant) };
 	}

@@ -7,6 +7,7 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "@server/db/schema";
+import type { ReadQueryOptions } from "@server/db/worker-read";
 import {
 	EXECUTION_POLICY_RULE_LIMIT,
 	type ExecutionPolicyFacts,
@@ -36,7 +37,17 @@ export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 }
 
 export class ExecutionPolicyRepository {
-	async load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
+	async load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy>;
+	async load(narratorId: string, readOptions?: ReadQueryOptions): Promise<LoadedExecutionPolicy>;
+	async load(
+		narratorId: string,
+		readOptionsOrSignal?: ReadQueryOptions | AbortSignal,
+	): Promise<LoadedExecutionPolicy> {
+		const readOptions =
+			readOptionsOrSignal instanceof AbortSignal
+				? { signal: readOptionsOrSignal }
+				: readOptionsOrSignal;
+		const signal = readOptions?.signal;
 		signal?.throwIfAborted();
 		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
 			throw new WorkersUnavailableError("requires_committed_file");
@@ -44,7 +55,12 @@ export class ExecutionPolicyRepository {
 		const facts = await runReadTask<ExecutionPolicyFacts>(
 			sqlite.filename,
 			{ kind: "executionPolicyFacts", narratorId },
-			{ diagnosticSource: "execution-policy-facts", timeoutMs: 5_000, signal },
+			{
+				...readOptions,
+				diagnosticSource: "execution-policy-facts",
+				timeoutMs: Math.min(readOptions?.timeoutMs ?? 5_000, 5_000),
+				signal,
+			},
 		);
 		signal?.throwIfAborted();
 		return materializeExecutionPolicy(narratorId, facts);
