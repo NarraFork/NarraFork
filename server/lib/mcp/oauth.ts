@@ -123,6 +123,7 @@ export function resetMcpOAuthForTests(): void {
 	stopRewrite = undefined;
 	store = undefined;
 	pendingFlows.clear();
+	revisions.clear();
 }
 
 /** OAuth applies to remote transports unless the admin pinned a static Authorization header. */
@@ -147,9 +148,22 @@ interface PendingFlow {
 	expiresAt: number;
 	/** Registration and discovery written during the flow, persisted only with its tokens. */
 	staged: McpOAuthRecord;
+	revision: number;
 }
 
 const pendingFlows = new Map<string, PendingFlow>();
+/** Bumped by sign-out / delete so an exchange or refresh already in flight cannot write back. */
+const revisions = new Map<string, number>();
+
+function revisionOf(serverId: string): number {
+	return revisions.get(serverId) ?? 0;
+}
+
+function resetCredentials(serverId: string): void {
+	revisions.set(serverId, revisionOf(serverId) + 1);
+	for (const [state, flow] of pendingFlows)
+		if (flow.serverId === serverId) pendingFlows.delete(state);
+}
 
 function prunePendingFlows(now = Date.now()): void {
 	for (const [state, flow] of pendingFlows) if (flow.expiresAt <= now) pendingFlows.delete(state);
@@ -157,12 +171,15 @@ function prunePendingFlows(now = Date.now()): void {
 
 class NarraForkOAuthProvider implements OAuthClientProvider {
 	authorizationUrl?: URL;
+	private readonly revision: number;
 
 	constructor(
 		private readonly config: McpServerConfig,
 		private readonly storeKey: string,
 		private readonly flow?: PendingFlow,
-	) {}
+	) {
+		this.revision = flow?.revision ?? revisionOf(storeKey);
+	}
 
 	private stored(): McpOAuthRecord {
 		const record = getStore().get(this.storeKey);
@@ -180,6 +197,8 @@ class NarraForkOAuthProvider implements OAuthClientProvider {
 	 * existing authorization intact.
 	 */
 	private save(change: Partial<McpOAuthRecord>): void {
+		if (revisionOf(this.storeKey) !== this.revision)
+			throw new Error("MCP OAuth credentials were reset while this request was running");
 		if (this.flow && !change.tokens) {
 			Object.assign(this.flow.staged, change);
 			return;
@@ -326,6 +345,7 @@ export async function startMcpOAuth(
 		state: randomBytes(32).toString("base64url"),
 		expiresAt: Date.now() + FLOW_TTL_MS,
 		staged: {},
+		revision: revisionOf(config.id),
 	};
 	const provider = new NarraForkOAuthProvider(config, config.id, flow);
 	const result = await auth(provider, {
@@ -388,14 +408,12 @@ export function setMcpOAuthClientSecret(serverId: string, secret: string | null 
 
 /** Forget tokens and registration but keep the configured client secret. */
 export function signOutMcpOAuth(serverId: string): void {
+	resetCredentials(serverId);
 	getStore().update(serverId, (record) => ({ clientSecret: record.clientSecret }));
-	for (const [state, flow] of pendingFlows)
-		if (flow.serverId === serverId) pendingFlows.delete(state);
 }
 
 /** Remove everything stored for a deleted server. */
 export function deleteMcpOAuth(serverId: string): void {
+	resetCredentials(serverId);
 	getStore().update(serverId, () => undefined);
-	for (const [state, flow] of pendingFlows)
-		if (flow.serverId === serverId) pendingFlows.delete(state);
 }
