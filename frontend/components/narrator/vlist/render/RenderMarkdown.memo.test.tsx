@@ -25,6 +25,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { RenderLodCtx } from "../../lod/RenderLodCtx";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import type { MeasuredElement, PreparedInlineBlock } from "../prepared-block";
+import { reasoningTranslationNodes } from "../reasoning-translation-visibility";
 import type { RenderMarkdownProps } from "./RenderMarkdown";
 
 let RenderMarkdown: typeof import("./RenderMarkdown").RenderMarkdown;
@@ -129,6 +130,7 @@ function inputs(): Required<Inputs> {
 		measured: measureMarkdown("memoized body", 640),
 		showSource: false,
 		sourceText: "memoized body",
+		observeSourceRanges: false,
 		onUnknownHeight: noop,
 		animateStreaming: false,
 		sealOnMount: false,
@@ -143,6 +145,7 @@ function changedInputs(a: Inputs): Required<Inputs> {
 		measured: { ...a.measured, height: a.measured.height + 1 },
 		showSource: true,
 		sourceText: "updated raw source",
+		observeSourceRanges: true,
 		onUnknownHeight: () => {},
 		animateStreaming: true,
 		sealOnMount: true,
@@ -155,6 +158,7 @@ const inputKeys = [
 	"measured",
 	"showSource",
 	"sourceText",
+	"observeSourceRanges",
 	"onUnknownHeight",
 	"animateStreaming",
 	"sealOnMount",
@@ -163,6 +167,37 @@ const inputKeys = [
 	"typographyRevision",
 ] as const satisfies readonly (keyof Inputs)[];
 const measuredKeys = ["height", "blocks", "frame", "contentWidth", "usedWidth"] as const;
+
+test("rendered, code-only step lines report their own source and not the hidden step", async () => {
+	const text = "```ts\nconst clock = 1;\n```";
+	const measured = measureMarkdown(text, 640, { sourceRanges: true });
+	const target = (id: string) => ({
+		ownerNarratorId: "owner",
+		messageId: "message",
+		blockId: id,
+		elementId: id,
+		blockRevision: 1,
+	});
+	const own = target("opened");
+	const evidence = [
+		{ start: 0, end: text.length, step: 0, target: own },
+		{ start: 0, end: text.length, step: 1, target: target("collapsed") },
+	];
+	await act(async () => {
+		root.render(
+			<MantineProvider>
+				<RenderMarkdown measured={measured} />
+			</MantineProvider>,
+		);
+	});
+	const observed = [...reasoningTranslationNodes(container, evidence, false, 0)];
+	expect(
+		observed.map(({ line, target }) => ({
+			code: line.hasAttribute("data-vlist-code-line"),
+			target,
+		})),
+	).toEqual([{ code: true, target: own }]);
+});
 
 describe("sameMarkdownRenderInputs", () => {
 	test("hits for fresh props/measured wrappers with identical blocks and frame", () => {

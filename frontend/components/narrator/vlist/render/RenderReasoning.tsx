@@ -20,6 +20,7 @@
 
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { Box, Group, Text, ThemeIcon } from "@mantine/core";
+import type { ReasoningTranslationEvidence } from "@shared/pretext-layout/reasoning-translation-sources";
 import type { ReasoningTranslationVisibilityTarget } from "@shared/reasoning-translation";
 import { TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import { IconBrain, IconChevronDown, IconChevronRight, IconLanguage } from "@tabler/icons-react";
@@ -66,6 +67,7 @@ export interface ReasoningLabels {
 
 interface RenderReasoningProps {
 	translationSource?: ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
@@ -103,6 +105,7 @@ function BrainBadge() {
 
 export function RenderReasoning({
 	translationSource,
+	translationEvidence,
 	measured,
 	labels = {},
 	showSource,
@@ -127,6 +130,7 @@ export function RenderReasoning({
 			return (
 				<ExpandedView
 					translationSource={translationSource}
+					translationEvidence={translationEvidence}
 					measured={measured}
 					labels={labels}
 					showSource={showSource}
@@ -286,6 +290,7 @@ function ReasoningHeaderRow({
 
 function ExpandedView({
 	translationSource,
+	translationEvidence,
 	measured,
 	labels,
 	showSource,
@@ -300,6 +305,7 @@ function ExpandedView({
 	onToggleTextExpanded,
 }: {
 	translationSource?: ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
@@ -314,7 +320,12 @@ function ExpandedView({
 	/** The anim store's scope (narratorId); see RenderMarkdown.animScope. */
 	animScope?: string;
 }) {
-	const visibleRef = useVisibleReasoningSource<HTMLDivElement>(translationSource);
+	const visibleRef = useVisibleReasoningSource<HTMLDivElement>(
+		translationSource,
+		translationEvidence,
+		translationEvidence ? measured : undefined,
+		translationEvidence ? showSource : undefined,
+	);
 	const showToggle = !measured.isStreaming;
 	const bodyMeasured: MeasuredElement = {
 		textPreview: measured.textPreview,
@@ -348,7 +359,12 @@ function ExpandedView({
 					marginTop: 0,
 				}}
 			>
-				{translationSource ? <ReasoningTranslationIndicator target={translationSource} /> : null}
+				{translationSource || translationEvidence ? (
+					<ReasoningTranslationIndicator
+						target={translationSource}
+						evidence={translationEvidence}
+					/>
+				) : null}
 				{/* Source view swaps the render for the raw text inside the SAME reserved
 				    body geometry, so the card cannot move (RenderMarkdown pins the box). */}
 				<RenderTextPreview
@@ -357,6 +373,7 @@ function ExpandedView({
 					measured={bodyMeasured}
 					showSource={showSource}
 					sourceText={sourceText}
+					observeSourceRanges={!!translationEvidence && sourceText === measured.displayText}
 					onUnknownHeight={
 						measured.textPreview?.expanded && hasUnpredictableBlock(measured.blocks)
 							? undefined

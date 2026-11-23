@@ -13,6 +13,7 @@ export interface TextPreviewOptions {
 	textExpanded?: boolean;
 	direction?: "head" | "tail";
 	preparedBlocks?: PreparedBlock[];
+	sourceRanges?: boolean;
 }
 
 /** Long live tails are plain text: no guessing the omitted Markdown context. */
@@ -32,6 +33,7 @@ export function measureTextPreview(
 		!expanded && direction === "tail" && selected.truncated
 			? null
 			: measureMarkdown(selected.text, contentWidth, {
+					sourceRanges: opts.sourceRanges,
 					...(!selected.truncated && opts.preparedBlocks
 						? { preparedBlocks: opts.preparedBlocks }
 						: {}),
