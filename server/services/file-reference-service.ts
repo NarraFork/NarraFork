@@ -1020,30 +1020,16 @@ const productionDependencies: FileReferenceDependencies = {
 			context.paths.flavor === "windows" ? path.replaceAll("\\", "/").toLowerCase() : path
 		).split("/");
 		if (segments.some((part) => [".ssh", ".aws", ".gnupg", ".kube"].includes(part))) return true;
+		const { isSecretHomeRelativePath, isSecretPlatformPath, isSecretUserPath } = await import(
+			"../lib/fs-secret-paths"
+		);
 		const nf = segments.indexOf(".narrafork");
-		if (nf >= 0) {
-			const first = segments[nf + 1] ?? "";
-			if (
-				[
-					"settings.json",
-					"codex-credentials.json",
-					"provider-keys.json",
-					"secret.key",
-					"update-server.json",
-					"update-server-test.json",
-					"narrafork.lock",
-				].includes(first) ||
-				first.startsWith("narrafork.db")
-			)
-				return true;
-		}
+		if (nf >= 0 && isSecretHomeRelativePath(segments.slice(nf + 1))) return true;
 		if (context.backend.kind === "remote") return false;
-		const [{ isSecretPlatformPath, isSecretUserPath }, { getHome }, { narraforkDir }] =
-			await Promise.all([
-				import("../lib/fs-secret-paths"),
-				import("../lib/platform"),
-				import("../lib/settings"),
-			]);
+		const [{ getHome }, { narraforkDir }] = await Promise.all([
+			import("../lib/platform"),
+			import("../lib/settings"),
+		]);
 		// Canonicalize the protected roots too: a symlinked custom NARRAFORK_HOME must
 		// not make its settings/database readable through the target's physical spelling.
 		const [platformHome, userHome] = await Promise.all([
