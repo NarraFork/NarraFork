@@ -269,6 +269,7 @@ export interface TraceItemData {
 	category?: string;
 	/** Markdown body for an expandable row; null/empty → non-expandable dot row. */
 	bodyText?: string | null;
+	sourceRanges?: boolean;
 	/** Streaming shimmer on this row (renderer only). */
 	shimmer?: boolean;
 	/**
@@ -801,6 +802,7 @@ export function measureCollapsibleTrace(
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
 				const inner = traceBodyInnerWidth(contentWidth);
 				body = measureTextPreview(item.bodyText, inner, {
+					sourceRanges: item.sourceRanges,
 					textExpanded: expandState.textExpandedKeys?.includes(item.key ?? String(itemIndex)),
 					direction: item.shimmer ? "tail" : "head",
 				});
@@ -1048,6 +1050,7 @@ export function measureActivityTrace(
 
 /** ReasoningStepsTrace step input — body is the step's markdown. */
 export interface ReasoningStepItem {
+	sourceRanges?: boolean;
 	title: string;
 	/** Step markdown body; null/empty → a non-expandable title row. */
 	body?: string | null;
@@ -1081,6 +1084,7 @@ export function measureReasoningStepsTrace(
 				title: s.title,
 				hasIcon: false,
 				bodyText: s.body ?? null,
+				sourceRanges: s.sourceRanges,
 				shimmer: s.shimmer,
 				key: s.key,
 				// Passthrough so the step row paints `data-nf-unit` and can be paired with

@@ -41,8 +41,13 @@ export function markdownMathSupport(): MathSupport | undefined {
  * The returned array is SHARED: treat it as immutable. A consumer needing a
  * different `marginTop` must re-wrap the block in a copy.
  */
-export function preparedMarkdownBlocks(markdown: string): PreparedBlock[] {
+export function preparedMarkdownBlocks(markdown: string, sourceRanges = false): PreparedBlock[] {
 	// The KaTeX revision joins the key so bodies prepared before the runtime landed
 	// (formulas as literal text) are not served once it can measure them.
-	return getPreparedMarkdownBlocks(markdown, markdownMathSupport(), getKatexRevision());
+	return getPreparedMarkdownBlocks(
+		markdown,
+		markdownMathSupport(),
+		getKatexRevision(),
+		sourceRanges,
+	);
 }
