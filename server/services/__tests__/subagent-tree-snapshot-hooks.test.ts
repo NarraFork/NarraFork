@@ -16,10 +16,11 @@
  * narrator's event consumer, so a capture that blocks indefinitely freezes the whole
  * session. It must degrade to a null boundary and let the tool proceed.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -36,6 +37,7 @@ import { normalizePathForComparison } from "../../lib/platform-path";
 import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import type { TreeSnapshotSession } from "../narrator-tree-snapshot-hooks";
+import * as snapshotHooks from "../narrator-tree-snapshot-hooks";
 import {
 	buildTreeSnapshotEventHooks,
 	buildTreeSnapshotExecutionHooks,
@@ -43,6 +45,20 @@ import {
 import { treeSnapshotPhysicalDir } from "../tree-snapshot-paths";
 import { resetHotPathCaptureStateForTests, worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 import { peekClaim } from "../worktree-write-claims";
+
+// Retained boundary/ownership algorithms use an explicit test-only policy;
+// ordinary local execution is exercised separately below.
+const previousSetting = settings.workspace.treeSnapshotsEnabled;
+let restorePolicy = () => {};
+beforeEach(() => {
+	const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	restorePolicy = () => policy.mockRestore();
+	settings.workspace.treeSnapshotsEnabled = true;
+});
+afterEach(() => {
+	restorePolicy();
+	settings.workspace.treeSnapshotsEnabled = previousSetting;
+});
 
 const createdNarrators: string[] = [];
 const tempDirs: string[] = [];
@@ -766,7 +782,7 @@ describe("subagent snapshot hooks record boundaries", () => {
 		await hooks.onSnapshotAfter?.(second.toolUseId, "Write");
 		const row = await readToolCallBoundaries(second.toolUseId);
 		expect(row?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
-	});
+	}, 30_000);
 });
 
 /**
@@ -866,5 +882,93 @@ describe("subagent snapshot hooks never block the loop", () => {
 		const row = await readToolCallBoundaries(toolUseId);
 		expect(row?.treeHashBefore).toBeNull();
 		expect(row?.treeHashAfter).toBeNull();
+	});
+});
+
+describe("local subagent execution retains claims without capture", () => {
+	beforeEach(() => {
+		restorePolicy();
+		settings.workspace.treeSnapshotsEnabled = true;
+	});
+	for (const toolName of ["Write", "Edit", "StructSed", "Bash", "GenUI"]) {
+		test(`${toolName} leaves no background or hot scan with the legacy setting enabled`, async () => {
+			const repo = await createRepo("nf-sa-local-disabled-");
+			const narratorId = await createSubagent(repo);
+			const { toolUseId } = await seedToolCall(narratorId, toolName, 1);
+			const session: TreeSnapshotSession = {
+				cwd: repo,
+				_lastTreeHash: "stale",
+				_lastTreeHashAt: Date.now(),
+				_treeHashBefore: new Map([[toolUseId, "a".repeat(40)]]),
+			};
+			const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+			const input =
+				toolName === "Bash"
+					? { command: "true" }
+					: toolName === "GenUI"
+						? { action: "create", prefix: "fixture" }
+						: { file_path: join(repo, "target.txt") };
+			const context = {
+				toolUse: { name: toolName, toolUseId, input },
+				effectiveInput: input,
+				binding: { toolCallId: "unused-fixture-id", attempt: 1 },
+				executionTarget: {
+					deviceId: "local",
+					backendKind: "local" as const,
+					cwd: repo,
+					selectionSource: "local_default" as const,
+				},
+			};
+			const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+			const capture = spyOn(worktreeTreeSnapshot, "capture");
+			try {
+				await hooks.onToolExecutionBefore?.(context);
+				expect(peekClaim(repo, toolUseId)?.to).toBeNull();
+				await hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } });
+				await new Promise<void>((done) => setImmediate(done));
+				expect(peekClaim(repo, toolUseId)?.to).toBeNumber();
+				expect(hot).not.toHaveBeenCalled();
+				expect(capture).not.toHaveBeenCalled();
+				expect(session._treeHashBefore?.size).toBe(0);
+				expect(session._lastTreeHash).toBeUndefined();
+				expect(session._lastTreeHashAt).toBeUndefined();
+			} finally {
+				hot.mockRestore();
+				capture.mockRestore();
+			}
+		});
+	}
+
+	test("an after-hook exception seals the local write claim", async () => {
+		const repo = await createRepo("nf-sa-local-after-error-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const input = { file_path: join(repo, "target.txt") };
+		const context = {
+			toolUse: { name: "Write", toolUseId: generateId(), input },
+			effectiveInput: input,
+			binding: { toolCallId: "unused-fixture-id", attempt: 1 },
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local" as const,
+				cwd: repo,
+				selectionSource: "local_default" as const,
+			},
+		};
+		await hooks.onToolExecutionBefore?.(context);
+		expect(peekClaim(repo, context.toolUse.toolUseId)?.to).toBeNull();
+		const after = spyOn(snapshotHooks, "recordTreeSnapshotAfter").mockRejectedValue(
+			new Error("fixture"),
+		);
+		try {
+			await expect(
+				hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } }),
+			).rejects.toThrow("fixture");
+			expect(peekClaim(repo, context.toolUse.toolUseId)?.to).toBeNumber();
+			expect(peekClaim(repo, context.toolUse.toolUseId)?.declared).toEqual(["target.txt"]);
+		} finally {
+			after.mockRestore();
+		}
 	});
 });

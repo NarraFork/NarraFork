@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -11,7 +12,7 @@ import {
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const {
@@ -323,9 +324,9 @@ afterEach(async () => {
 	backgroundOccupancyStore.setRuntimeLive(narratorId, false);
 	await backgroundOccupancyStore.flush();
 });
-afterAll(() => {
+afterAll(async () => {
 	backgroundOccupancyStore.resetForTests();
-	sqlite.close();
+	await disposeWorkerDb();
 });
 
 describe("async question receipt runtime adoption", () => {

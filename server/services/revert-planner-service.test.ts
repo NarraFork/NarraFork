@@ -8,7 +8,6 @@ import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-pr
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
-import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -16,11 +15,14 @@ import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
+import { assertDbReadersReady } from "../lib/db-worker/pool";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
+import { makeRetainedHistoryRuntimeForTests } from "./__tests__/retained-file-history";
 import { fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
-import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
+import { type LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import { type RevertPlanFileCursor, RevertPlanService } from "./revert-plan-service";
 import {
@@ -74,7 +76,8 @@ beforeEach(async () => {
 	// Schema ONLY from the test-preload-isolated DB. No production connection/data,
 	// migration edits, fake receipts or mocked selection/reversal/planner services.
 	// A byte image built once per process replaces replaying ~550 DDL statements per case.
-	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	sqlite = openFileWorkerDatabase(isolatedTemplate);
+	await assertDbReadersReady(sqlite.filename);
 	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
 	db = database(sqlite);
 	clock = Date.parse("2026-09-07T12:00:00.000Z");
@@ -112,7 +115,7 @@ beforeEach(async () => {
 				updatedAt: now(),
 			})
 			.run();
-	runtime = new LocalFileChangeRuntime({
+	runtime = makeRetainedHistoryRuntimeForTests({
 		db,
 		privateRoot: join(root, "private"),
 		blobStoreOptions: { minimumFreeBytes: 0 },
@@ -209,7 +212,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	await closeRevertManifestWorkers();
-	sqlite.close();
+	await closeFileWorkerDatabase(sqlite);
 	await rm(root, { recursive: true, force: true });
 });
 function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {

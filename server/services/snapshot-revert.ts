@@ -28,7 +28,7 @@ export interface RevertResult extends FileChangeRevertApplyResponse {
 }
 
 /** An explicitly empty/read-only selection, rather than a missing history item. */
-export function emptyRevertResult(): RevertResult {
+export function emptyRevertResult(): RevertResult & { historyStatus: "complete" } {
 	return {
 		planId: "",
 		status: "committed",

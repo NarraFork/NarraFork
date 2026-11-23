@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import * as fileHistoryPolicy from "../../shared/file-change-protocol";
 import { blockIdAt } from "../../tests/block-ids";
 import { testEnvironment } from "../../tests/preload";
 import { app } from "../app";
 import { db } from "../db";
 import * as schema from "../db/schema";
+import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolExecutionTarget } from "../lib/agent/types";
@@ -44,6 +46,22 @@ const now = () => new Date().toISOString();
 const options = () => ({ principal: { userId, isAdmin: false } });
 
 beforeEach(async () => {
+	spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	const runtime = await getDefaultLocalFileChangeRuntime();
+	const internal = runtime as unknown as {
+		executeBound(request: { backend: ExecutionBackend }): Promise<unknown>;
+	};
+	const executeBound = internal.executeBound.bind(runtime);
+	spyOn(internal, "executeBound").mockImplementation((request) =>
+		executeBound({
+			...request,
+			backend: new Proxy(request.backend, {
+				get(target, property) {
+					return property === "kind" ? "remote" : Reflect.get(target, property);
+				},
+			}),
+		}),
+	);
 	cwd = await mkdtemp(join(testEnvironment.isolatedHome, "scoped-per-file-"));
 	userId = generateId();
 	narratorId = generateId();
@@ -472,7 +490,7 @@ describe("HTTP edit confirmation keeps primary/subagent semantics", () => {
 	}
 });
 
-// Real Write evidence, local ACL/planner/executor and SQLite COW; only fault injection is mocked.
+// Explicit policy injection exercises retained recovery mechanics with real Write evidence and IO.
 describe("narrator-scoped per-file recovery consumers", () => {
 	test("preview contains measured files and execution preserves the file-only history", async () => {
 		const call = await write("one.txt");
@@ -609,6 +627,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		const pending: RevertTransactionOutcome = {
 			...emptyRevertResult(),
 			planId: "pending-plan",
+			historyStatus: "complete",
 			status: "executing",
 			journalStatus: "applying",
 			settling: true,

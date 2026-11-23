@@ -409,6 +409,8 @@ export const ExactRow = memo(
 		const extra = resolveRenderExtra(item.spec);
 		const translationSource = item.spec.reasoningTranslationSources?.[0];
 		if (translationSource) extra.reasoningTranslationSource = translationSource;
+		if (item.spec.reasoningTranslationEvidence)
+			extra.reasoningTranslationEvidence = item.spec.reasoningTranslationEvidence;
 		const resolveContentTarget: ContentTargetResolver = (target) =>
 			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;
@@ -1083,6 +1085,7 @@ export const ExactRow = memo(
 		prev.item.spec.kind === next.item.spec.kind &&
 		prev.item.spec.opts === next.item.spec.opts &&
 		prev.item.spec.reasoningTranslationSources === next.item.spec.reasoningTranslationSources &&
+		prev.item.spec.reasoningTranslationEvidence === next.item.spec.reasoningTranslationEvidence &&
 		prev.item.spec.lifecycleId === next.item.spec.lifecycleId &&
 		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
 		// must reach the DOM even though it affects nothing else.

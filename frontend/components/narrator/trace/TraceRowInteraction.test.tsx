@@ -244,19 +244,73 @@ afterAll(() => {
 	mock.restore();
 });
 
-test("Edit right-click opens its historical resource with the persisted row identity", async () => {
+test.each([
+	"Edit",
+	"StructSed",
+])("folded local %s opens its current file using the tool authority", async (toolName) => {
+	const target = { deviceId: "local", path: "/original/a.ts" };
+	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+	try {
+		const openFilePanel = mock((..._args: unknown[]) => {});
+		await renderRow({
+			narratorId: "row-reader",
+			tool: {
+				toolName,
+				toolUseId: "tool-1",
+				filePath: target.path,
+				isFileTool: true,
+				fileTarget: target,
+				fileNarratorId: "actual-child",
+			},
+			dock: { narratorId: "remote-host", openFilePanel } as unknown as NarratorDockContextValue,
+		});
+		expect(menuLabels()).not.toContain("editPreview.open");
+		await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+		expect(resolve).toHaveBeenCalledWith("actual-child", [target], expect.any(AbortSignal));
+		expect(openFilePanel).toHaveBeenCalledTimes(1);
+		expect(openFilePanel).toHaveBeenCalledWith(target.path, undefined, {
+			deviceId: "local",
+			fileNarratorId: "actual-child",
+			referenceOrigin: true,
+			selection: undefined,
+		});
+	} finally {
+		resolve.mockRestore();
+	}
+});
+
+test("a folded Edit with unknown execution target offers no historical or host-path navigation", async () => {
+	const openFilePanel = mock((..._args: unknown[]) => {});
+	await renderRow({
+		narratorId: "reader",
+		tool: { toolName: "Edit", toolUseId: "tool", filePath: "/unknown/a.ts", isFileTool: true },
+		dock: { narratorId: "host", openFilePanel } as unknown as NarratorDockContextValue,
+	});
+	expect(menuLabels()).not.toContain("editPreview.open");
+	expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+	expect(openFilePanel).not.toHaveBeenCalled();
+});
+
+test("remote Edit right-click opens its historical resource with the persisted row identity", async () => {
 	const openFilePanel = mock((..._args: unknown[]) => {});
 	const ref = { toolCallId: "actual-pk", messageId: "actual-message", executionAttempt: 2 };
 	await renderRow({
 		narratorId: "row-reader",
-		tool: { toolName: "Edit", toolUseId: "reused-sdk", filePath: "/work/a.ts", isFileTool: true },
+		tool: {
+			toolName: "Edit",
+			toolUseId: "reused-sdk",
+			filePath: "/work/a.ts",
+			isFileTool: true,
+			fileTarget: { deviceId: "RemoteCase", path: "/work/a.ts" },
+			fileNarratorId: "row-reader",
+		},
 		toolDetailRef: ref,
 		dock: { narratorId: "different-host", openFilePanel } as unknown as NarratorDockContextValue,
 	});
 	expect(menuLabels()).toContain("editPreview.open");
 	clickMenuItem("editPreview.open");
 	expect(openFilePanel).toHaveBeenCalledWith("/work/a.ts", undefined, {
-		toolEdit: { ...ref, narratorId: "row-reader", toolUseId: "reused-sdk" },
+		toolEdit: { ...ref, narratorId: "row-reader", toolUseId: "reused-sdk", deviceId: "RemoteCase" },
 	});
 	expect(closeSwipeMock).toHaveBeenCalled();
 });
