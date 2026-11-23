@@ -1980,9 +1980,15 @@ interface McpToolPermissionDraft {
 
 /** Whether saving keeps the stored client secret: it belongs to one URL + pre-registered client. */
 function keepsOAuthClientSecret(d: McpServerDraft): boolean {
-	const clientId = d.oauthClientId.trim();
-	const binding = `${normalizeUrlProtocol(d.url) ?? ""}\n${clientId}`;
-	return d.hasOAuthClientSecret && !!clientId && binding === d.oauthSecretBinding;
+	return (
+		d.hasOAuthClientSecret &&
+		!!d.oauthClientId.trim() &&
+		oauthSecretBindingOf(d) === d.oauthSecretBinding
+	);
+}
+
+function oauthSecretBindingOf(d: Pick<McpServerDraft, "url" | "oauthClientId">): string {
+	return `${normalizeUrlProtocol(d.url) ?? ""}\n${d.oauthClientId.trim()}`;
 }
 
 const EMPTY_DRAFT: McpServerDraft = {
@@ -2122,7 +2128,7 @@ function McpToolsTab() {
 			setJsonError(null);
 			const next = result.draft;
 			// The JSON view hides the secret field, so a typed secret must not follow a new client.
-			const sameClient = next.url === draft.url && next.oauthClientId === draft.oauthClientId;
+			const sameClient = oauthSecretBindingOf(next) === oauthSecretBindingOf(draft);
 			setDraft(sameClient ? next : { ...next, oauthClientSecret: "" });
 		},
 		[draft],
