@@ -9,7 +9,7 @@ import { FILE_CHANGE_LIMITS, type FileChangeBlobRef } from "@shared/file-change-
 import { and, asc, eq, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import type { SQLiteTransactionConfig } from "drizzle-orm/sqlite-core";
-import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
+import type { ReadQueryOptions } from "../db/worker-read";
 import type {
 	FileChangeBlobAdmission,
 	FileChangeBlobLease,
@@ -92,6 +92,7 @@ export class FileChangeBlobCatalog {
 	async readBudget(
 		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
 	): Promise<FileChangeBlobBudgetMetadata | null> {
+		const { readQueryFirst } = await import("../db/worker-read");
 		const row = await readQueryFirst(
 			this.db.select().from(budgets).where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID)).limit(1),
 			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
@@ -109,6 +110,7 @@ export class FileChangeBlobCatalog {
 		const ref = validateRef(input.ref);
 		const budget = await this.readBudget(input);
 		if (!budget) throw fail("namespace_unverified", "Blob catalog has not been initialized");
+		const { readQueryFirst } = await import("../db/worker-read");
 		const row = await readQueryFirst(
 			this.db.select().from(blobs).where(eq(blobs.digest, ref.digest)).limit(1),
 			{ ...input, executionPolicy: "worker-required", maxRows: 1 },
