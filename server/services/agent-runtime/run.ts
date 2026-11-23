@@ -818,6 +818,8 @@ async function executeRun(
 				const woke = await awaitPendingWake(owner, run);
 				if (woke === "input") outcome.freshInput = true;
 				else if (woke === "hold") continue;
+				// The answer so far was provisional: a cancelled wait ends the run cancelled.
+				else if (woke === "cancel") outcome = { ...outcome, aborted: true };
 			}
 			if (!outcome.freshInput || run.cancel.signal.aborted) break;
 			// The old session finalizer has restored its temporary model. Rotate the epoch

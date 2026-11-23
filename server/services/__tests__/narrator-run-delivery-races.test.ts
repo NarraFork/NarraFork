@@ -2195,8 +2195,11 @@ describe("G. a turn that ends with work still pending", () => {
 		});
 		getRunControl(RUN)?.cancel.abort("stop");
 		await handle.foreground;
-		await handle.terminal;
+		expect((await handle.terminal).interrupted).toBe(true);
 		expect(publication.commitAgentTerminal).toHaveBeenCalledTimes(1);
+		expect(publication.commitAgentTerminal).toHaveBeenCalledWith(
+			expect.objectContaining({ eventKind: "cancelled" }),
+		);
 		await settle(() => !getExecutionOwner(RUN));
 	});
 });
