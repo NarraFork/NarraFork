@@ -1,7 +1,7 @@
 import { Alert, Box, Button, Group, Loader, Stack } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	type GitTarget,
@@ -11,6 +11,7 @@ import {
 	useGitWorkspaceSubscription,
 } from "../../hooks/useGit";
 import { gitTargetKey } from "../../lib/api/git";
+import { describeApiError } from "../../lib/api-error";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 import { GitBranchBar } from "./GitBranchBar";
 import { GitChangesTab } from "./GitChangesTab";
@@ -23,7 +24,7 @@ export function GitPanel({ narratorId }: { narratorId?: string }) {
 }
 
 function NarratorGitPanel({ narratorId }: { narratorId: string }) {
-	const { t } = useTranslation("git");
+	const { t } = useTranslation(["git", "errors"]);
 	const qc = useQueryClient();
 	const workspaceQuery = useGitWorkspace(narratorId);
 	const workspace = workspaceQuery.data;
@@ -32,13 +33,30 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 		[narratorId, workspace, workspaceQuery.isError],
 	);
 
+	const retainedTarget = useRef<GitTarget | null>(null);
+	if (target || retainedTarget.current?.narratorId !== narratorId)
+		retainedTarget.current = target
+			? {
+					narratorId: target.narratorId,
+					workspaceKey: target.workspaceKey,
+					repositoryKey: target.repositoryKey,
+					canWrite: false,
+				}
+			: null;
+	const subscriptionTarget = target ?? retainedTarget.current;
+	// This owner remains mounted when private content is replaced by the recovery state.
+	const subscriptions = useGitWorkspaceSubscription(subscriptionTarget);
+	const state = subscriptionTarget ? subscriptions.getState(subscriptionTarget) : "waiting";
+	const suspended = !!subscriptionTarget && !subscriptions.canRead(subscriptionTarget);
+	const described = describeApiError(workspaceQuery.error, t);
+
 	// A refusal withholds `data` and may drop the query entirely; explain it rather than spin or
 	// render nothing. No workspace facts are shown, only the refusal and a retry.
 	if (workspaceQuery.isPending && !workspaceQuery.accessDenied) return <Loader size="sm" />;
 
 	return (
 		<Stack gap={4} style={{ height: "100%", minHeight: 0 }}>
-			{!target || workspaceQuery.accessDenied ? (
+			{!target || workspaceQuery.accessDenied || suspended ? (
 				<Stack gap={4} p="xs">
 					<Group justify="flex-end">
 						<Button
@@ -46,7 +64,11 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 							variant="subtle"
 							leftSection={<IconRefresh size={13} />}
 							loading={workspaceQuery.isFetching}
-							onClick={() => workspaceQuery.refetch()}
+							onClick={() => {
+								if (subscriptionTarget && suspended && state !== "workspace_changed")
+									subscriptions.refresh(subscriptionTarget);
+								else void workspaceQuery.refetch();
+							}}
 						>
 							{t("workspace.retry")}
 						</Button>
@@ -55,17 +77,27 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 						color="yellow"
 						title={t(
 							`workspace.${
-								workspaceQuery.accessDenied
+								workspaceQuery.accessDenied || state === "denied"
 									? "access_denied"
-									: workspaceQuery.isError
-										? "error"
-										: (workspace?.state ?? "error")
+									: suspended
+										? state === "refresh_required"
+											? "refresh_required"
+											: state === "waiting"
+												? "loading"
+												: "recovering"
+										: workspaceQuery.isError
+											? "error"
+											: (workspace?.state ?? "error")
 							}`,
 						)}
 					>
-						{workspaceQuery.accessDenied
+						{workspaceQuery.accessDenied || suspended
 							? null
-							: workspaceQuery.error?.message || workspace?.reason}
+							: workspaceQuery.error
+								? described.status === 503 && !described.localized
+									? t("workspace.refresh_required")
+									: described.message
+								: workspace?.reason}
 					</Alert>
 				</Stack>
 			) : (
@@ -95,12 +127,35 @@ export function GitPanelContent({
 }) {
 	const { t } = useTranslation("git");
 	const qc = useQueryClient();
-	useGitWorkspaceSubscription(target);
+	const subscriptions = useGitWorkspaceSubscription(target);
+	const state = subscriptions.getState(target);
 
 	const refresh = () => {
 		if (onRefresh) onRefresh();
 		else invalidateWorkspaceQueries(qc, target);
 	};
+
+	if (!subscriptions.canRead(target))
+		return (
+			<Stack gap={4} p="xs">
+				<Group justify="flex-end">
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						leftSection={<IconRefresh size={13} />}
+						onClick={refresh}
+					>
+						{t("workspace.retry")}
+					</Button>
+				</Group>
+				<Alert
+					color="yellow"
+					title={t(
+						`workspace.${state === "denied" ? "access_denied" : state === "refresh_required" ? "refresh_required" : state === "waiting" ? "loading" : "recovering"}`,
+					)}
+				/>
+			</Stack>
+		);
 
 	return (
 		<div

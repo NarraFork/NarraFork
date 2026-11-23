@@ -1141,6 +1141,89 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
+	test("a recovering panel retains its subscription, refreshes the same id, and distinguishes a real denial", async () => {
+		const add = spyOn(narratorWSManager, "addListener");
+		const send = spyOn(narratorWSManager, "send");
+		try {
+			const { container, queryClient } = await renderNarratorWorkspace(readyWorkspace());
+			const listener = add.mock.calls.find(([options]) =>
+				options.types?.includes("git_workspace_error"),
+			)?.[1];
+			const subscription = send.mock.calls.find(
+				([message]) => message.type === "git_workspace_subscribe",
+			)?.[0];
+			expect(listener).toBeDefined();
+			expect(subscription).toBeDefined();
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "retryable",
+				code: "DB_READ_WORKER_UNAVAILABLE",
+				message: "Database worker read timed out",
+				version: 1000,
+				retrying: true,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.recovering"]) === true,
+			);
+			expect(container.textContent).not.toContain("Database worker");
+			expect(container.textContent).not.toContain(gitLocale["workspace.access_denied"]);
+			expect(
+				send.mock.calls.filter(([message]) => message.type === "git_workspace_unsubscribe"),
+			).toHaveLength(0);
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "retryable",
+				code: "DB_READ_WORKER_UNAVAILABLE",
+				version: 1001,
+				retrying: false,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.refresh_required"]) === true,
+			);
+			const refresh = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+				(button) => button.textContent === "Refresh",
+			);
+			expect(refresh).toBeDefined();
+			refresh?.click();
+			expect(send.mock.calls.at(-1)?.[0]).toEqual({
+				type: "git_workspace_refresh",
+				subscriptionId: subscription?.subscriptionId,
+			});
+			listener?.({
+				...subscription,
+				repositoryKey: readyWorkspace().repositoryKey,
+				type: "git_workspace_subscribed",
+				version: 1002,
+			});
+			await waitForWorkspace(() => container.textContent?.includes("Changes") === true);
+			expect(
+				new Set(
+					send.mock.calls
+						.filter(([message]) => message.type === "git_workspace_subscribe")
+						.map(([message]) => message.subscriptionId),
+				).size,
+			).toBe(1);
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "denied",
+				code: "GIT_WORKSPACE_ACCESS_DENIED",
+				version: 1003,
+				retrying: false,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.access_denied"]) === true,
+			);
+			expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
+			queryClient.clear();
+		} finally {
+			add.mockRestore();
+			send.mockRestore();
+		}
+	});
+
 	test("permission revocation drops private facts and unmount releases its listener", async () => {
 		const add = spyOn(narratorWSManager, "addListener");
 		const remove = spyOn(narratorWSManager, "removeListener");
@@ -1150,6 +1233,13 @@ describe("GitPanel", () => {
 				options.types?.includes("narrator_access_changed"),
 			);
 			expect(subscription).toBeDefined();
+			// Seed a previously published total; this test verifies revocation, not production.
+			queryClient.setQueryData(["gitLineStats", "local:/repo"], {
+				linesAdded: 7,
+				linesRemoved: 1,
+				files: [],
+				complete: true,
+			});
 			expect(queryClient.getQueryData(["gitLineStats", "local:/repo"])).toBeDefined();
 			api.getGitWorkspace = async () =>
 				readyWorkspace({ state: "access_denied", capabilities: { read: false, write: false } });

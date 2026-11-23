@@ -20,7 +20,7 @@ import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
 import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
-import { bashTool, resolveBashTimeoutMs } from "../bash";
+import { bashTool, resolveBashTimeoutMs, setBashKillSettleGraceMsForTests } from "../bash";
 import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 
@@ -2009,5 +2009,38 @@ describe("TeamStatus accepts the aliases it printed", () => {
 
 		expect(sent.isError).toBeFalsy();
 		expect(deliveredMessages[0]?.targetId).toBe("ZyxwVutsRqpoNmlkJihgF");
+	});
+});
+
+describe("Foreground Bash that survives its kill", () => {
+	test("a timed-out process that never exits still returns a result", async () => {
+		seed();
+		const kill = mock(async () => {});
+		const handle: ExecHandle = {
+			// Never settles: the kill did not take, or its exit event was lost.
+			exited: new Promise<number | null>(() => {}),
+			onData() {},
+			isExited: () => false,
+			kill,
+		};
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: async () => handle,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		setBashKillSettleGraceMsForTests(50);
+		try {
+			const result = await bashTool.execute({ command: "hang", timeout: 20 }, ctx);
+
+			expect(kill).toHaveBeenCalled();
+			expect(result.output).toContain("Command timed out after 20ms");
+			expect(result.output).toContain("Process did not exit within 50ms after being killed");
+			expect(result.output).toContain("[exit code: 1]");
+		} finally {
+			setBashKillSettleGraceMsForTests(undefined);
+		}
 	});
 });

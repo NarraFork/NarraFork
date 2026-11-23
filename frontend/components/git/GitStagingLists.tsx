@@ -322,7 +322,9 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 		summary?.observationId,
 		[...filter.selected].sort(),
 	]);
-	const { groups, folders, toggleGroup, toggleFolder } = useGitStagingFolderPrefs(staging.scopeKey);
+	const { groups, folders, toggleGroup, toggleFolder } = useGitStagingFolderPrefs(
+		staging.preferenceKey,
+	);
 	const [reports, setReports] = useState<Record<string, GitStagingPageReport>>({});
 	const report = useCallback(
 		(value: GitStagingPageReport) =>
@@ -369,7 +371,7 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 		file: GitStagingFile;
 	} | null>(null);
 	const previewList =
-		preview?.owner === staging.scopeKey && staging.active && !staging.refused
+		preview?.owner === staging.displayScope && staging.active && !staging.refused
 			? summary?.lists.find((entry) => entry.id === preview.listId)
 			: undefined;
 	const closePreview = useCallback(() => setPreview(null), []);
@@ -648,7 +650,7 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 											onToggleFolder={toggleFolder}
 											onManage={management.manage}
 											onPreview={(listId, file) => {
-												if (rowsCurrent) setPreview({ owner: staging.scopeKey, listId, file });
+												if (rowsCurrent) setPreview({ owner: staging.displayScope, listId, file });
 											}}
 											onMove={move}
 											onSelect={select}
@@ -686,7 +688,7 @@ export function GitStagingWorkspace({ target }: { target: GitTarget; onRefresh?:
 			>
 				{previewList && preview && (
 					<GitStagingDiffPreview
-						key={`${staging.scopeKey}:${previewList.id}:${preview.file.fileId}`}
+						key={`${staging.displayScope}:${previewList.id}:${preview.file.fileId}`}
 						target={target}
 						staging={staging}
 						list={previewList}

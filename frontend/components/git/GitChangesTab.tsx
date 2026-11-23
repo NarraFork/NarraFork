@@ -135,6 +135,7 @@ function DisplayConfirmation({
 
 /** Everything a tree row needs that does not change per node. */
 interface TreeContext {
+	attributionHover: { current: string | null };
 	generation: string;
 	actionEpoch: number;
 	canWrite: boolean;
@@ -204,9 +205,9 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 	const preferenceKey = gitTargetKey(target) ?? "";
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
-	const { data: summary, isLoading, error } = useGitStatus(target);
+	const { data: summary, isLoading, error } = useGitStatus(target, "details", { pushOnly: true });
 	const status = summary ?? { staged: 0, branch: "", hasChanges: true };
-	const lineStats = useGitLineStats(target);
+	const lineStats = useGitLineStats(target, "details", { pushOnly: true });
 	const stage = useGitStage(target);
 	const unstage = useGitUnstage(target);
 	const commit = useGitCommit(target);
@@ -227,6 +228,10 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 	const unstagedFolders = useGitFolderPrefs(preferenceKey, "unstaged");
 
 	const pages = useGitStatusPages(target, statusFilter.selected);
+	const attributionHover = useMemo<{ current: string | null }>(
+		() => ({ current: null, scope: pages.displayScope }),
+		[pages.displayScope],
+	);
 	const listConfig = useMemo<GitChangesListConfig>(
 		() => ({
 			mode: viewMode,
@@ -248,6 +253,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		config: listConfig,
 		rowHeight,
 		displayScope: pages.displayScope,
+		workspaceIdentity: pages.workspaceIdentity,
 		displayAllowed: pages.displayAllowed && !displayBlocked,
 	});
 	const candidateMatches =
@@ -260,6 +266,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		candidateMatches ? list.candidateWindow.rows : [],
 		{
 			generation: pages.queryGeneration,
+			cache: pages.cache,
 			enabled: pages.displayAllowed,
 			onSnapshotObservation: pages.observeSnapshotStats,
 		},
@@ -328,7 +335,12 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		!list.isRetained &&
 		list.displayGeneration === pages.queryGeneration &&
 		list.displaySnapshotId === pages.pages[0]?.snapshotId;
-	const refreshing = displayAllowed && (list.isRetained || list.window.statsRefreshing === true);
+	const refreshing =
+		displayAllowed &&
+		(pages.updating ||
+			pageStats.updating ||
+			list.isRetained ||
+			list.window.statsRefreshing === true);
 	const [scopeError, setScopeError] = useState<string | null>(null);
 	const generationRef = useRef(pages.queryGeneration);
 	generationRef.current = pages.queryGeneration;
@@ -354,7 +366,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 		pages.isComplete &&
 		pages.snapshotValid &&
 		list.window.loadedFiles === pages.counts?.filteredFiles;
-	const snapshotNeedsRefresh = pages.pages.length > 0 && !pages.snapshotValid;
+	const snapshotNeedsRefresh = !!displayWindow?.snapshotId && !pages.snapshotValid;
 	const partialReason =
 		pages.pages[0]?.complete === false
 			? t("pages.partial", {
@@ -559,6 +571,7 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 	): TreeContext {
 		return {
 			generation: pages.queryGeneration,
+			attributionHover,
 			actionEpoch,
 			canWrite: listWritable,
 			rangeComplete,
@@ -718,11 +731,25 @@ function NativeGitChangesTab({ target, onRefresh }: { target: GitTarget; onRefre
 			data-git-native-view
 			style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}
 		>
-			{isLoading && <Loader size="xs" />}
-			{(error || pages.error || pageStats.error || displayError || list.error || scopeError) && (
+			{(isLoading || (pages.isCachePending && !list.window.snapshotId)) && <Loader size="xs" />}
+			{pages.waitingForConnection && (
+				<Text role="status" c="dimmed" size="xs" px="xs">
+					{t("pages.waitingForConnection")}
+				</Text>
+			)}
+			{(error ||
+				pages.error ||
+				pages.statsError ||
+				pageStats.error ||
+				displayError ||
+				list.error ||
+				scopeError) && (
 				<Text c="red" size="xs" px="xs">
 					{scopeError ||
-						(error || pages.error || pageStats.error || displayError || list.error)?.message}
+						(pages.error || error)?.message ||
+						(pages.statsError
+							? t("lineStats.failed")
+							: (pageStats.error || displayError || list.error)?.message)}
 				</Text>
 			)}
 			{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error) && (
@@ -1127,6 +1154,7 @@ function FileRow({
 			onActivate={() => ctx.onOpenFile(file.path)}
 		>
 			<AttributionHoverCard
+				intent={ctx.attributionHover}
 				target={ctx.target}
 				filePath={file.path}
 				section={ctx.section}
@@ -1194,6 +1222,7 @@ function FileRow({
 function sameRowContext(left: TreeContext, right: TreeContext) {
 	return (
 		left.generation === right.generation &&
+		left.attributionHover === right.attributionHover &&
 		left.actionEpoch === right.actionEpoch &&
 		left.target === right.target &&
 		left.t === right.t &&
@@ -1255,20 +1284,23 @@ function formatAttributionTime(value: string): string {
 }
 
 function AttributionHoverCard({
+	intent,
 	target,
 	filePath,
 	section,
 	t,
 	children,
 }: {
+	intent: { current: string | null };
 	target: GitTarget;
 	filePath: string;
 	section: GitFileSection;
 	t: Translate;
 	children: ReactNode;
 }) {
-	const [activated, setActivated] = useState(false);
-	const pointerInside = useRef(false);
+	const intentKey = JSON.stringify([section, filePath]);
+	const [activated, setActivated] = useState(intent.current === intentKey);
+	const pointerInside = useRef(intent.current === intentKey);
 	const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
 	useEffect(
 		() => () => {
@@ -1282,29 +1314,28 @@ function AttributionHoverCard({
 		// biome-ignore lint/a11y/noStaticElementInteractions: This passive badge delays a hover card; the file row owns click and keyboard activation.
 		<span
 			data-attribution-hover-target="true"
-			onMouseEnter={
-				activated
-					? undefined
-					: (event) => {
-							pointerInside.current = true;
-							const element = event.currentTarget;
-							if (pending.current != null) clearTimeout(pending.current);
-							pending.current = setTimeout(() => {
-								pending.current = null;
-								if (element.isConnected && document.visibilityState !== "hidden")
-									setActivated(true);
-							}, 120);
-						}
-			}
-			onMouseLeave={
-				activated
-					? undefined
-					: () => {
-							pointerInside.current = false;
-							if (pending.current != null) clearTimeout(pending.current);
-							pending.current = null;
-						}
-			}
+			onMouseEnter={(event) => {
+				pointerInside.current = true;
+				if (activated) {
+					intent.current = intentKey;
+					return;
+				}
+				const element = event.currentTarget;
+				if (pending.current != null) clearTimeout(pending.current);
+				pending.current = setTimeout(() => {
+					pending.current = null;
+					if (element.isConnected && document.visibilityState !== "hidden") {
+						intent.current = intentKey;
+						setActivated(true);
+					}
+				}, 120);
+			}}
+			onMouseLeave={() => {
+				pointerInside.current = false;
+				if (intent.current === intentKey) intent.current = null;
+				if (pending.current != null) clearTimeout(pending.current);
+				pending.current = null;
+			}}
 			style={{
 				display: "inline-flex",
 				flexShrink: 0,
