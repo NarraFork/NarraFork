@@ -900,7 +900,9 @@ export function useTakeoverSubagent() {
 				}
 			}
 		},
-		onSuccess: (_data, id) => {
+		// A refusal (e.g. the session delivers no result) also refetches, so the composer
+		// learns what the server knows and offers Stop instead of a takeover that fails.
+		onSettled: (_data, _error, id) => {
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 		},
 	});

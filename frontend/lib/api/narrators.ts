@@ -129,6 +129,8 @@ export interface FastModeResolution {
 export type NarratorDetail = ApiEntity &
 	Partial<FastModeResolution> & {
 		navigationSummary?: NarratorNavigationSummary;
+		/** Whether the session's run delivers its result to a caller (takeover target). */
+		deliversResult?: boolean;
 	};
 
 const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
