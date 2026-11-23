@@ -28,8 +28,10 @@ import {
 	runDisplayPageQuery,
 } from "../display-page-query";
 import {
+	drainDbWorkerPool,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
+	resumeDbWorkerPool,
 	runReadTask,
 	shutdownDbWorkerPool,
 } from "../pool";
@@ -169,13 +171,13 @@ beforeEach(async () => {
 	createFixture(writer);
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	previousWorker = process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	delete process.env.NARRAFORK_DB_WORKER;
 	await resetDbWorkerPoolForTest();
 });
 
 afterEach(async () => {
-	await shutdownDbWorkerPool();
+	await drainDbWorkerPool({ timeoutMs: 20_000 });
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
@@ -244,6 +246,7 @@ function controlledDisplaySettlement() {
 			}
 		}
 		terminate(): void {
+			if (this.terminated) return;
 			this.terminated = true;
 			this.emit("exit", 0);
 		}
@@ -583,17 +586,28 @@ describe("real readonly display page worker", () => {
 		});
 		expect(worker.success).toBe(true);
 		const bundled = await worker.outputs[0].text();
-		for (const symbol of [
+		const runtimeSymbols = [
 			"acquireInstanceLock",
 			"consumeCleanShutdownState",
 			"ensureFts",
-			"sqliteTable",
-			"drizzle-orm",
 			"getPretextDocumentPage",
 			"loadModelHistorySource",
 			"executePersistedToolCall",
-		])
-			expect(bundled).not.toContain(symbol);
+		];
+		expect(runtimeSymbols.filter((symbol) => bundled.includes(symbol))).toEqual([]);
+		// The shared entry also hosts approved pure ORM/schema domain readers.
+		// Display's own execution subgraph must remain independent of those dependencies.
+		const queryBuild = await Bun.build({
+			entrypoints: [fileURLToPath(new URL("../display-page-query.ts", import.meta.url))],
+			target: "bun",
+		});
+		expect(queryBuild.success).toBe(true);
+		const queryBundle = await queryBuild.outputs[0].text();
+		expect(
+			[...runtimeSymbols, "sqliteTable", "drizzle-orm"].filter((symbol) =>
+				queryBundle.includes(symbol),
+			),
+		).toEqual([]);
 		const protocol = await Bun.build({
 			entrypoints: [fileURLToPath(new URL("../display-page-protocol.ts", import.meta.url))],
 			target: "bun",
@@ -1025,6 +1039,10 @@ describe("real readonly display page worker", () => {
 		await shutdownDbWorkerPool();
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
+		// A native SQLite statement can outlive terminate(); the reader slot is not reusable until exit.
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+		resumeDbWorkerPool();
 		removeSlowDisplayFixture();
 		expect(await read()).toHaveLength(1);
 	}, 30_000);
@@ -1042,6 +1060,10 @@ describe("real readonly display page worker", () => {
 		await shutdownDbWorkerPool();
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 		expect(getDbWorkerPoolStats().queued).toBe(0);
+		// A native SQLite statement can outlive terminate(); the reader slot is not reusable until exit.
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+		resumeDbWorkerPool();
 		removeSlowDisplayFixture();
 		expect(await read()).toHaveLength(1);
 	}, 30_000);

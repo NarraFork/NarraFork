@@ -1,3 +1,4 @@
+import type { GitStatusPageCacheState } from "@shared/git-status-page";
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { GitStagingFilesPage, GitStagingSummary } from "../../shared/git-staging-lists";
 import type {
@@ -11,6 +12,10 @@ import { observePageLifecycle, type PageLifecycleTarget } from "./page-lifecycle
 
 interface GitTransport {
 	readonly connected: boolean;
+	reconnect?(): void;
+	getCredentialIdentity?(): unknown;
+	getConnectionCredentialIdentity?(): unknown;
+	onCredentialChange?(callback: () => void): () => void;
 	send(message: Record<string, unknown>): boolean;
 	addListener(options: ListenerOptions, callback: MessageCallback): ListenerHandle;
 	removeListener(handle: ListenerHandle): void;
@@ -44,6 +49,14 @@ export const gitSnapshotKey = (key: string | undefined, view: GitWorkspaceView) 
 	view,
 ];
 
+export type GitAuthorizationState =
+	| "waiting"
+	| "authorized"
+	| "paused"
+	| "refresh_required"
+	| "denied"
+	| "workspace_changed";
+
 interface Entry {
 	target: GitTarget;
 	consumers: Record<GitWorkspaceView, number>;
@@ -52,8 +65,20 @@ interface Entry {
 	version: number;
 	acknowledged: boolean;
 	catchUp: boolean;
-	failed: boolean;
+	state: GitAuthorizationState;
+	authorizationEpoch: number;
+	errorCode?: string;
+	readError?: Error;
+	workspaceReprobed?: boolean;
+	writeConfirmed?: boolean;
+	confirmedCanWrite?: boolean;
+	everAcknowledged?: boolean;
+	everSubscribed?: boolean;
+	httpAuthorized?: boolean;
 	stagingGeneration?: number;
+	statusPages?: GitStatusPageCacheState;
+	statusPagesUpdating?: boolean;
+	retiredPageWorkers: Set<string>;
 	observation?: GitStagingObservationState;
 	observationRevision: number;
 	observationSubscriptionId?: string;
@@ -78,14 +103,32 @@ export class GitWorkspaceSubscriptions {
 	private visible: boolean;
 	private connected: boolean;
 	private revision = 0;
+	private principalTransition = false;
+	private principalRequiresProbe = false;
+	private principalCredential: unknown;
+	private principalIdentity: unknown;
+	private hasPrincipalBinding = false;
+	private subjectConsumers = 0;
+	private trustedCredential: unknown;
+	private trustedPrincipal: unknown;
+	private awaitingPrincipal = false;
+	private reconnectCredential: unknown;
+	private credentialChanged = false;
+	private verifiedTargets = new Map<string, { principal: unknown; repositoryKey?: string }>();
 
 	constructor(
 		private readonly qc: QueryClient,
 		private readonly transport: GitTransport,
 		private readonly lifecycle?: PageLifecycleTarget,
-		private readonly onRejected?: (target: GitTarget) => void,
+		private readonly onRejected?: (target: GitTarget, denied: boolean) => void,
+		private readonly onWorkspaceChanged?: (target: GitTarget) => void,
+		private readonly onAuthorized?: (target: GitTarget, renewed: boolean) => void,
 	) {
 		this.connected = !!transport.connected;
+		this.principalCredential = transport.getCredentialIdentity?.();
+		this.principalIdentity = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
+		this.trustedCredential = this.principalCredential;
+		this.trustedPrincipal = this.principalIdentity;
 		this.visible =
 			(lifecycle?.document ?? (typeof document === "undefined" ? undefined : document))
 				?.visibilityState !== "hidden";
@@ -98,10 +141,130 @@ export class GitWorkspaceSubscriptions {
 		};
 	};
 	getRevision = () => this.revision;
+	getPrincipalKey(): string {
+		return JSON.stringify([
+			this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id,
+			this.transport.getCredentialIdentity?.(),
+		]);
+	}
+	retainSubject(): () => void {
+		this.synchronizePrincipal();
+		this.hasPrincipalBinding = true;
+		this.subjectConsumers++;
+		if (!this.dispose) this.observe();
+		return () => {
+			this.subjectConsumers--;
+			if (!this.subjectConsumers && !this.entries.size && !this.principalTransition) {
+				this.dispose?.();
+				this.dispose = undefined;
+			}
+		};
+	}
+	getStatusPageConnectionKey(target: GitTarget): string | undefined {
+		const entry = this.entries.get(authorizationKey(target));
+		return entry?.acknowledged &&
+			this.isPush(target) &&
+			this.visible &&
+			(!target.repositoryKey || entry.target.repositoryKey === target.repositoryKey) &&
+			entry.principal === this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id
+			? entry.id
+			: undefined;
+	}
+	isStatusPageUpdating(target: GitTarget): boolean {
+		return this.entries.get(authorizationKey(target))?.statusPagesUpdating === true;
+	}
+	getStatusPageState(target: GitTarget): GitStatusPageCacheState | undefined {
+		const entry = this.entries.get(authorizationKey(target));
+		return entry &&
+			this.canRead(target) &&
+			entry.principal === this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id
+			? entry.statusPages
+			: undefined;
+	}
+	/** Capture before dispatch: a response cannot replace a newer connection or Worker notice. */
+	statusPageReadPublisher(
+		target: GitTarget,
+		{ membershipOnly = false } = {},
+	): (state: GitStatusPageCacheState) => boolean {
+		const key = authorizationKey(target);
+		const entry = this.entries.get(key);
+		const id = entry?.id;
+		const principal = this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
+		const worker = entry?.statusPages?.workerEpoch;
+		const authorized = this.getWriteResultGuard(target);
+		return (state) => {
+			if (
+				!entry ||
+				this.entries.get(key) !== entry ||
+				entry.id !== id ||
+				!authorized() ||
+				this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id !== principal
+			)
+				return false;
+			const previous = entry.statusPages;
+			if (previous && previous.workerEpoch !== worker && state.workerEpoch !== previous.workerEpoch)
+				return false;
+			const samePublished =
+				previous?.workerEpoch === state.workerEpoch &&
+				previous.memberVersion === state.memberVersion &&
+				previous.statsVersion === state.statsVersion;
+			if (
+				membershipOnly &&
+				previous?.workerEpoch === state.workerEpoch &&
+				previous.memberVersion === state.memberVersion &&
+				previous.statsVersion > state.statsVersion
+			)
+				return true;
+			// Equal versions do not order scheduling/error transitions. Keep the latest
+			// authorized notice instead of letting an older HTTP read clear it.
+			return samePublished || this.publishStatusPageState(target, state);
+		};
+	}
+	/** HTTP reconciliation may advance a published version, never resurrect a retired Worker. */
+	publishStatusPageState(target: GitTarget, state: GitStatusPageCacheState): boolean {
+		const entry = this.entries.get(authorizationKey(target));
+		if (
+			!entry ||
+			!this.canRead(target) ||
+			!state ||
+			entry.principal !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id ||
+			typeof state.workerEpoch !== "string" ||
+			!Number.isSafeInteger(state.memberVersion) ||
+			!Number.isSafeInteger(state.statsVersion) ||
+			entry.retiredPageWorkers.has(state.workerEpoch)
+		)
+			return false;
+		const previous = entry.statusPages;
+		if (
+			previous?.workerEpoch === state.workerEpoch &&
+			(previous.memberVersion > state.memberVersion ||
+				(previous.memberVersion === state.memberVersion &&
+					previous.statsVersion > state.statsVersion))
+		)
+			return false;
+		if (previous && previous.workerEpoch !== state.workerEpoch) {
+			entry.retiredPageWorkers.add(previous.workerEpoch);
+			if (entry.retiredPageWorkers.size > 16) {
+				const oldest = entry.retiredPageWorkers.values().next().value;
+				if (oldest !== undefined) entry.retiredPageWorkers.delete(oldest);
+			}
+		}
+		if (JSON.stringify(previous) === JSON.stringify(state)) return true;
+		entry.statusPages = state;
+		entry.statusPagesUpdating = state.updating;
+		this.notify();
+		return true;
+	}
+	private markStatusPagesUpdating(entry: Entry): void {
+		if (entry.statusPagesUpdating) return;
+		entry.statusPagesUpdating = true;
+		if (entry.statusPages) entry.statusPages = { ...entry.statusPages, updating: true };
+		this.notify();
+	}
 	getStagingObservation(target: GitTarget): GitStagingObservationState | undefined {
 		const entry = this.entries.get(authorizationKey(target));
 		return entry &&
-			!entry.failed &&
+			this.canRead(target) &&
 			!entry.awaitingObservation &&
 			this.connected &&
 			this.visible &&
@@ -118,6 +281,7 @@ export class GitWorkspaceSubscriptions {
 		const state = this.getStagingObservation(target);
 		return (
 			!!entry?.acknowledged &&
+			this.canWrite(target) &&
 			entry.observationHolds === 0 &&
 			!!state &&
 			state.status === "settled" &&
@@ -160,7 +324,7 @@ export class GitWorkspaceSubscriptions {
 		const entry = this.entries.get(authorizationKey(target));
 		if (
 			!entry ||
-			entry.failed ||
+			!this.canRead(target) ||
 			!entry.acknowledged ||
 			!this.connected ||
 			!this.visible ||
@@ -247,6 +411,8 @@ export class GitWorkspaceSubscriptions {
 		ensureSummary = false,
 	): Promise<void> {
 		const entry = this.entries.get(authorizationKey(target));
+		const authorized = this.getWriteResultGuard(target);
+		if (!authorized()) return Promise.resolve();
 		if (entry?.stagingRefresh && generation <= (entry.stagingGeneration ?? -1)) {
 			entry.stagingRefresh.verify ||= ensureSummary;
 			for (const id of affectedListIds) entry.stagingRefresh.affected.add(id);
@@ -277,8 +443,7 @@ export class GitWorkspaceSubscriptions {
 						{ queryKey: ["gitStagingLists", target.workspaceKey, target.narratorId] },
 						{ cancelRefetch: false },
 					);
-					if (entry && (this.entries.get(authorizationKey(target)) !== entry || entry.failed))
-						return;
+					if (!authorized()) return;
 					const summary = this.qc
 						.getQueriesData<GitStagingSummary>({
 							queryKey: ["gitStagingLists", target.workspaceKey, target.narratorId],
@@ -334,24 +499,278 @@ export class GitWorkspaceSubscriptions {
 	isVisible() {
 		return this.visible;
 	}
+	/** Transport ownership is not authorization; paused push subscriptions never trigger HTTP fallback. */
 	isPush(target: GitTarget) {
-		return this.connected && !this.entries.get(authorizationKey(target))?.failed;
+		return this.connected && !this.isDenied(target);
+	}
+	getState(target: GitTarget): GitAuthorizationState {
+		return this.entries.get(authorizationKey(target))?.state ?? "waiting";
+	}
+	getReadError(target: GitTarget): Error | undefined {
+		return this.entries.get(authorizationKey(target))?.readError;
+	}
+	getAuthorizationKey(target: GitTarget): string {
+		const entry = this.entries.get(authorizationKey(target));
+		return JSON.stringify([entry?.id, entry?.authorizationEpoch]);
+	}
+	private completePrincipalTransition(): boolean {
+		if (
+			!this.principalTransition ||
+			!this.connected ||
+			this.awaitingPrincipal ||
+			!this.credentialChanged ||
+			this.principalIdentity === undefined ||
+			this.transport.getConnectionCredentialIdentity?.() !== this.principalCredential ||
+			this.transport.getCredentialIdentity?.() !== this.principalCredential
+		)
+			return false;
+		this.principalTransition = false;
+		return true;
+	}
+	private synchronizePrincipal(principalObserved = false, reconnect = true) {
+		const current = this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
+		const credential = this.transport.getCredentialIdentity?.();
+		if (!this.hasPrincipalBinding) {
+			this.principalIdentity = current;
+			this.principalCredential = credential;
+			this.trustedCredential = credential;
+			this.trustedPrincipal = current;
+			return;
+		}
+		const principalChanged = this.principalIdentity !== current;
+		const tokenChanged = this.principalCredential !== credential;
+		if (!principalChanged && !tokenChanged) {
+			if (principalObserved && this.awaitingPrincipal && current !== undefined) {
+				this.awaitingPrincipal = false;
+				if (this.completePrincipalTransition())
+					for (const entry of this.entries.values()) this.subscribeEntry(entry);
+				void this.qc.invalidateQueries({ queryKey: ["gitWorkspace"] });
+				this.notify();
+			}
+			return;
+		}
+		this.credentialChanged = credential !== undefined && credential !== this.trustedCredential;
+		this.awaitingPrincipal =
+			tokenChanged && !principalObserved && current === this.trustedPrincipal;
+		this.principalCredential = credential;
+		this.principalIdentity = current;
+		this.principalTransition = true;
+		this.principalRequiresProbe = true;
+		this.verifiedTargets.clear();
+		if (!this.dispose) this.observe();
+		for (const entry of this.entries.values()) {
+			this.unsubscribeEntry(entry, true, true);
+			entry.principal = current;
+			entry.state = "refresh_required";
+		}
+		const privateQueries = {
+			predicate: (query: { queryKey: readonly unknown[] }) => {
+				const prefix = String(query.queryKey[0]);
+				if (prefix === "gitWorkspace" || prefix === "gitSummary")
+					return (
+						(tokenChanged && !principalObserved) ||
+						query.queryKey.length < 5 ||
+						query.queryKey[4] !== current
+					);
+				return [...FACTS, "gitBranches"].includes(prefix);
+			},
+		};
+		void this.qc.cancelQueries(privateQueries);
+		this.qc.removeQueries(privateQueries);
+		if (tokenChanged && !principalObserved) {
+			void this.qc.cancelQueries({ queryKey: ["auth", "me"], exact: true });
+			void this.qc.invalidateQueries({ queryKey: ["auth", "me"], exact: true });
+		}
+		if (this.completePrincipalTransition()) {
+			for (const entry of this.entries.values()) this.subscribeEntry(entry);
+		} else if (
+			reconnect &&
+			this.credentialChanged &&
+			this.reconnectCredential !== credential &&
+			this.transport.getConnectionCredentialIdentity?.() !== credential
+		) {
+			this.reconnectCredential = credential;
+			this.transport.reconnect?.();
+		}
+		this.notify();
+	}
+	canConfirmWorkspace(): boolean {
+		return !this.awaitingPrincipal && (!this.principalTransition || this.credentialChanged);
+	}
+	private verified(target: GitTarget): boolean {
+		const value = this.verifiedTargets.get(authorizationKey(target));
+		return (
+			!!value &&
+			value.principal === this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id &&
+			(!target.repositoryKey || value.repositoryKey === target.repositoryKey)
+		);
+	}
+	needsWorkspaceProbe(narratorId: string): boolean {
+		if (
+			this.hasPrincipalBinding &&
+			(this.principalIdentity !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id ||
+				this.transport.getCredentialIdentity?.() !== this.principalCredential)
+		)
+			return true;
+		return (
+			this.principalRequiresProbe &&
+			![...this.verifiedTargets.keys()].some(
+				(key) => (JSON.parse(key) as unknown[])[0] === narratorId,
+			)
+		);
+	}
+	canRead(target: GitTarget): boolean {
+		const entry = this.entries.get(authorizationKey(target));
+		if (
+			this.hasPrincipalBinding &&
+			this.principalIdentity !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id
+		)
+			return false;
+		if (
+			!this.visible ||
+			this.principalTransition ||
+			this.awaitingPrincipal ||
+			(this.transport.getCredentialIdentity &&
+				this.transport.getCredentialIdentity() !== this.principalCredential) ||
+			(this.principalRequiresProbe && !this.verified(target))
+		)
+			return false;
+		if (!entry) return !this.connected;
+		if (target.repositoryKey && entry.target.repositoryKey !== target.repositoryKey) return false;
+		if (entry.principal !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id)
+			return false;
+		// Preserve initial HTTP-only clients, never fall back after a grant or pause.
+		return entry.state === "authorized" && entry.acknowledged && this.connected
+			? true
+			: !this.connected &&
+					!entry.everSubscribed &&
+					(entry.httpAuthorized === true ||
+						(entry.authorizationEpoch === 0 && entry.state === "waiting"));
 	}
 	isDenied(target: GitTarget) {
-		return !!this.entries.get(authorizationKey(target))?.failed;
+		return this.getState(target) === "denied";
+	}
+	private suspend(
+		entry: Entry,
+		state: GitAuthorizationState,
+		clear = false,
+		cancelWorkspace = true,
+	) {
+		entry.catchUp ||= entry.acknowledged;
+		entry.acknowledged = false;
+		entry.httpAuthorized = false;
+		entry.authorizationEpoch++;
+		entry.state = state;
+		entry.awaitingObservation = true;
+		entry.observationRevision++;
+		entry.observationSubscriptionId = undefined;
+		entry.stagingRefresh = undefined;
+		const key = gitTargetKey(entry.target);
+		if (cancelWorkspace)
+			void this.qc.cancelQueries({ queryKey: ["gitWorkspace", entry.target.narratorId] });
+		void this.qc.cancelQueries({ queryKey: ["gitSummary", entry.target.narratorId] });
+		for (const prefix of [...FACTS, "gitBranches"]) {
+			void this.qc.cancelQueries({ queryKey: [prefix, key] });
+			if (clear) this.qc.removeQueries({ queryKey: [prefix, key] });
+		}
+	}
+	pauseNarrator(narratorId: string, retry = false) {
+		for (const entry of this.entries.values()) {
+			if (entry.target.narratorId !== narratorId) continue;
+			this.unavailable(entry.target);
+			if (retry) this.refresh(entry.target);
+		}
+	}
+	revokeNarrator(narratorId: string, denied: boolean) {
+		for (const entry of this.entries.values()) {
+			if (entry.target.narratorId !== narratorId) continue;
+			if (denied) this.reject(entry.target);
+			else this.unavailable(entry.target, true);
+		}
+	}
+	private retireTransport(entry: Entry) {
+		if (entry.id && this.connected)
+			this.transport.send({ type: "git_workspace_unsubscribe", subscriptionId: entry.id });
+		entry.id = "";
 	}
 	/** HTTP read denials and push denials revoke the same cached workspace facts. */
-	reject(target: GitTarget) {
+	reject(target: GitTarget, error?: Error) {
 		const entry = this.entries.get(authorizationKey(target));
-		if (!entry || entry.failed) return;
-		entry.acknowledged = false;
-		entry.failed = true;
-		for (const prefix of FACTS) {
-			void this.qc.cancelQueries({ queryKey: [prefix, gitTargetKey(target)] });
-			this.qc.removeQueries({ queryKey: [prefix, gitTargetKey(target)] });
+		if (!entry || this.isDenied(target)) return;
+		if (error) entry.readError = error;
+		this.suspend(entry, "denied", true);
+		this.retireTransport(entry);
+		this.onRejected?.(target, true);
+		this.notify();
+	}
+	canWrite(target: GitTarget): boolean {
+		const entry = this.entries.get(authorizationKey(target));
+		return (
+			this.canRead(target) && entry?.writeConfirmed !== false && entry?.confirmedCanWrite !== false
+		);
+	}
+	confirmWorkspace(target: GitTarget | null) {
+		this.synchronizePrincipal();
+		if (!this.canConfirmWorkspace())
+			throw new DOMException("Git principal confirmation pending", "AbortError");
+		this.hasPrincipalBinding = true;
+		if (!target) return;
+		this.verifiedTargets.set(authorizationKey(target), {
+			principal: this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id,
+			repositoryKey: target.repositoryKey ?? undefined,
+		});
+		if (this.verifiedTargets.size > 64) {
+			const oldest = this.verifiedTargets.keys().next().value;
+			if (oldest !== undefined) this.verifiedTargets.delete(oldest);
 		}
-		this.onRejected?.(target);
-		void this.qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+		const entry = this.entries.get(authorizationKey(target));
+		if (entry && !entry.everSubscribed && !this.connected && !this.principalTransition) {
+			entry.httpAuthorized = true;
+			entry.state = "authorized";
+		}
+		if (entry?.state === "authorized") {
+			if (
+				entry.readError ||
+				entry.writeConfirmed === false ||
+				entry.confirmedCanWrite !== target.canWrite
+			) {
+				entry.readError = undefined;
+				entry.confirmedCanWrite = target.canWrite;
+				entry.writeConfirmed = true;
+				this.notify();
+			}
+			return;
+		}
+		if (entry && !entry.id && this.principalRequiresProbe) {
+			entry.target = target;
+			if (!this.principalTransition) this.subscribeEntry(entry);
+			this.notify();
+			return;
+		}
+		if (entry?.state !== "workspace_changed") return;
+		this.unsubscribeEntry(entry, false, true);
+		entry.target = target;
+		this.subscribeEntry(entry);
+		this.notify();
+	}
+	workspaceChanged(target: GitTarget) {
+		const entry = this.entries.get(authorizationKey(target));
+		if (!entry) return;
+		const reprobe = !entry.workspaceReprobed;
+		entry.workspaceReprobed = true;
+		this.suspend(entry, "workspace_changed");
+		if (reprobe) this.onWorkspaceChanged?.(target);
+		this.notify();
+	}
+	unavailable(target: GitTarget, clear = false, error?: Error) {
+		const entry = this.entries.get(authorizationKey(target));
+		if (!entry) return;
+		if (error) entry.readError = error;
+		this.suspend(entry, "refresh_required", clear);
+		if (clear) {
+			this.retireTransport(entry);
+			this.onRejected?.(target, false);
+		}
 		this.notify();
 	}
 	/** Access continuity only, not data freshness or a write grant. Capture before await. */
@@ -359,30 +778,46 @@ export class GitWorkspaceSubscriptions {
 		const key = authorizationKey(target);
 		const entry = this.entries.get(key);
 		const id = entry?.id;
+		const epoch = entry?.authorizationEpoch;
 		const principal = this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
+		if (!entry)
+			return () => {
+				const current = this.entries.get(key);
+				return (
+					!this.connected &&
+					(!current || current.authorizationEpoch === 0) &&
+					this.canRead(target) &&
+					this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id === principal
+				);
+			};
 		return () =>
 			!!entry &&
 			this.entries.get(key) === entry &&
-			!entry.failed &&
+			this.canRead(target) &&
 			entry.id === id &&
+			entry.authorizationEpoch === epoch &&
 			this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id === principal;
 	}
 	owns(key: string) {
 		return (
 			this.connected &&
-			[...this.entries.values()].some(
-				(entry) => !entry.failed && gitTargetKey(entry.target) === key,
-			)
+			[...this.entries.values()].some((entry) => !!entry.id && gitTargetKey(entry.target) === key)
 		);
 	}
 
 	subscribe(target: GitTarget, view: GitWorkspaceView = "details"): () => void {
+		this.synchronizePrincipal();
+		this.hasPrincipalBinding = true;
 		const key = authorizationKey(target);
 		let entry = this.entries.get(key);
 		if (entry) {
 			entry.consumers[view]++;
-			if (entry.principal !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id) {
+			if (
+				entry.principal !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id ||
+				(target.repositoryKey && entry.target.repositoryKey !== target.repositoryKey)
+			) {
 				this.unsubscribeEntry(entry);
+				entry.target = target;
 				this.subscribeEntry(entry);
 				this.notify();
 			}
@@ -396,11 +831,14 @@ export class GitWorkspaceSubscriptions {
 				version: -1,
 				acknowledged: false,
 				catchUp: false,
-				failed: false,
+				state: "waiting",
+				authorizationEpoch: 0,
+				principal: this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id,
 				observationRevision: 0,
 				awaitingObservation: true,
 				observationHolds: 0,
 				observationInstances: new Set(),
+				retiredPageWorkers: new Set(),
 			};
 			entry.consumers[view]++;
 			this.entries.set(key, entry);
@@ -419,7 +857,7 @@ export class GitWorkspaceSubscriptions {
 			else {
 				this.unsubscribeEntry(current);
 				this.entries.delete(key);
-				if (!this.entries.size) {
+				if (!this.entries.size && !this.subjectConsumers && !this.principalTransition) {
 					this.dispose?.();
 					this.dispose = undefined;
 				}
@@ -434,23 +872,46 @@ export class GitWorkspaceSubscriptions {
 		// Projection changes must not release the directory's last watcher.
 		if (this.connected && this.visible && entry.id) this.sendSubscribe(entry);
 	}
-	private unsubscribeEntry(entry: Entry) {
+	private unsubscribeEntry(entry: Entry, clear = false, preserveWorkspaceRead = true) {
 		if (entry.id && this.connected)
 			this.transport.send({ type: "git_workspace_unsubscribe", subscriptionId: entry.id });
-		entry.acknowledged = false;
-		entry.awaitingObservation = true;
-		entry.observationRevision++;
+		this.suspend(entry, "waiting", clear, !preserveWorkspaceRead);
 		entry.id = "";
 	}
 	private subscribeEntry(entry: Entry) {
+		if (this.principalTransition || (this.principalRequiresProbe && !this.verified(entry.target))) {
+			entry.state = "refresh_required";
+			return;
+		}
 		if (!this.connected || !this.visible) return;
+		const credential = this.transport.getCredentialIdentity?.();
+		if (
+			this.transport.getCredentialIdentity &&
+			(credential === undefined ||
+				this.transport.getConnectionCredentialIdentity?.() !== credential)
+		) {
+			entry.state = "refresh_required";
+			if (credential !== undefined) {
+				this.principalTransition = true;
+				this.principalCredential = credential;
+				this.credentialChanged = true;
+				this.transport.reconnect?.();
+			}
+			return;
+		}
 		entry.id = `git-workspace-${++nextSubscriptionId}`;
+		entry.everSubscribed = true;
 		entry.principal = this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
 		entry.version = -1;
+		// A new authorization/connection owns its own cache baseline.
+		entry.statusPages = undefined;
+		entry.statusPagesUpdating = false;
+		entry.retiredPageWorkers.clear();
 		entry.stagingGeneration = undefined;
 		entry.awaitingObservation = true;
 		entry.observationRevision++;
-		entry.failed = false;
+		entry.state = "waiting";
+		entry.errorCode = undefined;
 		entry.acknowledged = false;
 		const key = gitTargetKey(entry.target);
 		for (const prefix of ["gitStatus", "gitLineStats"])
@@ -479,22 +940,30 @@ export class GitWorkspaceSubscriptions {
 		if (!this.visible) return true;
 		const entry = this.entries.get(authorizationKey(target));
 		if (!entry || !this.connected) return false;
-		if (entry.failed) {
+		entry.readError = undefined;
+		if (entry.state === "denied" || entry.errorCode === "GIT_WORKSPACE_SUBSCRIPTION_LIMIT") {
 			this.subscribeEntry(entry);
 			this.notify();
-		} else if (entry.id && entry.acknowledged) {
-			this.beginStagingObservation(target);
+		} else if (entry.id) {
+			if (entry.acknowledged) {
+				this.markStatusPagesUpdating(entry);
+				this.beginStagingObservation(target);
+			} else if (entry.state !== "workspace_changed") {
+				entry.state = "paused";
+				this.notify();
+			}
 			this.transport.send({ type: "git_workspace_refresh", subscriptionId: entry.id });
-		}
+		} else this.subscribeEntry(entry);
 		return true;
 	}
 	retry(target: GitTarget) {
 		const entry = this.entries.get(authorizationKey(target));
-		if (entry?.failed) this.refresh(target);
+		if (entry && entry.state !== "waiting" && !entry.acknowledged) this.refresh(target);
 	}
 
 	private observe() {
 		this.connected = !!this.transport.connected;
+		this.completePrincipalTransition();
 		this.visible =
 			(this.lifecycle?.document ?? (typeof document === "undefined" ? undefined : document))
 				?.visibilityState !== "hidden";
@@ -513,17 +982,25 @@ export class GitWorkspaceSubscriptions {
 			},
 			(data) => this.receive(data),
 		);
+		const offPrincipal = this.qc.getQueryCache().subscribe((event) => {
+			if (event.query.queryKey[0] === "auth" && event.query.queryKey[1] === "me")
+				this.synchronizePrincipal(event.type === "updated" && event.action.type === "success");
+		});
+		const offCredential = this.transport.onCredentialChange?.(() => this.synchronizePrincipal());
 		const offConnection = this.transport.onConnectionChange((connected) => {
 			if (this.connected === connected) return;
+			this.synchronizePrincipal(false, false);
 			this.connected = connected;
+			this.completePrincipalTransition();
 			for (const entry of this.entries.values()) {
-				entry.catchUp ||= entry.acknowledged;
-				entry.acknowledged = false;
-				entry.awaitingObservation = true;
-				entry.observationRevision++;
+				this.suspend(entry, "waiting");
 				if (connected) this.subscribeEntry(entry);
 			}
 			this.notify();
+			if (!this.entries.size && !this.subjectConsumers && !this.principalTransition) {
+				this.dispose?.();
+				this.dispose = undefined;
+			}
 		});
 		const offLifecycle = observePageLifecycle(
 			{
@@ -551,6 +1028,8 @@ export class GitWorkspaceSubscriptions {
 			this.lifecycle,
 		);
 		this.dispose = () => {
+			offPrincipal();
+			offCredential?.();
 			offConnection();
 			offLifecycle();
 			this.transport.removeListener(handle);
@@ -558,6 +1037,7 @@ export class GitWorkspaceSubscriptions {
 	}
 
 	private receive(data: Parameters<MessageCallback>[0]) {
+		if (!data) return;
 		if (data.type === "narrator_access_changed") {
 			// Access hints invalidate pending results even before React applies its cache cleanup.
 			for (const value of this.entries.values()) {
@@ -575,38 +1055,90 @@ export class GitWorkspaceSubscriptions {
 			!entry ||
 			!this.connected ||
 			!this.visible ||
+			this.principalTransition ||
+			this.awaitingPrincipal ||
+			(this.transport.getCredentialIdentity &&
+				this.transport.getCredentialIdentity() !== this.principalCredential) ||
 			entry.principal !== this.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id
 		)
 			return;
 		const target = entry.target;
 		if (data.type === "git_workspace_error") {
-			this.reject(target);
+			if (data.version !== undefined) {
+				if (!Number.isSafeInteger(data.version) || (data.version as number) <= entry.version)
+					return;
+				entry.version = data.version as number;
+			}
+			const denied =
+				data.kind === "denied" ||
+				(data.kind === undefined &&
+					[
+						"GIT_WORKSPACE_ACCESS_DENIED",
+						"GIT_ACCESS_DENIED",
+						"ACCESS_DENIED",
+						"access_denied",
+						"FORBIDDEN",
+					].includes(String(data.code)));
+			const changed = data.kind === "workspace_changed";
+			const alreadyChanged = entry.workspaceReprobed === true;
+			if (changed) entry.workspaceReprobed = true;
+			const state = denied
+				? "denied"
+				: changed
+					? "workspace_changed"
+					: data.retrying === true
+						? "paused"
+						: "refresh_required";
+			this.suspend(entry, state, denied || data.code === "GIT_WORKSPACE_UNAVAILABLE");
+			if (denied) this.retireTransport(entry);
+			entry.errorCode = typeof data.code === "string" ? data.code : undefined;
+			if (denied || data.code === "GIT_WORKSPACE_UNAVAILABLE") this.onRejected?.(target, denied);
+			if (changed && !alreadyChanged) this.onWorkspaceChanged?.(target);
+			this.notify();
 			return;
 		}
-		if (data.workspaceKey !== target.workspaceKey) return;
-		if (data.type === "git_workspace_staging_observation") {
-			if (
-				data.narratorId !== target.narratorId ||
-				(target.repositoryKey && data.repositoryKey !== target.repositoryKey)
-			)
-				return;
-			this.publishStagingObservation(target, data.observation as GitStagingObservationState);
+		if (
+			data.workspaceKey !== target.workspaceKey ||
+			data.narratorId !== target.narratorId ||
+			(target.repositoryKey && data.repositoryKey !== target.repositoryKey) ||
+			!Number.isSafeInteger(data.version) ||
+			(data.version as number) <= entry.version
+		)
 			return;
-		}
 		const initial = data.type === "git_workspace_subscribed";
 		if (initial) {
-			if (entry.acknowledged) return;
+			if (entry.state === "workspace_changed") return;
+			const renewed = entry.everAcknowledged === true;
+			if (entry.acknowledged) this.suspend(entry, "waiting");
+			entry.writeConfirmed = !renewed || !this.onAuthorized;
+			entry.everAcknowledged = true;
 			entry.acknowledged = true;
-			entry.version = typeof data.version === "number" ? data.version : -1;
-			// The separate observation state verifies the post-gap baseline; matching snapshots stay cached.
+			this.trustedCredential = this.transport.getCredentialIdentity?.();
+			this.trustedPrincipal = entry.principal;
+			entry.state = "authorized";
+			entry.readError = undefined;
+			entry.workspaceReprobed = false;
+			entry.errorCode = undefined;
+			entry.version = data.version as number;
+			if (renewed) {
+				for (const view of ["details", "summary"] as const)
+					this.qc.setQueryData<GitWorkspaceSnapshot>(
+						gitSnapshotKey(gitTargetKey(target), view),
+						(previous) => (previous ? { ...previous, revision: -1, updating: true } : undefined),
+					);
+			}
+			this.onAuthorized?.(target, renewed);
+			this.notify();
+			// Reauthorization starts a fresh cache baseline on the same subscription.
 			if (!entry.catchUp) return;
 			entry.catchUp = false;
 		}
-		if (
-			!initial &&
-			(!entry.acknowledged || typeof data.version !== "number" || data.version <= entry.version)
-		)
+		if (!initial && !entry.acknowledged) return;
+		if (data.type === "git_workspace_staging_observation") {
+			entry.version = data.version as number;
+			this.publishStagingObservation(target, data.observation as GitStagingObservationState);
 			return;
+		}
 		if (data.type === "git_workspace_staging_lists_changed") {
 			if (
 				data.narratorId !== target.narratorId ||
@@ -653,6 +1185,11 @@ export class GitWorkspaceSubscriptions {
 			if (data.view !== entry.view || !data.snapshot || typeof data.version !== "number") return;
 			entry.version = data.version;
 			const snapshot = data.snapshot as GitWorkspaceSnapshot;
+			if (snapshot.statusPages) {
+				this.publishStatusPageState(target, snapshot.statusPages);
+				entry.statusPagesUpdating = entry.statusPages?.updating;
+				this.notify();
+			}
 			for (const key of new Set([gitTargetKey(target), data.workspaceKey])) {
 				if (typeof key !== "string") continue;
 				this.publish(key, entry.view, snapshot);
@@ -663,6 +1200,11 @@ export class GitWorkspaceSubscriptions {
 		if (!initial) {
 			if (data.type !== "git_workspace_changed") return;
 			entry.version = data.version as number;
+			if (
+				Array.isArray(data.categories) &&
+				data.categories.some((category) => ["worktree", "index", "head", "refs"].includes(category))
+			)
+				this.markStatusPagesUpdating(entry);
 		}
 		// Only non-statistical views need catch-up after missed change categories.
 		const categories = initial
@@ -672,8 +1214,7 @@ export class GitWorkspaceSubscriptions {
 				: [];
 		const prefixes = new Set<string>();
 		if (categories.some((category) => ["worktree", "index", "head", "refs"].includes(category)))
-			for (const prefix of ["gitModifications", "gitDiff", "gitStatusPageStats"])
-				prefixes.add(prefix);
+			for (const prefix of ["gitModifications", "gitDiff"]) prefixes.add(prefix);
 		if (categories.includes("refs") || categories.includes("head")) prefixes.add("gitLog");
 		if (categories.includes("stash")) prefixes.add("gitStashList");
 		const keys = new Set([gitTargetKey(target), data.workspaceKey]);

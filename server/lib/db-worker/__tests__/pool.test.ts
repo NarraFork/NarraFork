@@ -1,26 +1,35 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
 	aggregateObjectStorage,
 	loadScanContext,
 	measureTable,
 	scanDatabaseObjectStorage,
 } from "../../../services/storage-scan-queries";
+import { logger } from "../../logger";
+import { DbReadError } from "../errors";
 import {
+	DB_READ_QUEUE_MAX_BYTES,
+	DB_READ_QUEUE_MAX_TASKS,
+	DbReadTaskOverloadedError,
+	drainDbWorkerPool,
 	getConfiguredConcurrency,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	runEphemeralReadTask,
 	runReadTask,
+	runTrackedEphemeralReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
 	WorkersUnavailableError,
 } from "../pool";
 import type { StorageScanContextResult, StorageScanTablesResult } from "../protocol";
+import { getDbReadAbortDiagnostics } from "../read-diagnostics";
 import { shardTableNames } from "../storage-scan-runner";
 
 /**
@@ -29,30 +38,39 @@ import { shardTableNames } from "../storage-scan-runner";
  */
 function createFixtureDatabase(dbPath: string): void {
 	const db = new Database(dbPath);
-	db.run("PRAGMA journal_mode = WAL");
-	db.run("CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, status TEXT)");
-	db.run("CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_json TEXT)");
-	db.run("CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT)");
-	db.run("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT)");
-	db.run("CREATE TABLE zzz_last (id TEXT PRIMARY KEY, payload TEXT)");
-	db.run("CREATE INDEX idx_messages_content ON narrator_messages (content_json)");
-	db.run("CREATE INDEX idx_narrators_status ON narrators (status)");
-	db.run("CREATE VIRTUAL TABLE narrators_fts USING fts5(title, tokenize='trigram')");
+	const statements: Array<{ finalize(): void }> = [];
+	try {
+		db.run("PRAGMA journal_mode = WAL");
+		db.run("CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, status TEXT)");
+		db.run("CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_json TEXT)");
+		db.run("CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT)");
+		db.run("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT)");
+		db.run("CREATE TABLE zzz_last (id TEXT PRIMARY KEY, payload TEXT)");
+		db.run("CREATE INDEX idx_messages_content ON narrator_messages (content_json)");
+		db.run("CREATE INDEX idx_narrators_status ON narrators (status)");
+		db.run("CREATE VIRTUAL TABLE narrators_fts USING fts5(title, tokenize='trigram')");
 
-	const insertNarrator = db.prepare("INSERT INTO narrators (id, title, status) VALUES (?, ?, ?)");
-	const insertMessage = db.prepare(
-		"INSERT INTO narrator_messages (id, content_json) VALUES (?, ?)",
-	);
-	const insertDump = db.prepare("INSERT INTO api_requests (id, raw_dump_json) VALUES (?, ?)");
-	const seed = db.transaction(() => {
-		for (let i = 0; i < 200; i++) {
-			insertNarrator.run(`n${i}`, `narrator ${i}`, i % 2 === 0 ? "idle" : "working");
-			insertMessage.run(`m${i}`, JSON.stringify({ type: "text", text: "x".repeat(200) }));
-			if (i % 3 === 0) insertDump.run(`a${i}`, "y".repeat(500));
-		}
-	});
-	seed();
-	db.close();
+		const insertNarrator = db.prepare("INSERT INTO narrators (id, title, status) VALUES (?, ?, ?)");
+		statements.push(insertNarrator);
+		const insertMessage = db.prepare(
+			"INSERT INTO narrator_messages (id, content_json) VALUES (?, ?)",
+		);
+		statements.push(insertMessage);
+		const insertDump = db.prepare("INSERT INTO api_requests (id, raw_dump_json) VALUES (?, ?)");
+		statements.push(insertDump);
+		const seed = db.transaction(() => {
+			for (let i = 0; i < 200; i++) {
+				insertNarrator.run(`n${i}`, `narrator ${i}`, i % 2 === 0 ? "idle" : "working");
+				insertMessage.run(`m${i}`, JSON.stringify({ type: "text", text: "x".repeat(200) }));
+				if (i % 3 === 0) insertDump.run(`a${i}`, "y".repeat(500));
+			}
+		});
+		seed();
+	} finally {
+		// strict close requires every explicitly prepared statement to release its native handle.
+		for (const statement of statements) statement.finalize();
+		db.close(true);
+	}
 }
 
 /**
@@ -66,7 +84,7 @@ function writeWorkerFixture(dir: string, name: string, body: string): string {
 	const file = join(dir, name);
 	writeFileSync(
 		file,
-		`import { parentPort } from "node:worker_threads";\nparentPort.on("message", data => self.onmessage?.({ data }));\n${body}\npostMessage({ type: "ready" });\n`,
+		`import { parentPort } from "node:worker_threads";\nconst self = { onmessage: undefined };\nconst postMessage = (message) => parentPort.postMessage(message);\nparentPort.on("message", data => self.onmessage?.({ data }));\n${body}\npostMessage({ type: "ready" });\n`,
 		"utf8",
 	);
 	return pathToFileURL(file).href;
@@ -79,6 +97,23 @@ const HANGING_WORKER_BODY = `self.onmessage = () => {};`;
 const CRASHING_WORKER_BODY = `
 self.onmessage = (event) => {
 	if (event.data?.type === "task") process.exit(3);
+};
+`;
+
+/** Counts successful tasks and exposes controlled failure/hanging paths without opening a database. */
+const REUSABLE_WORKER_BODY = `
+let posted = 0;
+self.onmessage = (event) => {
+	const { type, requestId, params } = event.data;
+	if (type !== "task") return;
+	if (params.kind === "storageScanContext") {
+		postMessage({ type: "result", requestId, result: ++posted, durationMs: 0 });
+		return;
+	}
+	postMessage({ type: "progress", requestId, tableName: "started", done: 0, total: 1 });
+	if (params.tableNames?.[0] === "error")
+		postMessage({ type: "error", requestId, code: "DB_READ_FAILED", message: "fixture task failed", durationMs: 0 });
+	if (params.tableNames?.[0] === "exit") process.exit(3);
 };
 `;
 
@@ -178,7 +213,7 @@ describe("scan result determinism", () => {
 			expect(serial.topTables.length).toBeGreaterThan(0);
 			expect(serial.objectBytes).toBeGreaterThan(0);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 
@@ -191,7 +226,7 @@ describe("scan result determinism", () => {
 				second.topTables.map((table) => table.name),
 			);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 
@@ -206,7 +241,7 @@ describe("scan result determinism", () => {
 			const fromSubset = subset.topTables.find((table) => table.name === "narrator_messages");
 			expect(fromSubset).toEqual(fromFull);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	});
 });
@@ -223,7 +258,7 @@ describe("worker pool", () => {
 	});
 
 	afterEach(async () => {
-		await shutdownDbWorkerPool();
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
 		setDbWorkerSpecifiersForTest(null);
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -231,7 +266,7 @@ describe("worker pool", () => {
 	});
 
 	test("wakes queued work after cancellation during cold startup", async () => {
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		const specifier = writeWorkerFixture(
 			home,
 			"delayed-ready-worker.ts",
@@ -277,6 +312,286 @@ describe("worker pool", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 		expect(getDbWorkerPoolStats().busy).toBe(0);
 	}, 5000);
+
+	test("settles successful and failed tasks with explicit cleanup and reuses their worker", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "reusable-worker.ts", REUSABLE_WORKER_BODY),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		let unrelatedAborts = 0;
+		controller.signal.addEventListener("abort", () => unrelatedAborts++);
+		const add = spyOn(controller.signal, "addEventListener");
+		const remove = spyOn(controller.signal, "removeEventListener");
+		const abort = spyOn(AbortController.prototype, "abort");
+		const timers = spyOn(globalThis, "setTimeout");
+		const clear = spyOn(globalThis, "clearTimeout");
+		try {
+			for (let posted = 2; posted <= 9; posted++) {
+				expect(
+					await runReadTask(
+						dbPath,
+						{ kind: "storageScanContext" },
+						{ signal: controller.signal, timeoutMs: 30_000 },
+					),
+				).toBe(posted);
+				const taskTimer = timers.mock.calls.findLastIndex(
+					([, ms]) => typeof ms === "number" && ms <= 30_000,
+				);
+				expect(clear).toHaveBeenCalledWith(timers.mock.results[taskTimer]?.value);
+			}
+			const failure = await runReadTask(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: ["error"] },
+				{ signal: controller.signal, timeoutMs: 30_000 },
+			).catch((error: unknown) => error);
+			expect(failure).toMatchObject({ code: "DB_READ_FAILED", message: "fixture task failed" });
+			const taskTimers = timers.mock.calls.flatMap(([, ms], index) =>
+				typeof ms === "number" && ms <= 30_000 ? [timers.mock.results[index]?.value] : [],
+			);
+			expect(taskTimers).toHaveLength(9);
+			for (const timer of taskTimers) expect(clear).toHaveBeenCalledWith(timer);
+			expect(add).toHaveBeenCalledTimes(9);
+			expect(remove).toHaveBeenCalledTimes(9);
+			for (let index = 0; index < add.mock.calls.length; index++) {
+				const listener = add.mock.calls[index]?.[1];
+				expect(add.mock.calls[index]).toEqual(["abort", listener, { once: true }]);
+				expect(remove.mock.calls[index]).toEqual(["abort", listener]);
+			}
+			expect(abort).not.toHaveBeenCalled();
+			controller.abort();
+			expect(unrelatedAborts).toBe(1);
+			expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(10);
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(getDbWorkerPoolStats()).toMatchObject({ workers: 1, busy: 0, queued: 0 });
+		} finally {
+			clear.mockRestore();
+			timers.mockRestore();
+			abort.mockRestore();
+			remove.mockRestore();
+			add.mockRestore();
+		}
+	});
+
+	test.each([
+		"exit",
+		"postMessage",
+		"abort",
+		"timeout",
+		"shutdown",
+	] as const)("releases the dispatched task timer and listener after %s", async (failure) => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "cleanup-worker.ts", REUSABLE_WORKER_BODY),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		const add = spyOn(controller.signal, "addEventListener");
+		const remove = spyOn(controller.signal, "removeEventListener");
+		const timers = spyOn(globalThis, "setTimeout");
+		const clear = spyOn(globalThis, "clearTimeout");
+		const started = Promise.withResolvers<void>();
+		const post =
+			failure === "postMessage"
+				? spyOn(Worker.prototype, "postMessage").mockImplementationOnce(() => {
+						throw new Error("fixture dispatch failed");
+					})
+				: undefined;
+		try {
+			const task = runReadTask(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: [failure] },
+				{
+					signal: controller.signal,
+					timeoutMs: failure === "timeout" ? 50 : 30_000,
+					onProgress: () => started.resolve(),
+				},
+			).catch((error: unknown) => error);
+			if (failure !== "exit" && failure !== "postMessage") {
+				await started.promise;
+				if (failure === "abort") controller.abort();
+				else if (failure === "shutdown") void shutdownDbWorkerPool().catch(() => {});
+				// Shared admission rechecks its absolute deadline; let its real timer expire.
+			}
+			expect(await task).toMatchObject({
+				code:
+					failure === "abort"
+						? "DB_READ_ABORTED"
+						: failure === "timeout"
+							? "DB_READ_TASK_TIMEOUT"
+							: failure === "postMessage"
+								? "DB_READ_FAILED"
+								: failure === "shutdown"
+									? "DB_READ_UNAVAILABLE"
+									: "DB_READ_WORKER_EXITED",
+			});
+			expect(add).toHaveBeenCalledTimes(1);
+			expect(remove.mock.calls).toEqual([["abort", add.mock.calls[0]?.[1]]]);
+			expect(timers.mock.calls.length).toBeGreaterThanOrEqual(1);
+			for (const timer of timers.mock.results)
+				if (timer.type === "return") expect(clear).toHaveBeenCalledWith(timer.value);
+			expect(getDbWorkerPoolStats()).toMatchObject({ workers: 0, busy: 0 });
+		} finally {
+			post?.mockRestore();
+			clear.mockRestore();
+			timers.mockRestore();
+			remove.mockRestore();
+			add.mockRestore();
+		}
+	});
+
+	test("retains the PG cancellation permit through ACK and native exit before replacement", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		const releasePath = join(home, "release-pg-ack");
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"ack-worker.ts",
+				`
+			import { existsSync } from "node:fs";
+			let posted = 0;
+			self.onmessage = async (event) => {
+				const { type, requestId, params } = event.data;
+				if (type === "task") {
+					if (params.kind === "storageScanContext")
+						postMessage({ type: "result", requestId, result: ++posted, durationMs: 0 });
+					else postMessage({ type: "progress", requestId, tableName: "started", done: 0, total: 1 });
+				} else if (type === "cancel") {
+					postMessage({ type: "progress", requestId, tableName: "cancelling", done: 0, total: 1 });
+					while (!existsSync(${JSON.stringify(releasePath)})) await Bun.sleep(1);
+					postMessage({ type: "result", requestId, result: "late result", durationMs: 0 });
+				}
+			};
+			`,
+			),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const cancelling = Promise.withResolvers<void>();
+		const add = spyOn(controller.signal, "addEventListener");
+		const remove = spyOn(controller.signal, "removeEventListener");
+		const timers = spyOn(globalThis, "setTimeout");
+		const clear = spyOn(globalThis, "clearTimeout");
+		try {
+			const task = runReadTask(
+				"fixture-postgres-source",
+				{
+					kind: "displayPageMessagesPostgres",
+					messageIds: ["fixture-message"],
+					ioBudget: 32,
+					deadlineAt: Date.now() + 30_000,
+				},
+				{
+					signal: controller.signal,
+					timeoutMs: 30_000,
+					onProgress: ({ tableName }) => {
+						if (tableName === "started") started.resolve();
+						if (tableName === "cancelling") cancelling.resolve();
+					},
+				},
+			).catch((error: unknown) => error);
+			await started.promise;
+			controller.abort();
+			await cancelling.promise;
+			expect(timers).toHaveBeenCalledTimes(2);
+			const taskTimer = timers.mock.results[0]?.value;
+			const ackTimer = timers.mock.results[1]?.value;
+			expect(timers.mock.calls[1]?.[1]).toBe(1000);
+			expect(clear.mock.calls.filter(([timer]) => timer === taskTimer)).toHaveLength(0);
+			expect(clear.mock.calls.filter(([timer]) => timer === ackTimer)).toHaveLength(0);
+			expect(remove).not.toHaveBeenCalled();
+			const queued = runReadTask(dbPath, { kind: "storageScanContext" });
+			await Promise.resolve();
+			expect(getDbWorkerPoolStats()).toMatchObject({ workers: 1, busy: 1, queued: 1 });
+			writeFileSync(releasePath, "release");
+			expect(await task).toMatchObject({ code: "DB_READ_ABORTED" });
+			expect(await queued).toBe(1);
+			expect(clear).toHaveBeenCalledWith(taskTimer);
+			expect(remove).toHaveBeenCalledTimes(1);
+			expect(clear.mock.calls.filter(([timer]) => timer === ackTimer)).toHaveLength(1);
+			expect(getDbWorkerPoolStats()).toMatchObject({ workers: 1, busy: 0, queued: 0 });
+		} finally {
+			writeFileSync(releasePath, "release");
+			clear.mockRestore();
+			timers.mockRestore();
+			remove.mockRestore();
+			add.mockRestore();
+		}
+	});
+
+	test.each([
+		"abort",
+		"timeout",
+	] as const)("retires a PG worker without cancellation ACK after %s and advances the queue", async (cancellation) => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "unacknowledged-worker.ts", REUSABLE_WORKER_BODY),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const add = spyOn(controller.signal, "addEventListener");
+		const remove = spyOn(controller.signal, "removeEventListener");
+		const nativeClearTimeout = globalThis.clearTimeout;
+		const nativeSetTimeout = globalThis.setTimeout;
+		const ackArmed = Promise.withResolvers<Parameters<typeof clearTimeout>[0]>();
+		const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: TimerHandler,
+			ms?: number,
+			...args: unknown[]
+		) => {
+			const timer = nativeSetTimeout(fn, ms, ...args);
+			if (ms === 1000) ackArmed.resolve(timer);
+			return timer;
+		}) as typeof setTimeout);
+		const clear = spyOn(globalThis, "clearTimeout");
+		let ackTimer: Parameters<typeof clearTimeout>[0];
+		try {
+			const task = runReadTask(
+				"fixture-postgres-source",
+				{
+					kind: "displayPageMessagesPostgres",
+					messageIds: ["fixture-message"],
+					ioBudget: 32,
+					deadlineAt: Date.now() + 30_000,
+				},
+				{
+					signal: controller.signal,
+					timeoutMs: cancellation === "timeout" ? 50 : 30_000,
+					onProgress: () => started.resolve(),
+				},
+			).catch((error: unknown) => error);
+			await started.promise;
+			if (cancellation === "abort") controller.abort();
+			ackTimer = await ackArmed.promise;
+			expect(clear.mock.calls.filter(([timer]) => timer === ackTimer)).toHaveLength(0);
+			expect(remove).not.toHaveBeenCalled();
+			const queued = runReadTask(dbPath, { kind: "storageScanContext" });
+			await Promise.resolve();
+			expect(getDbWorkerPoolStats().queued).toBe(1);
+			// Fire the actual registered watchdog, without waiting for its production delay.
+			const onAckTimeout = timers.mock.calls.find(([, ms]) => ms === 1000)?.[0];
+			if (typeof onAckTimeout !== "function") throw new Error("ACK timer missing");
+			nativeClearTimeout(ackTimer);
+			onAckTimeout();
+			// A termination request alone does not free the shared native slot.
+			expect(getDbWorkerPoolStats().workers).toBe(1);
+			expect(await task).toMatchObject({
+				code: cancellation === "abort" ? "DB_READ_ABORTED" : "DB_READ_TASK_TIMEOUT",
+			});
+			expect(await queued).toBe(1);
+			expect(remove.mock.calls).toEqual([["abort", add.mock.calls[0]?.[1]]]);
+			expect(getDbWorkerPoolStats()).toMatchObject({ workers: 1, busy: 0, queued: 0 });
+		} finally {
+			// Leave a still-armed real watchdog intact so failed assertions cannot strand an owner.
+			clear.mockRestore();
+			timers.mockRestore();
+			remove.mockRestore();
+			add.mockRestore();
+		}
+	});
 
 	test("runs a scan-context task in a worker", async () => {
 		const context = await runReadTask<StorageScanContextResult>(dbPath, {
@@ -330,7 +645,7 @@ describe("worker pool", () => {
 			const direct = measureTable(db, table, context);
 			expect(workerResult.tables[0]).toEqual(direct);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	}, 60_000);
 
@@ -372,7 +687,7 @@ describe("worker pool", () => {
 	 * and serialised everything (measured on a real database: four concurrent scans took 4x a single
 	 * scan, i.e. a 1.00x speedup). Workers are now claimed synchronously at hand-out time.
 	 */
-	test("grows to the configured concurrency for simultaneous tasks", async () => {
+	test("ordinary work reaches shared capacity while the reserved worker stays available", async () => {
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "4";
 		const releasePath = join(home, "release-concurrent-tasks");
 		const specifier = writeWorkerFixture(
@@ -401,7 +716,7 @@ describe("worker pool", () => {
 					timeoutMs: 60_000,
 					onProgress: ({ tableName }) => {
 						started.add(tableName);
-						if (started.size === names.length) allStarted.resolve();
+						if (started.size === 3) allStarted.resolve();
 					},
 				},
 			),
@@ -409,11 +724,15 @@ describe("worker pool", () => {
 		const completed = Promise.all(tasks);
 		try {
 			// Readiness can take longer than 50ms on CI. Hold every task at a barrier instead
-			// of sampling startup timing; four resident workers alone would not prove concurrency.
+			// of sampling startup timing; three resident workers alone would not prove concurrency.
 			await Promise.race([allStarted.promise, completed]);
-			expect(started.size).toBe(4);
-			expect(getDbWorkerPoolStats().workers).toBe(4);
-			expect(getDbWorkerPoolStats().busy).toBe(4);
+			expect(started.size).toBe(3);
+			expect(getDbWorkerPoolStats().workers).toBe(3);
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				busy: 3,
+				queued: 1,
+				configuration: { concurrency: 4, reservedCapacity: 1, normalCapacity: 3 },
+			});
 		} finally {
 			writeFileSync(releasePath, "release");
 			await completed;
@@ -651,7 +970,7 @@ describe("worker pool", () => {
 	 * second task can only ever be in the queue.
 	 */
 	test("times out while waiting in the queue rather than waiting forever", async () => {
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		setDbWorkerSpecifiersForTest([
 			writeWorkerFixture(home, "hanging-worker.ts", HANGING_WORKER_BODY),
 		]);
@@ -683,7 +1002,7 @@ describe("worker pool", () => {
 
 	/** An abort must also cancel a task that has not been given a worker yet. */
 	test("aborts a task while it is still waiting in the queue", async () => {
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		setDbWorkerSpecifiersForTest([
 			writeWorkerFixture(home, "hanging-worker.ts", HANGING_WORKER_BODY),
 		]);
@@ -710,7 +1029,7 @@ describe("worker pool", () => {
 
 	/** Shutdown must settle queued waiters too; dropping them reintroduces the hang. */
 	test("shutdown rejects tasks still waiting in the queue", async () => {
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		setDbWorkerSpecifiersForTest([
 			writeWorkerFixture(home, "hanging-worker.ts", HANGING_WORKER_BODY),
 		]);
@@ -740,7 +1059,7 @@ describe("worker pool", () => {
 	 * by itself distinguish the two drains; it pins the guarantee the quota is there to keep.
 	 */
 	test("serves queued tasks in submission order", async () => {
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		const completions: string[] = [];
 		const names = ["narrators", "projects", "api_requests", "zzz_last", "narrator_messages"];
 		await Promise.all(
@@ -755,4 +1074,493 @@ describe("worker pool", () => {
 		);
 		expect(completions).toEqual(names);
 	}, 90_000);
+});
+
+describe("read cancellation diagnostics", () => {
+	let home = "";
+	let dbPath = "";
+	const receivedTaskWorker = `
+	self.onmessage = (event) => {
+		if (event.data?.type !== "task") return;
+		postMessage({ type: "progress", requestId: event.data.requestId, tableName: event.data.requestId, done: 0, total: 1 });
+	};
+	`;
+	beforeEach(async () => {
+		home = mkdtempSync(join(tmpdir(), "narrafork-db-abort-diagnostics-"));
+		dbPath = join(home, "private-source.db");
+		writeFileSync(dbPath, "fake database source");
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		await resetDbWorkerPoolForTest();
+	});
+	afterEach(async () => {
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		setDbWorkerSpecifiersForTest(null);
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("pre-aborted ordinary, ephemeral and tracked reads have admission context without an ID", async () => {
+		const controller = new AbortController();
+		controller.abort(new Error("private cancellation reason"));
+		const params = {
+			kind: "selectRows",
+			sql: "SELECT ?",
+			params: ["private bind"],
+			maxRows: 1,
+		} as const;
+		const options = { signal: controller.signal, diagnosticSource: "private caller label" };
+		const tasks = [
+			runReadTask(dbPath, { ...params, params: [...params.params] }, options),
+			runEphemeralReadTask(dbPath, { ...params, params: [...params.params] }, options),
+		];
+		const tracked = runTrackedEphemeralReadTask(
+			dbPath,
+			{ ...params, params: [...params.params] },
+			options,
+		);
+		tasks.push(tracked.result);
+		for (const task of tasks) {
+			const error = await task.catch((failure: unknown) => failure);
+			expect(error).toBeInstanceOf(DbReadError);
+			expect(error).toMatchObject({
+				name: "DbReadError",
+				code: "DB_READ_ABORTED",
+				message: "database read task aborted",
+			});
+			expect(getDbReadAbortDiagnostics(error)).toEqual({ kind: "selectRows", phase: "admission" });
+		}
+		await tracked.released;
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+	});
+
+	test("cancellation during ephemeral startup remains acquiring and has no allocated task ID", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "starting-worker.ts", `await new Promise(() => {});`),
+		]);
+		const controller = new AbortController();
+		const task = runEphemeralReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{ signal: controller.signal, timeoutMs: 5000 },
+		).catch((error: unknown) => error);
+		await Bun.sleep(0);
+		expect(getDbWorkerPoolStats()).toMatchObject({ starting: 1, tracked: 0 });
+		controller.abort("private startup reason");
+		const error = await task;
+		expect(error).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "storageScanContext",
+			phase: "acquiring",
+		});
+		expect(getDbWorkerPoolStats().busy).toBe(0);
+	});
+
+	test("queued cancellation has no allocated ID while the dispatched blocker retains its ID", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "queued-worker.ts", receivedTaskWorker),
+		]);
+		const started = Promise.withResolvers<string>();
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				onProgress: ({ tableName }) => started.resolve(tableName),
+				timeoutMs: 5000,
+			},
+		).catch((error: unknown) => error);
+		const taskId = await started.promise;
+		const controller = new AbortController();
+		const queued = runReadTask(
+			dbPath,
+			{ kind: "storageScanTables", tableNames: ["private_table"] },
+			{ signal: controller.signal, timeoutMs: 5000 },
+		).catch((error: unknown) => error);
+		await Promise.resolve();
+		expect(getDbWorkerPoolStats().queued).toBe(1);
+		controller.abort();
+		expect(getDbReadAbortDiagnostics(await queued)).toEqual({
+			kind: "storageScanTables",
+			phase: "queued",
+		});
+		expect(getDbWorkerPoolStats().queued).toBe(0);
+		blockerController.abort();
+		expect(getDbReadAbortDiagnostics(await blocker)).toEqual({
+			kind: "storageScanContext",
+			phase: "running",
+			taskId,
+		});
+	});
+
+	test("tracked running cancellation correlates the actual posted ID without private inputs", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "running-worker.ts", receivedTaskWorker),
+		]);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<string>();
+		const task = runTrackedEphemeralReadTask(
+			dbPath,
+			{
+				kind: "selectRows",
+				sql: "SELECT secret_payload FROM private_table WHERE token = ?",
+				params: ["private bind"],
+				maxRows: 1,
+			},
+			{
+				signal: controller.signal,
+				diagnosticSource: "private source label",
+				onProgress: ({ tableName }) => started.resolve(tableName),
+				timeoutMs: 5000,
+			},
+		);
+		const result = task.result.catch((error: unknown) => error);
+		const taskId = await started.promise;
+		controller.abort({ sql: "private reason SQL", params: ["private reason bind"], dbPath });
+		const error = await result;
+		expect(error).toBeInstanceOf(DbReadError);
+		expect(taskId).toMatch(/^dbr-[a-z0-9]+-[a-z0-9]+$/);
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "selectRows",
+			phase: "running",
+			taskId,
+		});
+		expect(JSON.stringify(getDbReadAbortDiagnostics(error))).not.toContain("private");
+		expect(JSON.stringify(error)).toBe('{"code":"DB_READ_ABORTED","name":"DbReadError"}');
+		await task.released;
+		expect(getDbWorkerPoolStats().tracked).toBe(0);
+	});
+
+	test("worker-returned cancellation uses the host domain and task ID, not remote error properties", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"aborted-worker.ts",
+				`
+			self.onmessage = (event) => {
+				if (event.data?.type !== "task") return;
+				const { requestId } = event.data;
+				postMessage({ type: "progress", requestId, tableName: requestId, done: 0, total: 1 });
+				postMessage({ type: "error", requestId, code: "DB_READ_ABORTED", message: "database read task aborted", durationMs: 0,
+					taskId: "dbr-forged-1", phase: "admission", domainTask: "private task", sql: "private SQL", remoteError: { reason: "private" } });
+			};
+			`,
+			),
+		]);
+		let taskId = "";
+		const error = await runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{
+				onProgress: ({ tableName }) => {
+					taskId = tableName;
+				},
+				timeoutMs: 5000,
+			},
+		).catch((failure: unknown) => failure);
+		expect(error).toBeInstanceOf(DbReadError);
+		expect(taskId).toMatch(/^dbr-[a-z0-9]+-[a-z0-9]+$/);
+		expect(getDbReadAbortDiagnostics(error)).toEqual({
+			kind: "domainRead",
+			domainTask: "readerProbe",
+			phase: "running",
+			taskId,
+		});
+		expect(error).not.toHaveProperty("remoteError");
+		expect(error).not.toHaveProperty("taskId");
+	});
+
+	test("deduplicated subscriptions cancel independently and retain the execution owner's diagnostics", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "shared-worker.ts", receivedTaskWorker),
+		]);
+		const controller = new AbortController();
+		const started = Promise.withResolvers<string>();
+		const owner = runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{
+				signal: controller.signal,
+				dedupeKey: "shared-abort",
+				timeoutMs: 5000,
+				onProgress: ({ tableName }) => started.resolve(tableName),
+			},
+		).catch((error: unknown) => error);
+		const waiterController = new AbortController();
+		const waiter = runReadTask(
+			dbPath,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{ dedupeKey: "shared-abort", timeoutMs: 5000, signal: waiterController.signal },
+		).catch((error: unknown) => error);
+		const taskId = await started.promise;
+		controller.abort();
+		const ownerError = await owner;
+		expect(ownerError).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(getDbWorkerPoolStats()).toMatchObject({ inFlight: 1, busy: 1 });
+		waiterController.abort();
+		const waiterError = await waiter;
+		expect(waiterError).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(waiterError).not.toBe(ownerError);
+		expect(getDbReadAbortDiagnostics(waiterError)).toEqual({
+			kind: "domainRead",
+			domainTask: "readerProbe",
+			phase: "running",
+			taskId,
+		});
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		expect(getDbWorkerPoolStats().inFlight).toBe(0);
+	});
+
+	test("cancellation after ID allocation but before post remains dispatching and does not post a task", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"counting-worker.ts",
+				`
+			let posted = 0;
+			self.onmessage = (event) => {
+				if (event.data?.type !== "task") return;
+				postMessage({ type: "result", requestId: event.data.requestId, result: ++posted, durationMs: 0 });
+			};
+			`,
+			),
+		]);
+		expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		const controller = new AbortController();
+		let aborted = false;
+		Object.defineProperty(controller.signal, "aborted", {
+			// Binding an ID makes the worker busy before the final pre-post cancellation check.
+			get: () => {
+				if (!aborted && getDbWorkerPoolStats().busy === 1) {
+					aborted = true;
+					controller.abort("private pre-post reason");
+				}
+				return aborted;
+			},
+		});
+		const posted = spyOn(Worker.prototype, "postMessage");
+		try {
+			const error = await runReadTask(
+				dbPath,
+				{ kind: "storageScanContext" },
+				{ signal: controller.signal, timeoutMs: 5000 },
+			).catch((failure: unknown) => failure);
+			expect(error).toMatchObject({ code: "DB_READ_ABORTED" });
+			expect(getDbReadAbortDiagnostics(error)).toEqual({
+				kind: "storageScanContext",
+				phase: "dispatching",
+				taskId: expect.stringMatching(/^dbr-[a-z0-9]+-[a-z0-9]+$/),
+			});
+			expect(posted.mock.calls.filter(([message]) => message?.type === "task")).toHaveLength(0);
+			expect(getDbWorkerPoolStats()).toMatchObject({ busy: 0, tracked: 0 });
+			expect(await runReadTask(dbPath, { kind: "storageScanContext" })).toBe(1);
+		} finally {
+			posted.mockRestore();
+		}
+	});
+});
+
+describe("queue admission diagnostics", () => {
+	let home = "";
+	let dbPath = "";
+
+	beforeEach(async () => {
+		home = mkdtempSync(join(tmpdir(), "narrafork-db-queue-diagnostics-"));
+		dbPath = join(home, "fake.db");
+		// The stand-in workers never open it: only the source-identity filesystem check runs.
+		writeFileSync(dbPath, "fake database source");
+		await resetDbWorkerPoolForTest();
+	});
+
+	afterEach(async () => {
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
+		setDbWorkerSpecifiersForTest(null);
+		delete process.env.NARRAFORK_DB_WORKER;
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("queue admission diagnostics preserve the count boundary and rate-limit without payloads", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "diagnostic-hanging-worker.ts", HANGING_WORKER_BODY),
+		]);
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				timeoutMs: 30_000,
+			},
+		).catch((error: unknown) => error);
+		const controllers: AbortController[] = [];
+		const waiters: Array<Promise<unknown>> = [];
+		const records: Array<Record<string, unknown>> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
+			if (message === "Database read queue admission rejected") records.push(fields ?? {});
+		});
+		let wallClock: { mockRestore(): void } | undefined;
+		try {
+			const readyBy = performance.now() + 2_000;
+			while (!getDbWorkerPoolStats().busy && performance.now() < readyBy) await Bun.sleep(1);
+			expect(getDbWorkerPoolStats().busy).toBe(1);
+			for (let index = 0; index < (DB_READ_QUEUE_MAX_TASKS * 3) / 4; index++) {
+				const controller = new AbortController();
+				controllers.push(controller);
+				waiters.push(
+					runReadTask(
+						dbPath,
+						{ kind: "storageScanContext" },
+						{
+							signal: controller.signal,
+							timeoutMs: 30_000,
+						},
+					).catch((error: unknown) => error),
+				);
+			}
+			await Bun.sleep(0);
+			expect(getDbWorkerPoolStats().queued).toBe((DB_READ_QUEUE_MAX_TASKS * 3) / 4);
+			const queuedBytes = getDbWorkerPoolStats().queuedBytes;
+			let now = Date.now() + 20_000;
+			wallClock = spyOn(Date, "now").mockImplementation(() => now);
+			const secret = "https://private.invalid/?token=private-queue-payload";
+			const rejected = () =>
+				runReadTask(
+					dbPath,
+					{
+						kind: "selectRows",
+						sql: "SELECT ? AS private_queue_template",
+						params: [secret],
+						maxRows: 1,
+					},
+					{ diagnosticSource: secret },
+				);
+			for (let index = 0; index < 8; index++) {
+				const error = await rejected().catch((error: unknown) => error);
+				expect(error).toBeInstanceOf(DbReadTaskOverloadedError);
+				expect(error).toMatchObject({
+					code: "DB_READ_TASK_OVERLOADED",
+					name: "DbReadTaskOverloadedError",
+					message: "Database read worker queue is full",
+				});
+			}
+			expect(records).toHaveLength(5);
+			expect(records[0]).toMatchObject({
+				reason: "normal-count",
+				taskKind: "selectRows",
+				queued: (DB_READ_QUEUE_MAX_TASKS * 3) / 4,
+				queuedBytes,
+				maxQueued: DB_READ_QUEUE_MAX_TASKS,
+				maxQueuedBytes: DB_READ_QUEUE_MAX_BYTES,
+				workers: 1,
+				busy: 1,
+				retiring: 0,
+				pendingSpawns: 0,
+				concurrency: 2,
+				rateLimitWindowMs: 10_000,
+				rateLimitMaxLogs: 5,
+			});
+			now += 10_000;
+			await expect(rejected()).rejects.toMatchObject({ code: "DB_READ_TASK_OVERLOADED" });
+			expect(records).toHaveLength(6);
+			expect(records.at(-1)?.suppressedSinceLastLog).toBe(3);
+			const text = JSON.stringify(records);
+			for (const privateText of [
+				secret,
+				"private_queue_template",
+				dbPath,
+				"sql",
+				"params",
+				"diagnosticSource",
+			])
+				expect(text).not.toContain(privateText);
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				queued: (DB_READ_QUEUE_MAX_TASKS * 3) / 4,
+				queuedBytes,
+			});
+		} finally {
+			wallClock?.mockRestore();
+			for (const controller of controllers) controller.abort();
+			blockerController.abort();
+			await Promise.all([...waiters, blocker]);
+			warn.mockRestore();
+		}
+	});
+
+	test("queue admission diagnostics preserve the inclusive byte boundary", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "diagnostic-byte-worker.ts", HANGING_WORKER_BODY),
+		]);
+		const blockerController = new AbortController();
+		const blocker = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				signal: blockerController.signal,
+				timeoutMs: 30_000,
+			},
+		).catch((error: unknown) => error);
+		const queuedController = new AbortController();
+		const probeController = new AbortController();
+		let probe: Promise<unknown> | undefined;
+		let queued: Promise<unknown> | undefined;
+		const records: Array<Record<string, unknown>> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, fields) => {
+			if (message === "Database read queue admission rejected") records.push(fields ?? {});
+		});
+		try {
+			const readyBy = performance.now() + 2_000;
+			while (!getDbWorkerPoolStats().busy && performance.now() < readyBy) await Bun.sleep(1);
+			expect(getDbWorkerPoolStats().busy).toBe(1);
+			probe = runReadTask(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: [""] },
+				{
+					signal: probeController.signal,
+					timeoutMs: 30_000,
+				},
+			).catch((error: unknown) => error);
+			await Bun.sleep(0);
+			const overhead = getDbWorkerPoolStats().queuedBytes;
+			expect(overhead).toBeGreaterThan(0);
+			probeController.abort();
+			await probe;
+			queued = runReadTask(
+				dbPath,
+				{
+					kind: "storageScanTables",
+					tableNames: ["private-queue-body".padEnd(6 * 1024 * 1024 - overhead, "x")],
+				},
+				{ signal: queuedController.signal, timeoutMs: 30_000 },
+			).catch((error: unknown) => error);
+			await Bun.sleep(0);
+			expect(getDbWorkerPoolStats()).toMatchObject({
+				queued: 1,
+				queuedBytes: 6 * 1024 * 1024,
+			});
+			const error = await runReadTask(dbPath, { kind: "storageScanContext" }).catch(
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(DbReadError);
+			expect(error).toMatchObject({ code: "DB_READ_OVERLOADED" });
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({
+				reason: "normal-bytes",
+				taskKind: "storageScanContext",
+				queued: 1,
+				queuedBytes: 6 * 1024 * 1024,
+				busy: 1,
+			});
+			expect(JSON.stringify(records)).not.toContain("private-queue-body");
+			expect(getDbWorkerPoolStats().queued).toBe(1);
+		} finally {
+			probeController.abort();
+			queuedController.abort();
+			blockerController.abort();
+			await Promise.all([probe, queued, blocker]);
+			warn.mockRestore();
+		}
+	});
 });

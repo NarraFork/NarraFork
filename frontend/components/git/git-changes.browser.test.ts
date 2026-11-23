@@ -111,6 +111,7 @@ function broadcastObservation(
 	if (save) session.states.set(workspaceKey, state);
 	for (const { socket, identity } of session.subscriptions.values()) {
 		if (identity.workspaceKey !== workspaceKey || socket.readyState !== 1) continue;
+		identity.version++;
 		socket.send(
 			JSON.stringify({
 				type: "git_workspace_staging_observation",
@@ -2279,6 +2280,9 @@ test("expired complete snapshots expose a centered footer refresh that restores 
 			);
 			await page.waitForSelector('[data-testid="git-changes-range-controls"] button');
 			await expectRangeFooter(page, "Refresh");
+			expect(
+				(await snapshot(page)).network.requests.filter((request) => request.expired),
+			).toHaveLength(1);
 			await page.evaluate(() => {
 				const current = (window as unknown as FixtureWindow).gitChangesFixture;
 				current.holdFirstPage();

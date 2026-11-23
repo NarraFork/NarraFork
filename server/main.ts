@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { extname, resolve } from "node:path";
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
 // resolve the tsconfig alias, and this module is dependency-free string constants, so it adds
@@ -57,7 +57,7 @@ import {
 import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
 import { prepareMcpTools } from "./lib/mcp/tool-bridge";
-import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { getNarraforkHome } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
@@ -1574,17 +1574,6 @@ if (activeDatabaseBackend === "sqlite") {
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
 // every settings save.
 reconcileNugRelayClients(settings.nugProviders ?? []);
-
-// One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
-const legacySnapshotsDir = getNarraforkPath("snapshots");
-if (existsSync(legacySnapshotsDir)) {
-	try {
-		rmSync(legacySnapshotsDir, { recursive: true, force: true });
-		logger.info("Removed legacy snapshot directory", { path: legacySnapshotsDir });
-	} catch (err) {
-		logger.warn("Failed to remove legacy snapshot directory", { error: String(err) });
-	}
-}
 
 type GracefulShutdownOptions = {
 	reason: string;

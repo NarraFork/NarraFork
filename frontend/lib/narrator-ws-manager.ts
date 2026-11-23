@@ -20,6 +20,7 @@ import {
 } from "@shared/recent-tabs";
 import type { BusinessSocket } from "@shared/remote-access/business-transport";
 import { getToken } from "./api";
+import { onTokenChange } from "./api/client";
 import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
@@ -392,6 +393,9 @@ export class NarratorWSManager {
 	private connectingAt = 0;
 	private _connected = false;
 	private _disconnected = false;
+	private credentialIdentity = 0;
+	private credentialIds = new Map<string, number>();
+	private connectionCredentialIdentity: number | undefined;
 	private hasConnectedOnce = false;
 	private networkOffline = false;
 	private reconnectAttempts = 0;
@@ -1398,6 +1402,28 @@ export class NarratorWSManager {
 	}
 
 	/** Force a reconnect (e.g. from the UI reconnect button). */
+	/** Opaque credential identity: equal credential values reuse the same private identity. */
+	getCredentialIdentity(): number | undefined {
+		const token = getToken();
+		const credentialKey = shareAuth
+			? `share:${shareAuth.shareId}:${shareAuth.token}`
+			: token
+				? `token:${token}`
+				: undefined;
+		if (!credentialKey) return undefined;
+		let identity = this.credentialIds.get(credentialKey);
+		if (identity === undefined) {
+			identity = ++this.credentialIdentity;
+			this.credentialIds.set(credentialKey, identity);
+		}
+		return identity;
+	}
+	onCredentialChange(callback: () => void): () => void {
+		return onTokenChange(() => callback());
+	}
+	getConnectionCredentialIdentity(): number | undefined {
+		return this._connected ? this.connectionCredentialIdentity : undefined;
+	}
 	reconnect(): void {
 		this._clearConnectTimeout();
 		clearTimeout(this.reconnectTimer);
@@ -1468,6 +1494,7 @@ export class NarratorWSManager {
 		const tokenQuery = shareAuth
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
+		this.connectionCredentialIdentity = this.getCredentialIdentity();
 		const ws = businessTransport.openSocket("/ws/narrator", tokenQuery);
 		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
 		ws.binaryType = "arraybuffer";

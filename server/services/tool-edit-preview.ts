@@ -3,6 +3,7 @@ import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
 	type FileChangeState,
+	isFileHistoryEnabledForDevice,
 } from "@shared/file-change-protocol";
 import type {
 	ToolEditPreview,
@@ -351,6 +352,8 @@ export async function getToolEditPreview(
 		if (row.executionPathFlavor === "spec" || row.resolvedFilePath?.startsWith("spec://"))
 			return reject("unsupported");
 		signal.throwIfAborted();
+		// The message-ref selector supplies the frozen execution target, not request input.
+		if (!isFileHistoryEnabledForDevice(row.executionDeviceId)) return result;
 		if (!row.fileChangeOperationId) return { ...result, ...(await treePreview(row, signal)) };
 		const snapshot = await readEvidence(row, signal);
 		signal.throwIfAborted();

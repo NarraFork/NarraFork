@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { GitLineStats } from "@shared/git-line-stats";
+import type { GitStatusPageCacheState } from "@shared/git-status-page";
 import type {
 	GitStagingWatchState,
 	GitWorkspaceCategory,
@@ -1235,4 +1236,276 @@ describe("directory-owned Git snapshots", () => {
 		expect(bounded.detailsTruncated).toBe(true);
 		expect(bounded.lineStats?.complete).toBe(true);
 	});
+});
+
+describe("watch-owned paging cache production", () => {
+	const cache = (memberVersion = 1, statsVersion = 0): GitStatusPageCacheState => ({
+		status: "ready",
+		workerEpoch: "worker-1",
+		memberVersion,
+		statsVersion,
+		updating: statsVersion === 0,
+	});
+
+	test("first subscription prewarms while its initial fingerprint probe is still pending", async () => {
+		const fixture = snapshotFixture();
+		const probe = deferred<{ fingerprints: { worktree: string }; uncertain: [] }>();
+		let productions = 0;
+		const pool = new GitWorkspaceWatchPool(async () => probe.promise, 5, {
+			...fixture.reads,
+			observePages: async () => {
+				productions++;
+				return cache(1, 1);
+			},
+		});
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			() => {},
+		);
+		try {
+			await waitFor(() => productions === 1);
+		} finally {
+			off();
+			probe.resolve({ fingerprints: { worktree: "first" }, uncertain: [] });
+		}
+	});
+
+	test("first subscription prewarms once and sends complete statistics before the 200-file projection", async () => {
+		const fixture = snapshotFixture();
+		const release = deferred<void>();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const files = Array.from({ length: 561 }, (_, i) => ({ path: `dir/f-${i}`, status: " M" }));
+		let productions = 0;
+		let released = 0;
+		let fullCount = 0;
+		const reads = {
+			...fixture.reads,
+			status: async () => ({ ...statusFacts(), files, totalFiles: files.length }),
+			lineStats: async () => {
+				fixture.counts.lineStats++;
+				return {
+					...lineFacts(),
+					files: files.map(({ path }) => ({
+						path,
+						unstagedLinesAdded: 2,
+						unstagedLinesRemoved: 1,
+						complete: true,
+					})),
+				};
+			},
+			observePages: async (
+				_target: GitWorkspaceTarget,
+				signal: AbortSignal,
+				readStats: (signal: AbortSignal) => Promise<GitLineStats>,
+				onPublished?: (cache: GitStatusPageCacheState) => void,
+			) => {
+				productions++;
+				onPublished?.(cache());
+				await release.promise;
+				fullCount = (await readStats(signal)).files.length;
+				return cache(1, 1);
+			},
+			pagesState: async () => cache(1, 1),
+			releasePages: () => {
+				released++;
+			},
+		};
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			reads,
+		);
+		const first = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		const second = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => snapshots.some((value) => value.statusPages?.memberVersion === 1));
+			expect(
+				snapshots.some(
+					(value) => value.statusPages?.statsVersion === 0 && value.statusPages.updating,
+				),
+			).toBe(true);
+			release.resolve();
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.statsVersion === 1 && !value.updating),
+			);
+			expect(productions).toBe(1);
+			expect(fullCount).toBe(561);
+			expect(fixture.counts.lineStats).toBe(1);
+			expect(snapshots.at(-1)?.status?.files).toHaveLength(200);
+			expect(snapshots.at(-1)?.lineStats?.files).toHaveLength(200);
+			first();
+			expect(released).toBe(0);
+		} finally {
+			second();
+			first();
+		}
+		expect(released).toBe(1);
+	});
+
+	test("dirty advances before production and burst edits allow only one trailing publication", async () => {
+		const fixture = snapshotFixture();
+		const gate = deferred<void>();
+		const order: string[] = [];
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let fingerprint = "a";
+		let productions = 0;
+		let validations = 0;
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: fingerprint }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				invalidate: () => {
+					order.push("dirty");
+				},
+				validatePages: async () => {
+					validations++;
+					return { changed: false, reliable: true };
+				},
+				observePages: async (_target, _signal, _readStats, onPublished) => {
+					const round = ++productions;
+					order.push("produce");
+					if (round === 1) await gate.promise;
+					onPublished?.(cache(round, round));
+					return cache(round, round);
+				},
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => productions === 1);
+			fingerprint = "b";
+			await waitFor(() => order.filter((value) => value === "dirty").length === 2);
+			for (let i = 0; i < 10; i++) {
+				fingerprint = `change-${i}`;
+				await pause(6);
+			}
+			gate.resolve();
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 2 && !value.updating),
+			);
+			expect(order[0]).toBe("dirty");
+			expect(order[1]).toBe("produce");
+			expect(productions).toBe(2);
+			expect(validations).toBe(0);
+			expect(snapshots.some((value) => value.statusPages?.memberVersion === 1)).toBe(false);
+		} finally {
+			off();
+			gate.resolve();
+		}
+	});
+
+	test("capacity busy is stable until released capacity makes the existing subscription retryable", async () => {
+		const fixture = snapshotFixture();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let productions = 0;
+		let admitted = false;
+		const state = (): GitStatusPageCacheState =>
+			admitted
+				? cache(1, 1)
+				: { ...cache(0, 0), status: "error", updating: false, errorCode: "GIT_STATUS_PAGE_BUSY" };
+		let capacityReleased = false;
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				observePages: async () => {
+					productions++;
+					if (capacityReleased) admitted = true;
+					return state();
+				},
+				pagesState: async () =>
+					capacityReleased && !admitted
+						? { ...cache(0, 0), status: "pending", updating: false }
+						: state(),
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() =>
+				snapshots.some(
+					(value) => value.statusPages?.errorCode === "GIT_STATUS_PAGE_BUSY" && !value.updating,
+				),
+			);
+			await pause(50);
+			expect(productions).toBe(1);
+			capacityReleased = true;
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 1 && !value.updating),
+			);
+			expect(productions).toBe(2);
+		} finally {
+			off();
+		}
+	});
+
+	test("failed production exposes error and an existing subscription wakes after Worker loss", async () => {
+		const fixture = snapshotFixture();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let productions = 0;
+		let lost = false;
+		let currentCache = cache(1, 1);
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				observePages: async () => {
+					productions++;
+					if (productions === 1) throw new Error("worker unavailable");
+					currentCache = {
+						...cache(productions, productions),
+						workerEpoch: lost ? "worker-2" : "worker-1",
+					};
+					lost = false;
+					return currentCache;
+				},
+				pagesState: async () =>
+					productions === 1 || lost
+						? { ...cache(0, 0), status: "pending", workerEpoch: "worker-2" }
+						: currentCache,
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => snapshots.some((value) => value.statusPages?.status === "error"));
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 2 && !value.updating),
+			);
+			lost = true;
+			await waitFor(() =>
+				snapshots.some(
+					(value) =>
+						value.statusPages?.workerEpoch === "worker-2" &&
+						value.statusPages.memberVersion === 3 &&
+						!value.updating,
+				),
+			);
+			expect(productions).toBe(3);
+		} finally {
+			off();
+		}
+	}, 7000);
 });

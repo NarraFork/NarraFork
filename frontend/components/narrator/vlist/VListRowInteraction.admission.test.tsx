@@ -426,7 +426,13 @@ describe("VList row controller admission — actual DOM", () => {
 			narratorId: "old-reader",
 			toolUseId: "render-id",
 			toolDetailRef: { toolUseId: "old-tool", toolCallId: "old-call" },
-			toolMeta: { toolName: "Edit", filePath: "/old.ts", isFileTool: true },
+			toolMeta: {
+				toolName: "Edit",
+				filePath: "/old.ts",
+				isFileTool: true,
+				fileTarget: { deviceId: "RemoteCase", path: "/old.ts" },
+				fileNarratorId: "old-reader",
+			},
 		};
 		await renderRows([oldRow], {
 			narratorId: "host",
@@ -446,7 +452,13 @@ describe("VList row controller admission — actual DOM", () => {
 				messageId: "actual-message",
 				executionAttempt: 3,
 			},
-			toolMeta: { toolName: "Edit", filePath: "C:/work/new.ts", isFileTool: true },
+			toolMeta: {
+				toolName: "Edit",
+				filePath: "C:/work/new.ts",
+				isFileTool: true,
+				fileTarget: { deviceId: "RemoteCase", path: "C:/work/new.ts" },
+				fileNarratorId: "latest-reader",
+			},
 		};
 		await renderRows([latestRow], {
 			narratorId: "host",
@@ -462,7 +474,7 @@ describe("VList row controller admission — actual DOM", () => {
 			menuItem("editPreview.open").click();
 		});
 		expect(latestOpen).toHaveBeenCalledWith("C:/work/new.ts", undefined, {
-			toolEdit: { narratorId: "latest-reader", ...latestRow.toolDetailRef },
+			toolEdit: { narratorId: "latest-reader", ...latestRow.toolDetailRef, deviceId: "RemoteCase" },
 		});
 		expect(oldOpen).not.toHaveBeenCalled();
 		expect(bodyMounts).toBe(1);

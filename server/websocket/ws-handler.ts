@@ -7,6 +7,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { runReadFanoutWebSocketScope } from "../lib/read-fanout-diagnostics";
 import { settings } from "../lib/settings";
 import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import { currentSqlTraceSpan, runInSqlTraceSpan, startSqlTraceSpan } from "../lib/sql-trace";
@@ -536,9 +537,11 @@ function dispatchParsedMessage(
 ): void {
 	if (channel === "narrator") {
 		trackWebSocketHandler(
-			handleNarratorWS.message(
-				ws as ServerWebSocket<WSData & { channel: "narrator" }>,
-				parsed as NarratorClientMessage,
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleNarratorWS.message(
+					ws as ServerWebSocket<WSData & { channel: "narrator" }>,
+					parsed as NarratorClientMessage,
+				),
 			),
 			(err) => {
 				logger.warn("Narrator WS message handler error", { error: String(err) });
@@ -551,7 +554,9 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "external-narrator") {
 		trackWebSocketHandler(
-			handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
+			),
 			(err) => {
 				logger.warn("External narrator WS message handler error", { error: String(err) });
 				try {
@@ -569,16 +574,20 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "terminal") {
 		trackWebSocketHandler(
-			Promise.resolve(
-				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				Promise.resolve(
+					handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
+				),
 			),
 			(err) => logger.warn("Terminal WS message handler error", { error: String(err) }),
 		);
 	} else if (channel === "vnet") {
 		trackWebSocketHandler(
-			handleVNetWS.message(
-				ws as ServerWebSocket<WSData & { channel: "vnet" }>,
-				parsed as VNetClientMessage,
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleVNetWS.message(
+					ws as ServerWebSocket<WSData & { channel: "vnet" }>,
+					parsed as VNetClientMessage,
+				),
 			),
 			(err) => {
 				logger.warn("VNet WS message handler error", { error: String(err) });
@@ -591,7 +600,9 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "device") {
 		trackWebSocketHandler(
-			handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+			),
 			(err) => logger.warn("Device WS message handler error", { error: String(err) }),
 		);
 	}
@@ -656,7 +667,9 @@ export const wsHandlers = {
 				const narratorWs = ws as ServerWebSocket<WSData & { channel: "narrator" }>;
 				narratorWs.data.lastPongAt = Date.now();
 				try {
-					handleOutlineLiveBinary(narratorWs, bytes);
+					runReadFanoutWebSocketScope(channel, "outline_binary", () =>
+						handleOutlineLiveBinary(narratorWs, bytes),
+					);
 				} catch (error) {
 					logger.warn("Outline live frame handler error", { error: String(error) });
 				}
@@ -685,9 +698,11 @@ export const wsHandlers = {
 					return;
 				}
 				trackWebSocketHandler(
-					handleDeviceWS.binaryMessage(
-						ws as ServerWebSocket<WSData & { channel: "device" }>,
-						bytes,
+					runReadFanoutWebSocketScope(channel, "binary", () =>
+						handleDeviceWS.binaryMessage(
+							ws as ServerWebSocket<WSData & { channel: "device" }>,
+							bytes,
+						),
 					),
 					(err) => logger.warn("Device WS binary handler error", { error: String(err) }),
 				);

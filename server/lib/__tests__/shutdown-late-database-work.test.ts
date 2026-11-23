@@ -354,7 +354,7 @@ test("shutdown deadline before native reader exit forbids clean marking and pool
 		diagnostics: process.env.NF_DB_WORKER_SQL_DIAGNOSTICS,
 	};
 	delete process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
 	const directory = mkdtempSync(join(tmpdir(), "nf-shutdown-reader-deadline-"));
 	const path = join(directory, "reader.db");

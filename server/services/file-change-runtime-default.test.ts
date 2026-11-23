@@ -1,7 +1,8 @@
 import { expect, mock, test } from "bun:test";
-import { chmod, lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
+import { isFileHistoryEnabledForDevice } from "../../shared/file-change-protocol";
 import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
 import {
@@ -25,6 +26,22 @@ import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import { localFileChangeRuntimeBinding } from "./file-change-runtime";
+import { ensureFileSnapshot, ensureFileSnapshots } from "./file-snapshot-service";
+
+test("local file history policy and legacy snapshots do not read content", async () => {
+	for (const deviceId of [null, undefined, "", "local"]) {
+		expect(isFileHistoryEnabledForDevice(deviceId)).toBe(false);
+	}
+	expect(isFileHistoryEnabledForDevice("remote-device")).toBe(true);
+	const readContent = mock(async () => {
+		throw new Error("local snapshot read forbidden");
+	});
+	expect(
+		await ensureFileSnapshot("unrecorded", "local", "/local.txt", readContent, "required"),
+	).toBe("disabled");
+	await ensureFileSnapshots("unrecorded", "local", [{ path: "/local.txt", readContent }]);
+	expect(readContent).not.toHaveBeenCalled();
+});
 
 /**
  * Deliberately exercises the application DB and default runtime created by Write/Edit.
@@ -32,7 +49,7 @@ import { localFileChangeRuntimeBinding } from "./file-change-runtime";
  * test coordinator, catalog, quota override, or execution-backend resolver is injected.
  */
 test.skipIf(process.platform === "win32")(
-	"default Write/Edit accepts protected 0775 appdata and ignores a stale hotSafe runtime",
+	"default local Write/Edit retains IO metadata without blobs, including corrupt legacy storage",
 	async () => {
 		expect(process.env.NARRAFORK_TEST).toBe("1");
 		const uid = process.geteuid?.();
@@ -74,6 +91,12 @@ test.skipIf(process.platform === "win32")(
 				.run();
 			const filePath = join(workspace, "default.txt");
 			const runtimeBefore = localFileChangeRuntimeBinding();
+			const budgetBefore = db
+				.select()
+				.from(fileChangeStorageBudgets)
+				.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
+				.get();
+			const blobsBefore = db.select().from(fileChangeBlobs).limit(10).all();
 
 			async function context(toolName: "Write" | "Edit"): Promise<ToolContext> {
 				if (!workspace) throw new Error("Default-runtime workspace was not created");
@@ -141,7 +164,7 @@ test.skipIf(process.platform === "win32")(
 			expect(created).toMatchObject({
 				output: `Wrote 10 bytes to ${filePath}`,
 				metadata: {
-					fileChangeEvidence: { version: 3, grade: "measured", settlement: "settled" },
+					fileChangeEvidence: { version: 3, grade: "unknown", settlement: "settled" },
 				},
 			});
 			expect(created.isError).not.toBe(true);
@@ -153,8 +176,13 @@ test.skipIf(process.platform === "win32")(
 				.from(fileChangeStorageBudgets)
 				.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
 				.get();
-			expect(budgetAfterWrite?.status).toBe("unverified");
-			expect(created.metadata?.historyStatus).toBe("complete");
+			expect(budgetAfterWrite).toEqual(budgetBefore);
+			expect(created.metadata?.historyStatus).toBe("disabled");
+			expect(created.metadata?.diskOutcome).toBe("applied");
+			expect(created.output).not.toContain("history is unavailable");
+			const legacyStorage = join(data, "file-change-blobs");
+			await expect(lstat(legacyStorage)).rejects.toMatchObject({ code: "ENOENT" });
+			await writeFile(legacyStorage, "unavailable legacy blob directory");
 
 			const edited = await editTool.execute(
 				{ file_path: filePath, old_string: "original", new_string: "edited" },
@@ -165,10 +193,13 @@ test.skipIf(process.platform === "win32")(
 				metadata: {
 					linesAdded: 1,
 					linesRemoved: 1,
-					fileChangeEvidence: { version: 3, grade: "measured", settlement: "settled" },
+					fileChangeEvidence: { version: 3, grade: "unknown", settlement: "settled" },
 				},
 			});
 			expect(edited.isError).not.toBe(true);
+			expect(edited.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "disabled" });
+			expect(await readFile(legacyStorage, "utf8")).toBe("unavailable legacy blob directory");
+			expect(db.select().from(fileChangeBlobs).limit(10).all()).toEqual(blobsBefore);
 			expect(await readFile(filePath, "utf8")).toBe("edited\r\n");
 			expect(rejectedOldRuntime.execute).not.toHaveBeenCalled();
 			expect(Object.getOwnPropertyDescriptor(globalThis, staleKey)?.value).toBe(rejectedOldRuntime);
@@ -211,26 +242,22 @@ test.skipIf(process.platform === "win32")(
 			for (const effect of effects) {
 				expect(effect).toMatchObject({
 					settlement: "settled",
-					attributionGrade: "measured",
+					attributionGrade: "unknown",
 					executionConfirmed: true,
-					outcome: "changed",
+					outcome: "unknown",
 					executionReceiptJson: null,
 					diskOutcome: "applied",
 				});
 				expect(effect.observedAfterStateJson).toEqual(effect.intendedAfterStateJson);
-				const state = effect.intendedAfterStateJson;
-				if (state.kind !== "regular") throw new Error("Missing actual raw after blob");
-				const blob = db
-					.select()
-					.from(fileChangeBlobs)
-					.where(eq(fileChangeBlobs.digest, state.blob.digest))
-					.get();
-				expect(blob?.status).toBe("ready");
-				if (!blob) throw new Error("Missing blob catalog reference");
-				expect(blob.storageKey).toMatch(/^sha256\/[a-f0-9]{2}\/[a-f0-9]{64}$/);
-				expect((await readFile(join(data, "file-change-blobs", blob.storageKey))).byteLength).toBe(
-					state.blob.sizeBytes,
-				);
+				for (const state of [
+					effect.beforeStateJson,
+					effect.intendedAfterStateJson,
+					effect.observedAfterStateJson,
+				])
+					expect(state).toEqual({ kind: "unknown", reason: "history_unavailable" });
+				expect(effect.beforeBlobDigest).toBeNull();
+				expect(effect.intendedAfterBlobDigest).toBeNull();
+				expect(effect.observedAfterBlobDigest).toBeNull();
 				expect(
 					db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, effect.scopeId)).get(),
 				).toMatchObject({
@@ -267,7 +294,6 @@ test.skipIf(process.platform === "win32")(
 			for (const [path, mode] of [
 				[home, 0o700],
 				[data, 0o775],
-				[join(data, "file-change-blobs"), 0o700],
 				[sourcePath, 0o600],
 			] as const) {
 				const stat = await lstat(path);

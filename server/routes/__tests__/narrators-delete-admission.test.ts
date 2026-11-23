@@ -238,15 +238,13 @@ describe("the narrator itself running", () => {
 	});
 
 	test.each([
-		["/messages/m", undefined],
-		["/blocks", { blockIds: ["m:0"] }],
+		["/messages/m?skipRevert=0", undefined],
+		["/blocks", { blockIds: ["m:0"], skipRevert: false }],
 	] as const)("an unplanned file-restoring deletion (%s) is refused before interrupting", async (path, body) => {
 		const session = registerBusyLoop(narratorId, WORKTREE);
 		const response = await del(`/${narratorId}${path}`, body);
 		expect(response.status).toBe(409);
-		expect(((await response.json()) as { code?: string }).code).toBe(
-			"REVERT_CONFIRMATION_REQUIRED",
-		);
+		expect(((await response.json()) as { code?: string }).code).toBe("FILE_HISTORY_DISABLED");
 		expect(session.abortController.signal.aborted).toBe(false);
 		expect(session._loopRunning).toBe(true);
 	});

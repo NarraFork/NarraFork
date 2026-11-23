@@ -445,7 +445,7 @@ describe("real SQLite workspace CAS", () => {
 		// The retired immediate restore entry point refuses before any file or history IO;
 		// a restore now requires a confirmed plan ID and hash from an action preview.
 		expect(revert.status).toBe(409);
-		expect(await revert.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(await revert.json()).toMatchObject({ code: "FILE_HISTORY_DISABLED" });
 		expect((await workspaceContextService.get(id)).revision).toBe(2);
 		expect(
 			(
@@ -699,7 +699,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 		const opts = skipRevert === undefined ? {} : { skipRevert };
 		if (action === "message")
 			return {
-				path: `${base}/messages/${f.answer}${skipRevert ? "?skipRevert=1" : ""}`,
+				path: `${base}/messages/${f.answer}${skipRevert === undefined ? "" : `?skipRevert=${skipRevert ? "1" : "0"}`}`,
 				init: { method: "DELETE" },
 			};
 		if (action === "rollback")
@@ -753,36 +753,38 @@ describe("history-only HTTP actions after a workspace switch", () => {
 		expect(await readFile(f.newFile, "utf8")).toBe("new workspace bytes\n");
 	}
 
-	test.each([
-		"rollback",
-		"message",
-		"block",
-		"batch",
-	] as const)("%s with skipRevert changes only history despite missing file evidence", async (action) => {
-		const f = await fixture();
-		const spies = await forbidFileRollback();
-		const req = await request(f, action, true);
-		const response = await app(owner).request(req.path, req.init);
-		const body = await response.json();
-		expect(response.status, JSON.stringify(body)).toBe(200);
-		expect(body.ok).toBe(true);
-		if (action === "rollback" || action === "message") expect(await refs()).toEqual([f.user]);
-		else {
-			// Deleting selected blocks must retain the unrelated manual-switch reminder.
-			expect(await refs()).toEqual(
-				action === "block"
-					? [f.user, f.answer, f.later, f.workspaceReminder]
-					: [f.user, f.answer, f.workspaceReminder],
-			);
-			expect(readTestMessageContent(sqlite, f.answer)).toEqual([
-				{ type: "text", text: "keep this text" },
-			]);
-		}
-		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
-		await assertFiles(f);
-	});
+	for (const skipRevert of [undefined, true]) {
+		test.each([
+			"rollback",
+			"message",
+			"block",
+			"batch",
+		] as const)(`%s with skipRevert=${skipRevert} changes only history despite missing file evidence`, async (action) => {
+			const f = await fixture();
+			const spies = await forbidFileRollback();
+			const req = await request(f, action, skipRevert);
+			const response = await app(owner).request(req.path, req.init);
+			const body = await response.json();
+			expect(response.status, JSON.stringify(body)).toBe(200);
+			expect(body.ok).toBe(true);
+			if (action === "rollback" || action === "message") expect(await refs()).toEqual([f.user]);
+			else {
+				// Deleting selected blocks must retain the unrelated manual-switch reminder.
+				expect(await refs()).toEqual(
+					action === "block"
+						? [f.user, f.answer, f.later, f.workspaceReminder]
+						: [f.user, f.answer, f.workspaceReminder],
+				);
+				expect(readTestMessageContent(sqlite, f.answer)).toEqual([
+					{ type: "text", text: "keep this text" },
+				]);
+			}
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			await assertFiles(f);
+		});
+	}
 
-	for (const skipRevert of [undefined, false]) {
+	for (const skipRevert of [false]) {
 		test.each([
 			"rollback",
 			"message",
@@ -801,7 +803,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			expect(response.status).toBe(409);
 			// A file-restoring rollback needs a confirmed plan and HTTP deletions are
 			// history-only, so every action is refused at that gate before any IO.
-			expect((await response.json()).code).toBe("REVERT_CONFIRMATION_REQUIRED");
+			expect((await response.json()).code).toBe("FILE_HISTORY_DISABLED");
 			expect(interrupt).not.toHaveBeenCalled();
 			expect(await refs()).toEqual(before);
 			await assertFiles(f);

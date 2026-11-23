@@ -249,12 +249,12 @@ test("100 read events preserve a real worker's multi-page snapshot and its cache
 	const invalidated = mock(({ queryKey }: { queryKey: string }) => pages.invalidate(queryKey));
 	eventBus.on("git:workspace_invalidated", invalidated);
 	try {
-		const first = await pages.read({ scope, source, query: { limit: 100 } });
+		const first = await pages.readOnDemand({ scope, source, query: { limit: 100 } });
 		const statsQuery = {
 			snapshotId: first.snapshotId,
 			rows: [{ type: "file" as const, section: "unstaged" as const, path: "file-000" }],
 		};
-		await pages.readStats({ scope, source, query: statsQuery, readStats });
+		await pages.readStatsOnDemand({ scope, source, query: statsQuery, readStats });
 		const read = mock(async () => summary());
 		const queue = new GitToolRefreshQueue({
 			state: {},
@@ -276,12 +276,12 @@ test("100 read events preserve a real worker's multi-page snapshot and its cache
 				path,
 				`read-${index}`,
 			);
-		const second = await pages.read({
+		const second = await pages.readOnDemand({
 			scope,
 			source,
 			query: { limit: 100, cursor: first.nextCursor ?? undefined },
 		});
-		const third = await pages.read({
+		const third = await pages.readOnDemand({
 			scope,
 			source,
 			query: { limit: 100, cursor: second.nextCursor ?? undefined },
@@ -289,7 +289,7 @@ test("100 read events preserve a real worker's multi-page snapshot and its cache
 		expect(second.snapshotId).toBe(first.snapshotId);
 		expect(third.snapshotId).toBe(first.snapshotId);
 		expect(
-			(await pages.readStats({ scope, source, query: statsQuery, readStats })).rows[0],
+			(await pages.readStatsOnDemand({ scope, source, query: statsQuery, readStats })).rows[0],
 		).toMatchObject({ added: 2, complete: true });
 		expect(source.read).toHaveBeenCalledTimes(1);
 		expect(readStats).toHaveBeenCalledTimes(1);

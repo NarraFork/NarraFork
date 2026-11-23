@@ -32,8 +32,9 @@ export interface UseMessageRevertConfirmResult {
 
 /**
  * Confirm-then-apply flow for the two destructive history actions offered from a
- * message's context menu: deleting a tool block (rolls its file changes back) and
- * rolling the whole session back to a block. Both stage a pending target that the
+ * message's context menu: deleting a tool block and rolling the session back to
+ * a block. Local sessions keep workspace files; remote sessions review their
+ * file restore plan. Both stage a pending target that the
  * RevertActionConfirmModal renders, then apply it through the revert mutation and
  * refresh the message list structure.
  *
@@ -59,8 +60,8 @@ export function useMessageRevertConfirm(
 	const [applying, setApplying] = useState(false);
 	const revertHistorySubmitting = isPending || applying;
 
-	// Deleting a block rolls its file changes back, so it asks first rather than
-	// firing straight from the context menu.
+	// Deleting a block is irreversible, so it asks first rather than firing
+	// straight from the context menu.
 	const [pendingBlockDelete, setPendingBlockDelete] = useState<BlockTarget | null>(null);
 
 	const handleDeleteBlock = useCallback(

@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import { FILE_CHANGE_LIMITS, isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import {
 	type FileReference,
 	type FileReferenceSnapshot,
@@ -63,8 +63,10 @@ import {
 	users,
 } from "../db/schema";
 import { readQuery } from "../db/worker-read";
+import { localBackend } from "../lib/agent/execution/local-backend";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
+import { decodeFileBytes, looksBinary } from "../lib/agent/tools/encoding";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -123,6 +125,7 @@ import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "../lib/file-reference-input";
+import { checkWriteBoundary } from "../lib/fs-write-boundary";
 import { getNarratorFolderIdForUser } from "../lib/git-identity";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -303,7 +306,15 @@ import {
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
-import { captureFileReferences } from "../services/file-reference-service";
+import {
+	assertFileHistoryEnabledForDevice,
+	isNarratorFileHistoryEnabled,
+	resolveNarratorMessageOnlyRevert,
+} from "../services/file-history-policy";
+import {
+	authorizeEditorReferenceContext,
+	captureFileReferences,
+} from "../services/file-reference-service";
 import {
 	applyToolCall,
 	type DeviceFileIdentity,
@@ -1027,6 +1038,15 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 		subPath === "revert-action-preview" ||
 		subPath === "revert-plans" ||
 		/^revert-plans\/[^/]+\/apply$/.test(subPath);
+	const fileHistoryRequest =
+		scopedRevert ||
+		subPath === "unrevert" ||
+		/^revert-plans\//.test(subPath) ||
+		subPath === "blocks/revert-action-preview" ||
+		subPath === "blocks/rollback-preview" ||
+		/^blocks\/[^/]+\/(?:edit|delete)-preview$/.test(subPath);
+	if (fileHistoryRequest && !(await isNarratorFileHistoryEnabled(id)))
+		assertFileHistoryEnabledForDevice("local");
 	if (
 		need === "write" &&
 		!scopedRevert &&
@@ -3428,7 +3448,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
 	// Whether the truncated messages' file changes are rolled back, and how wide.
-	// Undefined => the legacy `rollback` field decides (see below), then default true.
+	// Undefined => honor the legacy `rollback` field, then the execution device default.
 	let skipRevert: boolean | undefined;
 	let legacyRollback: boolean | undefined;
 	let revertPlan:
@@ -3554,17 +3574,23 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		keepTextFilePaths = body.keepTextFilePaths;
 	}
 
-	// `skipRevert` is authoritative. A client that only sends the legacy `rollback`
-	// field gets that field's ORIGINAL meaning honoured — "revert files" — which is
-	// what the old UI offered and the server then ignored. Neither present => revert,
-	// preserving the behaviour every edit actually had.
-	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
+	// Explicit file recovery remains a request, never a hint we can silently discard.
+	// Without one, local edits only rewrite messages; remote defaults remain unchanged.
+	const historyOnly = await resolveNarratorMessageOnlyRevert(
+		id,
+		skipRevert ?? (legacyRollback === undefined ? undefined : !legacyRollback),
+		!!revertPlan || (skipRevert !== true && legacyRollback !== false && scope !== undefined),
+	);
+	const revertFiles = !historyOnly;
 	if (revertFiles && !revertPlan)
 		throw new AppError(
 			"Review a fresh edit preview before restoring files",
 			409,
 			"REVERT_CONFIRMATION_REQUIRED",
 		);
+	// Confirmed restores here execute through RevertPlannerLocalAccess, irrespective
+	// of a remote session default. Reject its disabled actual backend before interruption.
+	if (revertFiles || revertPlan) assertFileHistoryEnabledForDevice(localBackend.deviceId);
 
 	const narrator = await narratorService.getById(id);
 	const userId = c.get("user").sub;
@@ -4773,8 +4799,14 @@ function requireHistoryOnlyDeletion(historyOnly: boolean): void {
 // Delete blocks.
 narratorRoutes.delete("/:id/blocks", async (c) => {
 	const narratorId = c.req.param("id");
-	const { blockIds, skipRevert } = deleteBlocksSchema.parse(await c.req.json());
-	requireHistoryOnlyDeletion(skipRevert === true);
+	const { blockIds, skipRevert, scope } = deleteBlocksSchema.parse(await c.req.json());
+	requireHistoryOnlyDeletion(
+		await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			skipRevert,
+			skipRevert !== true && scope !== undefined,
+		),
+	);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteBlocks(narratorId, blockIds, {
 		skipRevert: true,
@@ -4790,20 +4822,27 @@ narratorRoutes.post("/:id/blocks/rollback", async (c) => {
 	const { blockIds, skipRevert, scope, revertPlan } = rollbackToBlocksSchema.parse(
 		await c.req.json(),
 	);
-	if (skipRevert !== true && !revertPlan)
+	const historyOnly = await resolveNarratorMessageOnlyRevert(
+		id,
+		skipRevert,
+		!!revertPlan || (skipRevert !== true && scope !== undefined),
+	);
+	if (!historyOnly && !revertPlan)
 		throw new AppError(
 			"Review a fresh rollback preview before restoring files",
 			409,
 			"REVERT_CONFIRMATION_REQUIRED",
 		);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
+	// The reviewed-plan executor is the local adapter, not the session default.
+	if (revertPlan || !historyOnly) assertFileHistoryEnabledForDevice(localBackend.deviceId);
+	if (!historyOnly) await assertWorkspaceHistoryRevertSupported(id);
 	const narrator = await narratorService.getById(id);
 	// As for the index route: the rollback discards the running turn it lands in.
 	await prepareHistoryRewrite(id);
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	const result = await rollbackToBlocks(id, blockIds, {
 		revertPlan,
-		skipRevert: skipRevert === true,
+		skipRevert: historyOnly,
 		principal: narratorPrincipalOf(c),
 		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
@@ -4911,7 +4950,13 @@ narratorRoutes.post("/:id/blocks/:blockId/allow-retry", async (c) => {
 narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
+	const requestedSkipRevert = c.req.query("skipRevert");
+	requireHistoryOnlyDeletion(
+		await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			requestedSkipRevert === undefined ? undefined : requestedSkipRevert === "1",
+		),
+	);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert: true,
@@ -5200,6 +5245,10 @@ narratorRoutes.post("/:id/detach", async (c) => {
 	return c.json({ detached: true });
 });
 
+/** How long a takeover waits for a run caught between passes to reappear. */
+const TAKEOVER_OWNER_WAIT_MS = 1_500;
+const TAKEOVER_OWNER_POLL_MS = 50;
+
 /**
  * Take over a running run WITHOUT stopping what it is doing.
  *
@@ -5220,19 +5269,39 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		return c.json({ error: "Subagent is not running" }, 400);
 	}
 	const { getRunControl } = await import("../services/agent-runtime/ownership");
-	if (!getRunControl(id) && !isLoopRunning(id)) {
-		// The DB says working/waiting but no run owns it: a run caught between passes,
-		// or a zombie row. Retry rather than recording a hold nothing will honour.
-		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+	const owned = () => Boolean(getRunControl(id)) || isLoopRunning(id);
+	// The DB says working/waiting but no run owns it: either a run caught between
+	// passes (it reappears within moments) or a zombie row whose writer is gone.
+	for (let waited = 0; !owned() && waited < TAKEOVER_OWNER_WAIT_MS; ) {
+		await Bun.sleep(TAKEOVER_OWNER_POLL_MS);
+		waited += TAKEOVER_OWNER_POLL_MS;
+	}
+	let status: "idle" | "working" | "waiting" = narrator.status;
+	const zombie = !owned();
+	if (zombie) {
+		// Work owned without a run (a recovery stage, a pending permission) is not a
+		// zombie: it still asks for a retry.
+		const { isNarratorRuntimeBusy } = await import("../services/narrator-session-state");
+		if (isNarratorRuntimeBusy(id)) {
+			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+		}
 	}
 	const { controlRun } = await import("../services/agent-runtime/run");
 	await controlRun(id, { kind: "hold" });
+	if (zombie) {
+		// A zombie would refuse every takeover forever, leaving Stop as the only way
+		// out. Repair it to idle only after the hold exists, so a waiting parent sees
+		// `taken_over` instead of a settled result: the user's next message then runs
+		// as a held turn, exactly like a hold that survived a restart.
+		const { reconcileRunningStatus } = await import("../services/narrator-session");
+		if (await reconcileRunningStatus(id)) status = "idle";
+	}
 	// Display adapters for the destination's panel chip and tool card.
 	broadcastToNarrator(deliverTo.narratorId, {
 		type: "subagent_status_changed",
 		narratorId: deliverTo.narratorId,
 		subagentNarratorId: id,
-		status: narrator.status,
+		status,
 		substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
 	});
 	await broadcastSubagentTakeoverChanged({
@@ -6962,7 +7031,9 @@ function fileHistoryConflictBody(error: unknown) {
 	const historyError = error instanceof FileHistoryError ? error : null;
 	return {
 		error: error instanceof Error ? error.message : String(error),
-		code: historyError?.code ?? "FILE_HISTORY_PREPARE_FAILED",
+		code:
+			historyError?.code ??
+			(error instanceof AppError ? error.code : "FILE_HISTORY_PREPARE_FAILED"),
 	};
 }
 
@@ -7328,7 +7399,109 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 
 	let currentContent: string | null;
 	try {
-		currentContent = await rebuildDeviceFileState(narratorId, identity);
+		if (isFileHistoryEnabledForDevice(identity.deviceId)) {
+			currentContent = await rebuildDeviceFileState(narratorId, identity);
+		} else {
+			const unavailable = () =>
+				new AppError(
+					"Current file cannot be read safely for this permission preview",
+					409,
+					"PERMISSION_FILE_PREVIEW_UNAVAILABLE",
+				);
+			const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+			// Keep both frozen names: canonical identity does not replace the lexical
+			// path, whose own secret/Read rules and later symlink changes still apply.
+			const filePath = toolCall.resolvedFilePath;
+			const deviceId = identity.deviceId;
+			const expectedCanonicalPath = toolCall.canonicalFilePath;
+			const expectedCwd = toolCall.executionCwd;
+			const expectedGeneration = toolCall.runtimeGeneration;
+			if (
+				!filePath ||
+				!expectedCanonicalPath ||
+				!expectedCwd ||
+				toolCall.executionDeviceId !== deviceId ||
+				identity.pathFlavor !== localBackend.pathFlavor ||
+				toolCall.executionPathFlavor !== localBackend.pathFlavor ||
+				expectedGeneration !== localBackend.runtimeGeneration ||
+				!localBackend.paths.isAbsolute(filePath) ||
+				!localBackend.paths.isAbsolute(expectedCanonicalPath) ||
+				!localBackend.paths.isAbsolute(expectedCwd) ||
+				!localBackend.paths.equals(identity.filePath, expectedCanonicalPath)
+			)
+				throw unavailable();
+			const authorizeCurrent = async () => {
+				signal.throwIfAborted();
+				let abort = () => {};
+				const cancelled = new Promise<never>((_resolve, reject) => {
+					abort = () => reject(unavailable());
+					signal.addEventListener("abort", abort, { once: true });
+					if (signal.aborted) abort();
+				});
+				try {
+					// The formal read boundary authorizes the actual user, device, Read
+					// rules and secret paths before any content IO. Ask is not approval.
+					const current = await Promise.race([
+						authorizeEditorReferenceContext(
+							narratorId,
+							c.get("user").sub,
+							filePath,
+							deviceId,
+							"read",
+						),
+						cancelled,
+					]);
+					signal.throwIfAborted();
+					const canonical = current.target.canonicalPath;
+					if (
+						current.backend.kind !== "local" ||
+						current.backend.deviceId !== deviceId ||
+						current.target.runtimeGeneration !== expectedGeneration ||
+						!canonical ||
+						!localBackend.paths.equals(canonical, expectedCanonicalPath) ||
+						!localBackend.paths.equals(current.target.cwd, expectedCwd)
+					)
+						throw unavailable();
+					return current;
+				} catch {
+					throw unavailable();
+				} finally {
+					signal.removeEventListener("abort", abort);
+				}
+			};
+			const authorized = await authorizeCurrent();
+			const boundary = checkWriteBoundary(filePath, [
+				authorized.target.cwd,
+				...(settings.paths.extraWritableDirs ?? []),
+			]);
+			if (
+				!boundary.allowed ||
+				!boundary.physicalPath ||
+				!expectedCanonicalPath ||
+				!localBackend.paths.equals(boundary.physicalPath, expectedCanonicalPath)
+			)
+				throw unavailable();
+			const live = await localBackend.resolvePathIdentity(filePath, { signal }).catch(() => {
+				throw unavailable();
+			});
+			if (!localBackend.paths.equals(live.canonicalPath, boundary.physicalPath))
+				throw unavailable();
+			if (!live.exists) currentContent = null;
+			else {
+				const read = await localBackend
+					.readFileBytes(filePath, {
+						maxBytes: 1024 * 1024,
+						expectedResolvedPath: boundary.physicalPath,
+						signal,
+					})
+					.catch(() => {
+						throw unavailable();
+					});
+				if (read.truncated || looksBinary(read.bytes)) throw unavailable();
+				currentContent = decodeFileBytes(read.bytes).text;
+			}
+			await authorizeCurrent();
+		}
 	} catch (error) {
 		return c.json(fileHistoryConflictBody(error), 409);
 	}
