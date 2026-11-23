@@ -151,8 +151,7 @@ export function createDatabaseReaderReadiness(options: {
 			if (options.backend === "postgres") return { ok: true };
 			const current = liveState();
 			if (current.status === "ready") return { ok: true };
-			if (state.status === "ready" && current.status === "failed")
-				return { ok: false, code: current.code };
+			if (state.status === "ready" && current.status === "failed") state = current;
 			if (inFlight) return inFlight;
 			if (state.status === "failed" && now() - lastProbeAt < retryIntervalMs)
 				return { ok: false, code: state.code };

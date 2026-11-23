@@ -397,7 +397,7 @@ describe("database reader readiness", () => {
 		});
 	}
 
-	test("real drain and resume require an explicit successful probe to restore API health", async () => {
+	test("real drain and resume re-probe before restoring API health", async () => {
 		const previousOff = process.env.NARRAFORK_DB_WORKER;
 		const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		const directory = mkdtempSync(join(tmpdir(), "nf-reader-ready-"));
@@ -408,6 +408,7 @@ describe("database reader readiness", () => {
 		delete process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		try {
+			let now = 0;
 			const probe = mock((options: { signal: AbortSignal; timeoutMs: number }) =>
 				assertDbReadersReady(path, options),
 			);
@@ -416,6 +417,7 @@ describe("database reader readiness", () => {
 				probe,
 				availability: getDbWorkerAvailability,
 				databaseAvailability: () => getDbWorkerAvailability(path),
+				now: () => now,
 			});
 			expect(await readiness.wait()).toEqual({ ok: true });
 			const runtime = entry(readiness);
@@ -425,7 +427,9 @@ describe("database reader readiness", () => {
 			expect((await runtime.request("/api/health"))?.status).toBe(503);
 			expect((await runtime.request("/api/data"))?.status).toBe(503);
 			expect(probe).toHaveBeenCalledTimes(1);
-			await assertDbReadersReady(path, { timeoutMs: 30_000 });
+			now += 5_000;
+			expect(await readiness.wait()).toEqual({ ok: true });
+			expect(probe).toHaveBeenCalledTimes(2);
 			expect((await runtime.request("/api/health"))?.status).toBe(200);
 			expect((await runtime.request("/api/data"))?.status).toBe(200);
 		} finally {
