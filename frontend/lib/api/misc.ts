@@ -497,6 +497,10 @@ export const miscApi = {
 	mcpStartOAuth: (id: string) =>
 		request<{ authorizationUrl: string } | { authorized: true }>(`/mcp/servers/${id}/oauth/start`, {
 			method: "POST",
+			// Built from the mount prefix the app runs under, so the provider returns behind the proxy.
+			body: JSON.stringify({
+				redirectUrl: new URL(`${apiBase()}/mcp/oauth/callback`, window.location.href).href,
+			}),
 		}),
 	mcpSignOutOAuth: (id: string) =>
 		request<{ ok: boolean }>(`/mcp/servers/${id}/oauth`, { method: "DELETE" }),

@@ -117,7 +117,9 @@ mock.module("../../../server/lib/mcp/tool-bridge", () => ({
 	},
 }));
 
-const { mcpOAuthCallbackRoutes, mcpRoutes } = await import("../../../server/routes/mcp");
+const { mcpOAuthCallbackRoutes, mcpRoutes, requestedMcpOAuthRedirectUrl } = await import(
+	"../../../server/routes/mcp"
+);
 const { getMcpOAuthStatus } = await import("../../../server/lib/mcp/oauth");
 
 let role: "admin" | "user" = "user";
@@ -847,6 +849,28 @@ describe("MCP OAuth routes", () => {
 		role = "user";
 		const res = await app.request("/servers/existing/oauth/start", { method: "POST" });
 		expect(res.status).toBe(403);
+	});
+
+	it("the OAuth redirect keeps the mount prefix the browser runs under, on the same origin only", async () => {
+		const probe = new Hono().post("/", async (c) =>
+			c.text(requestedMcpOAuthRedirectUrl(c, (await c.req.json()).redirectUrl)),
+		);
+		const ask = async (redirectUrl: unknown) =>
+			(
+				await probe.request("/", {
+					method: "POST",
+					headers: { Origin: "https://nf.example", "Content-Type": "application/json" },
+					body: JSON.stringify({ redirectUrl }),
+				})
+			).text();
+		const fallback = "https://nf.example/api/mcp/oauth/callback";
+		expect(await ask("https://nf.example/nf/api/mcp/oauth/callback")).toBe(
+			"https://nf.example/nf/api/mcp/oauth/callback",
+		);
+		expect(await ask(undefined)).toBe(fallback);
+		expect(await ask("https://evil.example/api/mcp/oauth/callback")).toBe(fallback);
+		expect(await ask("https://nf.example/nf/other")).toBe(fallback);
+		expect(await ask("https://nf.example/api/mcp/oauth/callback?x=1")).toBe(fallback);
 	});
 
 	it("the public callback rejects unknown state and escapes provider errors", async () => {
