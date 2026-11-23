@@ -395,6 +395,14 @@ export class RevertTransactionService {
 			const after = result.observedAfter;
 			if (result.status === "applied" && after?.kind === "regular")
 				await this.blobRef(after.blob.digest);
+		} catch (error) {
+			result = { ...result, historyStatus: "unavailable" };
+			logger.warn("Revert file blob metadata unavailable", {
+				planId: run.request.planId,
+				reason: errorCode(error),
+			});
+		}
+		try {
 			const recorded = this.journal.recordResult(run.ctx as RevertJournalContext, row.id, result);
 			if (
 				recorded.receiptJson &&

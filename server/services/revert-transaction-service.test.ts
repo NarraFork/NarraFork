@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
+import * as workerReads from "../db/worker-read";
 import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	db,
@@ -29,6 +30,42 @@ import { RevertMutationJournal } from "./revert-mutation-journal";
 import { RevertSelectionService } from "./revert-selection-service";
 
 describe("independent file restoration", () => {
+	test("a failed post-restore Worker lookup still durably records the applied file", async () => {
+		const { a, b, plan } = await twoFiles();
+		const readFirst = workerReads.readQueryFirst;
+		let injected = false;
+		const read = spyOn(workerReads, "readQueryFirst").mockImplementation((query, options) => {
+			if (
+				!injected &&
+				query.toSQL().sql.includes('select "size_bytes", "status" from "file_change_blobs"') &&
+				journalFiles(plan).some((file) => file.status === "applying")
+			) {
+				injected = true;
+				return Promise.reject(new Error("injected post-restore Worker failure"));
+			}
+			return readFirst(query, options);
+		});
+		try {
+			const result = await execution(plan).whenSettled;
+			expect(injected).toBe(true);
+			expect(await fs.readFile(a, "utf8")).toBe("original");
+			expect(await fs.readFile(b, "utf8")).toBe("original");
+			expect(result.historyStatus).toBe("unavailable");
+			expect(journalFiles(plan).map((file) => file.status)).toEqual(["applied", "applied"]);
+			expect(journalFiles(plan)[0].receiptJson).toMatchObject({ historyStatus: "unavailable" });
+		} finally {
+			read.mockRestore();
+		}
+		await fs.writeFile(a, "later user work");
+		setFileHook(() => {
+			throw new Error("replay must not dispatch restored files");
+		});
+		const replay = await execution(plan).whenSettled;
+		expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+		expect(replay.historyStatus).toBe("unavailable");
+		expect(await fs.readFile(a, "utf8")).toBe("later user work");
+	});
+
 	test("history-changing success uses five collector scans including preview and history.prepare", async () => {
 		const collect = spyOn(RevertSelectionService.prototype, "collect");
 		try {
