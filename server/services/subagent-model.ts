@@ -81,6 +81,8 @@ export function resolveSubagentTypePreference(
 export function resolveParentNarratorProvider(
 	parentId: string | null | undefined,
 	parentModel: string | null | undefined,
+	/** What a following parent's stored `__parent__` currently resolves to. */
+	resolvedParentModel?: string | null,
 ): string | undefined {
 	const storedModel = parentModel?.trim() || FOLLOW_DEFAULT_MODEL;
 	if (parentId) {
@@ -89,7 +91,7 @@ export function resolveParentNarratorProvider(
 		const runtimeProvider = getNarratorRuntimeModel(parentId, storedModel)?.provider;
 		if (runtimeProvider) return runtimeProvider;
 	}
-	return deriveProviderFromModelReference(storedModel, new Set());
+	return deriveProviderFromModelReference(resolvedParentModel?.trim() || storedModel, new Set());
 }
 
 /** True for the bare sentinel and for an accidental `provider:<sentinel>` value. */
@@ -285,7 +287,7 @@ export async function resolveSubagentModelInheritance(
 		resolveSubagentModelSelectionFromPolicy({
 			policy,
 			candidates: [],
-			preferredProvider: resolveParentNarratorProvider(source.id, sourceStoredModel),
+			preferredProvider: resolveParentNarratorProvider(source.id, source.model, sourceStoredModel),
 		});
 	if (!selection) {
 		throw new ValidationError(`No models are allowed for "${policy.poolKey}" subagents`);
