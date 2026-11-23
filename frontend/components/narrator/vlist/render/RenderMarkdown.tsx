@@ -156,6 +156,7 @@ export interface RenderMarkdownProps {
 	showSource?: boolean;
 	/** The raw markdown, needed only while `showSource` holds. */
 	sourceText?: string;
+	observeSourceRanges?: boolean;
 	/**
 	 * Fired once the unknown-block subtree settles at a real pixel height.
 	 * Only used for PreparedUnknownBlock; ordinary blocks never call this.
@@ -217,6 +218,7 @@ function RenderMarkdownBody({
 	measured,
 	showSource,
 	sourceText,
+	observeSourceRanges,
 	onUnknownHeight,
 	animateStreaming,
 	sealOnMount,
@@ -313,9 +315,15 @@ function RenderMarkdownBody({
 				height={frame.contentHeight}
 				limited={limited}
 				direction={measured.textPreview?.direction}
+				observeSourceRanges={observeSourceRanges}
 			/>
 		);
 	}
+	const sourceAttrs = (block: PreparedBlock) => {
+		const range = block.sourceRange;
+		const offset = measured.textPreview?.sourceStart ?? 0;
+		return range ? sourceRangeAttributes(range.start + offset, range.end + offset) : undefined;
+	};
 
 	// When any unpredictable block is present, switch the whole host to a
 	// simple stacked flow. Absolute frame tops cannot reflow subsequent siblings
@@ -341,6 +349,7 @@ function RenderMarkdownBody({
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
 							key={index}
 							data-vlist-flow-block={block.kind}
+							{...sourceAttrs(block)}
 							style={{
 								position: "relative",
 								width: "100%",
@@ -380,6 +389,18 @@ function RenderMarkdownBody({
 				const blockFrame = frame.blocks[index];
 				if (!blockFrame) return null;
 				const marginTop = block.marginTop;
+				const rendered = (
+					<BlockView
+						block={block}
+						frame={blockFrame}
+						contentWidth={contentWidth}
+						flowing={false}
+						animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+						animScope={animScope}
+						sealAnimation={sealAnimation}
+						codeCopyPlacement={copyPlacements.get(index)}
+					/>
+				);
 				return (
 					// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
 					<Fragment key={index}>
@@ -387,16 +408,13 @@ function RenderMarkdownBody({
 						    marginTop before frame.top) belongs to no text box; fill it so a
 						    drag-selection can resolve a caret there. */}
 						<CaretFiller top={blockFrame.top - marginTop} height={marginTop} width={contentWidth} />
-						<BlockView
-							block={block}
-							frame={blockFrame}
-							contentWidth={contentWidth}
-							flowing={false}
-							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
-							animScope={animScope}
-							sealAnimation={sealAnimation}
-							codeCopyPlacement={copyPlacements.get(index)}
-						/>
+						{block.sourceRange ? (
+							<div {...sourceAttrs(block)} style={{ display: "contents" }}>
+								{rendered}
+							</div>
+						) : (
+							rendered
+						)}
 					</Fragment>
 				);
 			})}
@@ -427,6 +445,10 @@ export function RenderMarkdown(props: RenderMarkdownProps) {
  * the reader asks for a height change), so the source scrolls inside the reserved
  * box instead. Exactly what a tool card's capped markdown body already does.
  */
+function sourceRangeAttributes(start: number, end: number) {
+	return { "data-vlist-source-start": start, "data-vlist-source-end": end };
+}
+
 function MarkdownSourceBody({
 	text,
 	width,
@@ -434,6 +456,7 @@ function MarkdownSourceBody({
 	limited = false,
 	direction = "head",
 	plainText = false,
+	observeSourceRanges = false,
 }: {
 	plainText?: boolean;
 	text: string;
@@ -441,6 +464,7 @@ function MarkdownSourceBody({
 	height: number;
 	limited?: boolean;
 	direction?: "head" | "tail";
+	observeSourceRanges?: boolean;
 }) {
 	const metrics = typographyMetrics();
 	const font = plainText ? metrics.font.body : metrics.font.markdownCode;
@@ -458,6 +482,23 @@ function MarkdownSourceBody({
 		});
 		return ranges.map((range) => materializeLineRange(prepared, range).text);
 	}, [limited, text, width, height, direction, font, lineHeight]);
+	let cursor = 0;
+	const rawLineAttrs = (line: string, exact: boolean) => {
+		if (!observeSourceRanges || cursor < 0) return;
+		const start = exact ? cursor : text.indexOf(line, cursor);
+		if (start < 0 || (!exact && text.slice(cursor, start).trim().length)) {
+			cursor = -1;
+			return;
+		}
+		const end = start + line.length;
+		cursor = exact ? end + 1 : end;
+		const nonblank = line.trim();
+		if (nonblank)
+			return sourceRangeAttributes(
+				start + line.indexOf(nonblank),
+				start + line.indexOf(nonblank) + nonblank.length,
+			);
+	};
 	return (
 		<div
 			data-vlist-markdown-source={plainText ? undefined : true}
@@ -493,13 +534,24 @@ function MarkdownSourceBody({
 							// biome-ignore lint/suspicious/noArrayIndexKey: bounded visual source lines
 							key={index}
 							data-vlist-source-line
+							{...(direction === "head" ? rawLineAttrs(line, false) : undefined)}
 							data-vlist-line={plainText ? true : undefined}
 							style={{ height: lineHeight, whiteSpace: "pre" }}
 						>
 							{line}
 						</div>
 					))
-				: text}
+				: observeSourceRanges
+					? text.split("\n").map((line, index) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: raw source lines are positional
+							<Fragment key={index}>
+								{index ? "\n" : null}
+								<span data-vlist-source-line {...rawLineAttrs(line, true)}>
+									{line}
+								</span>
+							</Fragment>
+						))
+					: text}
 		</div>
 	);
 }
