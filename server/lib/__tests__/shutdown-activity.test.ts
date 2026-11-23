@@ -128,11 +128,13 @@ describe("clean shutdown marker lifecycle", () => {
 describe("main shutdown wiring without booting the server", () => {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 	test.each([
-		"sqlite",
-		"postgres",
-	])("%s startup schedules maintenance only once on SQLite", async (backend) => {
+		["sqlite", true],
+		["postgres", true],
+		["sqlite", false],
+		["postgres", false],
+	] as const)("%s startup with reader admission=%s schedules maintenance only once on SQLite", async (backend, admitted) => {
 		const maintenanceStart = main.lastIndexOf(
-			'if (activeDatabaseBackend === "sqlite") {',
+			'if (readerStartupAdmission.ok && activeDatabaseBackend === "sqlite") {',
 			main.indexOf('startTeamDatabaseMaintenance("status"'),
 		);
 		const maintenanceEnd = main.indexOf(
@@ -149,15 +151,16 @@ describe("main shutdown wiring without booting the server", () => {
 		const migrate = mock(async () => {});
 		await new Function(
 			"activeDatabaseBackend",
+			"readerStartupAdmission",
 			"startTeamDatabaseMaintenance",
 			"retireLegacyChapterResources",
 			"scheduleProjectIndexRebuild",
 			"migrateAggregationsOnStartup",
 			"logger",
 			`${code}\nreturn start();`,
-		)(backend, () => {}, cleanup, rebuild, migrate, { warn() {} });
+		)(backend, { ok: admitted }, () => {}, cleanup, rebuild, migrate, { warn() {} });
 		for (const operation of [cleanup, rebuild, migrate])
-			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" ? 1 : 0);
+			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" && admitted ? 1 : 0);
 	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
