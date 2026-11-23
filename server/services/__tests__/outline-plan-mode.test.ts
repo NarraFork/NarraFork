@@ -1348,12 +1348,15 @@ describe("review round 2", () => {
 		await enter(id, owner);
 		const plan = await writePlan(id, owner);
 		const space = await ensureSessionSpace(id);
+		const resolutions: Promise<unknown>[] = [];
 		const resolveElsewhere = (requestId: string, decision: "allow" | "deny") => {
 			const handler = (event: { spaceId: string; actorKind: string }) => {
 				if (event.spaceId !== space.id || event.actorKind !== "human") return;
 				eventBus.off("outline:committed", handler);
 				// Another approver's plain route wins the resolution while the card's write lands.
-				void resolvePermission(requestId, decision, { userId: colleague, decidedBy: "user" });
+				resolutions.push(
+					resolvePermission(requestId, decision, { userId: colleague, decidedBy: "user" }),
+				);
 				pendingPermissions.delete(requestId);
 			};
 			eventBus.on("outline:committed", handler);
@@ -1362,25 +1365,31 @@ describe("review round 2", () => {
 
 		const denied = await submit(id);
 		resolveElsewhere(denied.requestId, "deny");
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: denied.requestId,
-				principal: { userId: owner, isAdmin: false },
-				body: { action: "draft", seenSeq: denied.input._planSeq as number },
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_NOT_WAITING" });
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: denied.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { action: "draft", seenSeq: denied.input._planSeq as number },
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_NOT_WAITING" });
+		await Promise.all(resolutions.splice(0));
 		expect(denied.outcome()?.behavior).toBe("deny");
 		expect((await block(plan.root)).taskJson?.plan?.state).toBe("planning");
 
 		const allowed = await submit(id);
 		resolveElsewhere(allowed.requestId, "allow");
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: allowed.requestId,
-				principal: { userId: owner, isAdmin: false },
-				body: { action: "draft", seenSeq: allowed.input._planSeq as number },
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_DECIDED" });
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: allowed.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { action: "draft", seenSeq: allowed.input._planSeq as number },
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_DECIDED" });
+		await Promise.all(resolutions.splice(0));
 		expect(allowed.outcome()?.behavior).toBe("allow");
 		expect((await block(plan.root)).taskJson?.plan).toMatchObject({
 			state: "approved",

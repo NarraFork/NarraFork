@@ -1415,7 +1415,7 @@ export interface AgentConfig {
 	 * the response produced still runs, and the loop ends the turn once the step's tools
 	 * have settled instead of sending the next provider request. One-shot like shouldStop.
 	 */
-	shouldYieldToInput?: () => boolean;
+	shouldYieldToInput?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cut the provider response at the next tool-call
 	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
 	 * Supply a fresh signal for each loop invocation. */

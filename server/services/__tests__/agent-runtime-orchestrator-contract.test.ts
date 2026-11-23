@@ -1165,8 +1165,8 @@ describe("native media input transitions follow the unified run control", () => 
 			await resumeNextBufferedMessage(source, "en");
 			const id = await completed.promise;
 			await getRunControl(id)?.terminal;
-			expect(getBufferedMessages("contract-primary")).toHaveLength(0);
-			expect(getBufferedMessages(id)).toHaveLength(0);
+			expect(await getBufferedMessages("contract-primary")).toHaveLength(0);
+			expect(await getBufferedMessages(id)).toHaveLength(0);
 			activeNarrators.delete(id);
 			getExecutionOwner(id)?.release();
 			setUploadsDirForTests(null);
@@ -1824,7 +1824,7 @@ describe("real shared orchestrator profile contract", () => {
 					});
 					if (!accepted.buffered) throw new Error("expected queued input");
 					order.push("queued");
-					if (scenario.softStop) expect(options.config.shouldYieldToInput?.()).toBe(true);
+					if (scenario.softStop) expect(await options.config.shouldYieldToInput?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
 					const text = typeof injection === "string" ? injection : injection?.text;
 					expect(text ?? "").not.toContain(feedback);
@@ -1907,7 +1907,7 @@ describe("real shared orchestrator profile contract", () => {
 				);
 				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
 					.delivery;
-				expect(options.config.shouldYieldToInput?.()).toBe(false);
+				expect(await options.config.shouldYieldToInput?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);

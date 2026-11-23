@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import * as pool from "../../lib/db-worker/pool";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
@@ -1045,9 +1046,21 @@ describe("Send exact delivery receipts", () => {
 		const restores: Array<() => void> = [];
 		let rowsAtCreatorFailure = 0;
 		if (failure === "parent lookup") {
-			const lookup = spyOn(db.query.narratorToolCalls, "findFirst").mockImplementationOnce(() => {
-				throw new Error("parent lookup unavailable");
-			});
+			const original = pool.runReadTask;
+			let failed = false;
+			const lookup = spyOn(pool, "runReadTask").mockImplementation(((...args) => {
+				const params = args[1];
+				if (
+					!failed &&
+					"sql" in params &&
+					params.sql.includes('from "narrator_tool_calls"') &&
+					childRows().length === 1
+				) {
+					failed = true;
+					throw new Error("parent lookup unavailable");
+				}
+				return original(...args);
+			}) as typeof pool.runReadTask);
 			restores.push(() => lookup.mockRestore());
 		} else if (failure === "parent update") {
 			// The child's message/ref transaction commits before this separate update fails.
@@ -1055,16 +1068,25 @@ describe("Send exact delivery receipts", () => {
 					ON narrators WHEN OLD.id = 'parent'
 					BEGIN SELECT RAISE(ABORT, 'parent version unavailable'); END`);
 			restores.push(() => sqlite.run("DROP TRIGGER fail_parent_version"));
-		} else if (failure === "creator lookup") {
-			const lookup = spyOn(db.query.users, "findFirst").mockImplementationOnce(() => {
-				rowsAtCreatorFailure = childRows().length;
-				throw new Error("creator unavailable");
-			});
-			restores.push(() => lookup.mockRestore());
-		} else if (failure === "creator rejection") {
-			const lookup = spyOn(db.query.users, "findFirst").mockRejectedValueOnce(
-				new Error("creator unavailable"),
-			);
+		} else if (failure.startsWith("creator")) {
+			const original = pool.runReadTask;
+			let failed = false;
+			const lookup = spyOn(pool, "runReadTask").mockImplementation(((...args) => {
+				const params = args[1];
+				if (
+					!failed &&
+					"sql" in params &&
+					params.sql.includes('from "users"') &&
+					childRows().length === 1
+				) {
+					failed = true;
+					rowsAtCreatorFailure = childRows().length;
+					if (failure === "creator rejection")
+						return Promise.reject(new Error("creator unavailable"));
+					throw new Error("creator unavailable");
+				}
+				return original(...args);
+			}) as typeof pool.runReadTask);
 			restores.push(() => lookup.mockRestore());
 		}
 		try {

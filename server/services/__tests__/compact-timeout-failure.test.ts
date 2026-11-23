@@ -15,10 +15,14 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators, projects } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getRuntimeTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -118,7 +122,8 @@ beforeEach(() => {
 	narratorContext.generateCompactSummary = realGenerateCompactSummary;
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	__setCompactWatchdogTimingsForTests(null);
 	narratorContext.generateCompactSummary = realGenerateCompactSummary;
 	mock.module("../../db", () => realDbModule);
@@ -140,8 +145,9 @@ describe("watchdog timeout is a compact failure", () => {
 		const promise = runCustomCompact(NARRATOR_ID, "en", "m-target", { mode: "blocking" });
 		await requestStarted;
 
-		await expect(promise).rejects.toBeInstanceOf(CompactTimeoutError);
-		await expect(promise).rejects.toThrow(/no progress/);
+		const error = await captureWorkerRejection(promise);
+		expect(error).toBeInstanceOf(CompactTimeoutError);
+		expect((error as Error).message).toMatch(/no progress/);
 
 		// The marker survives as a failed compact carrying the timeout reason — the
 		// cancel path would have deleted it outright.
@@ -177,7 +183,7 @@ describe("watchdog timeout is a compact failure", () => {
 		await requestStarted;
 		expect(cancelCompact(NARRATOR_ID)).toBe(true);
 
-		await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+		expect(await captureWorkerRejection(promise)).toMatchObject({ name: "AbortError" });
 
 		// Marker removed, completion (not failure) broadcast, no error recorded.
 		expect(await readMarker()).toBeUndefined();

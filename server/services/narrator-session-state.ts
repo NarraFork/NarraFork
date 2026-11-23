@@ -824,12 +824,12 @@ export function listRuntimeBusyNarratorIds(): string[] {
 
 /** Deprecated read-only view; the mailbox is the sole queue authority. */
 export const bufferedMessages = {
-	get(narratorId: string): BufferedMessage[] | undefined {
-		const messages = getBufferedMessages(narratorId);
+	async get(narratorId: string): Promise<BufferedMessage[] | undefined> {
+		const messages = await getBufferedMessages(narratorId);
 		return messages.length ? messages : undefined;
 	},
-	has(narratorId: string): boolean {
-		return getBufferedMessages(narratorId).length > 0;
+	async has(narratorId: string): Promise<boolean> {
+		return (await getBufferedMessages(narratorId)).length > 0;
 	},
 };
 

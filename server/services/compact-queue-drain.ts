@@ -32,7 +32,7 @@ import { getBufferedMessages } from "./narrator-buffer";
 async function resolveQueueOwnerLocale(
 	narratorId: string,
 ): Promise<{ locale: Locale; replyInUserLanguage: boolean }> {
-	const createdBy = getBufferedMessages(narratorId)?.[0]?.createdBy;
+	const createdBy = (await getBufferedMessages(narratorId))?.[0]?.createdBy;
 	if (!createdBy) return { locale: "en", replyInUserLanguage: false };
 	try {
 		const [locale, replyInUserLanguage] = await Promise.all([
@@ -55,7 +55,7 @@ async function resolveQueueOwnerLocale(
  */
 export async function drainQueuedMessagesAfterCompact(narratorId: string): Promise<void> {
 	try {
-		if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) {
+		if (((await getBufferedMessages(narratorId))?.length ?? 0) === 0) {
 			const { wakeInboxIfEligible } = await import("./agent-runtime/inbox");
 			await wakeInboxIfEligible(narratorId);
 			return;

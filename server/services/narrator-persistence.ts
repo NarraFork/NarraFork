@@ -41,6 +41,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type { EpochRecord } from "../lib/agent/tool-loading";
 import type {
@@ -1150,12 +1151,35 @@ export async function bumpParentNarratorMessageVersion(
 	parentToolUseId?: string | null,
 ): Promise<void> {
 	if (!parentToolUseId) return;
-	const parentToolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.toolUseId, parentToolUseId),
-		columns: { narratorId: true },
-	});
+	const parentToolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			where: eq(narratorToolCalls.toolUseId, parentToolUseId),
+			columns: { id: true, narratorId: true },
+			limit: 1,
+		}),
+		persistenceReadOptions(),
+	);
 	if (!parentToolCall) return;
-	await bumpNarratorMessageVersions([parentToolCall.narratorId]);
+	db.transaction((tx) => {
+		const current = tx
+			.select({ narratorId: narratorToolCalls.narratorId, toolUseId: narratorToolCalls.toolUseId })
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, parentToolCall.id))
+			.get();
+		if (
+			!current ||
+			current.narratorId !== parentToolCall.narratorId ||
+			current.toolUseId !== parentToolUseId
+		)
+			throw new RuntimeReadConflictError();
+		tx.update(narrators)
+			.set({
+				messageVersion: sql`${narrators.messageVersion} + 1`,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, parentToolCall.narratorId))
+			.run();
+	});
 }
 
 /**
@@ -1279,19 +1303,61 @@ function preserveBackgroundCompactingSubstatus(current: string[], next: string[]
 	return next;
 }
 
+type NarratorRead = Partial<
+	Pick<typeof narrators.$inferSelect, "status" | "substatus" | "turnStartedAt" | "permissionMode">
+>;
+function assertNarratorRead(tx: DbTx, id: string, observed: NarratorRead | undefined) {
+	const current = tx
+		.select({
+			status: narrators.status,
+			substatus: narrators.substatus,
+			turnStartedAt: narrators.turnStartedAt,
+			permissionMode: narrators.permissionMode,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, id))
+		.get();
+	if (!observed) {
+		if (current) throw new RuntimeReadConflictError();
+		return;
+	}
+	if (
+		!current ||
+		Object.entries(observed).some(([key, value]) => current[key as keyof typeof current] !== value)
+	)
+		throw new RuntimeReadConflictError();
+}
+interface PersistenceReadOptions {
+	signal?: AbortSignal;
+	deadlineAt?: number;
+	timeoutMs?: number;
+}
+function persistenceReadOptions(options: PersistenceReadOptions = {}) {
+	return {
+		executionPolicy: "worker-required" as const,
+		signal: options.signal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: Math.min(options.timeoutMs ?? 30_000, 30_000),
+	};
+}
+
 async function writeSubstatus(
 	narratorId: string,
 	substatus: string[],
 	now = new Date().toISOString(),
+	observed?: NarratorRead,
 ) {
 	// Retry on transient SQLite locks so a busy DB never leaves a stale substatus
 	// tag (e.g. "reflecting"/"reasoning") stuck on the narrator forever.
 	await withDbRetry(
-		() =>
-			db
-				.update(narrators)
-				.set({ substatus: JSON.stringify(substatus), updatedAt: now })
-				.where(eq(narrators.id, narratorId)),
+		async () =>
+			db.transaction((tx) => {
+				assertNarratorRead(tx, narratorId, observed);
+				tx.update(narrators)
+					.set({ substatus: JSON.stringify(substatus), updatedAt: now })
+					.where(eq(narrators.id, narratorId))
+					.run();
+			}),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
 	backgroundOccupancyStore.refreshNarrator(narratorId);
@@ -2084,10 +2150,14 @@ const sqliteNarratorPersistence = {
 		// behaviour decision about the primary path, not part of opening this seam.
 		if (createdBy) {
 			try {
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, createdBy),
-					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-				});
+				const user = await readQueryFirst(
+					db.query.users.findMany({
+						where: eq(users.id, createdBy),
+						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+						limit: 1,
+					}),
+					persistenceReadOptions(),
+				);
 				return { ...msgWithSeq, creator: user ?? null };
 			} catch (error) {
 				// Display enrichment cannot turn a committed input into a failed write.
@@ -3606,17 +3676,28 @@ const sqliteNarratorPersistence = {
 		if (updated.length > 0) eventBus.emit({ type: "narrator:fast_mode_changed", narratorId });
 	},
 
-	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean): Promise<boolean> {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { permissionMode: true },
-		});
+	async updateRelaxedPlan(
+		narratorId: string,
+		relaxedPlan: boolean,
+		readOptions?: PersistenceReadOptions,
+	): Promise<boolean> {
+		const current = await readQueryFirst(
+			db.query.narrators.findMany({
+				where: eq(narrators.id, narratorId),
+				columns: { permissionMode: true },
+				limit: 1,
+			}),
+			persistenceReadOptions(readOptions),
+		);
 		const effectiveRelaxedPlan = forcesRelaxedPlan(current?.permissionMode) ? true : relaxedPlan;
 		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ relaxedPlan: effectiveRelaxedPlan, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
+		db.transaction((tx) => {
+			assertNarratorRead(tx, narratorId, current);
+			tx.update(narrators)
+				.set({ relaxedPlan: effectiveRelaxedPlan, updatedAt: now })
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
 		return effectiveRelaxedPlan;
 	},
 
@@ -3654,7 +3735,7 @@ const sqliteNarratorPersistence = {
 	async updateStatus(
 		narratorId: string,
 		status: "idle" | "working" | "waiting" | "archived",
-		options?: {
+		options?: PersistenceReadOptions & {
 			substatus?: string[];
 			errorMessage?: string;
 			errorCode?: string;
@@ -3706,11 +3787,21 @@ const sqliteNarratorPersistence = {
 		// completion (e.g. during a disconnect) still notifies.
 		let broadcastTurnStartedAt: string | undefined = turnStartedAt;
 		const writeStatus = async () => {
+			let observed: NarratorRead | undefined;
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true, updatedAt: true },
-				});
+				const row = await readQueryFirst(
+					db.query.narrators.findMany({
+						where: eq(narrators.id, narratorId),
+						columns: { status: true, substatus: true, turnStartedAt: true, updatedAt: true },
+						limit: 1,
+					}),
+					persistenceReadOptions(options),
+				);
+				observed = row && {
+					status: row.status,
+					substatus: row.substatus,
+					turnStartedAt: row.turnStartedAt,
+				};
 				if (broadcastTurnStartedAt === undefined) {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}
@@ -3734,75 +3825,55 @@ const sqliteNarratorPersistence = {
 			// (e.g. clearing "reflecting" after a danger reflection ends) is never
 			// silently dropped when the DB is momentarily busy.
 			wroteStatus = await withDbRetry(
-				async () => {
-					const recoveryObservation = options?.recoveryObservation;
-					if (recoveryObservation || options?.expectedLogicalRunId !== undefined) {
-						return db.transaction((tx) => {
-							if (recoveryObservation) {
-								if (recoveryObservation.id !== narratorId) throw new RuntimeReadConflictError();
-								assertRestartRecoveryObservation(tx, { narrator: recoveryObservation });
-							}
-							if (options?.expectedLogicalRunId !== undefined) {
-								const current = tx
-									.select({ logicalRunId: narrators.logicalRunId })
-									.from(narrators)
-									.where(eq(narrators.id, narratorId))
-									.get();
-								if (!current || current.logicalRunId !== options.expectedLogicalRunId)
-									throw new RuntimeReadConflictError();
-							}
-							if (options?.parentRecoveryTurn) {
-								const parent = tx
-									.select({ turnStartedAt: narrators.turnStartedAt })
-									.from(narrators)
-									.where(eq(narrators.id, options.parentRecoveryTurn.id))
-									.get();
-								if (!parent || parent.turnStartedAt !== options.parentRecoveryTurn.turnStartedAt)
-									throw new RuntimeReadConflictError();
-							}
-							tx.update(narrators)
-								.set({
-									status,
-									archivedWithNarratorId: null,
-									errorMessage: normalizedErrorMessage,
-									errorRetryable: normalizedErrorMessage
-										? (normalizedErrorRetryable ?? null)
-										: null,
-									updatedAt: now,
-									...(turnStartedAt !== undefined && { turnStartedAt }),
-									...(actualSubstatus !== undefined && {
-										substatus: JSON.stringify(actualSubstatus),
-									}),
-								})
+				async () =>
+					db.transaction((tx) => {
+						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
+						const recoveryObservation = options?.recoveryObservation;
+						if (recoveryObservation) {
+							if (recoveryObservation.id !== narratorId) throw new RuntimeReadConflictError();
+							assertRestartRecoveryObservation(tx, { narrator: recoveryObservation });
+						}
+						if (options?.expectedLogicalRunId !== undefined) {
+							const current = tx
+								.select({ logicalRunId: narrators.logicalRunId })
+								.from(narrators)
 								.where(eq(narrators.id, narratorId))
-								.run();
-							return true;
-						});
-					}
-					const write = db
-						.update(narrators)
-						.set({
-							status,
-							archivedWithNarratorId: null,
-							errorMessage: normalizedErrorMessage,
-							// Kept in lockstep with errorMessage: cleared on recovery, set only when the
-							// provider diagnostics actually told us whether a retry is worthwhile.
-							errorRetryable: normalizedErrorMessage ? (normalizedErrorRetryable ?? null) : null,
-							updatedAt: now,
-							...(turnStartedAt !== undefined && { turnStartedAt }),
-							...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
-						})
-						.where(
-							and(
-								eq(narrators.id, narratorId),
-								options?.unlessArchived ? ne(narrators.status, "archived") : undefined,
-							),
-						);
-					if (options?.unlessArchived)
-						return (await write.returning({ id: narrators.id })).length > 0;
-					await write;
-					return true;
-				},
+								.get();
+							if (!current || current.logicalRunId !== options.expectedLogicalRunId)
+								throw new RuntimeReadConflictError();
+						}
+						if (options?.parentRecoveryTurn) {
+							const parent = tx
+								.select({ turnStartedAt: narrators.turnStartedAt })
+								.from(narrators)
+								.where(eq(narrators.id, options.parentRecoveryTurn.id))
+								.get();
+							if (!parent || parent.turnStartedAt !== options.parentRecoveryTurn.turnStartedAt)
+								throw new RuntimeReadConflictError();
+						}
+						const changed = tx
+							.update(narrators)
+							.set({
+								status,
+								archivedWithNarratorId: null,
+								errorMessage: normalizedErrorMessage,
+								errorRetryable: normalizedErrorMessage ? (normalizedErrorRetryable ?? null) : null,
+								updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
+								...(turnStartedAt !== undefined && { turnStartedAt }),
+								...(actualSubstatus !== undefined && {
+									substatus: JSON.stringify(actualSubstatus),
+								}),
+							})
+							.where(
+								and(
+									eq(narrators.id, narratorId),
+									options?.unlessArchived ? ne(narrators.status, "archived") : undefined,
+								),
+							)
+							.returning({ id: narrators.id })
+							.all();
+						return options?.unlessArchived ? changed.length > 0 : true;
+					}),
 				{ label: "updateStatus.write", maxRetries: 5 },
 			);
 		};
@@ -3967,7 +4038,7 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		expectedStatus: string | string[],
 		newStatus: "idle" | "working" | "waiting" | "archived",
-		options?: {
+		options?: PersistenceReadOptions & {
 			substatus?: string[];
 			errorMessage?: string;
 			diagnostics?: ApiRequestDiagnostics;
@@ -3990,11 +4061,17 @@ const sqliteNarratorPersistence = {
 		let broadcastTurnStartedAt: string | undefined;
 		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
+			let observed: NarratorRead | undefined;
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true },
-				});
+				const row = await readQueryFirst(
+					db.query.narrators.findMany({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true, turnStartedAt: true },
+						limit: 1,
+					}),
+					persistenceReadOptions(options),
+				);
+				observed = row;
 				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
@@ -4013,17 +4090,23 @@ const sqliteNarratorPersistence = {
 			// transition (which clears transient substatus tags) is never dropped.
 			return withDbRetry(
 				async () =>
-					sqlite
-						.prepare(
+					db.transaction((tx) => {
+						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
+						const statement = sqlite.prepare(
 							substatusJson !== undefined
 								? `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
 								: `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
-						)
-						.run(
-							...(substatusJson !== undefined
-								? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
-								: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
-						),
+						);
+						try {
+							return statement.run(
+								...(substatusJson !== undefined
+									? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
+									: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
+							);
+						} finally {
+							statement.finalize();
+						}
+					}),
 				{ label: "compareAndSetStatus.write", maxRetries: 5 },
 			);
 		};
@@ -4088,18 +4171,22 @@ const sqliteNarratorPersistence = {
 	async updateSubstatus(
 		narratorId: string,
 		substatus: string[],
-		options?: { preserveTiming?: boolean },
+		options?: PersistenceReadOptions & { preserveTiming?: boolean },
 	) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narrators.findMany({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+					limit: 1,
+				}),
+				persistenceReadOptions(options),
+			);
 			const actualSubstatus =
 				options?.preserveTiming === false
 					? substatus
 					: preserveTurnTimingSubstatus(parseSubstatus(row?.substatus), substatus);
-			await writeSubstatus(narratorId, actualSubstatus);
+			await writeSubstatus(narratorId, actualSubstatus, undefined, row);
 			broadcastToNarrator(narratorId, {
 				type: "substatus_change",
 				narratorId,
@@ -4115,16 +4202,24 @@ const sqliteNarratorPersistence = {
 	 * Serialized with all other substatus writers to avoid stale read-modify-write
 	 * updates clobbering persistent tags like "error" or "unread".
 	 */
-	async addSubstatus(narratorId: string, tag: string): Promise<string[]> {
+	async addSubstatus(
+		narratorId: string,
+		tag: string,
+		options?: PersistenceReadOptions,
+	): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narrators.findMany({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+					limit: 1,
+				}),
+				persistenceReadOptions(options),
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (current.includes(tag)) return current;
 			const updated = [...current, tag];
-			await writeSubstatus(narratorId, updated);
+			await writeSubstatus(narratorId, updated, undefined, row);
 			broadcastToNarrator(narratorId, {
 				type: "substatus_change",
 				narratorId,
@@ -4141,16 +4236,24 @@ const sqliteNarratorPersistence = {
 	 * Serialized with all other substatus writers to avoid stale read-modify-write
 	 * updates clobbering persistent tags like "error" or "unread".
 	 */
-	async removeSubstatus(narratorId: string, tag: string): Promise<string[]> {
+	async removeSubstatus(
+		narratorId: string,
+		tag: string,
+		options?: PersistenceReadOptions,
+	): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narrators.findMany({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+					limit: 1,
+				}),
+				persistenceReadOptions(options),
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (!current.includes(tag)) return current;
 			const updated = current.filter((t) => t !== tag);
-			await writeSubstatus(narratorId, updated);
+			await writeSubstatus(narratorId, updated, undefined, row);
 			broadcastToNarrator(narratorId, {
 				type: "substatus_change",
 				narratorId,
