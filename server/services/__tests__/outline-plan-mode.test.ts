@@ -40,6 +40,7 @@ import {
 	startApprovedOutlinePlan,
 } from "../outline-plan-mode";
 import { taskSourceForNarrator } from "../task-source";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const NOW = "2026-11-04T00:00:00.000Z";
 
@@ -662,35 +663,44 @@ describe("deciding (the card's route)", () => {
 		await enter(id, owner);
 		await writePlan(id, owner);
 		const sub = await submit(id);
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: sub.requestId,
-				principal: { userId: owner, isAdmin: false },
-				body: { action: "lock", delegate: theirs, seenSeq: sub.input._planSeq as number },
-			}),
-		).rejects.toMatchObject({ statusCode: 404 });
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: sub.requestId,
-				principal: { userId: owner, isAdmin: false },
-				body: { action: "lock", delegate: id, seenSeq: sub.input._planSeq as number },
-			}),
-		).rejects.toMatchObject({ statusCode: 400 });
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: sub.requestId,
-				principal: { userId: stranger, isAdmin: false },
-				body: { action: "lock", seenSeq: sub.input._planSeq as number },
-			}),
-		).rejects.toMatchObject({ statusCode: 403 });
+		// Settle natively before expect to avoid Bun's reused-Worker promise-matcher stall.
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: sub.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { action: "lock", delegate: theirs, seenSeq: sub.input._planSeq as number },
+				}),
+			),
+		).toMatchObject({ statusCode: 404 });
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: sub.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { action: "lock", delegate: id, seenSeq: sub.input._planSeq as number },
+				}),
+			),
+		).toMatchObject({ statusCode: 400 });
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: sub.requestId,
+					principal: { userId: stranger, isAdmin: false },
+					body: { action: "lock", seenSeq: sub.input._planSeq as number },
+				}),
+			),
+		).toMatchObject({ statusCode: 403 });
 		expect(sub.outcome()).toBeNull();
-		await expect(
-			decideOutlinePlanRequest({
-				requestId: `missing-${sub.requestId}`,
-				principal: { userId: owner, isAdmin: false },
-				body: { action: "draft", seenSeq: 0 },
-			}),
-		).rejects.toMatchObject({ statusCode: 404 });
+		expect(
+			await captureWorkerRejection(
+				decideOutlinePlanRequest({
+					requestId: `missing-${sub.requestId}`,
+					principal: { userId: owner, isAdmin: false },
+					body: { action: "draft", seenSeq: 0 },
+				}),
+			),
+		).toMatchObject({ statusCode: 404 });
 	});
 
 	test("an approval that did not come through the card is recorded as a draft on the approver's behalf", async () => {

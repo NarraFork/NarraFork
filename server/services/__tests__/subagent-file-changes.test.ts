@@ -20,7 +20,7 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileAttributions,
 	fileChangeEffects,
@@ -33,10 +33,14 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 // The real module is captured and restored in `afterAll`: `mock.module` is
-// PROCESS-GLOBAL in Bun, so leaving it installed hands this in-memory database to
+// PROCESS-GLOBAL in Bun, so leaving it installed hands this fixture database to
 // every other suite that runs afterwards in the same process — they then query a
 // database with none of their fixtures in it and fail for no visible reason.
 const realDbModule = { ...(await import("../../db")) };
@@ -319,9 +323,10 @@ beforeEach(async () => {
 	await makeNarrator("sub-b", PARENT);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 afterEach(() => {
@@ -699,7 +704,7 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
 		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
 		await parentExecutionCall("current");
-		const prepare = spyOn(sqlite, "prepare");
+		const worker = spyOn(workerPool, "runReadTask");
 		try {
 			const changes = await getChildSubagentFileChanges({
 				parentNarratorId: PARENT,
@@ -718,19 +723,25 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				files: [{ filePath: "src/current.ts", linesAdded: 4 }],
 				countsTruncated: false,
 			});
-			const lookups = prepare.mock.calls
-				.map(([text]) => text)
+			const lookups = worker.mock.calls
+				.flatMap(([, task]) => (task.kind === "selectRows" ? [task.sql] : []))
 				.filter((text) => text.includes('from "file_change_effects"'));
 			expect(lookups).toHaveLength(1);
-			const plan = sqlite
-				.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${lookups[0]}`)
-				.all("current-op", "apply", "changed", "settled", "measured", 2)
-				.map(({ detail }) => detail);
-			expect(plan).toContainEqual(
-				expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
+			const statement = sqlite.query<{ detail: string }, SQLQueryBindings[]>(
+				`EXPLAIN QUERY PLAN ${lookups[0]}`,
 			);
+			try {
+				const plan = statement
+					.all("current-op", "apply", "changed", "settled", "measured", 2)
+					.map(({ detail }) => detail);
+				expect(plan).toContainEqual(
+					expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
+				);
+			} finally {
+				statement.finalize();
+			}
 		} finally {
-			prepare.mockRestore();
+			worker.mockRestore();
 		}
 	});
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
@@ -1554,6 +1565,50 @@ describe("execution and device isolation regressions", () => {
 		if (!omitted) throw new Error("Omitted child must retain an incomplete projection");
 		expect(hasSubagentFileChanges(omitted)).toBe(true);
 		expect(formatSubagentFileChanges(omitted)).toContain("totals are lower bounds");
+	});
+});
+
+describe("Worker read admission", () => {
+	test("Worker failure rejects evidence instead of reporting empty success or reading locally", async () => {
+		const failure = new Error("injected Worker failure");
+		const worker = spyOn(workerPool, "runReadTask").mockRejectedValue(failure);
+		const local = spyOn(sqlite, "query");
+		try {
+			expect(await captureWorkerRejection(getFileChangesBySubagent(["sub-a"]))).toBe(failure);
+			expect(await captureWorkerRejection(getTeamSubagentFileChanges(PARENT))).toBe(failure);
+			expect(local).not.toHaveBeenCalled();
+			expect(worker).toHaveBeenCalledTimes(2);
+		} finally {
+			local.mockRestore();
+			worker.mockRestore();
+		}
+	});
+
+	test("cancellation and deadline reach Worker admission without local reads", async () => {
+		const local = spyOn(sqlite, "query");
+		try {
+			for (const options of [{ signal: AbortSignal.abort() }, { deadlineAt: Date.now() - 1 }]) {
+				const error = await captureWorkerRejection(getFileChangesBySubagent(["sub-a"], options));
+				expect(error).toBeInstanceOf(Error);
+			}
+			expect(local).not.toHaveBeenCalled();
+		} finally {
+			local.mockRestore();
+		}
+	});
+
+	test("resolved run options retain the caller's cancellation budget", async () => {
+		const signal = new AbortController().signal;
+		const deadlineAt = Date.now() + 30_000;
+		const options = await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT, {
+			signal,
+			deadlineAt,
+			timeoutMs: 5000,
+		});
+		expect(options.signal).toBe(signal);
+		expect(options.deadlineAt).toBe(deadlineAt);
+		expect(options.timeoutMs).toBe(5000);
+		expect(await getFileChangesBySubagent([], options)).toEqual(new Map());
 	});
 });
 

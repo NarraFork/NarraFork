@@ -3,6 +3,7 @@ import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 import {
 	BackgroundOccupancyIndex,
 	isOccupancyNarratorSeed,
@@ -57,69 +58,80 @@ const taskColumns = {
 	subagentNarratorId: backgroundTasks.subagentNarratorId,
 };
 
-/** Injectable DB handle also exercises the real SQL against an isolated in-memory DB. */
+/** Injectable DB handle exercises real SQL against a committed file/WAL database. */
 export function createDatabaseBackgroundOccupancySource(
 	readDatabase: () => Promise<Pick<BunSQLiteDatabase, "select">>,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): BackgroundOccupancySource {
 	return {
 		async scanNarrators(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(after === null ? undefined : gt(narrators.id, after))
-				.orderBy(asc(narrators.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(after === null ? undefined : gt(narrators.id, after))
+					.orderBy(asc(narrators.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async scanTasks(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(after === null ? undefined : gt(backgroundTasks.id, after))
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(after === null ? undefined : gt(backgroundTasks.id, after))
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async getNarrators(ids) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(inArray(narrators.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getTasks(ids) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(inArray(backgroundTasks.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(inArray(backgroundTasks.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getProjections(childId, after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(
-					and(
-						or(
-							eq(backgroundTasks.id, childId),
-							and(
-								eq(backgroundTasks.type, "agent"),
-								eq(backgroundTasks.subagentNarratorId, childId),
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(
+						and(
+							or(
+								eq(backgroundTasks.id, childId),
+								and(
+									eq(backgroundTasks.type, "agent"),
+									eq(backgroundTasks.subagentNarratorId, childId),
+								),
 							),
+							after === null ? undefined : gt(backgroundTasks.id, after),
 						),
-						after === null ? undefined : gt(backgroundTasks.id, after),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 	};
 }

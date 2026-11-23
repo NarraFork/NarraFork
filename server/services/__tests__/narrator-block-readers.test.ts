@@ -19,9 +19,12 @@ import {
 	setSystemTime,
 	test,
 } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite, activeDatabaseBackend: "sqlite" }));
 
@@ -53,10 +56,10 @@ afterEach(() => {
 	settings.narratorBlocks.compactJson = compactJson;
 	setSystemTime();
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 /** Non-ASCII on purpose: SQL lengths count characters and bytes differently. */

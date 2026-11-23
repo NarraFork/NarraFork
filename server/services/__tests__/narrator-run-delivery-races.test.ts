@@ -540,6 +540,26 @@ describe("background and detached terminal source transactions", () => {
 				await handle.completion;
 				expect(sessionRow()?.status).toBe("idle");
 			});
+		test(`${detached ? "detached" : "background"} publishes its terminal answer when the boundary Worker read fails`, async () => {
+			const { handle, gate, calls, runId } = await launch();
+			const boundary = await import("../subagent-execution-boundary");
+			const read = spyOn(boundary, "readSubagentExecutionBoundary").mockRejectedValue(
+				new Error("injected boundary Worker failure"),
+			);
+			gate.resolve();
+			const result = await handle.completion;
+			expect(read).toHaveBeenCalled();
+			expect(result.finalText).toBe("same immutable terminal answer");
+			expect(result.output).toContain("same immutable terminal answer");
+			expect(result.output).toContain("File-change summary unavailable");
+			expect(calls).toHaveLength(1);
+			expect(taskRow()).toMatchObject({
+				status: "completed",
+				logicalRunId: runId,
+				output: "same immutable terminal answer",
+			});
+			expect(delivered(runId)).toHaveLength(1);
+		});
 		test(`${detached ? "detached" : "background"} retries one failed source commit without a second terminal or model pass`, async () => {
 			const { handle, gate, calls, runId } = await launch();
 			const commit = backgroundTaskService.markCompleted.bind(backgroundTaskService);

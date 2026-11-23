@@ -1270,14 +1270,24 @@ async function renderResult(
 		}),
 		{ executionPolicy: "worker-required", maxRows: 1 },
 	);
+	let executionBoundary: Awaited<ReturnType<typeof boundary.readSubagentExecutionBoundary>>;
+	try {
+		executionBoundary = await boundary.readSubagentExecutionBoundary(
+			id,
+			publicationRun.logicalRunId,
+		);
+	} catch (error) {
+		logger.warn("Agent result delivered without its file-change summary", {
+			id,
+			error: String(error),
+		});
+		return `${finalText}\n\n<subagent_file_changes>\nFile-change summary unavailable: execution boundary could not be read.\n</subagent_file_changes>`;
+	}
 	return appendSubagentFileChanges(
 		{
 			parentNarratorId: deliverTo.narratorId,
 			childNarratorId: id,
-			executionBoundary: await boundary.readSubagentExecutionBoundary(
-				id,
-				publicationRun.logicalRunId,
-			),
+			executionBoundary,
 			scope: {
 				sourceToolUseId: deliverTo.toolUseId,
 				startedAt: turn?.turnStartedAt ?? null,

@@ -4,7 +4,7 @@ import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 } from "../../shared/recent-tabs";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
 import {
 	backgroundTasks,
 	narratorMessageRefs,
@@ -12,13 +12,21 @@ import {
 	narrators,
 	projects,
 } from "../db/schema";
+import { getNarratorWorkerTestDb } from "../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
-const { broadcastToNarrator, broadcastToUser, getNarratorConnections, handleNarratorWS } =
-	await import("./narrator-ws");
+const {
+	broadcastToNarrator,
+	broadcastToUser,
+	drainNarratorWsReadTasks,
+	getNarratorConnections,
+	handleNarratorWS,
+} = await import("./narrator-ws");
 const { eventBus } = await import("../lib/event-bus");
 const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
 const { backgroundTaskService } = await import("../services/background-task-service");
@@ -131,16 +139,18 @@ function seedReadableNarrator(id: string) {
 		.run();
 }
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openedConnections.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
+	await drainNarratorWsReadTasks({ deadlineAt: Date.now() + 5000 });
+	if (backgroundOccupancyStore.isReady) await settleOccupancy();
 	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 describe("account preference invalidation", () => {

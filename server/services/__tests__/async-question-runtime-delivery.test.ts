@@ -591,7 +591,7 @@ describe("async question receipt runtime adoption", () => {
 
 		const freed = await drainInjectionsIntoHistory(running, "en");
 		expect(freed.text).not.toContain("All except Redis");
-		freed.onConsumed();
+		await freed.onConsumed();
 		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
 		const accepted = delivery();
 		expect(accepted).toHaveLength(1);
@@ -603,7 +603,7 @@ describe("async question receipt runtime adoption", () => {
 		for (let boundary = 0; boundary < MAILBOX_LIMITS.noticePending + 2; boundary++) {
 			const drained = await drainInjectionsIntoHistory(running, "en");
 			answerParts.push(...drained.parts.filter((part) => part.messageId === answerId));
-			drained.onConsumed();
+			await drained.onConsumed();
 			if (answerParts.length) break;
 		}
 		expect(answerParts).toHaveLength(1);

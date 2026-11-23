@@ -4,7 +4,7 @@ import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
-import { getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { readTestMessageContent } from "../../../tests/setup";
 import {
 	apiRequests,
 	narratorMessageRefs,
@@ -19,12 +19,15 @@ import {
 	tryClaimExecution,
 } from "../agent-runtime/ownership";
 import type { TokenUsageSnapshot } from "../narrator-event-handler";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // Functional in-memory test db (not empty stubs): Bun's mock.module is global
 // and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
 // Do NOT import the real `../../db` first: that opens the runtime database and runs
 // drizzle migrations (journal may reference SQL files that are gitignored / absent).
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const dbStub = {
 	db,
 	sqlite,
@@ -573,12 +576,13 @@ afterEach(() => {
 	broadcastTargets.length = 0;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	// Leave the in-memory stub in place. Bun's mock.module is process-global and
 	// mock.restore() does not undo module mocks; re-pointing at a lazily imported
 	// real `../../db` would open the runtime database mid-suite.
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+	await fixture.close();
 });
 
 async function cleanupFileContextNarrator(id: string) {

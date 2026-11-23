@@ -1,9 +1,12 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import { logger } from "../../lib/logger";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
@@ -82,10 +85,11 @@ afterEach(async () => {
 	service.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDb);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.module("../narrator-session", () => realSession);
+	await fixture.close();
 });
 
 test("slow entry paths log once with bounded stages and counters, without private data", async () => {

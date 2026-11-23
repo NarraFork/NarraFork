@@ -6,9 +6,12 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -115,10 +118,10 @@ beforeEach(() => {
 afterEach(() => {
 	settings.narratorBlocks.write = true;
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 describe("block backfill", () => {
