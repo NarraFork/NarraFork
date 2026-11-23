@@ -179,8 +179,6 @@ export const registrationCodeService = {
 			revokedAt: null,
 			createdAt: now.toISOString(),
 		};
-		await db.insert(registrationCodes).values(row);
-
 		const creator = await readQueryFirst(
 			db.query.users.findMany({
 				limit: 1,
@@ -189,6 +187,7 @@ export const registrationCodeService = {
 			}),
 			{ executionPolicy: "worker-required" },
 		);
+		await db.insert(registrationCodes).values(row);
 
 		return {
 			code,
