@@ -39,6 +39,7 @@ import {
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeLinkService } from "../knowledge-link-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 /**
  * Seed knowledge grants into the unified `acl_grants` table.
@@ -199,7 +200,11 @@ describe("collection as read gate", () => {
 			content: "body",
 		});
 		// Low user: collection gate blocks even though the entry is public.
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(lowId) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(lowId) }),
+			),
+		).toThrow();
 		// Writer (clearance + tag): can read.
 		const ok = await knowledgeService.getEntry(entry.id, { principal: P(writerId) });
 		expect(ok.id).toBe(entry.id);
@@ -267,37 +272,43 @@ describe("collection-scoped grants", () => {
 				})
 			).id,
 		).toBe(firstEntry.id);
-		await expect(
-			knowledgeService.getEntry(secondEntry.id, { principal: P(scopedUserId) }),
-		).rejects.toThrow();
-		await expect(
-			knowledgeService.createEntry({
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(secondEntry.id, { principal: P(scopedUserId) }),
+			),
+		).toThrow();
+		expect(
+			await knowledgeService.createEntry({
 				collectionId: first.restrictedId,
 				title: `scoped-write-${TAG}`,
 				principal: P(scopedUserId),
 			}),
-		).resolves.toBeDefined();
-		await expect(
-			knowledgeService.createEntry({
-				collectionId: second.restrictedId,
-				title: `scoped-write-denied-${TAG}`,
-				principal: P(scopedUserId),
-			}),
-		).rejects.toThrow();
+		).toBeDefined();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.createEntry({
+					collectionId: second.restrictedId,
+					title: `scoped-write-denied-${TAG}`,
+					principal: P(scopedUserId),
+				}),
+			),
+		).toThrow();
 	});
 });
 
 describe("collection write control", () => {
 	test("low user cannot create an entry in a restricted collection (NotFound, no leak)", async () => {
 		const { restrictedId } = await makeCollections();
-		await expect(
-			knowledgeService.createEntry({
-				collectionId: restrictedId,
-				title: `x-${TAG}`,
-				content: "b",
-				principal: P(lowId),
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.createEntry({
+					collectionId: restrictedId,
+					title: `x-${TAG}`,
+					content: "b",
+					principal: P(lowId),
+				}),
+			),
+		).toThrow();
 	});
 
 	test("writer (clearance+tag+write grant) can create in a restricted collection", async () => {
@@ -332,9 +343,11 @@ describe("collection write control", () => {
 		);
 		expect(renamed?.name).toBe(`renamed-${TAG}`);
 		// A different low user cannot manage it.
-		await expect(
-			knowledgeService.updateCollection(col.id, { name: "nope" }, P(lowId)),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.updateCollection(col.id, { name: "nope" }, P(lowId)),
+			),
+		).toThrow();
 	});
 });
 
@@ -361,12 +374,14 @@ describe("addRevision / write_main collection gate (pinned gap)", () => {
 		});
 		// write_main must be refused (collection unreadable → NotFound), proving the gate is
 		// in addRevision itself (which does NOT go through loadReadableEntry).
-		await expect(
-			knowledgeService.addRevision(entry.id, {
-				content: "hijack",
-				principal: P(blockedWriter),
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.addRevision(entry.id, {
+					content: "hijack",
+					principal: P(blockedWriter),
+				}),
+			),
+		).toThrow();
 		// Content unchanged.
 		const fresh = await knowledgeService.getEntry(entry.id, {
 			withContent: true,
@@ -451,12 +466,18 @@ describe("review path collection gate (pinned gap)", () => {
 			entryId: entry.id,
 		});
 		expect(list.find((s) => s.id === submissionId)).toBeUndefined();
-		await expect(
-			knowledgeBranchService.getSubmission(P(reviewerNoCollection), submissionId),
-		).rejects.toThrow();
-		await expect(
-			knowledgeBranchService.review(P(reviewerNoCollection), submissionId, { verdict: "approve" }),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.getSubmission(P(reviewerNoCollection), submissionId),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.review(P(reviewerNoCollection), submissionId, {
+					verdict: "approve",
+				}),
+			),
+		).toThrow();
 
 		// Admin can approve (collection gate short-circuits) → merges.
 		const res = await knowledgeBranchService.review(P(adminId, "admin"), submissionId, {
@@ -522,7 +543,11 @@ describe("collection ACL panel edits change canRead", () => {
 
 		// Raise the level → hidden (entry itself is still public: collection gate wins).
 		await knowledgeAcl.updateCollectionAcl(col.id, { classificationLevel: "confidential" });
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(viewer) }),
+			),
+		).toThrow();
 
 		// Lower it back to public → visible again (the panel's "clear level" action).
 		await knowledgeAcl.updateCollectionAcl(col.id, { classificationLevel: null });
@@ -530,7 +555,11 @@ describe("collection ACL panel edits change canRead", () => {
 
 		// Add a compartment the viewer lacks → hidden on the tag axis alone.
 		await knowledgeAcl.updateCollectionAcl(col.id, { controlledTags: [secretTagId] });
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(viewer) }),
+			),
+		).toThrow();
 
 		// Naming the viewer as owner short-circuits the gate, even with the tag still set.
 		await knowledgeAcl.updateCollectionAcl(col.id, { ownerUserId: viewer });
@@ -538,7 +567,11 @@ describe("collection ACL panel edits change canRead", () => {
 
 		// Removing the owner restores the compartment denial (no lingering grant).
 		await knowledgeAcl.updateCollectionAcl(col.id, { ownerUserId: null });
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(viewer) }),
+			),
+		).toThrow();
 
 		// Clearing the compartment list reopens it.
 		await knowledgeAcl.updateCollectionAcl(col.id, { controlledTags: [] });
@@ -631,6 +664,10 @@ describe("authorization fails closed, never open", () => {
 		const kept = await knowledgeService.filterReadable(P(writerId), [{ id: entry.id }]);
 		expect(kept.length).toBe(0);
 		// ...and the single-entry path reports not-found rather than serving it ungated.
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(writerId) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(writerId) }),
+			),
+		).toThrow();
 	});
 });

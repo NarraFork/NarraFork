@@ -22,6 +22,7 @@ import { narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { packActivationService } from "../knowledge-pack-activation-service";
 import { knowledgePackService } from "../knowledge-pack-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 let userId: string;
@@ -141,9 +142,11 @@ describe("pack create + activate + cleanup", () => {
 			archive,
 			ownerUserId: userId,
 		});
-		await expect(packActivationService.activate(narratorId, pack.id, principal())).rejects.toThrow(
-			/zip-slip|escape/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				packActivationService.activate(narratorId, pack.id, principal()),
+			),
+		).toThrow(/zip-slip|escape/i);
 
 		// No whitelist row should have been created for this pack's narrator/dir.
 		const wl = await db.query.narratorWhitelistDirs.findMany({
@@ -175,7 +178,9 @@ describe("pack ACL filtering", () => {
 		expect(visible.some((p) => p.id === secretPack.id)).toBe(false);
 
 		// ...and getPack must throw (NotFound, not leaking existence).
-		await expect(knowledgePackService.getPack(secretPack.id, principal())).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(knowledgePackService.getPack(secretPack.id, principal())),
+		).toThrow();
 
 		// An admin sees it (admin short-circuits ACL).
 		const adminView = await knowledgePackService.getPack(secretPack.id, {
@@ -189,9 +194,11 @@ describe("pack ACL filtering", () => {
 describe("pack archive validation", () => {
 	test("rejects an unsupported archive type", async () => {
 		const bad = new File([new Uint8Array([1, 2, 3])], "notes.txt", { type: "text/plain" });
-		await expect(
-			knowledgePackService.createPack({ name: `Bad ${TAG}`, archive: bad }),
-		).rejects.toThrow(/Unsupported pack archive type/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgePackService.createPack({ name: `Bad ${TAG}`, archive: bad }),
+			),
+		).toThrow(/Unsupported pack archive type/i);
 	});
 });
 
@@ -233,13 +240,15 @@ describe("pack management authorization (write actions)", () => {
 		// Sanity: the other user can read it (it is public).
 		expect((await knowledgePackService.getPack(packId, otherPrincipal())).id).toBe(packId);
 		// ...but cannot manage it.
-		await expect(
-			knowledgePackService.updatePackMeta(
-				packId,
-				{ classificationLevel: "secret" },
-				otherPrincipal(),
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgePackService.updatePackMeta(
+					packId,
+					{ classificationLevel: "secret" },
+					otherPrincipal(),
+				),
 			),
-		).rejects.toThrow(/permission/i);
+		).toThrow(/permission/i);
 		// The ACL was not changed.
 		const after = await knowledgePackService.getPack(packId, { userId: "admin-x", role: "admin" });
 		expect(after.classificationLevel).toBeNull();
@@ -255,9 +264,11 @@ describe("pack management authorization (write actions)", () => {
 			buildTarGz("mgmt-replace-evil", { "evil.sh": "rm -rf /" }),
 			"evil.tar.gz",
 		);
-		await expect(
-			knowledgePackService.replaceArchive(packId, replacement, otherPrincipal()),
-		).rejects.toThrow(/permission/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgePackService.replaceArchive(packId, replacement, otherPrincipal()),
+			),
+		).toThrow(/permission/i);
 		// The archive hash is unchanged (bytes were not swapped).
 		const after = await knowledgePackService.getPack(packId, { userId: "admin-x", role: "admin" });
 		expect(after.archiveHash).toBe(original.archiveHash);
@@ -265,9 +276,11 @@ describe("pack management authorization (write actions)", () => {
 
 	test("a non-owner cannot delete a readable pack", async () => {
 		const packId = await makePublicPack("mgmt-delete");
-		await expect(knowledgePackService.deletePack(packId, otherPrincipal())).rejects.toThrow(
-			/permission/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgePackService.deletePack(packId, otherPrincipal()),
+			),
+		).toThrow(/permission/i);
 		// Still exists.
 		expect((await knowledgePackService.getPack(packId, otherPrincipal())).id).toBe(packId);
 	});
@@ -307,8 +320,10 @@ describe("pack management authorization (write actions)", () => {
 			archive: secretArchive,
 			classificationLevel: "secret",
 		});
-		await expect(knowledgePackService.deletePack(secretPack.id, otherPrincipal())).rejects.toThrow(
-			/not found/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgePackService.deletePack(secretPack.id, otherPrincipal()),
+			),
+		).toThrow(/not found/i);
 	});
 });

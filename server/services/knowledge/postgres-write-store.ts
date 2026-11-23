@@ -79,11 +79,12 @@ import {
 	specNamespaces,
 	specProtectedTasks,
 } from "@server/db/postgres-schema";
-import { ValidationError } from "@server/lib/errors";
+import { AppError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { KNOWLEDGE_REVISION_VERSION_BASE } from "./revision-version";
+import { assertDraftVersion } from "./write-guards";
 import type {
 	AclAuditEventWrite,
 	AclGrantRowWrite,
@@ -132,6 +133,26 @@ import {
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …)`. PG-side only. */
 type PgTransaction = Parameters<Parameters<BunSQLDatabase["transaction"]>[0]>[0];
+
+async function assertCurrentDraftVersion(
+	tx: PgTransaction,
+	input: RebaseDraftContentWrite | CreateSubmissionWrite,
+): Promise<void> {
+	const [current] = await tx
+		.select({
+			contentHash: knowledgeDrafts.contentHash,
+			baseRevisionId: knowledgeDrafts.baseRevisionId,
+			updatedAt: knowledgeDrafts.updatedAt,
+			status: knowledgeDrafts.status,
+			title: knowledgeDrafts.title,
+			targetCollectionId: knowledgeDrafts.targetCollectionId,
+			keywordsJson: knowledgeDrafts.keywordsJson,
+		})
+		.from(knowledgeDrafts)
+		.where(eq(knowledgeDrafts.id, input.draftId))
+		.limit(1);
+	assertDraftVersion(current, input.expectedDraft);
+}
 
 /** The whole grant-delete section, named so the transaction call site stays a
  *  non-async arrow (see the header). */
@@ -495,6 +516,7 @@ async function rebaseDraftContentSection(
 	input: RebaseDraftContentWrite,
 ): Promise<InvalidatedSubmissionRef[]> {
 	await lockDraft(tx, input.draftId);
+	await assertCurrentDraftVersion(tx, input);
 	await tx
 		.update(knowledgeDrafts)
 		.set({
@@ -515,6 +537,7 @@ async function createSubmissionSection(
 	// supersedes the open request can never interleave with this guard's
 	// "no open request" read.
 	await lockDraft(tx, input.draftId);
+	await assertCurrentDraftVersion(tx, input);
 	const open = await tx
 		.select({ id: knowledgeSubmissions.id, status: knowledgeSubmissions.status })
 		.from(knowledgeSubmissions)
@@ -562,6 +585,22 @@ async function setSubmissionVerdictSection(
 	input: SetSubmissionVerdictWrite,
 ): Promise<void> {
 	await lockSubmission(tx, input.submissionId);
+	const [fresh] = await tx
+		.select({ status: knowledgeSubmissions.status })
+		.from(knowledgeSubmissions)
+		.where(eq(knowledgeSubmissions.id, input.submissionId))
+		.limit(1);
+	if (
+		!fresh ||
+		fresh.status !== input.expectedStatus ||
+		!(CLAIMABLE_SUBMISSION_STATUSES as readonly string[]).includes(fresh.status)
+	) {
+		throw new AppError(
+			"Submission changed; reload and retry",
+			409,
+			"KNOWLEDGE_SUBMISSION_CONFLICT",
+		);
+	}
 	await tx
 		.update(knowledgeSubmissions)
 		.set({
@@ -703,6 +742,14 @@ async function commitMergedRevisionSection(
 	}
 
 	await lockEntry(tx, input.entryId);
+	const [entry] = await tx
+		.select({ currentRevisionId: knowledgeEntries.currentRevisionId })
+		.from(knowledgeEntries)
+		.where(eq(knowledgeEntries.id, input.entryId))
+		.limit(1);
+	if (!entry || entry.currentRevisionId !== input.expectedMainRevisionId) {
+		throw new AppError("Main revision changed; reload and retry", 409, "KNOWLEDGE_MAIN_CONFLICT");
+	}
 	const version = await claimNextRevisionVersion(tx, input.entryId);
 	await tx.insert(knowledgeRevisions).values({
 		id: input.revisionId,

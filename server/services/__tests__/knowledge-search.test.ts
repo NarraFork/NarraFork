@@ -8,6 +8,7 @@
  */
 import { beforeAll, describe, expect, test } from "bun:test";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 let collectionId: string;
 
@@ -120,6 +121,10 @@ describe("project isolation (H3)", () => {
 		// Direct KnowledgeRead-style lookup must enforce the same context boundary.
 		expect((await knowledgeService.getEntry(entryA.id, { projectId: projA })).id).toBe(entryA.id);
 		expect((await knowledgeService.getEntry(entryG.id, { projectId: projA })).id).toBe(entryG.id);
-		await expect(knowledgeService.getEntry(entryB.id, { projectId: projA })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entryB.id, { projectId: projA }),
+			),
+		).toThrow();
 	});
 });

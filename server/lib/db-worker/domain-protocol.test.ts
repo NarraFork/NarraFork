@@ -10,6 +10,27 @@ import { runDomainRead } from "./domain-task-registry";
 import { ReadBudgetMeter } from "./read-budget";
 
 describe("registered database read domains", () => {
+	test("knowledge and recall inputs bound identifiers, shape and result windows", () => {
+		const input = { narratorId: "n", messageId: null, limit: 50 };
+		expect(createDomainReadParams("recallConversation", input).input).toEqual(input);
+		for (const id of ["", "x".repeat(257), "界".repeat(100), "x\0y"]) {
+			expect(() => createDomainReadParams("knowledgeEntryDetail", { entryId: id })).toThrow();
+			expect(() =>
+				createDomainReadParams("recallToolCallDetail", { toolCallId: id, narratorId: null }),
+			).toThrow();
+			expect(() =>
+				createDomainReadParams("recallConversation", { ...input, narratorId: id }),
+			).toThrow();
+		}
+		for (const limit of [0, -1, 51, 0.5, NaN])
+			expect(() => createDomainReadParams("recallConversation", { ...input, limit })).toThrow();
+		const malformed = {
+			kind: "domainRead",
+			task: "knowledgeEntryDetail",
+			input: { entryId: "entry", extra: true },
+		} as const;
+		expect(() => validateDomainRead(malformed)).toThrow();
+	});
 	test("file snapshot inputs bound identifiers, owner context and page size", () => {
 		const editor = { sourceInstanceId: "source", sourceId: "operation" };
 		const revert = {
