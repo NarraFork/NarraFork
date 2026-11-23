@@ -635,17 +635,22 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 
 	async function notifyTransfer(recipientId: string, deliveryId?: string) {
 		if (!wake || !deliveryId) return;
-		const row = await readQueryFirst(
-			database
-				.select({ metadataJson: narratorBufferedMessages.metadataJson })
-				.from(narratorBufferedMessages)
-				.where(eq(narratorBufferedMessages.deliveryId, deliveryId))
-				.limit(1),
-			{ executionPolicy: "worker-required", maxRows: 1 },
-		);
-		const event = row?.metadataJson
-			? (JSON.parse(row.metadataJson) as { eventKind?: string }).eventKind
-			: undefined;
+		let event: string | undefined;
+		try {
+			const row = await readQueryFirst(
+				database
+					.select({ metadataJson: narratorBufferedMessages.metadataJson })
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.deliveryId, deliveryId))
+					.limit(1),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
+			event = row?.metadataJson
+				? (JSON.parse(row.metadataJson) as { eventKind?: string }).eventKind
+				: undefined;
+		} catch (error) {
+			logger.warn("Publication wake metadata unavailable", { recipientId, error: String(error) });
+		}
 		// Restart/cancel notices are observable on the next pass, not permission to spend a turn.
 		if (event === "started" || event === "cancelled") return;
 		try {

@@ -79,6 +79,40 @@ afterAll(() => {
 	mock.restore();
 });
 
+test("transferred terminal notice still wakes its idle recipient when Worker metadata fails", async () => {
+	const service = createRuntimePublicationService(db);
+	service.stop();
+	const wake = mock(() => {});
+	service.setWake(wake);
+	const run = {
+		producerKind: "agent" as const,
+		taskId: "child",
+		recipientId: "parent",
+		logicalRunId: "wake-failure",
+	};
+	service.store.reserveRunSlots(run);
+	service.store.commitIntent({
+		...run,
+		eventKind: "completed",
+		summary: "ready",
+		resultRef: "message:ready",
+	});
+	const read = spyOn(workerRead, "readQueryFirst").mockRejectedValueOnce(
+		new Error("metadata Worker unavailable"),
+	);
+	try {
+		const result = await service.flushRecipient("parent").catch((error) => error);
+		expect(wake).toHaveBeenCalledWith("parent");
+		expect(result).toBe(1);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+		expect(pending("agent")).toHaveLength(1);
+		expect(await service.flushRecipient("parent")).toBe(0);
+		expect(wake).toHaveBeenCalledTimes(1);
+	} finally {
+		read.mockRestore();
+	}
+});
+
 describe("atomic background agent registration", () => {
 	const create = () =>
 		tasks.createAgentTask({
