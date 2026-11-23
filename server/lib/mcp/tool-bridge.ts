@@ -60,9 +60,26 @@ function createMcpToolDefinition(
 						parts.push(
 							`[image: ${item.mimeType ?? "image/png"}, ${item.data.length} bytes base64]`,
 						);
+					} else if (item.type === "audio" && item.data) {
+						parts.push(
+							`[audio: ${item.mimeType ?? "audio/wav"}, ${item.data.length} bytes base64]`,
+						);
 					} else if (item.type === "resource" && item.resource) {
-						const resource = item.resource as { uri?: string; text?: string };
-						parts.push(resource.text ?? `[resource: ${resource.uri ?? "unknown"}]`);
+						const resource = item.resource as {
+							uri?: string;
+							text?: string;
+							blob?: string;
+							mimeType?: string;
+						};
+						parts.push(
+							resource.text ??
+								`[resource: ${resource.uri ?? "unknown"}${resource.blob ? `, ${resource.mimeType ?? "application/octet-stream"}, ${resource.blob.length} bytes base64` : ""}]`,
+						);
+					} else if (item.type === "resource_link" && item.uri) {
+						const label = item.title ?? item.name;
+						parts.push(
+							`[resource link: ${label ? `${label} <${item.uri}>` : item.uri}${item.mimeType ? `, ${item.mimeType}` : ""}]`,
+						);
 					}
 				}
 				return { output: parts.join("\n\n") || "(no output)", isError: result.isError };

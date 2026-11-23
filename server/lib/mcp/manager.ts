@@ -108,6 +108,16 @@ interface ActiveClient {
 	refreshAgain?: boolean;
 }
 
+const MAX_STRUCTURED_CONTENT_CHARS = 100_000;
+
+/** Spec 2025-06-18+: structured results SHOULD be mirrored as text; serialize when a server omits it. */
+function structuredContentText(structured: unknown): string {
+	const json = JSON.stringify(structured) ?? "null";
+	return json.length > MAX_STRUCTURED_CONTENT_CHARS
+		? `${json.slice(0, MAX_STRUCTURED_CONTENT_CHARS)}\n[structured content truncated: ${json.length} chars]`
+		: json;
+}
+
 class McpManager {
 	private clients = new Map<string, ActiveClient>();
 	private _shuttingDown = false;
@@ -510,6 +520,9 @@ class McpManager {
 			data?: string;
 			mimeType?: string;
 			resource?: unknown;
+			uri?: string;
+			name?: string;
+			title?: string;
 		}>;
 		isError?: boolean;
 	}> {
@@ -538,12 +551,7 @@ class McpManager {
 			content:
 				result.content.length || result.structuredContent === undefined
 					? result.content
-					: [
-							{
-								type: "text",
-								text: "The MCP server returned structured content only (currently not displayed). The tool call has completed.",
-							},
-						],
+					: [{ type: "text", text: structuredContentText(result.structuredContent) }],
 			isError: result.isError,
 		};
 	}
