@@ -65,6 +65,7 @@ export interface RuntimeHistoryOptions {
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
+	deadline?: number;
 	preparation?: ModelHistoryPreparation;
 	/**
 	 * Optional tools whose presence follows session loading, and the currently loaded
@@ -218,6 +219,7 @@ export async function buildRuntimeHistory(
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
 			signal: options.attachmentSignal,
+			deadline: options.deadline,
 			preparation: options.preparation,
 		}));
 	checkBudget();
@@ -365,6 +367,7 @@ export async function buildRuntimeHistory(
 		// Receipt guards must compare the same bytes the model receives, especially
 		// grouped agent messages whose markers are inserted between item bodies.
 		modelMessages.map(projectMessageSenderForModel),
+		{ signal: options.attachmentSignal, deadlineAt: options.deadline },
 	);
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.

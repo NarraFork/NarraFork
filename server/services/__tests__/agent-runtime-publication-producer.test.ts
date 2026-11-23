@@ -10,6 +10,7 @@ import {
 	narrators,
 	runtimePublicationOutbox,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { MAILBOX_LIMITS as L } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
@@ -76,6 +77,40 @@ afterAll(() => {
 	publisher.stop();
 	sqlite.close();
 	mock.restore();
+});
+
+test("transferred terminal notice still wakes its idle recipient when Worker metadata fails", async () => {
+	const service = createRuntimePublicationService(db);
+	service.stop();
+	const wake = mock(() => {});
+	service.setWake(wake);
+	const run = {
+		producerKind: "agent" as const,
+		taskId: "child",
+		recipientId: "parent",
+		logicalRunId: "wake-failure",
+	};
+	service.store.reserveRunSlots(run);
+	service.store.commitIntent({
+		...run,
+		eventKind: "completed",
+		summary: "ready",
+		resultRef: "message:ready",
+	});
+	const read = spyOn(workerRead, "readQueryFirst").mockRejectedValueOnce(
+		new Error("metadata Worker unavailable"),
+	);
+	try {
+		const result = await service.flushRecipient("parent").catch((error) => error);
+		expect(wake).toHaveBeenCalledWith("parent");
+		expect(result).toBe(1);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(0);
+		expect(pending("agent")).toHaveLength(1);
+		expect(await service.flushRecipient("parent")).toBe(0);
+		expect(wake).toHaveBeenCalledTimes(1);
+	} finally {
+		read.mockRestore();
+	}
 });
 
 describe("atomic background agent registration", () => {
@@ -303,7 +338,7 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(runtimePublicationOutbox).all()[0].logicalRunId).toBe(
 			task.logicalRunId,
 		);
-		expect(publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
+		expect(await publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
 	});
 
 	test("101st Bash completion is terminal while full mailbox retains its intent and immutable source", async () => {
@@ -311,7 +346,7 @@ describe("real task producers use publication outbox", () => {
 		await startBash("last");
 		expect(await tasks.markCompleted("last", "complete result")).toBe(true);
 		expect((await tasks.getById("last"))?.status).toBe("completed");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(100);
 		const [intent] = db.select().from(runtimePublicationOutbox).all();
 		expect(intent.state).toBe("pending");
@@ -327,11 +362,11 @@ describe("real task producers use publication outbox", () => {
 		fill("bash");
 		await startBash("early");
 		await tasks.markCompleted("early", "earlier");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		mailbox.cancel(pending("bash")[0].deliveryId ?? "", "free one slot");
 		await startBash("late");
 		await tasks.markCompleted("late", "later");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		const fresh = pending("bash").filter((row) => row.metadataJson);
 		expect(fresh).toHaveLength(1);
 		expect(JSON.parse(fresh[0].metadataJson ?? "{}").taskId).toBe("early");
@@ -358,8 +393,8 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 		expect(await tasks.markCompleted("atomic", "output")).toBe(true);
 		expect(await tasks.markCompleted("atomic", "MUST NOT REPLACE")).toBe(false);
-		publisher.flushRecipient("parent");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(1);
 		expect((await tasks.getById("atomic"))?.output).toBe("output");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
@@ -374,7 +409,7 @@ describe("real task producers use publication outbox", () => {
 		if (status === "failed") await tasks.markFailed(status, "failure");
 		if (status === "timeout") await tasks.markTimedOut(status, "deadline");
 		if (status === "cancelled") await tasks.markCancelled(status);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(JSON.parse(pending("bash")[0].metadataJson ?? "{}").eventKind).toBe(
 			status === "timeout" ? "timed_out" : status,
 		);
@@ -425,7 +460,7 @@ describe("real task producers use publication outbox", () => {
 		}).publication!;
 		expect(restored).toEqual(second);
 		await tasks.markCompleted("child", "second result");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("agent").map((row) => JSON.parse(row.metadataJson ?? "{}").eventKind)).toEqual([
 			"completed",
 			"started",
@@ -444,8 +479,8 @@ describe("real task producers use publication outbox", () => {
 		await startBash("recovered");
 		await tasks.markCompleted("recovered", "durable");
 		const restartedWorker = createRuntimePublicationService(db);
-		expect(restartedWorker.flushPage()).toBe(true);
-		expect(restartedWorker.flushPage()).toBe(false);
+		expect(await restartedWorker.flushPage()).toBe(true);
+		expect(await restartedWorker.flushPage()).toBe(false);
 		expect(pending("bash")).toHaveLength(1);
 		expect(db.select().from(backgroundTasks).all()).toHaveLength(1);
 		restartedWorker.stop();
@@ -533,13 +568,57 @@ describe("real task producers use publication outbox", () => {
 			.where(eq(backgroundTasks.id, "retained"))
 			.run();
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
 		db.update(narratorBufferedMessages)
 			.set({ state: "materialized", adoptedAt: new Date().toISOString() })
 			.run();
 		expect(await tasks.cleanupCompleted(0)).toBe(1);
 	});
+
+	for (const changed of ["status", "publication"] as const)
+		test(`retention rejects a concurrent ${changed} change after its Worker observation`, async () => {
+			await startBash("retained");
+			await tasks.markCompleted("retained", "result");
+			await publisher.flushRecipient("parent");
+			db.update(backgroundTasks)
+				.set({ completedAt: time })
+				.where(eq(backgroundTasks.id, "retained"))
+				.run();
+			db.update(narratorBufferedMessages).set({ state: "materialized", adoptedAt: time }).run();
+			const original = workerRead.readDbAll;
+			let injected = false;
+			const probe = spyOn(workerRead, "readDbAll").mockImplementation(
+				async <T = Record<string, unknown>>(
+					source: Parameters<typeof workerRead.readDbAll>[0],
+					query: Parameters<typeof workerRead.readDbAll>[1],
+					options?: workerRead.ReadQueryOptions,
+				): Promise<T[]> => {
+					const row = await original<T>(source, query, options);
+					if (!injected) {
+						expect(row[0]).toHaveProperty("pending", 0);
+						injected = true;
+						if (changed === "status")
+							db.update(backgroundTasks)
+								.set({ status: "running" })
+								.where(eq(backgroundTasks.id, "retained"))
+								.run();
+						else db.update(narratorBufferedMessages).set({ adoptedAt: null }).run();
+					}
+					return row;
+				},
+			);
+			try {
+				const error = await tasks.cleanupCompleted(0).catch((error) => error);
+				expect(injected).toBe(true);
+				expect(error).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+				expect(
+					db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "retained")).get()?.status,
+				).toBe(changed === "status" ? "running" : "completed");
+			} finally {
+				probe.mockRestore();
+			}
+		});
 
 	test("quota rejection happens before creating a new task or consuming arrival sequence", async () => {
 		// Build the quota fixture through the real reservation primitive in one transaction.

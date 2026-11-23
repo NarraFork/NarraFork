@@ -163,7 +163,7 @@ afterEach(async () => {
 	await flushDeltas();
 	cleanDb(sqlite);
 	// An emptied case cannot leave an outbox page cursor positioned in the next case.
-	runtimePublication.flushPage();
+	await runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";

@@ -392,7 +392,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 
 	test("busy subagent changes mailbox provenance only when after-tools input is consumed", async () => {
 		const { active, owner, run } = await reasoningIdleFixture("subagent");
-		const consumed = mock(() => {});
+		const consumed = mock(async () => {});
 		const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory");
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
@@ -411,7 +411,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				const input = await options.config.getAfterToolsInjections?.();
 				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
 				expect(await options.config.hasPendingWake?.()).toBe(step.before);
-				input.onConsumed?.();
+				await input.onConsumed?.();
 				expect(await options.config.hasPendingWake?.()).toBe(step.after);
 				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
 				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);

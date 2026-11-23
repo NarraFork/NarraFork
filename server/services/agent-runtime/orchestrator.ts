@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { readQueryFirst } from "@server/db/worker-read";
 import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
@@ -59,7 +60,6 @@ import {
 	isBotNarrator,
 	isPlanModeTrait,
 	isTeamNarrator,
-	parseSubstatus,
 	redactDraftTraits,
 } from "../../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
@@ -263,6 +263,7 @@ import { trackCommunicationWork } from "./async-work";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { type CheckpointStop, isCheckpointStop } from "./checkpoint-stop";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
+import { createRuntimeFinalizationReads } from "./finalization-reads";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
@@ -1197,11 +1198,18 @@ export async function runAgentLoopUnlocked(
 					)
 						managedOptionalTools.add(tool.name);
 				}
-				const [latestNarrator] = await db
-					.select({ enabledTools: narrators.enabledTools })
-					.from(narrators)
-					.where(eq(narrators.id, narratorId))
-					.limit(1);
+				const latestNarrator = await readQueryFirst(
+					db
+						.select({ enabledTools: narrators.enabledTools })
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal: active.abortController.signal,
+					},
+				);
 				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
@@ -1751,10 +1759,14 @@ export async function runAgentLoopUnlocked(
 						});
 						return { titleUpdate: false };
 					}
-					const n = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { title: true },
-					});
+					const n = await readQueryFirst(
+						db.query.narrators.findMany({
+							limit: 1,
+							where: eq(narrators.id, narratorId),
+							columns: { title: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					// `messageCount` is the real message count, not a turn count, so it is
 					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
@@ -2244,26 +2256,29 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
 							? afterToolsInput.mailbox
 							: isLastModelInputMailbox(history, content);
-					consumeAgentMessageHistory(history);
+					void trackCommunicationWork(consumeAgentMessageHistory(history));
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, placement);
 					return {
 						...input,
-						onConsumed: () => {
-							input.onConsumed();
+						onConsumed: async () => {
+							await input.onConsumed();
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can
@@ -3836,20 +3851,8 @@ export async function runAgentLoopUnlocked(
 				});
 			} else {
 				try {
-					const fresh = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { pendingModelRestore: true },
-					});
-					if (fresh?.pendingModelRestore) {
-						const restoreModel = fresh.pendingModelRestore;
-						await db
-							.update(narrators)
-							.set({
-								model: restoreModel,
-								pendingModelRestore: null,
-								updatedAt: new Date().toISOString(),
-							})
-							.where(eq(narrators.id, narratorId));
+					const restoreModel = await createRuntimeFinalizationReads(db).restoreModel(narratorId);
+					if (restoreModel) {
 						updateNarratorModel(narratorId, restoreModel);
 						// The primary active is already marked dead above, so the live
 						// updater only propagates to followers; still publish this DB restore.
@@ -3963,16 +3966,13 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const leftover = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { substatus: true },
-					});
-					const tags = parseSubstatus(leftover?.substatus);
-					if (tags.includes("reflecting") || tags.includes("reasoning")) {
-						await narratorService.updateSubstatus(
-							narratorId,
-							tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
-						);
+					const substatus =
+						await createRuntimeFinalizationReads(db).clearTransientSubstatus(narratorId);
+					if (substatus) {
+						(
+							await import("../background-occupancy-store")
+						).backgroundOccupancyStore.refreshNarrator(narratorId);
+						broadcastToNarrator(narratorId, { type: "substatus_change", narratorId, substatus });
 					}
 				} catch (err) {
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {

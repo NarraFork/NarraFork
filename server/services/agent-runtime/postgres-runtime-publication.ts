@@ -125,6 +125,7 @@ import {
 	decodeRunAssistantProjection,
 	parseRunSourceBoundary,
 } from "./publication-result";
+import { assertRuntimeSourceUnchanged } from "./read-conflict";
 import type { PgRuntimeTx, RuntimeQueuePort } from "./runtime-queue-port";
 import { translateWriteError } from "./runtime-write";
 
@@ -589,9 +590,12 @@ export function createPostgresRuntimePublication(
 		// remains in its existing source; later semantic edits must not change this receipt.
 		const originalBytes = Buffer.byteLength(text);
 		const preview = text.slice(0, 12_001);
-		const storedText = new TextDecoder().decode(Buffer.from(preview).subarray(0, snapshotBytes), {
-			stream: true,
-		});
+		const storedText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+			Buffer.from(preview).subarray(0, snapshotBytes),
+			{
+				stream: true,
+			},
+		);
 		const truncated = originalBytes > Buffer.byteLength(storedText);
 		const message: RefMessageInput = {
 			id: messageId,
@@ -854,6 +858,18 @@ export function createPostgresRuntimePublication(
 			if (input.taskRow && !input.binding.deliverTo)
 				throw new ValidationError("Background task registration requires a delivery destination");
 			return runComposite("publication.startRun", async (tx) => {
+				if (input.expectedSource) {
+					const [source] = await tx
+						.select({
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							ownerUserId: narrators.ownerUserId,
+							policySourceNarratorId: narrators.policySourceNarratorId,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRuntimeSourceUnchanged(input.expectedSource, source);
+				}
 				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
 				if ((input.taskRow || input.adoptRegisteredRun) && recipientId) {

@@ -20,9 +20,12 @@ import {
 } from "../../lib/search/execution-scope";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-// Share the preload-isolated file-backed DB with the real prefix/history workers.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Context now imports publication services; load it only after binding the isolated DB.
 const { createRuntimeEventContext } = await import("../agent-runtime/context");
@@ -100,8 +103,10 @@ afterEach(() => {
 	mock.restore();
 });
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	(await import("../agent-runtime/publication")).stopRuntimePublications();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	unregisterProvider();
+	mock.module("../../db", () => realDb);
 });
 
 function active(narratorId: string): ActiveNarrator {
@@ -1175,7 +1180,9 @@ describe("the run service owns the entire finalization", () => {
 			expect((await handle.terminal).hasError).toBe(true);
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			// Not consumed by the failing run and not auto-woken past the failure.
-			expect(bufferModule.getBufferedMessages(CHILD).map((m) => m.text)).toEqual(["keep me"]);
+			expect((await bufferModule.getBufferedMessages(CHILD)).map((m) => m.text)).toEqual([
+				"keep me",
+			]);
 			expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(0);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 		} finally {
@@ -1191,10 +1198,10 @@ describe("the run service owns the entire finalization", () => {
 		if (!current) throw new Error("expected successor");
 		const accepted = await bufferModule.enqueueBufferedMessage(CHILD, "keep me");
 		expect(accepted.ok).toBe(true);
-		const queued = bufferModule.getBufferedMessages(CHILD);
+		const queued = await bufferModule.getBufferedMessages(CHILD);
 		try {
 			expect(old.release()).toBe(false);
-			expect(bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
+			expect(await bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
 			expect(getExecutionOwner(CHILD)).toBe(current);
 		} finally {
 			await bufferModule.clearBufferedMessages(CHILD);

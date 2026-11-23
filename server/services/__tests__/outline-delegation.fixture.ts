@@ -136,7 +136,7 @@ export function installDelegationHarness(): void {
 		settings.agent.subagentAllowedModels = originalAllowedModels;
 		for (const id of narratorIds) {
 			setRunHold(id, undefined);
-			drainPendingInjections(id);
+			await drainPendingInjections(id);
 			clearAliasRegistry(id);
 			activeNarrators.delete(id);
 		}

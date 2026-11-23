@@ -1,21 +1,15 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { openSchemaCopyInMemory } from "../../../tests/sqlite-schema-image";
-import * as relations from "../../db/relations";
+import { cleanDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
 import type { AgentConfig, ToolCallBinding } from "../../lib/agent/types";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
 // Copy the fully migrated isolated test schema, including generated columns and
 // partial indexes. Reconstructing columns alone is not a real startup fixture.
 const realDbModule = { ...(await import("../../db")) };
-const sqlite = openSchemaCopyInMemory(realDbModule.sqlite);
-const tables = sqlite
-	.query<{ name: string }, []>(
-		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 2048",
-	)
-	.all();
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { executeTool } = await import("../../lib/agent/tool-executor");
 const { requestPermissionRuleTool } = await import("../../lib/agent/tools/request-permission-rule");
@@ -27,14 +21,14 @@ const previousTool = toolRegistry.get("RequestPermissionRule");
 toolRegistry.register(requestPermissionRuleTool);
 let sequence = 0;
 beforeEach(() => {
-	for (const { name } of tables) sqlite.run(`DELETE FROM "${name.replaceAll('"', '""')}"`);
+	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
 	toolRegistry.unregister("RequestPermissionRule");
 	if (previousTool) toolRegistry.register(previousTool);
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 async function fixture(
 	status: "pending" | "approved" | "applied" | "alreadyExists" = "approved",

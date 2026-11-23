@@ -14,13 +14,15 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { parseTraits } from "../../lib/narrator-utils";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 // Snapshot the real db module before mocking: Bun's mock.module is process-wide and
 // mock.restore() does not undo it, so this FTS-less test db would otherwise leak into
 // later real-db suites.
@@ -105,10 +107,10 @@ afterEach(() => {
 	clearAliasRegistry(PARENT_ID);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await closeRuntimeTestDb(sqlite);
 });
 
 describe("markRecoveryOffered", () => {

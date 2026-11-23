@@ -10,6 +10,27 @@ import { runDomainRead } from "./domain-task-registry";
 import { ReadBudgetMeter } from "./read-budget";
 
 describe("registered database read domains", () => {
+	test("publication terminal reads require an explicit block-read switch", () => {
+		const run = {
+			producerKind: "agent" as const,
+			taskId: "actor",
+			recipientId: "parent",
+			logicalRunId: "run",
+		};
+		for (const fromBlocks of [false, true])
+			expect(
+				createDomainReadParams("publicationTerminalResult", { run, fromBlocks }).input,
+			).toEqual({ run, fromBlocks });
+		for (const fromBlocks of [undefined, null, "false", 1])
+			expect(() =>
+				validateDomainRead({
+					kind: "domainRead",
+					task: "publicationTerminalResult",
+					input: { run, fromBlocks: fromBlocks as never },
+				}),
+			).toThrow();
+	});
+
 	test("knowledge and recall inputs bound identifiers, shape and result windows", () => {
 		const input = { narratorId: "n", messageId: null, limit: 50 };
 		expect(createDomainReadParams("recallConversation", input).input).toEqual(input);

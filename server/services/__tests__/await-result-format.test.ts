@@ -1,12 +1,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-// Use a functional in-memory test db rather than empty stubs. Bun's mock.module
+// Use a functional test db rather than empty stubs. Bun's mock.module
 // is process-global and leaks to later suites, so empty stubs ({}) would make
 // `db.insert`/`db.delete` undefined in every subsequently-loaded real-db test.
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -40,7 +42,7 @@ beforeEach(async () => {
 	await backgroundOccupancyStore.start();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	runtimePublication.stop();
 	runtimePublication.setWake(async (narratorId) => {
 		await wakeInboxIfEligible(narratorId);
@@ -48,6 +50,7 @@ afterAll(() => {
 	backgroundOccupancyStore.resetForTests();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await closeRuntimeTestDb(sqlite);
 });
 
 afterEach(async () => {

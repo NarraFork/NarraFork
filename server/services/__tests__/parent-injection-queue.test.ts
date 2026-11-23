@@ -21,10 +21,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 import type { ParentInboundMessage } from "../parent-inbound-queue";
@@ -130,8 +132,8 @@ beforeEach(() => {
 			.values({ id, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
 			.run();
 });
-afterAll(() => {
-	sqlite.close();
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 });
 
 describe("parent injection queue — order across kinds", () => {

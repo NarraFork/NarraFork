@@ -122,7 +122,7 @@ afterEach(async () => {
 	for (const release of pendingReleases.splice(0)) release();
 	state.activeNarrators.clear();
 	for (const owner of runOwners.splice(0)) owner.release();
-	drainPendingInjections(ROOT);
+	await drainPendingInjections(ROOT);
 	mock.restore();
 });
 
