@@ -365,7 +365,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 === Source 19 ===
 Module: github.com/pion/webrtc/v4
-Version: v4.2.26
+Version: v4.2.27
 Upstream: https://github.com/pion/webrtc
 Source file: LICENSE
 License / notice: MIT
@@ -441,7 +441,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 === Source 23 ===
 Module: github.com/pion/datachannel
-Version: v1.6.3
+Version: v1.6.4
 Upstream: https://github.com/pion/datachannel
 Source file: LICENSE
 License / notice: MIT
@@ -450,7 +450,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 24 ===
 Module: github.com/pion/dtls/v3
-Version: v3.1.15
+Version: v3.1.16
 Upstream: https://github.com/pion/dtls
 Source file: LICENSE
 License / notice: MIT
@@ -459,7 +459,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 25 ===
 Module: github.com/pion/ice/v4
-Version: v4.4.8
+Version: v4.4.9
 Upstream: https://github.com/pion/ice
 Source file: LICENSE
 License / notice: MIT
@@ -570,7 +570,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 === Source 31 ===
 Module: github.com/pion/sctp
-Version: v1.12.0
+Version: v1.12.1
 Upstream: https://github.com/pion/sctp
 Source file: LICENSE
 License / notice: MIT
@@ -619,7 +619,7 @@ Source SHA-256: a432957d21745499063512eb345d76bac3fbdeeeba8c8480e0001c9d5755b2b0
 
 === Source 36 ===
 Module: github.com/pion/transport/v5
-Version: v5.1.4
+Version: v5.1.5
 Upstream: https://github.com/pion/transport
 Source file: LICENSE
 License / notice: MIT AND BSD-3-Clause
@@ -628,7 +628,7 @@ Verbatim text: see Source 19 (byte-identical original, including attribution).
 
 === Source 37 ===
 Module: github.com/pion/transport/v5
-Version: v5.1.4
+Version: v5.1.5
 Upstream: https://github.com/pion/transport
 Source file: utils/xor/xor_generic.go:1-4 (verbatim source notice)
 License / notice: BSD-3-Clause; full Go license reproduced in the Go standard-library section
