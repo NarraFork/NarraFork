@@ -35,6 +35,7 @@ import {
 	IconChevronRight,
 	IconDownload,
 	IconEye,
+	IconKey,
 	IconPencil,
 	IconPlug,
 	IconPlus,
@@ -70,6 +71,7 @@ import {
 	useUpdateHook,
 } from "../../hooks/useHooks";
 import {
+	useAuthorizeMcpServer,
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
@@ -77,6 +79,7 @@ import {
 	useMcpServers,
 	useRefreshAllMcpServers,
 	useRefreshMcpServer,
+	useSignOutMcpServer,
 	useTestMcpConnection,
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
@@ -1956,6 +1959,13 @@ interface McpServerDraft {
 	url: string;
 	env: McpSecretDraftEntry[];
 	headers: McpSecretDraftEntry[];
+	oauthClientId: string;
+	oauthScope: string;
+	/** New OAuth client secret; empty keeps the saved one. Never filled from the server. */
+	oauthClientSecret: string;
+	hasOAuthClientSecret: boolean;
+	/** URL and client id the saved secret belongs to; changing either drops it. */
+	oauthSecretBinding: string;
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
 	mode: McpLoadingMode;
@@ -1968,6 +1978,19 @@ interface McpToolPermissionDraft {
 	enabled?: boolean;
 }
 
+/** Whether saving keeps the stored client secret: it belongs to one URL + pre-registered client. */
+function keepsOAuthClientSecret(d: McpServerDraft): boolean {
+	return (
+		d.hasOAuthClientSecret &&
+		!!d.oauthClientId.trim() &&
+		oauthSecretBindingOf(d) === d.oauthSecretBinding
+	);
+}
+
+function oauthSecretBindingOf(d: Pick<McpServerDraft, "url" | "oauthClientId">): string {
+	return `${normalizeUrlProtocol(d.url) ?? ""}\n${d.oauthClientId.trim()}`;
+}
+
 const EMPTY_DRAFT: McpServerDraft = {
 	name: "",
 	transport: "stdio",
@@ -1977,6 +2000,11 @@ const EMPTY_DRAFT: McpServerDraft = {
 	url: "",
 	env: [],
 	headers: [],
+	oauthClientId: "",
+	oauthScope: "",
+	oauthClientSecret: "",
+	hasOAuthClientSecret: false,
+	oauthSecretBinding: "",
 	originalEnvKeys: [],
 	originalHeaderKeys: [],
 	mode: "auto",
@@ -2060,6 +2088,8 @@ function McpToolsTab() {
 	const deleteMutation = useDeleteMcpServer();
 	const connectMutation = useConnectMcpServer();
 	const refreshMutation = useRefreshMcpServer();
+	const authorizeMcp = useAuthorizeMcpServer();
+	const signOutMutation = useSignOutMcpServer();
 	const refreshAllMutation = useRefreshAllMcpServers();
 	const testMutation = useTestMcpConnection();
 
@@ -2096,7 +2126,10 @@ function McpToolsTab() {
 				return;
 			}
 			setJsonError(null);
-			setDraft(result.draft);
+			const next = result.draft;
+			// The JSON view hides the secret field, so a typed secret must not follow a new client.
+			const sameClient = oauthSecretBindingOf(next) === oauthSecretBindingOf(draft);
+			setDraft(sameClient ? next : { ...next, oauthClientSecret: "" });
 		},
 		[draft],
 	);
@@ -2192,6 +2225,8 @@ function McpToolsTab() {
 			url?: string;
 			envKeys?: string[];
 			headerKeys?: string[];
+			oauth?: { clientId?: string; scope?: string };
+			auth?: { hasClientSecret: boolean };
 			mode?: McpLoadingMode;
 			enabled?: boolean;
 			defaultBehavior?: string;
@@ -2211,6 +2246,11 @@ function McpToolsTab() {
 				url: server.url ?? "",
 				env: createPreservedMcpSecretEntries(envKeys),
 				headers: createPreservedMcpSecretEntries(headerKeys),
+				oauthClientId: server.oauth?.clientId ?? "",
+				oauthScope: server.oauth?.scope ?? "",
+				oauthClientSecret: "",
+				hasOAuthClientSecret: server.auth?.hasClientSecret ?? false,
+				oauthSecretBinding: `${server.url ?? ""}\n${server.oauth?.clientId ?? ""}`,
 				originalEnvKeys: [...envKeys],
 				originalHeaderKeys: [...headerKeys],
 				mode: resolveMcpLoadingMode(server),
@@ -2235,8 +2275,20 @@ function McpToolsTab() {
 				.map((a) => a.trim())
 				.filter(Boolean);
 			if (d.cwd.trim()) payload.cwd = d.cwd.trim();
+			if (includeClears) payload.oauth = null;
+			if (d.hasOAuthClientSecret) payload.oauthClientSecret = null;
 		} else {
 			payload.url = normalizeUrlProtocol(d.url) ?? "";
+			const clientId = d.oauthClientId.trim();
+			const scope = d.oauthScope.trim();
+			if (clientId || scope) {
+				payload.oauth = { ...(clientId && { clientId }), ...(scope && { scope }) };
+			} else if (includeClears) {
+				payload.oauth = null;
+			}
+			if (clientId && d.oauthClientSecret) payload.oauthClientSecret = d.oauthClientSecret;
+			else if (d.hasOAuthClientSecret && !keepsOAuthClientSecret(d))
+				payload.oauthClientSecret = null;
 		}
 
 		if (includeClears) {
@@ -2436,6 +2488,17 @@ function McpToolsTab() {
 									<Badge size="xs" variant="outline">
 										{server.transport}
 									</Badge>
+									{server.auth?.authorized ? (
+										<Badge size="xs" variant="light" color="teal">
+											{t("mcpOAuthAuthorized")}
+										</Badge>
+									) : (
+										server.auth?.required && (
+											<Badge size="xs" variant="light" color="orange">
+												{t("mcpOAuthRequired")}
+											</Badge>
+										)
+									)}
 									{server.status === "connected" && (
 										<Text size="xs" c="dimmed">
 											{t("mcpToolCount", { count: server.tools.length })}
@@ -2489,6 +2552,31 @@ function McpToolsTab() {
 									>
 										<IconRefresh size={14} />
 									</ActionIcon>
+									{server.auth?.supported && (
+										<Button
+											variant={server.auth.required ? "light" : "subtle"}
+											color={server.auth.required ? "orange" : undefined}
+											size="compact-xs"
+											leftSection={<IconKey size={12} />}
+											disabled={!mcpServerManagementSupported}
+											loading={authorizeMcp.isPending && authorizeMcp.pendingId === server.id}
+											onClick={() => authorizeMcp.authorize(server.id)}
+										>
+											{server.auth.authorized ? t("mcpOAuthReauthorize") : t("mcpOAuthAuthorize")}
+										</Button>
+									)}
+									{server.auth?.authorized && (
+										<Button
+											variant="subtle"
+											color="gray"
+											size="compact-xs"
+											disabled={!mcpServerManagementSupported}
+											loading={signOutMutation.isPending && signOutMutation.variables === server.id}
+											onClick={() => signOutMutation.mutate(server.id)}
+										>
+											{t("mcpOAuthSignOut")}
+										</Button>
+									)}
 									<Button
 										variant="subtle"
 										size="compact-xs"
@@ -2793,6 +2881,51 @@ function McpToolsTab() {
 												</ActionIcon>
 											</Group>
 										))}
+									</div>
+									{/* OAuth (MCP authorization) */}
+									<div>
+										<Text size="sm" fw={500}>
+											{t("mcpOAuth")}
+										</Text>
+										<Text size="xs" c="dimmed" mb={4}>
+											{t("mcpOAuthDesc")}
+										</Text>
+										<Group gap="xs" grow>
+											<TextInput
+												size="xs"
+												label={t("mcpOAuthClientId")}
+												value={draft.oauthClientId}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthClientId: val }));
+												}}
+											/>
+											<TextInput
+												size="xs"
+												label={t("mcpOAuthScope")}
+												value={draft.oauthScope}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthScope: val }));
+												}}
+											/>
+										</Group>
+										{draft.oauthClientId.trim() && (
+											<TextInput
+												size="xs"
+												mt={4}
+												type="password"
+												label={t("mcpOAuthClientSecret")}
+												placeholder={
+													keepsOAuthClientSecret(draft) ? t("mcpSecretUnchanged") : undefined
+												}
+												value={draft.oauthClientSecret}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthClientSecret: val }));
+												}}
+											/>
+										)}
 									</div>
 								</>
 							)}

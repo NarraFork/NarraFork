@@ -462,6 +462,23 @@ function mcpOAuthRedirectUrl(c: Context): string {
 	return `${resolvePublicOrigin(c).origin}${MCP_OAUTH_CALLBACK_PATH}`;
 }
 
+/**
+ * The callback URL the browser asked for, which carries the proxy prefix NarraFork is mounted
+ * under; accepted only on the same origin and ending in the callback path.
+ */
+export function requestedMcpOAuthRedirectUrl(c: Context, requested: unknown): string {
+	const fallback = mcpOAuthRedirectUrl(c);
+	if (typeof requested !== "string") return fallback;
+	try {
+		const url = new URL(requested);
+		if (url.origin !== new URL(fallback).origin) return fallback;
+		if (!url.pathname.endsWith(MCP_OAUTH_CALLBACK_PATH) || url.search || url.hash) return fallback;
+		return url.href;
+	} catch {
+		return fallback;
+	}
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -474,7 +491,9 @@ mcpRoutes.post("/servers/:id/oauth/start", requireAdmin, async (c) => {
 	const config = findMcpServer(c.req.param("id") ?? "");
 	if (!config) return c.json({ error: "Not found" }, 404);
 	try {
-		const result = await startMcpOAuth(config, mcpOAuthRedirectUrl(c));
+		const body = (await c.req.json().catch(() => ({}))) as { redirectUrl?: unknown } | null;
+		const redirectUrl = requestedMcpOAuthRedirectUrl(c, body?.redirectUrl);
+		const result = await startMcpOAuth(config, redirectUrl);
 		if ("authorized" in result && config.enabled) await mcpManager.connect(config);
 		return c.json(result);
 	} catch (error) {
@@ -507,7 +526,7 @@ function escapeHtml(text: string): string {
 
 function callbackPage(c: Context, ok: boolean, message: string) {
 	const title = ok ? "MCP authorization complete" : "MCP authorization failed";
-	const body = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;padding:2rem"><h1>${title}</h1><p>${escapeHtml(message)}</p>${ok ? "<script>setTimeout(()=>window.close(),1500)</script>" : ""}</body></html>`;
+	const body = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;padding:2rem"><h1>${title}</h1><p>${escapeHtml(message)}</p><p><a href="../../../routines">Back to NarraFork</a></p>${ok ? '<script>setTimeout(()=>{window.close();location.replace("../../../routines")},1500)</script>' : ""}</body></html>`;
 	c.header("Cache-Control", "no-store");
 	c.header("Referrer-Policy", "no-referrer");
 	return c.html(body, ok ? 200 : 400);
