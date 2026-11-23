@@ -221,8 +221,11 @@ describe("floating overlays above the WCO drag surface", () => {
 			/html\[data-nf-wco\] \.nf-wco-top-gap \{[^}]*height: var\(--mantine-spacing-md\)[^}]*-webkit-app-region: drag/,
 		);
 		expect(desktop).toMatch(
-			/html\[data-nf-wco\] \.nf-app-shell:has\(\[data-nf-wco-titlebar\]\) \.nf-wco-top-gap \{\s*display: none/,
+			/html\[data-nf-wco\]\[data-nf-wco-titlebar-page\] \.nf-wco-top-gap \{\s*display: none/,
 		);
+		// `:has()` over the shell re-matched on every node the session list inserted and
+		// restyled the whole page per scroll step; the page attribute lives on <html>.
+		expect(css.replace(/\/\*[\s\S]*?\*\//g, "")).not.toMatch(/:has\(/);
 		expect(css).not.toMatch(/mantine-AppShell-navbar[^{]*\{[^}]*padding-top: 0/);
 		// The navbar's inline padding leaves a dead column down the window's left edge.
 		// The brand row bleeds over it, keeping its content in place.

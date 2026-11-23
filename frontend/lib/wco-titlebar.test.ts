@@ -43,9 +43,7 @@ describe("WCO title-bar rows", () => {
 		const voidRule = css.match(/\[data-nf-titlebar-row\] \.dv-void-container \{[^}]*\}/)?.[0];
 		expect(voidRule).toContain("-webkit-app-region: drag");
 		expect(voidRule).toContain("-webkit-user-drag: none");
-		expect(css).toMatch(
-			/:has\(\[data-nf-wco-titlebar\]\) \.nf-wco-main-strip \{[^}]*display: none/,
-		);
+		expect(css).toMatch(/\[data-nf-wco-titlebar-page\] \.nf-wco-main-strip \{[^}]*display: none/);
 		const page = await Bun.file(
 			new URL("../routes/narrators/$narratorId.tsx", import.meta.url),
 		).text();
