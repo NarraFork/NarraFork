@@ -736,6 +736,20 @@ function withCachedRuntimeFields(
 	};
 }
 
+export async function refreshRecentTabsAfterReconnect(qc: QueryClient): Promise<void> {
+	try {
+		await refreshRecentTabsLoadedWindow(qc);
+	} finally {
+		await qc.refetchQueries(
+			{
+				queryKey: RECENT_TABS_QUERY_KEY,
+				predicate: (query) => query.state.status === "error",
+			},
+			{ throwOnError: true },
+		);
+	}
+}
+
 export function refreshRecentTabsLoadedWindow(
 	qc: QueryClient,
 	options: { reset?: boolean; minimumRevision?: number } = {},
