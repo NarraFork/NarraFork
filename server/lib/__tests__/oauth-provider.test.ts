@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -11,6 +11,7 @@ import {
 	oauthGrants,
 	users,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { captureWorkerRejectionThrower } from "../../services/__tests__/narrator-worker-fixture";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant, revokeOAuthGrantForUser } from "../../services/oauth-grant-service";
@@ -251,6 +252,59 @@ describe("oauth-provider authorization codes", () => {
 });
 
 describe("oauth-provider code exchange (PKCE)", () => {
+	for (const mode of ["exchange", "refresh"] as const) {
+		test(`${mode} does not require another Worker client lookup after consumption`, async () => {
+			await ensureClient();
+			const issued = await issueCode();
+			const exchange = () =>
+				exchangeCodeForToken({
+					code: issued.code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: issued.verifier,
+				});
+			const initial = mode === "refresh" ? await exchange() : null;
+			const original = workerRead.readQueryFirst;
+			const read = spyOn(workerRead, "readQueryFirst").mockImplementation(async (...args) => {
+				const consumed =
+					mode === "exchange"
+						? db
+								.select()
+								.from(oauthAuthorizationCodes)
+								.where(eq(oauthAuthorizationCodes.id, issued.row!.id))
+								.get()?.consumedAt
+						: db
+								.select()
+								.from(oauthAccessTokens)
+								.where(
+									eq(oauthAccessTokens.refreshTokenHash, hashOAuthSecret(initial!.refreshToken)),
+								)
+								.get()?.refreshUsedAt;
+				if (consumed && args[0].toSQL().sql.includes("oauth_clients"))
+					throw new Error("reader failed after credential consumption");
+				return original(...args);
+			});
+			let error: unknown;
+			let pair: Awaited<ReturnType<typeof exchangeCodeForToken>> | undefined;
+			try {
+				pair =
+					mode === "exchange"
+						? await exchange()
+						: await refreshAccessToken({
+								clientId: CLIENT_ID,
+								refreshToken: initial!.refreshToken,
+							});
+			} catch (caught) {
+				error = caught;
+			} finally {
+				read.mockRestore();
+			}
+			expect(error).toBeUndefined();
+			expect(pair?.accessToken).toStartWith("nfat_");
+			expect(pair && (await validateAccessToken(pair.accessToken))).toBeTruthy();
+		});
+	}
+
 	test("exchanges a code for access + refresh tokens with the correct verifier", async () => {
 		await ensureClient();
 		const { code, verifier } = await issueCode({ scopes: ["device.provision"] });

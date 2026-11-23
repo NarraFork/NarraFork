@@ -453,6 +453,10 @@ export interface IssueTokenPairInput {
 
 /** Persist one access+refresh pair and return the plaintext tokens. */
 export async function issueTokenPair(input: IssueTokenPairInput): Promise<OAuthTokenPair> {
+	return persistTokenPair(input, await resolveTokenPairAuthority(input));
+}
+
+async function resolveTokenPairAuthority(input: IssueTokenPairInput) {
 	const client = await requireActiveClient(input.clientId);
 	if (input.oauthClientId && input.oauthClientId !== client.id) {
 		throw new OAuthError("invalid_client", "OAuth client binding does not match client_id");
@@ -474,6 +478,13 @@ export async function issueTokenPair(input: IssueTokenPairInput): Promise<OAuthT
 		scopes = intersectScopes(scopes, grant.scopes);
 	}
 
+	return { oauthClientId, grantId, scopes };
+}
+
+async function persistTokenPair(
+	input: IssueTokenPairInput,
+	{ oauthClientId, grantId, scopes }: Awaited<ReturnType<typeof resolveTokenPairAuthority>>,
+): Promise<OAuthTokenPair> {
 	const accessToken = `nfat_${base64url(randomBytes(32))}`;
 	const refreshToken = `nfrt_${base64url(randomBytes(32))}`;
 	const now = Date.now();
@@ -569,6 +580,15 @@ export async function exchangeCodeForToken(input: ExchangeCodeInput): Promise<OA
 		});
 	}
 
+	const tokenInput: IssueTokenPairInput = {
+		clientId: row.clientId,
+		oauthClientId: row.oauthClientId ?? client.id,
+		grantId: row.grantId,
+		userId: row.userId,
+		scopes: row.scopes,
+	};
+	const authority = await resolveTokenPairAuthority(tokenInput);
+
 	// Consume with a compare-and-set before checking the verifier. Exactly one
 	// concurrent exchange can win, and a bad verifier still burns the code.
 	const [consumed] = await db
@@ -584,13 +604,7 @@ export async function exchangeCodeForToken(input: ExchangeCodeInput): Promise<OA
 		throw new OAuthError("invalid_grant", "code_verifier does not match code_challenge");
 	}
 
-	return issueTokenPair({
-		clientId: row.clientId,
-		oauthClientId: row.oauthClientId ?? client.id,
-		grantId: row.grantId,
-		userId: row.userId,
-		scopes: row.scopes,
-	});
+	return persistTokenPair(tokenInput, authority);
 }
 
 export interface RefreshAccessTokenInput {
@@ -693,6 +707,17 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 		grantId: row.grantId,
 	});
 
+	const tokenInput: IssueTokenPairInput = {
+		clientId: row.clientId,
+		oauthClientId: row.oauthClientId ?? client.id,
+		grantId: row.grantId,
+		userId: row.userId,
+		scopes: row.scopes,
+		refreshFamilyId: familyId,
+		refreshParentTokenId: row.id,
+		refreshFamilyExpiresAt: familyExpiresAt,
+	};
+	const authority = await resolveTokenPairAuthority(tokenInput);
 	const consumedAt = new Date().toISOString();
 	const [consumed] = await db
 		.update(oauthAccessTokens)
@@ -719,16 +744,7 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 		reasonCode: "refresh_rotated",
 	});
 
-	return issueTokenPair({
-		clientId: row.clientId,
-		oauthClientId: row.oauthClientId ?? client.id,
-		grantId: row.grantId,
-		userId: row.userId,
-		scopes: row.scopes,
-		refreshFamilyId: familyId,
-		refreshParentTokenId: row.id,
-		refreshFamilyExpiresAt: familyExpiresAt,
-	});
+	return persistTokenPair(tokenInput, authority);
 }
 
 async function revokeTokenRow(
