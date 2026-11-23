@@ -8,13 +8,19 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { WriteConflictError } from "../../db/backend/write-port";
 import { registrationCodes, userPreferences, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import {
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -49,9 +55,10 @@ beforeEach(async () => {
 	settings.auth.registrationOpen = false;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 describe("registration with a code", () => {
@@ -81,9 +88,11 @@ describe("registration with a code", () => {
 	});
 
 	test("registration without a code is still refused while closed", async () => {
-		expect(registerUser({ username: "alice", password: "correct-horse-battery" })).rejects.toThrow(
-			"Registration is closed",
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				registerUser({ username: "alice", password: "correct-horse-battery" }),
+			),
+		).toThrow("Registration is closed");
 	});
 
 	test("a code is consumed and cannot admit a second user", async () => {
@@ -97,17 +106,21 @@ describe("registration with a code", () => {
 		const alice = await db.query.users.findFirst({ where: eq(users.username, "alice") });
 		expect(row?.usedByUserId).toBe(alice?.id ?? "");
 
-		expect(registerUser({ username: "bob", password: "another-passphrase", code })).rejects.toThrow(
-			"already been used",
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				registerUser({ username: "bob", password: "another-passphrase", code }),
+			),
+		).toThrow("already been used");
 	});
 
 	test("a bound code rejects a different username and creates nothing", async () => {
 		const { code } = await issueCode({ createdByUserId: adminId, boundUsername: "alice" });
 
-		expect(registerUser({ username: "bob", password: "another-passphrase", code })).rejects.toThrow(
-			"different username",
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				registerUser({ username: "bob", password: "another-passphrase", code }),
+			),
+		).toThrow("different username");
 
 		// Atomicity: the rejected attempt must not leave the account or its
 		// preferences row behind, and the code must remain usable.
@@ -127,12 +140,14 @@ describe("registration with a code", () => {
 
 	test("an unknown code creates no account", async () => {
 		expect(
-			registerUser({
-				username: "alice",
-				password: "correct-horse-battery",
-				code: "nfrc_definitely-not-issued",
-			}),
-		).rejects.toThrow("Invalid registration code");
+			await captureWorkerRejectionThrower(
+				registerUser({
+					username: "alice",
+					password: "correct-horse-battery",
+					code: "nfrc_definitely-not-issued",
+				}),
+			),
+		).toThrow("Invalid registration code");
 
 		await Bun.sleep(0);
 		const alice = await db.query.users.findFirst({ where: eq(users.username, "alice") });
@@ -155,9 +170,11 @@ describe("registration with a code", () => {
 			createdAt: new Date().toISOString(),
 		});
 
-		await expect(
-			registerUser({ username: "alice", password: "correct-horse-battery", code }),
-		).rejects.toThrow("Username already taken");
+		expect(
+			await captureWorkerRejectionThrower(
+				registerUser({ username: "alice", password: "correct-horse-battery", code }),
+			),
+		).toThrow("Username already taken");
 
 		const row = await db.query.registrationCodes.findFirst({
 			where: eq(registrationCodes.id, summary.id),
@@ -251,7 +268,7 @@ describe("registerUser consumes the account store as a business capability", () 
 
 		try {
 			const failure = registerUser({ username: "alice", password: "correct-horse-battery" });
-			await expect(failure).rejects.toThrow("storage unavailable");
+			expect(await captureWorkerRejectionThrower(failure)).toThrow("storage unavailable");
 		} finally {
 			registrationAccountStore.createAccount = real;
 		}
@@ -338,7 +355,7 @@ describe("a lost username race is reported as USERNAME_TAKEN, not as a storage f
 
 		try {
 			const failure = registerUser({ username: "alice", password: "correct-horse-battery" });
-			await expect(failure).rejects.toThrow("disk on fire");
+			expect(await captureWorkerRejectionThrower(failure)).toThrow("disk on fire");
 		} finally {
 			registrationAccountStore.createAccount = real;
 		}

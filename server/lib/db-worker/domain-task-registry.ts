@@ -33,6 +33,9 @@ const loaders: { [K in SyncDomainReadTaskKind]: () => Promise<DomainReadModule<K
 			return { ready: true };
 		},
 	}),
+	platformIntegrationAuthoritySnapshot: async () => ({
+		read: (await import("./integration-authority-read-task")).readIntegrationAuthoritySnapshotTask,
+	}),
 };
 const loadedModules = new Map<SyncDomainReadTaskKind, Promise<unknown>>();
 function loadDomain<K extends SyncDomainReadTaskKind>(task: K): Promise<DomainReadModule<K>> {

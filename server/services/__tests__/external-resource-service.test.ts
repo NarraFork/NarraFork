@@ -27,6 +27,7 @@ import {
 import { integrationAuthorityService } from "../integration-authority-service";
 import { integrationResourceBindingService } from "../integration-resource-binding-service";
 import type { ExternalOAuthContext } from "../oauth-resource-access";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const ids = {
 	user: generateId(),
@@ -282,30 +283,34 @@ describe("external integration resource lists", () => {
 	});
 
 	test("fails closed when a legacy provision binding has no versioned identity", async () => {
-		await expect(
-			provisionExternalDevice(context, "external-list-0", {
-				projectId: ids.allowedProjectA,
-				name: "Ignored idempotent name",
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "RESOURCE_PROVISION_CONFLICT" });
+		expect(
+			await captureWorkerRejection(
+				provisionExternalDevice(context, "external-list-0", {
+					projectId: ids.allowedProjectA,
+					name: "Ignored idempotent name",
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "RESOURCE_PROVISION_CONFLICT" });
 	});
 
 	test("rolls back device, binding, and OAuth event when create fails before commit", async () => {
 		const eventCountBefore = await db.query.oauthGrantEvents.findMany({
 			where: eq(oauthGrantEvents.grantId, ids.grant),
 		});
-		await expect(
-			provisionExternalDevice(
-				context,
-				"atomic-create-failure",
-				{ projectId: ids.allowedProjectA, name: "Atomic create rollback device" },
-				{
-					beforeDeviceTransactionCommit: () => {
-						throw new Error("injected create failure");
+		expect(
+			await captureWorkerRejectionThrower(
+				provisionExternalDevice(
+					context,
+					"atomic-create-failure",
+					{ projectId: ids.allowedProjectA, name: "Atomic create rollback device" },
+					{
+						beforeDeviceTransactionCommit: () => {
+							throw new Error("injected create failure");
+						},
 					},
-				},
+				),
 			),
-		).rejects.toThrow("injected create failure");
+		).toThrow("injected create failure");
 		expect(
 			await db.query.remoteDevices.findFirst({
 				where: eq(remoteDevices.name, "Atomic create rollback device"),
@@ -337,13 +342,15 @@ describe("external integration resource lists", () => {
 		const eventCountBefore = await db.query.oauthGrantEvents.findMany({
 			where: eq(oauthGrantEvents.grantId, ids.grant),
 		});
-		await expect(
-			rotateExternalDeviceCredential(context, created.device.id, {
-				beforeDeviceRotateTransactionCommit: () => {
-					throw new Error("injected rotate failure");
-				},
-			}),
-		).rejects.toThrow("injected rotate failure");
+		expect(
+			await captureWorkerRejectionThrower(
+				rotateExternalDeviceCredential(context, created.device.id, {
+					beforeDeviceRotateTransactionCommit: () => {
+						throw new Error("injected rotate failure");
+					},
+				}),
+			),
+		).toThrow("injected rotate failure");
 		const after = await db.query.remoteDevices.findFirst({
 			where: eq(remoteDevices.id, created.device.id),
 		});
@@ -402,46 +409,48 @@ describe("external integration resource lists", () => {
 		const eventCountBefore = await db.query.oauthGrantEvents.findMany({
 			where: eq(oauthGrantEvents.grantId, ids.grant),
 		});
-		await expect(
-			provisionExternalNarrator(
-				context,
-				provisionKey,
-				{
-					projectId: ids.allowedProjectA,
-					deviceId: ids.projectDevice,
-					deviceIds: [ids.projectDevice],
-					title,
-				},
-				{
-					beforeNarratorTransactionCommit: (tx, narratorId) => {
-						expect(
-							tx
-								.select({ id: narrators.id })
-								.from(narrators)
-								.where(eq(narrators.id, narratorId))
-								.get(),
-						).toEqual({ id: narratorId });
-						expect(
-							tx
-								.select({ resourceId: integrationResourceBindings.resourceId })
-								.from(integrationResourceBindings)
-								.where(eq(integrationResourceBindings.provisionKey, provisionKey))
-								.get(),
-						).toEqual({ resourceId: narratorId });
-						expect(
-							tx
-								.select({ requestId: oauthGrantEvents.requestId })
-								.from(oauthGrantEvents)
-								.where(
-									eq(oauthGrantEvents.requestId, `resource-provisioned:narrator:${narratorId}`),
-								)
-								.get(),
-						).toEqual({ requestId: `resource-provisioned:narrator:${narratorId}` });
-						throw new Error("injected narrator transaction failure");
+		expect(
+			await captureWorkerRejectionThrower(
+				provisionExternalNarrator(
+					context,
+					provisionKey,
+					{
+						projectId: ids.allowedProjectA,
+						deviceId: ids.projectDevice,
+						deviceIds: [ids.projectDevice],
+						title,
 					},
-				},
+					{
+						beforeNarratorTransactionCommit: (tx, narratorId) => {
+							expect(
+								tx
+									.select({ id: narrators.id })
+									.from(narrators)
+									.where(eq(narrators.id, narratorId))
+									.get(),
+							).toEqual({ id: narratorId });
+							expect(
+								tx
+									.select({ resourceId: integrationResourceBindings.resourceId })
+									.from(integrationResourceBindings)
+									.where(eq(integrationResourceBindings.provisionKey, provisionKey))
+									.get(),
+							).toEqual({ resourceId: narratorId });
+							expect(
+								tx
+									.select({ requestId: oauthGrantEvents.requestId })
+									.from(oauthGrantEvents)
+									.where(
+										eq(oauthGrantEvents.requestId, `resource-provisioned:narrator:${narratorId}`),
+									)
+									.get(),
+							).toEqual({ requestId: `resource-provisioned:narrator:${narratorId}` });
+							throw new Error("injected narrator transaction failure");
+						},
+					},
+				),
 			),
-		).rejects.toThrow("injected narrator transaction failure");
+		).toThrow("injected narrator transaction failure");
 		expect(
 			await db.query.narrators.findFirst({ where: eq(narrators.title, title) }),
 		).toBeUndefined();

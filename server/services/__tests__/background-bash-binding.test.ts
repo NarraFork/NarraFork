@@ -3,14 +3,19 @@ import { spawnSync } from "node:child_process";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { testEnvironment } from "../../../tests/preload";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import type { ExecHandle, ExecParams, ExecutionBackend } from "../../lib/agent/execution/backend";
 import { posixPathSemantics } from "../../lib/agent/execution/path-semantics";
 import type { ToolCallBinding, ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-// Module mocks are process-global in Bun. Keep this full-schema in-memory fixture
+// Module mocks are process-global in Bun. Keep this full-schema file/WAL fixture
 // in its own process, including when a larger test directory is run in parallel.
 if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	test("isolated background Bash execution binding suite", () => {
@@ -38,7 +43,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	}
 
 	const { backgroundTasks, narratorMessages, narrators, narratorToolCalls } = schema;
-	const { sqlite } = getTestDb();
+	const fixture = getNarratorWorkerTestDb();
+	const { sqlite } = fixture;
+	await fixture.ready;
 	const queries: string[] = [];
 	const db = drizzle({
 		client: sqlite,
@@ -291,9 +298,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		cleanDb(sqlite);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		backgroundTaskService.setBroadcastFnForTests(null);
-		sqlite.close();
+		await fixture.close();
 	});
 
 	describe("background Bash actual execution provenance", () => {
@@ -370,10 +377,12 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		test("manual service uses durable startup and a failed dispatch is kept in the task list", async () => {
 			const scheduler = lease();
 			await expect(
-				startManual("service", scheduler, async () => {
-					throw new Error("fixture dispatch failed");
-				}),
-			).rejects.toMatchObject({ code: "TASK_START_FAILED" });
+				await captureWorkerRejection(
+					startManual("service", scheduler, async () => {
+						throw new Error("fixture dispatch failed");
+					}),
+				),
+			).toMatchObject({ code: "TASK_START_FAILED" });
 			await bounded(scheduler.released);
 			expect(execCommand).not.toHaveBeenCalled();
 			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
@@ -392,16 +401,20 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 				};
 			});
 			const scheduler = lease();
-			await expect(startManual("task", scheduler)).rejects.toMatchObject({
+			await expect(await captureWorkerRejection(startManual("task", scheduler))).toMatchObject({
 				code: "TASK_START_FAILED",
 			});
 			await bounded(scheduler.released);
 			expect((await backgroundTaskService.getById(taskRow().id))?.status).toBe("failed");
 		});
 
-		test("uses a real in-memory DB and temporary HOME", () => {
+		test("uses an isolated file/WAL DB and temporary HOME", () => {
 			const databases = sqlite.query("PRAGMA database_list").all() as Array<{ file: string }>;
-			expect(databases.every((database) => database.file === "")).toBe(true);
+			expect(
+				databases.filter((database) => database.file !== "").map((database) => database.file),
+			).toEqual([sqlite.filename]);
+			expect(sqlite.filename.startsWith(testEnvironment.narraforkHome)).toBe(true);
+			expect(sqlite.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
 			expect(process.env.HOME).toBe(testEnvironment.isolatedHome);
 			expect(process.env.HOME).not.toBe(testEnvironment.originalHome);
 		});
@@ -436,7 +449,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 				.update(narratorToolCalls)
 				.set({ executionAttempt: 2 })
 				.where(eq(narratorToolCalls.id, binding.toolCallId));
-			await expect(create(binding, "bash-stale")).rejects.toThrow("not an actual running attempt");
+			await expect(await captureWorkerRejectionThrower(create(binding, "bash-stale"))).toThrow(
+				"not an actual running attempt",
+			);
 			await create({ ...binding, attempt: 2 }, "bash-attempt-2");
 			expect(
 				db
@@ -468,16 +483,18 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		>)("rejects %s without starting a process", async (_label, overrides) => {
 			await seedCall("bad-call", overrides);
 			const binding = { toolCallId: "bad-call", attempt: 1 };
-			await expect(run(context(binding))).rejects.toThrow("not an actual running attempt");
+			await expect(await captureWorkerRejectionThrower(run(context(binding)))).toThrow(
+				"not an actual running attempt",
+			);
 			expect(execCommand).not.toHaveBeenCalled();
 			expect(db.select().from(backgroundTasks).all()).toEqual([]);
 		});
 
 		test("wrong PK is rejected even when a matching provider id exists", async () => {
 			await seedCall();
-			await expect(run(context({ toolCallId: "missing", attempt: 1 }))).rejects.toThrow(
-				"not an actual running attempt",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(run(context({ toolCallId: "missing", attempt: 1 }))),
+			).toThrow("not an actual running attempt");
 			expect(execCommand).not.toHaveBeenCalled();
 		});
 
@@ -489,7 +506,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			Number.MAX_SAFE_INTEGER + 1,
 		])("rejects malformed attempt %s rather than allocating one", async (attempt) => {
 			const binding = await seedCall();
-			await expect(create({ ...binding, attempt })).rejects.toThrow(
+			await expect(await captureWorkerRejectionThrower(create({ ...binding, attempt }))).toThrow(
 				"Invalid background Bash execution binding",
 			);
 			expect(db.select().from(backgroundTasks).all()).toEqual([]);
@@ -506,8 +523,10 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		>)("rejects mismatched frozen %s before execCommand", async (_label, overrides) => {
 			const binding = await seedCall();
 			await expect(
-				run(context(binding, { executionTarget: { ...target, ...overrides } })),
-			).rejects.toThrow("execution target does not match");
+				await captureWorkerRejectionThrower(
+					run(context(binding, { executionTarget: { ...target, ...overrides } })),
+				),
+			).toThrow("execution target does not match");
 			expect(execCommand).not.toHaveBeenCalled();
 		});
 
@@ -638,7 +657,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			executions[0].finish();
 			await flush();
 			expect(taskRow().status).toBe("completed");
-			await expect(run(context(binding))).rejects.toThrow(
+			await expect(await captureWorkerRejectionThrower(run(context(binding)))).toThrow(
 				"already exists for this execution attempt",
 			);
 			expect(execCommand).toHaveBeenCalledTimes(1);
@@ -648,9 +667,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const binding = await seedCall();
 			const updateExecutionLease = lease();
 			failId = true;
-			await expect(run(context(binding, { updateExecutionLease }))).rejects.toThrow(
-				"Injected ID generation failure",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(run(context(binding, { updateExecutionLease }))),
+			).toThrow("Injected ID generation failure");
 			expect(execCommand).not.toHaveBeenCalled();
 			expect(updateExecutionLease.transfer).not.toHaveBeenCalled();
 			expect(updateExecutionLease.release).not.toHaveBeenCalled();
@@ -661,7 +680,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const binding = await seedCall();
 			await create(undefined, "bash_collision");
 			fixedId = "collision";
-			await expect(run(context(binding))).rejects.toThrow();
+			await expect(await captureWorkerRejectionThrower(run(context(binding)))).toThrow();
 			expect(execCommand).not.toHaveBeenCalled();
 			expect(taskRow().toolCallId).toBeNull();
 		});
@@ -672,7 +691,9 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			sqlite.run(
 				"CREATE TRIGGER reject_background_insert BEFORE INSERT ON background_tasks BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END",
 			);
-			await expect(run(context(binding, { updateExecutionLease }))).rejects.toThrow();
+			await expect(
+				await captureWorkerRejectionThrower(run(context(binding, { updateExecutionLease }))),
+			).toThrow();
 			expect(execCommand).not.toHaveBeenCalled();
 			expect(updateExecutionLease.transfer).not.toHaveBeenCalled();
 			expect(updateExecutionLease.release).not.toHaveBeenCalled();
@@ -827,7 +848,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			test("a service that exited during the restart is settled with its real exit code", async () => {
 				await createService("svc-dead");
 				const { durable, handle } = await spawnRealService("svc-dead", "echo last-words; exit 4");
-				await expect(handle.exited).resolves.toBe(4);
+				await expect(await handle.exited).toBe(4);
 				expect((await durable.readOrphanedServiceOutcome("svc-dead")).exitCode).toBe(4);
 				expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
 				const row = taskRow();

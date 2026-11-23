@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
@@ -10,13 +10,17 @@ import {
 	markAgentMessageConsumed,
 	trackAgentMessageHistory,
 } from "../agent-message-delivery";
+import { drainCommunicationWork, getCommunicationWorkStatus } from "../agent-runtime/async-work";
 import {
 	drainPendingInjections,
 	projectPendingInjection,
 	runItems,
 } from "../parent-injection-queue";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
@@ -69,8 +73,10 @@ const { listInboxRows, inboxDelivery, inboxAgentText, runtimeInbox, claimInboxHe
 	"../agent-runtime/inbox"
 );
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ["parent", "child", "sibling"]) getExecutionOwner(id)?.release();
+	await drainCommunicationWork();
+	expect(getCommunicationWorkStatus().pending).toBe(0);
 });
 async function agentQueued(id = "child") {
 	return (await listInboxRows(id, ["agent_message"])).map((row) => ({
@@ -262,13 +268,14 @@ beforeEach(() => {
 	seed("child", "parent");
 	seed("sibling", "parent");
 });
-afterAll(() => {
+afterAll(async () => {
 	clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	mock.module("../agent-runtime/run", () => runModule);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.module("../../db", () => realDb);
 	mock.module("../../lib/agent", () => realAgent);
+	await fixture.close();
 });
 
 describe("last model input mailbox provenance", () => {
@@ -714,7 +721,7 @@ describe("Send exact delivery receipts", () => {
 			fromToolUseId: "send-call",
 		};
 		try {
-			await expect(markAgentMessageConsumed(delivery)).resolves.toBeUndefined();
+			await expect(await markAgentMessageConsumed(delivery)).toBeUndefined();
 			expect(consumedAt(id)).toBeNull();
 			expect(getBufferedMessages("child")).toHaveLength(0);
 			expect(await consume()).toBeNull();

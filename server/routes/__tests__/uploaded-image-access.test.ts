@@ -13,7 +13,7 @@ import { mediaRefToContentBlock } from "@shared/media-attachments";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { wavFile } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	aclGrants,
 	narratorMessageRefs,
@@ -34,8 +34,14 @@ import {
 	saveUploadedImage,
 	setUploadsDirForTests,
 } from "../../lib/uploads";
+import {
+	captureWorkerRejection,
+	getNarratorWorkerTestDb,
+} from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const dbFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = dbFixture;
+await dbFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { narratorService } = await import("../../services/narrator-service");
@@ -81,12 +87,13 @@ beforeEach(() => {
 	}
 });
 afterEach(() => setReferenceLookupLimitsForTests(null));
-afterAll(() => {
+afterAll(async () => {
 	setUploadsDirForTests(null);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
 	rmSync(home, { recursive: true, force: true });
+	await dbFixture.close();
 });
 
 function addNarrator(
@@ -605,7 +612,7 @@ describe("bounded reference lookup", () => {
 			principal: forkOwner,
 		});
 		setTimeout(() => controller.abort(), 0);
-		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		expect(await captureWorkerRejection(pending)).toMatchObject({ name: "AbortError" });
 		expect(
 			await narratorReferencesImage(context, source, image.imageId, { principal: forkOwner }),
 		).toBe(true);
@@ -624,7 +631,7 @@ describe("bounded reference lookup", () => {
 		// Another user is not affected by this user's queue.
 		const other = narratorReferencesImage(context, source, image.imageId, { principal: stranger });
 		controller.abort();
-		await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+		expect(await captureWorkerRejection(waiting)).toMatchObject({ name: "AbortError" });
 		expect(await first).toBe(true);
 		expect(await other).toBe(true);
 		// Every slot was returned.

@@ -1,11 +1,15 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const { eventBus } = await import("../../lib/event-bus");

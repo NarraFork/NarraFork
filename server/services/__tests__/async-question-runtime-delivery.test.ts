@@ -1,7 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
-import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -11,8 +10,11 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const {
@@ -326,14 +328,16 @@ afterEach(async () => {
 });
 afterAll(async () => {
 	backgroundOccupancyStore.resetForTests();
-	await disposeWorkerDb();
+	await fixture.close();
 });
 
 describe("async question receipt runtime adoption", () => {
 	test("scheduling needs a persisted user event and never creates a queue-only answer", async () => {
 		await expect(
-			scheduleQuestionAnswerDelivery(narratorId, "missing", "answer", undefined),
-		).rejects.toThrow("persisted");
+			await captureWorkerRejectionThrower(
+				scheduleQuestionAnswerDelivery(narratorId, "missing", "answer", undefined),
+			),
+		).toThrow("persisted");
 		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
 	});
 	test("retries share one durable inbox identity and do not interrupt the current run", async () => {

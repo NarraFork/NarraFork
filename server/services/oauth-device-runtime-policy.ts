@@ -52,31 +52,20 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		return denied("OAuth device provenance is inactive");
 	}
 	readOptions?.signal?.throwIfAborted();
-	const liveDevice = await (readOptions
-		? readQueryFirst(
-				db.query.remoteDevices.findMany({
-					limit: 1,
-					where: eq(remoteDevices.id, device.id),
-					columns: {
-						id: true,
-						createdBy: true,
-						scope: true,
-						projectId: true,
-						revokedAt: true,
-					},
-				}),
-				{ ...readOptions, executionPolicy: "worker-required" },
-			)
-		: db.query.remoteDevices.findFirst({
-				where: eq(remoteDevices.id, device.id),
-				columns: {
-					id: true,
-					createdBy: true,
-					scope: true,
-					projectId: true,
-					revokedAt: true,
-				},
-			}));
+	const liveDevice = await readQueryFirst(
+		db.query.remoteDevices.findMany({
+			limit: 1,
+			where: eq(remoteDevices.id, device.id),
+			columns: {
+				id: true,
+				createdBy: true,
+				scope: true,
+				projectId: true,
+				revokedAt: true,
+			},
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!liveDevice || liveDevice.revokedAt) return denied("Device revoked");
 	// OAuth grants are no longer project-bound: the resource binding (grant
 	// ownership) is the isolation boundary, so a missing projectId is allowed.
@@ -100,23 +89,16 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 	}
 
 	readOptions?.signal?.throwIfAborted();
-	const client = await (readOptions
-		? readQueryFirst(
-				db.query.oauthClients.findMany({
-					limit: 1,
-					where: and(
-						eq(oauthClients.id, authority.authority.integrationId),
-						isNull(oauthClients.revokedAt),
-					),
-				}),
-				{ ...readOptions, executionPolicy: "worker-required" },
-			)
-		: db.query.oauthClients.findFirst({
-				where: and(
-					eq(oauthClients.id, authority.authority.integrationId),
-					isNull(oauthClients.revokedAt),
-				),
-			}));
+	const client = await readQueryFirst(
+		db.query.oauthClients.findMany({
+			limit: 1,
+			where: and(
+				eq(oauthClients.id, authority.authority.integrationId),
+				isNull(oauthClients.revokedAt),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!client?.publicClient) return denied("OAuth client is inactive");
 
 	// Grant ownership (verified above via the active resource binding + live

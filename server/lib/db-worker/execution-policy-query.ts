@@ -113,15 +113,19 @@ function readExecutionPolicyFacts(
 		K extends "whitelistDirs" | "blacklistDirs" | "commandWhitelist" | "commandBlacklist",
 	>(table: string, columns: string): ExecutionPolicyFacts[K] {
 		const result: Record<string, unknown>[] = [];
-		const statement = db.query<Record<string, unknown>, string[]>(
+		const statement = db.prepare<Record<string, unknown>, string[]>(
 			`SELECT ${ruleColumns}, ${columns} FROM ${table}
 			WHERE narrator_id IN (${ids}) LIMIT ${EXECUTION_POLICY_RULE_LIMIT + 1}`,
 		);
-		for (const row of statement.iterate(...inheritedNarratorIds)) {
-			if (result.length === EXECUTION_POLICY_RULE_LIMIT)
-				throw new Error("Permission rule budget exceeded");
-			checkBytes(row);
-			result.push({ ...row, enabled: Number(row.enabled) === 1 });
+		try {
+			for (const row of statement.iterate(...inheritedNarratorIds)) {
+				if (result.length === EXECUTION_POLICY_RULE_LIMIT)
+					throw new Error("Permission rule budget exceeded");
+				checkBytes(row);
+				result.push({ ...row, enabled: Number(row.enabled) === 1 });
+			}
+		} finally {
+			statement.finalize();
 		}
 		return result as unknown as ExecutionPolicyFacts[K];
 	}

@@ -500,6 +500,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/worker-read-adapter.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/lib/db-worker/database-identity.ts": ["driver"],
 	"server/lib/db-worker/domain-task-registry.ts": ["driver"],
+	"server/lib/db-worker/integration-authority-read-task.ts": ["driver"],
 	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
 	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
