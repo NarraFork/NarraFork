@@ -84,6 +84,7 @@ const { activeNarrators, withNarratorMutationAdmission, withNarratorWorkAdmissio
 	"../narrator-session-state"
 );
 const parentInjection = await import("../parent-injection-queue");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
@@ -110,8 +111,10 @@ let cwd: string;
 let seq = 0;
 
 beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	seq = 0;
 	broadcasts.length = 0;
 	settings.agent.autoContinuationMode = "off";
@@ -124,6 +127,7 @@ afterEach(async () => {
 	setRunHold(RUN, undefined);
 	await drainRuntimeTestWork();
 	mock.restore();
+	backgroundOccupancyStore.resetForTests();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
@@ -2155,6 +2159,117 @@ describe("F. a parked held result", () => {
 		expect(toolOutput()).toContain("parked answer");
 		expect(getRunHold(RUN)).toBeUndefined();
 		expect(sessionRow()?.substatus ?? []).not.toContain("taken_over");
+	});
+});
+
+describe("G. a turn that ends with work still pending", () => {
+	async function startWaitingRun(startWork: () => Promise<void>) {
+		const calls = scriptPasses([
+			async () => {
+				await startWork();
+				return { finalText: "started the work, waiting for it" };
+			},
+			async () => ({ finalText: "the real answer" }),
+		]);
+		const publication = getRuntimePublicationService();
+		spyOn(publication, "commitAgentTerminal");
+		const handle = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "work",
+			binding: binding(),
+			foreground: true,
+		});
+		await settle(() => calls.length === 1 && sessionRow()?.status === "idle");
+		// Idle, waiting for the work to wake it: no result snapshot reached the caller.
+		expect(getExecutionOwner(RUN)).toBeDefined();
+		expect(toolOutput()).toBe("PENDING");
+		expect(publication.commitAgentTerminal).not.toHaveBeenCalled();
+		return { calls, handle, publication };
+	}
+
+	async function expectRealAnswer(
+		{ calls, handle, publication }: Awaited<ReturnType<typeof startWaitingRun>>,
+		settleWork: () => Promise<void>,
+	) {
+		await settleWork();
+		await inbox.wakeInboxIfEligible(RUN);
+		const result = await handle.foreground;
+		expect(calls).toHaveLength(2);
+		expect(result.output).toContain("the real answer");
+		expect(result.output).not.toContain("waiting for it");
+		const terminal = await handle.terminal;
+		expect(consumed(terminal.logicalRunId)).toHaveLength(1);
+		expect(publication.commitAgentTerminal).toHaveBeenCalledTimes(1);
+		await settle(() => !getExecutionOwner(RUN));
+	}
+
+	test("a background task wakes the same run, whose answer is the result", async () => {
+		seed();
+		const waiting = await startWaitingRun(async () => {
+			await backgroundTaskService.createBashTask({
+				id: "pending-bash",
+				parentNarratorId: RUN,
+				command: "bun test",
+			});
+		});
+		await expectRealAnswer(waiting, async () => {
+			expect(await backgroundTaskService.markCompleted("pending-bash", "tests passed", 0)).toBe(
+				true,
+			);
+		});
+	});
+
+	test("a Watch observation wakes the same run, whose answer is the result", async () => {
+		seed();
+		const { createWatchObservation } = await import("../watch-observation");
+		let observation: Awaited<ReturnType<typeof createWatchObservation>> | undefined;
+		try {
+			const waiting = await startWaitingRun(async () => {
+				observation = await createWatchObservation({
+					narratorId: RUN,
+					title: "Pending observation",
+					command: "bash target",
+				});
+			});
+			await expectRealAnswer(waiting, async () => {
+				await observation?.finish({ status: "completed", output: "matched" });
+			});
+		} finally {
+			observation?.release();
+		}
+	});
+
+	test("with the occupancy store stopped for a restart, the task rows say what is pending", async () => {
+		seed();
+		const { hasPendingWork } = await import("../agent-runtime/pending-wake");
+		await backgroundOccupancyStore.stop();
+		expect(await hasPendingWork(RUN)).toBe(false);
+		await backgroundTaskService.createBashTask({
+			id: "pending-bash",
+			parentNarratorId: RUN,
+			command: "bun test",
+		});
+		expect(await hasPendingWork(RUN)).toBe(true);
+	});
+
+	test("cancelling the waiting run ends it once", async () => {
+		seed();
+		const { handle, publication } = await startWaitingRun(async () => {
+			await backgroundTaskService.createBashTask({
+				id: "pending-bash",
+				parentNarratorId: RUN,
+				command: "bun test",
+			});
+		});
+		getRunControl(RUN)?.cancel.abort("stop");
+		await handle.foreground;
+		expect((await handle.terminal).interrupted).toBe(true);
+		expect(publication.commitAgentTerminal).toHaveBeenCalledTimes(1);
+		expect(publication.commitAgentTerminal).toHaveBeenCalledWith(
+			expect.objectContaining({ eventKind: "cancelled" }),
+		);
+		await settle(() => !getExecutionOwner(RUN));
 	});
 });
 

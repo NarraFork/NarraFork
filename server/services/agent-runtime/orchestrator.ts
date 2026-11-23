@@ -120,7 +120,6 @@ import {
 import { type ExecutionOwner, getRunHold, type RunControl } from "../agent-runtime/ownership";
 import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
-import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { getStatusSummaryCached, markStatusDirty, peekStatusSummary } from "../git-status-cache";
 import { classifyGitToolRefresh, GitToolRefreshQueue } from "../git-tool-refresh-policy";
@@ -267,6 +266,7 @@ import { createRuntimeFinalizationReads } from "./finalization-reads";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { hasPendingSessionWake } from "./pending-wake";
 import {
 	applyPlanApproval,
 	dropDeferredPlanApproval,
@@ -443,11 +443,7 @@ export async function runAgentLoopUnlocked(
 	active._runPersonActed = false;
 	const personRun = () => personSpoke || active._runPersonActed === true;
 	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
-	const workPendingAtEnd = async (): Promise<boolean> =>
-		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
-		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
-		// A question a person has yet to answer: their answer wakes the session.
-		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
+	const workPendingAtEnd = (): Promise<boolean> => hasPendingSessionWake(narratorId);
 	let checkpointPause: CheckpointStop | undefined;
 	const checkpointIdentity = run?.logicalRunId
 		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }

@@ -820,6 +820,22 @@ async function executeRun(
 				);
 				if (woke === "input") outcome.freshInput = true;
 			}
+			// A delivering run whose turn ended while work it started is still pending has not
+			// produced its result yet: it waits for that work to wake it and continues.
+			if (
+				!outcome.freshInput &&
+				deliverTo &&
+				req.deliver !== false &&
+				outcome.allowInboxWake === true &&
+				!run.cancel.signal.aborted &&
+				!activeHold(id)
+			) {
+				const woke = await awaitPendingWake(owner, run);
+				if (woke === "input") outcome.freshInput = true;
+				else if (woke === "hold") continue;
+				// The answer so far was provisional: a cancelled wait ends the run cancelled.
+				else if (woke === "cancel") outcome = { ...outcome, aborted: true };
+			}
 			if (!outcome.freshInput || run.cancel.signal.aborted) break;
 			// The old session finalizer has restored its temporary model. Rotate the epoch
 			// in the short admission, retaining this run, hold and all three caller promises.
@@ -1820,6 +1836,80 @@ export async function awaitRunHold(
 		}
 	}
 }
+
+/** How often a run waiting on pending work re-checks it, as a backstop to its wake. */
+export const PENDING_WAKE_RECHECK_MS = 2_000;
+
+/**
+ * Keep a delivering run open while work its session started will still wake it
+ * (background tasks, Watch observations, subagents, open questions, queued notices):
+ * the result snapshot is the answer after that work, not the turn that started it.
+ * The owner is kept, so queued input wakes this same run (`wakeHeldRun`). Returns
+ * "settled" once nothing is pending, "hold" when the user took the run over.
+ */
+async function awaitPendingWake(
+	owner: ExecutionOwner,
+	run: RunControl,
+): Promise<"input" | "settled" | "hold" | "cancel"> {
+	const id = owner.narratorId;
+	const { hasPendingWork, hasQueuedWake } = await import("./pending-wake");
+	const { flushInboxPublicationBarrier } = await import("./inbox");
+	// Work is read before the outbox flush: a task that settled before the read has its
+	// notice in the outbox, so the flush moves it into the inbox before the inbox read.
+	// Unreadable pending state before waiting keeps the previous behavior: the run settles
+	// with this answer. Once waiting (e.g. the store stopped for a restart), it keeps waiting.
+	const pending = async (waiting: boolean): Promise<"input" | "settled" | undefined> => {
+		try {
+			const working = await hasPendingWork(id);
+			await flushInboxPublicationBarrier(id);
+			if (await hasQueuedWake(id)) return "input";
+			return working ? undefined : "settled";
+		} catch (error) {
+			logger.warn("Pending wake state unavailable", { id, waiting, error: String(error) });
+			return waiting ? undefined : "settled";
+		}
+	};
+	const first = await pending(false);
+	if (first) return first;
+	const { narratorService } = await import("../narrator-service");
+	await narratorService.updateStatus(id, "idle");
+	const { promise, resolve } = Promise.withResolvers<"input" | "settled" | "hold" | "cancel">();
+	let done = false;
+	const finish = (reason: "input" | "settled" | "hold" | "cancel") => {
+		if (done) return;
+		done = true;
+		resolve(reason);
+	};
+	run.wake = (reason) => finish(reason === "release" ? "hold" : reason);
+	const onCancel = () => finish("cancel");
+	run.cancel.signal.addEventListener("abort", onCancel, { once: true });
+	// A takeover may claim the run while it waits: it is not finalizing yet.
+	run.finalizing = false;
+	setExecutionSuspended(owner, true);
+	const check = async () => {
+		if (done) return;
+		if (run.cancel.signal.aborted) return finish("cancel");
+		if (activeHold(id)) return finish("hold");
+		const woke = await pending(true);
+		if (woke) finish(woke);
+	};
+	const timer = setInterval(() => void check(), PENDING_WAKE_RECHECK_MS);
+	try {
+		await check();
+		return await promise;
+	} finally {
+		clearInterval(timer);
+		run.wake = undefined;
+		run.cancel.signal.removeEventListener("abort", onCancel);
+		setExecutionSuspended(owner, false);
+		if (!activeHold(id)) run.finalizing = true;
+	}
+}
+
+const activeHold = (id: string) => {
+	const hold = getRunHold(id);
+	return hold && !hold.released ? hold : undefined;
+};
 
 /** Wake a held run for queued input. Returns whether a held run was woken. */
 export function wakeHeldRun(narratorId: string): boolean {
