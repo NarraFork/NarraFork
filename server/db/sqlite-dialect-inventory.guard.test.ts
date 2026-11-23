@@ -590,6 +590,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/git-staging-kernel.ts": ["json1"],
 	"server/services/git-staging-worker.ts": ["driver", "pragma"],
 	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
+	"server/services/integration-authority-read-task.ts": ["driver"],
 	"server/services/narrator-messages.ts": ["handle", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],

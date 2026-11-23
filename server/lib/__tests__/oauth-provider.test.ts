@@ -11,6 +11,7 @@ import {
 	oauthGrants,
 	users,
 } from "../../db/schema";
+import { captureWorkerRejectionThrower } from "../../services/__tests__/narrator-worker-fixture";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant, revokeOAuthGrantForUser } from "../../services/oauth-grant-service";
 import { generateId } from "../id";
@@ -177,15 +178,17 @@ describe("oauth-provider authorization codes", () => {
 
 	test("rejects unknown scopes", async () => {
 		await ensureClient();
-		await expect(
-			issueAuthorizationCode({
-				clientId: CLIENT_ID,
-				userId: await ensureUser(),
-				redirectUri: REDIRECT_URI,
-				scopes: ["admin:everything"],
-				codeChallenge: "x",
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				issueAuthorizationCode({
+					clientId: CLIENT_ID,
+					userId: await ensureUser(),
+					redirectUri: REDIRECT_URI,
+					scopes: ["admin:everything"],
+					codeChallenge: "x",
+				}),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("rejects scopes the client is not registered for", async () => {
@@ -195,7 +198,9 @@ describe("oauth-provider authorization codes", () => {
 			.update(oauthClients)
 			.set({ scopes: ["narrator.provision"] })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
-		await expect(issueCode({ scopes: ["device.provision"] })).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(issueCode({ scopes: ["device.provision"] })),
+		).toThrow(OAuthError);
 		// Restore for other tests.
 		await db
 			.update(oauthClients)
@@ -205,35 +210,39 @@ describe("oauth-provider authorization codes", () => {
 
 	test("rejects unregistered redirect URIs and unknown/revoked clients", async () => {
 		await ensureClient();
-		await expect(
-			issueAuthorizationCode({
-				clientId: CLIENT_ID,
-				userId: await ensureUser(),
-				redirectUri: "https://evil.example/callback",
-				scopes: ["device.provision"],
-				codeChallenge: "x",
-			}),
-		).rejects.toThrow(OAuthError);
-		await expect(
-			issueAuthorizationCode({
-				clientId: "no-such-client",
-				userId: await ensureUser(),
-				redirectUri: REDIRECT_URI,
-				scopes: [],
-				codeChallenge: "x",
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				issueAuthorizationCode({
+					clientId: CLIENT_ID,
+					userId: await ensureUser(),
+					redirectUri: "https://evil.example/callback",
+					scopes: ["device.provision"],
+					codeChallenge: "x",
+				}),
+			),
+		).toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				issueAuthorizationCode({
+					clientId: "no-such-client",
+					userId: await ensureUser(),
+					redirectUri: REDIRECT_URI,
+					scopes: [],
+					codeChallenge: "x",
+				}),
+			),
+		).toThrow(OAuthError);
 
 		await db
 			.update(oauthClients)
 			.set({ revokedAt: new Date().toISOString() })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
-		await expect(issueCode()).rejects.toThrow(OAuthError);
+		expect(await captureWorkerRejectionThrower(issueCode())).toThrow(OAuthError);
 		await db
 			.update(oauthClients)
 			.set({ revokedAt: null, publicClient: false })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
-		await expect(issueCode()).rejects.toThrow(OAuthError);
+		expect(await captureWorkerRejectionThrower(issueCode())).toThrow(OAuthError);
 		await db
 			.update(oauthClients)
 			.set({ publicClient: true })
@@ -281,23 +290,27 @@ describe("oauth-provider code exchange (PKCE)", () => {
 	test("a code is single-use even when the verifier is wrong", async () => {
 		await ensureClient();
 		const { code, verifier } = await issueCode();
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: CLIENT_ID,
-				redirectUri: REDIRECT_URI,
-				codeVerifier: `${verifier}-wrong`,
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: `${verifier}-wrong`,
+				}),
+			),
+		).toThrow(OAuthError);
 		// Retrying with the CORRECT verifier still fails: the code was consumed.
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: CLIENT_ID,
-				redirectUri: REDIRECT_URI,
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("atomically allows only one concurrent exchange", async () => {
@@ -334,35 +347,41 @@ describe("oauth-provider code exchange (PKCE)", () => {
 			.update(oauthAuthorizationCodes)
 			.set({ expiresAt: new Date(Date.now() - 1_000).toISOString() })
 			.where(eq(oauthAuthorizationCodes.id, row.id));
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: CLIENT_ID,
-				redirectUri: REDIRECT_URI,
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("rejects mismatched client_id and redirect_uri", async () => {
 		await ensureClient();
 		const { code, verifier } = await issueCode();
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: "some-other-client",
-				redirectUri: REDIRECT_URI,
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(OAuthError);
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: CLIENT_ID,
-				redirectUri: `${REDIRECT_URI}/other`,
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: "some-other-client",
+					redirectUri: REDIRECT_URI,
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: CLIENT_ID,
+					redirectUri: `${REDIRECT_URI}/other`,
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("verifyPkceChallenge accepts only the exact S256 digest", () => {
@@ -403,9 +422,11 @@ describe("oauth-provider refresh / revoke / validate", () => {
 		// Rotation keeps the child usable until an old refresh token is replayed.
 		expect(await validateAccessToken(first.accessToken)).toBeNull();
 		expect(await validateAccessToken(second.accessToken)).toBeTruthy();
-		await expect(
-			refreshAccessToken({ refreshToken: first.refreshToken, clientId: CLIENT_ID }),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: first.refreshToken, clientId: CLIENT_ID }),
+			),
+		).toThrow(OAuthError);
 		expect(await validateAccessToken(second.accessToken)).toBeNull();
 		const events = await db.query.oauthGrantEvents.findMany({
 			where: eq(oauthGrantEvents.oauthClientId, root?.oauthClientId as string),
@@ -456,9 +477,11 @@ describe("oauth-provider refresh / revoke / validate", () => {
 			redirectUri: REDIRECT_URI,
 			codeVerifier: verifier,
 		});
-		await expect(
-			refreshAccessToken({ refreshToken: pair.refreshToken, clientId: "another-client" }),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: pair.refreshToken, clientId: "another-client" }),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("revoking the access token invalidates it; revoking refresh blocks rotation", async () => {
@@ -474,12 +497,14 @@ describe("oauth-provider refresh / revoke / validate", () => {
 		expect(await validateAccessToken(pair.accessToken)).toBeNull();
 
 		await revokeToken(pair.refreshToken);
-		await expect(
-			refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
+			),
+		).toThrow(OAuthError);
 
 		// Unknown tokens are a silent no-op.
-		await expect(revokeToken("nfat_does-not-exist")).resolves.toBeUndefined();
+		expect(await revokeToken("nfat_does-not-exist")).toBeUndefined();
 	});
 
 	test("client revocation immediately invalidates existing bearer tokens", async () => {
@@ -569,14 +594,16 @@ describe("oauth-provider grant lifecycle", () => {
 		const firstGrant = await createGrant();
 		const pending = await issueCode({ grantId: firstGrant.id });
 		await revokeOAuthGrantForUser({ grantId: firstGrant.id, userId: await ensureUser() });
-		await expect(
-			exchangeCodeForToken({
-				code: pending.code,
-				clientId: CLIENT_ID,
-				redirectUri: REDIRECT_URI,
-				codeVerifier: pending.verifier,
-			}),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code: pending.code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: pending.verifier,
+				}),
+			),
+		).toThrow(OAuthError);
 
 		const secondGrant = await createGrant();
 		const issued = await issueCode({ grantId: secondGrant.id });
@@ -589,9 +616,11 @@ describe("oauth-provider grant lifecycle", () => {
 		expect(await validateAccessToken(pair.accessToken)).toBeTruthy();
 		await revokeOAuthGrantForUser({ grantId: secondGrant.id, userId: await ensureUser() });
 		expect(await validateAccessToken(pair.accessToken)).toBeNull();
-		await expect(
-			refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
-		).rejects.toThrow(OAuthError);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
+			),
+		).toThrow(OAuthError);
 	});
 
 	test("client revocation blocks a pending code and refresh immediately", async () => {
@@ -609,18 +638,22 @@ describe("oauth-provider grant lifecycle", () => {
 				.update(oauthClients)
 				.set({ revokedAt: new Date().toISOString() })
 				.where(eq(oauthClients.clientId, CLIENT_ID));
-			await expect(
-				exchangeCodeForToken({
-					code: pending.code,
-					clientId: CLIENT_ID,
-					redirectUri: REDIRECT_URI,
-					codeVerifier: pending.verifier,
-				}),
-			).rejects.toThrow(OAuthError);
+			expect(
+				await captureWorkerRejectionThrower(
+					exchangeCodeForToken({
+						code: pending.code,
+						clientId: CLIENT_ID,
+						redirectUri: REDIRECT_URI,
+						codeVerifier: pending.verifier,
+					}),
+				),
+			).toThrow(OAuthError);
 			expect(await validateAccessToken(pair.accessToken)).toBeNull();
-			await expect(
-				refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
-			).rejects.toThrow(OAuthError);
+			expect(
+				await captureWorkerRejectionThrower(
+					refreshAccessToken({ refreshToken: pair.refreshToken, clientId: CLIENT_ID }),
+				),
+			).toThrow(OAuthError);
 		} finally {
 			await db
 				.update(oauthClients)

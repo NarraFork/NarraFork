@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -9,8 +8,9 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as schema from "../../db/schema";
 import { createDeviceTransferTaskManager } from "../device-transfer-service";
 import { DeviceTransferTaskStore } from "../device-transfer-task-store";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
 
-const sqlite = new Database(":memory:");
+const sqlite = openFileWorkerDatabase();
 sqlite.run("PRAGMA foreign_keys = ON");
 sqlite.run("CREATE TABLE remote_devices (id TEXT PRIMARY KEY NOT NULL)");
 sqlite.run(`
@@ -65,8 +65,8 @@ function taskValues(
 	};
 }
 
-afterAll(() => {
-	sqlite.close();
+afterAll(async () => {
+	await closeFileWorkerDatabase(sqlite);
 	rmSync(fileRoot, { recursive: true, force: true });
 });
 

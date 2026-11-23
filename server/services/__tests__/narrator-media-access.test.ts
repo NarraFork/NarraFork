@@ -7,7 +7,7 @@ import { type MediaRef, mediaRefToContentBlock } from "@shared/media-attachments
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -21,8 +21,11 @@ import * as fsScanClient from "../../lib/fs-scan-worker/client";
 import { generateId } from "../../lib/id";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
 import { setUploadsDirForTests } from "../../lib/uploads";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const dbFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = dbFixture;
+await dbFixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -46,12 +49,13 @@ beforeEach(() => {
 		db.insert(users).values({ id, username: id, passwordHash: "x", createdAt: now }).run();
 	}
 });
-afterAll(() => {
+afterAll(async () => {
 	setUploadsDirForTests(null);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
 	rmSync(home, { recursive: true, force: true });
+	await dbFixture.close();
 });
 
 function addNarrator(ownerUserId: string) {
@@ -563,7 +567,7 @@ test("lookup observes cancellation between reference pages", async () => {
 		signal: controller.signal,
 	});
 	setTimeout(() => controller.abort(), 0);
-	await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+	expect(await captureWorkerRejection(pending)).toMatchObject({ name: "AbortError" });
 });
 
 test("oversized legacy JSON authorizes exact references and cancellation fails closed", async () => {
@@ -584,7 +588,9 @@ test("oversized legacy JSON authorizes exact references and cancellation fails c
 	expect(await narratorReferencesMedia(context, `${source}-wrong`, media.mediaId)).toBe(false);
 	const controller = new AbortController();
 	controller.abort();
-	await expect(
-		narratorReferencesMedia(context, source, media.mediaId, { signal: controller.signal }),
-	).rejects.toMatchObject({ name: "AbortError" });
+	expect(
+		await captureWorkerRejection(
+			narratorReferencesMedia(context, source, media.mediaId, { signal: controller.signal }),
+		),
+	).toMatchObject({ name: "AbortError" });
 });

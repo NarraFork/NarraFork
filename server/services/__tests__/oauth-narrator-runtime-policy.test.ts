@@ -262,7 +262,12 @@ describe("OAuth narrator runtime policy", () => {
 				expect(options?.signal).toBe(request.signal);
 				expect(options?.deadlineAt).toBe(deadlineAt);
 			}
-			expect(reads.mock.calls.every(([, params]) => params.kind === "selectRows")).toBe(true);
+			expect(
+				reads.mock.calls.some(
+					([, params]) =>
+						params.kind === "domainRead" && params.task === "platformIntegrationAuthoritySnapshot",
+				),
+			).toBe(true);
 			request.abort(new Error("OAuth request cancelled"));
 			const count = reads.mock.calls.length;
 			expect(

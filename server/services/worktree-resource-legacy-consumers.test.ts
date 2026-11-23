@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { drizzle } from "drizzle-orm/bun-sqlite";
 import { Hono } from "hono";
 import * as schema from "../db/schema";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import { fixtureDatabase } from "./__tests__/worktree-resource-fixture";
 
 let fixture: ReturnType<typeof fixtureDatabase>;
@@ -104,7 +106,10 @@ const { terminalViewService } = await import("./terminal-view-service");
 const now = "2026-01-01T00:00:00.000Z";
 
 beforeEach(() => {
-	fixture = fixtureDatabase();
+	const memory = fixtureDatabase();
+	const sqlite = openFileWorkerDatabase(memory.sqlite);
+	memory.sqlite.close(true);
+	fixture = { sqlite, database: drizzle({ client: sqlite, schema }) };
 	directory = mkdtempSync(join(tmpdir(), "resource-consumer-fixture-"));
 	fixture.database
 		.insert(schema.users)
@@ -152,8 +157,8 @@ beforeEach(() => {
 	dtach.isSocketAlive.mockClear();
 	dtach.killSession.mockClear();
 });
-afterEach(() => {
-	fixture?.sqlite.close();
+afterEach(async () => {
+	if (fixture) await closeFileWorkerDatabase(fixture.sqlite);
 	if (directory) rmSync(directory, { recursive: true, force: true });
 });
 

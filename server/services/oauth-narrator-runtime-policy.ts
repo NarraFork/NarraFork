@@ -164,29 +164,19 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	const narrator =
 		loadedNarrator?.id === narratorId
 			? loadedNarrator
-			: await (readOptions
-					? readQueryFirst(
-							db.query.narrators.findMany({
-								limit: 1,
-								where: eq(narrators.id, narratorId),
-								columns: {
-									id: true,
-									oauthPolicySnapshotJson: true,
-									contextProjectId: true,
-									defaultDeviceId: true,
-								},
-							}),
-							{ ...readOptions, executionPolicy: "worker-required" },
-						)
-					: db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: {
-								id: true,
-								oauthPolicySnapshotJson: true,
-								contextProjectId: true,
-								defaultDeviceId: true,
-							},
-						}));
+			: await readQueryFirst(
+					db.query.narrators.findMany({
+						limit: 1,
+						where: eq(narrators.id, narratorId),
+						columns: {
+							id: true,
+							oauthPolicySnapshotJson: true,
+							contextProjectId: true,
+							defaultDeviceId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const provenance = await integrationResourceBindingService.get(
 		"narrator",
@@ -246,23 +236,16 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	}
 
 	readOptions?.signal?.throwIfAborted();
-	const client = await (readOptions
-		? readQueryFirst(
-				db.query.oauthClients.findMany({
-					limit: 1,
-					where: and(
-						eq(oauthClients.id, authority.authority.integrationId),
-						isNull(oauthClients.revokedAt),
-					),
-				}),
-				{ ...readOptions, executionPolicy: "worker-required" },
-			)
-		: db.query.oauthClients.findFirst({
-				where: and(
-					eq(oauthClients.id, authority.authority.integrationId),
-					isNull(oauthClients.revokedAt),
-				),
-			}));
+	const client = await readQueryFirst(
+		db.query.oauthClients.findMany({
+			limit: 1,
+			where: and(
+				eq(oauthClients.id, authority.authority.integrationId),
+				isNull(oauthClients.revokedAt),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!client?.publicClient) throw runtimeForbidden("OAuth client is inactive");
 	// Grant ownership is the boundary: require the send_message capability on the
 	// authority (any scope) rather than a project-scoped grant.
@@ -281,21 +264,13 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	if (!policy) throw runtimeForbidden("OAuth narrator policy intersection is empty");
 
 	readOptions?.signal?.throwIfAborted();
-	const deviceRows = await (readOptions
-		? readQuery(
-				db.query.remoteDevices.findMany({
-					where: and(
-						inArray(remoteDevices.id, snapshot.deviceIds),
-						isNull(remoteDevices.revokedAt),
-					),
-					columns: { id: true, scope: true, projectId: true },
-				}),
-				{ ...readOptions, executionPolicy: "worker-required" },
-			)
-		: db.query.remoteDevices.findMany({
-				where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
-				columns: { id: true, scope: true, projectId: true },
-			}));
+	const deviceRows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
+			columns: { id: true, scope: true, projectId: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const devicesById = new Map(deviceRows.map((device) => [device.id, device]));
 	for (const deviceId of snapshot.deviceIds) {
 		const device = devicesById.get(deviceId);
