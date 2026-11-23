@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { boundedBodyText, hasBlockStorage, hasRowsOnlyBodies } from "../../lib/narrator-bodies";
+import { boundedBodyText, hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { MAILBOX_LIMITS as L } from "./limits";
 import { publicationDedupeKey } from "./publication-key";
 import type { PublicationRun } from "./publication-outbox";
@@ -26,7 +26,7 @@ export function readPublicationTerminalSnapshot(
 			sqlite,
 			run,
 			options,
-			fromBlocks || hasRowsOnlyBodies(sqlite) || hasBlockStorage(sqlite),
+			fromBlocks || hasRowsOnlyBodies(sqlite),
 			signal,
 		),
 	)();
@@ -202,14 +202,14 @@ export function readPublicationTerminalResult(
 
 export function readPublicationTerminalResultTask(
 	sqlite: Database,
-	input: { run: PublicationRun; options?: AgentTerminalResultReadOptions },
+	input: { run: PublicationRun; options?: AgentTerminalResultReadOptions; fromBlocks: boolean },
 	signal: AbortSignal,
 ): AgentTerminalResult | null {
 	return readPublicationTerminalSnapshot(
 		sqlite,
 		input.run,
 		input.options ?? {},
-		hasBlockStorage(sqlite),
+		input.fromBlocks,
 		signal,
 	);
 }

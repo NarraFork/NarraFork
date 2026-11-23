@@ -12,6 +12,7 @@ import {
 	narratorMessageRefs as refs,
 } from "../../db/schema";
 import * as workerRead from "../../db/worker-read";
+import { settings } from "../../lib/settings";
 import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
 const { db, sqlite, ready } = getTestDb();
@@ -418,6 +419,50 @@ test("snapshot requires committed terminal proof and remains readable after cons
 	expect(await service.readAgentTerminalResult(run)).toBeNull();
 });
 
+test("Worker terminal receipt honors restored JSON when block reads are disabled", async () => {
+	const run = start();
+	snapshot(run, "RESTORED JSON");
+	const id = `publication-result:${run.logicalRunId}`;
+	const restored = readTestMessageContent(sqlite, id);
+	const [block] = splitEnvelope({
+		id,
+		narratorId: "actor",
+		role: "disp",
+		contentJson: readTestMessageContent(sqlite, id),
+		contentText: "RESTORED JSON",
+		parentToolUseId: null,
+	}).blocks;
+	if (!block) throw new Error("Missing receipt block");
+	db.delete(narratorBlocks).where(eq(narratorBlocks.messageId, id)).run();
+	db.insert(narratorBlocks)
+		.values({
+			id: "rollback-block",
+			messageId: id,
+			ordinal: 0,
+			kind: block.kind,
+			subtype: block.subtype,
+			phase: block.phase,
+			payload: JSON.parse(JSON.stringify(block.payload).replaceAll("RESTORED JSON", "STALE BLOCK")),
+			state: block.state,
+			createdAt: time,
+		})
+		.run();
+	db.update(messages)
+		.set({ bodyFormat: 2, bodyRowsOnly: 0, contentJson: restored })
+		.where(eq(messages.id, id))
+		.run();
+	sqlite.run("DELETE FROM narrator_block_sync_queue WHERE message_id = ?", [id]);
+	const previous = settings.narratorBlocks.read;
+	try {
+		settings.narratorBlocks.read = false;
+		expect(await service.readAgentTerminalResult(run)).toEqual({ output: "RESTORED JSON" });
+		settings.narratorBlocks.read = true;
+		expect(await service.readAgentTerminalResult(run)).toEqual({ output: "STALE BLOCK" });
+	} finally {
+		settings.narratorBlocks.read = previous;
+	}
+});
+
 test("rows-only terminal receipt uses its bounded body while original output stays authoritative", async () => {
 	const run = start();
 	snapshot(run, "ORIGINAL RECEIPT");
@@ -452,7 +497,13 @@ test("rows-only terminal receipt uses its bounded body while original output sta
 		.set({ bodyFormat: 2, bodyRowsOnly: 1, contentJson: [] })
 		.where(eq(messages.id, id))
 		.run();
-	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "ORIGINAL RECEIPT" });
+	const previousRead = settings.narratorBlocks.read;
+	try {
+		settings.narratorBlocks.read = false;
+		expect(await service.readAgentTerminalResult(run)).toEqual({ output: "ORIGINAL RECEIPT" });
+	} finally {
+		settings.narratorBlocks.read = previousRead;
+	}
 	db.update(messages).set({ originalContentJson: body }).where(eq(messages.id, id)).run();
 	db.update(narratorBlocks)
 		.set({ payload: { raw: [{ type: "text", text: "EDITED BODY" }] } })

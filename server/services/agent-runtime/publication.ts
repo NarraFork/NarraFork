@@ -22,6 +22,7 @@ import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { parseSubstatus, parseTraits } from "../../lib/narrator-utils";
+import { settings } from "../../lib/settings";
 import {
 	type RunBindingInput,
 	type RuntimeRunBinding,
@@ -616,7 +617,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return readDomainTask(
 			database.$client,
 			"publicationTerminalResult",
-			{ run, options },
+			{ run, options, fromBlocks: settings.narratorBlocks.read },
 			{ ...readOptions, executionPolicy: "worker-required" },
 		);
 	}

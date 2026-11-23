@@ -137,7 +137,10 @@ export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinit
 		validate: (input) => {
 			if (
 				!record(input) ||
-				Object.keys(input).some((key) => key !== "run" && key !== "options") ||
+				Object.keys(input).some(
+					(key) => key !== "run" && key !== "options" && key !== "fromBlocks",
+				) ||
+				typeof input.fromBlocks !== "boolean" ||
 				!record(input.run) ||
 				Object.keys(input.run).length !== 4
 			)
