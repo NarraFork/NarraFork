@@ -265,7 +265,7 @@ export async function seedFixture(owner: FixtureLifetime) {
 		async resolveFile({ identity, signal }) {
 			signal.throwIfAborted();
 			if (identity.deviceId !== "local") throw new Error("No remote fallback");
-			const scope = runtime.evidence.getScope(identity.scopeId);
+			const scope = await runtime.evidence.getScope(identity.scopeId, { signal });
 			if (!scope) throw new Error("No scope metadata");
 			return {
 				identity,
@@ -496,7 +496,9 @@ export async function twoFiles() {
 		await write(path, "changed");
 	}
 	const plan = await prepare();
-	const ordered = plans.listFiles(owner, plan.id).items.sort((x, y) => x.sequence - y.sequence);
+	const ordered = (await plans.listFiles(owner, plan.id)).items.sort(
+		(x, y) => x.sequence - y.sequence,
+	);
 	return {
 		a: ordered[0].identityJson.canonicalPath,
 		b: ordered[1].identityJson.canonicalPath,

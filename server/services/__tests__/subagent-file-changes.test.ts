@@ -20,7 +20,7 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileAttributions,
 	fileChangeEffects,
@@ -33,10 +33,14 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 // The real module is captured and restored in `afterAll`: `mock.module` is
-// PROCESS-GLOBAL in Bun, so leaving it installed hands this in-memory database to
+// PROCESS-GLOBAL in Bun, so leaving it installed hands this fixture database to
 // every other suite that runs afterwards in the same process — they then query a
 // database with none of their fixtures in it and fail for no visible reason.
 const realDbModule = { ...(await import("../../db")) };
@@ -319,7 +323,8 @@ beforeEach(async () => {
 	await makeNarrator("sub-b", PARENT);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
@@ -699,7 +704,8 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
 		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
 		await parentExecutionCall("current");
-		const prepare = spyOn(sqlite, "prepare");
+		const workerReads = await import("../../db/worker-read");
+		const read = spyOn(workerReads, "readQuery");
 		try {
 			const changes = await getChildSubagentFileChanges({
 				parentNarratorId: PARENT,
@@ -718,19 +724,19 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				files: [{ filePath: "src/current.ts", linesAdded: 4 }],
 				countsTruncated: false,
 			});
-			const lookups = prepare.mock.calls
-				.map(([text]) => text)
-				.filter((text) => text.includes('from "file_change_effects"'));
+			const lookups = read.mock.calls
+				.map(([query]) => query.toSQL())
+				.filter(({ sql }) => sql.includes('from "file_change_effects"'));
 			expect(lookups).toHaveLength(1);
 			const plan = sqlite
-				.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${lookups[0]}`)
-				.all("current-op", "apply", "changed", "settled", "measured", 2)
+				.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${lookups[0].sql}`)
+				.all(...(lookups[0].params as SQLQueryBindings[]))
 				.map(({ detail }) => detail);
 			expect(plan).toContainEqual(
 				expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
 			);
 		} finally {
-			prepare.mockRestore();
+			read.mockRestore();
 		}
 	});
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
@@ -806,8 +812,8 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				await getCurrentSubagentFileChangeOptions(["sub-a"], "wrong-parent")
 			).executionBoundariesBySubagent?.get("sub-a"),
 		).toBeNull();
-		recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
-		recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1625,7 +1631,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 			["remote-a", WORKSPACE],
 			["remote-a", OTHER_WORKSPACE],
 		]) {
-			recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
+			await recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
 			await attribute({
 				narratorId: "sub-a",
 				filePath: "same.ts",
@@ -1634,7 +1640,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 				linesAdded: 1,
 			});
 		}
-		recordTeamFileChange(PARENT, "sub-a", "same.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "same.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1656,11 +1662,11 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		} = await import("../subagent-team");
 		clearTeamFileChanges(PARENT);
 		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
-		recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
+		await recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
-		recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
 		expect(getTeamFileChanges(PARENT).has("ordinary-fork")).toBe(false);
 		expect(getTeamFileChangeEntries(PARENT).get("sub-a")?.[0]).toEqual({
 			deviceId: null,
@@ -1682,7 +1688,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 
 		// One change, recorded the way `trackFileChange` records it: the in-memory team
 		// map AND an attribution row.
-		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1719,10 +1725,51 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		clearTeamFileChanges(PARENT);
 		clearTeamFileChanges("other-parent");
 
-		recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
+		await recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
 		expect(getTeamFileChanges(PARENT).size).toBe(0);
 		expect((await getSubagentFileChanges(PARENT)).totalFiles).toBe(0);
 
 		clearTeamFileChanges("other-parent");
 	});
+});
+
+describe("required subagent evidence isolation", () => {
+	for (const fault of ["spawn", "crash", "timeout", "disabled", "cancelled", "deadline"] as const) {
+		test(`${fault} rejects instead of inventing zero file changes`, async () => {
+			const old = process.env.NARRAFORK_DB_WORKER;
+			const controller = new AbortController();
+			const options = { signal: controller.signal, deadlineAt: Date.now() + 30_000 };
+			if (fault === "disabled") process.env.NARRAFORK_DB_WORKER = "off";
+			if (fault === "cancelled") controller.abort(new Error("cancelled"));
+			if (fault === "deadline") options.deadlineAt = Date.now() - 1;
+			const error =
+				fault === "spawn"
+					? new workerPool.WorkersUnavailableError("spawn failed")
+					: fault === "timeout"
+						? new workerPool.DbReadTaskTimeoutError("timed out")
+						: new Error("worker crashed");
+			const read = ["spawn", "crash", "timeout"].includes(fault)
+				? spyOn(workerPool, "runReadTask").mockRejectedValue(error)
+				: null;
+			const prepare = spyOn(sqlite, "prepare");
+			const query = spyOn(sqlite, "query");
+			try {
+				for (const work of [
+					() => getTeamSubagentFileChanges(PARENT, undefined, undefined, options),
+					() => getFileChangesBySubagent(["sub-a"], options),
+					() => getCurrentSubagentFileChangeOptions(["sub-a"], PARENT, options),
+				]) {
+					expect(await captureWorkerRejection(work())).toBeInstanceOf(Error);
+				}
+				expect(prepare).not.toHaveBeenCalled();
+				expect(query).not.toHaveBeenCalled();
+			} finally {
+				prepare.mockRestore();
+				query.mockRestore();
+				read?.mockRestore();
+				if (old === undefined) delete process.env.NARRAFORK_DB_WORKER;
+				else process.env.NARRAFORK_DB_WORKER = old;
+			}
+		});
+	}
 });

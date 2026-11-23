@@ -67,7 +67,13 @@ function fixture(
 	}> = [];
 	const reads: Array<{ path: string; opts?: ReadBytesOptions }> = [];
 	const globs: GlobOptions[] = [];
-	const access: Array<{ narratorId: string; userId: string; need: string }> = [];
+	const access: Array<{
+		narratorId: string;
+		userId: string;
+		need: string;
+		signal?: AbortSignal;
+		deadlineAt?: number;
+	}> = [];
 	let readHook: ((path: string, opts?: ReadBytesOptions) => Promise<ReadBytesResult>) | undefined;
 	let globHook: ((opts: GlobOptions) => Promise<GlobMatches>) | undefined;
 	let generation = 1;
@@ -155,8 +161,14 @@ function fixture(
 		supportsFsReadBounded: boolean;
 	};
 	const deps: FileReferenceDependencies = {
-		async loadScope(narratorId, userId, need) {
-			access.push({ narratorId, userId, need });
+		async loadScope(narratorId, userId, need, options) {
+			access.push({
+				narratorId,
+				userId,
+				need,
+				signal: options?.signal,
+				deadlineAt: options?.deadlineAt,
+			});
 			if (revoked || userId !== "visitor") throw new NotFoundError("Narrator", narratorId);
 			return scope;
 		},
@@ -216,6 +228,17 @@ function fixture(
 }
 
 describe("read-only large file panels", () => {
+	test("scope admission and recheck share the operation signal and absolute deadline", async () => {
+		const f = fixture();
+		const before = Date.now();
+		await f.service.filePanelInfo("n", "visitor", { deviceId: f.id, path: "/work/file.ts" });
+		expect(f.access).toHaveLength(2);
+		expect(f.access[0].signal).toBeInstanceOf(AbortSignal);
+		expect(f.access[0].deadlineAt).toBeGreaterThan(before);
+		expect(f.access[1].signal).toBe(f.access[0].signal);
+		expect(f.access[1].deadlineAt).toBe(f.access[0].deadlineAt);
+	});
+
 	for (const remote of [false, true]) {
 		test(`metadata and UTF-8 pages are bounded (${remote ? "remote" : "local"})`, async () => {
 			const f = fixture({ remote });
@@ -771,7 +794,13 @@ describe("safe file capture and preview", () => {
 		).rejects.toBeInstanceOf(NotFoundError);
 		expect(f.reads).toHaveLength(0);
 		await f.service.captureFileReferences("narrator", "visitor", [ref()]);
-		expect(f.access.at(-1)).toEqual({ narratorId: "narrator", userId: "visitor", need: "write" });
+		expect(f.access.at(-1)).toEqual({
+			narratorId: "narrator",
+			userId: "visitor",
+			need: "write",
+			signal: expect.any(AbortSignal),
+			deadlineAt: expect.any(Number),
+		});
 	});
 	test("ask and deny never become allow, even within cwd", async () => {
 		for (const decision of ["ask", "deny"] as const) {

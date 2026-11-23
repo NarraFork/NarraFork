@@ -31,6 +31,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { editorOperationMetadataSchema } from "../lib/validators/editor-documents";
 import { denyHostEditorHelpers } from "../routes/editor-native-fixture";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	executeEditorDocumentFileChange,
 	getEditorDocumentService,
@@ -267,7 +268,9 @@ for (const scenario of [
 						code: "STALE_WRITE",
 					});
 				}
-				await expect(queryEditorOperation(actor, randomUUID())).rejects.toMatchObject({
+				await expect(
+					(await settleWorkerRead(queryEditorOperation(actor, randomUUID()))).result(),
+				).rejects.toMatchObject({
 					code: "EDITOR_OPERATION_UNKNOWN",
 				});
 				if (large) {
@@ -331,10 +334,16 @@ for (const scenario of [
 						.where(eq(fileChangeOperations.id, row.id))
 						.run();
 					await expect(
-						queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
+						(
+							await settleWorkerRead(
+								queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
+							)
+						).result(),
 					).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
 					revoked = true;
-					await expect(cold.operation(actor, large.result.operationId)).rejects.toThrow("revoked");
+					await expect(
+						(await settleWorkerRead(cold.operation(actor, large.result.operationId))).result(),
+					).rejects.toThrow("revoked");
 				}
 				await expect(
 					lstat(join(getNarraforkHome(), "editor-native-operations")),
