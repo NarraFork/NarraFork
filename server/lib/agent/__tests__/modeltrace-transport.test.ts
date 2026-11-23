@@ -109,9 +109,11 @@ test("fork keeps the complete Codex input and cache key, but replaces socket and
 	const original = captured;
 	await drain(provider, fork(provider, parent));
 	const diagnostic = captured;
-	expect(original?.request.instructions).toBe("original instructions");
+	expect(original?.request.input[0]).toEqual({
+		role: "developer",
+		content: [{ type: "input_text", text: "original instructions" }],
+	});
 	expect(JSON.stringify(original?.request.input)).toContain("dGVzdA==");
-	expect(diagnostic?.request.instructions).toBe(original?.request.instructions);
 	expect(diagnostic?.request.tools).toEqual(original?.request.tools);
 	expect(diagnostic?.request.input).toEqual([
 		...(original?.request.input ?? []),

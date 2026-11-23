@@ -242,7 +242,7 @@ describe("chat completions downgrade", () => {
 });
 
 describe("OpenAI Responses downgrade", () => {
-	test("a known-bad relay gets the schema in instructions, not text.format", async () => {
+	test("a known-bad relay gets the schema in the developer message, not text.format", async () => {
 		rememberMissingNativeStructuredOutput(RESPONSES_KEY);
 		const { request, result } = await drive(
 			responsesProvider(),
@@ -255,8 +255,7 @@ describe("OpenAI Responses downgrade", () => {
 		// `text.format`, answered in prose, and the summary silently vanished.
 		expect(request.body).not.toHaveProperty("text");
 		expect(request.body).not.toHaveProperty("response_format");
-		expect(String(request.body.instructions)).toContain("optimizedPrompt");
-		expect(String(request.body.instructions).startsWith("sys")).toBe(true);
+		expect(responsesInstructionOf(request.body)).toBe(withSchemaInstruction("sys", FORMAT));
 
 		expect(result.reasoningSummary).toBe("补充了字段与校验。");
 		expect(result.structured).toEqual({
@@ -277,7 +276,7 @@ describe("OpenAI Responses downgrade", () => {
 				strict: true,
 			},
 		});
-		expect(request.body.instructions).toBe("sys");
+		expect(responsesInstructionOf(request.body)).toBe("sys");
 	});
 
 	test("a chat-only failure does not downgrade the Responses endpoint", async () => {
@@ -289,9 +288,20 @@ describe("OpenAI Responses downgrade", () => {
 			provider.generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT }),
 		);
 		expect(request.body).toHaveProperty("text");
-		expect(request.body.instructions).toBe("sys");
+		expect(responsesInstructionOf(request.body)).toBe("sys");
 	});
 });
+
+function responsesInstructionOf(body: Record<string, unknown>): string {
+	expect(body).not.toHaveProperty("instructions");
+	const input = body.input as Array<{
+		role: string;
+		content: Array<{ type: string; text: string }>;
+	}>;
+	expect(input.map((item) => item.role)).toEqual(["developer", "user"]);
+	expect(input[0].content[0].type).toBe("input_text");
+	return input[0].content[0].text;
+}
 
 describe("explicit structured-output rejection", () => {
 	for (const mode of ["completions", "responses"] as const) {
@@ -304,7 +314,7 @@ describe("explicit structured-output rejection", () => {
 			});
 		const instructionOf = (body: Record<string, unknown>) =>
 			mode === "responses"
-				? String(body.instructions)
+				? responsesInstructionOf(body)
 				: (body.messages as Array<{ content: string }>)[0].content;
 		const nativeOf = (body: Record<string, unknown>) =>
 			mode === "responses"

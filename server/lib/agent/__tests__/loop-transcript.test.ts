@@ -209,7 +209,7 @@ for (const [name, provider, model] of projectionProviders()) {
 for (const apiMode of ["responses", "codex"] as const) {
 	test(`${apiMode}: outgoing instructions remain the baseline; update stays in input`, async () => {
 		const provider = new OpenAIProvider({ ...CONFIG, apiMode });
-		const requests: Array<{ instructions: string; input: unknown[] }> = [];
+		const requests: Array<{ input: unknown[] }> = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (_input, init) => {
 			requests.push(JSON.parse(String(init?.body)));
@@ -252,9 +252,12 @@ for (const apiMode of ["responses", "codex"] as const) {
 			globalThis.fetch = originalFetch;
 		}
 		expect(requests).toHaveLength(3);
-		expect(requests[1].instructions).toBe(requests[0].instructions);
-		expect(requests[1].instructions).toContain("frozen-baseline");
-		expect(requests[1].instructions).not.toContain("<context_update>");
+		expect(requests[1]).not.toHaveProperty("instructions");
+		expect(requests[1].input[0]).toMatchObject({
+			role: "developer",
+			content: [{ type: "input_text", text: expect.stringContaining("frozen-baseline") }],
+		});
+		expect(JSON.stringify(requests[1].input[0])).not.toContain("<context_update>");
 		expect(requests[1].input.slice(0, requests[0].input.length)).toEqual(requests[0].input);
 		expect(requests[1].input).toEqual(requests[2].input);
 		expect(JSON.stringify(requests[1].input).split("<context_update>")).toHaveLength(2);

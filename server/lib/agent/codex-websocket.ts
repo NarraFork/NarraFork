@@ -620,7 +620,7 @@ export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 ): Record<string, string> {
 	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
-	// contract (no top-level instructions/tools, additional_tools spliced into
+	// contract (no top-level tools, additional_tools spliced into
 	// input, parallel_tool_calls off) that this transport does not implement, and
 	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {

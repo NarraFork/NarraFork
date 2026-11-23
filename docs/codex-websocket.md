@@ -46,7 +46,8 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   `response.create` 的 `client_metadata`（见 `applyTurnStateToRequest`），与 codex-rs 一致——
   上游 `build_websocket_headers` 显式传 `/*turn_state*/ None`，并在 WS 的 `client_metadata`
   里注入该 token；只有 HTTP 路径才把它作为请求头发送
-- **不发送** `x-openai-internal-codex-responses-lite`：该头不是身份标记，而是一份请求体契约的一半。真实客户端由模型目录里的 `ModelInfo.use_responses_lite` 驱动，置位时同时做四件事——省略顶层 `instructions` 与 `tools`、把 `additional_tools` 与 developer 指令消息插到 `input` 最前、`parallel_tool_calls: false`、再加这个头。上游会校验这对配对关系，只要 `tools` 里出现 hosted 工具（如 `web_search` / `image_generation`）就返回 400：`X-OpenAI-Internal-Codex-Responses-Lite only supports function tools, custom tools, and client-executed tool search.`。NarraFork 发送的是经典非 lite 请求体，因此不声明 lite；`stripResponsesLiteHeader` 会把用户 `extraHeaders` 里塞进来的该头也去掉。
+- 系统提示词作为 `input` 开头的 `developer` 消息发送，不写入顶层 `instructions`，以便缓存。官方客户端也在非 Lite 模式下使用这种布局。
+- **不发送** `x-openai-internal-codex-responses-lite`：官方客户端仅在模型目录设置 `ModelInfo.use_responses_lite` 时才发送此头，并把顶层工具改放到 `input` 中的 `additional_tools`，同时禁用并行工具调用。NarraFork 保留顶层 `tools`，以支持 `web_search` / `image_generation` 等 hosted 工具；`stripResponsesLiteHeader` 也会移除 `extraHeaders` 中的此头。
 - 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.summary: "auto"`（非 lite 形态省略 `reasoning.context`，与 codex-rs 0.159.2 一致）与 `text.verbosity: "low"`，`client_metadata` 含会话稳定的 `x-codex-window-id`，以及拿到 turn state 之后的 `x-codex-turn-state`
 - 增量续写复用判定（`requestWithoutInput`）**排除 `client_metadata`**：该字段带有随请求变化的运行时值
   （尤其是 `x-codex-turn-state`），若参与比较，首个响应之后的每个请求都会被判定为「不同请求」，
