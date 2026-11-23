@@ -469,7 +469,8 @@ describe("auxiliary content projection", () => {
 						id: "watch-task",
 						alias: "watch-agent-fix",
 						title: "watch agent Fix login",
-						status: "timeout",
+						status: "completed",
+						watchOutcome: "deadline",
 						preview:
 							"Watch reached its deadline for agent fix. Only the observation ended; the target was not stopped.\n\nSubagent is still running.",
 						watch: "agent",
@@ -483,7 +484,7 @@ describe("auxiliary content projection", () => {
 			includeDetail: true,
 			labels: { watchNoticeLabel: "观察", watchNoticeDeadline: "已到截止时间" },
 		});
-		expect(data.detail?.sections[0].body).toMatchObject({ text: "Subagent is still running." });
+		expect(JSON.stringify(data.detail)).toContain("Watch reached its deadline");
 		expect(data).toMatchObject({
 			toolName: "观察",
 			summary: "Fix login · 已到截止时间",

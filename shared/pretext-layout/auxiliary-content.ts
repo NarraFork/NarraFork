@@ -306,15 +306,17 @@ export function buildAuxiliaryContentData(
 			task?.status ||
 			sourceStatus;
 		if (watch) {
-			// The folded row never reads the output, so only the status speaks to the outcome.
+			// The folded row never reads the output: the producer recorded the outcome, and
+			// older rows fall back to what their status says.
 			label = opts.labels?.watchNoticeLabel ?? "Watch";
 			category = "watch";
 			const outcome =
-				sourceStatus === "timeout"
+				task?.watchOutcome ??
+				(sourceStatus === "timeout"
 					? "deadline"
 					: ["fail", "failed", "error"].includes(sourceStatus ?? "")
 						? "failed"
-						: null;
+						: null);
 			summary = short(
 				[watch.targetName ?? summary, outcome && watchNoticeOutcomeLabel(outcome, opts.labels)]
 					.filter(Boolean)
@@ -326,11 +328,7 @@ export function buildAuxiliaryContentData(
 		if (body.flavor === "agent" && task?.id)
 			target = { kind: "narrator", narratorId: task.id, messageId: task.resultMessageId };
 		if (opts.includeDetail)
-			content = joinContent(
-				body.items,
-				(item) => (body.flavor === "bash" && watchNoticeFromTask(item)?.body) || item.preview,
-				opts.preview === true,
-			);
+			content = joinContent(body.items, (item) => item.preview, opts.preview === true);
 		sourceTruncated = body.items.some((item) => item.truncated === true);
 		format = body.flavor === "bash" ? "text" : "markdown";
 	} else if (body?.kind === "messages") {
