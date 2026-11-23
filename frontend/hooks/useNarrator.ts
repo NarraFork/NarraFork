@@ -16,6 +16,7 @@ import {
 } from "../lib/api";
 import {
 	type BlockTarget,
+	type NarratorDetail,
 	type RevertAction,
 	type RevertActionConfirmOptions,
 	type RevertActionPreview,
@@ -1236,6 +1237,19 @@ export function useUpdateModel() {
 		mutationFn: ({ id, model }: { id: string; model: string }) =>
 			api.updateNarratorModel(id, model),
 		onSuccess: (_data, vars) => {
+			// The PATCH has succeeded; do not wait for a second round-trip to show the selection.
+			qc.setQueryData<NarratorDetail>(
+				["narrators", vars.id],
+				(current: NarratorDetail | undefined) =>
+					current && current.model !== vars.model
+						? {
+								...current,
+								model: vars.model,
+								runtimeModel: undefined,
+								modelInheritance: undefined,
+							}
+						: current,
+			);
 			// Changing the model abandons the unavailable model's wait condition, so
 			// dismiss its persistent notification even if the server does not emit a
 			// recovery event for the old model.
