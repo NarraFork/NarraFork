@@ -1303,7 +1303,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 	// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 	// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 	// the background after that queue is mounted.
-	withBackgroundOccupancyInitialization(
+	const narratorRecovery = withBackgroundOccupancyInitialization(
 		async () => {
 			const plannedUpdate = await getPlannedUpdateStartupProtection({
 				claimAuthorization: automaticResumeEnabled(),
@@ -1337,6 +1337,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 		activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
 	)
 		.then(async ({ plannedUpdate, ordinaryRestart }) => {
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 			await restorePendingModelOverrides();
 			// Browser-backed narrators must see their restored sessions before planned-update continuation
 			// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1609,6 +1610,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 		// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
 		void migrateAggregationsOnStartup();
 	}
+	await narratorRecovery;
 }
 
 const databaseStartup = createDatabaseReaderStartup({

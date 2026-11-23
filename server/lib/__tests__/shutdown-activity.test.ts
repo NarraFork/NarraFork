@@ -154,8 +154,17 @@ describe("main shutdown wiring without booting the server", () => {
 			"scheduleProjectIndexRebuild",
 			"migrateAggregationsOnStartup",
 			"logger",
+			"narratorRecovery",
 			`${code}\nreturn start;`,
-		)(backend, () => {}, cleanup, rebuild, migrate, { warn() {} }) as () => Promise<void>;
+		)(
+			backend,
+			() => {},
+			cleanup,
+			rebuild,
+			migrate,
+			{ warn() {} },
+			Promise.resolve(),
+		) as () => Promise<void>;
 		const startup = createDatabaseReaderStartup({
 			readiness: {
 				state: admitted

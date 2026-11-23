@@ -17,6 +17,95 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("database reader startup recovery", () => {
+	test("shutdown owns the production narrator recovery until its last write settles", async () => {
+		const source = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
+		const begin = source.indexOf("\t// Keep only targets discovered by this startup.");
+		const end = source.indexOf("\n\t/**\n\t * Scan for narrators", begin);
+		const initializerEnd = source.indexOf("\nconst databaseStartup =", end);
+		expect(begin).toBeGreaterThan(0);
+		expect(end).toBeGreaterThan(begin);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lifecycle = { accepting: true };
+		const gate = createStartupReadinessGate();
+		const protection = { narratorIds: new Set<string>() };
+		const dependencies = {
+			httpLifecycle: lifecycle,
+			startupReadiness: gate,
+			cancelDatabaseStartup: () => gate.settle({ ok: false, error: "SERVER_SHUTTING_DOWN" }),
+			withBackgroundOccupancyInitialization: (work: () => Promise<unknown>) => work(),
+			getPlannedUpdateStartupProtection: async () => ({ protection }),
+			automaticResumeEnabled: () => false,
+			prepareOrdinaryRestartRecovery: async () => ({ protection, heldRunIds: [] }),
+			mergeStartupProtection: () => protection,
+			recoverNarrators: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+			activeDatabaseBackend: "sqlite",
+			backgroundOccupancyInitializer: undefined,
+			restorePendingModelOverrides: async () => {},
+			finishRecoveryDiscovery: () => {},
+			restoreNarratorsAfterPlannedUpdate: async () => {},
+			restoreOrdinaryRestartRecovery: async () => {},
+			startQuestionAnswerRecovery: () => {},
+			failUnownedStartupRecovery: async () => {},
+			isProviderUnavailableError: () => false,
+			reportBrokenModelNarrators: () => {},
+			logger: { error() {}, info() {}, warn() {} },
+			importModule: async () => ({
+				recoverInboxClaimsOnColdStartup: async () => {},
+				restoreBrowserSessionsAfterUpdate: async () => {},
+				startBlockBackfill() {},
+				startStorageHistoryRetention() {},
+			}),
+		};
+		const recovery = source.slice(begin, end).replace(/\bimport\s*\(/g, "importModule(");
+		const ownedAwait =
+			source.slice(end, initializerEnd).match(/\n\tawait narratorRecovery;/)?.[0] ?? "";
+		const initialize = new Function(
+			...Object.keys(dependencies),
+			new Bun.Transpiler({ loader: "ts" }).transformSync(
+				`return async () => { ${recovery} ${ownedAwait} };`,
+			),
+		)(...Object.values(dependencies)) as () => Promise<void>;
+		let attempts = 0;
+		const startup = createDatabaseReaderStartup({
+			readiness: {
+				state: { status: "waiting" },
+				wait: async () =>
+					++attempts === 1 ? { ok: false, code: "DB_READERS_UNAVAILABLE" } : { ok: true },
+			},
+			initialize,
+			onUnavailable() {},
+			onError(error) {
+				throw error;
+			},
+			retryIntervalMs: 1,
+		});
+		try {
+			await startup.start();
+			await entered.promise;
+			lifecycle.accepting = false;
+			startup.stop();
+			let drained = false;
+			const draining = startup.drain().then(() => {
+				drained = true;
+			});
+			await Bun.sleep(5);
+			expect(startup.pending).toBe(true);
+			expect(drained).toBe(false);
+			release.resolve();
+			await draining;
+			expect(startup.pending).toBe(false);
+			expect(gate.state.status).not.toBe("ready");
+		} finally {
+			release.resolve();
+			startup.stop();
+			await startup.drain();
+		}
+	});
+
 	test("shutdown drains an in-flight initializer before relinquishing ownership", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
