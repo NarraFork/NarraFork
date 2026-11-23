@@ -145,6 +145,8 @@ interface PendingFlow {
 	state: string;
 	codeVerifier?: string;
 	expiresAt: number;
+	/** Registration and discovery written during the flow, persisted only with its tokens. */
+	staged: McpOAuthRecord;
 }
 
 const pendingFlows = new Map<string, PendingFlow>();
@@ -162,13 +164,30 @@ class NarraForkOAuthProvider implements OAuthClientProvider {
 		private readonly flow?: PendingFlow,
 	) {}
 
-	private record(): McpOAuthRecord {
+	private stored(): McpOAuthRecord {
 		const record = getStore().get(this.storeKey);
 		if (record.binding === bindingOf(this.config)) return record;
 		return { clientSecret: record.clientSecret };
 	}
 
+	private record(): McpOAuthRecord {
+		return this.flow ? { ...this.stored(), ...this.flow.staged } : this.stored();
+	}
+
+	/**
+	 * A flow stages its writes until consent yields tokens, so a re-authorization the
+	 * admin abandons (or one that re-registers for a new callback URL) leaves the
+	 * existing authorization intact.
+	 */
 	private save(change: Partial<McpOAuthRecord>): void {
+		if (this.flow && !change.tokens) {
+			Object.assign(this.flow.staged, change);
+			return;
+		}
+		if (this.flow) {
+			change = { ...this.flow.staged, ...change };
+			this.flow.staged = {};
+		}
 		const binding = bindingOf(this.config);
 		const stored = getStore().get(this.storeKey).binding;
 		// A background connection for another URL / client id (e.g. testing an unsaved
@@ -226,11 +245,13 @@ class NarraForkOAuthProvider implements OAuthClientProvider {
 	}
 
 	tokens(): OAuthTokens | undefined {
-		return this.record().tokens;
+		// An admin-started flow always goes to consent: refreshing the old grant would
+		// keep its old scope and hide a needed scope upgrade.
+		return this.flow ? undefined : this.record().tokens;
 	}
 
 	saveTokens(tokens: OAuthTokens): void {
-		const previous = this.record().tokens;
+		const previous = this.flow ? undefined : this.record().tokens;
 		// Refresh responses may omit the refresh token, which then stays valid (RFC 6749 §6).
 		const refresh_token = tokens.refresh_token ?? previous?.refresh_token;
 		this.save({
@@ -288,7 +309,7 @@ export function createMcpOAuthProvider(
 
 export type McpOAuthStartResult = { authorized: true } | { authorizationUrl: string };
 
-/** Begin (or silently complete via refresh) authorization for a configured server. */
+/** Begin an interactive authorization for a configured server. */
 export async function startMcpOAuth(
 	config: McpServerConfig,
 	redirectUrl: string,
@@ -304,6 +325,7 @@ export async function startMcpOAuth(
 		redirectUrl,
 		state: randomBytes(32).toString("base64url"),
 		expiresAt: Date.now() + FLOW_TTL_MS,
+		staged: {},
 	};
 	const provider = new NarraForkOAuthProvider(config, config.id, flow);
 	const result = await auth(provider, {
