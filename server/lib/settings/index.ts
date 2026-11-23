@@ -15,6 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
@@ -653,7 +654,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (!_cache.current) {
 		setSecretEncryption(merged.secrets?.encrypt !== false);
 		// Before anything creates a credential owner, which picks its files from the result.
-		migrateCredentialFiles();
+		// Only the server's own thread: a worker that loads settings must not move files
+		// under owners the server already created.
+		if (isMainThread) migrateCredentialFiles();
 	}
 
 	// Migrate legacy per-provider codexOAuth to centralized credential pool

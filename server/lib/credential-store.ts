@@ -2,8 +2,8 @@
  * `credentials.json`: every model credential of this instance in one encrypted file
  * (docs/PROVIDER-SOURCING-DESIGN.md §15.3).
  *
- * Two owners keep credentials in memory: CodexManager (the `codex` group) and the provider
- * key store (every other group, plus the group secrets). Each hands its part here when it
+ * Two owners keep credentials in memory: CodexManager (the `codex` group's accounts) and the
+ * provider key store (API keys of every other group, plus the group secrets). Each hands its part here when it
  * saves; the file is written from both parts as they were last saved, so neither can write
  * over the other's changes. One instance per NarraFork home.
  *
@@ -69,7 +69,12 @@ export interface KeyPart {
 	groupSecrets: Record<string, GroupSecrets>;
 }
 
-const isCodex = (credential: Credential) => credential.target.groupId === CODEX_GROUP;
+/**
+ * Codex accounts sign in; every other credential is an API key. Telling them apart by
+ * sign-in kind rather than group id keeps a connection that happens to be called `codex`
+ * with the keys.
+ */
+const isCodex = (credential: Credential) => credential.auth.kind !== "api_key";
 
 function parseFile(raw: unknown): CredentialsFile {
 	const value = (raw ?? {}) as Partial<CredentialsFile>;

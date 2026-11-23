@@ -677,11 +677,11 @@ resolveRoute({
   - 多个旧连接指向同一已知服务时仍是多个组，不自动合并。用户以后想合到一个池里，可以把凭据移到同一组，空组自动消失（S5 提供入口）。
 - **过渡期新建**：S5 之前前端仍用旧的“添加供应商”页，新建的连接一律按上面的规则一对一建组，不并入已有组。
 - **一次性启动迁移**（S1，已实现，`server/lib/credential-migration.ts`）：
-  - 模式由文件决定，不用 settings 标记：`credentials.json` 存在即统一模式，CodexManager 与 `ProviderKeyStore` 都从它读写（`credential-store.ts` 每个 home 一个实例，两者各交自己的一段，写文件时拼上另一段最近保存的内容，互不覆盖）；不存在时两者照旧读写 `codex-credentials.json` / `provider-keys.json`。`search:` 条目两种模式都留在 `provider-keys.json`。
-  - 时机：首次加载设置时，`secrets.encrypt` 生效之后、任何凭据所有者创建之前（旧的 per-provider `codexOAuth` 迁移随之挪到加密开关之后）；热重载不重跑。只在没有 `credentials.json` 且旧文件里有模型凭据时执行，新装实例在有凭据后的下一次启动迁移。不读 settings：Key 的归属 id 已带连接 id 与命名空间。
-  - 步骤：读两个旧文件（任一不可读 → 放弃，零写入）→ 按 15.3 定 id（冲突 → 放弃，零写入）→ 把 `settings.json`、`codex-credentials.json`、`provider-keys.json`、`credential-state.json`、`codex-stats.json` 中存在的复制到 `credential-backups/pre-sourcing-<时间>/`（目录 0700、文件 0600）→ 旧 Codex 文件里仍内嵌的运行时状态写进 `credential-state.json`（`codex-stats.json` 仍由 CodexManager 加载时迁走）→ 原子写出完整的 `credentials.json` → 清理：`provider-keys.json` 只留搜索 Key（没有就删除），删 `codex-credentials.json`。
+  - 模式由文件决定，不用 settings 标记：`credentials.json` 存在即统一模式，CodexManager 与 `ProviderKeyStore` 都从它读写（`credential-store.ts` 每个 home 一个实例，两者各交自己的一段——按登录方式区分，`api_key` 归 Key 段、其余归 Codex 段——写文件时拼上另一段最近保存的内容，互不覆盖）；不存在时两者照旧读写 `codex-credentials.json` / `provider-keys.json`。`search:` 条目两种模式都留在 `provider-keys.json`。
+  - 时机：首次加载设置时，`secrets.encrypt` 生效之后、任何凭据所有者创建之前（旧的 per-provider `codexOAuth` 迁移随之挪到加密开关之后）；热重载和加载设置的 Worker 线程（如请求录制）不跑。只在没有 `credentials.json` 且旧文件里有模型凭据时执行，新装实例在有凭据后的下一次启动迁移。不读 settings：Key 的归属 id 已带连接 id 与命名空间。
+  - 步骤：读两个旧文件（任一不可读 → 放弃，零写入）→ 按 15.3 定 id（id 重复，或两类连接共用一个组 id，如 NUG 与自定义 API 同 id、自定义 API 的 id 为 `codex` → 放弃，零写入）→ 把 `settings.json`、`codex-credentials.json`、`provider-keys.json`、`credential-state.json`、`codex-stats.json` 中存在的复制到 `credential-backups/pre-sourcing-<时间>/`（目录 0700、文件 0600）→ 旧 Codex 文件里仍内嵌的运行时状态写进 `credential-state.json`（`codex-stats.json` 仍由 CodexManager 加载时迁走）→ 原子写出完整的 `credentials.json` → 清理：`provider-keys.json` 只留搜索 Key（没有就删除），删 `codex-credentials.json`。
   - 崩溃恢复：写出 `credentials.json` 之前崩溃，下次从旧文件重做（多一份备份）；之后崩溃，下次以统一模式启动并重做清理（幂等，所有者忽略残留的非搜索条目）。
-  - 放弃时旧体系照常可用、可编辑，下次启动重试。id 冲突不会自愈：记日志，`GET /api/settings` 带 `credentialMigrationConflicts`（id 与所属来源组、标签），供应商设置页顶部显示一条提示，管理员删除或重新添加其中一个后重启即可完成迁移。
+  - 放弃时旧体系照常可用、可编辑，下次启动重试。id 冲突不会自愈：记日志，`GET /api/settings` 只对管理员带 `credentialMigrationConflicts`（id、所属来源组与类别、标签），供应商设置页顶部显示一条提示，管理员删除或重新添加其中一个后重启即可完成迁移。
   - 文件中 Key 归属按组：`nug:<id>` → `<id>`，`builtin:tokendance` / `builtin:CommandCode` → `tokendance` / `CommandCode`；`quota:<id>` / `nug-oauth:<id>` 成为 `groupSecrets[<id>]` 的 `quotaAccessToken` / `oauthClientSecret`。旧命名空间只留在 `ProviderKeyStore` 外观里，调用方语义不变。
 - **过渡投影**：设置页重组（S5）之前，内存里的 `settings` 继续由来源组 + 凭据投影出 `customApiProviders` / `nugProviders` / `tokendance` / `commandCode` 及派生的三个数组；因为迁移是一对一，投影出的连接 id、前缀与迁移前完全相同。`GET /api/settings` 与整数组 `PATCH` 照旧，写入翻译成来源组与凭据。这沿用了 Key 迁出时 `provider-keys-projection.ts` 的做法。
   - 记账：所有适配器路径（含只有一个普通 Key 的直连路径）都显式上报 `credentialId`，`defaultRequestSourceId` 只留给旧数据。这样单凭据组的记账 id 不再依赖“按前缀找连接 id”，网络身份下沉到凭据后也不会变。

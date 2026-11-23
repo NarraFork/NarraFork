@@ -12,17 +12,20 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { Hono } from "hono";
 import { settingsRoutes } from "../../routes/settings";
 import { CodexManager } from "../codex-manager";
 import {
 	CREDENTIAL_BACKUPS_DIR,
+	type CredentialIdConflict,
 	getCredentialMigrationConflicts,
 	migrateCredentialFiles,
 } from "../credential-migration";
 import {
 	CREDENTIALS_FILE,
 	type CredentialsFile,
+	getCredentialStore,
 	resetCredentialStoresForTests,
 } from "../credential-store";
 import {
@@ -272,8 +275,14 @@ describe("credential migration", () => {
 		const before = snapshot(dir);
 		expect(migrateCredentialFiles(dir)).toBe("conflict");
 		expect(snapshot(dir)).toEqual(before);
-		const conflicts = [
-			{ id: "gw", sources: [{ groupId: "codex", label: "One" }, { groupId: "gw" }] },
+		const conflicts: CredentialIdConflict[] = [
+			{
+				id: "gw",
+				sources: [
+					{ groupId: "codex", kind: "codex", label: "One" },
+					{ groupId: "gw", kind: "nug" },
+				],
+			},
 		];
 		expect(getCredentialMigrationConflicts()).toEqual(conflicts);
 
@@ -292,6 +301,85 @@ describe("credential migration", () => {
 		resetCredentialStoresForTests();
 		expect(migrateCredentialFiles(dir)).toBe("migrated");
 		expect(getCredentialMigrationConflicts()).toEqual([]);
+	});
+
+	test("two kinds of connection sharing an id stop it: their keys would share a group", () => {
+		const { dir } = legacyHome({
+			accounts: [],
+			keys: [key("shared", "k-1", "sk-api"), key("nug:shared", "nug:shared", "nug-key")],
+		});
+		expect(migrateCredentialFiles(dir)).toBe("conflict");
+		expect(getCredentialMigrationConflicts()).toEqual([
+			{
+				id: "shared",
+				sources: [
+					{ groupId: "shared", kind: "api" },
+					{ groupId: "shared", kind: "nug" },
+				],
+			},
+		]);
+		expect(existsSync(join(dir, CREDENTIALS_FILE))).toBe(false);
+	});
+
+	test("a connection whose id is `codex` keeps its keys apart from Codex accounts", () => {
+		const { dir } = legacyHome({ keys: [key("codex", "relay-key", "sk-relay")] });
+		// Same group id as the Codex accounts: reported, nothing moves.
+		expect(migrateCredentialFiles(dir)).toBe("conflict");
+		expect(getCredentialMigrationConflicts().map((c) => c.id)).toEqual(["codex"]);
+
+		// And in a credentials.json that has such a connection, neither owner takes the other's.
+		const homeDir2 = mkdtempSync(join(tmpdir(), "narrafork-credential-migration-"));
+		dirs.push(homeDir2);
+		const dir2 = join(homeDir2, ".narrafork");
+		mkdirSync(dir2, { recursive: true });
+		resetCredentialStoresForTests();
+		getCredentialStore(dir2).create({
+			version: 1,
+			credentials: [
+				{
+					id: "relay-key",
+					target: { groupId: "codex" },
+					ownerUserId: null,
+					priority: 0,
+					createdAt: 1,
+					auth: { kind: "api_key", apiKey: "sk-relay" },
+				},
+			],
+			groupSecrets: {},
+		});
+		const manager = new CodexManager({ homeDir: homeDir2, registerProcessHooks: false });
+		managers.push(manager);
+		expect(manager.exportForTransfer()).toEqual([]);
+		manager.importFromTransfer(
+			[{ id: "acc-9", refreshToken: "rt-9", accountId: "a9" }],
+			() => "add",
+		);
+		expect(new ProviderKeyStore(join(dir2, "provider-keys.json")).firstKey("codex")).toBe(
+			"sk-relay",
+		);
+		expect(credentialsOf(dir2).credentials.map((c) => [c.id, c.auth.kind])).toEqual([
+			["acc-9", "oauth"],
+			["relay-key", "api_key"],
+		]);
+	});
+
+	test("a worker thread that loads settings leaves the migration to the server", async () => {
+		const { dir } = legacyHome();
+		// Plain files: the worker's home has no copy of this process's secret.key.
+		writeFileSync(join(dir, "codex-credentials.json"), JSON.stringify(LEGACY_ACCOUNTS));
+		writeFileSync(join(dir, "provider-keys.json"), JSON.stringify(LEGACY_KEYS));
+		const before = snapshot(dir);
+		const worker = new Worker(new URL("./fixtures/load-settings-worker.ts", import.meta.url), {
+			env: { ...process.env, NARRAFORK_HOME: dir },
+		});
+		const home = await new Promise((resolve, reject) => {
+			worker.once("message", resolve);
+			worker.once("error", reject);
+		});
+		await worker.terminate();
+		expect(home).toBe(dir);
+		expect(existsSync(join(dir, CREDENTIALS_FILE))).toBe(false);
+		expect(snapshot(dir)["codex-credentials.json"]).toBe(before["codex-credentials.json"]);
 	});
 
 	test("a crash before credentials.json is written: the next start migrates again", () => {

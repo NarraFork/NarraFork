@@ -20,7 +20,7 @@ import {
 	parseStoredCodexCredentials,
 } from "./codex-manager";
 import { CREDENTIAL_STATE_FILE, CredentialStateStore } from "./credential-state";
-import { CODEX_GROUP, type Credential, getCredentialStore } from "./credential-store";
+import { CODEX_GROUP, getCredentialStore } from "./credential-store";
 import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
 import {
@@ -42,10 +42,19 @@ const BACKED_UP_FILES = [
 	"codex-stats.json",
 ];
 
+/** What a credential belongs to: Codex, a custom API / NUG connection, or TokenDance / Command Code. */
+export type CredentialSourceKind = "codex" | "api" | "nug" | "builtin";
+
+export interface CredentialSource {
+	groupId: string;
+	kind: CredentialSourceKind;
+	label?: string;
+}
+
+/** An id held by more than one credential, or a group id shared by different kinds of source. */
 export interface CredentialIdConflict {
 	id: string;
-	/** Who holds the id: a group (`codex`, a connection id, `tokendance`, …) and a label. */
-	sources: Array<{ groupId: string; label?: string }>;
+	sources: CredentialSource[];
 }
 
 export type CredentialMigrationResult =
@@ -107,17 +116,23 @@ export function assignCredentialIds(
 	return keys.map((key) => ({ ...key, id: ids.get(key) ?? key.id }));
 }
 
-function findConflicts(credentials: readonly Credential[]): CredentialIdConflict[] {
-	return [...Map.groupBy(credentials, (c) => c.id)]
-		.filter(([, list]) => list.length > 1)
-		.map(([id, list]) => ({
-			id,
-			sources: list.map((c) => ({
-				groupId: c.target.groupId,
-				...(c.label ? { label: c.label } : {}),
-			})),
-		}));
+function findConflicts(sources: ReadonlyArray<CredentialSource & { id: string }>) {
+	const conflicts: CredentialIdConflict[] = [];
+	const describe = ({ id: _id, ...source }: CredentialSource & { id: string }) => source;
+	for (const [id, list] of Map.groupBy(sources, (s) => s.id)) {
+		if (list.length > 1) conflicts.push({ id, sources: list.map(describe) });
+	}
+	// Keys file under their group id alone, so two kinds of connection cannot share one.
+	for (const [groupId, list] of Map.groupBy(sources, (s) => s.groupId)) {
+		if (new Set(list.map((s) => s.kind)).size > 1 && !conflicts.some((c) => c.id === groupId)) {
+			conflicts.push({ id: groupId, sources: list.map(describe) });
+		}
+	}
+	return conflicts;
 }
+
+const sourceKind = (owner: string): CredentialSourceKind =>
+	owner.startsWith("nug:") ? "nug" : owner.startsWith("builtin:") ? "builtin" : "api";
 
 /** Copy the files the migration reads or changes; owner-only, like the originals. */
 function backUp(home: string): string {
@@ -211,24 +226,38 @@ export function migrateCredentialFiles(home = getNarraforkHome()): CredentialMig
 		const keys = parseStoredProviderKeys(keysRaw).filter((k) => !isSearchKeyOwner(k.providerId));
 		if (!accounts.length && !keys.length) return "nothing";
 
-		const now = Date.now();
-		const part = keyPartOf(
-			assignCredentialIds(
-				accounts.map((a) => a.id),
-				keys,
-			),
+		const assigned = assignCredentialIds(
+			accounts.map((a) => a.id),
+			keys,
 		);
-		const credentials = [
-			...accounts.map((account) => codexToCredential(account, now)),
-			...part.credentials,
-		];
-		const conflicts = findConflicts(credentials);
+		const conflicts = findConflicts([
+			...accounts.map((a) => ({
+				id: a.id,
+				groupId: CODEX_GROUP,
+				kind: "codex" as const,
+				...(a.displayName ? { label: a.displayName } : {}),
+			})),
+			...assigned
+				.filter((k) => !SECRET_OWNER.test(k.providerId))
+				.map((k) => ({
+					id: k.id,
+					groupId: keyOwnerGroup(k.providerId),
+					kind: sourceKind(k.providerId),
+					...(k.label ? { label: k.label } : {}),
+				})),
+		]);
 		if (conflicts.length) {
 			lastConflicts = conflicts;
 			logger.error("Credential migration stopped: credentials share an id", { conflicts });
 			return "conflict";
 		}
 
+		const now = Date.now();
+		const part = keyPartOf(assigned);
+		const credentials = [
+			...accounts.map((account) => codexToCredential(account, now)),
+			...part.credentials,
+		];
 		const backup = backUp(home);
 		moveCodexRuntimeState(home, accounts);
 		store.create({ version: 1, credentials, groupSecrets: part.groupSecrets });

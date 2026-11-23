@@ -986,8 +986,9 @@ function publicAuthSettings(auth: NarraForkSettings["auth"]) {
 
 async function buildSettingsResponse(
 	source: NarraForkSettings,
-	extra?: { serverRestarting?: boolean; newUrl?: string },
+	extra?: { serverRestarting?: boolean; newUrl?: string; admin?: boolean },
 ) {
+	const admin = extra?.admin === true;
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
@@ -1006,7 +1007,8 @@ async function buildSettingsResponse(
 		// know whether it is on before rendering the site-quota inputs and the balance row.
 		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
 		// Credentials that stopped the move to credentials.json; the providers page lists them.
-		credentialMigrationConflicts: getCredentialMigrationConflicts(),
+		// Labels can be account emails, so only admins see them.
+		...(admin ? { credentialMigrationConflicts: getCredentialMigrationConflicts() } : {}),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1307,7 +1309,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 }
 
 settingsRoutes.get("/", async (c) => {
-	return c.json(await buildSettingsResponse(settings));
+	return c.json(await buildSettingsResponse(settings, { admin: c.get("user").role === "admin" }));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -1985,6 +1987,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
+				admin: true,
 			}),
 		);
 		const finishedAt = performance.now();
