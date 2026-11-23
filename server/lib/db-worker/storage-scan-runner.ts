@@ -29,7 +29,7 @@ import { logger } from "../logger";
 import {
 	DbReadTaskExecutionError,
 	DbReadTaskTimeoutError,
-	getConfiguredConcurrency,
+	getDbReadSchedulingPressure,
 	runEphemeralReadTask,
 	runReadTask,
 	WorkersUnavailableError,
@@ -185,7 +185,11 @@ async function runObjectStorageScan(
 		);
 
 		const tableNames = context.tables.map((table) => table.name);
-		const shards = shardTableNames(tableNames, getConfiguredConcurrency());
+		// Shards must fit the ordinary lane: the reserved lane and a small queue limit cannot absorb extras.
+		const shards = shardTableNames(
+			tableNames,
+			Math.max(1, getDbReadSchedulingPressure().normalCapacity),
+		);
 		// The context step is unit 1, so a long dbstat walk is visible before the first table finishes.
 		const total = tableNames.length + 1;
 		const completedTables = new Set<string>();
