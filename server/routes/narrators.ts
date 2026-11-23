@@ -5232,20 +5232,25 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		waited += TAKEOVER_OWNER_POLL_MS;
 	}
 	let status: "idle" | "working" | "waiting" = narrator.status;
-	if (!owned()) {
-		// A zombie would refuse every takeover forever, leaving Stop as the only way
-		// out. Repair it to idle (keeping its reason tags) and hold that idle session:
-		// the user's next message then runs as a held turn, exactly like a hold that
-		// survived a restart. Work owned without a run (a recovery stage, a pending
-		// permission) is not a zombie and still asks for a retry.
-		const { reconcileRunningStatus } = await import("../services/narrator-session");
-		if (!(await reconcileRunningStatus(id))) {
+	const zombie = !owned();
+	if (zombie) {
+		// Work owned without a run (a recovery stage, a pending permission) is not a
+		// zombie: it still asks for a retry.
+		const { isNarratorRuntimeBusy } = await import("../services/narrator-session-state");
+		if (isNarratorRuntimeBusy(id)) {
 			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
 		}
-		status = "idle";
 	}
 	const { controlRun } = await import("../services/agent-runtime/run");
 	await controlRun(id, { kind: "hold" });
+	if (zombie) {
+		// A zombie would refuse every takeover forever, leaving Stop as the only way
+		// out. Repair it to idle only after the hold exists, so a waiting parent sees
+		// `taken_over` instead of a settled result: the user's next message then runs
+		// as a held turn, exactly like a hold that survived a restart.
+		const { reconcileRunningStatus } = await import("../services/narrator-session");
+		if (await reconcileRunningStatus(id)) status = "idle";
+	}
 	// Display adapters for the destination's panel chip and tool card.
 	broadcastToNarrator(deliverTo.narratorId, {
 		type: "subagent_status_changed",

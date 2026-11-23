@@ -37,6 +37,7 @@ const { db } = await import("../../db");
 const { narrators, users } = await import("../../db/schema");
 const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
+const { eventBus } = await import("../../lib/event-bus");
 const { parseSubstatus } = await import("../../lib/narrator-utils");
 const { activeNarrators, claimNarratorRuntime } = await import(
 	"../../services/narrator-session-state"
@@ -325,8 +326,17 @@ describe("when nothing is actually running", () => {
 	test("repairs a zombie row and holds it instead of refusing forever", async () => {
 		// working in the DB, but no run will ever own it again: its writer is gone.
 		await setSubagentRow({ substatus: JSON.stringify(["interrupted"]) });
+		// A parent waiting on this subagent settles when it turns idle without a hold.
+		const heldWhenIdle: boolean[] = [];
+		const onStatus = (event: { narratorId: string; status: string }) => {
+			if (event.narratorId === subagentId && event.status === "idle")
+				heldWhenIdle.push(isTakenOver(subagentId));
+		};
+		eventBus.on("narrator:status_changed", onStatus);
 
-		const res = await takeover(subagentId);
+		const res = await takeover(subagentId).finally(() =>
+			eventBus.off("narrator:status_changed", onStatus),
+		);
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ takenOver: true });
@@ -337,6 +347,8 @@ describe("when nothing is actually running", () => {
 		expect(parseSubstatus(row?.substatus)).toEqual(
 			expect.arrayContaining(["interrupted", "taken_over"]),
 		);
+		expect(heldWhenIdle.length).toBeGreaterThan(0);
+		expect(heldWhenIdle.every(Boolean)).toBe(true);
 	});
 
 	test("asks for a retry while work is owned without a run", async () => {
