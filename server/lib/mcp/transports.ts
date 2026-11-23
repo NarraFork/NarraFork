@@ -1,7 +1,7 @@
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { envWithAmbientProxy } from "../net/proxy-env";
 import type { McpServerConfig } from "../settings";
 import { createMcpOAuthProvider } from "./oauth";
@@ -52,26 +52,37 @@ function createStdioTransport(config: McpServerConfig): Transport {
 	return transport;
 }
 
+/**
+ * Options shared by the remote transports. With OAuth the SDK reuses the transport's
+ * fetch for discovery, registration and token requests, which may go to another
+ * origin, so the configured headers are added only to requests to the MCP server's
+ * own origin instead of riding along in `requestInit`.
+ */
+function remoteTransportOptions(config: McpServerConfig, url: URL, oauthKey: string) {
+	const authProvider = createMcpOAuthProvider(config, oauthKey);
+	if (!authProvider) return { requestInit: { headers: config.headers } };
+	const headers = Object.entries(config.headers ?? {});
+	const fetchWithHeaders: FetchLike = async (input, init) => {
+		if (new URL(input).origin !== url.origin) return fetch(input, init);
+		const merged = new Headers(init?.headers);
+		for (const [name, value] of headers) merged.set(name, value);
+		return fetch(input, { ...init, headers: merged });
+	};
+	return { authProvider, fetch: fetchWithHeaders };
+}
+
 function createStreamableHttpTransport(config: McpServerConfig, oauthKey: string): Transport {
 	if (!config.url) {
 		throw new Error(`MCP server "${config.name}": streamable-http transport requires a url`);
 	}
-	return new StreamableHTTPClientTransport(new URL(config.url), {
-		authProvider: createMcpOAuthProvider(config, oauthKey),
-		requestInit: {
-			headers: config.headers,
-		},
-	});
+	const url = new URL(config.url);
+	return new StreamableHTTPClientTransport(url, remoteTransportOptions(config, url, oauthKey));
 }
 
 function createSseTransport(config: McpServerConfig, oauthKey: string): Transport {
 	if (!config.url) {
 		throw new Error(`MCP server "${config.name}": sse transport requires a url`);
 	}
-	return new SSEClientTransport(new URL(config.url), {
-		authProvider: createMcpOAuthProvider(config, oauthKey),
-		requestInit: {
-			headers: config.headers,
-		},
-	});
+	const url = new URL(config.url);
+	return new SSEClientTransport(url, remoteTransportOptions(config, url, oauthKey));
 }
