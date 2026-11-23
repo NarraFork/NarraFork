@@ -1,4 +1,4 @@
-import { afterAll, afterEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, expect, mock, spyOn, test } from "bun:test";
 import type {
 	GitStagingObservationState,
 	GitStatusPagesWatchState,
@@ -6,6 +6,7 @@ import type {
 	GitWorkspaceSnapshot,
 } from "@shared/git-workspace-events";
 import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
+import { DbReadTaskOverloadedError, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 
@@ -89,7 +90,9 @@ const narratorTargets = new Map<string, GitWorkspaceTarget>();
 const integrationCallbacks = new Set<(categories: GitWorkspaceCategory[]) => Promise<void>>();
 let denied = false;
 let failure: unknown;
+let refreshFailure: unknown;
 let authorizations = 0;
+const authorizationSignals: AbortSignal[] = [];
 const metadataAuthorizations: Array<boolean | GitWorkspaceTarget | undefined> = [];
 let hold: Promise<void> | undefined;
 let stagingHold: Promise<void> | undefined;
@@ -110,10 +113,12 @@ mock.module("../services/git-workspace-access", () => ({
 		metadataDiscovery?: boolean | GitWorkspaceTarget,
 	) => {
 		metadataAuthorizations.push(metadataDiscovery);
+		authorizationSignals.push(_signal);
 		authorizations++;
 		principal = user.userId;
 		await hold;
-		if (denied || deniedUsers.has(user.userId)) throw new Error("denied");
+		if (denied || deniedUsers.has(user.userId))
+			throw new AppError("denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
 		if (failure) throw failure;
 		const narratorTarget = narratorTargets.get(origin.narratorId);
 		if (narratorTarget) return narratorTarget;
@@ -139,6 +144,7 @@ mock.module("../services/git-workspace-watch", () => ({
 	GitWorkspaceWatchPool: class {
 		refresh(target: GitWorkspaceTarget) {
 			refreshed.push(target);
+			if (refreshFailure) throw refreshFailure;
 			if (integrationTarget) realPool.refresh(target);
 		}
 		subscribe(
@@ -177,6 +183,11 @@ const { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } = await im
 );
 const frames: {
 	type: string;
+	subscriptionId?: string;
+	kind?: string;
+	code?: string;
+	message?: string;
+	retrying?: boolean;
 	workspaceKey?: string;
 	snapshot?: GitWorkspaceSnapshot;
 	view?: string;
@@ -203,11 +214,47 @@ const message = {
 	subscriptionId: "panel",
 	narratorId: "narrator",
 };
+const timerCleanups: Array<() => void> = [];
+function retryTimers(includeAuthorizationTimeout = false) {
+	const original = globalThis.setTimeout;
+	const timers: Array<{ delay: number; fire: () => void }> = [];
+	const handles: Array<ReturnType<typeof setTimeout>> = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: (...args: unknown[]) => void,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		if (
+			![3000, 6000, 12_000, 24_000].includes(delay ?? -1) &&
+			!(includeAuthorizationTimeout && delay === 20_000)
+		)
+			return original(callback, delay, ...args);
+		const handle = original(() => {}, 2_000_000_000);
+		handle.unref?.();
+		handles.push(handle);
+		timers.push({
+			delay: delay ?? 0,
+			fire: () => {
+				clearTimeout(handle);
+				callback(...args);
+			},
+		});
+		return handle;
+	}) as typeof setTimeout);
+	timerCleanups.push(() => {
+		spy.mockRestore();
+		for (const handle of handles) clearTimeout(handle);
+	});
+	return timers;
+}
 afterEach(() => {
 	releaseGitWorkspaceSubscriptions(ws);
+	for (const cleanup of timerCleanups.splice(0)) cleanup();
 	denied = false;
 	failure = undefined;
+	refreshFailure = undefined;
 	authorizations = 0;
+	authorizationSignals.length = 0;
 	metadataAuthorizations.length = 0;
 	hold = undefined;
 	stagingHold = undefined;
@@ -421,22 +468,481 @@ test("idle heartbeats do not repeat the expensive authorization scan", async () 
 	expect(authorizations).toBe(2);
 });
 
-test("temporary device outage retries the subscription without browser polling", async () => {
+test("temporary device outage pauses facts and reauthorizes before a new acknowledgement", async () => {
+	const timers = retryTimers();
 	await handleGitWorkspaceMessage(ws, message);
+	const oldPublish = required(snapshotCallbacks[0]);
 	failure = new AppError("offline", 503, "GIT_WATCH_RETRYABLE");
 	await notify?.(["worktree"]);
-	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_subscribed"]);
+	expect(frames.map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_error",
+	]);
+	expect(frames[1]).toMatchObject({ kind: "retryable", version: 2, retrying: true });
 	expect(stops).toBe(1);
+	oldPublish(snapshotFacts(98));
 	failure = undefined;
-	await waitForState(
-		() =>
-			frames.filter((frame) => frame.type === "git_workspace_subscribed").length === 2 &&
-			frames.at(-1)?.type === "git_workspace_changed",
-		4000,
+	required(timers[0]).fire();
+	await waitForState(() => subscriptions === 2);
+	expect(frames.at(-1)).toMatchObject({ type: "git_workspace_subscribed", version: 3 });
+	expect(metadataAuthorizations.at(-1)).toBe(false);
+	oldPublish(snapshotFacts(99));
+	required(snapshotCallbacks[1])(snapshotFacts(2));
+	await waitForState(() => frames.at(-1)?.type === "git_workspace_snapshot");
+	expect(frames.at(-1)?.snapshot?.revision).toBe(2);
+	expect(frames.at(-1)?.version).toBe(4);
+});
+
+const privateFailure = "SELECT private_column FROM secrets WHERE token = 'private-bind'";
+for (const [name, error, code] of [
+	["workers unavailable", new WorkersUnavailableError(privateFailure), "DB_READ_UNAVAILABLE"],
+	["queue overloaded", new DbReadTaskOverloadedError(), "DB_READ_TASK_OVERLOADED"],
+	...[
+		"DB_READ_UNAVAILABLE",
+		"DB_READ_OVERLOADED",
+		"DB_READ_BUSY",
+		"DB_READ_DATABASE_CLOSED",
+		"DB_READ_WORKER_EXITED",
+		"DB_READ_READER_EXIT_UNCONFIRMED",
+		"DB_READ_TASK_TIMEOUT",
+	].map(
+		(code) =>
+			[
+				code,
+				Object.assign(new Error(privateFailure), { code, sql: privateFailure }),
+				code,
+			] as const,
+	),
+	[
+		"application 503",
+		new AppError(privateFailure, 503, "DB_READ_UNAVAILABLE"),
+		"DB_READ_UNAVAILABLE",
+	],
+	["request timeout", new DOMException(privateFailure, "TimeoutError"), "GIT_WATCH_RETRYABLE"],
+] as const) {
+	test(`initial ${name} failure sends a safe pause and retries full authorization`, async () => {
+		const timers = retryTimers();
+		failure = error;
+		await handleGitWorkspaceMessage(ws, message);
+		expect(frames).toHaveLength(1);
+		expect(frames[0]).toMatchObject({
+			type: "git_workspace_error",
+			kind: "retryable",
+			code,
+			version: 1,
+			retrying: true,
+		});
+		expect(frames[0]?.workspaceKey).toBeUndefined();
+		expect(JSON.stringify(frames)).not.toContain("private");
+		expect(subscriptions).toBe(0);
+		expect(timers.map((timer) => timer.delay)).toEqual([3000]);
+		failure = undefined;
+		required(timers[0]).fire();
+		await waitForState(() => subscriptions === 1);
+		expect(authorizations).toBe(2);
+		expect(metadataAuthorizations).toEqual([false, false]);
+		expect(frames.at(-1)).toMatchObject({ type: "git_workspace_subscribed", version: 2 });
+	});
+}
+
+for (const [name, error, kind, code] of [
+	["403", new AppError(privateFailure, 403, "FORBIDDEN"), "denied", "GIT_WORKSPACE_ACCESS_DENIED"],
+	[
+		"404",
+		new AppError(privateFailure, 404, "PRIVATE_RESOURCE_NOT_FOUND"),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+	[
+		"identity conflict",
+		new AppError(privateFailure, 409, "GIT_WORKSPACE_CHANGED"),
+		"workspace_changed",
+		"GIT_WORKSPACE_CHANGED",
+	],
+	[
+		"key mismatch",
+		new AppError(privateFailure, 409, "WORKSPACE_KEY_MISMATCH"),
+		"workspace_changed",
+		"GIT_WORKSPACE_CHANGED",
+	],
+	[
+		"non-identity conflict",
+		new AppError(privateFailure, 409, "GIT_NOT_SUPPORTED"),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+	["unknown", new Error(privateFailure), "unavailable", "GIT_WORKSPACE_UNAVAILABLE"],
+	[
+		"SQL failure",
+		Object.assign(new Error(privateFailure), { code: "DB_READ_FAILED" }),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+	[
+		"invalid query",
+		Object.assign(new Error(privateFailure), { code: "DB_READ_INVALID" }),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+	[
+		"application conflict with reader code",
+		new AppError(privateFailure, 409, "DB_READ_BUSY"),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+	[
+		"application internal failure",
+		new AppError(privateFailure, 500, "DB_READ_UNAVAILABLE"),
+		"unavailable",
+		"GIT_WORKSPACE_UNAVAILABLE",
+	],
+] as const) {
+	test(`${name} pauses an acknowledged subscription without leaking facts or starting retries`, async () => {
+		const timers = retryTimers();
+		await handleGitWorkspaceMessage(ws, message);
+		const oldNotify = required(notify);
+		const oldPublish = required(snapshotCallbacks[0]);
+		const oldObservation = required(stagingAuthorizations[0]);
+		failure = error;
+		await oldNotify(["refs"]);
+		expect(frames.at(-1)).toMatchObject({
+			type: "git_workspace_error",
+			kind,
+			code,
+			version: 2,
+			retrying: false,
+		});
+		expect(JSON.stringify(frames)).not.toContain("private");
+		expect(stops).toBe(1);
+		expect(timers).toHaveLength(0);
+		failure = undefined;
+		await oldNotify(["worktree"]);
+		oldPublish(snapshotFacts(99));
+		oldObservation.observation(pendingObservation);
+		eventBus.emit({
+			type: "git:staging_lists_changed",
+			workspaceKey: "key",
+			listId: "private-list",
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(frames).toHaveLength(2);
+		expect(authorizations).toBe(2);
+	});
+}
+
+for (const error of [
+	new DOMException("cancelled", "AbortError"),
+	Object.assign(new Error(privateFailure), { code: "DB_READ_ABORTED" }),
+]) {
+	test(`internal ${error.name} cancellation pauses a live subscription without automatic retries`, async () => {
+		const timers = retryTimers();
+		await handleGitWorkspaceMessage(ws, message);
+		failure = error;
+		await notify?.(["refs"]);
+		expect(stops).toBe(1);
+		expect(frames.at(-1)).toMatchObject({
+			type: "git_workspace_error",
+			kind: "unavailable",
+			retrying: false,
+			version: 2,
+		});
+		expect(timers).toHaveLength(0);
+		failure = undefined;
+		required(snapshotCallbacks[0])(snapshotFacts(99));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(authorizations).toBe(2);
+		expect(frames).toHaveLength(2);
+		await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+		expect(frames.at(-1)).toMatchObject({ type: "git_workspace_subscribed", version: 3 });
+	});
+}
+
+test("four retries exhaust at 3/6/12/24 seconds and explicit refresh restores the same id", async () => {
+	const timers = retryTimers();
+	failure = Object.assign(new Error(privateFailure), { code: "DB_READ_BUSY" });
+	await handleGitWorkspaceMessage(ws, message);
+	for (let attempt = 0; attempt < 4; attempt++) {
+		required(timers[attempt]).fire();
+		await waitForState(() => frames.length === attempt + 2);
+	}
+	expect(timers.map((timer) => timer.delay)).toEqual([3000, 6000, 12_000, 24_000]);
+	expect(authorizations).toBe(5);
+	expect(frames.map((frame) => frame.version)).toEqual([1, 2, 3, 4, 5]);
+	expect(frames.map((frame) => frame.retrying)).toEqual([true, true, true, true, false]);
+	expect(frames.at(-1)?.kind).toBe("retryable");
+	for (const timer of timers) timer.fire();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(authorizations).toBe(5);
+	failure = undefined;
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(frames.at(-1)).toMatchObject({ type: "git_workspace_subscribed", version: 6 });
+	expect(subscriptions).toBe(1);
+	expect(refreshed).toHaveLength(1);
+	failure = new WorkersUnavailableError(privateFailure);
+	await notify?.(["refs"]);
+	expect(timers.map((timer) => timer.delay)).toEqual([3000, 6000, 12_000, 24_000, 3000]);
+	expect(frames.at(-1)).toMatchObject({ kind: "retryable", retrying: true, version: 7 });
+});
+
+test("acknowledged DB failure drops old snapshots and observations across successful recovery", async () => {
+	const timers = retryTimers();
+	await handleGitWorkspaceMessage(ws, message);
+	const oldNotify = required(notify);
+	const oldPublish = required(snapshotCallbacks[0]);
+	const oldObservation = required(stagingAuthorizations[0]);
+	failure = new WorkersUnavailableError(privateFailure);
+	oldPublish(snapshotFacts(99));
+	await waitForState(() => frames.at(-1)?.kind === "retryable");
+	failure = undefined;
+	await oldNotify(["worktree"]);
+	oldObservation.observation(pendingObservation);
+	required(timers[0]).fire();
+	await waitForState(() => subscriptions === 2);
+	await oldNotify(["index"]);
+	oldPublish(snapshotFacts(100));
+	oldObservation.observation(pendingObservation);
+	await expect(oldObservation.beforeWrite()).rejects.toMatchObject({ name: "AbortError" });
+	expect(frames.map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_error",
+		"git_workspace_subscribed",
+	]);
+	const currentObservation = required(stagingAuthorizations[1]);
+	currentObservation.observation(pendingObservation);
+	await waitForState(() => frames.at(-1)?.type === "git_workspace_staging_observation");
+	required(snapshotCallbacks[1])(snapshotFacts(2));
+	await waitForState(() => frames.at(-1)?.type === "git_workspace_snapshot");
+	expect(frames.map((frame) => frame.version)).toEqual([1, 2, 3, 4, 5]);
+	expect(frames.at(-1)?.snapshot?.revision).toBe(2);
+});
+
+test("a healthy subscription explicitly refreshes with a new acknowledgement before replaying facts", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	required(snapshotCallbacks[0])(snapshotFacts(2));
+	await waitForState(() => frames.at(-1)?.type === "git_workspace_snapshot");
+	const beforeRefresh = frames.length;
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(frames.slice(beforeRefresh).map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_snapshot",
+	]);
+	expect(frames.slice(beforeRefresh).map((frame) => frame.version)).toEqual([3, 4]);
+	expect(frames.at(-1)?.snapshot?.revision).toBe(2);
+	expect(subscriptions).toBe(1);
+	expect(stops).toBe(0);
+	expect(refreshed).toHaveLength(1);
+	expect(metadataAuthorizations.at(-1)).toBe(false);
+	const acknowledgements = frames.filter(
+		(frame) => frame.type === "git_workspace_subscribed",
+	).length;
+	await handleGitWorkspaceMessage(ws, { ...message, view: "summary" });
+	expect(frames.filter((frame) => frame.type === "git_workspace_subscribed")).toHaveLength(
+		acknowledgements,
 	);
-	expect(frames.filter((frame) => frame.type === "git_workspace_subscribed")).toHaveLength(2);
-	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
-}, 10_000);
+});
+
+test("a manual refresh survives authorization failure and refreshes the producer once after recovery", async () => {
+	const timers = retryTimers();
+	await handleGitWorkspaceMessage(ws, message);
+	failure = new WorkersUnavailableError(privateFailure);
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(refreshed).toHaveLength(0);
+	expect(timers.map((timer) => timer.delay)).toEqual([3000]);
+	failure = undefined;
+	required(timers[0]).fire();
+	await waitForState(() => refreshed.length === 1);
+	expect(subscriptions).toBe(2);
+	expect(frames.at(-1)).toMatchObject({ type: "git_workspace_subscribed", version: 3 });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(refreshed).toHaveLength(1);
+});
+
+test("failures after authorization keep the four-retry budget until the whole delivery succeeds", async () => {
+	const timers = retryTimers();
+	await handleGitWorkspaceMessage(ws, message);
+	refreshFailure = new AppError(privateFailure, 503, "GIT_WATCH_RETRYABLE");
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	for (let attempt = 0; attempt < 4; attempt++) {
+		required(timers[attempt]).fire();
+		await waitForState(
+			() => frames.filter((frame) => frame.type === "git_workspace_error").length === attempt + 2,
+		);
+	}
+	expect(timers.map((timer) => timer.delay)).toEqual([3000, 6000, 12_000, 24_000]);
+	expect(refreshed).toHaveLength(5);
+	expect(frames.at(-1)).toMatchObject({ kind: "retryable", retrying: false });
+	refreshFailure = undefined;
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(frames.at(-1)?.type).toBe("git_workspace_subscribed");
+	expect(refreshed).toHaveLength(6);
+});
+
+for (const pausedFirst of [false, true]) {
+	test(`repository identity changes ${pausedFirst ? "during pause" : "while authorized"} reject old watcher facts`, async () => {
+		const timers = retryTimers();
+		await handleGitWorkspaceMessage(ws, message);
+		const oldNotify = required(notify);
+		const oldPublish = required(snapshotCallbacks[0]);
+		if (pausedFirst) {
+			failure = new WorkersUnavailableError(privateFailure);
+			await oldNotify(["refs"]);
+			failure = undefined;
+		}
+		narratorTargets.set("narrator", {
+			workspace: {
+				deviceId: "local",
+				workspaceKey: "key",
+				repositoryKey: "replacement-repo",
+				state: "ready",
+				capabilities: { read: true },
+			},
+			backend: { runtimeGeneration: 1 },
+		} as GitWorkspaceTarget);
+		if (pausedFirst) {
+			required(timers[0]).fire();
+			await waitForState(() => frames.at(-1)?.kind === "workspace_changed");
+		} else {
+			oldPublish(snapshotFacts(99));
+			await waitForState(() => frames.at(-1)?.kind === "workspace_changed");
+		}
+		expect(frames.at(-1)).toMatchObject({ code: "GIT_WORKSPACE_CHANGED", retrying: false });
+		expect(subscriptions).toBe(1);
+		oldPublish(snapshotFacts(100));
+		await oldNotify(["worktree"]);
+		expect(frames.some((frame) => frame.type === "git_workspace_snapshot")).toBe(false);
+		expect(JSON.stringify(frames)).not.toContain("replacement-repo");
+	});
+}
+
+test("refreshes during authorization merge into one serial trailing refresh", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	let finish = () => {};
+	hold = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const refresh = { type: "git_workspace_refresh" as const, subscriptionId: "panel" };
+	const first = handleGitWorkspaceMessage(ws, refresh);
+	await handleGitWorkspaceMessage(ws, refresh);
+	await handleGitWorkspaceMessage(ws, refresh);
+	expect(authorizations).toBe(2);
+	expect(refreshed).toHaveLength(0);
+	finish();
+	await first;
+	await waitForState(() => refreshed.length === 2);
+	expect(authorizations).toBe(3);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(authorizations).toBe(3);
+	expect(subscriptions).toBe(1);
+});
+
+test("cleared retry callbacks cannot steal a newer timer or restart a replaced target", async () => {
+	const timers = retryTimers();
+	failure = new WorkersUnavailableError(privateFailure);
+	await handleGitWorkspaceMessage(ws, message);
+	const oldTimer = required(timers[0]);
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(authorizations).toBe(2);
+	expect(timers).toHaveLength(2);
+	oldTimer.fire();
+	expect(authorizations).toBe(2);
+	required(timers[1]).fire();
+	await waitForState(() => authorizations === 3 && timers.length === 3);
+	await handleGitWorkspaceMessage(ws, { ...message, narratorId: "replacement" });
+	expect(authorizations).toBe(4);
+	for (const timer of timers.slice(0, 3)) timer.fire();
+	expect(authorizations).toBe(4);
+	failure = undefined;
+	required(timers[3]).fire();
+	await waitForState(() => subscriptions === 1);
+	expect(frames.at(-1)?.type).toBe("git_workspace_subscribed");
+});
+
+test("authorization timeout cancels its read and rejects a late successful target", async () => {
+	const timers = retryTimers(true);
+	let finish = () => {};
+	hold = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const subscribing = handleGitWorkspaceMessage(ws, message);
+	expect(timers.map((timer) => timer.delay)).toEqual([20_000]);
+	required(timers[0]).fire();
+	expect(authorizationSignals[0]?.aborted).toBe(true);
+	expect(authorizationSignals[0]?.reason.name).toBe("TimeoutError");
+	finish();
+	await subscribing;
+	expect(subscriptions).toBe(0);
+	expect(frames.at(-1)).toMatchObject({ kind: "retryable", retrying: true, version: 1 });
+	expect(timers.map((timer) => timer.delay)).toEqual([20_000, 3000]);
+});
+
+test("unsubscribe and disconnect abort in-flight reads and discard late retry callbacks", async () => {
+	const timers = retryTimers();
+	failure = new WorkersUnavailableError(privateFailure);
+	await handleGitWorkspaceMessage(ws, message);
+	await handleGitWorkspaceMessage(ws, {
+		type: "git_workspace_unsubscribe",
+		subscriptionId: "panel",
+	});
+	required(timers[0]).fire();
+	expect(authorizations).toBe(1);
+	failure = undefined;
+	let finish = () => {};
+	hold = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const subscribing = handleGitWorkspaceMessage(ws, message);
+	releaseGitWorkspaceSubscriptions(ws);
+	expect(authorizationSignals[1]?.aborted).toBe(true);
+	finish();
+	await subscribing;
+	expect(subscriptions).toBe(0);
+	expect(frames).toHaveLength(1);
+});
+
+test("subscription capacity reports rejected registration and admits a new id after capacity is freed", async () => {
+	const timers = retryTimers();
+	for (let index = 0; index < 16; index++)
+		await handleGitWorkspaceMessage(ws, { ...message, subscriptionId: `panel-${index}` });
+	await handleGitWorkspaceMessage(ws, { ...message, subscriptionId: "overflow" });
+	expect(authorizations).toBe(16);
+	expect(frames.at(-1)).toMatchObject({
+		type: "git_workspace_error",
+		subscriptionId: "overflow",
+		kind: "unavailable",
+		code: "GIT_WORKSPACE_SUBSCRIPTION_LIMIT",
+		version: 1,
+		retrying: false,
+	});
+	expect(timers).toHaveLength(0);
+	await handleGitWorkspaceMessage(ws, {
+		type: "git_workspace_refresh",
+		subscriptionId: "overflow",
+	});
+	expect(authorizations).toBe(16);
+	await handleGitWorkspaceMessage(ws, {
+		type: "git_workspace_unsubscribe",
+		subscriptionId: "panel-0",
+	});
+	await handleGitWorkspaceMessage(ws, { ...message, subscriptionId: "readmitted" });
+	expect(authorizations).toBe(17);
+	expect(frames.at(-1)).toMatchObject({
+		type: "git_workspace_subscribed",
+		subscriptionId: "readmitted",
+		version: 1,
+	});
+});
+
+test("successful authorization clears its timeout without aborting its returned target signal", async () => {
+	const timers = retryTimers(true);
+	await handleGitWorkspaceMessage(ws, message);
+	expect(authorizationSignals[0]?.aborted).toBe(false);
+	expect(frames[0]?.type).toBe("git_workspace_subscribed");
+	expect(timers.map((timer) => timer.delay)).toEqual([20_000]);
+	required(timers[0]).fire();
+	expect(authorizationSignals[0]?.aborted).toBe(false);
+	await notify?.(["worktree"]);
+	expect(authorizationSignals.every((signal) => !signal.aborted)).toBe(true);
+});
 
 test("two sockets rebind a real shared watch pool after a generation change without offline", async () => {
 	const otherFrames: typeof frames = [];
