@@ -387,13 +387,25 @@ export function BackgroundTasksPanel({
 	// Rows seen running since the panel opened stay visible once they finish,
 	// independent of any client/server clock skew.
 	const seenActiveIdsRef = useRef(new Set<string>());
+	const seenActiveWatchIdsRef = useRef(new Set<string>());
 	useEffect(() => {
 		for (const task of tasks) {
 			if (isBackgroundTaskActive(task.effectiveStatus || task.status)) {
 				seenActiveIdsRef.current.add(task.id);
+				if (isWatchTask(task)) seenActiveWatchIdsRef.current.add(task.id);
 			}
 		}
 	}, [tasks]);
+	// A long-running row older than the loaded history leaves the list when it
+	// finishes; keep "Load older" reachable so its result can still be found.
+	const seenRowOutsideLoaded = useMemo(() => {
+		const loaded = new Set(tasks.map((task) => task.id));
+		for (const id of seenActiveIdsRef.current) {
+			if (loaded.has(id)) continue;
+			if (filter.showWatch || !seenActiveWatchIdsRef.current.has(id)) return true;
+		}
+		return false;
+	}, [tasks, filter.showWatch]);
 	const visibleTasks = useMemo(
 		() =>
 			filterBackgroundTasks(tasks, filter, {
@@ -711,8 +723,9 @@ export function BackgroundTasksPanel({
 				    are history, and a user scrolling to read one row should not pull in
 				    pages they did not ask for. */}
 				{/* Every active row arrives with the first page, so older pages only
-				    hold finished rows, which are hidden until "completed" is checked. */}
-				{hasNextPage && filter.showCompleted && (
+				    hold finished rows, which are hidden until "completed" is checked
+				    unless one of them finished while the panel was open. */}
+				{hasNextPage && (filter.showCompleted || seenRowOutsideLoaded) && (
 					<Button
 						variant="subtle"
 						size="xs"
