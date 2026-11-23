@@ -10,10 +10,11 @@ import {
 	GIT_STATUS_PAGE_MAX_BYTES,
 	GIT_STATUS_PAGE_MAX_LIMIT,
 	type GitStatusFilterChar,
-	type GitStatusPage,
+	type GitStatusPageCacheState,
 	type GitStatusPageCounts,
 	type GitStatusPageFile,
-	type GitStatusPageStatsResult,
+	type GitStatusPageResult,
+	type GitStatusPageStatsResponse,
 	type GitStatusPageStatsRow,
 	gitStatusMatchesSection,
 	normalizeGitStatusFilter,
@@ -142,6 +143,14 @@ export function createGitBrowserNetwork(
 	const denied = new Map<"page" | "stats", number>();
 	const mutations: string[] = [];
 	let revision = 0;
+	let publishedStats = 1;
+	const cacheState = (member = revision): GitStatusPageCacheState => ({
+		status: "ready",
+		workerEpoch: "browser-fixture",
+		memberVersion: member + 1,
+		statsVersion: publishedStats,
+		updating: false,
+	});
 	let nextSnapshot = 0;
 	let nextRequest = 0;
 	let nextStatsRequest = 0;
@@ -149,6 +158,7 @@ export function createGitBrowserNetwork(
 	let holdFirst = false;
 	let holdStats = false;
 	let expireNextCursor = false;
+	let expireNextPage = false;
 	const stagingReads: string[] = [];
 	const stagingSummaryReads: Array<{ generation: number; settled: boolean }> = [];
 	let holdSummary = false;
@@ -555,7 +565,9 @@ export function createGitBrowserNetwork(
 		const nextOffset = offset + files.length;
 		const hasMore = nextOffset < snapshot.files.length;
 		snapshot.expiresAt = Date.now() + 120_000;
-		const response: GitStatusPage = {
+		const response: Extract<GitStatusPageResult, { status: "ready" }> = {
+			status: "ready",
+			cache: cacheState(snapshot.revision),
 			snapshotId,
 			expiresAt: snapshot.expiresAt,
 			files,
@@ -595,8 +607,9 @@ export function createGitBrowserNetwork(
 		}
 		const denial = denied.get("page");
 		if (denial) denied.delete("page");
-		if (expireNextCursor && cursor) {
+		if (expireNextPage || (expireNextCursor && cursor)) {
 			expireNextCursor = false;
+			expireNextPage = false;
 			record.expired = true;
 			snapshots.delete(snapshotId);
 		}
@@ -634,7 +647,9 @@ export function createGitBrowserNetwork(
 		if (!Array.isArray(rows) || rows.length > GIT_STATUS_PAGE_MAX_LIMIT) {
 			return json({ error: "Invalid statistics batch" }, 400);
 		}
-		const result: GitStatusPageStatsResult = {
+		const result: Extract<GitStatusPageStatsResponse, { status: "ready" }> = {
+			status: "ready",
+			cache: cacheState(snapshot.revision),
 			snapshotId,
 			rows: rows.map((row) => {
 				if (row.type === "file") {
@@ -945,6 +960,11 @@ export function createGitBrowserNetwork(
 	}, window.fetch);
 
 	return {
+		cacheState,
+		publishCache() {
+			publishedStats++;
+			return cacheState();
+		},
 		observationControl,
 		ordinaryBlockDiff: () =>
 			blockDiff(
@@ -1011,6 +1031,9 @@ export function createGitBrowserNetwork(
 		},
 		expireNextCursor() {
 			expireNextCursor = true;
+		},
+		expireNextPage() {
+			expireNextPage = true;
 		},
 		holdNextPage() {
 			holdNext = true;

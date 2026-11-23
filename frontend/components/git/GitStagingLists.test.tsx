@@ -10,11 +10,13 @@ import {
 	type GitStagingSummary,
 } from "@shared/git-staging-lists";
 import type { GitStagingObservationState } from "@shared/git-workspace-events";
-import { QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
+import { type ReactNode, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { useGitWorkspaceSubscription } from "../../hooks/useGit";
 import { __resetGitStagingFolderPrefsCache } from "../../hooks/useGitStagingFolderPrefs";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/api/client";
@@ -36,6 +38,17 @@ const wsSent: Record<string, unknown>[] = [];
 let stateSequence = 0;
 let stateEpoch = 1;
 let autoObservation = true;
+let wsVersion = 0;
+let credential = 0;
+let credentialPrincipal: unknown;
+function credentialIdentity() {
+	const principal = client?.getQueryData<{ id: string }>(["auth", "me"])?.id;
+	if (principal !== credentialPrincipal) {
+		credentialPrincipal = principal;
+		credential++;
+	}
+	return credential;
+}
 function observationState(
 	overrides: Partial<GitStagingObservationState> = {},
 ): GitStagingObservationState {
@@ -55,6 +68,7 @@ function emitObservation(observation: GitStagingObservationState) {
 	for (const callback of wsListeners)
 		callback({
 			type: "git_workspace_staging_observation",
+			version: ++wsVersion,
 			subscriptionId: wsSent.filter((message) => message.type === "git_workspace_subscribe").at(-1)
 				?.subscriptionId,
 			workspaceKey: "w",
@@ -65,16 +79,19 @@ function emitObservation(observation: GitStagingObservationState) {
 mock.module("../../lib/narrator-ws-manager", () => ({
 	narratorWSManager: {
 		connected: true,
+		getCredentialIdentity: credentialIdentity,
+		getConnectionCredentialIdentity: credentialIdentity,
 		send: (message: Record<string, unknown>) => {
 			wsSent.push(message);
 			if (message.type === "git_workspace_subscribe")
 				queueMicrotask(() => {
 					for (const callback of wsListeners) {
-						callback({ ...message, type: "git_workspace_subscribed", version: 0 });
+						callback({ ...message, type: "git_workspace_subscribed", version: ++wsVersion });
 						if (autoObservation)
 							callback({
 								...message,
 								type: "git_workspace_staging_observation",
+								version: ++wsVersion,
 								observation: observationState(),
 							});
 					}
@@ -187,13 +204,24 @@ async function inputValue(input: Element, value: string | boolean) {
 	change(input, value);
 	await flush();
 }
+function WorkspaceOwner({ target, children }: { target: GitTarget; children: ReactNode }) {
+	const subscriptions = useGitWorkspaceSubscription(target);
+	const qc = useQueryClient();
+	const principal = qc.getQueryData<{ id: string }>(["auth", "me"])?.id;
+	useEffect(() => {
+		if (principal) subscriptions.confirmWorkspace(target);
+	});
+	return children;
+}
 async function render(content = <GitStagingWorkspace target={target} />) {
 	root.render(
 		<QueryClientProvider client={client}>
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
 					<ConfirmDialogProvider>
-						<div style={{ height: 700 }}>{content}</div>
+						<WorkspaceOwner target={(content.props as { target?: GitTarget }).target ?? target}>
+							<div style={{ height: 700 }}>{content}</div>
+						</WorkspaceOwner>
 					</ConfirmDialogProvider>
 				</MantineProvider>
 			</I18nextProvider>
@@ -212,6 +240,7 @@ beforeEach(async () => {
 	stateSequence = 0;
 	stateEpoch = 1;
 	autoObservation = true;
+	wsVersion = 0;
 	const { window } = parseHTML("<html><head></head><body><div id='root'></div></body></html>");
 	const store = new Map<string, string>();
 	const storage = {
@@ -277,7 +306,7 @@ beforeEach(async () => {
 			react: { useSuspense: false },
 		});
 	await i18n.changeLanguage("en");
-	restore = installGitChangesTestTransport();
+	restore = installGitChangesTestTransport({ mockWorkspace: false });
 	client = createGitChangesTestQueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
 	});

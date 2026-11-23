@@ -2,21 +2,30 @@ import {
 	GIT_STATUS_PAGE_DEFAULT_LIMIT,
 	type GitStatusFilterChar,
 	type GitStatusPage,
+	type GitStatusPageCacheState,
+	type GitStatusPageResult,
 	normalizeGitStatusFilter,
 } from "@shared/git-status-page";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { GitTarget } from "../lib/api/git";
-import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { useGitWorkspaceSubscription } from "./useGit";
+import { readWorkspace, useGitWorkspaceSubscription } from "./useGit";
 
 export const GIT_STATUS_PAGE_AUTO_PAGE_LIMIT = 10;
+const RECOVERY_STABILITY_MS = 1_000;
+const RECOVERY_WINDOW_MS = 60_000;
+const RECOVERIES_PER_WINDOW = 2;
 
 type ReadingCycle = {
 	scope: string;
 	intent: "automatic" | "manual" | "cancelled" | "exhausted" | "error";
 	recoveryUsed: boolean;
+	recoveryVersion?: string;
+	recoveryGeneration?: string;
+	recoveryTimes?: number[];
+	statsSettledGeneration?: string;
+	settledAt?: number;
 };
 
 const EMPTY_PAGES: GitStatusPage[] = [];
@@ -26,7 +35,7 @@ const errorCode = (error: unknown) =>
 const staleCursor = (error: unknown) =>
 	["GIT_STATUS_PAGE_EXPIRED", "GIT_STATUS_PAGE_INVALID_CURSOR"].includes(errorCode(error) ?? "");
 
-/** Each generation owns a complete cursor chain; ordinary invalidation starts a new chain. */
+/** Each generation owns a complete cursor chain; reads only consume published cache. */
 export function useGitStatusPages(
 	target: GitTarget | null | undefined,
 	selectedFilter: readonly GitStatusFilterChar[] | ReadonlySet<GitStatusFilterChar> = [],
@@ -34,13 +43,22 @@ export function useGitStatusPages(
 ) {
 	const qc = useQueryClient();
 	const owner = useId();
+	const principal = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
 	const enabled = options.enabled !== false && !!target;
 	const subscriptions = useGitWorkspaceSubscription(enabled ? target : null);
 	const denied = !!target && subscriptions.isDenied(target);
 	const filterKey = normalizeGitStatusFilter([...selectedFilter]).join(",");
 	const limit = options.limit ?? GIT_STATUS_PAGE_DEFAULT_LIMIT;
 	const autoPageLimit = options.autoPageLimit ?? GIT_STATUS_PAGE_AUTO_PAGE_LIMIT;
-	const scope = JSON.stringify([target?.workspaceKey, target?.narratorId, filterKey, limit]);
+	const scope = JSON.stringify([
+		target?.workspaceKey,
+		target?.narratorId,
+		target?.repositoryKey,
+		target?.rootPath,
+		filterKey,
+		limit,
+		principal,
+	]);
 	// Display ownership is independent of the cursor/cache generation.
 	const displayScope = JSON.stringify([
 		target?.narratorId,
@@ -49,24 +67,32 @@ export function useGitStatusPages(
 		target?.rootPath,
 		filterKey,
 		limit,
+		principal,
 	]);
-	// Cursor and statistics expiry share one recovery until an explicit cycle reset.
+	// Cursor and statistics share one recovery per published version until a valid handoff.
 	const autoCycle = useRef<ReadingCycle>({ scope, intent: "automatic", recoveryUsed: false });
 	if (autoCycle.current.scope !== scope) {
 		autoCycle.current.intent = "error";
 		autoCycle.current = { scope, intent: "automatic", recoveryUsed: false };
 	}
-	const active = enabled && !denied && subscriptions.isVisible();
-	const activeState = useRef({ scope, active });
+	const connected = !!target && subscriptions.isPush(target);
+	const readable = !!target && subscriptions.canRead(target);
+	const authorizationKey = target ? subscriptions.getAuthorizationKey(target) : undefined;
+	const active = enabled && readable && connected && subscriptions.isVisible();
+	const observedCache = target ? subscriptions.getStatusPageState(target) : undefined;
+	const updating = !!target && subscriptions.isStatusPageUpdating(target);
+	const connectionKey = target ? subscriptions.getStatusPageConnectionKey(target) : undefined;
+	const connection = useRef<{ scope: string; key?: string }>({ scope });
+	const reconciliation = useMemo(() => ({ scope, last: "" }), [scope]);
+	const cacheVersion = (cache: GitStatusPageCacheState | undefined) =>
+		JSON.stringify([cache?.workerEpoch, cache?.memberVersion, cache?.statsVersion]);
+	const activeState = useRef({ scope, active, authorizationKey });
 	const [generation, setGeneration] = useState(0);
 	const epoch = useMemo(
-		() => ({ controller: new AbortController(), scope, generation }),
-		[scope, generation],
+		() => ({ controller: new AbortController(), scope, generation, authorizationKey }),
+		[scope, generation, authorizationKey],
 	);
-	const versions = useMemo(() => ({ scope, values: new Map<string, number>() }), [scope]);
-	const narratorId = target?.narratorId;
-	const workspaceKey = target?.workspaceKey;
-	const queryGeneration = JSON.stringify([scope, owner, generation]);
+	const queryGeneration = JSON.stringify([scope, owner, generation, authorizationKey]);
 	const displayIdentity = useRef({
 		scope: displayScope,
 		generation: queryGeneration,
@@ -94,11 +120,6 @@ export function useGitStatusPages(
 	const batch = useRef<AbortController | null>(null);
 	const batchPromise = useRef<Promise<void> | null>(null);
 	const [isLoadingAll, setLoadingAll] = useState(false);
-	const [watchValidity, setWatchValidity] = useState<{
-		scope: string;
-		snapshotId?: string;
-		reliable: boolean;
-	}>({ scope, reliable: true });
 	const cancelLoadAll = useCallback(() => {
 		if (!batch.current) return;
 		autoCycle.current.intent = "cancelled";
@@ -109,7 +130,7 @@ export function useGitStatusPages(
 		void qc.cancelQueries({ queryKey, exact: true });
 	}, [qc, queryKey]);
 	const restart = useCallback(
-		(mode: "snapshot" | "cycle" = "snapshot") => {
+		(mode: "snapshot" | "cycle" | "publication" = "snapshot") => {
 			if (epoch.controller.signal.aborted) return;
 			const cycle = autoCycle.current;
 			const intent = cycle.intent;
@@ -122,20 +143,49 @@ export function useGitStatusPages(
 			autoCycle.current =
 				mode === "cycle"
 					? { scope, intent: "automatic", recoveryUsed: false }
-					: { scope, intent, recoveryUsed: cycle.recoveryUsed };
+					: {
+							...cycle,
+							scope,
+							intent: mode === "publication" && intent === "error" ? "automatic" : intent,
+						};
 			setGeneration((value) => value + 1);
 		},
 		[epoch, cancelLoadAll, qc, queryKey, scope],
 	);
-	const recoverSnapshot = useCallback(() => {
-		if (autoCycle.current.recoveryUsed) {
-			autoCycle.current.intent = "error";
-			return false;
-		}
-		autoCycle.current.recoveryUsed = true;
-		restart();
-		return true;
-	}, [restart]);
+	const failedCache = useRef<{ scope: string; cache: GitStatusPageCacheState } | null>(null);
+	const publishedVersion = useRef("");
+	const lease = useRef<{
+		generation: string;
+		expiresAt: number;
+		establishedAt: number;
+		attempted: boolean;
+	} | null>(null);
+	const recoverSnapshot = useCallback(
+		(leaseExpiry = false) => {
+			const cycle = autoCycle.current;
+			const now = Date.now();
+			if (cycle.recoveryVersion !== publishedVersion.current) {
+				cycle.recoveryUsed = false;
+				cycle.recoveryTimes = [];
+			}
+			const recent = (cycle.recoveryTimes ?? []).filter((at) => now - at < RECOVERY_WINDOW_MS);
+			const settledAt = leaseExpiry ? lease.current?.establishedAt : cycle.settledAt;
+			const stable = settledAt !== undefined && now - settledAt >= RECOVERY_STABILITY_MS;
+			if (recent.length >= RECOVERIES_PER_WINDOW || (cycle.recoveryUsed && !stable)) {
+				cycle.intent = "error";
+				return false;
+			}
+			cycle.recoveryUsed = true;
+			cycle.recoveryTimes = [...recent, now];
+			cycle.recoveryVersion = publishedVersion.current;
+			cycle.recoveryGeneration = queryGeneration;
+			cycle.statsSettledGeneration = undefined;
+			cycle.settledAt = undefined;
+			restart();
+			return true;
+		},
+		[restart, queryGeneration],
+	);
 	useLayoutEffect(() => {
 		// Repository/root refinements need a fresh chain even when the query identity
 		// is unchanged. Never expose that identity's old pages under the new owner.
@@ -144,25 +194,51 @@ export function useGitStatusPages(
 	const query = useInfiniteQuery({
 		queryKey,
 		initialPageParam: undefined as string | undefined,
-		queryFn: ({ pageParam, signal }) => {
+		queryFn: async ({ pageParam, signal }): Promise<GitStatusPageResult> => {
 			const signals = [signal, epoch.controller.signal];
 			if (batch.current) signals.push(batch.current.signal);
 			const requestSignal = AbortSignal.any(signals);
 			// QueryClient may schedule an old chain's refetch in the same invalidation
 			// turn that retires its generation. Do not dispatch that obsolete request.
 			requestSignal.throwIfAborted();
-			return api.getGitStatusPage(
-				target as GitTarget,
-				{
-					cursor: pageParam,
-					filter: filterKey ? (filterKey.split(",") as GitStatusFilterChar[]) : [],
-					limit,
-				},
+			const publish = subscriptions.statusPageReadPublisher(target as GitTarget, {
+				membershipOnly: pageParam !== undefined,
+			});
+			const baseline = subscriptions.getStatusPageState(target as GitTarget);
+			const result = await readWorkspace(
+				qc,
+				target,
+				() =>
+					api.getGitStatusPage(
+						target as GitTarget,
+						{
+							cursor: pageParam,
+							filter: filterKey ? (filterKey.split(",") as GitStatusFilterChar[]) : [],
+							limit,
+						},
+						requestSignal,
+					),
+				false,
 				requestSignal,
-			);
+			).catch((failure: unknown) => {
+				requestSignal.throwIfAborted();
+				if (baseline) failedCache.current = { scope, cache: baseline };
+				throw failure;
+			});
+			requestSignal.throwIfAborted();
+			const accepted = publish(result.cache);
+			if (result.status === "error") {
+				failedCache.current = { scope, cache: result.cache };
+				throw Object.assign(new Error(result.cache.message ?? "Git cache unavailable"), {
+					code: result.cache.errorCode ?? "GIT_STATUS_PAGE_SOURCE_FAILED",
+				});
+			}
+			return accepted ? result : { status: "pending", cache: result.cache };
 		},
 		getNextPageParam: (lastPage) =>
-			lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
+			lastPage.status === "ready" && lastPage.hasMore
+				? (lastPage.nextCursor ?? undefined)
+				: undefined,
 		enabled: active,
 		staleTime: Infinity,
 		// Generation keys are never reused; release obsolete full page chains immediately.
@@ -172,16 +248,63 @@ export function useGitStatusPages(
 		refetchOnMount: false,
 		retry: false,
 	});
-	const error = statsFailure?.generation === queryGeneration ? statsFailure.error : query.error;
-	const readRefused = [401, 403, 404].includes(
-		(query.error as { status?: number } | null)?.status ?? 0,
+	const response = query.data?.pages[0];
+	const readyPages = useMemo(() => {
+		const ready =
+			query.data?.pages.filter(
+				(page): page is Extract<GitStatusPageResult, { status: "ready" }> =>
+					page.status === "ready",
+			) ?? [];
+		const first = ready[0];
+		return first &&
+			ready.every(
+				(page) =>
+					page.snapshotId === first.snapshotId &&
+					page.cache.workerEpoch === first.cache.workerEpoch &&
+					page.cache.memberVersion === first.cache.memberVersion,
+			)
+			? ready
+			: EMPTY_PAGES;
+	}, [query.data]);
+	const firstReady = readyPages[0] as Extract<GitStatusPageResult, { status: "ready" }> | undefined;
+	const cache =
+		observedCache &&
+		(!firstReady ||
+			(observedCache.workerEpoch === firstReady.cache.workerEpoch &&
+				observedCache.memberVersion === firstReady.cache.memberVersion))
+			? observedCache
+			: (firstReady?.cache ?? response?.cache);
+	if (observedCache ?? response?.cache)
+		publishedVersion.current = cacheVersion(observedCache ?? response?.cache);
+	const cacheFailure = useMemo(
+		() =>
+			cache?.errorCode
+				? Object.assign(new Error(cache.message ?? "Git cache update failed"), {
+						code: cache.errorCode,
+					})
+				: null,
+		[cache?.errorCode, cache?.message],
 	);
+	const statsError = useMemo(
+		() =>
+			cache?.statsErrorCode
+				? Object.assign(new Error("Git statistics update failed"), { code: cache.statsErrorCode })
+				: null,
+		[cache?.statsErrorCode],
+	);
+	const refusal = target ? subscriptions.getReadError(target) : undefined;
+	const error =
+		statsFailure?.generation === queryGeneration
+			? statsFailure.error
+			: (refusal ?? query.error ?? cacheFailure);
+	const readRefused =
+		!!refusal || [401, 403, 404].includes((query.error as { status?: number } | null)?.status ?? 0);
 	const displayAllowed =
 		enabled &&
 		!!target?.workspaceKey &&
 		!!target?.narratorId &&
 		!displayIdentityPending &&
-		!denied &&
+		readable &&
 		!readRefused;
 	const current = useRef(query);
 	current.current = query;
@@ -192,10 +315,19 @@ export function useGitStatusPages(
 				epoch.controller.signal.aborted ||
 				observation.generation !== currentGeneration.current ||
 				observation.generation !== queryGeneration ||
-				observation.snapshotId !== current.current.data?.pages[0]?.snapshotId
+				current.current.data?.pages[0]?.status !== "ready" ||
+				observation.snapshotId !== (current.current.data?.pages[0] as GitStatusPage)?.snapshotId
 			)
 				return;
-			if (!observation.expired || recoverSnapshot()) return;
+			if (!observation.expired) {
+				const cycle = autoCycle.current;
+				cycle.statsSettledGeneration = observation.generation;
+				const last = current.current.data?.pages.at(-1);
+				if (last?.status === "ready" && !last.hasMore && !current.current.error)
+					cycle.settledAt ??= Date.now();
+				return;
+			}
+			if (recoverSnapshot()) return;
 			// Statistics and cursor expiry share one recovery allowance. Preserve the
 			// displayed files, but invalidate range actions and expose an explicit retry.
 			cancelLoadAll();
@@ -227,17 +359,23 @@ export function useGitStatusPages(
 			void qc.cancelQueries({ queryKey, exact: true });
 		};
 	}, [epoch, qc, queryKey]);
-	useEffect(() => {
+	useLayoutEffect(() => {
 		const previous = activeState.current;
-		activeState.current = { scope, active };
+		activeState.current = { scope, active, authorizationKey };
 		if (active) {
 			// A hidden/closed panel may have missed workspace change notifications.
-			if (previous.scope === scope && !previous.active) restart();
+			if (
+				previous.scope === scope &&
+				!previous.active &&
+				previous.authorizationKey === authorizationKey
+			)
+				restart();
 			return;
 		}
+		connection.current = { scope };
 		cancelLoadAll();
 		void qc.cancelQueries({ queryKey, exact: true });
-	}, [active, scope, cancelLoadAll, qc, queryKey, restart]);
+	}, [active, scope, authorizationKey, cancelLoadAll, qc, queryKey, restart]);
 	useEffect(
 		() =>
 			qc.getQueryCache().subscribe((event) => {
@@ -252,46 +390,59 @@ export function useGitStatusPages(
 		[qc, queryGeneration, restart],
 	);
 	useEffect(() => {
-		if (!enabled || !narratorId || !workspaceKey) return;
-		// Statistical snapshots can arrive repeatedly with unchanged files. Only actual
-		// category changes (or a reconnect that missed them) reset the paging chain.
-		const handle = narratorWSManager.addListener(
-			{ narratorIds: [narratorId], types: ["git_workspace_changed"] },
-			(data) => {
-				if (
-					data.type !== "git_workspace_changed" ||
-					data.workspaceKey !== workspaceKey ||
-					typeof data.version !== "number"
-				)
-					return;
-				const id = String(data.subscriptionId ?? "");
-				if (data.version <= (versions.values.get(id) ?? -1)) return;
-				versions.values.set(id, data.version);
-				if (data.statusPagesReliable === false) cancelLoadAll();
-				if (typeof data.statusPagesReliable === "boolean")
-					setWatchValidity({
-						scope,
-						snapshotId: current.current.data?.pages[0]?.snapshotId,
-						reliable: data.statusPagesReliable,
-					});
-				const changed =
-					typeof data.statusPagesChanged === "boolean"
-						? data.statusPagesChanged
-						: Array.isArray(data.categories) &&
-							data.categories.some((value) =>
-								["worktree", "index", "head", "refs"].includes(value),
-							);
-				if (changed) restart();
-			},
-		);
-		const offConnection = narratorWSManager.onConnectionChange((connected, reconnect) => {
-			if (connected && reconnect) restart();
-		});
-		return () => {
-			narratorWSManager.removeListener(handle);
-			offConnection();
-		};
-	}, [enabled, narratorId, workspaceKey, restart, versions, scope, cancelLoadAll]);
+		if (!active || !connectionKey) return;
+		const previous = connection.current;
+		connection.current = { scope, key: connectionKey };
+		if (previous.scope === scope && previous.key && previous.key !== connectionKey) restart();
+	}, [active, connectionKey, scope, restart]);
+	useEffect(() => {
+		if (
+			!active ||
+			(query.isFetching && !response) ||
+			(!response && !query.error) ||
+			!observedCache ||
+			observedCache.memberVersion === 0
+		)
+			return;
+		const baseline =
+			response?.cache ??
+			(failedCache.current?.scope === scope ? failedCache.current.cache : undefined);
+		const newer =
+			!baseline ||
+			observedCache.workerEpoch !== baseline.workerEpoch ||
+			observedCache.memberVersion > baseline.memberVersion ||
+			((response?.status === "pending" ||
+				!!error ||
+				(response?.status === "ready" && response.expiresAt <= Date.now())) &&
+				observedCache.memberVersion === baseline.memberVersion &&
+				observedCache.statsVersion > baseline.statsVersion) ||
+			(!response && baseline.status === "error" && observedCache.status === "ready");
+		if (!newer) return;
+		const version = JSON.stringify([
+			observedCache.workerEpoch,
+			observedCache.memberVersion,
+			observedCache.statsVersion,
+		]);
+		// Includes the ready-before-pending race. One read per published membership,
+		// not one per local generation, render or old response.
+		if (reconciliation.last === version) return;
+		reconciliation.last = version;
+		autoCycle.current.recoveryUsed = false;
+		restart("publication");
+	}, [
+		active,
+		query.isFetching,
+		query.error,
+		response,
+		error,
+		observedCache,
+		reconciliation,
+		restart,
+		scope,
+	]);
+	useEffect(() => {
+		if (updating) cancelLoadAll();
+	}, [updating, cancelLoadAll]);
 	useEffect(() => {
 		if (!error || epoch.controller.signal.aborted) return;
 		if (!active || !staleCursor(error)) autoCycle.current.intent = "error";
@@ -343,13 +494,9 @@ export function useGitStatusPages(
 	const loadAll = useCallback((): Promise<void> => {
 		if (batchPromise.current) return batchPromise.current;
 		if (!displayAllowed || !current.current.data) return Promise.resolve();
-		if (
-			watchValidity.scope === scope &&
-			watchValidity.snapshotId === current.current.data.pages[0]?.snapshotId &&
-			!watchValidity.reliable
-		)
-			return Promise.resolve();
-		if ((current.current.data.pages.at(-1)?.expiresAt ?? 0) <= Date.now()) return Promise.resolve();
+		if (!active || updating || cache?.updating) return Promise.resolve();
+		const last = current.current.data.pages.at(-1);
+		if (last?.status !== "ready" || last.expiresAt <= Date.now()) return Promise.resolve();
 		// The explicit full-range intent owns scheduling after the current shared page.
 		autoCycle.current.intent = "manual";
 		const controller = new AbortController();
@@ -377,8 +524,8 @@ export function useGitStatusPages(
 		const promise = Promise.resolve().then(work);
 		batchPromise.current = promise;
 		return promise;
-	}, [displayAllowed, epoch, fetchNextPage, watchValidity, scope]);
-	const pages = displayAllowed ? (query.data?.pages ?? EMPTY_PAGES) : EMPTY_PAGES;
+	}, [displayAllowed, epoch, fetchNextPage, active, updating, cache?.updating]);
+	const pages = displayAllowed ? readyPages : EMPTY_PAGES;
 	const first = pages[0];
 	const last = pages.at(-1);
 	const expiresAt = last?.expiresAt;
@@ -389,13 +536,18 @@ export function useGitStatusPages(
 		return () => clearTimeout(timer);
 	}, [expiresAt]);
 	const statusPagesReliable =
-		watchValidity.scope !== scope ||
-		watchValidity.snapshotId !== first?.snapshotId ||
-		watchValidity.reliable;
+		!updating &&
+		!cache?.updating &&
+		!cache?.errorCode &&
+		(!observedCache ||
+			!firstReady ||
+			(observedCache.workerEpoch === firstReady.cache.workerEpoch &&
+				observedCache.memberVersion === firstReady.cache.memberVersion));
 	const snapshotValid =
 		!!first &&
 		statusPagesReliable &&
 		active &&
+		!!connectionKey &&
 		activeState.current.active &&
 		!!expiresAt &&
 		expiresAt > Date.now() &&
@@ -403,20 +555,68 @@ export function useGitStatusPages(
 		!staleCursor(error) &&
 		pages.every((page) => page.snapshotId === first.snapshotId);
 	const pageChainLoaded = snapshotValid && !!last && !last.hasMore;
+	useEffect(() => {
+		const cycle = autoCycle.current;
+		if (pageChainLoaded && cycle.statsSettledGeneration === queryGeneration)
+			cycle.settledAt ??= Date.now();
+		if (expiresAt === undefined) return;
+		if (expiresAt <= Date.now() && lease.current?.generation !== queryGeneration) return;
+		if (lease.current?.generation !== queryGeneration || lease.current.expiresAt !== expiresAt)
+			lease.current = {
+				generation: queryGeneration,
+				expiresAt,
+				establishedAt: Date.now(),
+				attempted: false,
+			};
+		if (
+			active &&
+			!snapshotValid &&
+			expiresAt <= Date.now() &&
+			!epoch.controller.signal.aborted &&
+			!error &&
+			!lease.current.attempted
+		) {
+			lease.current.attempted = true;
+			// Renew one expired cursor lease from published cache. No statistics polling
+			// and no Git production; repeated failures share the recovery ceiling.
+			recoverSnapshot(true);
+		}
+	}, [
+		active,
+		expiresAt,
+		snapshotValid,
+		pageChainLoaded,
+		queryGeneration,
+		epoch,
+		error,
+		recoverSnapshot,
+	]);
 	const reset = useCallback(() => restart("cycle"), [restart]);
+	const refresh = useCallback(() => {
+		autoCycle.current.intent = "automatic";
+		autoCycle.current.recoveryUsed = false;
+		autoCycle.current.recoveryTimes = [];
+		if (target) subscriptions.refresh(target);
+	}, [target, subscriptions]);
 	const retry = useCallback(() => {
+		if (target && !subscriptions.canRead(target)) {
+			subscriptions.refresh(target);
+			restart("cycle");
+			return Promise.resolve(current.current);
+		}
 		if (
 			staleCursor(error) ||
-			[401, 403, 404].includes((current.current.error as { status?: number } | null)?.status ?? 0)
+			[401, 403, 404].includes((error as { status?: number } | null)?.status ?? 0)
 		) {
 			restart("cycle");
 			return Promise.resolve(current.current);
 		}
 		return current.current.data?.pages.length ? fetchNextPage() : current.current.refetch();
-	}, [error, fetchNextPage, restart]);
+	}, [error, fetchNextPage, restart, target, subscriptions]);
 	return {
 		...query,
 		error,
+		statsError,
 		isError: !!error,
 		isSuccess: !error && query.isSuccess,
 		isLoadingError: !!error && !query.data,
@@ -426,8 +626,15 @@ export function useGitStatusPages(
 		pages,
 		queryGeneration,
 		displayScope,
+		workspaceIdentity: JSON.stringify([
+			target?.workspaceKey,
+			target?.narratorId,
+			target?.repositoryKey,
+			target?.rootPath,
+			principal,
+		]),
 		displayAllowed,
-		readRefused: denied || readRefused,
+		readRefused: !readable || denied || readRefused,
 		observeSnapshotStats,
 		counts: first?.counts,
 		complete: first?.complete ?? false,
@@ -440,7 +647,11 @@ export function useGitStatusPages(
 		loadAll,
 		cancelLoadAll,
 		fetchNextPage,
-		refresh: reset,
+		cache,
+		updating: updating || !!cache?.updating || !active,
+		waitingForConnection: !connected || !connectionKey,
+		isCachePending: response?.status === "pending",
+		refresh,
 		reset,
 		retry,
 		refetch: reset,

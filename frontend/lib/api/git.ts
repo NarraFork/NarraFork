@@ -10,11 +10,11 @@ import type {
 } from "@shared/git-staging-lists";
 import type {
 	GitStatusFilterChar,
-	GitStatusPage,
 	GitStatusPageQuery,
+	GitStatusPageResult,
 	GitStatusPageScopeProof,
 	GitStatusPageStatsQuery,
-	GitStatusPageStatsResult,
+	GitStatusPageStatsResponse,
 } from "@shared/git-status-page";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type {
@@ -186,7 +186,9 @@ export const gitApi = {
 		if (query.cursor !== undefined) params.set("cursor", query.cursor);
 		if (query.limit !== undefined) params.set("limit", String(query.limit));
 		if (query.filter?.length) params.set("filter", query.filter.join(","));
-		return gitRequest<GitStatusPage>(gitReadPath(target, `/status-files?${params}`), { signal });
+		return gitRequest<GitStatusPageResult>(gitReadPath(target, `/status-files?${params}`), {
+			signal,
+		});
 	},
 	getGitStatusPageStats: (
 		target: GitTarget,
@@ -198,7 +200,7 @@ export const gitApi = {
 			rows: JSON.stringify(query.rows),
 		});
 		if (query.filter?.length) params.set("filter", query.filter.join(","));
-		return gitRequest<GitStatusPageStatsResult>(
+		return gitRequest<GitStatusPageStatsResponse>(
 			gitReadPath(target, `/status-page-stats?${params}`),
 			{ signal },
 		);

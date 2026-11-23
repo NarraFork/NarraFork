@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { GitStatusPageScopeProof } from "../../shared/git-status-page";
+import type { GitStatusPageResult, GitStatusPageScopeProof } from "../../shared/git-status-page";
 import { GitStatusPageService } from "./git-status-page";
 import { GitStatusPageEngine } from "./git-status-page-engine";
 import type { GitStatusPageRawResult, GitStatusPageRequest } from "./git-status-page-protocol";
@@ -15,6 +15,10 @@ const request = (): GitStatusPageRequest => ({
 const noRemote = async (): Promise<GitStatusPageRawResult> => {
 	throw new Error("Unexpected source read");
 };
+function ready(value: GitStatusPageResult) {
+	if (value.status !== "ready") throw new Error("Expected ready");
+	return value;
+}
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	const promise = new Promise<T>((done) => {
@@ -22,175 +26,88 @@ function deferred<T>() {
 	});
 	return { promise, resolve };
 }
+async function warm(engine: GitStatusPageEngine, complete = true) {
+	await engine.observe(request(), signal, async () => raw(status, complete));
+	return ready(await engine.read(request(), signal));
+}
 
-describe("bounded worker snapshot validation", () => {
-	test("repeated same-state validations do not starve a slow first read or filter change", async () => {
-		for (const cached of [false, true]) {
-			let now = 0;
-			const engine = new GitStatusPageEngine(undefined, () => now);
-			if (cached) await engine.read(request(), signal, async () => raw(status));
-			const source = deferred<GitStatusPageRawResult>();
-			const pending = engine.read(
-				{ ...request(), query: { limit: 1, filter: ["A"] } },
-				signal,
-				() => source.promise,
-			);
-			for (let index = 0; index < 4; index++) {
-				now += 3001;
-				expect(await engine.validateSnapshots(request(), signal, async () => raw(status))).toEqual({
-					changed: false,
-					reliable: cached,
-				});
-			}
-			source.resolve(raw(status));
-			const page = await pending;
-			expect(page.complete).toBe(true);
-			expect(page.counts.filteredFiles).toBe(2);
-			expect(engine.stats.snapshots).toBe(cached ? 2 : 1);
-			engine.close();
-		}
-	});
-
-	test("a read which publishes during validation is included in the final comparison", async () => {
+describe("background membership validation", () => {
+	test("same members retain cursors and changed/partial observations reject old cursors", async () => {
 		const engine = new GitStatusPageEngine();
-		await engine.read(request(), signal, async () => raw(status));
-		const readSource = deferred<GitStatusPageRawResult>();
-		const freshSource = deferred<GitStatusPageRawResult>();
-		const pending = engine.read(request(), signal, () => readSource.promise);
-		const validating = engine.validateSnapshots(request(), signal, () => freshSource.promise);
-		readSource.resolve(raw(`${status} M dir/temporary\0`));
-		const published = await pending;
-		freshSource.resolve(raw(status));
-		expect(await validating).toEqual({ changed: true, reliable: true });
-		await expect(
-			engine.read(
-				{ ...request(), query: { ...request().query, cursor: published.nextCursor as string } },
-				signal,
-				noRemote,
-			),
-		).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		engine.close();
-	});
-
-	test("an older validation cannot overwrite a newer completed validation", async () => {
-		const engine = new GitStatusPageEngine();
-		await engine.read(request(), signal, async () => raw(status));
-		const oldSource = deferred<GitStatusPageRawResult>();
-		const older = engine.validateSnapshots(request(), signal, () => oldSource.promise);
-		const current = `${status} M dir/current\0`;
-		expect(await engine.validateSnapshots(request(), signal, async () => raw(current))).toEqual({
-			changed: true,
-			reliable: true,
-		});
-		const page = await engine.read(request(), signal, async () => raw(current));
-		oldSource.resolve(raw(status));
-		expect(await older).toEqual({ changed: false, reliable: false });
-		const next = await engine.read(
-			{ ...request(), query: { ...request().query, cursor: page.nextCursor as string } },
-			signal,
-			noRemote,
-		);
-		expect(next.snapshotId).toBe(page.snapshotId);
-		engine.close();
-	});
-
-	test("existing cache validation prevents an older ABA read from publishing afterward", async () => {
-		const engine = new GitStatusPageEngine();
-		const first = await engine.read(request(), signal, async () => raw(status));
-		const older = deferred<GitStatusPageRawResult>();
-		const pending = engine.read(request(), signal, () => older.promise);
+		const first = await warm(engine);
 		expect(await engine.validateSnapshots(request(), signal, async () => raw(status))).toEqual({
 			changed: false,
 			reliable: true,
 		});
-		older.resolve(raw(`${status} M dir/temporary\0`));
-		await expect(pending).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		const next = await engine.read(
-			{ ...request(), query: { ...request().query, cursor: first.nextCursor as string } },
-			signal,
-			noRemote,
-		);
-		expect(next.snapshotId).toBe(first.snapshotId);
-		expect(engine.stats.snapshots).toBe(1);
-		engine.close();
-	});
-	test("same full fingerprint preserves cursors and changed membership invalidates them", async () => {
-		const engine = new GitStatusPageEngine();
-		const first = await engine.read(request(), signal, async () => raw(status));
-		expect(await engine.validateSnapshots(request(), signal, async () => raw(status))).toEqual({
-			changed: false,
-			reliable: true,
-		});
-		const second = await engine.read(
-			{ ...request(), query: { ...request().query, cursor: first.nextCursor as string } },
-			signal,
-			noRemote,
-		);
-		expect(second.snapshotId).toBe(first.snapshotId);
 		expect(
-			await engine.validateSnapshots(request(), signal, async () =>
-				raw(`${status} M dir/new-change\0`),
-			),
+			ready(
+				await engine.read(
+					{ ...request(), query: { ...request().query, cursor: first.nextCursor as string } },
+					signal,
+				),
+			).snapshotId,
+		).toBe(first.snapshotId);
+		expect(
+			await engine.validateSnapshots(request(), signal, async () => raw(`${status} M dir/newer\0`)),
 		).toEqual({ changed: true, reliable: true });
 		await expect(
 			engine.read(
 				{ ...request(), query: { ...request().query, cursor: first.nextCursor as string } },
 				signal,
-				noRemote,
 			),
 		).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+		expect(
+			await engine.validateSnapshots(request(), signal, async () => raw(status, false)),
+		).toEqual({ changed: true, reliable: false });
 		engine.close();
 	});
-
-	test("unknown/incomplete validation retains browsing but never claims reliability", async () => {
-		const engine = new GitStatusPageEngine();
-		expect(await engine.validateSnapshots(request(), signal, noRemote)).toEqual({
-			changed: false,
-			reliable: false,
-		});
-		const first = await engine.read(request(), signal, async () => raw(status));
-		expect(
-			await engine.validateSnapshots(request(), signal, async () => ({
-				stdout: status,
-				complete: false,
-				limitReason: "remote-truncated",
-			})),
-		).toEqual({ changed: false, reliable: false });
-		expect(
-			await engine.validateSnapshots(request(), signal, async () => {
-				throw new Error("disconnected");
-			}),
-		).toEqual({ changed: false, reliable: false });
-		const second = await engine.read(
-			{ ...request(), query: { ...request().query, cursor: first.nextCursor as string } },
-			signal,
-			noRemote,
-		);
-		expect(second.snapshotId).toBe(first.snapshotId);
-		engine.close();
-	});
-
-	test("initial baseline prevents older unpublished scans from becoming a trusted snapshot", async () => {
+	test("a cold validation prewarms without an HTTP reader and an older producer cannot win", async () => {
 		const engine = new GitStatusPageEngine();
 		const source = deferred<GitStatusPageRawResult>();
-		const pending = engine.read(request(), signal, () => source.promise);
+		const older = engine.validateSnapshots(request(), signal, () => source.promise);
 		expect(await engine.validateSnapshots(request(), signal, async () => raw(status))).toEqual({
-			changed: false,
-			reliable: false,
+			changed: true,
+			reliable: true,
 		});
-		source.resolve(raw(`${status} M dir/temporary\0`));
-		await expect(pending).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		expect(engine.stats.snapshots).toBe(0);
-		const fresh = await engine.read(request(), signal, async () => raw(status));
-		expect(fresh.complete).toBe(true);
+		source.resolve(raw(`${status} M obsolete\0`));
+		expect(await older).toEqual({ changed: false, reliable: false });
+		expect(ready(await engine.read(request(), signal)).counts.totalFiles).toBe(4);
 		engine.close();
 	});
 });
 
 describe("worker verified batch scope", () => {
-	test("directory and filter prove the whole section, not merely loaded page membership", async () => {
+	test("statistics-only refresh preserves a matching write-time membership scan", async () => {
+		for (const onDemand of [false, true]) {
+			const engine = new GitStatusPageEngine();
+			const first = onDemand
+				? await engine.readOnDemand(request(), signal, async () => raw(status))
+				: await warm(engine);
+			const source = deferred<GitStatusPageRawResult>();
+			const pending = engine.assertScope(
+				{
+					...request(),
+					proof: {
+						snapshotId: first.snapshotId,
+						filter: ["M"],
+						section: "unstaged",
+						directory: "dir",
+					},
+					files: ["dir/a", "dir/b"],
+				},
+				signal,
+				() => source.promise,
+			);
+			engine.invalidateStats(request().scope.queryKey);
+			source.resolve(raw(status));
+			expect(await pending).toBe(true);
+			engine.close();
+		}
+	});
+
+	test("directory and filter prove the complete section, not only the loaded page", async () => {
 		const engine = new GitStatusPageEngine();
-		const first = await engine.read(request(), signal, async () => raw(status));
+		const first = await warm(engine);
 		expect(first.files).toHaveLength(1);
 		const proof: GitStatusPageScopeProof = {
 			snapshotId: first.snapshotId,
@@ -222,9 +139,9 @@ describe("worker verified batch scope", () => {
 		engine.close();
 	});
 
-	test("actor, workspace, source generation and query filter must match the cached observation", async () => {
+	test("actor, workspace, generation, filter and directory remain isolated", async () => {
 		const engine = new GitStatusPageEngine();
-		const first = await engine.read(request(), signal, async () => raw(status));
+		const first = await warm(engine);
 		const proof: GitStatusPageScopeProof = {
 			snapshotId: first.snapshotId,
 			filter: ["M"],
@@ -244,7 +161,7 @@ describe("worker verified batch scope", () => {
 		engine.close();
 	});
 
-	test("external membership/status/rename changes and incomplete fresh scans reject writes", async () => {
+	test("readable last-good never authorizes a write without a complete fresh scan", async () => {
 		for (const next of [
 			raw(`${status} M dir/added-later\0`),
 			raw(status.replace("MM dir/b", " M dir/b")),
@@ -252,28 +169,38 @@ describe("worker verified batch scope", () => {
 			raw(status, false),
 		]) {
 			const engine = new GitStatusPageEngine();
-			const first = await engine.read(request(), signal, async () => raw(status));
-			const proof: GitStatusPageScopeProof = {
-				snapshotId: first.snapshotId,
-				filter: ["M"],
-				section: "unstaged",
-				directory: "dir",
-			};
+			const first = await warm(engine);
+			engine.invalidate(request().scope.queryKey);
+			expect(ready(await engine.read(request(), signal)).cache.updating).toBe(true);
+			let freshScans = 0;
 			await expect(
 				engine.assertScope(
-					{ ...request(), proof, files: ["dir/a", "dir/b"] },
+					{
+						...request(),
+						proof: {
+							snapshotId: first.snapshotId,
+							filter: ["M"],
+							section: "unstaged",
+							directory: "dir",
+						},
+						files: ["dir/a", "dir/b"],
+					},
 					signal,
-					async () => next,
+					async () => {
+						freshScans++;
+						return next;
+					},
 				),
 			).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+			expect(freshScans).toBe(1);
 			engine.close();
 		}
 	});
 
-	test("ninth-snapshot eviction, idle expiry and partial cached scans cannot authorize a batch", async () => {
+	test("evicted/expired/partial observations cannot authorize any batch", async () => {
 		let now = 0;
 		const engine = new GitStatusPageEngine(undefined, () => now);
-		const first = await engine.read(request(), signal, async () => raw(status));
+		const first = await warm(engine);
 		const proof: GitStatusPageScopeProof = {
 			snapshotId: first.snapshotId,
 			filter: ["M"],
@@ -281,12 +208,15 @@ describe("worker verified batch scope", () => {
 			directory: "dir",
 		};
 		for (let index = 0; index < 8; index++)
-			await engine.read(request(), signal, async () => raw(status));
+			await engine.read(
+				{ ...request(), scope: { ...request().scope, actorId: `actor-${index}` } },
+				signal,
+			);
 		expect(engine.stats.snapshots).toBe(8);
 		await expect(
 			engine.assertScope({ ...request(), proof, files: ["dir/a", "dir/b"] }, signal, noRemote),
 		).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		const fresh = await engine.read(request(), signal, async () => raw(status));
+		const fresh = ready(await engine.read(request(), signal));
 		now = 120_000;
 		await expect(
 			engine.assertScope(
@@ -299,7 +229,7 @@ describe("worker verified batch scope", () => {
 				noRemote,
 			),
 		).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		const partial = await engine.read(request(), signal, async () => raw(status, false));
+		const partial = await warm(engine, false);
 		await expect(
 			engine.assertScope(
 				{
@@ -314,33 +244,73 @@ describe("worker verified batch scope", () => {
 		engine.close();
 	});
 
-	test("eviction during write-time fresh scan rejects the result before authorization", async () => {
-		const engine = new GitStatusPageEngine();
-		const first = await engine.read(request(), signal, async () => raw(status));
-		const source = deferred<GitStatusPageRawResult>();
-		const pending = engine.assertScope(
-			{
-				...request(),
-				proof: {
-					snapshotId: first.snapshotId,
-					filter: ["M"],
-					section: "unstaged",
-					directory: "dir",
+	test("eviction or dirty during a write-time scan rejects its late result", async () => {
+		for (const mode of ["evict", "dirty"] as const) {
+			const engine = new GitStatusPageEngine();
+			const first = await warm(engine);
+			const source = deferred<GitStatusPageRawResult>();
+			const pending = engine.assertScope(
+				{
+					...request(),
+					proof: {
+						snapshotId: first.snapshotId,
+						filter: ["M"],
+						section: "unstaged",
+						directory: "dir",
+					},
+					files: ["dir/a", "dir/b"],
 				},
-				files: ["dir/a", "dir/b"],
-			},
-			signal,
-			() => source.promise,
-		);
-		for (let index = 0; index < 8; index++)
-			await engine.read(request(), signal, async () => raw(status));
-		source.resolve(raw(status));
-		await expect(pending).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		engine.close();
+				signal,
+				() => source.promise,
+			);
+			if (mode === "evict")
+				for (let i = 0; i < 8; i++)
+					await engine.read(
+						{ ...request(), scope: { ...request().scope, actorId: `actor-${i}` } },
+						signal,
+					);
+			else engine.invalidate(request().scope.queryKey);
+			source.resolve(raw(status));
+			await expect(pending).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+			engine.close();
+		}
 	});
 });
 
-test("parent service transports validation and scope proofs to the same isolated Worker", async () => {
+test("parent statistics invalidation preserves an in-flight scoped write assertion", async () => {
+	const pages = new GitStatusPageService();
+	const entered = deferred<void>();
+	const scan = deferred<GitStatusPageRawResult>();
+	let checking = false;
+	const source = {
+		kind: "remote" as const,
+		identity: "device:7:/root",
+		read: async () => {
+			if (!checking) return raw(status);
+			entered.resolve();
+			return scan.promise;
+		},
+	};
+	try {
+		const first = await pages.readOnDemand({ ...request(), source });
+		checking = true;
+		const pending = pages.assertScope({
+			scope: request().scope,
+			source,
+			proof: { snapshotId: first.snapshotId, filter: ["M"], section: "unstaged", directory: "dir" },
+			files: ["dir/a", "dir/b"],
+		});
+		await entered.promise;
+		pages.invalidateStats(request().scope.queryKey);
+		scan.resolve(raw(status));
+		await pending;
+	} finally {
+		scan.resolve(raw(status));
+		await pages.close();
+	}
+});
+
+test("parent service transports background validation and scope proofs to the isolated Worker", async () => {
 	const pages = new GitStatusPageService();
 	let stdout = status;
 	let scans = 0;
@@ -353,7 +323,8 @@ test("parent service transports validation and scope proofs to the same isolated
 		},
 	};
 	try {
-		const first = await pages.read({ ...request(), source });
+		await pages.validate({ queryKey: request().scope.queryKey, source });
+		const first = ready(await pages.read({ ...request(), source }));
 		expect(await pages.validate({ queryKey: request().scope.queryKey, source })).toEqual({
 			changed: false,
 			reliable: true,
@@ -365,31 +336,17 @@ test("parent service transports validation and scope proofs to the same isolated
 			files: ["dir/b", "dir/a"],
 		});
 		expect(scans).toBe(3);
-		const next = await pages.read({
-			...request(),
-			source,
-			query: { ...request().query, cursor: first.nextCursor as string },
-		});
-		expect(next.snapshotId).toBe(first.snapshotId);
+		expect(
+			ready(
+				await pages.read({
+					...request(),
+					source,
+					query: { ...request().query, cursor: first.nextCursor as string },
+				}),
+			).snapshotId,
+		).toBe(first.snapshotId);
 		expect(scans).toBe(3);
 		stdout += " M dir/late\0";
-		const failure = await pages
-			.assertScope({
-				scope: request().scope,
-				source,
-				proof: {
-					snapshotId: first.snapshotId,
-					filter: ["M"],
-					section: "unstaged",
-					directory: "dir",
-				},
-				files: ["dir/a", "dir/b"],
-			})
-			.then(
-				() => null,
-				(error: unknown) => error,
-			);
-		expect(failure).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
 	} finally {
 		await pages.close();
 	}

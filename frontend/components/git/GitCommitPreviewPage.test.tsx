@@ -28,6 +28,7 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { ApiError, api } from "../../lib/api";
 import { type GitWorkspace, gitBasePath } from "../../lib/api/git";
 import { buildCommitPreviewHref } from "../../lib/git-commit-preview-navigation";
+import { type MessageCallback, narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { installCanvasStub } from "../narrator/vlist/measure/test-canvas-stub";
@@ -35,6 +36,10 @@ import { installCanvasStub } from "../narrator/vlist/measure/test-canvas-stub";
 // Real Router/React transitions can exceed Bun's 5s default on busy Windows runners.
 setDefaultTimeout(20_000);
 // Actual file-route components, query hooks, and shared preview. Only API I/O is mocked.
+mock.module("../narrator/header/NarratorWorktreeControls", () => ({
+	NarratorWorktreeControls: () => null,
+}));
+const { NarratorGitBar } = await import("../narrator/header/NarratorGitBar");
 const disposeCanvas = installCanvasStub();
 const { Route: narratorRoute } = await import(
 	"../../routes/git/narrators/$narratorId/commits/$sha"
@@ -107,6 +112,7 @@ let root: Root;
 let container: HTMLDivElement;
 let queryClient: QueryClient;
 let restoreDom: () => void;
+let restoreGitConnection: (() => void) | undefined;
 let router: ReturnType<typeof makeRouter> | undefined;
 
 function installDom() {
@@ -325,9 +331,112 @@ afterEach(async () => {
 	await tick();
 	container.remove();
 	mock.restore();
+	restoreGitConnection?.();
+	restoreGitConnection = undefined;
 	restoreDom();
 });
 afterAll(disposeCanvas);
+
+test.each([
+	"header",
+	"preview",
+])("a standalone %s retains its only authorization owner through pause, exhaustion and same-id recovery", async (host) => {
+	const descriptor = Object.getOwnPropertyDescriptor(narratorWSManager, "connected");
+	Object.defineProperty(narratorWSManager, "connected", { configurable: true, value: true });
+	restoreGitConnection = () =>
+		descriptor
+			? Object.defineProperty(narratorWSManager, "connected", descriptor)
+			: Reflect.deleteProperty(narratorWSManager, "connected");
+	spyOn(narratorWSManager, "getCredentialIdentity").mockReturnValue(1);
+	spyOn(narratorWSManager, "getConnectionCredentialIdentity").mockReturnValue(1);
+	const callbacks = new Map<number, { callback: MessageCallback; types?: string[] }>();
+	const sent: Record<string, unknown>[] = [];
+	const registered = new Set<unknown>();
+	let handle = 0;
+	let version = 0;
+	const emit = (
+		type: string,
+		extra: Record<string, unknown> = {},
+		subscription = sent.filter((message) => message.type === "git_workspace_subscribe").at(-1),
+	) => {
+		const frame = {
+			...subscription,
+			repositoryKey: "repo-key",
+			type,
+			version: ++version,
+			...extra,
+		};
+		for (const { callback, types } of callbacks.values()) {
+			if (!types || types.includes(type)) callback(frame);
+		}
+	};
+	spyOn(narratorWSManager, "addListener").mockImplementation((options, callback) => {
+		const id = ++handle;
+		callbacks.set(id, { callback, types: options.types });
+		return { _id: id };
+	});
+	spyOn(narratorWSManager, "removeListener").mockImplementation((listener) => {
+		callbacks.delete(listener._id);
+	});
+	spyOn(narratorWSManager, "onConnectionChange").mockImplementation(() => () => {});
+	spyOn(narratorWSManager, "send").mockImplementation((message) => {
+		sent.push(message);
+		if (message.type === "git_workspace_subscribe" && !registered.has(message.subscriptionId)) {
+			registered.add(message.subscriptionId);
+			queueMicrotask(() => emit("git_workspace_subscribed", {}, message));
+		}
+		return true;
+	});
+	spyOn(api, "getGitWorkspace").mockResolvedValue(workspace({ branch: "private-branch" }));
+	const native = spyOn(api, "getGitStatus");
+	const lines = spyOn(api, "getGitLineStats");
+	if (host === "preview") await mount(buildCommitPreviewHref(TARGET, SHA, FILE, "window"));
+	else
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<QueryClientProvider client={queryClient}>
+						<NarratorGitBar narratorId={TARGET.narratorId} onOpenGitPanel={() => {}} />
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+	await waitFor(() => text().includes(host === "preview" ? "PRIVATE_PATCH" : "private-branch"));
+	const id = sent.find((message) => message.type === "git_workspace_subscribe")?.subscriptionId;
+	emit("git_workspace_error", {
+		kind: "retryable",
+		code: "DB_READ_WORKER_UNAVAILABLE",
+		retrying: true,
+	});
+	await waitFor(() => text().includes(gitLocale["workspace.recovering"]));
+	for (let turn = 0; turn < 8; turn++) await tick();
+	expect(text()).not.toContain("PRIVATE_PATCH");
+	expect(text()).not.toContain("private-branch");
+	expect(sent.filter((message) => message.type === "git_workspace_unsubscribe")).toHaveLength(0);
+	emit("git_workspace_error", {
+		kind: "retryable",
+		code: "DB_READ_WORKER_UNAVAILABLE",
+		retrying: false,
+	});
+	await waitFor(() => text().includes(gitLocale["workspace.refresh_required"]));
+	const refresh = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+		(button) => button.textContent === "Refresh" || button.getAttribute("aria-label") === "Refresh",
+	);
+	expect(refresh).toBeDefined();
+	refresh?.click();
+	expect(sent.at(-1)).toEqual({ type: "git_workspace_refresh", subscriptionId: id });
+	emit("git_workspace_subscribed");
+	await waitFor(() => text().includes(host === "preview" ? "PRIVATE_PATCH" : "private-branch"));
+	expect(
+		new Set(
+			sent
+				.filter((message) => message.type === "git_workspace_subscribe")
+				.map((message) => message.subscriptionId),
+		).size,
+	).toBe(1);
+	expect(native).not.toHaveBeenCalled();
+	expect(lines).not.toHaveBeenCalled();
+});
 
 describe("standalone commit file routes with real memory history", () => {
 	test("a cold window waits for workspace identity instead of showing and reloading provisional content", async () => {
