@@ -4,21 +4,42 @@ import { watchOutcome, watchTargetName } from "./WatchTaskRow";
 
 describe("watch row", () => {
 	test("outcome distinguishes watching, deadline, match, target end, cancel and failure", () => {
-		expect(watchOutcome({ status: "running", output: null }, true)).toBe("watching");
+		const agent = { type: "agent" as const };
+		const bashFor = { type: "bash" as const, pattern: "ready" };
+		const terminalFor = { type: "terminal" as const, pattern: "PASS" };
+		expect(watchOutcome({ status: "running", output: null }, agent)).toBe("watching");
 		expect(
 			watchOutcome(
 				{ status: "completed", output: "Watch reached its deadline for agent a" },
-				false,
+				agent,
 			),
 		).toBe("deadline");
-		expect(watchOutcome({ status: "completed", output: "Watch bash b: completed." }, true)).toBe(
-			"matched",
-		);
-		expect(watchOutcome({ status: "completed", output: "Watch agent a: completed." }, false)).toBe(
+		expect(
+			watchOutcome({ status: "completed", output: "Watch bash b: found.\n\nready" }, bashFor),
+		).toBe("matched");
+		expect(watchOutcome({ status: "completed", output: "Watch agent a: completed." }, agent)).toBe(
 			"ended",
 		);
-		expect(watchOutcome({ status: "cancelled", output: null }, false)).toBe("cancelled");
-		expect(watchOutcome({ status: "failed", output: "x" }, false)).toBe("failed");
+		expect(watchOutcome({ status: "completed", output: "PASS seen" }, terminalFor)).toBe("matched");
+		expect(watchOutcome({ status: "cancelled", output: null }, agent)).toBe("cancelled");
+		expect(watchOutcome({ status: "failed", output: "x" }, agent)).toBe("failed");
+	});
+
+	test("a target that ends without the pattern, or is replaced, is not a success", () => {
+		const bashFor = { type: "bash" as const, pattern: "ready" };
+		const agent = { type: "agent" as const };
+		expect(watchOutcome({ status: "completed", output: "Watch bash b: completed." }, bashFor)).toBe(
+			"ended",
+		);
+		expect(watchOutcome({ status: "completed", output: "Watch bash b: failed." }, bashFor)).toBe(
+			"stopped",
+		);
+		expect(watchOutcome({ status: "completed", output: "Watch agent a: superseded." }, agent)).toBe(
+			"replaced",
+		);
+		expect(watchOutcome({ status: "completed", output: "Watch agent a: taken_over." }, agent)).toBe(
+			"replaced",
+		);
 	});
 
 	test("target name drops the watch prefix and a terminal title's pattern suffix", () => {

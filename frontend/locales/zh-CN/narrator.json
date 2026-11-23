@@ -2244,6 +2244,8 @@
 		"watchStatusDeadline": "已到期",
 		"watchStatusMatched": "已匹配",
 		"watchStatusTargetEnded": "目标已结束",
+		"watchStatusTargetReplaced": "运行已被替换",
+		"watchStatusTargetStopped": "目标已中止",
 		"watchCancel": "停止观察（不影响目标）"
 	},
 	"sidecar": {

@@ -22,6 +22,15 @@ export function isWatchDeadlineOutput(output: string | null | undefined): boolea
 	);
 }
 
+/**
+ * The target status a finished agent/bash watch reported in its first line
+ * (`Watch bash b1: found.`), or null when the output has no such header.
+ */
+export function watchResultTargetStatus(output: string | null | undefined): string | null {
+	const header = output?.split("\n", 1)[0] ?? "";
+	return /^Watch (?:agent|bash) .*: ([a-z_]+)\.$/.exec(header)?.[1] ?? null;
+}
+
 export function isWatchCommand(command: string | null | undefined): boolean {
 	if (!command) return false;
 	return (

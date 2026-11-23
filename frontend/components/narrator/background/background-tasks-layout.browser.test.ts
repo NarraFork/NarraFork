@@ -303,6 +303,15 @@ test("filters hide old and watch rows; watches render as their own row and on th
 		expect(watchRows[1].text).toMatch(/Bash.*server.*for ready on.*watching.*Deadline 5m/);
 		expect(watchRows[2].text).toMatch(/Terminal.*tests.*for PASS.*deadline reached.*Deadline 30m/);
 		expect(watchRows[2].text).not.toContain("left");
+		expect(await page.$("[data-watch-output]")).toBeNull();
+		await page.click('[data-watch-task="watch-terminal"] [data-watch-toggle]');
+		expect(
+			await page.$eval(
+				'[data-watch-task="watch-terminal"] [data-watch-output]',
+				(n) => n.textContent,
+			),
+		).toContain('Terminal watch timed out: "PASS" did not appear');
+		expect(await page.$('[data-watch-task="watch-agent"] [data-watch-toggle]')).toBeNull();
 		await toggle("Completed");
 		expect(await surfaceText()).not.toContain("bun run build");
 		expect(await page.$$eval("[data-watch-task]", (n) => n.length)).toBe(2);

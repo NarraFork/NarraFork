@@ -2247,6 +2247,8 @@
 		"watchStatusDeadline": "deadline reached",
 		"watchStatusMatched": "matched",
 		"watchStatusTargetEnded": "target finished",
+		"watchStatusTargetReplaced": "run replaced",
+		"watchStatusTargetStopped": "target stopped",
 		"watchCancel": "Stop watching (the target keeps running)"
 	},
 	"sidecar": {

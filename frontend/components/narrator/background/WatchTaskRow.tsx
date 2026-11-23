@@ -1,8 +1,20 @@
 import { ActionIcon, Badge, Box, Code, Group, Stack, Text, Tooltip } from "@mantine/core";
 import { isBackgroundTaskActiveStatus } from "@shared/background-task-list";
 import { formatProgressDuration } from "@shared/tool-progress";
-import { isWatchDeadlineOutput, parseWatchCommand } from "@shared/watch-command";
-import { IconClock, IconExternalLink, IconEye, IconX } from "@tabler/icons-react";
+import {
+	isWatchDeadlineOutput,
+	parseWatchCommand,
+	type WatchTarget,
+	watchResultTargetStatus,
+} from "@shared/watch-command";
+import {
+	IconChevronDown,
+	IconChevronRight,
+	IconClock,
+	IconExternalLink,
+	IconEye,
+	IconX,
+} from "@tabler/icons-react";
 import type { TFunction } from "i18next";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -43,17 +55,32 @@ export function watchTargetName(title: string | null, pattern: string | undefine
 	return name || null;
 }
 
-type WatchOutcome = "watching" | "deadline" | "matched" | "ended" | "cancelled" | "failed";
+type WatchOutcome =
+	| "watching"
+	| "deadline"
+	| "matched"
+	| "ended"
+	| "replaced"
+	| "stopped"
+	| "cancelled"
+	| "failed";
 
 export function watchOutcome(
 	task: Pick<WatchTaskRowTask, "status" | "output">,
-	hasPattern: boolean,
+	target: Pick<WatchTarget, "type" | "pattern"> | null,
 ): WatchOutcome {
 	if (isBackgroundTaskActiveStatus(task.status)) return "watching";
 	if (task.status === "cancelled") return "cancelled";
 	if (task.status === "failed") return "failed";
 	if (task.status === "timeout" || isWatchDeadlineOutput(task.output)) return "deadline";
-	return hasPattern ? "matched" : "ended";
+	// Agent and bash watches finish "completed" whatever the target did; the
+	// target's own status is in the result header.
+	const targetStatus = watchResultTargetStatus(task.output);
+	if (targetStatus === "found" || targetStatus === "text_matched") return "matched";
+	if (targetStatus === "superseded" || targetStatus === "taken_over") return "replaced";
+	if (targetStatus && targetStatus !== "completed") return "stopped";
+	// A terminal watch completes on its pattern, or on the terminal exiting when it has none.
+	return target?.type === "terminal" && target.pattern ? "matched" : "ended";
 }
 
 const OUTCOME_COLOR: Record<WatchOutcome, string> = {
@@ -61,6 +88,8 @@ const OUTCOME_COLOR: Record<WatchOutcome, string> = {
 	deadline: "gray",
 	matched: "green",
 	ended: "green",
+	replaced: "yellow",
+	stopped: "orange",
 	cancelled: "gray",
 	failed: "red",
 };
@@ -75,6 +104,10 @@ function outcomeLabel(outcome: WatchOutcome, t: TFunction<"narrator">): string {
 			return t("backgroundTasks.watchStatusMatched");
 		case "ended":
 			return t("backgroundTasks.watchStatusTargetEnded");
+		case "replaced":
+			return t("backgroundTasks.watchStatusTargetReplaced");
+		case "stopped":
+			return t("backgroundTasks.watchStatusTargetStopped");
 		case "cancelled":
 			return t("backgroundTasks.statusCancelled");
 		case "failed":
@@ -175,11 +208,14 @@ export function WatchAttachment({ watches }: { watches: readonly WatchTaskRowTas
 export function WatchTaskRow({ task, onOpenAgent, onCancel }: WatchTaskRowProps) {
 	const { t } = useTranslation("narrator");
 	const target = parseWatchCommand(task.command);
-	const outcome = watchOutcome(task, !!target?.pattern);
+	const outcome = watchOutcome(task, target);
 	const watching = outcome === "watching";
 	const targetName = watchTargetName(task.title, target?.pattern) || target?.id || task.id;
 	const openAgent = target?.type === "agent" && onOpenAgent ? onOpenAgent : undefined;
-	const preview = outcome === "matched" || outcome === "ended" || outcome === "failed";
+	const [expanded, setExpanded] = useState(false);
+	const output = watching ? null : task.output;
+	const preview = resultPreview(output);
+	const toggle = () => setExpanded((current) => !current);
 
 	return (
 		<Box
@@ -192,10 +228,25 @@ export function WatchTaskRow({ task, onOpenAgent, onCancel }: WatchTaskRowProps)
 		>
 			<Box
 				className={classes.header}
-				onClick={() => openAgent?.(target?.id as string)}
-				style={{ cursor: openAgent ? "pointer" : "default" }}
+				onClick={() => (openAgent ? openAgent(target?.id as string) : output && toggle())}
+				style={{ cursor: openAgent || output ? "pointer" : "default" }}
 			>
 				<Group gap={6} wrap="nowrap" className={classes.identity}>
+					{output && (
+						<ActionIcon
+							size="xs"
+							variant="transparent"
+							color="gray"
+							data-watch-toggle
+							aria-expanded={expanded}
+							onClick={(event) => {
+								event.stopPropagation();
+								toggle();
+							}}
+						>
+							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+						</ActionIcon>
+					)}
 					<IconEye size={14} />
 					<Badge size="xs" variant="light" color="grape">
 						{t("backgroundTasks.watchBadge")}
@@ -260,10 +311,21 @@ export function WatchTaskRow({ task, onOpenAgent, onCancel }: WatchTaskRowProps)
 					/>
 				</Box>
 			)}
-			{preview && resultPreview(task.output) && (
-				<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
-					{resultPreview(task.output)}
-				</Text>
+			{output && expanded ? (
+				<Code
+					block
+					mt={4}
+					data-watch-output
+					style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}
+				>
+					{output}
+				</Code>
+			) : (
+				preview && (
+					<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
+						{preview}
+					</Text>
+				)
 			)}
 		</Box>
 	);

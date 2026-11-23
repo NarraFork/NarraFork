@@ -5,6 +5,7 @@ import {
 	isWatchDeadlineOutput,
 	parseWatchCommand,
 	WATCH_COMMAND_PREFIX,
+	watchResultTargetStatus,
 } from "./watch-command";
 
 const row = (target: Parameters<typeof formatWatchTarget>[0]) =>
@@ -48,5 +49,14 @@ describe("watch command", () => {
 		expect(isWatchDeadlineOutput("Terminal watch timed out: observation reached")).toBe(true);
 		expect(isWatchDeadlineOutput("Watch agent a: completed.")).toBe(false);
 		expect(isWatchDeadlineOutput(null)).toBe(false);
+	});
+
+	test("reads the target status from a finished watch's header line", () => {
+		expect(watchResultTargetStatus("Watch bash b1: found.\n\nready")).toBe("found");
+		expect(watchResultTargetStatus("Watch agent Fix: login: taken_over.")).toBe("taken_over");
+		expect(
+			watchResultTargetStatus("Observation fulfilled by the ordinary agent notice"),
+		).toBeNull();
+		expect(watchResultTargetStatus(null)).toBeNull();
 	});
 });
