@@ -136,10 +136,14 @@ const sourceKind = (owner: string): CredentialSourceKind =>
 
 /** Copy the files the migration reads or changes; owner-only, like the originals. */
 function backUp(home: string): string {
+	const root = resolve(home, CREDENTIAL_BACKUPS_DIR);
+	mkdirSync(root, { recursive: true, mode: 0o700 });
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-	const dir = resolve(home, CREDENTIAL_BACKUPS_DIR, `pre-sourcing-${stamp}`);
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	for (const path of [resolve(home, CREDENTIAL_BACKUPS_DIR), dir]) chmodPrivate(path, 0o700);
+	// A retry after a failed attempt never writes into an earlier backup.
+	let dir = resolve(root, `pre-sourcing-${stamp}`);
+	for (let n = 2; existsSync(dir); n++) dir = resolve(root, `pre-sourcing-${stamp}-${n}`);
+	mkdirSync(dir, { mode: 0o700 });
+	for (const path of [root, dir]) chmodPrivate(path, 0o700);
 	for (const name of BACKED_UP_FILES) {
 		const source = resolve(home, name);
 		if (!existsSync(source)) continue;

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import {
 	cpSync,
 	existsSync,
@@ -41,6 +41,7 @@ import { readSecretJSON, writeSecretJSON } from "../secret-store";
 const dirs: string[] = [];
 const managers: CodexManager[] = [];
 afterEach(() => {
+	setSystemTime();
 	for (const manager of managers.splice(0)) manager.dispose();
 	resetCredentialStoresForTests();
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -384,6 +385,8 @@ describe("credential migration", () => {
 
 	test("a crash before credentials.json is written: the next start migrates again", () => {
 		const { dir } = legacyHome();
+		// Both attempts in the same millisecond: the retry still gets its own backup.
+		setSystemTime(new Date("2026-11-14T00:00:00Z"));
 		const write = spyOn(secretStore, "writeSecretJSON").mockImplementationOnce(() => {
 			throw new Error("disk full");
 		});
@@ -399,7 +402,11 @@ describe("credential migration", () => {
 		resetCredentialStoresForTests();
 		expect(migrateCredentialFiles(dir)).toBe("migrated");
 		expect(credentialsOf(dir).credentials).toHaveLength(12);
-		expect(readdirSync(join(dir, CREDENTIAL_BACKUPS_DIR))).toHaveLength(2);
+		setSystemTime();
+		expect(readdirSync(join(dir, CREDENTIAL_BACKUPS_DIR)).sort()).toEqual([
+			"pre-sourcing-2026-11-14T00-00-00-000Z",
+			"pre-sourcing-2026-11-14T00-00-00-000Z-2",
+		]);
 	});
 
 	test("a crash after credentials.json is written: the next start finishes the clean-up", () => {
