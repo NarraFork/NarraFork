@@ -148,7 +148,7 @@ describe("OpenAIProvider chat request formatting", () => {
 		expect(contentTypes.includes("image_url")).toBe(false);
 	});
 
-	it("codex mode keeps prompt_cache_key constant and reuses the full input prefix", async () => {
+	it("codex mode keeps the GPT-6.2 developer prefix and cache key stable across turns", async () => {
 		const originalFetch = globalThis.fetch;
 		const capturedBodies: Record<string, unknown>[] = [];
 		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
@@ -160,11 +160,12 @@ describe("OpenAIProvider chat request formatting", () => {
 		}) as typeof fetch;
 
 		try {
+			const model = "codex:gpt-6.2-sol";
 			// Each request is what the loop sends: its transcript plus the turn's input,
 			// projected, with the system prompt.
 			const request = async (rows: DbMessage[]): Promise<unknown[]> => {
-				const { history } = await codexProvider.buildHistory(rows, "codex:gpt-5.3-codex");
-				codexProvider.injectSystemPrompt(history, "Stay cached", "codex:gpt-5.3-codex", "en");
+				const { history } = await codexProvider.buildHistory(rows, model);
+				codexProvider.injectSystemPrompt(history, "Stay cached", model, "en");
 				return history;
 			};
 			const conversationId = "cache-conv-1";
@@ -173,7 +174,7 @@ describe("OpenAIProvider chat request formatting", () => {
 			const firstParams: ChatParams = {
 				conversationId,
 				content: "",
-				model: "codex:gpt-5.3-codex",
+				model,
 				cwd: "/tmp",
 				history: await request(transcript.withInput("hello 1")),
 				tools: [],
@@ -202,7 +203,7 @@ describe("OpenAIProvider chat request formatting", () => {
 			const secondParams: ChatParams = {
 				conversationId,
 				content: "",
-				model: "codex:gpt-5.3-codex",
+				model,
 				cwd: "/tmp",
 				history: await request(transcript.withInput("hello 2")),
 				tools: [],
@@ -224,6 +225,12 @@ describe("OpenAIProvider chat request formatting", () => {
 		}>;
 		expect(body1.prompt_cache_key).toBe("cache-conv-1");
 		expect(body2.prompt_cache_key).toBe("cache-conv-1");
+		expect(body1).not.toHaveProperty("instructions");
+		expect(body2).not.toHaveProperty("instructions");
+		expect(body1.input?.[0]).toMatchObject({
+			role: "developer",
+			content: [{ type: "input_text", text: expect.stringContaining("Stay cached") }],
+		});
 		expect(body1.tools).toEqual(body2.tools);
 		expect(body2.input?.slice(0, body1.input?.length ?? 0)).toEqual(body1.input);
 		expect(JSON.stringify(body2.input)).toContain('"type":"web_search_call"');

@@ -33,22 +33,20 @@ export interface InputCharacterOptions extends InputCharacterBudget {
 	includeComposition?: boolean;
 	/** Completions only: first messages[] entry is the known injected runtime prefix. */
 	firstMessageIsRuntimeSystem?: boolean;
-	/** Responses may concatenate historical system turns into instructions; only this prefix is fixed. */
+	/** For Responses payloads with top-level instructions, only this prefix is fixed. */
 	instructionsFixedChars?: number;
 }
 
 // Runtime provenance is object identity, not a text/role heuristic. This survives delegate
 // replacement while remaining absent from serialized wire/history data and user JSON.
 const runtimeSystemMessages = new WeakSet<object>();
-const runtimeInstructionRoots = new WeakSet<object>();
-/** The builder generated root instructions itself rather than lifting history text. */
-export function markRuntimeInstructions<T extends object>(body: T): T {
-	runtimeInstructionRoots.add(body);
-	return body;
-}
 export function markRuntimeSystemMessage<T extends object>(message: T): T {
 	runtimeSystemMessages.add(message);
 	return message;
+}
+
+export function isRuntimeSystemMessage(message: unknown): boolean {
+	return !!message && typeof message === "object" && runtimeSystemMessages.has(message);
 }
 
 type ObjectValue = Record<string, unknown>;
@@ -382,7 +380,13 @@ async function measureInputCharacters(
 				await content(message, fixed ? "system" : "other");
 			}
 		}
-		for (const field of ["input", "contents"]) await content(request[field], "other");
+		if (Array.isArray(request.input)) {
+			for (const item of request.input)
+				await content(item, isRuntimeSystemMessage(item) ? "system" : "other");
+		} else {
+			await content(request.input, "other");
+		}
+		await content(request.contents, "other");
 		if (request.tools) {
 			// Tool declarations are model inputs; only transport/cache annotations are omitted.
 			if (!Array.isArray(request.tools)) fail("unsupported_input");
@@ -470,7 +474,7 @@ export async function reportInputCharacters(
 	const options: InputCharacterOptions = { ...budget, includeComposition: true };
 	const request = object(body);
 	const first = params.history?.[0];
-	const synthetic = !!first && typeof first === "object" && runtimeSystemMessages.has(first);
+	const synthetic = isRuntimeSystemMessage(first);
 	if (
 		params.history &&
 		Array.isArray(request.messages) &&
@@ -484,9 +488,8 @@ export async function reportInputCharacters(
 		options.instructionsFixedChars === undefined
 	) {
 		const runtimeContent = object(first).content;
-		options.instructionsFixedChars = runtimeInstructionRoots.has(request)
-			? request.instructions.length
-			: synthetic && typeof runtimeContent === "string"
+		options.instructionsFixedChars =
+			synthetic && typeof runtimeContent === "string"
 				? runtimeContent.length > (options.maxChars ?? 32 * 1024 * 1024) ||
 					request.instructions === runtimeContent ||
 					(!params.signal.aborted && request.instructions.startsWith(runtimeContent))

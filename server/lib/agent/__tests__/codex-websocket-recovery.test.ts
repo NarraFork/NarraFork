@@ -22,7 +22,7 @@ import {
 } from "../codex-websocket";
 import { diagnosticsFromError } from "../error-diagnostics";
 import { isRetryableError, ProviderInvalidStateError } from "../error-handling";
-import { OpenAIProvider } from "../openai-provider";
+import { CODEX_DEFAULT_INSTRUCTIONS, OpenAIProvider } from "../openai-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
 import { ApiRequestDumpCollector } from "../request-dump";
 
@@ -148,6 +148,11 @@ afterEach(async () => {
 function userMessage(text: string) {
 	return { role: "user", content: [{ type: "input_text", text }] };
 }
+
+const defaultDeveloperPrefix = {
+	role: "developer",
+	content: [{ type: "input_text", text: CODEX_DEFAULT_INSTRUCTIONS }],
+};
 
 async function runStream(
 	server: TestServer,
@@ -909,7 +914,11 @@ for (const { code, frame } of recoverableErrors) {
 		expect(server.connectionCount()).toBe(2);
 		expect(server.requests[1]?.connectionIndex).toBe(1);
 		expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[1]?.body.input).toEqual([...history, userMessage("continue")]);
+		expect(server.requests[1]?.body.input).toEqual([
+			defaultDeveloperPrefix,
+			...history,
+			userMessage("continue"),
+		]);
 		expect(requestTurnState(server, 0)).toBeUndefined();
 		expect(requestTurnState(server, 1)).toBe("sticky-1");
 		// WS routing state rides response.create.client_metadata, NOT handshake
@@ -1218,7 +1227,11 @@ test.each([
 		expect(collectText(next.events)).toBe("ok");
 		expect(server.requests).toHaveLength(3);
 		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[2]?.body.input).toEqual([...history, userMessage("next")]);
+		expect(server.requests[2]?.body.input).toEqual([
+			defaultDeveloperPrefix,
+			...history,
+			userMessage("next"),
+		]);
 		expect(server.requests[2]?.connectionIndex).toBe(1);
 		expect(server.connectionCount()).toBe(2);
 		expect(clientClosedAtInvalidState).toBe(true);

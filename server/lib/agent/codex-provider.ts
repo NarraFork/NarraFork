@@ -1,5 +1,5 @@
 import type { NativeMediaInput } from "@shared/media-attachments";
-import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { reportInputCharacters } from "./input-characters";
 import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
@@ -32,10 +32,8 @@ import {
 import {
 	appendDiagnosticOpenAIInput,
 	applyOpenAIModelMetadata,
-	CODEX_DEFAULT_INSTRUCTIONS,
-	convertHistoryToResponsesApi,
+	buildResponsesInput,
 	diagnosticTransportIdentity,
-	isResponsesInputItem,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
@@ -895,43 +893,22 @@ export class CodexProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
-		let instructions = "";
-		const inputMessages: OAIMessage[] = [];
-		for (const msg of messages) {
-			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
-			const role = (msg as any).role;
-			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
-				if (typeof msg.content === "string") {
-					instructions += (instructions ? "\n\n" : "") + msg.content;
-				}
-				continue;
-			}
-			inputMessages.push(msg);
-		}
-
-		const sanitizedInputMessages = inputMessages.filter((msg) => {
-			if (msg.role !== "assistant") return true;
-			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-			if (hasToolCalls) return true;
-			if (typeof msg.content === "string") return msg.content.length > 0;
-			if (Array.isArray(msg.content)) return msg.content.length > 0;
-			return false;
-		});
-
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
-				// Codex runs official gpt/codex ids → credential-strict replay. The
-				// reasoning source identity is the "codex" prefix shared by every
-				// provider instance this class creates.
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: "codex",
-			}),
+			input: buildResponsesInput(
+				messages,
+				{
+					// Codex runs official gpt/codex ids → credential-strict replay. The
+					// reasoning source identity is the "codex" prefix shared by every
+					// provider instance this class creates.
+					strict: hasCredentialBoundReasoning(model),
+					currentSource: "codex",
+				},
+				"codex",
+			),
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
 		const tools =
 			params.diagnostic && !params.diagnosticFork
 				? []
