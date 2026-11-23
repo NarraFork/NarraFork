@@ -1,5 +1,5 @@
+import type { AddProviderType, ProviderPreset } from "@shared/sourcing/presets";
 import type { NUGProviderState } from "./NUGProvidersSection";
-import type { AddProviderType, ProviderPreset } from "./provider-presets";
 import type { CustomApiProviderState, UserAgentMode } from "./types";
 
 export interface AddProviderDraft {

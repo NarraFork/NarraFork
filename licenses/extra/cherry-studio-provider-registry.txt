@@ -18,7 +18,7 @@ upstream package author; no copyright year is inferred.
 The upstream repository root uses AGPL; this reuse is limited to the MIT-declared
 provider-registry subpackage data. No upstream main src implementation is copied.
 
-Data mapping (frontend/components/providers/provider-presets.ts):
+Data mapping (server/lib/sourcing/presets.ts):
 - Keep only provider id, name, compatible API base URLs and default chat protocol.
 - anthropic-messages maps to anthropic-messages; openai-responses maps to
   openai-responses; openai-chat-completions maps to completions-compatible;
@@ -51,7 +51,7 @@ Data mapping (frontend/components/providers/provider-presets.ts):
   gateway). NUG and the custom option are UI actions, not registry records.
 - Do not carry model data, website metadata, referral links or promotion URLs.
 
-Local connection selection (provider-connection-presets.ts), not upstream data:
+Local connection variants (server/lib/sourcing/presets.ts), not upstream data:
 - NarraFork-authored region/billing mapping contains factual API addresses only;
   no vendor code or documentation excerpts are copied. Registry data above and
   its attribution/license text below remain unchanged.

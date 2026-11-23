@@ -6,6 +6,7 @@ import { BalanceProbeRequestError } from "../provider-balance-adapters";
 import { isProviderBalanceCandidate, ProviderBalanceCache } from "../provider-balance-cache";
 import { getProviderKeyStore } from "../provider-keys";
 import type { CustomApiProviderConfig } from "../settings";
+import { QuotaStore } from "../sourcing/quota-store";
 
 function provider(id = "relay-test"): CustomApiProviderConfig {
 	return {
@@ -383,7 +384,7 @@ describe("site-account credit failures", () => {
 			globalProxy: () => undefined,
 			fetch,
 			now: () => now,
-			persistence,
+			store: new QuotaStore(persistence),
 		});
 		return {
 			cache,
@@ -504,7 +505,7 @@ describe("capability plugin gating", () => {
 			providers: () => [provider()],
 			globalProxy: () => undefined,
 			now: () => now,
-			persistence,
+			store: new QuotaStore(persistence),
 			engine: () => ({
 				id: "test-connector",
 				probe: async () => {

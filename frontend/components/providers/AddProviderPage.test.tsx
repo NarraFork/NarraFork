@@ -1,15 +1,27 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { SourcingCatalog } from "@shared/sourcing/presets";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import { sourcingRoutes } from "../../../server/routes/sourcing";
 import { ApiError } from "../../lib/api";
+import { sourcingApi } from "../../lib/api/sourcing";
+import commonEn from "../../locales/en/common.json";
 import settingsEn from "../../locales/en/settings.json";
+import commonZhCn from "../../locales/zh-CN/common.json";
 import settingsZhCn from "../../locales/zh-CN/settings.json";
 import { defaultLocalImportSelection } from "./LocalProviderImport";
 import { ProviderImportContext, TokenDanceAddContext } from "./provider-add-context";
 import type { AddProviderDraft } from "./provider-add-draft";
-import { PROVIDER_PRESETS } from "./provider-presets";
+import { SOURCING_CATALOG_QUERY_KEY } from "./provider-catalog";
+
+// The page reads its presets from GET /api/sourcing/templates; serve it the route's response.
+const catalog = (await (await sourcingRoutes.request("/templates")).json()) as SourcingCatalog;
+const PROVIDER_PRESETS = catalog.presets;
+const queryClient = new QueryClient();
+queryClient.setQueryData(SOURCING_CATALOG_QUERY_KEY, catalog);
 
 // Install before loading React DOM so its native input-event support is detected.
 // Mantine's test environment keeps real controls but removes portals/transitions.
@@ -79,7 +91,10 @@ await i18n.init({
 	lng: "en",
 	fallbackLng: "en",
 	defaultNS: "settings",
-	resources: { en: { settings: settingsEn }, "zh-CN": { settings: settingsZhCn } },
+	resources: {
+		en: { settings: settingsEn, common: commonEn },
+		"zh-CN": { settings: settingsZhCn, common: commonZhCn },
+	},
 	initImmediate: false,
 });
 
@@ -103,9 +118,11 @@ beforeEach(async () => {
 	await act(async () => {
 		root?.render(
 			<I18nextProvider i18n={i18n}>
-				<MantineProvider env="test">
-					<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => addHandler(draft)} />
-				</MantineProvider>
+				<QueryClientProvider client={queryClient}>
+					<MantineProvider env="test">
+						<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => addHandler(draft)} />
+					</MantineProvider>
+				</QueryClientProvider>
 			</I18nextProvider>,
 		);
 	});
@@ -225,18 +242,20 @@ describe("AddProviderPage interactions", () => {
 				await act(async () => {
 					root?.render(
 						<I18nextProvider i18n={i18n}>
-							<MantineProvider env="test">
-								<TokenDanceAddContext
-									value={{
-										login: async () => {
-											calls++;
-											throw error;
-										},
-									}}
-								>
-									<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
-								</TokenDanceAddContext>
-							</MantineProvider>
+							<QueryClientProvider client={queryClient}>
+								<MantineProvider env="test">
+									<TokenDanceAddContext
+										value={{
+											login: async () => {
+												calls++;
+												throw error;
+											},
+										}}
+									>
+										<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+									</TokenDanceAddContext>
+								</MantineProvider>
+							</QueryClientProvider>
 						</I18nextProvider>,
 					);
 				});
@@ -259,6 +278,102 @@ describe("AddProviderPage interactions", () => {
 			});
 		}
 	}
+	test("a catalog failure explains itself, keeps local import and recovers on retry", async () => {
+		const spy = spyOn(sourcingApi, "templates")
+			.mockRejectedValueOnce(new Error("offline"))
+			.mockResolvedValueOnce(catalog);
+		const failingClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		try {
+			await act(async () => {
+				root?.render(
+					<I18nextProvider i18n={i18n}>
+						<QueryClientProvider client={failingClient}>
+							<MantineProvider env="test">
+								<ProviderImportContext
+									value={{
+										importProvider: async () => ({ refreshFailed: false }),
+										detectedSources: [{ source: "codex", found: true }],
+										detecting: false,
+									}}
+								>
+									<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+								</ProviderImportContext>
+							</MantineProvider>
+						</QueryClientProvider>
+					</I18nextProvider>,
+				);
+			});
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			});
+			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+				i18n.t("addProviderCatalogLoadFailed"),
+			);
+			// The import entry needs no presets, so it is still offered and preselected.
+			expect(
+				container.querySelector("button[data-local-import-option]")?.getAttribute("aria-pressed"),
+			).toBe("true");
+			expect(container.querySelectorAll("button[data-provider-preset]").length).toBe(0);
+			await act(async () => {
+				[...container.querySelectorAll("button")]
+					.find((node) => node.textContent?.trim() === i18n.t("retry", { ns: "common" }))
+					?.dispatchEvent(new Event("click", { bubbles: true }));
+			});
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			});
+			expect(container.querySelector('[role="alert"]')).toBeNull();
+			expect(container.querySelectorAll("button[data-provider-preset]").length).toBeGreaterThan(0);
+			expect(spy).toHaveBeenCalledTimes(2);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("retrying without local sources still preselects the default preset", async () => {
+		const spy = spyOn(sourcingApi, "templates")
+			.mockRejectedValueOnce(new Error("offline"))
+			.mockResolvedValueOnce(catalog);
+		const failingClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const flush = () =>
+			act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			});
+		try {
+			root?.unmount();
+			root = createRoot(container);
+			await act(async () => {
+				root?.render(
+					<I18nextProvider i18n={i18n}>
+						<QueryClientProvider client={failingClient}>
+							<MantineProvider env="test">
+								<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+							</MantineProvider>
+						</QueryClientProvider>
+					</I18nextProvider>,
+				);
+			});
+			await flush();
+			expect(container.querySelector('[role="alert"]')).not.toBeNull();
+			expect(container.querySelector("button[data-provider-preset][data-selected]")).toBeNull();
+			await act(async () => {
+				[...container.querySelectorAll("button")]
+					.find((node) => node.textContent?.trim() === i18n.t("retry", { ns: "common" }))
+					?.dispatchEvent(new Event("click", { bubbles: true }));
+			});
+			await flush();
+			expect(container.querySelector('[role="alert"]')).toBeNull();
+			expect(
+				container
+					.querySelector("button[data-provider-preset][data-selected]")
+					?.getAttribute("data-provider-preset"),
+			).toBe("deepseek");
+			expect(field("addProviderBaseUrl").value).toBe("https://api.deepseek.com/v1");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
 	test("a save rejection keeps the form and key available for a successful retry", async () => {
 		await click(preset("OpenAI"));
 		await type("addProviderApiKey", "retained-on-error");
@@ -617,17 +732,19 @@ describe("import from this machine", () => {
 		await act(async () => {
 			root?.render(
 				<I18nextProvider i18n={i18n}>
-					<MantineProvider env="test">
-						<ProviderImportContext
-							value={{
-								importProvider: async () => ({ refreshFailed: false }),
-								detectedSources: detecting ? undefined : sources,
-								detecting,
-							}}
-						>
-							<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
-						</ProviderImportContext>
-					</MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<MantineProvider env="test">
+							<ProviderImportContext
+								value={{
+									importProvider: async () => ({ refreshFailed: false }),
+									detectedSources: detecting ? undefined : sources,
+									detecting,
+								}}
+							>
+								<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+							</ProviderImportContext>
+						</MantineProvider>
+					</QueryClientProvider>
 				</I18nextProvider>,
 			);
 		});
@@ -690,8 +807,8 @@ describe("import from this machine", () => {
 		});
 		await renderWithImport([{ source: "codex", found: false }]);
 		expect(selectedPreset()).toBe("tokendance");
-		expect(defaultAddProviderPresetId("zh-CN")).toBe("tokendance");
-		expect(defaultAddProviderPresetId("en")).toBe("deepseek");
+		expect(defaultAddProviderPresetId(PROVIDER_PRESETS, "zh-CN")).toBe("tokendance");
+		expect(defaultAddProviderPresetId(PROVIDER_PRESETS, "en")).toBe("deepseek");
 	});
 
 	test("default selection skips providers without a key or already configured", () => {

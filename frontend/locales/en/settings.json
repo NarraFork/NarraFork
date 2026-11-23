@@ -1481,6 +1481,7 @@
 	"addProviderSearch": "Search",
 	"addProviderSearchPlaceholder": "Search providers",
 	"addProviderCustom": "Custom",
+	"addProviderCatalogLoadFailed": "Could not load the provider presets",
 	"addProviderNoResults": "No matches",
 	"addProviderAttribution": "Presets: Cherry Studio (MIT). See Licenses.",
 	"addProviderConfigure": "Configure",
