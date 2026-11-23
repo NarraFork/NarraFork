@@ -1304,10 +1304,7 @@ function preserveBackgroundCompactingSubstatus(current: string[], next: string[]
 }
 
 type NarratorRead = Partial<
-	Pick<
-		typeof narrators.$inferSelect,
-		"status" | "substatus" | "turnStartedAt" | "updatedAt" | "permissionMode"
-	>
+	Pick<typeof narrators.$inferSelect, "status" | "substatus" | "turnStartedAt" | "permissionMode">
 >;
 function assertNarratorRead(tx: DbTx, id: string, observed: NarratorRead | undefined) {
 	const current = tx
@@ -1315,7 +1312,6 @@ function assertNarratorRead(tx: DbTx, id: string, observed: NarratorRead | undef
 			status: narrators.status,
 			substatus: narrators.substatus,
 			turnStartedAt: narrators.turnStartedAt,
-			updatedAt: narrators.updatedAt,
 			permissionMode: narrators.permissionMode,
 		})
 		.from(narrators)
@@ -3801,7 +3797,11 @@ const sqliteNarratorPersistence = {
 					}),
 					persistenceReadOptions(options),
 				);
-				observed = row;
+				observed = row && {
+					status: row.status,
+					substatus: row.substatus,
+					turnStartedAt: row.turnStartedAt,
+				};
 				if (broadcastTurnStartedAt === undefined) {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}

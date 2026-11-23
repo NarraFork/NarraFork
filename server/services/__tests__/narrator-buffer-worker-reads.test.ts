@@ -367,6 +367,30 @@ test("ordinary and missing-row substatus decisions retain their behavior", async
 	expect(await buffer.getBufferedMessages("absent")).toEqual([]);
 });
 
+test("a title save after a terminal observation does not reject the idle transition", async () => {
+	db.update(narrators)
+		.set({ status: "working", substatus: '["thinking"]', title: "before" })
+		.where(eq(narrators.id, "actor"))
+		.run();
+	const gate = gateRead('"narrators"');
+	const work = persistence.updateStatus("actor", "idle", { substatus: ["unread"] });
+	try {
+		await gate.entered;
+		db.update(narrators)
+			.set({ title: "automatic title", updatedAt: "2026-11-24T00:00:00.000Z" })
+			.where(eq(narrators.id, "actor"))
+			.run();
+	} finally {
+		gate.release();
+	}
+	await work;
+	gate.restore();
+	expect(db.select().from(narrators).where(eq(narrators.id, "actor")).get()).toMatchObject({
+		status: "idle",
+		title: "automatic title",
+	});
+});
+
 test("a reparented initiating tool cannot bump the stale parent's message version", async () => {
 	db.insert(narrators).values({ id: "other", createdAt: now, updatedAt: now }).run();
 	db.insert(narratorMessages)
