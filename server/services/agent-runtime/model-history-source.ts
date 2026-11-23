@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
+import { readDomainTask } from "../../db/worker-read";
 import {
 	compiledWorkerSpecifiers,
 	connectCompiledBunWorker,
@@ -18,6 +19,7 @@ import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import {
+	MODEL_HISTORY_EXECUTION_MS,
 	type ModelHistoryPreparation,
 	ModelHistoryTimeoutError,
 } from "../../lib/model-history-preparation";
@@ -585,8 +587,6 @@ async function streamHistory(
 					progress.toolRows += event.data.rows.length;
 			} catch (error) {
 				logHistoryWorkerFailure("message", error);
-				// Request preparation also performs bounded SQLite metadata reads. Preserve
-				// their result code so the outer whole-read retry can release this slot first.
 				const code = backend.backend === "sqlite" ? safeSqliteCode(error) : undefined;
 				finish(
 					new AppError(
@@ -604,7 +604,7 @@ async function streamHistory(
 				limit: options.limit,
 				maxBytes: MODEL_HISTORY_MAX_BYTES,
 				versioned,
-				bodiesFromBlocks: backend.backend === "sqlite" && blockBodies(backend.sqlite),
+				bodiesFromBlocks: backend.backend === "sqlite" && settings.narratorBlocks.read,
 				previous: previous ? modelHistoryManifest(previous.source) : undefined,
 				previousCatalogIdentity: previous?.catalogIdentity,
 				...(backend.backend === "sqlite"
@@ -646,9 +646,37 @@ async function readModelHistorySource(
 	const signature = async () => {
 		options.preparation?.phase("signature");
 		state.signatureReads++;
-		return backend.backend === "sqlite"
-			? readSqliteModelHistorySignature(backend.sqlite, narratorId)
-			: readPostgresModelHistorySignature(backend.sql, narratorId, { signal: options.signal });
+		if (backend.backend === "postgres")
+			return readPostgresModelHistorySignature(backend.sql, narratorId, { signal: options.signal });
+		if (!backend.sqlite.filename || backend.sqlite.filename === ":memory:")
+			return readSqliteModelHistorySignature(backend.sqlite, narratorId);
+		checkWorkerEnabled();
+		const deadlineAt = Math.min(
+			options.deadline ?? Infinity,
+			Date.now() + MODEL_HISTORY_EXECUTION_MS,
+		);
+		if (Date.now() >= deadlineAt) throw new ModelHistoryTimeoutError();
+		try {
+			return await readDomainTask(
+				backend.sqlite,
+				"modelHistorySignature",
+				{ narratorId },
+				{
+					deadlineAt,
+					diagnosticSource: "model-history.signature",
+					signal: options.signal,
+				},
+			);
+		} catch (error) {
+			if (options.signal?.aborted) {
+				if (options.signal.reason instanceof Error && options.signal.reason.name !== "AbortError")
+					throw options.signal.reason;
+				throw new AppError("Model history preparation cancelled");
+			}
+			if ((error as { code?: string } | undefined)?.code === "DB_READ_TASK_TIMEOUT")
+				throw new ModelHistoryTimeoutError();
+			throw error;
+		}
 	};
 	const before = await signature();
 	check();

@@ -3,6 +3,7 @@
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
 import { safeSqliteCode, workerFailureDetails } from "../../lib/db-worker/failure";
+import { hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { type ModelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import {
@@ -62,12 +63,16 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 					? pin(readSqliteModelHistorySignature(connection, request.narratorId))
 					: undefined;
 				const query = sqliteHistoryQuery(connection);
+				const snapshotRequest = {
+					...request,
+					bodiesFromBlocks: request.bodiesFromBlocks || hasRowsOnlyBodies(connection),
+				};
 				completed = {
 					...(request.previous
-						? await queryModelHistoryDelta(query, request, request.previous, sendPage)
+						? await queryModelHistoryDelta(query, snapshotRequest, request.previous, sendPage)
 						: await queryModelHistory(
 								query,
-								request,
+								snapshotRequest,
 								(rows) => sendPage({ type: "page", rows }),
 								(rows) => sendPage({ type: "tools", rows }),
 							)),

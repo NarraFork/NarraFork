@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import * as workerRead from "../../db/worker-read";
+import { resetDbWorkerPoolForTest, setDbWorkerSpecifiersForTest } from "../../lib/db-worker/pool";
 import { logger } from "../../lib/logger";
-import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { modelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
@@ -17,7 +19,6 @@ import {
 	queryModelHistory,
 	sqliteHistoryQuery,
 } from "./model-history-query";
-import * as revisionModule from "./model-history-revision";
 import { readSqliteModelHistorySignature } from "./model-history-revision";
 import { renderModelHistoryRevisionSql } from "./model-history-revision-sql";
 import {
@@ -57,13 +58,13 @@ function message(db: Database, id: string, seq: number, extra = "", role = "user
 		"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, 'owner', ?, ?)",
 	).run(`ref:${id}`, id, seq);
 }
-/** Runs `mutate` right after the main thread's first signature read, before the worker starts. */
+/** Runs `mutate` between the signature snapshot and the history payload snapshot. */
 function afterFirstSignature(mutate: () => void) {
-	const realRead = revisionModule.readSqliteModelHistorySignature;
+	const realRead = workerRead.readDomainTask;
 	let reads = 0;
-	const spy = spyOn(revisionModule, "readSqliteModelHistorySignature").mockImplementation(
-		(connection, id) => {
-			const signature = realRead(connection, id);
+	const spy = spyOn(workerRead, "readDomainTask").mockImplementation(
+		async (connection, task, input, options) => {
+			const signature = await realRead(connection, task, input, options);
 			if (++reads === 1) mutate();
 			return signature;
 		},
@@ -581,7 +582,8 @@ describe("complete bounded model source", () => {
 		const RealWorker = globalThis.Worker;
 		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
-			instance.addEventListener("message", () => controller.abort(), { once: true });
+			if (String(specifier).includes("model-history-worker"))
+				instance.addEventListener("message", () => controller.abort(), { once: true });
 			return instance;
 		});
 		try {
@@ -610,6 +612,54 @@ describe("complete bounded model source", () => {
 			restore();
 		}
 	});
+	test.each([
+		"create",
+		"run",
+		"timeout",
+		"disabled",
+	] as const)("file-backed signature %s failure does not read on the owning connection", async (failure) => {
+		const db = fixture(true);
+		const backend = { backend: "sqlite" as const, sqlite: db };
+		await resetDbWorkerPoolForTest();
+		const inline = spyOn(db, "query");
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		try {
+			if (failure === "disabled") process.env.NARRAFORK_DB_WORKER = "off";
+			else {
+				const path = join(db.filename, "..", "signature-worker.ts");
+				if (failure !== "create")
+					writeFileSync(
+						path,
+						`import { parentPort } from "node:worker_threads";
+							parentPort.on("message", ({ type, requestId }) => {
+								if (type !== "task") return;
+								${failure === "run" ? 'parentPort.postMessage({type:"error", requestId, code:"DB_READ_FAILED", message:"signature fixture failure"});' : ""}
+							});
+							parentPort.postMessage({type:"ready", buildId:${JSON.stringify(RUNTIME_BUILD_ID)}});`,
+					);
+				setDbWorkerSpecifiersForTest([pathToFileURL(path).href]);
+			}
+			const result = loadModelHistorySource(backend, "owner", {
+				deadline: Date.now() + (failure === "timeout" ? 1000 : 5000),
+			});
+			if (failure === "timeout") {
+				await expect(result).rejects.toThrow("Model history preparation exceeded");
+			} else if (failure === "run") {
+				await expect(result).rejects.toMatchObject({ code: "DB_READ_FAILED" });
+			} else {
+				await expect(result).rejects.toMatchObject({
+					code: failure === "create" ? "DB_READ_UNAVAILABLE" : "MODEL_HISTORY_WORKER_DISABLED",
+				});
+			}
+			expect(inline).not.toHaveBeenCalled();
+			expect(modelHistorySourceStats().cacheEntries).toBe(0);
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+			inline.mockRestore();
+			await resetDbWorkerPoolForTest();
+		}
+	});
 	test("a real worker closing without a result rejects and releases its slot", async () => {
 		const db = fixture(true);
 		const RealWorker = globalThis.Worker;
@@ -617,7 +667,11 @@ describe("complete bounded model source", () => {
 		const url = URL.createObjectURL(
 			new Blob(["process.exit(0)"], { type: "application/javascript" }),
 		);
-		const worker = spyOn(workerGlobal, "Worker").mockImplementation(() => new RealWorker(url));
+		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) =>
+			String(specifier).includes("model-history-worker")
+				? new RealWorker(url)
+				: new RealWorker(specifier, options),
+		);
 		try {
 			await expect(
 				loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner"),
@@ -642,6 +696,7 @@ describe("complete bounded model source", () => {
 		let failedDispatches = 0;
 		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
+			if (!String(specifier).includes("model-history-worker")) return instance;
 			const send = instance.postMessage.bind(instance);
 			const terminate = instance.terminate.bind(instance);
 			spyOn(instance, "postMessage").mockImplementation((message) => {
@@ -1159,7 +1214,7 @@ describe("slow history diagnostics and worker admission", () => {
 			const source = await loadModelHistorySource({ backend: "sqlite", sqlite: db }, "owner");
 			expect(source.messages).toHaveLength(1);
 			expect(warn).toHaveBeenCalledTimes(1);
-			expect(warn.mock.calls[0][1]).toMatchObject({ narratorId: "owner", phase: "worker" });
+			expect(warn.mock.calls[0][1]).toMatchObject({ narratorId: "owner", phase: "signature" });
 			expect(timers.timers).toHaveLength(1);
 			expect(clear).toHaveBeenCalledWith(timers.timers[0]);
 		} finally {
@@ -1239,7 +1294,8 @@ describe("slow history diagnostics and worker admission", () => {
 			await second.promise;
 			const dropped = load("other", cancelled.signal);
 			const next = load("owner");
-			await Promise.resolve();
+			for (let attempt = 0; attempt < 100 && modelHistorySourceStats().queued < 2; attempt++)
+				await Bun.sleep(5);
 			expect(modelHistorySourceStats()).toMatchObject({ workers: 2, queued: 2 });
 			now += 10_001;
 			timers.fire[2]();

@@ -1,10 +1,15 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as workerRead from "../../db/worker-read";
 import * as failures from "../../lib/db-worker/failure";
-import { resumeDbWorkerPool, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
+import {
+	resetDbWorkerPoolForTest,
+	resumeDbWorkerPool,
+	shutdownDbWorkerPool,
+} from "../../lib/db-worker/pool";
 import { logger } from "../../lib/logger";
 import { settings } from "../../lib/settings";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
@@ -57,6 +62,13 @@ function intercept(
 function noSlots() {
 	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0, cacheEntries: 0 });
 }
+async function isolateHistoryHandshake() {
+	const signature = await workerRead.readDomainTask(db, "modelHistorySignature", {
+		narratorId: "owner",
+	});
+	const read = spyOn(workerRead, "readDomainTask").mockResolvedValue(signature);
+	restores.push(() => read.mockRestore());
+}
 function failureDiagnostics() {
 	const calls: Parameters<typeof logger.error>[] = (logger.error as ReturnType<typeof spyOn>).mock
 		.calls;
@@ -99,15 +111,21 @@ beforeEach(() => {
 	}
 });
 afterEach(async () => {
-	await resetModelHistoryWorkersForTest();
-	resumeDbWorkerPool();
-	clearModelHistorySourceCacheForTest();
-	for (const restore of restores.splice(0).reverse()) restore();
-	for (const url of urls.splice(0)) URL.revokeObjectURL(url);
-	delete process.env.NARRAFORK_DB_WORKER;
-	delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-	db.close();
-	rmSync(root, { recursive: true, force: true });
+	try {
+		const results = await Promise.allSettled([
+			resetModelHistoryWorkersForTest(),
+			resetDbWorkerPoolForTest(),
+		]);
+		for (const result of results) if (result.status === "rejected") throw result.reason;
+	} finally {
+		clearModelHistorySourceCacheForTest();
+		for (const restore of restores.splice(0).reverse()) restore();
+		for (const url of urls.splice(0)) URL.revokeObjectURL(url);
+		delete process.env.NARRAFORK_DB_WORKER;
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		db.close();
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("synchronous creation failures keep bounded scalar root diagnostics without text or paths", async () => {
@@ -142,6 +160,7 @@ test.each([
 	"timeout",
 	"abort",
 ])("a worker with no ready frame handles %s without receiving database identity", async (mode) => {
+	await isolateHistoryHandshake();
 	const url = standIn("self.onmessage = () => {}; setInterval(() => {}, 1000);");
 	let sends = 0;
 	let terminations = 0;
@@ -211,6 +230,7 @@ test.each([
 	await Bun.write(modulePath, build.outputs[0]);
 	const frozen = await import(modulePath);
 	expect(() => frozen.assertWorkerBuildId("frozen-build")).not.toThrow();
+	await isolateHistoryHandshake();
 	const check = spyOn(failures, "assertWorkerBuildId").mockImplementation(
 		frozen.assertWorkerBuildId,
 	);
@@ -266,29 +286,39 @@ test.each([
 	noSlots();
 });
 
-test.each([
-	"SQLITE_BUSY",
-	"SQLITE_ERROR",
-])("request metadata SELECT preserves %s without broadening retries", async (code) => {
+function withRowsOnlyProbe(script: string) {
 	const oldRead = settings.narratorBlocks.read;
 	settings.narratorBlocks.read = false;
 	restores.push(() => {
 		settings.narratorBlocks.read = oldRead;
 	});
-	const original = db.query.bind(db);
-	let metadataReads = 0;
-	const query = spyOn(db, "query").mockImplementation(((sql: string) => {
-		if (
-			sql === "SELECT 1 FROM narrator_messages WHERE body_rows_only = 1 LIMIT 1" &&
-			++metadataReads === 1
-		)
-			throw Object.assign(new Error("database is locked"), { code });
-		return original(sql);
-	}) as typeof db.query);
-	restores.push(() => query.mockRestore());
+	const path = join(root, "metadata-worker.ts");
+	writeFileSync(
+		path,
+		`import { Database } from "bun:sqlite";
+		const original = Database.prototype.query;
+		Database.prototype.query = function (sql) {
+			if (sql === "SELECT 1 FROM narrator_messages WHERE body_rows_only = 1 LIMIT 1") {
+				${script}
+			}
+			return original.call(this, sql);
+		};
+		await import(${JSON.stringify(new URL("./model-history-worker.ts", import.meta.url).href)});`,
+	);
+	return path;
+}
+
+test.each([
+	"SQLITE_BUSY",
+	"SQLITE_ERROR",
+])("worker metadata SELECT preserves %s without broadening retries", async (code) => {
+	const path = withRowsOnlyProbe(
+		`throw Object.assign(new Error("database is locked"), { code: ${JSON.stringify(code)} });`,
+	);
 	let sends = 0;
 	const worker = intercept((RealWorker, args) => {
-		const instance = new RealWorker(...args);
+		const instance =
+			worker.mock.calls.length === 1 ? new RealWorker(path) : new RealWorker(...args);
 		const send = instance.postMessage.bind(instance);
 		spyOn(instance, "postMessage").mockImplementation((message) => {
 			if ("narratorId" in message) sends++;
@@ -299,14 +329,45 @@ test.each([
 	if (code === "SQLITE_BUSY") {
 		expect((await load()).messages).toHaveLength(1);
 		expect(worker).toHaveBeenCalledTimes(2);
-		expect(metadataReads).toBe(2);
-		expect(sends).toBe(1);
+		expect(sends).toBe(2);
 	} else {
 		await expect(load()).rejects.toMatchObject({ code: "SQLITE_ERROR" });
 		expect(worker).toHaveBeenCalledTimes(1);
-		expect(sends).toBe(0);
+		expect(sends).toBe(1);
 		noSlots();
 	}
+});
+
+test("rows-only metadata and the signature label the same committed Worker snapshot", async () => {
+	const body = [{ type: "text", text: "rows-only body" }];
+	const payload = JSON.stringify({ raw: body });
+	db.query(
+		"INSERT INTO narrator_blocks (id,message_id,ordinal,kind,payload) VALUES ('b','m0',0,'text',?)",
+	).run(payload);
+	db.query(
+		"UPDATE narrator_messages SET content_json=NULL,body_format=2,body_rows_only=1,body_bytes=? WHERE id='m0'",
+	).run(Buffer.byteLength(payload));
+	const path = withRowsOnlyProbe(`
+		if (!this.inTransaction) throw new Error("metadata outside history snapshot");
+		const writer = new Database(this.filename);
+		try {
+			writer.query("UPDATE narrator_messages SET body_rows_only=0,body_format=1,content_json=? WHERE id='m0'")
+				.run('[{"type":"text","text":"new projection"}]');
+		} finally {
+			writer.close();
+		}
+	`);
+	const ownerQuery = spyOn(db, "query");
+	restores.push(() => ownerQuery.mockRestore());
+	const worker = intercept((RealWorker) => new RealWorker(path));
+	const source = await load();
+	expect(source.messages[0].contentJson).toEqual(body);
+	expect(ownerQuery).not.toHaveBeenCalled();
+	worker.mockRestore();
+	const next = await load();
+	expect(next).not.toBe(source);
+	expect(next.messages[0].contentJson).toEqual([{ type: "text", text: "new projection" }]);
+	expect(await load()).toBe(next);
 });
 
 test.each([
@@ -517,17 +578,22 @@ test("history retry count is bounded and cancellation during backoff does not sp
 test.each([
 	"off",
 	"zero",
-])("disabled worker %s may serve a verified cache hit but never computes a miss inline", async (mode) => {
-	const cached = await load();
+])("disabled worker %s explicitly rejects warm and cold file-backed reads", async (mode) => {
+	await load();
 	if (mode === "off") process.env.NARRAFORK_DB_WORKER = "off";
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "0";
 	const worker = intercept(() => {
 		throw new Error("must not construct");
 	});
-	expect(await load()).toBe(cached);
+	const ownerQuery = spyOn(db, "query");
+	restores.push(() => ownerQuery.mockRestore());
+	await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_DISABLED" });
+	expect(ownerQuery).not.toHaveBeenCalled();
 	insert(1);
+	ownerQuery.mockClear();
 	await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_DISABLED" });
 	expect(worker).not.toHaveBeenCalled();
+	expect(ownerQuery).not.toHaveBeenCalled();
 	expect(modelHistorySourceStats()).toMatchObject({ workers: 0, queued: 0 });
 });
 
@@ -538,12 +604,24 @@ test("history admission rejects overload and queued cancellation releases all sl
 	const pending = Array.from({ length: MODEL_HISTORY_MAX_QUEUE + 2 }, () =>
 		load(controller.signal).catch((error) => error),
 	);
-	await Promise.resolve();
-	await Promise.resolve();
-	expect(modelHistorySourceStats()).toMatchObject({ workers: 2, queued: MODEL_HISTORY_MAX_QUEUE });
-	await expect(load()).rejects.toMatchObject({ code: "MODEL_HISTORY_WORKER_OVERLOADED" });
-	controller.abort();
-	await Promise.all(pending);
+	try {
+		for (
+			let attempt = 0;
+			attempt < 100 && modelHistorySourceStats().queued < MODEL_HISTORY_MAX_QUEUE;
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(modelHistorySourceStats()).toMatchObject({
+			workers: 2,
+			queued: MODEL_HISTORY_MAX_QUEUE,
+		});
+		await expect(load(controller.signal)).rejects.toMatchObject({
+			code: "MODEL_HISTORY_WORKER_OVERLOADED",
+		});
+	} finally {
+		controller.abort();
+		await Promise.all(pending);
+	}
 	noSlots();
 });
 

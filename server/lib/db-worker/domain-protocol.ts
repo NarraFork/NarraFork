@@ -1,8 +1,10 @@
+import type { ModelHistorySignature } from "../../services/agent-runtime/model-history-revision";
 import { DbReadError } from "./errors";
 import type { ReadBudgetMeter } from "./read-budget";
 
 export interface DomainReadTaskMap {
 	readerProbe: { params: null; result: { ready: true } };
+	modelHistorySignature: { params: { narratorId: string }; result: ModelHistorySignature };
 }
 export type DomainReadTaskKind = keyof DomainReadTaskMap;
 export type DomainReadParams = {
@@ -23,6 +25,15 @@ export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinit
 		maxResultBytes: SNAPSHOT_BYTES,
 		maxArrayItems: 10_000,
 		validate: (input) => input === null,
+	},
+	modelHistorySignature: {
+		maxInputBytes: 1024,
+		maxResultBytes: 1024,
+		maxArrayItems: 0,
+		validate: (input) => {
+			const id = (input as { narratorId?: unknown } | null)?.narratorId;
+			return typeof id === "string" && id.length > 0 && Buffer.byteLength(id) <= 256;
+		},
 	},
 };
 /** Validate structure before clone; numeric DTO budgets are observations, without serialization. */

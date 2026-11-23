@@ -26,6 +26,14 @@ const loaders: { [K in DomainReadTaskKind]: () => Promise<DomainReadModule<K>> }
 			return { ready: true };
 		},
 	}),
+	modelHistorySignature: async () => {
+		const { readSqliteModelHistorySignature } = await import(
+			"../../services/agent-runtime/model-history-revision"
+		);
+		return {
+			read: (sqlite, { narratorId }) => readSqliteModelHistorySignature(sqlite, narratorId),
+		};
+	},
 };
 const loadedModules = new Map<DomainReadTaskKind, Promise<unknown>>();
 function loadDomain<K extends DomainReadTaskKind>(task: K): Promise<DomainReadModule<K>> {
