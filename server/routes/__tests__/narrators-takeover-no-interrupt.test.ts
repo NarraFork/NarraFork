@@ -334,7 +334,7 @@ describe("when nothing is actually running", () => {
 		};
 		eventBus.on("narrator:status_changed", onStatus);
 
-		const res = await takeover(subagentId).finally(() =>
+		const res = await Promise.resolve(takeover(subagentId)).finally(() =>
 			eventBus.off("narrator:status_changed", onStatus),
 		);
 
