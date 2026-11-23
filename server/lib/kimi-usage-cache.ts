@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { identifyService } from "@shared/sourcing/identify";
 import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
 import { outboundFetch } from "./net/outbound-fetch";
@@ -91,20 +92,9 @@ let saveRequested = false;
 // Detection
 // ---------------------------------------------------------------------------
 
-/** True when the provider's baseUrl points at a kimi.com / kimi.ai host. */
+/** True when an enabled provider's baseUrl points at a kimi.com / kimi.ai host. */
 export function isKimiCustomApiProvider(config: { baseUrl?: string; disabled?: boolean }): boolean {
-	if (config.disabled || !config.baseUrl) return false;
-	try {
-		const host = new URL(config.baseUrl).hostname.toLowerCase();
-		return (
-			host === "kimi.com" ||
-			host === "kimi.ai" ||
-			host.endsWith(".kimi.com") ||
-			host.endsWith(".kimi.ai")
-		);
-	} catch {
-		return false;
-	}
+	return !config.disabled && identifyService(config).templateId === "kimi-code";
 }
 
 // ---------------------------------------------------------------------------
