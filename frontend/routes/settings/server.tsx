@@ -18,7 +18,8 @@ function SettingsServerPage() {
 	const handlePwaUpdate = async () => {
 		setPwaUpdating(true);
 		const { clearPwaCacheAndReload } = await import("@frontend/lib/pwa");
-		await clearPwaCacheAndReload();
+		// An explicit refresh clears the caches even when the worker is already current.
+		await clearPwaCacheAndReload({ clearCaches: true });
 	};
 
 	return (
