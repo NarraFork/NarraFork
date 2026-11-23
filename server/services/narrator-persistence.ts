@@ -116,7 +116,9 @@ import {
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import {
+	assertRecoveryFields,
 	assertRestartRecoveryObservation,
+	type ParentRecoveryTurn,
 	type RestartNarrator,
 	type RestartRecoveryObservation,
 } from "./recovery-observation";
@@ -1626,6 +1628,7 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	recoveryGuard?: { narrator?: RestartNarrator; parentTurn?: ParentRecoveryTurn };
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
@@ -1662,6 +1665,19 @@ function persistPlacement(
 	messageId: string,
 	placement?: MessagePlacementOptions,
 ) {
+	if (placement?.recoveryGuard) {
+		const { narrator, parentTurn } = placement.recoveryGuard;
+		if (narrator) assertRestartRecoveryObservation(tx, { narrator });
+		if (parentTurn)
+			assertRecoveryFields(
+				parentTurn,
+				tx
+					.select({ id: narrators.id, turnStartedAt: narrators.turnStartedAt })
+					.from(narrators)
+					.where(eq(narrators.id, parentTurn.id))
+					.get(),
+			);
+	}
 	if (!placement?.mailboxClaim && !placement?.onPersist) return;
 	const ref = tx
 		.select({ id: narratorMessageRefs.id })
@@ -1717,6 +1733,7 @@ function persistPlacement(
 export type PgPlacementTx = PgNarratorRefsTx;
 
 export interface PgMessagePlacementHooks {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	/** All additional narrator rows touched by onPersist, declared before locks are acquired. */
 	narratorIds?: readonly string[];
 	/**
@@ -1753,6 +1770,32 @@ export function createPgPlacedMessageMaterializer(
 			throw new Error("Mailbox claim has no reserved recipient identity");
 		if (message.id !== row.recipientMessageId)
 			throw new Error("Placed message must use the reserved recipient identity");
+		if (hooks?.recoveryGuard) {
+			const { narrators: pgNarrators } = await import("../db/postgres-schema");
+			const { narrator, parentTurn } = hooks.recoveryGuard;
+			if (narrator) {
+				const [current] = await tx
+					.select({
+						id: pgNarrators.id,
+						status: pgNarrators.status,
+						substatus: pgNarrators.substatus,
+						logicalRunId: pgNarrators.logicalRunId,
+						runtimeRegistrationJson: pgNarrators.runtimeRegistrationJson,
+					})
+					.from(pgNarrators)
+					.where(eq(pgNarrators.id, narrator.id))
+					.limit(1);
+				assertRecoveryFields(narrator, current);
+			}
+			if (parentTurn) {
+				const [current] = await tx
+					.select({ id: pgNarrators.id, turnStartedAt: pgNarrators.turnStartedAt })
+					.from(pgNarrators)
+					.where(eq(pgNarrators.id, parentTurn.id))
+					.limit(1);
+				assertRecoveryFields(parentTurn, current);
+			}
+		}
 		const persisted = await persistPgMessageWithRef(tx, message);
 		await hooks?.onPersist?.(tx, persisted.messageId, persisted.refId);
 		return { messageId: persisted.messageId, refId: persisted.refId };
@@ -1760,7 +1803,11 @@ export function createPgPlacedMessageMaterializer(
 	materializer.planNarratorLocks = async (tx, claim) => {
 		if (claim.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
 		const { narratorIds } = await resolvePgMessageNarratorLocks(tx, message);
-		return [...narratorIds, ...(hooks?.narratorIds ?? [])];
+		return [
+			...narratorIds,
+			...(hooks?.narratorIds ?? []),
+			...(hooks?.recoveryGuard?.parentTurn ? [hooks.recoveryGuard.parentTurn.id] : []),
+		];
 	};
 	return materializer;
 }

@@ -43,6 +43,9 @@ const { backgroundTaskService } = await import("../background-task-service");
 const { clearAliasRegistry, SUBAGENT_ALIAS_TRAIT_PREFIX } = await import("../subagent-alias");
 const session = await import("../narrator-session");
 const ownership = await import("../agent-runtime/ownership");
+const inbox = await import("../agent-runtime/inbox");
+const { createMailboxStore } = await import("../agent-runtime/mailbox");
+const { RESTART_NARRATOR_COLUMNS } = await import("../recovery-observation");
 
 const FAILED_AT_MS = Date.parse("2026-04-01T02:00:00.000Z");
 const FAILED_AT = new Date(FAILED_AT_MS).toISOString();
@@ -113,6 +116,68 @@ afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	await closeRuntimeTestDb(sqlite);
+});
+
+describe("recovery Continue placement", () => {
+	for (const change of ["parent", "child", "missing-parent", "none"] as const) {
+		test(`message and mailbox materialization are atomic with the ${change} observation`, async () => {
+			await seedFailedSubagent("continue-child");
+			const narrator = await db.query.narrators.findFirst({
+				where: eq(narrators.id, "continue-child"),
+				columns: RESTART_NARRATOR_COLUMNS,
+			});
+			if (!narrator) throw new Error("Missing child");
+			const parent = await db.query.narrators.findFirst({
+				where: eq(narrators.id, PARENT_ID),
+				columns: { id: true, turnStartedAt: true },
+			});
+			if (!parent) throw new Error("Missing parent");
+			const owner = ownership.tryClaimExecution("continue-child", "tool-replay");
+			if (!owner) throw new Error("Missing owner");
+			releaseOwners.push(owner);
+			createMailboxStore(db).enqueue({
+				narratorId: "continue-child",
+				kind: "user_input",
+				text: "Continue",
+				projectedByteSize: 8,
+			});
+			const row = await inbox.claimInboxHead("continue-child", () => true);
+			if (!row) throw new Error("Missing claim");
+			if (change === "parent")
+				db.update(narrators)
+					.set({ turnStartedAt: FAILED_AT })
+					.where(eq(narrators.id, PARENT_ID))
+					.run();
+			if (change === "child")
+				db.update(narrators)
+					.set({ logicalRunId: "winner" })
+					.where(eq(narrators.id, narrator.id))
+					.run();
+			if (change === "missing-parent") parent.id = "missing-parent";
+			const input = {
+				claim: inbox.inboxClaim(row),
+				narratorId: narrator.id,
+				text: "Continue",
+				contentBlocks: [{ type: "text", text: "Continue" }],
+				recoveryGuard: { narrator, parentTurn: parent },
+			};
+			const result =
+				change === "none"
+					? await inbox.persistClaimedUserInput(input)
+					: await captureWorkerRejection(inbox.persistClaimedUserInput(input));
+			if (change === "none") expect(result).toMatchObject({ contentText: "Continue" });
+			else expect(result).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+			expect(
+				sqlite.query("SELECT id FROM narrator_messages WHERE narrator_id = ?").all(narrator.id),
+			).toHaveLength(change === "none" ? 1 : 0);
+			expect(
+				sqlite.query("SELECT id FROM narrator_message_refs WHERE narrator_id = ?").all(narrator.id),
+			).toHaveLength(change === "none" ? 1 : 0);
+			expect(
+				sqlite.query("SELECT state FROM narrator_buffered_messages WHERE id = ?").get(row.id),
+			).toMatchObject({ state: change === "none" ? "materialized" : "claimed" });
+		});
+	}
 });
 
 describe("markRecoveryOffered", () => {

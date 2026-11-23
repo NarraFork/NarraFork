@@ -3864,6 +3864,10 @@ async function feedMessageUnlocked(
 		const deliverTo = await readSessionDeliverTo(narratorId);
 		recoveryStart?.check();
 		userMsg = (await persistClaimedUserInput({
+			recoveryGuard: {
+				narrator: internalOptions?.run?.recoveryObservation,
+				parentTurn: internalOptions?.run?.parentRecoveryTurn,
+			},
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
 			narratorId,
@@ -3894,7 +3898,7 @@ async function feedMessageUnlocked(
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		if (
-			recoveryStart &&
+			(recoveryStart || internalOptions?.run?.recoveryObservation) &&
 			acceptedInputId &&
 			!internalOptions?.bufferedId &&
 			!internalOptions?.bufferedRow
