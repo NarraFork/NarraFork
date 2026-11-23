@@ -141,12 +141,12 @@ async function waitForStatus(taskId: string, timeoutMs = 3_000) {
 	}
 }
 
-async function notices() {
-	await flushRuntimePublications(PARENT);
+async function notices(narratorId = PARENT) {
+	await flushRuntimePublications(narratorId);
 	return db
 		.select()
 		.from(narratorBufferedMessages)
-		.where(eq(narratorBufferedMessages.narratorId, PARENT))
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
 		.all()
 		.map((r) => projectPendingInjection(r));
 }
@@ -297,6 +297,70 @@ describe("rendered pattern freshness", () => {
 		const text = `${"A".repeat(100_000)}B`;
 		expect(createRenderedPatternMatcher(pattern, "")(text)).toBe(text.indexOf(pattern));
 		expect(createRenderedPatternMatcher("[a].*", "")("xx[a].*xx")).toBe(2);
+	});
+});
+
+describe("repeated terminal watches", () => {
+	test("one watcher's repeated lifecycle watches share one observation and one notice", async () => {
+		const first = await startLifecycle(undefined, 60_000);
+		const repeat = await startTerminalWatch({
+			narratorId: PARENT,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			timeoutMs: 120_000,
+		});
+		expect(repeat).toMatchObject({ status: "started", taskId: first, reused: true });
+		expect(activeWatchIds(TERMINAL)).toEqual([first]);
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await waitForStatus(first))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a repeated lifecycle watch extends the shared deadline and times out once", async () => {
+		const first = await startLifecycle(undefined, 1_000);
+		expect(await startLifecycle(undefined, 1_500)).toBe(first);
+		await Bun.sleep(1_200);
+		expect((await row(first))?.status).toBe("running");
+		const done = await waitForStatus(first);
+		expect(done?.output).toContain("observation reached its deadline");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("text watches with different patterns stay separate but share one ending notice", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const ready = await start(buffer, "READY", { kind: "offset", offset: 0 });
+		const done = await start(buffer, "DONE", { kind: "offset", offset: 0 });
+		const lifecycle = await startLifecycle(buffer);
+		expect(new Set([ready, done, lifecycle]).size).toBe(3);
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal was detached from the server");
+		// Duplicates settle silently but keep their own outcome: an unmatched pattern is not a match.
+		for (const id of [ready, done, lifecycle])
+			expect((await waitForStatus(id))?.status).toBe("failed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("different watchers of one terminal keep independent watches and notices", async () => {
+		const other = "terminal-watch-other";
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({ id: other, variant: "primary", status: "idle", createdAt: now, updatedAt: now })
+			.run();
+		const mine = await startLifecycle();
+		const theirs = await startTerminalWatch({
+			narratorId: other,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			timeoutMs: 60_000,
+		});
+		if (theirs.status !== "started") throw new Error(theirs.message);
+		expect(theirs.reused).toBeFalsy();
+		expect(theirs.taskId).not.toBe(mine);
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await waitForStatus(mine))?.status).toBe("completed");
+		expect((await waitForStatus(theirs.taskId))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(await notices(other)).toHaveLength(1);
 	});
 });
 

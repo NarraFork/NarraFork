@@ -552,10 +552,27 @@ async function startWatch(
 		registrationSignal: ctx.signal,
 	});
 	if (ctx.signal.aborted) {
-		if (started.status === "started") await cancelWatchRegistration(started.observation);
+		if (started.status === "started" && !started.reused)
+			await cancelWatchRegistration(started.observation);
 		return makeAbortedResult(terminalName);
 	}
 	if (started.status === "error") return { output: started.message, isError: true };
+	if (started.reused) {
+		return {
+			output: `Already watching terminal "${terminalName}" until exit or deadline (background task "${started.alias}"); no second watch was added. Its deadline is now in ${Math.round(started.remainingMs / 1000)}s. Stop({ type: "bash", id: "${started.alias}" }) cancels only the observation.`,
+			title: terminalName,
+			metadata: {
+				kind: "watch",
+				type: "terminal",
+				id: terminalId,
+				targetId: terminalId,
+				watchId: started.taskId,
+				watchAlias: started.alias,
+				status: "watching",
+				reused: true,
+			},
+		};
+	}
 	return {
 		output:
 			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +
