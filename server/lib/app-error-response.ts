@@ -41,16 +41,20 @@ export function toErrorPayload(error: AppError): ErrorResponsePayload {
 
 /** Share the infrastructure-only classification and safe payload across HTTP and WS upgrades. */
 export function toDatabaseReadUnavailablePayload(error: unknown): ErrorResponsePayload | null {
-	if (
-		!(error instanceof AppError) &&
-		error instanceof Error &&
-		"code" in error &&
-		typeof error.code === "string" &&
-		unavailableReadCodes.has(error.code)
-	) {
-		// Readers can report plain Error instances reconstructed from worker messages.
-		// Match only stable codes; never serialize their message, reason, SQL or binds.
-		return { ...toErrorPayload(catalogError("DATABASE_READ_UNAVAILABLE")), code: error.code };
+	try {
+		if (
+			!(error instanceof AppError) &&
+			error instanceof Error &&
+			"code" in error &&
+			typeof error.code === "string" &&
+			unavailableReadCodes.has(error.code)
+		) {
+			// Readers can report plain Error instances reconstructed from worker messages.
+			// Match only stable codes; never serialize their message, reason, SQL or binds.
+			return { ...toErrorPayload(catalogError("DATABASE_READ_UNAVAILABLE")), code: error.code };
+		}
+	} catch {
+		return null;
 	}
 	return null;
 }
