@@ -11,7 +11,7 @@
  * returned to the caller exactly once.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { and, eq, gt, isNull, lt, or } from "drizzle-orm";
+import { and, eq, exists, gt, isNull, lt, or } from "drizzle-orm";
 import { db } from "../db";
 import {
 	integrationAuthorities,
@@ -479,6 +479,21 @@ async function resolveTokenPairAuthority(input: IssueTokenPairInput) {
 	return { oauthClientId, grantId, scopes };
 }
 
+function activeTokenClientWhere(oauthClientId: string) {
+	return exists(
+		db
+			.select({ id: oauthClients.id })
+			.from(oauthClients)
+			.where(
+				and(
+					eq(oauthClients.id, oauthClientId),
+					isNull(oauthClients.revokedAt),
+					eq(oauthClients.publicClient, true),
+				),
+			),
+	);
+}
+
 async function persistTokenPair(
 	input: IssueTokenPairInput,
 	{ oauthClientId, grantId, scopes }: Awaited<ReturnType<typeof resolveTokenPairAuthority>>,
@@ -592,7 +607,13 @@ export async function exchangeCodeForToken(input: ExchangeCodeInput): Promise<OA
 	const [consumed] = await db
 		.update(oauthAuthorizationCodes)
 		.set({ consumedAt: new Date().toISOString() })
-		.where(and(eq(oauthAuthorizationCodes.id, row.id), isNull(oauthAuthorizationCodes.consumedAt)))
+		.where(
+			and(
+				eq(oauthAuthorizationCodes.id, row.id),
+				isNull(oauthAuthorizationCodes.consumedAt),
+				activeTokenClientWhere(authority.oauthClientId),
+			),
+		)
 		.returning({ id: oauthAuthorizationCodes.id });
 	if (!consumed) {
 		throw new OAuthError("invalid_grant", "Authorization code is invalid or already used");
@@ -725,15 +746,21 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 			revokedByType: "system",
 			revokedReason: "Refresh token rotated",
 		})
-		.where(and(eq(oauthAccessTokens.id, row.id), isNull(oauthAccessTokens.revokedAt)))
+		.where(
+			and(
+				eq(oauthAccessTokens.id, row.id),
+				isNull(oauthAccessTokens.revokedAt),
+				activeTokenClientWhere(authority.oauthClientId),
+			),
+		)
 		.returning({ id: oauthAccessTokens.id });
 	if (!consumed) {
 		const raced = await readQueryFirst(
 			db.query.oauthAccessTokens.findMany({ limit: 1, where: eq(oauthAccessTokens.id, row.id) }),
 			{ executionPolicy: "worker-required" },
 		);
-		if (raced) await revokeRefreshFamilyForReuse(raced);
-		throw new OAuthError("invalid_grant", "Refresh token reuse detected");
+		if (raced?.refreshUsedAt) await revokeRefreshFamilyForReuse(raced);
+		throw new OAuthError("invalid_grant", "Refresh token is invalid, revoked, or already used");
 	}
 	eventBus.emit({
 		type: "oauth:token_invalidated",

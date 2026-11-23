@@ -253,6 +253,64 @@ describe("oauth-provider authorization codes", () => {
 });
 
 describe("oauth-provider code exchange (PKCE)", () => {
+	for (const mode of ["exchange", "refresh"] as const) {
+		test(`${mode} rejects a client revoked after authority resolution without consuming credentials`, async () => {
+			await ensureClient();
+			const issued = await issueCode();
+			const exchange = () =>
+				exchangeCodeForToken({
+					code: issued.code,
+					clientId: CLIENT_ID,
+					redirectUri: REDIRECT_URI,
+					codeVerifier: issued.verifier,
+				});
+			const initial = mode === "refresh" ? await exchange() : null;
+			const original = workerRead.readQueryFirst;
+			let clientReads = 0;
+			const read = spyOn(workerRead, "readQueryFirst").mockImplementation(async (...args) => {
+				const result = await original(...args);
+				if (args[0].toSQL().sql.includes("oauth_clients") && ++clientReads === 2) {
+					db.update(oauthClients)
+						.set({ revokedAt: new Date().toISOString() })
+						.where(eq(oauthClients.clientId, CLIENT_ID))
+						.run();
+				}
+				return result;
+			});
+			let error: unknown;
+			try {
+				if (initial)
+					await refreshAccessToken({
+						clientId: CLIENT_ID,
+						refreshToken: initial.refreshToken,
+					});
+				else await exchange();
+			} catch (caught) {
+				error = caught;
+			} finally {
+				read.mockRestore();
+				db.update(oauthClients)
+					.set({ revokedAt: null })
+					.where(eq(oauthClients.clientId, CLIENT_ID))
+					.run();
+			}
+			expect(error).toBeInstanceOf(OAuthError);
+			expect(clientReads).toBeGreaterThanOrEqual(2);
+			if (initial) {
+				const row = await db.query.oauthAccessTokens.findFirst({
+					where: eq(oauthAccessTokens.refreshTokenHash, hashOAuthSecret(initial.refreshToken)),
+				});
+				expect(row?.revokedAt).toBeNull();
+				expect(row?.refreshUsedAt).toBeNull();
+			} else {
+				const row = await db.query.oauthAuthorizationCodes.findFirst({
+					where: eq(oauthAuthorizationCodes.codeHash, hashOAuthSecret(issued.code)),
+				});
+				expect(row?.consumedAt).toBeNull();
+			}
+		});
+	}
+
 	test("exchanges a valid grant with one normal slot and no queue", async () => {
 		await ensureClient();
 		const grant = await createGrant();
