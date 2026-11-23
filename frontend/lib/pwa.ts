@@ -1,6 +1,5 @@
 import { STARTUP_STATUS_HEADER } from "@shared/startup-status";
 import { apiUrl, getAppBase } from "./base-path";
-import { appVersionsMatch } from "./version-match";
 
 const WORKER_UPDATE_TIMEOUT_MS = 8000;
 
@@ -267,6 +266,8 @@ function tryWorkerUpdate(): Promise<boolean> {
 			if (!active) return;
 			const health = await fetchServerHealth(3000, controller.signal);
 			if (settled || !health?.version) return;
+			const { appVersionsMatch } = await import("./version-match");
+			if (settled) return;
 			const serverVersion = health.version;
 			channel = new MessageChannel();
 			channel.port1.onmessage = (event) => {
