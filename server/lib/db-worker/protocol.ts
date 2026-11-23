@@ -31,12 +31,10 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
-import type { ComposerDocumentParams } from "./composer-document-query";
 import type { RecallConversationParams } from "./recall-conversation-query";
 import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 import type { SubagentActivityParams } from "./subagent-activity-query";
-import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -47,7 +45,6 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
-	| "composerDocument"
 	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
@@ -56,7 +53,6 @@ export type DbReadTaskName =
 	| "storageScanSessionPreview"
 	| "revertSelectionBody"
 	| "databaseCleanupContext"
-	| "toolDetailSnapshot"
 	| "selectRows"
 	| "executionPolicyFacts"
 	| "toolEditPreview"
@@ -336,7 +332,6 @@ export interface StorageScanTablesResult {
 
 export type DbReadTaskParams =
 	| BenchmarkReadParams
-	| ComposerDocumentParams
 	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
 	| RecallToolCallParams
 	| RecallConversationParams
@@ -361,7 +356,6 @@ export type DbReadTaskParams =
 	| StorageScanSessionPreviewParams
 	| RevertSelectionBodyParams
 	| { kind: "databaseCleanupContext" }
-	| ToolDetailSnapshotParams
 	| SelectRowsParams
 	| { kind: "executionPolicyFacts"; narratorId: string }
 	| { kind: "toolEditPreview"; toolCallId: string }

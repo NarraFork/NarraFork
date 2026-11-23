@@ -61,7 +61,12 @@ import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import { TokenText } from "../../content/TokenLines";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
-import { FragmentGap, LINE_FRAGMENTS_STYLE, LineFragments } from "./line-fragments";
+import {
+	FragmentGap,
+	LINE_FRAGMENTS_STYLE,
+	LineFragments,
+	lineChipAttribute,
+} from "./line-fragments";
 import { MarkdownLineFragments } from "./MarkdownLineFragments";
 import { staticInlineMarkupCache } from "./static-inline-markup";
 import {
@@ -840,7 +845,7 @@ function TableCellView({
 						justifyContent,
 					}}
 				>
-					<LineFragments>
+					<LineFragments chip={lineChipAttribute(line.fragments)}>
 						{line.fragments.map((frag, fi) => (
 							<Fragment
 								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
@@ -1135,7 +1140,11 @@ function InlineBlockView({
 									dangerouslySetInnerHTML={{ __html: markup }}
 								/>
 							) : (
-								<span data-vlist-line-frags style={LINE_FRAGMENTS_STYLE}>
+								<span
+									data-vlist-line-frags
+									data-vlist-line-chip={lineChipAttribute(line.fragments)}
+									style={LINE_FRAGMENTS_STYLE}
+								>
 									{line.fragments.map((frag, fi) => {
 										// An inline formula replaces its placeholder glyph with real KaTeX
 										// output, pinned to the width the measure layer reserved.
