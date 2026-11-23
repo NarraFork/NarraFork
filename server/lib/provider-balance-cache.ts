@@ -1,18 +1,17 @@
 import type {
 	ProviderBalanceAdapter,
 	ProviderBalanceData,
+	ProviderBalanceError,
 	ProviderBalanceSnapshot,
+	ProviderBalanceStatus,
 } from "@shared/provider-balance";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { selectProviderKey } from "./agent/pooled-provider";
 import { isDeepSeekCustomApiProvider } from "./deepseek-balance-cache";
 import { isKimiCustomApiProvider } from "./kimi-usage-cache";
 import { logger } from "./logger";
 import type { outboundFetch } from "./net/outbound-fetch";
 import { isOpencodeCustomApiProvider } from "./opencode-usage-cache";
-import {
-	createPersistedCredentialCache,
-	type PersistedCredentialCache,
-} from "./persisted-credential-cache";
 import {
 	BalanceProbeRequestError,
 	balanceErrorCode,
@@ -22,8 +21,10 @@ import {
 	getProviderBalanceEngine,
 	type ProviderBalanceQueryEngine,
 } from "./provider-balance-engine";
+import type { UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { importLegacyQuotaCache, QuotaStore, quotaStore } from "./sourcing/quota-store";
 
 export const PROVIDER_BALANCE_STALE_MS = 60_000;
 export const PROVIDER_BALANCE_MANUAL_THROTTLE_MS = 10_000;
@@ -49,13 +50,16 @@ interface Task {
 }
 interface Entry {
 	id: string;
+	/** Where the snapshot is stored: the credential a new request would use. */
+	credentialId: string;
 	identity: string;
 	config: CustomApiProviderConfig;
-	snapshot: ProviderBalanceSnapshot;
+	generation: string;
 	endpoint?: { adapter: ProviderBalanceAdapter; root: string };
 	task?: Task;
 	nextManualAt: number;
 }
+type Endpoint = NonNullable<Entry["endpoint"]>;
 
 export function isProviderBalanceCandidate(config: CustomApiProviderConfig): boolean {
 	return !!(
@@ -111,11 +115,14 @@ function connectionIdentity(config: CustomApiProviderConfig, globalProxy: unknow
  * none is usable, an empty credential makes the provider ineligible instead of probing a
  * disabled key projected into settings.
  */
-function withSelectedCredential(config: CustomApiProviderConfig): CustomApiProviderConfig {
+function withSelectedCredential(config: CustomApiProviderConfig): UsageSubject {
 	const store = getProviderKeyStore();
-	if (!store.readable || store.list(config.id).length === 0) return config;
+	const subject = { id: config.id, providerId: config.id, config };
+	if (!store.readable || store.list(config.id).length === 0) return subject;
 	const chosen = selectProviderKey(config.id);
-	return chosen ? withProviderKey(config, chosen) : { ...config, apiKey: "" };
+	return chosen
+		? { ...subject, id: chosen.id, config: withProviderKey(config, chosen) }
+		: { ...subject, config: { ...config, apiKey: "" } };
 }
 
 /** What survives a restart: the discovery result and the last good balance. */
@@ -171,11 +178,95 @@ export function parsePersistedProviderBalance(raw: unknown): PersistedProviderBa
 	};
 }
 
+type BalanceState = Omit<ProviderBalanceSnapshot, "generation">;
+
+/** Relay allowances in the shared shape; the original state stays in `detail`. */
+function relaySnapshot(state: BalanceState, endpoint?: Endpoint): QuotaSnapshot {
+	const { status, adapter, balance, fetchedAt, attemptedAt, error } = state;
+	const unlimited = balance?.unlimited ? { unlimited: true } : {};
+	const balances = (balance?.amounts ?? []).map((amount) => ({
+		unit: amount.unit,
+		remaining: amount.remaining,
+		...(amount.total !== undefined ? { total: amount.total } : {}),
+		...unlimited,
+	}));
+	if (balance?.unlimited && balances.length === 0) {
+		balances.push({ unit: "", remaining: null, unlimited: true });
+	}
+	return {
+		fetchedAt,
+		...(error ? { error } : {}),
+		scope: balance?.scope ?? "key",
+		windows: [],
+		balances,
+		...(balance?.planName ? { plan: balance.planName } : {}),
+		detail: {
+			status,
+			...(adapter ? { adapter } : {}),
+			...(endpoint ? { endpoint } : {}),
+			balance,
+			attemptedAt,
+		},
+	};
+}
+
+/** The stored state, when it is one a restart may bring back (discovery settled). */
+function persistedState(snapshot: QuotaSnapshot | undefined): PersistedProviderBalance | null {
+	return snapshot
+		? parsePersistedProviderBalance({
+				...(snapshot.detail as object),
+				fetchedAt: snapshot.fetchedAt,
+			})
+		: null;
+}
+
+/** A snapshot read from disk: only a settled discovery may come back. */
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
+	const state = persistedState(snapshot);
+	return (
+		state &&
+		relaySnapshot(
+			{
+				status: state.status,
+				...(state.endpoint ? { adapter: state.endpoint.adapter } : {}),
+				balance: state.balance,
+				fetchedAt: state.fetchedAt,
+				attemptedAt: state.attemptedAt,
+				error: null,
+			},
+			state.endpoint,
+		)
+	);
+}
+
+/** One discovery round with the active engine, in the shared snapshot shape. */
+export async function probeRelayQuota(
+	credential: UsageSubject,
+	signal: AbortSignal,
+): Promise<QuotaSnapshot> {
+	const found = await getProviderBalanceEngine().probe({ config: credential.config, signal });
+	const now = Date.now();
+	return relaySnapshot(
+		{
+			status: found ? "supported" : "unsupported",
+			...(found ? { adapter: found.adapter } : {}),
+			balance: found?.balance ?? null,
+			fetchedAt: found ? now : 0,
+			attemptedAt: now,
+			error: null,
+		},
+		found ? { adapter: found.adapter, root: found.root } : undefined,
+	);
+}
+
 interface CacheOptions {
 	providers: () => CustomApiProviderConfig[];
 	globalProxy: () => unknown;
-	/** Survive restarts; values are only restored under the same connection identity. */
-	persistence?: PersistedCredentialCache<PersistedProviderBalance>;
+	/**
+	 * Where snapshots live; values are only restored under the same connection identity.
+	 * Defaults to a private in-memory store.
+	 */
+	store?: QuotaStore;
 	fetch?: typeof outboundFetch;
 	now?: () => number;
 	requestTimeoutMs?: number;
@@ -187,7 +278,9 @@ interface CacheOptions {
 	 * Which credential each provider is probed with. Defaults to the pool's choice for a new
 	 * request; injectable so a test can pin the credential without a real key store.
 	 */
-	resolveCredential?: (config: CustomApiProviderConfig) => CustomApiProviderConfig;
+	resolveCredential?: (config: CustomApiProviderConfig) => UsageSubject;
+	/** A pre-snapshot cache file to import on the first sync, then delete. */
+	legacyFile?: string;
 }
 
 /** Bounded background jobs. Read paths never await upstream IO. */
@@ -196,30 +289,54 @@ export class ProviderBalanceCache {
 	private queue: Task[] = [];
 	private active = 0;
 	private now: () => number;
+	private store: QuotaStore;
+	private legacyImported = false;
 
 	constructor(private options: CacheOptions) {
 		this.now = options.now ?? Date.now;
+		this.store = options.store ?? new QuotaStore();
 	}
 
 	sync(): void {
 		const resolveCredential = this.options.resolveCredential ?? withSelectedCredential;
+		const globalProxy = this.options.globalProxy();
 		const providers = new Map(
 			this.options
 				.providers()
 				.map(resolveCredential)
-				.filter(isProviderBalanceCandidate)
-				.map((p) => [p.id, p]),
+				.filter((credential) => isProviderBalanceCandidate(credential.config))
+				.map((credential) => [
+					credential.providerId,
+					{ ...credential, identity: connectionIdentity(credential.config, globalProxy) },
+				]),
 		);
-		const globalProxy = this.options.globalProxy();
+		if (this.options.legacyFile && !this.legacyImported) {
+			this.legacyImported = true;
+			void importLegacyQuotaCache(
+				this.options.legacyFile,
+				parsePersistedProviderBalance,
+				[...providers.values()].map((p) => ({
+					legacyKey: p.providerId,
+					id: p.id,
+					identity: p.identity,
+				})),
+				(state) =>
+					relaySnapshot(
+						{ ...state, adapter: state.endpoint?.adapter, error: null },
+						state.endpoint,
+					),
+				this.store,
+			);
+		}
 		for (const [id, entry] of this.entries) {
-			const config = providers.get(id);
-			if (!config || entry.identity !== connectionIdentity(config, globalProxy)) {
+			const current = providers.get(id);
+			if (!current || entry.identity !== current.identity || entry.credentialId !== current.id) {
 				this.entries.delete(id);
 				this.cancel(entry);
-				if (!config) this.options.persistence?.remove(id);
+				if (!current) this.store.remove(entry.credentialId);
 			}
 		}
-		for (const [id, config] of providers) {
+		for (const [id, { id: credentialId, config, identity }] of providers) {
 			if (this.entries.has(id)) continue;
 			let roots: string[] | null = null;
 			try {
@@ -227,22 +344,26 @@ export class ProviderBalanceCache {
 			} catch {
 				roots = null;
 			}
-			const identity = connectionIdentity(config, globalProxy);
-			const restored = roots ? this.options.persistence?.restore(id, identity) : undefined;
+			const restored = roots ? persistedState(this.store.get(credentialId, identity)) : null;
 			// A restored endpoint must still be one this base URL would probe.
 			const usable =
 				restored && (!restored.endpoint || roots?.includes(restored.endpoint.root))
 					? restored
 					: undefined;
-			this.entries.set(id, {
+			const entry: Entry = {
 				id,
+				credentialId,
 				identity,
 				config: structuredClone(config),
+				generation: crypto.randomUUID(),
 				nextManualAt: 0,
 				...(usable?.endpoint ? { endpoint: usable.endpoint } : {}),
-				snapshot: usable
+			};
+			this.entries.set(id, entry);
+			this.put(
+				entry,
+				usable
 					? {
-							generation: crypto.randomUUID(),
 							status: usable.status,
 							...(usable.endpoint ? { adapter: usable.endpoint.adapter } : {}),
 							balance: usable.balance,
@@ -251,15 +372,59 @@ export class ProviderBalanceCache {
 							error: null,
 						}
 					: {
-							generation: crypto.randomUUID(),
 							status: roots ? "pending" : "error",
 							balance: null,
 							fetchedAt: 0,
 							attemptedAt: 0,
 							error: roots ? null : "invalid_configuration",
 						},
-			});
+			);
 		}
+	}
+
+	/** The entry's state as the routes serve it, read from the store. */
+	private snapshot(entry: Entry): ProviderBalanceSnapshot {
+		// Another source can hold this credential id after an endpoint edit; only a snapshot
+		// saved under this entry's own identity describes its balance.
+		const stored = this.store.get(entry.credentialId, entry.identity, restoreSnapshot);
+		const detail = stored?.detail as
+			| {
+					status: ProviderBalanceStatus;
+					adapter?: ProviderBalanceAdapter;
+					balance: ProviderBalanceData | null;
+					attemptedAt: number;
+			  }
+			| undefined;
+		if (!stored || !detail) {
+			return {
+				generation: entry.generation,
+				status: "pending",
+				balance: null,
+				fetchedAt: 0,
+				attemptedAt: 0,
+				error: null,
+			};
+		}
+		return {
+			generation: entry.generation,
+			status: detail.status,
+			...(detail.adapter ? { adapter: detail.adapter } : {}),
+			balance: detail.balance,
+			fetchedAt: stored.fetchedAt,
+			attemptedAt: detail.attemptedAt,
+			error: (stored.error ?? null) as ProviderBalanceError | null,
+		};
+	}
+
+	/** Publish a new state (memory only; `persist` decides what reaches the disk). */
+	private put(entry: Entry, state: BalanceState): void {
+		if (this.entries.get(entry.id) !== entry) return;
+		this.store.set(entry.credentialId, entry.identity, relaySnapshot(state, entry.endpoint), false);
+	}
+
+	private update(entry: Entry, patch: Partial<BalanceState>): void {
+		const { generation: _generation, ...state } = this.snapshot(entry);
+		this.put(entry, { ...state, ...patch });
 	}
 
 	/**
@@ -274,42 +439,31 @@ export class ProviderBalanceCache {
 	 *   allowance — including the persisted one — is dropped. Keeping it would let a later
 	 *   network blip revive credit belonging to a token that no longer works.
 	 */
-	private failureSnapshot(entry: Entry, error: unknown): ProviderBalanceSnapshot {
+	private failureSnapshot(entry: Entry, error: unknown): Partial<BalanceState> {
 		const kind = error instanceof BalanceProbeRequestError ? error.kind : "transient";
 		if (kind === "transient" || kind === "unsupported") {
-			const previous = entry.snapshot.balance;
+			const { balance: previous, fetchedAt } = this.snapshot(entry);
 			const keep =
 				previous !== null &&
 				entry.endpoint !== undefined &&
-				entry.snapshot.fetchedAt > 0 &&
-				this.now() - entry.snapshot.fetchedAt <= PROVIDER_BALANCE_KEEP_LAST_GOOD_MS;
+				fetchedAt > 0 &&
+				this.now() - fetchedAt <= PROVIDER_BALANCE_KEEP_LAST_GOOD_MS;
 			return {
-				...entry.snapshot,
 				status: keep ? "supported" : "error",
 				balance: keep ? previous : null,
 				error: "request_failed",
 			};
 		}
-		this.options.persistence?.remove(entry.id);
-		return {
-			...entry.snapshot,
-			status: "error",
-			balance: null,
-			error: balanceErrorCode(kind),
-		};
+		this.store.unpersist(entry.credentialId);
+		return { status: "error", balance: null, error: balanceErrorCode(kind) };
 	}
 
+	/** Only settled discoveries survive a restart. */
 	private persist(entry: Entry): void {
-		const { status, balance, fetchedAt, attemptedAt } = entry.snapshot;
-		if (status !== "supported" && status !== "unsupported") return;
-		if (status === "supported" && !entry.endpoint) return;
-		this.options.persistence?.save(entry.id, entry.identity, {
-			status,
-			...(entry.endpoint ? { endpoint: entry.endpoint } : {}),
-			balance,
-			fetchedAt,
-			attemptedAt,
-		});
+		const { generation: _generation, ...state } = this.snapshot(entry);
+		if (state.status !== "supported" && state.status !== "unsupported") return;
+		if (state.status === "supported" && !entry.endpoint) return;
+		this.store.set(entry.credentialId, entry.identity, relaySnapshot(state, entry.endpoint));
 	}
 
 	private cancel(entry: Entry): void {
@@ -326,14 +480,14 @@ export class ProviderBalanceCache {
 
 	generations(): Record<string, string> {
 		this.sync();
-		return Object.fromEntries([...this.entries].map(([id, e]) => [id, e.snapshot.generation]));
+		return Object.fromEntries([...this.entries].map(([id, e]) => [id, e.generation]));
 	}
 
 	/** Does not schedule network activity; useful immediately after scheduling a mutation. */
 	peek(id: string): ProviderBalanceSnapshot | null {
 		this.sync();
-		const snapshot = this.entries.get(id)?.snapshot;
-		return snapshot ? structuredClone(snapshot) : null;
+		const entry = this.entries.get(id);
+		return entry ? structuredClone(this.snapshot(entry)) : null;
 	}
 
 	/** Only pending entries qualify; unsupported and failed discoveries are not polled. */
@@ -345,7 +499,8 @@ export class ProviderBalanceCache {
 	private fillPending(): void {
 		for (const entry of this.entries.values()) {
 			if (this.queue.length >= (this.options.maxQueued ?? MAX_QUEUED)) break;
-			if (entry.snapshot.status === "pending" && !entry.task) void this.schedule(entry, "probe");
+			if (this.snapshot(entry).status === "pending" && !entry.task)
+				void this.schedule(entry, "probe");
 		}
 	}
 
@@ -353,19 +508,20 @@ export class ProviderBalanceCache {
 		this.sync();
 		const selected = [...this.entries].filter(([id]) => !providerId || id === providerId);
 		for (const [, entry] of selected) {
-			if (entry.snapshot.status === "pending") void this.schedule(entry, "probe");
+			const snapshot = this.snapshot(entry);
+			if (snapshot.status === "pending") void this.schedule(entry, "probe");
 			else if (
-				entry.snapshot.status === "supported" &&
-				this.now() - entry.snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
+				snapshot.status === "supported" &&
+				this.now() - snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
 			) {
 				void this.schedule(entry, "refresh");
 			} else if (
 				// A transient failure with a known endpoint is retryable: without this the
 				// entry would sit in its failure state forever once the keep-last-good
 				// window expired. Deterministic failures are deliberately excluded.
-				entry.snapshot.error === "request_failed" &&
+				snapshot.error === "request_failed" &&
 				entry.endpoint !== undefined &&
-				this.now() - entry.snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
+				this.now() - snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
 			) {
 				void this.schedule(entry, "refresh");
 			} else if (
@@ -373,20 +529,22 @@ export class ProviderBalanceCache {
 				// answer is a configuration state that only an administrator can change, and
 				// re-enabling it has to bring the value back without a manual probe. Active
 				// discovery is cheap here — it is refused before any process is spawned.
-				entry.snapshot.error === "plugin_not_enabled" &&
-				this.now() - entry.snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
+				snapshot.error === "plugin_not_enabled" &&
+				this.now() - snapshot.attemptedAt >= PROVIDER_BALANCE_STALE_MS
 			) {
 				void this.schedule(entry, "probe");
 			}
 		}
-		return Object.fromEntries(selected.map(([id, entry]) => [id, structuredClone(entry.snapshot)]));
+		return Object.fromEntries(
+			selected.map(([id, entry]) => [id, structuredClone(this.snapshot(entry))]),
+		);
 	}
 
 	/** Let HTTP callers report cooldown/backpressure instead of claiming a probe started. */
 	manualRetryAfterMs(id: string): number {
 		this.sync();
 		const entry = this.entries.get(id);
-		if (!entry || entry.task || entry.snapshot.error === "invalid_configuration") return 0;
+		if (!entry || entry.task || this.snapshot(entry).error === "invalid_configuration") return 0;
 		const cooldown = Math.max(0, entry.nextManualAt - this.now());
 		return this.queue.length >= (this.options.maxQueued ?? MAX_QUEUED)
 			? Math.max(1_000, cooldown)
@@ -399,8 +557,9 @@ export class ProviderBalanceCache {
 		const entry = this.entries.get(id);
 		if (!entry) return Promise.resolve(null);
 		if (entry.task) return entry.task.promise;
-		if (entry.snapshot.error === "invalid_configuration" || this.now() < entry.nextManualAt) {
-			return Promise.resolve(structuredClone(entry.snapshot));
+		const snapshot = this.snapshot(entry);
+		if (snapshot.error === "invalid_configuration" || this.now() < entry.nextManualAt) {
+			return Promise.resolve(structuredClone(snapshot));
 		}
 		return this.schedule(entry, entry.endpoint ? mode : "probe");
 	}
@@ -417,7 +576,7 @@ export class ProviderBalanceCache {
 		const task: Task = { entry, mode, promise, resolve, controller: new AbortController() };
 		entry.task = task;
 		entry.nextManualAt = this.now() + PROVIDER_BALANCE_MANUAL_THROTTLE_MS;
-		if (mode === "probe") entry.snapshot = { ...entry.snapshot, status: "pending", error: null };
+		if (mode === "probe") this.update(entry, { status: "pending", error: null });
 		this.queue.push(task);
 		this.pump();
 		return promise;
@@ -450,11 +609,10 @@ export class ProviderBalanceCache {
 			return this.entries.get(entry.id) === entry;
 		};
 		try {
-			entry.snapshot = {
-				...entry.snapshot,
+			this.update(entry, {
 				status: mode === "probe" ? "probing" : "supported",
 				attemptedAt: this.now(),
-			};
+			});
 			const engine = this.options.engine?.() ?? getProviderBalanceEngine();
 			if (mode === "probe") {
 				const found = await engine.probe({
@@ -465,14 +623,13 @@ export class ProviderBalanceCache {
 				});
 				if (!current()) return;
 				entry.endpoint = found ? { adapter: found.adapter, root: found.root } : undefined;
-				entry.snapshot = {
-					...entry.snapshot,
+				this.update(entry, {
 					status: found ? "supported" : "unsupported",
 					adapter: found?.adapter,
 					balance: found?.balance ?? null,
 					fetchedAt: found ? this.now() : 0,
 					error: null,
-				};
+				});
 			} else if (entry.endpoint) {
 				const balance = await engine.refresh({
 					config: entry.config,
@@ -483,14 +640,14 @@ export class ProviderBalanceCache {
 					root: entry.endpoint.root,
 				});
 				if (!current()) return;
-				entry.snapshot = { ...entry.snapshot, balance, fetchedAt: this.now(), error: null };
+				this.update(entry, { balance, fetchedAt: this.now(), error: null });
 			}
 		} catch (error) {
 			// An aborted round is a failure if this identity still exists. A superseded
 			// request is instead discarded, even if its transport ignored cancellation.
 			this.sync();
 			if (this.entries.get(entry.id) === entry) {
-				entry.snapshot = this.failureSnapshot(entry, error);
+				this.update(entry, this.failureSnapshot(entry, error));
 			}
 		} finally {
 			clearTimeout(timer);
@@ -500,10 +657,12 @@ export class ProviderBalanceCache {
 			if (elapsed >= 2_000) {
 				const safeId = /^[\w-]{1,64}$/.test(entry.id) ? entry.id : "custom-provider";
 				logger.warn(
-					`[provider-balance] slow operation provider=${safeId} mode=${mode} durationMs=${Math.round(elapsed)} status=${entry.snapshot.status}`,
+					`[provider-balance] slow operation provider=${safeId} mode=${mode} durationMs=${Math.round(elapsed)} status=${this.snapshot(entry).status}`,
 				);
 			}
-			task.resolve(this.entries.get(entry.id) === entry ? structuredClone(entry.snapshot) : null);
+			task.resolve(
+				this.entries.get(entry.id) === entry ? structuredClone(this.snapshot(entry)) : null,
+			);
 		}
 	}
 }
@@ -511,10 +670,8 @@ export class ProviderBalanceCache {
 export const providerBalanceCache = new ProviderBalanceCache({
 	providers: () => settings.customApiProviders ?? [],
 	globalProxy: () => settings.proxy,
-	persistence: createPersistedCredentialCache(
-		"provider-balances.json",
-		parsePersistedProviderBalance,
-	),
+	store: quotaStore,
+	legacyFile: "provider-balances.json",
 });
 
 export const getProviderBalanceGenerations = () => providerBalanceCache.generations();

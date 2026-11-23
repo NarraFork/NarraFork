@@ -30,7 +30,8 @@ function legacyIsDeepSeek(baseUrl?: string): boolean {
 			!url.password &&
 			!url.search &&
 			!url.hash &&
-			["/", "/v1", "/anthropic"].includes(url.pathname.replace(/\/$/, "") || "/")
+			// Plus `/anthropic/v1`, the add page's Anthropic preset, which the old check missed.
+			["/", "/v1", "/anthropic", "/anthropic/v1"].includes(url.pathname.replace(/\/$/, "") || "/")
 		);
 	} catch {
 		return false;
@@ -99,6 +100,28 @@ describe("identifyService", () => {
 				baseUrl,
 				isOpencodeGoBaseUrl(baseUrl),
 			]);
+		}
+	});
+
+	test("DeepSeek's Anthropic preset is DeepSeek, under the same strict rules", () => {
+		for (const baseUrl of [
+			"https://api.deepseek.com/anthropic/v1",
+			"https://api.deepseek.com/anthropic/v1/",
+		]) {
+			expect(identifyService({ baseUrl, protocol: "anthropic-messages" })).toEqual({
+				templateId: "deepseek",
+			});
+		}
+		for (const baseUrl of [
+			"http://api.deepseek.com/anthropic/v1",
+			"https://api.deepseek.com:8443/anthropic/v1",
+			"https://api.deepseek.com/anthropic/v1?x=1",
+			"https://api.deepseek.com/anthropic/v2",
+			"https://relay.example/anthropic/v1",
+		]) {
+			expect(identifyService({ baseUrl, protocol: "anthropic-messages" })).toEqual({
+				templateId: "anthropic-compatible",
+			});
 		}
 	});
 
