@@ -325,6 +325,7 @@ export interface UpdateDraftContentWrite {
 
 export interface RebaseDraftContentWrite {
 	draftId: string;
+	expectedDraft: KnowledgeDraftVersion;
 	content: string;
 	contentHash: string;
 	baseRevisionId: string | null;
@@ -334,6 +335,7 @@ export interface RebaseDraftContentWrite {
 export interface CreateSubmissionWrite {
 	submissionId: string;
 	draftId: string;
+	expectedDraft: KnowledgeDraftVersion;
 	entryId: string | null;
 	collectionId: string | null;
 	title: string | null;
@@ -349,6 +351,7 @@ export interface CreateSubmissionWrite {
 
 export interface SetSubmissionVerdictWrite {
 	submissionId: string;
+	expectedStatus: "pending" | "conflict";
 	status: string;
 	verdict: string;
 	findingsJson: unknown;
@@ -396,6 +399,7 @@ export interface CommitMergedRevisionWrite {
 	submissionId: string;
 	draftId: string;
 	entryId: string;
+	expectedMainRevisionId: string | null;
 	revisionId: string;
 	content: string;
 	contentHash: string;
@@ -405,6 +409,17 @@ export interface CommitMergedRevisionWrite {
 	reviewerUserId: string;
 	now: string;
 }
+
+export type KnowledgeDraftVersion = Pick<
+	KnowledgeDraftRow,
+	| "contentHash"
+	| "baseRevisionId"
+	| "updatedAt"
+	| "status"
+	| "title"
+	| "targetCollectionId"
+	| "keywordsJson"
+>;
 
 export interface RenameKnowledgeLevelWrite {
 	levelId: string;

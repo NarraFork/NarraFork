@@ -364,6 +364,7 @@ describe("PostgreSQL knowledge write path", () => {
 							const submission = await store.createSubmissionGuarded({
 								submissionId: generateId(),
 								draftId: draft.id,
+								expectedDraft: draft,
 								entryId: entryAId,
 								collectionId: null,
 								title: null,
@@ -376,10 +377,16 @@ describe("PostgreSQL knowledge write path", () => {
 								round: 1,
 								now: NOW(),
 							});
+							const [observedMain] = await pgDb
+								.select({ revisionId: pgSchema.knowledgeEntries.currentRevisionId })
+								.from(pgSchema.knowledgeEntries)
+								.where(eq(pgSchema.knowledgeEntries.id, entryAId))
+								.limit(1);
 							const { version } = await store.commitMergedRevision({
 								submissionId: submission.id,
 								draftId: draft.id,
 								entryId: entryAId,
+								expectedMainRevisionId: observedMain.revisionId,
 								revisionId: generateId(),
 								content: "merged content",
 								contentHash: "hm",
@@ -397,6 +404,7 @@ describe("PostgreSQL knowledge write path", () => {
 									submissionId: submission.id,
 									draftId: draft.id,
 									entryId: entryAId,
+									expectedMainRevisionId: observedMain.revisionId,
 									revisionId: generateId(),
 									content: "other",
 									contentHash: "ho",

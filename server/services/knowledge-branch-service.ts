@@ -931,6 +931,7 @@ async function rebaseDraft(
 	// post-commit notification.
 	const invalidated = await knowledgeWriteStore.rebaseDraftContent({
 		draftId,
+		expectedDraft: draft,
 		content: merged,
 		contentHash: hashContent(merged),
 		baseRevisionId: currentRevisionId,
@@ -1067,6 +1068,7 @@ async function submitForReview(
 	const submission = await knowledgeWriteStore.createSubmissionGuarded({
 		submissionId: id,
 		draftId,
+		expectedDraft: draft,
 		entryId: draft.entryId,
 		// Standalone publish target (NULL for linked entries).
 		collectionId: draft.entryId ? null : draft.targetCollectionId,
@@ -1347,6 +1349,7 @@ async function review(
 				: sub.status;
 	await knowledgeWriteStore.setSubmissionReviewVerdict({
 		submissionId,
+		expectedStatus: sub.status,
 		status: newStatus,
 		verdict: input.verdict,
 		findingsJson: findings,
@@ -1420,7 +1423,13 @@ async function approveAndMerge(
 		};
 	}
 
-	const revisionId = await commitMergedRevision(sub, merged, reviewerUserId, now);
+	const revisionId = await commitMergedRevision(
+		sub,
+		merged,
+		reviewerUserId,
+		now,
+		entry.currentRevisionId,
+	);
 	return { submissionId: sub.id, status: "approved" as const, mergedRevisionId: revisionId };
 }
 
@@ -1514,12 +1523,19 @@ async function resolveConflict(
 		throw new ValidationError("Submission has no target entry to resolve against");
 	}
 	const caps = await resolvePrincipalCaps(principal);
-	await assertSubmissionReviewAuthority(caps, sub, readOptions);
+	const authority = await assertSubmissionReviewAuthority(caps, sub, readOptions);
+	if (!authority.entry) throw new ValidationError("Submission has no target entry");
 	if (isSelfReviewBlocked(principal, sub)) {
 		throw new ValidationError("You cannot resolve your own submission");
 	}
 	const now = nowIso();
-	const revisionId = await commitMergedRevision(sub, input.resolvedContent, principal.userId, now);
+	const revisionId = await commitMergedRevision(
+		sub,
+		input.resolvedContent,
+		principal.userId,
+		now,
+		authority.entry.currentRevisionId,
+	);
 	return { submissionId, status: "approved" as const, mergedRevisionId: revisionId };
 }
 
@@ -1529,6 +1545,7 @@ async function commitMergedRevision(
 	content: string,
 	reviewerUserId: string,
 	now: string,
+	expectedMainRevisionId: string | null,
 ): Promise<string> {
 	// Only called for LINKED submissions (approveAndMerge / resolveConflict), so entryId is set.
 	const targetEntryId = sub.entryId;
@@ -1544,6 +1561,7 @@ async function commitMergedRevision(
 		submissionId: sub.id,
 		draftId: sub.draftId,
 		entryId: targetEntryId,
+		expectedMainRevisionId,
 		revisionId,
 		content,
 		contentHash: hashContent(content),
