@@ -27,6 +27,7 @@ import { narratorService } from "../narrator-service";
 import { type ActiveNarrator, activeNarrators } from "../narrator-session-state";
 import * as lifecycle from "../subagent-lifecycle";
 import { resetTraitLayerCaches } from "../trait-layer-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const created: string[] = [];
 const markTakenOver = (id: string) => setRunHold(id, { released: false });
@@ -205,7 +206,9 @@ describe("Send(doInterrupt)", () => {
 	test("the controller interrupts; a sibling is refused before delivery", async () => {
 		const { parent, child, sibling } = await team();
 		const turn = liveTurn(child);
-		await expect(sendSubagentMessageDetailed(sendInput(sibling, child))).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(sendSubagentMessageDetailed(sendInput(sibling, child))),
+		).toThrow();
 		expect(turn.signal.aborted).toBe(false);
 		const result = await sendSubagentMessageDetailed(sendInput(parent, child));
 		expect(result.targets.map((target) => target.status)).toEqual(["queued"]);

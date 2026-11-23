@@ -33,6 +33,7 @@ import {
 	getRuntimeTestDb,
 	prepareRuntimeTestDb,
 } from "./agent-runtime-test-database";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
@@ -1655,9 +1656,7 @@ describe("planned update continuation scheduling", () => {
 		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
 		try {
 			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-			await expect(recovery?.completion.then(() => "completed" as const)).resolves.toBe(
-				"completed",
-			);
+			expect(await recovery?.completion.then(() => "completed" as const)).toBe("completed");
 			expect(terminalReleased).toBe(false);
 			expect(terminalSettled).toBe(false);
 			expect(updatedToolResults).toHaveLength(0);
@@ -2381,7 +2380,10 @@ describe("planned update continuation scheduling", () => {
 			throw new Error("foreground continuation failed");
 		};
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		await expect(recovery?.completion).rejects.toThrow("Failed to mount 1 legacy narrator");
+		if (!recovery) throw new Error("Missing recovery completion");
+		expect(await captureWorkerRejectionThrower(recovery.completion)).toThrow(
+			"Failed to mount 1 legacy narrator",
+		);
 		expect(continueNarratorCalls).toBe(1);
 		const row = sqlite
 			.prepare("SELECT status, substatus, error_message FROM narrators WHERE id = 'owner'")
