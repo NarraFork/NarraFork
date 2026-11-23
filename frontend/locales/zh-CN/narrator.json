@@ -2228,7 +2228,23 @@
 		"outputLoadFailed": "输出加载失败",
 		"openAgent": "打开 agent",
 		"reattachPartial": "当前后端运行时打开已分离的子代理会话后，不会重新阻塞原父级工具调用。",
-		"loadOlder": "加载更早的任务"
+		"loadOlder": "加载更早的任务",
+		"filterCompleted": "已完成",
+		"filterWatch": "Watch",
+		"filteredEmpty": "没有运行中的任务，勾选“已完成”或“Watch”查看更多",
+		"watchBadge": "Watch",
+		"watchedBy": "被盯着",
+		"watchTargetAgent": "代理",
+		"watchTargetBash": "Bash",
+		"watchTargetTerminal": "终端",
+		"watchPattern": "匹配 {{pattern}}",
+		"watchTimeout": "期限 {{duration}}",
+		"watchRemaining": "剩余 {{duration}}",
+		"watchStatusWatching": "观察中",
+		"watchStatusDeadline": "已到期",
+		"watchStatusMatched": "已匹配",
+		"watchStatusTargetEnded": "目标已结束",
+		"watchCancel": "停止观察（不影响目标）"
 	},
 	"sidecar": {
 		"contextViews": {

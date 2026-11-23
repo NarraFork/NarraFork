@@ -1,3 +1,4 @@
+import { formatWatchTarget, WATCH_DEADLINE_OUTPUT_PREFIX } from "@shared/watch-command";
 import type { ToolContext, ToolResult } from "../lib/agent/types";
 import { isRuntimeToolAllowed, runtimeWatchTargets } from "./agent-runtime/policy";
 import { prepareBackgroundBashResult } from "./background-bash-result";
@@ -29,7 +30,7 @@ interface TargetResult {
 async function resultText(type: string, label: string, result: TargetResult): Promise<string> {
 	const header =
 		result.status === "timeout"
-			? `Watch reached its deadline for ${type} ${label}. Only the observation ended; the target was not stopped.`
+			? `${WATCH_DEADLINE_OUTPUT_PREFIX} for ${type} ${label}. Only the observation ended; the target was not stopped.`
 			: `Watch ${type} ${label}: ${result.status}.`;
 	const prepared = await prepareBackgroundBashResult(
 		label,
@@ -137,7 +138,13 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 	const observation = await createWatchObservation({
 		narratorId: ctx.narratorId,
 		title: `watch bash ${label}`,
-		command: `bash ${JSON.stringify(task.id)} run ${JSON.stringify(task.logicalRunId)}${input.pattern ? ` for ${JSON.stringify(input.pattern)}` : ""}`,
+		command: formatWatchTarget({
+			type: "bash",
+			id: task.id,
+			runId: task.logicalRunId,
+			pattern: input.pattern,
+			timeoutMs: input.timeout,
+		}),
 		toolUseId: ctx.currentToolUseId,
 	});
 	if (ctx.signal.aborted) {
@@ -201,7 +208,12 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 	const observation = await createWatchObservation({
 		narratorId: ctx.narratorId,
 		title: `watch agent ${snapshot.title ?? label}`,
-		command: `agent ${JSON.stringify(id)} run ${JSON.stringify(snapshot.publicationRun?.logicalRunId ?? null)}`,
+		command: formatWatchTarget({
+			type: "agent",
+			id,
+			runId: snapshot.publicationRun?.logicalRunId ?? null,
+			timeoutMs: input.timeout,
+		}),
 		toolUseId: ctx.currentToolUseId,
 	});
 	if (ctx.signal.aborted) {
