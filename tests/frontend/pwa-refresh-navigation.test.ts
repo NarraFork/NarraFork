@@ -1,5 +1,6 @@
 import { expect, mock, test } from "bun:test";
 import { setBaseHref } from "../../server/lib/spa-base-href";
+import { STARTUP_STATUS_HEADER } from "../../shared/startup-status";
 
 const source = await Bun.file("frontend/src-sw.ts").text();
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
@@ -53,6 +54,7 @@ function worker(
 		"API_WS_PREFIXES",
 		"isApiOrWsRelativePath",
 		"appVersionsMatch",
+		"STARTUP_STATUS_HEADER",
 		"__APP_VERSION__",
 		"setTimeout",
 		"clearTimeout",
@@ -76,6 +78,7 @@ function worker(
 		["api", "ws"],
 		() => false,
 		(a: string, b: string) => a === b,
+		STARTUP_STATUS_HEADER,
 		"1.0.0",
 		timers.setTimeout,
 		timers.clearTimeout,
@@ -91,7 +94,9 @@ test("recovery route precedes precache and preserves fresh/startup HTML", async 
 		let networkRequest: Request | undefined;
 		const runtime = worker(async (request: Request) => {
 			networkRequest = request;
-			return new Response("fresh", { status, headers: { "content-type": "text/html" } });
+			const headers: Record<string, string> = { "content-type": "text/html" };
+			if (status === 503) headers[STARTUP_STATUS_HEADER] = "1";
+			return new Response("fresh", { status, headers });
 		});
 		const route = runtime.routes[0];
 		if (!route) throw new Error("Missing route");
@@ -119,7 +124,11 @@ for (const failure of ["error", "timeout", "proxy"] as const) {
 			async (request: Request) => {
 				signal = request.signal;
 				if (failure === "error") throw Error("offline");
-				if (failure === "proxy") return new Response("bad gateway", { status: 502 });
+				if (failure === "proxy")
+					return new Response("bad gateway", {
+						status: 502,
+						headers: { "content-type": "text/html" },
+					});
 				return new Promise(() => {});
 			},
 			{

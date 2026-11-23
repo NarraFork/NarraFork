@@ -9,6 +9,7 @@ import {
 import { NavigationRoute, registerRoute } from "workbox-routing";
 import { CacheFirst, StaleWhileRevalidate } from "workbox-strategies";
 import { setBaseHref } from "../server/lib/spa-base-href";
+import { STARTUP_STATUS_HEADER } from "../shared/startup-status";
 import { API_WS_PREFIXES, isApiOrWsRelativePath } from "./lib/app-path-classify";
 import { appVersionsMatch } from "./lib/version-match";
 
@@ -31,7 +32,8 @@ registerRoute(
 					}, RELOAD_NAVIGATION_TIMEOUT_MS);
 				}),
 			]);
-			if (response.status < 500 || response.headers.get("content-type")?.includes("text/html")) {
+			// The startup page polls itself back; a proxy 502/504 page runs no app code.
+			if (response.status < 500 || response.headers.has(STARTUP_STATUS_HEADER)) {
 				return response;
 			}
 			void response.body?.cancel();
