@@ -2876,7 +2876,7 @@ export async function drainInjectionsIntoHistory(
 	text: string;
 	parts: AgentInputPart[];
 	lastInputWasMailbox: boolean;
-	onConsumed: () => void;
+	onConsumed: () => Promise<void>;
 }> {
 	const narratorId = active.narratorId;
 	// Every part is a persisted row. Unresolved questions are listed in the pass's system
@@ -3048,9 +3048,9 @@ export async function drainInjectionsIntoHistory(
 		lastInputWasMailbox: adoptedDeliveries.some(
 			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
 		),
-		onConsumed: () => {
-			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
-			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
+		onConsumed: async () => {
+			for (const delivery of adoptedDeliveries) await consumeAgentMessageDelivery(delivery);
+			for (const delivery of adoptedMailbox) await consumeMailboxDelivery(delivery);
 		},
 	};
 }

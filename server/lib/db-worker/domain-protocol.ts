@@ -1,3 +1,4 @@
+import type { readPublicationTerminalResultTask } from "../../services/agent-runtime/publication-reader";
 import type { ComposerDocumentMetadata, ComposerDocumentParams } from "./composer-document-query";
 import { DbReadError } from "./errors";
 import type { readEditorOperationEvidence, readRevertPlan } from "./file-read-snapshots";
@@ -13,6 +14,10 @@ export const DOMAIN_READ_STREAM_TIMEOUT_MS = 30_000;
 export const COMPOSER_DOCUMENT_RESULT_BYTES = 24 * 1024 * 1024;
 
 interface SyncDomainReadTaskMap {
+	publicationTerminalResult: {
+		params: Parameters<typeof readPublicationTerminalResultTask>[1];
+		result: ReturnType<typeof readPublicationTerminalResultTask>;
+	};
 	knowledgeEntryDetail: {
 		params: Parameters<typeof readKnowledgeEntryDetail>[1];
 		result: ReturnType<typeof readKnowledgeEntryDetail>;
@@ -125,6 +130,38 @@ export function isDomainReadStreamTask(params: {
 }
 
 export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinition } = {
+	publicationTerminalResult: {
+		maxInputBytes: 4096,
+		maxResultBytes: 65536,
+		maxArrayItems: 128,
+		validate: (input) => {
+			if (
+				!record(input) ||
+				Object.keys(input).some((key) => key !== "run" && key !== "options") ||
+				!record(input.run) ||
+				Object.keys(input.run).length !== 4
+			)
+				return false;
+			const run = input.run;
+			if (
+				(run.producerKind !== "agent" && run.producerKind !== "bash") ||
+				!boundedId(run.taskId) ||
+				!boundedId(run.logicalRunId) ||
+				!boundedId(run.recipientId)
+			)
+				return false;
+			if (input.options === undefined) return true;
+			return (
+				record(input.options) &&
+				Object.keys(input.options).every(
+					(key) => key === "settledRunId" || key === "includeEventKind",
+				) &&
+				(input.options.settledRunId === undefined || boundedId(input.options.settledRunId)) &&
+				(input.options.includeEventKind === undefined ||
+					typeof input.options.includeEventKind === "boolean")
+			);
+		},
+	},
 	knowledgeEntryDetail: {
 		maxInputBytes: 1024,
 		maxResultBytes: 132 * 1024 * 1024,

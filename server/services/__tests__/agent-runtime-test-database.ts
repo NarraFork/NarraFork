@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { expect } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import * as communicationWork from "../agent-runtime/async-work";
 import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
@@ -26,7 +26,7 @@ export async function prepareRuntimeTestDb(sqlite: Database): Promise<void> {
 	await notifications.resetNotificationBackgroundWorkForTests({ expectedFailures: 0 });
 }
 
-const acknowledgedFailures = 0;
+let acknowledgedFailures = 0;
 
 export async function drainRuntimeTestWork(options: { deadlineAt?: number } = {}): Promise<void> {
 	try {
@@ -42,6 +42,37 @@ export async function drainRuntimeTestWork(options: { deadlineAt?: number } = {}
 	expect(communicationWork.getCommunicationWorkStatus().pending).toBe(0);
 	expect(communicationWork.getCommunicationWorkFailureCount()).toBe(acknowledgedFailures);
 	await (await import("../notification-service")).drainNotificationBackgroundWork(options);
+}
+
+/** An injected bookkeeping failure must be the exact new marker, not a sticky old failure. */
+export async function expectRuntimeTestFailure<T>(
+	work: () => Promise<T>,
+	expected: { kind: "marker"; caller: string },
+): Promise<T> {
+	await drainRuntimeTestWork();
+	const before = communicationWork.getCommunicationWorkFailureCount();
+	const original = communicationWork.markCommunicationWorkFailed;
+	const stacks: string[] = [];
+	const marker = spyOn(communicationWork, "markCommunicationWorkFailed").mockImplementation(() => {
+		stacks.push(new Error().stack ?? "");
+		original();
+	});
+	try {
+		const result = await work();
+		try {
+			await communicationWork.drainCommunicationWork();
+		} catch (error) {
+			expect(error).toMatchObject({ message: "Communication database tail failed" });
+		}
+		expect(stacks).toHaveLength(1);
+		expect(stacks[0]).toContain(expected.caller);
+		expect(communicationWork.getCommunicationWorkFailureCount() - before).toBe(1);
+		acknowledgedFailures++;
+		await drainRuntimeTestWork();
+		return result;
+	} finally {
+		marker.mockRestore();
+	}
 }
 
 /** Stop publishers before closing; reader shutdown follows all detached producer tails. */

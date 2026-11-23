@@ -35,8 +35,11 @@ import { getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narrators } from "../../db/schema";
 import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
 import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -209,7 +212,8 @@ beforeAll(() => {
 	setUploadsDirForTests(join(HOME, "uploads"));
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	setUploadsDirForTests(null);
 	rmSync(HOME, { recursive: true, force: true });
 });
@@ -575,7 +579,7 @@ describe("failed user recovery", () => {
 			return { messageId, refId };
 		});
 		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
-		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("materialized");
+		expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("materialized");
 		expect(store.claimBatch(NARRATOR_ID, { token: "again", epoch: "again" })).toHaveLength(0);
 	});
 

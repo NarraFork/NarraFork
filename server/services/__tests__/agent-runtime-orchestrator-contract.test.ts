@@ -1801,7 +1801,7 @@ describe("real shared orchestrator profile contract", () => {
 					const before = db.select().from(narratorBufferedMessages).get();
 					expect(before).toMatchObject({ state: "materialized", adoptedAt: null });
 					expect(injection.onConsumed).toBeFunction();
-					injection.onConsumed?.();
+					await injection.onConsumed?.();
 					await new Promise<void>((resolve) => setImmediate(resolve));
 					expect(db.select().from(narratorBufferedMessages).get()?.adoptedAt).toBeString();
 					return finished;
@@ -1941,7 +1941,7 @@ describe("real shared orchestrator profile contract", () => {
 						event.message.id === message?.id,
 				);
 				expect(projected.map(([id]) => id)).toEqual(["contract-parent", "contract-child"]);
-				packet.onConsumed?.();
+				await packet.onConsumed?.();
 				await new Promise<void>((resolve) => setImmediate(resolve));
 				expect(
 					db

@@ -24,6 +24,7 @@ import {
 	getTableColumns,
 	gt,
 	inArray,
+	isNull,
 	like,
 	lt,
 	ne,
@@ -56,6 +57,7 @@ import {
 	runtimePublication,
 	taskPublicationRun,
 } from "./agent-runtime/publication";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { BackgroundBashLifecycle } from "./background-bash-lifecycle";
@@ -4423,6 +4425,8 @@ class BackgroundTaskService {
 			.select({
 				id: backgroundTasks.id,
 				logicalRunId: backgroundTasks.logicalRunId,
+				status: backgroundTasks.status,
+				completedAt: backgroundTasks.completedAt,
 				parentNarratorId: backgroundTasks.parentNarratorId,
 				type: backgroundTasks.type,
 				subagentNarratorId: backgroundTasks.subagentNarratorId,
@@ -4461,7 +4465,7 @@ class BackgroundTaskService {
 			)
 			.limit(100)
 			.all();
-		// SQLite path: sync hasPendingSource.
+		// Observe retention before the committing transaction rechecks it.
 		const pub = getRuntimePublicationService();
 		const deletable: typeof rows = [];
 		for (const row of rows) {
@@ -4470,43 +4474,66 @@ class BackgroundTaskService {
 				deletable.push(row);
 				continue;
 			}
-			const pending =
-				pub.backend === "sqlite"
-					? runtimePublication.hasPendingSource(taskPublicationRun(row))
-					: await pub.hasPendingSource(taskPublicationRun(row));
+			const pending = await pub.hasPendingSource(taskPublicationRun(row));
 			if (!pending) deletable.push(row);
 		}
 
 		if (deletable.length === 0) return 0;
 
-		const deletableIds = deletable.map((row) => row.id);
-		await db.delete(backgroundTasks).where(
-			and(
-				inArray(backgroundTasks.id, deletableIds),
-				notInArray(backgroundTasks.status, ["running", "paused"]),
-				lt(backgroundTasks.completedAt, cutoff),
-				// A takeover temporarily cancels the projection, not the work. Keep
-				// it while the child is held/running so its finalizer retains a row.
-				notExists(
-					db
-						.select({ one: sql`1` })
-						.from(narrators)
-						.where(
-							and(
-								eq(
-									narrators.id,
-									sql`coalesce(${backgroundTasks.subagentNarratorId}, ${backgroundTasks.id})`,
-								),
-								or(
-									inArray(narrators.status, ["working", "waiting"]),
-									like(narrators.substatus, '%"taken_over"%'),
-									like(narrators.substatus, '%"manual_override"%'),
+		runAtomicWrite(db, "background-task.cleanupCompleted", (tx) => {
+			for (const row of deletable) {
+				if (
+					row.logicalRunId &&
+					runtimePublication.hasPendingSourceInTransaction(taskPublicationRun(row), tx)
+				)
+					throw new RuntimeReadConflictError();
+			}
+			const removed = tx
+				.delete(backgroundTasks)
+				.where(
+					and(
+						or(
+							...deletable.map((row) =>
+								and(
+									eq(backgroundTasks.id, row.id),
+									eq(backgroundTasks.status, row.status),
+									row.completedAt === null
+										? isNull(backgroundTasks.completedAt)
+										: eq(backgroundTasks.completedAt, row.completedAt),
+									row.logicalRunId === null
+										? isNull(backgroundTasks.logicalRunId)
+										: eq(backgroundTasks.logicalRunId, row.logicalRunId),
 								),
 							),
 						),
-				),
-			),
-		);
+						notInArray(backgroundTasks.status, ["running", "paused"]),
+						lt(backgroundTasks.completedAt, cutoff),
+						// A takeover temporarily cancels the projection, not the work. Keep
+						// it while the child is held/running so its finalizer retains a row.
+						notExists(
+							db
+								.select({ one: sql`1` })
+								.from(narrators)
+								.where(
+									and(
+										eq(
+											narrators.id,
+											sql`coalesce(${backgroundTasks.subagentNarratorId}, ${backgroundTasks.id})`,
+										),
+										or(
+											inArray(narrators.status, ["working", "waiting"]),
+											like(narrators.substatus, '%"taken_over"%'),
+											like(narrators.substatus, '%"manual_override"%'),
+										),
+									),
+								),
+						),
+					),
+				)
+				.returning({ id: backgroundTasks.id })
+				.all();
+			if (removed.length !== deletable.length) throw new RuntimeReadConflictError();
+		});
 
 		for (const row of deletable) {
 			backgroundOccupancyStore.refreshTask(row.id);
@@ -4538,8 +4565,8 @@ class BackgroundTaskService {
 			).catch(() => {});
 		}
 
-		logger.debug("Cleaned up completed background tasks", { deleted: deletableIds.length });
-		return deletableIds.length;
+		logger.debug("Cleaned up completed background tasks", { deleted: deletable.length });
+		return deletable.length;
 	}
 
 	/** Broadcast cleanup deltas to affected parent narrators (shared by PG and SQLite paths). */

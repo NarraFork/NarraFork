@@ -1,16 +1,23 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { splitEnvelope } from "@shared/narrator-blocks/storage";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
+	backgroundTasks,
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
+	narratorBlocks,
 	narrators,
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { createRuntimePublicationService, getRuntimePublicationService, runtimePublication } =
 	await import("../agent-runtime/publication");
 runtimePublication.stop();
@@ -61,10 +68,204 @@ beforeEach(() => {
 		])
 		.run();
 });
-afterAll(() => {
+afterAll(async () => {
 	service.stop();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 	mock.restore();
+});
+
+test("publication state is read in a Worker independently from terminal body readability", async () => {
+	const run = start();
+	const read = spyOn(workerRead, "readDbAll");
+	const ownerQuery = spyOn(sqlite, "query").mockImplementation(() => {
+		throw new Error("Publication observations must not SELECT on the owner connection");
+	});
+	try {
+		expect(await service.readRunPublicationState(run)).toEqual({ state: "reserved" });
+		expect(await service.readAgentTerminalResult(run)).toBeNull();
+		expect(read).toHaveBeenCalledTimes(1);
+		expect(read.mock.calls[0]?.[2]).toMatchObject({
+			executionPolicy: "worker-required",
+			maxRows: 1,
+		});
+		expect(ownerQuery).not.toHaveBeenCalled();
+	} finally {
+		ownerQuery.mockRestore();
+		read.mockRestore();
+	}
+	snapshot(run, "RESULT");
+	db.delete(refs)
+		.where(eq(refs.messageId, `publication-result:${run.logicalRunId}`))
+		.run();
+	db.delete(messages)
+		.where(eq(messages.id, `publication-result:${run.logicalRunId}`))
+		.run();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readRunPublicationState(run)).toEqual({
+		state: "settled",
+		eventKind: "completed",
+	});
+	service.consumeAwaitedTerminal(run);
+	db.delete(mailbox).run();
+	db.delete(outbox).run();
+	expect(await service.readRunPublicationState(run)).toEqual({ state: "settled" });
+	expect(await service.readRunPublicationState({ ...run, logicalRunId: "different-run" })).toEqual({
+		state: "none",
+	});
+});
+
+function taskProjection() {
+	return {
+		id: "task-projection",
+		parentNarratorId: "parent",
+		type: "agent" as const,
+		status: "completed" as const,
+		subagentNarratorId: "actor",
+		logicalRunId: "old-task-run",
+		startedAt: time,
+		createdAt: time,
+		updatedAt: time,
+	};
+}
+
+function afterTaskPreflight(mutate: () => void) {
+	const original = workerRead.readQueryFirst;
+	let changed = false;
+	async function read<T>(
+		query: PromiseLike<T[]> & { toSQL(): { sql: string; params: unknown[] } },
+		options?: workerRead.ReadQueryOptions,
+	): Promise<T | undefined> {
+		const row = await original(query, options);
+		if (!changed && query.toSQL().sql.includes("background_tasks")) {
+			changed = true;
+			mutate();
+		}
+		return row;
+	}
+	return spyOn(workerRead, "readQueryFirst").mockImplementation(read);
+}
+
+test("task projection rejects a destination changed after the Worker snapshot", async () => {
+	const first = start();
+	const snapshot = await workerRead.readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, "actor"),
+			columns: { runtimeRegistrationJson: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
+	const destination = snapshot?.runtimeRegistrationJson?.run?.deliverTo;
+	if (!destination) throw new Error("Missing registered destination");
+	db.insert(narrators).values({ id: "other", createdAt: time, updatedAt: time }).run();
+	const next = service.startRun({
+		narratorId: "actor",
+		binding: {
+			deliverTo: { narratorId: "other", toolUseId: "new-tool" },
+		},
+	});
+	expect(next.binding.logicalRunId).not.toBe(first.logicalRunId);
+	const registered = db
+		.select()
+		.from(narrators)
+		.where(eq(narrators.id, "actor"))
+		.get()?.runtimeRegistrationJson;
+	expect(() =>
+		service.startRun({
+			narratorId: "actor",
+			binding: { deliverTo: destination },
+			taskRow: taskProjection(),
+		}),
+	).toThrow("Stale task publication destination");
+	expect(
+		db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "task-projection")).get(),
+	).toBeUndefined();
+	expect(
+		db.select().from(narrators).where(eq(narrators.id, "actor")).get()?.runtimeRegistrationJson,
+	).toEqual(registered);
+});
+
+for (const changed of ["logicalRun", "destination", "taskGeneration"] as const) {
+	test(`restart rejects changed ${changed} after its Worker preflight`, async () => {
+		const run = start();
+		db.insert(backgroundTasks).values(taskProjection()).run();
+		let registered: (typeof narrators.$inferSelect)["runtimeRegistrationJson"] | undefined;
+		const probe = afterTaskPreflight(() => {
+			if (changed === "logicalRun") start();
+			else if (changed === "destination") {
+				const current = db
+					.select()
+					.from(narrators)
+					.where(eq(narrators.id, "actor"))
+					.get()?.runtimeRegistrationJson;
+				const currentRun = current?.run;
+				if (!current || !currentRun) throw new Error("Missing registered actor run");
+				db.update(narrators)
+					.set({
+						runtimeRegistrationJson: {
+							...current,
+							run: {
+								...currentRun,
+								deliverTo: { narratorId: "parent", toolUseId: "replacement-tool" },
+							},
+						},
+					})
+					.where(eq(narrators.id, "actor"))
+					.run();
+			} else
+				db.update(backgroundTasks)
+					.set({ logicalRunId: "replacement-task-run" })
+					.where(eq(backgroundTasks.id, "task-projection"))
+					.run();
+			registered = db
+				.select()
+				.from(narrators)
+				.where(eq(narrators.id, "actor"))
+				.get()?.runtimeRegistrationJson;
+		});
+		try {
+			const error = await getRuntimePublicationService()
+				.restartAgentTask({
+					taskId: "task-projection",
+					logicalRunId: run.logicalRunId,
+					subagentNarratorId: "actor",
+					subagentType: "general",
+					toolUseId: "test-tool-use",
+					expectedStatus: "completed",
+					now: time,
+				})
+				.catch((error) => error);
+			expect(error).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+			expect(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "task-projection")).get()
+					?.status,
+			).toBe("completed");
+			expect(
+				db.select().from(narrators).where(eq(narrators.id, "actor")).get()?.runtimeRegistrationJson,
+			).toEqual(registered);
+		} finally {
+			probe.mockRestore();
+		}
+	});
+}
+
+test("restart projects the registered actor run when the task has a distinct ID", async () => {
+	const run = start();
+	db.insert(backgroundTasks).values(taskProjection()).run();
+	expect(
+		await getRuntimePublicationService().restartAgentTask({
+			taskId: "task-projection",
+			logicalRunId: run.logicalRunId,
+			subagentNarratorId: "actor",
+			subagentType: "general",
+			toolUseId: "test-tool-use",
+			expectedStatus: "completed",
+			now: time,
+		}),
+	).toEqual({ id: "task-projection" });
+	expect(
+		db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "task-projection")).get(),
+	).toMatchObject({ status: "running", logicalRunId: run.logicalRunId });
 });
 
 test("foreground terminal persists then consumes atomically, preserves source and never publishes notices", async () => {
@@ -142,7 +343,7 @@ test("foreground terminal persists then consumes atomically, preserves source an
 	}
 });
 
-test("readonly result lookup never adopts old history/compact or initial idle as a terminal result", () => {
+test("readonly result lookup never adopts old history/compact or initial idle as a terminal result", async () => {
 	assistant("old", "OLD RESULT", 0);
 	db.insert(messages)
 		.values({
@@ -165,33 +366,35 @@ test("readonly result lookup never adopts old history/compact or initial idle as
 		.run();
 	const run = start();
 	const before = db.select().from(outbox).all();
-	expect(service.readAgentTerminalResult(run)).toBeNull();
-	expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
 	assistant("current", "CURRENT RUN RESULT", 2);
-	expect(service.readAgentTerminalResult(run)).toBeNull();
-	expect(service.readAgentTerminalResult(run, { settledRunId: "different-run" })).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readAgentTerminalResult(run, { settledRunId: "different-run" })).toBeNull();
 	for (const status of ["working", "waiting"] as const) {
 		db.update(narrators).set({ status }).where(eq(narrators.id, "actor")).run();
-		expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
+		expect(
+			await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId }),
+		).toBeNull();
 	}
 	db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "actor")).run();
-	expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toEqual({
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toEqual({
 		output: "CURRENT RUN RESULT",
 		sourceResultRef: "message:current",
 	});
 	expect(db.select().from(outbox).all()).toEqual(before);
 	start();
-	expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
 });
 
-test("snapshot requires committed terminal proof and remains readable after consume/GC without UI-edit drift", () => {
+test("snapshot requires committed terminal proof and remains readable after consume/GC without UI-edit drift", async () => {
 	const run = start();
 	const resultRef = snapshot(run, "IMMUTABLE RUN RESULT", false);
-	expect(service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
 	db.transaction((tx) =>
 		service.commit({ ...run, eventKind: "completed", resultRef, summary: "done" }, tx),
 	);
-	expect(service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
 	const id = `publication-result:${run.logicalRunId}`;
 	const original = readTestMessageContent(sqlite, id);
 	db.update(messages)
@@ -202,42 +405,110 @@ test("snapshot requires committed terminal proof and remains readable after cons
 		})
 		.where(eq(messages.id, id))
 		.run();
-	expect(service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
 	service.consumeAwaitedTerminal(run);
 	db.delete(mailbox).run();
-	expect(service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
-	expect(service.readAgentTerminalResult({ ...run, logicalRunId: "different" })).toBeNull();
-	expect(service.readAgentTerminalResult({ ...run, recipientId: "other-parent" })).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "IMMUTABLE RUN RESULT" });
+	expect(await service.readAgentTerminalResult({ ...run, logicalRunId: "different" })).toBeNull();
+	expect(await service.readAgentTerminalResult({ ...run, recipientId: "other-parent" })).toBeNull();
 	db.update(messages)
 		.set({ originalContentJson: [{ type: "text", text: "x".repeat(300_000) }] })
 		.where(eq(messages.id, id))
 		.run();
-	expect(service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
 });
 
-test("queued/cancelled mailbox dedupe is a terminal authority even after outbox transfer and actor restart", () => {
+test("rows-only terminal receipt uses its bounded body while original output stays authoritative", async () => {
+	const run = start();
+	snapshot(run, "ORIGINAL RECEIPT");
+	const id = `publication-result:${run.logicalRunId}`;
+	const stored = db.select().from(messages).where(eq(messages.id, id)).get();
+	const body = readTestMessageContent(sqlite, id);
+	expect(body).toHaveLength(1);
+	const [block] = splitEnvelope({
+		id,
+		narratorId: "actor",
+		role: "disp",
+		contentJson: body,
+		contentText: stored?.contentText ?? null,
+		parentToolUseId: null,
+	}).blocks;
+	if (!block) throw new Error("Receipt fixture requires a stored block");
+	db.delete(narratorBlocks).where(eq(narratorBlocks.messageId, id)).run();
+	db.insert(narratorBlocks)
+		.values({
+			id: `receipt-block:${run.logicalRunId}`,
+			messageId: id,
+			ordinal: 0,
+			kind: block.kind,
+			subtype: block.subtype,
+			phase: block.phase,
+			payload: block.payload,
+			state: block.state,
+			createdAt: time,
+		})
+		.run();
+	db.update(messages)
+		.set({ bodyFormat: 2, bodyRowsOnly: 1, contentJson: [] })
+		.where(eq(messages.id, id))
+		.run();
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "ORIGINAL RECEIPT" });
+	db.update(messages).set({ originalContentJson: body }).where(eq(messages.id, id)).run();
+	db.update(narratorBlocks)
+		.set({ payload: { raw: [{ type: "text", text: "EDITED BODY" }] } })
+		.where(eq(narratorBlocks.messageId, id))
+		.run();
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "ORIGINAL RECEIPT" });
+	db.update(messages)
+		.set({ originalContentJson: [{ type: "text", text: "x".repeat(300_000) }] })
+		.where(eq(messages.id, id))
+		.run();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
+});
+
+test("queued/cancelled mailbox dedupe is a terminal authority even after outbox transfer and actor restart", async () => {
 	const run = start();
 	snapshot(run, "FIRST RUN");
 	service.store.transferNext("parent", "agent");
-	expect(service.readAgentTerminalResult(run)).toEqual({ output: "FIRST RUN" });
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "FIRST RUN" });
 	db.update(mailbox).set({ state: "cancelled", text: "", metadataJson: null }).run();
 	const next = start();
-	expect(service.readAgentTerminalResult(run)).toEqual({ output: "FIRST RUN" });
-	expect(service.readAgentTerminalResult(next)).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toEqual({ output: "FIRST RUN" });
+	expect(await service.readAgentTerminalResult(next)).toBeNull();
 });
 
-test("foreground deferred getter → consume → late commit preserves the actual full-source message", () => {
+test("Worker result projections preserve leading BOM, whitespace and Unicode exactly", async () => {
+	const run = start();
+	const text = "\uFEFF  exact\r\n故障🙂  ";
+	assistant("exact-source", text, 0);
+	sqlite
+		.prepare("UPDATE narrator_messages SET content_text = CAST(? AS TEXT) WHERE id = ?")
+		.run(Buffer.from(text), "exact-source");
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toEqual({
+		output: text,
+		sourceResultRef: "message:exact-source",
+	});
+	snapshot(run, text);
+	expect(await service.readAgentTerminalResult(run)).toEqual({
+		output: text,
+		sourceResultRef: "message:exact-source",
+	});
+});
+
+test("foreground deferred getter → consume → late commit preserves the actual full-source message", async () => {
 	const run = start();
 	const text = `FOREGROUND RESULT ${"x".repeat(40_000)}`;
 	assistant("foreground-source", text, 0);
-	const result = service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId });
+	const result = await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId });
 	expect(result?.output).toContain("Output truncated.");
 	expect(result?.sourceResultRef).toBe("message:foreground-source");
 	start(); // Start a new run BEFORE consumption to exercise read→consume ABA.
 	assistant("future-source", "FUTURE RUN RESULT", 1);
 	service.consumeAwaitedTerminal(run, { sourceResultRef: result?.sourceResultRef });
 	service.consumeAwaitedTerminal(run, { sourceResultRef: "message:future-source" }); // first receipt wins
-	expect(service.readAgentTerminalResult(run)?.sourceResultRef).toBe("message:foreground-source");
+	expect((await service.readAgentTerminalResult(run))?.sourceResultRef).toBe(
+		"message:foreground-source",
+	);
 	snapshot(run, text);
 	const body = readTestMessageContent<{ publicationResult?: { sourceResultRef?: string } }>(
 		sqlite,
@@ -245,15 +516,15 @@ test("foreground deferred getter → consume → late commit preserves the actua
 	);
 	const block = body[0];
 	expect(block?.publicationResult?.sourceResultRef).toBe("message:foreground-source");
-	expect(service.readAgentTerminalResult(run)?.output).toContain("Output truncated.");
+	expect((await service.readAgentTerminalResult(run))?.output).toContain("Output truncated.");
 });
 
-test("deferred assistant output is source-after-only and bounded; absent/thinking-only output is not received", () => {
+test("deferred assistant output is source-after-only and bounded; absent/thinking-only output is not received", async () => {
 	const run = start();
 	assistant("large", "x".repeat(300_000), 0);
-	expect(service.readAgentTerminalResult(run)).toBeNull();
+	expect(await service.readAgentTerminalResult(run)).toBeNull();
 	expect(
-		service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })?.output,
+		(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId }))?.output,
 	).toHaveLength(12_000);
 	db.update(messages)
 		.set({
@@ -262,7 +533,7 @@ test("deferred assistant output is source-after-only and bounded; absent/thinkin
 		})
 		.where(eq(messages.id, "large"))
 		.run();
-	expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toEqual({
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toEqual({
 		output: "BEFORE EDIT",
 		sourceResultRef: "message:large",
 	});
@@ -274,5 +545,5 @@ test("deferred assistant output is source-after-only and bounded; absent/thinkin
 		})
 		.where(eq(messages.id, "large"))
 		.run();
-	expect(service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
+	expect(await service.readAgentTerminalResult(run, { settledRunId: run.logicalRunId })).toBeNull();
 });
