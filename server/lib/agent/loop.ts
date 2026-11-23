@@ -381,8 +381,11 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
  * a message. Whatever comes next arrives later as its own input, so after a round with
  * one the model may rightly have nothing to add yet.
  */
-function handsOffWork(toolUse: AgentToolUse): boolean {
-	if (toolUse.name === "Send" || toolUse.name === "Agent" || toolUse.name === "Watch") return true;
+function handsOffWork(toolUse: AgentToolUse, result: ToolExecResult | undefined): boolean {
+	if (toolUse.name === "Watch") {
+		return !result?.isError && result?.metadata?.status === "watching";
+	}
+	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
 	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
 }
 
@@ -8051,7 +8054,9 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			yield { type: "turn_complete", turnIndex };
-			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
+			quietFinishAllowed =
+				!!config.bot ||
+				toolUses.some((toolUse) => handsOffWork(toolUse, stepResults.get(toolUse.toolUseId)));
 			turnIndex++;
 		} catch (error) {
 			if (isCheckpointStop(error)) {

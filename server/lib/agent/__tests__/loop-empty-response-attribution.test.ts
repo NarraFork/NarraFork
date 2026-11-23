@@ -8,7 +8,7 @@ import {
 } from "../codex-websocket";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
-import { type AgentConfig, type AgentEvent, ApiError } from "../types";
+import { type AgentConfig, type AgentEvent, ApiError, type ToolResult } from "../types";
 
 /**
  * These tests pin the two halves of the "every failure looks the same" defect:
@@ -569,6 +569,7 @@ describe("an empty reply after handing work off is a finish", () => {
 		tail: typeof quietTail,
 		call: typeof quietCall = { name: "__QuietFinishTest", input: "{}" },
 		intermediateTool = false,
+		result: ToolResult = { output: "Started.", metadata: { status: "watching" } },
 	) {
 		providerScenario = "tool_then_quiet";
 		providerAttempts = 0;
@@ -581,7 +582,7 @@ describe("an empty reply after handing work off is a finish", () => {
 			name: call.name,
 			description: "Stand-in tool",
 			parameters: z.object({}).passthrough(),
-			execute: async () => ({ output: "Started." }),
+			execute: async () => result,
 		});
 		try {
 			return await runLoop({ maxTurns: 4, ...overrides });
@@ -619,6 +620,24 @@ describe("an empty reply after handing work off is a finish", () => {
 	});
 
 	const reasoningOnly = { reasoning: "waiting for the result", reasoningOutputIndex: 0 };
+	test.each([
+		{ output: "Already finished.", metadata: { status: "completed" } },
+		{ output: "Disconnected." },
+		{ output: "Registration failed.", isError: true, metadata: { status: "watching" } },
+	])("Watch without a registered observation still retries: %j", async (result) => {
+		const events = await quietRun(
+			{},
+			reasoningOnly,
+			{ name: "Watch", input: '{"type":"terminal","id":"term-1"}' },
+			false,
+			result,
+		);
+		expect(events.at(-1)).toMatchObject({
+			type: "invalid_state",
+			reason: "reasoning_only_exhausted",
+		});
+		expect(providerAttempts).toBeGreaterThan(2);
+	});
 	test.each([
 		["Watch", '{"type":"terminal","id":"term-1"}'],
 		["Send", '{"id":"parent","message":"done"}'],
