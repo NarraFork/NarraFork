@@ -69,7 +69,7 @@ const server = Bun.serve({
 				return new Response("unauthorized", {
 					status: 401,
 					headers: {
-						"WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`,
+						"WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"`,
 					},
 				});
 			const mcp = new McpServer({ name: "fixture", version: "1.0.0" });
@@ -228,6 +228,43 @@ describe("MCP OAuth", () => {
 		});
 		oauth.deleteMcpOAuth(cfg.id);
 		expect(oauth.getMcpOAuthStatus(cfg).hasClientSecret).toBe(false);
+	});
+
+	test("consent uses the challenged scope when none is configured", async () => {
+		await mcpManager.testConnection(config);
+		const started = await oauth.startMcpOAuth(config, redirectUrl);
+		if (!("authorizationUrl" in started)) throw new Error("expected a redirect");
+		expect(new URL(started.authorizationUrl).searchParams.get("scope")).toBe("mcp:tools");
+	});
+
+	test("re-authorization always asks for consent and an abandoned one keeps the old grant", async () => {
+		await authorize();
+		const again = await oauth.startMcpOAuth(config, "https://other.example/api/mcp/oauth/callback");
+		expect("authorizationUrl" in again).toBe(true);
+		expect(oauth.getMcpOAuthStatus(config).authorized).toBe(true);
+		expect((await mcpManager.testConnection(config)).ok).toBe(true);
+	});
+
+	test("testing an unsaved URL does not touch the saved server's credentials", async () => {
+		await authorize();
+		const edited = { ...config, id: "test-remote", url: `${baseUrl}/mcp?draft=1` };
+		expect(await mcpManager.testConnection(edited, config.id)).toMatchObject({
+			authRequired: true,
+		});
+		expect(oauth.getMcpOAuthStatus(config).authorized).toBe(true);
+	});
+
+	test("sign-out during an in-flight exchange is not undone", async () => {
+		const started = await oauth.startMcpOAuth(config, redirectUrl);
+		if (!("authorizationUrl" in started)) throw new Error("expected a redirect");
+		const state = new URL(started.authorizationUrl).searchParams.get("state") ?? "";
+		await expect(
+			oauth.finishMcpOAuth(state, "good-code", (id) => {
+				oauth.signOutMcpOAuth(id);
+				return config;
+			}),
+		).rejects.toThrow("reset");
+		expect(oauth.getMcpOAuthStatus(config).authorized).toBe(false);
 	});
 
 	test("a static Authorization header opts the server out of OAuth", () => {
