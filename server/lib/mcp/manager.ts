@@ -108,6 +108,18 @@ interface ActiveClient {
 	refreshAgain?: boolean;
 }
 
+// At most 3 UTF-8 bytes per UTF-16 unit, so a capped result stays under the
+// pipeline's 256 KiB per-capture limit.
+const MAX_STRUCTURED_CONTENT_CHARS = 80_000;
+
+/** Spec 2025-06-18+: structured results SHOULD be mirrored as text; serialize when a server omits it. */
+function structuredContentText(structured: unknown): string {
+	const json = JSON.stringify(structured) ?? "null";
+	if (json.length <= MAX_STRUCTURED_CONTENT_CHARS) return json;
+	// Notice first: output previews keep the tail, so the JSON excerpt must be the last line.
+	return `[structured content truncated: first ${MAX_STRUCTURED_CONTENT_CHARS} of ${json.length} chars]\n${json.slice(0, MAX_STRUCTURED_CONTENT_CHARS)}`;
+}
+
 class McpManager {
 	private clients = new Map<string, ActiveClient>();
 	private _shuttingDown = false;
@@ -510,6 +522,9 @@ class McpManager {
 			data?: string;
 			mimeType?: string;
 			resource?: unknown;
+			uri?: string;
+			name?: string;
+			title?: string;
 		}>;
 		isError?: boolean;
 	}> {
@@ -538,12 +553,7 @@ class McpManager {
 			content:
 				result.content.length || result.structuredContent === undefined
 					? result.content
-					: [
-							{
-								type: "text",
-								text: "The MCP server returned structured content only (currently not displayed). The tool call has completed.",
-							},
-						],
+					: [{ type: "text", text: structuredContentText(result.structuredContent) }],
 			isError: result.isError,
 		};
 	}

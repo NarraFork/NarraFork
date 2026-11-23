@@ -260,15 +260,30 @@ describe("MCP uses one published directory without output-schema compilation", (
 		expect(calls).toHaveLength(2);
 	});
 
-	test("structured-only content is reported as completed but not displayed, without replay", async () => {
+	test("structured-only content is serialized as text, without replay", async () => {
 		await mcpManager.connect(config);
-		result = { content: [], structuredContent: { value: 42 } };
+		result = { content: [], structuredContent: { value: 42, nested: { ok: true } } };
 		const response = await mcpManager.callTool(config.id, "plain", {});
-		expect(response.content).toHaveLength(1);
-		expect(response.content[0].text).toContain("structured content only");
-		expect(response.content[0].text).toContain("call has completed");
+		expect(response.content).toEqual([{ type: "text", text: '{"value":42,"nested":{"ok":true}}' }]);
 		expect(response.isError).toBeUndefined();
-		expect(calls).toEqual(["plain"]);
+		const large = { value: "x".repeat(200_000) };
+		result = { content: [], structuredContent: large };
+		const capped = (await mcpManager.callTool(config.id, "plain", {})).content[0].text ?? "";
+		const [notice, excerpt] = capped.split("\n");
+		expect(notice).toBe("[structured content truncated: first 80000 of 200012 chars]");
+		expect(excerpt).toBe(JSON.stringify(large).slice(0, 80_000));
+		expect(calls).toEqual(["plain", "plain"]);
+	});
+
+	test("resource links and audio content pass through the validated envelope", async () => {
+		await mcpManager.connect(config);
+		result = {
+			content: [
+				{ type: "audio", data: "AA==", mimeType: "audio/wav" },
+				{ type: "resource_link", uri: "file:///a.txt", name: "a.txt" },
+			],
+		};
+		expect((await mcpManager.callTool(config.id, "plain", {})).content).toEqual(result.content);
 	});
 
 	test("discovery keeps its per-page timeout and tool calls forward AbortSignal", async () => {
