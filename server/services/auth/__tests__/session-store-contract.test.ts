@@ -17,7 +17,7 @@
  *   - a bump for an unknown account answers 0 and changes nothing (the pre-port
  *     `?? 0` behaviour, preserved verbatim).
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on a file-backed fixture, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -25,18 +25,21 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Locale } from "@shared/i18n-locales";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
 const { sqliteAuthSessionStore: store } = await import("../sqlite-session-store");
 const { authSessionStore } = await import("../store");
 
-afterAll(() => {
+afterAll(async () => {
+	await close();
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
 });

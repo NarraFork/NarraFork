@@ -51,6 +51,7 @@ import {
 	type RecentTabsInfiniteData,
 	recentTabsSectionQueryKey,
 	reconcileRecentTabsRuntimePatches,
+	refreshRecentTabsAfterReconnect,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
 	snapshotRecentTabRuntimeVersions,
@@ -474,7 +475,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		const now = Date.now();
 		if (now - lastReconnectRefreshRef.current < 5000) return;
 		lastReconnectRefreshRef.current = now;
-		void Promise.all([refreshRecentTabsLoadedWindow(qc), refreshRuntime()]).catch(() => {
+		void Promise.all([refreshRecentTabsAfterReconnect(qc), refreshRuntime()]).catch(() => {
 			notifications.show({ color: "red", message: t("recentTabsSyncError") });
 		});
 	}, [qc, refreshRuntime, t]);

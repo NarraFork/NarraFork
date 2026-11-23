@@ -1471,6 +1471,7 @@ export async function assertDbReadersReady(
 	dbPath: string,
 	options: Pick<RunReadTaskOptions, "timeoutMs" | "signal"> = {},
 ): Promise<void> {
+	if (workersDisabled() === "worker_unavailable") resumeDbWorkerPool();
 	const disabled = workersDisabled();
 	if (disabled) throw new WorkersUnavailableError(disabled);
 	const timeoutMs = options.timeoutMs ?? 30_000;

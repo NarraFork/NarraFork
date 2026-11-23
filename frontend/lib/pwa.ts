@@ -1,5 +1,17 @@
 import { STARTUP_STATUS_HEADER } from "@shared/startup-status";
-import { apiUrl } from "./base-path";
+import { apiUrl, getAppBase } from "./base-path";
+
+const WORKER_UPDATE_TIMEOUT_MS = 8000;
+
+function isAppRegistration(registration: ServiceWorkerRegistration): boolean {
+	try {
+		const base = new URL(getAppBase(), window.location.href);
+		const scope = new URL(registration.scope);
+		return scope.origin === base.origin && scope.pathname.startsWith(base.pathname);
+	} catch {
+		return false;
+	}
+}
 
 interface ServerHealth {
 	/** Overall health status reported by the replacement server. */
@@ -135,13 +147,12 @@ export async function fetchServerHealth(
 }
 
 /**
- * Clear all PWA caches and unregister service workers.
+ * Clear this app's PWA caches and unregister its service workers.
  * Used when applying updates to ensure fresh assets are loaded.
  */
 export async function clearPwaCache(): Promise<void> {
 	// Independent tasks: a broken/hung SW API must not prevent Cache Storage cleanup.
 	const unregister = async () => {
-		// Unregister all service workers controlling this origin.
 		if ("serviceWorker" in navigator) {
 			const registrations =
 				typeof navigator.serviceWorker.getRegistrations === "function"
@@ -150,18 +161,20 @@ export async function clearPwaCache(): Promise<void> {
 							(reg): reg is ServiceWorkerRegistration => !!reg,
 						);
 
-			if (registrations.length > 0) {
+			const appRegistrations = registrations.filter(isAppRegistration);
+			if (appRegistrations.length > 0) {
 				await Promise.allSettled(
-					registrations.map((reg) => Promise.resolve().then(() => reg.unregister())),
+					appRegistrations.map((reg) => Promise.resolve().then(() => reg.unregister())),
 				);
-				console.log(`[PWA] Unregistered ${registrations.length} service workers`);
+				console.log(`[PWA] Unregistered ${appRegistrations.length} service workers`);
 			}
 		}
 	};
 	const clearCaches = async () => {
-		// Clear all Cache Storage entries.
 		if ("caches" in window) {
-			const keys = await caches.keys();
+			const keys = (await caches.keys()).filter(
+				(key) => key.startsWith("workbox-precache") || key.startsWith("narrafork-"),
+			);
 			if (keys.length > 0) {
 				await Promise.allSettled(keys.map((k) => Promise.resolve().then(() => caches.delete(k))));
 				console.log(`[PWA] Cleared ${keys.length} caches`);
@@ -212,6 +225,64 @@ export function leaveForStartupPageIfStarting(response: Response): void {
 
 let reloadPromise: Promise<void> | undefined;
 
+function tryWorkerUpdate(): Promise<boolean> {
+	const serviceWorker = navigator.serviceWorker;
+	if (!serviceWorker?.getRegistration) return Promise.resolve(false);
+	return new Promise((resolve) => {
+		const previousController = serviceWorker.controller;
+		let registration: ServiceWorkerRegistration | undefined;
+		let channel: MessageChannel | undefined;
+		let settled = false;
+		const controller = new AbortController();
+		const finish = (updated: boolean) => {
+			if (settled) return;
+			settled = true;
+			window.clearTimeout(timeout);
+			controller.abort();
+			serviceWorker.removeEventListener("controllerchange", changed);
+			channel?.port1.close();
+			channel?.port2.close();
+			resolve(updated);
+		};
+		const changed = () => {
+			if (
+				registration?.active &&
+				serviceWorker.controller !== previousController &&
+				serviceWorker.controller === registration.active
+			)
+				finish(true);
+		};
+		const timeout = window.setTimeout(() => finish(false), WORKER_UPDATE_TIMEOUT_MS);
+		serviceWorker.addEventListener("controllerchange", changed);
+		void (async () => {
+			registration = await serviceWorker.getRegistration(
+				new URL(getAppBase(), window.location.href).href,
+			);
+			if (settled) return;
+			if (!registration || !isAppRegistration(registration)) return finish(false);
+			await registration.update();
+			if (settled) return;
+			const active = registration.active;
+			if (!active) return;
+			const health = await fetchServerHealth(3000, controller.signal);
+			if (settled || !health?.version) return;
+			const { appVersionsMatch } = await import("./version-match");
+			if (settled) return;
+			const serverVersion = health.version;
+			channel = new MessageChannel();
+			channel.port1.onmessage = (event) => {
+				if (
+					typeof event.data?.version === "string" &&
+					appVersionsMatch(event.data.version, serverVersion)
+				) {
+					finish(true);
+				}
+			};
+			active.postMessage({ type: "GET_VERSION" }, [channel.port2]);
+		})().catch(() => finish(false));
+	});
+}
+
 /**
  * Coalesce concurrent refresh attempts, but allow retry if the page stays alive
  * (e.g. the user cancels beforeunload). Automatic version checks keep their own
@@ -220,10 +291,10 @@ let reloadPromise: Promise<void> | undefined;
  * to use the network (it may ignore search). Unregistration is best effort and does not
  * detach the current document; SW navigation handling must also be network-first.
  */
-export function clearPwaCacheAndReload(): Promise<void> {
+export function clearPwaCacheAndReload({ clearCaches = false } = {}): Promise<void> {
 	reloadPromise ??= Promise.resolve()
 		.then(async () => {
-			await clearPwaCache();
+			if (clearCaches || !(await tryWorkerUpdate())) await clearPwaCache();
 			window.location.replace(networkReloadUrl());
 		})
 		.finally(() => {

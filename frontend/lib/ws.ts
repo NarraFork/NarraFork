@@ -62,7 +62,7 @@ function isLocalViteDirect(vitePort: string): boolean {
  * that occurs when React StrictMode unmounts during the CONNECTING phase.
  *
  * Detaches all handlers first, then either closes immediately (if OPEN) or
- * waits for the connection to open before closing (if CONNECTING).
+ * allows a CONNECTING socket one second to open before closing it anyway.
  */
 export function safeCloseWs(
 	ws: BusinessSocket | null,
@@ -72,9 +72,21 @@ export function safeCloseWs(
 	ws.onmessage = null;
 	ws.onerror = null;
 	if (ws.readyState === 0) {
-		// Wait for the connection to establish, then close it cleanly
-		ws.onopen = () => ws.close();
-		ws.onclose = null;
+		const timer = setTimeout(() => {
+			ws.onopen = null;
+			ws.onclose = null;
+			if (ws.readyState === 0) ws.close();
+		}, 1000);
+		ws.onopen = () => {
+			clearTimeout(timer);
+			ws.onopen = null;
+			ws.close();
+		};
+		ws.onclose = () => {
+			clearTimeout(timer);
+			ws.onopen = null;
+			ws.onclose = null;
+		};
 	} else {
 		ws.onopen = null;
 		ws.onclose = null;
