@@ -1964,6 +1964,8 @@ interface McpServerDraft {
 	/** New OAuth client secret; empty keeps the saved one. Never filled from the server. */
 	oauthClientSecret: string;
 	hasOAuthClientSecret: boolean;
+	/** URL and client id the saved secret belongs to; changing either drops it. */
+	oauthSecretBinding: string;
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
 	mode: McpLoadingMode;
@@ -1989,6 +1991,7 @@ const EMPTY_DRAFT: McpServerDraft = {
 	oauthScope: "",
 	oauthClientSecret: "",
 	hasOAuthClientSecret: false,
+	oauthSecretBinding: "",
 	originalEnvKeys: [],
 	originalHeaderKeys: [],
 	mode: "auto",
@@ -2231,6 +2234,7 @@ function McpToolsTab() {
 				oauthScope: server.oauth?.scope ?? "",
 				oauthClientSecret: "",
 				hasOAuthClientSecret: server.auth?.hasClientSecret ?? false,
+				oauthSecretBinding: `${server.url ?? ""}\n${server.oauth?.clientId ?? ""}`,
 				originalEnvKeys: [...envKeys],
 				originalHeaderKeys: [...headerKeys],
 				mode: resolveMcpLoadingMode(server),
@@ -2255,6 +2259,8 @@ function McpToolsTab() {
 				.map((a) => a.trim())
 				.filter(Boolean);
 			if (d.cwd.trim()) payload.cwd = d.cwd.trim();
+			if (includeClears) payload.oauth = null;
+			if (d.hasOAuthClientSecret) payload.oauthClientSecret = null;
 		} else {
 			payload.url = normalizeUrlProtocol(d.url) ?? "";
 			const clientId = d.oauthClientId.trim();
@@ -2264,9 +2270,11 @@ function McpToolsTab() {
 			} else if (includeClears) {
 				payload.oauth = null;
 			}
+			// A client secret belongs to one pre-registered client; changing it drops the secret.
+			const binding = `${payload.url}\n${clientId}`;
 			if (clientId && d.oauthClientSecret) payload.oauthClientSecret = d.oauthClientSecret;
-			// A client secret belongs to a pre-registered client; dropping the client drops it.
-			else if (!clientId && d.hasOAuthClientSecret) payload.oauthClientSecret = null;
+			else if (d.hasOAuthClientSecret && (!clientId || binding !== d.oauthSecretBinding))
+				payload.oauthClientSecret = null;
 		}
 
 		if (includeClears) {
