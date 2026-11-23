@@ -227,6 +227,47 @@ test("queue replacement conflicts without overwriting a newer edit", async () =>
 	expect((await buffer.getBufferedMessages("actor")).map((row) => row.text)).toEqual(["newer"]);
 });
 
+test("a Spec replacement lost to a claim enqueues the new notice", async () => {
+	register();
+	const update = {
+		uri: "spec://claim.json",
+		path: "claim.json",
+		revisionId: "one",
+		updatedBy: "user" as const,
+		preview: null,
+		taskSummary: "first",
+		timestamp: now,
+	};
+	await interjectSpecEditAsUserMessage("actor", update, "en", null);
+	const [previous] = await buffer.getBufferedMessages("actor");
+	const { createMailboxStore } = await import("../agent-runtime/mailbox");
+	const store = createMailboxStore(db);
+	const gate = gateRead("narrator_buffered_messages");
+	const work = interjectSpecEditAsUserMessage(
+		"actor",
+		{ ...update, taskSummary: "replacement notice" },
+		"en",
+		null,
+	);
+	try {
+		await gate.entered;
+		const claimed = store.claimBatch("actor", { token: "owner", epoch: "epoch" }, { count: 1 });
+		expect(claimed.map((row) => row.id)).toEqual([previous.id]);
+	} finally {
+		gate.release();
+	}
+	expect(await work).toEqual({ delivered: "interjected" });
+	gate.restore();
+	const queued = await buffer.getBufferedMessages("actor");
+	expect(queued).toHaveLength(1);
+	expect(queued[0].id).not.toBe(previous.id);
+	expect(queued[0].text).toContain("replacement notice");
+	expect(db.select().from(mailbox).where(eq(mailbox.id, previous.id)).get()).toMatchObject({
+		state: "claimed",
+		text: previous.text,
+	});
+});
+
 test("a concurrent enqueue cannot be erased by an empty soft-stop observation", async () => {
 	const active = register();
 	active._bufferSoftStop = true;

@@ -24,9 +24,11 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	getBufferedMessages,
 	pushBufferedMessage,
+	readBufferedMessageDeliveryReceipt,
 	toBufferSummary,
 	updateBufferedMessage,
 } from "./narrator-buffer";
@@ -157,7 +159,15 @@ export async function interjectSpecEditAsUserMessage(
 	// into one message at its original position rather than stacking in reverse.
 	const trackedId = specEditInterjectIds.get(narratorId);
 	if (trackedId) {
-		if (await updateBufferedMessage(narratorId, trackedId, text)) {
+		let replaced = false;
+		try {
+			replaced = await updateBufferedMessage(narratorId, trackedId, text);
+		} catch (error) {
+			if (!(error instanceof RuntimeReadConflictError)) throw error;
+			const receipt = await readBufferedMessageDeliveryReceipt(narratorId, trackedId);
+			if (receipt?.state === "queued" || receipt?.state === "failed") throw error;
+		}
+		if (replaced) {
 			requestBufferedMessageSoftStop(narratorId);
 			await broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };
