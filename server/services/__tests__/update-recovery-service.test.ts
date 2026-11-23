@@ -1950,6 +1950,7 @@ describe("planned update continuation scheduling", () => {
 		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
 		const runtime = await import("../agent-runtime/orchestrator");
 		const finishLoop = Promise.withResolvers<void>();
+		const loopEntered = Promise.withResolvers<void>();
 		const buffer = await import("../narrator-buffer");
 		if (input !== "plain") {
 			sqlite
@@ -2000,6 +2001,7 @@ describe("planned update continuation scheduling", () => {
 			async (current, owner, _text, _images, _run, prePromptBashCommand) => {
 				expect(owner.isCurrent()).toBe(true);
 				current._loopRunning = true;
+				loopEntered.resolve();
 				if (prePromptBashCommand)
 					await narratorModule.handleBashCommand(
 						"owner",
@@ -2016,6 +2018,7 @@ describe("planned update continuation scheduling", () => {
 		try {
 			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 			await recovery?.completion;
+			await loopEntered.promise;
 			expect(runtimeSpy).toHaveBeenCalledTimes(1);
 			expect(active._currentUserId).toBe(input === "plain" ? "acl-user" : "queued-user");
 			expect(bashSpy).toHaveBeenCalledTimes(input.includes("bash") ? 1 : 0);
@@ -2035,9 +2038,10 @@ describe("planned update continuation scheduling", () => {
 				]);
 			}
 		} finally {
+			const { getRunControl } = await import("../agent-runtime/ownership");
+			const terminal = getRunControl("owner")?.terminal;
 			finishLoop.resolve();
-			// Serialize with runtime ownership release before the next isolated case.
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await terminal;
 			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
 			activeNarrators.delete("owner");
 			historySpy.mockRestore();

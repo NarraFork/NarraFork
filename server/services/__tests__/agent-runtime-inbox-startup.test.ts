@@ -1,9 +1,10 @@
 import { afterAll, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narrators } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const inbox = await import("../agent-runtime/inbox");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
@@ -15,10 +16,10 @@ const store = createMailboxStore(db);
 const time = "2026-09-09T00:00:00.000Z";
 for (const id of ["previous", "live", "legacy", "legacy-live", "barrier", "sender"])
 	db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
-afterAll(() => {
+afterAll(async () => {
 	for (const id of ["live", "legacy-live", "barrier"]) getExecutionOwner(id)?.release();
 	runtimePublication.stop();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 function enqueue(id: string, text = "accepted bytes") {
 	const result = store.enqueue({

@@ -18,9 +18,10 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { getTestDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -134,7 +135,8 @@ beforeEach(() => {
 
 afterEach(resetFixture);
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.module("../narrator-session", () => realNarratorSession);
 	mock.restore();

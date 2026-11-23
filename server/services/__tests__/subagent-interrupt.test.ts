@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { getTestDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
 /*
  * Interrupt, queue and control semantics of a run that delivers to a tool call (a
@@ -24,7 +24,8 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		expect(result.status).toBe(0);
 	}, 65_000);
 } else {
-	const { db, sqlite } = getTestDb();
+	const { db, sqlite, ready } = getRuntimeTestDb();
+	await ready;
 	const { narrators } = await import("../../db/schema");
 	// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 	const realDbModule = { ...(await import("../../db")) };
@@ -173,9 +174,10 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		await clearBufferedMessages(SUBAGENT_ID);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		mock.module("../../db", () => realDbModule);
 		mock.restore();
+		await closeRuntimeTestDb(sqlite);
 	});
 
 	describe("interrupted pass planning", () => {

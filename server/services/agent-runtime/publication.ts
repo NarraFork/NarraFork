@@ -1408,7 +1408,7 @@ function createSqliteAsyncPublicationService(
 					.limit(1),
 				{ executionPolicy: "worker-required", maxRows: 1 },
 			);
-			if (!existing) return undefined;
+			if (!existing || existing.status !== input.expectedStatus) return undefined;
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
 					const current = tx

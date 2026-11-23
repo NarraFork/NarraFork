@@ -28,6 +28,7 @@ import {
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { drainRuntimeTestWork } from "./agent-runtime-test-database";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -98,6 +99,7 @@ afterEach(async () => {
 		activeNarrators.delete(id);
 		setRunHold(id, undefined);
 	}
+	await drainRuntimeTestWork();
 	mock.restore();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
