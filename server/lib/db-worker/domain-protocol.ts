@@ -1,5 +1,5 @@
-import type { readIntegrationAuthoritySnapshotTask } from "../../services/integration-authority-read-task";
 import { DbReadError } from "./errors";
+import type { readIntegrationAuthoritySnapshotTask } from "./integration-authority-read-task";
 import type { ReadBudgetMeter } from "./read-budget";
 
 export interface DomainReadTaskMap {

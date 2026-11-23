@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
-import type { integrationAuthorities, integrationCapabilityGrants } from "../db/schema";
-import { DbReadError } from "../lib/db-worker/errors";
+import type { integrationAuthorities, integrationCapabilityGrants } from "../../db/schema";
+import { DbReadError } from "./errors";
 
 export interface IntegrationAuthoritySnapshotReadInput {
 	authorityId: string;

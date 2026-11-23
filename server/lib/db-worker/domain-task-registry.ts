@@ -27,8 +27,7 @@ const loaders: { [K in DomainReadTaskKind]: () => Promise<DomainReadModule<K>> }
 		},
 	}),
 	platformIntegrationAuthoritySnapshot: async () => ({
-		read: (await import("../../services/integration-authority-read-task"))
-			.readIntegrationAuthoritySnapshotTask,
+		read: (await import("./integration-authority-read-task")).readIntegrationAuthoritySnapshotTask,
 	}),
 };
 const loadedModules = new Map<DomainReadTaskKind, Promise<unknown>>();

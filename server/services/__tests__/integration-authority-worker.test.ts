@@ -2,10 +2,10 @@ import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../../db";
 import { integrationAuthorities, integrationCapabilityGrants } from "../../db/schema";
+import { readIntegrationAuthoritySnapshotTask } from "../../lib/db-worker/integration-authority-read-task";
 import * as pool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { WorkerHandle } from "../../lib/worker-runtime/lifecycle";
-import { readIntegrationAuthoritySnapshotTask } from "../integration-authority-read-task";
 import { integrationAuthorityService } from "../integration-authority-service";
 
 const now = "2026-01-01T00:00:00.000Z";
