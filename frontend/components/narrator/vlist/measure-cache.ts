@@ -613,6 +613,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
+		if (r.sourceRanges === true) rev += "|tsr:1";
 		if (r.shimmer === true) rev += "|tw:1";
 		// A DRILLED-IN row nests a whole tool card, so the trace's height now depends
 		// on that card's own height-bearing fields. `opts.expandedIndices` only tells

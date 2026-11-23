@@ -1,11 +1,24 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type {
 	GitStatusFilterChar,
-	GitStatusPage,
+	GitStatusPageCacheState,
+	GitStatusPageResult,
 	GitStatusPageStatsQuery,
-	GitStatusPageStatsResult,
+	GitStatusPageStatsResponse,
 	GitStatusPageStatsRow,
 } from "@shared/git-status-page";
+
+type GitStatusPage = Extract<GitStatusPageResult, { status: "ready" }>;
+type GitStatusPageStatsResult = Extract<GitStatusPageStatsResponse, { status: "ready" }>;
+let publishedStats = 1;
+const cacheState = (statsVersion = publishedStats, memberVersion = 1): GitStatusPageCacheState => ({
+	status: "ready",
+	workerEpoch: "worker",
+	memberVersion,
+	statsVersion,
+	updating: false,
+});
+
 import { parseHTML } from "linkedom";
 import type { Root } from "react-dom/client";
 import type { GitTarget } from "../lib/api/git";
@@ -27,6 +40,8 @@ const transport = {
 	connected: true,
 	send: (message: Record<string, unknown>) => {
 		sent.push(message);
+		if (message.type === "git_workspace_subscribe")
+			queueMicrotask(() => emit("git_workspace_subscribed", { version: 0 }));
 		return true;
 	},
 	addListener: (_options: unknown, callback: MessageCallback) => {
@@ -73,6 +88,8 @@ const result = (
 ): GitStatusPageStatsResult => {
 	if (!query) throw new Error("Missing statistics request");
 	return {
+		status: "ready",
+		cache: cacheState(),
 		snapshotId: query.snapshotId,
 		rows: query.rows.map((row) => ({ ...row, added, removed: 1, complete: true })),
 	};
@@ -125,6 +142,8 @@ const expired = () =>
 	Object.assign(new Error("expired"), { data: { code: "GIT_STATUS_PAGE_EXPIRED" } });
 function statusPage(snapshotId: string, hasMore = false): GitStatusPage {
 	return {
+		status: "ready",
+		cache: cacheState(),
 		snapshotId,
 		expiresAt: Date.now() + 120_000,
 		files: [{ path: "src/deep/file", status: " M" }],
@@ -145,11 +164,8 @@ function statusPage(snapshotId: string, hasMore = false): GitStatusPage {
 	};
 }
 function emit(type: string, extra: Record<string, unknown> = {}) {
-	const subscriptionId = sent
-		.filter((message) => message.type === "git_workspace_subscribe")
-		.at(-1)?.subscriptionId;
-	for (const listener of listeners.values())
-		listener({ type, subscriptionId, workspaceKey: target.workspaceKey, ...extra });
+	const subscription = sent.filter((message) => message.type === "git_workspace_subscribe").at(-1);
+	for (const listener of listeners.values()) listener({ ...subscription, type, ...extra });
 }
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -162,6 +178,7 @@ beforeEach(() => {
 	listeners.clear();
 	connections.clear();
 	sent.length = 0;
+	publishedStats = 1;
 	transport.connected = true;
 	Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
@@ -179,6 +196,8 @@ afterEach(async () => {
 
 test("viewport identities ignore count feedback and only fetch missing rows, including unknown observations", async () => {
 	const read = spyOn(api, "getGitStatusPageStats").mockImplementation(async (_target, query) => ({
+		status: "ready",
+		cache: cacheState(),
 		snapshotId: query.snapshotId,
 		rows: query.rows.map((row) => ({
 			...row,
@@ -208,6 +227,31 @@ test("viewport identities ignore count feedback and only fetch missing rows, inc
 		removed: 0,
 		complete: true,
 	});
+});
+
+test("a statistics response from before a pause cannot publish after the same subscription is acknowledged", async () => {
+	const pending = deferred<GitStatusPageStatsResult>();
+	const read = spyOn(api, "getGitStatusPageStats")
+		.mockImplementationOnce(() => pending.promise)
+		.mockImplementation(async (_target, query) => result(query, 23));
+	await render({ rows: [file("private.ts")] });
+	const oldSignal = read.mock.calls[0]?.[2];
+	const query = read.mock.calls[0]?.[1];
+	emit("git_workspace_error", {
+		version: 1,
+		kind: "retryable",
+		code: "DB_READ_WORKER_UNAVAILABLE",
+		retrying: true,
+	});
+	emit("git_workspace_subscribed", { version: 2 });
+	await flush();
+	expect(oldSignal?.aborted).toBe(true);
+	expect(read).toHaveBeenCalledTimes(2);
+	expect(latest.data?.rows[0]?.added).toBe(23);
+	pending.resolve(result(query, 99));
+	await flush();
+	expect(latest.data?.rows[0]?.added).toBe(23);
+	expect(sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
 });
 
 test("batching reuses the existing status page row budget", async () => {
@@ -252,7 +296,7 @@ test("ordinary 200-file WS projections and badge pushes never replace viewport s
 	expect(latest.data?.rows[0]?.added).toBe(201);
 });
 
-test("content-only changes abort old statistics while statusPagesChanged remains false", async () => {
+test("content-only changes keep the same statistics epoch until a newer completed version is published", async () => {
 	const old = deferred<GitStatusPageStatsResult>();
 	const read = spyOn(api, "getGitStatusPageStats")
 		.mockImplementationOnce(() => old.promise)
@@ -264,6 +308,17 @@ test("content-only changes abort old statistics while statusPagesChanged remains
 		version: 1,
 		statusPagesChanged: false,
 		categories: ["worktree"],
+	});
+	await flush();
+	expect(read.mock.calls[0]?.[2]?.aborted).toBe(false);
+	expect(latest.source.epoch).toBe(source.epoch);
+	expect(latest.source.updating).toBe(true);
+	expect(read).toHaveBeenCalledTimes(1);
+	publishedStats = 2;
+	emit("git_workspace_snapshot", {
+		version: 2,
+		view: "details",
+		snapshot: { revision: 2, updating: false, statusPages: cacheState() },
 	});
 	await flush();
 	expect(read.mock.calls[0]?.[2]?.aborted).toBe(true);
@@ -283,6 +338,15 @@ test("refresh and reconnect renew statistics while unchanged monitor probes reta
 	const initial = latest.source.epoch;
 	invalidateWorkspaceQueries(client, target);
 	await flush();
+	expect(latest.source.epoch).toBe(initial);
+	expect(read).toHaveBeenCalledTimes(1);
+	publishedStats++;
+	emit("git_workspace_snapshot", {
+		version: 1,
+		view: "details",
+		snapshot: { revision: 1, updating: false, statusPages: cacheState() },
+	});
+	await flush();
 	expect(latest.source.epoch).not.toBe(initial);
 	const refreshedSource = latest.source;
 	const refreshedData = latest.data;
@@ -298,6 +362,10 @@ test("refresh and reconnect renew statistics while unchanged monitor probes reta
 		expect(latest.data).toBe(refreshedData);
 		expect(read).toHaveBeenCalledTimes(2);
 	}
+	transport.connected = false;
+	for (const connection of [...connections]) connection(false, false);
+	await flush();
+	transport.connected = true;
 	for (const connection of [...connections]) connection(true, true);
 	await flush();
 	expect(latest.source.epoch).not.toBe(refreshedSource.epoch);
@@ -463,6 +531,9 @@ test("expired snapshots remain recoverable rather than entering the unknown meas
 		.mockImplementation(async (_target, query) => result(query, 7));
 	await render({ rows: [file("expired")] });
 	await render({ rows: [file("expired"), file("next")] });
+	expect(read).toHaveBeenCalledTimes(1);
+	latest.retry();
+	await flush();
 	expect(read.mock.calls[1]?.[1].rows).toEqual([file("expired"), file("next")]);
 	expect(latest.data?.rows.every((row) => row.added === 7)).toBe(true);
 });
@@ -470,7 +541,9 @@ test("expired snapshots remain recoverable rather than entering the unknown meas
 test.each([
 	false,
 	true,
-])("statistics expiry shares one recovery per reading cycle (hasMore=%s)", async (hasMore) => {
+])("statistics recovery requires a stable complete measured handoff (hasMore=%s)", async (hasMore) => {
+	let now = Date.now();
+	spyOn(Date, "now").mockImplementation(() => now);
 	const pages = spyOn(api, "getGitStatusPage")
 		.mockResolvedValueOnce(statusPage("old", hasMore))
 		.mockResolvedValueOnce(statusPage("fresh", hasMore))
@@ -483,21 +556,22 @@ test.each([
 	expect(latestPages.pages[0]?.snapshotId).toBe("fresh");
 	expect(latest.data?.snapshotId).toBe("fresh");
 	expect(latest.data?.rows[0]?.added).toBe(12);
+	now += 1_100;
 	read.mockRejectedValueOnce(expired());
 	void client.invalidateQueries({ queryKey: ["gitStatusPageStats", target.workspaceKey] });
 	await flush();
 	await flush();
-	expect(pages).toHaveBeenCalledTimes(2);
-	expect(latestPages.pages[0]?.snapshotId).toBe("fresh");
-	expect(latestPages.error?.message).toContain("expired");
-	expect(latestPages.snapshotValid).toBe(false);
-	await latestPages.retry();
-	await flush();
-	await flush();
-	expect(pages).toHaveBeenCalledTimes(3);
-	expect(latestPages.error).toBeNull();
-	expect(latestPages.snapshotValid).toBe(true);
-	expect(latest.data?.snapshotId).toBe("later");
+	if (hasMore) {
+		expect(pages).toHaveBeenCalledTimes(2);
+		expect(latestPages.snapshotValid).toBe(false);
+		expect(latestPages.error?.message).toContain("expired");
+	} else {
+		expect(pages).toHaveBeenCalledTimes(3);
+		expect(latestPages.pages[0]?.snapshotId).toBe("later");
+		expect(latestPages.error).toBeNull();
+		expect(latestPages.snapshotValid).toBe(true);
+		expect(latest.data?.snapshotId).toBe("later");
+	}
 });
 
 test.each([
@@ -515,7 +589,7 @@ test.each([
 	expect(pages).toHaveBeenCalledTimes(2);
 	expect(read).toHaveBeenCalledTimes(2);
 	expect(latest.data).toBeUndefined();
-	latestPages.refresh();
+	latestPages.reset();
 	await flush();
 	await flush();
 	expect(pages).toHaveBeenCalledTimes(4);
@@ -536,7 +610,7 @@ test("late expiry and callbacks from an old generation cannot restart the replac
 	await renderIntegrated();
 	const oldGeneration = latestPages.queryGeneration;
 	const oldObservation = latestPages.observeSnapshotStats;
-	latestPages.refresh();
+	latestPages.reset();
 	await flush();
 	await flush();
 	const generation = latestPages.queryGeneration;
@@ -596,7 +670,7 @@ test.each([
 		await flush();
 		await flush();
 	} else if (scope === "page-generation") {
-		latestPages.refresh();
+		latestPages.reset();
 		await flush();
 		await flush();
 	}
@@ -637,7 +711,6 @@ for (const status of [401, 403, 404]) {
 				expect(latest.readRefused).toBe(true);
 				expect(latest.displayAllowed).toBe(false);
 				expect(latest.data).toBeUndefined();
-				expect(latest.error?.message).toBe(`late HTTP ${status}`);
 				expect(read).toHaveBeenCalledTimes(2);
 			} else {
 				expect(latest.readRefused).toBe(false);
@@ -664,6 +737,7 @@ for (const status of [401, 403, 404]) {
 		expect(latest.displayAllowed).toBe(false);
 		expect(latest.data).toBeUndefined();
 		latest.retry();
+		emit("git_workspace_subscribed", { version: 10 });
 		await flush();
 		expect(latest.displayAllowed).toBe(true);
 		expect(latest.data?.rows[0]?.added).toBe(23);

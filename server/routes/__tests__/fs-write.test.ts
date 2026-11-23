@@ -12,7 +12,7 @@
  *  - the save is attributed as `human`, not left for the watcher to classify as
  *    `external` — which would render the user's own edit as an anonymous foreign change.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -25,6 +25,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { Hono } from "hono";
 import iconv from "iconv-lite";
 import { AppError } from "../../lib/errors";
@@ -80,6 +81,15 @@ async function save(
 		body: JSON.stringify(body),
 	});
 	return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+}
+
+async function captureRetainedTree(path: string): Promise<string> {
+	const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	try {
+		return await worktreeTreeSnapshot.capture(path);
+	} finally {
+		policy.mockRestore();
+	}
 }
 
 function sha256(text: string): string {
@@ -663,7 +673,7 @@ describe("the tree snapshot boundary", () => {
 		// The boundary the route took, read back from the shadow repository. Captured
 		// again here only to obtain the hash — `capture` is deduplicated by content, so
 		// this returns the same tree the save recorded.
-		const treeHash = await worktreeTreeSnapshot.capture(repo);
+		const treeHash = await captureRetainedTree(repo);
 		expect(treeHash).toBeTruthy();
 
 		// The assertion that matters: the recorded tree holds the saved content, so this
@@ -675,11 +685,11 @@ describe("the tree snapshot boundary", () => {
 	test("the save is a boundary of its own, separating it from what follows", async () => {
 		const target = join(repo, "src", "sequenced.ts");
 		await save({ path: target, content: "first\n", narratorId: repoNarratorId });
-		const afterSave = await worktreeTreeSnapshot.capture(repo);
+		const afterSave = await captureRetainedTree(repo);
 
 		// Something else writes afterwards, the way a tool would.
 		writeFileSync(join(repo, "src", "by-a-tool.ts"), "tool wrote this\n");
-		const afterTool = await worktreeTreeSnapshot.capture(repo);
+		const afterTool = await captureRetainedTree(repo);
 
 		// Two distinct trees: the save's own state is addressable, so a revert of the
 		// later write can land on it instead of undoing the save too.

@@ -6,7 +6,7 @@ import { openSchemaCopyAt } from "../../../tests/sqlite-schema-image";
 import { closeReadDatabase } from "../../lib/db-worker/pool";
 
 const roots = new WeakMap<Database, string>();
-/** Independent file/WAL handles preserve the production Worker read boundary. */
+
 export function openFileWorkerDatabase(template?: Database): Database {
 	const root = mkdtempSync(join(tmpdir(), "file-read-worker-"));
 	const path = join(root, "state.db");
@@ -17,6 +17,7 @@ export function openFileWorkerDatabase(template?: Database): Database {
 	roots.set(database, root);
 	return database;
 }
+
 export async function closeFileWorkerDatabase(database: Database): Promise<void> {
 	const root = roots.get(database);
 	if (root) await closeReadDatabase(database.filename, { timeoutMs: 5000 });

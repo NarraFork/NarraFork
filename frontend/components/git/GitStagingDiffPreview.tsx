@@ -448,7 +448,7 @@ export function GitStagingDiffPreview({
 				diff={data?.diff}
 				truncated={data?.truncated}
 				file={file.path}
-				resetKey={`${staging.scopeKey}:${list.id}:${file.fileId}`}
+				resetKey={`${staging.displayScope}:${list.id}:${file.fileId}`}
 				loading={!data && query.isLoading}
 				error={data ? null : localizeError(query.error)}
 				unitActions={unitActions}

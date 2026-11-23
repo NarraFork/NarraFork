@@ -6,7 +6,12 @@
 export const FILE_CHANGE_EVIDENCE_VERSION = 3;
 
 export type FileWriteOutcome = "applied" | "not_applied" | "conflict" | "unknown";
-export type FileHistoryStatus = "complete" | "unavailable";
+export type FileHistoryStatus = "complete" | "unavailable" | "disabled";
+
+/** File history is retained only for explicitly remote devices. */
+export function isFileHistoryEnabledForDevice(deviceId: string | null | undefined): boolean {
+	return Boolean(deviceId && deviceId !== "local");
+}
 
 export interface FileHistoryTarget {
 	deviceId: string;

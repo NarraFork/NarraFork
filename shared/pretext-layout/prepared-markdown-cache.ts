@@ -164,25 +164,26 @@ export function getPreparedMarkdownBlocks(
 	markdown: string,
 	math: MathSupport | undefined,
 	mathRevision: string | number,
+	sourceRanges = false,
 ): PreparedBlock[] {
 	if (markdown.length === 0) return [];
 	if (markdown.length > MAX_CACHED_TEXT_LENGTH) {
 		misses++;
-		return parseMarkdownToPreparedBlocks(markdown, math);
+		return parseMarkdownToPreparedBlocks(markdown, math, sourceRanges);
 	}
 	// `math ? "m" : "n"` and the revision both matter: the flag covers "no runtime
 	// at all", the revision covers "a different runtime state". `fontRevision`
 	// covers "the same text, measured against a different font" (header note), and
 	// the typography generation covers "the same text and face, at a different size
 	// or letter spacing" — the user-driven counterpart of a face swap.
-	const key = `${math ? "m" : "n"}${mathRevision}\u0000f${fontRevision}\u0000t${getTypographyRevision()}\u0000${markdown}`;
+	const key = `${math ? "m" : "n"}${mathRevision}\u0000f${fontRevision}\u0000t${getTypographyRevision()}\u0000${sourceRanges ? "r" : ""}\u0000${markdown}`;
 	const found = cache.get(key);
 	if (found !== undefined) {
 		hits++;
 		return found;
 	}
 	misses++;
-	const blocks = parseMarkdownToPreparedBlocks(markdown, math);
+	const blocks = parseMarkdownToPreparedBlocks(markdown, math, sourceRanges);
 	if (cacheChars + key.length > CACHE_CHAR_CEILING) {
 		cache.clear();
 		cacheChars = 0;

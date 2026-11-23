@@ -1,4 +1,14 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	mock,
+	spyOn,
+	test,
+} from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -15,6 +25,7 @@ import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attac
 import { eq } from "drizzle-orm";
 import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
 import * as schema from "../../db/schema";
+import { assertDbReadersReady } from "../../lib/db-worker/pool";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
 import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
@@ -36,6 +47,9 @@ const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
+beforeAll(async () => {
+	await assertDbReadersReady(sqlite.filename);
+});
 afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();

@@ -663,9 +663,14 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 	run(request: ReadRequest, context: WorkerTaskContext): Promise<unknown> {
 		requestOwners.get(context.requestId)?.add(this);
 		if (this.closed) return Promise.reject(new WorkersUnavailableError("worker_unavailable"));
+		if (request.identity) {
+			assertReadDatabaseOpen(request.identity);
+			this.databaseIds.add(request.identity.id);
+		}
+		request.diagnostics.requestId = context.requestId;
 		request.poolDiagnostic.requestId = context.requestId;
 		request.poolDiagnostic.dispatchedAt = Date.now();
-		if (request.identity) this.databaseIds.add(request.identity.id);
+		request.phase.phase = "dispatching";
 		this.lastDiagnostic = request.poolDiagnostic.sql ? request.poolDiagnostic : undefined;
 		if (request.poolDiagnostic.sql) {
 			this.diagnosticWorker ??= `dbw-${++sqlDiagnosticWorkerCounter}`;
@@ -882,6 +887,9 @@ function logQueueRejection(
 					}
 				}
 				return {
+					kind: request.poolDiagnostic.kind,
+					source: request.poolDiagnostic.source,
+					code: "TASK_QUEUE_FULL",
 					incomingTask: readPoolTaskSnapshot(
 						request.poolDiagnostic,
 						now,
@@ -949,12 +957,12 @@ function execute(
 			},
 		})
 		.catch((error) => {
-			if (error instanceof TaskQueueError || error instanceof DbReadTaskTimeoutError)
-				warnReadPoolFailure(
-					request.poolDiagnostic,
-					error instanceof DbReadTaskTimeoutError ? "TASK_QUEUE_TIMEOUT" : error.code,
-					runtime(profile).stats,
-				);
+			if (
+				error instanceof TaskQueueError &&
+				error.code !== "TASK_QUEUE_FULL" &&
+				error.code !== "TASK_QUEUE_TIMEOUT"
+			)
+				warnReadPoolFailure(request.poolDiagnostic, error.code, runtime(profile).stats);
 			if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL") {
 				logQueueRejection(request, bytes, profile, error.reason);
 			}
@@ -1463,6 +1471,7 @@ export async function assertDbReadersReady(
 	dbPath: string,
 	options: Pick<RunReadTaskOptions, "timeoutMs" | "signal"> = {},
 ): Promise<void> {
+	if (workersDisabled() === "worker_unavailable") resumeDbWorkerPool();
 	const disabled = workersDisabled();
 	if (disabled) throw new WorkersUnavailableError(disabled);
 	const timeoutMs = options.timeoutMs ?? 30_000;

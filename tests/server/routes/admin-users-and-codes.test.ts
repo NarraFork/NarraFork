@@ -11,12 +11,14 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { registrationCodes, userPreferences, users } from "../../../server/db/schema";
 import { AppError } from "../../../server/lib/errors";
-import { getNarratorWorkerTestDb } from "../../../server/services/__tests__/narrator-worker-fixture";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
 import { cleanDb } from "../../setup";
 
-const dbFixture = getNarratorWorkerTestDb();
-const { db, sqlite } = dbFixture;
-await dbFixture.ready;
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -74,9 +76,9 @@ afterEach(() => {
 });
 
 afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
-	await dbFixture.close();
 });
 
 describe("POST /users", () => {

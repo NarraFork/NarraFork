@@ -96,7 +96,7 @@ beforeEach(async () => {
 		})
 		.run();
 	io = { ...fileChangeLocalIo };
-	runtime = makeRuntime();
+	runtime = makeHistoryRuntimeForTests();
 });
 
 afterEach(async () => {
@@ -113,14 +113,30 @@ function namespaceDiagnosticLogs(calls: readonly (readonly unknown[])[]) {
 		.map(([, fields]) => fields as Record<string, unknown>);
 }
 
-function makeRuntime(options: Partial<LocalFileChangeRuntimeOptions> = {}) {
-	return new LocalFileChangeRuntime({
+function makeHistoryRuntimeForTests(options: Partial<LocalFileChangeRuntimeOptions> = {}) {
+	const runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot,
 		io,
 		blobStoreOptions: { minimumFreeBytes: 0 },
 		...options,
 	});
+	// Explicit test-only injection keeps exercising the retained history machinery.
+	// The production local policy has no option or environment flag to enable it.
+	const internal = runtime as unknown as {
+		executeBound(request: { backend: ExecutionBackend }): Promise<unknown>;
+	};
+	const executeBound = internal.executeBound.bind(runtime);
+	internal.executeBound = (request) =>
+		executeBound({
+			...request,
+			backend: new Proxy(request.backend, {
+				get(target, property) {
+					return property === "kind" ? "remote" : Reflect.get(target, property);
+				},
+			}),
+		});
+	return runtime;
 }
 
 async function callContext(
@@ -212,6 +228,81 @@ function effects() {
 function operations() {
 	return db.select().from(schema.fileChangeOperations).all();
 }
+describe("local metadata-only writes", () => {
+	beforeEach(() => {
+		runtime = new LocalFileChangeRuntime({ db, privateRoot, io });
+	});
+
+	test("Write/Edit/StructSed bypass blob initialization and keep metadata, counts and replay fences", async () => {
+		const initialize = spyOn(runtime, "initialize").mockRejectedValue(
+			new Error("legacy blob unavailable"),
+		);
+		try {
+			const path = join(workspace, "metadata.txt");
+			const ctx = await callContext("Write", path);
+			const written = await write(path, "one\ntwo\n", ctx);
+			expect(written.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "disabled" });
+			await writeFile(join(privateRoot, "file-change-blobs"), "legacy storage placeholder");
+			expect((await edit(path, "one", "first")).metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "disabled",
+				linesAdded: 1,
+				linesRemoved: 1,
+			});
+			const structural = await withLocalFileChangeRuntime(runtime, async () =>
+				structSedTool.execute(
+					{ file_path: path, command: "delete", address: "2", dry_run: false },
+					await callContext("StructSed", path),
+				),
+			);
+			expect(structural.isError).not.toBe(true);
+			expect(structural.metadata).toMatchObject({
+				diskOutcome: "applied",
+				historyStatus: "disabled",
+			});
+			expect(await readFile(path, "utf8")).toBe("first\n");
+			expect(initialize).not.toHaveBeenCalled();
+			expect(db.select().from(schema.fileChangeBlobs).all()).toHaveLength(0);
+			expect(db.select().from(schema.fileChangeStorageBudgets).all()).toHaveLength(0);
+			expect(db.select().from(schema.narratorFileSnapshots).all()).toHaveLength(0);
+			expect(db.select().from(schema.fileAttributions).all()).toHaveLength(3);
+			for (const effect of effects()) {
+				expect(effect).toMatchObject({
+					diskOutcome: "applied",
+					attributionGrade: "unknown",
+					outcome: "unknown",
+					beforeBlobDigest: null,
+					intendedAfterBlobDigest: null,
+					observedAfterBlobDigest: null,
+				});
+			}
+			// A new runtime cannot replay an already-linked durable attempt.
+			runtime = new LocalFileChangeRuntime({ db, privateRoot, io });
+			expect((await write(path, "replayed", ctx)).isError).toBe(true);
+			expect(await readFile(path, "utf8")).toBe("first\n");
+		} finally {
+			initialize.mockRestore();
+		}
+	});
+
+	test("an unknown local mutation stays unknown without producing historical content", async () => {
+		io.apply = async () => ({
+			kind: "target_mutation_unknown",
+			error: new Error("sync failed"),
+			parentEffects: { createdPaths: [], possiblePaths: [] },
+		});
+		const result = await write(join(workspace, "unknown.txt"), "maybe written");
+		expect(result.isError).toBe(true);
+		expect(result.metadata).toMatchObject({ diskOutcome: "unknown", historyStatus: "disabled" });
+		expect(effects()[0]).toMatchObject({
+			diskOutcome: "unknown",
+			executionConfirmed: false,
+			attributionGrade: "unknown",
+		});
+		expect(db.select().from(schema.fileChangeBlobs).all()).toHaveLength(0);
+	});
+});
+
 describe("bounded immutable request digest", () => {
 	test("matches existing JSON digest including escaping and surrogate chunk boundaries", async () => {
 		const units = Math.floor(FILE_CHANGE_LIMITS.streamChunkBytes / 6);
@@ -473,7 +564,7 @@ describe("single-file writes with independent history", () => {
 				};
 			},
 		});
-		runtime = makeRuntime();
+		runtime = makeHistoryRuntimeForTests();
 		await runtime.initialize();
 		const sql = spyOn(sqlite, "prepare");
 		const started = performance.now();
@@ -566,7 +657,7 @@ describe("single-file writes with independent history", () => {
 				return handle;
 			},
 		});
-		runtime = makeRuntime();
+		runtime = makeHistoryRuntimeForTests();
 		expect((await write(path, "tool")).isError).toBe(true);
 		expect(await readFile(moved, "utf8")).toBe("original");
 		expect(await readFile(path, "utf8")).toBe("foreign");
@@ -606,9 +697,15 @@ describe("single-file writes with independent history", () => {
 				expect(result.isError).not.toBe(true);
 				expect(result.output).toContain("DRY RUN");
 				expect(result.output).not.toContain("File saved;");
-				expect(result.metadata?.historyStatus).toBe("unavailable");
+				expect(result.metadata?.historyStatus).toBe("disabled");
 				expect(await readFile(path, "utf8")).toBe("before\n");
-				expect(operations()).toEqual([]);
+				if (failure === "pending") {
+					expect(init).not.toHaveBeenCalled();
+					expect(operations()).toMatchObject([
+						{ effectOutcome: "no_change", settlement: "settled" },
+					]);
+				} else expect(operations()).toEqual([]);
+				expect(effects()).toEqual([]);
 			} finally {
 				init?.mockRestore();
 			}
@@ -680,7 +777,7 @@ describe("single-file writes with independent history", () => {
 			const result = await withLocalFileChangeRuntime(runtime, () => executeTool(tool, config));
 			expect(result.isError).not.toBe(true);
 			expect(result.output).toContain("DRY RUN");
-			expect(result.metadata?.historyStatus).toBe("unavailable");
+			expect(result.metadata?.historyStatus).toBe("disabled");
 			expect(await readFile(path, "utf8")).toBe("before\n");
 		} finally {
 			if (previous) toolRegistry.register(previous);
@@ -704,7 +801,7 @@ describe("single-file writes with independent history", () => {
 		};
 		const a = write(path, "one\n");
 		await enter.promise;
-		const other = makeRuntime();
+		const other = makeHistoryRuntimeForTests();
 		const ctx = await callContext("Edit", path, root);
 		const b = withLocalFileChangeRuntime(other, () =>
 			editTool.execute({ file_path: path, old_string: "one", new_string: "two" }, ctx),
@@ -891,7 +988,7 @@ describe("single-file writes with independent history", () => {
 
 	test("shared initialization failure is diagnosed once per actual attempt and preserves its exception", async () => {
 		let now = 0;
-		runtime = makeRuntime({ historyDiagnosticClock: () => now });
+		runtime = makeHistoryRuntimeForTests({ historyDiagnosticClock: () => now });
 		const original = new FileChangeBlobCatalogError(
 			"namespace_mismatch",
 			"original initialization failure",
@@ -938,7 +1035,7 @@ describe("single-file writes with independent history", () => {
 
 	test("concurrent write waiters retain applied outcomes and count only their shared initialization failure", async () => {
 		let now = 0;
-		runtime = makeRuntime({ historyDiagnosticClock: () => now });
+		runtime = makeHistoryRuntimeForTests({ historyDiagnosticClock: () => now });
 		const initialize = spyOn(
 			FileChangeBlobCatalog.prototype,
 			"initializeNamespace",
@@ -1034,7 +1131,7 @@ describe("single-file writes with independent history", () => {
 		if (!budget) throw new Error("Initialized test catalog is missing its budget");
 		const storedKey = "a".repeat(64);
 		db.update(schema.fileChangeStorageBudgets).set({ namespaceKey: storedKey }).run();
-		runtime = makeRuntime();
+		runtime = makeHistoryRuntimeForTests();
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const path = join(workspace, "namespace-mismatch.txt");

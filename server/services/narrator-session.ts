@@ -189,6 +189,7 @@ import {
 	backgroundAgentNoticePreview,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
+import { resolveNarratorMessageOnlyRevert } from "./file-history-policy";
 import { gitService } from "./git-service";
 import { cancelModelTrace } from "./modeltrace-service";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
@@ -7273,6 +7274,14 @@ async function rollbackToBlockUnlocked(
 	blockIndex: number,
 	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -7644,7 +7653,7 @@ function buildEditedUserContentJson(
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
  *
- * `opts.revertFiles` (default true) selects file recovery or history-only editing.
+ * `opts.revertFiles` selects file recovery or history-only editing (the local default).
  * File recovery requires `opts.revertPlan`: the exact plan reviewed by the user.
  * The fixed target and history version are checked before any file or history write.
  *
@@ -7692,8 +7701,8 @@ export interface EditAndRegenerateOptions {
 	userId?: string | null;
 	deferContinuation?: boolean;
 	/**
-	 * Roll back the file changes the truncated messages made. Defaults to true,
-	 * which is what every edit did before this was expressible.
+	 * Restore file changes from the truncated messages. Defaults to false locally;
+	 * remote execution retains its existing file-recovery default.
 	 */
 	revertFiles?: boolean;
 	/** How wide that rollback reaches; omitted means the server default (`narrator`). */
@@ -7708,6 +7717,13 @@ async function editAndRegenerateUnlocked(
 	replyInUserLanguage: boolean,
 	opts?: EditAndRegenerateOptions,
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	// Resolve file intent before session creation, interruption or attachment writes.
+	const skipRevert = await resolveNarratorMessageOnlyRevert(
+		narratorId,
+		opts?.revertFiles === undefined ? undefined : !opts.revertFiles,
+		!!opts?.revertPlan || (opts?.revertFiles !== false && opts?.revertScope !== undefined),
+	);
+	opts = { ...opts, revertFiles: !skipRevert };
 	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });

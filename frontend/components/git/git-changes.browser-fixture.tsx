@@ -1,15 +1,16 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
-import { Profiler, useState } from "react";
+import { Profiler, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { GitStatusPage } from "../../../shared/git-status-page";
 import { setTypography } from "../../../shared/pretext-layout/typography";
+import { useGitWorkspaceSubscription } from "../../hooks/useGit";
 import { useGitStagingLists } from "../../hooks/useGitStagingLists";
 import type { GitTarget } from "../../lib/api/git";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { type MessageCallback, narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonEnglish from "../../locales/en/common.json";
 import gitEnglish from "../../locales/en/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
@@ -34,6 +35,57 @@ const network = createGitBrowserNetwork(total, {
 	stagingPaths: params.get("stagingPaths") === "1",
 	blockMove: (params.get("blockMove") as GitBrowserBlockScenario | null) ?? undefined,
 });
+// Native-list fixtures use a deterministic push transport; ChangeLists retain
+// the browser suite's real observation WebSocket server.
+if (params.get("staging") !== "1") {
+	const callbacks = new Map<number, MessageCallback>();
+	const subscriptions = new Map<unknown, Record<string, unknown>>();
+	let id = 0;
+	let version = 0;
+	Object.defineProperty(narratorWSManager, "connected", { configurable: true, value: true });
+	narratorWSManager.getCredentialIdentity = () => 1;
+	narratorWSManager.getConnectionCredentialIdentity = () => 1;
+	narratorWSManager.addListener = (_options, callback) => {
+		const handle = { _id: ++id };
+		callbacks.set(handle._id, callback);
+		return handle;
+	};
+	narratorWSManager.removeListener = (handle) => {
+		callbacks.delete(handle._id);
+	};
+	narratorWSManager.send = (message) => {
+		if (message.type === "git_workspace_subscribe") {
+			subscriptions.set(message.subscriptionId, message);
+			queueMicrotask(() => {
+				for (const callback of callbacks.values())
+					callback({ ...message, type: "git_workspace_subscribed", version: ++version });
+				for (const callback of callbacks.values())
+					callback({
+						...message,
+						type: "git_workspace_snapshot",
+						version: ++version,
+						view: "details",
+						snapshot: { revision: version, updating: false, statusPages: network.publishCache() },
+					});
+			});
+		} else if (message.type === "git_workspace_refresh") {
+			const subscription = subscriptions.get(message.subscriptionId);
+			const cache = network.publishCache();
+			queueMicrotask(() => {
+				for (const callback of callbacks.values())
+					callback({
+						...subscription,
+						type: "git_workspace_snapshot",
+						version: ++version,
+						view: "details",
+						snapshot: { revision: version, updating: false, statusPages: cache },
+					});
+			});
+		} else if (message.type === "git_workspace_unsubscribe")
+			subscriptions.delete(message.subscriptionId);
+		return true;
+	};
+}
 if (params.get("holdNextPage") === "1") network.holdNextPage();
 const queryClient = new QueryClient({
 	defaultOptions: {
@@ -53,6 +105,17 @@ let setExtraReader: (enabled: boolean) => void;
 let setOrdinaryWidth: (width: number) => void;
 function ExtraStagingReader({ target }: { target: GitTarget }) {
 	useGitStagingLists(target);
+	return null;
+}
+function WorkspaceAuthorization({ target }: { target: GitTarget }) {
+	const subscriptions = useGitWorkspaceSubscription(target);
+	const workspace = useQuery({
+		queryKey: ["gitWorkspace", target.narratorId, target.workspaceKey],
+		queryFn: async () => target,
+	});
+	useEffect(() => {
+		if (workspace.data && workspace.dataUpdatedAt) subscriptions.confirmWorkspace(workspace.data);
+	}, [subscriptions, workspace.data, workspace.dataUpdatedAt]);
 	return null;
 }
 network.warm(currentTarget.workspaceKey);
@@ -86,6 +149,7 @@ function App() {
 	return (
 		<I18nextProvider i18n={i18n}>
 			<QueryClientProvider client={queryClient}>
+				{params.get("staging") === "1" && <WorkspaceAuthorization target={target} />}
 				<MantineProvider forceColorScheme="dark">
 					<ConfirmDialogProvider>
 						<div
@@ -564,6 +628,8 @@ export const fixture = {
 		return version;
 	},
 	expireSnapshot() {
+		// Exhaust automatic lease renewal so the retained range needs an explicit refresh.
+		network.expireNextPage();
 		for (const query of queryClient.getQueryCache().getAll()) {
 			if (query.getObserversCount() === 0) continue;
 			const data = query.state.data as { pages?: GitStatusPage[] } | undefined;
