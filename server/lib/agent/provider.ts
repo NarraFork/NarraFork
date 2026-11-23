@@ -36,6 +36,7 @@ import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
 import { buildCommandCodeProvider } from "./commandcode-provider";
+import { reportCredentialId } from "./credential-report";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
@@ -369,7 +370,7 @@ builtinProviderSources.register("tokendance", {
 				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
 			);
 		}
-		return new TokenDanceProvider();
+		return reportCredentialId(new TokenDanceProvider(), "tokendance");
 	},
 	listReadiness: () => {
 		const config = getTokenDanceRuntimeConfig();
@@ -404,8 +405,11 @@ builtinProviderSources.register("codex", {
 });
 
 builtinProviderSources.register("CommandCode", {
-	resolve: (provider, model) =>
-		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	resolve: (provider, model) => {
+		if (provider !== "CommandCode") return null;
+		const adapter = buildCommandCodeProvider(model, settings.commandCode);
+		return adapter ? reportCredentialId(adapter, "CommandCode") : null;
+	},
 	listReadiness: () => [
 		{
 			id: "builtin:CommandCode",
@@ -469,8 +473,9 @@ function registerCredentialProviderSource<
 				(keys.length === 1 && keys[0]?.apiKey === config.apiKey && !keys[0]?.network);
 			const configVersion = JSON.stringify(config);
 			const protocolVersion = resolveModelProtocol(prefix, model);
+			// A single-credential connection is billed to the connection itself.
 			const adapter: ProviderAdapter = plain
-				? adapterFor(prefix, model, config)
+				? reportCredentialId(adapterFor(prefix, model, config), config.id)
 				: new PooledProvider(config.id, (key) =>
 						adapterFor(prefix, model, withProviderKey(config, key)),
 					);
