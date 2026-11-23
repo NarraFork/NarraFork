@@ -7,6 +7,8 @@ import { hasInboxKind } from "./inbox";
  */
 export async function hasPendingWork(narratorId: string): Promise<boolean> {
 	const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+	// A store stopped for a restart cannot say the work finished: assume it still runs.
+	if (backgroundOccupancyStore.isStopped) return true;
 	await backgroundOccupancyStore.flush();
 	if (backgroundOccupancyStore.countActiveWakeWork(narratorId) > 0) return true;
 	const { countOpenAsyncQuestions } = await import("../narrator-question-service");

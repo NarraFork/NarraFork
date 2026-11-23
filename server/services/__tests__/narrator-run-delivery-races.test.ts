@@ -2184,6 +2184,14 @@ describe("G. a turn that ends with work still pending", () => {
 		}
 	});
 
+	test("a restart stopping the occupancy store reads as work still pending", async () => {
+		seed();
+		const { hasPendingWork } = await import("../agent-runtime/pending-wake");
+		expect(await hasPendingWork(RUN)).toBe(false);
+		await backgroundOccupancyStore.stop();
+		expect(await hasPendingWork(RUN)).toBe(true);
+	});
+
 	test("cancelling the waiting run ends it once", async () => {
 		seed();
 		const { handle, publication } = await startWaitingRun(async () => {

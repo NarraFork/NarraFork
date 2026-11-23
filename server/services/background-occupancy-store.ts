@@ -247,6 +247,11 @@ export class BackgroundOccupancyStore {
 		return this.ready && !this.failure;
 	}
 
+	/** Stopped for shutdown: its counts are no longer read, not zero. */
+	get isStopped(): boolean {
+		return this.stopped;
+	}
+
 	getActiveTaskIds(parentId: string, opts?: OccupancyActiveTaskOptions): string[] {
 		this.assertReadable();
 		return this.index.getActiveTaskIds(parentId, opts);
