@@ -114,6 +114,10 @@ import {
 } from "./narrator-refs/seq-store";
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
+import {
+	assertRestartRecoveryObservation,
+	type RestartRecoveryObservation,
+} from "./recovery-observation";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -4829,6 +4833,7 @@ const sqliteNarratorPersistence = {
 		},
 		messageId?: string,
 		toolCallId?: string,
+		recoveryObservation?: RestartRecoveryObservation,
 	): Promise<boolean> {
 		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
 		if (!exactId) return false;
@@ -4837,37 +4842,41 @@ const sqliteNarratorPersistence = {
 		const condition = and(...conditions);
 		if (!condition) return false;
 
-		const affectedToolCalls = await db
-			.update(narratorToolCalls)
-			.set({
-				outputJson: result.output ?? null,
-				outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-				status: result.status,
-				errorMessage: result.errorMessage ?? null,
-				permissionStartedAt:
-					typeof result.permissionStartedAt === "number"
-						? new Date(result.permissionStartedAt).toISOString()
-						: undefined,
-				executionStartedAt:
-					typeof result.executionStartedAt === "number"
-						? new Date(result.executionStartedAt).toISOString()
-						: undefined,
-				...(result.preserveTiming
-					? {}
-					: {
-							durationMs: result.durationMs ?? null,
-							completedAt:
-								typeof result.completedAt === "number"
-									? new Date(result.completedAt).toISOString()
-									: new Date().toISOString(),
-						}),
-				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-			})
-			.where(condition)
-			.returning({
-				narratorId: narratorToolCalls.narratorId,
-				messageId: narratorToolCalls.messageId,
-			});
+		const affectedToolCalls = db.transaction((tx) => {
+			if (recoveryObservation) assertRestartRecoveryObservation(tx, recoveryObservation);
+			return tx
+				.update(narratorToolCalls)
+				.set({
+					outputJson: result.output ?? null,
+					outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
+					status: result.status,
+					errorMessage: result.errorMessage ?? null,
+					permissionStartedAt:
+						typeof result.permissionStartedAt === "number"
+							? new Date(result.permissionStartedAt).toISOString()
+							: undefined,
+					executionStartedAt:
+						typeof result.executionStartedAt === "number"
+							? new Date(result.executionStartedAt).toISOString()
+							: undefined,
+					...(result.preserveTiming
+						? {}
+						: {
+								durationMs: result.durationMs ?? null,
+								completedAt:
+									typeof result.completedAt === "number"
+										? new Date(result.completedAt).toISOString()
+										: new Date().toISOString(),
+							}),
+					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+				})
+				.where(condition)
+				.returning({
+					narratorId: narratorToolCalls.narratorId,
+					messageId: narratorToolCalls.messageId,
+				})
+				.all();
+		});
 		if (affectedToolCalls.length === 0) return false;
 		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
 		for (const toolCall of affectedToolCalls)

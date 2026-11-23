@@ -16,7 +16,7 @@ import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-co
  * registers those facts; any two sessions can be related the same way.
  */
 
-import { readQuery, readQueryFirst } from "@server/db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq, inArray } from "drizzle-orm";
@@ -2055,7 +2055,9 @@ async function deliverHeldResult(
 }
 
 /** Restore holds after a restart from their durable `taken_over` mirror; returns the ids. */
-export async function hydrateRunHolds(): Promise<Set<string>> {
+export async function hydrateRunHolds(
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<Set<string>> {
 	const { asc, gt } = await import("drizzle-orm");
 	const PAGE = 500;
 	const startedAt = Date.now();
@@ -2071,7 +2073,7 @@ export async function hydrateRunHolds(): Promise<Set<string>> {
 				.where(gt(narrators.id, after))
 				.orderBy(asc(narrators.id))
 				.limit(PAGE),
-			{ executionPolicy: "worker-required", maxRows: PAGE },
+			{ ...options, executionPolicy: "worker-required", maxRows: PAGE },
 		);
 		scanned += rows.length;
 		for (const row of rows) {

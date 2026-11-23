@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { testEnvironment } from "../../../tests/preload";
@@ -807,7 +808,11 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 					taskId: id,
 					command,
 					cwd: testEnvironment.isolatedHome,
-					env: { PATH: process.env.PATH, HOME: testEnvironment.isolatedHome },
+					env: {
+						PATH: process.env.PATH,
+						HOME: testEnvironment.isolatedHome,
+						NARRAFORK_TEST_SERVICE_MANIFEST: join(durable.getServicesRoot(), id, "service.json"),
+					},
 					shellPath: "/bin/sh",
 					login: false,
 				});
@@ -850,16 +855,25 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 
 			test("a service that exited during the restart is settled with its real exit code", async () => {
 				await createService("svc-dead");
-				const { durable, handle } = await spawnRealService("svc-dead", "echo last-words; exit 4");
-				await expect(await handle.exited).toBe(4);
-				expect((await durable.readOrphanedServiceOutcome("svc-dead")).exitCode).toBe(4);
-				expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
-				const row = taskRow();
-				expect(row.status).toBe("failed");
-				expect(row.exitCode).toBe(4);
-				expect(row.output).toContain("last-words");
-				expect(row.output).toContain("exited while NarraFork was restarting");
-				expect((await durable.readOrphanedServiceOutcome("svc-dead")).hasManifest).toBe(false);
+				const { durable, handle } = await spawnRealService(
+					"svc-dead",
+					'while [ ! -f "$NARRAFORK_TEST_SERVICE_MANIFEST" ]; do sleep 0.01; done; echo last-words; exit 4',
+				);
+				try {
+					expect(await durable.readManifest("svc-dead")).not.toBeNull();
+					expect(await handle.exited).toBe(4);
+					expect((await durable.readOrphanedServiceOutcome("svc-dead")).exitCode).toBe(4);
+					expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+					const row = taskRow();
+					expect(row.status).toBe("failed");
+					expect(row.exitCode).toBe(4);
+					expect(row.output).toContain("last-words");
+					expect(row.output).toContain("exited while NarraFork was restarting");
+					expect((await durable.readOrphanedServiceOutcome("svc-dead")).hasManifest).toBe(false);
+				} finally {
+					await handle.kill();
+					await durable.removeServiceArtifacts("svc-dead");
+				}
 			});
 
 			test("a service without a manifest still reports an unknown outcome", async () => {

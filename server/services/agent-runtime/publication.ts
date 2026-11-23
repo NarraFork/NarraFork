@@ -556,10 +556,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	}
 
 	/** State evidence shares one bounded read snapshot; result readability is not admission. */
-	async function readRunPublicationState(
-		run: PublicationRun,
-		options: RuntimeReadOptions = {},
-	): Promise<RunPublicationStatus> {
+	function runPublicationStateQuery(run: PublicationRun, slot: number) {
 		if (run.producerKind !== "agent" && run.producerKind !== "bash")
 			throw new Error("Invalid publication producer identity");
 		for (const pointer of [run.taskId, run.logicalRunId, run.recipientId])
@@ -574,14 +571,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
 			publicationDedupeKey(run, event),
 		);
-		const [row] = await readDbAll<{
-			reserved: number;
-			eventKind: Exclude<PublicationEvent, "started"> | null;
-			deliveredKey: string | null;
-			consumed: number;
-		}>(
-			database,
-			sql`SELECT
+		return sql`SELECT ${slot} AS slot,
 			EXISTS (SELECT 1 FROM ${runtimePublicationOutbox} WHERE ${where}
 				AND ${runtimePublicationOutbox.eventKind} = 'terminal'
 				AND ${runtimePublicationOutbox.state} = 'reserved') AS reserved,
@@ -596,17 +586,46 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				eq(runtimeAwaitedTerminalConsumptions.taskId, run.taskId),
 				eq(runtimeAwaitedTerminalConsumptions.logicalRunId, run.logicalRunId),
 				eq(runtimeAwaitedTerminalConsumptions.recipientId, run.recipientId),
-			)}) AS consumed`,
-			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
-		);
-		if (!row) throw new Error("Publication state snapshot unavailable");
-		if (row.reserved) return { state: "reserved" };
-		if (row.eventKind) return { state: "settled", eventKind: row.eventKind };
-		if (row.deliveredKey) {
-			const eventKind = publicationEventFromDedupeKey(row.deliveredKey);
-			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
+			)}) AS consumed`;
+	}
+
+	async function readRunPublicationStates(
+		runs: PublicationRun[],
+		options: RuntimeReadOptions = {},
+	): Promise<RunPublicationStatus[]> {
+		if (runs.length > 1_000) throw new Error("Too many publication state identities");
+		const states: RunPublicationStatus[] = [];
+		for (let start = 0; start < runs.length; start += 10) {
+			const chunk = runs.slice(start, start + 10);
+			const rows = await readDbAll<{
+				slot: number;
+				reserved: number;
+				eventKind: Exclude<PublicationEvent, "started"> | null;
+				deliveredKey: string | null;
+				consumed: number;
+			}>(
+				database,
+				sql`${sql.join(chunk.map(runPublicationStateQuery), sql` UNION ALL `)} ORDER BY slot`,
+				{ ...options, executionPolicy: "worker-required", maxRows: chunk.length },
+			);
+			if (rows.length !== chunk.length) throw new Error("Publication state snapshot unavailable");
+			for (const row of rows) {
+				if (row.reserved) states.push({ state: "reserved" });
+				else if (row.eventKind) states.push({ state: "settled", eventKind: row.eventKind });
+				else if (row.deliveredKey) {
+					const eventKind = publicationEventFromDedupeKey(row.deliveredKey);
+					states.push({ state: "settled", ...(eventKind ? { eventKind } : {}) });
+				} else states.push({ state: row.consumed ? "settled" : "none" });
+			}
 		}
-		return { state: row.consumed ? "settled" : "none" };
+		return states;
+	}
+
+	async function readRunPublicationState(
+		run: PublicationRun,
+		options: RuntimeReadOptions = {},
+	): Promise<RunPublicationStatus> {
+		return (await readRunPublicationStates([run], options))[0];
 	}
 
 	function readAgentTerminalResult(
@@ -727,6 +746,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		persistResult,
 		readAgentTerminalResult,
 		readRunPublicationState,
+		readRunPublicationStates,
 		commit,
 		flushRecipient,
 		flushPage,
@@ -900,6 +920,7 @@ export function createUnwiredPublicationFacade(
 		persistResult: () => unavailable("persistResult"),
 		readAgentTerminalResult: () => unavailable("readAgentTerminalResult"),
 		readRunPublicationState: () => unavailable("readRunPublicationState"),
+		readRunPublicationStates: () => unavailable("readRunPublicationStates"),
 		commit: () => unavailable("commit"),
 		flushRecipient: () => unavailable("flushRecipient"),
 		flushPage: () => unavailable("flushPage"),
@@ -1140,10 +1161,17 @@ export interface AsyncRuntimePublicationService {
 	readAgentTerminalResult(
 		run: PublicationRun,
 		options?: AgentTerminalResultReadOptions,
-		committedObservation?: { signal?: AbortSignal },
+		committedObservation?: RuntimeReadOptions,
 	): Promise<AgentTerminalResult | null>;
 	/** Whether this run may still publish a terminal: the ONLY authority for resume-vs-deliver decisions. */
-	readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus>;
+	readRunPublicationState(
+		run: PublicationRun,
+		options?: RuntimeReadOptions,
+	): Promise<RunPublicationStatus>;
+	readRunPublicationStates(
+		runs: PublicationRun[],
+		options?: RuntimeReadOptions,
+	): Promise<RunPublicationStatus[]>;
 	/** Durable, exact-run consumption; revoke only terminal notices not yet in recipient history. */
 	consumeAwaitedTerminal(
 		run: PublicationRun,
@@ -1996,10 +2024,14 @@ function createSqliteAsyncPublicationService(
 			return await runReadTask<AgentTerminalResult | null>(
 				sqlite.filename,
 				{ kind: "publicationTerminalResult", run, options, fromBlocks: blockReadsEnabled() },
-				{ signal, timeoutMs: 5_000 },
+				{
+					...committedObservation,
+					timeoutMs: Math.min(committedObservation.timeoutMs ?? 5_000, 5_000),
+				},
 			);
 		},
-		readRunPublicationState: async (run) => legacy.readRunPublicationState(run),
+		readRunPublicationState: async (run, options) => legacy.readRunPublicationState(run, options),
+		readRunPublicationStates: (runs, options) => legacy.readRunPublicationStates(runs, options),
 		consumeAwaitedTerminal: async (run, options) => legacy.consumeAwaitedTerminal(run, options),
 		hasPendingSource: async (run) => legacy.hasPendingSource(run),
 		flushRecipient: async (recipientId) => legacy.flushRecipient(recipientId),
@@ -2201,6 +2233,17 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 		},
 		readAgentTerminalResult: (run, options) => engine.readAgentTerminalResult(run, options),
 		readRunPublicationState: (run) => engine.readRunPublicationState(run),
+		readRunPublicationStates: async (runs) => {
+			if (runs.length > 1_000) throw new Error("Too many publication state identities");
+			const states: RunPublicationStatus[] = [];
+			for (let start = 0; start < runs.length; start += 100)
+				states.push(
+					...(await Promise.all(
+						runs.slice(start, start + 100).map((run) => engine.readRunPublicationState(run)),
+					)),
+				);
+			return states;
+		},
 		consumeAwaitedTerminal: (run, options) => queue.outbox.consumeAwaitedTerminal(run, options),
 		hasPendingSource: (run) => engine.hasPendingSource(run),
 		flushRecipient,
