@@ -38,7 +38,9 @@ const { narrators, users } = await import("../../db/schema");
 const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
 const { parseSubstatus } = await import("../../lib/narrator-utils");
-const { activeNarrators } = await import("../../services/narrator-session-state");
+const { activeNarrators, claimNarratorRuntime } = await import(
+	"../../services/narrator-session-state"
+);
 const {
 	getExecutionOwner,
 	getRunHold,
@@ -304,14 +306,52 @@ describe("releasing a hold", () => {
 });
 
 describe("when nothing is actually running", () => {
-	test("refuses with 409 rather than recording a hold nobody will honour", async () => {
-		// working in the DB, but no run owns it: between passes, or a zombie row.
+	test("waits out the gap between passes and holds the run that resumes", async () => {
+		// working in the DB, no run for a moment: the next pass claims it shortly.
+		const pending = takeover(subagentId);
+		await Bun.sleep(100);
+		const { run, turn } = registerRun(subagentId);
+
+		const res = await pending;
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ takenOver: true });
+		expect(turn.signal.aborted).toBe(false);
+		expect(run.cancel.signal.aborted).toBe(false);
+		expect(isTakenOver(subagentId)).toBe(true);
+		expect((await readSubagent())?.status).toBe("working");
+	});
+
+	test("repairs a zombie row and holds it instead of refusing forever", async () => {
+		// working in the DB, but no run will ever own it again: its writer is gone.
+		await setSubagentRow({ substatus: JSON.stringify(["interrupted"]) });
+
 		const res = await takeover(subagentId);
 
-		expect(res.status).toBe(409);
-		expect(isTakenOver(subagentId)).toBe(false);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ takenOver: true });
+		expect(isTakenOver(subagentId)).toBe(true);
 		const row = await readSubagent();
-		expect(parseSubstatus(row?.substatus)).not.toContain("taken_over");
+		// Idle and held, like a hold restored after a restart: the next message runs it.
+		expect(row?.status).toBe("idle");
+		expect(parseSubstatus(row?.substatus)).toEqual(
+			expect.arrayContaining(["interrupted", "taken_over"]),
+		);
+	});
+
+	test("asks for a retry while work is owned without a run", async () => {
+		const release = claimNarratorRuntime(subagentId, "recovery-stage");
+		try {
+			const res = await takeover(subagentId);
+
+			expect(res.status).toBe(409);
+			expect(isTakenOver(subagentId)).toBe(false);
+			const row = await readSubagent();
+			expect(row?.status).toBe("working");
+			expect(parseSubstatus(row?.substatus)).not.toContain("taken_over");
+		} finally {
+			release();
+		}
 	});
 
 	test("refuses an idle subagent", async () => {

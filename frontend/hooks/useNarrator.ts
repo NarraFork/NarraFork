@@ -854,7 +854,20 @@ export function useUpdateSubagentConclusion() {
 export function useTakeoverSubagent() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (id: string) => api.takeoverSubagent(id),
+		mutationFn: async (id: string) => {
+			// 409 means the run is between passes; it settles within moments.
+			const MAX_ATTEMPTS = 4;
+			const RETRY_DELAY_MS = 400;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await api.takeoverSubagent(id);
+				} catch (err) {
+					const isSettling = err instanceof ApiError && err.status === 409;
+					if (!isSettling || attempt >= MAX_ATTEMPTS - 1) throw err;
+					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+				}
+			}
+		},
 		onSuccess: (_data, id) => {
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 		},

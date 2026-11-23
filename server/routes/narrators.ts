@@ -5200,6 +5200,10 @@ narratorRoutes.post("/:id/detach", async (c) => {
 	return c.json({ detached: true });
 });
 
+/** How long a takeover waits for a run caught between passes to reappear. */
+const TAKEOVER_OWNER_WAIT_MS = 1_500;
+const TAKEOVER_OWNER_POLL_MS = 50;
+
 /**
  * Take over a running run WITHOUT stopping what it is doing.
  *
@@ -5220,10 +5224,25 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		return c.json({ error: "Subagent is not running" }, 400);
 	}
 	const { getRunControl } = await import("../services/agent-runtime/ownership");
-	if (!getRunControl(id) && !isLoopRunning(id)) {
-		// The DB says working/waiting but no run owns it: a run caught between passes,
-		// or a zombie row. Retry rather than recording a hold nothing will honour.
-		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+	const owned = () => Boolean(getRunControl(id)) || isLoopRunning(id);
+	// The DB says working/waiting but no run owns it: either a run caught between
+	// passes (it reappears within moments) or a zombie row whose writer is gone.
+	for (let waited = 0; !owned() && waited < TAKEOVER_OWNER_WAIT_MS; ) {
+		await Bun.sleep(TAKEOVER_OWNER_POLL_MS);
+		waited += TAKEOVER_OWNER_POLL_MS;
+	}
+	let status: "idle" | "working" | "waiting" = narrator.status;
+	if (!owned()) {
+		// A zombie would refuse every takeover forever, leaving Stop as the only way
+		// out. Repair it to idle (keeping its reason tags) and hold that idle session:
+		// the user's next message then runs as a held turn, exactly like a hold that
+		// survived a restart. Work owned without a run (a recovery stage, a pending
+		// permission) is not a zombie and still asks for a retry.
+		const { reconcileRunningStatus } = await import("../services/narrator-session");
+		if (!(await reconcileRunningStatus(id))) {
+			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+		}
+		status = "idle";
 	}
 	const { controlRun } = await import("../services/agent-runtime/run");
 	await controlRun(id, { kind: "hold" });
@@ -5232,7 +5251,7 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		type: "subagent_status_changed",
 		narratorId: deliverTo.narratorId,
 		subagentNarratorId: id,
-		status: narrator.status,
+		status,
 		substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
 	});
 	await broadcastSubagentTakeoverChanged({
