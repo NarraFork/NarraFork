@@ -4,7 +4,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { envWithAmbientProxy } from "../net/proxy-env";
 import type { McpServerConfig } from "../settings";
-import { createMcpOAuthProvider } from "./oauth";
+import { createMcpOAuthProvider, noteMcpOAuthChallenge } from "./oauth";
 
 /** `oauthKey` selects whose stored OAuth tokens a remote transport uses (default: config.id). */
 export function createTransport(config: McpServerConfig, oauthKey = config.id): Transport {
@@ -66,7 +66,10 @@ function remoteTransportOptions(config: McpServerConfig, url: URL, oauthKey: str
 		if (new URL(input).origin !== url.origin) return fetch(input, init);
 		const merged = new Headers(init?.headers);
 		for (const [name, value] of headers) merged.set(name, value);
-		return fetch(input, { ...init, headers: merged });
+		const response = await fetch(input, { ...init, headers: merged });
+		if (response.status === 401 || response.status === 403)
+			noteMcpOAuthChallenge(config, oauthKey, response);
+		return response;
 	};
 	return { authProvider, fetch: fetchWithHeaders };
 }

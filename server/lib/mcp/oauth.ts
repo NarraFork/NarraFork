@@ -15,6 +15,7 @@
 import { randomBytes } from "node:crypto";
 import {
 	auth,
+	extractWWWAuthenticateParams,
 	type OAuthClientProvider,
 	type OAuthDiscoveryState,
 	UnauthorizedError,
@@ -124,6 +125,7 @@ export function resetMcpOAuthForTests(): void {
 	store = undefined;
 	pendingFlows.clear();
 	revisions.clear();
+	challengedScopes.clear();
 }
 
 /** OAuth applies to remote transports unless the admin pinned a static Authorization header. */
@@ -152,6 +154,24 @@ interface PendingFlow {
 }
 
 const pendingFlows = new Map<string, PendingFlow>();
+/** Scope from the latest 401/403 challenge per server, for consent when none is configured. */
+const challengedScopes = new Map<string, { binding: string; scope: string }>();
+
+/** Called by the remote transports for 401/403 responses from the MCP server itself. */
+export function noteMcpOAuthChallenge(
+	config: McpServerConfig,
+	storeKey: string,
+	response: Response,
+): void {
+	const { scope } = extractWWWAuthenticateParams(response);
+	if (scope) challengedScopes.set(storeKey, { binding: bindingOf(config), scope });
+}
+
+function challengedScope(config: McpServerConfig): string | undefined {
+	const challenge = challengedScopes.get(config.id);
+	return challenge?.binding === bindingOf(config) ? challenge.scope : undefined;
+}
+
 /** Bumped by sign-out / delete so an exchange or refresh already in flight cannot write back. */
 const revisions = new Map<string, number>();
 
@@ -161,6 +181,7 @@ function revisionOf(serverId: string): number {
 
 function resetCredentials(serverId: string): void {
 	revisions.set(serverId, revisionOf(serverId) + 1);
+	challengedScopes.delete(serverId);
 	for (const [state, flow] of pendingFlows)
 		if (flow.serverId === serverId) pendingFlows.delete(state);
 }
@@ -348,10 +369,8 @@ export async function startMcpOAuth(
 		revision: revisionOf(config.id),
 	};
 	const provider = new NarraForkOAuthProvider(config, config.id, flow);
-	const result = await auth(provider, {
-		serverUrl: config.url,
-		...(config.oauth?.scope && { scope: config.oauth.scope }),
-	});
+	const scope = config.oauth?.scope ?? challengedScope(config);
+	const result = await auth(provider, { serverUrl: config.url, ...(scope && { scope }) });
 	if (result === "AUTHORIZED") return { authorized: true };
 	if (!provider.authorizationUrl) throw new Error("Authorization server returned no URL");
 	pendingFlows.set(flow.state, flow);
