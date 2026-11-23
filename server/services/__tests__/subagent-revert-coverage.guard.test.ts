@@ -26,20 +26,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, getTestDb } from "../../../tests/setup";
 import { fileAttributions, narrators } from "../../db/schema";
 
-import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
-
-const fixture = getNarratorWorkerTestDb();
-await fixture.ready;
-const { db, sqlite } = fixture;
+const { db, sqlite } = getTestDb();
 // The real module is captured and restored in `afterAll`: `mock.module` is
-// PROCESS-GLOBAL in Bun, so leaving it installed hands this fixture database to
+// PROCESS-GLOBAL in Bun, so leaving it installed hands this in-memory database to
 // every other suite that runs afterwards in the same process — they then query a
 // database with none of their fixtures in it and fail for no visible reason.
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite }));
 
 const { getSubagentFileChanges } = await import("../subagent-file-changes");
 
@@ -81,8 +77,7 @@ beforeEach(async () => {
 	await makeNarrator("sub-outside", PARENT, OTHER_WORKSPACE);
 });
 
-afterAll(async () => {
-	await fixture.close();
+afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
