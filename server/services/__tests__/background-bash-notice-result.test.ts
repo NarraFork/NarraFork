@@ -9,6 +9,7 @@ import { flushRuntimePublications, runtimePublication } from "../agent-runtime/p
 import { discardBackgroundBashResult } from "../background-bash-result";
 import { backgroundTaskService } from "../background-task-service";
 import { projectPendingInjection } from "../parent-injection-queue";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const PARENT = "bash-notice-result-parent";
 const paths = new Set<string>();
@@ -169,8 +170,10 @@ describe("real Bash terminal publication result", () => {
 		});
 		try {
 			expect(
-				await backgroundTaskService.markCompleted(task.id, "x".repeat(5120), 0, task.controller),
-			).toBe(false);
+				await captureWorkerRejection(
+					backgroundTaskService.markCompleted(task.id, "x".repeat(5120), 0, task.controller),
+				),
+			).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
 			expect(spill).not.toBe("");
 			expect(await Bun.file(spill).exists()).toBe(false);
 			expect(await notices()).toHaveLength(0);
