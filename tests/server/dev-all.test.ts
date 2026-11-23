@@ -95,7 +95,7 @@ describe("owned process lifecycle", () => {
 		expect(await run).toBe(7);
 	});
 
-	test("hybrid mode keeps Vite ports and trace defaults; frontend exit stops only its backend", async () => {
+	test("hybrid mode serves the compiled frontend beside Vite and keeps its ports and trace defaults", async () => {
 		const h = harness();
 		const run = runDevAll(
 			parseLaunchOptions(["--production", "--frontend-dev"]),
@@ -104,7 +104,7 @@ describe("owned process lifecycle", () => {
 			h.deps,
 		);
 		await h.backendStarted.promise;
-		expect(h.builds[0].frontend).toBe(false);
+		expect(h.builds[0].frontend).toBe(true);
 		expect(h.calls).toHaveLength(2);
 		expect(h.calls[0].env).toMatchObject({ NODE_ENV: "production", NF_SQL_TRACE: "summary" });
 		expect(h.calls[0].env.PORT).toBeUndefined();

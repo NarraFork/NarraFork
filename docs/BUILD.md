@@ -39,7 +39,7 @@ bun run build:linux-arm64
 
 `bun run start` 和 `bun run start:dev` 先构建本机单文件运行产物，再从该产物启动后端。
 主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。
-`start` 使用已构建的 `dist/frontend`；`start:dev` 保留源码 Vite 前端及原端口（前端 41221、后端默认 7778），不要求先构建整站前端。
+`start` 在后端端口使用已构建的 `dist/frontend`；`start:dev` 同样在后端默认 7778 提供该静态前端，并额外启动源码 Vite 热重载入口 41221。两者都要求先构建整站前端。
 显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供这层隔离。
 
 构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移。
@@ -50,14 +50,15 @@ bun run build:linux-arm64
 每次构建输出独占路径以及耗时、产物大小。**日常重启建议复用该路径，代码变更后再构建**：
 
 ```sh
-# 只构建后端，用于与 Vite 搭配
-bun run build:runtime
-bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
-
-# 连同已有的静态前端一起构建
+# 构建静态前端，并将它嵌入冻结后端
 bun run build
 bun run build:runtime --frontend
+
+# 只提供静态前端及后端
 bun run start --runtime="<构建输出的可执行文件绝对路径>"
+
+# 或在相同后端产物之外，额外提供 Vite 热重载入口
+bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
 ```
 
 `--runtime` 明确选择已有产物，跳过编译；找不到该文件会报错，不自动换一个版本。
@@ -264,4 +265,4 @@ chmod +x dist/narrafork-*
 - `bun run build:android-rootfs` — 构建 Android rootfs
 - `bun run build:runtime` — 构建本机冻结后端；加 `--frontend` 嵌入已有静态前端
 - `bun run start` — 构建并运行本机产物及静态前端；`--runtime=<path>` 复用已构建版本
-- `bun run start:dev` — 冻结后端搭配源码 Vite；同样支持 `--runtime=<path>`
+- `bun run start:dev` — 冻结后端及静态前端，额外提供源码 Vite 热重载入口；同样支持 `--runtime=<path>`

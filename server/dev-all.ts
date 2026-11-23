@@ -102,7 +102,9 @@ export async function runDevAll(
 					throw new Error("--runtime must name an executable file");
 			} else {
 				({ executable: runtime } = await deps.build({
-					frontend: !options.frontendDev,
+					// Vite is an additional hot-reload entry in hybrid mode, not a
+					// replacement for the compiled frontend served by the backend.
+					frontend: true,
 					signal,
 				}));
 				signal?.throwIfAborted();
