@@ -671,7 +671,7 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
 	if (!deliveryId) return;
 	const port = getRuntimeQueuePort();
 	if (port) {
-		const current = await port.mailbox.getByDelivery(row.deliveryId);
+		const current = await port.mailbox.getByDelivery(deliveryId);
 		if (current?.state === "claimed" && current.claimToken === row.claimToken)
 			await port.mailbox.failClaim(inboxClaim(row), String(error));
 		return;
