@@ -517,9 +517,10 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				onRequestStart: (info) =>
+				// The account is the credential; the inner adapter only knows "codex".
+				onRequestStart: () =>
 					params.onRequestStart?.({
-						credentialId: info?.credentialId ?? ctx.id,
+						credentialId: ctx.id,
 						validateDiagnosticCredential: () =>
 							this.manager.isDiagnosticCredentialCurrent(ctx.credential),
 					}),
@@ -653,8 +654,7 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
 			};
 			let hasStreamedEvents = false;
 			let sawPolicyViolation = false;

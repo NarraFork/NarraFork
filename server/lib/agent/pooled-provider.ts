@@ -242,10 +242,10 @@ export class PooledProvider implements ProviderAdapter {
 			try {
 				const result = await run(this.adapterFor(key));
 				clearKeyCooldown(key.id);
-				if (typeof result === "object" && result !== null && !("credentialId" in result)) {
-					return { ...result, credentialId: key.id };
-				}
-				return result;
+				// The key is the credential; an inner adapter's own id is the connection's.
+				return typeof result === "object" && result !== null
+					? { ...result, credentialId: key.id }
+					: result;
 			} catch (err) {
 				const more =
 					reportKeyFault(key, err) && !!selectProviderKey(this.providerId, undefined, tried);
@@ -287,7 +287,7 @@ export class PooledProvider implements ProviderAdapter {
 				...params,
 				onRequestStart: () => params.onRequestStart?.({ credentialId: key.id }),
 			})) {
-				yield { ...event, credentialId: event.credentialId ?? key.id };
+				yield { ...event, credentialId: key.id };
 			}
 			return;
 		}
@@ -316,7 +316,7 @@ export class PooledProvider implements ProviderAdapter {
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: event.credentialId ?? key.id };
+					yield { ...event, credentialId: key.id };
 				}
 				clearKeyCooldown(key.id);
 				return;
