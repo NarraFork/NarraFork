@@ -170,6 +170,10 @@ class NarraForkOAuthProvider implements OAuthClientProvider {
 
 	private save(change: Partial<McpOAuthRecord>): void {
 		const binding = bindingOf(this.config);
+		const stored = getStore().get(this.storeKey).binding;
+		// A background connection for another URL / client id (e.g. testing an unsaved
+		// edit) must not replace the saved server's credentials; only a flow may rebind.
+		if (!this.flow && stored !== undefined && stored !== binding) return;
 		getStore().update(this.storeKey, (current) => ({
 			...(current.binding === binding ? current : { clientSecret: current.clientSecret }),
 			binding,
