@@ -268,8 +268,10 @@ describe("MCP uses one published directory without output-schema compilation", (
 		expect(response.isError).toBeUndefined();
 		const large = { value: "x".repeat(200_000) };
 		result = { content: [], structuredContent: large };
-		const full = (await mcpManager.callTool(config.id, "plain", {})).content[0].text;
-		expect(full).toBe(JSON.stringify(large));
+		const capped = (await mcpManager.callTool(config.id, "plain", {})).content[0].text ?? "";
+		const [notice, excerpt] = capped.split("\n");
+		expect(notice).toBe("[structured content truncated: first 80000 of 200012 chars]");
+		expect(excerpt).toBe(JSON.stringify(large).slice(0, 80_000));
 		expect(calls).toEqual(["plain", "plain"]);
 	});
 

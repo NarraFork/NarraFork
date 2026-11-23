@@ -108,10 +108,16 @@ interface ActiveClient {
 	refreshAgain?: boolean;
 }
 
+// At most 3 UTF-8 bytes per UTF-16 unit, so a capped result stays under the
+// pipeline's 256 KiB per-capture limit.
+const MAX_STRUCTURED_CONTENT_CHARS = 80_000;
+
 /** Spec 2025-06-18+: structured results SHOULD be mirrored as text; serialize when a server omits it. */
 function structuredContentText(structured: unknown): string {
-	// Size limits and the full-output file are applied by the generic tool-output truncation.
-	return JSON.stringify(structured) ?? "null";
+	const json = JSON.stringify(structured) ?? "null";
+	if (json.length <= MAX_STRUCTURED_CONTENT_CHARS) return json;
+	// Notice first: output previews keep the tail, so the JSON excerpt must be the last line.
+	return `[structured content truncated: first ${MAX_STRUCTURED_CONTENT_CHARS} of ${json.length} chars]\n${json.slice(0, MAX_STRUCTURED_CONTENT_CHARS)}`;
 }
 
 class McpManager {
