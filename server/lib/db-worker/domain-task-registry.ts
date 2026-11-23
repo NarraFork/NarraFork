@@ -27,6 +27,15 @@ interface DomainReadModule<K extends SyncDomainReadTaskKind> {
 	validate?: (input: unknown) => boolean;
 }
 const loaders: { [K in SyncDomainReadTaskKind]: () => Promise<DomainReadModule<K>> } = {
+	knowledgeEntryDetail: async () => ({
+		read: (await import("./knowledge-entry-reader")).readKnowledgeEntryDetail,
+	}),
+	recallConversation: async () => ({
+		read: (await import("./recall-reader")).readRecallConversation,
+	}),
+	recallToolCallDetail: async () => ({
+		read: (await import("./recall-reader")).readRecallToolCallDetail,
+	}),
 	editorOperationEvidence: async () => ({
 		read: (await import("./file-read-snapshots")).readEditorOperationEvidence,
 	}),

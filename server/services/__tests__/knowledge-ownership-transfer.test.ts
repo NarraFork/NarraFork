@@ -20,6 +20,7 @@ import { generateId } from "../../lib/id";
 import { knowledgeAcl, type Principal } from "../knowledge-acl";
 import { knowledgeService } from "../knowledge-service";
 import { classifyDanger } from "../narrator-permission";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -119,12 +120,20 @@ describe("transferEntryOwner (service)", () => {
 
 	test("a non-owner non-admin user cannot transfer (NotFound, no leak)", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		await expect(knowledgeService.transferEntryOwner(entryId, bobId, P(lowId))).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferEntryOwner(entryId, bobId, P(lowId)),
+			),
+		).toThrow();
 	});
 
 	test("owner cannot abandon ownership (null) — ValidationError", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		await expect(knowledgeService.transferEntryOwner(entryId, null, P(aliceId))).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferEntryOwner(entryId, null, P(aliceId)),
+			),
+		).toThrow();
 	});
 
 	test("admin can abandon ownership (null → unowned)", async () => {
@@ -140,9 +149,11 @@ describe("transferEntryOwner (service)", () => {
 
 	test("transfer to a non-existent user is rejected", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		await expect(
-			knowledgeService.transferEntryOwner(entryId, "no-such-user", P(adminId, "admin")),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferEntryOwner(entryId, "no-such-user", P(adminId, "admin")),
+			),
+		).toThrow();
 	});
 
 	test("collection-gate-first: an entry owner locked out of the collection cannot transfer", async () => {
@@ -163,9 +174,11 @@ describe("transferEntryOwner (service)", () => {
 			principal: P(adminId, "admin"),
 		});
 		// Alice is the entry owner but cannot read the collection → transfer is NotFound.
-		await expect(
-			knowledgeService.transferEntryOwner(entry.id, bobId, P(aliceId)),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferEntryOwner(entry.id, bobId, P(aliceId)),
+			),
+		).toThrow();
 		// Admin can still transfer.
 		const res = await knowledgeService.transferEntryOwner(entry.id, bobId, P(adminId, "admin"));
 		expect(res.ownerUserId).toBe(bobId);
@@ -195,21 +208,31 @@ describe("transferCollectionOwner (service)", () => {
 
 	test("non-owner non-admin cannot transfer (NotFound)", async () => {
 		const id = await makeOwnedCollection(aliceId);
-		await expect(knowledgeService.transferCollectionOwner(id, bobId, P(lowId))).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferCollectionOwner(id, bobId, P(lowId)),
+			),
+		).toThrow();
 	});
 
 	test("owner cannot abandon; admin can", async () => {
 		const id = await makeOwnedCollection(aliceId);
-		await expect(knowledgeService.transferCollectionOwner(id, null, P(aliceId))).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferCollectionOwner(id, null, P(aliceId)),
+			),
+		).toThrow();
 		const res = await knowledgeService.transferCollectionOwner(id, null, P(adminId, "admin"));
 		expect(res.ownerUserId).toBeNull();
 	});
 
 	test("transfer to a non-existent user is rejected", async () => {
 		const id = await makeOwnedCollection(aliceId);
-		await expect(
-			knowledgeService.transferCollectionOwner(id, "no-such-user", P(adminId, "admin")),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.transferCollectionOwner(id, "no-such-user", P(adminId, "admin")),
+			),
+		).toThrow();
 	});
 });
 

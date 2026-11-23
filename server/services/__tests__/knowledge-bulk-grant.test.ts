@@ -28,6 +28,7 @@ import { bulkKnowledgeGrantSchema } from "../../lib/validators";
 import { knowledgeRoutes } from "../../routes/knowledge";
 import { knowledgeAcl, type Principal } from "../knowledge-acl";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -241,39 +242,45 @@ describe("bulkGrant service semantics", () => {
 describe("bulkGrant transactionality (no half-applied batch)", () => {
 	test("an unknown clearance level aborts before ANY row is written", async () => {
 		const ids = [await makeUser("user", "bgtx1"), await makeUser("user", "bgtx2")];
-		await expect(
-			knowledgeAcl.bulkGrant({
-				userIds: ids,
-				grantType: "clearance",
-				clearanceLevel: `no-such-level-${TAG}`,
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeAcl.bulkGrant({
+					userIds: ids,
+					grantType: "clearance",
+					clearanceLevel: `no-such-level-${TAG}`,
+				}),
+			),
+		).toThrow();
 		// Critical assertion: not one grant for either user.
 		expect(await countUserGrants(ids, "clearance")).toBe(0);
 	});
 
 	test("an unknown tag aborts before ANY row is written", async () => {
 		const ids = [await makeUser("user", "bgtx3"), await makeUser("user", "bgtx4")];
-		await expect(
-			knowledgeAcl.bulkGrant({
-				userIds: ids,
-				grantType: "tag",
-				tagId: `ghost-tag-${generateId(8)}`,
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeAcl.bulkGrant({
+					userIds: ids,
+					grantType: "tag",
+					tagId: `ghost-tag-${generateId(8)}`,
+				}),
+			),
+		).toThrow();
 		expect(await countUserGrants(ids, "tag")).toBe(0);
 	});
 
 	test("an unknown collection aborts before ANY row is written", async () => {
 		const ids = [await makeUser("user", "bgtx5"), await makeUser("user", "bgtx6")];
-		await expect(
-			knowledgeAcl.bulkGrant({
-				collectionId: `ghost-col-${generateId(8)}`,
-				userIds: ids,
-				grantType: "tag",
-				tagId: secretTagId,
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeAcl.bulkGrant({
+					collectionId: `ghost-col-${generateId(8)}`,
+					userIds: ids,
+					grantType: "tag",
+					tagId: secretTagId,
+				}),
+			),
+		).toThrow();
 		expect(await countUserGrants(ids, "tag")).toBe(0);
 	});
 });
@@ -378,7 +385,11 @@ describe("collection ACL changes drive canRead (end-to-end)", () => {
 			classificationLevel: "confidential",
 			controlledTags: [secretTagId],
 		});
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(reader) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(reader) }),
+			),
+		).toThrow();
 		expect(
 			(await knowledgeService.listCollections(undefined, P(reader))).map((c) => c.id),
 		).not.toContain(col.id);
@@ -411,7 +422,11 @@ describe("collection ACL changes drive canRead (end-to-end)", () => {
 		await knowledgeAcl.updateCollectionAcl(col.id, {
 			controlledTags: [secretTagId, extraTagId],
 		});
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(reader) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(reader) }),
+			),
+		).toThrow();
 	});
 
 	test("transferring collection ownership hands the owner short-circuit to the new owner", async () => {
@@ -432,7 +447,11 @@ describe("collection ACL changes drive canRead (end-to-end)", () => {
 		expect((await knowledgeService.getEntry(entry.id, { principal: P(oldOwner) })).id).toBe(
 			entry.id,
 		);
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(newOwner) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(newOwner) }),
+			),
+		).toThrow();
 
 		// The current owner may transfer (admin OR owner — not admin-only).
 		await knowledgeService.transferCollectionOwner(col.id, newOwner, P(oldOwner));
@@ -443,6 +462,10 @@ describe("collection ACL changes drive canRead (end-to-end)", () => {
 		expect((await knowledgeService.getEntry(entry.id, { principal: P(newOwner) })).id).toBe(
 			entry.id,
 		);
-		await expect(knowledgeService.getEntry(entry.id, { principal: P(oldOwner) })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.getEntry(entry.id, { principal: P(oldOwner) }),
+			),
+		).toThrow();
 	});
 });

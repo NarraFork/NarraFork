@@ -1,9 +1,11 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { knowledgeCollections, knowledgeEntries, knowledgePacks, projects } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { deletePackArchive, type PackArchiveFormat, savePackArchive } from "../lib/pack-archives";
+import type { KnowledgeReadOptions } from "./knowledge/read-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -61,15 +63,38 @@ const PACK_LIST_COLUMNS = {
  */
 async function resolvePackAcl(
 	pack: Pick<Pack, "id" | "entryId" | "classificationLevel" | "controlledTagsJson" | "ownerUserId">,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<{ aclEntry: AclEntry; aclCollection: AclCollection }> {
 	if (pack.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, pack.entryId),
-		});
+		const entry = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, pack.entryId),
+				columns: {
+					id: true,
+					collectionId: true,
+					ownerUserId: true,
+					classificationLevel: true,
+					controlledTagsJson: true,
+					reviewTagsJson: true,
+				},
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (entry) {
-			const collection = await db.query.knowledgeCollections.findFirst({
-				where: eq(knowledgeCollections.id, entry.collectionId),
-			});
+			const collection = await readQueryFirst(
+				db.query.knowledgeCollections.findMany({
+					limit: 1,
+					where: eq(knowledgeCollections.id, entry.collectionId),
+					columns: {
+						defaultLevel: true,
+						classificationLevel: true,
+						controlledTagsJson: true,
+						ownerUserId: true,
+					},
+				}),
+				{ ...readOptions, executionPolicy: "worker-required" },
+			);
 			return {
 				aclEntry: {
 					id: entry.id,
@@ -111,9 +136,13 @@ async function resolvePackAcl(
 }
 
 /** Whether the principal may read/activate this pack (dual-axis canRead). */
-async function canAccessPack(principal: Principal, pack: Pack): Promise<boolean> {
+async function canAccessPack(
+	principal: Principal,
+	pack: Pack,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<boolean> {
 	const caps = await resolvePrincipalCaps(principal);
-	const { aclEntry, aclCollection } = await resolvePackAcl(pack);
+	const { aclEntry, aclCollection } = await resolvePackAcl(pack, readOptions);
 	return canRead(caps, aclEntry, aclCollection);
 }
 
@@ -121,12 +150,17 @@ async function canAccessPack(principal: Principal, pack: Pack): Promise<boolean>
  * Load a pack and assert the principal may access it. Throws NotFoundError on
  * miss OR no-access (never leak existence of packs the caller can't see).
  */
-async function loadAccessiblePack(packId: string, principal: Principal): Promise<Pack> {
-	const pack = await db.query.knowledgePacks.findFirst({
-		where: eq(knowledgePacks.id, packId),
-	});
+async function loadAccessiblePack(
+	packId: string,
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<Pack> {
+	const pack = await readQueryFirst(
+		db.query.knowledgePacks.findMany({ limit: 1, where: eq(knowledgePacks.id, packId) }),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!pack) throw new NotFoundError("Knowledge pack", packId);
-	if (!(await canAccessPack(principal, pack))) {
+	if (!(await canAccessPack(principal, pack, readOptions))) {
 		throw new NotFoundError("Knowledge pack", packId);
 	}
 	return pack;
@@ -140,9 +174,13 @@ async function loadAccessiblePack(packId: string, principal: Principal): Promise
  * rewrite its access control, swap its archive bytes (which an agent later extracts), or
  * delete it. Unreadable → NotFound (don't leak); readable-but-not-owner → ValidationError.
  */
-async function assertCanManagePack(packId: string, principal: Principal): Promise<Pack> {
+async function assertCanManagePack(
+	packId: string,
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<Pack> {
 	// loadAccessiblePack already throws NotFound on miss/unreadable (no existence leak).
-	const pack = await loadAccessiblePack(packId, principal);
+	const pack = await loadAccessiblePack(packId, principal, readOptions);
 	const caps = await resolvePrincipalCaps(principal);
 	if (!caps.isAdmin && pack.ownerUserId !== principal.userId) {
 		throw new ValidationError("You do not have permission to manage this pack");
@@ -154,33 +192,41 @@ async function assertCanManagePack(packId: string, principal: Principal): Promis
 async function listPacks(
 	principal: Principal,
 	opts: { projectId?: string; entryId?: string; limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-	const rows = await db.query.knowledgePacks.findMany({
-		where: (p, { and: a, eq: e, or, isNull }) => {
-			const conds = [e(p.status, "active" as const)];
-			if (opts.entryId) conds.push(e(p.entryId, opts.entryId));
-			// Project isolation: this project's packs + global (projectId null) ones.
-			if (opts.projectId) {
-				const scope = or(e(p.projectId, opts.projectId), isNull(p.projectId));
-				if (scope) conds.push(scope);
-			}
-			return a(...conds);
-		},
-		columns: PACK_LIST_COLUMNS,
-		orderBy: (p, { desc: d }) => [d(p.updatedAt)],
-		limit,
-	});
+	const rows = await readQuery(
+		db.query.knowledgePacks.findMany({
+			where: (p, { and: a, eq: e, or, isNull }) => {
+				const conds = [e(p.status, "active" as const)];
+				if (opts.entryId) conds.push(e(p.entryId, opts.entryId));
+				// Project isolation: this project's packs + global (projectId null) ones.
+				if (opts.projectId) {
+					const scope = or(e(p.projectId, opts.projectId), isNull(p.projectId));
+					if (scope) conds.push(scope);
+				}
+				return a(...conds);
+			},
+			columns: PACK_LIST_COLUMNS,
+			orderBy: (p, { desc: d }) => [d(p.updatedAt)],
+			limit,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	// ACL post-filter (canRead) — unreadable packs never surface or count.
 	const out: typeof rows = [];
 	for (const r of rows) {
-		if (await canAccessPack(principal, r as Pack)) out.push(r);
+		if (await canAccessPack(principal, r as Pack, readOptions)) out.push(r);
 	}
 	return out;
 }
 
-async function getPack(packId: string, principal: Principal): Promise<Pack> {
-	return loadAccessiblePack(packId, principal);
+async function getPack(
+	packId: string,
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<Pack> {
+	return loadAccessiblePack(packId, principal, readOptions);
 }
 
 interface CreatePackInput {
@@ -196,17 +242,30 @@ interface CreatePackInput {
 	archive: File;
 }
 
-async function createPack(input: CreatePackInput): Promise<Pack> {
+async function createPack(
+	input: CreatePackInput,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<Pack> {
 	if (input.projectId) {
-		const proj = await db.query.projects.findFirst({
-			where: eq(projects.id, input.projectId),
-		});
+		const proj = await readQueryFirst(
+			db.query.projects.findMany({
+				limit: 1,
+				where: eq(projects.id, input.projectId),
+				columns: { id: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!proj) throw new ValidationError(`Project not found: ${input.projectId}`);
 	}
 	if (input.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, input.entryId),
-		});
+		const entry = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, input.entryId),
+				columns: { id: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!entry) throw new ValidationError(`Knowledge entry not found: ${input.entryId}`);
 	}
 
@@ -215,11 +274,15 @@ async function createPack(input: CreatePackInput): Promise<Pack> {
 
 	// Slug uniqueness within scope (a specific project, or the global projectId-null
 	// scope). Mirrors the (project_id, slug) unique index on the table.
-	const dup = await db.query.knowledgePacks.findFirst({
-		where: (p, { and: a, eq: e, isNull }) =>
-			a(e(p.slug, slug), input.projectId ? e(p.projectId, input.projectId) : isNull(p.projectId)),
-		columns: { id: true },
-	});
+	const dup = await readQueryFirst(
+		db.query.knowledgePacks.findMany({
+			limit: 1,
+			where: (p, { and: a, eq: e, isNull }) =>
+				a(e(p.slug, slug), input.projectId ? e(p.projectId, input.projectId) : isNull(p.projectId)),
+			columns: { id: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (dup) {
 		throw new ValidationError(`Pack slug already exists in this scope: ${slug}`);
 	}
@@ -272,12 +335,18 @@ async function updatePackMeta(
 	packId: string,
 	input: UpdatePackInput,
 	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<Pack> {
-	const pack = await assertCanManagePack(packId, principal);
+	const pack = await assertCanManagePack(packId, principal, readOptions);
 	if (input.entryId !== undefined && input.entryId !== null) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, input.entryId),
-		});
+		const entry = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, input.entryId),
+				columns: { id: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!entry) throw new ValidationError(`Knowledge entry not found: ${input.entryId}`);
 	}
 	const patch: Partial<Pack> = { updatedAt: nowIso() };
@@ -298,8 +367,13 @@ async function updatePackMeta(
 }
 
 /** Replace the archive bytes; bumps the hash so stale activations can be detected. */
-async function replaceArchive(packId: string, archive: File, principal: Principal): Promise<Pack> {
-	const pack = await assertCanManagePack(packId, principal);
+async function replaceArchive(
+	packId: string,
+	archive: File,
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<Pack> {
+	const pack = await assertCanManagePack(packId, principal, readOptions);
 	const oldFormat = pack.archiveFormat as PackArchiveFormat;
 	const saved = await savePackArchive(pack.id, archive);
 	// If the format changed (e.g. zip → tar.gz), remove the old archive file.
@@ -318,8 +392,12 @@ async function replaceArchive(packId: string, archive: File, principal: Principa
 	return updated;
 }
 
-async function deletePack(packId: string, principal: Principal): Promise<{ deleted: true }> {
-	const pack = await assertCanManagePack(packId, principal);
+async function deletePack(
+	packId: string,
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<{ deleted: true }> {
+	const pack = await assertCanManagePack(packId, principal, readOptions);
 	// Activations cascade-delete via FK; the on-disk extract dirs are cleaned by the
 	// activation service / startup sweep. Remove the persistent archive here.
 	await db.delete(knowledgePacks).where(eq(knowledgePacks.id, pack.id));

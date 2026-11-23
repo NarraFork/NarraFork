@@ -8,6 +8,7 @@ import {
 	type SubagentKnowledgeCycle,
 	syncSubagentKnowledgeCycle,
 } from "../subagent-knowledge-injection";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 // Exercise the exact authorized primary-loop block without booting the runtime,
 // a provider session, a queue or a server. This is a call-segment test, NOT a claim
@@ -82,7 +83,8 @@ for (const kind of ["primary", "subagent"] as const) {
 			const ids = new Set(["old-cycle"]);
 			const cycle = { seq: 8, ids };
 			const failed = run(cycle);
-			if (kind === "primary") await expect(failed).rejects.toThrow("temporarily unavailable");
+			if (kind === "primary")
+				expect(await captureWorkerRejectionThrower(failed)).toThrow("temporarily unavailable");
 			else expect(await failed).toBe(9); // existing warning/degrade policy
 			expect(cycle.seq).toBe(8);
 			expect([...cycle.ids]).toEqual(["old-cycle"]);

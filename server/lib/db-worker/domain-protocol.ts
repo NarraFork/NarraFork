@@ -2,7 +2,9 @@ import type { ComposerDocumentMetadata, ComposerDocumentParams } from "./compose
 import { DbReadError } from "./errors";
 import type { readEditorOperationEvidence, readRevertPlan } from "./file-read-snapshots";
 import type { readIntegrationAuthoritySnapshotTask } from "./integration-authority-read-task";
+import type { readKnowledgeEntryDetail } from "./knowledge-entry-reader";
 import type { ReadBudgetMeter } from "./read-budget";
+import type { readRecallConversation, readRecallToolCallDetail } from "./recall-reader";
 import type { ToolDetailMetadata, ToolDetailSnapshotParams } from "./tool-detail-query";
 import { TOOL_DETAIL_PAYLOAD_BYTE_LIMIT } from "./tool-detail-selection";
 
@@ -11,6 +13,18 @@ export const DOMAIN_READ_STREAM_TIMEOUT_MS = 30_000;
 export const COMPOSER_DOCUMENT_RESULT_BYTES = 24 * 1024 * 1024;
 
 interface SyncDomainReadTaskMap {
+	knowledgeEntryDetail: {
+		params: Parameters<typeof readKnowledgeEntryDetail>[1];
+		result: ReturnType<typeof readKnowledgeEntryDetail>;
+	};
+	recallConversation: {
+		params: Parameters<typeof readRecallConversation>[1];
+		result: ReturnType<typeof readRecallConversation>;
+	};
+	recallToolCallDetail: {
+		params: Parameters<typeof readRecallToolCallDetail>[1];
+		result: ReturnType<typeof readRecallToolCallDetail>;
+	};
 	editorOperationEvidence: {
 		params: Parameters<typeof readEditorOperationEvidence>[1];
 		result: ReturnType<typeof readEditorOperationEvidence>;
@@ -111,6 +125,36 @@ export function isDomainReadStreamTask(params: {
 }
 
 export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinition } = {
+	knowledgeEntryDetail: {
+		maxInputBytes: 1024,
+		maxResultBytes: 132 * 1024 * 1024,
+		maxArrayItems: 10_000,
+		validate: (input) =>
+			record(input) && Object.keys(input).length === 1 && boundedId(input.entryId),
+	},
+	recallToolCallDetail: {
+		maxInputBytes: 1024,
+		maxResultBytes: 40 * 1024 * 1024,
+		maxArrayItems: 10_000,
+		validate: (input) =>
+			record(input) &&
+			Object.keys(input).length === 2 &&
+			boundedId(input.toolCallId) &&
+			nullableId(input.narratorId),
+	},
+	recallConversation: {
+		maxInputBytes: 1024,
+		maxResultBytes: 4 * 1024 * 1024,
+		maxArrayItems: 10_000,
+		validate: (input) =>
+			record(input) &&
+			Object.keys(input).length === 3 &&
+			boundedId(input.narratorId) &&
+			nullableId(input.messageId) &&
+			Number.isInteger(input.limit) &&
+			Number(input.limit) >= 1 &&
+			Number(input.limit) <= 50,
+	},
 	editorOperationEvidence: {
 		maxInputBytes: 2048,
 		maxResultBytes: SNAPSHOT_BYTES,
