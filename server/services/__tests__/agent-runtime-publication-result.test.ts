@@ -91,6 +91,48 @@ test("publication state batches preserve identity order within the Worker SQL bu
 		probe.mockRestore();
 	}
 });
+
+test.each([
+	{ name: "default", timeoutMs: undefined, withDeadline: false, expectedTimeoutMs: 5_000 },
+	{ name: "shorter", timeoutMs: 2_000, withDeadline: true, expectedTimeoutMs: 2_000 },
+	{ name: "capped", timeoutMs: 10_000, withDeadline: true, expectedTimeoutMs: 5_000 },
+])("committed terminal reads forward only the $name Worker budget", async (budget) => {
+	const run = start();
+	const signal = new AbortController().signal;
+	const deadlineAt = budget.withDeadline ? Date.now() + 10_000 : undefined;
+	const observation = {
+		ownerNarratorId: "parent",
+		signal,
+		timeoutMs: budget.timeoutMs,
+		...(deadlineAt !== undefined ? { deadlineAt } : {}),
+	};
+	const dispatch = spyOn(pool, "runReadTask");
+	try {
+		const publication = getRuntimePublicationService();
+		expect(await publication.readAgentTerminalResult(run, {}, observation)).toBeNull();
+		snapshot(run, "COMMITTED ANSWER");
+		expect(await publication.readAgentTerminalResult(run, {}, observation)).toEqual({
+			output: "COMMITTED ANSWER",
+		});
+		expect(dispatch).toHaveBeenCalledWith(
+			sqlite.filename,
+			expect.objectContaining({ kind: "publicationTerminalResult", run }),
+			{
+				signal,
+				timeoutMs: budget.expectedTimeoutMs,
+				...(deadlineAt !== undefined ? { deadlineAt } : {}),
+			},
+		);
+		const failure = new Error("terminal Worker read failed");
+		dispatch.mockRejectedValueOnce(failure);
+		expect(
+			await captureWorkerRejection(publication.readAgentTerminalResult(run, {}, observation)),
+		).toBe(failure);
+	} finally {
+		dispatch.mockRestore();
+	}
+});
+
 function snapshot(run: ReturnType<typeof start>, text: string, commit = true) {
 	return db.transaction((tx) => {
 		const resultRef = service.persistResult(run, text, tx);

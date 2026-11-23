@@ -2025,7 +2025,10 @@ function createSqliteAsyncPublicationService(
 				sqlite.filename,
 				{ kind: "publicationTerminalResult", run, options, fromBlocks: blockReadsEnabled() },
 				{
-					...committedObservation,
+					signal,
+					...(committedObservation.deadlineAt !== undefined
+						? { deadlineAt: committedObservation.deadlineAt }
+						: {}),
 					timeoutMs: Math.min(committedObservation.timeoutMs ?? 5_000, 5_000),
 				},
 			);
