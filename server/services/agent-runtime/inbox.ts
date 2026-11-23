@@ -667,7 +667,8 @@ export async function withInboxOwner<T>(narratorId: string, work: () => Promise<
  * delivery is left untouched.
  */
 export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown): Promise<void> {
-	if (!row.deliveryId) return;
+	const deliveryId = row.deliveryId;
+	if (!deliveryId) return;
 	const port = getRuntimeQueuePort();
 	if (port) {
 		const current = await port.mailbox.getByDelivery(row.deliveryId);
@@ -675,9 +676,16 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
 			await port.mailbox.failClaim(inboxClaim(row), String(error));
 		return;
 	}
-	const current = await runtimeInbox.getByDelivery(row.deliveryId);
-	if (current?.state === "claimed" && current.claimToken === row.claimToken)
-		runtimeInbox.failClaim(inboxClaim(row), String(error));
+	runAtomicWrite(db, "inbox.releaseClaim", (tx) => {
+		const current = runtimeInbox.getByDelivery(deliveryId, tx);
+		if (
+			current?.state === "claimed" &&
+			current.id === row.id &&
+			current.claimToken === row.claimToken &&
+			current.claimEpoch === row.claimEpoch
+		)
+			runtimeInbox.failClaim(inboxClaim(row), String(error));
+	});
 }
 
 /**

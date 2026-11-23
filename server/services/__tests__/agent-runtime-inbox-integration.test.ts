@@ -948,6 +948,34 @@ test("accepted maximum Send body is stored once and a new clone provenance canno
 	await expect(inbox.enqueueInboxAgent(clone, clone.text)).rejects.toThrow("receipt");
 });
 
+test("Worker read outage cannot strand an input claim after its execution owner releases", async () => {
+	await inbox.enqueueInboxAgent(delivery("child", "retry input"), "retry input");
+	const owner = required(tryClaimExecution("child", "run"));
+	const row = required(await inbox.claimInboxHead("child", () => true));
+	const read = spyOn(workerRead, "readQueryFirst").mockRejectedValue(
+		new Error("release Worker unavailable"),
+	);
+	let result: unknown;
+	try {
+		result = await inbox.releaseInboxClaim(row, "preparation failed").catch((error) => error);
+	} finally {
+		owner.release();
+		read.mockRestore();
+	}
+	expect(state(row.id)).toMatchObject({ state: "queued", claimToken: null, claimEpoch: null });
+	expect(result).toBeUndefined();
+	const nextOwner = required(tryClaimExecution("child", "run"));
+	try {
+		const next = required(await inbox.claimInboxHead("child", () => true));
+		expect(next.id).toBe(row.id);
+		await inbox.releaseInboxClaim(row, "stale release");
+		expect(state(row.id)).toMatchObject({ state: "claimed", claimToken: next.claimToken });
+		await inbox.releaseInboxClaim(next, "cleanup");
+	} finally {
+		nextOwner.release();
+	}
+});
+
 test("failed agent payloads still fill their quota without preventing user acceptance", async () => {
 	for (let index = 0; index < 50; index++) await inbox.enqueueInboxAgent(delivery(), "same words");
 	const owner = tryClaimExecution("child", "run");
