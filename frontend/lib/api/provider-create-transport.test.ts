@@ -225,14 +225,12 @@ describe("provider creation API transport", () => {
 			status: 401,
 			data: { code: "OAUTH_REQUIRED" },
 		});
-		expect(removedStorageKeys).toEqual(["narrafork_current_user_v1"]);
+		expect(removedStorageKeys).toEqual([]);
 		responseBody = JSON.stringify({ code: "UNAUTHORIZED", error: "Session expired" });
 		await expect(settingsApi.getSettings({ maxResponseBytes: 1024 })).rejects.toMatchObject({
 			status: 401,
 		});
-		expect(removedStorageKeys.filter((key) => key === "narrafork_token")).toEqual([
-			"narrafork_token",
-		]);
+		expect(removedStorageKeys).toContain("narrafork_token");
 		expect(jsonReads).toBe(0);
 	});
 

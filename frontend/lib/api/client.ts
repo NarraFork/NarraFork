@@ -169,7 +169,6 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
  * to sign users out at random.
  */
 function clearTokenIfSessionInvalid(data: Record<string, unknown> | null): void {
-	clearCurrentUserCache();
 	if (isSessionInvalidResponse(data)) clearToken();
 }
 
