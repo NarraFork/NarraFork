@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diskSpaceMonitor } from "../lib/disk-safety";
@@ -39,7 +39,7 @@ async function entries(path: string): Promise<string[]> {
 	}
 }
 
-test("low-space snapshots do not create shadow repos/receipts and resume after space recovers", async () => {
+test("local snapshots stay disabled before and after disk space recovers", async () => {
 	const worktree = await mkdtemp(join(tmpdir(), "nf-disk-snapshot-"));
 	try {
 		const init = await safeSpawn({
@@ -57,8 +57,8 @@ test("low-space snapshots do not create shadow repos/receipts and resume after s
 		expect(await readFile(join(worktree, "file"), "utf8")).toBe("unchanged");
 		diskSpaceMonitor.assess = originalAssess;
 		const recovered = await worktreeTreeSnapshot.tryCaptureHot(worktree);
-		expect(recovered).toMatch(/^[a-f0-9]{40,64}$/);
-		expect((await stat(shadowRoot)).isDirectory()).toBe(true);
+		expect(recovered).toBeNull();
+		expect(await entries(shadowRoot)).toEqual(before);
 	} finally {
 		await rm(worktree, { recursive: true, force: true });
 	}

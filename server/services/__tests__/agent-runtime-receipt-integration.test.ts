@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -11,7 +12,7 @@ import {
 import { createMailboxStore } from "../agent-runtime/mailbox";
 import type { MailboxClaim, MailboxRow } from "../agent-runtime/mailbox-types";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 mock.module("../../db", () => ({
 	db,
 	sqlite,
@@ -44,7 +45,7 @@ beforeEach(() => {
 	for (const id of ["recipient", "sender", "fork"])
 		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
 });
-afterAll(() => sqlite.close());
+afterAll(async () => disposeWorkerDb());
 
 test("SQL ref-insert failure cannot leave an orphan history message", async () => {
 	const { row, claim } = enqueue();

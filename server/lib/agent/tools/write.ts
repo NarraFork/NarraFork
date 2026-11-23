@@ -196,10 +196,17 @@ export const writeTool: ToolDefinition = {
 				},
 			});
 			if (recorded) {
-				const hint = await trackFileChange(ctx, ioPath, "write", backend, null, {
-					evidenceRecorded: true,
-					hint: true,
-				});
+				const { linesAdded, linesRemoved } = recorded.metadata ?? {};
+				const hint = await trackFileChange(
+					ctx,
+					ioPath,
+					"write",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
+					{ evidenceRecorded: Boolean(recorded.metadata?.fileChangeEvidence), hint: true },
+				);
 				return withOverlapHint(recorded, hint);
 			}
 			flow.declined();
@@ -211,8 +218,8 @@ export const writeTool: ToolDefinition = {
 					canonicalPath: queuePath,
 				},
 				async () => {
-					// Read an existing file exactly once. The same complete content drives both
-					// the required snapshot and encoding preservation, avoiding TOCTOU drift.
+					// Read once: remote history and encoding preservation share the same
+					// complete content, avoiding TOCTOU drift.
 					const stat = await backend.statFile(ioPath);
 					if (stat && !stat.isFile)
 						throw new Error(`Write target is not a regular file: ${resolvedPath}`);
@@ -228,19 +235,22 @@ export const writeTool: ToolDefinition = {
 						existingEncoding = decoded.encoding;
 						existingIsBinary = looksBinary(bytes);
 					}
-					const snapshot = await boundedFileHistory(() =>
-						ensureFileSnapshot(
-							ctx.narratorId,
-							backend.deviceId,
-							ioPath,
-							async () => ({
-								content: existingContent,
-								encoding: existingEncoding,
-								isBinary: existingIsBinary,
-							}),
-							"best-effort",
-						),
-					).catch(() => "failed" as const);
+					const snapshot =
+						backend.kind === "local"
+							? "disabled"
+							: await boundedFileHistory(() =>
+									ensureFileSnapshot(
+										ctx.narratorId,
+										backend.deviceId,
+										ioPath,
+										async () => ({
+											content: existingContent,
+											encoding: existingEncoding,
+											isBinary: existingIsBinary,
+										}),
+										"best-effort",
+									),
+								).catch(() => "failed" as const);
 
 					flow.writing();
 					await backend.mkdirp(backendDirname(backend, ioPath));
@@ -282,7 +292,12 @@ export const writeTool: ToolDefinition = {
 						metadata: {
 							...lineStatsMetadata(diffStats),
 							diskOutcome: "applied",
-							historyStatus: snapshot === "failed" ? "unavailable" : "complete",
+							historyStatus:
+								snapshot === "disabled"
+									? "disabled"
+									: snapshot === "failed"
+										? "unavailable"
+										: "complete",
 							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
 						},
 					};
@@ -310,7 +325,7 @@ export const writeTool: ToolDefinition = {
 				isError: true,
 				metadata: {
 					diskOutcome: remoteDispatched ? "unknown" : "not_applied",
-					historyStatus: "unavailable",
+					historyStatus: backend.kind === "local" ? "disabled" : "unavailable",
 					...fileChangeDiagnosticMetadata(err),
 					...fileWriteOutcomeMetadata(err),
 				},
