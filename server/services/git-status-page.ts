@@ -3,9 +3,12 @@ import type { GitLineStats } from "../../shared/git-line-stats";
 import {
 	GIT_STATUS_PAGE_MAX_LIMIT,
 	type GitStatusPage,
+	type GitStatusPageCacheState,
 	type GitStatusPageQuery,
+	type GitStatusPageResult,
 	type GitStatusPageScopeProof,
 	type GitStatusPageStatsQuery,
+	type GitStatusPageStatsResponse,
 	type GitStatusPageStatsResult,
 	type GitStatusPageValidation,
 	isGitStatusFilterChar,
@@ -25,6 +28,7 @@ import {
 	type GitStatusPageWorkerOutput,
 	type GitStatusPageWorkerValue,
 	gitStatusPageScopesOverlap,
+	gitStatusPageSourceIdentity,
 } from "./git-status-page-protocol";
 
 import { validateGitStatusPageStatsQuery } from "./git-status-page-stats";
@@ -44,7 +48,8 @@ export interface ReadGitStatusPageOptions {
 }
 export interface ReadGitStatusPageStatsOptions extends Omit<ReadGitStatusPageOptions, "query"> {
 	query: GitStatusPageStatsQuery;
-	readStats: (signal: AbortSignal) => Promise<GitLineStats>;
+	/** Used by producers and by the legacy on-demand statistics endpoint. */
+	readStats?: (signal: AbortSignal) => Promise<GitLineStats>;
 }
 export interface ValidateGitStatusPagesOptions {
 	queryKey: string;
@@ -58,8 +63,20 @@ export interface AssertGitStatusPageScopeOptions {
 	files: string[];
 	signal?: AbortSignal;
 }
+export interface ObserveGitStatusPagesOptions extends ValidateGitStatusPagesOptions {
+	readStats: (signal: AbortSignal) => Promise<GitLineStats>;
+	onPublished?: (cache: GitStatusPageCacheState) => void;
+}
 interface TaskOptions extends ReadGitStatusPageOptions {
-	operation?: "validate" | "assert" | "stats";
+	operation?:
+		| "validate"
+		| "assert"
+		| "stats"
+		| "observe"
+		| "cache-state"
+		| "read-on-demand"
+		| "stats-on-demand";
+	onPublished?: (cache: GitStatusPageCacheState) => void;
 	statsQuery?: GitStatusPageStatsQuery;
 	readStats?: ReadGitStatusPageStatsOptions["readStats"];
 	proof?: GitStatusPageScopeProof;
@@ -75,6 +92,8 @@ interface Pending {
 	sent: boolean;
 	remoteStarted: boolean;
 	admitted: boolean;
+	invalidated?: boolean;
+	released?: boolean;
 	dispatching?: Promise<void>;
 	permit?: TaskQueuePermit;
 }
@@ -100,6 +119,7 @@ export class GitStatusPageService {
 	});
 	private readonly startup = new AbortController();
 	private readonly pending = new Map<number, Pending>();
+	private readonly leases = new Map<string, number>();
 	private readonly statisticsReads = new Map<
 		number,
 		{ queryKey: string; controller: AbortController }
@@ -109,11 +129,27 @@ export class GitStatusPageService {
 	private closing: Promise<void> | undefined;
 	private onClosed: (() => void) | undefined;
 
-	read(options: ReadGitStatusPageOptions): Promise<GitStatusPage> {
-		return this.submit(options) as Promise<GitStatusPage>;
+	read(options: ReadGitStatusPageOptions): Promise<GitStatusPageResult> {
+		return this.submit(options) as Promise<GitStatusPageResult>;
 	}
 
-	readStats(options: ReadGitStatusPageStatsOptions): Promise<GitStatusPageStatsResult> {
+	readOnDemand(options: ReadGitStatusPageOptions): Promise<GitStatusPage> {
+		return this.submit({ ...options, operation: "read-on-demand" }) as Promise<GitStatusPage>;
+	}
+
+	readStatsOnDemand(options: ReadGitStatusPageStatsOptions): Promise<GitStatusPageStatsResult> {
+		if (options.signal?.aborted)
+			return Promise.reject(statisticsCancellation(options.signal.reason));
+		validateGitStatusPageStatsQuery(options.query);
+		return this.submit({
+			...options,
+			query: { filter: options.query.filter },
+			statsQuery: options.query,
+			operation: "stats-on-demand",
+		}) as Promise<GitStatusPageStatsResult>;
+	}
+
+	readStats(options: ReadGitStatusPageStatsOptions): Promise<GitStatusPageStatsResponse> {
 		if (this.closed) return Promise.reject(new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
 		if (options.signal?.aborted)
 			return Promise.reject(statisticsCancellation(options.signal.reason));
@@ -127,14 +163,12 @@ export class GitStatusPageService {
 			query: { filter: options.query.filter },
 			statsQuery: options.query,
 			operation: "stats",
-		}) as Promise<GitStatusPageStatsResult>;
+		}) as Promise<GitStatusPageStatsResponse>;
 	}
 
 	validate(options: ValidateGitStatusPagesOptions): Promise<GitStatusPageValidation> {
 		if (this.closed) return Promise.reject(new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
 		if (options.signal?.aborted) return Promise.reject(options.signal.reason);
-		if (!this.worker && !this.connecting && this.pending.size === 0)
-			return Promise.resolve({ changed: false, reliable: false });
 		return this.submit({
 			scope: { actorId: "git-watch", workspaceKey: "git-watch", queryKey: options.queryKey },
 			query: {},
@@ -142,6 +176,55 @@ export class GitStatusPageService {
 			signal: options.signal,
 			operation: "validate",
 		}) as Promise<GitStatusPageValidation>;
+	}
+
+	observe(options: ObserveGitStatusPagesOptions): Promise<GitStatusPageCacheState> {
+		return this.submit({
+			...options,
+			scope: { actorId: "git-watch", workspaceKey: "git-watch", queryKey: options.queryKey },
+			query: {},
+			operation: "observe",
+		}) as Promise<GitStatusPageCacheState>;
+	}
+
+	cacheState(options: ValidateGitStatusPagesOptions): Promise<GitStatusPageCacheState> {
+		return this.submit({
+			...options,
+			scope: { actorId: "git-watch", workspaceKey: "git-watch", queryKey: options.queryKey },
+			query: {},
+			operation: "cache-state",
+		}) as Promise<GitStatusPageCacheState>;
+	}
+
+	retain(queryKey: string, source?: GitStatusPageSource): void {
+		const sourceIdentity = source && gitStatusPageSourceIdentity(source);
+		const key = JSON.stringify([queryKey, sourceIdentity ?? null]);
+		const count = this.leases.get(key) ?? 0;
+		if (count === 0 && this.leases.size >= 128)
+			throw new GitStatusPageError("GIT_STATUS_PAGE_BUSY");
+		this.leases.set(key, count + 1);
+		if (count === 0) this.post({ action: "retain", queryKey, sourceIdentity });
+	}
+	release(queryKey: string, source?: GitStatusPageSource): void {
+		const sourceIdentity = source && gitStatusPageSourceIdentity(source);
+		const key = JSON.stringify([queryKey, sourceIdentity ?? null]);
+		const count = this.leases.get(key) ?? 0;
+		if (count > 1) {
+			this.leases.set(key, count - 1);
+			return;
+		}
+		this.leases.delete(key);
+		for (const pending of this.pending.values())
+			if (
+				pending.options.scope.queryKey === queryKey &&
+				(sourceIdentity === undefined ||
+					gitStatusPageSourceIdentity(pending.options.source) === sourceIdentity) &&
+				["observe", "validate", "assert"].includes(pending.options.operation ?? "")
+			) {
+				pending.invalidated = true;
+				pending.released = true;
+			}
+		this.post({ action: "release", queryKey, sourceIdentity });
 	}
 
 	async assertScope(options: AssertGitStatusPageScopeOptions): Promise<void> {
@@ -187,7 +270,7 @@ export class GitStatusPageService {
 			const controller = new AbortController();
 			const abort = () => {
 				controller.abort(
-					options.operation === "stats"
+					options.operation === "stats" || options.operation === "stats-on-demand"
 						? statisticsCancellation(options.signal?.reason)
 						: options.signal?.reason,
 				);
@@ -224,32 +307,24 @@ export class GitStatusPageService {
 		return promise;
 	}
 
-	invalidateStats(queryKey: string): void {
-		for (const [id, pending] of this.pending) {
+	private dirtyPending(queryKey: string, includePages = true): void {
+		for (const pending of this.pending.values())
 			if (
-				pending.options.operation !== "stats" ||
-				!gitStatusPageScopesOverlap(pending.options.scope.queryKey, queryKey)
+				(["observe", "validate", "stats-on-demand"].includes(pending.options.operation ?? "") ||
+					(includePages &&
+						["assert", "read-on-demand"].includes(pending.options.operation ?? ""))) &&
+				gitStatusPageScopesOverlap(pending.options.scope.queryKey, queryKey)
 			)
-				continue;
-			pending.controller.abort(new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
-			if (!pending.sent)
-				this.finish(id, undefined, new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
-		}
-		for (const read of this.statisticsReads.values())
-			if (gitStatusPageScopesOverlap(read.queryKey, queryKey))
-				read.controller.abort(new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
+				pending.invalidated = true;
+	}
+	invalidateStats(queryKey: string): void {
+		this.dirtyPending(queryKey, false);
 		this.post({ action: "invalidate-stats", queryKey });
 	}
 
 	invalidate(queryKey: string): void {
-		this.invalidateStats(queryKey);
-		for (const [id, pending] of this.pending) {
-			if (!gitStatusPageScopesOverlap(pending.options.scope.queryKey, queryKey)) continue;
-			pending.controller.abort(new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
-			if (!pending.sent)
-				this.finish(id, undefined, new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
-		}
-		// Invalidation and reads share this port, so an in-flight scan cannot publish across it.
+		// The parent remembers dirty generations even before the Worker has connected.
+		this.dirtyPending(queryKey);
 		this.post({ action: "invalidate", queryKey });
 	}
 
@@ -296,14 +371,20 @@ export class GitStatusPageService {
 		try {
 			const waiting = this.pending.get(id);
 			if (!waiting) return;
-			const active = this.admission.stats.active;
-			const acquiring = this.admission.acquire({
-				signal: waiting.controller.signal,
-				// Scan/bridge budgets remain owned by the Worker, including cancellation ACKs.
-				deadlineAt: Infinity,
-			});
-			waiting.admitted = this.admission.stats.active > active;
-			permit = await acquiring;
+			// Cache projections must not queue behind a scan or a numstat bridge.
+			if (
+				["observe", "validate", "assert", "read-on-demand", "stats-on-demand"].includes(
+					waiting.options.operation ?? "",
+				)
+			) {
+				const active = this.admission.stats.active;
+				const acquiring = this.admission.acquire({
+					signal: waiting.controller.signal,
+					deadlineAt: Infinity,
+				});
+				waiting.admitted = this.admission.stats.active > active;
+				permit = await acquiring;
+			}
 			waiting.admitted = true;
 			if (!this.pending.has(id) || this.closed) return;
 			waiting.permit = permit;
@@ -311,6 +392,10 @@ export class GitStatusPageService {
 			const worker = this.worker ?? (await this.connect());
 			const pending = this.pending.get(id);
 			if (!pending || this.closed) return;
+			if (pending.invalidated)
+				throw new GitStatusPageError(
+					pending.released ? "GIT_STATUS_PAGE_CANCELLED" : "GIT_STATUS_PAGE_EXPIRED",
+				);
 			const { scope, query, source } = pending.options;
 			pending.sent = true;
 			worker.ref();
@@ -361,6 +446,10 @@ export class GitStatusPageService {
 			);
 			this.worker = worker;
 			this.handle = handle;
+			for (const key of this.leases.keys()) {
+				const [queryKey, sourceIdentity] = JSON.parse(key) as [string, string | null];
+				this.post({ action: "retain", queryKey, sourceIdentity: sourceIdentity ?? undefined });
+			}
 			worker.on("message", (message: GitStatusPageWorkerOutput) => this.receive(message));
 			worker.on("error", () => this.failWorker(worker));
 			worker.on("messageerror", () => this.failWorker(worker));
@@ -428,6 +517,12 @@ export class GitStatusPageService {
 			})();
 			return;
 		}
+		if (message.action === "cache-published") {
+			const pending = this.pending.get(message.id);
+			if (pending && !pending.invalidated && !pending.controller.signal.aborted)
+				pending.options.onPublished?.(message.cache);
+			return;
+		}
 		if (message.action === "result") {
 			this.finish(message.id, message.value);
 			return;
@@ -482,7 +577,12 @@ export class GitStatusPageService {
 		if (durationMs >= 2_000) {
 			try {
 				logger.warn("Slow Git status page operation", {
-					operation: pending.options.operation ?? "read",
+					operation:
+						pending.options.operation === "read-on-demand"
+							? "read"
+							: pending.options.operation === "stats-on-demand"
+								? "stats"
+								: (pending.options.operation ?? "read"),
 					durationMs,
 					success: !this.closed && !reason && !error && value !== undefined,
 				});
@@ -491,6 +591,12 @@ export class GitStatusPageService {
 		pending.controller.abort();
 		if (this.closed) pending.reject(new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
 		else if (reason) pending.reject(reason);
+		else if (pending.invalidated)
+			pending.reject(
+				new GitStatusPageError(
+					pending.released ? "GIT_STATUS_PAGE_CANCELLED" : "GIT_STATUS_PAGE_EXPIRED",
+				),
+			);
 		else if (error) pending.reject(error);
 		else if (value !== undefined) pending.resolve(value);
 		else pending.reject(new GitStatusPageError("GIT_STATUS_PAGE_SOURCE_FAILED"));
@@ -533,12 +639,38 @@ export class GitStatusPageService {
 }
 
 const pages = new GitStatusPageService();
-export function readGitStatusPage(options: ReadGitStatusPageOptions): Promise<GitStatusPage> {
+export function readGitStatusPageOnDemand(
+	options: ReadGitStatusPageOptions,
+): Promise<GitStatusPage> {
+	return pages.readOnDemand(options);
+}
+export function readGitStatusPageStatsOnDemand(
+	options: ReadGitStatusPageStatsOptions,
+): Promise<GitStatusPageStatsResult> {
+	return pages.readStatsOnDemand(options);
+}
+export function observeGitStatusPages(
+	options: ObserveGitStatusPagesOptions,
+): Promise<GitStatusPageCacheState> {
+	return pages.observe(options);
+}
+export function getGitStatusPagesCacheState(
+	options: ValidateGitStatusPagesOptions,
+): Promise<GitStatusPageCacheState> {
+	return pages.cacheState(options);
+}
+export function retainGitStatusPages(queryKey: string, source?: GitStatusPageSource): void {
+	pages.retain(queryKey, source);
+}
+export function releaseGitStatusPages(queryKey: string, source?: GitStatusPageSource): void {
+	pages.release(queryKey, source);
+}
+export function readGitStatusPage(options: ReadGitStatusPageOptions): Promise<GitStatusPageResult> {
 	return pages.read(options);
 }
 export function readGitStatusPageStats(
 	options: ReadGitStatusPageStatsOptions,
-): Promise<GitStatusPageStatsResult> {
+): Promise<GitStatusPageStatsResponse> {
 	return pages.readStats(options);
 }
 export function invalidateGitStatusPageStats(queryKey: string): void {

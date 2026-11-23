@@ -98,6 +98,18 @@ export async function detachBashProcess(
 	return entry.detach();
 }
 
+/**
+ * How long a foreground Bash waits for its process to exit after killing it. A
+ * process that survives the kill (uninterruptible I/O, a lost exit event, a remote
+ * device that stopped answering) must not hold the turn forever.
+ */
+let killSettleGraceMs = 15_000;
+
+/** Test hook: shorten the post-kill grace period. */
+export function setBashKillSettleGraceMsForTests(ms: number | undefined): void {
+	killSettleGraceMs = ms ?? 15_000;
+}
+
 const runningBashProcesses = hotSafe(
 	"narrafork:runningBashProcesses",
 	() => new Map<string, RunningBashEntry>(),
@@ -521,8 +533,23 @@ export const bashTool: ToolDefinition = {
 				let timedOut = false;
 				let aborted = false;
 				let exited = false;
+				let abandoned = false;
+				let abandonTimer: ReturnType<typeof setTimeout> | undefined;
+				const abandonWait = Promise.withResolvers<null>();
 
 				const kill = () => handle.kill();
+				// A kill that ends the foreground wait is bounded: stop waiting for an exit
+				// that never comes, so the turn ends with a result instead of hanging.
+				const stopAndBound = () => {
+					if (!abandonTimer && !detached) {
+						abandonTimer = setTimeout(() => {
+							if (exited || detached) return;
+							abandoned = true;
+							abandonWait.resolve(null);
+						}, killSettleGraceMs);
+					}
+					return kill();
+				};
 
 				// Collect stdout + stderr into a single buffer with size limit.
 				// Use StringDecoder to handle multi-byte UTF-8 characters split across chunks.
@@ -594,19 +621,19 @@ export const bashTool: ToolDefinition = {
 				// Abort: if already aborted, kill immediately
 				if (ctx.signal.aborted) {
 					aborted = true;
-					await kill();
+					await stopAndBound();
 				}
 
 				const abortHandler = () => {
 					aborted = true;
-					void kill();
+					void stopAndBound();
 				};
 				ctx.signal.addEventListener("abort", abortHandler, { once: true });
 
 				// Timeout
 				const timer = setTimeout(() => {
 					timedOut = true;
-					void kill();
+					void stopAndBound();
 				}, timeoutMs);
 
 				// Serialize concurrent detach requests. Output stays in this collector
@@ -702,7 +729,7 @@ export const bashTool: ToolDefinition = {
 						timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
 						narratorId: ctx.narratorId,
 						detach,
-						kill: () => void kill(),
+						kill: () => void stopAndBound(),
 						setTimedOut: () => {
 							timedOut = true;
 						},
@@ -741,7 +768,7 @@ export const bashTool: ToolDefinition = {
 					// Kill if process is dead and no recent output (zombie/leaked)
 					if (!pidAlive && !hadOutput && !exited) {
 						watchdogKilled = true;
-						void kill();
+						void stopAndBound();
 						return;
 					}
 
@@ -760,7 +787,7 @@ export const bashTool: ToolDefinition = {
 				// Wait for process to finish
 				let exitCodeValue: number | null = null;
 				try {
-					exitCodeValue = await handle.exited;
+					exitCodeValue = await Promise.race([handle.exited, abandonWait.promise]);
 					await detachPending?.catch(() => undefined);
 				} catch (error) {
 					await detachPending?.catch(() => undefined);
@@ -780,6 +807,7 @@ export const bashTool: ToolDefinition = {
 					throw error;
 				} finally {
 					clearTimeout(timer);
+					clearTimeout(abandonTimer);
 					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
@@ -818,6 +846,13 @@ export const bashTool: ToolDefinition = {
 				if (watchdogKilled)
 					meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 				if (aborted) meta.push("Command was aborted by user");
+				if (abandoned) {
+					meta.push(
+						`Process did not exit within ${killSettleGraceMs}ms after being killed` +
+							(handle.pid ? ` (pid ${handle.pid})` : "") +
+							"; stopped waiting for it, it may still be running",
+					);
+				}
 				if (!timedOut && !aborted && handle.outputIncomplete?.()) {
 					meta.push(
 						"Output is incomplete: the device reached its output limit or a background " +
@@ -828,7 +863,8 @@ export const bashTool: ToolDefinition = {
 					output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 				}
 
-				const exitCode = exitCodeValue ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
+				const exitCode =
+					exitCodeValue ?? (timedOut || aborted || watchdogKilled || abandoned ? 1 : 0);
 				if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 				if (detached) {
