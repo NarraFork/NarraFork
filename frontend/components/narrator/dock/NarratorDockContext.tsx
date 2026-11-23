@@ -83,8 +83,6 @@ export interface NarratorBrowserInfo {
 interface NarratorDockBridges {
 	/** Registered by the chat panel; called by the terminal to append to chat input. */
 	appendChatInput: ((text: string) => void) | null;
-	/** Registered by the terminal panel; called by chat to write to terminal stdin. */
-	writeTerminalStdin: ((text: string) => void) | null;
 	/** Registered by the chat panel; called by the search panel to jump to a message. */
 	scrollToMessage: ScrollToMessageFn | null;
 	/**
@@ -144,11 +142,6 @@ export interface NarratorDockContextValue {
 	registerAppendChatInput: (fn: (text: string) => void) => () => void;
 	/** Append text to the chat input, if a chat panel is mounted. */
 	appendChatInput: (text: string) => void;
-
-	/** Register the terminal-stdin writer (returns an unregister fn). */
-	registerWriteTerminalStdin: (fn: (text: string) => void) => () => void;
-	/** Write text to the terminal, if a terminal panel is mounted. */
-	writeTerminalStdin: (text: string) => void;
 
 	/** Register the message-jump handler (returns an unregister fn). */
 	registerScrollToMessage: (fn: ScrollToMessageFn) => () => void;
@@ -270,7 +263,6 @@ export function NarratorDockProvider({
 
 	const bridgesRef = useRef<NarratorDockBridges>({
 		appendChatInput: null,
-		writeTerminalStdin: null,
 		scrollToMessage: null,
 		submitToNarrator: null,
 		addFileReference: null,
@@ -735,8 +727,6 @@ export function NarratorDockProvider({
 			NarratorDockContextValue,
 			| "registerAppendChatInput"
 			| "appendChatInput"
-			| "registerWriteTerminalStdin"
-			| "writeTerminalStdin"
 			| "registerScrollToMessage"
 			| "scrollToMessage"
 			| "registerSubmitToNarrator"
@@ -751,14 +741,6 @@ export function NarratorDockProvider({
 				};
 			},
 			appendChatInput: (text) => bridgesRef.current.appendChatInput?.(text),
-			registerWriteTerminalStdin: (fn) => {
-				bridgesRef.current.writeTerminalStdin = fn;
-				return () => {
-					if (bridgesRef.current.writeTerminalStdin === fn)
-						bridgesRef.current.writeTerminalStdin = null;
-				};
-			},
-			writeTerminalStdin: (text) => bridgesRef.current.writeTerminalStdin?.(text),
 			registerScrollToMessage: (fn) => {
 				bridgesRef.current.scrollToMessage = fn;
 				return () => {

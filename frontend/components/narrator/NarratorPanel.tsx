@@ -133,7 +133,6 @@ import {
 import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
@@ -300,7 +299,6 @@ function NarratorPanelBody({
 	highlightMessageId,
 	highlightRequestId,
 	highlightNeedle,
-	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
@@ -1618,15 +1616,6 @@ function NarratorPanelBody({
 		if (dock) dock.toggleToolPanel("terminal");
 		else onToggleTerminal?.();
 	}, [dock, onToggleTerminal]);
-	// Chat → terminal "send selection": prefer the explicit prop, else bridge
-	// through the dock context (writes to the terminal panel if one is open).
-	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
-	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
-		if (REMOTE_BUILD) return undefined;
-		if (onSendToTerminal) return onSendToTerminal;
-		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
-		return undefined;
-	}, [onSendToTerminal, dock, terminalToolOpened, dockWriteTerminalStdin]);
 
 	// ── Plugin panel picker (dock surfaces only) ──
 	// Opens a plugin UI contribution as a dockview sibling panel. Params are
@@ -3600,14 +3589,6 @@ function NarratorPanelBody({
 									</Menu.Dropdown>
 								</Menu>
 							</Box>
-						)}
-
-						{effSendToTerminal && (
-							<SelectionPopover
-								containerRef={contentRef}
-								onAction={effSendToTerminal}
-								label={tt("sendToTerminal")}
-							/>
 						)}
 
 						{/* Scroll to bottom button */}

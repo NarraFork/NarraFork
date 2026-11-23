@@ -494,26 +494,6 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 		}
 	}, [t, props.api]);
 
-	// Bridge: register terminal stdin writer so chat can push text to us.
-	const registerWrite = dock?.registerWriteTerminalStdin;
-	const handleWriteRef = useCallback(
-		(fn: ((text: string) => void) | null) => {
-			if (!registerWrite || !fn) return;
-			const unregister = registerWrite(fn);
-			return unregister;
-		},
-		[registerWrite],
-	);
-	const unregisterRef = useRef<(() => void) | null>(null);
-	const onWriteRef = useCallback(
-		(fn: ((text: string) => void) | null) => {
-			unregisterRef.current?.();
-			unregisterRef.current = fn ? (handleWriteRef(fn) ?? null) : null;
-		},
-		[handleWriteRef],
-	);
-	useEffect(() => () => unregisterRef.current?.(), []);
-
 	const sendToChat = useCallback((text: string) => dock?.appendChatInput(text), [dock]);
 
 	return (
@@ -531,12 +511,7 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 					</Center>
 				}
 			>
-				<NarratorTerminal
-					narratorId={narratorId}
-					onSendToChat={sendToChat}
-					onWriteRef={onWriteRef}
-					onExit={close}
-				/>
+				<NarratorTerminal narratorId={narratorId} onSendToChat={sendToChat} onExit={close} />
 			</Suspense>
 		</ToolPanelShell>
 	);
