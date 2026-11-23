@@ -46,6 +46,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	mock.restore();
+	service.unregisterAbortController("task");
 	await drain();
 });
 afterAll(async () => {
@@ -92,6 +93,140 @@ function expectConflict(error: unknown) {
 		message: "Runtime state changed while reading",
 	});
 }
+
+function interleaveFirst(mutate: () => void) {
+	const original = reads.readQueryFirst;
+	let fired = false;
+	spyOn(reads, "readQueryFirst").mockImplementation((async (query, options) => {
+		const result = await original(query as Parameters<typeof reads.readQueryFirst>[0], options);
+		if (!fired && query.toSQL().sql.includes('from "background_tasks"')) {
+			fired = true;
+			mutate();
+		}
+		return result;
+	}) as typeof reads.readQueryFirst);
+	return () => expect(fired).toBe(true);
+}
+
+for (const existing of [false, true]) {
+	test(`agent ${existing ? "restart" : "creation"} rejects a changed task before registering a run`, async () => {
+		db.insert(narrators).values({ id: "task", createdAt: now, updatedAt: now }).run();
+		if (existing)
+			seed({ type: "agent", subagentNarratorId: "task", status: "failed", logicalRunId: "old" });
+		const fired = interleaveFirst(() => {
+			if (existing)
+				db.update(backgroundTasks)
+					.set({ logicalRunId: "winner" })
+					.where(eq(backgroundTasks.id, "task"))
+					.run();
+			else seed({ type: "agent", subagentNarratorId: "task", logicalRunId: "winner" });
+		});
+		expectConflict(
+			await captureWorkerRejection(
+				service.createAgentTask({
+					id: "task",
+					subagentNarratorId: "task",
+					subagentType: "general",
+					binding: { deliverTo: { narratorId: "parent", toolUseId: "origin" } },
+				}),
+			),
+		);
+		fired();
+		expect(stored()?.logicalRunId).toBe("winner");
+		expect(
+			db
+				.select({ run: narrators.logicalRunId })
+				.from(narrators)
+				.where(eq(narrators.id, "task"))
+				.get()?.run,
+		).toBeNull();
+		expect(sqlite.query("SELECT id FROM runtime_publication_outbox").all()).toEqual([]);
+	});
+}
+
+test("cancel does not abort a run changed after its Worker snapshot", async () => {
+	await service.createBashTask({ id: "task", parentNarratorId: "parent", command: "build" });
+	await drain();
+	const controller = new AbortController();
+	service.registerAbortController("task", controller);
+	const fired = interleaveFirst(() =>
+		db
+			.update(backgroundTasks)
+			.set({ logicalRunId: "winner" })
+			.where(eq(backgroundTasks.id, "task"))
+			.run(),
+	);
+	expectConflict(await captureWorkerRejection(service.cancel("task")));
+	fired();
+	expect(controller.signal.aborted).toBe(false);
+	expect(stored()?.status).toBe("running");
+	expect(stored()?.logicalRunId).toBe("winner");
+});
+
+for (const command of [`😀${"x".repeat(100)}`, "a😀".repeat(50), "", null]) {
+	test(`cancel signals an unchanged task with command ${JSON.stringify(command)}`, async () => {
+		await service.createBashTask({
+			id: "task",
+			parentNarratorId: "parent",
+			command: command ?? "",
+		});
+		if (command === null)
+			db.update(backgroundTasks).set({ command }).where(eq(backgroundTasks.id, "task")).run();
+		await drain();
+		const controller = new AbortController();
+		service.registerAbortController("task", controller);
+		expect(await service.cancel("task")).toBe(true);
+		expect(controller.signal.aborted).toBe(true);
+		expect(stored()?.status).toBe("cancelled");
+	});
+}
+
+test("cancel tolerates output and renewal-only metadata changes", async () => {
+	await service.createBashTask({ id: "task", parentNarratorId: "parent", command: "build" });
+	await drain();
+	const controller = new AbortController();
+	service.registerAbortController("task", controller);
+	const fired = interleaveFirst(() =>
+		db
+			.update(backgroundTasks)
+			.set({ output: "latest tail", updatedAt: "2099-01-01" })
+			.where(eq(backgroundTasks.id, "task"))
+			.run(),
+	);
+	expect(await service.cancel("task")).toBe(true);
+	fired();
+	expect(controller.signal.aborted).toBe(true);
+	expect(stored()?.status).toBe("cancelled");
+});
+
+test("list/detail reads preserve budgets, whitelist options and propagate Worker failure", async () => {
+	seed();
+	const original = reads.readQueryFirst;
+	const budget = {
+		signal: new AbortController().signal,
+		deadlineAt: Date.now() + 10_000,
+		timeoutMs: 2_000,
+		unrelated: "not a read option",
+	};
+	const probe = spyOn(reads, "readQueryFirst").mockImplementation((async (query, options) => {
+		expect(options).toEqual({
+			signal: budget.signal,
+			deadlineAt: budget.deadlineAt,
+			timeoutMs: budget.timeoutMs,
+			executionPolicy: "worker-required",
+			maxRows: 1,
+		});
+		return original(query as Parameters<typeof reads.readQueryFirst>[0], options);
+	}) as typeof reads.readQueryFirst);
+	expect((await service.getById("task", budget))?.id).toBe("task");
+	expect(probe).toHaveBeenCalledTimes(1);
+	probe.mockRestore();
+	const failure = new Error("list worker unavailable");
+	const read = spyOn(reads, "readQuery").mockRejectedValue(failure);
+	expect(await service.listByParents([], budget)).toEqual([]);
+	expect(read).not.toHaveBeenCalled();
+	expect(await captureWorkerRejection(service.listByParents(["parent"], budget))).toBe(failure);
+});
 
 test("restart scan is isolated, bounded, empty-safe and preserves the read budget", async () => {
 	const original = pool.runReadTask;

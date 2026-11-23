@@ -987,23 +987,40 @@ export async function restoreCarriedOrdinaryTargets(
 	driven: ReadonlySet<string>,
 	includedNarratorIds?: ReadonlySet<string>,
 	humanReplyContext?: { narratorId: string; context: ReplyContext },
+	options: RecoveryReadOptions = {},
 ): Promise<void> {
 	const { continueNarrator } = await import("./narrator-session");
 	const failures: string[] = [];
-	for (const target of source.logicalRuns ?? []) {
-		if (
-			driven.has(target.narratorId) ||
-			(includedNarratorIds && !includedNarratorIds.has(target.narratorId))
-		)
-			continue;
+	const targets = (source.logicalRuns ?? []).filter(
+		(target) =>
+			!driven.has(target.narratorId) &&
+			(!includedNarratorIds || includedNarratorIds.has(target.narratorId)),
+	);
+	const observations = new Map<string, RestartNarrator>();
+	const ids = [...new Set(targets.map((target) => target.narratorId))];
+	for (let offset = 0; offset < ids.length; offset += 100) {
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, ids.slice(offset, offset + 100)),
+				columns: RESTART_NARRATOR_COLUMNS,
+			}),
+			{
+				signal: options.signal,
+				deadlineAt: options.deadlineAt,
+				timeoutMs: options.timeoutMs,
+				executionPolicy: "worker-required",
+				maxRows: 100,
+			},
+		);
+		for (const row of rows) observations.set(row.id, row);
+	}
+	for (const target of targets) {
 		try {
 			await withRecoveryAdvance(source.updateEpoch, async () => {
 				const current = getRecoverySource(source.updateEpoch);
 				if (!current?.pendingNarratorIds.includes(target.narratorId)) return;
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, target.narratorId),
-					columns: RESTART_NARRATOR_COLUMNS,
-				});
+				options.signal?.throwIfAborted();
+				const row = observations.get(target.narratorId);
 				const saved = current.narrators.find((entry) => entry.narratorId === target.narratorId);
 				const valid =
 					row &&
@@ -1027,6 +1044,8 @@ export async function restoreCarriedOrdinaryTargets(
 							resumeRunId: row.logicalRunId ?? undefined,
 							recovered: true,
 							deliver: false,
+							recoveryObservation: row,
+							cancelSignal: options.signal,
 						},
 						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
 					);
@@ -1040,6 +1059,7 @@ export async function restoreCarriedOrdinaryTargets(
 					});
 			});
 		} catch (error) {
+			if (error instanceof RuntimeReadConflictError) throw error;
 			failures.push(target.narratorId);
 			logger.error("Could not resume interrupted standalone narrator", {
 				narratorId: target.narratorId,
@@ -1090,6 +1110,7 @@ export async function restoreOrdinaryRestartRecovery(
 					driven,
 					options.includedNarratorIds,
 					options.humanReplyContext,
+					options,
 				),
 			onQueueCompleted: async () => {
 				if (!options.includedNarratorIds) {

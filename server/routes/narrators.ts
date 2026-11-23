@@ -3322,7 +3322,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const { resumed, skipped } = await resumeRecoverySubagents({
+	const { resumed, skipped, conflict } = await resumeRecoverySubagents({
 		narratorId: id,
 		subagentIds: body.subagentIds,
 		locale,
@@ -3338,6 +3338,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	});
 
 	if (resumed.length === 0) {
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
 	}
 
@@ -3350,6 +3351,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			userId,
 			humanReplyContext: { locale, replyInUserLanguage },
 		});
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: "watch", resumed: resumed.length, skipped });
 	}
 
@@ -3370,6 +3372,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		null,
 		{ origin: "system", originLabel: formatOriginLabel("recovery") },
 	);
+	if (conflict) throw conflict;
 	return c.json({ ok: true, mode: "notify", resumed: resumed.length, skipped });
 });
 

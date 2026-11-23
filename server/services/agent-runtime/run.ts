@@ -99,6 +99,9 @@ export interface StartNarratorRunRequest {
 	registeredStart?: RegisteredAgentStart;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
+	recoveryObservation?: import("../recovery-observation").RestartNarrator;
+	parentRecoveryTurn?: import("../recovery-observation").ParentRecoveryTurn;
+	onRegistered?: () => void;
 	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
 	convergeOnlyActiveProjections?: boolean;
 	/** Recovery that must not deliver into a call that already has its result. */
@@ -244,7 +247,10 @@ async function prepareLogicalRun(
 			resumeRunId: req.resumeRunId,
 			binding,
 			expectedSource: row,
+			recoveryObservation: req.recoveryObservation,
+			parentRecoveryTurn: req.parentRecoveryTurn,
 		});
+	req.onRegistered?.();
 	if (!deliverTo || !publicationRun) return { binding: registered };
 	// A caller waiting in the foreground receives the result itself, never via a task.
 	// A new run that only inherits a destination which already holds an earlier

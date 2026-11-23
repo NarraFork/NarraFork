@@ -79,6 +79,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
@@ -115,7 +116,10 @@ import {
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import {
+	assertRecoveryFields,
 	assertRestartRecoveryObservation,
+	type ParentRecoveryTurn,
+	type RestartNarrator,
 	type RestartRecoveryObservation,
 } from "./recovery-observation";
 
@@ -1624,6 +1628,7 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	recoveryGuard?: { narrator?: RestartNarrator; parentTurn?: ParentRecoveryTurn };
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
@@ -1660,6 +1665,19 @@ function persistPlacement(
 	messageId: string,
 	placement?: MessagePlacementOptions,
 ) {
+	if (placement?.recoveryGuard) {
+		const { narrator, parentTurn } = placement.recoveryGuard;
+		if (narrator) assertRestartRecoveryObservation(tx, { narrator });
+		if (parentTurn)
+			assertRecoveryFields(
+				parentTurn,
+				tx
+					.select({ id: narrators.id, turnStartedAt: narrators.turnStartedAt })
+					.from(narrators)
+					.where(eq(narrators.id, parentTurn.id))
+					.get(),
+			);
+	}
 	if (!placement?.mailboxClaim && !placement?.onPersist) return;
 	const ref = tx
 		.select({ id: narratorMessageRefs.id })
@@ -1715,6 +1733,7 @@ function persistPlacement(
 export type PgPlacementTx = PgNarratorRefsTx;
 
 export interface PgMessagePlacementHooks {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	/** All additional narrator rows touched by onPersist, declared before locks are acquired. */
 	narratorIds?: readonly string[];
 	/**
@@ -1751,6 +1770,32 @@ export function createPgPlacedMessageMaterializer(
 			throw new Error("Mailbox claim has no reserved recipient identity");
 		if (message.id !== row.recipientMessageId)
 			throw new Error("Placed message must use the reserved recipient identity");
+		if (hooks?.recoveryGuard) {
+			const { narrators: pgNarrators } = await import("../db/postgres-schema");
+			const { narrator, parentTurn } = hooks.recoveryGuard;
+			if (narrator) {
+				const [current] = await tx
+					.select({
+						id: pgNarrators.id,
+						status: pgNarrators.status,
+						substatus: pgNarrators.substatus,
+						logicalRunId: pgNarrators.logicalRunId,
+						runtimeRegistrationJson: pgNarrators.runtimeRegistrationJson,
+					})
+					.from(pgNarrators)
+					.where(eq(pgNarrators.id, narrator.id))
+					.limit(1);
+				assertRecoveryFields(narrator, current);
+			}
+			if (parentTurn) {
+				const [current] = await tx
+					.select({ id: pgNarrators.id, turnStartedAt: pgNarrators.turnStartedAt })
+					.from(pgNarrators)
+					.where(eq(pgNarrators.id, parentTurn.id))
+					.limit(1);
+				assertRecoveryFields(parentTurn, current);
+			}
+		}
 		const persisted = await persistPgMessageWithRef(tx, message);
 		await hooks?.onPersist?.(tx, persisted.messageId, persisted.refId);
 		return { messageId: persisted.messageId, refId: persisted.refId };
@@ -1758,7 +1803,11 @@ export function createPgPlacedMessageMaterializer(
 	materializer.planNarratorLocks = async (tx, claim) => {
 		if (claim.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
 		const { narratorIds } = await resolvePgMessageNarratorLocks(tx, message);
-		return [...narratorIds, ...(hooks?.narratorIds ?? [])];
+		return [
+			...narratorIds,
+			...(hooks?.narratorIds ?? []),
+			...(hooks?.recoveryGuard?.parentTurn ? [hooks.recoveryGuard.parentTurn.id] : []),
+		];
 	};
 	return materializer;
 }
@@ -2255,17 +2304,21 @@ const sqliteNarratorPersistence = {
 		// keeping the message role `disp` so it never enters the model history.
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentBlocks?: any[],
+		recoveryGuard?: (tx: DbTx) => void,
 	) {
-		const msg = await appendPersistedMessage({
-			id: generateId(),
-			narratorId,
-			role: "disp",
-			contentJson: contentBlocks ?? [{ type: "info", message: text }],
-			contextCharsJson: { segments: [] },
-			// Custom-block callers supply already-formatted text; preserve legacy default.
-			contentText: contentBlocks ? text : `[Info] ${text}`,
-			createdAt: new Date().toISOString(),
-		});
+		const msg = await appendPersistedMessage(
+			{
+				id: generateId(),
+				narratorId,
+				role: "disp",
+				contentJson: contentBlocks ?? [{ type: "info", message: text }],
+				contextCharsJson: { segments: [] },
+				// Custom-block callers supply already-formatted text; preserve legacy default.
+				contentText: contentBlocks ? text : `[Info] ${text}`,
+				createdAt: new Date().toISOString(),
+			},
+			recoveryGuard ? { withRows: recoveryGuard } : undefined,
+		);
 		const seq = msg.seq;
 		broadcastToNarrator(narratorId, {
 			type: "message",
@@ -3612,6 +3665,9 @@ const sqliteNarratorPersistence = {
 			skipErrorMessage?: boolean;
 			/** Run finalization must not unarchive a concurrently archived session. */
 			unlessArchived?: boolean;
+			recoveryObservation?: RestartNarrator;
+			parentRecoveryTurn?: import("./recovery-observation").ParentRecoveryTurn;
+			expectedLogicalRunId?: string | null;
 		},
 	) {
 		let wroteStatus = false;
@@ -3679,6 +3735,50 @@ const sqliteNarratorPersistence = {
 			// silently dropped when the DB is momentarily busy.
 			wroteStatus = await withDbRetry(
 				async () => {
+					const recoveryObservation = options?.recoveryObservation;
+					if (recoveryObservation || options?.expectedLogicalRunId !== undefined) {
+						return db.transaction((tx) => {
+							if (recoveryObservation) {
+								if (recoveryObservation.id !== narratorId) throw new RuntimeReadConflictError();
+								assertRestartRecoveryObservation(tx, { narrator: recoveryObservation });
+							}
+							if (options?.expectedLogicalRunId !== undefined) {
+								const current = tx
+									.select({ logicalRunId: narrators.logicalRunId })
+									.from(narrators)
+									.where(eq(narrators.id, narratorId))
+									.get();
+								if (!current || current.logicalRunId !== options.expectedLogicalRunId)
+									throw new RuntimeReadConflictError();
+							}
+							if (options?.parentRecoveryTurn) {
+								const parent = tx
+									.select({ turnStartedAt: narrators.turnStartedAt })
+									.from(narrators)
+									.where(eq(narrators.id, options.parentRecoveryTurn.id))
+									.get();
+								if (!parent || parent.turnStartedAt !== options.parentRecoveryTurn.turnStartedAt)
+									throw new RuntimeReadConflictError();
+							}
+							tx.update(narrators)
+								.set({
+									status,
+									archivedWithNarratorId: null,
+									errorMessage: normalizedErrorMessage,
+									errorRetryable: normalizedErrorMessage
+										? (normalizedErrorRetryable ?? null)
+										: null,
+									updatedAt: now,
+									...(turnStartedAt !== undefined && { turnStartedAt }),
+									...(actualSubstatus !== undefined && {
+										substatus: JSON.stringify(actualSubstatus),
+									}),
+								})
+								.where(eq(narrators.id, narratorId))
+								.run();
+							return true;
+						});
+					}
 					const write = db
 						.update(narrators)
 						.set({
@@ -4834,6 +4934,7 @@ const sqliteNarratorPersistence = {
 		messageId?: string,
 		toolCallId?: string,
 		recoveryObservation?: RestartRecoveryObservation,
+		recoveryGuard?: (tx: DbTx) => void,
 	): Promise<boolean> {
 		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
 		if (!exactId) return false;
@@ -4844,6 +4945,7 @@ const sqliteNarratorPersistence = {
 
 		const affectedToolCalls = db.transaction((tx) => {
 			if (recoveryObservation) assertRestartRecoveryObservation(tx, recoveryObservation);
+			recoveryGuard?.(tx);
 			return tx
 				.update(narratorToolCalls)
 				.set({

@@ -244,6 +244,7 @@ function transitions(values: unknown[]): unknown[] {
 async function flushDeltas(): Promise<void> {
 	do {
 		if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		await Promise.all([...pendingBroadcasts]);
 	} while (pendingBroadcasts.size > 0);
 }

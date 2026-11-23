@@ -22,6 +22,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
+import type { MessagePlacementOptions } from "../narrator-persistence";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
 import { trackCommunicationWork } from "./async-work";
@@ -1046,6 +1047,7 @@ export interface MaterializedInboxUserMessage {
  * unattributed.
  */
 export async function materializeClaimedInboxUserMessage(input: {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	claim: MailboxClaim;
 	/** The claim row's reserved recipient identity; re-read by claim id when omitted. */
 	reservedMessageId?: string | null;
@@ -1096,7 +1098,10 @@ export async function materializeClaimedInboxUserMessage(input: {
 	const placed = capturePlacedRef();
 	const row = await queue.mailbox.materialize(
 		input.claim,
-		createPgPlacedMessageMaterializer(message, { onPersist: placed.hook }),
+		createPgPlacedMessageMaterializer(message, {
+			onPersist: placed.hook,
+			recoveryGuard: input.recoveryGuard,
+		}),
 	);
 	if (placed.captured.refId === undefined || placed.captured.seq === undefined)
 		throw new Error("Mailbox materialize committed without a recipient ref");
@@ -1155,6 +1160,7 @@ export interface ClaimedUserInputMessage {
  * branch into either dialect or pass transaction handles themselves.
  */
 export async function persistClaimedUserInput(input: {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	claim: MailboxClaim;
 	reservedMessageId?: string | null;
 	narratorId: string;
@@ -1215,6 +1221,7 @@ export async function persistClaimedUserInput(input: {
 		input.origin,
 		{
 			mailboxClaim: input.claim,
+			recoveryGuard: input.recoveryGuard,
 			composerDocument: input.composerDocument,
 			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
 		},

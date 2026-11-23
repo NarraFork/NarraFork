@@ -26,6 +26,75 @@ const { createRuntimePublicationService, getRuntimePublicationService, runtimePu
 runtimePublication.stop();
 const service = createRuntimePublicationService(db);
 const time = "2026-10-02T00:00:00.000Z";
+
+for (const change of ["run", "registration", "status", "cancelled", "missing"] as const) {
+	test(`recovery admission rejects ${change} changed after its Worker observation`, async () => {
+		const { RESTART_NARRATOR_COLUMNS } = await import("../recovery-observation");
+		const observed = await workerRead.readQueryFirst(
+			db.query.narrators.findMany({
+				where: eq(narrators.id, "actor"),
+				columns: RESTART_NARRATOR_COLUMNS,
+				limit: 1,
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
+		expect(observed).toBeDefined();
+		if (!observed) throw new Error("Fixture actor missing");
+		db.update(narrators)
+			.set({ status: "working", substatus: "[]", updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, "actor"))
+			.run();
+		if (change === "run")
+			db.update(narrators)
+				.set({ logicalRunId: "concurrent-run" })
+				.where(eq(narrators.id, "actor"))
+				.run();
+		if (change === "registration")
+			db.update(narrators)
+				.set({
+					runtimeRegistrationJson: {
+						version: 1,
+						controller: { narratorId: "parent", actions: ["stop"] },
+					},
+				})
+				.where(eq(narrators.id, "actor"))
+				.run();
+		if (change === "status")
+			db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "actor")).run();
+		if (change === "cancelled")
+			db.update(narrators)
+				.set({ substatus: '["cancelled"]' })
+				.where(eq(narrators.id, "actor"))
+				.run();
+		if (change === "missing") db.delete(narrators).where(eq(narrators.id, "actor")).run();
+		expect(() =>
+			service.startRun({ narratorId: "actor", binding: {}, recoveryObservation: observed }),
+		).toThrow(expect.objectContaining({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" }));
+		expect(db.select().from(outbox).all()).toHaveLength(0);
+	});
+}
+
+test("recovery admission tolerates its own status transition and renewal-only timestamps", async () => {
+	const { RESTART_NARRATOR_COLUMNS } = await import("../recovery-observation");
+	const observed = await workerRead.readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, "actor"),
+			columns: RESTART_NARRATOR_COLUMNS,
+			limit: 1,
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
+	if (!observed) throw new Error("Fixture actor missing");
+	db.update(narrators)
+		.set({ status: "working", substatus: "[]", updatedAt: new Date().toISOString() })
+		.where(eq(narrators.id, "actor"))
+		.run();
+	expect(
+		service.startRun({ narratorId: "actor", binding: {}, recoveryObservation: observed }).binding
+			.logicalRunId,
+	).toBeTruthy();
+});
+
 function assistant(id: string, text: string, seq: number) {
 	db.insert(messages)
 		.values({
