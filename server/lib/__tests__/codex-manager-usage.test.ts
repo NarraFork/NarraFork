@@ -530,10 +530,11 @@ describe("CodexManager usage quota state", () => {
 			secretText(join(narraforkDir, "codex-credentials.json")),
 		) as Array<{ id: string }>;
 		expect(persistedCredentials.map((entry) => entry.id)).toEqual(["ok", "manual", "quota"]);
-		const persistedStats = JSON.parse(
-			readFileSync(join(narraforkDir, "codex-stats.json"), "utf-8"),
+		manager.dispose();
+		const persistedState = JSON.parse(
+			readFileSync(join(narraforkDir, "credential-state.json"), "utf-8"),
 		) as Record<string, unknown>;
-		expect(Object.keys(persistedStats).sort()).toEqual(["manual", "ok", "quota"]);
+		expect(Object.keys(persistedState).sort()).toEqual(["manual", "ok", "quota"]);
 	});
 
 	test("删除分页末尾凭据后快照页码会回退到有效页", () => {
@@ -729,14 +730,11 @@ describe("CodexManager usage quota state", () => {
 		globalThis.fetch = (async () => createUsageResponse(40, resetAtSec)) as unknown as typeof fetch;
 
 		await manager.getUsage("cred-history");
+		manager.dispose();
 		const saved = JSON.parse(
-			secretText(join(tmpHome, ".narrafork", "codex-credentials.json")),
-		) as Array<{
-			id: string;
-			usageHistory?: Array<{ timestamp: number; remainingPercent: number }>;
-		}>;
-		const entry = saved.find((item) => item.id === "cred-history");
-		const history = entry?.usageHistory ?? [];
+			readFileSync(join(tmpHome, ".narrafork", "credential-state.json"), "utf-8"),
+		) as Record<string, { usageHistory?: Array<{ timestamp: number; remainingPercent: number }> }>;
+		const history = saved["cred-history"]?.usageHistory ?? [];
 
 		expect(history.some((item) => item.timestamp === oldHistoryTimestamp)).toBe(false);
 		expect(history.some((item) => item.timestamp === retainedHistoryTimestamp)).toBe(true);
