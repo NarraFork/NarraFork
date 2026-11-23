@@ -37,6 +37,30 @@ function apiRequestColumns(sqlite: Database): Set<string> {
 }
 
 /**
+ * The legacy columns still to drop. A later migration may add a legacy name back for the
+ * current schema (0226 re-adds `token_accounting_version` with its own partial index), so a
+ * column that a non-legacy index still uses belongs to the current schema and is kept.
+ */
+function droppableLegacyColumns(sqlite: Database): string[] {
+	const columns = apiRequestColumns(sqlite);
+	const present = LEGACY_REQUEST_COLUMNS.filter((column) => columns.has(column));
+	if (present.length === 0) return present;
+	const liveIndexSql = (
+		sqlite
+			.prepare(
+				"SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'api_requests' AND sql IS NOT NULL",
+			)
+			.all() as Array<{ name: string; sql: string }>
+	)
+		.filter((index) => !LEGACY_REQUEST_INDEXES.includes(index.name))
+		.map((index) => index.sql.toLowerCase());
+	return present.filter(
+		(column) =>
+			!liveIndexSql.some((sql) => new RegExp(`(^|[^a-z0-9_])${column}([^a-z0-9_]|$)`).test(sql)),
+	);
+}
+
+/**
  * Whether any request dump is still stored. Stops at the first non-null row and reads only the
  * record header, never the payload itself.
  */
@@ -50,9 +74,8 @@ export function hasRetainedLegacyRequestDump(sqlite: Database): boolean {
 
 /** Whether any part of 0207's physical cleanup is still outstanding. Catalog reads only. */
 export function hasPendingLegacyRequestRetirement(sqlite: Database): boolean {
-	const columns = apiRequestColumns(sqlite);
 	return (
-		LEGACY_REQUEST_COLUMNS.some((column) => columns.has(column)) ||
+		droppableLegacyColumns(sqlite).length > 0 ||
 		LEGACY_REQUEST_TABLES.some((table) => objectExists(sqlite, "table", table)) ||
 		LEGACY_REQUEST_INDEXES.some((index) => objectExists(sqlite, "index", index))
 	);
@@ -69,11 +92,11 @@ export function retireLegacyRequestStorage(sqlite: Database): boolean {
 	for (const index of LEGACY_REQUEST_INDEXES) {
 		if (objectExists(sqlite, "index", index)) sqlite.run(`DROP INDEX \`${index}\``);
 	}
-	const columns = apiRequestColumns(sqlite);
-	if (!LEGACY_REQUEST_COLUMNS.some((column) => columns.has(column))) return true;
+	const columns = droppableLegacyColumns(sqlite);
+	if (columns.length === 0) return true;
 	if (hasRetainedLegacyRequestDump(sqlite)) return false;
-	for (const column of LEGACY_REQUEST_COLUMNS) {
-		if (columns.has(column)) sqlite.run(`ALTER TABLE \`api_requests\` DROP COLUMN \`${column}\``);
+	for (const column of columns) {
+		sqlite.run(`ALTER TABLE \`api_requests\` DROP COLUMN \`${column}\``);
 	}
 	return true;
 }
