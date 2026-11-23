@@ -14,9 +14,13 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -375,7 +379,7 @@ for (const shape of shapes) {
 			shape.seed();
 			runThrows = new Error("Archived narrators cannot run");
 
-			await expect(startInjectionContinuationIfPossible(SUB_ID, "en")).resolves.toBeDefined();
+			await expect(await startInjectionContinuationIfPossible(SUB_ID, "en")).toBeDefined();
 			await waitUntil(() => runCalls.length > 0);
 			await waitUntil(() =>
 				String(

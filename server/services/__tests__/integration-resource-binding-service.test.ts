@@ -13,6 +13,7 @@ import {
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { integrationResourceBindingService } from "../integration-resource-binding-service";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const ids = {
 	user: generateId(),
@@ -126,27 +127,31 @@ afterAll(async () => {
 
 describe("IntegrationResourceBindingService", () => {
 	test("validates polymorphic resources and bounds metadata", async () => {
-		await expect(
-			integrationResourceBindingService.create({
-				resourceType: "device",
-				resourceId: generateId(),
-				sourceType: "oauth_client",
-				sourceId: ids.client,
-				authorityType: "oauth_grant",
-				authorityId: ids.grant,
-			}),
-		).rejects.toThrow();
-		await expect(
-			integrationResourceBindingService.create({
-				resourceType: "device",
-				resourceId: ids.deviceA,
-				sourceType: "oauth_client",
-				sourceId: ids.client,
-				authorityType: "oauth_grant",
-				authorityId: ids.grant,
-				metadataJson: { oversized: "x".repeat(5_000) },
-			}),
-		).rejects.toThrow(/4096/);
+		expect(
+			await captureWorkerRejectionThrower(
+				integrationResourceBindingService.create({
+					resourceType: "device",
+					resourceId: generateId(),
+					sourceType: "oauth_client",
+					sourceId: ids.client,
+					authorityType: "oauth_grant",
+					authorityId: ids.grant,
+				}),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				integrationResourceBindingService.create({
+					resourceType: "device",
+					resourceId: ids.deviceA,
+					sourceType: "oauth_client",
+					sourceId: ids.client,
+					authorityType: "oauth_grant",
+					authorityId: ids.grant,
+					metadataJson: { oversized: "x".repeat(5_000) },
+				}),
+			),
+		).toThrow(/4096/);
 	});
 
 	test("serializes concurrent upserts and rejects implicit provenance transfer", async () => {
@@ -171,16 +176,18 @@ describe("IntegrationResourceBindingService", () => {
 			where: eq(integrationResourceBindings.resourceId, ids.deviceC),
 		});
 		expect(rows).toHaveLength(1);
-		await expect(
-			integrationResourceBindingService.upsert({
-				resourceType: "device",
-				resourceId: ids.deviceC,
-				sourceType: "oauth_client",
-				sourceId: generateId(),
-				authorityType: "oauth_grant",
-				authorityId: ids.grant,
-			}),
-		).rejects.toMatchObject({ code: "INTEGRATION_PROVENANCE_CONFLICT" });
+		expect(
+			await captureWorkerRejection(
+				integrationResourceBindingService.upsert({
+					resourceType: "device",
+					resourceId: ids.deviceC,
+					sourceType: "oauth_client",
+					sourceId: generateId(),
+					authorityType: "oauth_grant",
+					authorityId: ids.grant,
+				}),
+			),
+		).toMatchObject({ code: "INTEGRATION_PROVENANCE_CONFLICT" });
 	});
 
 	test("preserves lifecycle history and prevents terminal bindings from reactivating", async () => {

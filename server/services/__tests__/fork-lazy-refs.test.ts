@@ -11,10 +11,16 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
-import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -118,7 +124,7 @@ afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	await disposeWorkerDb();
+	await fixture.close();
 });
 
 describe("fork materializes only post-compact refs", () => {
@@ -458,7 +464,9 @@ describe("bounded inherited range preparation", () => {
 					.run();
 			}
 		});
-		await expect(ensureRefsCoverSeq(child.id, 4, { maxRows: 450 })).rejects.toMatchObject({
+		await expect(
+			await captureWorkerRejection(ensureRefsCoverSeq(child.id, 4, { maxRows: 450 })),
+		).toMatchObject({
 			code: "HISTORY_REFS_BUDGET_EXCEEDED",
 		});
 		expect(await refsOf(child.id)).toHaveLength(4);
@@ -474,7 +482,9 @@ describe("bounded inherited range preparation", () => {
 			.set({ segmentCompactId: "parent-compact" })
 			.where(eq(narratorMessageRefs.id, "ref-parent-parent-old-3"))
 			.run();
-		await expect(ensureRefsCoverSeq(child.id, 3, { maxRows: 1 })).rejects.toMatchObject({
+		await expect(
+			await captureWorkerRejection(ensureRefsCoverSeq(child.id, 3, { maxRows: 1 })),
+		).toMatchObject({
 			code: "HISTORY_REFS_BUDGET_EXCEEDED",
 		});
 		expect(await refsOf(child.id)).toHaveLength(4);
@@ -487,13 +497,17 @@ describe("bounded inherited range preparation", () => {
 		const child = await lazyFork();
 		const controller = new AbortController();
 		controller.abort(new Error("cancelled before preparation"));
-		await expect(ensureRefsCoverSeq(child.id, 0, { signal: controller.signal })).rejects.toThrow(
-			"cancelled",
-		);
 		await expect(
-			ensureRefsCoverSeq(child.id, 0, { deadlineAt: Date.now() - 1 }),
-		).rejects.toMatchObject({ code: "HISTORY_REFS_TIMEOUT" });
-		await expect(ensureRefsCoverSeq(child.id, 0, { maxRows: 1 })).rejects.toMatchObject({
+			await captureWorkerRejectionThrower(
+				ensureRefsCoverSeq(child.id, 0, { signal: controller.signal }),
+			),
+		).toThrow("cancelled");
+		await expect(
+			await captureWorkerRejection(ensureRefsCoverSeq(child.id, 0, { deadlineAt: Date.now() - 1 })),
+		).toMatchObject({ code: "HISTORY_REFS_TIMEOUT" });
+		await expect(
+			await captureWorkerRejection(ensureRefsCoverSeq(child.id, 0, { maxRows: 1 })),
+		).toMatchObject({
 			code: "HISTORY_REFS_BUDGET_EXCEEDED",
 		});
 		expect(await refsOf(child.id)).toHaveLength(4);
@@ -503,8 +517,8 @@ describe("bounded inherited range preparation", () => {
 		}, 0);
 		try {
 			await expect(
-				ensureRefsCoverSeq(child.id, 0, { maxPages: 1, pageSize: 1 }),
-			).rejects.toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
+				await captureWorkerRejection(ensureRefsCoverSeq(child.id, 0, { maxPages: 1, pageSize: 1 })),
+			).toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
 			expect(timerRan).toBe(true);
 		} finally {
 			clearTimeout(timer);
@@ -524,7 +538,7 @@ describe("bounded inherited range preparation", () => {
 			.set({ refsInheritedFrom: "parent", refsBackfillCursor: null })
 			.where(eq(narrators.id, child.id))
 			.run();
-		await expect(ensureAllRefsMaterialized(child.id)).rejects.toMatchObject({
+		await expect(await captureWorkerRejection(ensureAllRefsMaterialized(child.id))).toMatchObject({
 			code: "HISTORY_REFS_INCOMPLETE",
 		});
 		expect((await lazyStateOf(child.id))?.refsInheritedFrom).toBe("parent");
@@ -536,10 +550,10 @@ describe("bounded inherited range preparation", () => {
 			.set({ refsInheritedFrom: child.id, refsBackfillCursor: 5 })
 			.where(eq(narrators.id, "parent"))
 			.run();
-		await expect(ensureRefsCoverSeq(child.id, 0)).rejects.toMatchObject({
+		await expect(await captureWorkerRejection(ensureRefsCoverSeq(child.id, 0))).toMatchObject({
 			code: "HISTORY_REFS_LINEAGE_CYCLE",
 		});
-		await expect(resolveLazyLineage(child.id)).rejects.toMatchObject({
+		await expect(await captureWorkerRejection(resolveLazyLineage(child.id))).toMatchObject({
 			code: "HISTORY_REFS_LINEAGE_CYCLE",
 		});
 		expect((await lazyStateOf(child.id))?.refsInheritedFrom).toBe("parent");
@@ -674,8 +688,10 @@ describe("source history rewrites retain lazy readers", () => {
 		const before = await refsOf(child.id);
 		try {
 			await expect(
-				narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
-			).rejects.toMatchObject({ code: "NARRATOR_REVERT_IN_PROGRESS" });
+				await captureWorkerRejection(
+					narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
+				),
+			).toMatchObject({ code: "NARRATOR_REVERT_IN_PROGRESS" });
 			expect(await refsOf(child.id)).toEqual(before);
 			expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(5);
 			expect(await refsOf("parent")).toHaveLength(9);
@@ -707,7 +723,9 @@ describe("source history rewrites retain lazy readers", () => {
 				.get()?.cursor;
 		}, 0);
 		try {
-			await expect(ensureRefsCoverSeq(child.id, 0, { pageSize: 1 })).rejects.toMatchObject({
+			await expect(
+				await captureWorkerRejection(ensureRefsCoverSeq(child.id, 0, { pageSize: 1 })),
+			).toMatchObject({
 				code: "NARRATOR_REVERT_IN_PROGRESS",
 			});
 			expect(admission).toBeDefined();
@@ -740,8 +758,10 @@ describe("source history rewrites retain lazy readers", () => {
 			}
 		});
 		await expect(
-			narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
-		).rejects.toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
+			await captureWorkerRejection(
+				narratorMessageQueries.deleteMessage("parent", "parent-old-2", { skipRevert: true }),
+			),
+		).toMatchObject({ code: "HISTORY_REFS_BUDGET_EXCEEDED" });
 		expect(await refsOf("parent")).toHaveLength(2010);
 		expect(await refsOf(child.id)).toHaveLength(4);
 		expect((await lazyStateOf(child.id))?.refsBackfillCursor).toBe(5);
@@ -754,11 +774,13 @@ describe("source history rewrites retain lazy readers", () => {
 		const timer = setTimeout(() => controller.abort(new Error("stop preservation")), 0);
 		try {
 			await expect(
-				narratorMessageQueries.deleteMessage("parent", "parent-old-2", {
-					skipRevert: true,
-					signal: controller.signal,
-				}),
-			).rejects.toThrow(/stop preservation|aborted/);
+				await captureWorkerRejectionThrower(
+					narratorMessageQueries.deleteMessage("parent", "parent-old-2", {
+						skipRevert: true,
+						signal: controller.signal,
+					}),
+				),
+			).toThrow(/stop preservation|aborted/);
 			expect(await refsOf("parent")).toHaveLength(9);
 			await ensureAllRefsMaterialized(child.id);
 			expect(await refsOf(child.id)).toEqual(await refsOf("parent"));

@@ -76,7 +76,8 @@ describe("authority read budgets", () => {
 		const options = { signal: new AbortController().signal, deadlineAt: Date.now() + 10_000 };
 		try {
 			expect((await loadNarratorForAccess(id.child, principal, "write")).id).toBe(id.child);
-			expect(reads).not.toHaveBeenCalled();
+			expect(reads.mock.calls.length).toBeGreaterThan(0);
+			reads.mockClear();
 			expect((await loadNarratorForAccess(id.child, principal, "write", options)).id).toBe(
 				id.child,
 			);

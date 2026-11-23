@@ -194,12 +194,13 @@ export async function loadProjectForAccess(
 	readOptions?: ReadQueryOptions,
 ) {
 	readOptions?.signal?.throwIfAborted();
-	const row = await (readOptions
-		? readQueryFirst(db.query.projects.findMany({ limit: 1, where: eq(projects.id, projectId) }), {
-				...readOptions,
-				executionPolicy: "worker-required",
-			})
-		: db.query.projects.findFirst({ where: eq(projects.id, projectId) }));
+	const row = await readQueryFirst(
+		db.query.projects.findMany({ limit: 1, where: eq(projects.id, projectId) }),
+		{
+			...readOptions,
+			executionPolicy: "worker-required",
+		},
+	);
 	if (!row) throw new NotFoundError("Project", projectId);
 	await assertProjectAccess(row, principal, need, readOptions);
 	return row;
@@ -224,19 +225,14 @@ export async function resolveProjectGate(
 	readOptions?.signal?.throwIfAborted();
 	if (!projectId) return { read: true, write: true };
 	if (principal.isAdmin) return { read: true, write: true };
-	const row = await (readOptions
-		? readQueryFirst(
-				db.query.projects.findMany({
-					limit: 1,
-					where: eq(projects.id, projectId),
-					columns: { id: true, ownerUserId: true, visibility: true },
-				}),
-				{ ...readOptions, executionPolicy: "worker-required" },
-			)
-		: db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { id: true, ownerUserId: true, visibility: true },
-			}));
+	const row = await readQueryFirst(
+		db.query.projects.findMany({
+			limit: 1,
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	// A dangling project reference fails closed: the chain claimed a gate exists, and
 	// we cannot show it was passed.
 	if (!row) return { read: false, write: false };

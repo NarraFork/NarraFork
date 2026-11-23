@@ -1,8 +1,11 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 await import("../narrator-service");
@@ -13,6 +16,7 @@ const { narratorMessageQueries } = await import("../narrator-messages");
 const { narratorRoutes } = await import("../../routes/narrators");
 const gitSummaryModule = await import("../narrator-git-summary");
 const displayReaderModule = await import("../narrator-display-page-reader");
+const workerPool = await import("../../lib/db-worker/pool");
 const time = "2026-10-12T00:00:00.000Z";
 /** `project` places the narrator in a project through its cwd's index link. */
 function narrator(
@@ -34,8 +38,15 @@ function narrator(
 			)
 			.run(id, project, time);
 }
-function queryTrace() {
+function queryTrace(includeWorkers = false) {
 	const queries: string[] = [];
+	if (includeWorkers) {
+		const run = workerPool.runReadTask;
+		spyOn(workerPool, "runReadTask").mockImplementation((...args) => {
+			if (args[1].kind === "selectRows") queries.push(args[1].sql);
+			return run(...args);
+		});
+	}
 	const prepare = sqlite.prepare.bind(sqlite);
 	spyOn(sqlite, "prepare").mockImplementation((...args: Parameters<typeof sqlite.prepare>) => {
 		queries.push(args[0]);
@@ -71,10 +82,11 @@ beforeEach(() => {
 			)
 			.run(id, id, time);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("request-local narrator loading", () => {
@@ -170,17 +182,23 @@ describe("request-local narrator loading", () => {
 		const cancelled = new AbortController();
 		cancelled.abort();
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
-		).rejects.toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
-		const read = displayReaderModule.readDisplayFixtureMessages;
-		spyOn(displayReaderModule, "readDisplayFixtureMessages").mockImplementation(async (...args) => {
-			const result = await read(...args);
-			sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
-			return result;
-		});
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
+			),
+		).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+		const read = displayReaderModule.readNarratorDisplayMessages;
+		spyOn(displayReaderModule, "readNarratorDisplayMessages").mockImplementation(
+			async (...args) => {
+				const result = await read(...args);
+				sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
+				return result;
+			},
+		);
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
-		).rejects.toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
+			),
+		).toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
 	});
 	test("read middleware snapshot is reusable without a second query, never as write, and require remains fresh", async () => {
 		narrator("n1");
@@ -202,7 +220,7 @@ describe("request-local narrator loading", () => {
 			await requireNarratorAccess(c, "n1", "read");
 			return c.json({ leaked: true });
 		});
-		const queries = queryTrace();
+		const queries = queryTrace(true);
 		expect(await (await app.request("/read")).json()).toEqual({ id: "n1", write: false });
 		expect(queries.filter((query) => query.includes('from "narrators"'))).toHaveLength(1);
 		expect((await app.request("/fresh")).status).toBe(404);
@@ -359,9 +377,11 @@ describe("request-local narrator loading", () => {
 				.every((query) => !query.includes("password_hash")),
 		).toBe(true);
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", {
-				messageVersion: page.messageVersion + 1,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", {
+					messageVersion: page.messageVersion + 1,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
 	});
 });

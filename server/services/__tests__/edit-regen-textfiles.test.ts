@@ -23,36 +23,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
 import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
-import { workerRejection } from "../../../tests/fixtures/worker-rejection";
-import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import { assertDbReadersReady } from "../../lib/db-worker/pool";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
-import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-// File/WAL DB from real migrations (mirrors tests/setup.ts).
-const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
-const sqlite = openFileWorkerDatabase();
-sqlite.run("PRAGMA foreign_keys = OFF");
-for (const file of readdirSync(DRIZZLE_DIR)
-	.filter((f) => f.endsWith(".sql"))
-	.sort()) {
-	const sql = readFileSync(join(DRIZZLE_DIR, file), "utf-8");
-	for (const stmt of sql
-		.split("--> statement-breakpoint")
-		.map((s) => s.trim())
-		.filter(Boolean)) {
-		try {
-			sqlite.run(stmt);
-		} catch (err) {
-			if (!String(err).includes("already exists")) throw err;
-		}
-	}
-}
-sqlite.run("PRAGMA foreign_keys = ON");
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -74,7 +53,7 @@ beforeAll(async () => {
 afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	await closeFileWorkerDatabase(sqlite);
+	await fixture.close();
 });
 afterEach(async () => {
 	closeNarrator("n1");
@@ -176,8 +155,8 @@ test("history editing persists semantic layout and legacy editing clears stale l
 		deferContinuation: true,
 	});
 	expect((await read())?.composerDocument).toBeNull();
-	expect(
-		await workerRejection(
+	await expect(
+		await captureWorkerRejectionThrower(
 			editAndRegenerate("n1", "m1", "mismatch", "en", false, {
 				composerDocument: document,
 				deferContinuation: true,
@@ -279,8 +258,8 @@ describe("editAndRegenerate native media history", () => {
 		const before = await blocks();
 		expect(before.filter(isMediaContentBlock)).toHaveLength(10);
 		const saved = readdirSync(join(cwd, "uploads", "n1", "media"));
-		expect(
-			await workerRejection(
+		await expect(
+			await captureWorkerRejectionThrower(
 				editAndRegenerate("n1", "m1", "", "en", false, {
 					...editOptions,
 					newMedia: [wavFile("eleventh.wav")],
@@ -312,8 +291,8 @@ describe("editAndRegenerate native media history", () => {
 		bytes.writeUInt32LE(bytes.length - 8, 4);
 		bytes.writeUInt32LE(bytes.length - 44, 40);
 		const added = new File([bytes], "added.wav", { type: "audio/wav" });
-		expect(
-			await workerRejection(
+		await expect(
+			await captureWorkerRejectionThrower(
 				editAndRegenerate("n1", "m1", "after", "en", false, {
 					...editOptions,
 					newMedia: [added],
@@ -370,8 +349,10 @@ describe("editAndRegenerate native media history", () => {
 		writeFileSync(otherPath, wavBytes());
 		truncateSync(otherPath, 65 * 1024 * 1024);
 		seed(cwd, [{ ...block }, { ...block, uploadNarratorId: "n2" }]);
-		expect(
-			await workerRejection(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)),
+		await expect(
+			await captureWorkerRejectionThrower(
+				editAndRegenerate("n1", "m1", "after", "en", false, editOptions),
+			),
 		).toThrow("Combined attachments exceed the 128 MiB limit");
 	});
 	test("a large retained text file does not consume the inline media budget", async () => {
@@ -418,8 +399,10 @@ describe("editAndRegenerate native media history", () => {
 			{ type: "text", text: "before" },
 		]);
 		const before = await blocks();
-		expect(
-			await workerRejection(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)),
+		await expect(
+			await captureWorkerRejectionThrower(
+				editAndRegenerate("n1", "m1", "after", "en", false, editOptions),
+			),
 		).toThrow("Combined attachments exceed the 128 MiB limit");
 		expect(await blocks()).toEqual(before);
 	});
@@ -434,8 +417,8 @@ describe("editAndRegenerate native media history", () => {
 			return Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>;
 		});
 		try {
-			expect(
-				await workerRejection(
+			await expect(
+				await captureWorkerRejectionThrower(
 					editAndRegenerate("n1", "m1", "after", "en", false, {
 						...editOptions,
 						newMedia: [wavFile()],
@@ -569,8 +552,8 @@ describe("editAndRegenerate text_file management", () => {
 			{ length: 9 },
 			(_, index) => new File([String(index)], `new-${index}.txt`, { type: "text/plain" }),
 		);
-		expect(
-			await workerRejection(
+		await expect(
+			await captureWorkerRejectionThrower(
 				editAndRegenerate("n1", "m1", "new", "en", false, {
 					userId: "attachment-user",
 					revertFiles: false,
@@ -607,8 +590,8 @@ describe("editAndRegenerate text_file management", () => {
 			return result;
 		});
 		try {
-			expect(
-				await workerRejection(
+			await expect(
+				await captureWorkerRejectionThrower(
 					editAndRegenerate("n1", "m1", "new", "en", false, {
 						userId: "attachment-user",
 						revertFiles: false,
@@ -770,8 +753,8 @@ describe("editAndRegenerate text_file management", () => {
 			},
 			{ type: "text", text: "old" },
 		]);
-		expect(
-			await workerRejection(
+		await expect(
+			await captureWorkerRejectionThrower(
 				editAndRegenerate("n1", "m1", "new", "en", false, {
 					userId: "attachment-user",
 					revertFiles: false,

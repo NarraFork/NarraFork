@@ -38,29 +38,18 @@ export async function resolveNarratorProjectId(
 	// The link table lives in the SQLite main database; on PostgreSQL only the explicit
 	// project is known until the index is ported there.
 	if (activeDatabaseBackend !== "sqlite") return null;
-	const link = await (readOptions
-		? readQueryFirst(
-				db
-					.select({ projectId: narratorProjectLinks.projectId })
-					.from(narratorProjectLinks)
-					.where(
-						and(
-							eq(narratorProjectLinks.narratorId, narrator.id),
-							eq(narratorProjectLinks.role, "primary"),
-						),
-					),
-				{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
-			)
-		: db
-				.select({ projectId: narratorProjectLinks.projectId })
-				.from(narratorProjectLinks)
-				.where(
-					and(
-						eq(narratorProjectLinks.narratorId, narrator.id),
-						eq(narratorProjectLinks.role, "primary"),
-					),
-				)
-				.get());
+	const link = await readQueryFirst(
+		db
+			.select({ projectId: narratorProjectLinks.projectId })
+			.from(narratorProjectLinks)
+			.where(
+				and(
+					eq(narratorProjectLinks.narratorId, narrator.id),
+					eq(narratorProjectLinks.role, "primary"),
+				),
+			),
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return link?.projectId ?? null;
 }
 
@@ -76,19 +65,14 @@ export async function resolveProjectIdForNarratorId(
 	readOptions?: ReadQueryOptions,
 ): Promise<string | null> {
 	readOptions?.signal?.throwIfAborted();
-	const narrator = await (readOptions
-		? readQueryFirst(
-				db.query.narrators.findMany({
-					limit: 1,
-					where: eq(narrators.id, narratorId),
-					columns: { id: true, contextProjectId: true },
-				}),
-				{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
-			)
-		: db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { id: true, contextProjectId: true },
-			}));
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+		}),
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!narrator) return null;
 	return await resolveNarratorProjectId(narrator, readOptions);
 }

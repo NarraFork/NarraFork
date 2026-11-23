@@ -5,9 +5,15 @@
  * account closes registration immediately and persists that to settings.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import {
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -19,9 +25,10 @@ beforeEach(() => {
 	settings.auth.registrationOpen = true;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 describe("registration auto-close", () => {
@@ -41,8 +48,10 @@ describe("registration auto-close", () => {
 	test("a second registration is rejected once registration auto-closed", async () => {
 		await registerUser({ username: "first-admin", password: "correct-horse-battery" });
 		expect(
-			registerUser({ username: "second-user", password: "another-passphrase" }),
-		).rejects.toThrow("Registration is closed");
+			await captureWorkerRejectionThrower(
+				registerUser({ username: "second-user", password: "another-passphrase" }),
+			),
+		).toThrow("Registration is closed");
 	});
 
 	test("an admin reopening registration lets further users in", async () => {

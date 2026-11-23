@@ -9,12 +9,15 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -102,10 +105,11 @@ function seedSourceMessage(id: string, narratorId: string, seq: number, text: st
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("extractSubagentToPrimary", () => {
@@ -276,14 +280,14 @@ describe("extractSubagentToPrimary", () => {
 
 	test("rejects non-subagent and archived sources", async () => {
 		seedPrimary("parent");
-		await expect(extractSubagentToPrimary("parent")).rejects.toThrow(
+		await expect(await captureWorkerRejectionThrower(extractSubagentToPrimary("parent"))).toThrow(
 			"Only subagent narrators can be extracted",
 		);
 
 		seedSubagent("sub-archived", { status: "archived" });
-		await expect(extractSubagentToPrimary("sub-archived")).rejects.toThrow(
-			"Archived subagents cannot be extracted",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(extractSubagentToPrimary("sub-archived")),
+		).toThrow("Archived subagents cannot be extracted");
 	});
 
 	test("compressed inheritMode writes a compact marker instead of full copies", async () => {
@@ -325,7 +329,9 @@ describe("extractSubagentToPrimary", () => {
 		seedPrimary();
 		seedSubagent("sub");
 		await expect(
-			narratorService.forkNarrator("sub", "m0", { inheritMode: "full" }),
-		).rejects.toThrow("Cannot fork from a subagent narrator");
+			await captureWorkerRejectionThrower(
+				narratorService.forkNarrator("sub", "m0", { inheritMode: "full" }),
+			),
+		).toThrow("Cannot fork from a subagent narrator");
 	});
 });
