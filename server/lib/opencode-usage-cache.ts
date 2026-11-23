@@ -259,12 +259,17 @@ export function syncOpencodeUsageCache(): void {
 			entries.delete(id);
 			entry.controller?.abort();
 			clearTimeout(entry.activityTimer);
-			if (!config) quotaStore.remove(id);
+			// A different account's snapshot must stop steering the key pool at once; a
+			// removed key's snapshot goes away entirely.
+			if (config) quotaStore.forget(id);
+			else quotaStore.remove(id);
 		}
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
 			entries.set(id, { identity: identity(config), generation: crypto.randomUUID(), failures: 0 });
+			// Restore synchronously: the pool reads the snapshot before any refresh finishes.
+			quotaStore.get(id, identity(config), restoreSnapshot);
 		}
 	}
 }

@@ -220,6 +220,25 @@ function persistedState(snapshot: QuotaSnapshot | undefined): PersistedProviderB
 		: null;
 }
 
+/** A snapshot read from disk: only a settled discovery may come back. */
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
+	const state = persistedState(snapshot);
+	return (
+		state &&
+		relaySnapshot(
+			{
+				status: state.status,
+				...(state.endpoint ? { adapter: state.endpoint.adapter } : {}),
+				balance: state.balance,
+				fetchedAt: state.fetchedAt,
+				attemptedAt: state.attemptedAt,
+				error: null,
+			},
+			state.endpoint,
+		)
+	);
+}
+
 /** One discovery round with the active engine, in the shared snapshot shape. */
 export async function probeRelayQuota(
 	credential: UsageSubject,
@@ -365,7 +384,9 @@ export class ProviderBalanceCache {
 
 	/** The entry's state as the routes serve it, read from the store. */
 	private snapshot(entry: Entry): ProviderBalanceSnapshot {
-		const stored = this.store.peek(entry.credentialId);
+		// Another source can hold this credential id after an endpoint edit; only a snapshot
+		// saved under this entry's own identity describes its balance.
+		const stored = this.store.get(entry.credentialId, entry.identity, restoreSnapshot);
 		const detail = stored?.detail as
 			| {
 					status: ProviderBalanceStatus;

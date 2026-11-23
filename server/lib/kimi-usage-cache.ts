@@ -418,10 +418,18 @@ function refreshSubject(subject: UsageSubject): Promise<KimiUsageCache | null> {
 	if (inFlight) return inFlight;
 	const run = (async (): Promise<KimiUsageCache | null> => {
 		const existing = usageOf(subject);
+		// A provider can be edited or re-purposed while the request is out; its late answer
+		// must not publish into the snapshot another source now reads for this credential.
+		const current = () =>
+			kimiSubjects().some(
+				(s) => s.id === subject.id && identity(s.config) === identity(subject.config),
+			);
 		try {
-			setUsage(subject, await probeKimiQuota(subject));
+			const fresh = await probeKimiQuota(subject);
+			if (current()) setUsage(subject, fresh);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
+			if (!current()) return null;
 			// Keep stale window data visible; only the error field advances.
 			//
 			// `fetchedAt` advances too when there was no previous entry, so a provider

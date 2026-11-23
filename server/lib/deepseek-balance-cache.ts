@@ -2,7 +2,7 @@ import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { identifyService } from "@shared/sourcing/identify";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
-import { firstCredentialId, type UsageSubject } from "./provider-key-subjects";
+import { firstCredential, type UsageSubject } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
@@ -153,10 +153,15 @@ let legacyImported = false;
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
  * their entry token, so even an abort-ignoring transport cannot publish a result. */
 export function syncDeepSeekBalanceCache(): void {
-	const providers = new Map(
+	// The balance is probed with the first credential's effective config, so a proxy set on
+	// that key applies here exactly as it does to inference.
+	const providers = new Map<string, { config: CustomApiProviderConfig; credentialId: string }>(
 		(settings.customApiProviders ?? [])
 			.filter((p) => isDeepSeekCustomApiProvider(p) && p.apiKey)
-			.map((p) => [p.id, { config: p, credentialId: firstCredentialId(p.id) }]),
+			.map((p) => {
+				const credential = firstCredential(p);
+				return [p.id, { config: credential.config, credentialId: credential.id }];
+			}),
 	);
 	if (!legacyImported) {
 		legacyImported = true;
@@ -166,7 +171,9 @@ export function syncDeepSeekBalanceCache(): void {
 			[...providers].map(([id, p]) => ({
 				legacyKey: id,
 				id: p.credentialId,
-				identity: identity(p.config),
+				// Legacy files were keyed by the provider config, before per-key networks applied.
+				identity: identity(settings.customApiProviders?.find((c) => c.id === id) ?? p.config),
+				storeIdentity: identity(p.config),
 			})),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
@@ -180,7 +187,8 @@ export function syncDeepSeekBalanceCache(): void {
 		) {
 			entries.delete(id);
 			entry.controller?.abort();
-			if (!provider) quotaStore.remove(entry.credentialId);
+			if (provider) quotaStore.forget(entry.credentialId);
+			else quotaStore.remove(entry.credentialId);
 		}
 	}
 	for (const [id, { config, credentialId }] of providers) {
@@ -190,6 +198,8 @@ export function syncDeepSeekBalanceCache(): void {
 				credentialId,
 				generation: crypto.randomUUID(),
 			});
+			// Restore synchronously, as the old entry-creation did.
+			quotaStore.get(credentialId, identity(config), restoreSnapshot);
 		}
 	}
 }
@@ -283,7 +293,11 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 	const config = settings.customApiProviders?.find((p) => p.id === providerId);
 	if (!entry || !config) return Promise.resolve(null);
 	if (entry.inFlight) return entry.inFlight;
-	const credential = { id: entry.credentialId, providerId, config: structuredClone(config) };
+	const credential = {
+		id: entry.credentialId,
+		providerId,
+		config: structuredClone(firstCredential(config).config),
+	};
 	const controller = new AbortController();
 	entry.controller = controller;
 	entry.inFlight = (async () => {

@@ -79,6 +79,11 @@ export class QuotaStore {
 		return snapshot;
 	}
 
+	/** Forget the in-memory copy only (an identity that changed, but may come back). */
+	forget(id: string): void {
+		this.held.delete(id);
+	}
+
 	/** The snapshot in memory, whatever identity it was saved under (key pool). */
 	peek(id: string): QuotaSnapshot | undefined {
 		return this.held.get(id)?.snapshot;
@@ -121,18 +126,26 @@ export const quotaStore = new QuotaStore(
 export function importLegacyQuotaCache<T>(
 	fileName: string,
 	parse: (raw: unknown) => T | null,
-	items: ReadonlyArray<{ legacyKey: string; id: string; identity: string }>,
+	items: ReadonlyArray<{
+		legacyKey: string;
+		id: string;
+		/** Identity the legacy entry was saved under. */
+		identity: string;
+		/** Identity to keep it under, when the live one is computed differently now. */
+		storeIdentity?: string;
+	}>,
 	toSnapshot: (value: T) => QuotaSnapshot | null,
 	store: QuotaStore = quotaStore,
 ): Promise<void> {
 	const path = getNarraforkPath(fileName);
 	if (!existsSync(path)) return Promise.resolve();
 	const legacy = createPersistedCredentialCache(fileName, parse);
-	for (const { legacyKey, id, identity } of items) {
-		if (store.get(id, identity)) continue;
+	for (const { legacyKey, id, identity, storeIdentity } of items) {
+		const liveIdentity = storeIdentity ?? identity;
+		if (store.get(id, liveIdentity)) continue;
 		const value = legacy.restore(legacyKey, identity);
 		const snapshot = value === undefined ? null : toSnapshot(value);
-		if (snapshot) store.set(id, identity, snapshot);
+		if (snapshot) store.set(id, liveIdentity, snapshot);
 	}
 	return unlink(path).catch(() => {});
 }
