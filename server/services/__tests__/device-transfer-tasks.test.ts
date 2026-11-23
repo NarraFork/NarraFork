@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as schema from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { createDeviceTransferTaskManager } from "../device-transfer-service";
 import { DeviceTransferTaskStore } from "../device-transfer-task-store";
 import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
@@ -71,6 +72,40 @@ afterAll(async () => {
 });
 
 describe("persistent device transfer tasks", () => {
+	test("retries interrupted recovery after a Worker read failure", async () => {
+		const manager = createDeviceTransferTaskManager(store, {
+			statRemote: async () => ({ exists: false, isDirectory: false, size: 0, mtimeMs: 0 }),
+			downloadFile: async () => ({ transferId: "unused", bytes: 0 }),
+			uploadFile: async () => ({ transferId: "unused", bytes: 0 }),
+		});
+		const recovery = spyOn(store, "recoverInterrupted");
+		const failure = new Error("reader unavailable");
+		const read = spyOn(workerRead, "readQuery").mockRejectedValueOnce(failure);
+		try {
+			const failed = await Promise.allSettled([
+				manager.resume(deviceId, "missing-recovery-task"),
+				manager.resume(deviceId, "missing-recovery-task"),
+			]);
+			expect(failed.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+			expect(recovery).toHaveBeenCalledTimes(1);
+			read.mockRestore();
+			let error: unknown;
+			let result: unknown;
+			try {
+				result = await manager.resume(deviceId, "missing-recovery-task");
+			} catch (caught) {
+				error = caught;
+			}
+			expect(error).toBeUndefined();
+			expect(result).toBeNull();
+			await manager.resume(deviceId, "missing-recovery-task");
+			expect(recovery).toHaveBeenCalledTimes(2);
+		} finally {
+			read.mockRestore();
+			recovery.mockRestore();
+		}
+	});
+
 	test("recovers interrupted work as paused without changing terminal states", async () => {
 		await db
 			.insert(schema.deviceTransferTasks)
