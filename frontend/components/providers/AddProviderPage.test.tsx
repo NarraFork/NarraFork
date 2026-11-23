@@ -330,6 +330,50 @@ describe("AddProviderPage interactions", () => {
 		}
 	});
 
+	test("retrying without local sources still preselects the default preset", async () => {
+		const spy = spyOn(sourcingApi, "templates")
+			.mockRejectedValueOnce(new Error("offline"))
+			.mockResolvedValueOnce(catalog);
+		const failingClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const flush = () =>
+			act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			});
+		try {
+			root?.unmount();
+			root = createRoot(container);
+			await act(async () => {
+				root?.render(
+					<I18nextProvider i18n={i18n}>
+						<QueryClientProvider client={failingClient}>
+							<MantineProvider env="test">
+								<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+							</MantineProvider>
+						</QueryClientProvider>
+					</I18nextProvider>,
+				);
+			});
+			await flush();
+			expect(container.querySelector('[role="alert"]')).not.toBeNull();
+			expect(container.querySelector("button[data-provider-preset][data-selected]")).toBeNull();
+			await act(async () => {
+				[...container.querySelectorAll("button")]
+					.find((node) => node.textContent?.trim() === i18n.t("retry", { ns: "common" }))
+					?.dispatchEvent(new Event("click", { bubbles: true }));
+			});
+			await flush();
+			expect(container.querySelector('[role="alert"]')).toBeNull();
+			expect(
+				container
+					.querySelector("button[data-provider-preset][data-selected]")
+					?.getAttribute("data-provider-preset"),
+			).toBe("deepseek");
+			expect(field("addProviderBaseUrl").value).toBe("https://api.deepseek.com/v1");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
 	test("a save rejection keeps the form and key available for a successful retry", async () => {
 		await click(preset("OpenAI"));
 		await type("addProviderApiKey", "retained-on-error");
