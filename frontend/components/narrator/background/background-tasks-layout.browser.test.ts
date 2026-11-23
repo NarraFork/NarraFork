@@ -39,7 +39,7 @@ const stubs: Record<string, string> = {
 		export const readFetchError = () => { throw new Error('Unexpected fetch'); };
 		export const api = {
 			cancelBackgroundTask: async (_parent, id) => window.backgroundTaskFixture.cancelled.push(id),
-			getBackgroundTaskOutputTail: async () => ({tail:window.backgroundTaskFixture.tasks[0].output,live:true,truncated:false}),
+			getBackgroundTaskOutputTail: async (_narratorId, taskId) => ({tail:(window.backgroundTaskFixture.tasks.find((task)=>task.id===taskId) ?? window.backgroundTaskFixture.tasks[0]).output,live:true,truncated:false}),
 			createBackgroundTask: (id, data) => create('task', id, data),
 			createBrowserSession: (id, data) => create('browser', id, data),
 			listBrowserSessions: async () => { window.backgroundTaskFixture.browserReads++; return []; },

@@ -64,7 +64,7 @@ import {
 	watchTargetKey,
 } from "./background-task-filter";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
-import { WatchAttachment, WatchTaskRow } from "./WatchTaskRow";
+import { WatchAttachment, WatchTaskRow, type WatchTaskRowTask } from "./WatchTaskRow";
 
 /** Poll interval for the live output tail of a running task. */
 const TAIL_POLL_INTERVAL_MS = 1_500;
@@ -343,6 +343,29 @@ function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailPr
 	);
 }
 
+/** Expanded body of a finished Watch row: its stored result, read once. */
+function WatchOutputDetail({ narratorId, task }: { narratorId: string; task: WatchTaskRowTask }) {
+	const { t } = useTranslation("narrator");
+	const { data, isLoading, isError } = useTaskOutputTail(narratorId, task.id, true, false);
+	return (
+		<Stack gap={2} data-message-selection-ignore>
+			<ContentViewer
+				bodyId={toolBodyId(task.id, "output.main")}
+				content={data?.tail ?? task.output ?? ""}
+				title={t("backgroundTasks.outputLabel")}
+				style={{ maxHeight: 320, fontSize: 11 }}
+				truncated={data?.truncated}
+			/>
+			{isLoading && <Loader size={12} />}
+			{isError && (
+				<Text size="xs" c="red">
+					{t("backgroundTasks.outputLoadFailed")}
+				</Text>
+			)}
+		</Stack>
+	);
+}
+
 interface BackgroundTasksPanelProps {
 	narratorId: string;
 	/**
@@ -538,6 +561,7 @@ export function BackgroundTasksPanel({
 								task={task}
 								onOpenAgent={canOpenSubagentSessions ? handleOpenSubagent : undefined}
 								onCancel={handleCancel}
+								renderOutput={(watch) => <WatchOutputDetail narratorId={narratorId} task={watch} />}
 							/>
 						);
 					}

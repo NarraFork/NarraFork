@@ -16,7 +16,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import type { TFunction } from "i18next";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import classes from "./BackgroundTasksDrawer.module.css";
 
@@ -35,6 +35,8 @@ interface WatchTaskRowProps {
 	/** Opens the watched subagent; absent when it cannot be opened from here. */
 	onOpenAgent?: (subagentNarratorId: string) => void;
 	onCancel: (taskId: string) => void;
+	/** Full stored output of a finished watch; the list row only carries a preview. */
+	renderOutput?: (task: WatchTaskRowTask) => ReactNode;
 }
 
 const TITLE_PREFIX = /^watch (?:agent |bash )?/;
@@ -205,7 +207,7 @@ export function WatchAttachment({ watches }: { watches: readonly WatchTaskRowTas
  * observed, the pattern it waits for and its deadline instead of the raw
  * `[watch] …` handle.
  */
-export function WatchTaskRow({ task, onOpenAgent, onCancel }: WatchTaskRowProps) {
+export function WatchTaskRow({ task, onOpenAgent, onCancel, renderOutput }: WatchTaskRowProps) {
 	const { t } = useTranslation("narrator");
 	const target = parseWatchCommand(task.command);
 	const outcome = watchOutcome(task, target);
@@ -312,14 +314,20 @@ export function WatchTaskRow({ task, onOpenAgent, onCancel }: WatchTaskRowProps)
 				</Box>
 			)}
 			{output && expanded ? (
-				<Code
-					block
-					mt={4}
-					data-watch-output
-					style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}
-				>
-					{output}
-				</Code>
+				renderOutput ? (
+					<Box mt={4} data-watch-output>
+						{renderOutput(task)}
+					</Box>
+				) : (
+					<Code
+						block
+						mt={4}
+						data-watch-output
+						style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}
+					>
+						{output}
+					</Code>
+				)
 			) : (
 				preview && (
 					<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
