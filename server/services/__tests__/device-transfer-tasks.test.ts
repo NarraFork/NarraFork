@@ -77,6 +77,9 @@ describe("persistent device transfer tasks", () => {
 			statRemote: async () => ({ exists: false, isDirectory: false, size: 0, mtimeMs: 0 }),
 			downloadFile: async () => ({ transferId: "unused", bytes: 0 }),
 			uploadFile: async () => ({ transferId: "unused", bytes: 0 }),
+			downloadDirectory: async () => ({ filesTransferred: 0, bytesTransferred: 0 }),
+			uploadDirectory: async () => ({ filesTransferred: 0, bytesTransferred: 0 }),
+			statLocal: stat,
 		});
 		const recovery = spyOn(store, "recoverInterrupted");
 		const failure = new Error("reader unavailable");
