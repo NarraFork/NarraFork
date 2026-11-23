@@ -65,7 +65,8 @@ function remoteTransportOptions(config: McpServerConfig, url: URL, oauthKey: str
 	const fetchWithHeaders: FetchLike = async (input, init) => {
 		if (new URL(input).origin !== url.origin) return fetch(input, init);
 		const merged = new Headers(init?.headers);
-		for (const [name, value] of headers) merged.set(name, value);
+		// Protocol headers the SDK sets (Accept, Content-Type, MCP-*) take precedence.
+		for (const [name, value] of headers) if (!merged.has(name)) merged.set(name, value);
 		const response = await fetch(input, { ...init, headers: merged });
 		if (response.status === 401 || response.status === 403)
 			noteMcpOAuthChallenge(config, oauthKey, response);
