@@ -32,7 +32,10 @@ import {
 import type { ProviderCatalogRefreshResult } from "./plugin-provider-catalog-refresh";
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
-import { PluginProviderConfigService } from "./plugin-provider-config-service";
+import {
+	declaredProviderSecretFields,
+	PluginProviderConfigService,
+} from "./plugin-provider-config-service";
 import { PluginProviderCredentialResolver } from "./plugin-provider-credential-resolver";
 import {
 	findPluginProviderForModel,
@@ -489,6 +492,11 @@ export function createPluginPlatformServices(
 			adapters: options.publicApiAdapters,
 		});
 	const secretVault = options.secretVault ?? pluginSecretVault;
+	// A vault key alone cannot be split into contribution id and field (both may contain
+	// dots), so provider secrets are routed to `credentials.json` by what the plugin
+	// declares. Read lazily: the registry is constructed further down.
+	secretVault.providerSecretFields = (pluginId) =>
+		declaredProviderSecretFields(providerRegistry, pluginId);
 	const hostServices =
 		options.hostServices ??
 		createPluginHostServices({
@@ -867,6 +875,9 @@ export function createPluginPlatformServices(
 			providerConfigSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerConfigs,
 			providerPrefixSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerPrefixes,
 			providerConfigPruner: async (pluginId, keep) => {
+				// Providers are registered by now, so their secrets can be told apart and moved
+				// into credentials.json (idempotent; a no-op on a legacy instance).
+				await secretVault.migrateProviderSecrets(pluginId);
 				// The credential for a provider lives in the vault, not in state.json, so both
 				// have to be pruned or a removed provider would leave a live secret behind that
 				// only an uninstall could clear.

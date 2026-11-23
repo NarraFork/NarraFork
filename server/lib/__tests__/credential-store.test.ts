@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ import {
 	searchKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../provider-keys";
+import * as secretStore from "../secret-store";
 import { changeSecretEncryption, readSecretJSON, SecretStoreError } from "../secret-store";
 
 const dirs: string[] = [];
@@ -370,6 +371,36 @@ describe("model keys in credentials.json", () => {
 				.exportForTransfer()
 				.map((c) => c.id),
 		).toEqual(["a"]);
+	});
+
+	test("a failed save changes neither memory nor disk, and is not persisted by a later save", () => {
+		const home = unifiedHome();
+		const store = getCredentialStore(home.dir);
+		const keys = home.keys();
+		savePluginProviderSecrets(store, [
+			{ pluginId: "p", contributionId: "demo", fields: { apiKey: "sk-1" } },
+		]);
+		const write = spyOn(secretStore, "writeSecretJSON").mockImplementationOnce(() => {
+			throw new Error("disk full");
+		});
+		try {
+			expect(() =>
+				savePluginProviderSecrets(store, [
+					{ pluginId: "p", contributionId: "demo", fields: { apiKey: "sk-rejected" } },
+				]),
+			).toThrow("disk full");
+		} finally {
+			write.mockRestore();
+		}
+		// The rejected edit is gone, and another owner's successful save does not commit it.
+		keys.add("conn", { apiKey: "sk-conn" });
+		expect(Object.fromEntries(pluginProviderSecrets(store, "p"))).toEqual({
+			demo: { apiKey: "sk-1" },
+		});
+		expect(home.file().credentials.find((c) => c.id === "plugin:p:demo")?.auth).toEqual({
+			kind: "opaque",
+			fields: { apiKey: "sk-1" },
+		});
 	});
 
 	test("ids are unique across Codex accounts and keys", () => {

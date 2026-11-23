@@ -12,17 +12,20 @@ export function pluginCredentialId(pluginId: string, contributionId: string): st
 }
 
 /**
- * `provider.<contributionId>.<field>`. Provider ids may contain dots, schema field names
- * in practice do not, so the field is the last segment.
+ * One secret field of one provider.
+ *
+ * A vault key cannot be split back into these two parts: both contribution ids and schema
+ * field names may contain dots, so `provider.demo.api.key` is ambiguous. Only a key that
+ * matches a *declared* (contribution id, field) pair is routed to a credential; anything
+ * else stays in the vault, exactly as before.
  */
-const PROVIDER_SECRET_KEY = /^provider\.(.+)\.([^.]+)$/;
-
-export function parseProviderSecretKey(
-	key: string,
-): { contributionId: string; field: string } | undefined {
-	const match = PROVIDER_SECRET_KEY.exec(key);
-	return match ? { contributionId: match[1] as string, field: match[2] as string } : undefined;
+export interface ProviderSecretRef {
+	contributionId: string;
+	field: string;
 }
+
+export const providerSecretKey = ({ contributionId, field }: ProviderSecretRef) =>
+	`provider.${contributionId}.${field}`;
 
 /** Secret fields of each provider of one plugin, by contribution id. */
 export function pluginProviderSecrets(

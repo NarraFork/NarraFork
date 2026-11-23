@@ -161,29 +161,32 @@ export class CredentialStore {
 		);
 	}
 
+	// Each save writes the proposed part first and only then publishes it: a failed write
+	// must not leave an edit the caller saw rejected live in memory, where the next
+	// owner's save would persist it.
 	saveCodex(credentials: Credential[]): void {
-		this.assertReadable();
-		this.codexPart = structuredClone(credentials);
-		this.write();
+		const next = structuredClone(credentials);
+		this.write(next, this.keyPart, this.pluginPart);
+		this.codexPart = next;
 	}
 
 	saveKeys(part: KeyPart): void {
-		this.assertReadable();
-		this.keyPart = structuredClone(part);
-		this.write();
+		const next = structuredClone(part);
+		this.write(this.codexPart, next, this.pluginPart);
+		this.keyPart = next;
 	}
 
 	savePlugins(credentials: Credential[]): void {
-		this.assertReadable();
-		this.pluginPart = structuredClone(credentials);
-		this.write();
+		const next = structuredClone(credentials);
+		this.write(this.codexPart, this.keyPart, next);
+		this.pluginPart = next;
 	}
 
 	/** The migration's single write: from here on the instance uses this file. */
 	create(file: CredentialsFile): void {
 		if (this.exists) throw new Error(`${CREDENTIALS_FILE} already exists`);
 		this.split(file);
-		this.write();
+		this.write(this.codexPart, this.keyPart, this.pluginPart);
 		this.exists = true;
 	}
 
@@ -196,23 +199,21 @@ export class CredentialStore {
 
 	/** Rewrite in the current encryption form. */
 	rewrite(): void {
-		if (this.exists && this.readable && existsSync(this.path)) this.write();
+		if (this.exists && this.readable && existsSync(this.path)) {
+			this.write(this.codexPart, this.keyPart, this.pluginPart);
+		}
 	}
 
-	private assertReadable(): void {
+	private write(codex: Credential[], keys: KeyPart, plugins: Credential[]): void {
 		if (this.unreadable) {
 			throw new SecretStoreError(
 				"Credentials on this server could not be read; nothing was changed",
 			);
 		}
-	}
-
-	private write(): void {
-		this.assertReadable();
 		const file: CredentialsFile = {
 			version: 1,
-			credentials: [...this.codexPart, ...this.keyPart.credentials, ...this.pluginPart],
-			groupSecrets: this.keyPart.groupSecrets,
+			credentials: [...codex, ...keys.credentials, ...plugins],
+			groupSecrets: keys.groupSecrets,
 		};
 		writeSecretJSON(this.path, file);
 	}

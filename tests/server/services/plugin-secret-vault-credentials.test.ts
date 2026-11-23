@@ -1,15 +1,29 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CREDENTIAL_BACKUPS_DIR } from "@server/lib/credential-backup";
 import {
 	CREDENTIALS_FILE,
 	type CredentialsFile,
 	getCredentialStore,
 	resetCredentialStoresForTests,
 } from "@server/lib/credential-store";
+import { savePluginProviderSecrets } from "@server/lib/plugin-credentials";
 import { readSecretJSON, SecretStoreError } from "@server/lib/secret-store";
-import { PluginProviderConfigService } from "@server/services/plugin-provider-config-service";
+import {
+	declaredProviderSecretFields,
+	PluginProviderConfigService,
+} from "@server/services/plugin-provider-config-service";
 import { PluginProviderCredentialResolver } from "@server/services/plugin-provider-credential-resolver";
 import { PluginProviderRegistry } from "@server/services/plugin-provider-registry";
 import { PluginSecretVault } from "@server/services/plugin-secret-vault";
@@ -34,23 +48,35 @@ function home(options: { unified: boolean }) {
 	if (options.unified) {
 		getCredentialStore(dir).create({ version: 1, credentials: [], groupSecrets: {} });
 	}
+	const registry = new PluginProviderRegistry();
 	const vault = new PluginSecretVault({
 		root: join(dir, "plugins"),
 		credentials: () => getCredentialStore(dir),
+		providerSecretFields: (id) => declaredProviderSecretFields(registry, id),
 	});
 	return {
 		dir,
 		vault,
+		registry,
 		credentials: () =>
 			(readSecretJSON(join(dir, CREDENTIALS_FILE)) as CredentialsFile).credentials.filter(
 				(c) => c.auth.kind === "opaque",
 			),
 		vaultFile: () => (existsSync(vault.path) ? readFileSync(vault.path, "utf8") : ""),
+		vaultJson: () => JSON.parse(readFileSync(vault.path, "utf8")),
+		backups: () =>
+			existsSync(join(dir, CREDENTIAL_BACKUPS_DIR))
+				? readdirSync(join(dir, CREDENTIAL_BACKUPS_DIR))
+				: [],
+		restart: () => resetCredentialStoresForTests(),
 	};
 }
 
-function provider(registry: PluginProviderRegistry, localId = "demo") {
-	registry.register({
+type Home = ReturnType<typeof home>;
+
+/** Register a provider whose secret fields may contain dots, as may its contribution id. */
+function provider(h: Home, localId = "demo", secretFields = ["apiKey"]) {
+	h.registry.register({
 		kind: "executable-plugin",
 		pluginId,
 		localId,
@@ -62,24 +88,32 @@ function provider(registry: PluginProviderRegistry, localId = "demo") {
 			type: "object",
 			properties: {
 				apiMode: { type: "string" },
-				apiKey: { type: "string", format: "password" },
+				...Object.fromEntries(
+					secretFields.map((field) => [field, { type: "string", format: "password" }]),
+				),
 			},
 		},
 	});
 	return `${pluginId}/${localId}@1`;
 }
 
+function configService(h: Home) {
+	return new PluginProviderConfigService({
+		registry: h.registry,
+		stateStore: new PluginStateStore({ root: join(h.dir, "plugins") }),
+		secretStore: h.vault,
+	});
+}
+
 describe("plugin provider secrets in credentials.json", () => {
 	test("config save, read and clear go through the credential; other secrets stay in the vault", async () => {
 		const h = home({ unified: true });
-		const registry = new PluginProviderRegistry();
-		const instanceId = provider(registry);
-		const service = new PluginProviderConfigService({
-			registry,
-			stateStore: new PluginStateStore({ root: join(h.dir, "plugins") }),
-			secretStore: h.vault,
+		const instanceId = provider(h);
+		const service = configService(h);
+		const resolver = new PluginProviderCredentialResolver({
+			registry: h.registry,
+			secretSource: h.vault,
 		});
-		const resolver = new PluginProviderCredentialResolver({ registry, secretSource: h.vault });
 
 		const view = await service.update(pluginId, instanceId, { apiMode: "x", apiKey: "sk-1" });
 		expect(view.secretsSet).toEqual(["apiKey"]);
@@ -111,8 +145,49 @@ describe("plugin provider secrets in credentials.json", () => {
 		expect(await resolver.resolve(instanceId)).toEqual({ apiMode: "x" });
 	});
 
+	test("dotted field names and contribution ids survive save, read and a catalog prune", async () => {
+		const h = home({ unified: true });
+		const dottedField = provider(h, "demo", ["api.key"]);
+		const dottedId = provider(h, "demo.v2", ["apiKey"]);
+		const service = configService(h);
+
+		await service.update(pluginId, dottedField, { "api.key": "sk-dotted-field" });
+		await service.update(pluginId, dottedId, { apiKey: "sk-dotted-id" });
+		expect(h.credentials().map((c) => [c.id, c.auth])).toEqual([
+			[`plugin:${pluginId}:demo`, { kind: "opaque", fields: { "api.key": "sk-dotted-field" } }],
+			[`plugin:${pluginId}:demo.v2`, { kind: "opaque", fields: { apiKey: "sk-dotted-id" } }],
+		]);
+		expect(await h.vault.getSecret({ pluginId, key: "provider.demo.api.key" })).toBe(
+			"sk-dotted-field",
+		);
+
+		// A refresh keeping both providers must not drop either credential.
+		expect(await h.vault.pruneProviderSecrets(pluginId, ["demo", "demo.v2"])).toBe(0);
+		expect(h.credentials()).toHaveLength(2);
+		expect((await configService(h).list(pluginId)).map((v) => v.secretsSet)).toEqual([
+			["api.key"],
+			["apiKey"],
+		]);
+	});
+
+	test("concurrent writes to one provider do not lose fields", async () => {
+		const h = home({ unified: true });
+		provider(h, "demo", ["a", "b", "c"]);
+		await Promise.all(
+			["a", "b", "c"].map((field) =>
+				h.vault.setSecret({ pluginId, key: `provider.demo.${field}`, value: `v-${field}` }),
+			),
+		);
+		expect(h.credentials()[0]?.auth).toEqual({
+			kind: "opaque",
+			fields: { a: "v-a", b: "v-b", c: "v-c" },
+		});
+	});
+
 	test("pruning drops removed providers' credentials; uninstalling drops all of the plugin's", async () => {
 		const h = home({ unified: true });
+		provider(h, "demo", ["apiKey", "region"]);
+		provider(h, "old.v2");
 		await h.vault.setSecret({ pluginId, key: "provider.demo.apiKey", value: "sk-1" });
 		await h.vault.setSecret({ pluginId, key: "provider.demo.region", value: "eu" });
 		await h.vault.setSecret({ pluginId, key: "provider.old.v2.apiKey", value: "sk-old" });
@@ -124,23 +199,18 @@ describe("plugin provider secrets in credentials.json", () => {
 		});
 
 		expect(await h.vault.pruneProviderSecrets(pluginId, ["demo"])).toBe(1);
-		expect(h.credentials().map((c) => c.id)).toEqual([
-			`plugin:${pluginId}:demo`,
-			"plugin:com.example.other:demo",
-		]);
+		expect(h.credentials().map((c) => c.id)).toEqual([`plugin:${pluginId}:demo`]);
 
 		expect(await h.vault.deletePlugin(pluginId)).toBe(3);
-		expect(h.credentials().map((c) => c.id)).toEqual(["plugin:com.example.other:demo"]);
+		expect(h.credentials()).toEqual([]);
 		expect(await h.vault.listKeys(pluginId)).toEqual([]);
-		expect(
-			await h.vault.getSecret({ pluginId: "com.example.other", key: "provider.demo.apiKey" }),
-		).toBe("o");
 	});
 
 	test("an unreadable credentials.json is never written, and yields no provider secrets", async () => {
 		const h = home({ unified: true });
+		provider(h);
 		await h.vault.setSecret({ pluginId, key: "provider.demo.apiKey", value: "sk-1" });
-		resetCredentialStoresForTests();
+		h.restart();
 		const path = join(h.dir, CREDENTIALS_FILE);
 		writeFileSync(path, "{not json");
 		await expect(
@@ -155,10 +225,117 @@ describe("plugin provider secrets in credentials.json", () => {
 
 	test("an instance without credentials.json keeps every secret in the vault", async () => {
 		const h = home({ unified: false });
+		provider(h);
 		mkdirSync(join(h.dir, "plugins"), { recursive: true });
 		await h.vault.setSecret({ pluginId, key: "provider.demo.apiKey", value: "sk-1" });
 		expect(h.vaultFile()).toContain("sk-1");
 		expect(existsSync(join(h.dir, CREDENTIALS_FILE))).toBe(false);
 		expect(await h.vault.getSecret({ pluginId, key: "provider.demo.apiKey" })).toBe("sk-1");
+	});
+});
+
+describe("plugin provider secret migration", () => {
+	/** A vault as a pre-unification instance left it, with one declared and one unknown key. */
+	async function seeded(options: { unified?: boolean; vault?: string } = {}) {
+		const h = home({ unified: options.unified !== false });
+		provider(h, "demo", ["apiKey", "api.key"]);
+		mkdirSync(join(h.dir, "plugins"), { recursive: true });
+		writeFileSync(
+			h.vault.path,
+			options.vault ??
+				JSON.stringify({
+					version: 1,
+					secrets: {
+						[pluginId]: {
+							"provider.demo.apiKey": "sk-a",
+							"provider.demo.api.key": "sk-dotted",
+							"provider.unknown.apiKey": "sk-unknown",
+							"session.token": "t-1",
+						},
+					},
+				}),
+			{ mode: 0o600 },
+		);
+		return h;
+	}
+
+	test("moves declared fields after an owner-only backup, and leaves everything else", async () => {
+		const h = await seeded();
+		expect(await h.vault.migrateProviderSecrets(pluginId)).toBe(1);
+		expect(h.credentials().map((c) => [c.id, c.auth])).toEqual([
+			[
+				`plugin:${pluginId}:demo`,
+				{ kind: "opaque", fields: { apiKey: "sk-a", "api.key": "sk-dotted" } },
+			],
+		]);
+		expect(h.vaultJson().secrets[pluginId]).toEqual({
+			"provider.unknown.apiKey": "sk-unknown",
+			"session.token": "t-1",
+		});
+		expect(statSync(h.vault.path).mode & 0o777).toBe(0o600);
+
+		const [backup] = h.backups();
+		expect(backup).toMatch(/^pre-plugin-credentials-/);
+		const dir = join(h.dir, CREDENTIAL_BACKUPS_DIR, backup as string);
+		expect(statSync(dir).mode & 0o777).toBe(0o700);
+		expect(statSync(join(dir, "secrets.json")).mode & 0o777).toBe(0o600);
+		expect(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8"))).toMatchObject({
+			secrets: { [pluginId]: { "provider.demo.apiKey": "sk-a" } },
+		});
+	});
+
+	test("idempotent, and an existing credential wins over the vault's copy", async () => {
+		const h = await seeded();
+		await h.vault.migrateProviderSecrets(pluginId);
+		const [credentials, vault, backups] = [h.credentials(), h.vaultFile(), h.backups()];
+		expect(await h.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect([h.credentials(), h.vaultFile(), h.backups()]).toEqual([credentials, vault, backups]);
+
+		// As after a crash between writing credentials and cleaning the vault.
+		const crash = await seeded();
+		savePluginProviderSecrets(getCredentialStore(crash.dir), [
+			{ pluginId, contributionId: "demo", fields: { apiKey: "sk-new" } },
+		]);
+		expect(await crash.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect(crash.credentials()[0]?.auth).toEqual({ kind: "opaque", fields: { apiKey: "sk-new" } });
+		expect(crash.vaultJson().secrets[pluginId]).toEqual({
+			"provider.unknown.apiKey": "sk-unknown",
+			"session.token": "t-1",
+		});
+	});
+
+	test("a secret cleared after a failed vault clean-up does not come back", async () => {
+		const h = await seeded();
+		savePluginProviderSecrets(getCredentialStore(h.dir), [
+			{ pluginId, contributionId: "demo", fields: { apiKey: "sk-a", "api.key": "sk-dotted" } },
+		]);
+		// Clearing removes both the credential and the vault copy the clean-up left behind.
+		await h.vault.deleteSecret({ pluginId, key: "provider.demo.apiKey" });
+		await h.vault.deleteSecret({ pluginId, key: "provider.demo.api.key" });
+		expect(h.credentials()).toEqual([]);
+		expect(await h.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect(h.credentials()).toEqual([]);
+	});
+
+	test("an unreadable vault or credentials.json means no writes", async () => {
+		const brokenVault = await seeded({ vault: "{not json" });
+		expect(await brokenVault.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect(brokenVault.vaultFile()).toBe("{not json");
+		expect(brokenVault.credentials()).toEqual([]);
+		expect(brokenVault.backups()).toEqual([]);
+
+		const brokenStore = await seeded();
+		brokenStore.restart();
+		writeFileSync(join(brokenStore.dir, CREDENTIALS_FILE), "{not json");
+		expect(await brokenStore.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect(brokenStore.vaultJson().secrets[pluginId]["provider.demo.apiKey"]).toBe("sk-a");
+		expect(brokenStore.backups()).toEqual([]);
+	});
+
+	test("a legacy instance keeps its vault", async () => {
+		const h = await seeded({ unified: false });
+		expect(await h.vault.migrateProviderSecrets(pluginId)).toBe(0);
+		expect(h.vaultJson().secrets[pluginId]["provider.demo.apiKey"]).toBe("sk-a");
+		expect(existsSync(join(h.dir, CREDENTIALS_FILE))).toBe(false);
 	});
 });

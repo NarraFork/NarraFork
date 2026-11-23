@@ -13,6 +13,7 @@
  */
 
 import { ValidationError } from "@server/lib/errors";
+import type { ProviderSecretRef } from "@server/lib/plugin-credentials";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import type { ProxyOverride } from "@server/lib/settings/types";
 import type { PluginProviderRegistry, ProviderRegistryEntry } from "./plugin-provider-registry";
@@ -105,6 +106,22 @@ export function secretFieldsOf(schema: ProviderRegistryEntry["configSchema"]): s
 		if (definition.type === "string" && isSecretSchemaNode(definition)) fields.push(name);
 	}
 	return fields;
+}
+
+/**
+ * Every secret field a plugin declares, keyed by contribution id. The vault routes only
+ * these keys to `credentials.json`: any other key keeps its old meaning.
+ */
+export function* declaredProviderSecretFields(
+	registry: Pick<PluginProviderRegistry, "list">,
+	pluginId: string,
+): Generator<ProviderSecretRef> {
+	for (const entry of registry.list()) {
+		if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
+		for (const field of secretFieldsOf(entry.configSchema)) {
+			yield { contributionId: entry.localId, field };
+		}
+	}
 }
 
 /** Secret-broker key for one provider config field. */

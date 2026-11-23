@@ -23,20 +23,24 @@
  * Writes are serialized through a promise chain and go through a temp file + rename, so
  * a crash mid-write cannot leave a truncated vault.
  *
- * Once the instance is on `credentials.json`, provider secrets (`provider.<contributionId>.<field>`)
- * are kept there instead, one `opaque` credential per provider (docs/PROVIDER-SOURCING-DESIGN.md
- * §15.7); the startup migration moves the old ones. Plugins address them by the same keys.
+ * Once the instance is on `credentials.json`, a provider's secret fields are kept there
+ * instead, one `opaque` credential per provider (docs/PROVIDER-SOURCING-DESIGN.md §15.7).
+ * Only keys matching a field the plugin actually declares take that route — a vault key
+ * is ambiguous on its own, because both contribution ids and field names may contain
+ * dots — and every other secret stays here, so the plugin-facing keys do not change.
  */
 
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { backUpCredentialFiles } from "@server/lib/credential-backup";
 import { type CredentialStore, getCredentialStore } from "@server/lib/credential-store";
 import { ValidationError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import {
-	parseProviderSecretKey,
+	type ProviderSecretRef,
 	pluginProviderSecrets,
+	providerSecretKey,
 	savePluginProviderSecrets,
 } from "@server/lib/plugin-credentials";
 
@@ -51,6 +55,8 @@ export interface PluginSecretVaultOptions {
 	fileName?: string;
 	/** Where provider secrets go when it is unified; without it every secret stays here. */
 	credentials?: () => CredentialStore;
+	/** The provider secret fields a plugin declares; wired by the platform services graph. */
+	providerSecretFields?: (pluginId: string) => Iterable<ProviderSecretRef>;
 }
 
 interface VaultDocument {
@@ -106,14 +112,18 @@ function assertKey(key: string): void {
 
 export class PluginSecretVault {
 	readonly path: string;
+	private readonly home: string;
 	private document?: VaultDocument;
 	private writeChain: Promise<unknown> = Promise.resolve();
 	private readonly credentials?: () => CredentialStore;
+	providerSecretFields?: (pluginId: string) => Iterable<ProviderSecretRef>;
 
 	constructor(options: PluginSecretVaultOptions = {}) {
 		const root = resolve(options.root ?? getNarraforkPath("plugins"));
 		this.path = join(root, options.fileName ?? "secrets.json");
+		this.home = dirname(root);
 		this.credentials = options.credentials;
+		this.providerSecretFields = options.providerSecretFields;
 	}
 
 	/** The store holding provider secrets, on an instance that uses `credentials.json`. */
@@ -122,17 +132,25 @@ export class PluginSecretVault {
 		return store?.unified ? store : undefined;
 	}
 
+	/** The declared provider field a key names, if any. */
+	private declaredRef(pluginId: string, key: string): ProviderSecretRef | undefined {
+		for (const ref of this.providerSecretFields?.(pluginId) ?? []) {
+			if (providerSecretKey(ref) === key) return ref;
+		}
+		return undefined;
+	}
+
 	/** Where a provider secret lives when it is not in this file. */
 	private providerSecret(pluginId: string, key: string) {
 		const store = this.providerStore();
-		const parsed = store && parseProviderSecretKey(key);
-		if (!store || !parsed) return undefined;
-		const fields = pluginProviderSecrets(store, pluginId).get(parsed.contributionId) ?? {};
+		const ref = store && this.declaredRef(pluginId, key);
+		if (!store || !ref) return undefined;
+		const fields = pluginProviderSecrets(store, pluginId).get(ref.contributionId) ?? {};
 		const save = (next: Record<string, string>) =>
 			savePluginProviderSecrets(store, [
-				{ pluginId, contributionId: parsed.contributionId, fields: next },
+				{ pluginId, contributionId: ref.contributionId, fields: next },
 			]);
-		return { field: parsed.field, fields, save };
+		return { field: ref.field, fields, save };
 	}
 
 	/** Remove the credentials of a plugin's providers that `keep` rejects; returns the fields removed. */
@@ -151,14 +169,34 @@ export class PluginSecretVault {
 
 	/** This file's keys, with provider secrets taken from `credentials.json` when it holds them. */
 	private keysOf(pluginId: string, document: VaultDocument): string[] {
-		const keys = Object.keys(document.secrets[pluginId] ?? {});
+		const keys = new Set(Object.keys(document.secrets[pluginId] ?? {}));
 		const store = this.providerStore();
-		if (!store) return keys;
-		const own = keys.filter((key) => !parseProviderSecretKey(key));
+		if (!store) return [...keys];
 		for (const [contributionId, fields] of pluginProviderSecrets(store, pluginId)) {
-			for (const field of Object.keys(fields)) own.push(`provider.${contributionId}.${field}`);
+			for (const field of Object.keys(fields)) {
+				keys.add(providerSecretKey({ contributionId, field }));
+			}
 		}
-		return own;
+		return [...keys];
+	}
+
+	/** Drop vault copies of keys now held in `credentials.json`; returns whether any were there. */
+	private async removeVaultKeys(
+		document: VaultDocument,
+		pluginId: string,
+		keys: readonly string[],
+	): Promise<boolean> {
+		const bucket = document.secrets[pluginId];
+		if (!bucket || !keys.some((key) => Object.hasOwn(bucket, key))) return false;
+		const nextBucket = { ...bucket };
+		for (const key of keys) delete nextBucket[key];
+		const next: VaultDocument = {
+			version: 1,
+			secrets: { ...document.secrets, [pluginId]: nextBucket },
+		};
+		await this.persist(next);
+		this.document = next;
+		return true;
 	}
 
 	private async load(): Promise<VaultDocument> {
@@ -210,13 +248,19 @@ export class PluginSecretVault {
 		if (Buffer.byteLength(input.value, "utf8") > MAX_VALUE_BYTES) {
 			throw new ValidationError("Secret value is too large");
 		}
-		const provider = this.providerSecret(input.pluginId, input.key);
-		if (provider) {
-			provider.save({ ...provider.fields, [provider.field]: input.value });
-			return;
-		}
 		await this.enqueue(async () => {
 			const document = await this.load();
+			const provider = this.providerSecret(input.pluginId, input.key);
+			if (provider) {
+				const stored = Object.hasOwn(provider.fields, provider.field);
+				if (!stored && this.keysOf(input.pluginId, document).length >= MAX_ENTRIES) {
+					throw new ValidationError("Too many secrets for this plugin");
+				}
+				provider.save({ ...provider.fields, [provider.field]: input.value });
+				// A leftover vault copy would be imported again by a later migration.
+				await this.removeVaultKeys(document, input.pluginId, [input.key]);
+				return;
+			}
 			const bucket = { ...(document.secrets[input.pluginId] ?? {}) };
 			if (!(input.key in bucket) && Object.keys(bucket).length >= MAX_ENTRIES) {
 				throw new ValidationError("Too many secrets for this plugin");
@@ -233,15 +277,18 @@ export class PluginSecretVault {
 
 	async deleteSecret(input: { pluginId: string; key: string }): Promise<boolean> {
 		assertKey(input.key);
-		const provider = this.providerSecret(input.pluginId, input.key);
-		if (provider) {
-			if (!Object.hasOwn(provider.fields, provider.field)) return false;
-			const { [provider.field]: _removed, ...rest } = provider.fields;
-			provider.save(rest);
-			return true;
-		}
 		return this.enqueue(async () => {
 			const document = await this.load();
+			const provider = this.providerSecret(input.pluginId, input.key);
+			if (provider) {
+				const stored = Object.hasOwn(provider.fields, provider.field);
+				if (stored) {
+					const { [provider.field]: _removed, ...rest } = provider.fields;
+					provider.save(rest);
+				}
+				const inVault = await this.removeVaultKeys(document, input.pluginId, [input.key]);
+				return stored || inVault;
+			}
 			const bucket = document.secrets[input.pluginId];
 			if (!bucket || !(input.key in bucket)) return false;
 			const nextBucket = { ...bucket };
@@ -258,8 +305,8 @@ export class PluginSecretVault {
 
 	/** Remove every secret for a plugin. Used when a plugin is uninstalled. */
 	async deletePlugin(pluginId: string): Promise<number> {
-		const credentials = this.dropProviderCredentials(pluginId, () => false);
 		return this.enqueue(async () => {
+			const credentials = this.dropProviderCredentials(pluginId, () => false);
 			const document = await this.load();
 			const bucket = document.secrets[pluginId];
 			const count = bucket ? Object.keys(bucket).length : 0;
@@ -290,8 +337,8 @@ export class PluginSecretVault {
 		keepContributionIds: readonly string[],
 	): Promise<number> {
 		const keep = new Set(keepContributionIds);
-		const credentials = this.dropProviderCredentials(pluginId, (id) => keep.has(id));
 		return this.enqueue(async () => {
+			const credentials = this.dropProviderCredentials(pluginId, (id) => keep.has(id));
 			const document = await this.load();
 			const bucket = document.secrets[pluginId];
 			if (!bucket) return credentials;
@@ -313,6 +360,58 @@ export class PluginSecretVault {
 			await this.persist(next);
 			this.document = next;
 			return removed;
+		});
+	}
+
+	/**
+	 * Move one plugin's provider secrets into `credentials.json`, once its contributions
+	 * are registered and so can be told apart (startup calls this from the same pass that
+	 * prunes provider config). Backup, then credentials, then the vault without them: a
+	 * crash in between is finished on the next pass, where a credential already present
+	 * wins over the vault's copy. Keys that name no declared field stay here.
+	 */
+	async migrateProviderSecrets(pluginId: string): Promise<number> {
+		const store = this.providerStore();
+		if (!store?.readable || !this.providerSecretFields) return 0;
+		return this.enqueue(async () => {
+			const document = await this.load();
+			const bucket = document.secrets[pluginId];
+			if (!bucket) return 0;
+			const moved: Array<{ ref: ProviderSecretRef; key: string; value: string }> = [];
+			for (const [key, value] of Object.entries(bucket)) {
+				const ref = this.declaredRef(pluginId, key);
+				if (ref) moved.push({ ref, key, value });
+			}
+			if (!moved.length) return 0;
+
+			const backup = backUpCredentialFiles(this.home, "pre-plugin-credentials", [
+				relative(this.home, this.path),
+			]);
+			const existing = pluginProviderSecrets(store, pluginId);
+			const changes = new Map<string, Record<string, string>>();
+			for (const { ref, value } of moved) {
+				if (existing.has(ref.contributionId)) continue;
+				const fields = changes.get(ref.contributionId) ?? {};
+				fields[ref.field] = value;
+				changes.set(ref.contributionId, fields);
+			}
+			if (changes.size) {
+				savePluginProviderSecrets(
+					store,
+					[...changes].map(([contributionId, fields]) => ({ pluginId, contributionId, fields })),
+				);
+			}
+			await this.removeVaultKeys(
+				document,
+				pluginId,
+				moved.map((m) => m.key),
+			);
+			logger.info("Moved plugin provider secrets to credentials.json", {
+				pluginId,
+				providers: changes.size,
+				backup,
+			});
+			return changes.size;
 		});
 	}
 
