@@ -41,6 +41,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import * as modelHistoryDatabase from "../db";
 import { db } from "../db";
 import {
@@ -2065,15 +2066,10 @@ async function resolveCatchUpChildAnchors(
 }
 
 function childCatchUpCondition(anchor: ResolvedChildAnchor): SQL<unknown> {
-	const conditions = [
+	return and(
 		gt(narratorMessageRefs.seq, anchor.seq),
-		isNull(narratorMessageRefs.segmentCompactId),
 		eq(narratorMessages.parentToolUseId, anchor.parentToolUseId),
-	];
-	if (anchor.narratorId) {
-		conditions.push(eq(narratorMessageRefs.narratorId, anchor.narratorId));
-	}
-	return and(...conditions) as SQL<unknown>;
+	) as SQL<unknown>;
 }
 
 function combineOrConditions(conditions: SQL<unknown>[]): SQL<unknown> | undefined {
@@ -4640,15 +4636,34 @@ const narratorMessageQueriesUnlocked = {
 				.limit(limit + 1);
 		}
 
+		// CROSS JOIN fixes join order, not index choice: ANALYZE can turn the OR
+		// into a global message scan when parentToolUseId is mostly NULL. On SQLite,
+		// the existing index plus a message-only IN predicate keeps this a seek.
+		// Resolved anchors all use the caller's refs, never a cursor's narratorId.
+		const sqliteChildLookup = modelHistoryDatabase.activeDatabaseBackend === "sqlite";
 		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
 			? await db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 					})
-					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(childWhere)
+					.from(
+						sqliteChildLookup
+							? sql`${narratorMessages} INDEXED BY idx_messages_parent_tool_use_lookup`
+							: narratorMessages,
+					)
+					.crossJoin(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.messageId, narratorMessages.id),
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+							sqliteChildLookup
+								? inArray(narratorMessages.parentToolUseId, [...resolvedChildAnchors.keys()])
+								: undefined,
+							childWhere,
+						),
+					)
 					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
 					.limit(limit + 1)
 			: [];
@@ -5525,25 +5540,30 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getPendingPermissions(narratorId: string) {
-		const visibleSubagentToolRows = await db
-			.select({ toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-					eq(narratorMessageRefs.narratorId, narratorId),
-				),
-			)
-			.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES]));
-		const visibleSubagentToolUseIds = visibleSubagentToolRows.map((row) => row.toolUseId);
-		const childVisibility =
-			visibleSubagentToolUseIds.length > 0
-				? and(
-						eq(narrators.parentNarratorId, narratorId),
-						inArray(narratorMessages.parentToolUseId, visibleSubagentToolUseIds),
+		const callerTool = alias(narratorToolCalls, "permission_caller_tool");
+		// Start at pending rows, then check the caller's actual refs for each child.
+		// Do not enumerate (or truncate) the caller's entire subagent-tool history.
+		const childVisibility = and(
+			eq(narrators.parentNarratorId, narratorId),
+			exists(
+				db
+					.select({ one: sql`1` })
+					.from(callerTool)
+					.innerJoin(
+						narratorMessageRefs,
+						and(
+							eq(narratorMessageRefs.messageId, callerTool.messageId),
+							eq(narratorMessageRefs.narratorId, narratorId),
+						),
 					)
-				: sql`0`;
+					.where(
+						and(
+							eq(callerTool.toolUseId, narratorMessages.parentToolUseId),
+							inArray(callerTool.toolName, [...SUBAGENT_TOOL_NAMES]),
+						),
+					),
+			),
+		);
 		const tcs = await db
 			.select({
 				id: narratorToolCalls.id,
