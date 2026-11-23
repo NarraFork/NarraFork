@@ -159,6 +159,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	await backgroundOccupancyStore.drain();
 	if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
 	await flushDeltas();
 	cleanDb(sqlite);
