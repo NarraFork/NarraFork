@@ -140,12 +140,30 @@ export class PluginSecretVault {
 		return undefined;
 	}
 
-	/** Where a provider secret lives when it is not in this file. */
+	/**
+	 * Where a provider secret lives when it is not in this file. A declared field routes
+	 * there whether or not it is stored yet; a key that only matches a *stored* credential
+	 * field still does, so a plugin that drops a field from its schema can read and clear
+	 * the value it already saved.
+	 */
 	private providerSecret(pluginId: string, key: string) {
 		const store = this.providerStore();
-		const ref = store && this.declaredRef(pluginId, key);
-		if (!store || !ref) return undefined;
-		const fields = pluginProviderSecrets(store, pluginId).get(ref.contributionId) ?? {};
+		if (!store) return undefined;
+		const stored = pluginProviderSecrets(store, pluginId);
+		let ref = this.declaredRef(pluginId, key);
+		if (!ref) {
+			for (const [contributionId, fields] of stored) {
+				const field = Object.keys(fields).find(
+					(name) => providerSecretKey({ contributionId, field: name }) === key,
+				);
+				if (field) {
+					ref = { contributionId, field };
+					break;
+				}
+			}
+		}
+		if (!ref) return undefined;
+		const fields = stored.get(ref.contributionId) ?? {};
 		const save = (next: Record<string, string>) =>
 			savePluginProviderSecrets(store, [
 				{ pluginId, contributionId: ref.contributionId, fields: next },
@@ -345,8 +363,11 @@ export class PluginSecretVault {
 			const nextBucket: Record<string, string> = {};
 			let removed = credentials;
 			for (const [key, value] of Object.entries(bucket)) {
+				// A key scoped to a retained provider stays, whatever its field is called;
+				// the first segment alone cannot tell, because contribution ids may contain dots.
+				const retained = keepContributionIds.some((id) => key.startsWith(`provider.${id}.`));
 				const match = /^provider\.([^.]+)\./.exec(key);
-				if (match && !keep.has(match[1])) {
+				if (!retained && match && !keep.has(match[1])) {
 					removed += 1;
 					continue;
 				}
@@ -387,11 +408,14 @@ export class PluginSecretVault {
 			const backup = backUpCredentialFiles(this.home, "pre-plugin-credentials", [
 				relative(this.home, this.path),
 			]);
+			// Merge field by field: an existing credential value wins, but a field the
+			// plugin only just declared is still moved out of the vault.
 			const existing = pluginProviderSecrets(store, pluginId);
 			const changes = new Map<string, Record<string, string>>();
 			for (const { ref, value } of moved) {
-				if (existing.has(ref.contributionId)) continue;
-				const fields = changes.get(ref.contributionId) ?? {};
+				const current = changes.get(ref.contributionId) ?? existing.get(ref.contributionId);
+				if (current && Object.hasOwn(current, ref.field)) continue;
+				const fields = changes.get(ref.contributionId) ?? { ...current };
 				fields[ref.field] = value;
 				changes.set(ref.contributionId, fields);
 			}

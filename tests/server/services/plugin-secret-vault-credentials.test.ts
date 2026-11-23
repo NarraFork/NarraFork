@@ -184,6 +184,18 @@ describe("plugin provider secrets in credentials.json", () => {
 		});
 	});
 
+	test("a field dropped from the schema can still be read and cleared", async () => {
+		const h = home({ unified: true });
+		provider(h, "demo", []); // the provider no longer declares any secret field
+		savePluginProviderSecrets(getCredentialStore(h.dir), [
+			{ pluginId, contributionId: "demo", fields: { apiKey: "sk-1" } },
+		]);
+		expect(await h.vault.getSecret({ pluginId, key: "provider.demo.apiKey" })).toBe("sk-1");
+		expect(await h.vault.listKeys(pluginId)).toEqual(["provider.demo.apiKey"]);
+		expect(await h.vault.deleteSecret({ pluginId, key: "provider.demo.apiKey" })).toBe(true);
+		expect(h.credentials()).toEqual([]);
+	});
+
 	test("pruning drops removed providers' credentials; uninstalling drops all of the plugin's", async () => {
 		const h = home({ unified: true });
 		provider(h, "demo", ["apiKey", "region"]);
@@ -296,8 +308,11 @@ describe("plugin provider secret migration", () => {
 		savePluginProviderSecrets(getCredentialStore(crash.dir), [
 			{ pluginId, contributionId: "demo", fields: { apiKey: "sk-new" } },
 		]);
-		expect(await crash.vault.migrateProviderSecrets(pluginId)).toBe(0);
-		expect(crash.credentials()[0]?.auth).toEqual({ kind: "opaque", fields: { apiKey: "sk-new" } });
+		expect(await crash.vault.migrateProviderSecrets(pluginId)).toBe(1);
+		expect(crash.credentials()[0]?.auth).toEqual({
+			kind: "opaque",
+			fields: { apiKey: "sk-new", "api.key": "sk-dotted" },
+		});
 		expect(crash.vaultJson().secrets[pluginId]).toEqual({
 			"provider.unknown.apiKey": "sk-unknown",
 			"session.token": "t-1",
@@ -330,6 +345,53 @@ describe("plugin provider secret migration", () => {
 		expect(await brokenStore.vault.migrateProviderSecrets(pluginId)).toBe(0);
 		expect(brokenStore.vaultJson().secrets[pluginId]["provider.demo.apiKey"]).toBe("sk-a");
 		expect(brokenStore.backups()).toEqual([]);
+	});
+
+	test("a field declared later is merged in without overwriting the stored fields", async () => {
+		const h = home({ unified: true });
+		provider(h, "demo", ["apiKey", "refreshToken"]);
+		savePluginProviderSecrets(getCredentialStore(h.dir), [
+			{ pluginId, contributionId: "demo", fields: { apiKey: "sk-current" } },
+		]);
+		mkdirSync(join(h.dir, "plugins"), { recursive: true });
+		writeFileSync(
+			h.vault.path,
+			JSON.stringify({
+				version: 1,
+				secrets: {
+					[pluginId]: { "provider.demo.apiKey": "sk-old", "provider.demo.refreshToken": "rt-1" },
+				},
+			}),
+		);
+		expect(await h.vault.migrateProviderSecrets(pluginId)).toBe(1);
+		expect(h.credentials()[0]?.auth).toEqual({
+			kind: "opaque",
+			fields: { apiKey: "sk-current", refreshToken: "rt-1" },
+		});
+		expect(h.vaultJson().secrets[pluginId]).toEqual({});
+	});
+
+	test("migration then pruning keeps a dotted provider's undeclared keys, drops removed ones", async () => {
+		const h = home({ unified: true });
+		provider(h, "demo.v2", ["apiKey"]);
+		mkdirSync(join(h.dir, "plugins"), { recursive: true });
+		writeFileSync(
+			h.vault.path,
+			JSON.stringify({
+				version: 1,
+				secrets: {
+					[pluginId]: {
+						"provider.demo.v2.apiKey": "sk-1",
+						"provider.demo.v2.sessionToken": "st-1",
+						"provider.ghost.apiKey": "sk-ghost",
+					},
+				},
+			}),
+		);
+		await h.vault.migrateProviderSecrets(pluginId);
+		expect(await h.vault.pruneProviderSecrets(pluginId, ["demo.v2"])).toBe(1);
+		expect(h.vaultJson().secrets[pluginId]).toEqual({ "provider.demo.v2.sessionToken": "st-1" });
+		expect(h.credentials()[0]?.auth).toEqual({ kind: "opaque", fields: { apiKey: "sk-1" } });
 	});
 
 	test("a legacy instance keeps its vault", async () => {
