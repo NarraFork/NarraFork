@@ -19,9 +19,12 @@ import {
 	projects,
 } from "../../../server/db/schema";
 import { logger } from "../../../server/lib/logger";
-import { cleanDb, getTestDb } from "../../setup";
+import { getNarratorWorkerTestDb } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
@@ -329,7 +332,8 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
