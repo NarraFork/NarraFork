@@ -164,13 +164,24 @@ function acceleratePublicationRetries(): number[] {
 	const delays: number[] = [];
 	spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
 		const [handler, delay, ...rest] = args;
+		const caller = new Error().stack
+			?.split("\n")
+			.find((frame) => frame.includes("/server/") && !frame.includes("/__tests__/"));
 		const retry =
-			delay === MAX_PUBLISH_RETRY_DELAY_MS || PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay);
+			(caller?.includes("/watch-observation.ts:") ?? false) &&
+			(delay === MAX_PUBLISH_RETRY_DELAY_MS || PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay));
 		if (retry && delay !== undefined) delays.push(delay);
 		return schedule(handler, retry ? 5 : delay, ...rest);
 	}) as typeof setTimeout);
 	return delays;
 }
+
+test("publication retry acceleration leaves unrelated Worker deadlines unchanged", () => {
+	const delays = acceleratePublicationRetries();
+	const timer = setTimeout(() => {}, MAX_PUBLISH_RETRY_DELAY_MS);
+	clearTimeout(timer);
+	expect(delays).toEqual([]);
+});
 
 test("ordinary task cancellation still resolves its kill handler after abort side effects", async () => {
 	await bashTask();

@@ -38,6 +38,10 @@ export interface StartRunInput {
 	binding: RunBindingInput;
 	resumeRunId?: string;
 	expectedSource?: import("./read-conflict").RuntimeSourceObservation;
+	recoveryObservation?: import("../recovery-observation").RestartNarrator;
+	parentRecoveryTurn?: import("../recovery-observation").ParentRecoveryTurn;
+	subagentRecovery?: import("../recovery-observation").ResumeSubagent;
+	expectedTask?: { id: string; row: import("../recovery-observation").AgentTaskObservation | null };
 	started?: boolean;
 	/** Task projection of a delivered run; adopts the actor's pre-registered run. */
 	taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
@@ -52,6 +56,7 @@ export interface StartRunInput {
 export interface StartedRun {
 	binding: RuntimeRunBinding;
 	publication?: PublicationRun;
+	recoveryObservation?: import("../recovery-observation").RestartNarrator;
 }
 
 import { blockReadsEnabled } from "../narrator-block-scans";
@@ -63,6 +68,13 @@ import {
 	raiseSeqFloorForClaim,
 	readTopRefSeq,
 } from "../narrator-refs/seq-store";
+import {
+	AGENT_TASK_OBSERVATION_COLUMNS,
+	assertRecoveryFields,
+	assertRecoveryRunAdmission,
+	RESTART_NARRATOR_COLUMNS,
+	RESUME_SUBAGENT_COLUMNS,
+} from "../recovery-observation";
 import { trackCommunicationWork } from "./async-work";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { NoticeKind, RuntimeDb, RuntimeTx } from "./mailbox-types";
@@ -208,6 +220,44 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		if (input.taskRow && !input.binding.deliverTo)
 			throw new ValidationError("Background task registration requires a delivery destination");
 		return runAtomicWrite(database, "publication.startRun", (tx) => {
+			if (input.expectedTask)
+				assertRecoveryFields(
+					input.expectedTask.row,
+					tx
+						.select(AGENT_TASK_OBSERVATION_COLUMNS)
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.expectedTask.id))
+						.get(),
+				);
+			if (input.subagentRecovery)
+				assertRecoveryFields(
+					input.subagentRecovery,
+					tx.query.narrators
+						.findFirst({
+							where: eq(narrators.id, input.narratorId),
+							columns: RESUME_SUBAGENT_COLUMNS,
+						})
+						.sync(),
+				);
+			if (input.parentRecoveryTurn)
+				assertRecoveryFields(
+					input.parentRecoveryTurn,
+					tx
+						.select({ id: narrators.id, turnStartedAt: narrators.turnStartedAt })
+						.from(narrators)
+						.where(eq(narrators.id, input.parentRecoveryTurn.id))
+						.get(),
+				);
+			if (input.recoveryObservation)
+				assertRecoveryRunAdmission(
+					input.recoveryObservation,
+					tx.query.narrators
+						.findFirst({
+							where: eq(narrators.id, input.narratorId),
+							columns: RESTART_NARRATOR_COLUMNS,
+						})
+						.sync(),
+				);
 			if (input.expectedSource) {
 				const source = tx
 					.select({
@@ -360,17 +410,36 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					)
 					.run();
 			}
-			if (publication && input.taskRow)
-				tx.insert(backgroundTasks)
-					.values({ ...input.taskRow, logicalRunId })
-					.run();
+			if (publication && input.taskRow) {
+				if (input.expectedTask?.row)
+					tx.update(backgroundTasks)
+						.set({ ...input.taskRow, logicalRunId })
+						.where(eq(backgroundTasks.id, input.taskRow.id))
+						.run();
+				else
+					tx.insert(backgroundTasks)
+						.values({ ...input.taskRow, logicalRunId })
+						.run();
+			}
 			// Only a live projection follows the run here; an ended task row is reopened
 			// (status and run together) by the run service, never relinked half-way.
 			tx.update(backgroundTasks)
 				.set({ logicalRunId })
 				.where(and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")))
 				.run();
-			return { binding: registration.run, ...(publication ? { publication } : {}) };
+			const recoveryObservation = input.subagentRecovery
+				? tx.query.narrators
+						.findFirst({
+							where: eq(narrators.id, input.narratorId),
+							columns: RESTART_NARRATOR_COLUMNS,
+						})
+						.sync()
+				: undefined;
+			return {
+				binding: registration.run,
+				...(publication ? { publication } : {}),
+				...(recoveryObservation ? { recoveryObservation } : {}),
+			};
 		});
 	}
 
@@ -1900,6 +1969,15 @@ function createSqliteAsyncPublicationService(
 		},
 		cancelAgentNarrator: async (input) => {
 			runAtomicWrite(db, "publication.cancelAgentNarrator", (tx) => {
+				if (input.expectedLogicalRunId !== undefined)
+					assertRecoveryFields(
+						{ logicalRunId: input.expectedLogicalRunId },
+						tx
+							.select({ logicalRunId: narrators.logicalRunId })
+							.from(narrators)
+							.where(eq(narrators.id, input.narratorId))
+							.get(),
+					);
 				tx.update(narrators)
 					.set({
 						backgroundStatus: "cancelled",

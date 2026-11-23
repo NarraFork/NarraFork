@@ -1,5 +1,6 @@
 import { and, eq, or } from "drizzle-orm";
 import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
+import { parseSubstatus } from "../lib/narrator-utils";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 
@@ -10,6 +11,46 @@ export const RESTART_NARRATOR_COLUMNS = {
 	logicalRunId: true,
 	runtimeRegistrationJson: true,
 } as const;
+export const RESUME_SUBAGENT_COLUMNS = {
+	...RESTART_NARRATOR_COLUMNS,
+	policySourceNarratorId: true,
+	backgroundStatus: true,
+	backgroundCompletedAt: true,
+	title: true,
+	subagentType: true,
+} as const;
+export type ResumeSubagent = Pick<
+	typeof narrators.$inferSelect,
+	keyof typeof RESUME_SUBAGENT_COLUMNS
+>;
+export type ParentRecoveryTurn = { id: string; turnStartedAt: string | null };
+export type AgentTaskObservation = Pick<
+	typeof backgroundTasks.$inferSelect,
+	"id" | "type" | "status" | "parentNarratorId" | "subagentNarratorId" | "logicalRunId"
+>;
+export const AGENT_TASK_OBSERVATION_COLUMNS = {
+	id: backgroundTasks.id,
+	type: backgroundTasks.type,
+	status: backgroundTasks.status,
+	parentNarratorId: backgroundTasks.parentNarratorId,
+	subagentNarratorId: backgroundTasks.subagentNarratorId,
+	logicalRunId: backgroundTasks.logicalRunId,
+};
+export function observeAgentTask(row: AgentTaskObservation): AgentTaskObservation {
+	return {
+		id: row.id,
+		type: row.type,
+		status: row.status,
+		parentNarratorId: row.parentNarratorId,
+		subagentNarratorId: row.subagentNarratorId,
+		logicalRunId: row.logicalRunId,
+	};
+}
+export function assertRecoveryFields(expected: object | null, current: object | undefined): void {
+	if (expected === null) {
+		if (current) throw new RuntimeReadConflictError();
+	} else assertObservation(expected, current);
+}
 export const RESTART_TOOL_COLUMNS = {
 	id: narratorToolCalls.id,
 	narratorId: narratorToolCalls.narratorId,
@@ -45,6 +86,29 @@ export interface RestartRecoveryObservation {
 	narrator: RestartNarrator;
 	tool?: RestartTool;
 	task?: RestartTask | null;
+}
+
+export function assertRecoveryRunAdmission(
+	expected: RestartNarrator,
+	current:
+		| (Omit<RestartNarrator, "runtimeRegistrationJson" | "status"> & {
+				runtimeRegistrationJson: unknown;
+				status: string;
+		  })
+		| undefined,
+): void {
+	if (
+		!current ||
+		current.id !== expected.id ||
+		current.logicalRunId !== expected.logicalRunId ||
+		JSON.stringify(current.runtimeRegistrationJson) !==
+			JSON.stringify(expected.runtimeRegistrationJson) ||
+		current.status !== "working" ||
+		parseSubstatus(current.substatus).some((tag) =>
+			["error", "interrupted", "taken_over", "manual_override", "cancelled"].includes(tag),
+		)
+	)
+		throw new RuntimeReadConflictError();
 }
 
 function assertObservation(expected: object, current: object | undefined): void {

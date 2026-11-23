@@ -79,6 +79,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
@@ -116,6 +117,7 @@ import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./nar
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import {
 	assertRestartRecoveryObservation,
+	type RestartNarrator,
 	type RestartRecoveryObservation,
 } from "./recovery-observation";
 
@@ -2255,17 +2257,21 @@ const sqliteNarratorPersistence = {
 		// keeping the message role `disp` so it never enters the model history.
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentBlocks?: any[],
+		recoveryGuard?: (tx: DbTx) => void,
 	) {
-		const msg = await appendPersistedMessage({
-			id: generateId(),
-			narratorId,
-			role: "disp",
-			contentJson: contentBlocks ?? [{ type: "info", message: text }],
-			contextCharsJson: { segments: [] },
-			// Custom-block callers supply already-formatted text; preserve legacy default.
-			contentText: contentBlocks ? text : `[Info] ${text}`,
-			createdAt: new Date().toISOString(),
-		});
+		const msg = await appendPersistedMessage(
+			{
+				id: generateId(),
+				narratorId,
+				role: "disp",
+				contentJson: contentBlocks ?? [{ type: "info", message: text }],
+				contextCharsJson: { segments: [] },
+				// Custom-block callers supply already-formatted text; preserve legacy default.
+				contentText: contentBlocks ? text : `[Info] ${text}`,
+				createdAt: new Date().toISOString(),
+			},
+			recoveryGuard ? { withRows: recoveryGuard } : undefined,
+		);
 		const seq = msg.seq;
 		broadcastToNarrator(narratorId, {
 			type: "message",
@@ -3612,6 +3618,9 @@ const sqliteNarratorPersistence = {
 			skipErrorMessage?: boolean;
 			/** Run finalization must not unarchive a concurrently archived session. */
 			unlessArchived?: boolean;
+			recoveryObservation?: RestartNarrator;
+			parentRecoveryTurn?: import("./recovery-observation").ParentRecoveryTurn;
+			expectedLogicalRunId?: string | null;
 		},
 	) {
 		let wroteStatus = false;
@@ -3679,6 +3688,50 @@ const sqliteNarratorPersistence = {
 			// silently dropped when the DB is momentarily busy.
 			wroteStatus = await withDbRetry(
 				async () => {
+					const recoveryObservation = options?.recoveryObservation;
+					if (recoveryObservation || options?.expectedLogicalRunId !== undefined) {
+						return db.transaction((tx) => {
+							if (recoveryObservation) {
+								if (recoveryObservation.id !== narratorId) throw new RuntimeReadConflictError();
+								assertRestartRecoveryObservation(tx, { narrator: recoveryObservation });
+							}
+							if (options?.expectedLogicalRunId !== undefined) {
+								const current = tx
+									.select({ logicalRunId: narrators.logicalRunId })
+									.from(narrators)
+									.where(eq(narrators.id, narratorId))
+									.get();
+								if (!current || current.logicalRunId !== options.expectedLogicalRunId)
+									throw new RuntimeReadConflictError();
+							}
+							if (options?.parentRecoveryTurn) {
+								const parent = tx
+									.select({ turnStartedAt: narrators.turnStartedAt })
+									.from(narrators)
+									.where(eq(narrators.id, options.parentRecoveryTurn.id))
+									.get();
+								if (!parent || parent.turnStartedAt !== options.parentRecoveryTurn.turnStartedAt)
+									throw new RuntimeReadConflictError();
+							}
+							tx.update(narrators)
+								.set({
+									status,
+									archivedWithNarratorId: null,
+									errorMessage: normalizedErrorMessage,
+									errorRetryable: normalizedErrorMessage
+										? (normalizedErrorRetryable ?? null)
+										: null,
+									updatedAt: now,
+									...(turnStartedAt !== undefined && { turnStartedAt }),
+									...(actualSubstatus !== undefined && {
+										substatus: JSON.stringify(actualSubstatus),
+									}),
+								})
+								.where(eq(narrators.id, narratorId))
+								.run();
+							return true;
+						});
+					}
 					const write = db
 						.update(narrators)
 						.set({
@@ -4834,6 +4887,7 @@ const sqliteNarratorPersistence = {
 		messageId?: string,
 		toolCallId?: string,
 		recoveryObservation?: RestartRecoveryObservation,
+		recoveryGuard?: (tx: DbTx) => void,
 	): Promise<boolean> {
 		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
 		if (!exactId) return false;
@@ -4844,6 +4898,7 @@ const sqliteNarratorPersistence = {
 
 		const affectedToolCalls = db.transaction((tx) => {
 			if (recoveryObservation) assertRestartRecoveryObservation(tx, recoveryObservation);
+			recoveryGuard?.(tx);
 			return tx
 				.update(narratorToolCalls)
 				.set({

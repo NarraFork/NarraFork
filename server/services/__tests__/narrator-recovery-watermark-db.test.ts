@@ -16,10 +16,12 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { parseTraits } from "../../lib/narrator-utils";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
@@ -114,6 +116,130 @@ afterAll(async () => {
 });
 
 describe("markRecoveryOffered", () => {
+	test("card admission ignores a metadata timestamp renewal after its Worker snapshot", async () => {
+		await seedFailedSubagent("card-renewal", ["background"]);
+		const original = workerRead.readQuery;
+		let changed = false;
+		spyOn(workerRead, "readQuery").mockImplementation((async (query, options) => {
+			const rows = await original(query as Parameters<typeof workerRead.readQuery>[0], options);
+			if (!changed && query.toSQL().sql.includes('"background_completed_at"')) {
+				changed = true;
+				db.update(narrators)
+					.set({ updatedAt: "2099-01-01T00:00:00.000Z" })
+					.where(eq(narrators.id, "card-renewal"))
+					.run();
+			}
+			return rows;
+		}) as typeof workerRead.readQuery);
+		expect(await persistSubagentRecoveryCard(PARENT_ID)).toBe(true);
+		expect(changed).toBe(true);
+		expect((await readRow("card-renewal"))?.updatedAt).toBe("2099-01-01T00:00:00.000Z");
+	});
+
+	test("a parent turn changed after its Worker snapshot conflicts before inserting a card", async () => {
+		await seedFailedSubagent("card-turn-race", ["background"]);
+		const original = workerRead.readQueryFirst;
+		let changed = false;
+		spyOn(workerRead, "readQueryFirst").mockImplementation((async (query, options) => {
+			const row = await original(query, options);
+			if (!changed) {
+				changed = true;
+				db.update(narrators)
+					.set({ turnStartedAt: new Date(FAILED_AT_MS - 30_000).toISOString() })
+					.where(eq(narrators.id, PARENT_ID))
+					.run();
+			}
+			return row;
+		}) as typeof workerRead.readQueryFirst);
+		const failure = await captureWorkerRejection(persistSubagentRecoveryCard(PARENT_ID));
+		expect(changed).toBe(true);
+		expect(failure).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+		expect(parseRecoveryOfferedAtMs((await readRow("card-turn-race"))?.traits)).toBeNull();
+	});
+
+	test("card first-row reads forward only read budgets and propagate Worker failure", async () => {
+		const failure = new Error("card read failed");
+		const first = spyOn(workerRead, "readQueryFirst").mockRejectedValue(failure);
+		const signal = new AbortController().signal;
+		const deadlineAt = Date.now() + 10_000;
+		const options = { signal, deadlineAt, timeoutMs: 2_000, ownerNarratorId: PARENT_ID };
+		expect(await captureWorkerRejection(persistSubagentRecoveryCard(PARENT_ID, options))).toBe(
+			failure,
+		);
+		expect(first.mock.calls[0]?.[1]).toEqual({
+			signal,
+			deadlineAt,
+			timeoutMs: 2_000,
+			executionPolicy: "worker-required",
+			maxRows: 1,
+		});
+	});
+
+	test("empty offers do not dispatch reads and failed Worker reads remain failures", async () => {
+		const failure = new Error("watermark Worker unavailable");
+		const read = spyOn(workerRead, "readQuery").mockRejectedValue(failure);
+		await markRecoveryOffered([]);
+		expect(read).not.toHaveBeenCalled();
+		const signal = new AbortController().signal;
+		const deadlineAt = Date.now() + 10_000;
+		const options = { signal, deadlineAt, timeoutMs: 2_000, ownerNarratorId: PARENT_ID };
+		expect(
+			await captureWorkerRejection(
+				markRecoveryOffered([{ id: "missing", failedAtMs: FAILED_AT_MS }], options),
+			),
+		).toBe(failure);
+		expect(read.mock.calls[0]?.[1]).toEqual({
+			signal,
+			deadlineAt,
+			timeoutMs: 2_000,
+			executionPolicy: "worker-required",
+			maxRows: 100,
+		});
+	});
+
+	test("a newer offer and unrelated traits committed after the Worker read are preserved", async () => {
+		await seedFailedSubagent("sub-offer-race", ["background"]);
+		const original = workerRead.readQuery;
+		const read = spyOn(workerRead, "readQuery").mockImplementation(((query, options) => {
+			return original(query as Parameters<typeof workerRead.readQuery>[0], options).then((rows) => {
+				db.update(narrators)
+					.set({
+						traits: [
+							"background",
+							"concurrent-trait",
+							buildRecoveryOfferedTrait(FAILED_AT_MS + 1_000),
+						],
+					})
+					.where(eq(narrators.id, "sub-offer-race"))
+					.run();
+				return rows;
+			});
+		}) as typeof workerRead.readQuery);
+		try {
+			await markRecoveryOffered([{ id: "sub-offer-race", failedAtMs: FAILED_AT_MS }]);
+			expect(read).toHaveBeenCalledTimes(1);
+			const row = await readRow("sub-offer-race");
+			expect(parseTraits(row?.traits)).toContain("concurrent-trait");
+			expect(parseRecoveryOfferedAtMs(row?.traits)).toBe(FAILED_AT_MS + 1_000);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("large offers use bounded batched Worker reads", async () => {
+		const read = spyOn(workerRead, "readQuery");
+		const entries = Array.from({ length: 205 }, (_, index) => ({
+			id: `missing-${index}`,
+			failedAtMs: FAILED_AT_MS,
+		}));
+		await markRecoveryOffered(entries);
+		expect(read).toHaveBeenCalledTimes(3);
+		for (const [, options] of read.mock.calls) {
+			expect(options).toMatchObject({ executionPolicy: "worker-required", maxRows: 100 });
+		}
+	});
+
 	test("stamps the watermark without advancing updatedAt", async () => {
 		await seedFailedSubagent("sub-1");
 
@@ -340,6 +466,16 @@ describe("resumeRecoverySubagents DB recovery", () => {
 			const task = await readBackgroundTask("sub-works");
 			expect(resume.mock.calls.at(-1)?.[0]).toBe("sub-works");
 			expect(resume.mock.calls.at(-1)?.[4]).toEqual({
+				cancelSignal: undefined,
+				parentRecoveryTurn: {
+					id: PARENT_ID,
+					turnStartedAt: new Date(FAILED_AT_MS - 120_000).toISOString(),
+				},
+				recoveryObservation: expect.objectContaining({
+					id: "sub-works",
+					logicalRunId: task?.logicalRunId,
+					status: "idle",
+				}),
 				resumeRunId: task?.logicalRunId ?? undefined,
 				recovered: true,
 			});
@@ -442,6 +578,59 @@ describe("resumeRecoverySubagents DB recovery", () => {
 });
 
 describe("recovery admission uses the parent's latest turn", () => {
+	test("resume batches missing target metadata and tasks and preserves only the read budget", async () => {
+		await seedParent();
+		const original = workerRead.readQuery;
+		const budget = {
+			signal: new AbortController().signal,
+			deadlineAt: Date.now() + 10_000,
+			timeoutMs: 2_000,
+		};
+		const read = spyOn(workerRead, "readQuery").mockImplementation((async (query, options) => {
+			expect(options).toEqual({
+				...budget,
+				executionPolicy: "worker-required",
+				maxRows: options?.maxRows,
+			});
+			return original(query as Parameters<typeof workerRead.readQuery>[0], options);
+		}) as typeof workerRead.readQuery);
+		const result = await resumeRecoverySubagents({
+			...resumeInput,
+			...budget,
+			subagentIds: Array.from({ length: 150 }, (_, i) => `missing-${i}`),
+		});
+		expect(read.mock.calls.map((call) => call[1]?.maxRows)).toEqual([
+			1, 1_000, 1_000, 1_000, 1_000,
+		]);
+		expect(result.resumed).toEqual([]);
+		expect(result.skipped).toHaveLength(150);
+	});
+
+	for (const change of ["parent", "subagent"] as const) {
+		test(`a ${change} changed after the batched Worker reads conflicts before task admission`, async () => {
+			await seedRecoverableSubagent("sub-fails", "retry-fails");
+			const resume = mockSuccessfulResume();
+			const original = backgroundTaskService.createAgentTask.bind(backgroundTaskService);
+			spyOn(backgroundTaskService, "createAgentTask").mockImplementation(async (input) => {
+				if (change === "parent")
+					db.update(narrators)
+						.set({ turnStartedAt: FAILED_AT })
+						.where(eq(narrators.id, PARENT_ID))
+						.run();
+				else
+					db.update(narrators).set({ substatus: "[]" }).where(eq(narrators.id, "sub-fails")).run();
+				return original(input);
+			});
+			expect(
+				await captureWorkerRejection(
+					resumeRecoverySubagents({ ...resumeInput, subagentIds: ["sub-fails"] }),
+				),
+			).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+			expect(resume).not.toHaveBeenCalled();
+			expect(await readBackgroundTask("sub-fails")).toBeUndefined();
+		});
+	}
+
 	test("an old card cannot restart a failure preceding the new parent turn", async () => {
 		await seedRecoverableSubagent("sub-fails", "retry-fails");
 		await seedRecoverableSubagent("sub-works", "retry-works");

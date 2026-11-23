@@ -221,6 +221,16 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 
+	async function drainCollectors() {
+		await bounded(
+			backgroundTaskService.drainBashCollectors().catch((error: unknown) => {
+				if (!(error instanceof Error) || error.message !== "Background Bash lifecycle failed")
+					throw error;
+			}),
+		);
+		expect(backgroundTaskService.getBashShutdownSnapshot().pending).toBe(0);
+	}
+
 	async function seedCall(
 		id = "actual-call",
 		extra: Partial<typeof narratorToolCalls.$inferInsert> = {},
@@ -288,6 +298,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		fixedId = undefined;
 		sqlite.run("DROP TRIGGER IF EXISTS reject_background_insert");
 		for (const execution of executions) execution.finish();
+		await drainCollectors();
 		await flush();
 		for (const row of db.select({ id: backgroundTasks.id }).from(backgroundTasks).all()) {
 			await backgroundTaskService.markCancelled(row.id);
@@ -657,6 +668,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const binding = await seedCall();
 			await run(context(binding));
 			executions[0].finish();
+			await drainCollectors();
 			await flush();
 			expect(taskRow().status).toBe("completed");
 			await expect(await captureWorkerRejectionThrower(run(context(binding)))).toThrow(

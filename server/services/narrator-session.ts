@@ -3672,7 +3672,15 @@ async function feedMessageUnlocked(
 		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "principal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	},
@@ -3919,16 +3927,16 @@ async function feedMessageUnlocked(
 
 		const narrator = await narratorService.getById(narratorId);
 		recoveryStart?.check();
-		await narratorService.updateStatus(
-			narratorId,
-			"working",
-			internalOptions?.preserveTurnStart
+		await narratorService.updateStatus(narratorId, "working", {
+			recoveryObservation: internalOptions?.run?.recoveryObservation,
+			parentRecoveryTurn: internalOptions?.run?.parentRecoveryTurn,
+			...(internalOptions?.preserveTurnStart
 				? {
 						turnStartedAt: active._turnStartedAt,
 						resumeTurn: true,
 					}
-				: { setTurnStart: true },
-		);
+				: { setTurnStart: true }),
+		});
 		recoveryStart?.check();
 		// The user message above is already persisted, so "first turn" means exactly one
 		// user message exists. `messageCount` cannot answer this any more — it now counts
@@ -6301,12 +6309,34 @@ export async function continueNarrator(
 	humanReplyContext?: ReplyContext,
 ): ReturnType<typeof continueNarratorUnlocked> {
 	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
-	return withNarratorStartAdmission(narratorId, () =>
-		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
-			run,
+	return withNarratorStartAdmission(narratorId, async () => {
+		let registered!: () => void;
+		const admitted = new Promise<void>((resolve) => {
+			registered = resolve;
+		});
+		const result = await continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
+			run: run?.recoveryObservation
+				? {
+						...run,
+						onRegistered: () => {
+							run.onRegistered?.();
+							registered();
+						},
+					}
+				: run,
 			humanReplyContext: frozenHumanReplyContext,
-		}),
-	);
+		});
+		if (run?.recoveryObservation && result.ok) {
+			if (!result.terminal) throw new Error("Recovery run did not expose its admission");
+			await Promise.race([
+				admitted,
+				result.terminal.then(() => {
+					throw new Error("Recovery run was not registered");
+				}),
+			]);
+		}
+		return result;
+	});
 }
 
 interface RecoveryContinuationStart {
@@ -6382,7 +6412,14 @@ async function continueNarratorUnlocked(
 		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	} = {},
@@ -6504,13 +6541,13 @@ async function continueNarratorUnlocked(
 	active._turnStartedAt = continueTiming.preserveTurnStart
 		? continueTiming.turnStartedAt
 		: new Date().toISOString();
-	await narratorService.updateStatus(
-		narratorId,
-		"working",
-		continueTiming.preserveTurnStart
+	await narratorService.updateStatus(narratorId, "working", {
+		recoveryObservation: run?.recoveryObservation,
+		parentRecoveryTurn: run?.parentRecoveryTurn,
+		...(continueTiming.preserveTurnStart
 			? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
-			: { setTurnStart: true },
-	);
+			: { setTurnStart: true }),
+	});
 
 	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
 	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
