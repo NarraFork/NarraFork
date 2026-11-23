@@ -1,3 +1,4 @@
+import { isTeamMember, teamRootOf } from "@server/lib/runtime-source";
 import type { ToolContext, ToolResult } from "../lib/agent/types";
 import { isRuntimeToolAllowed, runtimeWatchTargets } from "./agent-runtime/policy";
 import { prepareBackgroundBashResult } from "./background-bash-result";
@@ -8,9 +9,11 @@ import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	cancelWatchRegistration,
-	createWatchObservation,
+	MAX_WATCH_TIMEOUT_MS,
+	registerWatchObservation,
 	type WatchObservation,
 } from "./watch-observation";
+import { subscribeWatchSource } from "./watch-source";
 
 export interface TaskWatchInput {
 	type: "bash" | "agent";
@@ -43,9 +46,14 @@ function registeredResult(
 	id: string,
 	observation: WatchObservation,
 	label: string,
+	reused: boolean,
+	remainingMs: number,
 ): ToolResult {
+	const watching = reused
+		? `Already watching ${input.type} ${label} for this condition (watch ${JSON.stringify(observation.alias)}); no second watch was added. Its deadline is now in ${remainingMs}ms.`
+		: `Watching ${input.type} ${label} (watch ${JSON.stringify(observation.alias)}, deadline in ${remainingMs}ms).`;
 	return {
-		output: `Watching ${input.type} ${label} (watch ${JSON.stringify(observation.alias)}, deadline in ${input.timeout}ms). End your turn or continue independent work. Results arrive in the mailbox. Stop({ type: "bash", id: ${JSON.stringify(observation.alias)} }) cancels only this observation.`,
+		output: `${watching} End your turn or continue independent work. Results arrive in the mailbox. Stop({ type: "bash", id: ${JSON.stringify(observation.alias)} }) cancels only this observation.`,
 		metadata: {
 			kind: "watch",
 			type: input.type,
@@ -54,6 +62,7 @@ function registeredResult(
 			watchId: observation.taskId,
 			watchAlias: observation.alias,
 			status: "watching",
+			...(reused ? { reused: true } : {}),
 			...(input.type === "agent" ? { subagentId: id } : {}),
 		},
 	};
@@ -75,6 +84,7 @@ async function finishTargetObservation(
 	input: TaskWatchInput,
 	label: string,
 	result: TargetResult,
+	runKey: string,
 	sourceNotifies = true,
 ): Promise<void> {
 	if (observation.signal.aborted || result.status === "aborted") return;
@@ -90,7 +100,112 @@ async function finishTargetObservation(
 			? `Observation fulfilled by the ordinary ${input.type} completion notice for ${label}, run ${result.publicationRun?.logicalRunId ?? "legacy"}. This notice fulfils every watch of that recipient/run.`
 			: await resultText(input.type, label, result),
 		silent,
+		// Every observation of this run's end (with or without a pattern) shares one notice.
+		...(COALESCED_END_EXCLUDED.has(result.status) ? {} : { coalesceKey: `${runKey} end` }),
 	});
+}
+
+/** Deadlines and pattern matches are per condition; registration already merges repeats. */
+const COALESCED_END_EXCLUDED = new Set(["timeout", "found", "text_matched"]);
+
+/** Lifecycle outcomes are not read from the agent's committed result. */
+const AGENT_LIFECYCLE_STATUSES = new Set(["superseded", "taken_over", "unavailable", "timeout"]);
+
+/** Keep waiting past the shared waiter's own budget: each observation owns its deadline. */
+async function untilSettled(
+	wait: (timeoutMs: number) => Promise<TargetResult>,
+	signal: AbortSignal,
+): Promise<TargetResult> {
+	for (;;) {
+		const result = await wait(MAX_WATCH_TIMEOUT_MS);
+		if (result.status !== "timeout" || signal.aborted) return result;
+	}
+}
+
+interface ObserveTargetOptions {
+	input: TaskWatchInput;
+	ctx: ToolContext;
+	id: string;
+	label: string;
+	title: string;
+	command: string;
+	/** Target + run: shared by every condition this watcher observes on the run. */
+	runKey: string;
+	/** Target + run + condition: identical repeats by this watcher reuse one observation. */
+	conditionKey: string;
+	/** Source waiter shared by every watcher with the same condition and read authority. */
+	sourceKey: string;
+	wait: (timeoutMs: number, signal: AbortSignal) => Promise<TargetResult>;
+	deadlineOutput: () => string | null;
+	/** Re-validate a shared result for this watcher before it is published. */
+	accept?: (result: TargetResult) => Promise<TargetResult>;
+	sourceNotifies?: (result: TargetResult) => boolean;
+}
+
+async function observeTarget(opts: ObserveTargetOptions): Promise<ToolResult> {
+	const { input, ctx, label } = opts;
+	const fail = (error: unknown) =>
+		observation.finish({
+			status: "failed",
+			output: `Watch could not observe ${input.type === "agent" ? "agent" : "Bash"} ${label}: ${String(error)}. The target was not stopped.`,
+		});
+	const reachDeadline = async () => {
+		try {
+			await checkObservationAuthorization(ctx, input.type);
+			await finishTargetObservation(
+				observation,
+				input,
+				label,
+				{ status: "timeout", output: opts.deadlineOutput() },
+				opts.runKey,
+			);
+		} catch (error) {
+			await fail(error);
+		}
+	};
+	ctx.signal.throwIfAborted();
+	const registered = await registerWatchObservation({
+		narratorId: ctx.narratorId,
+		title: opts.title,
+		command: opts.command,
+		toolUseId: ctx.currentToolUseId,
+		dedupKey: opts.conditionKey,
+		timeoutMs: input.timeout,
+		onDeadline: () => void reachDeadline(),
+	});
+	const { observation, reused, remainingMs } = registered;
+	if (reused) {
+		if (ctx.signal.aborted)
+			return { output: "Watch registration interrupted. The target was not stopped." };
+		return registeredResult(input, opts.id, observation, label, true, remainingMs);
+	}
+	if (ctx.signal.aborted) {
+		await cancelWatchRegistration(observation);
+		return { output: "Watch registration interrupted. The target was not stopped." };
+	}
+	void (async () => {
+		try {
+			const shared = await subscribeWatchSource(
+				opts.sourceKey,
+				(signal) => untilSettled((timeoutMs) => opts.wait(timeoutMs, signal), signal),
+				observation.signal,
+			);
+			if (!shared) return;
+			const result = opts.accept ? await opts.accept(shared) : shared;
+			await checkObservationAuthorization(ctx, input.type);
+			await finishTargetObservation(
+				observation,
+				input,
+				label,
+				result,
+				opts.runKey,
+				opts.sourceNotifies?.(result) ?? true,
+			);
+		} catch (error) {
+			await fail(error);
+		}
+	})();
+	return registeredResult(input, opts.id, observation, label, false, remainingMs);
 }
 
 async function checkObservationAuthorization(
@@ -133,43 +248,26 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 			metadata: { kind: "watch", type: "bash", id: task.id, targetId: input.id, status },
 		};
 	}
-	ctx.signal.throwIfAborted();
-	const observation = await createWatchObservation({
-		narratorId: ctx.narratorId,
+	const runKey = `bash ${JSON.stringify(task.id)} run ${JSON.stringify(task.logicalRunId)}`;
+	const condition = input.pattern ? ` for ${JSON.stringify(input.pattern)}` : "";
+	return observeTarget({
+		input,
+		ctx,
+		id: task.id,
+		label,
 		title: `watch bash ${label}`,
-		command: `bash ${JSON.stringify(task.id)} run ${JSON.stringify(task.logicalRunId)}${input.pattern ? ` for ${JSON.stringify(input.pattern)}` : ""}`,
-		toolUseId: ctx.currentToolUseId,
+		command: `${runKey}${condition}`,
+		runKey,
+		conditionKey: `${runKey}${condition}`,
+		sourceKey: `${runKey}${condition}`,
+		wait: (timeoutMs, signal) =>
+			input.pattern
+				? backgroundTaskService.waitForText(task.id, input.pattern, timeoutMs, signal)
+				: backgroundTaskService.waitForCompletion(task.id, timeoutMs, signal),
+		deadlineOutput: () => backgroundTaskService.getOutputBuffer(task.id),
+		sourceNotifies: (result) =>
+			!(task.backgroundKind === "service" && result.status === "cancelled"),
 	});
-	if (ctx.signal.aborted) {
-		await cancelWatchRegistration(observation);
-		return { output: "Watch registration interrupted. The target was not stopped." };
-	}
-	void (async () => {
-		try {
-			const result = input.pattern
-				? await backgroundTaskService.waitForText(
-						task.id,
-						input.pattern,
-						input.timeout,
-						observation.signal,
-					)
-				: await backgroundTaskService.waitForCompletion(task.id, input.timeout, observation.signal);
-			await checkObservationAuthorization(ctx, input.type);
-			await finishTargetObservation(
-				observation,
-				input,
-				label,
-				result,
-				!(task.backgroundKind === "service" && result.status === "cancelled"),
-			);
-		} catch (error) {
-			await observation.finish({
-				status: "failed",
-				output: `Watch could not observe Bash ${label}: ${String(error)}. The target was not stopped.`,
-			});
-		}
-	})();
-	return registeredResult(input, task.id, observation, label);
 }
 
 async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<ToolResult> {
@@ -197,36 +295,39 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 			},
 		};
 	}
-	ctx.signal.throwIfAborted();
-	const observation = await createWatchObservation({
-		narratorId: ctx.narratorId,
+	const { narratorService } = await import("./narrator-service");
+	const recipientId = snapshot.publicationRun?.recipientId ?? ctx.narratorId;
+	const expectedRunId = snapshot.publicationRun?.logicalRunId;
+	// Committed reads verify the target against its team root, so watchers that share a
+	// root and recipient share one waiter; each still re-checks its own access below.
+	const teamRoot = teamRootOf(await narratorService.getById(id));
+	const runKey = `agent ${JSON.stringify(id)} run ${JSON.stringify(expectedRunId ?? null)}`;
+	return observeTarget({
+		input,
+		ctx,
+		id,
+		label,
 		title: `watch agent ${snapshot.title ?? label}`,
-		command: `agent ${JSON.stringify(id)} run ${JSON.stringify(snapshot.publicationRun?.logicalRunId ?? null)}`,
-		toolUseId: ctx.currentToolUseId,
-	});
-	if (ctx.signal.aborted) {
-		await cancelWatchRegistration(observation);
-		return { output: "Watch registration interrupted. The target was not stopped." };
-	}
-	void (async () => {
-		try {
-			const result = await waitForSubagentResult({
+		command: runKey,
+		runKey,
+		conditionKey: runKey,
+		sourceKey: `${runKey} to ${JSON.stringify(recipientId)} root ${JSON.stringify(teamRoot)}`,
+		wait: (timeoutMs, signal) =>
+			waitForSubagentResult({
 				subagentId: id,
-				recipientId: snapshot.publicationRun?.recipientId ?? ctx.narratorId,
-				expectedRunId: snapshot.publicationRun?.logicalRunId,
+				recipientId,
+				expectedRunId,
 				reportTakenOver: true,
-				watchOwnerNarratorId: ctx.narratorId,
-				timeoutMs: input.timeout,
-				signal: observation.signal,
-			});
-			await checkObservationAuthorization(ctx, input.type);
-			await finishTargetObservation(observation, input, label, result);
-		} catch (error) {
-			await observation.finish({
-				status: "failed",
-				output: `Watch could not observe agent ${label}: ${String(error)}. The target was not stopped.`,
-			});
-		}
-	})();
-	return registeredResult(input, id, observation, label);
+				watchOwnerNarratorId: teamRoot,
+				timeoutMs,
+				signal,
+			}),
+		deadlineOutput: () => "Subagent is still running.",
+		accept: async (result) => {
+			if (AGENT_LIFECYCLE_STATUSES.has(result.status)) return result;
+			if (!isTeamMember(await narratorService.getById(id), ctx.narratorId))
+				throw new Error("Observation access was revoked.");
+			return result;
+		},
+	});
 }

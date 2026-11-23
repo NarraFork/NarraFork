@@ -23,15 +23,18 @@ import {
 	runtimePublication,
 } from "../agent-runtime/publication";
 import { backgroundTaskService } from "../background-task-service";
+import { projectPendingInjection } from "../parent-injection-queue";
 import { clearAliasRegistry } from "../subagent-alias";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 import {
 	createWatchObservation,
 	MAX_PUBLISH_RETRY_DELAY_MS,
+	MAX_WATCHES_PER_NARRATOR,
 	PUBLISH_RETRY_DELAYS_MS,
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 } from "../watch-observation";
+import { activeWatchSourceCount, subscribeWatchSource } from "../watch-source";
 import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const PARENT = "watch-task-parent";
@@ -74,12 +77,12 @@ async function settled(id: string) {
 	}
 }
 
-async function notices() {
-	await flushRuntimePublications(PARENT);
+async function notices(narratorId = PARENT) {
+	await flushRuntimePublications(narratorId);
 	return db
 		.select()
 		.from(narratorBufferedMessages)
-		.where(eq(narratorBufferedMessages.narratorId, PARENT))
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
 		.all();
 }
 
@@ -573,9 +576,12 @@ describe("Watch observes Bash without owning its execution", () => {
 		expect(wakes).toEqual([PARENT]);
 	});
 
-	test("observations have independent deadlines and a later completion remains ordinary", async () => {
+	test("observations of different conditions have independent deadlines and a later completion remains ordinary", async () => {
 		await bashTask();
-		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		const first = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
 		const second = await watchTool.execute({ type: "bash", id: BASH, timeout: 5_000 }, context());
 		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
 		expect(task(watchId(second))?.status).toBe("running");
@@ -735,7 +741,9 @@ describe("Watch observes Bash without owning its execution", () => {
 	test("the observation budget is reserved across parallel registrations", async () => {
 		await bashTask();
 		const results = await Promise.all(
-			Array.from({ length: 21 }, () => watchTool.execute({ type: "bash", id: BASH }, context())),
+			Array.from({ length: 21 }, (_, i) =>
+				watchTool.execute({ type: "bash", id: BASH, pattern: `never-${i}` }, context()),
+			),
 		);
 		expect(results.filter((result) => !result.isError)).toHaveLength(20);
 		expect(results.filter((result) => result.isError)).toHaveLength(1);
@@ -1065,6 +1073,204 @@ describe("Watch follows an agent's registered current run", () => {
 		expect(task(id)?.output).toContain("target was not stopped");
 		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
 			"working",
+		);
+	});
+});
+
+describe("repeated watches by one watcher are deduplicated", () => {
+	test("a repeated Bash watch reuses its observation and extends the deadline to the later one", async () => {
+		await bashTask();
+		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		const repeat = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_500 }, context());
+		expect(watchId(repeat)).toBe(watchId(first));
+		expect(repeat.metadata).toMatchObject({ status: "watching", reused: true });
+		expect(repeat.output).toContain("no second watch was added");
+		expect(observations()).toHaveLength(1);
+		await Bun.sleep(1_200);
+		expect(task(watchId(first))?.status).toBe("running");
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+		expect(task(BASH)?.status).toBe("running");
+	});
+
+	test("a repeated Bash watch never shortens the existing deadline", async () => {
+		await bashTask();
+		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_500 }, context());
+		await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		await Bun.sleep(1_200);
+		expect(task(watchId(first))?.status).toBe("running");
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("concurrent identical registrations create one observation and one source waiter", async () => {
+		await bashTask();
+		const results = await Promise.all(
+			Array.from({ length: MAX_WATCHES_PER_NARRATOR + 5 }, () =>
+				watchTool.execute({ type: "bash", id: BASH }, context()),
+			),
+		);
+		expect(results.every((result) => !result.isError)).toBe(true);
+		expect(new Set(results.map(watchId)).size).toBe(1);
+		expect(results.filter((result) => result.metadata?.reused)).toHaveLength(
+			MAX_WATCHES_PER_NARRATOR + 4,
+		);
+		expect(observations()).toHaveLength(1);
+		expect(activeWatchSourceCount()).toBe(1);
+		await backgroundTaskService.markCompleted(BASH, "done once");
+		expect((await settled(watchId(results[0] as ToolResult)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(activeWatchSourceCount()).toBe(0);
+	});
+
+	test("different patterns stay separate observations and the completion notifies once", async () => {
+		await bashTask();
+		const ready = await watchTool.execute({ type: "bash", id: BASH, pattern: "READY" }, context());
+		const done = await watchTool.execute({ type: "bash", id: BASH, pattern: "DONE" }, context());
+		const end = await watchTool.execute({ type: "bash", id: BASH }, context());
+		expect(new Set([ready, done, end].map(watchId)).size).toBe(3);
+		expect(activeWatchSourceCount()).toBe(3);
+		await backgroundTaskService.markCompleted(BASH, "finished without either marker");
+		for (const result of [ready, done, end])
+			expect((await settled(watchId(result)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a repeated agent watch reuses its observation and one completion notifies once", async () => {
+		const first = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		const repeat = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(watchId(repeat)).toBe(watchId(first));
+		expect(observations()).toHaveLength(1);
+		completeAgent("agent final once");
+		expect((await settled(watchId(first)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(wakes).toEqual([PARENT]);
+	});
+
+	test("a repeated agent watch times out once", async () => {
+		const first = await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a new watch after the first one settled is registered afresh", async () => {
+		await bashTask();
+		const first = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		const again = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
+		expect(watchId(again)).not.toBe(watchId(first));
+		expect(again.metadata?.reused).toBeUndefined();
+	});
+});
+
+describe("watch results coalesce per watcher", () => {
+	const observe = (narratorId = PARENT) =>
+		createWatchObservation({ narratorId, title: "coalesce", command: "bash fixture" });
+
+	test("one watcher's observations of the same outcome publish one notice", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await first.finish({ status: "completed", output: "ended", coalesceKey: "run-1 end" });
+		await second.finish({ status: "completed", output: "ended", coalesceKey: "run-1 end" });
+		expect((await settled(first.taskId))?.status).toBe("completed");
+		const silent = await settled(second.taskId);
+		expect(silent?.status).toBe("completed");
+		expect(silent?.output).toContain("fulfilled by an earlier notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("repeated timeout notices of one key publish once", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await Promise.all([
+			first.finish({ status: "timeout", output: "deadline", coalesceKey: "run-2 deadline" }),
+			second.finish({ status: "timeout", output: "deadline", coalesceKey: "run-2 deadline" }),
+		]);
+		expect((await settled(second.taskId))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("different watchers of one target each receive their own notice", async () => {
+		const [mine, theirs] = await Promise.all([observe(PARENT), observe(OTHER)]);
+		await mine.finish({ status: "completed", output: "ended", coalesceKey: "run-3 end" });
+		await theirs.finish({ status: "completed", output: "ended", coalesceKey: "run-3 end" });
+		expect(await notices(PARENT)).toHaveLength(1);
+		expect(await notices(OTHER)).toHaveLength(1);
+	});
+
+	test("different outcome keys are not merged", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await first.finish({ status: "completed", output: "READY", coalesceKey: "run-4 READY" });
+		await second.finish({ status: "completed", output: "DONE", coalesceKey: "run-4 DONE" });
+		expect(await notices()).toHaveLength(2);
+	});
+
+	test("a duplicate waiting on a holder that is cancelled before delivery publishes instead", async () => {
+		const original = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		const [holder, follower] = await Promise.all([observe(), observe()]);
+		const blocked = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (id, ...rest) => {
+				if (id === holder.taskId) throw new Error("storage unavailable");
+				return original(id, ...rest);
+			},
+		);
+		acceleratePublicationRetries();
+		await holder.finish({ status: "completed", output: "holder", coalesceKey: "run-5 end" });
+		await follower.finish({ status: "completed", output: "follower", coalesceKey: "run-5 end" });
+		expect(task(follower.taskId)?.status).toBe("running");
+		expect(await backgroundTaskService.cancel(holder.taskId)).toBe(true);
+		const done = await settled(follower.taskId);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toBe("follower");
+		const delivered = (await notices()).map((row) => projectPendingInjection(row));
+		expect(
+			delivered.filter(
+				(notice) => notice?.kind === "bg_bash" && notice.task.id === follower.taskId,
+			),
+		).toHaveLength(1);
+		blocked.mockRestore();
+	});
+});
+
+describe("shared watch sources", () => {
+	test("subscribers share one waiter, which stops only when the last one leaves", async () => {
+		let starts = 0;
+		let sourceSignal: AbortSignal | undefined;
+		const start = (signal: AbortSignal) => {
+			starts++;
+			sourceSignal = signal;
+			return new Promise<string>(() => {});
+		};
+		const first = new AbortController();
+		const second = new AbortController();
+		const a = subscribeWatchSource("shared-test", start, first.signal);
+		const b = subscribeWatchSource("shared-test", start, second.signal);
+		await Bun.sleep(0);
+		expect(starts).toBe(1);
+		first.abort();
+		expect(await a).toBeUndefined();
+		expect(sourceSignal?.aborted).toBe(false);
+		second.abort();
+		expect(await b).toBeUndefined();
+		expect(sourceSignal?.aborted).toBe(true);
+		expect(activeWatchSourceCount()).toBe(0);
+	});
+
+	test("every subscriber receives the shared result and a later one starts afresh", async () => {
+		let starts = 0;
+		const start = async () => `result ${++starts}`;
+		const results = await Promise.all([
+			subscribeWatchSource("shared-result", start, new AbortController().signal),
+			subscribeWatchSource("shared-result", start, new AbortController().signal),
+		]);
+		expect(results).toEqual(["result 1", "result 1"]);
+		expect(await subscribeWatchSource("shared-result", start, new AbortController().signal)).toBe(
+			"result 2",
 		);
 	});
 });
