@@ -14,6 +14,7 @@ import {
 	isBackgroundTaskActiveStatus,
 } from "@shared/background-task-list";
 import type { ToolProgressPayload } from "@shared/tool-progress";
+import type { WatchTargetType } from "@shared/watch-command";
 import {
 	and,
 	asc,
@@ -183,6 +184,8 @@ export interface CompletedNotification {
 	alias: string | null;
 	status: string;
 	outputPreview: string;
+	/** Set when the task is a Watch observation: the watched target's type. */
+	watch?: WatchTargetType | null;
 	/** Initiating user of the completed execution, never inferred from its parent. */
 	userId?: string | null;
 }

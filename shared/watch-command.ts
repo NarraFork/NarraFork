@@ -85,3 +85,83 @@ export function parseWatchCommand(command: string | null | undefined): WatchTarg
 		return null;
 	}
 }
+
+/** The watched target type of a background task's command, or null when it is no watch. */
+export function watchCommandTargetType(command: string | null | undefined): WatchTargetType | null {
+	if (!command) return null;
+	if (command.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)) return "terminal";
+	return parseWatchCommand(command)?.type ?? null;
+}
+
+export type WatchNoticeOutcome =
+	| "deadline"
+	| "matched"
+	| "ended"
+	| "replaced"
+	| "stopped"
+	| "failed";
+
+export interface WatchNotice {
+	targetType: WatchTargetType | null;
+	/** Watched target's name, from the observation's title. */
+	targetName: string | null;
+	outcome: WatchNoticeOutcome;
+	/** The observed result without the "Watch agent X: completed." header line. */
+	body: string;
+}
+
+function watchNoticeOutcome(
+	status: string | null | undefined,
+	output: string,
+	targetStatus: string | null,
+	targetType: WatchTargetType | null,
+): WatchNoticeOutcome {
+	if (status === "failed" || status === "fail" || status === "error") return "failed";
+	if (status === "timeout" || isWatchDeadlineOutput(output)) return "deadline";
+	if (targetStatus === "found" || targetStatus === "text_matched") return "matched";
+	if (targetStatus === "superseded" || targetStatus === "taken_over") return "replaced";
+	if (targetStatus && targetStatus !== "completed") return "stopped";
+	if (output.startsWith("Terminal watch ended")) return "stopped";
+	// A terminal watch completes on its pattern; agent and bash report their own status.
+	return targetType === "terminal" && !targetStatus ? "matched" : "ended";
+}
+
+const WATCH_TITLE = /^watch (?:(agent|bash|terminal) )?/;
+const LEGACY_WATCH_TITLE = /^watch (agent|bash) /;
+
+/**
+ * Which target a finished background "bash" notice watched, when it is really a Watch
+ * observation's result; reads only the title and flag, never the (large) output.
+ * `watch` is set by the server; older rows are recognized by their agent/bash title.
+ */
+export function watchNoticeIdentity(task: {
+	title?: string | null;
+	watch?: WatchTargetType | null;
+}): Pick<WatchNotice, "targetType" | "targetName"> | null {
+	const title = task.title?.trim() ?? "";
+	if (!task.watch && !LEGACY_WATCH_TITLE.test(title)) return null;
+	const titleMatch = WATCH_TITLE.exec(title);
+	return {
+		targetType: task.watch ?? (titleMatch?.[1] as WatchTargetType | undefined) ?? null,
+		targetName: titleMatch ? title.slice(titleMatch[0].length).trim() || null : title || null,
+	};
+}
+
+/** A Watch observation's result notice, read from its output; null for ordinary bash. */
+export function watchNoticeFromTask(task: {
+	title?: string | null;
+	status?: string | null;
+	preview?: string | null;
+	watch?: WatchTargetType | null;
+}): WatchNotice | null {
+	const identity = watchNoticeIdentity(task);
+	if (!identity) return null;
+	const { targetType } = identity;
+	const preview = task.preview?.trim() ?? "";
+	const targetStatus = watchResultTargetStatus(preview);
+	const outcome = watchNoticeOutcome(task.status, preview, targetStatus, targetType);
+	const [header, ...rest] = preview.split(/\n\s*\n/);
+	const body =
+		targetStatus || isWatchDeadlineOutput(header) ? rest.join("\n\n").trim() || preview : preview;
+	return { ...identity, outcome, body };
+}

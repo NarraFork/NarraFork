@@ -5,6 +5,8 @@ import {
 	isWatchDeadlineOutput,
 	parseWatchCommand,
 	WATCH_COMMAND_PREFIX,
+	watchCommandTargetType,
+	watchNoticeFromTask,
 	watchResultTargetStatus,
 } from "./watch-command";
 
@@ -58,5 +60,65 @@ describe("watch command", () => {
 			watchResultTargetStatus("Observation fulfilled by the ordinary agent notice"),
 		).toBeNull();
 		expect(watchResultTargetStatus(null)).toBeNull();
+	});
+});
+
+describe("watchNoticeFromTask", () => {
+	test("reads a flagged agent watch's target, outcome and result body", () => {
+		expect(
+			watchNoticeFromTask({
+				title: "watch agent 实现服务端全量回源",
+				status: "completed",
+				preview:
+					"Watch reached its deadline for agent sub-1. Only the observation ended; the target was not stopped.\n\nSubagent is still running.",
+				watch: "agent",
+			}),
+		).toEqual({
+			targetType: "agent",
+			targetName: "实现服务端全量回源",
+			outcome: "deadline",
+			body: "Subagent is still running.",
+		});
+	});
+
+	test("recognises older unflagged agent and bash watch rows by title", () => {
+		expect(
+			watchNoticeFromTask({
+				title: "watch bash dev-server",
+				status: "completed",
+				preview: "Watch bash dev-server: found.\n\nready on :3000",
+			}),
+		).toMatchObject({ targetType: "bash", outcome: "matched", body: "ready on :3000" });
+		expect(
+			watchNoticeFromTask({
+				title: "watch agent a",
+				status: "failed",
+				preview: "boom",
+				watch: "agent",
+			})?.outcome,
+		).toBe("failed");
+		expect(
+			watchNoticeFromTask({
+				title: "watch agent a",
+				status: "completed",
+				preview: "Watch agent a: superseded.",
+			})?.outcome,
+		).toBe("replaced");
+	});
+
+	test("leaves ordinary bash completions alone", () => {
+		expect(
+			watchNoticeFromTask({ title: "bun test", status: "completed", preview: "ok" }),
+		).toBeNull();
+		expect(
+			watchNoticeFromTask({ title: "watch logs", status: "completed", preview: "tail output" }),
+		).toBeNull();
+	});
+
+	test("maps a task command to its watched target type", () => {
+		expect(watchCommandTargetType('[watch] agent "a"')).toBe("agent");
+		expect(watchCommandTargetType('[terminal watch] "t"')).toBe("terminal");
+		expect(watchCommandTargetType("bun test")).toBeNull();
+		expect(watchCommandTargetType(null)).toBeNull();
 	});
 });

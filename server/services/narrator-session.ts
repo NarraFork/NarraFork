@@ -2749,6 +2749,7 @@ export async function deliverPendingInjection(
 					title: bashTask.title || bashTask.id,
 					status: bashTask.status,
 					preview: bashTask.outputPreview ?? "",
+					...(bashTask.watch ? { watch: bashTask.watch } : {}),
 				},
 			];
 			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one

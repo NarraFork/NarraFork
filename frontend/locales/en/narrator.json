@@ -2347,6 +2347,15 @@
 		"copy": "Copy injected content",
 		"copied": "Copied",
 		"truncated": "[Preview truncated to keep the UI responsive. Use copy for the full content.]",
+		"watchNotice": {
+			"label": "Watch",
+			"deadline": "deadline reached",
+			"matched": "matched",
+			"ended": "target finished",
+			"replaced": "run replaced",
+			"stopped": "target stopped",
+			"failed": "failed"
+		},
 		"sources": {
 			"silent_progress": "Progress reminder",
 			"living_work_spec": "Task digest",

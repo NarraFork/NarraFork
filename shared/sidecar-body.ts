@@ -57,6 +57,7 @@ import {
 	type OutlineAnswerNoticeItem,
 	type OutlineTaskNoticeItem,
 } from "./outline-task-notice";
+import type { WatchTargetType } from "./watch-command";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Body payloads
@@ -100,6 +101,8 @@ export interface SideCarDoneTask {
 	preview: string;
 	/** The producer clipped the preview. */
 	truncated?: boolean;
+	/** Bash flavour only: the task is a Watch observation of this target type. */
+	watch?: WatchTargetType | null;
 	/**
 	 * The message INSIDE the agent's own session that produced this result — the
 	 * navigation target when the reader opens that session from this row.

@@ -76,11 +76,13 @@ type ToolTimingRecord = Partial<
 
 import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
+import { watchNoticeFromTask } from "../watch-command";
 import {
 	type AuxiliaryContentProjection,
 	auxiliaryContentKey,
 	auxiliaryContentViews,
 	buildAuxiliaryContentData,
+	watchNoticeOutcomeLabel,
 } from "./auxiliary-content";
 import {
 	type CommunicationState,
@@ -2538,6 +2540,7 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	status_fail: "Failed",
+	watchNoticeLabel: "Watch",
 	// Body of a background-task bubble whose task produced no output. Needs a fallback
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
@@ -3343,7 +3346,10 @@ function adaptSpokenInjection(
 		// the task id alone — no positional suffix.
 		const task = Array.isArray(body.items) ? body.items[0] : undefined;
 		if (!task) return null;
-		const preview = (task.preview ?? "").trim();
+		// A Watch observation's result arrives as a bash completion; it is labelled as the
+		// watch it is, addressed by its target, with the result header moved to the badge.
+		const watch = body.flavor === "bash" ? watchNoticeFromTask(task) : null;
+		const preview = (watch?.body ?? task.preview ?? "").trim();
 		// A bash task's preview is VERBATIM stdout/stderr, so it is fenced unconditionally
 		// (`verbatimOutputToMarkdown`) rather than handed to the Markdown parser. Linter
 		// and compiler output is preformatted text whose indentation and column rules ARE
@@ -3377,10 +3383,13 @@ function adaptSpokenInjection(
 					speaker:
 						body.flavor === "agent"
 							? task.title?.trim() || task.alias?.trim() || task.id
-							: task.alias?.trim() || task.title?.trim() || task.id,
+							: watch?.targetName || task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
-					speakerKind: task.status ?? null,
+					speakerKind: watch
+						? `${sysLabel(ctx, "watchNoticeLabel")} · ${watchNoticeOutcomeLabel(watch.outcome, ctx.labels)}`
+						: (task.status ?? null),
+					...(watch ? { watch: true } : {}),
 					// Only the AGENT flavour has a session: a background agent's task id IS
 					// its narrator id, whereas a bash task id addresses a shell invocation
 					// with no session to open. Gating on `flavor` rather than on the presence

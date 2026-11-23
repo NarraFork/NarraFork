@@ -455,4 +455,57 @@ describe("auxiliary content projection", () => {
 			).toBe("injection-bubble");
 		}
 	});
+
+	test("labels a Watch result as a watch of its target, not as a Bash command", () => {
+		const watchBlock = {
+			type: "system_injection",
+			source: "bg_bash",
+			modelText: "EXACT MODEL COPY",
+			body: {
+				kind: "tasksDone",
+				flavor: "bash",
+				items: [
+					{
+						id: "watch-task",
+						alias: "watch-agent-fix",
+						title: "watch agent Fix login",
+						status: "timeout",
+						preview:
+							"Watch reached its deadline for agent fix. Only the observation ended; the target was not stopped.\n\nSubagent is still running.",
+						watch: "agent",
+					},
+				],
+			},
+		};
+		const msg = message([watchBlock]);
+		const [view] = auxiliaryContentViews(msg);
+		const data = buildAuxiliaryContentData(view, {
+			includeDetail: true,
+			labels: { watchNoticeLabel: "观察", watchNoticeDeadline: "已到截止时间" },
+		});
+		expect(data.detail?.sections[0].body).toMatchObject({ text: "Subagent is still running." });
+		expect(data).toMatchObject({
+			toolName: "观察",
+			summary: "Fix login · 已到截止时间",
+			category: "watch",
+			sourceStatus: "completed",
+		});
+		const [bubble] = adaptSegment({ kind: "message", msg }, { lod: 3 });
+		expect(bubble.kind).toBe("injection-bubble");
+		expect(bubble.data).toMatchObject({
+			speaker: "Fix login",
+			speakerKind: "Watch · deadline reached",
+			watch: true,
+		});
+		expect(String((bubble.data as { markdown: string }).markdown)).toContain(
+			"Subagent is still running.",
+		);
+		expect(String((bubble.data as { markdown: string }).markdown)).not.toContain(
+			"Watch reached its deadline",
+		);
+
+		const [plain] = adaptSegment({ kind: "message", msg: message([injection()]) }, { lod: 3 });
+		expect(plain.data).toMatchObject({ speaker: "checks", speakerKind: "failed" });
+		expect((plain.data as { watch?: boolean }).watch).toBeUndefined();
+	});
 });

@@ -2344,6 +2344,15 @@
 		"copy": "复制注入内容",
 		"copied": "已复制",
 		"truncated": "[预览已截断以保持界面流畅。如需完整内容，请使用复制。]",
+		"watchNotice": {
+			"label": "Watch",
+			"deadline": "已到截止时间",
+			"matched": "已匹配",
+			"ended": "目标已结束",
+			"replaced": "运行已被替换",
+			"stopped": "目标已停止",
+			"failed": "失败"
+		},
 		"sources": {
 			"silent_progress": "进度提醒",
 			"living_work_spec": "任务摘要",
