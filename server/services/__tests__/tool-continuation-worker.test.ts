@@ -69,7 +69,7 @@ function stored() {
 		.where(eq(narratorToolContinuations.id, "record"))
 		.get();
 }
-function interleave(full: "first" | "many", mutation: () => void) {
+function interleave(full: "first" | "many", mutation: () => void | Promise<void>) {
 	let injected = false;
 	if (full === "first") {
 		const original = reads.readQueryFirst;
@@ -77,7 +77,7 @@ function interleave(full: "first" | "many", mutation: () => void) {
 			const row = await original(query, options);
 			if (!injected && row && typeof row === "object" && "toolCallId" in row) {
 				injected = true;
-				mutation();
+				await mutation();
 			}
 			return row;
 		});
@@ -93,7 +93,7 @@ function interleave(full: "first" | "many", mutation: () => void) {
 				"toolCallId" in rows[0]
 			) {
 				injected = true;
-				mutation();
+				await mutation();
 			}
 			return rows;
 		}) as typeof reads.readQuery);
@@ -162,6 +162,67 @@ for (const operation of ["checkpoint", "token"] as const)
 				expect(record?.payloadJson).toEqual({ ...(JSON.parse(raw) ?? {}), recoveryToken: "token" });
 			}
 		});
+
+for (const operation of ["result", "cancel"] as const) {
+	for (const change of ["renewed", "released", "taken-over"] as const) {
+		test(`${operation} ${change === "renewed" ? "survives a renewed lease" : `conflicts after the claim is ${change}`} after its Worker snapshot`, async () => {
+			seed();
+			db.update(narratorToolContinuations)
+				.set({
+					state: "resuming",
+					claimToken: "owner",
+					claimedAt: NOW,
+					deadlineAt: "2026-08-01T00:01:00.000Z",
+				})
+				.run();
+			let changed: ReturnType<typeof stored>;
+			const check = interleave(operation === "result" ? "first" : "many", async () => {
+				if (change === "renewed") {
+					const renewed = await service.renewClaim("call", {
+						claimToken: "owner",
+						updateEpoch: "epoch",
+						now: "2026-08-01T00:00:30.000Z",
+						deadlineAt: "2026-08-01T00:02:00.000Z",
+					});
+					expect(renewed?.deadlineAt).toBe("2026-08-01T00:02:00.000Z");
+				} else
+					db.update(narratorToolContinuations)
+						.set(
+							change === "released"
+								? { state: "waiting", claimToken: null, claimedAt: null, deadlineAt: null }
+								: { claimToken: "new-owner", claimedAt: "2026-08-01T00:00:30.000Z" },
+						)
+						.run();
+				changed = stored();
+			});
+			const work =
+				operation === "result"
+					? service.markResultWritten("call", {
+							claimToken: "owner",
+							updateEpoch: "epoch",
+							payloadJson: { toolSucceeded: true },
+						})
+					: service.cancelInterruptibleForNarrator("parent", "epoch");
+			if (change === "renewed") {
+				await work;
+				expect(stored()?.state).toBe(operation === "result" ? "resuming" : "cancelled");
+				if (operation === "result") {
+					expect(stored()?.payloadJson?.recoveryPhase).toBe("result_written");
+					expect(stored()?.payloadJson?.toolSucceeded).toBe(true);
+					expect(stored()?.deadlineAt).toBe("2026-08-01T00:02:00.000Z");
+					expect(stored()?.claimToken).toBe("owner");
+				}
+			} else {
+				expect(await captureWorkerRejection(work)).toMatchObject({
+					code: "RUNTIME_READ_CONFLICT",
+					statusCode: 409,
+				});
+				expect(stored()).toEqual(changed);
+			}
+			check();
+		});
+	}
+}
 
 for (const operation of [
 	"checkpoint",
