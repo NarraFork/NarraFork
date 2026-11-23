@@ -224,7 +224,9 @@ test("narrow headers retain expand, inspect, cancel, output interaction and suba
 		expect(selected).toBe(
 			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.output),
 		);
-		await page.click('[data-copy*="output.main"]');
+		await page.$eval('[data-copy*="output.main"]', (button) =>
+			(button as HTMLButtonElement).click(),
+		);
 		expect(await page.evaluate(() => window.backgroundTaskFixture.copied)).toEqual([selected]);
 		expect(await page.$('[data-output*="output.main"]')).not.toBeNull();
 		await headers[0].click();
