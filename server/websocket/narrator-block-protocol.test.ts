@@ -5,10 +5,13 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
 import { bodySql, readBodies } from "../lib/narrator-bodies";
+import { getNarratorWorkerTestDb } from "../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -16,9 +19,8 @@ mock.module("../db", () => ({ ...realDbModule, db, sqlite }));
 await import("../services/narrator-service");
 const { narratorStore } = await import("../services/narrator-store");
 const blockSync = await import("../services/narrator-block-sync");
-const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await import(
-	"./narrator-ws"
-);
+const { broadcastToNarrator, drainNarratorWsReadTasks, getNarratorConnections, handleNarratorWS } =
+	await import("./narrator-ws");
 const protocol = await import("./narrator-block-protocol");
 const { decodeBlockFrame } = await import("@frontend/lib/block-protocol");
 
@@ -75,14 +77,15 @@ beforeEach(() => {
 		[NOW, NOW],
 	);
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
+	await drainNarratorWsReadTasks({ deadlineAt: Date.now() + 5000 });
 	getNarratorConnections().clear();
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 const delta = (elementId: string, text: string, type = "text_delta") => ({
