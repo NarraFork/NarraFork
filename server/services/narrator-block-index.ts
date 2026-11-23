@@ -163,14 +163,28 @@ async function indexSlice(reader: IndexQueueReader): Promise<{ more: boolean; wr
 		await applyTurn();
 		const budget = runner.txChars;
 		const started = performance.now();
-		const done = database.sqlite.transaction(() => writeEntries(entries, at, started, budget))();
+		let callbackStarted = started;
+		let callbackFinished = started;
+		const done = database.sqlite.transaction(() => {
+			callbackStarted = performance.now();
+			const result = writeEntries(entries, at, started, budget);
+			callbackFinished = performance.now();
+			return result;
+		})();
 		at = done.next;
 		written += done.written;
-		const elapsedMs = performance.now() - started;
+		const finished = performance.now();
+		const elapsedMs = finished - started;
 		runner.notBefore = performance.now() + Math.min(MAX_PACE_MS, elapsedMs * APPLY_PACE_FACTOR);
 		if (elapsedMs > APPLY_TARGET_MS) {
 			runner.txChars = Math.max(TX_CHARS.min, Math.floor(budget / 2));
-			if (elapsedMs > 2 * APPLY_TARGET_MS) noteSlow(elapsedMs, done.chars);
+			if (elapsedMs > 2 * APPLY_TARGET_MS)
+				noteSlow(elapsedMs, done.chars, done.written, {
+					// Boundaries include wrapper overhead; they do not identify SQLite's internal work.
+					beginOrAcquireMs: callbackStarted - started,
+					callbackMs: callbackFinished - callbackStarted,
+					finishMs: finished - callbackFinished,
+				});
 		} else if (elapsedMs < APPLY_TARGET_MS / 2 && done.chars >= budget)
 			runner.txChars = Math.min(TX_CHARS.max, Math.ceil(budget * 1.25));
 	}
@@ -221,7 +235,12 @@ function writeEntries(
 }
 
 /** At most one line a minute. */
-function noteSlow(elapsedMs: number, chars: number): void {
+function noteSlow(
+	elapsedMs: number,
+	chars: number,
+	written: number,
+	timing: { beginOrAcquireMs: number; callbackMs: number; finishMs: number },
+): void {
 	const now = Date.now();
 	if (now - runner.slowAt < SLOW_LOG_INTERVAL_MS) {
 		runner.slowSuppressed++;
@@ -229,7 +248,11 @@ function noteSlow(elapsedMs: number, chars: number): void {
 	}
 	logger.warn("Slow block index write", {
 		elapsedMs: Math.round(elapsedMs),
+		beginOrAcquireMs: Math.round(timing.beginOrAcquireMs),
+		callbackMs: Math.round(timing.callbackMs),
+		finishMs: Math.round(timing.finishMs),
 		chars,
+		written,
 		nextChars: runner.txChars,
 		suppressed: runner.slowSuppressed,
 	});
@@ -276,5 +299,7 @@ export function resetBlockIndexForTests(): void {
 	runner.running = false;
 	runner.notBefore = 0;
 	runner.txChars = TX_CHARS.initial;
+	runner.slowAt = 0;
+	runner.slowSuppressed = 0;
 	queueTable = undefined;
 }
