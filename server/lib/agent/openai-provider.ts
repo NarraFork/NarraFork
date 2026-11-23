@@ -4208,7 +4208,11 @@ function responsesDeveloperMessage(text: string): OAIMessage {
 	return { role: "developer", content: [{ type: "input_text", text }] };
 }
 
-function responsesTextInput(text: string, instruction: string, mode: OpenAIApiMode): OAIMessage[] {
+function responsesTextInput(
+	text: string,
+	instruction: string | undefined,
+	mode: OpenAIApiMode,
+): OAIMessage[] {
 	const prefix = instruction || (mode === "codex" ? CODEX_DEFAULT_INSTRUCTIONS : "");
 	const user: OAIMessage = { role: "user", content: text };
 	return prefix ? [responsesDeveloperMessage(prefix), user] : [user];
