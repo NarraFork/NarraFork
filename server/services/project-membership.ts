@@ -355,7 +355,7 @@ export async function setProjectMembers(
 	const outcome: ProjectMemberBatchOutcome = { added: [], skipped: [], failed: [] };
 	const now = new Date().toISOString();
 	if (activeDatabaseBackend === "sqlite") {
-		return db.transaction(
+		db.transaction(
 			(tx) => {
 				const current = projectForManagedWrite(tx, projectId, principal);
 				for (const userId of wanted) {
@@ -396,38 +396,38 @@ export async function setProjectMembers(
 			},
 			{ behavior: "immediate" },
 		);
-	}
-	for (const userId of wanted) {
-		if (!known.has(userId) || userId === row.ownerUserId) {
-			outcome.failed.push(userId);
-			continue;
+	} else
+		for (const userId of wanted) {
+			if (!known.has(userId) || userId === row.ownerUserId) {
+				outcome.failed.push(userId);
+				continue;
+			}
+			const existing = heldByUser.get(userId) ?? [];
+			if (existing.length === 1 && existing[0].role === role) {
+				outcome.skipped.push(userId);
+				continue;
+			}
+			// Replace whatever tier they had, so exactly one row survives per member.
+			if (existing.length > 0) {
+				await db.delete(aclGrants).where(
+					inArray(
+						aclGrants.id,
+						existing.map((grant) => grant.id),
+					),
+				);
+			}
+			await db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType: "project",
+				scopeId: projectId,
+				principalType: "user",
+				principalId: userId,
+				capability: role,
+				grantedBy: principal.userId,
+				createdAt: now,
+			});
+			outcome.added.push(userId);
 		}
-		const existing = heldByUser.get(userId) ?? [];
-		if (existing.length === 1 && existing[0].role === role) {
-			outcome.skipped.push(userId);
-			continue;
-		}
-		// Replace whatever tier they had, so exactly one row survives per member.
-		if (existing.length > 0) {
-			await db.delete(aclGrants).where(
-				inArray(
-					aclGrants.id,
-					existing.map((grant) => grant.id),
-				),
-			);
-		}
-		await db.insert(aclGrants).values({
-			id: generateId(),
-			scopeType: "project",
-			scopeId: projectId,
-			principalType: "user",
-			principalId: userId,
-			capability: role,
-			grantedBy: principal.userId,
-			createdAt: now,
-		});
-		outcome.added.push(userId);
-	}
 
 	if (outcome.added.length > 0) {
 		recordAclEvent({
