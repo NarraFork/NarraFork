@@ -507,7 +507,7 @@ function escapeHtml(text: string): string {
 
 function callbackPage(c: Context, ok: boolean, message: string) {
 	const title = ok ? "MCP authorization complete" : "MCP authorization failed";
-	const body = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;padding:2rem"><h1>${title}</h1><p>${escapeHtml(message)}</p>${ok ? "<script>setTimeout(()=>window.close(),1500)</script>" : ""}</body></html>`;
+	const body = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;padding:2rem"><h1>${title}</h1><p>${escapeHtml(message)}</p><p><a href="/routines">Back to NarraFork</a></p>${ok ? '<script>setTimeout(()=>{window.close();location.replace("/routines")},1500)</script>' : ""}</body></html>`;
 	c.header("Cache-Control", "no-store");
 	c.header("Referrer-Policy", "no-referrer");
 	return c.html(body, ok ? 200 : 400);
