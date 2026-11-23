@@ -1978,6 +1978,13 @@ interface McpToolPermissionDraft {
 	enabled?: boolean;
 }
 
+/** Whether saving keeps the stored client secret: it belongs to one URL + pre-registered client. */
+function keepsOAuthClientSecret(d: McpServerDraft): boolean {
+	const clientId = d.oauthClientId.trim();
+	const binding = `${normalizeUrlProtocol(d.url) ?? ""}\n${clientId}`;
+	return d.hasOAuthClientSecret && !!clientId && binding === d.oauthSecretBinding;
+}
+
 const EMPTY_DRAFT: McpServerDraft = {
 	name: "",
 	transport: "stdio",
@@ -2270,10 +2277,8 @@ function McpToolsTab() {
 			} else if (includeClears) {
 				payload.oauth = null;
 			}
-			// A client secret belongs to one pre-registered client; changing it drops the secret.
-			const binding = `${payload.url}\n${clientId}`;
 			if (clientId && d.oauthClientSecret) payload.oauthClientSecret = d.oauthClientSecret;
-			else if (d.hasOAuthClientSecret && (!clientId || binding !== d.oauthSecretBinding))
+			else if (d.hasOAuthClientSecret && !keepsOAuthClientSecret(d))
 				payload.oauthClientSecret = null;
 		}
 
@@ -2903,7 +2908,7 @@ function McpToolsTab() {
 												type="password"
 												label={t("mcpOAuthClientSecret")}
 												placeholder={
-													draft.hasOAuthClientSecret ? t("mcpSecretUnchanged") : undefined
+													keepsOAuthClientSecret(draft) ? t("mcpSecretUnchanged") : undefined
 												}
 												value={draft.oauthClientSecret}
 												onChange={(e) => {
