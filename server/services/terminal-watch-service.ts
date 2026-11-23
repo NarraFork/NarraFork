@@ -21,6 +21,7 @@
  * terminal without watches pays nothing.
  */
 
+import { formatWatchTarget, TERMINAL_WATCH_DEADLINE_OUTPUT_PREFIX } from "@shared/watch-command";
 import type { IMarker } from "@xterm/headless";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
@@ -428,7 +429,12 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		observation = await createWatchObservation({
 			narratorId: input.narratorId,
 			title: `watch ${input.terminalName}${pattern ? `: ${pattern.slice(0, 40)}` : ""}`,
-			command: `terminal ${JSON.stringify(input.terminalId)}${pattern ? ` for ${JSON.stringify(pattern)}` : ""}`,
+			command: formatWatchTarget({
+				type: "terminal",
+				id: input.terminalId,
+				pattern: pattern || undefined,
+				timeoutMs: input.timeoutMs,
+			}),
 			toolUseId: input.toolUseId,
 			onObservationEnd: () => {
 				if (observation) release(observation.taskId);
@@ -651,7 +657,7 @@ async function timeOut(taskId: string): Promise<void> {
 	await settle(
 		watch,
 		"timeout",
-		`Terminal watch timed out: ${watch.pattern ? `${JSON.stringify(watch.pattern)} did not appear in` : "observation reached its deadline for"} terminal "${watch.terminalName}". The command may still be running.${watch.pattern ? `\nLast observed output:\n${watch.lastText ?? "(no completed output snapshot)"}` : ""}`,
+		`${TERMINAL_WATCH_DEADLINE_OUTPUT_PREFIX}: ${watch.pattern ? `${JSON.stringify(watch.pattern)} did not appear in` : "observation reached its deadline for"} terminal "${watch.terminalName}". The command may still be running.${watch.pattern ? `\nLast observed output:\n${watch.lastText ?? "(no completed output snapshot)"}` : ""}`,
 	);
 }
 

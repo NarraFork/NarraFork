@@ -20,6 +20,7 @@ const stubs: Record<string, string> = {
 	usePlatform: `export const useNarratorSubagentsCapability=()=>({supported:true,background:true,detachAttach:true,reattachBlocksParent:true}); export const useNarratorBrowserSessionsCapability=()=>({supported:true});`,
 	useTerminals: `export const useCanOpenTerminals=id=>id && window.backgroundTaskFixture.canCreate;`,
 	useMobileDrawerHistory: `export const useMobileDrawerHistory=()=>{};`,
+	useNarratorActivity: `export const useNarratorActivity=ids=>new Map(ids.map(id=>[id,{tools:window.backgroundTaskFixture.activity[id]??[]}]));`,
 	NarratorDockContext: `export const useNarratorDockContext=()=>({openSubagentPanel:id=>window.backgroundTaskFixture.opened.push(id)});`,
 	"react-router": `export const useNavigate=()=>()=>{throw new Error('Unexpected routing outside dock')};`,
 	api: `
@@ -38,7 +39,7 @@ const stubs: Record<string, string> = {
 		export const readFetchError = () => { throw new Error('Unexpected fetch'); };
 		export const api = {
 			cancelBackgroundTask: async (_parent, id) => window.backgroundTaskFixture.cancelled.push(id),
-			getBackgroundTaskOutputTail: async () => ({tail:window.backgroundTaskFixture.tasks[0].output,live:true,truncated:false}),
+			getBackgroundTaskOutputTail: async (_narratorId, taskId) => ({tail:(window.backgroundTaskFixture.tasks.find((task)=>task.id===taskId) ?? window.backgroundTaskFixture.tasks[0]).output,live:true,truncated:false}),
 			createBackgroundTask: (id, data) => create('task', id, data),
 			createBrowserSession: (id, data) => create('browser', id, data),
 			listBrowserSessions: async () => { window.backgroundTaskFixture.browserReads++; return []; },
@@ -64,7 +65,7 @@ beforeAll(async () => {
 					builder.onResolve(
 						{
 							filter:
-								/(?:useBackgroundTaskList|usePlatform|useTerminals|useMobileDrawerHistory|NarratorDockContext|ToolCallInspector|ContentViewer|lib\/api|@tanstack\/react-router)$/,
+								/(?:useBackgroundTaskList|useNarratorActivity|usePlatform|useTerminals|useMobileDrawerHistory|NarratorDockContext|ToolCallInspector|ContentViewer|lib\/api|@tanstack\/react-router)$/,
 						},
 						(args) => ({ path: args.path, namespace: "task-fixture" }),
 					);
@@ -223,7 +224,9 @@ test("narrow headers retain expand, inspect, cancel, output interaction and suba
 		expect(selected).toBe(
 			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.output),
 		);
-		await page.click('[data-copy*="output.main"]');
+		await page.$eval('[data-copy*="output.main"]', (button) =>
+			(button as HTMLButtonElement).click(),
+		);
 		expect(await page.evaluate(() => window.backgroundTaskFixture.copied)).toEqual([selected]);
 		expect(await page.$('[data-output*="output.main"]')).not.toBeNull();
 		await headers[0].click();
@@ -237,6 +240,84 @@ test("narrow headers retain expand, inspect, cancel, output interaction and suba
 			"child",
 		]);
 		expect(await page.evaluate(() => window.backgroundTaskFixture.beforeOpen)).toBe(2);
+	} finally {
+		await page.close();
+	}
+}, 15_000);
+
+test("filters hide old and watch rows; watches render as their own row and on their target", async () => {
+	if (!browser || !server) throw new Error("Fixture unavailable");
+	const page = await browser.newPage();
+	const errors: string[] = [];
+	page.on("pageerror", (error) => errors.push(String(error)));
+	try {
+		await page.setViewport({ width: 420, height: 844 });
+		await page.goto(server.url.origin, { waitUntil: "networkidle0" });
+		await page.waitForFunction(() => !!(window as unknown as FixtureWindow).fixture);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.start("en", 420, true, false, "tasks", "watch"),
+		);
+		await settle(page);
+		const rows = () =>
+			page.$$eval(
+				"#surface [data-watch-task], #surface .tabler-icon-robot, #surface .tabler-icon-terminal-2",
+				(nodes) =>
+					nodes.map(
+						(node) =>
+							node.closest("[data-watch-task]")?.getAttribute("data-watch-task") ??
+							node.getAttribute("class")?.match(/robot|terminal-2/)?.[0],
+					),
+			);
+		// Default: running agent and service only; finished build and every watch hidden.
+		expect(await rows()).toEqual(["robot", "terminal-2"]);
+		const surfaceText = () => page.$eval("#surface", (surface) => surface.textContent ?? "");
+		// The agent row carries its recent tool calls and the watch observing it.
+		expect(await page.$$eval("[data-agent-recent-tools] > *", (n) => n.length)).toBe(3);
+		const attachments = await page.$$eval("[data-watch-attachment]", (nodes) =>
+			nodes.map((node) => node.textContent),
+		);
+		expect(attachments).toHaveLength(2);
+		expect(attachments[0]).toMatch(/Watched.*Deadline 10m · 7m(30|29)s left/);
+		expect(attachments[1]).toMatch(/Watched.*ready on.*Deadline 5m/);
+
+		const toggle = async (label: string) => {
+			await page.$$eval(
+				"#surface label",
+				(labels, text) => (labels.find((l) => l.textContent === text) as HTMLElement).click(),
+				label,
+			);
+			await settle(page);
+		};
+		await toggle("Completed");
+		expect(await surfaceText()).toContain("bun run build");
+		expect(await page.$("[data-watch-task]")).toBeNull();
+		await toggle("Watch");
+		const watchRows = await page.$$eval("[data-watch-task]", (nodes) =>
+			nodes.map((node) => ({
+				id: node.getAttribute("data-watch-task"),
+				text: node.textContent,
+				bashStyled: !!node.querySelector(".tabler-icon-terminal-2, code[class*=summary]"),
+			})),
+		);
+		expect(watchRows.map((row) => row.id)).toEqual(["watch-agent", "watch-bash", "watch-terminal"]);
+		for (const row of watchRows) expect(row.bashStyled).toBe(false);
+		expect(watchRows[0].text).toMatch(/Agent.*Fix the login token refresh.*watching.*Deadline 10m/);
+		expect(watchRows[1].text).toMatch(/Bash.*server.*for ready on.*watching.*Deadline 5m/);
+		expect(watchRows[2].text).toMatch(/Terminal.*tests.*for PASS.*deadline reached.*Deadline 30m/);
+		expect(watchRows[2].text).not.toContain("left");
+		expect(await page.$("[data-watch-output]")).toBeNull();
+		await page.click('[data-watch-task="watch-terminal"] [data-watch-toggle]');
+		expect(
+			await page.$eval(
+				'[data-watch-task="watch-terminal"] [data-watch-output]',
+				(n) => n.textContent,
+			),
+		).toContain('Terminal watch timed out: "PASS" did not appear');
+		expect(await page.$('[data-watch-task="watch-agent"] [data-watch-toggle]')).toBeNull();
+		await toggle("Completed");
+		expect(await surfaceText()).not.toContain("bun run build");
+		expect(await page.$$eval("[data-watch-task]", (n) => n.length)).toBe(2);
+		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
 	}

@@ -4,6 +4,7 @@ import {
 	Badge,
 	Box,
 	Button,
+	Checkbox,
 	Code,
 	Collapse,
 	Drawer,
@@ -37,7 +38,7 @@ import {
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { useNarratorSubagentsCapability } from "../../../hooks/usePlatform";
@@ -47,12 +48,23 @@ import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
 } from "../../../lib/safe-area";
+import { ActivityToolCallRow } from "../../dashboard/ActivityToolCallRow";
+import { useNarratorActivity } from "../../dashboard/useNarratorActivity";
 import { ContentViewer } from "../content/ContentViewer";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CreateBackgroundTaskForm } from "../ManualResourceForms";
 import { ToolCallInspector } from "../tool-call/ToolCallInspector";
 import classes from "./BackgroundTasksDrawer.module.css";
+import {
+	activeWatchesByTarget,
+	type BackgroundTaskFilter,
+	DEFAULT_BACKGROUND_TASK_FILTER,
+	filterBackgroundTasks,
+	isWatchTask,
+	watchTargetKey,
+} from "./background-task-filter";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
+import { WatchAttachment, WatchTaskRow, type WatchTaskRowTask } from "./WatchTaskRow";
 
 /** Poll interval for the live output tail of a running task. */
 const TAIL_POLL_INTERVAL_MS = 1_500;
@@ -78,6 +90,8 @@ interface UnifiedTask {
 	subagentNarratorId: string | null;
 	activeChildTaskCount: number;
 	canCancelActiveWork: boolean;
+	startedAt: string;
+	isWatch: boolean;
 	/** `transfer` rows only: live byte progress, rendered as a real bar. */
 	progress?: ToolProgressPayload;
 }
@@ -101,6 +115,8 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 		subagentNarratorId: task.subagentNarratorId,
 		activeChildTaskCount: task.activeChildTaskCount,
 		canCancelActiveWork: task.canCancelActiveWork,
+		startedAt: task.startedAt,
+		isWatch: isWatchTask(task),
 		...(task.progress ? { progress: task.progress } : {}),
 	};
 }
@@ -327,6 +343,29 @@ function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailPr
 	);
 }
 
+/** Expanded body of a finished Watch row: its stored result, read once. */
+function WatchOutputDetail({ narratorId, task }: { narratorId: string; task: WatchTaskRowTask }) {
+	const { t } = useTranslation("narrator");
+	const { data, isLoading, isError } = useTaskOutputTail(narratorId, task.id, true, false);
+	return (
+		<Stack gap={2} data-message-selection-ignore>
+			<ContentViewer
+				bodyId={toolBodyId(task.id, "output.main")}
+				content={data?.tail ?? task.output ?? ""}
+				title={t("backgroundTasks.outputLabel")}
+				style={{ maxHeight: 320, fontSize: 11 }}
+				truncated={data?.truncated}
+			/>
+			{isLoading && <Loader size={12} />}
+			{isError && (
+				<Text size="xs" c="red">
+					{t("backgroundTasks.outputLoadFailed")}
+				</Text>
+			)}
+		</Stack>
+	);
+}
+
 interface BackgroundTasksPanelProps {
 	narratorId: string;
 	/**
@@ -366,7 +405,56 @@ export function BackgroundTasksPanel({
 	const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage, refresh } =
 		useBackgroundTaskList(narratorId, backgroundTasksSupported);
 
-	const allTasks = useMemo(() => tasks.map(toUnifiedTask), [tasks]);
+	const [filter, setFilter] = useState<BackgroundTaskFilter>(DEFAULT_BACKGROUND_TASK_FILTER);
+	const [openedAt] = useState(() => Date.now());
+	// Rows seen running since the panel opened stay visible once they finish,
+	// independent of any client/server clock skew.
+	const seenActiveIdsRef = useRef(new Set<string>());
+	const seenActiveWatchIdsRef = useRef(new Set<string>());
+	useEffect(() => {
+		for (const task of tasks) {
+			if (isBackgroundTaskActive(task.effectiveStatus || task.status)) {
+				seenActiveIdsRef.current.add(task.id);
+				if (isWatchTask(task)) seenActiveWatchIdsRef.current.add(task.id);
+			}
+		}
+	}, [tasks]);
+	// A long-running row older than the loaded history leaves the list when it
+	// finishes; keep "Load older" reachable so its result can still be found.
+	const seenRowOutsideLoaded = useMemo(() => {
+		const loaded = new Set(tasks.map((task) => task.id));
+		for (const id of seenActiveIdsRef.current) {
+			if (loaded.has(id)) continue;
+			if (filter.showWatch || !seenActiveWatchIdsRef.current.has(id)) return true;
+		}
+		return false;
+	}, [tasks, filter.showWatch]);
+	const visibleTasks = useMemo(
+		() =>
+			filterBackgroundTasks(tasks, filter, {
+				openedAt,
+				seenActiveIds: seenActiveIdsRef.current,
+			}),
+		[tasks, filter, openedAt],
+	);
+	const allTasks = useMemo(() => visibleTasks.map(toUnifiedTask), [visibleTasks]);
+	// Watches show on the row they observe even while the Watch filter hides their own rows.
+	const watchesByTarget = useMemo(
+		() => activeWatchesByTarget(tasks.filter(isWatchTask).map(toUnifiedTask)),
+		[tasks],
+	);
+	// Same activity-level subscription as the dashboard's running cards: one summary
+	// line per recent tool call, not the child's message stream.
+	const activeAgentIds = useMemo(
+		() =>
+			allTasks.flatMap((task) =>
+				task.kind === "agent" && task.subagentNarratorId && isBackgroundTaskActive(task.status)
+					? [task.subagentNarratorId]
+					: [],
+			),
+		[allTasks],
+	);
+	const agentActivity = useNarratorActivity(activeAgentIds);
 
 	const handleOpenSubagent = useCallback(
 		(subagentNarratorId: string) => {
@@ -445,7 +533,38 @@ export function BackgroundTasksPanel({
 						{reattachFallbackReason}
 					</Alert>
 				)}
+				<Group gap="md" wrap="wrap" data-background-task-filters>
+					<Checkbox
+						size="xs"
+						label={t("backgroundTasks.filterCompleted")}
+						checked={filter.showCompleted}
+						onChange={(event) => {
+							const showCompleted = event.currentTarget.checked;
+							setFilter((current) => ({ ...current, showCompleted }));
+						}}
+					/>
+					<Checkbox
+						size="xs"
+						label={t("backgroundTasks.filterWatch")}
+						checked={filter.showWatch}
+						onChange={(event) => {
+							const showWatch = event.currentTarget.checked;
+							setFilter((current) => ({ ...current, showWatch }));
+						}}
+					/>
+				</Group>
 				{allTasks.map((task) => {
+					if (task.isWatch) {
+						return (
+							<WatchTaskRow
+								key={task.id}
+								task={task}
+								onOpenAgent={canOpenSubagentSessions ? handleOpenSubagent : undefined}
+								onCancel={handleCancel}
+								renderOutput={(watch) => <WatchOutputDetail narratorId={narratorId} task={watch} />}
+							/>
+						);
+					}
 					const isActive = isBackgroundTaskActive(task.status);
 					const canOpenSubagent =
 						canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
@@ -454,6 +573,17 @@ export function BackgroundTasksPanel({
 					// lives in its subagent session, which the row already links to.
 					const canExpand = task.kind === "bash";
 					const expanded = canExpand && expandedTaskIds.has(task.id);
+					const watchKey =
+						task.kind === "agent" && task.subagentNarratorId
+							? watchTargetKey("agent", task.subagentNarratorId)
+							: task.kind === "bash"
+								? watchTargetKey("bash", task.id)
+								: null;
+					const watches = (watchKey && watchesByTarget.get(watchKey)) || [];
+					const recentTools =
+						task.kind === "agent" && task.subagentNarratorId && isActive
+							? (agentActivity.get(task.subagentNarratorId)?.tools ?? [])
+							: [];
 					const Icon =
 						task.kind === "bash"
 							? IconTerminal2
@@ -563,6 +693,14 @@ export function BackgroundTasksPanel({
 									)}
 								</Group>
 							</Box>
+							{recentTools.length > 0 && (
+								<Stack gap={2} mt={4} data-agent-recent-tools>
+									{recentTools.map((tool) => (
+										<ActivityToolCallRow key={tool.toolUseId} tool={tool} />
+									))}
+								</Stack>
+							)}
+							<WatchAttachment watches={watches} />
 							{/* Always shown while it exists — a transfer's bar is the row's whole
 							    point, and it must not be hidden behind expanding the row. */}
 							{task.progress && <TransferProgressBar progress={task.progress} />}
@@ -608,7 +746,10 @@ export function BackgroundTasksPanel({
 				{/* Explicit control rather than scroll-driven auto-paging: older tasks
 				    are history, and a user scrolling to read one row should not pull in
 				    pages they did not ask for. */}
-				{hasNextPage && (
+				{/* Every active row arrives with the first page, so older pages only
+				    hold finished rows, which are hidden until "completed" is checked
+				    unless one of them finished while the panel was open. */}
+				{hasNextPage && (filter.showCompleted || seenRowOutsideLoaded) && (
 					<Button
 						variant="subtle"
 						size="xs"
@@ -622,7 +763,11 @@ export function BackgroundTasksPanel({
 
 				{!isLoading && allTasks.length === 0 && (
 					<Text size="sm" c="dimmed" ta="center" py="md">
-						{t("backgroundTasks.empty")}
+						{t(
+							tasks.length > 0 || hasNextPage
+								? "backgroundTasks.filteredEmpty"
+								: "backgroundTasks.empty",
+						)}
 					</Text>
 				)}
 			</Stack>

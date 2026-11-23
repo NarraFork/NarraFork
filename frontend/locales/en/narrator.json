@@ -2231,7 +2231,25 @@
 		"outputLoadFailed": "Failed to load output",
 		"openAgent": "Open agent",
 		"reattachPartial": "Opening a detached subagent session will not re-block the original parent tool call in this backend runtime.",
-		"loadOlder": "Load older tasks"
+		"loadOlder": "Load older tasks",
+		"filterCompleted": "Completed",
+		"filterWatch": "Watch",
+		"filteredEmpty": "No running tasks. Check Completed or Watch to see more.",
+		"watchBadge": "Watch",
+		"watchedBy": "Watched",
+		"watchTargetAgent": "Agent",
+		"watchTargetBash": "Bash",
+		"watchTargetTerminal": "Terminal",
+		"watchPattern": "for {{pattern}}",
+		"watchTimeout": "Deadline {{duration}}",
+		"watchRemaining": "{{duration}} left",
+		"watchStatusWatching": "watching",
+		"watchStatusDeadline": "deadline reached",
+		"watchStatusMatched": "matched",
+		"watchStatusTargetEnded": "target finished",
+		"watchStatusTargetReplaced": "run replaced",
+		"watchStatusTargetStopped": "target stopped",
+		"watchCancel": "Stop watching (the target keeps running)"
 	},
 	"sidecar": {
 		"contextViews": {
