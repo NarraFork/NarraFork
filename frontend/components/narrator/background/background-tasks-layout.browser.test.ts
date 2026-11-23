@@ -245,7 +245,7 @@ test("narrow headers retain expand, inspect, cancel, output interaction and suba
 	}
 }, 15_000);
 
-test("filters hide old and watch rows; watches render as their own row and on their target", async () => {
+test("running and finished sections, icon kind filters, search, remembered collapse, and watches", async () => {
 	if (!browser || !server) throw new Error("Fixture unavailable");
 	const page = await browser.newPage();
 	const errors: string[] = [];
@@ -254,23 +254,44 @@ test("filters hide old and watch rows; watches render as their own row and on th
 		await page.setViewport({ width: 420, height: 844 });
 		await page.goto(server.url.origin, { waitUntil: "networkidle0" });
 		await page.waitForFunction(() => !!(window as unknown as FixtureWindow).fixture);
-		await page.evaluate(() =>
-			(window as unknown as FixtureWindow).fixture.start("en", 420, true, false, "tasks", "watch"),
-		);
-		await settle(page);
+		await page.evaluate(() => localStorage.clear());
+		const open = async () => {
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.start(
+					"en",
+					420,
+					true,
+					false,
+					"tasks",
+					"watch",
+				),
+			);
+			await settle(page);
+		};
+		await open();
+		// Rows in DOM order, each tagged with the section it sits under.
 		const rows = () =>
 			page.$$eval(
-				"#surface [data-watch-task], #surface .tabler-icon-robot, #surface .tabler-icon-terminal-2",
-				(nodes) =>
-					nodes.map(
-						(node) =>
-							node.closest("[data-watch-task]")?.getAttribute("data-watch-task") ??
-							node.getAttribute("class")?.match(/robot|terminal-2/)?.[0],
-					),
+				"#surface [data-background-task], #surface [data-watch-task], #surface [data-task-section]",
+				(nodes) => {
+					let section = "";
+					const out: string[] = [];
+					for (const node of nodes) {
+						const name = node.getAttribute("data-task-section");
+						if (name) section = name;
+						else
+							out.push(
+								`${section}:${node.getAttribute("data-background-task") ?? node.getAttribute("data-watch-task")}`,
+							);
+					}
+					return out;
+				},
 			);
-		// Default: running agent and service only; finished build and every watch hidden.
-		expect(await rows()).toEqual(["robot", "terminal-2"]);
-		const surfaceText = () => page.$eval("#surface", (surface) => surface.textContent ?? "");
+		// Default: running agent/service on top, the finished build below the divider, no watches.
+		expect(await rows()).toEqual(["running:agent", "running:server", "finished:old-build"]);
+		const sectionText = () =>
+			page.$$eval("[data-task-section]", (nodes) => nodes.map((node) => node.textContent));
+		expect(await sectionText()).toEqual(["Running · 2", "Finished · 1"]);
 		// The agent row carries its recent tool calls and the watch observing it.
 		expect(await page.$$eval("[data-agent-recent-tools] > *", (n) => n.length)).toBe(3);
 		const attachments = await page.$$eval("[data-watch-attachment]", (nodes) =>
@@ -280,18 +301,26 @@ test("filters hide old and watch rows; watches render as their own row and on th
 		expect(attachments[0]).toMatch(/Watched.*Deadline 10m · 7m(30|29)s left/);
 		expect(attachments[1]).toMatch(/Watched.*ready on.*Deadline 5m/);
 
-		const toggle = async (label: string) => {
-			await page.$$eval(
-				"#surface label",
-				(labels, text) => (labels.find((l) => l.textContent === text) as HTMLElement).click(),
-				label,
-			);
+		const toggleKind = async (kind: string) => {
+			await page.click(`[data-kind-filter="${kind}"]`);
 			await settle(page);
 		};
-		await toggle("Completed");
-		expect(await surfaceText()).toContain("bun run build");
-		expect(await page.$("[data-watch-task]")).toBeNull();
-		await toggle("Watch");
+		const pressed = () =>
+			page.$$eval("[data-kind-filter]", (nodes) =>
+				nodes.map(
+					(node) => `${node.getAttribute("data-kind-filter")}=${node.getAttribute("aria-pressed")}`,
+				),
+			);
+		expect(await pressed()).toEqual(["agent=true", "bash=true", "watch=false"]);
+		await toggleKind("watch");
+		expect(await rows()).toEqual([
+			"running:agent",
+			"running:server",
+			"running:watch-agent",
+			"running:watch-bash",
+			"finished:watch-terminal",
+			"finished:old-build",
+		]);
 		const watchRows = await page.$$eval("[data-watch-task]", (nodes) =>
 			nodes.map((node) => ({
 				id: node.getAttribute("data-watch-task"),
@@ -299,7 +328,6 @@ test("filters hide old and watch rows; watches render as their own row and on th
 				bashStyled: !!node.querySelector(".tabler-icon-terminal-2, code[class*=summary]"),
 			})),
 		);
-		expect(watchRows.map((row) => row.id)).toEqual(["watch-agent", "watch-bash", "watch-terminal"]);
 		for (const row of watchRows) expect(row.bashStyled).toBe(false);
 		expect(watchRows[0].text).toMatch(/Agent.*Fix the login token refresh.*watching.*Deadline 10m/);
 		expect(watchRows[1].text).toMatch(/Bash.*server.*for ready on.*watching.*Deadline 5m/);
@@ -314,14 +342,53 @@ test("filters hide old and watch rows; watches render as their own row and on th
 			),
 		).toContain('Terminal watch timed out: "PASS" did not appear');
 		expect(await page.$('[data-watch-task="watch-agent"] [data-watch-toggle]')).toBeNull();
-		await toggle("Completed");
-		expect(await surfaceText()).not.toContain("bun run build");
-		expect(await page.$$eval("[data-watch-task]", (n) => n.length)).toBe(2);
+
+		await toggleKind("bash");
+		expect(await rows()).toEqual([
+			"running:agent",
+			"running:watch-agent",
+			"running:watch-bash",
+			"finished:watch-terminal",
+		]);
+		await page.type("[data-background-task-search]", "login");
+		await settle(page);
+		expect(await rows()).toEqual(["running:agent", "running:watch-agent"]);
+		expect(await sectionText()).toEqual(["Running · 2", "Finished · 0"]);
+		await page.type("[data-background-task-search]", " nomatch");
+		await settle(page);
+		expect(await rows()).toEqual([]);
+		expect(await surfaceTextOf(page)).toContain("Nothing running");
+
+		// Kind toggles and the finished section's collapse survive reopening the panel.
+		await open();
+		expect(await pressed()).toEqual(["agent=true", "bash=false", "watch=true"]);
+		await toggleKind("bash");
+		await page.click("[data-finished-toggle]");
+		await settle(page);
+		expect(await rows()).toEqual([
+			"running:agent",
+			"running:server",
+			"running:watch-agent",
+			"running:watch-bash",
+		]);
+		await open();
+		expect(await page.$eval("[data-finished-toggle]", (n) => n.getAttribute("aria-expanded"))).toBe(
+			"false",
+		);
+		expect(await rows()).not.toContain("finished:old-build");
+		await page.click("[data-finished-toggle]");
+		await settle(page);
+		expect(await rows()).toContain("finished:old-build");
 		expect(errors).toEqual([]);
 	} finally {
+		await page.evaluate(() => localStorage.clear());
 		await page.close();
 	}
-}, 15_000);
+}, 20_000);
+
+function surfaceTextOf(page: Page) {
+	return page.$eval("#surface", (surface) => surface.textContent ?? "");
+}
 
 async function openCreationForm(page: Page) {
 	await page.click("#surface button:has(.tabler-icon-plus)");
