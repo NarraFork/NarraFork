@@ -282,6 +282,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentId: string;
 		delegated: import("./outline/delegation").DelegatedOutlineTask;
 	} | null = null;
+	/** Created but its run not yet handed to the run service: a failure archives it. */
+	let unstartedSubagentId: string | null = null;
 	let registeredStart: RegisteredAgentStart | undefined;
 	let registeredStartFailureEvent: "failed" | "cancelled" = "failed";
 	try {
@@ -305,6 +307,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			runtimePolicy: templatePolicy,
 		});
 		const subagentId = subagent.id;
+		unstartedSubagentId = subagentId;
 		updateLease.setNarratorId(subagentId);
 		if (input.onCreated) {
 			try {
@@ -442,6 +445,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				resumeRunId: task.logicalRunId,
 				registeredStart,
 			});
+			unstartedSubagentId = null;
 			if (!handle.started && handle.notStartedReason === "admission_closed")
 				throw new ValidationError("Background agent run did not start: admission is closed");
 			// A claimed execution owns all subsequent preparation/finish failures.
@@ -478,6 +482,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			cancelSignal: input.signal,
 			foreground: true,
 		});
+		unstartedSubagentId = null;
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 		delegatedBeforeRun = null;
@@ -510,6 +515,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				delegation: input.delegation,
 				userId: userId ?? null,
 			});
+		else if (unstartedSubagentId && !isCheckpointStop(error))
+			await archiveUnstartedSubagent(unstartedSubagentId);
 		throw error;
 	}
 }
@@ -528,6 +535,22 @@ export function aliasConflictNote(
 		`This agent was assigned "${assigned}" instead.` +
 		(background ? "" : " Use this alias with Watch or Send to reference this agent.")
 	);
+}
+
+/**
+ * A subagent created by a call that failed before its run started (e.g. its model could
+ * not be resolved): left as is it would stay "working" forever with no run behind it, and
+ * its caller would keep showing background work as running.
+ */
+async function archiveUnstartedSubagent(subagentId: string): Promise<void> {
+	await backgroundTaskService.cancel(subagentId).catch(() => false);
+	const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
+	const archived = await interruptAndArchiveSubagent(subagentId);
+	if (!archived.ok)
+		logger.warn("Unstarted subagent could not be archived", {
+			subagentId,
+			error: archived.error,
+		});
 }
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
