@@ -242,12 +242,17 @@ describe("MCP OAuth", () => {
 		expect(new URL(started.authorizationUrl).searchParams.get("scope")).toBe("mcp:tools");
 	});
 
-	test("consent uses the resource metadata URL from the challenge", async () => {
+	test("after a URL change, consent discovers via the challenge's resource metadata URL", async () => {
+		await authorize();
+		const moved = { ...config, url: `${baseUrl}/mcp?v=2` };
 		challengeMetadataPath = "/custom-prm";
-		await mcpManager.testConnection(config);
+		await mcpManager.testConnection(moved, config.id);
 		hits.length = 0;
-		await oauth.startMcpOAuth(config, redirectUrl);
-		expect(hits[0]).toBe("GET /custom-prm");
+		await oauth.startMcpOAuth(moved, redirectUrl);
+		expect(hits).toContain("GET /custom-prm");
+		expect(hits.some((hit) => hit.startsWith("GET /.well-known/oauth-protected-resource"))).toBe(
+			false,
+		);
 	});
 
 	test("re-authorization always asks for consent and an abandoned one keeps the old grant", async () => {
