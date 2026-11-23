@@ -610,38 +610,44 @@ export function cleanupBufferedTextFiles(id: string): Promise<void> {
 	return trackBufferedCleanup(async () => {
 		assertSqliteBufferRead("cleanupBufferedTextFiles");
 		const row = await stagingOwnerById(id);
-		const stagingId = row
-			? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
-			: id;
-		if (!stagingId) return;
-		const path = stagingPath(stagingId);
-		if (!ownedPath(path)) return;
-		// A small on-disk ownership pointer avoids scanning every narrator's mailbox.
-		// It is not a message registry: the DB row still decides whether files are leased.
-		const marker = join(path, STAGING_OWNER_FILE);
-		let ownerId: string | null = row?.id ?? stagingId;
-		let stagingPending = false;
-		if (!existsSync(marker) && (!row || row.kind !== "user_input")) return;
-		if (existsSync(marker)) {
-			if (!ownedPath(marker) || statSync(marker).size > 1024) return;
-			try {
-				const markerOwner = JSON.parse(readFileSync(marker, "utf8")).rowId;
-				if (markerOwner === null) stagingPending = true;
-				else if (typeof markerOwner === "string" && markerOwner) ownerId = markerOwner;
-				else return;
-			} catch {
-				return;
-			}
+		await cleanupObservedBufferedTextFiles(id, row);
+	});
+}
+async function cleanupObservedBufferedTextFiles(
+	id: string,
+	row: BufferObservation | undefined,
+): Promise<void> {
+	const stagingId = row
+		? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
+		: id;
+	if (!stagingId) return;
+	const path = stagingPath(stagingId);
+	if (!ownedPath(path)) return;
+	// A small on-disk ownership pointer avoids scanning every narrator's mailbox.
+	// It is not a message registry: the DB row still decides whether files are leased.
+	const marker = join(path, STAGING_OWNER_FILE);
+	let ownerId: string | null = row?.id ?? stagingId;
+	let stagingPending = false;
+	if (!existsSync(marker) && (!row || row.kind !== "user_input")) return;
+	if (existsSync(marker)) {
+		if (!ownedPath(marker) || statSync(marker).size > 1024) return;
+		try {
+			const markerOwner = JSON.parse(readFileSync(marker, "utf8")).rowId;
+			if (markerOwner === null) stagingPending = true;
+			else if (typeof markerOwner === "string" && markerOwner) ownerId = markerOwner;
+			else return;
+		} catch {
+			return;
 		}
-		// A null marker without a row-id match is unknown ownership, not an orphan.
-		if (stagingPending && !row) return;
-		const owner = ownerId === id ? row : ownerId ? await stagingOwnerById(ownerId) : undefined;
-		if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
-		db.transaction((tx) => {
-			assertBufferObservation(tx, row, id);
-			if (ownerId) assertBufferObservation(tx, owner, ownerId);
-			rmSync(path, { recursive: true, force: true });
-		});
+	}
+	// A null marker without a row-id match is unknown ownership, not an orphan.
+	if (stagingPending && !row) return;
+	const owner = ownerId === id ? row : ownerId ? await stagingOwnerById(ownerId) : undefined;
+	if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
+	db.transaction((tx) => {
+		assertBufferObservation(tx, row, id);
+		if (ownerId) assertBufferObservation(tx, owner, ownerId);
+		rmSync(path, { recursive: true, force: true });
 	});
 }
 /** Backend-neutral asynchronous cleanup used after mailbox consumption. */
@@ -1536,6 +1542,7 @@ export async function reorderBufferedMessages(narratorId: string, ids: string[])
 		return true;
 	});
 }
+const BUFFER_CLEAR_CLEANUP_PENDING = "Removed by user; attachment cleanup pending";
 export async function clearBufferedMessages(narratorId: string): Promise<void> {
 	const port = pgQueue();
 	if (port) {
@@ -1566,16 +1573,74 @@ export async function clearBufferedMessages(narratorId: string): Promise<void> {
 	db.transaction((tx) => {
 		for (const row of rows) {
 			assertBufferObservation(tx, row, row.id);
-			if (row.deliveryId) store.cancel(row.deliveryId, "Removed by user");
+			if (row.deliveryId && store.cancel(row.deliveryId, BUFFER_CLEAR_CLEANUP_PENDING)) {
+				tx.update(mailbox)
+					.set({
+						dedupeExpiresAt: null,
+						metadataJson: JSON.stringify({
+							stagingId: json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id,
+							cleanupDedupeExpiresAt: row.dedupeExpiresAt,
+						}),
+					})
+					.where(eq(mailbox.id, row.id))
+					.run();
+			}
 		}
 	});
-	await Promise.all(
-		rows.map((row) =>
-			cleanupBufferedTextFiles(
-				json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id,
-			),
-		),
-	);
+	for (;;) {
+		const cleanupRows = await readQuery(
+			db
+				.select({
+					id: mailbox.id,
+					narratorId: mailbox.narratorId,
+					kind: mailbox.kind,
+					state: mailbox.state,
+					deliveryId: mailbox.deliveryId,
+					contentRevision: mailbox.contentRevision,
+					metadataJson: mailbox.metadataJson,
+					textFilePathsJson: mailbox.textFilePathsJson,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+						eq(mailbox.state, "cancelled"),
+						eq(mailbox.lastError, BUFFER_CLEAR_CLEANUP_PENDING),
+					),
+				)
+				.limit(MAILBOX_LIMITS.userPending),
+			bufferReadOptions(),
+		);
+		if (!cleanupRows.length) return;
+		for (let offset = 0; offset < cleanupRows.length; offset += 4) {
+			const results = await Promise.allSettled(
+				cleanupRows.slice(offset, offset + 4).map((row) =>
+					trackBufferedCleanup(async () => {
+						if (!row.metadataJson) throw new RuntimeReadConflictError();
+						const metadata = json<{ cleanupDedupeExpiresAt?: string | null }>(row.metadataJson, {});
+						await cleanupObservedBufferedTextFiles(row.id, row);
+						db.update(mailbox)
+							.set({
+								metadataJson: null,
+								lastError: "Removed by user",
+								dedupeExpiresAt: metadata.cleanupDedupeExpiresAt ?? null,
+							})
+							.where(
+								and(
+									eq(mailbox.id, row.id),
+									eq(mailbox.state, "cancelled"),
+									eq(mailbox.lastError, BUFFER_CLEAR_CLEANUP_PENDING),
+									eq(mailbox.metadataJson, row.metadataJson),
+								),
+							)
+							.run();
+					}),
+				),
+			);
+			for (const result of results) if (result.status === "rejected") throw result.reason;
+		}
+	}
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */
 export async function retryBufferedMessage(

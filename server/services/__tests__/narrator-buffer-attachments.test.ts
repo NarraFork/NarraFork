@@ -28,6 +28,7 @@ import * as pool from "../../lib/db-worker/pool";
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -269,6 +270,105 @@ afterEach(async () => {
 	activeNarrators.clear();
 	await clearBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
+});
+
+test("clearing fifty attachments batches ownership reads with two read workers", async () => {
+	const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+	await pool.resetDbWorkerPoolForTest();
+	let probe: ReturnType<typeof spyOn> | undefined;
+	try {
+		expect(pool.getConfiguredConcurrency()).toBe(2);
+		const directories: string[] = [];
+		for (let i = 0; i < 50; i++) {
+			await enqueueBufferedMessage(NARRATOR_ID, `message ${i}`, undefined, null, null, null, [
+				textFile(`${i}.md`, "attachment"),
+			]);
+		}
+		for (const row of db.select().from(narratorBufferedMessages).all()) {
+			const stagingId = JSON.parse(row.metadataJson ?? "{}").stagingId;
+			if (stagingId) directories.push(join(HOME, "buffered-files", stagingId));
+		}
+		expect(directories).toHaveLength(50);
+		const original = pool.runReadTask;
+		let reads = 0;
+		probe = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+			reads++;
+			return original(path, params, options);
+		}) as typeof pool.runReadTask);
+		await clearBufferedMessages(NARRATOR_ID);
+		expect(reads).toBeLessThanOrEqual(4);
+		expect(directories.every((path) => !existsSync(path))).toBe(true);
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
+	} finally {
+		probe?.mockRestore();
+		if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
+		await pool.resetDbWorkerPoolForTest();
+	}
+});
+
+test("a cleanup Worker failure after cancellation remains retryable", async () => {
+	await enqueueBufferedMessage(NARRATOR_ID, "retry cleanup", undefined, null, null, null, [
+		textFile("retry.md", "attachment"),
+	]);
+	const row = db.select().from(narratorBufferedMessages).get();
+	if (!row) throw new Error("Missing buffered row");
+	db.update(narratorBufferedMessages)
+		.set({ dedupeExpiresAt: "2000-01-01T00:00:00.000Z" })
+		.where(eq(narratorBufferedMessages.id, row.id))
+		.run();
+	const { createMailboxStore } = await import("../agent-runtime/mailbox");
+	const store = createMailboxStore(db);
+	const directory = join(HOME, "buffered-files", JSON.parse(row.metadataJson ?? "{}").stagingId);
+	const original = pool.runReadTask;
+	const failure = new pool.DbReadTaskTimeoutError("cleanup timed out");
+	let reads = 0;
+	const probe = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+		if (++reads === 2) return Promise.reject(failure);
+		return original(path, params, options);
+	}) as typeof pool.runReadTask);
+	try {
+		expect(await captureWorkerRejectionThrower(clearBufferedMessages(NARRATOR_ID))).toThrow(
+			"cleanup timed out",
+		);
+	} finally {
+		probe.mockRestore();
+	}
+	expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("cancelled");
+	expect(store.collectTombstones([row.id], () => true)).toBe(0);
+	expect(existsSync(directory)).toBe(true);
+	await clearBufferedMessages(NARRATOR_ID);
+	expect(existsSync(directory)).toBe(false);
+	expect(db.select().from(narratorBufferedMessages).get()?.metadataJson).toBeNull();
+	expect(store.collectTombstones([row.id], () => true)).toBe(1);
+	await clearBufferedMessages(NARRATOR_ID);
+});
+
+test("a filesystem cleanup failure retains cancelled staging for the next clear", async () => {
+	await enqueueBufferedMessage(NARRATOR_ID, "retry unlink", undefined, null, null, null, [
+		textFile("retry.md", "attachment"),
+	]);
+	const row = db.select().from(narratorBufferedMessages).get();
+	if (!row) throw new Error("Missing buffered row");
+	const directory = join(HOME, "buffered-files", JSON.parse(row.metadataJson ?? "{}").stagingId);
+	const original = fs.rmSync;
+	const probe = spyOn(fs, "rmSync").mockImplementation((...args) => {
+		if (String(args[0]) === directory) throw new Error("unlink denied");
+		return original(...args);
+	});
+	try {
+		expect(await captureWorkerRejectionThrower(clearBufferedMessages(NARRATOR_ID))).toThrow(
+			"unlink denied",
+		);
+	} finally {
+		probe.mockRestore();
+	}
+	expect(existsSync(directory)).toBe(true);
+	expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("cancelled");
+	await clearBufferedMessages(NARRATOR_ID);
+	expect(existsSync(directory)).toBe(false);
+	expect(db.select().from(narratorBufferedMessages).get()?.metadataJson).toBeNull();
 });
 
 describe("toBufferSummary — attachments are visible to clients", () => {
