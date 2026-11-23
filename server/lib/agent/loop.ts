@@ -382,7 +382,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
  * one the model may rightly have nothing to add yet.
  */
 function handsOffWork(toolUse: AgentToolUse): boolean {
-	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
+	if (toolUse.name === "Send" || toolUse.name === "Agent" || toolUse.name === "Watch") return true;
 	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
 }
 
@@ -7388,7 +7388,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Keep the ordinary cleanup above, but do not retry or compact a model
 					// that has nothing to say while waiting for a background result / Send.
-					if (await config.shouldIdleOnReasoningOnly?.()) {
+					if (quietFinishAllowed || (await config.shouldIdleOnReasoningOnly?.())) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;

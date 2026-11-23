@@ -49,6 +49,7 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 - 后台 subagent 或 bash 任务完成后会自动唤醒主代理并带回结果；启动后应继续无依赖工作，或**直接结束当前响应**等通知，不在回合内轮询。
 - `Watch({ type: "terminal" | "bash" | "agent", id, pattern?, timeout?, start_at? })` 登记非阻塞观察并立即返回；`timeout` 单位为毫秒，默认 600000、上限 86400000，只约束观察，不停止目标。终端写入的 `notify_on` 保持原子写入并登记，Terminal 的 `timeout` 仍使用秒。
 - Watch 卡片的“已登记观察”不是工具仍在运行。任务完成、输出命中或观察超时会通过通知送达；结果已保存时可用 Watch 获取有界结果。
+- 包含 Watch、Send、Agent 或后台 Bash 的工具轮之后，紧接着的请求可以用空回复或纯 reasoning 安静结束；纯 reasoning 会丢弃并以 `reasoning_only_idle` 收尾，不消耗死回合重试预算。普通工具轮或用户输入后的纯 reasoning 仍按原规则恢复。
 - Await 已退役，旧声明或历史卡片不授予执行权。问题与文件传输沿用自动通知及 Question／后台任务列表查询；有新信息需要传递时用 Send，不发催促或状态轮询消息。
 
 **发布工作区规则（严格遵守）：**

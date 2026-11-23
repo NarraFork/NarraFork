@@ -38,10 +38,12 @@ let providerScenario:
 	| "tool_then_quiet" = "error_then_usage_only";
 /** What `tool_then_quiet` answers once its tool has run. */
 let quietTail:
+	| { reasoning: string; reasoningOutputIndex: number }
 	| { usage: { promptTokens: number; completionTokens: number } }
 	| { stopReason: string } = { usage: { promptTokens: 900, completionTokens: 0 } };
 /** The call `tool_then_quiet` makes first; a stand-in replaces any real tool by that name. */
 let quietCall: { name: string; input: string } = { name: "__QuietFinishTest", input: "{}" };
+let quietIntermediateTool = false;
 let providerAttempts = 0;
 let wsBaseUrl = "";
 /**
@@ -157,6 +159,17 @@ const testProvider: ProviderAdapter = {
 		}
 
 		if (providerScenario === "tool_then_quiet") {
+			if (quietIntermediateTool && providerAttempts === 2) {
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu-foreground",
+						name: quietCall.name,
+						input: '{"command":"ls"}',
+						stop: true,
+					},
+				};
+				return;
+			}
 			if (providerAttempts === 1) {
 				yield {
 					toolUseChunk: {
@@ -555,11 +568,13 @@ describe("an empty reply after handing work off is a finish", () => {
 		overrides: Partial<AgentConfig>,
 		tail: typeof quietTail,
 		call: typeof quietCall = { name: "__QuietFinishTest", input: "{}" },
+		intermediateTool = false,
 	) {
 		providerScenario = "tool_then_quiet";
 		providerAttempts = 0;
 		quietTail = tail;
 		quietCall = call;
+		quietIntermediateTool = intermediateTool;
 		const real = toolRegistry.get(call.name);
 		if (real) toolRegistry.unregister(call.name);
 		toolRegistry.register({
@@ -592,6 +607,7 @@ describe("an empty reply after handing work off is a finish", () => {
 	test.each([
 		["Send", '{"id":"parent","message":"done"}'],
 		["Agent", '{"prompt":"look into it"}'],
+		["Watch", '{"type":"terminal","id":"term-1"}'],
 		["Bash", '{"command":"bun test","run_in_background":true}'],
 	])("an ordinary narrator that handed work off with %s is done", async (name, input) => {
 		expect(lastType(await quietRun({}, usageOnly, { name, input }))).toBe("done");
@@ -600,6 +616,54 @@ describe("an empty reply after handing work off is a finish", () => {
 	test("a foreground command is not a hand-off", async () => {
 		const call = { name: "Bash", input: '{"command":"ls"}' };
 		expect(lastType(await quietRun({}, usageOnly, call))).toBe("invalid_state");
+	});
+
+	const reasoningOnly = { reasoning: "waiting for the result", reasoningOutputIndex: 0 };
+	test.each([
+		["Watch", '{"type":"terminal","id":"term-1"}'],
+		["Send", '{"id":"parent","message":"done"}'],
+		["Agent", '{"prompt":"look into it"}'],
+		["Bash", '{"command":"bun test","run_in_background":true}'],
+	])("reasoning-only immediately after %s idles without external work checks", async (name, input) => {
+		const events = await quietRun({ shouldIdleOnReasoningOnly: () => false }, reasoningOnly, {
+			name,
+			input,
+		});
+		expect(events.at(-1)).toEqual({ type: "done", reason: "reasoning_only_idle" });
+		expect(providerAttempts).toBe(2);
+		expect(events.some((event) => event.type === "stream_reset")).toBe(true);
+		expect(
+			events.some((event) => event.type === "retrying" || event.type === "invalid_state"),
+		).toBe(false);
+	});
+
+	test("a bot may idle on reasoning-only after an ordinary tool", async () => {
+		const events = await quietRun({ bot: true }, reasoningOnly);
+		expect(events.at(-1)).toEqual({ type: "done", reason: "reasoning_only_idle" });
+		expect(providerAttempts).toBe(2);
+	});
+
+	test("reasoning-only after an ordinary tool still exhausts retries", async () => {
+		const events = await quietRun({}, reasoningOnly);
+		expect(events.at(-1)).toMatchObject({
+			type: "invalid_state",
+			reason: "reasoning_only_exhausted",
+		});
+		expect(providerAttempts).toBeGreaterThan(2);
+	});
+
+	test("a hand-off does not allow idle after a later foreground tool round", async () => {
+		const events = await quietRun(
+			{},
+			reasoningOnly,
+			{ name: "Bash", input: '{"command":"sleep 1","run_in_background":true}' },
+			true,
+		);
+		expect(events.at(-1)).toMatchObject({
+			type: "invalid_state",
+			reason: "reasoning_only_exhausted",
+		});
+		expect(providerAttempts).toBeGreaterThan(3);
 	});
 
 	test("an ordinary narrator after other tools still reports the empty reply", async () => {
