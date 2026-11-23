@@ -31,6 +31,7 @@ import {
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { watchNoticeFromTask } from "@shared/watch-command";
 import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspace-directories";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -2749,6 +2750,18 @@ export async function deliverPendingInjection(
 					title: bashTask.title || bashTask.id,
 					status: bashTask.status,
 					preview: bashTask.outputPreview ?? "",
+					...(bashTask.watch
+						? {
+								watch: bashTask.watch,
+								watchOutcome:
+									watchNoticeFromTask({
+										title: bashTask.title,
+										status: bashTask.status,
+										preview: bashTask.outputPreview,
+										watch: bashTask.watch,
+									})?.outcome ?? null,
+							}
+						: {}),
 				},
 			];
 			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one
