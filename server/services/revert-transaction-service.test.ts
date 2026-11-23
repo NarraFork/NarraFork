@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import * as workerReads from "../db/worker-read";
+import * as workerPool from "../lib/db-worker/pool";
 import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	db,
@@ -30,6 +31,58 @@ import { RevertMutationJournal } from "./revert-mutation-journal";
 import { RevertSelectionService } from "./revert-selection-service";
 
 describe("independent file restoration", () => {
+	for (const failAt of [1, 2]) {
+		test(`finishFiles Worker read ${failAt} failure settles saved file results without rewriting history`, async () => {
+			const { a, b, plan } = await twoFiles();
+			const before = history();
+			const finishFiles = RevertMutationJournal.prototype.finishFiles;
+			let injected = false;
+			const finish = spyOn(RevertMutationJournal.prototype, "finishFiles").mockImplementation(
+				async function (this: RevertMutationJournal, ctx, options) {
+					const runRead = workerPool.runReadTask;
+					let reads = 0;
+					const read = spyOn(workerPool, "runReadTask").mockImplementation((...args) => {
+						if (++reads === failAt) {
+							injected = true;
+							return Promise.reject(new workerPool.WorkersUnavailableError("injected finish read"));
+						}
+						return runRead(...args);
+					});
+					try {
+						return await finishFiles.call(this, ctx, options);
+					} finally {
+						read.mockRestore();
+					}
+				},
+			);
+			try {
+				const result = await execution(plan).whenSettled;
+				expect(injected).toBe(true);
+				expect(journalFiles(plan).map((file) => file.status)).toEqual(["applied", "applied"]);
+				expect(operation(plan)?.status).toBe("partial");
+				expect(operation(plan)?.reason).toBe("DB_READ_UNAVAILABLE");
+				expect(result.status).toBe("partial");
+				expect(result.historyCommitted).toBe(false);
+				expect(result.historyStatus).toBe("unavailable");
+				expect(result.reason).toBe("DB_READ_UNAVAILABLE");
+				expect(history()).toBe(before);
+				for (const path of [a, b]) expect(await fs.readFile(path, "utf8")).toBe("original");
+			} finally {
+				finish.mockRestore();
+			}
+			await fs.writeFile(a, "later user work");
+			setFileHook(() => {
+				throw new Error("replay must not authorize target IO");
+			});
+			const replay = await execution(plan).whenSettled;
+			expect(replay.status).toBe("partial");
+			expect(replay.settling).toBe(false);
+			expect(replay.files.map((file) => file.status)).toEqual(["applied", "applied"]);
+			expect(history()).toBe(before);
+			expect(await fs.readFile(a, "utf8")).toBe("later user work");
+		});
+	}
+
 	test("a failed post-restore Worker lookup still durably records the applied file", async () => {
 		const { a, b, plan } = await twoFiles();
 		const readFirst = workerReads.readQueryFirst;

@@ -273,7 +273,11 @@ export class RevertMutationJournal {
 	failHistory(ctx: RevertJournalContext, reason: string): RevertJournalOperation {
 		return this.transaction((tx) => {
 			const operation = requireOperation(tx, ctx);
-			if (operation.status !== "files_verified" || !operation.coverageComplete) return operation;
+			if (
+				operation.status !== "applying" &&
+				(operation.status !== "files_verified" || !operation.coverageComplete)
+			)
+				return operation;
 			return this.update(tx, operation, {
 				status: operation.fileCount ? "partial" : "failed",
 				reason: reason.slice(0, 256),

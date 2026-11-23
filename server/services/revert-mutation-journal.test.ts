@@ -20,6 +20,23 @@ async function fixture() {
 	return { journal, ctx, files, plan };
 }
 describe("revert result journal", () => {
+	test("history failure only settles admitted execution and never certifies its files", async () => {
+		const { journal, ctx, files } = await fixture();
+		expect(journal.failHistory(ctx, "DB_READ_UNAVAILABLE").status).toBe("prepared");
+		await journal.startExecution(ctx);
+		journal.startFile(ctx, files[0].id);
+		const failed = journal.failHistory(ctx, "DB_READ_UNAVAILABLE");
+		expect(failed.status).toBe("partial");
+		expect(failed.reason).toBe("DB_READ_UNAVAILABLE");
+		expect(failed.appliedFileCount).toBe(0);
+		expect((await journal.listFiles(ctx)).items.map((file) => file.status).sort()).toEqual([
+			"applying",
+			"prepared",
+		]);
+		expect(journal.failHistory(ctx, "another failure")).toEqual(failed);
+		expect(() => journal.commit(ctx, { db, apply: () => {} })).toThrow("Every required file");
+	});
+
 	test("execution and each file dispatch are one-shot", async () => {
 		const { journal, ctx, files } = await fixture();
 		expect((await journal.startExecution(ctx)).started).toBe(true);
