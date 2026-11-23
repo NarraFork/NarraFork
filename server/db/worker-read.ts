@@ -458,8 +458,17 @@ export async function consumeReadDomainTask<K extends StreamDomainReadTaskKind>(
 				receivedChunks++;
 			},
 		});
+		const timeout = () =>
+			new DbReadError("DB_READ_TASK_TIMEOUT", "Domain stream exceeded its deadline");
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			const result = await handle.result;
+			const result = await Promise.race([
+				handle.result.finally(() => handle.released),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(timeout()), Math.max(0, deadlineAt - Date.now()));
+				}),
+			]);
+			if (Date.now() >= deadlineAt) throw timeout();
 			if (
 				!result ||
 				!Object.hasOwn(result, "metadata") ||
@@ -469,26 +478,7 @@ export async function consumeReadDomainTask<K extends StreamDomainReadTaskKind>(
 				throw new DbReadError("DB_READ_PROTOCOL", "Invalid domain stream completion");
 			return result;
 		} finally {
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			try {
-				await Promise.race([
-					handle.released,
-					new Promise<never>((_, reject) => {
-						timer = setTimeout(
-							() =>
-								reject(
-									new DbReadError(
-										"DB_READ_TASK_TIMEOUT",
-										"Domain stream worker exit was not confirmed",
-									),
-								),
-							Math.max(0, deadlineAt - Date.now()),
-						);
-					}),
-				]);
-			} finally {
-				clearTimeout(timer);
-			}
+			clearTimeout(timer);
 		}
 	});
 }
