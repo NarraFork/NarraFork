@@ -261,15 +261,11 @@ async function checkVersion(): Promise<void> {
 }
 
 self.addEventListener("activate", (event) => {
-	event.waitUntil(
-		(async () => {
-			try {
-				await checkVersion();
-			} finally {
-				await self.clients.claim();
-			}
-		})(),
-	);
+	// Claim without waiting on the network: fetches queue until activation finishes,
+	// so a slow health check here would stall every controlled page. The version
+	// check is only a hint; pages confirm with the live server themselves.
+	event.waitUntil(self.clients.claim());
+	void checkVersion().catch(() => {});
 });
 
 self.skipWaiting();

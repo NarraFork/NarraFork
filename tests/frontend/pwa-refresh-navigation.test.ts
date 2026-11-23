@@ -144,7 +144,7 @@ for (const failure of ["error", "timeout", "proxy"] as const) {
 	});
 }
 
-test("activation claims clients even on version mismatch and never unregisters", async () => {
+test("activation claims clients without waiting on the version check and never unregisters", async () => {
 	for (const version of ["1.0.0", "2.0.0", undefined]) {
 		const runtime = worker(async () => Response.json({ version }));
 		let activated: Promise<void> | undefined;
@@ -154,6 +154,8 @@ test("activation claims clients even on version mismatch and never unregisters",
 			},
 		});
 		await activated;
+		// The version check runs after the claim, off the activation path.
+		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(runtime.claim).toHaveBeenCalledTimes(1);
 		expect(runtime.unregister).not.toHaveBeenCalled();
 		expect(runtime.postMessage).toHaveBeenCalledTimes(version === "2.0.0" ? 1 : 0);
