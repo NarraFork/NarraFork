@@ -13,6 +13,7 @@ import type { AgentConfig, ToolContext } from "../../lib/agent/types";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 /** Relations and capability ceiling a delegation stores when it is created. */
 function delegated(parent: string, pool = "general") {
@@ -398,13 +399,15 @@ describe("asynchronous question integration", () => {
 			expect(decision.behavior).toBe("deny");
 		}
 		await expect(
-			questionService.createAsyncQuestion({
-				narratorId: CHILD,
-				toolCallId: ctx.toolCallBinding.toolCallId,
-				toolUseId: ctx.currentToolUseId,
-				questions: QUESTIONS,
-			}),
-		).rejects.toThrow("not available under this runtime policy");
+			await captureWorkerRejectionThrower(
+				questionService.createAsyncQuestion({
+					narratorId: CHILD,
+					toolCallId: ctx.toolCallBinding.toolCallId,
+					toolUseId: ctx.currentToolUseId,
+					questions: QUESTIONS,
+				}),
+			),
+		).toThrow("not available under this runtime policy");
 		expect(await questionService.countOpenAsyncQuestions(CHILD)).toBe(0);
 		expect(events).toEqual([]);
 	});
@@ -531,13 +534,15 @@ describe("asynchronous question integration", () => {
 		expect(result.output).toContain("Ask again without");
 		expect(await questionService.countOpenAsyncQuestions(PARENT)).toBe(0);
 		await expect(
-			questionService.createAsyncQuestion({
-				narratorId: OTHER,
-				toolCallId: ctx.toolCallBinding.toolCallId,
-				toolUseId: ctx.currentToolUseId,
-				questions: QUESTIONS,
-			}),
-		).rejects.toThrow("does not belong");
+			await captureWorkerRejectionThrower(
+				questionService.createAsyncQuestion({
+					narratorId: OTHER,
+					toolCallId: ctx.toolCallBinding.toolCallId,
+					toolUseId: ctx.currentToolUseId,
+					questions: QUESTIONS,
+				}),
+			),
+		).toThrow("does not belong");
 		expect(await questionService.countOpenAsyncQuestions(OTHER)).toBe(0);
 	});
 

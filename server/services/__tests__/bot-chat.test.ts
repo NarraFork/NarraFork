@@ -31,6 +31,7 @@ import { ForbiddenError, NotFoundError, ValidationError } from "../../lib/errors
 import { generateId } from "../../lib/id";
 import { BOT_TRAIT, isBotNarrator } from "../../lib/narrator-utils";
 import { resolveRuntimePolicy } from "../agent-runtime/policy";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 // ── narrator-session double: delivery is observed, never run as a real agent turn ──
 
@@ -248,11 +249,15 @@ describe("bot room resolution", () => {
 	});
 
 	test("refuses a narrator that is not a bot", async () => {
-		await expect(resolveBotRoom(plainNarrator, alice)).rejects.toBeInstanceOf(NotFoundError);
+		await expect(await captureWorkerRejection(resolveBotRoom(plainNarrator, alice))).toBeInstanceOf(
+			NotFoundError,
+		);
 	});
 
 	test("refuses a bot the person cannot see, without creating a room", async () => {
-		await expect(resolveBotRoom(privateBot, alice)).rejects.toBeInstanceOf(NotFoundError);
+		await expect(await captureWorkerRejection(resolveBotRoom(privateBot, alice))).toBeInstanceOf(
+			NotFoundError,
+		);
 		const phantom = await db.query.chatRooms.findFirst({
 			where: eq(chatRooms.dmKey, buildBotRoomKey(privateBot, alice)),
 		});
@@ -271,17 +276,23 @@ describe("bot room resolution", () => {
 describe("bot room access", () => {
 	test("only the person in the conversation can read it", async () => {
 		const room = await resolveBotRoom(openBot, alice);
-		await expect(assertCanRead(room.id, alice)).resolves.toBeDefined();
-		await expect(assertCanRead(room.id, bob)).rejects.toBeInstanceOf(NotFoundError);
+		await expect(await assertCanRead(room.id, alice)).toBeDefined();
+		await expect(await captureWorkerRejection(assertCanRead(room.id, bob))).toBeInstanceOf(
+			NotFoundError,
+		);
 		// Not even the bot's owner: the transcript, not the room, is the monitor.
-		await expect(assertCanRead(room.id, owner)).rejects.toBeInstanceOf(NotFoundError);
+		await expect(await captureWorkerRejection(assertCanRead(room.id, owner))).toBeInstanceOf(
+			NotFoundError,
+		);
 	});
 
 	test("posting requires the right to drive the bot", async () => {
 		const room = await resolveBotRoom(watchOnlyBot, alice);
 		await expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "hi" }),
-		).rejects.toBeInstanceOf(ForbiddenError);
+			await captureWorkerRejection(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "hi" }),
+			),
+		).toBeInstanceOf(ForbiddenError);
 	});
 
 	test("narrowing who may drive a bot stops their posts, not their history", async () => {
@@ -295,8 +306,10 @@ describe("bot room access", () => {
 		await postMessage({ roomId: room.id, senderUserId: alice, text: "before" });
 		await db.update(narrators).set({ writeAudience: "owner" }).where(eq(narrators.id, narrowing));
 		await expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "after" }),
-		).rejects.toBeInstanceOf(ForbiddenError);
+			await captureWorkerRejection(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "after" }),
+			),
+		).toBeInstanceOf(ForbiddenError);
 		expect(await roomTexts(room.id, alice)).toEqual(["before"]);
 		expect((await resolveBotRoom(narrowing, alice)).canPost).toBe(false);
 	});
@@ -304,8 +317,10 @@ describe("bot room access", () => {
 	test("so does staging a file, which could never be sent", async () => {
 		const room = await resolveBotRoom(watchOnlyBot, alice);
 		await expect(
-			createChatAttachment(room.id, alice, textFile("notes.md", "# hi")),
-		).rejects.toBeInstanceOf(ForbiddenError);
+			await captureWorkerRejection(
+				createChatAttachment(room.id, alice, textFile("notes.md", "# hi")),
+			),
+		).toBeInstanceOf(ForbiddenError);
 	});
 });
 
@@ -337,12 +352,14 @@ describe("bot messages", () => {
 
 	test("are bounded by the bot message ceiling", async () => {
 		await expect(
-			postBotMessage({
-				narratorId: openBot,
-				userId: alice,
-				text: "x".repeat(CHAT_BOT_MESSAGE_MAX_CHARS + 1),
-			}),
-		).rejects.toBeInstanceOf(ValidationError);
+			await captureWorkerRejection(
+				postBotMessage({
+					narratorId: openBot,
+					userId: alice,
+					text: "x".repeat(CHAT_BOT_MESSAGE_MAX_CHARS + 1),
+				}),
+			),
+		).toBeInstanceOf(ValidationError);
 	});
 
 	test("a person replying to the bot quotes the bot as author", async () => {
@@ -427,14 +444,18 @@ describe("Send({ user })", () => {
 
 	test("refuses an unknown person", async () => {
 		await expect(
-			sendAsBot({ narratorId: openBot, user: `nobody-${TAG}`, message: "hi" }),
-		).rejects.toBeInstanceOf(NotFoundError);
+			await captureWorkerRejection(
+				sendAsBot({ narratorId: openBot, user: `nobody-${TAG}`, message: "hi" }),
+			),
+		).toBeInstanceOf(NotFoundError);
 	});
 
 	test("reaches only people who can open the bot, without opening a room for others", async () => {
 		await expect(
-			sendAsBot({ narratorId: privateBot, user: aliceName, message: "Your session expired" }),
-		).rejects.toBeInstanceOf(ForbiddenError);
+			await captureWorkerRejection(
+				sendAsBot({ narratorId: privateBot, user: aliceName, message: "Your session expired" }),
+			),
+		).toBeInstanceOf(ForbiddenError);
 		const phantom = await db.query.chatRooms.findFirst({
 			where: eq(chatRooms.dmKey, buildBotRoomKey(privateBot, alice)),
 		});
@@ -559,13 +580,15 @@ describe("delivery to the bot", () => {
 		refusal = new ValidationError("Message queue is full");
 		try {
 			await expect(
-				postMessage({
-					roomId: room.id,
-					senderUserId: bob,
-					text: "Here is the plan",
-					attachmentIds: [draft.id],
-				}),
-			).rejects.toThrow("Message queue is full");
+				await captureWorkerRejectionThrower(
+					postMessage({
+						roomId: room.id,
+						senderUserId: bob,
+						text: "Here is the plan",
+						attachmentIds: [draft.id],
+					}),
+				),
+			).toThrow("Message queue is full");
 		} finally {
 			refusal = null;
 		}
@@ -591,8 +614,10 @@ describe("delivery to the bot", () => {
 		const room = await resolveBotRoom(openBot, alice);
 		const draft = await createChatAttachment(room.id, alice, textFile("x.md", "x"));
 		await expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "", attachmentIds: [draft.id] }),
-		).rejects.toBeInstanceOf(ValidationError);
+			await captureWorkerRejection(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "", attachmentIds: [draft.id] }),
+			),
+		).toBeInstanceOf(ValidationError);
 	});
 
 	test("the bot hears posts in the room's order, even when they race", async () => {
@@ -673,7 +698,9 @@ describe("bot narrators", () => {
 	});
 
 	test("a bot needs a name", async () => {
-		await expect(narratorService.create({ kind: "bot" })).rejects.toBeInstanceOf(ValidationError);
+		await expect(
+			await captureWorkerRejection(narratorService.create({ kind: "bot" })),
+		).toBeInstanceOf(ValidationError);
 	});
 
 	test("the bot protocol follows the persona in the system prompt", () => {

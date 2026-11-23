@@ -11,10 +11,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -779,9 +783,11 @@ describe("background task batch active count", () => {
 			spyOn(databaseBackgroundOccupancySource, "getProjections"),
 		];
 		try {
-			await expect(backgroundTaskService.countActiveKindsByParentBatch([PARENT])).rejects.toThrow(
-				"not initialized",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(
+					backgroundTaskService.countActiveKindsByParentBatch([PARENT]),
+				),
+			).toThrow("not initialized");
 			for (const read of reads) expect(read).not.toHaveBeenCalled();
 		} finally {
 			for (const read of reads) read.mockRestore();
@@ -1844,7 +1850,7 @@ describe("background task list deltas", () => {
 		expect(upsert.status).toBe("cancelled");
 		expect(upsert.effectiveStatus).toBe("continued");
 		expect(deltas[0]?.activeCount).toBe(1);
-		await expect(backgroundTaskService.getById(subagentId)).resolves.toMatchObject({
+		await expect(await backgroundTaskService.getById(subagentId)).toMatchObject({
 			status: "cancelled",
 			completedAt: stored?.completedAt ?? null,
 		});

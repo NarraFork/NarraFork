@@ -32,6 +32,7 @@ import {
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 } from "../watch-observation";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const PARENT = "watch-task-parent";
 const CHILD = "watch-task-child";
@@ -689,7 +690,7 @@ describe("Watch observes Bash without owning its execution", () => {
 			"CREATE TRIGGER watch_mailbox_write_fault BEFORE INSERT ON narrator_buffered_messages WHEN NEW.notice_kind = 'bash' BEGIN SELECT RAISE(ABORT, 'transient watch mailbox fault'); END;",
 		);
 		try {
-			await expect(flushRuntimePublications(PARENT)).rejects.toThrow(
+			await expect(await captureWorkerRejectionThrower(flushRuntimePublications(PARENT))).toThrow(
 				"transient watch mailbox fault",
 			);
 			expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
@@ -802,9 +803,9 @@ describe("Watch follows an agent's registered current run", () => {
 		const setting = process.env.NARRAFORK_DB_WORKER;
 		try {
 			process.env.NARRAFORK_DB_WORKER = "off";
-			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBeInstanceOf(
-				workerPool.WorkersUnavailableError,
-			);
+			await expect(
+				await captureWorkerRejection(publication.readAgentTerminalResult(run, {}, {})),
+			).toBeInstanceOf(workerPool.WorkersUnavailableError);
 		} finally {
 			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = setting;
@@ -815,15 +816,21 @@ describe("Watch follows an agent's registered current run", () => {
 			new workerPool.DbReadTaskTimeoutError("timed out"),
 		]) {
 			dispatch.mockRejectedValueOnce(error);
-			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBe(error);
+			await expect(
+				await captureWorkerRejection(publication.readAgentTerminalResult(run, {}, {})),
+			).toBe(error);
 		}
 		const interrupted = AbortSignal.abort();
 		await expect(
-			publication.readAgentTerminalResult(run, {}, { signal: interrupted }),
-		).rejects.toBe(interrupted.reason);
+			await captureWorkerRejection(
+				publication.readAgentTerminalResult(run, {}, { signal: interrupted }),
+			),
+		).toBe(interrupted.reason);
 		await expect(
-			sqlite.transaction(() => publication.readAgentTerminalResult(run, {}, {}))(),
-		).rejects.toBeInstanceOf(workerPool.WorkersUnavailableError);
+			await captureWorkerRejection(
+				sqlite.transaction(() => publication.readAgentTerminalResult(run, {}, {}))(),
+			),
+		).toBeInstanceOf(workerPool.WorkersUnavailableError);
 		expect(inline).not.toHaveBeenCalled();
 
 		dispatch.mockRejectedValueOnce(new workerPool.DbReadTaskExecutionError("worker exited"));
@@ -855,7 +862,7 @@ describe("Watch follows an agent's registered current run", () => {
 		expect((await notices()).some((notice) => notice.noticeKind === "agent")).toBe(true);
 	});
 
-	test("a running background agent can still be watched with SQLite Workers disabled", async () => {
+	test("a running background agent cannot be watched with required authority Workers disabled", async () => {
 		await backgroundTaskService.createAgentTask({
 			id: CHILD,
 			subagentNarratorId: CHILD,
@@ -868,25 +875,16 @@ describe("Watch follows an agent's registered current run", () => {
 		try {
 			process.env.NARRAFORK_DB_WORKER = "off";
 			const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
-			expect(result.metadata).toMatchObject({ status: "watching" });
-			expect(await backgroundTaskService.markCompleted(CHILD, "background agent output")).toBe(
-				true,
-			);
-			db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, CHILD)).run();
-			eventBus.emit({
-				type: "narrator:status_changed",
-				narratorId: CHILD,
-				status: "idle",
-				substatus: [],
-			});
-			expect(await settled(watchId(result))).toMatchObject({
-				status: "completed",
-				output: expect.stringContaining("fulfilled by the ordinary agent completion notice"),
-			});
+			expect(result.isError).toBe(true);
+			expect(result.metadata).toMatchObject({ kind: "watch", status: "failed" });
+			expect(result.output).toContain("workers unavailable");
+			expect(result.output).not.toContain("Watching");
+			expect(observations()).toHaveLength(0);
+			expect(task(CHILD)?.status).toBe("running");
 			expect(
 				dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult"),
 			).toBe(false);
-			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(1);
+			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(0);
 		} finally {
 			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = setting;
@@ -896,17 +894,22 @@ describe("Watch follows an agent's registered current run", () => {
 	test("an already settled Watch rechecks team ownership after the Worker responds", async () => {
 		completeAgent("must stay private after reassignment");
 		const read = workerPool.runReadTask;
-		spyOn(workerPool, "runReadTask").mockImplementationOnce(
+		let reassigned = false;
+		spyOn(workerPool, "runReadTask").mockImplementation(
 			async <T>(...args: Parameters<typeof read>) => {
 				const result = await read<T>(...args);
-				db.update(narrators)
-					.set({ runtimeRegistrationJson: delegationRegistration(OTHER, "general") })
-					.where(eq(narrators.id, CHILD))
-					.run();
+				if (args[1].kind === "publicationTerminalResult" && !reassigned) {
+					reassigned = true;
+					db.update(narrators)
+						.set({ runtimeRegistrationJson: delegationRegistration(OTHER, "general") })
+						.where(eq(narrators.id, CHILD))
+						.run();
+				}
 				return result;
 			},
 		);
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(reassigned).toBe(true);
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("access was revoked");
 		expect(result.output).not.toContain("must stay private after reassignment");

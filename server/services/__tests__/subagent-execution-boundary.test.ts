@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -13,8 +13,12 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const databaseFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = databaseFixture;
+await databaseFixture.ready;
+afterAll(() => databaseFixture.close());
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 // Initialize through the service entrypoint to honor its persistence import cycle.
@@ -143,28 +147,34 @@ describe("subagent logical-run receipts", () => {
 		expect(next.executionSegmentId).not.toBe(first.executionSegmentId);
 		expect(next.executionBoundary?.sourceToolCallId).toBe("next-call");
 		await expect(
-			establishSubagentExecutionSegment({ ...request, binding: nextBinding }),
-		).rejects.toThrow("conflicts");
+			await captureWorkerRejectionThrower(
+				establishSubagentExecutionSegment({ ...request, binding: nextBinding }),
+			),
+		).toThrow("conflicts");
 		expect(await readSubagentExecutionBoundary("child", "run-1")).toEqual(first.executionBoundary);
 	});
 	test("new attempt invalidates old proof and a foreign or forged segment is rejected", async () => {
 		await fixture();
 		await establishSubagentExecutionSegment({ ...request, binding });
 		await expect(
-			establishSubagentExecutionSegment({
-				...request,
-				logicalRunId: "other",
-				binding: { ...binding, executionSegmentId: "foreign" },
-			}),
-		).rejects.toThrow("does not match");
+			await captureWorkerRejectionThrower(
+				establishSubagentExecutionSegment({
+					...request,
+					logicalRunId: "other",
+					binding: { ...binding, executionSegmentId: "foreign" },
+				}),
+			),
+		).toThrow("does not match");
 		await db
 			.update(narratorToolCalls)
 			.set({ executionAttempt: 2 })
 			.where(eq(narratorToolCalls.id, "call"));
 		expect(await readSubagentExecutionBoundary("child")).toBeNull();
-		await expect(establishSubagentExecutionSegment({ ...request, binding })).rejects.toThrow(
-			"stale",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(
+				establishSubagentExecutionSegment({ ...request, binding }),
+			),
+		).toThrow("stale");
 	});
 	for (const reason of ["not_found", "not_latest_turn", "narrator_busy", "not_denied"] as const) {
 		test(`rejected retry (${reason}) preserves narrator, background task and attribution`, async () => {
@@ -440,7 +450,7 @@ describe("subagent logical-run receipts", () => {
 				const { reExecuteDeniedToolCall } = await import("../narrator-session");
 				const retried = reExecuteDeniedToolCall("child", "denied-write", "en");
 				if (outcome === "prepare_failure") {
-					await expect(retried).rejects.toThrow("prepare failed");
+					await expect(await captureWorkerRejectionThrower(retried)).toThrow("prepare failed");
 					// Nothing ran: the session's run and its attribution are untouched.
 					expect(
 						(await db.query.narrators.findFirst({ where: eq(narrators.id, "child") }))
