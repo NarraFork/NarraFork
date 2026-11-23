@@ -18,6 +18,7 @@ import {
 	databaseReaderUnavailableResponse,
 	requiresDatabaseReaders,
 } from "../db-reader-readiness";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
 import { DbReadError } from "../db-worker/errors";
 import {
 	assertDbReadersReady,
@@ -167,13 +168,12 @@ function entry(readiness: DatabaseReaderReadiness, backend = "sqlite", recoveryF
 
 function startupEntry(readiness: DatabaseReaderReadiness) {
 	const calls: string[] = [];
-	const start = source.indexOf(
-		"const readerStartupAdmission = await databaseReaderReadiness.wait();",
-	);
+	const start = source.indexOf("async function initializeDatabaseStartup(): Promise<void> {");
 	const end = source.indexOf("// Migrate OAuth authorities first", start);
 	if (start < 0 || end < start) throw new Error("Cannot locate production startup admission");
 	const dependencies = {
 		databaseReaderReadiness: readiness,
+		httpLifecycle: { accepting: true },
 		activeDatabaseBackend: "sqlite",
 		startupShutdownState: {},
 		scheduleBackgroundIntegrityCheck: () => calls.push("integrity"),
@@ -192,12 +192,21 @@ function startupEntry(readiness: DatabaseReaderReadiness) {
 		},
 	};
 	const body = source.slice(start, end).replace(/\bimport\s*\(/g, "importModule(");
-	const compiled = transpiler.transformSync(`async function startup() { ${body} } }`);
+	const compiled = transpiler.transformSync(`${body} }`);
 	if (/\bimport\s*\(/.test(compiled)) throw new Error("Startup sandbox contains a native import");
-	const startWork = new Function(...Object.keys(dependencies), `${compiled}\nreturn startup;`)(
-		...Object.values(dependencies),
-	) as () => Promise<void>;
-	return { calls, startWork, logger: dependencies.logger };
+	const initialize = new Function(
+		...Object.keys(dependencies),
+		`${compiled}\nreturn initializeDatabaseStartup;`,
+	)(...Object.values(dependencies)) as () => Promise<void>;
+	const startup = createDatabaseReaderStartup({
+		readiness,
+		initialize,
+		onUnavailable: () => {},
+		onError: (error) => {
+			throw error;
+		},
+	});
+	return { calls, startWork: startup.start, stop: startup.stop, logger: dependencies.logger };
 }
 
 describe("database reader readiness", () => {
@@ -542,6 +551,8 @@ describe("production reader admission entrypoints", () => {
 		await rejected;
 		expect(failedStartup.calls).toEqual([]);
 		expect(failedStartup.logger.warn).not.toHaveBeenCalled();
+		startup.stop();
+		failedStartup.stop();
 	});
 });
 

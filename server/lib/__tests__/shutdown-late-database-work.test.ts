@@ -148,6 +148,7 @@ function sandbox(options: {
 		getTeamDatabaseMaintenanceStatus: () =>
 			options.teamMaintenance?.snapshot() ?? { stopped: true, pending: 0, failed: false },
 		backgroundOccupancyInitializer: { stop: nothing },
+		databaseStartup: { stop: () => trace.push("databaseStartup.stop") },
 		stopBackgroundOccupancy: async () => {
 			trace.push("occupancy.stop");
 		},
@@ -904,6 +905,7 @@ test("producer admission closes before request waits consume the entire business
 	try {
 		await runtime.run({ reason: "fixture-expired", skipWindowsProcessTreeKill: true });
 		for (const owner of [
+			"databaseStartup.stop",
 			"bash.stop",
 			"history.stop",
 			"occupancy.stop",
