@@ -54,6 +54,7 @@ import {
 import { lstat, mkdtemp, open, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
@@ -1724,14 +1725,18 @@ export const worktreeTreeSnapshot = {
 	 * index. Identical states yield the same hash, so repeated calls are cheap and
 	 * deduplicate naturally.
 	 *
-	 * Production goes through {@link tryCaptureHot}, which calls this with a signal;
-	 * the method stays separate because that is the seam the warm-up runs through.
+	 * Both this direct entry and {@link tryCaptureHot} enforce the file-history policy
+	 * before touching the shadow store. The retained algorithm is exercised only
+	 * under explicitly injected test policy.
 	 */
 	async capture(
 		worktreePath: string,
 		deviceId: string = LOCAL_DEVICE_ID,
 		opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 	): Promise<string> {
+		if (!isFileHistoryEnabledForDevice(deviceId)) {
+			throw new TreeSnapshotError("Local workspace tree snapshots are disabled.");
+		}
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
 		// A caller carrying a signal is the warm-up itself (the thing that can BE
@@ -1791,6 +1796,9 @@ export const worktreeTreeSnapshot = {
 			requireFresh?: boolean;
 		},
 	): Promise<string | null> {
+		// Check policy before disk probes, shared warmups, or background capture.
+		// The direct capture entry independently enforces the same policy.
+		if (!isFileHistoryEnabledForDevice(deviceId)) return null;
 		const budgetMs = opts?.budgetMs ?? HOT_PATH_CAPTURE_BUDGET_MS;
 		const warmupGitTimeoutMs = opts?.warmupGitTimeoutMs ?? WARMUP_GIT_TIMEOUT_MS;
 		const cooldownMs = opts?.cooldownMs ?? WARMUP_FAILURE_COOLDOWN_MS;

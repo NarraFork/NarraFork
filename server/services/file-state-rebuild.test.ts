@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +33,10 @@ import {
 import type { AgentConfig, AgentToolUse } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
+import {
+	allowRetainedFileHistoryForTests,
+	retainFileHistoryForTests,
+} from "./__tests__/retained-file-history";
 import { getDefaultLocalFileChangeRuntime } from "./file-change-runtime";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
@@ -388,7 +392,15 @@ async function addInitializingToolCall(
 	return toolUseId;
 }
 
+let restoreHistory: () => void;
+let restorePolicy: () => void;
+beforeEach(async () => {
+	restorePolicy = allowRetainedFileHistoryForTests();
+	restoreHistory = retainFileHistoryForTests(await getDefaultLocalFileChangeRuntime());
+});
 afterEach(async () => {
+	restoreHistory();
+	restorePolicy();
 	setRemoteBackendResolver(null);
 	for (const narratorId of createdNarrators.splice(0)) {
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));

@@ -12,10 +12,10 @@ import {
 import { AppError } from "../../errors";
 import { DISPLAY_MESSAGE_COLUMNS, DISPLAY_TOOL_COLUMNS } from "../display-page-query";
 import {
+	drainDbWorkerPool,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	runReadTask,
-	shutdownDbWorkerPool,
 } from "../pool";
 
 const failureOf = (promise: Promise<unknown>) => promise.catch((error: unknown) => error);
@@ -25,7 +25,7 @@ const failureOf = (promise: Promise<unknown>) => promise.catch((error: unknown) 
 test("PG display port invalid URL/connection errors never expose credential sentinels", async () => {
 	const secret = "PG_DISPLAY_SECRET_SENTINEL";
 	const previous = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	await resetDbWorkerPoolForTest();
 	try {
 		for (const url of [`not-a-url-${secret}`, `postgres://user:${secret}@127.0.0.1:1/invalid`]) {
@@ -52,7 +52,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 		expect(failure).toMatchObject({ code: "DISPLAY_PAGE_READER_UNAVAILABLE" });
 		expect(String((failure as Error).message)).not.toContain(secret);
 	} finally {
-		await shutdownDbWorkerPool();
+		await drainDbWorkerPool({ timeoutMs: 20_000 });
 		if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 		else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previous;
 	}
@@ -63,7 +63,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 	async () => {
 		let callbackError: unknown;
 		const previous = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		await resetDbWorkerPoolForTest();
 		try {
 			const result = await withPostgres(async ({ port, credentials }) => {
@@ -329,7 +329,7 @@ test("PG display port invalid URL/connection errors never expose credential sent
 			if (callbackError) throw callbackError;
 			expect(result.status).toBe("verified");
 		} finally {
-			await shutdownDbWorkerPool();
+			await drainDbWorkerPool({ timeoutMs: 20_000 });
 			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 			else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previous;
 		}

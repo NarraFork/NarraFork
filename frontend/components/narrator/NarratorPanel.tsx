@@ -22,6 +22,7 @@ import { notifications } from "@mantine/notifications";
 import { parseProviderWaitInfo } from "@shared/agent-protocol/quota-exhausted";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	FileReference,
 	FileReferenceContext,
@@ -91,6 +92,7 @@ import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTermin
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
+	currentWorkspaceContext,
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
 	workspaceDirectoryRequiredDeviceId,
@@ -857,8 +859,15 @@ function NarratorPanelBody({
 				return false;
 			}
 			try {
+				const currentWorkspace = currentWorkspaceContext(qc, narratorId);
+				if (!currentWorkspace) throw new Error(t("revertPlanReloadRequired"));
+				if (!isFileHistoryEnabledForDevice(currentWorkspace.deviceId) && !revertOpts.skipRevert)
+					throw new Error(t("revertPlanReloadRequired"));
+				const confirmedOpts = !isFileHistoryEnabledForDevice(currentWorkspace.deviceId)
+					? { skipRevert: true }
+					: revertOpts;
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
-					...revertOpts,
+					...confirmedOpts,
 					...opts,
 					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});

@@ -214,6 +214,8 @@ function fixture(
 	);
 	child.get("/preview", (c) => c.json({ ok: true }));
 	const bindings = {
+		resolveNarratorMessageOnlyRevert: async (_id: string, skipRevert?: boolean) =>
+			skipRevert === true,
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
 		requestRecordingRoutes: new Hono(),

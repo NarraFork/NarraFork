@@ -5,6 +5,7 @@ import {
 	type SelectRowsParams,
 	type SelectRowsResult,
 } from "../../lib/db-worker/protocol";
+import { ReadBudgetMeter } from "../../lib/db-worker/read-budget";
 import { validateSelectRows } from "../../lib/db-worker/select-rows";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
@@ -59,7 +60,10 @@ export function createSqliteSearchQueryExecutor(
 			maxRows: SELECT_ROWS_MAX_ROWS,
 		};
 		try {
-			validateSelectRows(query);
+			const budget = new ReadBudgetMeter();
+			validateSelectRows(query, budget);
+			if (budget.snapshot().some(({ actual, threshold }) => actual > threshold))
+				throw new Error("Search query budget exceeded");
 		} catch {
 			throw new AppError("Invalid or oversized search query", 413, "SEARCH_QUERY_BUDGET_EXCEEDED");
 		}

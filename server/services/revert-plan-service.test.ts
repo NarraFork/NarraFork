@@ -295,7 +295,7 @@ async function withFileBackedReader(run: (reader: RevertPlanService) => Promise<
 	try {
 		await pool.resetDbWorkerPoolForTest();
 		delete process.env.NARRAFORK_DB_WORKER;
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 		fileDb.exec("PRAGMA foreign_keys = ON");
 		const reader = new RevertPlanService(drizzle(fileDb), { namespaceKey });
 		const prepare = spyOn(fileDb, "prepare").mockImplementation(() => {

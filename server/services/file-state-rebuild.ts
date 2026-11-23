@@ -2,7 +2,7 @@
  * Rebuild file contents by replaying successful Write/Edit tool calls from the
  * narrator's first-touch snapshots. File identity is device + target path.
  */
-import { and, asc, eq, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narratorFileSnapshots,
@@ -948,9 +948,13 @@ async function loadSnapshotMap(
 	narratorId: string,
 	legacyLocalCwd: string | null,
 	canonicalAliases: Map<string, DeviceFileIdentity>,
+	requestedDeviceIds?: string[],
 ): Promise<Map<string, SnapshotBaseline>> {
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
+		where: and(
+			eq(narratorFileSnapshots.narratorId, narratorId),
+			requestedDeviceIds ? inArray(narratorFileSnapshots.deviceId, requestedDeviceIds) : undefined,
+		),
 		orderBy: narratorFileSnapshots.createdAt,
 		columns: {
 			deviceId: true,
@@ -1029,7 +1033,12 @@ async function rebuildDeviceStates(
 	const grouped = groupByDeviceFileStrict(toolCalls, legacyLocalCwd);
 	const result = new Map<string, DeviceFileState>();
 	if ((requestedMap ?? grouped).size === 0) return result;
-	const snapshots = await loadSnapshotMap(narratorId, legacyLocalCwd, canonicalAliases);
+	const snapshots = await loadSnapshotMap(
+		narratorId,
+		legacyLocalCwd,
+		canonicalAliases,
+		requested ? [...new Set(requested.map((identity) => identity.deviceId))] : undefined,
+	);
 	// First-touch capture precedes Edit matching, so a snapshot alone does not
 	// prove any successful mutation. Default "all" includes only successful calls;
 	// explicit requests may still retrieve the baseline after excluding first Write.

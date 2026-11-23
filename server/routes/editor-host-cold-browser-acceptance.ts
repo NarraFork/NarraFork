@@ -318,7 +318,7 @@ export async function editorHostColdBrowserAcceptance(options: {
 		expect(saveReceipt).toMatchObject({
 			status: "saved",
 			diskOutcome: "applied",
-			historyStatus: "unavailable",
+			historyStatus: "disabled",
 		});
 		expect(savedWithHistoryGap.session?.phase).toBe("idle");
 		expect(savedWithHistoryGap.dirty).toBe(false);
@@ -368,7 +368,7 @@ export async function editorHostColdBrowserAcceptance(options: {
 				signal: AbortSignal.timeout(5000),
 			},
 		);
-		expect(coldQuery.ok).toBe(true);
+		expect(coldQuery.ok, await coldQuery.clone().text()).toBe(true);
 		const coldReceipt = (await coldQuery.json()) as { status: string; operationId: string };
 		// The old process confirmed the write, but its effect never persisted. A fresh
 		// process cannot infer that proof from matching current bytes or the descriptor.

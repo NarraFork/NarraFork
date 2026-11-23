@@ -32,7 +32,7 @@ describe("chapter settings retirement", () => {
 		expect(saved.chapters).toBeUndefined();
 		expect(saved.containers).toBeUndefined();
 		// The default itself is untouched by the migration.
-		expect(DEFAULTS.workspace.treeSnapshotsEnabled).toBe(true);
+		expect(DEFAULTS.workspace.treeSnapshotsEnabled).toBe(false);
 	});
 
 	test("an explicit workspace value wins over a leftover chapters value", () => {
@@ -45,6 +45,6 @@ describe("chapter settings retirement", () => {
 
 	test("installs without the old group keep the default", () => {
 		writeSettings({});
-		expect(reloadSettings().workspace.treeSnapshotsEnabled).toBe(true);
+		expect(reloadSettings().workspace.treeSnapshotsEnabled).toBe(false);
 	});
 });

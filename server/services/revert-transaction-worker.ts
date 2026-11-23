@@ -226,7 +226,32 @@ export function closeRevertManifestWorkers(): Promise<void> {
 	return manifestWorkers.current.pool.close(new RevertTransactionError("MANIFEST_WORKER_FAILED"));
 }
 export function getRevertManifestWorkerStats() {
-	return manifestWorkers.current.pool.stats;
+	const {
+		active,
+		queued,
+		queuedBytes,
+		closed,
+		workers,
+		starting,
+		idle,
+		retiring,
+		created,
+		reused,
+		failed,
+	} = manifestWorkers.current.pool.stats;
+	return {
+		active,
+		queued,
+		queuedBytes,
+		closed,
+		workers,
+		starting,
+		idle,
+		retiring,
+		created,
+		reused,
+		failed,
+	};
 }
 export async function resetRevertManifestWorkersForTests(): Promise<void> {
 	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only manifest pool reset");
