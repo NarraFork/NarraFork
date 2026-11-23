@@ -14,10 +14,12 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { Hono } from "hono";
 import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
 import * as workerRead from "../../db/worker-read";
 import { narratorTraitsLock } from "../../lib/async-mutex";
+import { AppError } from "../../lib/errors";
 import { parseTraits } from "../../lib/narrator-utils";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
@@ -46,6 +48,7 @@ const ownership = await import("../agent-runtime/ownership");
 const inbox = await import("../agent-runtime/inbox");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { RESTART_NARRATOR_COLUMNS } = await import("../recovery-observation");
+const recovery = await import("../narrator-subagent-recovery");
 
 const FAILED_AT_MS = Date.parse("2026-04-01T02:00:00.000Z");
 const FAILED_AT = new Date(FAILED_AT_MS).toISOString();
@@ -470,6 +473,73 @@ const resumeInput = {
 };
 
 describe("resumeRecoverySubagents DB recovery", () => {
+	for (const mode of ["watch", "notify"] as const) {
+		test(`a later conflict preserves card and ${mode} handling for already-started children`, async () => {
+			await seedRecoveryCard();
+			for (const [id, alias] of [
+				["sub-fails", "retry-fails"],
+				["sub-works", "retry-works"],
+				["sub-no-longer-failed", "retry-third"],
+			])
+				await seedRecoverableSubagent(id, alias);
+			const resume = spyOn(session, "continueNarrator").mockImplementation(async () => {
+				db.update(narrators)
+					.set({ logicalRunId: "winner" })
+					.where(eq(narrators.id, "sub-works"))
+					.run();
+				return { ok: true, terminal: Promise.resolve() };
+			});
+			const watch = spyOn(recovery, "startRecoveryWatchBatch").mockResolvedValue({
+				messageId: "watch",
+				toolUseIds: [],
+			});
+			const send = spyOn(session, "sendMessage").mockResolvedValue(
+				{} as Awaited<ReturnType<typeof session.sendMessage>>,
+			);
+			const { narratorRoutes } = await import("../../routes/narrators");
+			const app = new Hono();
+			app.use("*", async (c, next) => {
+				c.set("user", { sub: "human", role: "admin", iat: 0, exp: 2_147_483_647 });
+				await next();
+			});
+			app.onError(
+				(error) =>
+					new Response(
+						JSON.stringify({ code: error instanceof AppError ? error.code : "UNKNOWN" }),
+						{ status: error instanceof AppError ? error.statusCode : 500 },
+					),
+			);
+			app.route("/narrators", narratorRoutes);
+			const response = await app.request(`/narrators/${PARENT_ID}/subagent-recovery`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					messageId: CARD_ID,
+					subagentIds: CARD_ENTRIES.map((entry) => entry.id),
+					mode,
+				}),
+			});
+			expect(response.status).toBe(409);
+			expect(await response.json()).toEqual({ code: "RUNTIME_READ_CONFLICT" });
+			expect(resume).toHaveBeenCalledTimes(1);
+			expect((await readBackgroundTask("sub-fails"))?.status).toBe("running");
+			expect(await readBackgroundTask("sub-works")).toBeUndefined();
+			expect(await readBackgroundTask("sub-no-longer-failed")).toBeUndefined();
+			const card = await readRecoveryCard();
+			expect(card).toMatchObject({ status: "pending", resumedCount: 1, mode });
+			expect(card.subagents).toEqual(CARD_ENTRIES.slice(1));
+			if (mode === "watch") {
+				expect(watch).toHaveBeenCalledTimes(1);
+				expect(watch.mock.calls[0]?.[0].aliases).toEqual(["retry-fails"]);
+				expect(send).not.toHaveBeenCalled();
+			} else {
+				expect(send).toHaveBeenCalledTimes(1);
+				expect(send.mock.calls[0]?.[1]).toContain("retry-fails");
+				expect(watch).not.toHaveBeenCalled();
+			}
+		});
+	}
+
 	test("continues after initialization throws and fails its already-created task row", async () => {
 		await seedRecoverableSubagent("sub-fails", "retry-fails");
 		await seedRecoverableSubagent("sub-works", "retry-works");

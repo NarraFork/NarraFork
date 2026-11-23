@@ -1157,6 +1157,7 @@ export async function markRecoveryOffered(
 export interface ResumeRecoverySubagentsResult {
 	resumed: string[];
 	skipped: Array<{ id: string; reason: string }>;
+	conflict?: RuntimeReadConflictError;
 }
 
 /**
@@ -1281,7 +1282,8 @@ export async function resumeRecoverySubagents(
 		const byId = new Map(subagents.map((row) => [row.id, row]));
 		const tasksById = new Map(tasks.map((row) => [row.id, row]));
 
-		for (const subagentId of new Set(input.subagentIds)) {
+		const selectedIds = [...new Set(input.subagentIds)];
+		for (const [index, subagentId] of selectedIds.entries()) {
 			let claimedRunId: string | null = null;
 			try {
 				const subagent = byId.get(subagentId);
@@ -1385,15 +1387,27 @@ export async function resumeRecoverySubagents(
 				resumed.push(alias);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				if (claimedRunId)
-					await clearBackgroundRunningClaim(
-						subagentId,
-						input.narratorId,
-						message,
-						claimedRunId,
-						input,
-					);
-				if (err instanceof RuntimeReadConflictError) throw err;
+				let conflict = err instanceof RuntimeReadConflictError ? err : undefined;
+				if (claimedRunId) {
+					try {
+						await clearBackgroundRunningClaim(
+							subagentId,
+							input.narratorId,
+							message,
+							claimedRunId,
+							input,
+						);
+					} catch (cleanupError) {
+						if (!(cleanupError instanceof RuntimeReadConflictError)) throw cleanupError;
+						conflict = cleanupError;
+					}
+				}
+				if (conflict) {
+					if (!resumed.length) throw conflict;
+					const reason = conflict.code;
+					skipped.push(...selectedIds.slice(index).map((id) => ({ id, reason })));
+					return { resumed, skipped, conflict };
+				}
 				logger.warn("Failed to resume recovery subagent", { subagentId, error: message });
 				skipped.push({ id: subagentId, reason: message });
 			}
