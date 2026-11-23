@@ -1,15 +1,24 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { SourcingCatalog } from "@shared/sourcing/presets";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import { sourcingRoutes } from "../../../server/routes/sourcing";
 import { ApiError } from "../../lib/api";
 import settingsEn from "../../locales/en/settings.json";
 import settingsZhCn from "../../locales/zh-CN/settings.json";
 import { defaultLocalImportSelection } from "./LocalProviderImport";
 import { ProviderImportContext, TokenDanceAddContext } from "./provider-add-context";
 import type { AddProviderDraft } from "./provider-add-draft";
-import { PROVIDER_PRESETS } from "./provider-presets";
+import { SOURCING_CATALOG_QUERY_KEY } from "./provider-catalog";
+
+// The page reads its presets from GET /api/sourcing/templates; serve it the route's response.
+const catalog = (await (await sourcingRoutes.request("/templates")).json()) as SourcingCatalog;
+const PROVIDER_PRESETS = catalog.presets;
+const queryClient = new QueryClient();
+queryClient.setQueryData(SOURCING_CATALOG_QUERY_KEY, catalog);
 
 // Install before loading React DOM so its native input-event support is detected.
 // Mantine's test environment keeps real controls but removes portals/transitions.
@@ -103,9 +112,11 @@ beforeEach(async () => {
 	await act(async () => {
 		root?.render(
 			<I18nextProvider i18n={i18n}>
-				<MantineProvider env="test">
-					<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => addHandler(draft)} />
-				</MantineProvider>
+				<QueryClientProvider client={queryClient}>
+					<MantineProvider env="test">
+						<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => addHandler(draft)} />
+					</MantineProvider>
+				</QueryClientProvider>
 			</I18nextProvider>,
 		);
 	});
@@ -225,18 +236,20 @@ describe("AddProviderPage interactions", () => {
 				await act(async () => {
 					root?.render(
 						<I18nextProvider i18n={i18n}>
-							<MantineProvider env="test">
-								<TokenDanceAddContext
-									value={{
-										login: async () => {
-											calls++;
-											throw error;
-										},
-									}}
-								>
-									<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
-								</TokenDanceAddContext>
-							</MantineProvider>
+							<QueryClientProvider client={queryClient}>
+								<MantineProvider env="test">
+									<TokenDanceAddContext
+										value={{
+											login: async () => {
+												calls++;
+												throw error;
+											},
+										}}
+									>
+										<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+									</TokenDanceAddContext>
+								</MantineProvider>
+							</QueryClientProvider>
 						</I18nextProvider>,
 					);
 				});
@@ -617,17 +630,19 @@ describe("import from this machine", () => {
 		await act(async () => {
 			root?.render(
 				<I18nextProvider i18n={i18n}>
-					<MantineProvider env="test">
-						<ProviderImportContext
-							value={{
-								importProvider: async () => ({ refreshFailed: false }),
-								detectedSources: detecting ? undefined : sources,
-								detecting,
-							}}
-						>
-							<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
-						</ProviderImportContext>
-					</MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<MantineProvider env="test">
+							<ProviderImportContext
+								value={{
+									importProvider: async () => ({ refreshFailed: false }),
+									detectedSources: detecting ? undefined : sources,
+									detecting,
+								}}
+							>
+								<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+							</ProviderImportContext>
+						</MantineProvider>
+					</QueryClientProvider>
 				</I18nextProvider>,
 			);
 		});
@@ -690,8 +705,8 @@ describe("import from this machine", () => {
 		});
 		await renderWithImport([{ source: "codex", found: false }]);
 		expect(selectedPreset()).toBe("tokendance");
-		expect(defaultAddProviderPresetId("zh-CN")).toBe("tokendance");
-		expect(defaultAddProviderPresetId("en")).toBe("deepseek");
+		expect(defaultAddProviderPresetId(PROVIDER_PRESETS, "zh-CN")).toBe("tokendance");
+		expect(defaultAddProviderPresetId(PROVIDER_PRESETS, "en")).toBe("deepseek");
 	});
 
 	test("default selection skips providers without a key or already configured", () => {
