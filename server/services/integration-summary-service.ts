@@ -72,22 +72,20 @@ function countValue(row: { value: number } | undefined): number {
 }
 
 async function countConnectedApps(userId: string) {
-	const [activeRows, revokedRows] = await Promise.all([
-		readQuery(
-			db
-				.select({ value: count() })
-				.from(oauthGrants)
-				.where(and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt))),
-			{ executionPolicy: "worker-required" },
-		),
-		readQuery(
-			db
-				.select({ value: count() })
-				.from(oauthGrants)
-				.where(and(eq(oauthGrants.userId, userId), isNotNull(oauthGrants.revokedAt))),
-			{ executionPolicy: "worker-required" },
-		),
-	]);
+	const activeRows = await readQuery(
+		db
+			.select({ value: count() })
+			.from(oauthGrants)
+			.where(and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt))),
+		{ executionPolicy: "worker-required" },
+	);
+	const revokedRows = await readQuery(
+		db
+			.select({ value: count() })
+			.from(oauthGrants)
+			.where(and(eq(oauthGrants.userId, userId), isNotNull(oauthGrants.revokedAt))),
+		{ executionPolicy: "worker-required" },
+	);
 	return {
 		active: countValue(activeRows[0]),
 		revoked: countValue(revokedRows[0]),
@@ -141,38 +139,38 @@ async function getAdminSummary() {
 		revokedResourceRows,
 		externalDeviceRows,
 		externalNarratorRows,
-	] = await Promise.all([
-		getPluginSummary(),
-		readQuery(db.select({ value: count() }).from(oauthClients), {
+	] = [
+		await getPluginSummary(),
+		await readQuery(db.select({ value: count() }).from(oauthClients), {
 			executionPolicy: "worker-required",
 		}),
-		readQuery(
+		await readQuery(
 			db.select({ value: count() }).from(oauthClients).where(isNull(oauthClients.revokedAt)),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db.select({ value: count() }).from(oauthClients).where(isNotNull(oauthClients.revokedAt)),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db.select({ value: count() }).from(remoteDevices).where(isNull(remoteDevices.revokedAt)),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(remoteDevices)
 				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "online"))),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(remoteDevices)
 				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "offline"))),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -185,7 +183,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -198,7 +196,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -210,7 +208,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -222,7 +220,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -234,7 +232,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -247,7 +245,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-		readQuery(
+		await readQuery(
 			db
 				.select({ value: count() })
 				.from(integrationResourceBindings)
@@ -260,7 +258,7 @@ async function getAdminSummary() {
 				),
 			{ executionPolicy: "worker-required" },
 		),
-	]);
+	];
 
 	return {
 		plugins,

@@ -239,30 +239,28 @@ async function requireActiveGrantBinding(input: {
 	oauthClientId: string;
 	userId: string;
 }): Promise<ActiveGrantBinding> {
-	const [grant, authority] = await Promise.all([
-		readQueryFirst(
-			db.query.oauthGrants.findMany({
-				limit: 1,
-				where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
-				columns: { id: true, oauthClientId: true, userId: true },
-			}),
-			{ executionPolicy: "worker-required" },
-		),
-		readQueryFirst(
-			db.query.integrationAuthorities.findMany({
-				limit: 1,
-				where: and(
-					eq(integrationAuthorities.id, input.grantId),
-					eq(integrationAuthorities.kind, "oauth_grant"),
-					eq(integrationAuthorities.integrationType, "oauth_client"),
-					eq(integrationAuthorities.integrationId, input.oauthClientId),
-					eq(integrationAuthorities.state, "active"),
-				),
-				columns: { id: true, ownerUserId: true, revision: true },
-			}),
-			{ executionPolicy: "worker-required" },
-		),
-	]);
+	const grant = await readQueryFirst(
+		db.query.oauthGrants.findMany({
+			limit: 1,
+			where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
+			columns: { id: true, oauthClientId: true, userId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
+	const authority = await readQueryFirst(
+		db.query.integrationAuthorities.findMany({
+			limit: 1,
+			where: and(
+				eq(integrationAuthorities.id, input.grantId),
+				eq(integrationAuthorities.kind, "oauth_grant"),
+				eq(integrationAuthorities.integrationType, "oauth_client"),
+				eq(integrationAuthorities.integrationId, input.oauthClientId),
+				eq(integrationAuthorities.state, "active"),
+			),
+			columns: { id: true, ownerUserId: true, revision: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (
 		!grant ||
 		!authority ||

@@ -15,6 +15,7 @@ import * as workerRead from "../../db/worker-read";
 import { captureWorkerRejectionThrower } from "../../services/__tests__/narrator-worker-fixture";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant, revokeOAuthGrantForUser } from "../../services/oauth-grant-service";
+import { resetDbWorkerPoolForTest } from "../db-worker/pool";
 import { generateId } from "../id";
 import {
 	ACCESS_TOKEN_TTL_SECONDS,
@@ -252,6 +253,37 @@ describe("oauth-provider authorization codes", () => {
 });
 
 describe("oauth-provider code exchange (PKCE)", () => {
+	test("exchanges a valid grant with one normal slot and no queue", async () => {
+		await ensureClient();
+		const grant = await createGrant();
+		const issued = await issueCode({ grantId: grant.id });
+		const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		const previousQueue = process.env.NARRAFORK_DB_WORKER_MAX_QUEUED;
+		await resetDbWorkerPoolForTest();
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		process.env.NARRAFORK_DB_WORKER_MAX_QUEUED = "0";
+		let error: unknown;
+		let pair: Awaited<ReturnType<typeof exchangeCodeForToken>> | undefined;
+		try {
+			pair = await exchangeCodeForToken({
+				code: issued.code,
+				clientId: CLIENT_ID,
+				redirectUri: REDIRECT_URI,
+				codeVerifier: issued.verifier,
+			});
+		} catch (caught) {
+			error = caught;
+		} finally {
+			if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+			else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
+			if (previousQueue === undefined) delete process.env.NARRAFORK_DB_WORKER_MAX_QUEUED;
+			else process.env.NARRAFORK_DB_WORKER_MAX_QUEUED = previousQueue;
+			await resetDbWorkerPoolForTest();
+		}
+		expect(error).toBeUndefined();
+		expect(pair?.accessToken).toStartWith("nfat_");
+	});
+
 	for (const mode of ["exchange", "refresh"] as const) {
 		test(`${mode} does not require another Worker client lookup after consumption`, async () => {
 			await ensureClient();
