@@ -2120,7 +2120,10 @@ function McpToolsTab() {
 				return;
 			}
 			setJsonError(null);
-			setDraft(result.draft);
+			const next = result.draft;
+			// The JSON view hides the secret field, so a typed secret must not follow a new client.
+			const sameClient = next.url === draft.url && next.oauthClientId === draft.oauthClientId;
+			setDraft(sameClient ? next : { ...next, oauthClientSecret: "" });
 		},
 		[draft],
 	);
