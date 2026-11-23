@@ -2184,11 +2184,16 @@ describe("G. a turn that ends with work still pending", () => {
 		}
 	});
 
-	test("a restart stopping the occupancy store reads as work still pending", async () => {
+	test("with the occupancy store stopped for a restart, the task rows say what is pending", async () => {
 		seed();
 		const { hasPendingWork } = await import("../agent-runtime/pending-wake");
-		expect(await hasPendingWork(RUN)).toBe(false);
 		await backgroundOccupancyStore.stop();
+		expect(await hasPendingWork(RUN)).toBe(false);
+		await backgroundTaskService.createBashTask({
+			id: "pending-bash",
+			parentNarratorId: RUN,
+			command: "bun test",
+		});
 		expect(await hasPendingWork(RUN)).toBe(true);
 	});
 

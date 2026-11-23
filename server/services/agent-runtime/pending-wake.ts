@@ -1,4 +1,23 @@
+import { and, eq, inArray } from "drizzle-orm";
+import { db } from "../../db";
+import { backgroundTasks } from "../../db/schema";
 import { hasInboxKind } from "./inbox";
+
+function hasRunningWakeTask(narratorId: string): boolean {
+	return !!db
+		.select({ id: backgroundTasks.id })
+		.from(backgroundTasks)
+		.where(
+			and(
+				eq(backgroundTasks.parentNarratorId, narratorId),
+				eq(backgroundTasks.status, "running"),
+				eq(backgroundTasks.backgroundKind, "task"),
+				inArray(backgroundTasks.type, ["bash", "agent"]),
+			),
+		)
+		.limit(1)
+		.get();
+}
 
 /**
  * Live background work the session started whose completion wakes it (Bash tasks, Watch
@@ -7,10 +26,13 @@ import { hasInboxKind } from "./inbox";
  */
 export async function hasPendingWork(narratorId: string): Promise<boolean> {
 	const { backgroundOccupancyStore } = await import("../background-occupancy-store");
-	// A store stopped for a restart cannot say the work finished: assume it still runs.
-	if (backgroundOccupancyStore.isStopped) return true;
-	await backgroundOccupancyStore.flush();
-	if (backgroundOccupancyStore.countActiveWakeWork(narratorId) > 0) return true;
+	// A store stopped for a restart no longer reads: ask the task rows themselves.
+	if (backgroundOccupancyStore.isStopped) {
+		if (hasRunningWakeTask(narratorId)) return true;
+	} else {
+		await backgroundOccupancyStore.flush();
+		if (backgroundOccupancyStore.countActiveWakeWork(narratorId) > 0) return true;
+	}
 	const { countOpenAsyncQuestions } = await import("../narrator-question-service");
 	return (await countOpenAsyncQuestions(narratorId)) > 0;
 }
