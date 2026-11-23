@@ -498,6 +498,40 @@ import { createPostgresRuntimeQueue } from "./postgres-runtime-queue";
 					),
 				).toBe(true);
 
+				const restarted = await engine.startBashRun({
+					taskId: "ordinary-restart",
+					recipientId: "parent",
+					taskRow: {
+						id: "ordinary-restart",
+						parentNarratorId: "parent",
+						type: "bash",
+						status: "running",
+						command: "build",
+						startedAt: now,
+						createdAt: now,
+						updatedAt: now,
+					},
+				});
+				await engine.recoverStaleTask({
+					taskId: restarted.taskId,
+					now,
+					eventKind: "failed",
+					text: "Execution outcome unknown after restart; the command was not rerun.",
+				});
+				await queue.outbox.transferNext("parent", "bash");
+				expect((await engine.readTaskDetail(restarted.taskId))?.status).toBe("failed");
+				expect(await db.select().from(outbox).where(eq(outbox.taskId, restarted.taskId))).toEqual(
+					[],
+				);
+				expect(
+					await db.select().from(consumptions).where(eq(consumptions.taskId, restarted.taskId)),
+				).toHaveLength(1);
+				expect(
+					(await db.select().from(mailbox)).some((row) =>
+						row.text.includes("Execution outcome unknown"),
+					),
+				).toBe(false);
+
 				await engine.startBashRun({
 					taskId: "silent-rollback",
 					recipientId: "parent",

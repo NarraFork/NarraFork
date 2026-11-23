@@ -3418,11 +3418,7 @@ export const narratorService = {
 	 */
 	async extractSubagentToPrimary(
 		sourceNarratorId: string,
-		opts?: {
-			title?: string;
-			inheritMode?: "full" | "compressed";
-			locale?: Locale;
-		},
+		opts?: import("./subagent-extract").ExtractSubagentToPrimaryOpts,
 	) {
 		const { extractSubagentToPrimary } = await import("./subagent-extract");
 		return extractSubagentToPrimary(sourceNarratorId, opts);

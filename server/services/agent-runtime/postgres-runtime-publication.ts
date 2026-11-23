@@ -1918,6 +1918,13 @@ export function createPostgresRuntimePublication(
 					resultRef: section.resultRef,
 					summary: summarize(input.text),
 				});
+				if (
+					task.type === "bash" &&
+					!run.logicalRunId.startsWith("legacy:unknown:") &&
+					!task.command?.startsWith(WATCH_COMMAND_PREFIX) &&
+					!task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
+				)
+					await primitives.consumeAwaitedTerminal(tx, run);
 				return task;
 			});
 			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);

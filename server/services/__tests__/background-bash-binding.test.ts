@@ -83,6 +83,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	const { stopTool } = await import("../../lib/agent/tools/stop");
 	const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
 	const { drainPendingInjections } = await import("../parent-injection-queue");
+	const { runtimePublication } = await import("../agent-runtime/publication");
 	const PARENT = "binding-parent";
 	const OTHER = "binding-other";
 	const TOOL_USE_ID = "reused-provider-id";
@@ -783,6 +784,8 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 					.get(),
 			).toEqual({ status: "running", attempt: 1 });
 			expect(execCommand).not.toHaveBeenCalled();
+			// Force publication ahead of the drain instead of racing the scheduled transfer.
+			await runtimePublication.flushRecipient(PARENT);
 			expect(await drainPendingInjections(PARENT)).toEqual([]);
 		});
 	});
