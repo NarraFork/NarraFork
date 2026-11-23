@@ -8,6 +8,7 @@ import {
 	NarratorWSManager,
 	shouldDeliverToListener,
 } from "./narrator-ws-manager";
+import { withSocketTimers } from "./ws-test-utils";
 
 describe("complete input document lane ordering", () => {
 	test("snapshot and seal descriptors are not overtaken by immediate live input deltas", async () => {
@@ -1261,6 +1262,44 @@ function withSilencedWarn(fn: () => void): void {
 }
 
 describe("reconnect resilience", () => {
+	test("times out a silent handshake and reconnects through backoff", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					fire(10_000);
+					expect(manager.disconnected).toBe(true);
+					expect(reconnectInternals(manager).reconnectAttempts).toBe(1);
+					fire(1000);
+					expect(socket?.readyState).toBe(MockWebSocket.CLOSED);
+					expect(MockWebSocket.instances).toHaveLength(2);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
+	test("opening cancels the handshake deadline", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					if (!socket) throw new Error("Missing socket");
+					socket.readyState = MockWebSocket.OPEN;
+					socket.onopen?.();
+					fire(10_000);
+					expect(manager.connected).toBe(true);
+					expect(MockWebSocket.instances).toHaveLength(1);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
 	test("reconnects after a graceful server shutdown (1001) instead of never retrying", () => {
 		withMockBrowserGlobals(() => {
 			const manager = new NarratorWSManager();

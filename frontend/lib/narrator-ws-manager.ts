@@ -189,6 +189,7 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 /** Server close code for "the session token that opened this socket expired". */
 const SESSION_EXPIRED_CLOSE_CODE = 4001;
 /** Server close code for graceful shutdown ("Going Away") — the common case is a restart. */
@@ -387,6 +388,8 @@ export function setNarratorWSShareAuth(auth: { shareId: string; token: string } 
 
 export class NarratorWSManager {
 	private ws: BusinessSocket | null = null;
+	private connectTimer: ReturnType<typeof setTimeout> | undefined;
+	private connectingAt = 0;
 	private _connected = false;
 	private _disconnected = false;
 	private hasConnectedOnce = false;
@@ -489,6 +492,7 @@ export class NarratorWSManager {
 	}
 
 	disconnect(): void {
+		this._clearConnectTimeout();
 		this.cancelled = true;
 		this._unlistenVisibility();
 		this._unlistenNetwork();
@@ -1395,6 +1399,7 @@ export class NarratorWSManager {
 
 	/** Force a reconnect (e.g. from the UI reconnect button). */
 	reconnect(): void {
+		this._clearConnectTimeout();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
 		this._clearSyncProbe();
@@ -1432,6 +1437,7 @@ export class NarratorWSManager {
 		// when the fallback reconnect actually wins, so close-code handling still has
 		// priority when the browser delivers onclose in time.
 		const staleWs = this.ws;
+		this._clearConnectTimeout();
 		if (staleWs) {
 			this.ws = null;
 			safeCloseWs(staleWs);
@@ -1466,12 +1472,22 @@ export class NarratorWSManager {
 		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
+		this.connectingAt = Date.now();
+		this.connectTimer = setTimeout(() => {
+			if (this.cancelled || this.ws !== ws || ws.readyState !== 0) return;
+			this._clearConnectTimeout();
+			this.ws = null;
+			safeCloseWs(ws);
+			this._setConnected(false, false, true);
+			this._scheduleReconnect();
+		}, CONNECT_TIMEOUT_MS);
 
 		ws.onopen = () => {
 			if (this.cancelled || this.ws !== ws) {
 				ws.close();
 				return;
 			}
+			this._clearConnectTimeout();
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 			const isReconnect = this.hasConnectedOnce || this.reconnectAttempts > 0;
@@ -1600,6 +1616,7 @@ export class NarratorWSManager {
 
 		ws.onclose = (ev) => {
 			if (this.cancelled || this.ws !== ws) return;
+			this._clearConnectTimeout();
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
@@ -1683,6 +1700,12 @@ export class NarratorWSManager {
 				this._scheduleReconnect();
 			}
 		}, CLIENT_PING_TIMEOUT_MS);
+	}
+
+	private _clearConnectTimeout(): void {
+		clearTimeout(this.connectTimer);
+		this.connectTimer = undefined;
+		this.connectingAt = 0;
 	}
 
 	private _setConnected(
@@ -1800,6 +1823,7 @@ export class NarratorWSManager {
 
 	private _handleNetworkOffline(): void {
 		if (this.cancelled) return;
+		this._clearConnectTimeout();
 		this.networkOffline = true;
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
@@ -1873,6 +1897,7 @@ export class NarratorWSManager {
 		// the recovery decision sees a clean "missing" state and no sync_check or
 		// permission decision is ever written into a dead socket.
 		this._socketDiscarded = true;
+		this._clearConnectTimeout();
 		this._clearSyncProbe();
 		clearTimeout(this.pingTimeoutTimer);
 		this.pingTimeoutTimer = undefined;
@@ -1908,6 +1933,10 @@ export class NarratorWSManager {
 	}
 
 	private _recoverForeground(): void {
+		if (this.ws?.readyState === 0 && Date.now() - this.connectingAt >= CONNECT_TIMEOUT_MS) {
+			this.reconnect();
+			return;
+		}
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
 		const socketDiscarded = this._socketDiscarded;
