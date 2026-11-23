@@ -26,6 +26,7 @@ import {
 	drainDbWorkerPool,
 	getDbWorkerAvailability,
 	resumeDbWorkerPool,
+	setDbWorkerSpecifiersForTest,
 	WorkersUnavailableError,
 } from "../db-worker/pool";
 import { AppError, catalogError } from "../errors";
@@ -396,6 +397,38 @@ describe("database reader readiness", () => {
 			}
 		});
 	}
+
+	test("readiness retries a pool disabled by consecutive spawn failures", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-reader-spawn-"));
+		const path = join(directory, "ready.db");
+		const database = new Database(path);
+		database.run("CREATE TABLE readiness_fixture (id INTEGER PRIMARY KEY)");
+		database.close();
+		let now = 0;
+		try {
+			setDbWorkerSpecifiersForTest([new URL("missing-worker.ts", import.meta.url).href]);
+			const readiness = createDatabaseReaderReadiness({
+				backend: "sqlite",
+				probe: (options) => assertDbReadersReady(path, options),
+				availability: getDbWorkerAvailability,
+				databaseAvailability: () => getDbWorkerAvailability(path),
+				now: () => now,
+			});
+			expect((await readiness.wait()).ok).toBe(false);
+			now += 5_000;
+			expect((await readiness.wait()).ok).toBe(false);
+			expect(getDbWorkerAvailability().reason).toBe("worker_unavailable");
+			setDbWorkerSpecifiersForTest(null);
+			now += 5_000;
+			expect(await readiness.wait()).toEqual({ ok: true });
+			expect(getDbWorkerAvailability(path)).toEqual({ available: true, reason: null });
+		} finally {
+			setDbWorkerSpecifiersForTest(null);
+			await drainDbWorkerPool({ timeoutMs: 30_000 });
+			resumeDbWorkerPool();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 
 	test("real drain and resume re-probe before restoring API health", async () => {
 		const previousOff = process.env.NARRAFORK_DB_WORKER;

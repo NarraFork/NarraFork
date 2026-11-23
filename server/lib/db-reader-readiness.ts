@@ -95,7 +95,10 @@ export function createDatabaseReaderReadiness(options: {
 		try {
 			const pool = options.availability?.();
 			const database = includeDatabase ? options.databaseAvailability?.() : undefined;
-			return (!pool || pool.available) && (!database || database.available);
+			return (
+				(!pool || pool.available || (!includeDatabase && pool.reason === "worker_unavailable")) &&
+				(!database || database.available)
+			);
 		} catch {
 			return false;
 		}
