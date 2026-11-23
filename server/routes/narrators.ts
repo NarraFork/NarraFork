@@ -6191,6 +6191,7 @@ narratorRoutes.post("/:id/extract-primary", async (c) => {
 	const { extractPrimarySchema } = await import("../lib/validators");
 	const parsed = extractPrimarySchema.parse(body ?? {});
 	const newNarrator = await narratorService.extractSubagentToPrimary(id, {
+		signal: c.req.raw.signal,
 		title: parsed.title,
 		inheritMode: parsed.inheritMode ?? "full",
 		locale: parsed.locale ?? "en",

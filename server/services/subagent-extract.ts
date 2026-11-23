@@ -18,6 +18,7 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { measureSummaryCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { ValidationError } from "../lib/errors";
@@ -30,6 +31,7 @@ import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import type { Locale } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	flushQueuedSince,
 	newEnvelopeColumns,
@@ -51,6 +53,9 @@ import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 export const EXTRACT_FULL_MAX_MESSAGES = 2000;
 
 export interface ExtractSubagentToPrimaryOpts {
+	signal?: ReadQueryOptions["signal"];
+	deadlineAt?: number;
+	timeoutMs?: number;
 	title?: string;
 	/** Defaults to `"full"`. Overridden to `"compressed"` when history exceeds the soft cap. */
 	inheritMode?: "full" | "compressed";
@@ -68,24 +73,58 @@ type WriteAudience = "owner" | "project" | "public";
  * "project" visibility (an extract carries no project, so project resolution has
  * nothing to read). Missing parent → private/owner.
  */
-async function resolveExtractAudiences(source: {
-	parentNarratorId: string | null;
-}): Promise<{ visibility: Visibility; writeAudience: WriteAudience }> {
+async function resolveExtractAudiences(
+	source: {
+		parentNarratorId: string | null;
+	},
+	options: ReadQueryOptions,
+) {
 	let visibility: Visibility = "private";
 	let writeAudience: WriteAudience = "owner";
-	if (source.parentNarratorId) {
-		const parent = await db.query.narrators.findFirst({
-			where: eq(narrators.id, source.parentNarratorId),
-			columns: { visibility: true, writeAudience: true },
-		});
+	const parent = source.parentNarratorId
+		? await readQueryFirst(
+				db
+					.select({ visibility: narrators.visibility, writeAudience: narrators.writeAudience })
+					.from(narrators)
+					.where(eq(narrators.id, source.parentNarratorId))
+					.limit(1),
+				options,
+			)
+		: undefined;
+	if (parent) {
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
 	// Extract is always standalone in v1; project-visible without a project is a trap.
 	if (visibility === "project") visibility = "private";
 	if (writeAudience === "project") writeAudience = "owner";
-	return { visibility, writeAudience };
+	return { visibility, writeAudience, parent };
 }
+
+const EXTRACT_SOURCE_COLUMNS = {
+	id: narrators.id,
+	variant: narrators.variant,
+	status: narrators.status,
+	subagentType: narrators.subagentType,
+	model: narrators.model,
+	ownerUserId: narrators.ownerUserId,
+	policySourceNarratorId: narrators.policySourceNarratorId,
+	runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+	parentNarratorId: narrators.parentNarratorId,
+	title: narrators.title,
+	cwd: narrators.cwd,
+	defaultDeviceId: narrators.defaultDeviceId,
+	reasoningEffort: narrators.reasoningEffort,
+	fastModeOverride: narrators.fastModeOverride,
+	relaxedPlan: narrators.relaxedPlan,
+	planReflectionAutoApproveOverride: narrators.planReflectionAutoApproveOverride,
+	dangerReflectionOverride: narrators.dangerReflectionOverride,
+	questionReflectionOverride: narrators.questionReflectionOverride,
+	autoContinuationOverride: narrators.autoContinuationOverride,
+	behaviorFenceIntervalOverride: narrators.behaviorFenceIntervalOverride,
+	behaviorFenceAttachOverride: narrators.behaviorFenceAttachOverride,
+	taskBackend: narrators.taskBackend,
+};
 
 function defaultExtractTitle(
 	sourceTitle: string | null,
@@ -100,9 +139,16 @@ export async function extractSubagentToPrimary(
 	sourceId: string,
 	opts?: ExtractSubagentToPrimaryOpts,
 ) {
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, sourceId),
-	});
+	const readOptions: ReadQueryOptions = {
+		signal: opts?.signal,
+		deadlineAt: opts?.deadlineAt,
+		timeoutMs: opts?.timeoutMs,
+		executionPolicy: "worker-required",
+	};
+	const source = await readQueryFirst(
+		db.select(EXTRACT_SOURCE_COLUMNS).from(narrators).where(eq(narrators.id, sourceId)).limit(1),
+		readOptions,
+	);
 
 	if (!source) {
 		throw new ValidationError("Subagent not found");
@@ -116,16 +162,21 @@ export async function extractSubagentToPrimary(
 
 	const locale = (opts?.locale ?? "en") as Locale;
 	const subagentType = source.subagentType ?? null;
-	const maxFull = opts?.maxFullMessages ?? EXTRACT_FULL_MAX_MESSAGES;
+	const maxFull = Math.min(
+		EXTRACT_FULL_MAX_MESSAGES,
+		Math.max(0, Math.trunc(opts?.maxFullMessages ?? EXTRACT_FULL_MAX_MESSAGES)),
+	);
+	const refColumns = { messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq };
 
-	const sourceRefs = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-		})
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, sourceId))
-		.orderBy(asc(narratorMessageRefs.seq));
+	const sourceRefs = await readQuery(
+		db
+			.select(refColumns)
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, sourceId))
+			.orderBy(asc(narratorMessageRefs.seq))
+			.limit(maxFull + 1),
+		{ ...readOptions, maxRows: maxFull + 1 },
+	);
 
 	let inheritMode = opts?.inheritMode ?? "full";
 	if (inheritMode === "full" && sourceRefs.length > maxFull) {
@@ -168,9 +219,9 @@ export async function extractSubagentToPrimary(
 	// The extracted primary has no parent: materialize its current effective model.
 	const storedModel =
 		source.model === FOLLOW_PARENT_MODEL
-			? (await resolveSubagentModelForRun(source, source.ownerUserId)).model
+			? (await resolveSubagentModelForRun(source, source.ownerUserId, undefined, readOptions)).model
 			: (source.model ?? FOLLOW_DEFAULT_MODEL);
-	const audiences = await resolveExtractAudiences(source);
+	const audiences = await resolveExtractAudiences(source, readOptions);
 	const { ensureReplyContext } = await import("./narrator-reply-context");
 	const now = new Date().toISOString();
 	const id = generateId();
@@ -187,6 +238,46 @@ export async function extractSubagentToPrimary(
 		return withSeqFloorRaiseScope(() =>
 			db.transaction(
 				(tx) => {
+					const current = tx
+						.select(EXTRACT_SOURCE_COLUMNS)
+						.from(narrators)
+						.where(eq(narrators.id, sourceId))
+						.limit(1)
+						.get();
+					if (
+						!current ||
+						(Object.keys(EXTRACT_SOURCE_COLUMNS) as Array<keyof typeof source>).some((key) =>
+							key === "status"
+								? (current.status === "archived") !== (source.status === "archived")
+								: JSON.stringify(current[key]) !== JSON.stringify(source[key]),
+						)
+					)
+						throw new RuntimeReadConflictError();
+					if (source.parentNarratorId) {
+						const parent = tx
+							.select({ visibility: narrators.visibility, writeAudience: narrators.writeAudience })
+							.from(narrators)
+							.where(eq(narrators.id, source.parentNarratorId))
+							.limit(1)
+							.get();
+						if (JSON.stringify(parent) !== JSON.stringify(audiences.parent))
+							throw new RuntimeReadConflictError();
+					}
+					if ((opts?.inheritMode ?? "full") === "full") {
+						const refs = tx
+							.select(refColumns)
+							.from(narratorMessageRefs)
+							.where(eq(narratorMessageRefs.narratorId, sourceId))
+							.orderBy(asc(narratorMessageRefs.seq))
+							.limit(maxFull + 1)
+							.all();
+						if (
+							inheritMode === "full"
+								? JSON.stringify(refs) !== JSON.stringify(sourceRefs)
+								: refs.length <= maxFull
+						)
+							throw new RuntimeReadConflictError();
+					}
 					const queueMark = syncQueueMark();
 					const created = tx
 						.insert(narrators)
