@@ -81,7 +81,8 @@ export function AddProviderPage({
 	const { t, i18n } = useTranslation("settings");
 	const tokenDance = useTokenDanceAdd();
 	const importContext = useProviderImport();
-	const catalog = useProviderPresets();
+	const catalogQuery = useProviderPresets();
+	const catalog = catalogQuery.data;
 	const restoredRef = useRef(false);
 	const locallyEditedRef = useRef(false);
 	useEffect(() => {
@@ -199,13 +200,19 @@ export function AddProviderPage({
 	const detecting = !!importContext?.detecting;
 	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once when detection and the catalog settle
 	useEffect(() => {
-		if (autoSelectedRef.current || detecting || !catalog) return;
-		autoSelectedRef.current = true;
-		if (restoredRef.current || tokenDance?.restoredAddPage || locallyEditedRef.current) return;
+		if (autoSelectedRef.current || detecting) return;
+		if (restoredRef.current || tokenDance?.restoredAddPage || locallyEditedRef.current) {
+			autoSelectedRef.current = true;
+			return;
+		}
+		// Import needs no catalog, so a failed preset fetch must not hide it.
 		if (importAvailable) {
+			autoSelectedRef.current = true;
 			setImportSelected(true);
 			return;
 		}
+		if (!catalog) return;
+		autoSelectedRef.current = true;
 		const fallback = defaultAddProviderPresetId(catalog, language);
 		const next = catalog.find((item) => item.id === fallback);
 		if (next) selectPreset(next, false);
@@ -317,6 +324,16 @@ export function AddProviderPage({
 								</Button>
 							))}
 						</Group>
+						{catalogQuery.isError && (
+							<Alert color="red" role="alert">
+								<Group justify="space-between" wrap="nowrap">
+									<Text size="sm">{t("addProviderCatalogLoadFailed")}</Text>
+									<Button size="xs" variant="light" onClick={() => void catalogQuery.refetch()}>
+										{t("retry", { ns: "common" })}
+									</Button>
+								</Group>
+							</Alert>
+						)}
 						<Text fw={600} size="sm">
 							{t(
 								query.trim()

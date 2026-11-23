@@ -3,20 +3,20 @@ import type {
 	ProviderPreset,
 	SourcingCatalog,
 } from "@shared/sourcing/presets";
-import { useQuery } from "@tanstack/react-query";
+import { type UseQueryResult, useQuery } from "@tanstack/react-query";
 import { sourcingApi } from "../../lib/api/sourcing";
 import type { UserAgentMode } from "./types";
 
 export const SOURCING_CATALOG_QUERY_KEY = ["sourcing", "templates"] as const;
 
 /** The add-provider presets; never stale, since they are constants of the running build. */
-export function useProviderPresets(): readonly ProviderPreset[] | undefined {
+export function useProviderPresets(): UseQueryResult<readonly ProviderPreset[]> {
 	return useQuery({
 		queryKey: SOURCING_CATALOG_QUERY_KEY,
 		queryFn: sourcingApi.templates,
 		staleTime: Number.POSITIVE_INFINITY,
 		select: (catalog: SourcingCatalog) => catalog.presets,
-	}).data;
+	});
 }
 
 export function getProviderPresetName(
