@@ -18,8 +18,12 @@ import { gitDiscoveryCache } from "./git-discovery-cache";
 import {
 	getGitWorkspaceLineStats,
 	getGitWorkspaceStatus,
+	getGitWorkspaceStatusPagesCacheState,
 	invalidateGitWorkspace,
 	invalidateGitWorkspaceFacts,
+	observeGitWorkspaceStatusPages,
+	releaseGitWorkspaceStatusPages,
+	retainGitWorkspaceStatusPages,
 	validateGitWorkspaceCache,
 	validateGitWorkspaceStatusPages,
 } from "./git-management-service";
@@ -33,6 +37,7 @@ import {
 	dirtyGitStagingObservation,
 	settleGitStagingObservations,
 } from "./git-staging-observation";
+import { GitStatusPageError } from "./git-status-page-protocol";
 import { localGitStatusScopesOverlap } from "./git-status-query";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import { getRemoteGitStatusQueryKey } from "./remote-git-service";
@@ -369,6 +374,7 @@ interface Entry {
 	lastRefreshAt: number;
 	lastValidatedAt: number;
 	lineStatsUnsupported?: boolean;
+	pagesRetained?: boolean;
 }
 const snapshotReads = {
 	status: getGitWorkspaceStatus,
@@ -377,6 +383,10 @@ const snapshotReads = {
 	invalidateFacts: invalidateGitWorkspaceFacts,
 	validate: validateGitWorkspaceCache,
 	validatePages: validateGitWorkspaceStatusPages,
+	observePages: observeGitWorkspaceStatusPages,
+	pagesState: getGitWorkspaceStatusPagesCacheState,
+	releasePages: releaseGitWorkspaceStatusPages,
+	retainPages: retainGitWorkspaceStatusPages,
 };
 
 const stagingSyncs = new Map<string, Set<Promise<void>>>();
@@ -418,8 +428,26 @@ export class GitWorkspaceWatchPool {
 	constructor(
 		private probe = probeGitWatch,
 		private interval = WATCH_INTERVAL_MS,
-		private reads: Omit<typeof snapshotReads, "invalidateFacts" | "validatePages"> &
-			Partial<Pick<typeof snapshotReads, "invalidateFacts" | "validatePages">> = snapshotReads,
+		private reads: Omit<
+			typeof snapshotReads,
+			| "invalidateFacts"
+			| "validatePages"
+			| "observePages"
+			| "pagesState"
+			| "releasePages"
+			| "retainPages"
+		> &
+			Partial<
+				Pick<
+					typeof snapshotReads,
+					| "invalidateFacts"
+					| "validatePages"
+					| "observePages"
+					| "pagesState"
+					| "releasePages"
+					| "retainPages"
+				>
+			> = snapshotReads,
 		private timing: { boundedIntervalMs?: number; revalidateIntervalMs?: number } = {},
 	) {}
 
@@ -452,6 +480,8 @@ export class GitWorkspaceWatchPool {
 			(target.discoveryRuntimeGeneration ?? target.backend?.runtimeGeneration ?? 0) >
 			(entry.target.discoveryRuntimeGeneration ?? entry.target.backend?.runtimeGeneration ?? 0)
 		) {
+			this.reads.releasePages?.(entry.target);
+			entry.pagesRetained = false;
 			entry.target = target;
 			entry.previous = undefined;
 			entry.stagingListsFingerprint = undefined;
@@ -538,11 +568,15 @@ export class GitWorkspaceWatchPool {
 		const listener = { changed, snapshot };
 		entry.listeners.add(listener);
 		let stopObservation: (() => void) | undefined;
+		let stopped = false;
 		const stop = () => {
+			if (stopped) return;
+			stopped = true;
 			stopObservation?.();
 			entry.listeners.delete(listener);
 			if (entry.listeners.size) return;
 			entry.controller.abort();
+			this.reads.releasePages?.(entry.target);
 			clearTimeout(entry.timer);
 			clearTimeout(entry.refreshTimer);
 			if (this.entries.get(key) === entry) this.entries.delete(key);
@@ -552,6 +586,10 @@ export class GitWorkspaceWatchPool {
 			}
 		};
 		try {
+			if (!entry.pagesRetained && this.reads.retainPages) {
+				this.reads.retainPages(entry.target);
+				entry.pagesRetained = true;
+			}
 			if (
 				staging &&
 				target.backend?.kind === "local" &&
@@ -621,6 +659,9 @@ export class GitWorkspaceWatchPool {
 					...entry.snapshot,
 					revision: entry.revision,
 					updating: true,
+					...(entry.snapshot.statusPages && {
+						statusPages: { ...entry.snapshot.statusPages, updating: true, errorCode: undefined },
+					}),
 					statusError: undefined,
 					lineStatsError: undefined,
 				});
@@ -629,7 +670,12 @@ export class GitWorkspaceWatchPool {
 	}
 
 	private scheduleRefresh(entry: Entry, immediate = false): void {
-		if (!entry.probed || entry.refreshing || entry.refreshTimer || entry.controller.signal.aborted)
+		if (
+			(!entry.probed && !this.reads.observePages) ||
+			entry.refreshing ||
+			entry.refreshTimer ||
+			entry.controller.signal.aborted
+		)
 			return;
 		if (![...entry.listeners].some((listener) => listener.snapshot)) return;
 		const delay = immediate
@@ -659,6 +705,47 @@ export class GitWorkspaceWatchPool {
 			statusError: undefined,
 			lineStatsError: undefined,
 		});
+		let fullStats: ReturnType<typeof getGitWorkspaceLineStats> | undefined;
+		const readFullStats = (signal: AbortSignal) => {
+			if (entry.lineStatsUnsupported)
+				return Promise.reject(
+					new AppError("Git line statistics unsupported", 503, "GIT_LINE_STATS_UNSUPPORTED"),
+				);
+			fullStats ??= this.reads.lineStats(
+				target,
+				AbortSignal.any([controller.signal, signal]),
+				ttlMs,
+			);
+			return fullStats;
+		};
+		const pageTask = this.reads
+			.observePages?.(target, controller.signal, readFullStats, (statusPages) => {
+				if (current())
+					this.publish(entry, { ...entry.snapshot, revision, updating: true, statusPages });
+			})
+			.then((statusPages) => {
+				if (current())
+					this.publish(entry, { ...entry.snapshot, revision, updating: true, statusPages });
+			})
+			.catch((error: unknown) => {
+				if (!current()) return;
+				this.publish(entry, {
+					...entry.snapshot,
+					revision,
+					updating: true,
+					statusPages: {
+						status: "error",
+						workerEpoch: entry.snapshot?.statusPages?.workerEpoch ?? "unavailable",
+						memberVersion: entry.snapshot?.statusPages?.memberVersion ?? 0,
+						statsVersion: entry.snapshot?.statusPages?.statsVersion ?? 0,
+						updating: false,
+						errorCode:
+							error instanceof AppError || error instanceof GitStatusPageError
+								? error.code
+								: "GIT_STATUS_PAGE_SOURCE_FAILED",
+					},
+				});
+			});
 		let statusReady = false;
 		try {
 			const status = await this.reads.status(target, controller.signal, ttlMs);
@@ -680,7 +767,8 @@ export class GitWorkspaceWatchPool {
 				});
 				return;
 			}
-			const lineStats = await this.reads.lineStats(target, controller.signal, ttlMs);
+			const lineStats = await readFullStats(controller.signal);
+			await pageTask;
 			if (!current()) return;
 			entry.lastValidatedAt = Date.now();
 			this.publish(entry, { ...entry.snapshot, revision, lineStats, updating: false });
@@ -695,6 +783,9 @@ export class GitWorkspaceWatchPool {
 				...(statusReady ? { lineStatsError: code } : { statusError: code }),
 			});
 		} finally {
+			await pageTask;
+			if (current() && entry.snapshot?.updating)
+				this.publish(entry, { ...entry.snapshot, updating: false });
 			entry.refreshing = false;
 			if (entry.dirty) this.scheduleRefresh(entry);
 		}
@@ -776,6 +867,25 @@ export class GitWorkspaceWatchPool {
 					// Establish the directory baseline once, before reading facts. Its first
 					// invalidation also excludes pre-baseline HTTP work still in flight;
 					// additional subscribers never repeat this directory-level validation.
+					// Lightweight Worker health check also wakes an existing subscription after eviction/restart.
+					if (this.reads.pagesState && !entry.refreshing && !entry.dirty) {
+						try {
+							const cache = await this.reads.pagesState(target, controller.signal);
+							controller.signal.throwIfAborted();
+							if (
+								(cache.status !== "ready" && cache.errorCode !== "GIT_STATUS_PAGE_BUSY") ||
+								(cache.errorCode && cache.errorCode !== "GIT_STATUS_PAGE_BUSY") ||
+								(cache.statsErrorCode &&
+									cache.statsErrorCode !== "GIT_STATUS_PAGE_BUSY" &&
+									!entry.lineStatsUnsupported) ||
+								cache.updating ||
+								cache.workerEpoch !== entry.snapshot?.statusPages?.workerEpoch
+							)
+								this.markDirty(entry);
+						} catch {
+							if (!controller.signal.aborted) this.markDirty(entry);
+						}
+					}
 					const categories = entry.previous ? changedGitCategories(entry.previous, sample) : [];
 					const related = categories.some((category) => category !== "stash");
 					const uncertain = [...sample.uncertain, ...(entry.previous?.uncertain ?? [])].some(
@@ -784,6 +894,7 @@ export class GitWorkspaceWatchPool {
 					let pageState: GitStatusPagesWatchState | undefined;
 					if (
 						this.reads.validatePages &&
+						!this.reads.observePages &&
 						(!entry.previous ||
 							related ||
 							(uncertain &&

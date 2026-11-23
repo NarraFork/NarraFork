@@ -1,22 +1,28 @@
 import {
 	GIT_STATUS_PAGE_MAX_LIMIT,
 	type GitStatusFilterChar,
+	type GitStatusPageCacheState,
 	type GitStatusPageStatsResult,
 	type GitStatusPageStatsRow,
 	normalizeGitStatusFilter,
 } from "@shared/git-status-page";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { GitChangesPageStatsResult } from "../components/git/git-changes-list-model";
 import { api } from "../lib/api";
 import type { GitTarget } from "../lib/api/git";
-import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { useGitWorkspaceSubscription } from "./useGit";
+import { readWorkspace, useGitWorkspaceSubscription } from "./useGit";
 
 export interface GitStatusPageStatsSource {
 	snapshotId?: string;
 	pageGeneration?: string;
 	filterKey: string;
 	epoch: string;
+	workspaceIdentity?: string;
+	workerEpoch?: string;
+	memberVersion?: number;
+	statsVersion?: number;
+	updating?: boolean;
 }
 export const gitStatusPageStatsRowKey = (row: GitStatusPageStatsRow) =>
 	JSON.stringify([row.type, row.section, row.path]);
@@ -37,9 +43,14 @@ interface StatsEpoch {
 	queued: Set<string>;
 	running: boolean;
 	readRefused: boolean;
+	paused?: unknown;
+	resultCache?: GitStatusPageCacheState;
+	onCache: (cache: GitStatusPageCacheState) => void;
+	read: <T>(load: () => Promise<T>, signal: AbortSignal) => Promise<T>;
 	onExpired: (source: GitStatusPageStatsSource) => void;
 	onRefused: (source: GitStatusPageStatsSource, error: Error) => void;
 }
+class CacheWaiting extends Error {}
 const expiredSnapshot = (error: unknown) =>
 	((error as { data?: { code?: string }; code?: string } | null)?.data?.code ??
 		(error as { code?: string } | null)?.code) === "GIT_STATUS_PAGE_EXPIRED";
@@ -48,6 +59,8 @@ function createStatsEpoch(
 	source: GitStatusPageStatsSource,
 	onExpired: StatsEpoch["onExpired"],
 	onRefused: StatsEpoch["onRefused"],
+	onCache: StatsEpoch["onCache"],
+	read: StatsEpoch["read"],
 ): StatsEpoch {
 	const epoch: StatsEpoch = {
 		source,
@@ -59,6 +72,8 @@ function createStatsEpoch(
 		readRefused: false,
 		onExpired,
 		onRefused,
+		onCache,
+		read,
 	};
 	epoch.controller.signal.addEventListener(
 		"abort",
@@ -93,18 +108,37 @@ async function drainStatsEpoch(
 			}
 			if (!batch.length) continue;
 			try {
-				const result = await api.getGitStatusPageStats(
-					target,
-					{
-						snapshotId: epoch.source.snapshotId as string,
-						filter,
-						rows: batch.map(({ row }) => row),
-					},
+				const result = await epoch.read(
+					() =>
+						api.getGitStatusPageStats(
+							target,
+							{
+								snapshotId: epoch.source.snapshotId as string,
+								filter,
+								rows: batch.map(({ row }) => row),
+							},
+							signal,
+						),
 					signal,
 				);
 				signal.throwIfAborted();
+				if (result.status === "error")
+					throw Object.assign(new Error(result.cache.message ?? "Git statistics unavailable"), {
+						code: result.cache.errorCode,
+					});
+				if (
+					result.status !== "ready" ||
+					(epoch.source.workerEpoch !== undefined &&
+						(result.cache.workerEpoch !== epoch.source.workerEpoch ||
+							result.cache.memberVersion !== epoch.source.memberVersion ||
+							result.cache.statsVersion !== epoch.source.statsVersion))
+				) {
+					epoch.onCache(result.cache);
+					throw new CacheWaiting("Waiting for published Git statistics");
+				}
 				if (result.snapshotId !== epoch.source.snapshotId)
 					throw new Error("Git statistics snapshot changed");
+				epoch.resultCache = result.cache;
 				const measured = new Map(result.rows.map((row) => [gitStatusPageStatsRowKey(row), row]));
 				for (const pending of batch) {
 					const key = gitStatusPageStatsRowKey(pending.row);
@@ -123,12 +157,14 @@ async function drainStatsEpoch(
 					epoch.queued.clear();
 					return;
 				}
-				if (expiredSnapshot(error)) {
+				if (error instanceof CacheWaiting || expiredSnapshot(error)) {
+					epoch.paused = error;
+					// Pending and version transitions never become measured unknown rows.
 					// Snapshot expiry is a page-chain recovery event, not a measured unknown row.
 					for (const pending of epoch.pending.values()) pending.reject(error);
 					epoch.pending.clear();
 					epoch.queued.clear();
-					epoch.onExpired(epoch.source);
+					if (expiredSnapshot(error)) epoch.onExpired(epoch.source);
 					return;
 				}
 				for (const pending of batch) {
@@ -153,6 +189,7 @@ function readEpochRows(
 ) {
 	epoch.controller.signal.throwIfAborted();
 	signal.throwIfAborted();
+	if (epoch.paused) return Promise.reject(epoch.paused);
 	const demand: PendingRow[] = [];
 	const result = Promise.all(
 		rows.map((row) => {
@@ -227,6 +264,7 @@ export function useGitStatusPageStats(
 	visibleRows: readonly ({ type: string } | GitStatusPageStatsRow)[],
 	options: {
 		generation?: string;
+		cache?: GitStatusPageCacheState;
 		enabled?: boolean;
 		onSnapshotObservation?: (observation: {
 			snapshotId: string;
@@ -237,15 +275,40 @@ export function useGitStatusPageStats(
 ) {
 	const qc = useQueryClient();
 	const owner = useId();
+	const principal = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
 	const enabled = options.enabled !== false && !!target;
 	const subscriptions = useGitWorkspaceSubscription(enabled ? target : null);
 	const denied = !!target && subscriptions.isDenied(target);
-	const active = enabled && !!snapshotId && !denied && subscriptions.isVisible();
+	const observedCache = target ? subscriptions.getStatusPageState(target) : undefined;
+	const updating = !!target && subscriptions.isStatusPageUpdating(target);
+	const pageCache = options.cache;
+	const cache =
+		observedCache &&
+		(!pageCache ||
+			(observedCache.workerEpoch === pageCache.workerEpoch &&
+				observedCache.memberVersion === pageCache.memberVersion &&
+				observedCache.statsVersion >= pageCache.statsVersion))
+			? observedCache
+			: pageCache;
+	const connected = !!target && subscriptions.isPush(target);
+	const readable = !!target && subscriptions.canRead(target);
+	const authorizationKey = target ? subscriptions.getAuthorizationKey(target) : undefined;
+	const active = enabled && !!snapshotId && readable && connected && subscriptions.isVisible();
+	const cacheReady = !cache || cache.statsVersion > 0;
+	const workspaceIdentity = JSON.stringify([
+		target?.workspaceKey,
+		target?.narratorId,
+		target?.repositoryKey,
+		target?.rootPath,
+		principal,
+	]);
 	const filterKey = normalizeGitStatusFilter([...selectedFilter]).join(",");
 	const pageGeneration = options.generation;
 	const onSnapshotObservation = options.onSnapshotObservation;
 	const observationCallback = useRef(onSnapshotObservation);
 	observationCallback.current = onSnapshotObservation;
+	const currentTarget = useRef(target);
+	currentTarget.current = target;
 	const activeEpoch = useRef<StatsEpoch | null>(null);
 	const [refusal, setRefusal] = useState<{ epoch: string; error: Error } | null>(null);
 	const scope = JSON.stringify([
@@ -257,44 +320,79 @@ export function useGitStatusPageStats(
 		pageGeneration,
 		filterKey,
 		active,
+		principal,
+		cache?.workerEpoch,
+		cache?.memberVersion,
+		cache?.statsVersion,
+		authorizationKey,
 	]);
 	const [generation, setGeneration] = useState(0);
 	const sequence = useRef(0);
-	const epoch = useMemo(
-		() =>
-			createStatsEpoch(
-				{
-					snapshotId,
-					pageGeneration,
-					filterKey,
-					epoch: JSON.stringify([scope, generation, owner, ++sequence.current]),
-				},
-				(source) => {
-					const current = activeEpoch.current;
-					if (
-						!current ||
-						current.source.epoch !== source.epoch ||
-						current.controller.signal.aborted ||
-						!source.snapshotId ||
-						!source.pageGeneration
-					)
-						return;
-					observationCallback.current?.({
-						snapshotId: source.snapshotId,
-						generation: source.pageGeneration,
-						expired: true,
-					});
-				},
-				(source, error) => {
-					const current = activeEpoch.current;
-					if (current?.source.epoch !== source.epoch || current.controller.signal.aborted) return;
-					// A shared batch may finish after its viewport observer was cancelled.
-					// Refusal still revokes the entire active epoch, including cached views.
-					setRefusal({ epoch: source.epoch, error });
-				},
-			),
-		[scope, generation, owner, snapshotId, pageGeneration, filterKey],
-	);
+	const epoch = useMemo(() => {
+		const authorized = currentTarget.current
+			? subscriptions.getWriteResultGuard(currentTarget.current)
+			: () => false;
+		const target = currentTarget.current;
+		const publish = currentTarget.current
+			? subscriptions.statusPageReadPublisher(currentTarget.current)
+			: () => false;
+		return createStatsEpoch(
+			{
+				snapshotId,
+				pageGeneration,
+				filterKey,
+				workspaceIdentity,
+				workerEpoch: cache?.workerEpoch,
+				memberVersion: cache?.memberVersion,
+				statsVersion: cache?.statsVersion,
+				epoch: JSON.stringify([scope, generation, owner, ++sequence.current]),
+			},
+			(source) => {
+				const current = activeEpoch.current;
+				if (
+					!current ||
+					current.source.epoch !== source.epoch ||
+					current.controller.signal.aborted ||
+					!source.snapshotId ||
+					!source.pageGeneration
+				)
+					return;
+				observationCallback.current?.({
+					snapshotId: source.snapshotId,
+					generation: source.pageGeneration,
+					expired: true,
+				});
+			},
+			(source, error) => {
+				const current = activeEpoch.current;
+				if (current?.source.epoch !== source.epoch || current.controller.signal.aborted) return;
+				// A shared batch may finish after its viewport observer was cancelled.
+				// Refusal still revokes the entire active epoch, including cached views.
+				setRefusal({ epoch: source.epoch, error });
+			},
+			publish,
+			async (load, signal) => {
+				if (!target || !authorized())
+					throw new DOMException("Git authorization pending", "AbortError");
+				const result = await readWorkspace(qc, target, load, false, signal);
+				if (!authorized()) throw new DOMException("Git authorization superseded", "AbortError");
+				return result;
+			},
+		);
+	}, [
+		scope,
+		generation,
+		owner,
+		snapshotId,
+		pageGeneration,
+		filterKey,
+		workspaceIdentity,
+		cache?.workerEpoch,
+		cache?.memberVersion,
+		cache?.statsVersion,
+		subscriptions,
+		qc,
+	]);
 	activeEpoch.current = epoch;
 	const rowsKey = JSON.stringify(
 		visibleRows
@@ -325,7 +423,7 @@ export function useGitStatusPageStats(
 	}, [epoch, qc, target?.workspaceKey, target?.narratorId]);
 	const query = useQuery({
 		queryKey,
-		queryFn: async ({ signal }): Promise<GitStatusPageStatsResult> => {
+		queryFn: async ({ signal }): Promise<GitChangesPageStatsResult> => {
 			signal.throwIfAborted();
 			const measured = await readEpochRows(
 				epoch,
@@ -337,9 +435,15 @@ export function useGitStatusPageStats(
 			// Observer cancellation discards its delivery without cancelling shared epoch requests.
 			signal.throwIfAborted();
 			epoch.controller.signal.throwIfAborted();
-			return { snapshotId: snapshotId as string, rows: measured };
+			return {
+				snapshotId: snapshotId as string,
+				rows: measured,
+				cache: epoch.resultCache,
+				workspaceIdentity: epoch.source.workspaceIdentity,
+				filterKey: epoch.source.filterKey,
+			};
 		},
-		enabled: active && !epoch.readRefused && rows.length > 0,
+		enabled: active && cacheReady && !epoch.readRefused && rows.length > 0,
 		staleTime: Infinity,
 		gcTime: 0,
 		refetchOnWindowFocus: false,
@@ -374,13 +478,6 @@ export function useGitStatusPageStats(
 			}),
 		[qc, epoch, restart],
 	);
-	useEffect(
-		() =>
-			narratorWSManager.onConnectionChange((connected, reconnect) => {
-				if (connected && reconnect) restart();
-			}),
-		[restart],
-	);
 	useEffect(() => {
 		if (!active || !snapshotId || !pageGeneration || (!query.data && !expiredSnapshot(query.error)))
 			return;
@@ -394,15 +491,36 @@ export function useGitStatusPageStats(
 		epoch.readRefused ||
 		[401, 403, 404].includes((query.error as { status?: number } | null)?.status ?? 0);
 	const displayAllowed =
-		enabled && !!target?.workspaceKey && !!target?.narratorId && !denied && !readRefused;
+		enabled && !!target?.workspaceKey && !!target?.narratorId && readable && !readRefused;
+	const source = useMemo(
+		() => ({ ...epoch.source, updating: updating || !!cache?.updating || !active }),
+		[epoch, cache?.updating, active, updating],
+	);
+	const unavailable = useMemo(
+		() =>
+			cache?.statsVersion === 0 && cache.statsErrorCode
+				? Object.assign(new Error("Git statistics unavailable"), { code: cache.statsErrorCode })
+				: null,
+		[cache?.statsVersion, cache?.statsErrorCode],
+	);
+	const waiting = !unavailable && (!cacheReady || query.error instanceof CacheWaiting);
 	return {
-		source: epoch.source,
+		source,
 		rows,
-		data: active && displayAllowed ? query.data : undefined,
-		error: query.error ?? (refusal?.epoch === epoch.source.epoch ? refusal.error : null),
+		data: active && displayAllowed && !waiting ? query.data : undefined,
+		error: waiting
+			? null
+			: (unavailable ??
+				query.error ??
+				(refusal?.epoch === epoch.source.epoch ? refusal.error : null)),
 		displayAllowed,
-		readRefused: denied || readRefused,
-		isSettled: query.isSuccess || query.isError,
-		retry: restart,
+		readRefused: !readable || denied || readRefused,
+		isSettled: !!unavailable || (!waiting && (query.isSuccess || query.isError)),
+		isPending: waiting,
+		updating: updating || !!cache?.updating || !active,
+		retry: () => {
+			if (target && !subscriptions.canRead(target)) subscriptions.refresh(target);
+			restart();
+		},
 	};
 }

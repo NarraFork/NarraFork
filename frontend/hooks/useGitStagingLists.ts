@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { api } from "../lib/api";
 import { ApiError } from "../lib/api/client";
 import type { GitTarget } from "../lib/api/git";
-import { useGitWorkspaceSubscription } from "./useGit";
+import { readWorkspace, useGitWorkspaceSubscription } from "./useGit";
 
 export type GitStagingActionInput = GitStagingAction;
 
@@ -76,7 +76,12 @@ function useStagingScope(target: GitTarget) {
 	);
 	const readPrincipal = () => qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
 	const principal = useSyncExternalStore(subscribe, readPrincipal, readPrincipal);
-	const scopeKey = JSON.stringify([target.narratorId, target.workspaceKey, principal]);
+	const scopeKey = JSON.stringify([
+		target.narratorId,
+		target.workspaceKey,
+		principal,
+		subscriptions.getAuthorizationKey(target),
+	]);
 	const owner = useMemo(() => ({ live: true, scopeKey }), [scopeKey]);
 	useEffect(() => {
 		owner.live = true;
@@ -87,11 +92,18 @@ function useStagingScope(target: GitTarget) {
 	const current = useRef(owner);
 	current.current = owner;
 	const refused = subscriptions.isDenied(target);
-	const readable = typeof principal === "string" && !refused;
+	const readable = typeof principal === "string" && subscriptions.canRead(target);
+	const displayAllowed =
+		readable ||
+		(typeof principal === "string" &&
+			subscriptions.getState(target) === "waiting" &&
+			!subscriptions.needsWorkspaceProbe(target.narratorId) &&
+			!subscriptions.getReadError(target));
 	async function read<T>(signal: AbortSignal, load: () => Promise<T>, shared = false): Promise<T> {
 		const authorized = subscriptions.getWriteResultGuard(target);
+		if (!authorized() || signal.aborted) throw new GitStagingGuardError();
 		try {
-			const result = await load();
+			const result = await readWorkspace(qc, target, load, true, signal);
 			if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 			// Shared file reads belong to the query, not the observer that started it.
 			if (
@@ -102,12 +114,25 @@ function useStagingScope(target: GitTarget) {
 				throw new GitStagingGuardError();
 			return result;
 		} catch (error) {
-			if (error instanceof ApiError && [401, 403].includes(error.status))
-				subscriptions.reject(target);
+			if (authorized() && error instanceof ApiError) {
+				if (error.status === 403) subscriptions.reject(target);
+				else if ([401, 404].includes(error.status)) subscriptions.unavailable(target, true);
+			}
 			throw error;
 		}
 	}
-	return { qc, subscriptions, principal, scopeKey, owner, current, refused, readable, read };
+	return {
+		qc,
+		subscriptions,
+		principal,
+		scopeKey,
+		owner,
+		current,
+		refused,
+		readable,
+		displayAllowed,
+		read,
+	};
 }
 
 export function useGitStagingLists(target: GitTarget) {
@@ -127,9 +152,10 @@ export function useGitStagingLists(target: GitTarget) {
 		// Recheck offline CLI observations on return, without a permanent polling loop.
 		refetchOnWindowFocus: "always",
 	});
-	const summary = readable ? query.data : undefined;
+	const summary = scope.displayAllowed ? query.data : undefined;
 	const supported = summary?.capability.supported === true;
-	const canManage = supported && readable && target.canWrite && !query.error;
+	const canManage =
+		supported && readable && subscriptions.canWrite(target) && target.canWrite && !query.error;
 	const observation = subscriptions.getStagingObservation(target);
 	const selectionKey = JSON.stringify([scopeKey, subscriptions.getStagingSelectionKey(target)]);
 	const writable = canManage && subscriptions.isStagingWritable(target, summary);
@@ -161,6 +187,7 @@ export function useGitStagingLists(target: GitTarget) {
 				!chosen ||
 				chosen.scopeKey !== scopeKey ||
 				!state.canManage ||
+				!subscriptions.canWrite(target) ||
 				(!maintenance &&
 					(!state.writable ||
 						!subscriptions.isStagingWritable(target, state.summary) ||
@@ -192,10 +219,24 @@ export function useGitStagingLists(target: GitTarget) {
 				action.action === "sync" ? subscriptions.holdStagingObservation(target) : undefined;
 			let result: GitStagingActionResult;
 			try {
-				result = await api.gitStagingAction(target, action);
+				result = await readWorkspace(
+					qc,
+					target,
+					async () => {
+						try {
+							return await api.gitStagingAction(target, action);
+						} catch (error) {
+							if (!live()) throw new GitStagingGuardError();
+							throw error;
+						}
+					},
+					true,
+				);
 			} catch (error) {
-				if (error instanceof ApiError && [401, 403].includes(error.status))
-					subscriptions.reject(target);
+				if (authorized() && error instanceof ApiError) {
+					if (error.status === 403) subscriptions.reject(target);
+					else if ([401, 404].includes(error.status)) subscriptions.unavailable(target, true);
+				}
 				// CAS failures and uncertain writes must retire the user's stale selection too.
 				if (live() && error instanceof ApiError && error.status === 409) {
 					const code = error.data?.code;
@@ -271,6 +312,13 @@ export function useGitStagingLists(target: GitTarget) {
 		selectionKey,
 		refused,
 		scopeKey,
+		displayScope: JSON.stringify([
+			target.narratorId,
+			target.workspaceKey,
+			principal,
+			subscriptions.getPrincipalKey(),
+		]),
+		preferenceKey: JSON.stringify([target.narratorId, target.workspaceKey, principal]),
 		notice: readable && notice?.scopeKey === scopeKey ? notice : undefined,
 		refresh,
 	};
@@ -320,7 +368,7 @@ export function useGitStagingFiles(
 			scope.current.current === scope.owner &&
 			scope.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id === scope.principal &&
 			scope.subscriptions.isVisible() &&
-			!scope.subscriptions.isDenied(target),
+			scope.subscriptions.canRead(target),
 		[queryKey, scope.owner, scope.current, scope.qc, scope.principal, scope.subscriptions, target],
 	);
 	// Every Infinite Query fetch has one signal, including all pages of a refetch.
@@ -332,7 +380,7 @@ export function useGitStagingFiles(
 			if (
 				!readable ||
 				scope.qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id !== scope.principal ||
-				scope.subscriptions.isDenied(target) ||
+				!scope.subscriptions.canRead(target) ||
 				!scope.subscriptions.isVisible() ||
 				signal.aborted
 			)
