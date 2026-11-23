@@ -32,7 +32,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
-import { type ReadQueryOptions, readQuery } from "../db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 
 const exactRefCounts = new Map<string, { version: number; count: number }>();
 const EXACT_COUNT_CACHE_LIMIT = 256;
@@ -41,7 +41,9 @@ const EXACT_COUNT_CACHE_LIMIT = 256;
 export async function countNarratorMessageRefs(
 	narratorId: string,
 	messageVersion?: number,
+	options: Pick<ReadQueryOptions, "deadlineAt" | "signal"> = {},
 ): Promise<number> {
+	options.signal?.throwIfAborted();
 	const cached = exactRefCounts.get(narratorId);
 	if (messageVersion !== undefined && cached?.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
@@ -50,15 +52,23 @@ export async function countNarratorMessageRefs(
 	}
 	// Count and version are observed in one statement; never seed a cache under
 	// a pre-await version or use the insert-only messageCount high-water mark.
-	const row = await db
-		.select({
-			version: narrators.messageVersion,
-			count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
-			WHERE exact_refs.narrator_id = ${narratorId})`,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				version: narrators.messageVersion,
+				count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
+				WHERE exact_refs.narrator_id = ${narratorId})`,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{
+			...options,
+			diagnosticSource: "narrators.message-count.exact",
+			executionPolicy: "worker-required",
+			maxRows: 1,
+		},
+	);
 	if (row && messageVersion !== undefined && row.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
 		exactRefCounts.set(narratorId, { version: row.version, count: row.count });

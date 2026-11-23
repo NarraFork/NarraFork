@@ -1,8 +1,13 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
+import * as readPool from "../../lib/db-worker/pool";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 await import("../narrator-service");
@@ -75,6 +80,7 @@ afterAll(() => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	cleanDb(sqlite);
+	dispose();
 });
 
 describe("request-local narrator loading", () => {
@@ -172,12 +178,14 @@ describe("request-local narrator loading", () => {
 		await expect(
 			narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
 		).rejects.toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
-		const read = displayReaderModule.readDisplayFixtureMessages;
-		spyOn(displayReaderModule, "readDisplayFixtureMessages").mockImplementation(async (...args) => {
-			const result = await read(...args);
-			sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
-			return result;
-		});
+		const read = displayReaderModule.readNarratorDisplayMessages;
+		spyOn(displayReaderModule, "readNarratorDisplayMessages").mockImplementation(
+			async (...args) => {
+				const result = await read(...args);
+				sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-top'").run();
+				return result;
+			},
+		);
 		await expect(
 			narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
 		).rejects.toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
@@ -216,10 +224,11 @@ describe("request-local narrator loading", () => {
 			.prepare("UPDATE narrators SET message_count = 99, message_version = 7 WHERE id = 'n1'")
 			.run();
 		const queries = queryTrace();
+		const dispatch = spyOn(readPool, "runReadTask");
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
-		const afterFirst = queries.length;
+		const afterFirst = dispatch.mock.calls.length;
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
-		expect(queries.length).toBe(afterFirst);
+		expect(dispatch.mock.calls).toHaveLength(afterFirst);
 		sqlite.prepare("DELETE FROM narrator_message_refs WHERE id = 'ref-two'").run();
 		sqlite.prepare("UPDATE narrators SET message_version = 8 WHERE id = 'n1'").run();
 		expect(await countNarratorMessageRefs("n1", 8)).toBe(1);
@@ -227,9 +236,71 @@ describe("request-local narrator loading", () => {
 			narrator(`evict-${i}`);
 			await countNarratorMessageRefs(`evict-${i}`, 0);
 		}
-		const beforeReload = queries.length;
+		const beforeReload = dispatch.mock.calls.length;
 		expect(await countNarratorMessageRefs("n1", 8)).toBe(1);
-		expect(queries.length).toBe(beforeReload + 1);
+		expect(dispatch.mock.calls).toHaveLength(beforeReload + 1);
+		expect(queries.some((query) => query.includes("exact_refs"))).toBe(false);
+	});
+
+	test.each([
+		"create",
+		"run",
+		"timeout",
+		"disabled",
+	] as const)("detail reads fail closed when the SQLite Worker cannot %s", async (failure) => {
+		narrator("failure-parent");
+		narrator("failure-child", "viewer", null, "failure-parent", "subagent:general");
+		const directory = mkdtempSync(join(tmpdir(), "nf-detail-worker-"));
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		await readPool.resetDbWorkerPoolForTest();
+		const queries = queryTrace();
+		try {
+			if (failure === "disabled") process.env.NARRAFORK_DB_WORKER = "off";
+			else {
+				const path = join(directory, "worker.ts");
+				if (failure !== "create")
+					writeFileSync(
+						path,
+						`import { parentPort } from "node:worker_threads";
+							parentPort.on("message", ({ type, requestId }) => {
+								if (type !== "task") return;
+								${failure === "run" ? 'parentPort.postMessage({type:"error", requestId, code:"DB_READ_FAILED", message:"fixture read failure"});' : ""}
+							});
+							parentPort.postMessage({type:"ready"});`,
+					);
+				readPool.setDbWorkerSpecifiersForTest([pathToFileURL(path).href]);
+			}
+			const code =
+				failure === "timeout"
+					? "DB_READ_TASK_TIMEOUT"
+					: failure === "run"
+						? "DB_READ_FAILED"
+						: "DB_READ_UNAVAILABLE";
+			const options = { deadlineAt: Date.now() + (failure === "timeout" ? 500 : 3000) };
+			const result = await Promise.allSettled([
+				countNarratorMessageRefs("failure-child", undefined, options),
+				getNarratorNavigationSummary(
+					{
+						id: "failure-child",
+						parentNarratorId: "failure-parent",
+						variant: "subagent:general",
+						contextProjectId: null,
+					},
+					{ userId: "viewer", isAdmin: false },
+					options,
+				),
+			]);
+			expect(result).toEqual([
+				{ status: "rejected", reason: expect.objectContaining({ code }) },
+				{ status: "rejected", reason: expect.objectContaining({ code }) },
+			]);
+			expect(queries).toHaveLength(0);
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+			await readPool.resetDbWorkerPoolForTest();
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("navigation uses only readable parent and project summaries", async () => {

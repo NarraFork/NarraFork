@@ -2088,10 +2088,11 @@ narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator =
 		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const detailRead = { signal: c.req.raw.signal, deadlineAt: Date.now() + 30_000 };
 	const [hasDraft, navigationSummary, messageCount, fastMode] = await Promise.all([
 		narratorHasDraft(c.get("user").sub, id),
-		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c)),
-		countNarratorMessageRefs(id, narrator.messageVersion),
+		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c), detailRead),
+		countNarratorMessageRefs(id, narrator.messageVersion, detailRead),
 		resolveNarratorFastMode(id, { signal: c.req.raw.signal }),
 	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
