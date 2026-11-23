@@ -405,6 +405,12 @@ export interface McpToolPermission {
 	enabled?: boolean;
 }
 
+export interface McpOAuthConfig {
+	/** Pre-registered client id; omitted means dynamic client registration. */
+	clientId?: string;
+	scope?: string;
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -424,6 +430,8 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
+	/** sse/streamable-http: OAuth client settings; tokens and secrets live in mcp-oauth.json. */
+	oauth?: McpOAuthConfig;
 	/** Authoritative loading policy; absent only on legacy input. */
 	mode?: McpLoadingMode;
 	/** Compatibility projection of mode !== disabled. */
