@@ -1,5 +1,6 @@
 import { applyMcpLoadingPatch } from "@shared/mcp-loading-mode";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
 import { reportMutationError } from "../lib/query-client";
@@ -160,6 +161,58 @@ export function useConnectMcpServer() {
 	return useMutation({
 		mutationFn: api.mcpConnectServer,
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
+	});
+}
+
+/**
+ * Authorize a remote MCP server via OAuth. The window is opened synchronously in
+ * the click so popup blockers allow it, then pointed at the authorization URL;
+ * the server list refreshes once the window closes.
+ */
+export function useAuthorizeMcpServer() {
+	const qc = useQueryClient();
+	const mutation = useMutation({
+		mutationFn: api.mcpStartOAuth,
+		onError: (err) => reportMutationError(err),
+	});
+	const { mutate } = mutation;
+	const authorize = useCallback(
+		(id: string) => {
+			const popup = window.open("about:blank", "_blank");
+			if (popup) popup.opener = null;
+			const refresh = () => qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+			mutate(id, {
+				onSuccess: (result) => {
+					if (!("authorizationUrl" in result)) {
+						popup?.close();
+						void refresh();
+						return;
+					}
+					if (!popup) {
+						window.location.assign(result.authorizationUrl);
+						return;
+					}
+					popup.location.href = result.authorizationUrl;
+					const timer = window.setInterval(() => {
+						if (!popup.closed) return;
+						window.clearInterval(timer);
+						void refresh();
+					}, 1000);
+				},
+				onError: () => popup?.close(),
+			});
+		},
+		[mutate, qc],
+	);
+	return { authorize, isPending: mutation.isPending, pendingId: mutation.variables };
+}
+
+export function useSignOutMcpServer() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.mcpSignOutOAuth,
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
+		onError: (err) => reportMutationError(err),
 	});
 }
 
