@@ -161,7 +161,11 @@ export function watchNoticeFromTask(task: {
 	const targetStatus = watchResultTargetStatus(preview);
 	const outcome = watchNoticeOutcome(task.status, preview, targetStatus, targetType);
 	const [header, ...rest] = preview.split(/\n\s*\n/);
-	const body =
-		targetStatus || isWatchDeadlineOutput(header) ? rest.join("\n\n").trim() || preview : preview;
+	// Only a one-line result header is dropped; a terminal deadline runs straight into its
+	// observed output, which may itself contain blank lines.
+	const strip =
+		!header.includes("\n") &&
+		(targetStatus !== null || header.startsWith(WATCH_DEADLINE_OUTPUT_PREFIX));
+	const body = strip ? rest.join("\n\n").trim() || preview : preview;
 	return { ...identity, outcome, body };
 }

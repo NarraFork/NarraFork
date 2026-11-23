@@ -106,6 +106,19 @@ describe("watchNoticeFromTask", () => {
 		).toBe("replaced");
 	});
 
+	test("keeps a terminal deadline's observed output, blank lines included", () => {
+		const preview =
+			'Terminal watch timed out: "ready" did not appear in terminal "dev". The command may still be running.\nLast observed output:\nfirst\n\nsecond';
+		expect(
+			watchNoticeFromTask({
+				title: "watch dev: ready",
+				status: "timeout",
+				preview,
+				watch: "terminal",
+			}),
+		).toMatchObject({ outcome: "deadline", body: preview });
+	});
+
 	test("leaves ordinary bash completions alone", () => {
 		expect(
 			watchNoticeFromTask({ title: "bun test", status: "completed", preview: "ok" }),
