@@ -1,10 +1,14 @@
 import { hasInboxKind } from "./inbox";
 
-/** Live background work the session started (Bash tasks, Watch observations, subagents) or a question a person has yet to answer: each wakes it when it settles. */
+/**
+ * Live background work the session started whose completion wakes it (Bash tasks, Watch
+ * observations, subagents; never transfers or services), or a question a person has yet
+ * to answer.
+ */
 export async function hasPendingWork(narratorId: string): Promise<boolean> {
-	const { backgroundTaskService } = await import("../background-task-service");
-	if ((await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0)
-		return true;
+	const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+	await backgroundOccupancyStore.flush();
+	if (backgroundOccupancyStore.countActiveWakeWork(narratorId) > 0) return true;
 	const { countOpenAsyncQuestions } = await import("../narrator-question-service");
 	return (await countOpenAsyncQuestions(narratorId)) > 0;
 }
