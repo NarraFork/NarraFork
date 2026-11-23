@@ -6,6 +6,7 @@ import {
 	oauthGrants,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import {
 	adaptOAuthScope,
 	adaptPluginCapability,
@@ -71,16 +72,20 @@ function countValue(row: { value: number } | undefined): number {
 }
 
 async function countConnectedApps(userId: string) {
-	const [activeRows, revokedRows] = await Promise.all([
+	const activeRows = await readQuery(
 		db
 			.select({ value: count() })
 			.from(oauthGrants)
 			.where(and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt))),
+		{ executionPolicy: "worker-required" },
+	);
+	const revokedRows = await readQuery(
 		db
 			.select({ value: count() })
 			.from(oauthGrants)
 			.where(and(eq(oauthGrants.userId, userId), isNotNull(oauthGrants.revokedAt))),
-	]);
+		{ executionPolicy: "worker-required" },
+	);
 	return {
 		active: countValue(activeRows[0]),
 		revoked: countValue(revokedRows[0]),
@@ -134,88 +139,126 @@ async function getAdminSummary() {
 		revokedResourceRows,
 		externalDeviceRows,
 		externalNarratorRows,
-	] = await Promise.all([
-		getPluginSummary(),
-		db.select({ value: count() }).from(oauthClients),
-		db.select({ value: count() }).from(oauthClients).where(isNull(oauthClients.revokedAt)),
-		db.select({ value: count() }).from(oauthClients).where(isNotNull(oauthClients.revokedAt)),
-		db.select({ value: count() }).from(remoteDevices).where(isNull(remoteDevices.revokedAt)),
-		db
-			.select({ value: count() })
-			.from(remoteDevices)
-			.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "online"))),
-		db
-			.select({ value: count() })
-			.from(remoteDevices)
-			.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "offline"))),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					ne(integrationResourceBindings.state, "deleted"),
+	] = [
+		await getPluginSummary(),
+		await readQuery(db.select({ value: count() }).from(oauthClients), {
+			executionPolicy: "worker-required",
+		}),
+		await readQuery(
+			db.select({ value: count() }).from(oauthClients).where(isNull(oauthClients.revokedAt)),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db.select({ value: count() }).from(oauthClients).where(isNotNull(oauthClients.revokedAt)),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db.select({ value: count() }).from(remoteDevices).where(isNull(remoteDevices.revokedAt)),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(remoteDevices)
+				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "online"))),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(remoteDevices)
+				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "offline"))),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "orphaned"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "orphaned"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "active"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "active"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "orphaned"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "orphaned"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "revoked"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "revoked"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.resourceType, "device"),
-					ne(integrationResourceBindings.state, "deleted"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.resourceType, "device"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					ne(integrationResourceBindings.state, "deleted"),
+			{ executionPolicy: "worker-required" },
+		),
+		await readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
-	]);
+			{ executionPolicy: "worker-required" },
+		),
+	];
 
 	return {
 		plugins,

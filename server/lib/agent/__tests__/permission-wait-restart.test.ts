@@ -21,15 +21,19 @@
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { and, eq, isNull } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../../db/schema";
+import { getNarratorWorkerTestDb } from "../../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ ...realDbModule, db, sqlite }));
 afterAll(() => {

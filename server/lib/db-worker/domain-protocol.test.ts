@@ -10,13 +10,42 @@ import { runDomainRead } from "./domain-task-registry";
 import { ReadBudgetMeter } from "./read-budget";
 
 describe("registered database read domains", () => {
-	test("only foundation read tasks cross the fixed registry", () => {
+	test("only registered read tasks cross the fixed registry", () => {
 		expect(createDomainReadParams("readerProbe", null)).toEqual({
 			kind: "domainRead",
 			task: "readerProbe",
 			input: null,
 		});
 		expect(() => createDomainReadParams("readerProbe", {} as never)).toThrow();
+		const input = {
+			authorityId: "authority",
+			includeExpired: false,
+			now: "2026-01-01T00:00:00.000Z",
+		};
+		expect(createDomainReadParams("platformIntegrationAuthoritySnapshot", input)).toEqual({
+			kind: "domainRead",
+			task: "platformIntegrationAuthoritySnapshot",
+			input,
+		});
+		for (const invalid of [
+			null,
+			[],
+			{},
+			{ ...input, unexpected: true },
+			{ ...input, authorityId: "" },
+			{ ...input, authorityId: " " },
+			{ ...input, authorityId: "a".repeat(257) },
+			{ ...input, authorityId: "界".repeat(100) },
+			...["\u0000", "\n", "\r"].map((char) => ({ ...input, authorityId: `a${char}` })),
+			{ ...input, includeExpired: 1 },
+			{ ...input, now: "invalid" },
+			{ ...input, now: "2026" },
+			{ ...input, now: "2026-99-99T00:00:00.000Z" },
+		]) {
+			expect(() =>
+				createDomainReadParams("platformIntegrationAuthoritySnapshot", invalid as never),
+			).toThrow();
+		}
 		for (const task of [
 			"narratorBodyTexts",
 			"benchmarkSuiteListSnapshot",

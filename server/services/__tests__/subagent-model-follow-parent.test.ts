@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { FOLLOW_PARENT_MODEL } from "../../../shared/model-inheritance";
 import type { AgentConfig } from "../../lib/agent";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const CHILD_ENV = "NARRAFORK_SUBAGENT_MODEL_FOLLOW_TEST_CHILD";
 
@@ -534,8 +535,10 @@ if (process.env[CHILD_ENV] !== "1") {
 						expect(configs.at(-1)?.reasoningEffort).toBe("max");
 					}
 					await expect(
-						spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
-					).rejects.toThrow("No candidate model");
+						await captureWorkerRejectionThrower(
+							spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
+						),
+					).toThrow("No candidate model");
 				});
 			}
 		}
@@ -639,8 +642,10 @@ if (process.env[CHILD_ENV] !== "1") {
 					pools: { general: [] },
 				});
 				await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
-				await expect(drive(child.id, entry)).rejects.toThrow("No models are allowed");
-				await expect(spawn()).rejects.toThrow("No models are allowed");
+				await expect(await captureWorkerRejectionThrower(drive(child.id, entry))).toThrow(
+					"No models are allowed",
+				);
+				await expect(await captureWorkerRejectionThrower(spawn())).toThrow("No models are allowed");
 				expect(configs).toHaveLength(1);
 				expect((await narratorService.getById(child.id)).model).toBe(FOLLOW_PARENT_MODEL);
 				expect((await narratorService.getById(child.id)).status).toBe("idle");

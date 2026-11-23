@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { decodeBlockMessage } from "@frontend/lib/block-protocol";
 import { messageBlocks, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	aclGrants,
 	narratorMessageRefs,
@@ -12,8 +12,12 @@ import {
 	users,
 } from "../../db/schema";
 import { AppError } from "../../lib/errors";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { narratorContext } = await import("../narrator-context");

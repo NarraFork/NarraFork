@@ -7,6 +7,7 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { captureWorkerRejection } from "./__tests__/narrator-worker-fixture";
 
 const spawnModule = await import("../lib/spawn");
 let repo = "";
@@ -322,7 +323,9 @@ test("ordinary index lock churn preserves directory identity, while same-path Gi
 	await rename(join(repo, ".git"), join(repo, "old-git"));
 	await mkdir(join(repo, ".git"));
 	await writeFile(join(repo, ".git/HEAD"), "ref: refs/heads/main\n");
-	await expect(authorize("write")).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize("write"))).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	expect(gitCalls).toBe(0);
 	// Only an ordinary, explicit target resolution can establish the replacement.
 	await authorize("read", false);
@@ -341,17 +344,23 @@ test("cwd revisions, ancestor repository markers and retargeted root symlinks ca
 	await authorize("read", false);
 	gitCalls = 0;
 	await mkdir(join(repo, "sub/.git"));
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	await rm(join(repo, "sub/.git"), { recursive: true });
 	await db.update(narrators).set({ workspaceRevision: 1 }).where(eq(narrators.id, narratorId));
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	expect(gitCalls).toBe(0);
 	await authorize("read", false);
 	gitCalls = 0;
 	await rename(repo, join(root, "old-root"));
 	await mkdir(join(root, "replacement/.git"), { recursive: true });
 	await symlink(join(root, "replacement"), repo);
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	expect(gitCalls).toBe(0);
 });
 
@@ -362,7 +371,9 @@ test("fresh ACL and compiled policy are never replaced by metadata discovery", a
 		throw new AppError("Policy revoked", 403, "GIT_WORKSPACE_ACCESS_DENIED");
 	});
 	try {
-		await expect(authorize("write")).rejects.toMatchObject({ statusCode: 403 });
+		await expect(await captureWorkerRejection(authorize("write"))).toMatchObject({
+			statusCode: 403,
+		});
 	} finally {
 		policy.mockRestore();
 	}
@@ -371,7 +382,7 @@ test("fresh ACL and compiled policy are never replaced by metadata discovery", a
 		.insert(users)
 		.values({ id: stranger, username: stranger, passwordHash: "fixture", createdAt: now() });
 	await db.update(narrators).set({ ownerUserId: stranger }).where(eq(narrators.id, narratorId));
-	await expect(authorize()).rejects.toMatchObject({ statusCode: 404 });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({ statusCode: 404 });
 	expect(gitCalls).toBe(0);
 });
 
@@ -387,13 +398,19 @@ test("gitfile pointer replacement and bounded-read overflow fail closed without 
 	gitCalls = 0;
 	expect((await authorize()).workspace.state).toBe("ready");
 	await writeFile(join(gitDir, "gitdir"), `${join(root, "wrong/.git")}\n`);
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	await writeFile(join(gitDir, "gitdir"), `${join(repo, ".git")}\n`);
 	expect((await authorize()).workspace.state).toBe("ready");
 	await writeFile(join(repo, ".git"), "gitdir: elsewhere\n");
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	await writeFile(join(repo, ".git"), "x".repeat(4097));
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	expect(gitCalls).toBe(0);
 });
 
@@ -442,8 +459,7 @@ test("remote targets retain live ordinary discovery and device authorization", a
 	expect(refreshed.discoveryRuntimeGeneration).toBe(2);
 	expect(probes).toBe(4);
 	await db.update(remoteDevices).set({ revokedAt: now() }).where(eq(remoteDevices.id, deviceId));
-	const revoked = await authorize().catch((error: unknown) => error);
-	expect(revoked).toMatchObject({ statusCode: 403 });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({ statusCode: 403 });
 	expect(probes).toBe(4);
 	expect(gitCalls).toBe(0);
 });
@@ -512,6 +528,8 @@ test("the bounded metadata binding capacity preserves existing targets and refus
 	narratorId = first;
 	expect((await authorize()).workspace.state).toBe("ready");
 	narratorId = extraIds.at(-1) ?? first;
-	await expect(authorize()).rejects.toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+	await expect(await captureWorkerRejection(authorize())).toMatchObject({
+		code: "GIT_WORKSPACE_CHANGED",
+	});
 	expect(gitCalls).toBe(0);
 }, 30_000);

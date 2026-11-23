@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Hono } from "hono";
-import { cleanDb, getFileTestDb } from "../../../tests/setup";
-import * as readPool from "../../lib/db-worker/pool";
+import { cleanDb } from "../../../tests/setup";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite, dispose } = getFileTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 await import("../narrator-service");
@@ -18,6 +20,7 @@ const { narratorMessageQueries } = await import("../narrator-messages");
 const { narratorRoutes } = await import("../../routes/narrators");
 const gitSummaryModule = await import("../narrator-git-summary");
 const displayReaderModule = await import("../narrator-display-page-reader");
+const workerPool = await import("../../lib/db-worker/pool");
 const time = "2026-10-12T00:00:00.000Z";
 /** `project` places the narrator in a project through its cwd's index link. */
 function narrator(
@@ -39,8 +42,15 @@ function narrator(
 			)
 			.run(id, project, time);
 }
-function queryTrace() {
+function queryTrace(includeWorkers = false) {
 	const queries: string[] = [];
+	if (includeWorkers) {
+		const run = workerPool.runReadTask;
+		spyOn(workerPool, "runReadTask").mockImplementation((...args) => {
+			if (args[1].kind === "selectRows") queries.push(args[1].sql);
+			return run(...args);
+		});
+	}
 	const prepare = sqlite.prepare.bind(sqlite);
 	spyOn(sqlite, "prepare").mockImplementation((...args: Parameters<typeof sqlite.prepare>) => {
 		queries.push(args[0]);
@@ -76,11 +86,11 @@ beforeEach(() => {
 			)
 			.run(id, id, time);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	cleanDb(sqlite);
-	dispose();
+	await fixture.close();
 });
 
 describe("request-local narrator loading", () => {
@@ -176,8 +186,10 @@ describe("request-local narrator loading", () => {
 		const cancelled = new AbortController();
 		cancelled.abort();
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
-		).rejects.toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", { signal: cancelled.signal }),
+			),
+		).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
 		const read = displayReaderModule.readNarratorDisplayMessages;
 		spyOn(displayReaderModule, "readNarratorDisplayMessages").mockImplementation(
 			async (...args) => {
@@ -187,8 +199,10 @@ describe("request-local narrator loading", () => {
 			},
 		);
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
-		).rejects.toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
+			),
+		).toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
 	});
 	test("read middleware snapshot is reusable without a second query, never as write, and require remains fresh", async () => {
 		narrator("n1");
@@ -210,7 +224,7 @@ describe("request-local narrator loading", () => {
 			await requireNarratorAccess(c, "n1", "read");
 			return c.json({ leaked: true });
 		});
-		const queries = queryTrace();
+		const queries = queryTrace(true);
 		expect(await (await app.request("/read")).json()).toEqual({ id: "n1", write: false });
 		expect(queries.filter((query) => query.includes('from "narrators"'))).toHaveLength(1);
 		expect((await app.request("/fresh")).status).toBe(404);
@@ -224,7 +238,7 @@ describe("request-local narrator loading", () => {
 			.prepare("UPDATE narrators SET message_count = 99, message_version = 7 WHERE id = 'n1'")
 			.run();
 		const queries = queryTrace();
-		const dispatch = spyOn(readPool, "runReadTask");
+		const dispatch = spyOn(workerPool, "runReadTask");
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
 		const afterFirst = dispatch.mock.calls.length;
 		expect(await countNarratorMessageRefs("n1", 7)).toBe(2);
@@ -252,7 +266,7 @@ describe("request-local narrator loading", () => {
 		narrator("failure-child", "viewer", null, "failure-parent", "subagent:general");
 		const directory = mkdtempSync(join(tmpdir(), "nf-detail-worker-"));
 		const previous = process.env.NARRAFORK_DB_WORKER;
-		await readPool.resetDbWorkerPoolForTest();
+		await workerPool.resetDbWorkerPoolForTest();
 		const queries = queryTrace();
 		try {
 			if (failure === "disabled") process.env.NARRAFORK_DB_WORKER = "off";
@@ -268,7 +282,7 @@ describe("request-local narrator loading", () => {
 							});
 							parentPort.postMessage({type:"ready"});`,
 					);
-				readPool.setDbWorkerSpecifiersForTest([pathToFileURL(path).href]);
+				workerPool.setDbWorkerSpecifiersForTest([pathToFileURL(path).href]);
 			}
 			const code =
 				failure === "timeout"
@@ -298,7 +312,7 @@ describe("request-local narrator loading", () => {
 		} finally {
 			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = previous;
-			await readPool.resetDbWorkerPoolForTest();
+			await workerPool.resetDbWorkerPoolForTest();
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
@@ -430,9 +444,11 @@ describe("request-local narrator loading", () => {
 				.every((query) => !query.includes("password_hash")),
 		).toBe(true);
 		await expect(
-			narratorMessageQueries.getPretextDocumentPage("n1", {
-				messageVersion: page.messageVersion + 1,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
+			await captureWorkerRejection(
+				narratorMessageQueries.getPretextDocumentPage("n1", {
+					messageVersion: page.messageVersion + 1,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
 	});
 });

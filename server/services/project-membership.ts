@@ -12,16 +12,19 @@
  * otherwise left holding a UI full of things that will 404 on the next click.
  */
 
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { db } from "../db";
+import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { activeDatabaseBackend, db } from "../db";
 import { aclGrants, narrators, projects, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
 import { recordAclEvent } from "./acl/acl-audit";
+import { grantedScopeIdsWhere } from "./acl/acl-core";
 import { canManageProject, canWriteProject, type ProjectPrincipal } from "./project-acl";
+import { collectKeysetRows } from "./read/read-collect";
 import {
 	getRecentTabUserIds,
 	getRecentTabUserIdsForTeamTrees,
@@ -60,7 +63,44 @@ export interface ProjectAccessView {
 	canManage: boolean;
 }
 
-type ProjectRow = typeof projects.$inferSelect;
+type ProjectRow = Pick<typeof projects.$inferSelect, "id" | "ownerUserId" | "visibility">;
+type ProjectWriteTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Final authorization stays with the indexed mutation, never with the Worker pre-read. */
+function projectForManagedWrite(
+	tx: ProjectWriteTransaction,
+	projectId: string,
+	principal: ProjectPrincipal,
+): ProjectRow {
+	const grant = grantedScopeIdsWhere(
+		{ userId: principal.userId, role: principal.isAdmin ? "admin" : "user" },
+		"project",
+		"manage",
+		projects.id,
+	);
+	const manage = principal.isAdmin
+		? sql<number>`1`
+		: sql<number>`case when ${or(eq(projects.ownerUserId, principal.userId), grant)} then 1 else 0 end`;
+	const row = tx
+		.select({
+			id: projects.id,
+			ownerUserId: projects.ownerUserId,
+			visibility: projects.visibility,
+			canManage: manage.mapWith(Number),
+		})
+		.from(projects)
+		.where(eq(projects.id, projectId))
+		.limit(1)
+		.get();
+	if (!row) throw new NotFoundError("Project", projectId);
+	if (row.canManage !== 1)
+		throw new ValidationError(
+			row.ownerUserId === null
+				? "This project has no owner; an administrator must assign one before its membership can be changed"
+				: "Only the project owner, a manager or an administrator can change who may access this project",
+		);
+	return row;
+}
 
 /**
  * The `acl_grants` rows that mean "a person is a member of this project".
@@ -79,7 +119,14 @@ function projectMemberScope(projectId: string) {
 }
 
 async function loadProject(projectId: string): Promise<ProjectRow> {
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	const row = await readQueryFirst(
+		db.query.projects.findMany({
+			limit: 1,
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Project", projectId);
 	return row;
 }
@@ -105,25 +152,43 @@ export async function getProjectAccess(
 	principal: ProjectPrincipal,
 ): Promise<ProjectAccessView> {
 	const row = await loadProject(projectId);
-	const grants = await db
-		.select({
-			grantId: aclGrants.id,
-			userId: aclGrants.principalId,
-			role: aclGrants.capability,
-			createdAt: aclGrants.createdAt,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(aclGrants)
-		.leftJoin(users, eq(users.id, aclGrants.principalId))
-		.where(projectMemberScope(projectId));
+	const grants = await collectKeysetRows(
+		(after) =>
+			readQuery(
+				db
+					.select({
+						grantId: aclGrants.id,
+						userId: aclGrants.principalId,
+						role: aclGrants.capability,
+						createdAt: aclGrants.createdAt,
+						username: users.username,
+						avatarColor: users.avatarColor,
+						avatarImageId: users.avatarImageId,
+					})
+					.from(aclGrants)
+					.leftJoin(users, eq(users.id, aclGrants.principalId))
+					.where(
+						and(
+							projectMemberScope(projectId),
+							after === null ? undefined : gt(aclGrants.id, after),
+						),
+					)
+					.orderBy(asc(aclGrants.id))
+					.limit(200),
+				{ executionPolicy: "worker-required" },
+			),
+		(row) => row.grantId,
+	);
 
 	const owner = row.ownerUserId
-		? ((await db.query.users.findFirst({
-				where: eq(users.id, row.ownerUserId),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			})) ?? null)
+		? ((await readQueryFirst(
+				db.query.users.findMany({
+					limit: 1,
+					where: eq(users.id, row.ownerUserId),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)) ?? null)
 		: null;
 
 	// One row per (user, capability), so a user granted both read and write appears
@@ -173,10 +238,23 @@ export async function setProjectVisibility(
 	const row = await loadProject(projectId);
 	await assertCanManage(row, principal);
 	if (row.visibility !== visibility) {
-		await db
-			.update(projects)
-			.set({ visibility, updatedAt: new Date().toISOString() })
-			.where(eq(projects.id, projectId));
+		if (activeDatabaseBackend === "sqlite") {
+			db.transaction(
+				(tx) => {
+					projectForManagedWrite(tx, projectId, principal);
+					tx.update(projects)
+						.set({ visibility, updatedAt: new Date().toISOString() })
+						.where(eq(projects.id, projectId))
+						.run();
+				},
+				{ behavior: "immediate" },
+			);
+		} else {
+			await db
+				.update(projects)
+				.set({ visibility, updatedAt: new Date().toISOString() })
+				.where(eq(projects.id, projectId));
+		}
 		recordAclEvent({
 			actor: principal,
 			eventType: "project_visibility_changed",
@@ -231,15 +309,42 @@ export async function setProjectMembers(
 
 	// Preserve caller order while collapsing duplicates.
 	const wanted = [...new Set(userIds)];
-	const known = new Set(
-		(await db.select({ id: users.id }).from(users).where(inArray(users.id, wanted))).map(
-			(user) => user.id,
-		),
-	);
-	const held = await db
-		.select({ userId: aclGrants.principalId, role: aclGrants.capability, id: aclGrants.id })
-		.from(aclGrants)
-		.where(and(projectMemberScope(projectId), inArray(aclGrants.principalId, wanted)));
+	const known = new Set<string>();
+	const held: Array<{ userId: string; role: string; id: string }> = [];
+	for (let offset = 0; offset < wanted.length; offset += 100) {
+		const batch = wanted.slice(offset, offset + 100);
+		for (const user of await readQuery(
+			db.select({ id: users.id }).from(users).where(inArray(users.id, batch)),
+			{ executionPolicy: "worker-required" },
+		))
+			known.add(user.id);
+		if (activeDatabaseBackend !== "sqlite")
+			held.push(
+				...(await collectKeysetRows(
+					(after) =>
+						readQuery(
+							db
+								.select({
+									userId: aclGrants.principalId,
+									role: aclGrants.capability,
+									id: aclGrants.id,
+								})
+								.from(aclGrants)
+								.where(
+									and(
+										projectMemberScope(projectId),
+										inArray(aclGrants.principalId, batch),
+										after === null ? undefined : gt(aclGrants.id, after),
+									),
+								)
+								.orderBy(asc(aclGrants.id))
+								.limit(200),
+							{ executionPolicy: "worker-required" },
+						),
+					(row) => row.id,
+				)),
+			);
+	}
 	const heldByUser = new Map<string, { id: string; role: string }[]>();
 	for (const grant of held) {
 		const list = heldByUser.get(grant.userId) ?? [];
@@ -249,37 +354,80 @@ export async function setProjectMembers(
 
 	const outcome: ProjectMemberBatchOutcome = { added: [], skipped: [], failed: [] };
 	const now = new Date().toISOString();
-	for (const userId of wanted) {
-		if (!known.has(userId) || userId === row.ownerUserId) {
-			outcome.failed.push(userId);
-			continue;
+	if (activeDatabaseBackend === "sqlite") {
+		db.transaction(
+			(tx) => {
+				const current = projectForManagedWrite(tx, projectId, principal);
+				for (const userId of wanted) {
+					const status = ((): keyof ProjectMemberBatchOutcome => {
+						if (
+							!known.has(userId) ||
+							userId === current.ownerUserId ||
+							!tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1).get()
+						)
+							return "failed";
+						const held = tx
+							.select({ role: aclGrants.capability })
+							.from(aclGrants)
+							.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
+							.limit(2)
+							.all();
+						if (held.length === 1 && held[0].role === role) return "skipped";
+						tx.delete(aclGrants)
+							.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
+							.run();
+						tx.insert(aclGrants)
+							.values({
+								id: generateId(),
+								scopeType: "project",
+								scopeId: projectId,
+								principalType: "user",
+								principalId: userId,
+								capability: role,
+								grantedBy: principal.userId,
+								createdAt: now,
+							})
+							.run();
+						return "added";
+					})();
+					outcome[status].push(userId);
+				}
+				return outcome;
+			},
+			{ behavior: "immediate" },
+		);
+	} else
+		for (const userId of wanted) {
+			if (!known.has(userId) || userId === row.ownerUserId) {
+				outcome.failed.push(userId);
+				continue;
+			}
+			const existing = heldByUser.get(userId) ?? [];
+			if (existing.length === 1 && existing[0].role === role) {
+				outcome.skipped.push(userId);
+				continue;
+			}
+			// Replace whatever tier they had, so exactly one row survives per member.
+			if (existing.length > 0) {
+				await db.delete(aclGrants).where(
+					inArray(
+						aclGrants.id,
+						existing.map((grant) => grant.id),
+					),
+				);
+			}
+			await db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType: "project",
+				scopeId: projectId,
+				principalType: "user",
+				principalId: userId,
+				capability: role,
+				grantedBy: principal.userId,
+				createdAt: now,
+			});
+			outcome.added.push(userId);
 		}
-		const existing = heldByUser.get(userId) ?? [];
-		if (existing.length === 1 && existing[0].role === role) {
-			outcome.skipped.push(userId);
-			continue;
-		}
-		// Replace whatever tier they had, so exactly one row survives per member.
-		if (existing.length > 0) {
-			await db.delete(aclGrants).where(
-				inArray(
-					aclGrants.id,
-					existing.map((grant) => grant.id),
-				),
-			);
-		}
-		await db.insert(aclGrants).values({
-			id: generateId(),
-			scopeType: "project",
-			scopeId: projectId,
-			principalType: "user",
-			principalId: userId,
-			capability: role,
-			grantedBy: principal.userId,
-			createdAt: now,
-		});
-		outcome.added.push(userId);
-	}
 
 	if (outcome.added.length > 0) {
 		recordAclEvent({
@@ -306,10 +454,17 @@ export async function removeProjectMember(
 	const row = await loadProject(projectId);
 	await assertCanManage(row, principal);
 
-	const removed = await db
-		.delete(aclGrants)
-		.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
-		.returning({ id: aclGrants.id });
+	const scope = and(projectMemberScope(projectId), eq(aclGrants.principalId, userId));
+	const removed =
+		activeDatabaseBackend === "sqlite"
+			? db.transaction(
+					(tx) => {
+						projectForManagedWrite(tx, projectId, principal);
+						return tx.delete(aclGrants).where(scope).returning({ id: aclGrants.id }).all();
+					},
+					{ behavior: "immediate" },
+				)
+			: await db.delete(aclGrants).where(scope).returning({ id: aclGrants.id });
 	if (removed.length === 0) throw new NotFoundError("Project member", userId);
 
 	recordAclEvent({
@@ -357,17 +512,48 @@ export async function transferProjectOwner(
 		throw new ValidationError("Only an administrator can leave a project without an owner");
 	}
 	if (newOwnerUserId !== null) {
-		const target = await db.query.users.findFirst({
-			where: eq(users.id, newOwnerUserId),
-			columns: { id: true },
-		});
+		const target = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, newOwnerUserId),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!target) throw new NotFoundError("User", newOwnerUserId);
 	}
 
-	await db
-		.update(projects)
-		.set({ ownerUserId: newOwnerUserId, updatedAt: new Date().toISOString() })
-		.where(eq(projects.id, projectId));
+	if (activeDatabaseBackend === "sqlite") {
+		db.transaction(
+			(tx) => {
+				const current = projectForManagedWrite(tx, projectId, principal);
+				if (!principal.isAdmin && current.ownerUserId !== principal.userId)
+					throw new ValidationError(
+						"Only the current project owner or an administrator can transfer ownership",
+					);
+				if (
+					newOwnerUserId !== null &&
+					!tx
+						.select({ id: users.id })
+						.from(users)
+						.where(eq(users.id, newOwnerUserId))
+						.limit(1)
+						.get()
+				)
+					throw new NotFoundError("User", newOwnerUserId);
+				tx.update(projects)
+					.set({ ownerUserId: newOwnerUserId, updatedAt: new Date().toISOString() })
+					.where(eq(projects.id, projectId))
+					.run();
+			},
+			{ behavior: "immediate" },
+		);
+	} else {
+		await db
+			.update(projects)
+			.set({ ownerUserId: newOwnerUserId, updatedAt: new Date().toISOString() })
+			.where(eq(projects.id, projectId));
+	}
 
 	recordAclEvent({
 		actor: principal,
@@ -435,16 +621,19 @@ async function usersWithTabsInProject(projectId: string): Promise<string[]> {
 	// Bounded by the project's own narrators, and only the ids are read — no large
 	// fields.
 	const narratorIds = (
-		await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(
-				or(
-					eq(narrators.contextProjectId, projectId),
-					sql`${narrators.id} in (select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId})`,
-				),
-			)
-			.limit(TAB_SCAN_ENTITY_LIMIT)
+		await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(
+					or(
+						eq(narrators.contextProjectId, projectId),
+						sql`${narrators.id} in (select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId})`,
+					),
+				)
+				.limit(TAB_SCAN_ENTITY_LIMIT),
+			{ executionPolicy: "worker-required" },
+		)
 	).map((row) => row.id);
 	for (const narratorId of narratorIds) {
 		for (const userId of await getRecentTabUserIds("narrator", narratorId)) found.add(userId);
@@ -498,10 +687,15 @@ async function announceProjectAccessChange(
 	// used the knowledge base stay quiet.
 	if (recipients.size === 0) return;
 	try {
-		const inheriting = await db.query.knowledgeCollections.findFirst({
-			where: (c, { and: a, eq: e }) => a(e(c.projectId, projectId), e(c.inheritProjectGate, true)),
-			columns: { id: true },
-		});
+		const inheriting = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: (c, { and: a, eq: e }) =>
+					a(e(c.projectId, projectId), e(c.inheritProjectGate, true)),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!inheriting) return;
 		eventBus.emit({
 			type: "knowledge:acl_changed",

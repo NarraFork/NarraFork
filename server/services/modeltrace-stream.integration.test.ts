@@ -4,15 +4,21 @@ import { NotFoundError } from "@server/lib/errors";
 import { eq } from "drizzle-orm";
 import type { StreamingBlock } from "../../frontend/components/narrator/message/message-segments";
 import { applyStreamingDelta } from "../../frontend/components/narrator/streaming/streaming-delta-fold";
-import { getTestDb, readTestMessageContent } from "../../tests/setup";
+import { readTestMessageContent } from "../../tests/setup";
 import { apiRequests, narratorMessageRefs, narratorMessages, narrators, users } from "../db/schema";
 import {
 	forgetModelTraceRequest,
 	rememberModelTraceRequest,
 } from "../lib/agent/modeltrace-request";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "../lib/agent/provider";
+import {
+	captureWorkerRejection,
+	getNarratorWorkerTestDb,
+} from "./__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const dbStub = {
 	db,
 	sqlite,
@@ -120,7 +126,7 @@ afterEach(async () => {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 });
-afterAll(() => sqlite.close());
+afterAll(() => fixture.close());
 
 async function launch(options?: Parameters<typeof startModelTrace>[3]) {
 	await startModelTrace(parentId, userId, "en", options);
@@ -246,7 +252,9 @@ test.each([
 				})
 				.where(eq(narrators.id, parentId));
 		}
-		await expect(retryModelTrace(id, userId)).rejects.toBeInstanceOf(NotFoundError);
+		await expect(await captureWorkerRejection(retryModelTrace(id, userId))).toBeInstanceOf(
+			NotFoundError,
+		);
 		expect(chat).toHaveBeenCalledTimes(1);
 		assertReleased();
 	} finally {

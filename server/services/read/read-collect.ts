@@ -76,6 +76,25 @@ export function singlePage<T>(page: ReadPageResult<T>): CollectedRows<T> {
 	};
 }
 
+/** Collect complete metadata reads through strictly advancing, SQL-bounded keysets. */
+export async function collectKeysetRows<T>(
+	read: (after: string | null) => Promise<T[]>,
+	key: (row: T) => string,
+): Promise<T[]> {
+	const rows: T[] = [];
+	let after: string | null = null;
+	for (let page = 0; page < 20_000; page++) {
+		const next = await read(after);
+		if (!next.length) return rows;
+		const cursor = key(next[next.length - 1]);
+		if (after !== null && cursor <= after)
+			throw new Error("Database keyset cursor did not advance");
+		rows.push(...next);
+		after = cursor;
+	}
+	throw new Error("Database keyset read exceeded its page budget");
+}
+
 /** Parse `?limit`, ignoring absent and non-positive values. */
 export function parseLimitQuery(value: string | undefined): number | undefined {
 	const parsed = Number(value);

@@ -202,7 +202,7 @@ describe("OAuth device runtime authorization", () => {
 					deadlineAt,
 				}),
 			).toMatchObject({ allowed: true, grantId: ids.grant });
-			expect(reads.mock.calls).toHaveLength(5);
+			expect(reads.mock.calls).toHaveLength(4);
 			for (const [, , options] of reads.mock.calls) {
 				expect(options?.signal).toBe(request.signal);
 				expect(options?.deadlineAt).toBe(deadlineAt);
@@ -214,7 +214,7 @@ describe("OAuth device runtime authorization", () => {
 					deadlineAt,
 				}).catch((error: unknown) => error),
 			).toMatchObject({ message: "device request cancelled" });
-			expect(reads.mock.calls).toHaveLength(5);
+			expect(reads.mock.calls).toHaveLength(4);
 		} finally {
 			reads.mockRestore();
 		}

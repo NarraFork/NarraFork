@@ -60,6 +60,7 @@ import {
 } from "../nested-subagent-routing";
 import { listNestedSubagents, loadNestedSubagentSummaries } from "../subagent-nested";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const created: string[] = [];
 const userIds: string[] = [];
@@ -311,7 +312,9 @@ describe("depth backstops", () => {
 		const helperRow = await narratorService.getById(helper);
 		expect(parseRuntimePolicyTraits(helperRow.traits)[0]?.delegationDepth).toBe(2);
 		expect((await resolveNarratorRuntimePolicy(helper)).capabilities.spawnAgent).toBe(false);
-		await expect(subagent(helper, "general")).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+		expect(await captureWorkerRejectionThrower(subagent(helper, "general"))).toThrow(
+			DELEGATION_DEPTH_LIMIT_MESSAGE,
+		);
 		// Even when the helper's ceiling lost its stamp and was made unrestricted, the parent
 		// chain still places it at level 2.
 		await db
@@ -319,12 +322,16 @@ describe("depth backstops", () => {
 			.set({ traits: withRuntimePolicyTrait(["standalone"], { version: 1 }) })
 			.where(eq(narrators.id, helper));
 		resetTraitLayerCaches();
-		await expect(subagent(helper, "worker")).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+		expect(await captureWorkerRejectionThrower(subagent(helper, "worker"))).toThrow(
+			DELEGATION_DEPTH_LIMIT_MESSAGE,
+		);
 	});
 
 	test("creation: a general subagent still cannot spawn", async () => {
 		const { sibling } = await tree();
-		await expect(subagent(sibling, "general")).rejects.toThrow("capability ceiling");
+		expect(await captureWorkerRejectionThrower(subagent(sibling, "general"))).toThrow(
+			"capability ceiling",
+		);
 	});
 
 	test("control: the worker controls its helper; a level-2 narrator controls nobody", async () => {
@@ -349,9 +356,15 @@ describe("depth backstops", () => {
 			.set({ traits: withRuntimePolicyTrait(["standalone"], { version: 1 }) })
 			.where(eq(narrators.id, helper));
 		resetTraitLayerCaches();
-		await expect(
-			authorizeAgentControl({ callerNarratorId: helper, targetNarratorId: forged, action: "stop" }),
-		).rejects.toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
+		expect(
+			await captureWorkerRejectionThrower(
+				authorizeAgentControl({
+					callerNarratorId: helper,
+					targetNarratorId: forged,
+					action: "stop",
+				}),
+			),
+		).toThrow(DELEGATION_DEPTH_LIMIT_MESSAGE);
 	});
 
 	test("a read-only subagent cannot create a writable helper", async () => {
@@ -391,11 +404,13 @@ describe("reach", () => {
 		expect(await ids(primary, worker)).toEqual([worker]);
 		// The primary does not message its grandchildren; a helper does not reach its
 		// parent's siblings; a first-level sibling does not reach the worker's helpers.
-		await expect(ids(primary, helper)).rejects.toThrow("does not belong");
-		await expect(ids(helper, sibling)).rejects.toThrow("does not belong");
-		await expect(ids(sibling, helper)).rejects.toThrow("does not belong");
+		expect(await captureWorkerRejectionThrower(ids(primary, helper))).toThrow("does not belong");
+		expect(await captureWorkerRejectionThrower(ids(helper, sibling))).toThrow("does not belong");
+		expect(await captureWorkerRejectionThrower(ids(sibling, helper))).toThrow("does not belong");
 		const other = await tree();
-		await expect(ids(worker, other.helper)).rejects.toThrow("does not belong");
+		expect(await captureWorkerRejectionThrower(ids(worker, other.helper))).toThrow(
+			"does not belong",
+		);
 
 		// A helper reports to its parent (a subagent itself) through "parent".
 		const toParent = await sendSubagentMessageDetailed(sendInput(helper, ["parent"]));
@@ -424,11 +439,15 @@ describe("reach", () => {
 		await narratorService.updateStatus(helper, "idle");
 		const result = await wait(worker, helper);
 		expect(result.id).toBe(helper);
-		await expect(wait(worker, sibling)).rejects.toThrow("not a subagent this narrator launched");
-		await expect(wait(primary, helper)).rejects.toThrow("not a subagent this narrator launched");
+		expect(await captureWorkerRejectionThrower(wait(worker, sibling))).toThrow(
+			"not a subagent this narrator launched",
+		);
+		expect(await captureWorkerRejectionThrower(wait(primary, helper))).toThrow(
+			"not a subagent this narrator launched",
+		);
 		// A helper and an ordinary subagent may not wait for agents at all.
-		await expect(wait(helper, worker)).rejects.toThrow("Watch");
-		await expect(wait(sibling, worker)).rejects.toThrow("Watch");
+		expect(await captureWorkerRejectionThrower(wait(helper, worker))).toThrow("Watch");
+		expect(await captureWorkerRejectionThrower(wait(sibling, worker))).toThrow("Watch");
 	});
 });
 
@@ -626,13 +645,15 @@ describe("review round 1", () => {
 		const { worker, helper } = await tree();
 		await narratorService.updateStatus(helper, "working");
 		const helperRun = await backgroundRun(worker, helper);
-		await expect(
-			stopSubagentHelpers(worker, "test", {
-				assertAuthorized: () => {
-					throw new Error("revoked");
-				},
-			}),
-		).rejects.toThrow("revoked");
+		expect(
+			await captureWorkerRejectionThrower(
+				stopSubagentHelpers(worker, "test", {
+					assertAuthorized: () => {
+						throw new Error("revoked");
+					},
+				}),
+			),
+		).toThrow("revoked");
 		expect(helperRun.signal.aborted).toBe(false);
 	});
 
@@ -691,11 +712,15 @@ describe("review round 1", () => {
 		const mine = join(narraforkDir, "subagents", "my-helper");
 		try {
 			for (const name of ["Worker", "WORKER", " worker ", "General", "search"])
-				await expect(service.create({ ...def, name })).rejects.toThrow("built-in");
+				expect(await captureWorkerRejectionThrower(service.create({ ...def, name }))).toThrow(
+					"built-in",
+				);
 			await service.create({ ...def, name: "my-helper" });
-			await expect(service.update("my-helper", { ...def, name: "Worker" })).rejects.toThrow(
-				"built-in",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					service.update("my-helper", { ...def, name: "Worker" }),
+				),
+			).toThrow("built-in");
 			// Any spelling of a built-in name means the built-in, never a user's file.
 			for (const name of ["worker", "Worker", "WORKER"])
 				expect(await service.resolveTemplateDefinition(name)).toBeNull();
@@ -752,7 +777,7 @@ describe("review round 1", () => {
 			});
 			expect(failing).toEqual([]);
 			expect(await readFile(join(root, "general", "SUBAGENT.md"), "utf-8")).toBe(file("General"));
-			await expect(stat(join(root, "general-custom"))).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(stat(join(root, "general-custom")))).toThrow();
 
 			// A failing directory rename leaves the old directory, with its file already
 			// renamed: never a `-custom` directory whose file claims the reserved name.
@@ -765,17 +790,17 @@ describe("review round 1", () => {
 				},
 			});
 			expect(halfway).toEqual([]);
-			await expect(stat(join(root, "general-custom"))).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(stat(join(root, "general-custom")))).toThrow();
 
 			expect(await service.moveAsideReservedTemplates()).toEqual(["general-custom"]);
 			const moved = await service.resolveTemplateDefinition("general-custom");
 			expect(moved?.name).toBe("general-custom");
 			expect(moved?.prompt).toBe("My General prompt.");
-			await expect(stat(join(root, "general"))).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(stat(join(root, "general")))).toThrow();
 			// The symlinked directory is neither followed for the write nor moved.
 			expect((await lstat(join(root, "explore"))).isSymbolicLink()).toBe(true);
 			expect(await readFile(join(outside, "SUBAGENT.md"), "utf-8")).toBe(file("explore"));
-			await expect(stat(join(root, "explore-custom"))).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(stat(join(root, "explore-custom")))).toThrow();
 		} finally {
 			await cleanup();
 		}
@@ -799,7 +824,7 @@ describe("review round 1", () => {
 			await mkdir(join(root, "worker"), { recursive: true });
 			await writeFile(join(root, "worker", "SUBAGENT.md"), file);
 			expect(await service.moveAsideReservedTemplates()).toEqual(["worker-custom-2"]);
-			await expect(stat(join(root, "worker"))).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(stat(join(root, "worker")))).toThrow();
 			const moved = await service.resolveTemplateDefinition("worker-custom-2");
 			expect(moved?.name).toBe("worker-custom-2");
 			expect(moved?.prompt).toBe("My own worker prompt.");

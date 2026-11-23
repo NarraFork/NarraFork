@@ -26,6 +26,7 @@ import {
 	requireOwnedExternalDevice,
 	requireOwnedExternalNarrator,
 } from "../oauth-resource-access";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const now = new Date().toISOString();
 const userA = generateId();
@@ -633,31 +634,39 @@ describe("OAuth external resource access", () => {
 	});
 
 	test("rejects grant-less, authority-less, revoked-grant, and revoked-client principals", async () => {
-		await expect(requireExternalOAuthContext(principal({ grantId: null }))).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(requireExternalOAuthContext(principal({ grantId: null }))),
+		).toMatchObject({
 			statusCode: 403,
 			code: "OAUTH_GRANT_REQUIRED",
 		});
-		await expect(
-			requireExternalOAuthContext(
-				principal({
-					userId: userLegacy,
-					clientId: publicClientLegacy,
-					grantId: grantLegacy,
-				}),
+		expect(
+			await captureWorkerRejection(
+				requireExternalOAuthContext(
+					principal({
+						userId: userLegacy,
+						clientId: publicClientLegacy,
+						grantId: grantLegacy,
+					}),
+				),
 			),
-		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
-		await expect(
-			requireExternalOAuthContext(principal({ grantId: grantRevoked })),
-		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
-		await expect(
-			requireExternalOAuthContext(
-				principal({
-					userId: userRevokedClient,
-					clientId: publicRevokedClient,
-					grantId: grantRevokedClient,
-				}),
+		).toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
+		expect(
+			await captureWorkerRejection(
+				requireExternalOAuthContext(principal({ grantId: grantRevoked })),
 			),
-		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_CLIENT_FORBIDDEN" });
+		).toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
+		expect(
+			await captureWorkerRejection(
+				requireExternalOAuthContext(
+					principal({
+						userId: userRevokedClient,
+						clientId: publicRevokedClient,
+						grantId: grantRevokedClient,
+					}),
+				),
+			),
+		).toMatchObject({ statusCode: 403, code: "OAUTH_CLIENT_FORBIDDEN" });
 	});
 
 	test("enforces effective scopes and exact finite project membership", async () => {
@@ -700,12 +709,14 @@ describe("OAuth external resource access", () => {
 
 		// Cross-grant (grant B) and revoked resources remain hidden as 404.
 		for (const id of [deviceB, deviceRevokedA]) {
-			await expect(requireOwnedExternalDevice(ctx, id)).rejects.toMatchObject({
+			expect(await captureWorkerRejection(requireOwnedExternalDevice(ctx, id))).toMatchObject({
 				statusCode: 404,
 				code: "NOT_FOUND",
 			});
 		}
-		await expect(requireOwnedExternalNarrator(ctx, narratorB)).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(requireOwnedExternalNarrator(ctx, narratorB)),
+		).toMatchObject({
 			statusCode: 404,
 			code: "NOT_FOUND",
 		});
@@ -715,16 +726,18 @@ describe("OAuth external resource access", () => {
 		const ctx = await requireExternalOAuthContext(principal());
 		const ownedProjectDevice = await requireOwnedExternalDevice(ctx, deviceA);
 		const ownedGlobalDevice = await requireOwnedExternalDevice(ctx, deviceGlobalA);
-		await expect(assertExternalDeviceBinding(ctx, ownedProjectDevice)).resolves.toBeUndefined();
-		await expect(assertExternalDeviceBinding(ctx, ownedGlobalDevice)).resolves.toBeUndefined();
+		expect(await assertExternalDeviceBinding(ctx, ownedProjectDevice)).toBeUndefined();
+		expect(await assertExternalDeviceBinding(ctx, ownedGlobalDevice)).toBeUndefined();
 		// Same grant, different project is now allowed (project no longer a boundary).
 		const ownedProjectBDevice = await requireOwnedExternalDevice(ctx, deviceProjectBByA);
-		await expect(assertExternalDeviceBinding(ctx, ownedProjectBDevice)).resolves.toBeUndefined();
+		expect(await assertExternalDeviceBinding(ctx, ownedProjectBDevice)).toBeUndefined();
 
 		// Cross-grant device is still hidden (grant ownership fails).
-		await expect(
-			assertExternalDeviceBinding(ctx, { id: deviceB, scope: "project", projectId: projectB }),
-		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
+		expect(
+			await captureWorkerRejection(
+				assertExternalDeviceBinding(ctx, { id: deviceB, scope: "project", projectId: projectB }),
+			),
+		).toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
 
 		// De-projectization: a self-owned global device is accessible even when the
 		// client policy sets allowGlobalDevice=false — grant ownership is the boundary,
@@ -740,12 +753,12 @@ describe("OAuth external resource access", () => {
 		expect((await requireOwnedExternalDevice(noGlobalCtx, deviceGlobalNoGlobal)).id).toBe(
 			deviceGlobalNoGlobal,
 		);
-		await expect(
-			assertExternalDeviceBinding(noGlobalCtx, {
+		expect(
+			await assertExternalDeviceBinding(noGlobalCtx, {
 				id: deviceGlobalNoGlobal,
 				scope: "global",
 				projectId: projectA,
 			}),
-		).resolves.toBeUndefined();
+		).toBeUndefined();
 	});
 });

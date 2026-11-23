@@ -12,6 +12,7 @@ import {
 } from "@server/services/plugin-integration-authority-service";
 import { PluginPermissionStore, permissionSummary } from "@server/services/plugin-permission-store";
 import { eq } from "drizzle-orm";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const roots: string[] = [];
 const authorityIds = new Set<string>();
@@ -140,12 +141,14 @@ describe("PluginIntegrationAuthorityService", () => {
 			revision: 5,
 			grants: [{ grantId: "diagnostics-grant", grantedBy: "admin-user-2" }],
 		});
-		await expect(
-			service.replace(pluginId, installationId, [], {
-				expectedRevision: 4,
-				grantedBy: "stale-admin",
-			}),
-		).rejects.toMatchObject({ code: "PERMISSION_REVISION_CONFLICT" });
+		expect(
+			await captureWorkerRejection(
+				service.replace(pluginId, installationId, [], {
+					expectedRevision: 4,
+					grantedBy: "stale-admin",
+				}),
+			),
+		).toMatchObject({ code: "PERMISSION_REVISION_CONFLICT" });
 
 		const revokedGrant = await service.revoke(pluginId, installationId, ["diagnostics-grant"], {
 			expectedRevision: 5,
@@ -157,9 +160,11 @@ describe("PluginIntegrationAuthorityService", () => {
 			state: "revoked",
 			revision: 7,
 		});
-		await expect(
-			service.ensureInstallation(pluginId, installationId, permissionSummary(revokedGrant.set)),
-		).rejects.toThrow(/cannot be reactivated/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				service.ensureInstallation(pluginId, installationId, permissionSummary(revokedGrant.set)),
+			),
+		).toThrow(/cannot be reactivated/i);
 
 		const reinstalled = await service.ensureInstallation(
 			pluginId,
