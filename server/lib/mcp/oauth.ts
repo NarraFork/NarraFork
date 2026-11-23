@@ -125,7 +125,7 @@ export function resetMcpOAuthForTests(): void {
 	store = undefined;
 	pendingFlows.clear();
 	revisions.clear();
-	challengedScopes.clear();
+	challenges.clear();
 }
 
 /** OAuth applies to remote transports unless the admin pinned a static Authorization header. */
@@ -154,8 +154,13 @@ interface PendingFlow {
 }
 
 const pendingFlows = new Map<string, PendingFlow>();
-/** Scope from the latest 401/403 challenge per server, for consent when none is configured. */
-const challengedScopes = new Map<string, { binding: string; scope: string }>();
+/** Latest 401/403 challenge per server: its scope and resource metadata URL, for consent. */
+interface McpOAuthChallenge {
+	binding: string;
+	scope?: string;
+	resourceMetadataUrl?: URL;
+}
+const challenges = new Map<string, McpOAuthChallenge>();
 
 /** Called by the remote transports for 401/403 responses from the MCP server itself. */
 export function noteMcpOAuthChallenge(
@@ -163,13 +168,14 @@ export function noteMcpOAuthChallenge(
 	storeKey: string,
 	response: Response,
 ): void {
-	const { scope } = extractWWWAuthenticateParams(response);
-	if (scope) challengedScopes.set(storeKey, { binding: bindingOf(config), scope });
+	const { scope, resourceMetadataUrl } = extractWWWAuthenticateParams(response);
+	if (scope || resourceMetadataUrl)
+		challenges.set(storeKey, { binding: bindingOf(config), scope, resourceMetadataUrl });
 }
 
-function challengedScope(config: McpServerConfig): string | undefined {
-	const challenge = challengedScopes.get(config.id);
-	return challenge?.binding === bindingOf(config) ? challenge.scope : undefined;
+function latestChallenge(config: McpServerConfig): McpOAuthChallenge | undefined {
+	const challenge = challenges.get(config.id);
+	return challenge?.binding === bindingOf(config) ? challenge : undefined;
 }
 
 /** Bumped by sign-out / delete so an exchange or refresh already in flight cannot write back. */
@@ -181,7 +187,7 @@ function revisionOf(serverId: string): number {
 
 function resetCredentials(serverId: string): void {
 	revisions.set(serverId, revisionOf(serverId) + 1);
-	challengedScopes.delete(serverId);
+	challenges.delete(serverId);
 	for (const [state, flow] of pendingFlows)
 		if (flow.serverId === serverId) pendingFlows.delete(state);
 }
@@ -369,8 +375,13 @@ export async function startMcpOAuth(
 		revision: revisionOf(config.id),
 	};
 	const provider = new NarraForkOAuthProvider(config, config.id, flow);
-	const scope = config.oauth?.scope ?? challengedScope(config);
-	const result = await auth(provider, { serverUrl: config.url, ...(scope && { scope }) });
+	const challenge = latestChallenge(config);
+	const scope = config.oauth?.scope ?? challenge?.scope;
+	const result = await auth(provider, {
+		serverUrl: config.url,
+		...(scope && { scope }),
+		...(challenge?.resourceMetadataUrl && { resourceMetadataUrl: challenge.resourceMetadataUrl }),
+	});
 	if (result === "AUTHORIZED") return { authorized: true };
 	if (!provider.authorizationUrl) throw new Error("Authorization server returned no URL");
 	pendingFlows.set(flow.state, flow);

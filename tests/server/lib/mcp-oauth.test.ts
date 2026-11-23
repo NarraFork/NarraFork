@@ -18,6 +18,7 @@ const validTokens = new Set<string>();
 let tokenCounter = 0;
 let lastTokenForm: URLSearchParams | undefined;
 let lastRegistration: Record<string, unknown> | undefined;
+let challengeMetadataPath = "/.well-known/oauth-protected-resource/mcp";
 
 function json(body: unknown, status = 200) {
 	return Response.json(body, { status });
@@ -29,7 +30,10 @@ const server = Bun.serve({
 		const url = new URL(req.url);
 		const base = url.origin;
 		hits.push(`${req.method} ${url.pathname}`);
-		if (url.pathname.startsWith("/.well-known/oauth-protected-resource"))
+		if (
+			url.pathname === "/custom-prm" ||
+			url.pathname.startsWith("/.well-known/oauth-protected-resource")
+		)
 			return json({ resource: `${base}/mcp`, authorization_servers: [base] });
 		if (url.pathname === "/.well-known/oauth-authorization-server")
 			return json({
@@ -69,7 +73,7 @@ const server = Bun.serve({
 				return new Response("unauthorized", {
 					status: 401,
 					headers: {
-						"WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"`,
+						"WWW-Authenticate": `Bearer resource_metadata="${base}${challengeMetadataPath}", scope="mcp:tools"`,
 					},
 				});
 			const mcp = new McpServer({ name: "fixture", version: "1.0.0" });
@@ -118,6 +122,7 @@ beforeEach(() => {
 	tokenCounter = 0;
 	lastTokenForm = undefined;
 	lastRegistration = undefined;
+	challengeMetadataPath = "/.well-known/oauth-protected-resource/mcp";
 	rmSync(storePath, { force: true });
 	oauth.resetMcpOAuthForTests();
 });
@@ -235,6 +240,14 @@ describe("MCP OAuth", () => {
 		const started = await oauth.startMcpOAuth(config, redirectUrl);
 		if (!("authorizationUrl" in started)) throw new Error("expected a redirect");
 		expect(new URL(started.authorizationUrl).searchParams.get("scope")).toBe("mcp:tools");
+	});
+
+	test("consent uses the resource metadata URL from the challenge", async () => {
+		challengeMetadataPath = "/custom-prm";
+		await mcpManager.testConnection(config);
+		hits.length = 0;
+		await oauth.startMcpOAuth(config, redirectUrl);
+		expect(hits[0]).toBe("GET /custom-prm");
 	});
 
 	test("re-authorization always asks for consent and an abandoned one keeps the old grant", async () => {
