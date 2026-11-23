@@ -490,7 +490,8 @@ describe("through handlePermission", () => {
 				binding: call.binding,
 				cwd,
 			});
-			if (decidedBy === "user") await expect(check).resolves.toBeDefined();
+			// Settle natively before expect to avoid Bun's reused-Worker .resolves stall.
+			if (decidedBy === "user") expect(await check).toBeDefined();
 			else await expect(check).rejects.toThrow("Team cleanup requires a person's approval");
 		}
 		// Other actions keep their automatic approval.
@@ -499,8 +500,8 @@ describe("through handlePermission", () => {
 			.update(narratorToolCalls)
 			.set({ status: "running", permissionDecidedBy: "auto", permissionDecidedAt: now() })
 			.where(eq(narratorToolCalls.id, call.callId));
-		await expect(
-			recheckFinalToolExecutionPermission({
+		expect(
+			await recheckFinalToolExecutionPermission({
 				narratorId: "n",
 				toolName: "Team",
 				input: { action: "decision", text: "x" },
@@ -508,6 +509,6 @@ describe("through handlePermission", () => {
 				binding: call.binding,
 				cwd,
 			}),
-		).resolves.toBeDefined();
+		).toBeDefined();
 	});
 });
