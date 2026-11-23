@@ -2572,7 +2572,7 @@ async function deliverPendingInjectionsInOrder(
 					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
 						// It arrived between the pre-pass drain and history read. The model
 						// already saw it; acknowledge the receipt, do not add a second copy.
-						consumeMailboxDelivery(inboxConsumption(adopted));
+						await consumeMailboxDelivery(inboxConsumption(adopted));
 						continue;
 					}
 					adoptedMailbox?.push(inboxConsumption(adopted));
@@ -5598,10 +5598,10 @@ export async function getQuestionAnswerFallbackText(
 }
 
 /** A prebuilt history has no WeakMap registration for receipts that arrived later. */
-export function consumeQuestionAnswerModelReceipts(
+export async function consumeQuestionAnswerModelReceipts(
 	narratorId: string,
 	eventIds: ReadonlySet<string>,
-): void {
+): Promise<void> {
 	if (getNarratorMessageRefsPort()) return;
 	for (const messageId of eventIds) {
 		const row = db
@@ -5624,7 +5624,7 @@ export function consumeQuestionAnswerModelReceipts(
 			.limit(1)
 			.get();
 		if (row?.deliveryId && row.recipientRefId)
-			consumeMailboxDelivery({
+			await consumeMailboxDelivery({
 				deliveryId: row.deliveryId,
 				recipientNarratorId: narratorId,
 				recipientMessageId: messageId,

@@ -2256,7 +2256,7 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
@@ -2266,9 +2266,12 @@ export async function runAgentLoopUnlocked(
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, placement);

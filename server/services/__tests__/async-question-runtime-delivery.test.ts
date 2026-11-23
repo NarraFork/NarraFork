@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
@@ -10,6 +10,7 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { expectRuntimeTestFailure } from "./agent-runtime-test-database";
 import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 const fixture = getNarratorWorkerTestDb();
@@ -134,10 +135,13 @@ async function captureQuestionRequests(
 					injected.push(...input.parts);
 					return input;
 				},
-				onModelInputConsumed: (_history, _content, ids) => {
+				onModelInputConsumed: async (_history, _content, ids) => {
 					adopted.push(Array.from(ids ?? []));
 					running._questionAnswerAdoptedMessageIds = new Set(ids);
-					consumeQuestionAnswerModelReceipts(narratorId, running._questionAnswerAdoptedMessageIds);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						running._questionAnswerAdoptedMessageIds,
+					);
 				},
 			},
 			currentText,
@@ -332,6 +336,48 @@ afterAll(async () => {
 });
 
 describe("async question receipt runtime adoption", () => {
+	test("receipt completion does not precede the durable adoption write", async () => {
+		const text = persistAnswer();
+		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		await drainInjectionsIntoHistory(active(), "en");
+		await consumeQuestionAnswerModelReceipts(narratorId, new Set(["answer"]));
+		expect(db.select().from(narratorBufferedMessages).get()?.currentAdoptedRevision).toBe(1);
+	});
+	test("an absent receipt completes without creating an adoption", async () => {
+		await consumeQuestionAnswerModelReceipts(narratorId, new Set(["missing"]));
+		expect(db.select().from(narratorBufferedMessages).all()).toEqual([]);
+	});
+	test("a concurrent receipt revision rejects acknowledgement without adopting stale input", async () => {
+		const text = persistAnswer();
+		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		await drainInjectionsIntoHistory(active(), "en");
+		const reads = await import("../../db/worker-read");
+		const original = reads.readQueryFirst;
+		let injected = false;
+		const probe = spyOn(reads, "readQueryFirst").mockImplementation(async (query, options) => {
+			const row = await original(query, options);
+			if (!injected && row && typeof row === "object" && "deliveryId" in row) {
+				injected = true;
+				db.update(narratorBufferedMessages).set({ currentRevision: 2 }).run();
+			}
+			return row;
+		});
+		try {
+			const error = await expectRuntimeTestFailure(
+				() =>
+					consumeQuestionAnswerModelReceipts(narratorId, new Set(["answer"])).catch(
+						(error) => error,
+					),
+				{ kind: "marker", caller: "agent-message-delivery.ts" },
+			);
+			expect(injected).toBe(true);
+			expect(error).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+			expect(db.select().from(narratorBufferedMessages).get()?.currentAdoptedAt).toBeNull();
+		} finally {
+			probe.mockRestore();
+		}
+	});
+
 	test("scheduling needs a persisted user event and never creates a queue-only answer", async () => {
 		await expect(
 			await captureWorkerRejectionThrower(
