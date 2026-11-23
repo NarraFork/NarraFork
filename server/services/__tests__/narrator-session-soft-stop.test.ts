@@ -1,9 +1,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const {
@@ -60,7 +63,9 @@ async function queueMessage(text = "cut in"): Promise<string> {
 		"front",
 	);
 	expect(entry.ok).toBe(true);
-	expect(getBufferedMessages(NARRATOR_ID).some((message) => message.id === entry.id)).toBe(true);
+	expect((await getBufferedMessages(NARRATOR_ID)).some((message) => message.id === entry.id)).toBe(
+		true,
+	);
 	return entry.id;
 }
 
@@ -77,11 +82,14 @@ beforeEach(() => {
 		})
 		.run();
 });
-afterEach(() => {
-	clearBufferedMessages(NARRATOR_ID);
+afterEach(async () => {
+	await clearBufferedMessages(NARRATOR_ID);
 	activeNarrators.delete(NARRATOR_ID);
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(async () => {
+	await fixture.close();
+	mock.module("../../db", () => realDb);
+});
 
 describe("evaluateSoftStopRequest", () => {
 	test("permission feedback always stops and consumes its flag", () => {
@@ -170,7 +178,7 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferSoftStopTaken).toBe(true);
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBe(true);
 		// Consumed: the re-armed request now stands on its own, so the "queue emptied
@@ -180,7 +188,7 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 
 	test("the re-armed request stops the very next tool boundary", async () => {
 		const active = await grantedCutInStop();
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(
 			evaluateSoftStopRequest({
@@ -194,9 +202,9 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		// Re-arming a stop with nothing left to deliver would end the next pass at its
 		// first tool call for no reason.
 		const active = await grantedCutInStop();
-		clearBufferedMessages(NARRATOR_ID);
+		await clearBufferedMessages(NARRATOR_ID);
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferSoftStopTaken).toBe(true);
@@ -206,7 +214,7 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		const active = registerActiveNarrator();
 		await queueMessage();
 
-		rearmCutInSoftStopBeforeContinuing(active);
+		await rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(active._bufferSoftStop).toBeUndefined();
 	});
@@ -219,8 +227,8 @@ describe("clearBufferedMessageSoftStopIfIdle", () => {
 		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
 		expect(active._bufferSoftStop).toBe(true);
 
-		clearBufferedMessages(NARRATOR_ID);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		await clearBufferedMessages(NARRATOR_ID);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(false);
 	});
@@ -233,22 +241,24 @@ describe("clearBufferedMessageSoftStopIfIdle", () => {
 		// One of several queued messages was cancelled; the rest still need the boundary.
 		await queueMessage("queued-b");
 		expect(await removeBufferedMessage(NARRATOR_ID, first)).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((message) => message.text)).toEqual(["queued-b"]);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((message) => message.text)).toEqual([
+			"queued-b",
+		]);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(true);
 	});
 
-	test("is a no-op when no soft stop is pending", () => {
+	test("is a no-op when no soft stop is pending", async () => {
 		const active = registerActiveNarrator();
 
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBeUndefined();
 	});
 
-	test("does not throw for an unknown narrator", () => {
-		expect(() => clearBufferedMessageSoftStopIfIdle("no-such-narrator")).not.toThrow();
+	test("does not throw for an unknown narrator", async () => {
+		expect(await clearBufferedMessageSoftStopIfIdle("no-such-narrator")).toBeUndefined();
 	});
 });
 
@@ -270,18 +280,18 @@ describe("immediate guidance controls", () => {
 		await pushBufferedMessage(NARRATOR_ID, "next task");
 		requestBufferedMessageSoftStop(NARRATOR_ID);
 		await removeBufferedMessage(NARRATOR_ID, guide);
-		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
-		expect(hasPendingBufferedWork(NARRATOR_ID)).toBe(true);
-		expect(hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
+		await clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		expect(await hasPendingBufferedWork(NARRATOR_ID)).toBe(true);
+		expect(await hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferGuidancePending).toBe(false);
 	});
 
-	test("changing a failed input to urgent does not cancel the current owner", () => {
+	test("changing a failed input to urgent does not cancel the current owner", async () => {
 		const active = registerActiveNarrator();
 		active.abortController = new AbortController();
 		active._guidanceAbortController = new AbortController();
-		applyBufferedQueueModeControl(NARRATOR_ID, "interrupt", false, false);
+		await applyBufferedQueueModeControl(NARRATOR_ID, "interrupt", false, false);
 		expect(active.abortController.signal.aborted).toBe(false);
 		expect(active._guidanceAbortController.signal.aborted).toBe(false);
 		expect(active._bufferSoftStop).toBeUndefined();

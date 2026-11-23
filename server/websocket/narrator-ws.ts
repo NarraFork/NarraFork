@@ -2424,7 +2424,7 @@ export const handleNarratorWS = {
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
 				// to resume.
-				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+				await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2444,7 +2444,7 @@ export const handleNarratorWS = {
 			case "remove_buffer": {
 				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
-					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+					await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);
 				}
 				break;

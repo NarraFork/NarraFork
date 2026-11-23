@@ -171,6 +171,7 @@ import {
 } from "../narrator-recovery";
 import { handleBashCommand, narratorService } from "../narrator-service";
 import {
+	abortPendingBufferedGuidance,
 	accountRequestTokenUsage,
 	accountTokenUsageForTurn,
 	applySessionDefaultDevice,
@@ -178,19 +179,18 @@ import {
 	buildSystemPrompt,
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
+	consumeBufferedSoftStopRequest,
 	consumeQuestionAnswerModelReceipts,
 	decideOutlineTurnEndNote,
 	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
-	evaluateSoftStopRequest,
 	executeQueuedGoalCommand,
 	executeQueuedNewCommand,
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
-	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -1023,9 +1023,7 @@ export async function runAgentLoopUnlocked(
 			active._guidanceAbortController = new AbortController();
 			const passUrgentGuidance = new AbortController();
 			active._urgentGuidanceAbortController = passUrgentGuidance;
-			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
-				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
-			}
+			await abortPendingBufferedGuidance(active);
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -2402,7 +2400,7 @@ export async function runAgentLoopUnlocked(
 					return !!active._planApprovedContinue;
 				},
 				// Queued user input never skips a call: the step's tools all run first.
-				shouldYieldToInput: () => {
+				shouldYieldToInput: async () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -2410,15 +2408,7 @@ export async function runAgentLoopUnlocked(
 					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
 						active._bufferSoftStopTaken = true;
 					}
-					const decision = evaluateSoftStopRequest({
-						feedbackSoftStop: active._feedbackSoftStop,
-						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
-					});
-					active._feedbackSoftStop = decision.feedbackSoftStop;
-					active._bufferSoftStop = decision.bufferSoftStop;
-					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
-					return decision.stop;
+					return consumeBufferedSoftStopRequest(active);
 				},
 				// Both primary and child loops can outlive the abort drain. Never reuse
 				// eventContext/hooks here: a new turn may already own their mutable state.
@@ -3479,7 +3469,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3552,7 +3542,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
 				// reached, which would strand a cut-in message for the rest of the loop.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 

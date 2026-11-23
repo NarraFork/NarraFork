@@ -124,11 +124,11 @@ async function resolveCreator(userId: string | null): Promise<BufferCreator | nu
  * `routes/narrators.ts`). Skipping it would leave the interjected message
  * invisible in the narrator panel until a manual refresh.
  */
-function broadcastBufferSnapshot(narratorId: string): void {
+async function broadcastBufferSnapshot(narratorId: string): Promise<void> {
 	broadcastToNarrator(narratorId, {
 		type: "buffer_set",
 		narratorId,
-		messages: toBufferSummary(getBufferedMessages(narratorId)),
+		messages: toBufferSummary(await getBufferedMessages(narratorId)),
 	});
 }
 
@@ -156,10 +156,10 @@ export async function interjectSpecEditAsUserMessage(
 	// Rewrite the previous cut-in when it is still queued, so rapid saves collapse
 	// into one message at its original position rather than stacking in reverse.
 	const trackedId = specEditInterjectIds.get(narratorId);
-	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
+	if (trackedId) {
 		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
-			broadcastBufferSnapshot(narratorId);
+			await broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };
 		}
 	}
@@ -185,6 +185,6 @@ export async function interjectSpecEditAsUserMessage(
 
 	specEditInterjectIds.set(narratorId, result.id);
 	requestBufferedMessageSoftStop(narratorId);
-	broadcastBufferSnapshot(narratorId);
+	await broadcastBufferSnapshot(narratorId);
 	return { delivered: "interjected" };
 }

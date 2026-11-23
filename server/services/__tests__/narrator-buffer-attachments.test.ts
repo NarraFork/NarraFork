@@ -1,3 +1,4 @@
+import * as pool from "../../lib/db-worker/pool";
 /**
  * Attachments of a queued (buffered) message: what clients can see, and what an
  * in-place edit does to the files on disk.
@@ -35,7 +36,7 @@ import { getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narrators } from "../../db/schema";
 import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
 import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
-import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 const fixture = getNarratorWorkerTestDb();
 const { db, sqlite } = fixture;
@@ -132,24 +133,26 @@ test("composer layout survives cold durable queue projection, summary stays smal
 		.get();
 	if (!changed) throw new Error("Missing edited row");
 	expect(projectMailboxUserMessage(changed).composerDocument).toBeUndefined();
-	await expect(
-		enqueueBufferedMessage(
-			NARRATOR_ID,
-			"mismatch",
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			"back",
-			undefined,
-			undefined,
-			"fifo",
-			undefined,
-			undefined,
-			document,
+	expect(
+		await captureWorkerRejectionThrower(
+			enqueueBufferedMessage(
+				NARRATOR_ID,
+				"mismatch",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"back",
+				undefined,
+				undefined,
+				"fifo",
+				undefined,
+				undefined,
+				document,
+			),
 		),
-	).rejects.toThrow("does not match");
+	).toThrow("does not match");
 	await removeBufferedMessage(NARRATOR_ID, result.id);
 });
 
@@ -190,13 +193,13 @@ test("ZIP MIME alias survives durable queue reload and editing a kept attachment
 		undefined,
 		document,
 	);
-	const [reloaded] = getBufferedMessages(NARRATOR_ID);
+	const [reloaded] = await getBufferedMessages(NARRATOR_ID);
 	expect(reloaded.composerDocument).toEqual(document);
 	expect(reloaded.textFiles?.[0].type).toBe("application/zip");
 	expect(
 		await updateBufferedMessage(NARRATOR_ID, result.id, "", { composerDocument: document }),
 	).toBe(true);
-	expect(getBufferedMessages(NARRATOR_ID)[0].composerDocument).toEqual(document);
+	expect((await getBufferedMessages(NARRATOR_ID))[0].composerDocument).toEqual(document);
 	await removeBufferedMessage(NARRATOR_ID, result.id);
 });
 
@@ -261,10 +264,10 @@ async function readTextFilePathsJson(
 	return row?.json ? JSON.parse(row.json) : null;
 }
 
-afterEach(() => {
+afterEach(async () => {
 	bindRuntimeQueue(undefined);
 	activeNarrators.clear();
-	clearBufferedMessages(SUBAGENT_ID);
+	await clearBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
@@ -285,7 +288,7 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		);
 		expect(pushed.ok).toBe(true);
 
-		const [summary] = toBufferSummary(getBufferedMessages(NARRATOR_ID));
+		const [summary] = toBufferSummary(await getBufferedMessages(NARRATOR_ID));
 
 		expect(summary.imageCount).toBe(2);
 		expect(summary.images).toEqual([
@@ -315,7 +318,7 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 			textFile("dup.md", "bbbb"),
 		]);
 
-		const [summary] = toBufferSummary(getBufferedMessages(SUBAGENT_ID));
+		const [summary] = toBufferSummary(await getBufferedMessages(SUBAGENT_ID));
 
 		// Same filename twice: only the index tells them apart, which is why the
 		// keep key is positional rather than name-based.
@@ -329,7 +332,7 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		registerLiveLoop(NARRATOR_ID);
 		await pushBufferedMessage(NARRATOR_ID, "plain text");
 
-		const [summary] = toBufferSummary(getBufferedMessages(NARRATOR_ID));
+		const [summary] = toBufferSummary(await getBufferedMessages(NARRATOR_ID));
 
 		expect(summary.imageCount).toBe(0);
 		expect(summary.images).toEqual([]);
@@ -350,7 +353,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		});
 
 		expect(ok).toBe(true);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		expect(message.text).toBe("after");
 		expect(message.images?.map((i) => i.imageId)).toEqual([kept.imageId, added.imageId]);
 		expect(await readImagesJson(pushed.id)).toMatchObject([
@@ -366,7 +369,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 
 		await updateBufferedMessage(NARRATOR_ID, pushed.id, "text only", { images: [] });
 
-		expect(getBufferedMessages(NARRATOR_ID)[0].images).toBeUndefined();
+		expect((await getBufferedMessages(NARRATOR_ID))[0].images).toBeUndefined();
 		expect(await readImagesJson(pushed.id)).toBeNull();
 	});
 
@@ -381,7 +384,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		// drop attachments the caller never mentioned.
 		await updateBufferedMessage(NARRATOR_ID, pushed.id, "after");
 
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		expect(message.text).toBe("after");
 		expect(message.images?.map((i) => i.imageId)).toEqual([image.imageId]);
 		expect(message._savedFiles?.map((f) => f.filename)).toEqual(["keep.md"]);
@@ -399,7 +402,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 			null,
 			[textFile("kept.md"), textFile("dropped.md")],
 		);
-		const saved = getBufferedMessages(NARRATOR_ID)[0]._savedFiles ?? [];
+		const saved = (await getBufferedMessages(NARRATOR_ID))[0]._savedFiles ?? [];
 		expect(saved).toHaveLength(2);
 		const [keptFile, droppedFile] = saved;
 		expect(existsSync(keptFile.path)).toBe(true);
@@ -409,7 +412,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 			textFiles: [],
 			savedFiles: [keptFile],
 		});
-		deleteBufferedTextFile(droppedFile);
+		await deleteBufferedTextFile(droppedFile);
 
 		expect(existsSync(keptFile.path)).toBe(true);
 		expect(existsSync(droppedFile.path)).toBe(false);
@@ -421,7 +424,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		const pushed = await pushBufferedMessage(NARRATOR_ID, "one file", undefined, null, null, null, [
 			textFile("notes.md", "original"),
 		]);
-		const [keptFile] = getBufferedMessages(NARRATOR_ID)[0]._savedFiles ?? [];
+		const [keptFile] = (await getBufferedMessages(NARRATOR_ID))[0]._savedFiles ?? [];
 
 		const created = await persistAdditionalBufferedTextFiles(
 			pushed.id,
@@ -467,7 +470,7 @@ describe("updateBufferedMessage — attachment overwrite", () => {
 		});
 
 		expect(ok).toBe(true);
-		const [message] = getBufferedMessages(SUBAGENT_ID);
+		const [message] = await getBufferedMessages(SUBAGENT_ID);
 		expect(message.text).toBe("after");
 		expect(message.images?.map((i) => i.imageId)).toEqual(["new"]);
 		expect(message._savedFiles?.map((f) => f.filename)).toEqual(["new.md"]);
@@ -480,7 +483,9 @@ describe("updateBufferedMessage — attachment overwrite", () => {
 
 		await updateBufferedMessage(SUBAGENT_ID, queued.id, "after");
 
-		expect(getBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual(["keep"]);
+		expect((await getBufferedMessages(SUBAGENT_ID))[0].images?.map((i) => i.imageId)).toEqual([
+			"keep",
+		]);
 	});
 });
 
@@ -518,7 +523,7 @@ describe("queue teardown must not delete uploaded images", () => {
 		await pushBufferedMessage(NARRATOR_ID, "with file", undefined, null, null, null, [
 			textFile("temp.md"),
 		]);
-		const [savedFile] = getBufferedMessages(NARRATOR_ID)[0]._savedFiles ?? [];
+		const [savedFile] = (await getBufferedMessages(NARRATOR_ID))[0]._savedFiles ?? [];
 		expect(existsSync(savedFile.path)).toBe(true);
 
 		await dbClearAllBuffered(NARRATOR_ID);
@@ -546,14 +551,14 @@ describe("failed user recovery", () => {
 			oldClaim = claim;
 			store.failClaim(claim, "attachment preparation failed");
 		}
-		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID))[0]).toMatchObject({
+		expect(toBufferSummary(await getBufferedMessages(NARRATOR_ID))[0]).toMatchObject({
 			state: "failed",
 			error: "attachment preparation failed",
 			text: "retry me",
 		});
 		expect(store.claimBatch(NARRATOR_ID, { token: "blocked", epoch: "blocked" })).toHaveLength(0);
 		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "fixed")).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
+		expect((await getBufferedMessages(NARRATOR_ID))[0].state).toBe("failed");
 		expect(await retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(true);
 		expect(await retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(false);
 		const [row] = store.claimBatch(NARRATOR_ID, { token: "new-owner", epoch: "new-epoch" });
@@ -578,7 +583,7 @@ describe("failed user recovery", () => {
 				.run();
 			return { messageId, refId };
 		});
-		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
+		expect(await getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
 		expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("materialized");
 		expect(store.claimBatch(NARRATOR_ID, { token: "again", epoch: "again" })).toHaveLength(0);
 	});
@@ -590,7 +595,7 @@ describe("failed user recovery", () => {
 		const pushed = await enqueueBufferedMessage(NARRATOR_ID, "missing", [image], null, null, null, [
 			textFile("gone.md"),
 		]);
-		const message = getBufferedMessages(NARRATOR_ID)[0];
+		const message = (await getBufferedMessages(NARRATOR_ID))[0];
 		for (let attempt = 0; attempt < 5; attempt++) {
 			const [row] = store.claimBatch(NARRATOR_ID, { token: "owner", epoch: `missing-${attempt}` });
 			const claim = projectMailboxUserMessage(row)._mailboxClaim;
@@ -600,8 +605,10 @@ describe("failed user recovery", () => {
 		const saved = message._savedFiles?.[0];
 		if (!saved) throw new Error("missing saved file");
 		rmSync(saved.path);
-		await expect(retryBufferedMessage(NARRATOR_ID, pushed.id)).rejects.toThrow("missing");
-		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
+		expect(
+			await captureWorkerRejectionThrower(retryBufferedMessage(NARRATOR_ID, pushed.id)),
+		).toThrow("missing");
+		expect((await getBufferedMessages(NARRATOR_ID))[0].state).toBe("failed");
 		expect(await removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
 		expect(existsSync(getImagePath(NARRATOR_ID, image.imageId) as string)).toBe(true);
 		expect(existsSync(join(HOME, "buffered-files", message._stagingId as string))).toBe(false);
@@ -625,7 +632,7 @@ describe("persistent staging ownership", () => {
 			"front",
 		);
 		const later = await enqueueBufferedMessage(NARRATOR_ID, "later");
-		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual([
+		expect((await getBufferedMessages(NARRATOR_ID)).map((row) => row.id)).toEqual([
 			priority.id,
 			normal.id,
 			later.id,
@@ -636,12 +643,10 @@ describe("persistent staging ownership", () => {
 		);
 		const desired = [priority.id, later.id, normal.id];
 		expect(await reorderBufferedMessages(NARRATOR_ID, desired)).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual(desired);
-		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID)).map((row) => row.queueMode)).toEqual([
-			"tool",
-			"turn",
-			"turn",
-		]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((row) => row.id)).toEqual(desired);
+		expect(
+			toBufferSummary(await getBufferedMessages(NARRATOR_ID)).map((row) => row.queueMode),
+		).toEqual(["tool", "turn", "turn"]);
 		for (const id of desired) {
 			expect((await peekInbox(NARRATOR_ID))?.id).toBe(id);
 			const [claimed] = store.claimBatch(
@@ -682,13 +687,15 @@ describe("persistent staging ownership", () => {
 		// the write, so the payload stays a few bytes of real data.
 		const tooLarge = textFile("too-large.md");
 		Object.defineProperty(tooLarge, "size", { value: MAX_TEXT_FILE_SIZE + 1 });
-		await expect(
-			enqueueBufferedMessage(NARRATOR_ID, "failed", undefined, null, null, null, [
-				textFile("first.md"),
-				tooLarge,
-			]),
-		).rejects.toThrow("size limit");
-		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(
+			await captureWorkerRejectionThrower(
+				enqueueBufferedMessage(NARRATOR_ID, "failed", undefined, null, null, null, [
+					textFile("first.md"),
+					tooLarge,
+				]),
+			),
+		).toThrow("size limit");
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
 		expect(readdirSync(root).sort()).toEqual(before);
 	});
 
@@ -741,9 +748,11 @@ describe("persistent staging ownership", () => {
 				},
 			} as unknown as PostgresRuntimeQueue,
 		});
-		await expect(
-			enqueueBufferedMessage(NARRATOR_ID, "queued", undefined, null, null, null, [file]),
-		).rejects.toThrow("transaction rolled back");
+		expect(
+			await captureWorkerRejectionThrower(
+				enqueueBufferedMessage(NARRATOR_ID, "queued", undefined, null, null, null, [file]),
+			),
+		).toThrow("transaction rolled back");
 		expect(existsSync(staged.path)).toBe(true);
 	});
 
@@ -760,7 +769,7 @@ describe("persistent staging ownership", () => {
 		);
 		expect(result.ok).toBe(true);
 		expect(existsSync(staged.path)).toBe(false);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		const [saved] = message?._savedFiles ?? [];
 		expect(saved?.originalName).toBe("big.log");
 		expect(saved && (await Bun.file(saved.path).text())).toBe("staged body");
@@ -797,7 +806,7 @@ describe("persistent staging ownership", () => {
 		const pushed = await enqueueBufferedMessage(NARRATOR_ID, "cold", undefined, null, null, null, [
 			textFile("cold.md", "durable"),
 		]);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		expect(message.id).toBe(pushed.id);
 		expect(message._stagingId).not.toBe(message.id);
 		const path = message._savedFiles?.[0].path as string;
@@ -807,7 +816,7 @@ describe("persistent staging ownership", () => {
 		rmSync(join(HOME, "buffered-files", message._stagingId as string, ".mailbox-owner.json"), {
 			force: true,
 		});
-		cleanupBufferedTextFiles(message._stagingId as string);
+		await cleanupBufferedTextFiles(message._stagingId as string);
 		expect(existsSync(path)).toBe(true);
 		writeFileSync(
 			join(HOME, "buffered-files", message._stagingId as string, ".mailbox-owner.json"),
@@ -823,15 +832,30 @@ describe("persistent staging ownership", () => {
 		expect(row?.state).toBe("cancelled");
 	});
 
-	test("cleanup of an absent directory performs only a narrow primary-key lookup", () => {
-		const prepare = spyOn(sqlite, "prepare");
+	function observeCleanupReads() {
+		const queries: string[] = [];
+		const original = pool.runReadTask;
+		const probe = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+			if (params.kind === "selectRows" || params.kind === "selectValues") queries.push(params.sql);
+			return original(path, params, options);
+		}) as typeof pool.runReadTask);
+		return { queries, probe };
+	}
+	function expectOwnershipQueries(queries: string[], count: number) {
+		expect(queries).toHaveLength(count);
+		for (const query of queries) {
+			expect(query).toContain('where "narrator_buffered_messages"."id" = ? limit ?');
+			expect(query).not.toContain('"text",');
+			expect(query).not.toContain('"images_json"');
+		}
+	}
+	test("cleanup of an absent directory performs only a narrow primary-key lookup", async () => {
+		const { queries, probe } = observeCleanupReads();
 		try {
-			cleanupBufferedTextFiles("absent-staging-directory");
-			expect(prepare.mock.calls.map(([sql]) => sql)).toEqual([
-				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
-			]);
+			await cleanupBufferedTextFiles("absent-staging-directory");
+			expectOwnershipQueries(queries, 1);
 		} finally {
-			prepare.mockRestore();
+			probe.mockRestore();
 		}
 	});
 
@@ -849,23 +873,20 @@ describe("persistent staging ownership", () => {
 			null,
 			[textFile("cleanup.md", "leased payload")],
 		);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		const stagingId = message._stagingId as string;
 		const directory = join(HOME, "buffered-files", stagingId);
 		db.update(narratorBufferedMessages)
 			.set({ state })
 			.where(eq(narratorBufferedMessages.id, pushed.id))
 			.run();
-		const prepare = spyOn(sqlite, "prepare");
+		const { queries, probe } = observeCleanupReads();
 		try {
-			cleanupBufferedTextFiles(identity === "row" ? pushed.id : stagingId);
-			expect(prepare.mock.calls.map(([sql]) => sql)).toEqual([
-				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
-				'select "id", "kind", "state", "metadata_json" from "narrator_buffered_messages" where "narrator_buffered_messages"."id" = ?',
-			]);
+			await cleanupBufferedTextFiles(identity === "row" ? pushed.id : stagingId);
+			expectOwnershipQueries(queries, identity === "row" ? 1 : 2);
 			expect(existsSync(directory)).toBe(["queued", "claimed", "failed"].includes(state));
 		} finally {
-			prepare.mockRestore();
+			probe.mockRestore();
 		}
 	});
 
@@ -882,7 +903,7 @@ describe("persistent staging ownership", () => {
 			null,
 			[textFile("legacy.md", "retained until owner is known")],
 		);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		const stagingId = message._stagingId as string;
 		const directory = join(HOME, "buffered-files", stagingId);
 		const markerPath = join(directory, ".mailbox-owner.json");
@@ -893,9 +914,9 @@ describe("persistent staging ownership", () => {
 			.where(eq(narratorBufferedMessages.id, pushed.id))
 			.run();
 
-		cleanupBufferedTextFiles(stagingId);
+		await cleanupBufferedTextFiles(stagingId);
 		expect(existsSync(directory)).toBe(true);
-		cleanupBufferedTextFiles(pushed.id);
+		await cleanupBufferedTextFiles(pushed.id);
 		expect(existsSync(directory)).toBe(false);
 	});
 
@@ -908,7 +929,7 @@ describe("persistent staging ownership", () => {
 		const directory = join(HOME, "buffered-files", pushed.id);
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(join(directory, "legacy.md"), "old payload");
-		cleanupBufferedTextFiles(pushed.id);
+		await cleanupBufferedTextFiles(pushed.id);
 		expect(existsSync(directory)).toBe(false);
 	});
 
@@ -918,16 +939,16 @@ describe("persistent staging ownership", () => {
 		"{}",
 		'{"rowId":false}',
 		'{"rowId":""}',
-	])("cleanup retains staging with an invalid owner marker: %s", (marker) => {
+	])("cleanup retains staging with an invalid owner marker: %s", async (marker) => {
 		const stagingId = "invalid-owner-staging";
 		const directory = join(HOME, "buffered-files", stagingId);
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(join(directory, ".mailbox-owner.json"), marker);
-		cleanupBufferedTextFiles(stagingId);
+		await cleanupBufferedTextFiles(stagingId);
 		expect(existsSync(directory)).toBe(true);
 	});
 
-	test("cleanup removes marked staging after its owner row has been removed", () => {
+	test("cleanup removes marked staging after its owner row has been removed", async () => {
 		const stagingId = "removed-owner-staging";
 		const directory = join(HOME, "buffered-files", stagingId);
 		mkdirSync(directory, { recursive: true });
@@ -935,7 +956,7 @@ describe("persistent staging ownership", () => {
 			join(directory, ".mailbox-owner.json"),
 			JSON.stringify({ rowId: "removed-owner" }),
 		);
-		cleanupBufferedTextFiles(stagingId);
+		await cleanupBufferedTextFiles(stagingId);
 		expect(existsSync(directory)).toBe(false);
 	});
 
@@ -952,11 +973,13 @@ describe("persistent staging ownership", () => {
 		} as unknown as PostgresRuntimeQueue;
 		bindRuntimeQueue({ backend: "postgres", queue });
 
-		await expect(
-			enqueueBufferedMessage(NARRATOR_ID, "rollback", undefined, null, null, null, [
-				textFile("rollback.md", "discard me"),
-			]),
-		).rejects.toThrow("transaction rolled back");
+		expect(
+			await captureWorkerRejectionThrower(
+				enqueueBufferedMessage(NARRATOR_ID, "rollback", undefined, null, null, null, [
+					textFile("rollback.md", "discard me"),
+				]),
+			),
+		).toThrow("transaction rolled back");
 		expect(readdirSync(join(HOME, "buffered-files"))).toEqual([]);
 	});
 
@@ -979,11 +1002,13 @@ describe("persistent staging ownership", () => {
 		} as unknown as PostgresRuntimeQueue;
 		bindRuntimeQueue({ backend: "postgres", queue });
 
-		await expect(
-			enqueueBufferedMessage(NARRATOR_ID, "uncertain", undefined, null, null, null, [
-				textFile("uncertain.md", "retain me"),
-			]),
-		).rejects.toThrow("connection reset");
+		expect(
+			await captureWorkerRejectionThrower(
+				enqueueBufferedMessage(NARRATOR_ID, "uncertain", undefined, null, null, null, [
+					textFile("uncertain.md", "retain me"),
+				]),
+			),
+		).toThrow("connection reset");
 		const stagingPath = join(HOME, "buffered-files", stagingId);
 		expect(existsSync(stagingPath)).toBe(true);
 		expect(JSON.parse(await Bun.file(join(stagingPath, ".mailbox-owner.json")).text())).toEqual({
@@ -1021,11 +1046,13 @@ describe("persistent staging ownership", () => {
 		} as unknown as PostgresRuntimeQueue;
 		bindRuntimeQueue({ backend: "postgres", queue });
 
-		await expect(
-			enqueueBufferedMessage(NARRATOR_ID, "marker failure", undefined, null, null, null, [
-				textFile("marker.md", "keep me"),
-			]),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				enqueueBufferedMessage(NARRATOR_ID, "marker failure", undefined, null, null, null, [
+					textFile("marker.md", "keep me"),
+				]),
+			),
+		).toThrow();
 		const stagingPath = join(HOME, "buffered-files", stagingId);
 		expect(existsSync(stagingPath)).toBe(true);
 
@@ -1080,7 +1107,7 @@ describe("persistent staging ownership", () => {
 			null,
 			[textFile("pg.md", "durable")],
 		);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		const stagingId = message._stagingId as string;
 		const savedPath = message._savedFiles?.[0]?.path as string;
 		const calls: string[] = [];
@@ -1112,14 +1139,16 @@ describe("persistent staging ownership", () => {
 		await enqueueBufferedMessage(NARRATOR_ID, "pg poison", undefined, null, null, null, [
 			textFile("poison.md", "retained"),
 		]);
-		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [message] = await getBufferedMessages(NARRATOR_ID);
 		const stagingId = message._stagingId as string;
 		const oldWrite = process.env.NF_WRITE_BACKEND;
 		const oldRead = process.env.NF_READ_BACKEND;
 		process.env.NF_WRITE_BACKEND = "postgres";
 		process.env.NF_READ_BACKEND = "postgres";
 		try {
-			await expect(cleanupBufferedTextFilesAsync(stagingId)).rejects.toThrow("unavailable");
+			expect(await captureWorkerRejectionThrower(cleanupBufferedTextFilesAsync(stagingId))).toThrow(
+				"unavailable",
+			);
 			expect(existsSync(message._savedFiles?.[0]?.path as string)).toBe(true);
 		} finally {
 			if (oldWrite === undefined) delete process.env.NF_WRITE_BACKEND;
@@ -1139,14 +1168,14 @@ describe("persistent staging ownership", () => {
 		const message = projectMailboxUserMessage(row);
 		const saved = message._savedFiles?.[0] as NonNullable<typeof message._savedFiles>[number];
 		await dbClearAllBuffered(NARRATOR_ID);
-		cleanupBufferedTextFiles(message._stagingId as string);
-		deleteBufferedTextFile(saved);
+		await cleanupBufferedTextFiles(message._stagingId as string);
+		await deleteBufferedTextFile(saved);
 		expect(existsSync(saved.path)).toBe(true);
 		expect(await removeBufferedMessage(NARRATOR_ID, row.id)).toBe(false);
-		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
+		expect(await getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
 		await releaseBufferedMessage(message, "retry preparation");
-		expect(getBufferedMessages(NARRATOR_ID)[0].id).toBe(row.id);
-		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("leased");
+		expect((await getBufferedMessages(NARRATOR_ID))[0].id).toBe(row.id);
+		expect(await (await getBufferedMessages(NARRATOR_ID))[0].textFiles?.[0].text()).toBe("leased");
 		expect(await removeBufferedMessage(NARRATOR_ID, row.id)).toBe(true);
 		expect(existsSync(saved.path)).toBe(false);
 	});
@@ -1178,18 +1207,18 @@ describe("persistent staging ownership", () => {
 			.get();
 		expect(row?.fileReferencesJson).toBeNull();
 		expect(JSON.parse(row?.metadataJson ?? "{}").fileReferencesPath).toBeString();
-		expect(getBufferedMessages(NARRATOR_ID)[0].fileReferences?.[0].snapshotText).toBe(
+		expect((await getBufferedMessages(NARRATOR_ID))[0].fileReferences?.[0].snapshotText).toBe(
 			snapshot.snapshotText,
 		);
 		const body = "b".repeat(300 * 1024);
 		expect(
 			await updateBufferedMessage(NARRATOR_ID, pushed.id, body, { fileReferences: [snapshot] }),
 		).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID)[0].text).toBe(body);
-		expect(getBufferedMessages(NARRATOR_ID)[0].fileReferences?.[0].snapshotText).toBe(
+		expect((await getBufferedMessages(NARRATOR_ID))[0].text).toBe(body);
+		expect((await getBufferedMessages(NARRATOR_ID))[0].fileReferences?.[0].snapshotText).toBe(
 			snapshot.snapshotText,
 		);
-		const staging = getBufferedMessages(NARRATOR_ID)[0]._stagingId as string;
+		const staging = (await getBufferedMessages(NARRATOR_ID))[0]._stagingId as string;
 		await removeBufferedMessage(NARRATOR_ID, pushed.id);
 		expect(existsSync(join(HOME, "buffered-files", staging))).toBe(false);
 	});
@@ -1215,11 +1244,11 @@ describe("persistent staging ownership", () => {
 			.get();
 		expect(row?.commandText).toBeNull();
 		expect(row?.bashCommand).toBeNull();
-		expect(getBufferedMessages(NARRATOR_ID)[0].commandText).toBe(command);
-		expect(getBufferedMessages(NARRATOR_ID)[0].bashCommand).toBe(bash);
+		expect((await getBufferedMessages(NARRATOR_ID))[0].commandText).toBe(command);
+		expect((await getBufferedMessages(NARRATOR_ID))[0].bashCommand).toBe(bash);
 		await updateBufferedMessage(NARRATOR_ID, pushed.id, "edited display");
-		expect(getBufferedMessages(NARRATOR_ID)[0].commandText).toBe(command);
-		expect(getBufferedMessages(NARRATOR_ID)[0].bashCommand).toBe(bash);
+		expect((await getBufferedMessages(NARRATOR_ID))[0].commandText).toBe(command);
+		expect((await getBufferedMessages(NARRATOR_ID))[0].bashCommand).toBe(bash);
 		await removeBufferedMessage(NARRATOR_ID, pushed.id);
 	});
 
@@ -1237,7 +1266,7 @@ describe("persistent staging ownership", () => {
 				textFilePathsJson: JSON.stringify(files),
 			})
 			.run();
-		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("legacy");
+		expect(await (await getBufferedMessages(NARRATOR_ID))[0].textFiles?.[0].text()).toBe("legacy");
 		expect(await removeBufferedMessage(NARRATOR_ID, id)).toBe(true);
 		expect(existsSync(files[0].path)).toBe(false);
 	});
@@ -1276,7 +1305,7 @@ describe("persistent staging ownership", () => {
 			);
 			const expected =
 				frontOrder === "fifo" ? ["first", "second", "ordinary"] : ["second", "first", "ordinary"];
-			expect(getBufferedMessages(id).map((message) => message.text)).toEqual(expected);
+			expect((await getBufferedMessages(id)).map((message) => message.text)).toEqual(expected);
 			const { createMailboxStore } = await import("../agent-runtime/mailbox");
 			const [claimed] = createMailboxStore(db).claimBatch(
 				id,
@@ -1291,9 +1320,9 @@ describe("persistent staging ownership", () => {
 		const a = await enqueueBufferedMessage(NARRATOR_ID, "a");
 		const b = await enqueueBufferedMessage(NARRATOR_ID, "b");
 		expect(await reorderBufferedMessages(NARRATOR_ID, [a.id, a.id])).toBe(false);
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([a.id, b.id]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.id)).toEqual([a.id, b.id]);
 		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, a.id])).toBe(true);
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([b.id, a.id]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.id)).toEqual([b.id, a.id]);
 	});
 });
 
@@ -1352,7 +1381,7 @@ describe("native media mailbox durability", () => {
 			true,
 		);
 		expect((await row(accepted.id)).mediaJson).toBeNull();
-		expect(getBufferedMessages(NARRATOR_ID)[0].media).toBeUndefined();
+		expect((await getBufferedMessages(NARRATOR_ID))[0].media).toBeUndefined();
 	});
 	test("appended refs survive reload and caller mutation cannot rewrite the admitted metadata", async () => {
 		const accepted = await enqueue("before");
@@ -1382,7 +1411,7 @@ describe("native media mailbox durability", () => {
 			[media],
 		);
 		expect(accepted.ok).toBe(true);
-		const [queued] = getBufferedMessages(SUBAGENT_ID);
+		const [queued] = await getBufferedMessages(SUBAGENT_ID);
 		expect(queued.media).toEqual([media]);
 		expect(queued.queueMode).toBe("tool");
 		const { createMailboxStore } = await import("../agent-runtime/mailbox");
@@ -1416,7 +1445,7 @@ describe("native media mailbox durability", () => {
 		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
 		await updateBufferedMessage(NARRATOR_ID, accepted.id, "after", { media: [dirty] });
 		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
-		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID))[0].media).toEqual([media]);
+		expect(toBufferSummary(await getBufferedMessages(NARRATOR_ID))[0].media).toEqual([media]);
 	});
 	test("tracked schema upgrades an existing SQLite queue without ignored migration assets", async () => {
 		const { sqlite: upgrade } = getTestDb();
@@ -1459,14 +1488,14 @@ describe("native media mailbox durability", () => {
 });
 
 describe("unrelated files are untouched", () => {
-	test("deleteBufferedTextFile refuses a non-mailbox path", () => {
+	test("deleteBufferedTextFile refuses a non-mailbox path", async () => {
 		const dir = mkdtempSync(join(HOME, "single-"));
 		const target = join(dir, "target.md");
 		const neighbour = join(dir, "neighbour.md");
 		writeFileSync(target, "a");
 		writeFileSync(neighbour, "b");
 
-		deleteBufferedTextFile({ filename: "target.md", path: target, size: 1 });
+		await deleteBufferedTextFile({ filename: "target.md", path: target, size: 1 });
 
 		expect(existsSync(target)).toBe(true);
 		expect(existsSync(neighbour)).toBe(true);

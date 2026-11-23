@@ -4073,7 +4073,7 @@ async function applyPendingBufferModeControl(
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
 	);
-	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	await applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
 	return targetQueued && effectiveMode !== "turn";
 }
 
@@ -4180,7 +4180,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4257,7 +4257,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const { clearBufferedMessages } = await import("../services/narrator-buffer");
 	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
