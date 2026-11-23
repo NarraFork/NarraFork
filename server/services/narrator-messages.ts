@@ -4636,23 +4636,31 @@ const narratorMessageQueriesUnlocked = {
 				.limit(limit + 1);
 		}
 
-		// CROSS JOIN keeps SQLite on the parentToolUseId message index before
-		// probing the caller's unique ref. A refs-first OR plan scans the caller's
-		// history once per anchor, even when there are no new child messages.
+		// CROSS JOIN fixes join order, not index choice: ANALYZE can turn the OR
+		// into a global message scan when parentToolUseId is mostly NULL. On SQLite,
+		// the existing index plus a message-only IN predicate keeps this a seek.
 		// Resolved anchors all use the caller's refs, never a cursor's narratorId.
+		const sqliteChildLookup = modelHistoryDatabase.activeDatabaseBackend === "sqlite";
 		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
 			? await db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 					})
-					.from(narratorMessages)
+					.from(
+						sqliteChildLookup
+							? sql`${narratorMessages} INDEXED BY idx_messages_parent_tool_use_lookup`
+							: narratorMessages,
+					)
 					.crossJoin(narratorMessageRefs)
 					.where(
 						and(
 							eq(narratorMessageRefs.messageId, narratorMessages.id),
 							eq(narratorMessageRefs.narratorId, narratorId),
 							isNull(narratorMessageRefs.segmentCompactId),
+							sqliteChildLookup
+								? inArray(narratorMessages.parentToolUseId, [...resolvedChildAnchors.keys()])
+								: undefined,
 							childWhere,
 						),
 					)

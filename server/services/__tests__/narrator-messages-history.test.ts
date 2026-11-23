@@ -23,7 +23,7 @@ for (const statement of [
 	}
 }
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { narratorService } = await import("../narrator-service");
 const { narratorMessageQueries } = await import("../narrator-messages");
@@ -686,6 +686,133 @@ describe("pending and child catch-up query equivalence", () => {
 		const toolReads = queries.filter((row) => row.query.includes('from "narrator_tool_calls"'));
 		expect(toolReads).toHaveLength(1);
 		expect(toolReads[0].rows).toEqual([]);
+	});
+
+	for (const owners of [1, 100]) {
+		for (const statistics of ["none", "optimize", "analyze"] as const) {
+			test(`child lookup seeks with ${statistics} statistics, 10k history rows / ${owners} owners`, async () => {
+				for (let i = 0; i < owners; i++) await seedNarrator(`owner-${i}`);
+				sqlite.run(
+					`WITH RECURSIVE numbers(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM numbers WHERE x<9999)
+					INSERT INTO narrator_messages (id,narrator_id,role,content_json,created_at)
+					SELECT 'history-'||x,'owner-'||(x%?),'assistant','[]',? FROM numbers`,
+					[owners, now],
+				);
+				sqlite.run(
+					`WITH RECURSIVE numbers(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM numbers WHERE x<9999)
+					INSERT INTO narrator_message_refs (id,narrator_id,message_id,seq)
+					SELECT 'history-ref-'||x,'owner-'||(x%?),'history-'||x,x+1 FROM numbers`,
+					[owners],
+				);
+				await seedMessage({ id: "parent", narratorId: "owner-0", seq: 0, role: "assistant" });
+				const anchors = Array.from({ length: 8 }, (_, i) => ({ parentToolUseId: `anchor-${i}` }));
+				for (const anchor of anchors) {
+					await db.insert(narratorToolCalls).values({
+						id: anchor.parentToolUseId,
+						narratorId: "owner-0",
+						messageId: "parent",
+						toolUseId: anchor.parentToolUseId,
+						toolName: "Read",
+						status: "success",
+						createdAt: now,
+					});
+				}
+				try {
+					for (const childCount of [0, 2]) {
+						for (let i = 0; i < childCount; i++) {
+							await seedMessage({
+								id: `child-${i}`,
+								narratorId: "owner-0",
+								seq: 10001 + i,
+								role: "assistant",
+								parentToolUseId: `anchor-${i}`,
+							});
+						}
+						if (statistics === "optimize") {
+							sqlite.run("PRAGMA analysis_limit=1000");
+							// 0x10000 considers every table, including on a fresh connection.
+							sqlite.run("PRAGMA optimize=0x10002");
+						}
+						if (statistics === "analyze") {
+							sqlite.run("PRAGMA analysis_limit=0");
+							sqlite.run("ANALYZE");
+						}
+						if (statistics !== "none") {
+							expect(
+								sqlite
+									.query(
+										"SELECT stat FROM sqlite_stat1 WHERE idx='idx_messages_parent_tool_use_lookup'",
+									)
+									.get(),
+							).not.toBeNull();
+						}
+						const { result, queries } = await traceReads(() =>
+							narratorService.getMessagesAfter("owner-0", { childAnchors: anchors }, 1),
+						);
+						const childQuery = queries.find((row) =>
+							row.query.includes('cross join "narrator_message_refs"'),
+						);
+						if (!childQuery) throw new Error("missing child query");
+						const oldRows = sqlite
+							.query(`SELECT r.message_id,r.seq FROM narrator_message_refs r
+							JOIN narrator_messages m ON r.message_id=m.id WHERE ${anchors
+								.map(
+									() =>
+										"(r.narrator_id='owner-0' AND r.segment_compact_id IS NULL AND r.seq>-1 AND m.parent_tool_use_id=?)",
+								)
+								.join(" OR ")}
+							ORDER BY r.seq LIMIT 2`)
+							.values(...anchors.map((a) => a.parentToolUseId));
+						expect(childQuery.rows).toEqual(oldRows);
+						expect(childQuery.rows).toHaveLength(childCount);
+						expect(result.hitLimit).toBe(childCount > 1);
+						const plan = queryPlan(childQuery.query, childQuery.params);
+						expect(plan).toContain(
+							"SEARCH narrator_messages USING INDEX idx_messages_parent_tool_use_lookup (parent_tool_use_id=?)",
+						);
+						expect(plan).toContain("idx_narrator_refs_unique");
+						expect(plan).not.toContain("SCAN narrator_messages");
+					}
+				} finally {
+					// Do not leak fixture statistics into other tests using this connection.
+					if (statistics !== "none") {
+						sqlite.run("DELETE FROM sqlite_stat1");
+						sqlite.run("ANALYZE sqlite_schema");
+					}
+					sqlite.run("PRAGMA analysis_limit=0");
+				}
+			});
+		}
+	}
+
+	test("non-SQLite child query retains the unhinted query shape", async () => {
+		await seedNarrator("caller");
+		await seedMessage({ id: "parent", narratorId: "caller", seq: 0, role: "assistant" });
+		await db.insert(narratorToolCalls).values({
+			id: "anchor",
+			narratorId: "caller",
+			messageId: "parent",
+			toolUseId: "anchor",
+			toolName: "Read",
+			status: "success",
+			createdAt: now,
+		});
+		mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "postgres" }));
+		try {
+			const { queries } = await traceReads(() =>
+				narratorService.getMessagesAfter("caller", {
+					childAnchors: [{ parentToolUseId: "anchor" }],
+				}),
+			);
+			const childQuery = queries.find((row) =>
+				row.query.includes('cross join "narrator_message_refs"'),
+			);
+			if (!childQuery) throw new Error("missing child query");
+			expect(childQuery.query).not.toContain("INDEXED BY");
+			expect(childQuery.query).not.toContain('"parent_tool_use_id" in');
+		} finally {
+			mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+		}
 	});
 
 	test("indexed child catch-up preserves per-anchor seq, caller refs, global limit and cursor", async () => {

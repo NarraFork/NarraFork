@@ -593,7 +593,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/git-staging-kernel.ts": ["json1"],
 	"server/services/git-staging-worker.ts": ["driver", "pragma"],
 	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
-	"server/services/narrator-messages.ts": ["handle", "glob"],
+	"server/services/narrator-messages.ts": ["handle", "glob", "indexHint", "drizzleDialect"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
