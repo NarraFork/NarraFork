@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { integrationResourceBindings, narrators, oauthGrants, remoteDevices } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -446,14 +447,23 @@ export class IntegrationResourceBindingService {
 		);
 	}
 
-	async get(resourceType: IntegrationResourceType, resourceId: string) {
+	async get(
+		resourceType: IntegrationResourceType,
+		resourceId: string,
+		readOptions?: ReadQueryOptions,
+	) {
+		readOptions?.signal?.throwIfAborted();
+		const query = db.query.integrationResourceBindings.findMany({
+			limit: 1,
+			where: and(
+				eq(integrationResourceBindings.resourceType, resourceType),
+				eq(integrationResourceBindings.resourceId, resourceId),
+			),
+		});
 		return (
-			(await db.query.integrationResourceBindings.findFirst({
-				where: and(
-					eq(integrationResourceBindings.resourceType, resourceType),
-					eq(integrationResourceBindings.resourceId, resourceId),
-				),
-			})) ?? null
+			(readOptions
+				? await readQueryFirst(query, { ...readOptions, executionPolicy: "worker-required" })
+				: (await query)[0]) ?? null
 		);
 	}
 

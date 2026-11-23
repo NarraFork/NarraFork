@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ReadQueryOptions } from "@server/db/worker-read";
 import { hotSafe } from "@server/lib/hot-safe";
 import { robotDiagnosticRuleSet } from "@server/lib/robot-diagnostic-policy";
 import { getSettingsRevision } from "@server/lib/settings";
@@ -258,9 +259,15 @@ export class ExecutionPolicyEngine {
 		context: ExecutionTargetContext | null,
 		presets: readonly ExecutionPolicyPreset[] = [],
 		signal?: AbortSignal,
+		readOptions?: ReadQueryOptions,
 	): Promise<ResolvedExecutionPolicy> {
+		signal ??= readOptions?.signal;
 		signal?.throwIfAborted();
-		const loaded = await this.load(narratorId, signal);
+		// Request-budgeted facts never join or replace a cross-request in-flight load.
+		// Ordinary callers still share the cancellable cache entry.
+		const loaded = await (readOptions
+			? executionPolicyRepository.load(narratorId, { ...readOptions, signal })
+			: this.load(narratorId, signal));
 		signal?.throwIfAborted();
 		const revision = compiledRevision(loaded, presets);
 		const contextKey = context ? executionTargetContextKey(context) : "unrouted";

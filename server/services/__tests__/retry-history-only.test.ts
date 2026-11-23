@@ -4,7 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { workerFailure, workerRejection } from "../../../tests/fixtures/worker-rejection";
+import { cleanDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import {
 	fileChangeOperations,
 	narratorMessageRefs,
@@ -12,8 +14,9 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { allowRetainedFileHistoryForTests } from "./retained-file-history";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -138,6 +141,7 @@ function stopAtModelStart() {
 }
 
 beforeEach(() => {
+	allowRetainedFileHistoryForTests();
 	cleanDb(sqlite);
 	cwd = mkdtempSync(join(tmpdir(), "nf-retry-history-"));
 	path = join(cwd, "kept.txt");
@@ -152,7 +156,8 @@ afterEach(() => {
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
+	await disposeWorkerDb();
 	mock.module("../../db", () => realDb);
 });
 
@@ -170,7 +175,7 @@ describe("retry after history-only rollback", () => {
 			const apply = spyOn(localRevert, "applyLocalRevertPlan");
 			const { start, reachedStart } = stopAtModelStart();
 			for (let retry = 0; retry < 2; retry++) {
-				await expect(retryLastMessage(ID)).rejects.toBe(reachedStart);
+				expect(await workerFailure(retryLastMessage(ID))).toBe(reachedStart);
 				expect(evidence()).toEqual(kept);
 				expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
 			}
@@ -196,9 +201,8 @@ describe("retry after history-only rollback", () => {
 			expect(evidence()).toEqual(kept);
 		}
 		// Explicit file rollback still sees the evidence; it must not disappear globally.
-		await expect(narratorService.deleteMessagesAfter(ID, "user")).rejects.toMatchObject({
-			code: "REVERT_AUTHENTICATION_REQUIRED",
-		});
+		const failure = await workerFailure(narratorService.deleteMessagesAfter(ID, "user"));
+		expect(failure).toMatchObject({ code: "REVERT_AUTHENTICATION_REQUIRED" });
 		expect(evidence()).toEqual(kept);
 		expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
 	});
@@ -249,7 +253,9 @@ describe("retry after history-only rollback", () => {
 		const kept = await historyOnlyRollback();
 		message("real-answer", 2, "assistant", [{ type: "text", text: "a real answer" }]);
 		const { start } = stopAtModelStart();
-		await expect(retryLastMessage(ID)).rejects.toThrow("Last message is not a user message");
+		expect(await workerRejection(retryLastMessage(ID))).toThrow(
+			"Last message is not a user message",
+		);
 		expect(start).not.toHaveBeenCalled();
 		expect(evidence()).toEqual(kept);
 		expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");

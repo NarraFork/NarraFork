@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	GIT_STATUS_PAGE_MAX_BYTES,
@@ -14,7 +15,7 @@ import { testEnvironment } from "../../../tests/preload";
 import { cleanDb } from "../../../tests/setup";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import * as spawn from "../../lib/spawn";
-import { GitStatusPageError } from "../../services/git-status-page";
+import { closeGitStatusPages, GitStatusPageError } from "../../services/git-status-page";
 
 const { db, sqlite } = await import("../../db");
 const realDbModule = { ...(await import("../../db")) };
@@ -24,7 +25,7 @@ const management = await import("../../services/git-management-service");
 const { gitService } = await import("../../services/git-service");
 const { narratorGitRoutes } = await import("../git");
 const root = await realpath(await mkdtemp(join(testEnvironment.isolatedHome, "git-pages-http-")));
-await mkdir(join(root, ".git"));
+execFileSync("git", ["init", "--quiet", root], { timeout: 15_000, maxBuffer: 4096 });
 const NOW = "2026-10-29T00:00:00.000Z";
 const BASE = "http://localhost/api/narrators/n1/git";
 const page: GitStatusPage = {
@@ -64,6 +65,7 @@ beforeEach(() => {
 });
 afterEach(() => mock.restore());
 afterAll(async () => {
+	await closeGitStatusPages();
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
 	await rm(root, { recursive: true, force: true });
@@ -105,6 +107,21 @@ function statsUrl(key: string, query: Record<string, string> = {}) {
 	});
 	return `${BASE}/status-page-stats?${search}`;
 }
+
+test("cold HTTP reads retain the legacy page shape and never expose a pending cache DTO", async () => {
+	const app = appFor();
+	const key = await workspaceKey(app);
+	const response = await app.request(
+		`${BASE}/status-files?workspaceKey=${encodeURIComponent(key)}`,
+	);
+	expect(response.status).toBe(200);
+	const result = await response.json();
+	expect(result.files).toEqual([]);
+	expect(result.counts.totalFiles).toBe(0);
+	expect(result.snapshotId).toBeString();
+	expect(result).not.toHaveProperty("status");
+	expect(result).not.toHaveProperty("cache");
+});
 
 test("statistics uses read authorization and pins the workspace, actor, filter and request signal", async () => {
 	const app = appFor();

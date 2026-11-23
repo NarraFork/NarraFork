@@ -47,6 +47,7 @@ import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narr
 import { and, eq, inArray, or, type SQL, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, projects } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import type { AclPrincipal, GrantRow } from "./acl/acl-core";
 import { applyGrant, resolveCaps } from "./acl/acl-core";
@@ -194,11 +195,16 @@ function isOwner(row: NarratorAclRow, principal: NarratorPrincipal): boolean {
 async function ownGrants(
 	narratorId: string,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ read: boolean; write: boolean; manage: boolean }> {
-	const caps = await resolveCaps(toAclPrincipal(principal), {
-		type: "narrator",
-		id: narratorId,
-	});
+	const caps = await resolveCaps(
+		toAclPrincipal(principal),
+		{
+			type: "narrator",
+			id: narratorId,
+		},
+		readOptions,
+	);
 	return caps.own;
 }
 
@@ -213,14 +219,19 @@ async function ownGrants(
 async function gateAndProjectFor(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ gate: { read: boolean; write: boolean }; projectId: string | null }> {
-	const projectId = await resolveProjectIdForNarratorId(row.id);
+	const projectId = await resolveProjectIdForNarratorId(row.id, readOptions);
 	// A standalone narrator has no project, hence no gate to pass. That is "no gate
 	// here", not "unrestricted": the checks below still decide.
-	const gate = await resolveProjectGate(projectId, {
-		userId: principal.userId,
-		isAdmin: principal.isAdmin,
-	});
+	const gate = await resolveProjectGate(
+		projectId,
+		{
+			userId: principal.userId,
+			isAdmin: principal.isAdmin,
+		},
+		readOptions,
+	);
 	return { gate, projectId };
 }
 
@@ -244,13 +255,26 @@ async function gateAndProjectFor(
  * "has a parent": keying on the parent link would make every fork permanently follow
  * whatever it was forked from.
  */
-async function resolveJudgedRow(row: NarratorAclRow): Promise<NarratorAclRow | null> {
+async function resolveJudgedRow(
+	row: NarratorAclRow,
+	readOptions?: ReadQueryOptions,
+): Promise<NarratorAclRow | null> {
+	readOptions?.signal?.throwIfAborted();
 	if (row.type !== "subagent") return row;
 	if (!row.aclRootNarratorId) return null;
-	const root = await db.query.narrators.findFirst({
-		where: eq(narrators.id, row.aclRootNarratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const root = await (readOptions
+		? readQueryFirst(
+				db.query.narrators.findMany({
+					limit: 1,
+					where: eq(narrators.id, row.aclRootNarratorId),
+					columns: NARRATOR_ACL_COLUMNS,
+				}),
+				{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+			)
+		: db.query.narrators.findFirst({
+				where: eq(narrators.id, row.aclRootNarratorId),
+				columns: NARRATOR_ACL_COLUMNS,
+			}));
 	return root ?? null;
 }
 
@@ -290,12 +314,14 @@ export async function resolveAclRootId(row: NarratorAclRow): Promise<string | nu
 export async function canReadNarrator(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
 	if (principal.isAdmin) return true;
 	// A subagent is judged entirely on its root; an undeterminable root denies.
-	const judged = await resolveJudgedRow(row);
+	const judged = await resolveJudgedRow(row, readOptions);
 	if (!judged) return false;
-	return await readVerdict(judged, principal, singleFacts(judged, principal));
+	return await readVerdict(judged, principal, singleFacts(judged, principal, readOptions));
 }
 
 /**
@@ -309,10 +335,14 @@ interface NarratorAccessFacts {
 	own(): Promise<{ read: boolean; write: boolean }>;
 }
 
-function singleFacts(judged: NarratorAclRow, principal: NarratorPrincipal): NarratorAccessFacts {
+function singleFacts(
+	judged: NarratorAclRow,
+	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
+): NarratorAccessFacts {
 	return {
-		gateAndProject: () => gateAndProjectFor(judged, principal),
-		own: () => ownGrants(judged.id, principal),
+		gateAndProject: () => gateAndProjectFor(judged, principal, readOptions),
+		own: () => ownGrants(judged.id, principal, readOptions),
 	};
 }
 
@@ -351,11 +381,13 @@ async function readVerdict(
 export async function canWriteNarrator(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
 	if (principal.isAdmin) return true;
-	const judged = await resolveJudgedRow(row);
+	const judged = await resolveJudgedRow(row, readOptions);
 	if (!judged) return false;
-	return await writeVerdict(judged, principal, singleFacts(judged, principal));
+	return await writeVerdict(judged, principal, singleFacts(judged, principal, readOptions));
 }
 
 /** The write rule of {@link canWriteNarrator} on the judged row. */
@@ -527,10 +559,11 @@ export async function hasNarratorAccess(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
 	return need === "write"
-		? await canWriteNarrator(row, principal)
-		: await canReadNarrator(row, principal);
+		? await canWriteNarrator(row, principal, readOptions)
+		: await canReadNarrator(row, principal, readOptions);
 }
 
 /**
@@ -544,8 +577,9 @@ export async function assertNarratorAccess(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<void> {
-	if (await hasNarratorAccess(row, principal, need)) return;
+	if (await hasNarratorAccess(row, principal, need, readOptions)) return;
 	throw new NotFoundError("Narrator", row.id);
 }
 
@@ -554,10 +588,17 @@ export async function loadNarratorForAccess(
 	narratorId: string,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ) {
-	const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	readOptions?.signal?.throwIfAborted();
+	const row = await (readOptions
+		? readQueryFirst(
+				db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, narratorId) }),
+				{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+			)
+		: db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }));
 	if (!row) throw new NotFoundError("Narrator", narratorId);
-	await assertNarratorAccess(row, principal, need);
+	await assertNarratorAccess(row, principal, need, readOptions);
 	return row;
 }
 

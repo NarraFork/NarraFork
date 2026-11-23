@@ -5,10 +5,13 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../../../../db";
 import { fileChangeScopes, narrators, workspaceWriteLeases } from "../../../../db/schema";
+import { backgroundTaskService } from "../../../../services/background-task-service";
 import { FileChangeEvidenceService } from "../../../../services/file-change-evidence";
 import { withFileWrite } from "../../../../services/file-write-queue";
 import * as capture from "../../../../services/narrator-tree-snapshot-hooks";
+import { worktreeTreeSnapshot } from "../../../../services/worktree-tree-snapshot";
 import { generateId } from "../../../id";
+import { settings } from "../../../settings";
 import { localBackend } from "../../execution/local-backend";
 import type { ToolContext } from "../../types";
 import { bashTool } from "../bash";
@@ -144,10 +147,43 @@ test("snapshot observation failure leaves the command result intact", async () =
 		);
 		expect(result.isError).not.toBe(true);
 		expect(result.output).toContain("command succeeded");
+		expect(snapshot).not.toHaveBeenCalled();
 	} finally {
 		snapshot.mockRestore();
 	}
 });
+
+for (const background of [false, true]) {
+	test(`local ${background ? "background" : "foreground"} Bash never enters capture with the legacy setting enabled`, async () => {
+		const previous = settings.workspace.treeSnapshotsEnabled;
+		settings.workspace.treeSnapshotsEnabled = true;
+		const window = spyOn(capture, "beginBashCaptureWindow");
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		const tree = spyOn(worktreeTreeSnapshot, "capture");
+		try {
+			const result = await bashTool.execute(
+				{
+					command: command("process.stdout.write('completed')"),
+					timeout: 5000,
+					run_in_background: background,
+				},
+				ctx,
+			);
+			expect(result.isError).not.toBe(true);
+			if (background)
+				await backgroundTaskService.drainBashCollectors({ deadlineAt: Date.now() + 5000 });
+			await new Promise<void>((done) => setImmediate(done));
+			expect(window).not.toHaveBeenCalled();
+			expect(hot).not.toHaveBeenCalled();
+			expect(tree).not.toHaveBeenCalled();
+		} finally {
+			window.mockRestore();
+			hot.mockRestore();
+			tree.mockRestore();
+			settings.workspace.treeSnapshotsEnabled = previous;
+		}
+	});
+}
 
 test("Bash still rejects a changed frozen execution target", async () => {
 	ctx.executionTarget = {

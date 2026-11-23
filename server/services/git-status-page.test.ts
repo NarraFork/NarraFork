@@ -1,15 +1,25 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type { Worker } from "node:worker_threads";
 import type { GitLineStats } from "../../shared/git-line-stats";
-import type { GitStatusPageStatsRow } from "../../shared/git-status-page";
+import type {
+	GitStatusPageResult,
+	GitStatusPageStatsResponse,
+	GitStatusPageStatsRow,
+} from "../../shared/git-status-page";
 import { logger } from "../lib/logger";
-import type { GitStatusPageRawResult, GitStatusPageScope } from "./git-status-page";
-import { GitStatusPageService } from "./git-status-page";
+import { closeGitLineStatsWorkers, getGitLineStats } from "./git-line-stats";
+import {
+	type GitStatusPageRawResult,
+	type GitStatusPageScope,
+	GitStatusPageService,
+} from "./git-status-page";
 
+afterAll(closeGitLineStatsWorkers);
 const exec = promisify(execFile);
 const services: GitStatusPageService[] = [];
 const fixtures: string[] = [];
@@ -19,7 +29,31 @@ const scope: GitStatusPageScope = {
 	queryKey: '["remote","device",3,"/repo"]',
 };
 const sourceRows = (count: number) =>
-	Array.from({ length: count }, (_, index) => `?? f-${String(index).padStart(4, "0")}\0`).join("");
+	Array.from({ length: count }, (_, i) => `?? f-${String(i).padStart(4, "0")}\0`).join("");
+const paths = Array.from({ length: 561 }, (_, i) => `目录/file-${String(i).padStart(4, "0")}`);
+const source = {
+	kind: "remote" as const,
+	identity: "device:3:/repo",
+	read: async () => ({ stdout: paths.map((path) => `?? ${path}\0`).join(""), complete: true }),
+};
+const stats = (added = 2): GitLineStats => ({
+	files: paths.map((path) => ({
+		path,
+		unstagedLinesAdded: added,
+		unstagedLinesRemoved: 1,
+		complete: true,
+	})),
+	linesAdded: added * 561,
+	linesRemoved: 561,
+	complete: true,
+});
+const row: GitStatusPageStatsRow = { type: "directory", section: "unstaged", path: "目录" };
+function ready<T extends GitStatusPageResult | GitStatusPageStatsResponse>(
+	value: T,
+): Extract<T, { status: "ready" }> {
+	if (value.status !== "ready") throw new Error(`Expected ready: ${JSON.stringify(value)}`);
+	return value as Extract<T, { status: "ready" }>;
+}
 function service() {
 	const value = new GitStatusPageService();
 	services.push(value);
@@ -44,9 +78,8 @@ async function fixture() {
 	return path;
 }
 async function git(cwd: string, ...args: string[]) {
-	await exec("git", args, { cwd, timeout: 15_000, maxBuffer: 4096 });
+	await exec("git", args, { cwd, timeout: 15000, maxBuffer: 4096 });
 }
-
 afterEach(async () => {
 	await Promise.all(services.splice(0).map((value) => value.close()));
 	await Promise.all(fixtures.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -59,7 +92,7 @@ test("slow page requests log bounded metadata on success and failure but fast re
 	try {
 		for (const fail of [false, true]) {
 			const pages = service();
-			const read = pages.read({
+			const read = pages.readOnDemand({
 				scope,
 				query: {},
 				source: {
@@ -79,7 +112,7 @@ test("slow page requests log bounded metadata on success and failure but fast re
 			["Slow Git status page operation", { operation: "read", durationMs: 2500, success: true }],
 			["Slow Git status page operation", { operation: "read", durationMs: 2500, success: false }],
 		]);
-		const page = await service().read({
+		const page = await service().readOnDemand({
 			scope,
 			query: {},
 			source: {
@@ -96,66 +129,175 @@ test("slow page requests log bounded metadata on success and failure but fast re
 	}
 });
 
-describe("real statistics worker service", () => {
-	const row: GitStatusPageStatsRow = { type: "directory", section: "unstaged", path: "目录" };
-	const paths = Array.from(
-		{ length: 561 },
-		(_, index) => `目录/file-${String(index).padStart(4, "0")}`,
-	);
-	const stats = (): GitLineStats => ({
-		files: paths.map((path) => ({
-			path,
-			unstagedLinesAdded: 2,
-			unstagedLinesRemoved: 1,
-			complete: true,
-		})),
-		linesAdded: 1122,
-		linesRemoved: 561,
-		complete: true,
-	});
-	const source = {
-		kind: "remote" as const,
-		identity: "device:3:/repo",
-		read: async () => ({ stdout: paths.map((path) => `?? ${path}\0`).join(""), complete: true }),
-	};
-
-	test("first-page directory statistics and later files reuse a single source and cached full-status association", async () => {
+describe("shared background paging Worker", () => {
+	test("cold GET never scans, production publishes files before statistics, all GETs remain read-only", async () => {
 		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		let reads = 0;
-		const readStats = async () => {
-			reads++;
-			return stats();
+		let scans = 0;
+		let measures = 0;
+		const remote = {
+			...source,
+			read: async () => {
+				scans++;
+				return source.read();
+			},
 		};
-		const result = await pages.readStats({
-			scope,
-			source,
-			query: { snapshotId: page.snapshotId, rows: [row] },
-			readStats,
+		expect(await pages.read({ scope, source: remote, query: {} })).toMatchObject({
+			status: "pending",
+			cache: { memberVersion: 0, statsVersion: 0 },
 		});
+		expect(scans).toBe(0);
+		const started = deferred<void>();
+		const delayed = deferred<GitLineStats>();
+		const production = pages.observe({
+			queryKey: scope.queryKey,
+			source: remote,
+			readStats: async () => {
+				measures++;
+				started.resolve();
+				return delayed.promise;
+			},
+		});
+		await started.promise;
+		const page = ready(await pages.read({ scope, source: remote, query: {} }));
 		expect(page.files).toHaveLength(100);
-		expect(page.hasMore).toBe(true);
-		expect(result).toEqual({
-			snapshotId: page.snapshotId,
-			rows: [{ ...row, added: 1122, removed: 561, complete: true }],
-		});
-		const file = { type: "file" as const, section: "unstaged" as const, path: paths[560] };
+		expect(page.cache).toMatchObject({ statsVersion: 0, updating: true });
 		expect(
-			(
-				await pages.readStats({
-					scope,
-					source,
-					query: { snapshotId: page.snapshotId, rows: [file] },
-					readStats,
-				})
-			).rows,
-		).toEqual([{ ...file, added: 2, removed: 1, complete: true }]);
-		expect(reads).toBe(1);
+			await pages.readStats({
+				scope,
+				source: remote,
+				query: { snapshotId: page.snapshotId, rows: [row] },
+			}),
+		).toMatchObject({
+			status: "pending",
+			cache: { memberVersion: page.cache.memberVersion, statsVersion: 0 },
+		});
+		delayed.resolve(stats());
+		await production;
+		const measured = ready(
+			await pages.readStats({
+				scope,
+				source: remote,
+				query: { snapshotId: page.snapshotId, rows: [row] },
+				readStats: async () => {
+					throw new Error("GET must not measure");
+				},
+			}),
+		);
+		expect(measured.rows).toEqual([{ ...row, added: 1122, removed: 561, complete: true }]);
+		const collected = [...page.files];
+		let current = page;
+		while (current.nextCursor) {
+			current = ready(
+				await pages.read({ scope, source: remote, query: { cursor: current.nextCursor } }),
+			);
+			collected.push(...current.files);
+		}
+		expect(new Set(collected.map((file) => file.path)).size).toBe(561);
+		await pages.read({
+			scope: { ...scope, actorId: "bob" },
+			source: remote,
+			query: { filter: ["A"] },
+		});
+		expect(scans).toBe(1);
+		expect(measures).toBe(1);
 	});
 
-	test("statistics identities and batch limits are checked before the authorized callback runs", async () => {
+	test("GET bypasses both occupied production slots and cancelling a GET leaves producers alive", async () => {
 		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
+		const started = deferred<void>();
+		const delayed = deferred<GitStatusPageRawResult>();
+		const controller = new AbortController();
+		let active = 0;
+		const remote = {
+			...source,
+			read: async (signal: AbortSignal) => {
+				active++;
+				signal.addEventListener("abort", () => active--, { once: true });
+				if (active === 2) started.resolve();
+				return delayed.promise;
+			},
+		};
+		const productions = ["first", "second"].map((queryKey) =>
+			pages
+				.observe({
+					queryKey,
+					source: remote,
+					readStats: async () => stats(),
+					signal: controller.signal,
+				})
+				.catch((error) => error),
+		);
+		await started.promise;
+		const cancelled = new AbortController();
+		cancelled.abort(new Error("viewport replaced"));
+		await expect(
+			pages.read({ scope, source: remote, query: {}, signal: cancelled.signal }),
+		).rejects.toThrow("viewport replaced");
+		expect((await pages.read({ scope, source: remote, query: {} })).status).toBe("pending");
+		expect(active).toBe(2);
+		delayed.resolve({ stdout: "?? done\0", complete: true });
+		await Promise.all(productions);
+	});
+
+	test("dirty same-member cache keeps numbers and cursors until atomic replacement", async () => {
+		const pages = service();
+		await pages.observe({ queryKey: scope.queryKey, source, readStats: async () => stats() });
+		const page = ready(await pages.read({ scope, source, query: {} }));
+		pages.invalidateStats(scope.queryKey);
+		const retained = ready(
+			await pages.readStats({ scope, source, query: { snapshotId: page.snapshotId, rows: [row] } }),
+		);
+		expect(retained.cache.updating).toBe(true);
+		expect(retained.rows[0].added).toBe(1122);
+		await pages.observe({ queryKey: scope.queryKey, source, readStats: async () => stats(3) });
+		const fresh = ready(
+			await pages.readStats({ scope, source, query: { snapshotId: page.snapshotId, rows: [row] } }),
+		);
+		expect(fresh.cache.memberVersion).toBe(page.cache.memberVersion);
+		expect(fresh.cache.statsVersion).toBeGreaterThan(page.cache.statsVersion);
+		expect(fresh.rows[0].added).toBe(1683);
+		expect(
+			ready(await pages.read({ scope, source, query: { cursor: page.nextCursor as string } }))
+				.snapshotId,
+		).toBe(page.snapshotId);
+	});
+
+	test("Worker loss changes epoch and a cache GET never falls back to source computation", async () => {
+		const pages = service();
+		let scans = 0;
+		const remote = {
+			...source,
+			read: async () => {
+				scans++;
+				return source.read();
+			},
+		};
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: remote,
+			readStats: async () => stats(),
+		});
+		const before = ready(await pages.read({ scope, source: remote, query: {} }));
+		const worker = (pages as unknown as { worker: Worker }).worker;
+		await worker.terminate();
+		const cold = await pages.read({ scope, source: remote, query: {} });
+		expect(cold.status).toBe("pending");
+		expect(cold.cache.workerEpoch).not.toBe(before.cache.workerEpoch);
+		expect(scans).toBe(1);
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: remote,
+			readStats: async () => stats(),
+		});
+		const after = ready(await pages.read({ scope, source: remote, query: {} }));
+		expect(after.cache.workerEpoch).toBe(cold.cache.workerEpoch);
+		expect(scans).toBe(2);
+	});
+
+	test("statistics identity and batch limits reject before any supplied source runs", async () => {
+		const pages = service();
+		await pages.observe({ queryKey: scope.queryKey, source, readStats: async () => stats() });
+		const page = ready(await pages.read({ scope, source, query: {} }));
 		let reads = 0;
 		const options = {
 			scope,
@@ -174,7 +316,7 @@ describe("real statistics worker service", () => {
 			{ ...options, query: { ...options.query, filter: ["M" as const] } },
 			{ ...options, query: { ...options.query, snapshotId: "unknown" } },
 		])
-			expect(await rejected(pages.readStats(changed))).toMatchObject({
+			expect(await pages.readStats(changed).catch((error: unknown) => error)).toMatchObject({
 				code: "GIT_STATUS_PAGE_EXPIRED",
 			});
 		expect(
@@ -188,230 +330,25 @@ describe("real statistics worker service", () => {
 		expect(reads).toBe(0);
 	});
 
-	test("facts invalidation rejects pending measurements, discards late data and preserves continuation cursors", async () => {
-		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		const started = deferred<void>();
-		const delayed = deferred<GitLineStats>();
-		let sourceSignal: AbortSignal | undefined;
-		const pending = pages
-			.readStats({
-				scope,
-				source,
-				query: { snapshotId: page.snapshotId, rows: [row] },
-				readStats: (readSignal) => {
-					sourceSignal = readSignal;
-					started.resolve();
-					return delayed.promise;
-				},
-			})
-			.catch((error) => error);
-		await started.promise;
-		pages.invalidateStats(scope.queryKey);
-		expect(await pending).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
-		expect(sourceSignal?.aborted).toBe(true);
-		delayed.resolve(stats());
-		const next = await pages.read({ scope, source, query: { cursor: page.nextCursor as string } });
-		expect(next.snapshotId).toBe(page.snapshotId);
-		let reads = 0;
-		const result = await pages.readStats({
-			scope,
-			source,
-			query: { snapshotId: page.snapshotId, rows: [row] },
-			readStats: async () => {
-				reads++;
-				return {
-					...stats(),
-					files: stats().files.map((file) => ({ ...file, unstagedLinesAdded: 3 })),
-				};
-			},
-		});
-		expect(reads).toBe(1);
-		expect(result.rows[0].added).toBe(1683);
-	});
-
-	test("shared statistics survive cancellation of the request that first opened their bridge", async () => {
-		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		const started = deferred<void>();
-		const delayed = deferred<GitLineStats>();
-		const controller = new AbortController();
-		let reads = 0;
-		let sourceSignal: AbortSignal | undefined;
-		const options = {
-			scope,
-			source,
-			query: { snapshotId: page.snapshotId, rows: [row] },
-			readStats: (readSignal: AbortSignal) => {
-				reads++;
-				sourceSignal = readSignal;
-				started.resolve();
-				return delayed.promise;
-			},
-		};
-		const first = pages
-			.readStats({ ...options, signal: controller.signal })
-			.catch((error) => error);
-		await started.promise;
-		const second = pages.readStats(options);
-		// Let dispatch enqueue its read before cancellation on the same ordered Worker port.
-		await Promise.resolve();
-		controller.abort(new Error("viewport replaced"));
-		expect((await first).message).toBe("viewport replaced");
-		expect(sourceSignal?.aborted).toBe(false);
-		delayed.resolve(stats());
-		expect((await second).rows[0].added).toBe(1122);
-		expect(reads).toBe(1);
-	});
-
-	test("cancellation before bridge delivery preserves another authorized statistics waiter", async () => {
-		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		const controller = new AbortController();
-		let reads = 0;
-		const options = {
-			scope,
-			source,
-			query: { snapshotId: page.snapshotId, rows: [row] },
-			readStats: async () => {
-				reads++;
-				return stats();
-			},
-		};
-		const first = pages
-			.readStats({ ...options, signal: controller.signal })
-			.catch((error) => error);
-		const second = pages.readStats(options);
-		await Promise.resolve();
-		controller.abort();
-		const cancelled = await first;
-		expect(cancelled).toMatchObject({
-			code: "GIT_STATUS_PAGE_CANCELLED",
-			cause: { name: "AbortError" },
-		});
-		expect((await second).rows[0].added).toBe(1122);
-		expect(reads).toBe(1);
-	});
-
-	test("cancelling every statistics waiter aborts the shared source and permits a fresh read", async () => {
-		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		const started = deferred<void>();
-		const controller = new AbortController();
-		let sourceSignal: AbortSignal | undefined;
-		const pending = pages
-			.readStats({
-				scope,
-				source,
-				query: { snapshotId: page.snapshotId, rows: [row] },
-				signal: controller.signal,
-				readStats: (readSignal) =>
-					new Promise<GitLineStats>((_resolve, reject) => {
-						sourceSignal = readSignal;
-						readSignal.addEventListener("abort", () => reject(readSignal.reason), { once: true });
-						started.resolve();
-					}),
-			})
-			.catch((error) => error);
-		await started.promise;
-		controller.abort(new Error("cancelled"));
-		expect((await pending).message).toBe("cancelled");
-		expect(sourceSignal?.aborted).toBe(true);
-		expect(
-			(
-				await pages.readStats({
-					scope,
-					source,
-					query: { snapshotId: page.snapshotId, rows: [row] },
-					readStats: async () => stats(),
-				})
-			).rows[0].added,
-		).toBe(1122);
-	});
-
-	test("unsupported statistics remain unknown and close aborts active source work", async () => {
-		const pages = service();
-		const page = await pages.read({ scope, source, query: {} });
-		const result = await pages.readStats({
-			scope,
-			source,
-			query: { snapshotId: page.snapshotId, rows: [row] },
-			readStats: async () => {
-				throw new Error("GIT_LINE_STATS_UNSUPPORTED");
-			},
-		});
-		expect(result).toEqual({
-			snapshotId: page.snapshotId,
-			rows: [{ ...row, added: undefined, removed: undefined, complete: false }],
-		});
-		pages.invalidateStats(scope.queryKey);
-		const started = deferred<void>();
-		let sourceSignal: AbortSignal | undefined;
-		const pending = pages
-			.readStats({
-				scope,
-				source,
-				query: { snapshotId: page.snapshotId, rows: [row] },
-				readStats: (readSignal) =>
-					new Promise<GitLineStats>((_resolve, reject) => {
-						sourceSignal = readSignal;
-						readSignal.addEventListener("abort", () => reject(readSignal.reason), { once: true });
-						started.resolve();
-					}),
-			})
-			.catch((error) => error);
-		await started.promise;
-		await pages.close();
-		expect(await pending).toMatchObject({ code: "GIT_STATUS_PAGE_CLOSED" });
-		expect(sourceSignal?.aborted).toBe(true);
-	});
-});
-
-describe("real paging worker service", () => {
-	test("raw remote source is read only once and continuation never falls back to local Git", async () => {
-		const pages = service();
-		let reads = 0;
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
-			read: async () => {
-				reads++;
-				return { stdout: sourceRows(562), complete: true };
-			},
-		};
-		let page = await pages.read({ scope, source, query: {} });
-		const paths: string[] = [];
-		while (true) {
-			paths.push(...page.files.map((file) => file.path));
-			if (!page.nextCursor) break;
-			page = await pages.read({ scope, source, query: { cursor: page.nextCursor } });
-		}
-		expect(reads).toBe(1);
-		expect(paths.length).toBe(562);
-		expect(new Set(paths).size).toBe(562);
-		expect(page.complete).toBe(true);
-	});
-
-	test("full raw status decoding runs in Worker rather than the parent event loop", async () => {
+	test("full porcelain decoding and directory index construction never run on the parent thread", async () => {
 		const pages = service();
 		const stdout = sourceRows(9000);
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
-			read: async () => ({ stdout, complete: true }),
-		};
+		const remote = { ...source, read: async () => ({ stdout, complete: true }) };
 		const decode = TextDecoder.prototype.decode;
 		TextDecoder.prototype.decode = () => {
 			throw new Error("Parent must not decode porcelain");
 		};
 		let ticks = 0;
-		const timer = setInterval(() => {
-			ticks++;
-		}, 1);
+		const timer = setInterval(() => ticks++, 1);
 		try {
-			const page = await pages.read({ scope, source, query: {} });
-			expect(page.files).toHaveLength(100);
+			await pages.observe({
+				queryKey: scope.queryKey,
+				source: remote,
+				readStats: async () => stats(),
+			});
+			const page = ready(await pages.read({ scope, source: remote, query: {} }));
 			expect(page.counts.totalFiles).toBe(9000);
+			expect(page.files).toHaveLength(100);
 			expect(ticks).toBeGreaterThan(0);
 		} finally {
 			clearInterval(timer);
@@ -419,60 +356,60 @@ describe("real paging worker service", () => {
 		}
 	});
 
-	test("remote truncation, absent completeness metadata, identity changes and invalidation are explicit", async () => {
+	test("remote truncation and missing metadata remain partial; no local fallback exists", async () => {
 		const pages = service();
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
+		const remote = {
+			...source,
 			read: async (): Promise<GitStatusPageRawResult> => ({
 				stdout: sourceRows(3),
 				complete: false,
 				limitReason: "remote-truncated",
 			}),
 		};
-		const page = await pages.read({ scope, source, query: { limit: 1 } });
-		expect(page).toMatchObject({
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: remote,
+			readStats: async () => stats(),
+		});
+		expect(await pages.read({ scope, source: remote, query: {} })).toMatchObject({
+			status: "ready",
 			complete: false,
 			limitReason: "remote-truncated",
 			counts: { exact: false },
 		});
-		const missing = await pages.read({
-			scope,
-			source: { ...source, read: async () => ({ stdout: "?? x\0" }) },
-			query: {},
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: { ...remote, read: async () => ({ stdout: "?? x\0" }) },
+			readStats: async () => stats(),
 		});
-		expect(missing).toMatchObject({ complete: false, limitReason: "remote-incomplete" });
+		expect(await pages.read({ scope, source: remote, query: {} })).toMatchObject({
+			complete: false,
+			limitReason: "remote-incomplete",
+		});
+		const failed = {
+			...remote,
+			identity: "device:offline",
+			read: async (): Promise<GitStatusPageRawResult> => {
+				throw new Error("device offline");
+			},
+		};
+		await pages.observe({ queryKey: "offline", source: failed, readStats: async () => stats() });
 		expect(
-			await rejected(
-				pages.read({
-					scope,
-					source: { ...source, identity: "device:4:/repo" },
-					query: { limit: 1, cursor: page.nextCursor as string },
-				}),
-			),
-		).toMatchObject({ code: "GIT_STATUS_PAGE_INVALID_CURSOR" });
-		pages.invalidate(scope.queryKey);
-		expect(
-			await rejected(
-				pages.read({ scope, source, query: { limit: 1, cursor: page.nextCursor as string } }),
-			),
-		).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+			await pages.read({ scope: { ...scope, queryKey: "offline" }, source: failed, query: {} }),
+		).toMatchObject({ status: "error", cache: { errorCode: "GIT_STATUS_PAGE_SOURCE_FAILED" } });
 	});
 
-	test("two running scans, sixteen queued requests and cancellation stay bounded", async () => {
+	test("two running producers and sixteen queued jobs remain bounded and cancellable", async () => {
 		const pages = service();
 		const started = deferred<void>();
 		let running = 0;
-		let maximum = 0;
 		let reads = 0;
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
+		const remote = {
+			...source,
 			read: (signal: AbortSignal) =>
 				new Promise<GitStatusPageRawResult>((_resolve, reject) => {
 					reads++;
 					running++;
-					maximum = Math.max(maximum, running);
 					if (reads === 2) started.resolve();
 					signal.addEventListener(
 						"abort",
@@ -485,65 +422,236 @@ describe("real paging worker service", () => {
 				}),
 		};
 		const controllers = Array.from({ length: 18 }, () => new AbortController());
-		const requests = controllers.map((controller) =>
-			pages.read({ scope, source, query: {}, signal: controller.signal }).then(
-				() => "unexpected",
-				(error: unknown) => error,
-			),
+		const requests = controllers.map((controller, index) =>
+			pages
+				.observe({
+					queryKey: `workspace-${index}`,
+					source: remote,
+					readStats: async () => stats(),
+					signal: controller.signal,
+				})
+				.catch((error) => error),
 		);
-		expect(await rejected(pages.read({ scope, source, query: {} }))).toMatchObject({
-			code: "GIT_STATUS_PAGE_BUSY",
-		});
+		await expect(
+			pages.observe({ queryKey: "overflow", source: remote, readStats: async () => stats() }),
+		).rejects.toMatchObject({ code: "GIT_STATUS_PAGE_BUSY" });
 		await started.promise;
-		expect(reads).toBe(2);
-		// Abort queued work before releasing either running slot.
 		for (const controller of controllers.slice(2)) controller.abort();
 		for (const controller of controllers.slice(0, 2)) controller.abort();
-		const results = await Promise.all(requests);
-		expect(results.every((result) => result instanceof Error)).toBe(true);
-		expect(maximum).toBe(2);
+		expect((await Promise.all(requests)).every((result) => result instanceof Error)).toBe(true);
 		expect(reads).toBe(2);
 		expect(running).toBe(0);
 	});
 
-	test("invalidation during raw source read aborts its owner and prevents snapshot publication", async () => {
+	test("invalidated late production cannot publish and released work cancels its full-statistics source", async () => {
 		const pages = service();
 		const started = deferred<void>();
-		const result = deferred<GitStatusPageRawResult>();
-		let aborted = false;
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
-			read: (signal: AbortSignal) => {
-				signal.addEventListener(
-					"abort",
-					() => {
-						aborted = true;
+		const delayed = deferred<GitStatusPageRawResult>();
+		const pending = pages
+			.observe({
+				queryKey: scope.queryKey,
+				source: {
+					...source,
+					read: async () => {
+						started.resolve();
+						return delayed.promise;
 					},
-					{ once: true },
-				);
-				started.resolve();
-				return result.promise;
-			},
-		};
-		const pending = pages.read({ scope, source, query: {} }).then(
-			() => "unexpected",
-			(error: unknown) => error,
-		);
+				},
+				readStats: async () => stats(),
+			})
+			.catch((error) => error);
 		await started.promise;
 		pages.invalidate(scope.queryKey);
-		result.resolve({ stdout: sourceRows(2), complete: true });
+		delayed.resolve({ stdout: "?? obsolete\0", complete: true });
 		expect(await pending).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+		expect((await pages.read({ scope, source, query: {} })).status).toBe("pending");
+		const measuring = deferred<void>();
+		let aborted = false;
+		const work = pages
+			.observe({
+				queryKey: scope.queryKey,
+				source,
+				readStats: (signal) =>
+					new Promise<GitLineStats>((_resolve, reject) => {
+						signal.addEventListener(
+							"abort",
+							() => {
+								aborted = true;
+								reject(signal.reason);
+							},
+							{ once: true },
+						);
+						measuring.resolve();
+					}),
+			})
+			.catch((error) => error);
+		await measuring.promise;
+		pages.release(scope.queryKey);
+		expect(await work).toMatchObject({ code: "GIT_STATUS_PAGE_CANCELLED" });
 		expect(aborted).toBe(true);
+		expect((await pages.read({ scope, source, query: {} })).status).toBe("pending");
 	});
 
-	test("service close cancels active source work, drains the worker and rejects new requests", async () => {
+	test("cold-start invalidation rejects queued production and stale intermediate publication", async () => {
+		const pages = service();
+		const internal = pages as unknown as {
+			connect: () => Promise<Worker>;
+			pending: Map<number, unknown>;
+			receive: (message: unknown) => void;
+		};
+		const connect = internal.connect.bind(pages);
+		const started = deferred<void>();
+		const gate = deferred<void>();
+		internal.connect = async () => {
+			started.resolve();
+			await gate.promise;
+			return connect();
+		};
+		let scans = 0;
+		let published = 0;
+		const remote = {
+			...source,
+			read: async () => {
+				scans++;
+				return source.read();
+			},
+		};
+		const delayedStats = deferred<GitLineStats>();
+		const pending = pages
+			.observe({
+				queryKey: scope.queryKey,
+				source: remote,
+				readStats: async () => delayedStats.promise,
+				onPublished: () => {
+					published++;
+				},
+			})
+			.catch((error) => error);
+		await started.promise;
+		const id = internal.pending.keys().next().value;
+		pages.invalidateStats(scope.queryKey);
+		internal.receive({
+			action: "cache-published",
+			id,
+			cache: {
+				status: "ready",
+				workerEpoch: "old",
+				memberVersion: 1,
+				statsVersion: 0,
+				updating: true,
+			},
+		});
+		gate.resolve();
+		expect(await pending).toMatchObject({ code: "GIT_STATUS_PAGE_EXPIRED" });
+		delayedStats.resolve(stats(99));
+		expect(scans).toBe(0);
+		expect(published).toBe(0);
+		expect((await pages.read({ scope, source: remote, query: {} })).status).toBe("pending");
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: remote,
+			readStats: async () => stats(3),
+		});
+		const page = ready(await pages.read({ scope, source: remote, query: {} }));
+		expect(
+			ready(
+				await pages.readStats({
+					scope,
+					source: remote,
+					query: { snapshotId: page.snapshotId, rows: [row] },
+				}),
+			).rows[0].added,
+		).toBe(1683);
+	});
+
+	test("exact source leases keep sibling workspaces and shared owners alive on release", async () => {
+		const pages = service();
+		const parentScope = { ...scope, queryKey: '["local","/repo"]' };
+		const childScope = { ...scope, queryKey: '["local","/repo/sub"]' };
+		pages.retain(parentScope.queryKey, source);
+		pages.retain(parentScope.queryKey, source);
+		pages.retain(childScope.queryKey, source);
+		for (const owner of [parentScope, childScope])
+			await pages.observe({ queryKey: owner.queryKey, source, readStats: async () => stats() });
+		const started = deferred<void>();
+		const delayed = deferred<GitLineStats>();
+		const childWork = pages.observe({
+			queryKey: childScope.queryKey,
+			source,
+			readStats: async () => {
+				started.resolve();
+				return delayed.promise;
+			},
+		});
+		await started.promise;
+		pages.release(parentScope.queryKey, source);
+		expect((await pages.read({ scope: parentScope, source, query: {} })).status).toBe("ready");
+		pages.release(parentScope.queryKey, source);
+		expect((await pages.read({ scope: parentScope, source, query: {} })).status).toBe("pending");
+		expect((await pages.read({ scope: childScope, source, query: {} })).status).toBe("ready");
+		delayed.resolve(stats(4));
+		expect((await childWork).statsVersion).toBeGreaterThan(0);
+		pages.release(childScope.queryKey, source);
+		expect((await pages.read({ scope: childScope, source, query: {} })).status).toBe("pending");
+	});
+
+	test("same query key with a different source identity owns an independent lease", async () => {
+		const pages = service();
+		const other = { ...source, identity: "device:4:/repo" };
+		pages.retain(scope.queryKey, source);
+		pages.retain(scope.queryKey, other);
+		await pages.observe({ queryKey: scope.queryKey, source, readStats: async () => stats() });
+		await pages.observe({
+			queryKey: scope.queryKey,
+			source: other,
+			readStats: async () => stats(),
+		});
+		pages.release(scope.queryKey, source);
+		expect((await pages.read({ scope, source, query: {} })).status).toBe("pending");
+		expect((await pages.read({ scope, source: other, query: {} })).status).toBe("ready");
+		pages.release(scope.queryKey, other);
+		expect((await pages.read({ scope, source: other, query: {} })).status).toBe("pending");
+	});
+
+	test("254 real files flow through the full background measurement bridge beyond WebSocket limits", async () => {
+		const root = await fixture();
+		await git(root, "init", "-q");
+		await mkdir(join(root, "directory"));
+		const files = Array.from({ length: 254 }, (_, i) => `directory/file-${i}`);
+		await Promise.all(files.map((path) => writeFile(join(root, path), "one\ntwo")));
+		const pages = service();
+		const local = { kind: "local" as const, cwd: root };
+		const owner = { ...scope, queryKey: JSON.stringify(["local", root]) };
+		await pages.observe({
+			queryKey: owner.queryKey,
+			source: local,
+			readStats: (signal) => getGitLineStats(root, signal),
+		});
+		const page = ready(await pages.read({ scope: owner, source: local, query: {} }));
+		const rows: GitStatusPageStatsRow[] = [
+			{ type: "directory", section: "unstaged", path: "directory" },
+			{ type: "file", section: "unstaged", path: files[253] },
+		];
+		const measured = ready(
+			await pages.readStats({
+				scope: owner,
+				source: local,
+				query: { snapshotId: page.snapshotId, rows },
+			}),
+		);
+		expect(page.files).toHaveLength(100);
+		expect(measured.rows).toEqual([
+			{ ...rows[0], added: 508, removed: 0, complete: true },
+			{ ...rows[1], added: 2, removed: 0, complete: true },
+		]);
+	}, 15000);
+
+	test("close cancels owned work, drains Worker and rejects further requests", async () => {
 		const pages = service();
 		const started = deferred<void>();
 		let aborted = false;
-		const source = {
-			kind: "remote" as const,
-			identity: "device:3:/repo",
+		const remote = {
+			...source,
 			read: (signal: AbortSignal) =>
 				new Promise<GitStatusPageRawResult>((_resolve, reject) => {
 					signal.addEventListener(
@@ -557,10 +665,9 @@ describe("real paging worker service", () => {
 					started.resolve();
 				}),
 		};
-		const pending = pages.read({ scope, source, query: {} }).then(
-			() => "unexpected",
-			(error: unknown) => error,
-		);
+		const pending = pages
+			.observe({ queryKey: scope.queryKey, source: remote, readStats: async () => stats() })
+			.catch((error) => error);
 		await started.promise;
 		await pages.close();
 		expect(await pending).toMatchObject({ code: "GIT_STATUS_PAGE_CLOSED" });
@@ -570,7 +677,7 @@ describe("real paging worker service", () => {
 		});
 	});
 
-	test("isolated real Git repository pages more than 561 paths including rename and AM/MM", async () => {
+	test("isolated real Git observes more than 561 files including rename and AM/MM", async () => {
 		const root = await fixture();
 		await git(root, "init", "-q");
 		for (const name of ["旧 名.txt", "both.txt"])
@@ -592,73 +699,74 @@ describe("real paging worker service", () => {
 		await git(root, "add", "-A");
 		await writeFile(join(root, "added.txt"), "staged\nworktree\n");
 		await writeFile(join(root, "both.txt"), "staged change\nworktree\n");
-		const extras = Array.from(
-			{ length: 562 },
-			(_, index) => `untracked-${String(index).padStart(4, "0")}.txt`,
-		);
+		const extras = Array.from({ length: 562 }, (_, i) => `untracked-${i}.txt`);
 		extras.push("中文 空格.txt");
 		if (process.platform !== "win32") extras.push("换\n行.txt");
-		await Promise.all(extras.map((name) => writeFile(join(root, name), "x\n")));
+		await Promise.all(extras.map((path) => writeFile(join(root, path), "x\n")));
 		const pages = service();
 		const localScope = { ...scope, queryKey: JSON.stringify(["local", root]) };
-		const source = { kind: "local" as const, cwd: root };
-		let page = await pages.read({ scope: localScope, source, query: {} });
+		const local = { kind: "local" as const, cwd: root };
+		expect((await pages.read({ scope: localScope, source: local, query: {} })).status).toBe(
+			"pending",
+		);
+		await pages.observe({
+			queryKey: localScope.queryKey,
+			source: local,
+			readStats: async () => stats(),
+		});
+		let page = ready(await pages.read({ scope: localScope, source: local, query: {} }));
 		const files = [...page.files];
 		while (page.nextCursor) {
-			page = await pages.read({ scope: localScope, source, query: { cursor: page.nextCursor } });
+			page = ready(
+				await pages.read({ scope: localScope, source: local, query: { cursor: page.nextCursor } }),
+			);
 			files.push(...page.files);
 		}
-		expect(page.complete).toBe(true);
 		expect(files).toHaveLength(extras.length + 3);
-		expect(new Set(files.map((file) => file.path)).size).toBe(extras.length + 3);
-		expect(files.find((file) => file.path === "新 名.txt")).toMatchObject({
+		expect(new Set(files.map((entry) => entry.path)).size).toBe(files.length);
+		expect(files.find((entry) => entry.path === "新 名.txt")).toMatchObject({
 			status: "R ",
 			oldPath: "旧 名.txt",
 		});
-		expect(files.find((file) => file.path === "added.txt")?.status).toBe("AM");
-		expect(files.find((file) => file.path === "both.txt")?.status).toBe("MM");
-		for (const path of extras) expect(files.some((file) => file.path === path)).toBe(true);
-	}, 30_000);
+		expect(files.find((entry) => entry.path === "added.txt")?.status).toBe("AM");
+		expect(files.find((entry) => entry.path === "both.txt")?.status).toBe("MM");
+		expect(page.complete).toBe(true);
+	}, 30000);
 
 	test.skipIf(process.platform === "win32")(
-		"cancelling a local scan waits for owned Git and inherited-pipe descendants to exit",
+		"cancelling a local producer waits for owned Git and inherited-pipe descendants",
 		async () => {
 			const root = await fixture();
 			const bin = join(root, "bin");
 			await mkdir(bin);
-			const fakeScript = join(root, "git-fixture.js");
+			const script = join(root, "git-fixture.js");
 			await writeFile(
-				fakeScript,
+				script,
 				`const descendant = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "inherit", stderr: "inherit" });\nawait Bun.write("child.pid", JSON.stringify({ pid: process.pid, descendant: descendant.pid }));\nprocess.stdout.write("?? waiting.txt\\0");\nsetInterval(() => {}, 1000);\n`,
 			);
-			const gitPath = join(bin, "git");
-			await writeFile(gitPath, `#!/bin/sh\nexec "${process.execPath}" "${fakeScript}"\n`);
-			await chmod(gitPath, 0o755);
-			// Explicit subprocess environment works on Bun versions whose Worker ignores JS env mutations.
+			await writeFile(join(bin, "git"), `#!/bin/sh\nexec "${process.execPath}" "${script}"\n`);
+			await chmod(join(bin, "git"), 0o755);
 			const probe = `import { GitStatusPageService } from ${JSON.stringify(new URL("./git-status-page.ts", import.meta.url).href)};
 const pages = new GitStatusPageService();
 const controller = new AbortController();
 const root = process.cwd();
-const pending = pages.read({ scope: { actorId: "fixture", workspaceKey: "fixture", queryKey: JSON.stringify(["local", root]) }, source: { kind: "local", cwd: root }, query: {}, signal: controller.signal }).then(() => ({ success: true }), error => ({ name: error.name, code: error.code }));
+const pending = pages.observe({ queryKey: JSON.stringify(["local", root]), source: { kind: "local", cwd: root }, readStats: async () => ({ files: [], linesAdded: 0, linesRemoved: 0, complete: false }), signal: controller.signal }).then(() => ({ success: true }), error => ({ code: error.code }));
 try {
  let ids;
  const deadline = Date.now() + 5000;
- while (!ids && Date.now() < deadline) {
-  try { ids = await Bun.file("child.pid").json(); } catch { await Bun.sleep(5); }
- }
- if (!ids) { controller.abort(); throw new Error("Fixture Git did not start: " + Bun.which("git") + " result=" + JSON.stringify(await pending)); }
+ while (!ids && Date.now() < deadline) { try { ids = await Bun.file("child.pid").json(); } catch { await Bun.sleep(5); } }
+ if (!ids) { controller.abort(); throw new Error("Fixture Git did not start"); }
  controller.abort();
  const result = await pending;
  await pages.close();
  let parentGone = false;
  try { process.kill(ids.pid, 0); } catch { parentGone = true; }
  console.log(JSON.stringify({ ...ids, parentGone, cancelled: !result.success }));
-} finally { await pages.close(); }
-`;
+} finally { await pages.close(); }`;
 			const { stdout } = await exec(process.execPath, ["-e", probe], {
 				cwd: root,
 				env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
-				timeout: 12_000,
+				timeout: 12000,
 				maxBuffer: 4096,
 			});
 			const result = JSON.parse(stdout.trim()) as {
@@ -681,6 +789,6 @@ try {
 				expect(state === undefined || state === "Z").toBe(true);
 			}
 		},
-		15_000,
+		15000,
 	);
 });

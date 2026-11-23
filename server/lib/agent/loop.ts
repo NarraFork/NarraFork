@@ -372,7 +372,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
 	if (kind === "empty_response_usage_only") return true;
 	return (
 		kind === "empty_response_stop_without_content" &&
-		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+		QUIET_STOP_REASONS.has(signals.stopReason?.toLowerCase() ?? "")
 	);
 }
 
@@ -1438,7 +1438,7 @@ export async function runReflectionLoop(
 			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
 			rebuildRequestHistory: undefined,
 			historyEndsWithToolResults: undefined,
-			shouldIdleOnReasoningOnly: undefined,
+			hasPendingWake: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -7143,14 +7143,23 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
-					if (
-						quietFinishAllowed &&
+					const pendingWake =
 						requestStarted &&
 						!lastRetryErrorMessage &&
-						isQuietFinish(emptyKind, emptySignals)
+						isQuietFinish(emptyKind, emptySignals) &&
+						(await config.hasPendingWake?.());
+					if (
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals) &&
+						(quietFinishAllowed || pendingWake)
 					) {
 						yield* finishRequest();
-						yield { type: "done" };
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield pendingWake ? { type: "done", reason: "reasoning_only_idle" } : { type: "done" };
 						return;
 					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
@@ -7388,7 +7397,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Keep the ordinary cleanup above, but do not retry or compact a model
 					// that has nothing to say while waiting for a background result / Send.
-					if (await config.shouldIdleOnReasoningOnly?.()) {
+					if (await config.hasPendingWake?.()) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
