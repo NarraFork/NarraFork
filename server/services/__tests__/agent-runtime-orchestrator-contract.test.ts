@@ -772,12 +772,7 @@ describe("outline task leases", () => {
 		});
 
 		test("a system run that ends while something still works for the session in the background: not natural", async () => {
-			const { backgroundTaskService } = await import("../background-task-service");
-			const busy = spyOn(backgroundTaskService, "countActiveKindsByParent").mockResolvedValue({
-				activeCount: 1,
-				activeWorkCount: 1,
-				activeServiceCount: 0,
-			});
+			const busy = spyOn(backgroundOccupancyStore, "countActiveWakeWork").mockReturnValue(1);
 			try {
 				expect(await endOf([finished], { by: "system" })).toMatchObject({
 					natural: false,
