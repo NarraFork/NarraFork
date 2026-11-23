@@ -20,7 +20,6 @@ export interface DbReadAbortDiagnostics {
 }
 const taskKinds = {
 	benchmarkRead: true,
-	composerDocument: true,
 	compactSummary: true,
 	publicationTerminalResult: true,
 	executionPolicyFacts: true,
@@ -31,7 +30,6 @@ const taskKinds = {
 	revertSelectionBody: true,
 	subagentActivity: true,
 	databaseCleanupContext: true,
-	toolDetailSnapshot: true,
 	storageScanContext: true,
 	storageScanTables: true,
 	storageScanSerial: true,

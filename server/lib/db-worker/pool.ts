@@ -37,7 +37,11 @@ import {
 	peekReadDatabaseIdentity,
 	type ReadDatabaseIdentity,
 } from "./database-identity";
-import { validateDomainRead } from "./domain-protocol";
+import {
+	DOMAIN_READ_STREAM_TIMEOUT_MS,
+	isDomainReadStreamTask,
+	validateDomainRead,
+} from "./domain-protocol";
 import { DbReadError, errorFromWorkerFailure, readAborted } from "./errors";
 import { assertWorkerBuildId, workerFailureDetails } from "./failure";
 import {
@@ -616,8 +620,11 @@ class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
 			message.type === "result" ? message.durationMs : undefined,
 			request.fanoutExcluded,
 		);
-		if (message.type === "result") active.finish(undefined, message.result);
-		else {
+		if (message.type === "result") {
+			if (active.consumeSequence !== undefined)
+				active.cancel(new DbReadError("DB_READ_PROTOCOL", "Result arrived before chunk ACK"));
+			else active.finish(undefined, message.result);
+		} else {
 			if (message.code === "DB_READ_SNAPSHOT_CLEANUP_FAILED") this.failed = true;
 			try {
 				logger.warn("Database read worker query failed", {
@@ -1137,12 +1144,16 @@ async function runReadTaskInternal<T>(
 	try {
 		if (!isTaskKind(params.kind))
 			throw new DbReadError("DB_READ_INVALID", "Unknown database read task kind");
+		const stream = isDomainReadStreamTask(params);
+		if (stream && (!fresh || !exitTracker || compatibleEphemeral))
+			throw new DbReadError("DB_READ_INVALID", "Domain streams require a tracked one-shot worker");
 		const scheduling = classifyReadTask(params, options.schedulingHint);
 		const disabled = workersDisabled(profile);
 		if (disabled) throw new WorkersUnavailableError(disabled);
 		if (options.signal?.aborted) throw readAborted();
-		const timeoutMs =
-			profile === "shortReads"
+		const timeoutMs = stream
+			? Math.min(options.timeoutMs ?? DOMAIN_READ_STREAM_TIMEOUT_MS, DOMAIN_READ_STREAM_TIMEOUT_MS)
+			: profile === "shortReads"
 				? Math.min(options.timeoutMs ?? SHORT_READ_TIMEOUT_MS, SHORT_READ_TIMEOUT_MS)
 				: (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
 		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
@@ -1169,7 +1180,7 @@ async function runReadTaskInternal<T>(
 		if (params.kind === "selectValues" || params.kind === "selectChunks")
 			decodeReadBinds(params, diagnostics.meter);
 		if (
-			params.kind === "selectChunks" &&
+			(params.kind === "selectChunks" || stream) &&
 			(typeof options.onChunk !== "function" || options.dedupeKey)
 		) {
 			throw new DbReadError("DB_READ_INVALID", "Chunk reads require an independent consumer");
