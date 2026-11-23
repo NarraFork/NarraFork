@@ -5,7 +5,11 @@ import { mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker as NodeWorker } from "node:worker_threads";
-import { consumeReadSqlValues, readNativeRows } from "../../../db/worker-read";
+import {
+	consumeReadDomainTask,
+	consumeReadSqlValues,
+	readNativeRows,
+} from "../../../db/worker-read";
 import { WorkerHandle } from "../../worker-runtime/lifecycle";
 import { getReadDatabaseIdentity, resumeReadDatabase } from "../database-identity";
 import {
@@ -22,6 +26,7 @@ import {
 	runTrackedEphemeralReadTask,
 	setDbWorkerSpecifiersForTest,
 } from "../pool";
+import type { DbWorkerInbound } from "../protocol";
 
 let home: string;
 let path: string;
@@ -57,6 +62,58 @@ afterEach(async () => {
 });
 
 describe("owned ephemeral readers", () => {
+	test("domain reads time out before a delayed worker exit without releasing its ownership", async () => {
+		const stopping = Promise.withResolvers<number>();
+		const exit = Promise.withResolvers<number>();
+		class DelayedExitWorker extends EventEmitter {
+			postMessage(message: DbWorkerInbound) {
+				if (message.type === "task")
+					queueMicrotask(() =>
+						this.emit("message", {
+							type: "result",
+							requestId: message.requestId,
+							result: { metadata: { kind: "missing" }, bytes: 0, chunks: 0 },
+							durationMs: 0,
+						}),
+					);
+			}
+		}
+		const spawn = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+			const worker = new DelayedExitWorker();
+			queueMicrotask(() => worker.emit("message", { type: "ready" }));
+			return new WorkerHandle(worker as unknown as NodeWorker, exit.promise, () => {
+				stopping.resolve(Date.now());
+			});
+		});
+		setDbWorkerSpecifiersForTest(["delayed-exit"]);
+		const deadlineAt = Date.now() + 250;
+		const result = consumeReadDomainTask(
+			db,
+			"composerDocument",
+			{
+				narratorId: "n1",
+				messageId: "missing",
+				blockReads: false,
+			},
+			() => {},
+			{ deadlineAt },
+		).catch((error: unknown) => error);
+		try {
+			expect(await Promise.race([stopping.promise, result])).toBeLessThan(deadlineAt);
+			const beforeExit = await Promise.race([result, Bun.sleep(500).then(() => "still pending")]);
+			const trackedBeforeExit = getDbWorkerPoolStats().tracked;
+			exit.resolve(0);
+			const afterExit = await result;
+			expect(afterExit).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+			expect(beforeExit).toBe(afterExit);
+			expect(trackedBeforeExit).toBe(1);
+		} finally {
+			exit.resolve(0);
+			spawn.mockRestore();
+			setDbWorkerSpecifiersForTest(null);
+		}
+	});
+
 	test("startup cancellation keeps the release receipt pending until actual exit", async () => {
 		const terminated = deferred();
 		const workers: PendingExitWorker[] = [];

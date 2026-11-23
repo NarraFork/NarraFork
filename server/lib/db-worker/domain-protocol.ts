@@ -1,13 +1,38 @@
+import type { ComposerDocumentMetadata, ComposerDocumentParams } from "./composer-document-query";
 import { DbReadError } from "./errors";
 import type { ReadBudgetMeter } from "./read-budget";
+import type { ToolDetailMetadata, ToolDetailSnapshotParams } from "./tool-detail-query";
+import { TOOL_DETAIL_PAYLOAD_BYTE_LIMIT } from "./tool-detail-selection";
 
-export interface DomainReadTaskMap {
+export const DOMAIN_READ_STREAM_CHUNK_BYTES = 64 * 1024;
+export const DOMAIN_READ_STREAM_TIMEOUT_MS = 30_000;
+export const COMPOSER_DOCUMENT_RESULT_BYTES = 24 * 1024 * 1024;
+
+interface SyncDomainReadTaskMap {
 	readerProbe: { params: null; result: { ready: true } };
 }
+interface StreamDomainReadTaskMap {
+	composerDocument: { params: ComposerDocumentParams; result: ComposerDocumentMetadata };
+	toolDetailSnapshot: { params: ToolDetailSnapshotParams; result: ToolDetailMetadata };
+}
+export type DomainReadTaskMap = SyncDomainReadTaskMap & StreamDomainReadTaskMap;
+export type SyncDomainReadTaskKind = keyof SyncDomainReadTaskMap;
+export type StreamDomainReadTaskKind = keyof StreamDomainReadTaskMap;
 export type DomainReadTaskKind = keyof DomainReadTaskMap;
 export type DomainReadParams = {
 	[K in DomainReadTaskKind]: { kind: "domainRead"; task: K; input: DomainReadTaskMap[K]["params"] };
 }[DomainReadTaskKind];
+export type DomainReadStreamParams = Extract<DomainReadParams, { task: StreamDomainReadTaskKind }>;
+export interface DomainReadStreamContext {
+	signal: AbortSignal;
+	deadlineAt: number;
+	emit(bytes: Uint8Array): Promise<void>;
+}
+export interface DomainReadStreamResult<T = unknown> {
+	metadata: T;
+	bytes: number;
+	chunks: number;
+}
 interface DomainDefinition {
 	maxInputBytes: number;
 	maxResultBytes: number;
@@ -17,12 +42,70 @@ interface DomainDefinition {
 	validateResult?(result: unknown): boolean;
 }
 const SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const isId = (value: unknown) => typeof value === "string" && value.length > 0;
+const record = (value: unknown): value is Record<string, unknown> =>
+	!!value && typeof value === "object" && !Array.isArray(value);
+const isReferenceId = (value: unknown) =>
+	value === undefined || (typeof value === "string" && value.length > 0 && value.length <= 128);
+
+export const DOMAIN_STREAM_BYTE_LIMITS = {
+	composerDocument: COMPOSER_DOCUMENT_RESULT_BYTES,
+	// The stored-row cap still applies before projection. JSON escaping and repeated
+	// execution-target fields can expand the encoded representation. Allow for both,
+	// plus the fixed field names, without lowering the original stored-row cap.
+	toolDetailSnapshot: 32 * TOOL_DETAIL_PAYLOAD_BYTE_LIMIT + 128 * 1024,
+} satisfies Record<StreamDomainReadTaskKind, number>;
+
+export function isDomainReadStreamTask(params: {
+	kind: string;
+	task?: unknown;
+}): params is DomainReadStreamParams {
+	return (
+		params.kind === "domainRead" &&
+		typeof params.task === "string" &&
+		Object.hasOwn(DOMAIN_STREAM_BYTE_LIMITS, params.task)
+	);
+}
+
 export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinition } = {
 	readerProbe: {
 		maxInputBytes: 128 * 1024,
 		maxResultBytes: SNAPSHOT_BYTES,
 		maxArrayItems: 10_000,
 		validate: (input) => input === null,
+	},
+	composerDocument: {
+		maxInputBytes: 128 * 1024,
+		maxResultBytes: 128 * 1024,
+		maxArrayItems: 0,
+		validate: (input) =>
+			record(input) &&
+			isId(input.narratorId) &&
+			isId(input.messageId) &&
+			typeof input.blockReads === "boolean",
+	},
+	toolDetailSnapshot: {
+		maxInputBytes: 128 * 1024,
+		maxResultBytes: 128 * 1024,
+		maxArrayItems: 128,
+		validate: (input) =>
+			record(input) &&
+			isId(input.narratorId) &&
+			isId(input.toolUseId) &&
+			record(input.reference) &&
+			isReferenceId(input.reference.toolCallId) &&
+			isReferenceId(input.reference.messageId) &&
+			Array.isArray(input.columns) &&
+			input.columns.length > 0 &&
+			input.columns.length <= 128 &&
+			input.columns.every(
+				(column) =>
+					record(column) &&
+					isId(column.key) &&
+					isId(column.name) &&
+					typeof column.type === "string" &&
+					typeof column.virtual === "boolean",
+			),
 	},
 };
 /** Validate structure before clone; numeric DTO budgets are observations, without serialization. */
@@ -76,13 +159,15 @@ export function validateDomainRead(
 	if (!Object.hasOwn(DOMAIN_READ_DEFINITIONS, params.task))
 		throw new DbReadError("DB_READ_UNSUPPORTED", "Unregistered database read task");
 	const definition = DOMAIN_READ_DEFINITIONS[params.task];
-	checkDomainBudget(
+	const bytes = checkDomainBudget(
 		params.input,
 		definition.maxInputBytes,
 		definition.maxInputArrayItems ?? definition.maxArrayItems,
 		meter,
 		"input",
 	);
+	if (isDomainReadStreamTask(params) && bytes > definition.maxInputBytes)
+		throw new DbReadError("DB_READ_BUDGET", "Domain stream exceeded its input byte budget");
 	if (!definition.validate(params.input))
 		throw new DbReadError("DB_READ_INVALID", "Invalid domain read parameters");
 	return definition;

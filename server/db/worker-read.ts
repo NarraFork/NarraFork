@@ -11,11 +11,21 @@ import { SQLiteRelationalQuery } from "drizzle-orm/sqlite-core/query-builders/qu
 import { bindReadDatabase } from "../lib/db-worker/database-identity";
 import {
 	createDomainReadParams,
-	type DomainReadTaskKind,
+	DOMAIN_READ_STREAM_CHUNK_BYTES,
+	DOMAIN_READ_STREAM_TIMEOUT_MS,
+	DOMAIN_STREAM_BYTE_LIMITS,
+	type DomainReadStreamResult,
 	type DomainReadTaskMap,
+	type StreamDomainReadTaskKind,
+	type SyncDomainReadTaskKind,
 } from "../lib/db-worker/domain-protocol";
 import { DbReadError, readAborted } from "../lib/db-worker/errors";
-import { runReadTask, runShortReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import {
+	runReadTask,
+	runShortReadTask,
+	runTrackedEphemeralReadTask,
+	WorkersUnavailableError,
+} from "../lib/db-worker/pool";
 import type {
 	SelectDigestBatchEntry,
 	SelectDigestBatchParams,
@@ -374,7 +384,7 @@ export async function readDbAll<T = Record<string, unknown>>(
 		return readNativeRows<T>(client, compiled.sql, compiled.params as ReadBind[], options);
 	});
 }
-export async function readDomainTask<K extends DomainReadTaskKind>(
+export async function readDomainTask<K extends SyncDomainReadTaskKind>(
 	client: Database,
 	task: K,
 	input: DomainReadTaskMap[K]["params"],
@@ -389,6 +399,109 @@ export async function readDomainTask<K extends DomainReadTaskKind>(
 		const identity = bindReadDatabase(client);
 		return runReadTask(identity.path, createDomainReadParams(task, input), taskOptions(options));
 	});
+}
+
+/** Consumer completion acknowledges a frame; the bridge never retains payloads. */
+export async function consumeReadDomainTask<K extends StreamDomainReadTaskKind>(
+	client: Database,
+	task: K,
+	input: DomainReadTaskMap[K]["params"],
+	consume: (bytes: Uint8Array) => void | Promise<void>,
+	options: ReadQueryOptions = {},
+): Promise<DomainReadStreamResult<DomainReadTaskMap[K]["result"]>> {
+	return observeBridge(options, async (options) => {
+		countReadFanout(fanoutSpan(options), "domainTasks");
+		countReadFanout(fanoutSpan(options), "logicalTemplateUnknown");
+		const startedAt = Date.now();
+		const execution = taskOptions(options);
+		const timeoutMs = Math.min(execution.timeoutMs, DOMAIN_READ_STREAM_TIMEOUT_MS);
+		if (!Number.isFinite(execution.timeoutMs) || timeoutMs <= 0)
+			throw new DbReadError("DB_READ_TASK_TIMEOUT", "Domain stream deadline expired");
+		if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt))
+			throw new DbReadError("DB_READ_INVALID", "Invalid domain stream deadline");
+		const deadlineAt = Math.min(startedAt + timeoutMs, options.deadlineAt ?? Infinity);
+		const reason = inlineReason(client);
+		if (reason)
+			throw new DbReadError("DB_READ_UNSUPPORTED", `domain streams require a worker: ${reason}`);
+		if (typeof consume !== "function")
+			throw new DbReadError("DB_READ_INVALID", "Domain stream requires a consumer");
+		const params = createDomainReadParams(task, input);
+		const { path } = bindReadDatabase(client);
+		const maxBytes = DOMAIN_STREAM_BYTE_LIMITS[task];
+		let receivedBytes = 0;
+		let receivedChunks = 0;
+		const handle = runTrackedEphemeralReadTask<
+			DomainReadStreamResult<DomainReadTaskMap[K]["result"]>
+		>(path, params, {
+			...execution,
+			timeoutMs,
+			deadlineAt,
+			onChunk: async (frame) => {
+				const bytes = frame.rows?.[0]?.[0];
+				if (
+					!Array.isArray(frame.columns) ||
+					frame.columns.length !== 1 ||
+					frame.columns[0] !== "bytes" ||
+					!Array.isArray(frame.rows) ||
+					frame.rows.length !== 1 ||
+					!Array.isArray(frame.rows[0]) ||
+					frame.rows[0].length !== 1 ||
+					!(bytes instanceof Uint8Array) ||
+					bytes.byteLength === 0 ||
+					bytes.buffer.byteLength > DOMAIN_READ_STREAM_CHUNK_BYTES ||
+					receivedBytes + bytes.byteLength > maxBytes
+				)
+					throw new DbReadError("DB_READ_PROTOCOL", "Invalid domain stream frame");
+				const size = bytes.byteLength;
+				await consume(bytes);
+				receivedBytes += size;
+				receivedChunks++;
+			},
+		});
+		const timeout = () =>
+			new DbReadError("DB_READ_TASK_TIMEOUT", "Domain stream exceeded its deadline");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const result = await Promise.race([
+				handle.result.finally(() => handle.released),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(timeout()), Math.max(0, deadlineAt - Date.now()));
+				}),
+			]);
+			if (Date.now() >= deadlineAt) throw timeout();
+			if (
+				!result ||
+				!Object.hasOwn(result, "metadata") ||
+				result.bytes !== receivedBytes ||
+				result.chunks !== receivedChunks
+			)
+				throw new DbReadError("DB_READ_PROTOCOL", "Invalid domain stream completion");
+			return result;
+		} finally {
+			clearTimeout(timer);
+		}
+	});
+}
+
+export async function readDomainTaskText<K extends StreamDomainReadTaskKind>(
+	client: Database,
+	task: K,
+	input: DomainReadTaskMap[K]["params"],
+	options: ReadQueryOptions = {},
+) {
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	const parts: string[] = [];
+	const result = await consumeReadDomainTask(
+		client,
+		task,
+		input,
+		(bytes) => {
+			parts.push(decoder.decode(bytes, { stream: true }));
+		},
+		options,
+	);
+	parts.push(decoder.decode());
+	return { ...result, text: () => parts.join("") };
 }
 /** Internal generic SELECT batch: ordered immutable commitments, never returned source bodies. */
 export async function readSelectDigestBatch(
