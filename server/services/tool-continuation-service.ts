@@ -27,7 +27,6 @@ import { getInstanceMaintenanceAuthority } from "../lib/instance-lock";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
-
 import { contentJsonSql, storedBodyBytesSql, toolBlockOrdinalSql } from "./narrator-body-reads";
 import {
 	getRecoverySource,
@@ -36,6 +35,11 @@ import {
 	hasReservedRecoverySourceEpoch,
 	isRecoveryDiscoveryActive,
 } from "./recovery-handoff";
+import {
+	assertRestartRecoveryObservation,
+	type RestartRecoveryObservation,
+	type RestartTool,
+} from "./recovery-observation";
 
 type ContinuationReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
 
@@ -47,6 +51,7 @@ export interface ColdContinuationTakeoverEvidence {
 	sourceEpoch: string;
 	executionAttempt: number;
 	authorization: ColdContinuationAuthorization;
+	observed?: ToolContinuationRecord;
 }
 
 const coldRecoveryPasses = new WeakMap<
@@ -109,6 +114,7 @@ const ordinaryColdPasses = new WeakMap<
 		narratorId: string;
 		executionAttempt: number;
 		updatedAt: string;
+		observed?: ToolContinuationRecord;
 		state: string;
 		claimToken: string | null;
 		expiresAt: number;
@@ -135,34 +141,60 @@ export async function beginOrdinaryColdAdoptionPass(
 	input: {
 		rootEpoch: string;
 		toolCallId: string;
+		observation?: { continuation: ToolContinuationRecord; tool: RestartTool };
 	},
 	options: ContinuationReadOptions = {},
 ) {
 	ordinaryColdSource(input.rootEpoch);
-	const receipt = await readQueryFirst(
-		db
-			.select({
-				recordId: narratorToolContinuations.id,
-				sourceEpoch: narratorToolContinuations.updateEpoch,
-				narratorId: narratorToolContinuations.narratorId,
-				executionAttempt: narratorToolCalls.executionAttempt,
-				updatedAt: narratorToolContinuations.updatedAt,
-				state: narratorToolContinuations.state,
-				claimToken: narratorToolContinuations.claimToken,
-			})
-			.from(narratorToolContinuations)
-			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narratorToolContinuations.toolCallId))
-			.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
-			.limit(1),
-		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
-	);
+	if (
+		input.observation &&
+		(input.observation.continuation.toolCallId !== input.toolCallId ||
+			input.observation.tool.id !== input.toolCallId)
+	)
+		throw new ValidationError("Cold adoption observation has a different tool identity");
+	const receipt = input.observation
+		? {
+				recordId: input.observation.continuation.id,
+				sourceEpoch: input.observation.continuation.updateEpoch,
+				narratorId: input.observation.continuation.narratorId,
+				executionAttempt: input.observation.tool.executionAttempt,
+				updatedAt: input.observation.continuation.updatedAt,
+				state: input.observation.continuation.state,
+				claimToken: input.observation.continuation.claimToken,
+			}
+		: await readQueryFirst(
+				db
+					.select({
+						recordId: narratorToolContinuations.id,
+						sourceEpoch: narratorToolContinuations.updateEpoch,
+						narratorId: narratorToolContinuations.narratorId,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						updatedAt: narratorToolContinuations.updatedAt,
+						state: narratorToolContinuations.state,
+						claimToken: narratorToolContinuations.claimToken,
+					})
+					.from(narratorToolContinuations)
+					.innerJoin(
+						narratorToolCalls,
+						eq(narratorToolCalls.id, narratorToolContinuations.toolCallId),
+					)
+					.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			);
 	if (!receipt || hasReservedRecoverySourceEpoch(receipt.sourceEpoch))
 		throw new ValidationError(
 			"Ordinary cold adoption requires an actual non-reserved execution receipt",
 		);
 	ordinaryColdSource(input.rootEpoch);
 	const authorization = Object.freeze({}) as OrdinaryColdAdoptionAuthorization;
-	ordinaryColdPasses.set(authorization, { ...input, ...receipt, expiresAt: Date.now() + 300_000 });
+	ordinaryColdPasses.set(authorization, {
+		rootEpoch: input.rootEpoch,
+		toolCallId: input.toolCallId,
+		...receipt,
+		observed: input.observation?.continuation,
+		expiresAt: Date.now() + 300_000,
+	});
 	return {
 		authorization,
 		close: () => {
@@ -188,6 +220,7 @@ export type ToolContinuationRecoveryPhase =
 	| "owner_continuation_started";
 
 export interface PutToolContinuationInput {
+	recoveryObservation?: RestartRecoveryObservation;
 	toolCallId: string;
 	narratorId: string;
 	updateEpoch: string;
@@ -392,14 +425,22 @@ async function withExecutionReceipt(
 	input: PutToolContinuationInput,
 	options: ContinuationReadOptions = {},
 ): Promise<{ input: PutToolContinuationInput; attempt: number | null }> {
-	const tool = await readQueryFirst(
-		db
-			.select({ executionAttempt: narratorToolCalls.executionAttempt })
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, input.toolCallId))
-			.limit(1),
-		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
-	);
+	if (
+		input.recoveryObservation &&
+		(input.recoveryObservation.tool?.id !== input.toolCallId ||
+			input.recoveryObservation.tool.narratorId !== input.narratorId)
+	)
+		throw new ValidationError("Recovery observation has a different tool identity");
+	const tool =
+		input.recoveryObservation?.tool ??
+		(await readQueryFirst(
+			db
+				.select({ executionAttempt: narratorToolCalls.executionAttempt })
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, input.toolCallId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		));
 	return {
 		input: tool
 			? { ...input, payloadJson: { ...input.payloadJson, executionAttempt: tool.executionAttempt } }
@@ -707,6 +748,9 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const normalized = normalizePutInput(input, timestamp);
 		return runAtomicWrite(db, "tool-continuation.ordinaryColdAdoption", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (pass.observed) assertObservedContinuation(tx, input.toolCallId, pass.observed);
 			const source = ordinaryColdSource(pass.rootEpoch);
 			const existing = tx
 				.select()
@@ -766,7 +810,7 @@ export const toolContinuationService = {
 			if (
 				!existing ||
 				!tool ||
-				existing.updatedAt !== pass.updatedAt ||
+				(!pass.observed && existing.updatedAt !== pass.updatedAt) ||
 				existing.state !== pass.state ||
 				existing.claimToken !== pass.claimToken ||
 				tool.executionAttempt !== pass.executionAttempt
@@ -779,7 +823,7 @@ export const toolContinuationService = {
 				existing.toolCallId !== input.toolCallId ||
 				existing.updateEpoch !== pass.sourceEpoch ||
 				existing.narratorId !== input.narratorId ||
-				existing.updatedAt !== pass.updatedAt ||
+				(!pass.observed && existing.updatedAt !== pass.updatedAt) ||
 				existing.state === "cancelled" ||
 				isToolContinuationOwnerMounted(existing) ||
 				severed(owner) ||
@@ -889,7 +933,7 @@ export const toolContinuationService = {
 						and(
 							eq(narratorToolContinuations.id, existing.id),
 							eq(narratorToolContinuations.updateEpoch, pass.sourceEpoch),
-							eq(narratorToolContinuations.updatedAt, pass.updatedAt),
+							pass.observed ? undefined : eq(narratorToolContinuations.updatedAt, pass.updatedAt),
 						),
 					)
 					.returning()
@@ -928,6 +972,54 @@ export const toolContinuationService = {
 		);
 		if (!row) throw new RuntimeReadConflictError();
 		return decodeContinuationRow(row);
+	},
+
+	async getByToolCallIds(toolCallIds: string[], options: ContinuationReadOptions = {}) {
+		const ids = [...new Set(toolCallIds)];
+		if (ids.length > MAX_ROWS_PER_EPOCH)
+			throw new ValidationError("Too many continuation identities");
+		const records: ToolContinuationRecord[] = [];
+		let totalBytes = 0;
+		for (let start = 0; start < ids.length; start += METADATA_PAGE_SIZE) {
+			const where = inArray(
+				narratorToolContinuations.toolCallId,
+				ids.slice(start, start + METADATA_PAGE_SIZE),
+			);
+			const metadata = await readQuery(
+				db
+					.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
+					.from(narratorToolContinuations)
+					.where(where)
+					.limit(METADATA_PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
+			for (const row of metadata) {
+				totalBytes += row.bytes;
+				if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
+					throw new ValidationError("Continuation recovery payload budget exceeded");
+			}
+			if (!metadata.length) continue;
+			const rows = await readQuery(
+				db
+					.select(continuationReadColumns)
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							where,
+							or(
+								...metadata.map((row) =>
+									and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+								),
+							),
+						),
+					)
+					.limit(METADATA_PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
+			if (rows.length !== metadata.length) throw new RuntimeReadConflictError();
+			records.push(...rows.map(decodeContinuationRow));
+		}
+		return records;
 	},
 
 	async getToolCallResult(toolCallId: string): Promise<ToolContinuationToolCallResult | null> {
@@ -974,6 +1066,8 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const row = normalizePutInput(input, timestamp);
 		const upserted = runAtomicWrite(db, "continuation.upsert", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
 			assertExecutionReceipt(tx, input.toolCallId, receipt.attempt);
 			if (observed !== undefined) assertObservedContinuation(tx, input.toolCallId, observed);
 			return tx
@@ -1068,6 +1162,9 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const normalized = normalizePutInput(input, timestamp);
 		return runAtomicWrite(db, "tool-continuation.controlledColdTakeover", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (evidence.observed) assertObservedContinuation(tx, input.toolCallId, evidence.observed);
 			const tool = tx
 				.select({
 					narratorId: narratorToolCalls.narratorId,
@@ -1162,6 +1259,9 @@ export const toolContinuationService = {
 			throw new ValidationError("Cold Agent reattachment requires an Agent continuation");
 		const timestamp = isoNow();
 		return runAtomicWrite(db, "tool-continuation.controlledColdReattachAgent", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (evidence.observed) assertObservedContinuation(tx, input.toolCallId, evidence.observed);
 			const tool = tx
 				.select({
 					narratorId: narratorToolCalls.narratorId,

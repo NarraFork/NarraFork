@@ -62,6 +62,97 @@ function seed() {
 		.values({ id: "record", ...input, createdAt: NOW, updatedAt: NOW })
 		.run();
 }
+
+test("batched identity lookup preserves records, deduplicates ids and handles empty/missing sets", async () => {
+	seed();
+	const [record] = await service.getByToolCallIds(["call", "missing", "call"]);
+	expect(record).toMatchObject(input);
+	expect(await service.getByToolCallIds([])).toEqual([]);
+	expect(await service.getByToolCallIds(["missing"])).toEqual([]);
+});
+
+test("batch identity lookup uses two bounded reads per hundred records", async () => {
+	seed();
+	const ids = Array.from({ length: 200 }, (_, index) => `call-${index}`);
+	db.insert(narratorToolCalls)
+		.values(
+			ids.map((id) => ({
+				id,
+				narratorId: "parent",
+				messageId: "message",
+				toolUseId: `use-${id}`,
+				toolName: "Send",
+				status: "running" as const,
+				executionAttempt: 1,
+				createdAt: NOW,
+			})),
+		)
+		.run();
+	db.insert(narratorToolContinuations)
+		.values(
+			ids.map((id) => ({
+				...input,
+				id: `record-${id}`,
+				toolCallId: id,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})),
+		)
+		.run();
+	const original = pool.runReadTask;
+	let calls = 0;
+	spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+		calls++;
+		return original(path, params, options);
+	}) as typeof pool.runReadTask);
+	expect(await service.getByToolCallIds(["call", ...ids])).toHaveLength(201);
+	expect(calls).toBe(6);
+});
+
+test("batch payload size admission rejects oversized data and growth between snapshots", async () => {
+	seed();
+	db.update(narratorToolContinuations)
+		.set({ payloadJson: { text: "x".repeat(65_536) } })
+		.run();
+	const oversized = await captureWorkerRejection(service.getByToolCallIds(["call"]));
+	expect(oversized).toMatchObject({ message: "Continuation recovery payload budget exceeded" });
+	db.update(narratorToolContinuations).set({ payloadJson: {} }).run();
+	const original = reads.readQuery;
+	let fired = false;
+	spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+		const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+		if (!fired) {
+			fired = true;
+			db.update(narratorToolContinuations)
+				.set({ payloadJson: { text: "grew" } })
+				.run();
+		}
+		return result;
+	}) as typeof reads.readQuery);
+	const error = await captureWorkerRejection(service.getByToolCallIds(["call"]));
+	expect(error).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+	expect(fired).toBe(true);
+});
+
+test("batch metadata and payload reads forward budgets and propagate Worker errors", async () => {
+	seed();
+	const original = pool.runReadTask;
+	const signal = new AbortController().signal;
+	const deadlineAt = Date.now() + 10_000;
+	let calls = 0;
+	const probe = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+		calls++;
+		expect(options).toMatchObject({ signal, deadlineAt, timeoutMs: 2_000 });
+		return original(path, params, options);
+	}) as typeof pool.runReadTask);
+	expect(
+		await service.getByToolCallIds(["call"], { signal, deadlineAt, timeoutMs: 2_000 }),
+	).toHaveLength(1);
+	expect(calls).toBe(2);
+	const failure = new Error("batch worker failed");
+	probe.mockImplementation(() => Promise.reject(failure));
+	expect(await captureWorkerRejection(service.getByToolCallIds(["call"]))).toBe(failure);
+});
 function stored() {
 	return db
 		.select()
