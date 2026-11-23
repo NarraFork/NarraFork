@@ -381,10 +381,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
  * a message. Whatever comes next arrives later as its own input, so after a round with
  * one the model may rightly have nothing to add yet.
  */
-function handsOffWork(toolUse: AgentToolUse, result: ToolExecResult | undefined): boolean {
-	if (toolUse.name === "Watch") {
-		return !result?.isError && result?.metadata?.status === "watching";
-	}
+function handsOffWork(toolUse: AgentToolUse): boolean {
 	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
 	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
 }
@@ -1441,7 +1438,7 @@ export async function runReflectionLoop(
 			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
 			rebuildRequestHistory: undefined,
 			historyEndsWithToolResults: undefined,
-			shouldIdleOnReasoningOnly: undefined,
+			hasPendingWake: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -7146,14 +7143,23 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
-					if (
-						quietFinishAllowed &&
+					const pendingWake =
 						requestStarted &&
 						!lastRetryErrorMessage &&
-						isQuietFinish(emptyKind, emptySignals)
+						isQuietFinish(emptyKind, emptySignals) &&
+						(await config.hasPendingWake?.());
+					if (
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals) &&
+						(quietFinishAllowed || pendingWake)
 					) {
 						yield* finishRequest();
-						yield { type: "done" };
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield pendingWake ? { type: "done", reason: "reasoning_only_idle" } : { type: "done" };
 						return;
 					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
@@ -7391,7 +7397,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Keep the ordinary cleanup above, but do not retry or compact a model
 					// that has nothing to say while waiting for a background result / Send.
-					if (quietFinishAllowed || (await config.shouldIdleOnReasoningOnly?.())) {
+					if (await config.hasPendingWake?.()) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
@@ -8054,9 +8060,7 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			yield { type: "turn_complete", turnIndex };
-			quietFinishAllowed =
-				!!config.bot ||
-				toolUses.some((toolUse) => handsOffWork(toolUse, stepResults.get(toolUse.toolUseId)));
+			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
 		} catch (error) {
 			if (isCheckpointStop(error)) {
