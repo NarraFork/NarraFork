@@ -13,6 +13,7 @@ import {
 	type SubagentModelSelection,
 } from "../lib/narrator-custom-traits";
 import {
+	MAX_POLICY_SOURCE_DEPTH,
 	modelPoolKeyOf,
 	policySourceIdOf,
 	RUNTIME_SOURCE_COLUMNS,
@@ -80,6 +81,8 @@ export function resolveSubagentTypePreference(
 export function resolveParentNarratorProvider(
 	parentId: string | null | undefined,
 	parentModel: string | null | undefined,
+	/** What a following parent's stored `__parent__` currently resolves to. */
+	resolvedParentModel?: string | null,
 ): string | undefined {
 	const storedModel = parentModel?.trim() || FOLLOW_DEFAULT_MODEL;
 	if (parentId) {
@@ -88,7 +91,7 @@ export function resolveParentNarratorProvider(
 		const runtimeProvider = getNarratorRuntimeModel(parentId, storedModel)?.provider;
 		if (runtimeProvider) return runtimeProvider;
 	}
-	return deriveProviderFromModelReference(storedModel, new Set());
+	return deriveProviderFromModelReference(resolvedParentModel?.trim() || storedModel, new Set());
 }
 
 /** True for the bare sentinel and for an accidental `provider:<sentinel>` value. */
@@ -200,10 +203,14 @@ export function selectSubagentModel(input: {
 export async function resolveSubagentModelInheritance(
 	narrator: SourceModelRef,
 	actingUserId?: string | null,
+	depth = 0,
 ): Promise<{ selection: SubagentModelSelection; inheritance: SubagentModelInheritance }> {
 	const sourceId = policySourceIdOf(narrator);
 	if (!sourceId) {
 		throw new ValidationError("Following a model requires a registered source narrator");
+	}
+	if (depth >= MAX_POLICY_SOURCE_DEPTH) {
+		throw new ValidationError("Cannot resolve the source narrator's model: source chain too deep");
 	}
 	const source = await db.query.narrators.findFirst({
 		where: eq(narrators.id, sourceId),
@@ -216,9 +223,22 @@ export async function resolveSubagentModelInheritance(
 			contextProjectId: true,
 		},
 	});
-	if (!source || source.model === FOLLOW_PARENT_MODEL) {
+	if (!source) {
 		throw new ValidationError("Cannot resolve the source narrator's model");
 	}
+	// A source that itself follows its own source (a nested subagent's parent) is
+	// followed through to the model it currently resolves to.
+	const upstream =
+		source.model === FOLLOW_PARENT_MODEL
+			? await resolveSubagentModelInheritance(source, actingUserId, depth + 1)
+			: null;
+	const sourceStoredModel = upstream ? upstream.selection.model : source.model;
+	// The source's own effective tier (pool tier > own override > its source's).
+	const sourceReasoningEffort = upstream
+		? (upstream.selection.poolEntry?.reasoningEffort ??
+			source.reasoningEffort ??
+			upstream.inheritance.parentReasoningEffort)
+		: source.reasoningEffort;
 	const poolKey = modelPoolKeyOf(narrator);
 	const sourceTraits = poolKey
 		? await resolveEffectiveTraits({
@@ -232,11 +252,11 @@ export async function resolveSubagentModelInheritance(
 		poolKey && sourceTraits
 			? resolveEffectiveSubagentModelPolicy(sourceTraits.traits, poolKey)
 			: { source: "none", poolKey: "general", models: [], isExplicitEmpty: false };
-	const sourceModel = source.model || FOLLOW_DEFAULT_MODEL;
+	const sourceModel = sourceStoredModel || FOLLOW_DEFAULT_MODEL;
 	// When the source has no concrete model ID, following it would only reach the
 	// global default. A configured preference for the pool is the right source instead.
 	const typePref = poolKey ? resolveSubagentTypePreference(poolKey) : undefined;
-	if (!hasConcreteModelId(source.model) && typePref) {
+	if (!hasConcreteModelId(sourceStoredModel) && typePref) {
 		const preferred = resolveSubagentModelSelectionFromPolicy({
 			policy,
 			explicitModel: typePref,
@@ -250,7 +270,7 @@ export async function resolveSubagentModelInheritance(
 					model: displayModelReference(preferred.model),
 					parentModel: displayModelReference(sourceModel),
 					...(policy.source !== "none" && { poolKey: policy.poolKey }),
-					...(source.reasoningEffort && { parentReasoningEffort: source.reasoningEffort }),
+					...(sourceReasoningEffort && { parentReasoningEffort: sourceReasoningEffort }),
 				},
 			};
 		}
@@ -267,7 +287,7 @@ export async function resolveSubagentModelInheritance(
 		resolveSubagentModelSelectionFromPolicy({
 			policy,
 			candidates: [],
-			preferredProvider: resolveParentNarratorProvider(source.id, source.model),
+			preferredProvider: resolveParentNarratorProvider(source.id, source.model, sourceStoredModel),
 		});
 	if (!selection) {
 		throw new ValidationError(`No models are allowed for "${policy.poolKey}" subagents`);
@@ -281,7 +301,7 @@ export async function resolveSubagentModelInheritance(
 			model: displayModelReference(selection.model),
 			parentModel: displayModelReference(sourceModel),
 			...(policy.source !== "none" && { poolKey: policy.poolKey }),
-			...(source.reasoningEffort && { parentReasoningEffort: source.reasoningEffort }),
+			...(sourceReasoningEffort && { parentReasoningEffort: sourceReasoningEffort }),
 		},
 	};
 }
