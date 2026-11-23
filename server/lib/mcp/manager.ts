@@ -12,6 +12,7 @@ import { eventBus } from "../event-bus";
 import { logger } from "../logger";
 import type { McpServerConfig } from "../settings";
 import { settings } from "../settings";
+import { getMcpOAuthStatus, isMcpAuthorizationError, type McpOAuthStatus } from "./oauth";
 import { createTransport } from "./transports";
 
 /** Timeout for a connection or one discovery page, not the entire directory (ms). */
@@ -41,6 +42,7 @@ export interface McpServerConfigProjection {
 	url?: string;
 	envKeys: string[];
 	headerKeys: string[];
+	oauth?: { clientId?: string; scope?: string };
 	mode: McpLoadingMode;
 	enabled: boolean;
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
@@ -50,6 +52,8 @@ export interface McpServerConfigProjection {
 export interface McpServerStatus extends McpServerConfigProjection {
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;
+	/** OAuth state for remote servers; `required` means a background connect needs an admin. */
+	auth?: McpOAuthStatus & { required: boolean };
 	tools: Tool[];
 }
 
@@ -72,6 +76,7 @@ export function projectMcpServerConfig(config: McpServerConfig): McpServerConfig
 		...(config.url !== undefined && { url: config.url }),
 		envKeys: Object.keys(config.env ?? {}).sort(),
 		headerKeys: Object.keys(config.headers ?? {}).sort(),
+		...(config.oauth !== undefined && { oauth: { ...config.oauth } }),
 		mode: resolveMcpLoadingMode(config),
 		enabled: resolveMcpLoadingMode(config) !== "disabled",
 		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
@@ -97,6 +102,8 @@ interface ActiveClient {
 	tools: Tool[];
 	status: "connected" | "connecting" | "error";
 	error?: string;
+	/** Last failure was missing/expired OAuth authorization; retrying cannot fix it. */
+	authRequired?: boolean;
 	/** Number of consecutive reconnect attempts since last successful connection. */
 	reconnectAttempts: number;
 	/** Timer for pending reconnect. Cleared on manual disconnect. */
@@ -341,7 +348,12 @@ class McpManager {
 
 	private connectionFailed(entry: ActiveClient, error: unknown): void {
 		entry.status = "error";
-		entry.error = error instanceof Error ? error.message : String(error);
+		entry.authRequired = isMcpAuthorizationError(error);
+		entry.error = entry.authRequired
+			? `MCP server "${entry.config.name}" requires OAuth authorization`
+			: error instanceof Error
+				? error.message
+				: String(error);
 		this.revision++;
 		eventBus.emit({
 			type: "mcp:server_error",
@@ -349,7 +361,7 @@ class McpManager {
 			name: entry.config.name,
 			error: entry.error,
 		});
-		this.scheduleReconnect(entry.config.id);
+		if (!entry.authRequired) this.scheduleReconnect(entry.config.id);
 	}
 
 	/** Disconnect a single MCP server. */
@@ -567,6 +579,9 @@ class McpManager {
 				...projectMcpServerConfig(cfg),
 				status: entry?.status ?? "disconnected",
 				error: entry?.error,
+				...(cfg.transport !== "stdio" && {
+					auth: { ...getMcpOAuthStatus(cfg), required: !!entry?.authRequired },
+				}),
 				tools: entry?.tools ?? [],
 			};
 		});
@@ -575,10 +590,11 @@ class McpManager {
 	/** Test connection without persisting. Returns tool list on success. */
 	async testConnection(
 		config: McpServerConfig,
-	): Promise<{ ok: boolean; tools?: Tool[]; error?: string }> {
+		oauthKey = config.id,
+	): Promise<{ ok: boolean; tools?: Tool[]; error?: string; authRequired?: boolean }> {
 		let transport: Transport | null = null;
 		try {
-			transport = createTransport(config);
+			transport = createTransport(config, oauthKey);
 			const client = new Client({ name: "narrafork-test", version: "0.1.0" }, { capabilities: {} });
 			await client.connect(transport);
 			const tools = await listAllTools(client);
@@ -593,6 +609,7 @@ class McpManager {
 			return {
 				ok: false,
 				error: err instanceof Error ? err.message : String(err),
+				...(isMcpAuthorizationError(err) && { authRequired: true }),
 			};
 		}
 	}
@@ -656,7 +673,8 @@ class McpManager {
 			a.cwd !== b.cwd ||
 			JSON.stringify(a.args) !== JSON.stringify(b.args) ||
 			JSON.stringify(a.env) !== JSON.stringify(b.env) ||
-			JSON.stringify(a.headers) !== JSON.stringify(b.headers)
+			JSON.stringify(a.headers) !== JSON.stringify(b.headers) ||
+			JSON.stringify(a.oauth) !== JSON.stringify(b.oauth)
 		);
 	}
 }

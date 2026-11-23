@@ -6,10 +6,20 @@ import {
 	normalizeMcpLoadingConfig,
 	resolveMcpLoadingMode,
 } from "@shared/mcp-loading-mode";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { z } from "zod";
 import { generateShortId } from "../lib/id";
 import { mcpManager, projectMcpServerConfig } from "../lib/mcp/manager";
+import {
+	cancelMcpOAuth,
+	deleteMcpOAuth,
+	finishMcpOAuth,
+	MCP_OAUTH_CALLBACK_PATH,
+	setMcpOAuthClientSecret,
+	signOutMcpOAuth,
+	startMcpOAuth,
+} from "../lib/mcp/oauth";
+import { resolvePublicOrigin } from "../lib/public-origin";
 import { type McpServerConfig, saveSettings, settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
 import { narratorContext } from "../services/narrator-context";
@@ -91,6 +101,13 @@ const mcpToolPermissionPatchSchema = z.object({
 	enabled: z.boolean().optional(),
 });
 
+const mcpOAuthConfigSchema = z.object({
+	clientId: z.string().min(1).max(500).optional(),
+	scope: z.string().min(1).max(1000).optional(),
+});
+// Stored in the encrypted MCP OAuth file, never in settings.json. null clears it.
+const mcpOAuthClientSecretSchema = z.string().max(4000).nullable().optional();
+
 const mcpServerCreateSchema = z.object({
 	name: z.string().min(1).max(200).optional().default("Untitled"),
 	transport: z.enum(["stdio", "streamable-http", "sse"]).optional().default("stdio"),
@@ -100,6 +117,8 @@ const mcpServerCreateSchema = z.object({
 	env: mcpSecretMapSchema.optional(),
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
+	oauth: mcpOAuthConfigSchema.optional(),
+	oauthClientSecret: mcpOAuthClientSecretSchema,
 	mode: z.enum(["disabled", "auto", "resident"]).optional(),
 	enabled: z.boolean().optional(),
 	defaultBehavior: mcpBehaviorSchema.optional(),
@@ -117,6 +136,9 @@ const mcpServerPatchSchema = z.object({
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
 	headerPatch: mcpSecretMapPatchSchema.optional(),
+	// null removes the OAuth client settings; undefined leaves them unchanged.
+	oauth: mcpOAuthConfigSchema.nullable().optional(),
+	oauthClientSecret: mcpOAuthClientSecretSchema,
 	mode: z.enum(["disabled", "auto", "resident"]).optional(),
 	enabled: z.boolean().optional(),
 	// null explicitly clears the server-level override; undefined leaves it unchanged.
@@ -139,8 +161,18 @@ function applyMcpServerPatch(
 	server: McpServerConfig,
 	patch: z.infer<typeof mcpServerPatchSchema>,
 ): McpServerConfig {
-	const { defaultBehavior, toolPermissionPatch, envPatch, headerPatch, ...rest } = patch;
+	const {
+		defaultBehavior,
+		toolPermissionPatch,
+		envPatch,
+		headerPatch,
+		oauth,
+		oauthClientSecret: _secret,
+		...rest
+	} = patch;
 	const updated: McpServerConfig = { ...server, ...rest, ...applyMcpLoadingPatch(server, patch) };
+	if (oauth === null) delete updated.oauth;
+	else if (oauth) updated.oauth = oauth;
 	if (envPatch) {
 		const env = applyMcpSecretMapPatch(updated.env, envPatch);
 		if (env) updated.env = env;
@@ -203,14 +235,16 @@ mcpRoutes.post("/servers", requireAdmin, async (c) => {
 	}
 	if (hasMcpLoadingConflict(parsed.data))
 		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	const { oauthClientSecret, ...fields } = parsed.data;
 	const config: McpServerConfig = normalizeMcpLoadingConfig({
 		id: generateShortId(),
-		...parsed.data,
+		...fields,
 	});
 
 	const servers = [...(Array.isArray(settings.mcpServers) ? settings.mcpServers : []), config];
 	settings.mcpServers = servers;
 	saveSettings(settings);
+	setMcpOAuthClientSecret(config.id, oauthClientSecret);
 
 	if (config.enabled) {
 		await mcpManager.connect(config);
@@ -237,6 +271,7 @@ mcpRoutes.patch("/servers/:id", requireAdmin, async (c) => {
 	servers[idx] = updated;
 	settings.mcpServers = servers;
 	saveSettings(settings);
+	setMcpOAuthClientSecret(id, parsed.data.oauthClientSecret);
 
 	await mcpManager.reload();
 
@@ -254,6 +289,7 @@ mcpRoutes.delete("/servers/:id", requireAdmin, async (c) => {
 	settings.mcpServers = servers;
 	saveSettings(settings);
 	await mcpManager.disconnect(id);
+	deleteMcpOAuth(id);
 
 	return c.json({ ok: true });
 });
@@ -381,7 +417,8 @@ mcpRoutes.post("/servers/:id/test", requireAdmin, async (c) => {
 		mode: "auto",
 		enabled: true,
 	};
-	return c.json(await mcpManager.testConnection(config));
+	// Reuse the saved server's OAuth tokens; a test never starts an authorization.
+	return c.json(await mcpManager.testConnection(config, id));
 });
 
 /** Test connection without persisting. */
@@ -394,15 +431,129 @@ mcpRoutes.post("/servers/test", requireAdmin, async (c) => {
 	if (hasMcpLoadingConflict(parsed.data)) {
 		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
 	}
+	const { oauthClientSecret: _secret, ...fields } = parsed.data;
 	const config: McpServerConfig = {
 		id: "test",
-		...parsed.data,
+		...fields,
 		mode: "auto",
 		enabled: true,
 	};
 
 	const result = await mcpManager.testConnection(config);
 	return c.json(result);
+});
+
+function findMcpServer(id: string): McpServerConfig | undefined {
+	return (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).find((s) => s.id === id);
+}
+
+/** The callback must reach this server at the origin the admin's browser used. */
+function mcpOAuthRedirectUrl(c: Context): string {
+	const origin = c.req.header("Origin");
+	if (origin) {
+		try {
+			const url = new URL(origin);
+			if (url.protocol === "http:" || url.protocol === "https:")
+				return `${url.origin}${MCP_OAUTH_CALLBACK_PATH}`;
+		} catch {
+			// fall through to the resolved public origin
+		}
+	}
+	return `${resolvePublicOrigin(c).origin}${MCP_OAUTH_CALLBACK_PATH}`;
+}
+
+/**
+ * The callback URL the browser asked for, which carries the proxy prefix NarraFork is mounted
+ * under; accepted only on the same origin and ending in the callback path.
+ */
+export function requestedMcpOAuthRedirectUrl(c: Context, requested: unknown): string {
+	const fallback = mcpOAuthRedirectUrl(c);
+	if (typeof requested !== "string") return fallback;
+	try {
+		const url = new URL(requested);
+		if (url.origin !== new URL(fallback).origin) return fallback;
+		if (!url.pathname.endsWith(MCP_OAUTH_CALLBACK_PATH) || url.search || url.hash) return fallback;
+		return url.href;
+	} catch {
+		return fallback;
+	}
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Start OAuth authorization for a remote server. Returns the authorization URL the
+ * admin opens, or `authorized: true` when stored credentials were enough.
+ */
+mcpRoutes.post("/servers/:id/oauth/start", requireAdmin, async (c) => {
+	const config = findMcpServer(c.req.param("id") ?? "");
+	if (!config) return c.json({ error: "Not found" }, 404);
+	try {
+		const body = (await c.req.json().catch(() => ({}))) as { redirectUrl?: unknown } | null;
+		const redirectUrl = requestedMcpOAuthRedirectUrl(c, body?.redirectUrl);
+		const result = await startMcpOAuth(config, redirectUrl);
+		if ("authorized" in result && config.enabled) await mcpManager.connect(config);
+		return c.json(result);
+	} catch (error) {
+		return c.json({ error: errorMessage(error) }, 400);
+	}
+});
+
+/** Forget a server's OAuth tokens and registration (the client secret is kept). */
+mcpRoutes.delete("/servers/:id/oauth", requireAdmin, async (c) => {
+	const config = findMcpServer(c.req.param("id") ?? "");
+	if (!config) return c.json({ error: "Not found" }, 404);
+	signOutMcpOAuth(config.id);
+	if (config.enabled) await mcpManager.connect(config);
+	return c.json({ ok: true });
+});
+
+const callbackQuerySchema = z.object({
+	state: z.string().min(1).max(200),
+	code: z.string().min(1).max(4000).optional(),
+	error: z.string().max(200).optional(),
+	error_description: z.string().max(1000).optional(),
+});
+
+function escapeHtml(text: string): string {
+	return text.replace(
+		/[&<>"']/g,
+		(ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch,
+	);
+}
+
+function callbackPage(c: Context, ok: boolean, message: string) {
+	const title = ok ? "MCP authorization complete" : "MCP authorization failed";
+	const body = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;padding:2rem"><h1>${title}</h1><p>${escapeHtml(message)}</p><p><a href="../../../routines">Back to NarraFork</a></p>${ok ? '<script>setTimeout(()=>{window.close();location.replace("../../../routines")},1500)</script>' : ""}</body></html>`;
+	c.header("Cache-Control", "no-store");
+	c.header("Referrer-Policy", "no-referrer");
+	return c.html(body, ok ? 200 : 400);
+}
+
+/**
+ * Public OAuth redirect target, mounted before the session gate: the authorization
+ * server redirects the browser here without NarraFork credentials. Only a `state`
+ * minted by an admin's start request, unexpired and unused, is accepted.
+ */
+export const mcpOAuthCallbackRoutes = new Hono();
+
+mcpOAuthCallbackRoutes.get("/callback", async (c) => {
+	const parsed = callbackQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) return callbackPage(c, false, "Invalid authorization callback.");
+	const { state, code, error, error_description } = parsed.data;
+	if (error || !code) {
+		cancelMcpOAuth(state);
+		return callbackPage(c, false, error_description ?? error ?? "No authorization code.");
+	}
+	try {
+		const config = await finishMcpOAuth(state, code, findMcpServer);
+		if (config.enabled) await mcpManager.connect(config);
+		return callbackPage(c, true, `"${config.name}" is authorized. You can close this window.`);
+	} catch (err) {
+		return callbackPage(c, false, errorMessage(err));
+	}
 });
 
 /** Import MCP servers from JSON (Claude Desktop / Cursor / VS Code format). */

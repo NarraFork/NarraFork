@@ -1,4 +1,5 @@
-import { isOpencodeGoBaseUrl, parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
+import { parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
+import { identifyService } from "@shared/sourcing/identify";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { createPersistedCredentialCache } from "./persisted-credential-cache";
@@ -148,8 +149,7 @@ export function isOpencodeCustomApiProvider(config: {
 	baseUrl?: string;
 	disabled?: boolean;
 }): boolean {
-	if (config.disabled || !config.baseUrl) return false;
-	return isOpencodeGoBaseUrl(config.baseUrl);
+	return !config.disabled && identifyService(config).templateId === "opencode-go";
 }
 
 /**

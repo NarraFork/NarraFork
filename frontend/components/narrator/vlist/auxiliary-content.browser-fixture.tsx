@@ -94,6 +94,31 @@ function background(id = "background"): NarratorMsg {
 	]);
 }
 
+function watch(): NarratorMsg {
+	return message("watch", [
+		{
+			type: "system_injection",
+			source: "bg_bash",
+			modelText: "Watch reached its deadline for agent fix-login.",
+			body: {
+				kind: "tasksDone",
+				flavor: "bash",
+				items: [
+					{
+						id: "watch-task",
+						alias: "watch-agent-fix-login",
+						title: "watch agent 实现服务端全量回源",
+						status: "timeout",
+						preview:
+							"Watch reached its deadline for agent fix-login. Only the observation ended; the target was not stopped.\n\nSubagent is still running.",
+						watch: "agent",
+					},
+				],
+			},
+		},
+	]);
+}
+
 function knowledge(): NarratorMsg {
 	return message("knowledge", [
 		{
@@ -174,7 +199,7 @@ function inbound(id: string, showToUser?: boolean): NarratorMsg {
 }
 
 export interface FixtureOptions {
-	scene?: "background" | "knowledge" | "send" | "inbound" | "grouped";
+	scene?: "background" | "knowledge" | "send" | "inbound" | "grouped" | "watch";
 	width: number;
 	lod: RenderLod;
 	/** Account preference: undefined in the fixture means the new/default behavior. */
@@ -201,6 +226,8 @@ function messagesFor(scene: FixtureOptions["scene"]): NarratorMsg[] {
 			];
 		case "grouped":
 			return [background(), send("internal-between-auxiliaries", false), knowledge()];
+		case "watch":
+			return [background(), watch()];
 		default:
 			return [background()];
 	}

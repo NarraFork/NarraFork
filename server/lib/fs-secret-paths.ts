@@ -54,6 +54,7 @@ const SECRET_HOME_FILES: readonly string[] = [
 	"search-provider-secrets.json",
 	"credentials.json", // unified model credentials (provider sourcing S1)
 	"credential-state.json", // per-credential runtime state: account usage, failure counters
+	"mcp-oauth.json", // OAuth tokens and client secrets of remote MCP servers
 	"secret.key", // decrypts every credential file (secret-store.ts)
 	"update-server.json",
 	"update-server-test.json",

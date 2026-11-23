@@ -1,3 +1,4 @@
+import { identifyService } from "@shared/sourcing/identify";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { createPersistedCredentialCache } from "./persisted-credential-cache";
@@ -74,22 +75,7 @@ export function isDeepSeekCustomApiProvider(config: {
 	baseUrl?: string;
 	disabled?: boolean;
 }): boolean {
-	if (config.disabled || !config.baseUrl) return false;
-	try {
-		const url = new URL(config.baseUrl);
-		return (
-			url.protocol === "https:" &&
-			url.hostname === "api.deepseek.com" &&
-			!url.port &&
-			!url.username &&
-			!url.password &&
-			!url.search &&
-			!url.hash &&
-			["/", "/v1", "/anthropic"].includes(url.pathname.replace(/\/$/, "") || "/")
-		);
-	} catch {
-		return false;
-	}
+	return !config.disabled && identifyService(config).templateId === "deepseek";
 }
 
 function identity(config: CustomApiProviderConfig): string {
