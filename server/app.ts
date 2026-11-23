@@ -59,7 +59,7 @@ import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
-import { mcpRoutes } from "./routes/mcp";
+import { mcpOAuthCallbackRoutes, mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
 import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
@@ -446,6 +446,10 @@ setProviderBalanceEngine(builtinApikeyQuotaEngine);
 // here — external apps fetch metadata, exchange codes and revoke tokens without
 // a NarraFork session. Consent explicitly requires a first-party session.
 app.route("/api/oauth", oauthRoutes);
+
+// Public: redirect target for OAuth authorization of external MCP servers. Only a
+// single-use `state` minted by an admin's authorization request is accepted.
+app.route("/api/mcp/oauth", mcpOAuthCallbackRoutes);
 
 // Versioned external resource facade. It is mounted before the session-only gate,
 // but the router itself requires an OAuth principal and enforces scope + resource ownership.
