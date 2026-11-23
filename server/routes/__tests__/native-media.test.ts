@@ -63,6 +63,7 @@ function execute(text: string, bindings: Record<string, unknown>) {
 	return new Function(...Object.keys(bindings), js)(...Object.values(bindings));
 }
 const common = {
+	resolveNarratorMessageOnlyRevert: async () => true,
 	ValidationError,
 	NotFoundError,
 	catalogError,

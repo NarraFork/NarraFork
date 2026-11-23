@@ -1021,13 +1021,9 @@ export interface NarraForkSettings {
 	};
 	workspace: {
 		/**
-		 * Whether tool calls / external edits capture content-addressed whole-tree
-		 * snapshots of the workspace (the precise rollback boundary). When off, the
-		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
-		 * degrade automatically when a worktree proves too large to scan within the
-		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
-		 * were removed; migrated on load.
+		 * Legacy compatibility field, default false. Local file-history and whole-tree
+		 * capture stay disabled regardless of this value. Previously stored as
+		 * `chapters.treeSnapshotsEnabled`; still migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { useRevertHistoryAction } from "@frontend/hooks/useNarrator";
+import { useSwitchWorkspaceContext } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError } from "@frontend/lib/api";
 import type {
 	RevertActionConfirmOptions,
@@ -40,6 +41,7 @@ let action: "rollback_to_block" | "delete_tool_block";
 let pending: { messageId: string; blockIndex: number; blockId: string } | null;
 let execute: boolean;
 let applyErrors: unknown[];
+let applyCapturedAction: ((opts: RevertActionConfirmOptions) => Promise<unknown>) | undefined;
 
 interface CapturedRequest {
 	url: URL;
@@ -206,10 +208,16 @@ beforeEach(async () => {
 	queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: 3, retryDelay: 0 } },
 	});
+	queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+		deviceId: "remote-history",
+		contextKey: "remote-context",
+		revision: 1,
+	});
 	action = "rollback_to_block";
 	pending = { messageId: "message-1", blockIndex: 3, blockId: "block-1" };
 	execute = false;
 	applyErrors = [];
+	applyCapturedAction = undefined;
 	notifications.clean();
 	if (!i18n.isInitialized) {
 		await i18n.use(initReactI18next).init({
@@ -465,6 +473,25 @@ function deferredResponse() {
 	return { promise, resolve };
 }
 
+function WorkspaceSwitch() {
+	const mutation = useSwitchWorkspaceContext("narrator-test");
+	return (
+		<button
+			type="button"
+			data-workspace-switch
+			onClick={() =>
+				mutation.mutate({
+					expectedRevision: 1,
+					requestId: "switch-request",
+					target: { deviceId: "local", cwd: "/new" },
+				})
+			}
+		>
+			Switch workspace
+		</button>
+	);
+}
+
 function ActionFlow({
 	target,
 	selectedAction,
@@ -473,6 +500,9 @@ function ActionFlow({
 	selectedAction: typeof action;
 }) {
 	const mutation = useRevertHistoryAction("narrator-test");
+	applyCapturedAction = target
+		? (opts) => mutation.mutateAsync({ action: selectedAction, target, opts })
+		: undefined;
 	return (
 		<RevertActionConfirmModal
 			narratorId="narrator-test"
@@ -499,6 +529,7 @@ async function renderAction() {
 		<I18nextProvider i18n={i18n}>
 			<QueryClientProvider client={queryClient}>
 				<MantineProvider env="test">
+					<WorkspaceSwitch />
 					<ActionFlow target={pending} selectedAction={action} />
 				</MantineProvider>
 			</QueryClientProvider>
@@ -533,6 +564,216 @@ function hasButton(label: string) {
 		(candidate) => candidate.textContent?.trim() === label,
 	);
 }
+
+describe("local message-only confirmation", () => {
+	for (const selectedAction of ["rollback_to_block", "delete_tool_block"] as const) {
+		for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+			test(`${language}: ${selectedAction} confirms without any file preview or plan`, async () => {
+				action = selectedAction;
+				execute = true;
+				await i18n.changeLanguage(language);
+				queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+					deviceId: "local",
+					contextKey: "local-context",
+					revision: 2,
+				});
+				respond = (request) => {
+					if (request.url.pathname.endsWith("/blocks/rollback")) return reply({ ok: true });
+					if (request.url.pathname.endsWith("/blocks") && request.method === "DELETE")
+						return reply({ ok: true, results: [{ blockId: "block-1", messageDeleted: false }] });
+					throw new Error(`Unexpected request: ${request.url.pathname}`);
+				};
+				await renderAction();
+				expect(requests).toHaveLength(0);
+				expect(confirmations).toHaveLength(0);
+				expect(document.body.textContent).toContain(locale.revertMessagesOnlyKeepFiles);
+				expect(document.body.textContent).toContain(
+					selectedAction === "rollback_to_block"
+						? locale.rollbackMessagesOnlyConfirmDesc
+						: locale.blockDeleteMessagesOnlyConfirmDesc,
+				);
+				expect(document.body.querySelector(".mantine-Alert-root")).toBeNull();
+				expect(hasButton(locale.revertScopeUnavailableTitle)).toBe(false);
+				await click(
+					button(
+						selectedAction === "rollback_to_block"
+							? locale.rollbackConfirm
+							: locale.contextMenu_delete,
+					),
+				);
+				await waitFor(() => requests.length === 1);
+				expect(confirmations).toEqual([{ skipRevert: true }]);
+				expect(requests[0]?.body).toEqual({ blockIds: ["block-1"], skipRevert: true });
+				expect(requestsTo("/revert-action-preview")).toHaveLength(0);
+				expect(applyErrors).toHaveLength(0);
+			});
+		}
+	}
+
+	for (const deviceId of [undefined, null, "", "  "]) {
+		test(`a cached context with deviceId=${JSON.stringify(deviceId)} authorizes neither local actions nor previews`, async () => {
+			queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+				deviceId,
+				contextKey: "malformed",
+				revision: 1,
+			});
+			await renderAction();
+			expect(requests).toHaveLength(0);
+			expect(document.body.textContent).not.toContain(en.revertMessagesOnlyKeepFiles);
+			expect(button(props.messagesOnlyLabel).disabled).toBe(true);
+			await click(button(props.messagesOnlyLabel));
+			expect(confirmations).toHaveLength(0);
+		});
+	}
+
+	test("a captured confirmation rechecks transition and never turns an old file plan into local message deletion", async () => {
+		respond = normalResponse;
+		await renderAction();
+		await waitFor(() => hasButton(en.rollbackConfirmWithRevert));
+		const captured = applyCapturedAction;
+		if (!captured) throw new Error("Missing captured action");
+		const count = requests.length;
+		queryClient.setQueryData(["workspaceContextTransition", "narrator-test"], true);
+		await expect(captured({ skipRevert: true })).rejects.toThrow(en.revertPlanReloadRequired);
+		expect(requests).toHaveLength(count);
+		queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+			deviceId: "local",
+			contextKey: "local-new",
+			revision: 2,
+		});
+		queryClient.setQueryData(["workspaceContextTransition", "narrator-test"], false);
+		await expect(
+			captured({
+				skipRevert: false,
+				revertPlan: {
+					planId: "plan-1",
+					planHash: "old-hash",
+					action: "rollback_to_block",
+				},
+			}),
+		).rejects.toThrow(en.revertPlanReloadRequired);
+		expect(requests).toHaveLength(count);
+		await flush();
+	});
+
+	for (const outcome of ["success", "lost_response", "unverified_read"] as const) {
+		test(`workspace switch ${outcome} revokes old-device previews and confirmations until authoritative resolution`, async () => {
+			const response = deferredResponse();
+			const recovery = deferredResponse();
+			respond = (request) => {
+				if (request.url.pathname.endsWith("/workspace-context/switch")) return response.promise;
+				if (request.url.pathname.endsWith("/workspace-context")) return recovery.promise;
+				return normalResponse(request);
+			};
+			await renderAction();
+			await waitFor(() => hasButton(en.rollbackConfirmWithRevert));
+			const previewCount = requestsTo("/revert-action-preview").length;
+			const control = document.querySelector<HTMLElement>("[data-workspace-switch]");
+			if (!control) throw new Error("Missing workspace switch control");
+			await click(control);
+			expect(requestsTo("/workspace-context/switch")).toHaveLength(1);
+			expect(queryClient.getQueryData(["workspaceContextTransition", "narrator-test"])).toBe(true);
+			expect(hasButton(en.rollbackConfirmWithRevert)).toBe(false);
+			expect(button(props.messagesOnlyLabel).disabled).toBe(true);
+			await click(button(props.messagesOnlyLabel));
+			expect(confirmations).toHaveLength(0);
+			expect(requestsTo("/revert-action-preview")).toHaveLength(previewCount);
+			const current = { deviceId: "local", contextKey: "switched-local", revision: 2 };
+			if (outcome === "success") {
+				response.resolve(reply({ changed: true, current }));
+			} else {
+				response.resolve(reply({ error: "Lost switch response" }, 500));
+				await waitFor(() => requestsTo("/workspace-context").length === 1);
+				expect(button(props.messagesOnlyLabel).disabled).toBe(true);
+				recovery.resolve(
+					reply(outcome === "unverified_read" ? { ...current, deviceId: undefined } : current),
+				);
+			}
+			if (outcome === "unverified_read") {
+				await flush();
+				expect(queryClient.getQueryData(["workspaceContextTransition", "narrator-test"])).toBe(
+					true,
+				);
+				expect(button(props.messagesOnlyLabel).disabled).toBe(true);
+			} else {
+				await waitFor(
+					() => document.body.textContent?.includes(en.revertMessagesOnlyKeepFiles) === true,
+				);
+				expect(queryClient.getQueryData(["workspaceContextTransition", "narrator-test"])).toBe(
+					false,
+				);
+				await click(button(en.rollbackConfirm));
+				expect(confirmations).toEqual([{ skipRevert: true }]);
+			}
+			expect(requestsTo("/revert-action-preview")).toHaveLength(previewCount);
+		});
+	}
+
+	test("a switching cached local context does not authorize the local confirmation", async () => {
+		queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+			deviceId: "local",
+			contextKey: "cached-local",
+			revision: 1,
+		});
+		queryClient.setQueryData(["workspaceContextTransition", "narrator-test"], true);
+		await renderAction();
+		expect(requests).toHaveLength(0);
+		expect(document.body.textContent).not.toContain(en.revertMessagesOnlyKeepFiles);
+		expect(hasButton(en.rollbackConfirm)).toBe(false);
+		respond = (request) => {
+			if (request.url.pathname.endsWith("/revert-action-preview"))
+				return reply(preparedActionPreview({ expectedFileCount: 0 }));
+			return filesReply([]);
+		};
+		queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+			deviceId: "RemoteCase",
+			contextKey: "remote-new",
+			revision: 2,
+		});
+		queryClient.setQueryData(["workspaceContextTransition", "narrator-test"], false);
+		await waitFor(() => requestsTo("/revert-action-preview").length === 1);
+		expect(document.body.textContent).not.toContain(en.revertMessagesOnlyKeepFiles);
+	});
+
+	test("switching from remote to local cancels the file preview and ignores its late plan", async () => {
+		const response = deferredResponse();
+		respond = () => response.promise;
+		await renderAction();
+		const request = requestsTo("/revert-action-preview")[0];
+		expect(request).toBeDefined();
+		queryClient.setQueryData(["workspaceContext", "narrator-test"], {
+			deviceId: "local",
+			contextKey: "local-new",
+			revision: 2,
+		});
+		await waitFor(
+			() => document.body.textContent?.includes(en.revertMessagesOnlyKeepFiles) === true,
+		);
+		expect(request?.signal?.aborted).toBe(true);
+		response.resolve(reply(preparedActionPreview()));
+		await flush();
+		expect(requestsTo("/files")).toHaveLength(0);
+		expect(hasButton(en.rollbackConfirmWithRevert)).toBe(false);
+		await click(button(en.rollbackConfirm));
+		expect(confirmations).toEqual([{ skipRevert: true }]);
+	});
+
+	test("an unresolved workspace is not inferred to be local", async () => {
+		queryClient.removeQueries({ queryKey: ["workspaceContext", "narrator-test"] });
+		const context = deferredResponse();
+		respond = () => context.promise;
+		await renderAction();
+		expect(requestsTo("/workspace-context")).toHaveLength(1);
+		expect(requestsTo("/revert-action-preview")).toHaveLength(0);
+		expect(document.body.textContent).not.toContain(en.revertMessagesOnlyKeepFiles);
+		context.resolve(reply({ deviceId: "local", contextKey: "resolved-local", revision: 1 }));
+		await waitFor(
+			() => document.body.textContent?.includes(en.revertMessagesOnlyKeepFiles) === true,
+		);
+		expect(requestsTo("/revert-action-preview")).toHaveLength(0);
+		expect(confirmations).toHaveLength(0);
+	});
+});
 
 describe("fixed plan review stays minimal", () => {
 	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {

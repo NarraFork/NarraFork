@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { historyStrings } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -20,7 +21,7 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -128,7 +129,8 @@ afterEach(() => {
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
+	await disposeWorkerDb();
 	mock.module("../../db", () => realDb);
 });
 

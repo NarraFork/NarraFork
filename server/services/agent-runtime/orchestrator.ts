@@ -2233,13 +2233,7 @@ export async function runAgentLoopUnlocked(
 				historyEndsWithToolResults: preparedHistory.endsWithToolResults,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
-				shouldIdleOnReasoningOnly: async () => {
-					// Waiting on a mailbox reply or on its own background work, for any session.
-					if (lastModelInputWasMailbox) return true;
-					const { activeWorkCount } =
-						await backgroundTaskService.countActiveKindsByParent(narratorId);
-					return activeWorkCount > 0;
-				},
+				hasPendingWake: async () => lastModelInputWasMailbox || (await workPendingAtEnd()),
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;

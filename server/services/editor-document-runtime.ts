@@ -5,6 +5,10 @@ import {
 	type EditorApplyResult,
 	type EditorQueryResult,
 } from "../../shared/editor-provider-contracts";
+import {
+	type FileHistoryStatus,
+	isFileHistoryEnabledForDevice,
+} from "../../shared/file-change-protocol";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -96,7 +100,7 @@ type SavedSnapshot = {
 function savedResult(
 	operationId: string,
 	saved: SavedSnapshot,
-	historyAvailable: boolean,
+	historyStatus: FileHistoryStatus,
 ): EditorOperationResult {
 	return {
 		status: "saved",
@@ -106,7 +110,7 @@ function savedResult(
 			operationId,
 			...saved,
 			diskOutcome: "applied",
-			historyStatus: historyAvailable ? "complete" : "unavailable",
+			historyStatus,
 		},
 	};
 }
@@ -334,11 +338,14 @@ function effectResult(
 			: after.kind !== "unknown"
 	)
 		return { status: "uncertain", operationId };
-	return savedResult(
-		operationId,
-		saved,
-		after.kind === "regular" && operation.executionOutcome === "succeeded",
-	);
+	const historyStatus: FileHistoryStatus = !isFileHistoryEnabledForDevice(
+		effect.identityJson.deviceId,
+	)
+		? "disabled"
+		: after.kind === "regular" && operation.executionOutcome === "succeeded"
+			? "complete"
+			: "unavailable";
+	return savedResult(operationId, saved, historyStatus);
 }
 
 export const queryEditorOperation: NonNullable<
@@ -346,8 +353,18 @@ export const queryEditorOperation: NonNullable<
 > = async (actor, operationId, recovery) => {
 	actor.signal?.throwIfAborted();
 	const runtime = await getDefaultLocalFileChangeRuntime();
-	const namespace = await runtime.verifyNamespace(actor.signal);
-	const operation = runtime.evidence.getEditorOperation(namespace.sourceInstanceId, operationId);
+	let sourceInstanceId: string;
+	try {
+		sourceInstanceId = await runtime.readExistingSourceInstanceId(actor.signal);
+	} catch {
+		actor.signal?.throwIfAborted();
+		throw new EditorDocumentError(
+			"EDITOR_OPERATION_UNKNOWN",
+			"Original file operation source identity is unavailable",
+			404,
+		);
+	}
+	const operation = runtime.evidence.getEditorOperation(sourceInstanceId, operationId);
 	if (
 		!operation ||
 		operation.ownerUserId !== actor.userId ||
@@ -360,8 +377,18 @@ export const queryEditorOperation: NonNullable<
 		);
 	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
 	const effect = effects.length === 1 ? effects[0] : undefined;
-	const deviceId =
-		operation.executionBindingJson?.deviceId ?? effect?.identityJson.deviceId ?? "local";
+	const deviceId = operation.executionBindingJson?.deviceId ?? effect?.identityJson.deviceId;
+	if (
+		!deviceId ||
+		(effect &&
+			(effect.identityJson.deviceId !== deviceId ||
+				effect.identityJson.sourceInstanceId !== sourceInstanceId))
+	)
+		throw new EditorDocumentError(
+			"EDITOR_OPERATION_UNKNOWN",
+			"Original receipt device identity is unavailable or inconsistent",
+			404,
+		);
 	const authorize = actor.authorizeOperation?.bind(actor, deviceId);
 	if (authorize) await authorize();
 	else if (deviceId !== "local")
@@ -391,6 +418,13 @@ export const queryEditorOperation: NonNullable<
 					}
 				: null,
 			ownedRecovery?.rawDigest,
+		);
+	const namespace = await runtime.verifyNamespace(actor.signal);
+	if (namespace.sourceInstanceId !== sourceInstanceId)
+		throw new EditorDocumentError(
+			"EDITOR_OPERATION_UNKNOWN",
+			"Original file operation source identity changed",
+			404,
 		);
 	const intent = remoteEditorIntent(operation);
 	if (!intent)
@@ -476,7 +510,9 @@ export const queryEditorOperation: NonNullable<
 	await acknowledgeEditorReceipt(deviceId, intent.query).catch(() =>
 		editorRuntimeDiagnostic("debug", "Editor engine ACK deferred", { deferred: true }),
 	);
-	return committed ? savedResult(operationId, committed, false) : { status: "failed", operationId };
+	return committed
+		? savedResult(operationId, committed, "unavailable")
+		: { status: "failed", operationId };
 };
 
 export function editorRuntimeUnavailable(error: unknown): never {

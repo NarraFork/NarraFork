@@ -2407,6 +2407,7 @@ for (const large of [false, true]) {
 
 test.each([
 	"complete",
+	"disabled",
 	undefined,
 ] as const)("saved %s history avoids a fabricated history warning", async (historyStatus) => {
 	const show = spyOn(notifications, "show").mockReturnValue("unused");
