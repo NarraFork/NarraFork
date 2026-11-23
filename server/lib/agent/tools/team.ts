@@ -133,7 +133,10 @@ async function principalOf(ctx: ToolContext) {
 async function workerLabel(ctx: ToolContext, workerId: string | null): Promise<string | null> {
 	if (!workerId) return null;
 	const { resolveAgentLabel } = await import("../../../services/subagent-label");
-	return (await resolveAgentLabel(ctx.narratorId, workerId).catch(() => "")) || workerId;
+	return (
+		(await resolveAgentLabel(ctx.narratorId, workerId, { signal: ctx.signal }).catch(() => "")) ||
+		workerId
+	);
 }
 
 async function resolveReviewer(ctx: ToolContext, reviewer: string | undefined) {

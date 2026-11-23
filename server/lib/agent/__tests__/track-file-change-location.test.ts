@@ -16,9 +16,13 @@ describe("trackFileChange team location forwarding", () => {
 			const membership = {
 				$client: {},
 				select() { return this; }, from() { return this; }, where() { return this; },
+				limit() { return this; },
+				transaction(write) { return write(this); },
 				get() { return { type: "subagent", variant: "subagent:general", parentId: "parent" }; },
 			};
 			mock.module("@server/db", () => ({ db: membership, sqlite: membership.$client, activeDatabaseBackend: "sqlite" }));
+			const reads = await import("@server/db/worker-read");
+			mock.module("@server/db/worker-read", () => ({ ...reads, readQueryFirst: async (query) => query.get() }));
 			mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator() {} }));
 			mock.module("@server/lib/event-bus", () => ({ eventBus: { emit() {} } }));
 			mock.module("@server/lib/logger", () => ({ logger: { debug() {}, warn() {}, info() {} } }));
@@ -35,8 +39,8 @@ describe("trackFileChange team location forwarding", () => {
 			const calls = [];
 			mock.module("@server/services/narrator-subagent", () => ({
 				recordTeamFileChange(...args) {
-					calls.push(args);
-					team.recordTeamFileChange(...args);
+					calls.push(args.slice(0, 4));
+					return team.recordTeamFileChange(...args);
 				},
 			}));
 			const { trackFileChange } = await import("@server/lib/agent/tools/track-file-change");

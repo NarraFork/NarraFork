@@ -1687,6 +1687,10 @@ async function registerDetachedTask(
 		deliverTo.narratorId,
 		narratorId,
 		row?.title ?? undefined,
+		{
+			signal: run.cancel.signal,
+			deadlineAt: run.deadlineAt ? Date.parse(run.deadlineAt) : undefined,
+		},
 	);
 	// Re-registering the same run keeps its destination and absolute deadline.
 	await backgroundTaskService.createAgentTask({

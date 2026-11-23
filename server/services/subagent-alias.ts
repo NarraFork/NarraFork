@@ -1,5 +1,11 @@
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
+import { ValidationError } from "../lib/errors";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
+
+type AliasReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
+const MAX_ALIAS_SCOPE_ROWS = 1000;
 
 // === Background task alias registry ===
 // Provides human-readable aliases for background tasks (both Agent and Bash).
@@ -158,12 +164,21 @@ export async function persistSubagentAlias(
 	parentNarratorId: string,
 	subagentId: string,
 	alias: string,
+	options: AliasReadOptions = {},
+	expected?: { alias: string | undefined },
 ): Promise<void> {
-	const { db, narrators } = await loadAliasDb();
+	const { db, narrators, backgroundTasks } = await loadAliasDb();
 	await narratorTraitsLock.acquire(subagentId, async () => {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, subagentId),
-			columns: { parentNarratorId: true, traits: true },
+		const query = () =>
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, subagentId),
+				columns: { parentNarratorId: true, traits: true },
+			});
+		const row = await readQueryFirst(query(), {
+			...options,
+			executionPolicy: "worker-required",
+			maxRows: 1,
 		});
 		if (!row || row.parentNarratorId !== parentNarratorId) return;
 
@@ -174,10 +189,64 @@ export async function persistSubagentAlias(
 			...currentTraits.filter((trait) => !trait.startsWith(SUBAGENT_ALIAS_TRAIT_PREFIX)),
 			`${SUBAGENT_ALIAS_TRAIT_PREFIX}${alias}`,
 		];
-		await db
-			.update(narrators)
-			.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, subagentId));
+		db.transaction((tx) => {
+			const current = tx
+				.select({ parentNarratorId: narrators.parentNarratorId, traits: narrators.traits })
+				.from(narrators)
+				.where(eq(narrators.id, subagentId))
+				.get();
+			if (
+				!current ||
+				current.parentNarratorId !== row.parentNarratorId ||
+				JSON.stringify(current.traits) !== JSON.stringify(row.traits)
+			)
+				throw new RuntimeReadConflictError();
+			const siblings = tx
+				.select({ id: narrators.id, title: narrators.title, traits: narrators.traits })
+				.from(narrators)
+				.where(eq(narrators.parentNarratorId, parentNarratorId))
+				.limit(MAX_ALIAS_SCOPE_ROWS + 1)
+				.all();
+			const tasks = tx
+				.select({
+					id: backgroundTasks.id,
+					alias: backgroundTasks.alias,
+					subagentNarratorId: backgroundTasks.subagentNarratorId,
+				})
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.parentNarratorId, parentNarratorId))
+				.limit(MAX_ALIAS_SCOPE_ROWS + 1)
+				.all();
+			if (takenAliases(siblings, tasks, subagentId).has(alias))
+				throw new RuntimeReadConflictError();
+			if (expected) {
+				let currentAlias: string | undefined = getPersistedSubagentAliases(current.traits)[0];
+				if (!currentAlias) {
+					const task = tx
+						.select({
+							type: backgroundTasks.type,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							alias: backgroundTasks.alias,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, subagentId))
+						.limit(1)
+						.get();
+					if (
+						task?.type === "agent" &&
+						task.parentNarratorId === parentNarratorId &&
+						(task.subagentNarratorId ?? subagentId) === subagentId
+					)
+						currentAlias = task.alias || undefined;
+				}
+				if (currentAlias !== expected.alias) throw new RuntimeReadConflictError();
+			}
+			tx.update(narrators)
+				.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+				.where(eq(narrators.id, subagentId))
+				.run();
+		});
 	});
 }
 
@@ -185,22 +254,31 @@ export async function persistSubagentAlias(
 async function getExistingSubagentAlias(
 	parentNarratorId: string,
 	subagentId: string,
+	options: AliasReadOptions = {},
 ): Promise<string | undefined> {
 	const { db, backgroundTasks, narrators } = await loadAliasDb();
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, subagentId),
-		columns: { parentNarratorId: true, traits: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, subagentId),
+			columns: { parentNarratorId: true, traits: true },
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!row || row.parentNarratorId !== parentNarratorId) return;
 	const persisted = getPersistedSubagentAliases(row.traits)[0];
 	if (persisted) return persisted;
 
 	// Agent task rows share their subagent's id. Keep this a bounded PK lookup,
 	// and do not adopt an alias from a different task type or team.
-	const task = await db.query.backgroundTasks.findFirst({
-		where: eq(backgroundTasks.id, subagentId),
-		columns: { type: true, parentNarratorId: true, subagentNarratorId: true, alias: true },
-	});
+	const task = await readQueryFirst(
+		db.query.backgroundTasks.findMany({
+			limit: 1,
+			where: eq(backgroundTasks.id, subagentId),
+			columns: { type: true, parentNarratorId: true, subagentNarratorId: true, alias: true },
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (
 		task?.type === "agent" &&
 		task.parentNarratorId === parentNarratorId &&
@@ -213,16 +291,37 @@ async function getExistingSubagentAlias(
 async function getPersistedTakenAliases(
 	parentNarratorId: string,
 	excludeSubagentId: string,
+	options: AliasReadOptions = {},
 ): Promise<Set<string>> {
 	const { db, backgroundTasks, narrators } = await loadAliasDb();
-	const siblings = await db.query.narrators.findMany({
-		where: eq(narrators.parentNarratorId, parentNarratorId),
-		columns: { id: true, title: true, traits: true },
-	});
-	const tasks = await db.query.backgroundTasks.findMany({
-		where: eq(backgroundTasks.parentNarratorId, parentNarratorId),
-		columns: { id: true, alias: true, subagentNarratorId: true },
-	});
+	const siblings = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.parentNarratorId, parentNarratorId),
+			columns: { id: true, title: true, traits: true },
+			orderBy: asc(narrators.id),
+			limit: MAX_ALIAS_SCOPE_ROWS + 1,
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: MAX_ALIAS_SCOPE_ROWS + 1 },
+	);
+	const tasks = await readQuery(
+		db.query.backgroundTasks.findMany({
+			where: eq(backgroundTasks.parentNarratorId, parentNarratorId),
+			columns: { id: true, alias: true, subagentNarratorId: true },
+			orderBy: asc(backgroundTasks.id),
+			limit: MAX_ALIAS_SCOPE_ROWS + 1,
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: MAX_ALIAS_SCOPE_ROWS + 1 },
+	);
+	return takenAliases(siblings, tasks, excludeSubagentId);
+}
+
+function takenAliases(
+	siblings: { id: string; title: string | null; traits: unknown }[],
+	tasks: { id: string; alias: string | null; subagentNarratorId: string | null }[],
+	excludeSubagentId: string,
+): Set<string> {
+	if (siblings.length > MAX_ALIAS_SCOPE_ROWS || tasks.length > MAX_ALIAS_SCOPE_ROWS)
+		throw new ValidationError("Subagent alias scope exceeds its row budget");
 	const taken = new Set<string>();
 	for (const sibling of siblings) {
 		if (sibling.id === excludeSubagentId) continue;
@@ -240,9 +339,23 @@ async function getPersistedTakenAliases(
 }
 
 export interface SubagentAliasPersistenceAdapter {
-	getExistingAlias(parentNarratorId: string, subagentId: string): Promise<string | undefined>;
-	getTakenAliases(parentNarratorId: string, excludeSubagentId: string): Promise<Set<string>>;
-	persistAlias(parentNarratorId: string, subagentId: string, alias: string): Promise<void>;
+	getExistingAlias(
+		parentNarratorId: string,
+		subagentId: string,
+		options?: AliasReadOptions,
+	): Promise<string | undefined>;
+	getTakenAliases(
+		parentNarratorId: string,
+		excludeSubagentId: string,
+		options?: AliasReadOptions,
+	): Promise<Set<string>>;
+	persistAlias(
+		parentNarratorId: string,
+		subagentId: string,
+		alias: string,
+		options?: AliasReadOptions,
+		expected?: { alias: string | undefined },
+	): Promise<void>;
 }
 
 const defaultSubagentAliasPersistenceAdapter: SubagentAliasPersistenceAdapter = {
@@ -268,19 +381,24 @@ export async function registerAndPersistSubagentAlias(
 	parentNarratorId: string,
 	subagentId: string,
 	desiredAlias?: string,
+	options: AliasReadOptions = {},
 ): Promise<{ alias: string; conflicted: boolean }> {
 	return subagentAliasRegistrationLock.acquire(parentNarratorId, async () => {
 		const reg = getOrCreateRegistry(parentNarratorId);
 		// Recovery passes the (mutable) title, not necessarily the alias originally
 		// printed in Agent/Send results. Never overwrite that selector just because
 		// the parent turn's cleanup cleared the in-memory registry.
-		const existing =
-			reg.idToAlias.get(subagentId) ||
-			(await subagentAliasPersistenceAdapter.getExistingAlias(parentNarratorId, subagentId));
+		const persistedExisting = await subagentAliasPersistenceAdapter.getExistingAlias(
+			parentNarratorId,
+			subagentId,
+			options,
+		);
+		const existing = persistedExisting || reg.idToAlias.get(subagentId);
 		const base = existing || aliasBaseFor(subagentId, desiredAlias);
 		const persistedTaken = await subagentAliasPersistenceAdapter.getTakenAliases(
 			parentNarratorId,
 			subagentId,
+			options,
 		);
 		const isTaken = (candidate: string) => {
 			const memoryOwner = reg.aliasToId.get(candidate);
@@ -293,8 +411,14 @@ export async function registerAndPersistSubagentAlias(
 				? { alias: existing, conflicted: false }
 				: uniqueAliasFrom(base, isTaken, subagentId);
 
+		await subagentAliasPersistenceAdapter.persistAlias(
+			parentNarratorId,
+			subagentId,
+			alias,
+			options,
+			{ alias: persistedExisting },
+		);
 		setRegistryAlias(reg, subagentId, alias);
-		await subagentAliasPersistenceAdapter.persistAlias(parentNarratorId, subagentId, alias);
 		return { alias, conflicted: conflicted || alias !== base };
 	});
 }

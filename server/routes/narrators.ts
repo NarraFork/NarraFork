@@ -2100,7 +2100,7 @@ narratorRoutes.get("/:id", async (c) => {
 	// A resolution failure just leaves the plain "follow parent" label.
 	const modelInheritance =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelInheritance(narrator, c.get("user").sub)
+			? await resolveSubagentModelInheritance(narrator, c.get("user").sub, 0, detailRead)
 					.then((result) => result.inheritance)
 					.catch(() => undefined)
 			: undefined;
@@ -3043,7 +3043,11 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			const currentCwd = narrator.cwd ?? undefined;
 			const newModel =
 				narrator.model === FOLLOW_PARENT_MODEL
-					? (await resolveSubagentModelForRun(narrator, userId)).model
+					? (
+							await resolveSubagentModelForRun(narrator, userId, undefined, {
+								signal: c.req.raw.signal,
+							})
+						).model
 					: (narrator.model ?? undefined);
 			const newNarrator = await narratorService.create({
 				model: newModel,
@@ -5636,6 +5640,8 @@ narratorRoutes.patch("/:id/model", async (c) => {
 		await resolveSubagentModelForRun(
 			{ ...narrator, model: FOLLOW_PARENT_MODEL },
 			c.get("user").sub,
+			undefined,
+			{ signal: c.req.raw.signal },
 		);
 	}
 	const model = normalizeAutoModelValueForSave(parsed.data.model);

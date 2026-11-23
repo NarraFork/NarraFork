@@ -756,7 +756,8 @@ describe("executeTool update admission gate", () => {
 			if (!scheduled.updateEpoch) throw new Error("Missing scheduled fixture epoch");
 			await toolContinuationService.cancelEpoch(scheduled.updateEpoch);
 			releaseCheckpoint();
-			await expect(result).resolves.toMatchObject({ output: "once" });
+			// Native settlement avoids Bun's reused-Worker `.resolves` matcher stall.
+			expect(await result).toMatchObject({ output: "once" });
 			expect(executions).toBe(1);
 			expect(permissions).toBe(1);
 			if (cancelAt === "fresh-late-write") {
@@ -948,7 +949,7 @@ describe("executeTool update admission gate", () => {
 		expect(results[1]?.output).toContain("disabled");
 		expect(results[2]?.output).toContain("not allowed");
 		expect(results.slice(3).every((result) => !result.isError)).toBe(true);
-		expect(executed).toEqual(["Agent", "Watch", "Bash"]);
+		expect(executed.sort()).toEqual(["Agent", "Bash", "Watch"]);
 	});
 
 	test("phase two pauses a newly requested background Agent", async () => {

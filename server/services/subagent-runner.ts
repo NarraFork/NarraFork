@@ -320,13 +320,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			}
 		}
 		// Validates the pool now (a refused model fails the call before any run starts).
-		const { inheritance } = await resolveSubagentModelForRun(subagent, userId);
+		const { inheritance } = await resolveSubagentModelForRun(subagent, userId, undefined, {
+			signal: input.signal,
+		});
 		let aliasRegistration: { alias: string; conflicted: boolean };
 		try {
 			aliasRegistration = await registerAndPersistSubagentAlias(
 				parentNarratorId,
 				subagentId,
 				alias || title,
+				{ signal: input.signal },
 			);
 		} catch (err) {
 			aliasRegistration = registerTaskAlias(parentNarratorId, subagentId, alias || title);

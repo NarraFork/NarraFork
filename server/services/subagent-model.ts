@@ -4,6 +4,7 @@ import { isSubagentReasoningEffort } from "@shared/subagent-model-policy";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import {
@@ -204,6 +205,7 @@ export async function resolveSubagentModelInheritance(
 	narrator: SourceModelRef,
 	actingUserId?: string | null,
 	depth = 0,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): Promise<{ selection: SubagentModelSelection; inheritance: SubagentModelInheritance }> {
 	const sourceId = policySourceIdOf(narrator);
 	if (!sourceId) {
@@ -212,17 +214,21 @@ export async function resolveSubagentModelInheritance(
 	if (depth >= MAX_POLICY_SOURCE_DEPTH) {
 		throw new ValidationError("Cannot resolve the source narrator's model: source chain too deep");
 	}
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, sourceId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			id: true,
-			model: true,
-			reasoningEffort: true,
-			traits: true,
-			contextProjectId: true,
-		},
-	});
+	const source = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, sourceId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				id: true,
+				model: true,
+				reasoningEffort: true,
+				traits: true,
+				contextProjectId: true,
+			},
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!source) {
 		throw new ValidationError("Cannot resolve the source narrator's model");
 	}
@@ -230,7 +236,7 @@ export async function resolveSubagentModelInheritance(
 	// followed through to the model it currently resolves to.
 	const upstream =
 		source.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelInheritance(source, actingUserId, depth + 1)
+			? await resolveSubagentModelInheritance(source, actingUserId, depth + 1, options)
 			: null;
 	const sourceStoredModel = upstream ? upstream.selection.model : source.model;
 	// The source's own effective tier (pool tier > own override > its source's).
@@ -357,12 +363,18 @@ export async function resolveSubagentModelForRun(
 	narrator: SourceModelRef,
 	actingUserId?: string | null,
 	stickyProvider?: string,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): Promise<SubagentRunModel> {
 	if (narrator.model !== FOLLOW_PARENT_MODEL) {
 		const modelRef = narrator.model || FOLLOW_DEFAULT_MODEL;
 		return { modelRef, model: resolveEffectiveModel(modelRef, stickyProvider) };
 	}
-	const { selection, inheritance } = await resolveSubagentModelInheritance(narrator, actingUserId);
+	const { selection, inheritance } = await resolveSubagentModelInheritance(
+		narrator,
+		actingUserId,
+		0,
+		options,
+	);
 	if (narrator.id) recordInheritance(narrator.id, inheritance);
 	return {
 		modelRef: selection.model,
