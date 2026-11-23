@@ -9,6 +9,7 @@ export function createDatabaseReaderStartup(options: {
 	initialize: () => Promise<void>;
 	onUnavailable: (result: Extract<DatabaseReaderResult, { ok: false }>) => void;
 	onError: (error: unknown) => void;
+	onStop?: () => void;
 	retryIntervalMs?: number;
 }) {
 	const retryIntervalMs = options.retryIntervalMs ?? DATABASE_READ_RETRY_AFTER_SECONDS * 1000;
@@ -72,9 +73,11 @@ export function createDatabaseReaderStartup(options: {
 			return initialAttempt;
 		},
 		stop(): void {
+			if (stopped) return;
 			stopped = true;
 			clearTimeout(timer);
 			timer = undefined;
+			options.onStop?.();
 		},
 	};
 }

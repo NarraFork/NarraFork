@@ -171,16 +171,20 @@ describe("database reader startup recovery", () => {
 	test("shutdown before start does not probe", async () => {
 		const wait = mock(async () => ({ ok: true }) as const);
 		const initialize = mock(async () => {});
+		const onStop = mock(() => {});
 		const startup = createDatabaseReaderStartup({
 			readiness: { state: { status: "ready" }, wait },
 			initialize,
 			onUnavailable: () => {},
 			onError: () => {},
+			onStop,
 		});
+		startup.stop();
 		startup.stop();
 		await startup.start();
 		expect(wait).not.toHaveBeenCalled();
 		expect(initialize).not.toHaveBeenCalled();
+		expect(onStop).toHaveBeenCalledTimes(1);
 	});
 
 	test("unavailable readers keep retries sequential and report once without initialization", async () => {

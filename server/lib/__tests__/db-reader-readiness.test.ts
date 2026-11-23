@@ -37,7 +37,11 @@ import {
 	registerGracefulShutdownHandler,
 	registerRuntimeAddressGetter,
 } from "../server-restart";
-import { buildHealthPayload, createStartupReadinessGate } from "../startup-readiness";
+import {
+	buildHealthPayload,
+	createStartupReadinessGate,
+	type StartupReadinessGate,
+} from "../startup-readiness";
 
 function gate(backend: "sqlite" | "postgres" = "sqlite") {
 	const probe = Promise.withResolvers<void>();
@@ -64,13 +68,20 @@ function gate(backend: "sqlite" | "postgres" = "sqlite") {
 const source = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 const dispatcherSource = readFileSync(new URL("../../http-dispatcher.ts", import.meta.url), "utf8");
 const transpiler = new Bun.Transpiler({ loader: "ts" });
-function entry(readiness: DatabaseReaderReadiness, backend = "sqlite", recoveryFailed = false) {
-	const startupReadiness = createStartupReadinessGate();
-	if (recoveryFailed) startupReadiness.markFailed("provider needs repair");
-	else startupReadiness.markReady();
-	startupReadiness.settle(
-		recoveryFailed ? { ok: false, error: "provider needs repair" } : { ok: true },
-	);
+function entry(
+	readiness: DatabaseReaderReadiness,
+	backend = "sqlite",
+	recoveryFailed = false,
+	pendingStartup?: StartupReadinessGate,
+) {
+	const startupReadiness = pendingStartup ?? createStartupReadinessGate();
+	if (!pendingStartup) {
+		if (recoveryFailed) startupReadiness.markFailed("provider needs repair");
+		else startupReadiness.markReady();
+		startupReadiness.settle(
+			recoveryFailed ? { ok: false, error: "provider needs repair" } : { ok: true },
+		);
+	}
 	let businessCalls = 0;
 	let upgrades = 0;
 	const readUser = mock(async (_query: unknown, _options: unknown) => ({
@@ -151,6 +162,7 @@ function entry(readiness: DatabaseReaderReadiness, backend = "sqlite", recoveryF
 		},
 	};
 	return {
+		lifecycle: dependencies.lifecycle,
 		async request(path: string, options?: RequestInit) {
 			return fetchEntry(new Request(`http://127.0.0.1${path}`, options), server);
 		},
@@ -208,6 +220,77 @@ function startupEntry(readiness: DatabaseReaderReadiness) {
 	});
 	return { calls, startWork: startup.start, stop: startup.stop, logger: dependencies.logger };
 }
+
+test("cancelling recovered startup releases requests waiting on the actual admission barrier", async () => {
+	let probes = 0;
+	const readiness = createDatabaseReaderReadiness({
+		backend: "sqlite",
+		probe: async () => {
+			if (++probes === 1) throw new Error("injected startup failure");
+		},
+		retryIntervalMs: 0,
+	});
+	const gate = createStartupReadinessGate();
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const start = source.indexOf("const databaseStartup = createDatabaseReaderStartup(");
+	const end = source.indexOf("await databaseStartup.start();", start);
+	expect(start).toBeGreaterThanOrEqual(0);
+	expect(end).toBeGreaterThan(start);
+	const cancelStart = source.indexOf("function cancelDatabaseStartup(): void {");
+	const cancelEnd = source.indexOf("async function initializeDatabaseStartup()", cancelStart);
+	expect(cancelStart).toBeGreaterThanOrEqual(0);
+	expect(cancelEnd).toBeGreaterThan(cancelStart);
+	const compiled = transpiler.transformSync(
+		source.slice(cancelStart, cancelEnd) + source.slice(start, end),
+	);
+	const startup = new Function(
+		"createDatabaseReaderStartup",
+		"databaseReaderReadiness",
+		"initializeDatabaseStartup",
+		"startupReadiness",
+		"logger",
+		`${compiled}\nreturn databaseStartup;`,
+	)(
+		(options: Parameters<typeof createDatabaseReaderStartup>[0]) =>
+			createDatabaseReaderStartup({ ...options, retryIntervalMs: 1 }),
+		readiness,
+		async () => {
+			entered.resolve();
+			await release.promise;
+		},
+		gate,
+		{ error() {} },
+	) as ReturnType<typeof createDatabaseReaderStartup>;
+	const runtime = entry(readiness, "sqlite", false, gate);
+	try {
+		await startup.start();
+		expect((await runtime.request("/api/data"))?.status).toBe(503);
+		await entered.promise;
+		const response = runtime.request("/api/data");
+		await Bun.sleep(1);
+		expect(runtime.lifecycle.activeCount).toBe(1);
+		startup.stop();
+		runtime.lifecycle.stopAccepting();
+		runtime.lifecycle.abortAll();
+		expect(
+			await Promise.race([
+				response.then((result) => result?.status),
+				Bun.sleep(50).then(() => "timed out"),
+			]),
+		).toBe(503);
+		expect(await gate.barrier).toEqual({ ok: false, error: "SERVER_SHUTTING_DOWN" });
+		await runtime.lifecycle.drain();
+		expect(runtime.lifecycle.activeCount).toBe(0);
+		expect(runtime.businessCalls).toBe(0);
+		expect(startup.pending).toBe(true);
+	} finally {
+		gate.settle({ ok: false, error: "fixture cleanup" });
+		startup.stop();
+		release.resolve();
+		await startup.drain();
+	}
+});
 
 describe("database reader readiness", () => {
 	test("requires a completed probe and propagates the bounded probe options", async () => {

@@ -1150,8 +1150,14 @@ initKnowledgeNotify();
 // Register chat notification bridge (room messages to viewers, unread badges to the rest)
 initChatNotify();
 
+function cancelDatabaseStartup(): void {
+	const error = "SERVER_SHUTTING_DOWN";
+	startupReadiness.markFailed(error);
+	startupReadiness.settle({ ok: false, error });
+}
+
 async function initializeDatabaseStartup(): Promise<void> {
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 	// Verify database integrity in the background, now that the port is bound and requests are being
 	// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
 	// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
@@ -1177,7 +1183,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 	await import("./services/modeltrace-compat")
 		.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
 		.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 	// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
 	// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
 	// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
@@ -1190,13 +1196,13 @@ async function initializeDatabaseStartup(): Promise<void> {
 		await materializeLegacyDelegations().catch((error) =>
 			logger.warn("Legacy delegation materialization failed", { error: String(error) }),
 		);
-		if (!httpLifecycle.accepting) return;
+		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 		// The server is already serving here, so a failure is logged rather than thrown. It fails
 		// closed: a grant without its authority row is rejected as invalid_grant, and a resource
 		// without its binding is not listed for the client. The next startup retries the backfill.
 		try {
 			await backfillOAuthGrantAuthoritiesOnStartup();
-			if (!httpLifecycle.accepting) return;
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 			await backfillIntegrationResourceBindingsOnStartup();
 		} catch (error) {
 			logger.error(
@@ -1208,7 +1214,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 		}
 	}
 
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 	startVNetUdpRendezvous(settings.vnet).catch((err) => {
 		logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
 	});
@@ -1228,7 +1234,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 	} catch (err) {
 		logger.warn("Kimi usage startup refresh failed", { error: String(err) });
 	}
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 
 	try {
 		// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
@@ -1238,7 +1244,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 	} catch (err) {
 		logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
 	}
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 
 	try {
 		// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
@@ -1247,7 +1253,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 	} catch {
 		logger.warn("DeepSeek balance startup refresh failed");
 	}
-	if (!httpLifecycle.accepting) return;
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 
 	// A user's template in a built-in's directory moves aside without losing its contents.
 	void import("./services/custom-subagent-service")
@@ -1608,6 +1614,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 const databaseStartup = createDatabaseReaderStartup({
 	readiness: databaseReaderReadiness,
 	initialize: initializeDatabaseStartup,
+	onStop: cancelDatabaseStartup,
 	onUnavailable: (result) => {
 		logger.error("Database readers unavailable; database startup work is gated", {
 			code: result.code,
