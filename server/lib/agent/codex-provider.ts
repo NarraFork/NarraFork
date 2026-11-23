@@ -388,7 +388,7 @@ export class CodexProvider implements ProviderAdapter {
 
 	private async runWithFailover<T>(
 		operationName: string,
-		run: (provider: OpenAIProvider) => Promise<T>,
+		run: (provider: OpenAIProvider, credentialId: string) => Promise<T>,
 	): Promise<T> {
 		const maxAttempts = this.getMaxFailoverAttempts();
 		let attempt = 0;
@@ -400,7 +400,7 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 
 			try {
-				const result = await run(provider);
+				const result = await run(provider, ctx.id);
 				this.manager.reportSuccess(ctx.id);
 				return result;
 			} catch (err) {
@@ -953,9 +953,10 @@ export class CodexProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runWithFailover("generateWithMeta", (provider) =>
-			provider.generateWithMeta(text, model, systemInstruction, options),
-		);
+		return this.runWithFailover("generateWithMeta", async (provider, credentialId) => ({
+			...(await provider.generateWithMeta(text, model, systemInstruction, options)),
+			credentialId,
+		}));
 	}
 
 	async generateWithHistory(
@@ -982,8 +983,15 @@ export class CodexProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runWithFailover("generateWithHistoryWithMeta", (provider) =>
-			provider.generateWithHistoryWithMeta(systemInstruction, content, model, locale, options),
-		);
+		return this.runWithFailover("generateWithHistoryWithMeta", async (provider, credentialId) => ({
+			...(await provider.generateWithHistoryWithMeta(
+				systemInstruction,
+				content,
+				model,
+				locale,
+				options,
+			)),
+			credentialId,
+		}));
 	}
 }
