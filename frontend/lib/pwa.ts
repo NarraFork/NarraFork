@@ -290,10 +290,10 @@ function tryWorkerUpdate(): Promise<boolean> {
  * to use the network (it may ignore search). Unregistration is best effort and does not
  * detach the current document; SW navigation handling must also be network-first.
  */
-export function clearPwaCacheAndReload(): Promise<void> {
+export function clearPwaCacheAndReload({ clearCaches = false } = {}): Promise<void> {
 	reloadPromise ??= Promise.resolve()
 		.then(async () => {
-			if (!(await tryWorkerUpdate())) await clearPwaCache();
+			if (clearCaches || !(await tryWorkerUpdate())) await clearPwaCache();
 			window.location.replace(networkReloadUrl());
 		})
 		.finally(() => {
