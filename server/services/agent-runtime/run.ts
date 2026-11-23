@@ -1824,22 +1824,20 @@ async function awaitPendingWake(
 	const { flushInboxPublicationBarrier } = await import("./inbox");
 	// Work is read before the outbox flush: a task that settled before the read has its
 	// notice in the outbox, so the flush moves it into the inbox before the inbox read.
-	// Unreadable pending state keeps the previous behavior: the run settles with this answer.
-	const pending = async (): Promise<"input" | "settled" | undefined> => {
+	// Unreadable pending state before waiting keeps the previous behavior: the run settles
+	// with this answer. Once waiting (e.g. the store stopped for a restart), it keeps waiting.
+	const pending = async (waiting: boolean): Promise<"input" | "settled" | undefined> => {
 		try {
 			const working = await hasPendingWork(id);
 			await flushInboxPublicationBarrier(id);
 			if (await hasQueuedWake(id)) return "input";
 			return working ? undefined : "settled";
 		} catch (error) {
-			logger.warn("Pending wake state unavailable; settling the run", {
-				id,
-				error: String(error),
-			});
-			return "settled";
+			logger.warn("Pending wake state unavailable", { id, waiting, error: String(error) });
+			return waiting ? undefined : "settled";
 		}
 	};
-	const first = await pending();
+	const first = await pending(false);
 	if (first) return first;
 	const { narratorService } = await import("../narrator-service");
 	await narratorService.updateStatus(id, "idle");
@@ -1860,7 +1858,7 @@ async function awaitPendingWake(
 		if (done) return;
 		if (run.cancel.signal.aborted) return finish("cancel");
 		if (activeHold(id)) return finish("hold");
-		const woke = await pending();
+		const woke = await pending(true);
 		if (woke) finish(woke);
 	};
 	const timer = setInterval(() => void check(), PENDING_WAKE_RECHECK_MS);
