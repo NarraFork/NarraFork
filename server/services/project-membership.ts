@@ -354,46 +354,50 @@ export async function setProjectMembers(
 
 	const outcome: ProjectMemberBatchOutcome = { added: [], skipped: [], failed: [] };
 	const now = new Date().toISOString();
+	if (activeDatabaseBackend === "sqlite") {
+		return db.transaction(
+			(tx) => {
+				const current = projectForManagedWrite(tx, projectId, principal);
+				for (const userId of wanted) {
+					const status = ((): keyof ProjectMemberBatchOutcome => {
+						if (
+							!known.has(userId) ||
+							userId === current.ownerUserId ||
+							!tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1).get()
+						)
+							return "failed";
+						const held = tx
+							.select({ role: aclGrants.capability })
+							.from(aclGrants)
+							.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
+							.limit(2)
+							.all();
+						if (held.length === 1 && held[0].role === role) return "skipped";
+						tx.delete(aclGrants)
+							.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
+							.run();
+						tx.insert(aclGrants)
+							.values({
+								id: generateId(),
+								scopeType: "project",
+								scopeId: projectId,
+								principalType: "user",
+								principalId: userId,
+								capability: role,
+								grantedBy: principal.userId,
+								createdAt: now,
+							})
+							.run();
+						return "added";
+					})();
+					outcome[status].push(userId);
+				}
+				return outcome;
+			},
+			{ behavior: "immediate" },
+		);
+	}
 	for (const userId of wanted) {
-		if (activeDatabaseBackend === "sqlite") {
-			const status = db.transaction(
-				(tx): keyof ProjectMemberBatchOutcome => {
-					const current = projectForManagedWrite(tx, projectId, principal);
-					if (
-						!known.has(userId) ||
-						userId === current.ownerUserId ||
-						!tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1).get()
-					)
-						return "failed";
-					const held = tx
-						.select({ role: aclGrants.capability })
-						.from(aclGrants)
-						.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
-						.limit(2)
-						.all();
-					if (held.length === 1 && held[0].role === role) return "skipped";
-					tx.delete(aclGrants)
-						.where(and(projectMemberScope(projectId), eq(aclGrants.principalId, userId)))
-						.run();
-					tx.insert(aclGrants)
-						.values({
-							id: generateId(),
-							scopeType: "project",
-							scopeId: projectId,
-							principalType: "user",
-							principalId: userId,
-							capability: role,
-							grantedBy: principal.userId,
-							createdAt: now,
-						})
-						.run();
-					return "added";
-				},
-				{ behavior: "immediate" },
-			);
-			outcome[status].push(userId);
-			continue;
-		}
 		if (!known.has(userId) || userId === row.ownerUserId) {
 			outcome.failed.push(userId);
 			continue;
