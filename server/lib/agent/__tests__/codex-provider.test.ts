@@ -404,4 +404,29 @@ describe("CodexProvider credential reporting", () => {
 			events: ["codex-account-1"],
 		});
 	});
+
+	test("non-streaming results are billed to the account", async () => {
+		const provider = new CodexProvider({ useWebSocket: false });
+		const restore = withAccount(provider);
+		const result = { text: "summary", usage: undefined };
+		const generate = spyOn(OpenAIProvider.prototype, "generateWithMeta").mockResolvedValue(
+			result as never,
+		);
+		const history = spyOn(
+			OpenAIProvider.prototype,
+			"generateWithHistoryWithMeta",
+		).mockResolvedValue(result as never);
+		try {
+			expect((await provider.generateWithMeta("hi", "gpt-5.5")).credentialId).toBe(
+				"codex-account-1",
+			);
+			expect(
+				(await provider.generateWithHistoryWithMeta("sys", "hi", "gpt-5.5")).credentialId,
+			).toBe("codex-account-1");
+		} finally {
+			generate.mockRestore();
+			history.mockRestore();
+			restore();
+		}
+	});
 });
