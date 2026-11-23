@@ -183,7 +183,7 @@ import {
 } from "../lib/prompt-i18n";
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
-import { policySourceIdOf } from "../lib/runtime-source";
+import { policySourceIdOf, runDeliverToOf } from "../lib/runtime-source";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
@@ -2111,6 +2111,8 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
 		...fastMode,
+		// Takeover holds a delivered result; without a destination the UI offers Stop.
+		deliversResult: Boolean(runDeliverToOf(narrator)),
 		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
 		gitSummary: null,
 		navigationSummary,

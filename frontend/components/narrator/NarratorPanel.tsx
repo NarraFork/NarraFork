@@ -144,6 +144,7 @@ import {
 } from "./background/BackgroundTasksDrawer";
 import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
+import { resolveCanTakeover } from "./composer/composer-action-slot";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
@@ -1712,7 +1713,13 @@ function NarratorPanelBody({
 	// tool call stays blocked. canTakeover is shown only while the subagent is
 	// running and not already taken over.
 	const isTakenOver = isSubagent && substatus.includes("taken_over");
-	const canTakeover = isSubagent && isActive && !isTakenOver && retryRecoveryAllowsInterrupt;
+	const canTakeover = resolveCanTakeover({
+		isSubagent,
+		isActive,
+		isTakenOver,
+		retryRecoveryAllowsInterrupt,
+		deliversResult: narrator?.deliversResult,
+	});
 	/**
 	 * Whether the composer may offer the cut-in (priority queue) action.
 	 *

@@ -380,3 +380,42 @@ describe("when nothing is actually running", () => {
 		expect(res.status).toBe(400);
 	});
 });
+
+describe("a running subagent whose run delivers nowhere", () => {
+	const noDestination = {
+		version: 1,
+		run: { logicalRunId: "orphan-run" },
+	};
+
+	function getDetail(id: string) {
+		return app().request(`http://localhost/narrators/${id}`);
+	}
+
+	test("detail reports whether takeover has a result to hold", async () => {
+		const delegated = await getDetail(subagentId);
+		expect(delegated.status).toBe(200);
+		expect((await delegated.json()).deliversResult).toBe(true);
+
+		await setSubagentRow({ runtimeRegistrationJson: noDestination });
+		const orphan = await getDetail(subagentId);
+		expect(orphan.status).toBe(200);
+		expect((await orphan.json()).deliversResult).toBe(false);
+	});
+
+	test("takeover is refused but Stop still ends it", async () => {
+		await setSubagentRow({ runtimeRegistrationJson: noDestination });
+
+		const refused = await takeover(subagentId);
+		expect(refused.status).toBe(400);
+		expect(await refused.json()).toMatchObject({ error: "This session does not deliver a result" });
+
+		const stop = await app().request(`http://localhost/narrators/${subagentId}/interrupt`, {
+			method: "POST",
+		});
+		expect(stop.status).toBe(200);
+		expect(await stop.json()).toEqual({ interrupted: true });
+		const row = await readSubagent();
+		expect(row.status).toBe("idle");
+		expect(parseSubstatus(row.substatus)).toContain("interrupted");
+	});
+});

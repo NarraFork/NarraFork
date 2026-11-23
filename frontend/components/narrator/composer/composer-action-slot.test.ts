@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { resolveComposerActionSlot } from "./composer-action-slot";
+import { resolveCanTakeover, resolveComposerActionSlot } from "./composer-action-slot";
 
 function slot(overrides: Partial<Parameters<typeof resolveComposerActionSlot>[0]> = {}) {
 	return resolveComposerActionSlot({
@@ -46,5 +46,44 @@ describe("resolveComposerActionSlot", () => {
 
 	test("ordinary narrator idle → primary", () => {
 		expect(slot()).toBe("primary");
+	});
+});
+
+describe("resolveCanTakeover", () => {
+	const running = {
+		isSubagent: true,
+		isActive: true,
+		isTakenOver: false,
+		retryRecoveryAllowsInterrupt: true,
+	};
+
+	test("running delegated subagent → takeover", () => {
+		expect(resolveCanTakeover({ ...running, deliversResult: true })).toBe(true);
+	});
+
+	test("running subagent that delivers nowhere → Stop, never a takeover the server refuses", () => {
+		expect(resolveCanTakeover({ ...running, deliversResult: false })).toBe(false);
+		expect(
+			resolveComposerActionSlot({
+				canTakeover: resolveCanTakeover({ ...running, deliversResult: false }),
+				isTakenOver: false,
+				hasInput: false,
+				hasAttachments: false,
+				editing: false,
+			}),
+		).toBe("primary");
+	});
+
+	test("older server without the field keeps offering takeover", () => {
+		expect(resolveCanTakeover({ ...running, deliversResult: undefined })).toBe(true);
+	});
+
+	test("idle, taken-over, primary or recovering sessions → no takeover", () => {
+		expect(resolveCanTakeover({ ...running, isActive: false, deliversResult: true })).toBe(false);
+		expect(resolveCanTakeover({ ...running, isTakenOver: true, deliversResult: true })).toBe(false);
+		expect(resolveCanTakeover({ ...running, isSubagent: false, deliversResult: true })).toBe(false);
+		expect(
+			resolveCanTakeover({ ...running, retryRecoveryAllowsInterrupt: false, deliversResult: true }),
+		).toBe(false);
 	});
 });
