@@ -11,9 +11,9 @@ import { userIdentities, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { LDAP_PROVIDER_ID } from "../../lib/ldap/protocol";
 import { settings } from "../../lib/settings";
-import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite, ready } = getRuntimeTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
 await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -25,7 +25,7 @@ const { consumeStepUp, resetStepUpForTests, STEP_UP_PURPOSES, stepUpMethods, ver
 const { stepUpSchema } = await import("../../lib/validators/auth");
 
 afterAll(async () => {
-	await closeRuntimeTestDb(sqlite);
+	await close();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
@@ -69,22 +69,24 @@ describe("step-up verification", () => {
 	test("an account without a second factor cannot step up", async () => {
 		await seedUser(false);
 		expect(await stepUpMethods(userId)).toEqual([]);
-		await expect(verifyStepUp({ ...base(), method: "totp", code: "000000" })).rejects.toMatchObject(
-			{
-				code: "STEP_UP_MFA_REQUIRED",
-			},
-		);
+		expect(
+			await captureWorkerRejection(verifyStepUp({ ...base(), method: "totp", code: "000000" })),
+		).toMatchObject({
+			code: "STEP_UP_MFA_REQUIRED",
+		});
 	});
 
 	test("needs both the password and the code", async () => {
 		await seedUser(true);
 		expect(await stepUpMethods(userId)).toEqual(["totp", "backup_code"]);
-		await expect(
-			verifyStepUp({ ...base(), password: "wrong", method: "totp", code: code() }),
-		).rejects.toMatchObject({ code: "STEP_UP_FAILED" });
-		await expect(verifyStepUp({ ...base(), method: "totp", code: "000000" })).rejects.toMatchObject(
-			{ code: "STEP_UP_FAILED" },
-		);
+		expect(
+			await captureWorkerRejection(
+				verifyStepUp({ ...base(), password: "wrong", method: "totp", code: code() }),
+			),
+		).toMatchObject({ code: "STEP_UP_FAILED" });
+		expect(
+			await captureWorkerRejection(verifyStepUp({ ...base(), method: "totp", code: "000000" })),
+		).toMatchObject({ code: "STEP_UP_FAILED" });
 		const grant = await verifyStepUp({ ...base(), method: "totp", code: code() });
 		expect(grant.token).toStartWith("nfsu_");
 		expect(grant.expiresAt).toBeGreaterThan(Date.now());
@@ -146,14 +148,16 @@ describe("step-up verification", () => {
 		}));
 		try {
 			// A local password would not work; the directory's does.
-			await expect(
-				verifyStepUp({
-					...base(),
-					password: "not-the-directory-one",
-					method: "totp",
-					code: code(),
-				}),
-			).rejects.toMatchObject({ code: "STEP_UP_FAILED" });
+			expect(
+				await captureWorkerRejection(
+					verifyStepUp({
+						...base(),
+						password: "not-the-directory-one",
+						method: "totp",
+						code: code(),
+					}),
+				),
+			).toMatchObject({ code: "STEP_UP_FAILED" });
 
 			const grant = await verifyStepUp({
 				...base(),

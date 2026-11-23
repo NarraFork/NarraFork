@@ -28,9 +28,9 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../../tests/setup";
 import { userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
-import { closeRuntimeTestDb, getRuntimeTestDb } from "../../__tests__/agent-runtime-test-database";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 
-const { db, sqlite, ready } = getRuntimeTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
 await ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
@@ -39,7 +39,7 @@ const { sqliteAuthSessionStore: store } = await import("../sqlite-session-store"
 const { authSessionStore } = await import("../store");
 
 afterAll(async () => {
-	await closeRuntimeTestDb(sqlite);
+	await close();
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
 });

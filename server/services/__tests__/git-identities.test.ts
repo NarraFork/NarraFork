@@ -12,9 +12,9 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb } from "../../../tests/setup";
 import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite, ready } = getRuntimeTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
 await ready;
 mock.module("../../db", () => ({ db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
@@ -85,7 +85,7 @@ beforeEach(async () => {
 
 afterAll(async () => {
 	invalidateGitIdentityCache();
-	await closeRuntimeTestDb(sqlite);
+	await close();
 });
 
 describe("legacy profile compatibility", () => {

@@ -27,10 +27,10 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../../tests/setup";
 import { userMfaBackupCodes, userPasskeys, users, userTotp } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
-import { closeRuntimeTestDb, getRuntimeTestDb } from "../../__tests__/agent-runtime-test-database";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 import type { BackupCodeDraft } from "../mfa-store";
 
-const { db, sqlite, ready } = getRuntimeTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
 await ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
@@ -39,7 +39,7 @@ const { sqliteAuthMfaStore: store } = await import("../sqlite-mfa-store");
 const { authMfaStore } = await import("../store");
 
 afterAll(async () => {
-	await closeRuntimeTestDb(sqlite);
+	await close();
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
 });
