@@ -235,7 +235,7 @@ test("cancelling recovered startup releases requests waiting on the actual admis
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	const start = source.indexOf("const databaseStartup = createDatabaseReaderStartup(");
-	const end = source.indexOf("await databaseStartup.start();", start);
+	const end = source.indexOf("const databaseStartupPromise = databaseStartup.start();", start);
 	expect(start).toBeGreaterThanOrEqual(0);
 	expect(end).toBeGreaterThan(start);
 	const cancelStart = source.indexOf("function cancelDatabaseStartup(): void {");

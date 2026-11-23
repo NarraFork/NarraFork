@@ -17,6 +17,52 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("database reader startup recovery", () => {
+	test("main installs its signal owner while initial database startup is pending", async () => {
+		const source = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
+		const start = source.match(
+			/(?:await databaseStartup.start\(\);|const databaseStartupPromise = databaseStartup.start\(\);)/,
+		)?.[0];
+		expect(start).toBeDefined();
+		const signalStart = source.indexOf("const safeShutdown =");
+		const signalEnd = source.indexOf("claimBrowserShutdownOwnership();", signalStart);
+		expect(signalStart).toBeGreaterThan(0);
+		expect(signalEnd).toBeGreaterThan(signalStart);
+		const signals = new Map<string, () => void>();
+		const pending = Promise.withResolvers<void>();
+		const shutdown = mock(async () => {});
+		const claim = mock(() => {});
+		const run = new Function(
+			"databaseStartup",
+			"shutdownState",
+			"process",
+			"performGracefulShutdown",
+			"hotOnce",
+			"claimBrowserShutdownOwnership",
+			new Bun.Transpiler({ loader: "ts" }).transformSync(`return (async () => {
+				${start}
+				${source.slice(signalStart, signalEnd + "claimBrowserShutdownOwnership();".length)}
+				${source.includes("await databaseStartupPromise;") ? "await databaseStartupPromise;" : ""}
+			})();`),
+		)(
+			{ start: () => pending.promise },
+			{},
+			{ on: (signal: string, handler: () => void) => signals.set(signal, handler), exit() {} },
+			shutdown,
+			() => true,
+			claim,
+		) as Promise<void>;
+		try {
+			expect(signals.has("SIGINT")).toBe(true);
+			expect(signals.has("SIGTERM")).toBe(true);
+			expect(claim).toHaveBeenCalledTimes(1);
+			signals.get("SIGINT")?.();
+			expect(shutdown).toHaveBeenCalledWith({ reason: "signal" });
+		} finally {
+			pending.resolve();
+			await run;
+		}
+	});
+
 	test("shutdown owns the production narrator recovery until its last write settles", async () => {
 		const source = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 		const begin = source.indexOf("\t// Keep only targets discovered by this startup.");
@@ -360,5 +406,8 @@ test("main runs every gated startup service through the recovery initializer", (
 		expect(initializer).toContain(call);
 	expect(source).not.toContain("readerStartupAdmission");
 	expect(source.slice(end)).toContain("initialize: initializeDatabaseStartup");
-	expect(source.slice(end)).toContain("await databaseStartup.start()");
+	expect(source.slice(end)).toContain("const databaseStartupPromise = databaseStartup.start()");
+	expect(source.indexOf("await databaseStartupPromise;")).toBeGreaterThan(
+		source.indexOf('process.on("exit"'),
+	);
 });

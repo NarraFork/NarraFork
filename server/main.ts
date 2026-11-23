@@ -1629,7 +1629,7 @@ const databaseStartup = createDatabaseReaderStartup({
 		logger.error("Database startup initialization failed", { error: message });
 	},
 });
-await databaseStartup.start();
+const databaseStartupPromise = databaseStartup.start();
 
 // Establish client-egress relay channels for NUG providers configured with
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
@@ -2559,3 +2559,4 @@ shutdownState.onExit = () => {
 if (hotOnce("narrafork.mainShutdown.exit")) {
 	process.on("exit", () => shutdownState.onExit?.());
 }
+await databaseStartupPromise;
