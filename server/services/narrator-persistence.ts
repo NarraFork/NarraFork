@@ -3858,7 +3858,7 @@ const sqliteNarratorPersistence = {
 								archivedWithNarratorId: null,
 								errorMessage: normalizedErrorMessage,
 								errorRetryable: normalizedErrorMessage ? (normalizedErrorRetryable ?? null) : null,
-								updatedAt: now,
+								updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
 								...(turnStartedAt !== undefined && { turnStartedAt }),
 								...(actualSubstatus !== undefined && {
 									substatus: JSON.stringify(actualSubstatus),

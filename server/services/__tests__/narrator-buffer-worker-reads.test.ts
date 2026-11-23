@@ -432,6 +432,29 @@ test("a title save after a terminal observation does not reject the idle transit
 	});
 });
 
+test("a title save after a status snapshot cannot move updatedAt backwards", async () => {
+	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "actor")).run();
+	const gate = gateRead('"narrators"');
+	const work = persistence.updateStatus("actor", "idle", { substatus: ["unread"] });
+	const titleSavedAt = new Date(Date.now() + 1_000).toISOString();
+	try {
+		await gate.entered;
+		db.update(narrators)
+			.set({ title: "new title", updatedAt: titleSavedAt })
+			.where(eq(narrators.id, "actor"))
+			.run();
+	} finally {
+		gate.release();
+	}
+	await work;
+	gate.restore();
+	expect(db.select().from(narrators).where(eq(narrators.id, "actor")).get()).toMatchObject({
+		status: "idle",
+		title: "new title",
+		updatedAt: titleSavedAt,
+	});
+});
+
 test("a reparented initiating tool cannot bump the stale parent's message version", async () => {
 	db.insert(narrators).values({ id: "other", createdAt: now, updatedAt: now }).run();
 	db.insert(narratorMessages)
