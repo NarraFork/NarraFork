@@ -1,6 +1,7 @@
 import { applyMcpLoadingPatch } from "@shared/mcp-loading-mode";
 import { z } from "zod/v4";
 import { type NarraForkSettings, SETTING_DOCS } from "../../../lib/settings/index";
+import { isSensitiveHeaderName } from "../../../lib/settings/search-header-secrets";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
@@ -43,70 +44,108 @@ function prepareMcpServersWrite(
 	});
 }
 
-/** Mask sensitive fields before returning settings to the agent */
-function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
-	const result = { ...obj };
-	if (result.auth && typeof result.auth === "object") {
-		const auth = { ...(result.auth as Record<string, unknown>) };
-		if (typeof auth.jwtSecret === "string" && auth.jwtSecret.length > 0) {
-			auth.jwtSecret = "***MASKED***";
-		}
-		result.auth = auth;
-	}
-	// Mask API keys in provider arrays
-	for (const key of ["openaiProviders", "anthropicProviders", "nugProviders"]) {
-		const arr = result[key];
-		if (Array.isArray(arr)) {
-			result[key] = arr.map((p: Record<string, unknown>) => {
-				const masked = { ...p };
-				if (typeof masked.apiKey === "string") masked.apiKey = "***MASKED***";
-				return masked;
-			});
-		}
-	}
-	return result;
-}
+export const MASK = "***MASKED***";
 
 /**
- * Whether a setting key name holds a credential whose value must never be returned raw.
- *
- * Suffix-based so it matches `jwtSecret`, `oauthClientSecret`, `clientSecret`, any
- * `apiKey`, `relayToken` / other `*Token`, and `*password`. Only applied to STRING
- * values, so numeric settings like `maxTokens` are never affected.
+ * Whether a setting key holds a credential that must never reach the agent: `*secret`,
+ * `*apiKey`, `*token`, `*password`, a TLS `passphrase`, or a sensitive HTTP header
+ * (`Authorization`, `Cookie`, `X-Api-Key`, ...). Only string values are masked, so numeric
+ * settings such as `maxTokens` are unaffected.
  */
 function isSensitiveSettingKey(key: string): boolean {
-	const lower = key.toLowerCase();
+	// Separators ignored so environment-style names (`OPENAI_API_KEY`, `client-secret`) match.
+	const lower = key.toLowerCase().replace(/[-_.\s]/g, "");
 	return (
 		lower.endsWith("secret") ||
 		lower.endsWith("apikey") ||
 		lower.endsWith("token") ||
-		lower.endsWith("password")
+		lower.endsWith("password") ||
+		lower === "passphrase" ||
+		isSensitiveHeaderName(key)
 	);
 }
 
+/** Credentials embedded in a URL: proxy `user:pass@`, or a key in the query string. */
+function maskUrlCredentials(value: string): string {
+	if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+	try {
+		const url = new URL(value);
+		let changed = false;
+		if (url.password) {
+			url.password = MASK;
+			changed = true;
+		}
+		for (const name of [...url.searchParams.keys()]) {
+			if (isSensitiveSettingKey(name)) {
+				url.searchParams.set(name, MASK);
+				changed = true;
+			}
+		}
+		return changed ? url.toString() : value;
+	} catch {
+		return value;
+	}
+}
+
 /**
- * Recursively replace string values held under a sensitive key with the mask.
- *
- * `maskSensitive` masks by the known settings STRUCTURE (auth.jwtSecret, provider
- * apiKeys); this masks by key NAME, so a single `get_setting` value — including a nested
- * object or one of the credential keys that structural masking does not model — is never
- * returned in the clear.
+ * Every credential in a settings value, replaced by {@link MASK}. Matching by key name over
+ * the whole tree, rather than by a list of known provider arrays, keeps new credential
+ * fields (custom API keys, site tokens, OAuth client secrets, search headers) masked too.
  */
-function maskSensitiveByKey(key: string, value: unknown): unknown {
-	if (typeof value === "string" && value.length > 0 && isSensitiveSettingKey(key)) {
-		return "***MASKED***";
+export function maskSettingsSecrets(value: unknown, key = ""): unknown {
+	if (typeof value === "string") {
+		if (value.length > 0 && isSensitiveSettingKey(key)) return MASK;
+		return maskUrlCredentials(value);
 	}
-	if (Array.isArray(value)) {
-		return value.map((item) => maskSensitiveByKey(key, item));
-	}
+	if (Array.isArray(value)) return value.map((item) => maskSettingsSecrets(item, key));
 	if (value && typeof value === "object") {
 		const out: Record<string, unknown> = {};
 		for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-			out[k] = maskSensitiveByKey(k, v);
+			out[k] = maskSettingsSecrets(v, k);
 		}
 		return out;
 	}
 	return value;
+}
+
+/**
+ * A write that echoes masked values back keeps the stored secrets: each masked string
+ * (whole, or inside a URL) is replaced by the value at the same place in `current`. Array
+ * entries are paired by `id` when both have one, otherwise by position. Returns null when a
+ * masked value has nothing to restore from.
+ */
+export function restoreMaskedSecrets(patch: unknown, current: unknown): unknown | null {
+	if (typeof patch === "string") {
+		if (!patch.includes(MASK)) return patch;
+		if (typeof current !== "string") return null;
+		return patch === MASK || maskUrlCredentials(current) === patch ? current : null;
+	}
+	if (Array.isArray(patch)) {
+		const base = Array.isArray(current) ? current : [];
+		const out: unknown[] = [];
+		for (const [index, item] of patch.entries()) {
+			const id = (item as { id?: unknown } | null)?.id;
+			const match =
+				typeof id === "string"
+					? base.find((entry) => (entry as { id?: unknown } | null)?.id === id)
+					: base[index];
+			const restored = restoreMaskedSecrets(item, match);
+			if (restored === null) return null;
+			out.push(restored);
+		}
+		return out;
+	}
+	if (patch && typeof patch === "object") {
+		const base = current && typeof current === "object" ? (current as Record<string, unknown>) : {};
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+			const restored = restoreMaskedSecrets(v, base[k]);
+			if (restored === null) return null;
+			out[k] = restored;
+		}
+		return out;
+	}
+	return patch;
 }
 
 /** Get a nested value by dot-path (e.g. "agent.defaultModel") */
@@ -231,7 +270,8 @@ export const narraforkAdminTool: ToolDefinition = {
 		"Actions: get_settings (all settings with docs), " +
 		"get_setting (single key by dot-path), " +
 		"update_settings (partial merge, requires approval), " +
-		"reset_setting (revert to default, requires approval).",
+		"reset_setting (revert to default, requires approval). " +
+		`Credentials are returned as ${MASK}; writing ${MASK} back keeps the stored value.`,
 	parameters: z.object({
 		action: z
 			.enum(["get_settings", "get_setting", "update_settings", "reset_setting"])
@@ -273,7 +313,7 @@ export const narraforkAdminTool: ToolDefinition = {
 			case "get_settings": {
 				const current = settingsMod.loadSettings();
 				const defaults = settingsMod.getDefaults();
-				const masked = maskSensitive(current as unknown as Record<string, unknown>);
+				const masked = maskSettingsSecrets(current) as Record<string, unknown>;
 				const annotated = annotateSettings(
 					masked,
 					defaults as unknown as Record<string, unknown>,
@@ -290,9 +330,9 @@ export const narraforkAdminTool: ToolDefinition = {
 					return { output: "Error: 'path' is required for get_setting.", isError: true };
 				}
 				const current = settingsMod.loadSettings();
-				// Apply the SAME structural masking as get_settings, then read the path from
-				// the masked object so provider apiKeys and auth.jwtSecret come back masked.
-				const maskedSettings = maskSensitive(current as unknown as Record<string, unknown>);
+				// Read from the masked tree, then mask by the leaf name too: a path that names a
+				// credential directly (e.g. `auth.jwtSecret`) comes back masked either way.
+				const maskedSettings = maskSettingsSecrets(current) as Record<string, unknown>;
 				const rawVal = getByPath(maskedSettings, path);
 				if (rawVal === undefined) {
 					return {
@@ -300,10 +340,8 @@ export const narraforkAdminTool: ToolDefinition = {
 						isError: true,
 					};
 				}
-				// Defense in depth: also mask by key name, covering credential keys the
-				// structural mask does not model (oauthClientSecret, clientSecret, relayToken, …).
 				const leafKey = path.split(".").pop() ?? path;
-				const val = maskSensitiveByKey(leafKey, rawVal);
+				const val = maskSettingsSecrets(rawVal, leafKey);
 				const doc = SETTING_DOCS[path];
 				const defVal = getByPath(
 					settingsMod.getDefaults() as unknown as Record<string, unknown>,
@@ -348,12 +386,20 @@ export const narraforkAdminTool: ToolDefinition = {
 					return { output: "Error: 'value' is required for update_settings.", isError: true };
 				}
 				const current = settingsMod.loadSettings();
-				let patch = value;
-				if (Object.hasOwn(value, "mcpServers")) {
+				// Values read through get_settings come back masked; writing them back keeps the secrets.
+				const restored = restoreMaskedSecrets(value, current);
+				if (restored === null) {
+					return {
+						output: `Error: 'value' contains ${MASK} where no stored secret exists. Omit secret fields to keep them, or provide the real value.`,
+						isError: true,
+					};
+				}
+				let patch = restored as Record<string, unknown>;
+				if (Object.hasOwn(patch, "mcpServers")) {
 					try {
 						patch = {
-							...value,
-							mcpServers: prepareMcpServersWrite(current.mcpServers, value.mcpServers),
+							...patch,
+							mcpServers: prepareMcpServersWrite(current.mcpServers, patch.mcpServers),
 						};
 					} catch (error) {
 						return {
