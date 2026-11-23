@@ -45,7 +45,11 @@ describe("service templates", () => {
 		});
 	});
 
-	test("templates are frozen", () => {
-		expect(Object.isFrozen(getServiceTemplate("codex"))).toBe(true);
+	test("templates are frozen all the way down", () => {
+		const kimi = getServiceTemplate("kimi-code");
+		expect(Object.isFrozen(kimi)).toBe(true);
+		expect(Object.isFrozen(kimi.authKinds)).toBe(true);
+		expect(Object.isFrozen(kimi.defaults)).toBe(true);
+		expect(Object.isFrozen(kimi.regions?.china)).toBe(true);
 	});
 });

@@ -194,8 +194,17 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 	},
 ];
 
+/** Templates are shared by every caller, so nothing in them may be mutated. */
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const child of Object.values(value)) deepFreeze(child);
+		Object.freeze(value);
+	}
+	return value;
+}
+
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
-	TEMPLATES.map((template) => [template.id, Object.freeze(template)]),
+	TEMPLATES.map((template) => [template.id, deepFreeze(template)]),
 );
 
 export function listServiceTemplates(): readonly ServiceTemplate[] {
