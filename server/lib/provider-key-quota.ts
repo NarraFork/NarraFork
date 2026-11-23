@@ -1,9 +1,10 @@
 /**
- * What usage caches know about a key's allowance, for choosing keys.
+ * What is known about a key's allowance, for choosing keys.
  *
- * A cache that has seen a key's window used up registers a probe answering "blocked
- * until when"; the key pool skips that key until then instead of finding out from a
- * failed request. Leaf module so caches and the pool can both import it.
+ * The quota store (sourcing/quota-store.ts) registers the one probe: a key whose snapshot
+ * shows a window used up is blocked until that window refills, and the key pool skips it
+ * until then instead of finding out from a failed request. Leaf module so the store and
+ * the pool can both import it.
  */
 type Probe = (keyId: string, now: number) => number | undefined;
 

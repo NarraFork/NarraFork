@@ -28,6 +28,7 @@ import { db } from "../../db";
 import { aclGrants, knowledgeTags, users } from "../../db/schema";
 import { eventBus, type NarraForkEvent } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
+import { knowledgeReadStore, setKnowledgeReadStore } from "../knowledge/store";
 import {
 	BATCH_CAPS_USER_LIMIT,
 	knowledgeAcl,
@@ -88,6 +89,19 @@ const KNOWLEDGE_EVENT_TYPES = [
 
 const events: KnowledgeEvent[] = [];
 const pushes: Array<{ userId: string; message: Record<string, unknown> }> = [];
+const pendingReads = new Set<Promise<unknown>>();
+const originalReadStore = knowledgeReadStore;
+
+function trackRead(result: unknown): unknown {
+	if (!(result instanceof Promise)) return result;
+	const work = result;
+	pendingReads.add(work);
+	void work.then(
+		() => pendingReads.delete(work),
+		() => pendingReads.delete(work),
+	);
+	return work;
+}
 
 function eventsOfType<T extends KnowledgeEvent["type"]>(
 	type: T,
@@ -102,10 +116,25 @@ function pushTargets(reason: string, role: "reviewer" | "submitter"): string[] {
 		.map((p) => p.userId);
 }
 
-/** Wait for the async notify handlers (they are fire-and-forget by design). */
+/** Drain reads and their handler continuations before asserting absence or clearing captures. */
 async function settle(): Promise<void> {
-	for (let i = 0; i < 10; i++) await Promise.resolve();
-	await new Promise((r) => setTimeout(r, 20));
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error("Knowledge notifications did not settle")), 2_000);
+	});
+	try {
+		await Promise.race([
+			(async () => {
+				do {
+					await Promise.all([...pendingReads]);
+					await new Promise<void>((resolve) => setImmediate(resolve));
+				} while (pendingReads.size);
+			})(),
+			deadline,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 async function makeUser(role: "admin" | "user", label: string): Promise<string> {
@@ -121,6 +150,16 @@ async function makeUser(role: "admin" | "user", label: string): Promise<string> 
 }
 
 beforeAll(async () => {
+	setKnowledgeReadStore(
+		new Proxy(originalReadStore, {
+			get(target, key, receiver) {
+				const value = Reflect.get(target, key, receiver);
+				return typeof value === "function"
+					? (...args: unknown[]) => trackRead(Reflect.apply(value, target, args))
+					: value;
+			},
+		}),
+	);
 	adminId = await makeUser("admin", "kn-admin");
 	submitterId = await makeUser("user", "kn-submitter");
 	reviewerId = await makeUser("user", "kn-reviewer");
@@ -163,12 +202,15 @@ beforeAll(async () => {
 	initKnowledgeNotify();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await settle();
 	events.length = 0;
 	pushes.length = 0;
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await settle();
+	setKnowledgeReadStore(originalReadStore);
 	setKnowledgeNotifyPush(null);
 });
 

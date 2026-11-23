@@ -36,3 +36,15 @@ export function usageSubjects(
 export function shownSubjectId(subjects: readonly UsageSubject[], providerId: string) {
 	return subjects.find((subject) => subject.providerId === providerId)?.id;
 }
+
+/**
+ * The credential a provider-level quota (DeepSeek balance) is kept under: the provider's
+ * first stored key, which is the one settings shows, with its own network applied; the
+ * provider itself without stored keys.
+ */
+export function firstCredential(provider: CustomApiProviderConfig): UsageSubject {
+	const key = getProviderKeyStore().list(provider.id)[0];
+	return key
+		? { id: key.id, providerId: provider.id, config: withProviderKey(provider, key) }
+		: { id: provider.id, providerId: provider.id, config: provider };
+}
