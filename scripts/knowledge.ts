@@ -309,9 +309,11 @@ export function broadAnchors(
 	for (const node of nodes)
 		for (const anchor of node.anchors) {
 			// Outside the source roots (scripts/, .github/, …) every tracked non-test file counts.
-			const pool = SOURCE_ROOTS.some((r) => anchorPath(anchor).startsWith(`${r}/`))
-				? source
-				: (others ??= otherFiles());
+			let pool = source;
+			if (!SOURCE_ROOTS.some((r) => anchorPath(anchor).startsWith(`${r}/`))) {
+				others ??= otherFiles();
+				pool = others;
+			}
 			const count = pool.filter((f) => anchorMatches(anchor, f)).length;
 			if (count > BROAD_ANCHOR_FILES) out.push({ node, anchor, count });
 		}
