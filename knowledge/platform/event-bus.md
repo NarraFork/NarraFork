@@ -4,6 +4,18 @@ title: 事件总线
 summary: 服务之间的类型化事件，服务到 WebSocket 广播的解耦。
 anchors:
   - server/lib/event-bus.ts
+  - tests/server/lib/event-bus.test.ts
+keywords:
+  - eventBus
+  - NarraForkEvent
+  - NarraForkEventBus
+  - onAny
+  - narrator:ws_broadcast
+  - narrator:message_broadcast
+  - system:lifecycle_changed
+  - user_preferences:changed
+  - auth:changed
+  - 事件广播
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -23,6 +35,11 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 从哪读起
 - `server/lib/event-bus.ts`：事件联合类型与总线实现，新增事件加到 `NarraForkEvent`。
 - `server/middleware/auth.ts:notifyAuthChanged`：发出 `auth:changed` 的例子。
+
+## 改它时
+- 新增事件：在 `NarraForkEvent` 联合里加一个 `type` 变体，载荷只放标识和标量；若要推给浏览器，还要在 `websocket/narrator-ws.ts`（或对应通道）里订阅并广播，前端在 WS 管理器里按类型监听（例：`system:unattended_changed` → `unattended_mode_changed`）。
+- 高频事件要加入 `SILENT_EVENTS`，否则每次 emit 都写 debug 日志。
+- 不要依赖监听者的返回值或顺序：同类型监听者先于 `"*"` 监听者，各自吞掉异常；`tests/server/lib/event-bus.test.ts` 是总线行为的测试。
 
 ## 相关
 - [HTTP 路由与 WebSocket](http-ws.md)

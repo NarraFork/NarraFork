@@ -12,6 +12,24 @@ anchors:
   - frontend/routes/admin/terminals.tsx
   - frontend/routes/settings/terminals.tsx
   - server/lib/validators/terminals.ts
+  - server/services/__tests__/terminal-startup-recovery.test.ts
+  - server/websocket/__tests__/terminal-session-revalidation.test.ts
+keywords:
+  - 终端
+  - /ws/terminal
+  - /api/terminals
+  - TerminalRuntime
+  - Bun.Terminal
+  - bun-pty
+  - dtach
+  - BufferManager
+  - scrollback
+  - recoverOnStartup
+  - shutdownAll
+  - terminalWsMessageSchema
+  - pty.ready-stream.v1
+  - 孤儿终端
+  - /api/admin/terminals
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -31,10 +49,19 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 终端的 REST 管理在 `routes/terminals.ts`（列表、树、创建、改名、删除、进程列表、视图状态）。
 - 用户终端的 shell 环境会恢复被 NarraFork 清空的环境代理变量（`envWithAmbientProxy`）。
 
+- 前端：`useNarratorTerminals`/`useTreeTerminals`/`useCanOpenTerminals`（`hooks/useTerminals.ts`）按叙述者拉列表、树和是否可开终端（`/api/terminals`、`/tree`、`/access`），查询键以 `["terminals", …]` 开头；管理员页 `/settings/terminals`（`routes/settings/terminals.tsx`）管理全部终端与孤儿 dtach socket（`/api/admin/terminals/*`：列表、终止、批量终止、`kill-orphan`、`reattach-orphan`），`/admin/terminals` 只是重定向到它。
+
 ## 从哪读起
 - `server/services/terminal-service.ts`：创建、恢复、关闭、清理。
 - `server/terminal/runtime*.ts`、`dtach-service.ts`：各后端。
 - `server/websocket/terminal-ws.ts`：浏览器通道。
+
+## 改它时
+- 新增 WS 消息类型：`validators/websocket.ts` 的 `terminalWsMessageSchema`、`websocket/terminal-ws.ts` 的分派、前端终端组件；`terminal-session-revalidation.test.ts` 钉着会话变化后连接的复核。
+- 新增 PTY 后端：实现 `TerminalRuntime`，并在 `terminal-service.ts` 的创建顺序里决定位置；远程设备要先过授权/能力检查再有副作用（`runtime-remote.test.ts`）。
+- 改 dtach 恢复或关闭语义：`dtach-recovery-probe.test.ts`、`services/__tests__/terminal-startup-recovery.test.ts`；不变量：dtach 终端关闭服务时不杀会话、DB 状态保持 `running`，恢复探测失败保留状态而不是删除。
+- 改缓冲：`buffer-manager.test.ts`；订阅回放的读取游标和布局快照有数量/字节上限，别去掉。
+- 新增终端 REST 路由要经 `terminal-access.ts` 判断权限，不要只看登录。
 
 ## 相关
 - [访问控制](../security/acl.md)：终端访问控制。
