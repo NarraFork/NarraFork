@@ -260,7 +260,7 @@ const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 export const recentTabSchema = z.object({
 	// Retired types ("workspace", "group", "chapter") are refused: a full-list restore of
 	// one would store a row nothing renders and the one-time folder conversion never revisits.
-	type: z.enum(["narrator", "project", "subagent", "folder"]),
+	type: z.enum(["narrator", "project", "subagent", "folder", "team"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
@@ -272,6 +272,8 @@ export const recentTabSchema = z.object({
 	folderIcon: z.enum(RECENT_TAB_FOLDER_ICONS).optional(),
 	folderColor: z.enum(RECENT_TAB_FOLDER_COLORS).optional(),
 	folderPreviewCount: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).optional(),
+	/** Team tabs: accepted for a restore, but the server writes the team's own project. */
+	projectId: z.string().min(1).max(50).optional(),
 	title: z.string().max(RECENT_TAB_TEXT_MAX_CHARS),
 	subtitle: z.string().max(RECENT_TAB_TEXT_MAX_CHARS).optional(),
 	status: z.string().max(50).optional(),
@@ -284,6 +286,11 @@ export const upsertRecentTabSchema = recentTabSchema
 	.extend({
 		/** When true, only update an existing tab — skip if not already present. */
 		updateOnly: z.boolean().optional(),
+		/**
+		 * Pin (true) or unpin (false) in the same revision as the upsert: "pin to sidebar" on a
+		 * project or team page creates the tab and pins it at once. Omitted keeps the stored pin.
+		 */
+		pin: z.boolean().optional(),
 		/**
 		 * Where to place the tab, for a drop that both creates and positions it.
 		 *
@@ -313,7 +320,7 @@ export const batchUpsertRecentTabsSchema = z.object({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["narrator", "session", "project", "subagent", "folder"]),
+	type: z.enum(["narrator", "session", "project", "subagent", "folder", "team"]),
 	id: z.string().min(1).max(50),
 	/**
 	 * Entity-teardown cleanup (project deleted, narrator archived). When set, no undo

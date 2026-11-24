@@ -726,8 +726,8 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = upsertRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { updateOnly, beforeKey, afterKey, ...tab } = parsed.data;
-	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
+	const { updateOnly, beforeKey, afterKey, pin, ...tab } = parsed.data;
+	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey, pin }));
 });
 
 /** Atomically upsert several tabs with one revision. */

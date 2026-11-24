@@ -229,6 +229,14 @@ function pendingCount(teamId: string): number {
 	return visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1).rows.length;
 }
 
+/**
+ * The same count for a sidebar team tab (`recent-tab-teams.ts`). No access check: the caller
+ * shows it to members only, as the top bar does.
+ */
+export function teamPendingApprovalCount(teamId: string): number {
+	return pendingCount(teamId);
+}
+
 /** The top bar: running agents, pending approvals (members only), column counts, last event. */
 export async function readTeamPageSummary(
 	teamId: string,

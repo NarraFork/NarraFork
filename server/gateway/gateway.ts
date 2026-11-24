@@ -1774,6 +1774,12 @@ class Gateway {
 				continue;
 			}
 
+			// A pinned team: named, never numbered — IM cannot drive a team session.
+			if (type === "team") {
+				lines.push(`  👥 ${tab.title || tab.id || "?"}`);
+				continue;
+			}
+
 			const indent = tab.folderId ? "    " : "  ";
 			const narratorId =
 				type === "narrator"

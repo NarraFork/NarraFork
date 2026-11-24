@@ -627,6 +627,12 @@ async function announceAccessChange(
 		for (const userId of recipients) {
 			broadcastToUser(userId, { type: "narrator_access_changed", narratorId, reason });
 		}
+		// A team is read through its coordinator: whoever pinned the team and can no longer read
+		// the coordinator loses the tab, as a removed project member loses the project's tabs.
+		if (coordinatedTeamId(narratorId)) {
+			const { pruneTeamTabs } = await import("./recent-tabs-service");
+			await pruneTeamTabs(narratorId);
+		}
 		await dropNarratorSubscriptionsForUnauthorizedUsers(narratorId);
 		// Subagents delegate their access to this narrator, so tightening it revokes
 		// theirs too — but their subscriptions are keyed by their own ids and would keep
