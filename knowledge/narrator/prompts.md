@@ -47,7 +47,7 @@ keywords:
   - side-car
   - InjectionCadence
 status: draft
-verified_at: caf970762
+verified_at: 69715f280
 ---
 # 提示词与注入
 
@@ -75,6 +75,7 @@ verified_at: caf970762
 - 发送者显示名冻结：`collectSenderContext` 记录首次见到的人类显示名（JSON 映射），`projectFrozenSenders` 只改展示用户名，不改来源行、身份、角色和 origin（`lib/agent/sender-context.ts`、`sender-projection.ts`）。
 - 注入块的结构：持久化为自包含的原生块，`modelText` 为模型文本、`body` 为结构化展示体，旧行可能带相邻文本块并经 `normalizeLegacyInjectionBlock` 归一（`shared/native-injection.ts`）；`shared/sidecar-body.ts:renderSideCarBodyToText` 决定结构化体怎样拼成文本，文案由 `lib/sidecar-templates.ts:getSideCarModelTemplates(locale)` 提供。
 - 提示词库：每条一个 markdown 文件 `~/.narrafork/prompt-library/<id>.md`，正文上限 `MAX_PROMPT_CHARS` = 10000（与 `createNarratorSchema.systemPrompt` 上限对齐）、名称 ≤ 100、描述 ≤ 500；路由 `/api/prompt-library`（列表、`POST /summarize` 无状态摘要、`/:id` 读写删，只要求登录）与 `/api/prompt-optimize/draft`（无会话时的提示词优化）；前端 `usePromptLibrary` 共用查询键 `["prompt-library"]`。
+- 团队协调者提示词（`team-lead.ts`，en / zh-CN）说明分支名只取英文单词：中文标题要给 `Team` work.create 一个 `branchHint`，或给 `Agent` 一个英文 description。
 
 ## 从哪读起
 - `server/services/narrator-prompt.ts:buildEffectiveSystemPrompt`。

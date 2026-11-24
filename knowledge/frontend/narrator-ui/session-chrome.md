@@ -57,7 +57,7 @@ keywords:
   - 导入会话
   - 访问权限
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 412d79d6a
 ---
 # 会话外框
 
@@ -86,6 +86,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - Spec 面板展示模式 `source | split | rich`（`spec/spec-editor-mode.ts`）；`rich` 是 Tiptap 所见即所得，会重新序列化整份文档，因此只对能无损载入的 markdown 提供；标签排布保存串行，一次只发一个请求且总发最新排布（`spec-tab-save.ts`）。
 - 会话导入（`session-interchange/ImportSessionModal.tsx`）三种来源：浏览器上传（任何人）、服务器 `~/.claude`/`~/.codex` 扫描（仅管理员，否则隐藏）、在线设备扫描；UI 只隐藏服务端会拒绝的选项，服务端会重复校验。
 - 访问面板（`details/NarratorAccessPanel.tsx`）：可见范围（private/project/everyone）与可写范围（始终是可见范围的子集）两级，被限制的选项置灰而不是隐藏，另有逐人读/写授权。
+- 团队标记（`header/NarratorTeamBadge.tsx`）：带 `team` trait 且有项目（`NarratorPanel` 的 `compatibilityProjectId`）的会话在标题后显示「团队」徽标，点开 `/projects/$projectId/teams/$teamId`（团队 id 就是协调者的叙述者 id）。`useNarratorTeamBadge` 决定显示与否并给出固定宽度：Remote Access 构建（`REMOTE_BUILD`，其路由没有团队页）、工作区预览、没有路由上下文时不显示；是否在团队页本身按路由状态的 pathname（已去掉 basepath）比较；原生 `href` 用 `router.buildLocation` + `history.createHref`，反代子路径下带前缀。宽度由 `header-title-width.ts:headerBadgeLayoutWidth`（canvas 量完整文字 + sm 徽标固定外框）给出，徽标按该 px 宽度绘制，并作为 `titleBadgeWidth` 计入 `resolveHeaderLayoutAfterTitle` 预算：工具先收进溢出菜单，标题再缩；连最小标题宽度旁都放不下时 `showTitleBadge` 为 false，不显示徽标，溢出与关闭按钮不会被挤出标题行（`header-team-badge.browser.test.ts` 在 en / zh-CN 窄宽度下验证）。模型菜单触发器（`model/ModelPickerMenu.tsx`）的「默认（模型）」经 `followDefaultLabel`。
 
 ## 从哪读起
 - `dock/NarratorDockContext.tsx`：聊天面板与工具面板之间的发布/订阅与跨面板命令（页面级，无 Provider 时发布 hook 为空操作）。

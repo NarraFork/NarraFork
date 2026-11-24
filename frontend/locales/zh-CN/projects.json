@@ -233,7 +233,7 @@
 			"work_cancelled": "取消工作",
 			"work_cleanup": "清理 worktree",
 			"overrun": "协调者超出建议值",
-			"other": "{{kind}}",
+			"other": "其他团队动态",
 			"approval_allowed": "批准",
 			"approval_denied": "拒绝",
 			"question_answered": "回答了提问",
@@ -241,7 +241,12 @@
 			"question_ignored": "静默关闭了提问",
 			"question_supplemented": "补充了回答",
 			"question_deferred": "选择稍后回答提问",
-			"question_answered_by_ai": "让 AI 回答了提问"
+			"question_answered_by_ai": "让 AI 回答了提问",
+			"work_merged": "已合并",
+			"work_overlap": "改动与其他工作项重叠",
+			"work_exclusive_taken": "占用独占路径",
+			"work_exclusive_refused": "独占路径被拒",
+			"work_exclusive_released": "释放独占路径"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -356,5 +361,8 @@
 			"manageExplain": "给某人写权限，他就成为成员；给读权限，他可以旁观。收回权限立即生效。",
 			"onlyOwnerManages": "只有协调者的所有者或管理员可以调整团队里的人。"
 		}
-	}
+	},
+	"skills": "技能",
+	"routines": "例程",
+	"commands": "命令"
 }
