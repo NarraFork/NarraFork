@@ -130,7 +130,7 @@ server/
 - **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
 - **项目页**：`/projects/$projectId` 列出目录与会话（按链接表过滤，任何角色的链接都算）。
-- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。Tree 快照服务 Bash 观测与编辑预览，热捕获保留 4s 预算及后台暖捕获；`workspace.treeSnapshotsEnabled` 可关闭。
+- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。本地会话不保留文件历史，也不能恢复文件：`isFileHistoryEnabledForDevice`（`shared/file-change-protocol.ts`）只对远程设备为真，本地请求恢复返回 409 `FILE_HISTORY_DISABLED`。整树快照已不再抓取（本地被文件历史关闭挡住，远程设备未实现）；`workspace.treeSnapshotsEnabled` 是不起作用的兼容字段。
 - **叙述者服务拆分**：narrator-service / -session / -executor / -subagent / -context / -prompt / -title / -recovery / -event-handler。
 - 其余服务：技能、例程、通知、输出统计、更新检查等，均在 `server/services/` 下。
 
