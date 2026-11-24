@@ -1,5 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { ResolveProjectDirectoryResponse } from "@shared/project-directory";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { type SSEStreamingApi, streamSSE } from "hono/streaming";
@@ -17,13 +19,18 @@ import {
 	projectMembersSchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "../lib/validators";
 import { executionPolicyEngine } from "../services/execution-policy/engine";
 import { gitService } from "../services/git-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { canWriteProject, type ProjectAclRow } from "../services/project-acl";
-import { assignProjectRootKey, scheduleProjectIndexRebuild } from "../services/project-index";
+import { canReadProject, canWriteProject, type ProjectAclRow } from "../services/project-acl";
+import {
+	assignProjectRootKey,
+	resolveProjectForDirectory,
+	scheduleProjectIndexRebuild,
+} from "../services/project-index";
 import {
 	getProjectAccess,
 	removeProjectMember,
@@ -137,6 +144,59 @@ projectRoutes.get("/hidden-existence", async (c) => {
 	// Only meaningful when the caller sees nothing; a non-empty list needs no hint.
 	if (visible.rows.length > 0) return c.json({ hasHidden: false });
 	return c.json({ hasHidden: await adapter.anyProjectExists() });
+});
+
+/**
+ * Which project a local directory belongs to, before any session exists there: the
+ * new-session dialog's "start as a team" option needs a project id for the team route.
+ *
+ * Same rules and same gate as starting a session in that directory: any signed-in user may
+ * start a local session anywhere, and the session would put the directory into a project
+ * through the project index (`resolveProjectForDirectory`), creating the project of a git
+ * repository that has none, owned by the caller. `create: false` only looks; `create: true`
+ * makes that project. A non-git directory never gets one. A project the caller cannot read
+ * is reported as `no_access` without its id or name. Shape: `shared/project-directory.ts`.
+ *
+ * SQLite only, like the project index and the team routes it leads to: 503 on PostgreSQL
+ * before anything else.
+ */
+projectRoutes.post("/resolve-directory", async (c) => {
+	requireSqliteProjectMutation("Resolving a directory's project");
+	const principal = projectPrincipalOf(c);
+	if (!principal.userId) throw new AppError("Unauthorized", 401, "UNAUTHORIZED");
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		throw new ValidationError("Request body must be JSON");
+	}
+	const parsed = resolveProjectDirectorySchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const reply = (response: ResolveProjectDirectoryResponse) => c.json(response);
+
+	const directory = resolveProjectDirectory(parsed.data.cwd);
+	const info = await stat(directory).catch(() => null);
+	if (!info?.isDirectory()) return reply({ status: "not_directory" });
+
+	const found = await resolveProjectForDirectory(directory, principal.userId, {
+		create: parsed.data.create,
+	});
+	if (found.kind === "none") return reply({ status: "not_git" });
+	if (found.kind === "repository") return reply({ status: "repository", root: found.root });
+
+	const row = await db.query.projects.findFirst({ where: eq(projects.id, found.projectId) });
+	if (!row || !(await canReadProject(row as ProjectAclRow, principal)))
+		return reply({ status: "no_access" });
+	return reply({
+		status: "project",
+		project: {
+			id: row.id,
+			name: row.name,
+			gitPath: row.gitPath ?? null,
+			archived: row.status === "archived",
+			canWrite: await canWriteProject(row as ProjectAclRow, principal),
+		},
+	});
 });
 
 projectRoutes.post("/", async (c) => {

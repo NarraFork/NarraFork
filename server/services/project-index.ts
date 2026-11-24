@@ -55,13 +55,22 @@ const REBUILD_CACHE_MAX_ENTRIES = 512;
 const REBUILD_TIME_SLICE_MS = 8;
 const DERIVATION_MAX_ATTEMPTS = 8;
 
-type DirectoryProject = { projectId: string; directory: string } | null;
+/**
+ * What a local directory belongs to, for a caller that asks before any session exists.
+ * `repository` (a git repository no project covers yet) only comes back without `create`.
+ */
+export type DirectoryProject =
+	| { kind: "project"; projectId: string }
+	| { kind: "repository"; root: string }
+	| { kind: "none" };
 
 /** Facts needed to validate only the relevant project topology after asynchronous IO. */
 interface DirectoryResolution {
 	projectId: string | null;
 	directory: string;
 	repositoryRootKey: string | null;
+	/** The repository root that would get a project; set only when creation was not asked for. */
+	uncreatedRoot?: string;
 }
 
 interface DerivedIndexState {
@@ -286,23 +295,33 @@ async function createProjectForRoot(
 }
 
 /**
- * The project a local directory belongs to, creating one for a git repository that has
- * none. Returns null for a directory outside every project and every repository.
+ * The project a local directory belongs to, by the same rules as a session's working
+ * directory. With `create` (the default) a git repository that has no project gets one,
+ * owned by `ownerUserId`, exactly as a session started there would create it; without it
+ * nothing is written and such a repository comes back as `repository`. A directory
+ * outside every project and every repository is `none`: no project is ever created for it.
  */
 export async function resolveProjectForDirectory(
 	dir: string,
 	ownerUserId: string | null,
+	options: { create?: boolean } = {},
 ): Promise<DirectoryProject> {
-	const resolved = await resolveDirectoryProject(dir, ownerUserId);
-	return resolved.projectId
-		? { projectId: resolved.projectId, directory: resolved.directory }
-		: null;
+	const resolved = await resolveDirectoryProject(
+		dir,
+		ownerUserId,
+		undefined,
+		options.create ?? true,
+	);
+	if (resolved.projectId) return { kind: "project", projectId: resolved.projectId };
+	if (resolved.uncreatedRoot) return { kind: "repository", root: resolved.uncreatedRoot };
+	return { kind: "none" };
 }
 
 async function resolveDirectoryProject(
 	dir: string,
 	ownerUserId: string | null,
 	context?: RebuildContext,
+	create = true,
 ): Promise<DirectoryResolution> {
 	await ensureProjectRootKeys();
 	if (context) {
@@ -331,6 +350,8 @@ async function resolveDirectoryProject(
 	// created while the git probe ran.
 	const existing = matchProjectByKey(key) ?? matchProjectByKey(rootKey);
 	if (existing) return { projectId: existing, directory: key, repositoryRootKey: rootKey };
+	if (!create)
+		return { projectId: null, directory: key, repositoryRootKey: rootKey, uncreatedRoot: root };
 
 	let creation = creationsInFlight.get(rootKey);
 	if (!creation) {
