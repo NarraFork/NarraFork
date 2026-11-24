@@ -3651,6 +3651,8 @@ function NarratorPanelBody({
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
 						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
+						// Write access to the narrator (the terminal access read answers exactly that).
+						readOnly={canOpenTerminals === false}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}

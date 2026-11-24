@@ -3322,5 +3322,6 @@
 		}
 	},
 	"followDefaultUnset": "默认模型（未配置）",
-	"followSummaryUnset": "摘要模型（未配置）"
+	"followSummaryUnset": "摘要模型（未配置）",
+	"composerReadOnly": "只读：你可以查看这个会话，但不能给它发消息。"
 }
