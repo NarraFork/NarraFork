@@ -74,6 +74,7 @@ verified_at: 12e8a02d8
   - 基线解析不出或与分支无共同历史；
   - git 失败（含节点 blob 读不出），或 diff 列表超 1MB、`ls-tree` 列表超 512KB；
   - 节点文件超 2000 个或合计超 8MiB（按列出的大小，读之前判定，消息点名越线的文件）；
+  - 节点 blob 是 Git LFS 指针（以 `version https://git-lfs.github.com/spec/v1` 开头）：读不到真实锚点，不运行仓库过滤器去还原，直接判失败；
   - （改动 + 新增路径数）×（目录与 glob 锚点数）超过 25 万次匹配（同步匹配，上限按不明显阻塞事件循环取）。
 - `Team` 工具的错误结果带上 `AppError.details`，协调者由此拿到节点清单。
 

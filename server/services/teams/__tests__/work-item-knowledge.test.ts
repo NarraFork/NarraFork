@@ -405,6 +405,24 @@ describe("work.ready knowledge check", () => {
 		expect((await ready(work.id)).item.state).toBe("ready");
 	});
 
+	test("a node stored as a Git LFS pointer fails closed instead of losing its anchors", async () => {
+		await commit(source, TREE, "tree");
+		const work = await item();
+		await commit(
+			work.path,
+			{
+				"knowledge/api.md":
+					"version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 120\n",
+				"server/api.ts": "export const api = 2;\n",
+			},
+			"node moved to LFS",
+		);
+		const error = await refusal(work.id);
+		expect(error.code).toBe("TEAM_KNOWLEDGE_CHECK_UNAVAILABLE");
+		expect(error.message).toContain("knowledge/api.md is stored in Git LFS");
+		expect(stateOf(work.id)).toBe("in_review");
+	});
+
 	test("an oversized node blob fails closed before any blob is read", async () => {
 		await commit(source, TREE, "tree");
 		const work = await item();

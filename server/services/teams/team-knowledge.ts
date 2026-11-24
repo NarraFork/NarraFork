@@ -103,6 +103,9 @@ function assertWithinReadCaps(files: readonly TreeBlob[]): void {
 	}
 }
 
+/** The first line of every Git LFS pointer file (git-lfs spec v1). */
+const LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1";
+
 /** Read and parse the node blobs of the head; call it only after {@link assertWithinReadCaps}. */
 async function readNodes(git: TeamGit, files: readonly TreeBlob[]): Promise<KnowledgeNode[]> {
 	const nodes: KnowledgeNode[] = [];
@@ -115,6 +118,12 @@ async function readNodes(git: TeamGit, files: readonly TreeBlob[]): Promise<Know
 			})),
 		);
 		for (const { file, text } of texts) {
+			// A Git LFS pointer is not the node: its anchors are unknown, so the check cannot run.
+			// Repository filters are never run to resolve it.
+			if (text.startsWith(LFS_POINTER_PREFIX))
+				throw new KnowledgeCheckUnavailable(
+					`${file} is stored in Git LFS, so its anchors cannot be read from the commit`,
+				);
 			// A Markdown file without a node header anchors nothing (`check` reports it).
 			const node = parseNode(file, text);
 			if (node) nodes.push(node);
