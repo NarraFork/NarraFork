@@ -256,10 +256,16 @@ test("admission root traversal and acquisition read only bounded identity metada
 		throw new Error("Admission must not load a full narrator row");
 	});
 	const lookup = spyOn(db.query.narrators, "findFirst");
+	const workerLookup = spyOn(db.query.narrators, "findMany");
 	expect(await state.resolveNarratorAdmissionRoot(CHILD)).toBe(ROOT);
 	await acquire();
 	expect(fullRow).not.toHaveBeenCalled();
-	expect(lookup).toHaveBeenCalledTimes(3);
+	expect(lookup).toHaveBeenCalledTimes(2);
+	expect(workerLookup).toHaveBeenCalledTimes(1);
+	expect(workerLookup.mock.calls[0]?.[0]).toMatchObject({
+		limit: 1,
+		columns: { id: true, variant: true, parentNarratorId: true },
+	});
 	for (const [options] of lookup.mock.calls) {
 		expect(options?.columns).toEqual({ id: true, variant: true, parentNarratorId: true });
 	}
