@@ -9,6 +9,10 @@ anchors:
   - scripts/run-ci-tests.ts
   - .github/workflows/ci.yml
   - tests/scripts/ci-workflow.test.ts
+  - scripts/ci-native-diagnostics.ts
+  - scripts/ci-stage.ts
+  - scripts/summarize-ci-tests.py
+  - tests/scripts/ci-summary.test.ts
 keywords:
   - bun test
   - --isolate
@@ -22,6 +26,9 @@ keywords:
   - shard
   - CI Gate
   - junit
+  - NF_CI_STAGE_DIR
+  - ci-stage
+  - GITHUB_STEP_SUMMARY
   - puppeteer-core
   - *.browser.test.ts
   - *.guard.test.ts
@@ -29,7 +36,7 @@ keywords:
   - narrafork-test-
   - HTMLElement.prototype
 status: draft
-verified_at: 2e6441ad0
+verified_at: 9955fd5d5
 ---
 # 测试
 
@@ -47,6 +54,7 @@ verified_at: 2e6441ad0
 ## 从哪读起
 - `tests/preload.ts`、`tests/sqlite-template.ts`：测试环境隔离。
 - `scripts/run-ci-tests.ts`：CI 如何调用 bun test、输出/超时上限（30 分钟、64MB）。
+- 分片诊断：`run-ci-tests.ts` 经 `scripts/ci-native-diagnostics.ts` 把子进程启动/退出、静默与心跳（静默 60s、心跳 120s）和进程资源采样写进 `artifacts/native-tests*-diagnostics.jsonl`（单文件 256KB 上限）；远程访问浏览器集成测试经 `scripts/ci-stage.ts` 把各阶段（Go peer 构建、Chromium、WebRTC 连接、登录等）的起止写进 `NF_CI_STAGE_DIR` 下的 `ci-stage*.jsonl`（32KB 上限）。分片失败或被取消时，`scripts/summarize-ci-tests.py` 读 JUnit（8MB 上限、拒绝 DTD）和这些 JSONL，把最多 12 条失败（标出超时）写进 GitHub 步骤摘要，不复制测试输出；这些文件随测试报告一起上传（`tests/scripts/ci-summary.test.ts`、`tests/remote-access/ci-stage.test.ts`）。
 - `tests/scripts/ci-workflow.test.ts`：CI 契约。
 - `docs/TESTING.md`：补充背景（仅线索，以代码为准）。
 
