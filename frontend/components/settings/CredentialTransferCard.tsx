@@ -167,7 +167,7 @@ function ExportModal({
 	);
 }
 
-function CredentialChecklist({
+export function CredentialChecklist({
 	list,
 	selected,
 	onChange,

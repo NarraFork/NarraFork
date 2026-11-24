@@ -3048,6 +3048,7 @@
 		"none": "没有可导出的凭据。",
 		"archived": "已归档",
 		"kinds": {
+			"credential": "凭据",
 			"codex": "Codex",
 			"api-key": "API Key"
 		},
