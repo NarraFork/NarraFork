@@ -120,7 +120,7 @@ server/
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播，所有跨服务通信通过类型化事件流转。
-- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起）由用户决策解除（5 分钟超时）。
+- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起），直到用户决定、策略重新判定或会话中止才解除，没有整体超时（5 分钟的只有危险确认令牌、规则申请的有效期，以及 AskUserQuestion 自动反思的默认倒计时 `agent.questionReflectionTimeoutMs`，后者只在全部允许模式且开启时生效）。
 - **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（不预装，经 ToolSearch 按需成组加载）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。`isPreloadedMode` 只对 `resident` 为真；`auto` 故意不进旧的启用/禁用名单。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
