@@ -28,7 +28,7 @@ keywords:
   - teamWorktreePathsForNarrator
   - 归档团队
 status: draft
-verified_at: 2e6441ad0
+verified_at: 7a8bdfb90
 ---
 # 团队与成员
 
@@ -55,6 +55,7 @@ verified_at: 2e6441ad0
   - 还有「未收尾，或已收尾但仍记录着 worktree」的工作项就拒绝；
   - 否则在同一事务内连带删除团队行（`deleteTeamOfNarratorInTransaction`）。
 - 团队行 RESTRICT 叙述者与项目删除，删团队级联删工作项与事件（`team-tables-contract.test.ts`）。
+- 侧栏的团队标签（`team:<id>`）跟着生命周期走：归档时 `startTeamStatusSync` 从所有持有者的侧栏移除（取消归档不放回），删除协调者时一并移除，失去协调者读权限的持有者也会被移除（见[最近标签页](../recent-tabs.md)）。
 - 数据导入/导出：三张团队表不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
 - IM 网关永远不能驱动团队会话，也不能做团队树里的批准决定。
 

@@ -25,7 +25,7 @@ keywords:
   - /new
   - /approve
 status: draft
-verified_at: 2e6441ad0
+verified_at: 7a8bdfb90
 ---
 # IM 网关
 
@@ -37,6 +37,7 @@ verified_at: 2e6441ad0
 - 入站顺序（`gateway.ts:handleInboundMessage`）：按 `platform:userId` 限流（默认每分钟 20 条，`rateLimitPerMinute` 配成 0 则不限；超限回一句提示后丢弃）→ 解析命令 → 通过引用消息批准/拒绝权限（`handlePermissionByQuote`）→ 转发给绑定叙述者（`forwardToNarrator`）。
 - 空闲重置：`sessionIdleMinutes`（默认 0 即关闭）大于 0 时，映射超过该时长没有新消息就删除并新建，回复一句"会话已过期"（`getOrCreateMapping`）。
 - 命令（`handleCommand`）：`/new`（同 `/reset`，删除映射，下条消息新建叙述者）、`/model`、`/status`、`/stop`、`/list`、`/search`、`/switch`、`/approve`、`/deny`、`/help`。
+- `/list` 按侧栏顺序列最近标签：文件夹、项目、固定的团队（`👥` 加名字）只是一行字，不编号；只有带叙述者 id 的会话标签编号，能被 `/switch` 选中。团队标签不带 `narratorId`，所以不会被编号。
 - IM 发送者没有经过验证的 NarraFork 身份：新映射的 `appUserId` 由 `resolveGatewayAppUserId` 取用户表中最早创建的 5 个用户：只有一个就用它；多个时取其中第一个管理员，其中没有管理员则取最早创建的。该 id 会成为该轮对话读知识库的 ACL 主体，不只是显示用。
 - 团队会话不能从 IM 驱动（原因：发送者身份不可证，会污染多人共享对话的发言归属），逐分支：
   - 普通消息：映射指向团队叙述者（协调者或其子代理）时不转发，回复"请去 NarraFork"（`forwardToNarrator` 里的 `refuseTeamSession`）。

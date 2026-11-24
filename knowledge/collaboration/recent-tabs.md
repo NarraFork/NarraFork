@@ -1,14 +1,17 @@
 ---
 id: collaboration.recent-tabs
 title: 最近标签页
-summary: 每个用户最近打开的会话标签页：记录、运行时信息、作为通知和提醒的接收人来源。
+summary: 每个用户的侧栏标签：会话、文件夹、固定的项目与团队；记录、运行时信息、作为通知和提醒的接收人来源。
 anchors:
   - server/services/user-preferences-service.ts
   - server/services/recent-tabs-service.ts
+  - server/services/recent-tab-teams.ts
   - shared/recent-tabs.ts
   - server/routes/user-preferences.ts
   - server/db/schema.ts
   - frontend/components/nav/NarratorStatusIcon.tsx
+  - frontend/components/nav/PinToSidebarButton.tsx
+  - frontend/components/nav/recent-tab-page-pin.ts
   - frontend/components/nav/RecentTabBackgroundBubble.tsx
   - frontend/components/nav/RecentTabDetailCard.tsx
   - frontend/components/nav/RecentTabDropIndicator.tsx
@@ -48,28 +51,50 @@ keywords:
   - 标签文件夹
   - recent_tabs_group_mode
   - useRecentTabs
+  - 固定到侧栏
+  - PinToSidebarButton
+  - 团队标签
+  - team tab
+  - pendingApprovalCount
+  - project_id
 status: draft
-verified_at: 2e6441ad0
+verified_at: 7a8bdfb90
 ---
 # 最近标签页
 
-侧栏里每个用户自己的一份标签列表（叙述者、子代理、项目，外加用户手建的文件夹），存在 `user_recent_tabs` 表，每个标签一行。除了侧栏，它还是「谁在关注某个叙述者」的索引：通知、IM 提醒、会话重命名等都靠它找人。
+侧栏里每个用户自己的一份标签列表（叙述者、子代理、用户手建的文件夹，以及从项目页、团队页固定进来的项目与团队），存在 `user_recent_tabs` 表，每个标签一行。除了侧栏，它还是「谁在关注某个叙述者」的索引：通知、IM 提醒、会话重命名等都靠它找人；团队标签不进这个索引。
 
 ## 关键规则
 - 一用户最多 500 行（`RECENT_TABS_STORAGE_LIMIT`）。超限从列表底部（最久没动的一端）逐个淘汰：先淘汰未置顶的游离子代理，再是未置顶的普通标签或文件夹成员，最后连置顶也可淘汰；正在写入的那个单元不会被淘汰（`recent-tabs-service.ts:trimTabsAtomic`）。
-- 类型 `narrator/subagent/project/folder` 仍在使用；`chapter/group/workspace` 是旧数据，读取时排除或已迁移。分区只有 `projects` 与 `work`。文件夹不嵌套，成员紧跟文件夹头（`regroupFolders`）。
+- 类型 `narrator/subagent/project/folder/team` 在使用；`chapter/group/workspace` 是旧数据，读取时排除或已迁移。文件夹不嵌套，成员紧跟文件夹头（`regroupFolders`）；只有 `narrator/subagent` 能进文件夹（`canJoinFolder`），项目与团队只在顶层。
+- 分区：现在每个标签都写在 `work`（侧栏唯一的列表，`tabSection`）。`projects` 是项目标签旧的分区，侧栏早已不渲染它；每个用户首次读写时在锁内转换一次（`convertLegacyProjectSectionLocked`，探测是一条走索引的 `LIMIT 1`）：
+  - 置顶的旧项目标签移进 `work`（强制改写行的 `section`，`forceRowSync`）；
+  - 没置顶的旧项目标签删掉（当年访问项目页时自动记下的，不再翻出来）；
+  - 首次从偏好 JSON 迁移时同样只留置顶的项目标签。
+  `GET ...?section=projects` 仍可用，转换后为空。
+- 置顶：`PATCH /pin` 之外，upsert 可带 `pin`（true/false），在同一个版本里建标签并置顶（项目页、团队页的「固定到侧栏」用它）；不带 `pin` 的再次访问保留已存的置顶状态（`applyRecentTabUpsert`）。
+- 团队标签（`type: "team"`，id = 团队 id = 协调者叙述者 id，`recent-tab-teams.ts`）：
+  - 不代表协调者会话：`represented_narrator_id`、`narrator_id` 都是 NULL，所以 `getRecentTabUserIdsFor*` 看不到它，持有它不会收到协调者的通知；
+  - 标题与 `project_id`（新列，只有团队标签有值）由服务端从 `project_teams` 和协调者标题写入，客户端传的不算；upsert 和整表恢复都先过 `authorizeTeamTabs`：团队不存在、已归档、或用户读不了协调者，就不写（`upsertRecentTabsBatch`、`restoreRecentTabs`）；
+  - 协调者改名时持有者的团队标签跟着改（`syncNarratorTitleToRecentTabs` 另按 `(type, entity_id)` 索引找团队标签持有者）；
+  - 运行时补丁（`enrichTeamTabs`）：读得了才给协调者的 `status/substatus`；只读者加 `teamOnlooker`；成员加 `pendingApprovalCount`（团队页顶栏同一个计数 `teamPendingApprovalCount`，每次请求最多算 20 个团队，`TEAM_TAB_PENDING_COUNT_LIMIT`），其他人为 null；读不了的团队补丁为空状态；
+  - 何时移除：团队归档（`startTeamStatusSync` 发现归档后调 `pruneTeamTabs`，取消归档不恢复）、删除协调者（`narrator-service` 删除时 `removeTabFromAllUsers("team", id)`）、协调者共享变化后读不了（`narrator-sharing.ts:announceAccessChange` 调 `pruneTeamTabs`，逐个持有者重新判读）、失去项目（`pruneUnreadableProjectTabs` 对该项目的团队标签按协调者 ACL 判读，`usersWithTabsInProject` 也把团队标签持有者算进去）。
 - 每次写入都在用户级锁内进行：读行 → 变换 → 去重加限额 → 在一个事务里只更新有差异的行并把 `user_recent_tabs_meta.revision` +1，再向该用户广播 `user:recent_tabs_delta`（每批 100 个操作）（`persistMutationLocked`、`broadcastDelta`）。无变化不增版本。
 - 读取走游标分页：每页最多 50 行，游标绑定分区和版本，版本变了返回 409 `stale cursor`，客户端须从第一页重载（`listPage`）；文件夹成员不在顶层分页里。
 - 运行时信息与记录分开：`getRuntimePatches` 一次最多 100 个键，返回状态、草稿、终端/后台任务计数、在线查看者、团队只读旁观者标记等，不写库（`POST /api/user-preferences/recent-tabs/runtime`）。
 - 关闭、清空、解散文件夹会生成撤销令牌，内存里每用户一份、30 秒过期、全局最多 1000 份；令牌只在版本未变时可还原，否则 409（`restoreRecentTabs`）。进程重启后令牌失效。
 - 被标记为 `hiddenFromLists` 的叙述者不会写入标签（`withoutHiddenNarratorTabs`）；归档前会记下它所在的文件夹，取消归档时放回，文件夹已不存在则回到顶部（`rememberArchivedTabPlacement`、`restoreArchivedTabPlacement`）。
 - 旧版把标签存在偏好 JSON 里；首次访问时在锁内迁移，启动后还会分批（每批 100 个用户）补迁，找人的函数都会先等这次补迁完成（`ensureMigratedLocked`、`ensureAllRecentTabsMigrated`）。写入同时维护一份最多 20 条的旧格式影子。
-- 作为接收人来源：`getRecentTabUserIdsForNarrator`（按用户 id 游标分批查，可带上限）、`...ByRecency`（按最近访问排序取前 N）、`getRecentTabUserIdsForTeamTrees`（团队协调者及其子代理）。用的是 `represented_narrator_id` 索引，所以子代理标签也算。使用方：通知中心扇出、外部 IM 提醒、IM 网关的状态通知与 `/list`、项目成员变更与共享时的受影响用户（`project-membership.ts`、`narrator-sharing.ts`）。持有标签本身不是授权，各使用方仍要自己再判读权。
+- 作为接收人来源：`getRecentTabUserIdsForNarrator`（按用户 id 游标分批查，可带上限）、`...ByRecency`（按最近访问排序取前 N）、`getRecentTabUserIdsForTeamTrees`（团队协调者及其子代理）。用的是 `represented_narrator_id` 索引，所以子代理标签也算，团队标签不算。使用方：通知中心扇出、外部 IM 提醒、IM 网关的状态通知与 `/list`（团队标签只列名字、不编号，不能被 `/switch` 选中）、项目成员变更与共享时的受影响用户（`project-membership.ts`、`narrator-sharing.ts`）。持有标签本身不是授权，各使用方仍要自己再判读权。
 
 - 数据导出只带一张相关表：`recent_tab_archive_marks`（归档时记下的文件夹位置，`snapshot-protocol.ts:SNAPSHOT_TABLES.sessions`）；`user_recent_tabs` 本身不导出。
 
 ## 前端
 - `frontend/hooks/useRecentTabs.ts`（分页读、乐观更新、撤销提示、`user:recent_tabs_delta` 帧的合并）与 `useRecentTabsWS.ts`（订阅叙述者状态/标题等列表事件）；`recent-tabs-utils.ts`、`recent-tab-folders.ts`（把平铺列表按文件夹分组成渲染行；排布规则本身在 `shared/recent-tab-layout.ts`，前后端共用）。
+- 去哪：`recent-tabs-utils.ts:recentTabHref`（会话 `/narrators/:id`、项目 `/projects/:id`、团队 `/projects/:projectId/teams/:id`），`isTabActive`、行的点击、键盘 Enter（行上的 `data-tab-href`，`navRowHref`）和「在窗口中打开」（`recentTabWindowHref`）都按它。
+- 实时：`recentTabLiveNarratorId` 让团队标签跟随协调者，套接字订阅和运行时读取都带上它（同一个协调者的会话标签与团队标签各占一个键）；套接字补丁对团队标签只取标题和状态（`teamTabPatch`）；协调者状态一变，2 秒后合并重读一次运行时以刷新待批数。提醒（声音、favicon、PWA、`above_idle` 提前）只认会话标签：只固定了团队的人不会因协调者等待而被提醒。
+- 固定按钮：`PinToSidebarButton.tsx`（项目页标题旁、团队页顶栏标题旁、项目团队列表每行）从侧栏缓存读是否已置顶（`recent-tab-page-pin.ts:isPinnedInSidebar`），点了走 `useRecentTabs.ts:setRecentTabPinnedFromPage`（置顶 = 带 `pin: true` 的 upsert，取消 = 普通 unpin，标签留着）。项目列表卡片没有菜单，没加。
+- 团队标签的图标：协调者的 `NarratorStatusIcon` 加团队角标，成员有待批时右上角显示数量（`RecentTabs.tsx:TeamTabIcon`）；悬停卡片显示同样的状态和待批数。
 - `frontend/components/nav/RecentTabs.tsx` 是侧栏主体；拖拽模型 `recent-tab-drag-model.ts`/`recent-tab-drop-target.ts`/`useRecentTabsDrag.ts`，外部拖入 `useRecentTabExternalDrop.ts`，键盘导航 `recent-tab-keyboard-nav.ts`，触摸滑动 `useRowSwipe.tsx`（右滑关闭、左滑开菜单）。
 - 文件夹的折叠/预览/展开是每台设备的显示状态，存 localStorage，不上服务器（`useFolderDisplay.ts`）；预览条数才是文件夹行上的设置（`RECENT_TAB_FOLDER_DEFAULT_PREVIEW` = 3）。
 - 侧栏在会话完成/等待时触发浏览器声音与 PWA 通知；服务器标记了 `backgroundWorkActive` 的 done 转换保持静默，权限等待始终通知（`recent-tabs-logic.ts:isBackgroundWorkSilencedStatus`，`recent-tabs-silence.test.ts`）。
@@ -84,10 +109,13 @@ verified_at: 2e6441ad0
 - 改上限或分页常量：`shared/recent-tabs.ts`（`RECENT_TABS_STORAGE_LIMIT`、`PAGE_SIZE`、`LIVE_LIMIT`、`WS_BATCH_SIZE`、`LEGACY_LIMIT`）前后端共用，`server/services/recent-tabs-service.ts` 里还有撤销的 `UNDO_TTL_MS`/`UNDO_MAX_ENTRIES`；对应测试 `recent-tab-folders.test.ts`、`recent-tab-archive-placement.test.ts`、`frontend/hooks/useRecentTabs.test.ts`。
 - 加一种写操作：必须经 `mutate` 进用户级锁，并产出 delta 广播；路由加在 `server/routes/user-preferences.ts` 的 `/recent-tabs` 族；前端 `useRecentTabs.ts` 的乐观更新要与服务端结果一致，版本冲突走 409。
 - 改文件夹/置顶排布规则：只改 `shared/recent-tab-layout.ts`（服务端 `regroupFolders` 与客户端共用），不要在前端另写一份。
-- 改接收人来源函数（`getRecentTabUserIdsFor*`）：使用方（通知扇出、外部提醒、IM 网关、项目成员变更、叙述者分享）不会自动校验读权限，每处都要自己再过滤；`notification-recent-tabs.test.ts`、`gateway/__tests__/recent-tabs-consumers.test.ts` 覆盖。
+- 改接收人来源函数（`getRecentTabUserIdsFor*`）：使用方（通知扇出、外部提醒、IM 网关、项目成员变更、叙述者分享）不会自动校验读权限，每处都要自己再过滤；`notification-recent-tabs.test.ts`、`gateway/__tests__/recent-tabs-consumers.test.ts` 覆盖。团队标签不能写 `represented_narrator_id` 或 `narrator_id`：前者会让它进接收人索引，后者会让 IM 网关 `/list` 把它当会话编号（`recent-tab-teams.test.ts` 守着前者）。
+- 改团队标签：服务端规则在 `recent-tab-teams.ts`（这个模块不能静态导入 `recent-tabs-service`，反过来服务也只动态导入它，免得 ACL 依赖进到每个只 mock 了 `db` 的测试里）；测试 `server/services/__tests__/recent-tab-teams.test.ts`（存什么、置顶/移动/关闭撤销/淘汰、不进接收人索引、改名、运行时、归档/删除/失权移除、旧 `projects` 分区转换）、`frontend/hooks/recent-tabs-team.test.ts`、`RecentTabs.requests.test.tsx` 最后一条。
 - 侧栏行不显示 cwd 的前导斜杠问题由 `frontend/components/nav/recent-tab-path-subtitle.guard.test.ts` 守住（读源码断言），改 `RecentTabs.tsx` / `RecentTabDetailCard.tsx` 的路径渲染会触发它。
-- 改表 `user_recent_tabs`：SQLite 与 PG schema 两边；旧偏好 JSON 迁移（`ensureMigratedLocked`）仍在，别删。
+- 改表 `user_recent_tabs`：SQLite 与 PG schema 两边；旧偏好 JSON 迁移（`ensureMigratedLocked`）和旧 `projects` 分区转换仍在，别删。`type` 枚举只在 TS 层（两边库里都是 text），加类型不需要迁移；`project_id` 列是 `0263`/PG `0080` 加的。
 
 ## 相关
 - [通知与注意力](notifications.md)
 - [IM 网关](gateway.md)
+- [团队页与审批](teams/page.md)：团队标签的固定入口与待批计数。
+- [项目](projects.md)：项目页的固定入口。

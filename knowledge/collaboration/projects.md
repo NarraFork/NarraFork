@@ -41,7 +41,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 7a8bdfb90
 ---
 # 项目
 
@@ -57,6 +57,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `projects.rootKey`（realpath 规范化）是匹配键，局部唯一；被更早项目占用目录的项目 rootKey 永久为 null、不参与匹配。
 - 访问控制：admin、owner、`visibility=public`（所有登录用户可读）、`acl_grants` 的 read/write/manage，write/manage 隐含 read；owner 为 null 表示由 admin 管理（`project-acl.ts`）。进入项目是必要不充分条件，项目内会话/知识仍受自身 ACL。
 - 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。
+- 失去项目后清侧栏标签：被移出的成员、以及可见性收紧为 private 时持有项目内标签的人（`usersWithTabsInProject`：项目标签、项目内会话的标签、项目团队的团队标签，各有上限 500）逐个过 `pruneUnreadableProjectTabs`（见[最近标签页](recent-tabs.md)）。
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
 - 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。
 - PG 模式下创建、更新、删除、改可见性、成员变更、转让 owner 一律返回 503 `POSTGRES_UNSUPPORTED`（`requireSqliteProjectMutation`，在权限检查之前）；读取仍可用。
@@ -66,7 +67,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 旧"章节"路由只剩跳转：`/chapters/$chapterId` 跳 `/projects`，`/settings/chapters` 跳 `/settings/workspace`。
 
 ## 前端
-- `frontend/routes/projects/index.tsx`（项目列表）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
+- `frontend/routes/projects/index.tsx`（项目列表，卡片没有菜单）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`；标题旁的 `PinToSidebarButton` 把项目固定到侧栏，见[最近标签页](recent-tabs.md)）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
 - `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams/index.md)。
 
 ## 从哪读起
