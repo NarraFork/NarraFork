@@ -1045,7 +1045,17 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 
+export interface BufferedMessageEditLease {
+	ok: true;
+	token: string;
+	expiresAt: number;
+	leaseMs: number;
+	contentRevision: number;
+}
+
 export interface BufferMessageSummary {
+	/** Content-only revision, when supplied by a revision-aware server. */
+	contentRevision?: number;
 	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */
 	id: string;
 	/** Canonical timeline message id, when supplied by a new server. */

@@ -26,6 +26,12 @@ export interface QueuedMessagesData {
 	queueExpanded: boolean;
 	setQueueExpanded: (expanded: boolean) => void;
 	editingQueuedId: string | null;
+	startingQueuedId?: string | null;
+	queuedEditLockedId?: string;
+	queuedEditProtected?: boolean;
+	queuedEditError?: string;
+	queuedEditStale?: boolean;
+	queueMutationsDisabled?: boolean;
 	handleDragEndQueued: (event: DragEndEvent) => void;
 	handleMoveQueued: (id: string, direction: -1 | 1) => void;
 	handleChangeMode: (id: string, mode: QueueMode) => Promise<boolean> | Promise<void>;
@@ -49,20 +55,26 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 100, tolerance: 5 } }),
 	);
+	const mutationsDisabled =
+		props.queueMutationsDisabled ??
+		!!(props.editingQueuedId || props.startingQueuedId || props.queuedEditLockedId);
 	const urgent = (props.urgentDispatches ?? []).filter((entry) => entry.status !== "sent");
 	const trackedIds = new Set((props.urgentDispatches ?? []).map((entry) => entry.message.id));
 	for (const message of props.queuedMessages) {
 		if (
 			queuedMessageMode(message) === "interrupt" &&
 			!trackedIds.has(message.id) &&
-			message.id !== props.editingQueuedId
+			message.id !== props.editingQueuedId &&
+			message.id !== props.queuedEditLockedId
 		) {
 			urgent.push({ message, status: "failed" });
 		}
 	}
 	const queuedMessages = props.queuedMessages.filter(
 		(message) =>
-			(queuedMessageMode(message) !== "interrupt" || message.id === props.editingQueuedId) &&
+			(queuedMessageMode(message) !== "interrupt" ||
+				message.id === props.editingQueuedId ||
+				message.id === props.queuedEditLockedId) &&
 			!trackedIds.has(message.id),
 	);
 	if (queuedMessages.length === 0 && urgent.length === 0) return null;
@@ -92,7 +104,12 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 		queuedMessages.some((msg) => msg.id === props.editingQueuedId);
 	// Pin an active editor open, including single-to-multiple queue transitions.
 	// Manual collapse is unavailable until editing ends; keep the user's preference unchanged.
-	const listVisible = props.queueExpanded || single || hasActiveEditor;
+	const listVisible =
+		props.queueExpanded ||
+		single ||
+		hasActiveEditor ||
+		!!props.queuedEditLockedId ||
+		!!props.startingQueuedId;
 	const failures = queuedMessages.filter((msg) => msg.state === "failed").length;
 	return (
 		<Stack
@@ -112,6 +129,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 							narratorId={props.narratorId}
 							index={0}
 							isEditing={false}
+							queueMutationsDisabled={mutationsDisabled}
 							urgentStatus={dispatch.status === "sending" ? "sending" : "failed"}
 							urgentError={dispatch.error}
 							onSaveEdit={props.handleSaveEditQueued}
@@ -134,7 +152,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 						variant="subtle"
 						color="gray"
 						onClick={() => props.setQueueExpanded(!props.queueExpanded)}
-						disabled={hasActiveEditor}
+						disabled={hasActiveEditor || mutationsDisabled}
 						aria-expanded={listVisible}
 						leftSection={listVisible ? <IconChevronDown size={12} /> : <IconChevronUp size={12} />}
 					>
@@ -159,7 +177,11 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 							</ActionIcon>
 						</Menu.Target>
 						<Menu.Dropdown>
-							<Menu.Item color="red" onClick={props.handleCancelAllQueued}>
+							<Menu.Item
+								color="red"
+								disabled={mutationsDisabled}
+								onClick={props.handleCancelAllQueued}
+							>
 								{t("clearAllQueued")}
 							</Menu.Item>
 						</Menu.Dropdown>
@@ -189,8 +211,18 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 										index={index}
 										canMoveUp={ordinaryIds.indexOf(msg.id) > 0}
 										canMoveDown={ordinaryIds.indexOf(msg.id) < ordinaryIds.length - 1}
-										onClearAll={single ? props.handleCancelAllQueued : undefined}
+										onClearAll={
+											single && !mutationsDisabled ? props.handleCancelAllQueued : undefined
+										}
 										isEditing={props.editingQueuedId === msg.id}
+										isStartingEdit={props.startingQueuedId === msg.id}
+										isEditLocked={props.queuedEditLockedId === msg.id}
+										queueMutationsDisabled={mutationsDisabled}
+										editStale={props.queuedEditLockedId === msg.id && props.queuedEditStale}
+										editProtected={props.queuedEditProtected}
+										editError={
+											props.queuedEditLockedId === msg.id ? props.queuedEditError : undefined
+										}
 										onSaveEdit={props.handleSaveEditQueued}
 										onCancelEdit={props.handleCancelEditQueued}
 										onStartEdit={props.handleStartEditQueued}

@@ -199,6 +199,12 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 		handleMoveQueued,
 		handleChangeMode,
 		editingQueuedId,
+		startingQueuedId,
+		queuedEditLockedId,
+		queuedEditProtected,
+		queuedEditError,
+		queuedEditStale,
+		queueMutationsDisabled,
 		queueExpanded,
 		setQueueExpanded,
 		handleStartEditQueued,
@@ -243,6 +249,12 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 				queueExpanded={queueExpanded}
 				setQueueExpanded={setQueueExpanded}
 				editingQueuedId={editingQueuedId}
+				startingQueuedId={startingQueuedId}
+				queuedEditLockedId={queuedEditLockedId}
+				queuedEditProtected={queuedEditProtected}
+				queuedEditError={queuedEditError}
+				queuedEditStale={queuedEditStale}
+				queueMutationsDisabled={queueMutationsDisabled}
 				handleDragEndQueued={handleDragEndQueued}
 				handleMoveQueued={handleMoveQueued}
 				handleChangeMode={handleChangeMode}

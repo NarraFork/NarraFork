@@ -1761,8 +1761,28 @@ export function createPostgresRuntimeQueue(
 			return rows.length > 0;
 		},
 		/** Broadcasts are consumable, but cannot authorize a new execution. */
-		async hasWakeEligibleInput(narratorId: string): Promise<boolean> {
+		async hasWakeEligibleInput(narratorId: string, beforeUserInput = false): Promise<boolean> {
 			pointer(narratorId);
+			if (beforeUserInput) {
+				const rows = await db
+					.select({
+						kind: mailbox.kind,
+						direct: sql<boolean>`(${mailbox.kind} = 'agent_message' AND COALESCE(${mailbox.metadataJson}::jsonb -> 'isBroadcast', 'false'::jsonb) != 'true'::jsonb)`,
+					})
+					.from(mailbox)
+					.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+					.orderBy(
+						desc(mailbox.priority),
+						sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+						asc(mailbox.arrivalSeq),
+					)
+					.limit(L.agentPending + L.noticePending + 1);
+				for (const row of rows) {
+					if (row.kind === "user_input") return false;
+					if (row.direct) return true;
+				}
+				return false;
+			}
 			const rows = await db
 				.select({ id: mailbox.id })
 				.from(mailbox)

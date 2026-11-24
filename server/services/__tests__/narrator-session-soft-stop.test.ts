@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
@@ -89,6 +89,98 @@ afterEach(async () => {
 afterAll(async () => {
 	await fixture.close();
 	mock.module("../../db", () => realDb);
+});
+
+test("editing disarms guidance without cancelling model/tools and release re-arms durable modes and wakes", async () => {
+	const { beginBufferedMessageEdit } = await import("../narrator-buffer");
+	const { bufferEditHolds } = await import("../buffer-edit-hold");
+	const session = await import("../narrator-session");
+	const inbox = await import("../agent-runtime/inbox");
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	const active = registerActiveNarrator();
+	active._loopRunning = true;
+	active._bufferSoftStop = true;
+	active._bufferSoftStopTaken = true;
+	active._bufferGuidancePending = true;
+	active._guidanceAbortController = new AbortController();
+	active._urgentGuidanceAbortController = new AbortController();
+	const mid = await queueMessage();
+	let notification: Promise<void> | undefined;
+	const previous = bufferEditHolds.setListener(undefined);
+	bufferEditHolds.setListener((id) => {
+		notification = Promise.resolve(previous?.(id));
+		return notification;
+	});
+	try {
+		await beginBufferedMessageEdit(NARRATOR_ID, mid, "user", "editing");
+		await notification;
+		expect(active._bufferSoftStop).toBe(false);
+		expect(active._bufferGuidancePending).toBe(false);
+		expect(await hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
+		expect(await hasPendingBufferedWork(NARRATOR_ID)).toBe(false);
+		expect(session.requestUrgentBufferedGuidance(NARRATOR_ID)).toBe(false);
+		expect(await session.consumeBufferedSoftStopRequest(active)).toBe(false);
+		await rearmCutInSoftStopBeforeContinuing(active);
+		expect(active._bufferSoftStop).toBe(false);
+		expect(active._guidanceAbortController.signal.aborted).toBe(false);
+		expect(active._urgentGuidanceAbortController.signal.aborted).toBe(false);
+		await bufferEditHolds.release(NARRATOR_ID, {
+			messageId: mid,
+			userId: "user",
+			token: "editing",
+		});
+		await notification;
+		expect(active._bufferSoftStop).toBe(true);
+		expect(active._bufferGuidancePending).toBe(true);
+		expect(wake).toHaveBeenCalledWith(NARRATOR_ID);
+	} finally {
+		bufferEditHolds.setListener(undefined);
+		await bufferEditHolds.release(NARRATOR_ID, {
+			messageId: mid,
+			userId: "user",
+			token: "editing",
+		});
+		bufferEditHolds.setListener(previous);
+		wake.mockRestore();
+		active._loopRunning = false;
+	}
+});
+
+test("OAuth authorization loss is not blocked by an editor and cannot wake its cleared queue", async () => {
+	registerActiveNarrator();
+	const mid = await queueMessage();
+	const { beginBufferedMessageEdit } = await import("../narrator-buffer");
+	const { bufferEditHolds } = await import("../buffer-edit-hold");
+	const session = await import("../narrator-session");
+	const service = await import("../narrator-service");
+	const { backgroundTaskService } = await import("../background-task-service");
+	const { stopOAuthNarratorForAuthorizationLoss } = await import("../oauth-runtime-revocation");
+	const previous = bufferEditHolds.setListener(undefined);
+	const manual = spyOn(service, "interruptManualBash").mockReturnValue(false);
+	const interrupt = spyOn(session, "interruptNarrator").mockReturnValue(true);
+	const cancel = spyOn(backgroundTaskService, "cancelRunningByParent").mockResolvedValue(0);
+	const notifications: string[] = [];
+	try {
+		await beginBufferedMessageEdit(NARRATOR_ID, mid, "user", "edit");
+		bufferEditHolds.setListener((id) => {
+			notifications.push(id);
+		});
+		await stopOAuthNarratorForAuthorizationLoss(NARRATOR_ID, "test revoked");
+		expect(manual).toHaveBeenCalledWith(NARRATOR_ID);
+		expect(interrupt).toHaveBeenCalledWith(NARRATOR_ID);
+		expect(cancel).toHaveBeenCalledWith(NARRATOR_ID);
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(bufferEditHolds.held(NARRATOR_ID)).toBe(false);
+		bufferEditHolds.expire();
+		expect(notifications).toEqual([]);
+	} finally {
+		bufferEditHolds.setListener(undefined);
+		await bufferEditHolds.release(NARRATOR_ID, { messageId: mid, userId: "user", token: "edit" });
+		bufferEditHolds.setListener(previous);
+		manual.mockRestore();
+		interrupt.mockRestore();
+		cancel.mockRestore();
+	}
 });
 
 describe("evaluateSoftStopRequest", () => {

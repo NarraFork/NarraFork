@@ -207,6 +207,7 @@ import {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
@@ -276,6 +277,11 @@ import {
 	scanBrokenModelNarrators,
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
+import { bufferEditHolds } from "../services/buffer-edit-hold";
+import {
+	readBufferEditLeaseBody,
+	withBufferEditRequestDeadline,
+} from "../services/buffer-edit-request";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -353,6 +359,8 @@ import {
 import { bodyColumns, fillBody } from "../services/narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-writes";
 import {
+	beginBufferedMessageEdit,
+	canEditBufferedMessage,
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
 	releaseStagedFiles,
@@ -848,6 +856,53 @@ function unarchiveAsCaller(c: Context, id: string) {
 		narratorService.updateStatus(id, "idle"),
 	);
 }
+
+narratorRoutes.use("/:id/buffer/:mid/edit", async (c, next) => {
+	await requireNarratorAccess(c, c.req.param("id"), "write");
+	if (c.req.method === "DELETE") return next();
+	return withBufferEditRequestDeadline(
+		c.req.raw,
+		async (request) => {
+			c.req.raw = await readBufferEditLeaseBody(request);
+			await next();
+		},
+		10_000,
+	);
+});
+
+// Pin before either body-limit middleware reads the streamed body: even a slow
+// multipart upload must not outlive its edit lease and get dispatched half-edited.
+narratorRoutes.use("/:id/buffer/:mid", async (c, next) => {
+	if (c.req.method !== "PATCH") return next();
+	const id = c.req.param("id");
+	const messageId = c.req.param("mid");
+	await requireNarratorAccess(c, id, "write");
+	const rawToken = c.req.header("X-Buffer-Edit-Token");
+	const parsed =
+		rawToken === undefined ? undefined : bufferEditLeaseSchema.safeParse({ token: rawToken });
+	if (parsed && !parsed.success) throw new ValidationError(parsed.error.message);
+	const identity = parsed?.success
+		? { messageId, userId: c.get("user").sub, token: parsed.data.token }
+		: undefined;
+	await bufferEditHolds.mutate(
+		id,
+		messageId,
+		() =>
+			withBufferEditRequestDeadline(
+				c.req.raw,
+				async (request) => {
+					c.req.raw = request;
+					if (!(await canEditBufferedMessage(id, messageId)))
+						throw new NotFoundError("Buffered message", messageId);
+					await next();
+				},
+				undefined,
+				bufferEditHolds.mutationSignal(),
+			),
+		identity,
+	);
+	if (identity && c.res.ok) await bufferEditHolds.release(id, identity);
+});
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
@@ -3784,6 +3839,47 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 	return c.json(await resolveBufferQueue(id));
 });
 
+narratorRoutes.post("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await beginBufferedMessageEdit(
+			c.req.param("id"),
+			c.req.param("mid"),
+			c.get("user").sub,
+			parsed.data.token,
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.patch("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await bufferEditHolds.renew(
+			c.req.param("id"),
+			{
+				messageId: c.req.param("mid"),
+				userId: c.get("user").sub,
+				token: parsed.data.token,
+			},
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.delete("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse({ token: c.req.header("X-Buffer-Edit-Token") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await bufferEditHolds.release(c.req.param("id"), {
+		messageId: c.req.param("mid"),
+		userId: c.get("user").sub,
+		token: parsed.data.token,
+	});
+	return c.json({ ok: true });
+});
+
 interface LocatedBufferedMessage {
 	message: BufferedMessage;
 }
@@ -4092,7 +4188,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 				)
 			: [];
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
+		c.req.raw.signal.throwIfAborted();
 		const ok = await updateBufferedMessage(id, mid, text, {
+			signal: c.req.raw.signal,
 			images: [...keptImages, ...newImages],
 			media: [...keptMedia, ...createdMedia],
 			savedFiles,
@@ -4206,6 +4304,7 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 		try {
 			retried = await retryBufferedMessage(id, mid);
 		} catch (error) {
+			if (error instanceof AppError) throw error;
 			throw new ValidationError(
 				error instanceof Error ? error.message : "Buffered payload unavailable",
 			);

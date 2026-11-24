@@ -137,6 +137,7 @@ export {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
