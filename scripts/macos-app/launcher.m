@@ -331,10 +331,14 @@ static void setLoginItem(BOOL enabled) {
 	[self watchLockDir];
 
 	// Attach to a running server, or start ours. Either way the server itself
-	// opens the browser when it becomes ready (server.openBrowser).
-	self.foundPort = find_server_port(self.basePort, PORT_SCAN_SPAN);
-	if (!self.foundPort) [self startServer];
-
+	// opens the browser when it becomes ready (server.openBrowser). The probe
+	// runs off the main thread so a squatting port can't delay app startup.
+	[self probeInBackgroundWithGeneration:self.probeGeneration
+							   completion:^(int port) {
+								   self.foundPort = port;
+								   if (!port) [self startServer];
+								   [self refreshStatus];
+							   }];
 	[self refreshStatus];
 }
 
@@ -360,11 +364,31 @@ static void setLoginItem(BOOL enabled) {
 
 // ── Event-driven probing ─────────────────────────────────────────────────────
 
-// NSMenuDelegate: one live probe per menu open keeps the status line honest
-// without a background timer (cheap — refused connects return instantly).
+// One probe off the main thread; the completion runs on main only while
+// `gen` is still the current probe generation.
+- (void)probeInBackgroundWithGeneration:(unsigned long)gen
+							 completion:(void (^)(int port))completion {
+	int base = self.basePort;
+	__weak AppDelegate *weak = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+		int port = find_server_port(base, PORT_SCAN_SPAN);
+		dispatch_async(dispatch_get_main_queue(), ^{
+			AppDelegate *s = weak;
+			if (!s || gen != s.probeGeneration) return;
+			completion(port);
+		});
+	});
+}
+
+// NSMenuDelegate: the menu opens instantly with the last known state; a
+// background probe then patches titles in place (NSMenu is live).
 - (void)menuWillOpen:(NSMenu *)menu {
-	self.foundPort = find_server_port(self.basePort, PORT_SCAN_SPAN);
 	[self refreshStatus];
+	[self probeInBackgroundWithGeneration:self.probeGeneration
+							   completion:^(int port) {
+								   self.foundPort = port;
+								   [self refreshStatus];
+							   }];
 }
 
 - (NSString *)lockPath {
@@ -394,29 +418,36 @@ static void setLoginItem(BOOL enabled) {
 }
 
 // Probe once; while the lock exists but nothing answers yet (server still
-// mid-startup), schedule a bounded retry. Superseded generations bail out.
+// mid-startup), schedule a bounded retry. The probe itself runs off-thread so
+// a stalled port can't hitch the UI; superseded generations bail out.
 - (void)probeAfterLockEventWithGeneration:(unsigned long)gen attempt:(int)attempt {
 	if (gen != self.probeGeneration) return;
-	int port = find_server_port(self.basePort, PORT_SCAN_SPAN);
-	if (port || attempt >= STARTUP_PROBE_MAX_ATTEMPTS) {
-		self.foundPort = port;
-		[self refreshStatus];
-		return;
-	}
-	BOOL lockGone = ![[NSFileManager defaultManager] fileExistsAtPath:self.lockPath];
-	if (lockGone) {
-		self.foundPort = 0;
-		[self refreshStatus];
-		return;
-	}
 	__weak AppDelegate *weak = self;
-	dispatch_after(
-		dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-		dispatch_get_main_queue(),
-		^{
-			AppDelegate *s = weak;
-			[s probeAfterLockEventWithGeneration:gen attempt:attempt + 1];
-		});
+	[self probeInBackgroundWithGeneration:gen
+							   completion:^(int port) {
+								   AppDelegate *s = weak;
+								   if (!s) return;
+								   if (port || attempt >= STARTUP_PROBE_MAX_ATTEMPTS) {
+									   s.foundPort = port;
+									   [s refreshStatus];
+									   return;
+								   }
+								   BOOL lockGone = ![[NSFileManager defaultManager]
+									   fileExistsAtPath:s.lockPath];
+								   if (lockGone) {
+									   s.foundPort = 0;
+									   [s refreshStatus];
+									   return;
+								   }
+								   dispatch_after(
+									   dispatch_time(DISPATCH_TIME_NOW,
+													 (int64_t)(0.4 * NSEC_PER_SEC)),
+									   dispatch_get_main_queue(),
+									   ^{
+										   [weak probeAfterLockEventWithGeneration:gen
+																attempt:attempt + 1];
+									   });
+							   }];
 }
 
 // ── Server lifecycle ─────────────────────────────────────────────────────────
