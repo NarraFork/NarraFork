@@ -138,6 +138,7 @@
 		"build:macos": "bun scripts/build-cross-platform.ts --platform=darwin",
 		"build:macos-arm64": "bun scripts/build-cross-platform.ts --platform=darwin-arm64",
 		"build:macos-x64": "bun scripts/build-cross-platform.ts --platform=darwin-x64",
+		"build:macos-app": "bun scripts/build-macos-app.ts",
 		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
 		"plugins:validate-release": "bun scripts/validate-plugin-release.ts",
 		"check": "bunx @biomejs/biome check .",

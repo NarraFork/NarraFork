@@ -125,6 +125,10 @@ remote-peer/dist/
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
+# Experimental macOS .app packaging (docs/MACOS_APP.md): the bundler script and
+# the Mach-O launcher it compiles must survive a fresh clone.
+!scripts/build-macos-app.ts
+!scripts/macos-app/
 # Required by the cross-platform build and its post-processing workers.
 !scripts/post-process-worker.ts
 !scripts/lib/binary-metadata.ts
