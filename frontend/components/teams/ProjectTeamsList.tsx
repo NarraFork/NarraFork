@@ -4,6 +4,7 @@
  * route).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
+import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { teamsUnavailable, useCreateTeam, useProjectTeams } from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import {
@@ -22,6 +23,7 @@ import { IconPlus, IconUsersGroup } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TeamCreateFields, useTeamDraft } from "./TeamCreateFields";
+import { teamPinTitle } from "./team-page-model";
 
 export function CreateTeamModal({
 	projectId,
@@ -117,32 +119,48 @@ export function ProjectTeamsList({
 					{t("teams.noTeams")}
 				</Text>
 			)}
-			{rows.map((team) => (
-				<UnstyledButton
-					key={team.id}
-					onClick={() => onOpenTeam(team.id)}
-					data-testid="project-team-row"
-					data-team-id={team.id}
-					px="sm"
-					py="xs"
-					style={{
-						borderRadius: "var(--mantine-radius-sm)",
-						border: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<Group gap={8} wrap="nowrap">
-						<NarratorStatusIcon size={16} status={team.coordinatorStatus} />
-						<Text size="sm" fw={500} truncate style={{ flex: 1 }}>
-							{team.name || team.id}
-						</Text>
-						{team.access === "read" && (
-							<Badge size="xs" variant="light" color="gray" tt="none">
-								{t("teams.onlooker")}
-							</Badge>
+			{rows.map((team) => {
+				// The list asks for active teams, but a cached page can outlive an archive.
+				const pinTitle = teamPinTitle(team);
+				return (
+					// The pin is a sibling of the row's button, not inside it (no nested buttons).
+					<Group
+						key={team.id}
+						gap={4}
+						wrap="nowrap"
+						pr={4}
+						data-testid="project-team-row"
+						data-team-id={team.id}
+						style={{
+							borderRadius: "var(--mantine-radius-sm)",
+							border: "1px solid var(--mantine-color-default-border)",
+						}}
+					>
+						<UnstyledButton
+							onClick={() => onOpenTeam(team.id)}
+							data-testid="project-team-open"
+							px="sm"
+							py="xs"
+							style={{ flex: 1, minWidth: 0 }}
+						>
+							<Group gap={8} wrap="nowrap">
+								<NarratorStatusIcon size={16} status={team.coordinatorStatus} />
+								<Text size="sm" fw={500} truncate style={{ flex: 1 }}>
+									{team.name || team.id}
+								</Text>
+								{team.access === "read" && (
+									<Badge size="xs" variant="light" color="gray" tt="none">
+										{t("teams.onlooker")}
+									</Badge>
+								)}
+							</Group>
+						</UnstyledButton>
+						{pinTitle !== undefined && (
+							<PinToSidebarButton type="team" id={team.id} title={pinTitle} size="sm" />
 						)}
 					</Group>
-				</UnstyledButton>
-			))}
+				);
+			})}
 			{teams.hasNextPage && (
 				<Button
 					size="xs"

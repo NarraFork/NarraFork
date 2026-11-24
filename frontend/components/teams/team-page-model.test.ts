@@ -39,6 +39,7 @@ import {
 	summarySignature,
 	TEAM_BOARD_COLUMNS,
 	TEAM_CONVERSATION_MIN_WIDTH,
+	teamPinTitle,
 	teamWorkspaceLayout,
 	WORK_ITEM_STATUS_ICON,
 } from "./team-page-model";
@@ -356,5 +357,24 @@ describe("people (M1)", () => {
 		expect(audienceNotes("project", "owner")).toEqual(["projectRead"]);
 		expect(audienceNotes("public", "public")).toEqual(["publicWrite", "publicRead"]);
 		expect(audienceNotes("private", "owner")).toEqual([]);
+	});
+});
+
+describe("pin to sidebar", () => {
+	const team = {
+		id: "lead",
+		name: "Release crew",
+		status: "active" as const,
+		coordinatorStatus: "idle",
+	};
+	test("an active team offers its name (or id); an archived or unloaded one offers no pin", () => {
+		expect(teamPinTitle(team)).toBe("Release crew");
+		expect(teamPinTitle({ ...team, name: "" })).toBe("lead");
+		expect(teamPinTitle(undefined)).toBeUndefined();
+		expect(teamPinTitle({ ...team, status: "archived" })).toBeUndefined();
+		expect(teamPinTitle({ ...team, coordinatorStatus: "archived" })).toBeUndefined();
+		// The page's live summary can see the archive before the team detail does.
+		expect(teamPinTitle(team, "archived")).toBeUndefined();
+		expect(teamPinTitle(team, "working")).toBe("Release crew");
 	});
 });

@@ -14,6 +14,7 @@ import { TeamActivity } from "./TeamActivity";
 import { TeamBoard } from "./TeamBoard";
 import { TeamTopBar } from "./TeamTopBar";
 import { TeamWorkspace } from "./TeamWorkspace";
+import { teamPinTitle } from "./team-page-model";
 
 export function TeamPageView({
 	projectId,
@@ -64,6 +65,7 @@ export function TeamPageView({
 						projectId={projectId}
 						teamId={teamId}
 						title={team.data?.name ?? <Skeleton height={18} width={140} />}
+						teamName={teamPinTitle(team.data, summary.data?.coordinatorStatus)}
 						summary={summary.data}
 						onOpenSession={openSession}
 						onDisbanded={onDisbanded}

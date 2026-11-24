@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: 8d618cddc
+verified_at: 1f8e28731
 ---
 # 团队与成员
 
@@ -135,7 +135,7 @@ verified_at: 8d618cddc
 - 谁能解散：项目写权限 + 会话 owner 或管理员。读不到 → 404；能写不能管 → 403。
 - 拒绝：协调者已归档 → 409 `TEAM_ARCHIVED`（先取消归档）；`working`/`waiting` 或持有执行权 → 409 `NARRATOR_EXECUTION_BUSY`；还有未收尾或仍记录 worktree 的工作项 → 409 `TEAM_HAS_LIVE_WORK`。
 - 写入：`narratorTraitsLock` 内一个事务，先按重读的协调者行再判 owner/管理员（`managesInTransaction`，否则 403），再 `deleteTeamOfNarratorInTransaction` 删团队行（工作项与事件级联删除），去掉 `team` trait。标题、受众、消息和钉住的 `contextProjectId` 都不动。
-- 提交后：`forgetTeamSessions()`、`forgetTeamStatus`、`forgetCoordinatorRun`、`cancelCheckin`、异步删 `coordinator-outputs/<id>`；广播 `custom_traits_changed` 与 `announceTeamChange`；写一条 `team_disband` 说明（同样的确定 id 规则）。`Team` 工具由运行时的卸载对账从下一次请求里去掉，不需要重建基线。
+- 提交后：`forgetTeamSessions()`、`forgetTeamStatus`、`forgetCoordinatorRun`、`cancelCheckin`、异步删 `coordinator-outputs/<id>`；广播 `custom_traits_changed` 与 `announceTeamChange`；写一条 `team_disband` 说明（同样的确定 id 规则）；`removeTabFromAllUsers("team", id)` 移除所有人侧栏里的团队标签（会话自己的标签保留，失败只记日志）。`Team` 工具由运行时的卸载对账从下一次请求里去掉，不需要重建基线。
 
 生命周期：
 - 归档协调者即归档团队，`project_teams.status` 镜像协调者状态（`startTeamStatusSync`）；已归档团队不能改（409 `TEAM_ARCHIVED`）。
@@ -143,6 +143,7 @@ verified_at: 8d618cddc
   - 还有「未收尾，或已收尾但仍记录着 worktree」的工作项就拒绝；
   - 否则在同一事务内连带删除团队行（`deleteTeamOfNarratorInTransaction`）。
 - 团队行 RESTRICT 叙述者与项目删除，删团队级联删工作项与事件（`team-tables-contract.test.ts`）。
+- 侧栏的团队标签（`team:<id>`）跟着生命周期走：归档时 `startTeamStatusSync` 从所有持有者的侧栏移除（取消归档不放回），删除协调者或解散团队时一并移除，失去协调者读权限的持有者也会被移除（见[最近标签页](../recent-tabs.md)）。
 - 数据导入/导出：三张团队表不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
 - IM 网关永远不能驱动团队会话，也不能做团队树里的批准决定。
 

@@ -34,7 +34,7 @@ keywords:
   - agent.defaultNarratorWriteAudience
   - terminalAccessAllowed
 status: draft
-verified_at: 9400a828b
+verified_at: 160e3f0d4
 ---
 # 访问控制
 
@@ -51,7 +51,7 @@ verified_at: 9400a828b
 - `visibility`（private/project/public）与 `writeAudience`（owner/project/public）是两列，必须嵌套合法：private 只能 owner，project 可到 project，public 可到 public（`shared/narrator-access.ts:WRITE_AUDIENCE_BY_VISIBILITY`）。改 `visibility` 时同一条 UPDATE 里把越界的 `writeAudience` 收窄并单独审计（`narrator-sharing.ts:setNarratorVisibility`）。新建叙述者默认取该可见性允许的最宽写受众（`defaultWriteAudienceForNarrator`）。
 - 子代理没有自己的受众，判断委托给根叙述者（`acl_root_narrator_id`，`resolveJudgedRow`）；根无法确定则拒绝。
 - 项目 ACL 是最外层的门：管理员、owner、`public` 可见、或项目范围的授权（`project-acl.ts:canReadProject`）。
-- 只有 owner 和管理员能改共享（`canManageNarratorAcl`）：write 授权不含再分享权。每次改动后通知客户端并断开已失去权限的 WebSocket 订阅（`narrator-sharing.ts` 文件头 `announceAccessChange`）。
+- 只有 owner 和管理员能改共享（`canManageNarratorAcl`）：write 授权不含再分享权。每次改动后通知客户端并断开已失去权限的 WebSocket 订阅（`narrator-sharing.ts` 文件头 `announceAccessChange`）；改的是团队协调者时，还把读不了它的人侧栏里的团队标签移掉（`pruneTeamTabs`，见[最近标签页](../collaboration/recent-tabs.md)）。
 - 列表过滤下推到 SQL（`narratorReadableWhere`/`narratorReadableSqlFragment`），不在取出的页上过滤，以保持 `LIMIT n+1` 与总数正确。
 - 授权变更审计只写 id、布尔、角色名和计数，不写标题与内容；写入失败只记日志、不使被审计操作失败，并在事务提交之后调用（`acl/acl-audit.ts`）。
 - 路由层桥接：`lib/narrator-access.ts`（`requireNarratorAccess`、`getAuthorizedNarrator` 等）与 `lib/project-access.ts`（`requireProjectAccess`）把 Hono 上下文转成主体再调 ACL，新端点用它们表达「需要 read/write」，不要自己拼主体。

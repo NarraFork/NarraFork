@@ -6,6 +6,7 @@
  * session's turn, coordinator first).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
+import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { useDecideApproval, usePauseTeam, useTeamApprovals } from "@frontend/hooks/useTeams";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
@@ -316,6 +317,7 @@ export function TeamTopBar({
 	projectId,
 	teamId,
 	title,
+	teamName,
 	summary,
 	leading,
 	onOpenSession,
@@ -324,6 +326,11 @@ export function TeamTopBar({
 	projectId: string;
 	teamId: string;
 	title: ReactNode;
+	/**
+	 * The team's name once known and the team is active (`teamPinTitle`): shows "pin to sidebar"
+	 * beside the title. An archived team offers no pin.
+	 */
+	teamName?: string;
 	summary: TeamPageSummary | undefined;
 	/** Before the title (a back link on narrow screens). */
 	leading?: ReactNode;
@@ -376,6 +383,9 @@ export function TeamTopBar({
 				<Text fw={600} truncate data-testid="team-title">
 					{title}
 				</Text>
+				{teamName !== undefined && (
+					<PinToSidebarButton type="team" id={teamId} title={teamName} size="sm" />
+				)}
 				{archived && (
 					<Tooltip label={t("teams.top.archivedHint")} withinPortal multiline maw={280}>
 						<Badge

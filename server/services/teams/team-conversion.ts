@@ -72,6 +72,7 @@ import {
 	type NarratorPrincipal,
 } from "../narrator-acl";
 import { announceTeamChange } from "../narrator-sharing";
+import { removeTabFromAllUsers } from "../user-preferences-service";
 import { forgetCoordinatorRun } from "./coordinator-limits";
 import { removeCoordinatorOutputs } from "./coordinator-outputs";
 import { assertTeamRemovable, deleteTeamOfNarratorInTransaction } from "./team-records";
@@ -667,6 +668,14 @@ export async function disbandTeam(
 	void removeCoordinatorOutputs(teamId);
 	broadcastTraits(teamId, traits);
 	await announceTeamChange(teamId, actingUserId);
+	// The team is gone while its session stays: a pinned team tab would lead nowhere. One indexed
+	// read of `(type, entity_id)`; a failure only leaves tabs that the next access check prunes.
+	await removeTabFromAllUsers("team", teamId).catch((err) => {
+		logger.warn("Failed to remove team tabs after disband", {
+			teamId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 
 	const locale = await noteLocale(coordinator.ownerUserId);
 	await deliverNote(

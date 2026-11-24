@@ -537,7 +537,20 @@ export async function listProjectTeams(
 export function startTeamStatusSync(): () => void {
 	const onStatus = (event: { narratorId: string; status: string }) => {
 		try {
-			syncTeamStatus(event.narratorId, event.status === "archived", currentTeamStatusActor());
+			const archived = event.status === "archived";
+			const changed = syncTeamStatus(event.narratorId, archived, currentTeamStatusActor());
+			// An archived team leaves every sidebar it was pinned to (unarchiving does not bring the
+			// tab back: pinning it again is one click on the team page).
+			if (changed && archived) {
+				void import("../recent-tabs-service")
+					.then(({ pruneTeamTabs }) => pruneTeamTabs(event.narratorId))
+					.catch((error) =>
+						logger.warn("Failed to remove an archived team's tabs", {
+							teamId: event.narratorId,
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					);
+			}
 		} catch (error) {
 			logger.warn("Team status sync failed", {
 				teamId: event.narratorId,
