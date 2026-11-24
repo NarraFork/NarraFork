@@ -1,13 +1,12 @@
 /**
- * The team page's frame (docs/PROJECT_TEAMS-PLAN.md §二.11; P4): the project's teams on the
- * left, the coordinator's conversation in the middle, the board and the activity on the right,
- * the top bar above.
+ * The team page's frame (docs/PROJECT_TEAMS-PLAN.md §二.11; P4): the top bar above, the
+ * coordinator's conversation and beside it the board and the activity. The page is about one
+ * team: no list of the project's teams (teams are switched from the sidebar's pinned team tabs
+ * and the project page's list).
  *
  * The layout follows the frame's own width, not the viewport's (the app's sidebar takes up to
  * 480 px of it), and the conversation keeps at least `TEAM_CONVERSATION_MIN_WIDTH`:
- *   - room for all three → three columns;
- *   - room for the conversation and the side panel → two (the teams list leaves; the top bar's
- *     back link leads to the project, which lists them);
+ *   - room for the conversation and the side panel → split;
  *   - less → tabs (conversation / board / activity).
  *
  * The conversation sits at ONE place in the React tree in every layout; only CSS (display,
@@ -25,7 +24,6 @@ import { useTranslation } from "react-i18next";
 import {
 	TEAM_PAGE_TABS,
 	TEAM_SIDE_WIDTH,
-	TEAM_TEAMS_WIDTH,
 	type TeamPageTab,
 	teamWorkspaceLayout,
 } from "./team-page-model";
@@ -34,7 +32,6 @@ type SideTab = Exclude<TeamPageTab, "conversation">;
 
 export function TeamWorkspace({
 	topBar,
-	teams,
 	conversation,
 	board,
 	activity,
@@ -42,7 +39,6 @@ export function TeamWorkspace({
 	focusConversation = 0,
 }: {
 	topBar: ReactNode;
-	teams: ReactNode;
 	conversation: ReactNode;
 	board: ReactNode;
 	activity: ReactNode;
@@ -97,17 +93,6 @@ export function TeamWorkspace({
 				</Tabs>
 			)}
 			<Box style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "stretch" }}>
-				<ScrollArea
-					w={TEAM_TEAMS_WIDTH}
-					type="auto"
-					style={{
-						display: layout === "columns" ? undefined : "none",
-						flexShrink: 0,
-						borderRight: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<Box p="sm">{layout === "columns" && teams}</Box>
-				</ScrollArea>
 				<Box
 					ref={conversationRef}
 					style={{
