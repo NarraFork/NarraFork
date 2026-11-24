@@ -64,7 +64,8 @@ class SameReadTransport implements Transport {
 
 	async send(message: JSONRPCMessage): Promise<void> {
 		const deliver = this.onmessage;
-		if (!deliver || !("method" in message)) return;
+		// Notifications such as `initialized` have a method and no id.
+		if (!deliver || !("method" in message) || !("id" in message)) return;
 		if (message.method === "initialize") {
 			deliver({
 				jsonrpc: "2.0",
@@ -77,7 +78,6 @@ class SameReadTransport implements Transport {
 			});
 			return;
 		}
-		if (message.method === "notifications/initialized") return;
 		if (message.method === "tools/list") {
 			deliver({
 				jsonrpc: "2.0",
