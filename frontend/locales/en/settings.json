@@ -1,5 +1,6 @@
 {
 	"title": "Settings",
+
 	"remoteAccessSection": "WebRTC remote access",
 	"remoteAccess": {
 		"description": "Connect a paired browser directly to this instance using the matching hosted remote frontend. Pairing does not replace administrator login. No business traffic is relayed through the signaling server.",
@@ -51,6 +52,14 @@
 			"unknown": "Unknown"
 		}
 	},
+	"integrations": {
+		"capabilities": {
+			"quota": { "provide": "Provide Custom API quota snapshots" },
+			"provider": {
+				"connection": { "request": "Read quota through a host-managed provider connection" }
+			}
+		}
+	},
 	"providerBalance": {
 		"wallet": "Wallet balance",
 		"key": "Key remaining allowance",
@@ -69,7 +78,7 @@
 		"errorAuth": "Site access token or user id was rejected (401/403); check the quota query settings",
 		"errorInvalidResponse": "The site returned no recognisable allowance; check the site interface root",
 		"errorInvalidConfiguration": "Quota query is incomplete: fill in the site root, access token and user id",
-		"errorPluginNotEnabled": "The quota query plugin (apikey-quota) is disabled; enable it on the plugins page to query",
+		"errorPluginNotEnabled": "The Provider Quota plugin is disabled; enable it on the plugins page to query",
 		"group": "Group: {{name}}",
 		"stale": "Data may be outdated",
 		"source": "Source: {{source}}",

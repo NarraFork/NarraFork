@@ -45,3 +45,20 @@ declare module "@server/generated/embedded-builtin-plugins" {
 		files: ReadonlyArray<{ path: string; content: string }>;
 	}>;
 }
+
+// Required by compiled builds; source mode reads/builds the independent archive lazily.
+declare module "@server/generated/embedded-bundled-plugins" {
+	export const embeddedBundledPluginAssets: readonly {
+		pluginId: string;
+		version: string;
+		archivePath: string;
+		size: number;
+		sha256: string;
+	}[];
+}
+
+/** Bun's file asset import resolves to a virtual path, not executable plugin code. */
+declare module "*.nfplugin" {
+	const embeddedArchivePath: string;
+	export default embeddedArchivePath;
+}

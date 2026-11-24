@@ -47,7 +47,6 @@ import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
-import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -74,7 +73,6 @@ import {
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
-import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
@@ -85,7 +83,8 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalance } from "../../hooks/useProviderBalance";
+import { isProviderQuotaCapabilityEnabled, useProviderQuota } from "../../hooks/useProviderQuota";
+import { useQuotaNow } from "../../hooks/useQuotaNow";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
 import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
@@ -114,7 +113,6 @@ import {
 	useOutlineOpener,
 } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
-import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -199,11 +197,12 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
-import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
-import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
+import {
+	customApiQuotaDisplayFor,
+	resolveCustomApiQuotaProviderId,
+} from "./model/custom-api-usage-source";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
+import { buildProviderQuotaView } from "./model/provider-quota-view";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
@@ -454,7 +453,6 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -722,105 +720,38 @@ function NarratorPanelBody({
 	});
 	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
 
-	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
-	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
-	// stays disabled unless the current narrator's provider is a Kimi provider,
-	// so nothing polls while Kimi is not in use.
-	const currentKimiProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isKimiProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const { data: kimiUsagesData } = useQuery({
-		queryKey: ["kimi", "usages"],
-		queryFn: api.kimiGetUsages,
-		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
-		staleTime: 30_000,
-		refetchInterval: 60_000,
+	// The resolved model includes the concrete service used by an auto: session's last turn.
+	const currentQuotaProviderId = useMemo(
+		() => resolveCustomApiQuotaProviderId(resolvedModel, settingsData?.customApiProviders),
+		[resolvedModel, settingsData?.customApiProviders],
+	);
+	const rawQuotaGeneration = currentQuotaProviderId
+		? settingsData?.providerQuotaGenerations?.[currentQuotaProviderId]
+		: undefined;
+	const quotaGeneration = typeof rawQuotaGeneration === "string" ? rawQuotaGeneration : undefined;
+	const quotaCapabilityEnabled = isProviderQuotaCapabilityEnabled(settingsData);
+	const providerQuotaQuery = useProviderQuota(
+		currentQuotaProviderId,
+		quotaGeneration,
+		firstScreenActivity,
+		quotaCapabilityEnabled,
+	);
+	const { pushedQuota, quotaSnapshot } = customApiQuotaDisplayFor({
+		providerId: currentQuotaProviderId,
+		generation: quotaGeneration,
+		pushedQuotas: settingsData?.customApiQuotas,
+		snapshot: providerQuotaQuery.data,
 	});
-
-	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
-	// generation token so an allowance fetched for a replaced account is never shown.
-	// The current window lives in the status bar; weekly/monthly are in the popover.
-	const currentOpencodeProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const opencodeGeneration = currentOpencodeProviderId
-		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
-		: undefined;
-	const opencodeUsageQuery = useOpencodeUsage(
-		currentOpencodeProviderId,
-		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
-		firstScreenActivity,
+	const quotaNow = useQuotaNow(
+		firstScreenActivity && quotaCapabilityEnabled && Boolean(quotaSnapshot?.data?.expiresAt),
 	);
-
-	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
-	// generation so a balance fetched for a replaced account is never shown.
-	const currentDeepSeekProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const deepseekGeneration = currentDeepSeekProviderId
-		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
-		: undefined;
-	const deepseekBalancesQuery = useDeepSeekBalance(
-		currentDeepSeekProviderId,
-		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
-		firstScreenActivity,
+	const customApiQuotaView = buildProviderQuotaView(
+		quotaCapabilityEnabled ? quotaSnapshot : null,
+		t,
+		currentUser?.role === "admin",
+		providerQuotaQuery.isError,
+		quotaNow,
 	);
-
-	const currentBalanceProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (settingsData?.customApiProviders ?? []).find(
-			(p: { id: string; prefix?: string; disabled?: boolean }) =>
-				p.prefix === prefix && !p.disabled,
-		);
-		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
-			? (cfg.id as string)
-			: null;
-	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
-	const balanceGeneration = currentBalanceProviderId
-		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
-		: undefined;
-	const providerBalanceQuery = useProviderBalance(
-		currentBalanceProviderId,
-		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
-		firstScreenActivity,
-	);
-	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
-		customApiBalanceDisplayFor({
-			providerId: currentBalanceProviderId,
-			pushedQuotas: settingsData?.customApiQuotas,
-			snapshot: providerBalanceQuery.data,
-		});
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1229,80 +1160,15 @@ function NarratorPanelBody({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-	// Resolve custom API provider info for initial generic quota balance
-	const customApiProviderInfo = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const customApiProviders: Array<{ id: string; prefix?: string }> =
-			settingsData?.customApiProviders ?? [];
-		const cfg = customApiProviders.find((p) => p.prefix === prefix);
-		if (!cfg) return null;
-		if (cfg.id === currentDeepSeekProviderId) {
-			return {
-				providerId: cfg.id,
-				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
-			};
-		}
-		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
-		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
-		// Go one would otherwise fall through to the previous account's Kimi allowance.
-		const usageSource = usageSourceFor({
-			providerId: cfg.id,
-			opencodeProviderId: currentOpencodeProviderId,
-			kimiProviderId: currentKimiProviderId,
-		});
-		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
-		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
-		// generic text-balance slot — showing both would duplicate the 5h figure.
-		if (usageSource === "opencode") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
-		if (usageSource === "kimi") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && pushedQuota) {
-			return { providerId: cfg.id, ...pushedQuota };
-		}
-		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
-			// The shared window panel owns subscription amounts, including unknown/stale
-			// placeholders. Do not duplicate them in the generic balance text slot.
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
-			return {
-				providerId: cfg.id,
-				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
-			};
-		}
-		const quotas = settingsData?.customApiQuotas as
-			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
-			| undefined;
-		const quota = quotas?.[cfg.id];
-		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
-		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quota?.quotaBalance ?? null,
-			detailedQuotaBalance,
-		};
-	}, [
-		resolvedModel,
-		settingsData?.customApiProviders,
-		settingsData?.customApiQuotas,
-		currentKimiProviderId,
-		currentOpencodeProviderId,
-		currentDeepSeekProviderId,
-		deepseekBalancesQuery.data,
-		deepseekBalancesQuery.isError,
-		currentBalanceProviderId,
-		pushedQuota,
-		sub2ApiSubscriptionSnapshot,
-		providerBalanceQuery.data,
-		providerBalanceQuery.isError,
-		balanceT,
-		t,
-	]);
+	// Plugin values stay out of the pushed-text cache. The structured panel owns
+	// normalized snapshots; real stream text still wins, including after remount.
+	const customApiProviderInfo = currentQuotaProviderId
+		? {
+				providerId: currentQuotaProviderId,
+				quotaBalance: pushedQuota?.quotaBalance ?? null,
+				detailedQuotaBalance: pushedQuota?.detailedQuotaBalance?.trim() || null,
+			}
+		: null;
 
 	const wsState = useNarratorPanelWS({
 		narratorId,
@@ -1316,8 +1182,13 @@ function NarratorPanelBody({
 		initialDetailedQuotaBalance:
 			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
 		customApiProviderId: customApiProviderInfo?.providerId,
+		customApiProviderGeneration: quotaGeneration,
+		customApiProviderKeyId: providerQuotaQuery.data?.keyId,
+		customApiQuotaPushCompatible: providerQuotaQuery.data?.pushCompatible,
 		nugProviderId: nugProviderInfo?.providerId,
-		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
+		quotaProviderKey: currentQuotaProviderId
+			? `${currentQuotaProviderId}:${quotaGeneration ?? ""}`
+			: nugProviderInfo?.providerId,
 		onDraftChanged: forwardDraftChanged,
 		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
@@ -2983,34 +2854,12 @@ function NarratorPanelBody({
 		return undefined;
 	})();
 
-	/**
-	 * Props for the OpenCode Go allowance indicator, or undefined when the current
-	 * model is not on a Go endpoint.
-	 */
-	const opencodeQuotaProps = (() => {
-		if (!currentOpencodeProviderId) return undefined;
-		const waitingForQuota = quotaWaitProvider === "opencode";
-		return {
-			usage: opencodeUsageQuery.data,
-			waitingForQuota,
-			waitingText: waitingForQuota ? quotaWaitText : null,
-		};
-	})();
-
-	/**
-	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
-	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
-	 * for, like the generic quota slot above, so a disabled query's stale entry
-	 * for a re-pointed provider is never shown.
-	 */
-	const kimiQuotaView = currentKimiProviderId
-		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
-		: null;
+	// Source-neutral Custom API panel; Command Code retains its platform view.
 	const quotaPanelProps = (() => {
-		if (currentKimiProviderId) {
-			const waitingForQuota = quotaWaitProvider === "kimi";
+		if (currentQuotaProviderId && !pushedQuota) {
+			const waitingForQuota = quotaWaitProvider !== undefined;
 			return {
-				view: kimiQuotaView,
+				view: customApiQuotaView,
 				waitingForQuota,
 				waitingText: waitingForQuota ? quotaWaitText : null,
 			};
@@ -3756,16 +3605,20 @@ function NarratorPanelBody({
 							},
 							quota: {
 								// Structured subscription quotas are rendered by the status bar, not this text slot.
-								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
-								sub2api: sub2ApiSubscriptionSnapshot
-									? {
-											snapshot: sub2ApiSubscriptionSnapshot,
-											queryFailed: providerBalanceQuery.isError,
-										}
-									: undefined,
-								opencode: opencodeQuotaProps,
+								balance: commandCodeEnabled
+									? null
+									: (tokenDanceQuota?.balance ??
+										(currentQuotaProviderId ? (pushedQuota?.quotaBalance ?? null) : quotaBalance)),
+								detailsText:
+									tokenDanceQuota?.detailsText ??
+									(currentQuotaProviderId
+										? pushedQuota?.detailedQuotaBalance?.trim() || null
+										: quotaDetailsText),
+								hasDetailsPopover:
+									tokenDanceQuota?.hasDetailsPopover ??
+									(currentQuotaProviderId
+										? Boolean(pushedQuota?.detailedQuotaBalance?.trim())
+										: hasQuotaDetailsPopover),
 								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,

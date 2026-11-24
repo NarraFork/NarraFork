@@ -28,9 +28,13 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
+import { BuiltinPluginCatalogPanel } from "../../components/plugins/BuiltinPluginCatalogPanel";
+import { PluginSourceUpdateSummary } from "../../components/plugins/PluginSourceUpdateSummary";
+import { pluginCanUninstall } from "../../components/plugins/plugin-source-management";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import { PluginInstallModal } from "../../components/plugins-admin/PluginInstallModal";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
+import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	pluginKeys,
 	useDisablePlugin,
@@ -48,8 +52,10 @@ function pluginDisplayName(plugin: PluginSummary): string {
 	return plugin.displayName ?? plugin.pluginId;
 }
 
-function SettingsPluginsPage() {
+export function SettingsPluginsPage() {
 	const { t } = useTranslation("plugins");
+	const { data: user } = useCurrentUser();
+	const canManageSources = user?.role === "admin";
 	const navigate = useNavigate();
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
@@ -230,12 +236,7 @@ function SettingsPluginsPage() {
 										}
 									>
 										<Table.Td>
-											<Text size="sm" fw={500} lineClamp={1}>
-												{pluginDisplayName(plugin)}
-											</Text>
-											<Text size="xs" c="dimmed" lineClamp={1}>
-												{plugin.pluginId}
-											</Text>
+											<PluginSourceUpdateSummary plugin={plugin} canManage={canManageSources} />
 										</Table.Td>
 										<Table.Td>
 											<PluginStatusBadge plugin={plugin} />
@@ -282,11 +283,11 @@ function SettingsPluginsPage() {
 													</Tooltip>
 												)}
 												{/*
-												 * A plugin that ships with the application has no package to
-												 * remove, so it gets no uninstall action — the list itself
-												 * makes no other distinction.
+												 * Host capabilities distinguish readonly directory plugins
+												 * from installable bundled archives; their labels do not
+												 * determine whether uninstall is allowed.
 												 */}
-												{plugin.builtin ? null : (
+												{!pluginCanUninstall(plugin) ? null : (
 													<Tooltip label={t("admin.actions.uninstall")}>
 														<ActionIcon
 															variant="subtle"
@@ -309,6 +310,7 @@ function SettingsPluginsPage() {
 				</Box>
 			)}
 
+			<BuiltinPluginCatalogPanel canManage={canManageSources} disabled={!!pluginsDisabled} />
 			<PluginInstallModal opened={installOpen} onClose={() => setInstallOpen(false)} />
 		</Stack>
 	);

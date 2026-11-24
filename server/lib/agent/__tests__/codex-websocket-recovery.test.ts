@@ -1047,6 +1047,7 @@ test("normal abort still clears sticky state before the next chat", async () => 
 
 	const first = await runChat(provider, { signal: controller.signal }, (event) => {
 		if (event.text) controller.abort();
+		return undefined;
 	});
 	expect(collectText(first.events)).toBe("partial");
 	expect(first.error).toBeUndefined();

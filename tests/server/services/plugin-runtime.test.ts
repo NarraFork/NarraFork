@@ -1,19 +1,31 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { logger } from "../../../server/lib/logger";
 import type { JsonRpcEnvelope } from "../../../server/lib/plugins/protocol";
+import { PluginHostDispatcher } from "../../../server/services/plugin-host-dispatcher";
+import { PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION } from "../../../server/services/plugin-package-stage-protocol";
+import { PluginPackageStore } from "../../../server/services/plugin-package-store";
 import {
 	buildLocalProcessCommand,
 	type ContentLengthFrameError,
 	ContentLengthFrameParser,
 	encodeContentLengthFrame,
 	LocalProcessRunner,
+	type PluginPackageStageWorker,
 	type PluginProcessHandle,
 	type PluginProcessSpawner,
 	type PluginRunner,
 	PluginRuntime,
+	PluginRuntimeError,
 	type RunnerProcess,
+	type RunnerStartOptions,
 	RuntimeSupervisor,
 	type RuntimeSupervisorOptions,
+	stagePluginPackage,
 } from "../../../server/services/plugin-runtime";
 
 const encoder = new TextEncoder();
@@ -234,7 +246,7 @@ class FakeRunner implements PluginRunner {
 		private readonly errorMethod?: LifecycleMethod,
 	) {}
 
-	async start(): Promise<PluginProcessHandle> {
+	async start(_options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		const handle = new FakeProcessHandle(this.mode, this.errorMethod);
 		this.handles.push(handle);
 		setTimeout(() => {
@@ -257,11 +269,93 @@ const baseRuntimeOptions = {
 	pluginVersion: "1.0.0",
 	command: [bunPath, fixturePath],
 	cwd: fixtureCwd,
+	// These subprocesses are trusted test-owned fixtures, not installed plugins.
+	runnerOptions: {
+		allowedCwds: [fixtureCwd],
+		allowUnboundedResourceUsage: process.platform === "win32",
+	},
 };
 
 afterEach(() => {
 	// Let process-exit microtasks and stream readers settle between tests.
 	return sleep(5);
+});
+
+describe("isolated package staging", () => {
+	it.each([
+		"creation",
+		"runtime",
+		"timeout",
+		"disabled",
+	] as const)("fails closed on %s without invoking PackageStore on the main thread", async (mode) => {
+		const root = await mkdtemp(join(tmpdir(), "plugin-stage-worker-"));
+		const install = spyOn(PluginPackageStore.prototype, "install");
+		const oldDisabled = process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED;
+		const events = new EventEmitter();
+		let terminated = 0;
+		const worker = Object.assign(events, {
+			postMessage(input: { action: string }) {
+				queueMicrotask(() => {
+					if (input.action === "ping") {
+						events.emit("message", {
+							packageStageReady: true,
+							protocolVersion: PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION,
+						});
+					} else if (mode === "runtime") {
+						events.emit("error", new Error("test Worker failure"));
+					}
+				});
+			},
+			async terminate() {
+				terminated++;
+				queueMicrotask(() => events.emit("exit", 0));
+				return 0;
+			},
+		}) as unknown as PluginPackageStageWorker;
+		try {
+			if (mode === "disabled") process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED = "1";
+			await expect(
+				stagePluginPackage(root, new Uint8Array([1, 2, 3]), {
+					timeoutMs: 30,
+					exitTimeoutMs: 100,
+					workerFactory: () => {
+						if (mode === "creation") throw new Error("test Worker unavailable");
+						return worker;
+					},
+				}),
+			).rejects.toThrow();
+			expect(install).not.toHaveBeenCalled();
+			expect(terminated).toBe(mode === "runtime" || mode === "timeout" ? 1 : 0);
+			expect((await new PluginPackageStore(root).readCurrent()).plugins).toEqual({});
+		} finally {
+			if (oldDisabled === undefined) delete process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED;
+			else process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED = oldDisabled;
+			install.mockRestore();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("stages a real package in the Worker without publishing current or running inline", async () => {
+		const root = await mkdtemp(join(tmpdir(), "plugin-stage-worker-"));
+		const install = spyOn(PluginPackageStore.prototype, "install");
+		try {
+			const result = await stagePluginPackage(
+				root,
+				join(import.meta.dir, "../../fixtures/plugins/packages/valid-package"),
+			);
+			expect(result).toMatchObject({
+				pluginId: "com.example.hello",
+				version: "1.0.0",
+				currentUpdated: false,
+				signatureIdentity: null,
+			});
+			expect(install).not.toHaveBeenCalled();
+			expect((await new PluginPackageStore(root).readCurrent()).plugins).toEqual({});
+		} finally {
+			install.mockRestore();
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
 });
 
 describe("ContentLengthFrameParser", () => {
@@ -389,6 +483,7 @@ describe("LocalProcessRunner", () => {
 				spawn: () => raw.process,
 				maxBodyBytes: constructorCap,
 				killProcessTree: false,
+				allowUnboundedResourceUsage: process.platform === "win32",
 			});
 			const handle = await runner.start({
 				command: ["fixture"],
@@ -464,13 +559,21 @@ describe("LocalProcessRunner", () => {
 			spawn,
 			allowedCwds: [fixtureCwd],
 			envAllowlist: ["PATH", "LANG"],
+			allowUnboundedResourceUsage: process.platform === "win32",
 		});
 		const handle = await runner.start({
 			command: ["bun", fixturePath, "normal"],
 			cwd: fixtureCwd,
 			env: { PATH: "/safe", LANG: "zh_CN.UTF-8", HOME: "/secret", JWT_SECRET: "jwt" },
 		});
-		expect(captured?.command).toEqual(buildLocalProcessCommand(["bun", fixturePath, "normal"]));
+		expect(captured?.command).toEqual(
+			buildLocalProcessCommand(
+				["bun", fixturePath, "normal"],
+				undefined,
+				process.platform,
+				process.platform === "win32",
+			),
+		);
 		expect(captured?.options.cwd).toBe(fixtureCwd);
 		expect(captured?.options.env).toEqual({ PATH: "/safe", LANG: "zh_CN.UTF-8" });
 		expect(captured?.options.detached).toBe(process.platform !== "win32");
@@ -512,6 +615,7 @@ describe("LocalProcessRunner", () => {
 			spawn: () => raw.process,
 			stderrRingBytes: 8,
 			maxStdoutBytes: 16,
+			allowUnboundedResourceUsage: process.platform === "win32",
 		});
 		const handle = await runner.start({
 			command: ["fixture"],
@@ -676,6 +780,26 @@ describe("PluginRuntime", () => {
 		await runtime.shutdown();
 	});
 
+	it("cancels the notification waiter when sending a shutdown control request throws synchronously", async () => {
+		const runtime = new PluginRuntime({ ...baseRuntimeOptions, runner: new FakeRunner() });
+		await runtime.start();
+		const connection = runtime.rpcConnection;
+		if (!connection) throw new Error("missing actual RPC connection");
+		const original = connection.request.bind(connection);
+		const send = spyOn(connection, "request").mockImplementation((method, params, options) => {
+			if (method === "shutdown") throw new Error("transport closed before shutdown write");
+			return original(method, params, options);
+		});
+		try {
+			await runtime.shutdown();
+			expect(runtime.state).toBe("stopped");
+			await Promise.resolve();
+		} finally {
+			send.mockRestore();
+			await runtime.shutdown();
+		}
+	});
+
 	it("drains and shuts down active requests", async () => {
 		const runner = new FakeRunner();
 		const runtime = new PluginRuntime({
@@ -688,6 +812,122 @@ describe("PluginRuntime", () => {
 		await runtime.shutdown();
 		await expect(pending).rejects.toThrow("shut down");
 		expect(runtime.state).toBe("stopped");
+	});
+});
+
+describe("RuntimeSupervisor host-work ownership", () => {
+	let PluginManager: typeof import("../../../server/services/plugin-manager").PluginManager;
+	beforeAll(async () => {
+		// Cold module/DB setup is not part of a running plugin's shutdown budget.
+		({ PluginManager } = await import("../../../server/services/plugin-manager"));
+	}, 30_000);
+
+	it.each([
+		"shutdown",
+		"restart",
+		"replace",
+	] as const)("keeps real host writes and audit owned across process %s", async (transition) => {
+		const root = await mkdtemp(join(tmpdir(), "nf-rpc-ownership-"));
+		const database = new Database(":memory:");
+		database.run("CREATE TABLE late_writes (kind TEXT)");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const auditEntered = Promise.withResolvers<void>();
+		const auditRelease = Promise.withResolvers<void>();
+		let calls = 0;
+		const dispatcher = new PluginHostDispatcher({
+			maxConcurrency: 1,
+			methods: {
+				"test.lateWrite": {
+					method: "test.lateWrite",
+					handler: async () => {
+						calls++;
+						entered.resolve();
+						await release.promise;
+						database.run("INSERT INTO late_writes VALUES ('handler')");
+						if (transition === "restart") throw new Error("late failure after restart");
+						return true;
+					},
+				},
+			},
+			audit: async (entry) => {
+				if (entry.code !== "LATE_RESULT") return;
+				auditEntered.resolve();
+				await auditRelease.promise;
+				database.run("INSERT INTO late_writes VALUES ('audit')");
+				throw new Error("settled best-effort audit failure");
+			},
+		});
+		const supervisor = new RuntimeSupervisor();
+		const manager = new PluginManager({ root, runtimeSupervisor: supervisor });
+		const runtime = await supervisor.start({ ...baseRuntimeOptions, dispatcher, maxInFlight: 1 });
+		const oldConnection = runtime.rpcConnection;
+		if (!oldConnection) throw new Error("missing actual RPC connection");
+		const pid = runtime.pid;
+		try {
+			oldConnection.receive({ jsonrpc: "2.0", id: "late", method: "test.lateWrite" });
+			await entered.promise;
+			await oldConnection.close();
+			await runtime.shutdown(); // Process stop must not wait for an unbounded host handler.
+			expect(() => process.kill(pid as number, 0)).toThrow();
+			expect(runtime.rpcConnection).toBeUndefined();
+			expect(runtime.state).toBe("stopped");
+			expect(runtime.pendingInboundCount).toBe(1);
+			expect(supervisor.hasPendingShutdownWork()).toBe(true);
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			if (transition !== "shutdown") {
+				const replacement =
+					transition === "restart"
+						? await supervisor.start(runtime.pluginId)
+						: await supervisor.start({
+								...baseRuntimeOptions,
+								dispatcher,
+								maxInFlight: 1,
+								command: [...baseRuntimeOptions.command, "normal"],
+							});
+				if (transition === "replace") expect(replacement).not.toBe(runtime);
+				else expect(replacement).toBe(runtime);
+				const connection = replacement.rpcConnection;
+				if (!connection) throw new Error("missing replacement connection");
+				// Busy admission replies use sendError directly; observe the real control writes.
+				const rejected = spyOn(connection, "sendError");
+				const dispatched = spyOn(dispatcher, "dispatch");
+				try {
+					const ids = Array.from({ length: 8 }, (_, i) => `new-${i}`);
+					for (const id of ids)
+						connection.receive({ jsonrpc: "2.0", id, method: "test.lateWrite" });
+					await Promise.all(rejected.mock.results.map((result) => result.value));
+					expect(rejected.mock.calls.map(([id, , , data]) => [id, data])).toEqual(
+						ids.map((id) => [id, { code: "PLUGIN_BUSY", retryable: true }]),
+					);
+					expect(dispatched).not.toHaveBeenCalled();
+					expect(calls).toBe(1);
+					expect(connection.pendingInboundCount).toBe(0);
+				} finally {
+					dispatched.mockRestore();
+					rejected.mockRestore();
+				}
+			}
+			await manager.shutdown();
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			release.resolve();
+			await auditEntered.promise;
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			auditRelease.resolve();
+			await oldConnection.waitForPendingShutdownWork();
+			expect(manager.hasPendingShutdownWork()).toBe(false);
+			expect(database.query("SELECT kind FROM late_writes ORDER BY kind").all()).toEqual([
+				{ kind: "audit" },
+				{ kind: "handler" },
+			]);
+		} finally {
+			release.resolve();
+			auditRelease.resolve();
+			await supervisor.shutdown();
+			await oldConnection.waitForPendingShutdownWork();
+			database.close();
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -729,6 +969,139 @@ describe("RuntimeSupervisor", () => {
 		};
 	}
 
+	it("rejects a cancelled options start before registering or spawning a runtime", async () => {
+		const supervisor = new RuntimeSupervisor();
+		const runner = new FakeRunner();
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled before registration"));
+		try {
+			await expect(
+				supervisor.start({ ...baseRuntimeOptions, runner }, controller.signal),
+			).rejects.toThrow("cancelled before registration");
+			expect(supervisor.get(baseRuntimeOptions.pluginId)).toBeUndefined();
+			expect(runner.handles).toEqual([]);
+		} finally {
+			await supervisor.shutdown();
+		}
+	});
+
+	it("forwards options-start cancellation and cancels a failure-triggered restart", async () => {
+		const h = recoveryHarness();
+		const controller = new AbortController();
+		let entered!: () => void;
+		const entering = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const start = spyOn(h.runner, "start").mockImplementation(
+			(options) =>
+				new Promise<PluginProcessHandle>((_resolve, reject) => {
+					entered();
+					if (!options.signal) throw new Error("missing runner cancellation signal");
+					expect(options.signal).toBe(controller.signal);
+					options.signal.addEventListener("abort", () => reject(options.signal?.reason), {
+						once: true,
+					});
+				}),
+		);
+		const result = h.supervisor
+			.start({ ...baseRuntimeOptions, runner: h.runner }, controller.signal)
+			.then(
+				() => new Error("cancelled runtime unexpectedly became active"),
+				(error: unknown) => error,
+			);
+		try {
+			await entering;
+			controller.abort(
+				new PluginRuntimeError("cancelled during spawn", {
+					code: "START_CANCELLED",
+					kind: "transport",
+				}),
+			);
+			expect(await result).toMatchObject({ code: "START_CANCELLED" });
+			expect(h.supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+			expect(h.scheduled()).toHaveLength(1);
+			h.fire(0);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(h.supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+		} finally {
+			controller.abort();
+			await result;
+			await h.cleanup();
+			start.mockRestore();
+		}
+	});
+
+	it("forwards options-activate cancellation to its own real child and waits for exit", async () => {
+		const supervisor = new RuntimeSupervisor();
+		const runner = new LocalProcessRunner({
+			allowedCwds: [fixtureCwd],
+			allowUnboundedResourceUsage: process.platform === "win32",
+		});
+		const controller = new AbortController();
+		let entered!: () => void;
+		let release!: () => void;
+		const entering = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let owned: PluginProcessHandle | undefined;
+		const originalStart = runner.start.bind(runner);
+		const start = spyOn(runner, "start").mockImplementation(async (options) => {
+			const child = await originalStart(options);
+			owned = child;
+			entered();
+			await gate;
+			return child;
+		});
+		const result = supervisor
+			.activate(
+				{
+					...baseRuntimeOptions,
+					command: [bunPath, fixturePath, "slow"],
+					runner,
+					idleTimeoutMs: 3_000,
+					totalTimeoutMs: 5_000,
+					timeouts: { handshakeMs: 2_000, activationMs: 1_000, shutdownMs: 500, drainMs: 50 },
+				},
+				controller.signal,
+			)
+			.then(
+				() => ({ completed: true as const }),
+				(error: unknown) => ({ completed: false as const, error }),
+			);
+		try {
+			await Promise.race([
+				entering,
+				result.then((outcome) => {
+					if (!outcome.completed) throw outcome.error;
+					throw new Error("runtime became active before the test gate");
+				}),
+			]);
+			const child = owned;
+			const pid = child?.pid;
+			if (!child || !pid) throw new Error("expected the test-owned child PID");
+			expect(start.mock.calls[0]?.[0].signal).toBe(controller.signal);
+			controller.abort(new Error("cancel test-owned child"));
+			release();
+			expect(await result).toMatchObject({ completed: false, error: expect.any(Error) });
+			await supervisor.shutdown();
+			await child.exited;
+			expect(() => process.kill(pid, 0)).toThrow();
+			expect(supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+		} finally {
+			controller.abort();
+			release();
+			await result;
+			await supervisor.shutdown();
+			await owned?.terminate?.("test cleanup");
+			start.mockRestore();
+		}
+	}, 15_000);
+
 	it("recovery counts error plus exit only once against the restart budget", async () => {
 		const h = recoveryHarness({ maxRestarts: 1, maxTotalRestarts: 10 });
 		try {
@@ -747,6 +1120,56 @@ describe("RuntimeSupervisor", () => {
 			expect(h.scheduled()).toHaveLength(1);
 		} finally {
 			await h.cleanup();
+		}
+	});
+
+	it("throwing state observers cannot skip startup, recovery or shutdown ownership", async () => {
+		const h = recoveryHarness();
+		const observed: string[] = [];
+		const records: unknown[] = [];
+		const canary = "state-observer-/private/user-body";
+		const log = spyOn(logger, "warn").mockImplementation((message, data) => {
+			records.push({ message, data });
+		});
+		try {
+			const runtime = await h.supervisor.start({
+				...baseRuntimeOptions,
+				runner: h.runner,
+				onStateChange(state) {
+					observed.push(state);
+					throw new Error(canary);
+				},
+				onCrash() {
+					throw new Error(canary);
+				},
+			});
+			expect(runtime.state).toBe("active");
+			h.runner.handles[0].finish(1);
+			expect(h.scheduled()).toHaveLength(1);
+			h.fire(0);
+			await eventually(() => runtime.state === "active");
+			expect(runtime.generation).toBe(2);
+			await h.supervisor.shutdown();
+			expect(runtime.state).toBe("stopped");
+			expect(observed).toContain("starting");
+			expect(observed).toContain("crashed");
+			expect(observed).toContain("stopped");
+			expect(await Promise.all(h.runner.handles.map((handle) => handle.exited))).toEqual([1, 0]);
+			expect(records).toContainEqual({
+				message: "Plugin runtime health",
+				data: { code: "state_observer_failed", generation: 1 },
+			});
+			expect(records).toContainEqual({
+				message: "Plugin runtime health",
+				data: { code: "crash_observer_failed", generation: 1 },
+			});
+			expect(JSON.stringify(records)).not.toContain(canary);
+		} finally {
+			try {
+				await h.cleanup();
+			} finally {
+				log.mockRestore();
+			}
 		}
 	});
 
@@ -854,6 +1277,30 @@ describe("RuntimeSupervisor", () => {
 			expect(restart).not.toHaveBeenCalled();
 			expect(runtime.generation).toBe(1);
 			expect(h.runner.handles).toHaveLength(1);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it.each([
+		"scheduled",
+		"future",
+	] as const)("stopping producers blocks %s recovery without creating another runtime generation", async (failure) => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const restart = spyOn(runtime, "restart");
+			if (failure === "scheduled") h.runner.handles[0].finish(1);
+			h.supervisor.stopProducers();
+			if (failure === "scheduled") h.fire(0);
+			else h.runner.handles[0].finish(1);
+			// The mutex is a FIFO barrier for an already-dequeued recovery callback.
+			await h.supervisor.disable(runtime.pluginId);
+			expect(restart).not.toHaveBeenCalled();
+			expect(h.scheduled()).toHaveLength(failure === "scheduled" ? 1 : 0);
+			expect(runtime.generation).toBe(1);
+			expect(h.runner.handles).toHaveLength(1);
+			await expect(h.supervisor.start(runtime.pluginId)).rejects.toThrow("closed");
 		} finally {
 			await h.cleanup();
 		}

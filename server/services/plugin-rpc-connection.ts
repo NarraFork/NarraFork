@@ -65,6 +65,8 @@ export interface PluginRpcDispatchOptions {
 	generation?: number;
 	requestBytes?: number;
 	deadlineAt?: string;
+	/** Host-only ownership hook for real work that outlives a deadline/cancellation response. */
+	trackWork?: (work: Promise<unknown>) => void;
 }
 
 export interface PluginRpcConnectionErrorOptions {
@@ -112,6 +114,8 @@ interface MutableInboundRequest extends PluginRpcInboundRequest {
 	resolveTerminal: (response: JsonRpcResponse) => void;
 	terminal: Promise<JsonRpcResponse>;
 	deadlineTimer?: ReturnType<typeof setTimeout>;
+	trackWork?: NonNullable<PluginRpcDispatchOptions["trackWork"]>;
+	cancelWork?: Promise<unknown>;
 }
 
 export interface PluginRpcOutboundPending {
@@ -119,6 +123,7 @@ export interface PluginRpcOutboundPending {
 	key: string;
 	generation: number;
 	startedAt: number;
+	maxResponseBytes?: number;
 	resolve: (response: JsonRpcResponse) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
@@ -347,6 +352,8 @@ export interface PluginRpcConnectionOptions {
 	transport?: PluginRpcTransport;
 	generation?: number;
 	maxInFlight?: number;
+	/** Carry actual host occupancy across retired connections, without changing wire limits. */
+	pendingInboundElsewhere?: () => number;
 	/** Inbound frame cap; also the outbound default for existing callers. */
 	maxFrameBytes?: number;
 	/** Host-to-plugin cap, independent of untrusted inbound traffic. */
@@ -406,6 +413,10 @@ export const RPC_REQUEST_NOT_HANDLED = Symbol("RPC_REQUEST_NOT_HANDLED");
 export class PluginRpcConnection {
 	readonly outboundPending = new Map<string, PluginRpcOutboundPending>();
 	readonly inboundActive = new Map<string, MutableInboundRequest>();
+	// Response state can end before the actual host operation. Keep its capacity and ownership
+	// until dispatch and all registered children settle, including after close/generation changes.
+	private readonly inboundExecuting = new Set<object>();
+	private inboundIdle?: ReturnType<typeof Promise.withResolvers<void>>;
 
 	private readonly maxInFlight: number;
 	private readonly maxFrameBytes: number;
@@ -518,6 +529,19 @@ export class PluginRpcConnection {
 
 	get inboundActiveCount(): number {
 		return this.inboundActive.size;
+	}
+
+	get pendingInboundCount(): number {
+		return this.inboundExecuting.size;
+	}
+
+	hasPendingShutdownWork(): boolean {
+		return this.pendingInboundCount > 0;
+	}
+
+	/** Closed connections cannot accept new calls; children of existing calls remain owned. */
+	waitForPendingShutdownWork(): Promise<void> {
+		return this.inboundIdle?.promise ?? Promise.resolve();
 	}
 
 	get priorityWriter(): PluginPriorityWriter {
@@ -664,6 +688,7 @@ export class PluginRpcConnection {
 		options: {
 			signal?: AbortSignal;
 			timeoutMs?: number;
+			maxResponseBytes?: number;
 			id?: RpcId;
 			priority?: RpcMessagePriority;
 		} = {},
@@ -721,6 +746,9 @@ export class PluginRpcConnection {
 				key,
 				generation: this.generationValue,
 				startedAt: Date.now(),
+				...(options.maxResponseBytes === undefined
+					? {}
+					: { maxResponseBytes: positiveInteger(options.maxResponseBytes, "maxResponseBytes") }),
 				resolve: (response) =>
 					finish(() => {
 						clearTimeout(timer);
@@ -797,7 +825,11 @@ export class PluginRpcConnection {
 		active.cancelled = true;
 		active.controller.abort(reason);
 		try {
-			void Promise.resolve(this.dispatcher?.cancel?.(id, reason)).catch(() => undefined);
+			if (!active.cancelWork) {
+				active.cancelWork = Promise.resolve(this.dispatcher?.cancel?.(id, reason));
+				active.trackWork?.(active.cancelWork);
+				void active.cancelWork.catch(() => undefined);
+			}
 		} catch {
 			// Dispatcher cancellation is best effort; the transport response remains authoritative.
 		}
@@ -1066,6 +1098,18 @@ export class PluginRpcConnection {
 		this.outboundPending.delete(pending.key);
 		clearTimeout(pending.timer);
 		pending.removeAbort?.();
+		if (
+			pending.maxResponseBytes !== undefined &&
+			jsonBodyBytes(response) > pending.maxResponseBytes
+		) {
+			pending.reject(
+				new PluginRpcConnectionError("RPC response exceeds this request's byte limit", {
+					code: "RESPONSE_FRAME_LIMIT",
+					phase: pending.request.method,
+				}),
+			);
+			return;
+		}
 		pending.resolve(response);
 	}
 
@@ -1093,16 +1137,22 @@ export class PluginRpcConnection {
 			}
 		}
 		const dispatcher = this.dispatcher;
-		if (dispatcher?.dispatchNotification) {
+		if (dispatcher?.dispatchNotification && !this.inboundBudgetFull()) {
+			const owner = this.ownInboundWork();
 			try {
-				void Promise.resolve(
-					dispatcher.dispatchNotification(notification, {
-						generation: this.generationValue,
-						requestBytes: bodyBytes,
-					}),
-				).catch(() => undefined);
+				owner.trackWork(
+					Promise.resolve(
+						dispatcher.dispatchNotification(notification, {
+							generation: this.generationValue,
+							requestBytes: bodyBytes,
+							trackWork: owner.trackWork,
+						}),
+					),
+				);
 			} catch {
 				// Notification dispatch is best effort and cannot break transport routing.
+			} finally {
+				owner.settled();
 			}
 		}
 		if (notificationFeatures === undefined && !dispatcher?.dispatchNotification) {
@@ -1115,6 +1165,32 @@ export class PluginRpcConnection {
 				// A notification observer must not break transport dispatch.
 			}
 		}
+	}
+
+	private inboundBudgetFull(): boolean {
+		return (
+			this.pendingInboundCount + (this.options.pendingInboundElsewhere?.() ?? 0) >= this.maxInFlight
+		);
+	}
+
+	private ownInboundWork() {
+		const token = {};
+		this.inboundExecuting.add(token);
+		this.inboundIdle ??= Promise.withResolvers<void>();
+		let remaining = 1; // Includes response routing, separately from actual execution.
+		const settled = () => {
+			if (--remaining !== 0) return;
+			this.inboundExecuting.delete(token);
+			if (this.inboundExecuting.size === 0) {
+				this.inboundIdle?.resolve();
+				this.inboundIdle = undefined;
+			}
+		};
+		const trackWork = (work: Promise<unknown>) => {
+			remaining++;
+			void work.then(settled, settled);
+		};
+		return { trackWork, settled };
 	}
 
 	private async handleInboundRequest(request: JsonRpcRequest): Promise<void> {
@@ -1138,7 +1214,7 @@ export class PluginRpcConnection {
 			);
 			return;
 		}
-		if (this.inboundActive.size >= this.maxInFlight) {
+		if (this.inboundBudgetFull()) {
 			await this.sendError(
 				request.id,
 				JSON_RPC_ERROR_CODES.PLUGIN_BUSY,
@@ -1177,9 +1253,11 @@ export class PluginRpcConnection {
 			resolveTerminal(this.makeTimeoutResponse(active));
 		}, inboundDeadline.timeoutMs);
 		this.inboundActive.set(key, active);
+		const { trackWork, settled } = this.ownInboundWork();
+		active.trackWork = trackWork;
 		try {
-			const operation = this.dispatchInbound(request, active);
-			operation.catch(() => undefined);
+			const operation = this.dispatchInbound(request, active, trackWork);
+			trackWork(operation);
 			const response = await Promise.race([operation, terminal]);
 			if (active.responded || this.closed || active.generation !== this.generationValue) return;
 			active.responded = true;
@@ -1191,12 +1269,14 @@ export class PluginRpcConnection {
 		} finally {
 			if (active.deadlineTimer) clearTimeout(active.deadlineTimer);
 			this.inboundActive.delete(key);
+			settled();
 		}
 	}
 
 	private async dispatchInbound(
 		request: JsonRpcRequest,
 		active: MutableInboundRequest,
+		trackWork: NonNullable<PluginRpcDispatchOptions["trackWork"]>,
 	): Promise<JsonRpcResponse> {
 		const context: PluginRpcRequestHandlerContext = {
 			signal: active.controller.signal,
@@ -1205,6 +1285,7 @@ export class PluginRpcConnection {
 			generation: this.generationValue,
 			requestBytes: jsonBodyBytes(request),
 			deadlineAt: active.deadlineAt,
+			trackWork,
 		};
 		const handler = this.options.requestHandler;
 		if (handler) {

@@ -928,6 +928,7 @@ export class PluginPermissionStore {
 		pluginId: string,
 		installationId: string,
 		summary: PluginGrantSummary,
+		seedGrantedBy = "legacy-state",
 	): Promise<PluginPermissionSet> {
 		const current = await this.getSet(pluginId, installationId);
 		if (await this.hasSet(pluginId, installationId)) {
@@ -956,12 +957,12 @@ export class PluginPermissionStore {
 				capability: capability as PermissionGrant["capability"],
 				scope: { type: "global" },
 				grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
-				grantedBy: "legacy-state",
+				grantedBy: seedGrantedBy,
 			}));
 		const result = await this.replace(pluginId, installationId, grants, {
 			expectedRevision: current.revision,
 			targetRevision: Math.max(summary.revision, current.revision + 1),
-			grantedBy: "legacy-state",
+			grantedBy: seedGrantedBy,
 		});
 		return result.set;
 	}

@@ -28,6 +28,24 @@ Manifest、权限授予、沙箱和安装包格式由插件系统其他设计文
 
 ---
 
+### 1.2 已实现：Custom API 额度协议（可选 feature 扩展）
+
+额度扩展只处理 `settings.customApiProviders`；Codex、CommandCode、TokenDance、NUG 与既有 provider 插件不迁移、不由额度源接管。
+
+- Manifest 的 `contributes.quotaSources` 直接复用 [shared/provider-quota.ts](../../shared/provider-quota.ts) 的 `providerQuotaSourceSchema`；这是独立后端贡献，不绑定 `providerId`、不注册模型前缀，也不调用 `provider.describe`。旧 Manifest 缺省解析为 `quotaSources: []`。
+- `onQuota:<localId>`（或当前插件的完整贡献 ID）触发有界懒激活；宿主调用单次 unary `quota.query`，其业务协议版本是 `1.0`，与原有 Host API 版本机制、stdio `narrafork.rpc/1` 分开。
+- 返回值必须通过 `quotaQueryResultSchema`：规范化结果最多 16 KiB UTF-8，数量/数字/纯文本/错误码都有约束，不返回 HTML 或任意上游错误正文。宿主在对应 pending RPC 上另设独立响应上限，不扩大所有插件的入站 frame 限制。
+- 插件请求上游时只能调用后端专用 `provider.connection.request`，必须协商 `host_api.requests` 和 `host_api.provider_connection`，并持有 live `quota.provide`、`provider.connection.request` grant。两个能力有不同、可逆的一对一 canonical 映射；iframe 桥明确拒绝这个后端方法，共享方法清单与后端差集由 parity 测试精确校验。
+- `quota.query` 参数只含非秘密 Custom API target 与短期 opaque `reference`。宿主从真实 runtime binding 注入 plugin/install/runtime/generation 身份；插件不能通过参数自报 principal、target 或 credentials。连接服务复核当前 Custom API 配置代次、同源 URL、声明的 GET 路径、查询键和认证模式，返回最多 256 KiB 上游 body。JSON 转义的最坏情况有独立、有界出站封装余量，不能把 16 KiB 规范化额度与 256 KiB 原始 body 混为一谈。
+- 整次查询预算最多 30 秒，包含激活、授权、连接引用、RPC 和取消；单次连接请求最多 20 秒。禁用、卸载、升级/回滚、授权撤销和已绑定 runtime 代次变化都会取消在途查询并撤销引用。所有异步授权结束后再次同步复核 runtime、binding、安装身份、包代次与 grants；迟到成功不会写入新代次。
+- [server/services/plugin-quota-registry.ts](../../server/services/plugin-quota-registry.ts) 已接入 catalog/coordinator/manager/platform lifecycle。初次 catalog 未就绪时 driver 的 `isReady()` 为 false，通用服务保留 pending，不能据空目录宣告 unsupported。源 revision 使用安装身份、不可变包代次、贡献/声明摘要及持久 grant revision，兼顾重启缓存复用与重装失效。
+- 可选后端扩展提供 `provider.connection.request.destination?: "provider" | "site-account"`；缺省仍是 provider。站点账号必须同时命中 `request.auth: "site-token"`，只能访问宿主保存的站点根下固定 `/api/user/self`、无查询串，宿主注入站点 token 和 `New-Api-User`，不合并 inference headers、不跨 origin、不跟随重定向。显式账号配置不完整时是确定性失败，不偷偷退回推理 Key。
+- `quota.query.target` schema 可含 `keyId` 与 `siteQuota: { root: string | null }`，但这不代表这些字段都发到插件 wire。当前 registry 将 Key 身份绑定在短期 connection lease，并从兼容性 wire target 移除 `keyId`；传给插件的是 provider 级 `id: "custom-api/<providerId>"`。站点账号 root 只表达宿主已绑定的非秘密配置，不能覆盖 reference 对应的连接。公开 snapshot 可含 `keyId` 和 `pushCompatible: false`，防止账号余额或指定 Key 结果被另一 inference-key 的 push 文本替换。
+- `amounts[]` 的可选 `display: "summary" | "detail"` 控制摘要显示，省略保留旧版摘要行为；可选 `quota: "required" | "alternative" | "none"` 控制是否约束耗尽状态，省略等同 required。一个 data snapshot 中的 alternative 金额构成来源声明的单一替代池：任一正额/unlimited 为可用；全部已知且耗尽才 exhausted，未知会阻止推断耗尽。该池不跨 target/source，也绝不跨 currency 求和；none 仅作明细，不参与额度判定。Sub2API 订阅周期通过通用 `windows[]` 表达，旧 amount 仅作明细兼容投影；没有可信 resetAt 时保持 null。
+- 业务错误新增 `auth_failed`，仍只返回固定枚举；认证失败不伪装成成功零额或 unlimited。只有 site-account 站点 token 的 HTTP 401/403 映射为确定性 auth_failed；普通 provider-key 的 401/403 仍按既有 transient 策略，不能统一宣称认证错误。`refresh.keepLastGoodMs` 可选且无默认值（relay 为 600000 ms），只约束临时失败后的 last-good 保留；确定性 site auth/config/协议错误清除旧成功值，省略该设置的源保留原 SWR。
+
+可选 `plugin-source.json` 和来源/更新管理属于宿主管理层，不新增此 RPC 协议的方法，也不修改 Host API 原有版本维护。catalog 只返回 `sourceHint`/`sourceDiagnostics`；来源提示不能替代连接 reference、live grant 或已批准来源绑定。本地来源的 latest 由可信 NF descriptor 决定，延迟 load 才验证 archive 字节/摘要；未知包的自报 local/builtin 标记不注册新可信身份，无 homepage 时不补链接。
+
 ## 2. 当前代码事实与约束
 
 ### 2.1 `ProviderAdapter` 不是纯网络客户端接口

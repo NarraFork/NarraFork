@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import type { PluginSource, PluginSourceDiagnostic } from "@shared/plugin-source";
 import { formatZodError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
 import { type Manifest, safeParseManifest, type ViewSurface } from "../lib/plugins/manifest";
 import { NARRAFORK_RPC_PROTOCOL } from "../lib/plugins/protocol";
+import { readPluginSourceMetadata } from "../lib/plugins/source-metadata";
 import { compileThemeContribution } from "../lib/plugins/theme-compiler";
+import { builtinPluginCatalog } from "./builtin-plugin-catalog";
 import {
 	type CurrentPackagePointer,
 	type CurrentPointerFile,
@@ -61,7 +64,7 @@ export interface PluginContributionSummary {
 	hash: string;
 	id: string;
 	fullId: string;
-	kind: "provider" | "tool" | "command" | "event" | "view" | "theme";
+	kind: "provider" | "quotaSource" | "tool" | "command" | "event" | "view" | "theme";
 	/** Surfaces a view contribution may mount on; absent for non-view kinds. */
 	surfaces?: PluginViewSurface[];
 	title?: string;
@@ -109,28 +112,39 @@ export interface PluginManifestSummary {
 	activationEvents: string[];
 }
 
-export interface PluginPackageSummary {
+export interface PluginDistributionSummary {
+	/** A known NF-distributed identity is a label, not an exemption from package/trust validation. */
+	origin?: "builtin" | "installed";
+	packageKind?: "builtin-directory" | "installed";
+	canUninstall?: boolean;
+	/** Author-supplied hint only; configured bindings and automatic-update choices live elsewhere. */
+	sourceHint?: PluginSource | null;
+	/** Optional-file failures must not join the diagnostics that determine runtime compatibility. */
+	sourceDiagnostics?: PluginSourceDiagnostic[];
+}
+
+export interface PluginPackageSummary extends PluginDistributionSummary {
 	pluginId: string;
 	version: string;
 	hash: string;
 	path: string;
 	status: PluginPackageStatus;
 	isCurrent: boolean;
-	/** Shipped with the application instead of installed into the package store. */
+	/** Legacy read-only directory package; NF archives use origin/packageKind instead. */
 	builtin?: boolean;
 	manifest?: PluginManifestSummary;
 	contributions: PluginContributionSummary[];
 	diagnostics: PluginDiagnostic[];
 }
 
-export interface PluginCatalogPlugin {
+export interface PluginCatalogPlugin extends PluginDistributionSummary {
 	pluginId: string;
 	status: PluginStatus;
 	current: CurrentPackagePointer | null;
 	packages: PluginPackageSummary[];
 	contributions: PluginContributionSummary[];
 	diagnostics: PluginDiagnostic[];
-	/** Shipped with the application instead of installed into the package store. */
+	/** Legacy read-only directory package; NF archives use origin/packageKind instead. */
 	builtin?: boolean;
 }
 
@@ -179,6 +193,14 @@ function packageSort(a: { pluginId: string; version: string; hash: string }, b: 
 
 function contributionSort(a: PluginContributionSummary, b: PluginContributionSummary): number {
 	return a.id.localeCompare(b.id) || a.kind.localeCompare(b.kind);
+}
+
+function distributionSummary(pluginId: string, readonlyBuiltin = false): PluginDistributionSummary {
+	return {
+		origin: readonlyBuiltin || builtinPluginCatalog.get(pluginId) ? "builtin" : "installed",
+		packageKind: readonlyBuiltin ? "builtin-directory" : "installed",
+		canUninstall: !readonlyBuiltin,
+	};
 }
 
 function toManifestSummary(manifest: Manifest): PluginManifestSummary {
@@ -275,6 +297,10 @@ function contributionSummaries(
 		}
 	};
 	add("provider", manifest.contributes.providers as unknown as Array<Record<string, unknown>>);
+	add(
+		"quotaSource",
+		manifest.contributes.quotaSources as unknown as Array<Record<string, unknown>>,
+	);
 	add("tool", manifest.contributes.tools as unknown as Array<Record<string, unknown>>);
 	add("command", manifest.contributes.commands as unknown as Array<Record<string, unknown>>);
 	add("event", manifest.contributes.events as unknown as Array<Record<string, unknown>>);
@@ -542,6 +568,9 @@ export class PluginCatalog {
 				contributions,
 				diagnostics,
 				builtin: builtin || undefined,
+				...distributionSummary(pluginId, builtin),
+				sourceHint: currentPackage?.sourceHint ?? null,
+				sourceDiagnostics: currentPackage?.sourceDiagnostics ?? [],
 			};
 		});
 		return {
@@ -571,6 +600,9 @@ export class PluginCatalog {
 			path: this.packagePath(pluginId, pointer),
 			status: "missing",
 			isCurrent: true,
+			...distributionSummary(pluginId),
+			sourceHint: null,
+			sourceDiagnostics: [],
 			contributions: [],
 			diagnostics: [diagnostic("CURRENT_PACKAGE_MISSING", "Current package directory is missing")],
 		};
@@ -729,16 +761,27 @@ export class PluginCatalog {
 			status: "corrupt",
 			isCurrent,
 			builtin: location?.builtin,
+			...distributionSummary(pluginId, Boolean(location)),
+			sourceHint: null,
+			sourceDiagnostics: [],
 			contributions: [],
 			diagnostics,
 		};
 		try {
-			const packageRealPath = await withTimeout(
-				realpath(packagePath),
-				this.timeoutMs,
-				"package realpath",
-			);
-			if (!isInsidePath(resolutionRoot, packageRealPath)) {
+			// Canonicalize both roots: TEMP/profile aliases can differ from realpath on Windows.
+			const [storeRealPath, resolutionRealPath, packageRealPath] = await Promise.all([
+				withTimeout(
+					realpath(location ? resolutionRoot : this.root),
+					this.timeoutMs,
+					"plugin root realpath",
+				),
+				withTimeout(realpath(resolutionRoot), this.timeoutMs, "packages realpath"),
+				withTimeout(realpath(packagePath), this.timeoutMs, "package realpath"),
+			]);
+			if (
+				!isInsidePath(storeRealPath, resolutionRealPath) ||
+				!isInsidePath(resolutionRealPath, packageRealPath)
+			) {
 				diagnostics.push(
 					diagnostic(
 						"PACKAGE_PATH_ESCAPE",
@@ -818,6 +861,24 @@ export class PluginCatalog {
 					),
 				);
 				return base;
+			}
+			try {
+				const sourceMetadata = await withTimeout(
+					readPluginSourceMetadata(packageRealPath, pluginId, {
+						signal: AbortSignal.timeout(this.timeoutMs),
+					}),
+					this.timeoutMs,
+					"plugin source metadata read",
+				);
+				base.sourceHint = sourceMetadata.source;
+				base.sourceDiagnostics = sourceMetadata.diagnostics;
+			} catch {
+				base.sourceDiagnostics = [
+					{
+						code: "SOURCE_UNREADABLE",
+						message: "Plugin source metadata could not be read within its budget",
+					},
+				];
 			}
 			const declaredEntries = [
 				manifest.server?.entry,
@@ -900,6 +961,11 @@ export class PluginCatalog {
 					status: "corrupt",
 					isCurrent: true,
 					builtin: true,
+					origin: "builtin",
+					packageKind: "builtin-directory",
+					canUninstall: false,
+					sourceHint: null,
+					sourceDiagnostics: [],
 					contributions: [],
 					diagnostics: [
 						diagnostic("MANIFEST_TOO_LARGE", "manifest.json exceeds the size limit", manifestPath),
@@ -922,6 +988,11 @@ export class PluginCatalog {
 					status: "corrupt",
 					isCurrent: true,
 					builtin: true,
+					origin: "builtin",
+					packageKind: "builtin-directory",
+					canUninstall: false,
+					sourceHint: null,
+					sourceDiagnostics: [],
 					contributions: [],
 					diagnostics: [diagnostic("MANIFEST_INVALID", formatZodError(parsed.error), manifestPath)],
 				};

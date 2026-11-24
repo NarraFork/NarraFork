@@ -10,7 +10,7 @@
  * would open the database read-write, defeating the point of an isolated probe.
  */
 
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import {
 	DB_INTEGRITY_MODE_ENV,
 	DB_INTEGRITY_PATH_ENV,
@@ -49,9 +49,11 @@ function runProbe(): IntegrityProbeReport {
 		};
 	}
 
+	let statement: Statement | undefined;
 	try {
 		const pragma = mode === "full" ? "integrity_check" : "quick_check";
-		const rows = db.prepare(`PRAGMA ${pragma}`).all() as Record<string, unknown>[];
+		statement = db.prepare(`PRAGMA ${pragma}`);
+		const rows = statement.all() as Record<string, unknown>[];
 		const messages = rows
 			.map((row) => String(row[pragma] ?? Object.values(row)[0] ?? ""))
 			.filter((value) => value.length > 0);
@@ -74,6 +76,15 @@ function runProbe(): IntegrityProbeReport {
 			durationMs: Date.now() - startedAt,
 		};
 	} finally {
+		// Finalize before close. An unfinalized statement turns close() into a deferred
+		// "zombie" close, so the connection (and its file locks) is only torn down by process
+		// exit. On Windows that teardown made the server's writes fail with "database is
+		// locked" for over a second after every probe.
+		try {
+			statement?.finalize();
+		} catch {
+			// best effort
+		}
 		try {
 			db?.close();
 		} catch {

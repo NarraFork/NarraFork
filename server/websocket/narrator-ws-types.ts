@@ -83,6 +83,7 @@ export interface RecentTabsSnapshotMessage {
 // Server → Client messages
 export type NarratorServerMessage =
 	| import("@shared/reasoning-translation").ReasoningTranslationPatch
+	| { type: "provider_quota_changed"; providerIds: string[]; version: number }
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
 	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
@@ -967,6 +968,7 @@ export type NarratorServerMessage =
 	| {
 			type: "quota_balance";
 			narratorId: string;
+			customApiQuotaTarget?: { providerId: string; generation: string } | null;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
 			/** Parent copy of a subagent's frame: its balance is not the parent's. */

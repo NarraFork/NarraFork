@@ -89,6 +89,23 @@ function snapshot(...packages: PluginPackageSummary[]): PluginCatalogSnapshot {
 }
 
 describe("PluginContributionRegistry", () => {
+	test("discovers standalone quota contributions and indexes their declared onQuota activation", () => {
+		const pluginId = "com.example.quota-index";
+		const current = packageSummary({
+			pluginId,
+			contributions: [contribution(pluginId, "quota_", "quotaSource", { title: "Quota" })],
+			activationEvents: ["onQuota:quota_"],
+		});
+		const catalog = snapshot(current);
+		const registry = new PluginContributionRegistry(catalog);
+		expect(registry.listByKind("quotaSource")).toHaveLength(1);
+		expect(registry.listByKind("provider")).toEqual([]);
+		const activation = new ActivationIndex(catalog);
+		expect(activation.resolve("onQuota:quota_")).toMatchObject([
+			{ kind: "onQuota", contributionKind: "quotaSource", fullId: `${pluginId}/quota_` },
+		]);
+		expect(activation.getDiagnostics()).toEqual([]);
+	});
 	test("refreshes host-owned static entries by contribution kind", () => {
 		const pluginId = "com.example.registry";
 		const firstPackage = packageSummary({

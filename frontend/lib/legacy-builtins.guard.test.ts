@@ -214,16 +214,17 @@ const GUARDED_BUILTINS: readonly GuardedBuiltin[] = [
  * against the scan root rather than against the current directory.
  */
 function collectSourceFiles(root: string, dir: string = root, out: string[] = []): string[] {
-	for (const entry of readdirSync(dir)) {
-		const full = join(dir, entry);
-		const stats = statSync(full);
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const full = join(dir, entry.name);
+		// Preserve symlink traversal while ordinary entries use their directory metadata.
+		const stats = entry.isSymbolicLink() ? statSync(full) : entry;
 		if (stats.isDirectory()) {
-			if (shouldSkipDir(root, dir, entry)) continue;
+			if (shouldSkipDir(root, dir, entry.name)) continue;
 			collectSourceFiles(root, full, out);
 			continue;
 		}
-		const dot = entry.lastIndexOf(".");
-		if (dot >= 0 && SCAN_EXTENSIONS.has(entry.slice(dot))) out.push(full);
+		const dot = entry.name.lastIndexOf(".");
+		if (dot >= 0 && SCAN_EXTENSIONS.has(entry.name.slice(dot))) out.push(full);
 	}
 	return out;
 }
@@ -290,6 +291,7 @@ function collectBundledServerFiles(
 		...collectSourceFiles(FRONTEND_ROOT),
 		...collectSourceFiles(SHARED_ROOT),
 	],
+	readSource: (file: string) => string = (file) => readFileSync(file, "utf8"),
 ): string[] {
 	const queue: string[] = [];
 	const seen = new Set<string>();
@@ -309,14 +311,14 @@ function collectBundledServerFiles(
 	};
 	for (const file of entryFiles) {
 		if (isTestFile(file)) continue;
-		enqueue(readFileSync(file, "utf8"));
+		enqueue(readSource(file));
 	}
 	// Breadth-first over the reachable server modules. `queue` only grows through
 	// `enqueue`, which dedupes via `seen`, so this terminates on cyclic imports.
 	for (let i = 0; i < queue.length; i++) {
 		const file = queue[i];
 		if (!file) continue;
-		enqueue(readFileSync(file, "utf8"));
+		enqueue(readSource(file));
 	}
 	return [...seen].sort();
 }
@@ -361,16 +363,25 @@ function scanFile(file: string, source: string): Hit[] {
 }
 
 function scanRoots(): Hit[] {
+	const clientFiles = [...collectSourceFiles(FRONTEND_ROOT), ...collectSourceFiles(SHARED_ROOT)];
+	const sources = new Map<string, string>();
+	const readSource = (file: string): string => {
+		let source = sources.get(file);
+		if (source === undefined) {
+			source = readFileSync(file, "utf8");
+			sources.set(file, source);
+		}
+		return source;
+	};
 	const files = [
-		...collectSourceFiles(FRONTEND_ROOT),
-		...collectSourceFiles(SHARED_ROOT),
+		...clientFiles,
 		// Server modules only get scanned when the client bundle actually contains them.
-		...collectBundledServerFiles(),
+		...collectBundledServerFiles(clientFiles, readSource),
 	];
 	const hits: Hit[] = [];
 	for (const file of files) {
 		if (EXEMPT_FILES.has(file)) continue;
-		hits.push(...scanFile(file, readFileSync(file, "utf8")));
+		hits.push(...scanFile(file, readSource(file)));
 	}
 	return hits;
 }
@@ -388,6 +399,7 @@ function formatHits(hits: readonly Hit[]): string {
 }
 
 describe("legacy built-ins guard (Safari 14 build target)", () => {
+	// A complete client-tree scan includes synchronous filesystem IO and the transitive import graph.
 	it("uses no post-ES2020 built-in that lacks a polyfill", () => {
 		const banned = scanRoots().filter((hit) => hit.builtin.disposition === "banned");
 
@@ -402,7 +414,7 @@ describe("legacy built-ins guard (Safari 14 build target)", () => {
 			);
 		}
 		expect(banned).toHaveLength(0);
-	});
+	}, 15_000);
 
 	it("polyfill module is imported before anything else in main.tsx", () => {
 		const main = readFileSync(join(FRONTEND_ROOT, "main.tsx"), "utf8");
@@ -477,7 +489,7 @@ describe("legacy built-ins guard (Safari 14 build target)", () => {
 		// which in turn imports `@server/lib/id` — the second hop is the one a single-level
 		// walk would miss, and it is exactly where a `toSorted()` would hide.
 		const bundled = collectBundledServerFiles([join(SERVER_ROOT, "routes", "usage-history.ts")]);
-		const relatives = bundled.map((file) => relative(REPO_ROOT, file));
+		const relatives = bundled.map((file) => relative(REPO_ROOT, file).replaceAll("\\", "/"));
 		expect(relatives).toContain("server/services/credential-usage-totals.ts");
 		expect(relatives).toContain("server/lib/id.ts");
 	});

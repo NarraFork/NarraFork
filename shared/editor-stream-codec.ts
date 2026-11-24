@@ -77,7 +77,7 @@ export class EditorStreamCodec {
 			throw error;
 		}
 	}
-	push(bytes: Uint8Array, eof = false): { text: string; tags: Uint8Array } {
+	push(bytes: Uint8Array, eof = false): { text: string; tags: Uint8Array<ArrayBuffer> } {
 		if (this.ended) throw new Error("EDITOR_CODEC_CLOSED");
 		this.bytes += bytes.length;
 		if (this.bytes > EDITOR_FILE_MAX_BYTES) throw new Error("EDITOR_RAW_LIMIT");

@@ -25,7 +25,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalanceCapability } from "../../hooks/useProviderBalance";
+import { useProviderQuotaCapability } from "../../hooks/useProviderQuota";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";
@@ -203,10 +203,9 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		[t],
 	);
 	const geminiTransport = provider.geminiTransport ?? "generate-content";
-	// Quota querying is the apikey-quota plugin's capability: with the plugin disabled the
-	// site-quota inputs are removed instead of being shown as controls that cannot take effect.
-	// The stored values are untouched — they round-trip on save and reappear when it is enabled.
-	const quotaCapabilityEnabled = useProviderBalanceCapability();
+	// Site-account inputs share the host's Custom API quota-source capability with the
+	// saved snapshot. Disabling it hides controls without altering the stored draft.
+	const quotaCapabilityEnabled = useProviderQuotaCapability();
 	const geminiTransportData = useMemo(
 		() => [
 			{ value: "generate-content", label: t("geminiTransportGenerateContent") },

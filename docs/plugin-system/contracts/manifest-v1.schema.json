@@ -46,6 +46,7 @@
 			"default": {
 				"providers": [],
 				"searchProviders": [],
+				"quotaSources": [],
 				"tools": [],
 				"commands": [],
 				"events": [],
@@ -96,6 +97,10 @@
 										"minItems": 1
 									}
 								}
+							},
+							{
+								"required": ["quotaSources"],
+								"properties": { "quotaSources": { "minItems": 1 } }
 							},
 							{
 								"required": ["tools"],
@@ -159,6 +164,81 @@
 		}
 	],
 	"$defs": {
+		"pluginSourceMetadata": {
+			"$comment": "Optional plugin-source.json companion, not a manifest property. Derived from shared/plugin-source.ts; URL, path, control-character and identity refinements remain canonical parser checks. Missing/invalid source metadata does not invalidate an otherwise valid plugin.",
+			"type": "object",
+			"properties": {
+				"schemaVersion": { "type": "number", "const": 1 },
+				"pluginId": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128,
+					"pattern": "^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$"
+				},
+				"source": {
+					"oneOf": [
+						{
+							"type": "object",
+							"properties": {
+								"type": { "type": "string", "const": "github" },
+								"owner": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 100,
+									"pattern": "^[A-Za-z0-9_.-]+$"
+								},
+								"repo": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 100,
+									"pattern": "^[A-Za-z0-9_.-]+$"
+								},
+								"assetName": { "type": "string", "minLength": 1, "maxLength": 256 },
+								"metadataAsset": { "type": "string", "minLength": 1, "maxLength": 256 },
+								"checksumAsset": { "type": "string", "minLength": 1, "maxLength": 256 },
+								"homepage": { "type": "string", "minLength": 1, "maxLength": 2048 }
+							},
+							"required": ["type", "owner", "repo", "assetName"],
+							"additionalProperties": false
+						},
+						{
+							"type": "object",
+							"properties": {
+								"type": { "type": "string", "const": "website" },
+								"updateApi": { "type": "string", "minLength": 1, "maxLength": 2048 },
+								"downloadOrigins": {
+									"default": [],
+									"maxItems": 8,
+									"type": "array",
+									"items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+								},
+								"allowInsecureHttp": { "default": false, "type": "boolean" },
+								"homepage": { "type": "string", "minLength": 1, "maxLength": 2048 }
+							},
+							"required": ["type", "updateApi"],
+							"additionalProperties": false
+						},
+						{
+							"type": "object",
+							"properties": {
+								"type": { "type": "string", "const": "local" },
+								"builtinId": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 128,
+									"pattern": "^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$"
+								},
+								"homepage": { "type": "string", "minLength": 1, "maxLength": 2048 }
+							},
+							"required": ["type", "builtinId"],
+							"additionalProperties": false
+						}
+					]
+				}
+			},
+			"required": ["schemaVersion", "pluginId", "source"],
+			"additionalProperties": false
+		},
 		"controlFreeText": {
 			"type": "string",
 			"pattern": "^[^\\u0000-\\u001F\\u007F]*$"
@@ -315,6 +395,21 @@
 				},
 				"rpc": {
 					"$ref": "#/$defs/rpcProtocol"
+				},
+				"features": {
+					"type": "array",
+					"maxItems": 6,
+					"uniqueItems": true,
+					"items": {
+						"enum": [
+							"host_api.requests",
+							"host_api.notifications",
+							"host_api.provider_connection",
+							"rpc.cancel",
+							"stream.credit",
+							"events.poll"
+						]
+					}
 				},
 				"os": {
 					"type": "array",
@@ -793,6 +888,132 @@
 				}
 			}
 		},
+		"quotaSourceContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "title", "match", "requests"],
+			"$comment": "Derived from shared/provider-quota.ts providerQuotaSourceSchema; plain-text and absolute/suffix path rules remain canonical Zod refinements.",
+			"properties": {
+				"id": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128,
+					"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+				},
+				"title": { "type": "string", "minLength": 1, "maxLength": 200 },
+				"match": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"hosts": {
+							"type": "array",
+							"maxItems": 32,
+							"default": [],
+							"items": { "type": "string", "minLength": 1, "maxLength": 253 }
+						},
+						"pathPrefixes": {
+							"type": "array",
+							"maxItems": 32,
+							"default": [],
+							"items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+						},
+						"fallback": { "type": "boolean", "default": false }
+					}
+				},
+				"requests": {
+					"type": "array",
+					"minItems": 1,
+					"maxItems": 32,
+					"items": {
+						"type": "object",
+						"additionalProperties": false,
+						"required": ["path", "auth"],
+						"properties": {
+							"path": { "type": "string", "minLength": 1, "maxLength": 2048 },
+							"auth": {
+								"type": "string",
+								"enum": ["none", "bearer", "bearer-and-api-key", "site-token"]
+							},
+							"queryKeys": {
+								"type": "array",
+								"maxItems": 16,
+								"default": [],
+								"items": { "type": "string", "minLength": 1, "maxLength": 64 }
+							},
+							"headers": {
+								"type": "array",
+								"maxItems": 2,
+								"default": [],
+								"items": { "type": "string", "enum": ["accept", "user-agent"] }
+							}
+						}
+					}
+				},
+				"refresh": {
+					"type": "object",
+					"additionalProperties": false,
+					"default": {},
+					"properties": {
+						"staleMs": {
+							"type": "integer",
+							"minimum": 10000,
+							"maximum": 86400000,
+							"default": 60000
+						},
+						"keepLastGoodMs": {
+							"type": "integer",
+							"minimum": 0,
+							"maximum": 31536000000
+						},
+						"retryMs": {
+							"type": "integer",
+							"minimum": 10000,
+							"maximum": 86400000,
+							"default": 60000
+						},
+						"maxRetryMs": {
+							"type": "integer",
+							"minimum": 10000,
+							"maximum": 86400000,
+							"default": 600000
+						},
+						"activityMs": {
+							"type": "integer",
+							"minimum": 10000,
+							"maximum": 86400000,
+							"default": 20000
+						},
+						"unsupportedMs": {
+							"type": "integer",
+							"minimum": 60000,
+							"maximum": 604800000,
+							"default": 3600000
+						}
+					}
+				},
+				"limits": {
+					"type": "object",
+					"additionalProperties": false,
+					"default": {},
+					"properties": {
+						"timeoutMs": { "type": "integer", "minimum": 100, "maximum": 30000, "default": 30000 },
+						"requestTimeoutMs": {
+							"type": "integer",
+							"minimum": 100,
+							"maximum": 20000,
+							"default": 20000
+						},
+						"maxResponseBytes": {
+							"type": "integer",
+							"minimum": 1024,
+							"maximum": 262144,
+							"default": 262144
+						},
+						"maxRequests": { "type": "integer", "minimum": 1, "maximum": 16, "default": 8 }
+					}
+				}
+			}
+		},
 		"contributes": {
 			"type": "object",
 			"additionalProperties": false,
@@ -811,6 +1032,12 @@
 					"items": {
 						"$ref": "#/$defs/searchProviderContribution"
 					},
+					"default": []
+				},
+				"quotaSources": {
+					"type": "array",
+					"maxItems": 200,
+					"items": { "$ref": "#/$defs/quotaSourceContribution" },
 					"default": []
 				},
 				"tools": {
@@ -1141,7 +1368,7 @@
 				"type": "string",
 				"minLength": 1,
 				"maxLength": 256,
-				"pattern": "^(?:onStartup|(?:onCommand|onView|onProvider|onTool|onEvent|onSchedule):.+)$"
+				"pattern": "^(?:onStartup|(?:onCommand|onView|onProvider|onQuota|onTool|onEvent|onSchedule):.+)$"
 			}
 		}
 	},

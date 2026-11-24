@@ -15,6 +15,7 @@ import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
+import { collectPluginBuildModules } from "./generate-builtin-plugins";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
 import { ALPHA_BUILD_LOCK, frontendBuildDirectory, resolveBuildProfile } from "./lib/build-profile";
@@ -170,6 +171,15 @@ async function runBuildStep(command: string[]): Promise<{ exitCode: number }> {
 	});
 }
 
+// Step 0: Always generate independent bundled archives, including --skip-frontend builds.
+// This runs once before all target compilations; plugin JavaScript never enters the host graph.
+console.log("→ Building bundled plugin archives...");
+const bundledPluginModules = await collectPluginBuildModules(ROOT);
+if (!bundledPluginModules.has("embedded-bundled-plugins.ts")) {
+	throw new Error("Bundled plugin archive module is missing");
+}
+console.log("✓ Built bundled plugin archive materials");
+
 // Step 1: Build frontend with Vite
 if (!skipFrontend) {
 	console.log("→ Building frontend...");
@@ -216,11 +226,9 @@ const buildInfo = {
 };
 const generatedDir = join(ROOT, "server", "generated");
 mkdirSync(generatedDir, { recursive: true });
-for (const [name, source] of await collectBuildModules(
-	ROOT,
-	assetsUnder(FRONTEND_DIR),
-	buildInfo,
-)) {
+const buildModules = await collectBuildModules(ROOT, assetsUnder(FRONTEND_DIR), buildInfo);
+for (const [name, source] of bundledPluginModules) buildModules.set(name, source);
+for (const [name, source] of buildModules) {
 	const path = join(generatedDir, name);
 	writeFileSync(path, source);
 	console.log(`Generated ${relative(ROOT, path)}`);

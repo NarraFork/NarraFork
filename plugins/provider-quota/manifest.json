@@ -1,0 +1,163 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "io.narrafork.provider-quota",
+	"version": "1.0.3",
+	"displayName": "Provider Quota",
+	"description": "Bounded Custom API allowance queries through credential-free Host API connections.",
+	"publisher": { "id": "io.narrafork", "name": "NarraFork" },
+	"license": "MPL-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": ["host_api.requests", "rpc.cancel", "host_api.provider_connection"],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 15000
+	},
+	"activationEvents": ["onStartup"],
+	"contributes": {
+		"quotaSources": [
+			{
+				"id": "relay",
+				"title": "Relay allowance",
+				"match": { "hosts": [], "pathPrefixes": [], "fallback": true },
+				"requests": [
+					{ "path": "/**/v1/usage", "auth": "bearer", "queryKeys": [], "headers": ["accept"] },
+					{
+						"path": "/**/api/usage/token/",
+						"auth": "bearer",
+						"queryKeys": [],
+						"headers": ["accept"]
+					},
+					{ "path": "/**/api/status", "auth": "none", "queryKeys": [], "headers": ["accept"] },
+					{
+						"path": "/**/api/user/self",
+						"auth": "site-token",
+						"queryKeys": [],
+						"headers": ["accept"]
+					}
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"keepLastGoodMs": 600000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 8000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 8
+				}
+			},
+			{
+				"id": "deepseek",
+				"title": "DeepSeek balance",
+				"match": { "hosts": ["api.deepseek.com"], "pathPrefixes": ["/"], "fallback": false },
+				"requests": [
+					{ "path": "/user/balance", "auth": "bearer", "queryKeys": [], "headers": ["accept"] }
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			},
+			{
+				"id": "kimi",
+				"title": "Kimi coding allowance",
+				"match": {
+					"hosts": ["kimi.com", "kimi.ai", "*.kimi.com", "*.kimi.ai"],
+					"pathPrefixes": [],
+					"fallback": false
+				},
+				"requests": [
+					{
+						"path": "/coding/v1/usages",
+						"auth": "bearer",
+						"queryKeys": [],
+						"headers": ["accept", "user-agent"]
+					}
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			},
+			{
+				"id": "opencode",
+				"title": "OpenCode Go allowance",
+				"match": {
+					"hosts": ["opencode.ai", "*.opencode.ai"],
+					"pathPrefixes": ["/zen/go/", "/inference/go/"],
+					"fallback": false
+				},
+				"requests": [
+					{
+						"path": "/zen/go/v1/usage",
+						"auth": "bearer-and-api-key",
+						"queryKeys": [],
+						"headers": ["accept"]
+					},
+					{
+						"path": "/inference/go/v1/usage",
+						"auth": "bearer-and-api-key",
+						"queryKeys": [],
+						"headers": ["accept"]
+					}
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["quota.provide", "provider.connection.request"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

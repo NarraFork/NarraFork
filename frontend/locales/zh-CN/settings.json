@@ -1,5 +1,6 @@
 {
 	"title": "设置",
+
 	"remoteAccessSection": "WebRTC 远程访问",
 	"remoteAccess": {
 		"description": "使用匹配版本的托管远程前端，让已配对浏览器直连此实例。配对不能替代管理员登录，业务流量不经信令服务器中继。",
@@ -51,6 +52,12 @@
 			"unknown": "未知"
 		}
 	},
+	"integrations": {
+		"capabilities": {
+			"quota": { "provide": "提供 Custom API 额度快照" },
+			"provider": { "connection": { "request": "经宿主管理的提供商连接读取额度" } }
+		}
+	},
 	"providerBalance": {
 		"wallet": "钱包余额",
 		"key": "Key 剩余额度",
@@ -69,7 +76,7 @@
 		"errorAuth": "站点访问令牌或用户 ID 被拒绝（401/403），请检查额度查询配置",
 		"errorInvalidResponse": "站点返回的数据不是可识别的额度响应，请检查接口根地址",
 		"errorInvalidConfiguration": "额度查询配置不完整：请同时填写接口根地址、访问令牌和用户 ID",
-		"errorPluginNotEnabled": "额度查询插件（apikey-quota）已停用，请在插件页启用后再查询",
+		"errorPluginNotEnabled": "Provider Quota 插件已停用，请在插件页启用后再查询",
 		"group": "分组：{{name}}",
 		"stale": "数据可能已过期",
 		"source": "来源：{{source}}",

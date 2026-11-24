@@ -240,6 +240,7 @@ describe("main shutdown wiring without booting the server", () => {
 		])
 			expect(position(owner)).toBeLessThan(db);
 		expect(position("httpHandlers.drain")).toBeLessThan(position("pluginManager.shutdown"));
+		expect(position("websocketHandlers.drain")).toBeLessThan(position("pluginManager.shutdown"));
 		expect(position("websocketHandlers.drain")).toBeLessThan(position("computeWorkers.close"));
 		expect(position("tokenWorkers.close")).toBeLessThan(position("modelHistoryWorkers.close"));
 		expect(shutdown).toContain("TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000");

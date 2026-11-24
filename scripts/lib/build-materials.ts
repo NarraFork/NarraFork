@@ -8,9 +8,9 @@ import { buildLicenseManifestFromDisk } from "../../server/lib/licenses/manifest
 import type { HelperDistributionDependencies } from "../../shared/helper-distribution";
 import type { LocalizedValue } from "../../shared/i18n-locales";
 import type { RemotePeerDistribution } from "../../shared/remote-peer";
-import { renderBuiltinPluginModule } from "../generate-builtin-plugins";
+import { collectPluginBuildModules } from "../generate-builtin-plugins";
 
-/** Shared by release and local builds; these functions never write into the checkout. */
+/** Shared by release and local builds; these functions never mutate source/generated files. */
 function collectAssetFiles(directory: string): string[] {
 	const files: string[] = [];
 	const pending = [directory];
@@ -168,6 +168,6 @@ export async function collectBuildModules(
 		["build-info.ts", renderBuildInfo(info)],
 		["embedded-changelog.ts", renderChangelogs(root)],
 		["embedded-licenses.ts", renderLicenses(root)],
-		["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(root)],
+		...(await collectPluginBuildModules(root)),
 	]);
 }

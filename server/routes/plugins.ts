@@ -1,5 +1,6 @@
 import { readdir, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pluginSourceSchema } from "@shared/plugin-source";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { z } from "zod/v4";
@@ -324,6 +325,35 @@ function sanitizeContribution(value: unknown): Record<string, unknown> {
 	return result;
 }
 
+function sanitizePluginDistribution(item: Record<string, unknown>): Record<string, unknown> {
+	const result: Record<string, unknown> = {};
+	if (item.origin === "builtin" || item.origin === "installed") result.origin = item.origin;
+	if (item.packageKind === "builtin-directory" || item.packageKind === "installed")
+		result.packageKind = item.packageKind;
+	for (const key of ["installed", "canUninstall", "canUpdate"] as const) {
+		if (typeof item[key] === "boolean") result[key] = item[key];
+	}
+	if (item.sourceHint === null) result.sourceHint = null;
+	else if (item.sourceHint && typeof item.sourceHint === "object") {
+		const source = pluginSourceSchema.safeParse(item.sourceHint);
+		if (source.success) result.sourceHint = source.data;
+	}
+	if (Array.isArray(item.sourceDiagnostics)) {
+		const messages = {
+			SOURCE_INVALID: "Plugin source metadata is invalid",
+			SOURCE_MISMATCH: "Plugin source metadata belongs to another plugin",
+			SOURCE_UNREADABLE: "Plugin source metadata is unavailable",
+		} as const;
+		result.sourceDiagnostics = item.sourceDiagnostics.slice(0, 10).flatMap((entry) => {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+			const code = (entry as Record<string, unknown>).code;
+			if (typeof code !== "string" || !Object.hasOwn(messages, code)) return [];
+			return [{ code, message: messages[code as keyof typeof messages] }];
+		});
+	}
+	return result;
+}
+
 function sanitizePluginListItem(value: unknown): Record<string, unknown> {
 	const summary = sanitizeSummary(value) as Record<string, unknown>;
 	if (!value || typeof value !== "object" || Array.isArray(value)) return summary;
@@ -336,6 +366,10 @@ function sanitizePluginListItem(value: unknown): Record<string, unknown> {
 				entry && typeof entry === "object" && (entry as Record<string, unknown>).isCurrent === true,
 		) as Record<string, unknown> | undefined;
 		if (currentPackage) {
+			for (const [key, field] of Object.entries(sanitizePluginDistribution(currentPackage))) {
+				if (summary[key] === undefined) summary[key] = field;
+			}
+			if (typeof summary.installed !== "boolean") summary.installed = true;
 			if (typeof currentPackage.version === "string") summary.version = currentPackage.version;
 			const manifest = currentPackage.manifest;
 			if (manifest && typeof manifest === "object" && !Array.isArray(manifest)) {
@@ -477,6 +511,7 @@ function sanitizeSummary(value: unknown): RouteResult {
 			} else result[key] = item[key];
 		}
 	}
+	for (const [key, field] of Object.entries(sanitizePluginDistribution(item))) result[key] = field;
 	if (Array.isArray(item.contributions))
 		result.contributions = item.contributions.map(sanitizeContribution);
 	if (Array.isArray(item.health)) result.health = item.health.map(sanitizeHealth);

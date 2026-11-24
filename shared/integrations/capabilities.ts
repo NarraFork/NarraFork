@@ -305,6 +305,18 @@ export const CANONICAL_CAPABILITY_DESCRIPTORS = {
 	 * carries a query rather than conversation history.
 	 */
 	"provider.search": capability("provider.search", "provider", "execute", "medium", true, true),
+	"quota.provide": capability("quota.provide", "provider", "execute", "medium", false, false, {
+		allowedSubjects: ["plugin_installation"],
+	}),
+	"provider.connection.request": capability(
+		"provider.connection.request",
+		"provider",
+		"execute",
+		"high",
+		false,
+		true,
+		{ allowedSubjects: ["plugin_installation"], defaultRedaction: "secrets" },
+	),
 	"config.read": capability("config.read", "config", "read", "low", true),
 	"config.write": capability("config.write", "config", "write", "medium", true),
 	"secret.use": capability("secret.use", "secret", "execute", "critical", true),

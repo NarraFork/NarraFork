@@ -333,6 +333,8 @@ export type NarraForkEvent =
 			filesDone: number;
 	  }
 	| { type: "transfer:error"; transferId: string; deviceId: string; error: string }
+	// Custom API quota invalidation only; snapshots and credentials never travel on this event.
+	| { type: "provider:quota_changed"; providerIds: string[]; version: number }
 	// Plugin host control-plane changes are broadcast as an invalidation signal;
 	// clients refetch the bounded contribution snapshot over authenticated HTTP.
 	| {

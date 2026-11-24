@@ -1,3 +1,4 @@
+import { providerQuotaSourceSchema } from "@shared/provider-quota";
 import { z } from "zod";
 import {
 	capabilitySchema,
@@ -21,7 +22,7 @@ const CONTRIBUTION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const SEMVER_PATTERN =
 	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const ACTIVATION_EVENT_PATTERN =
-	/^(onStartup|onCommand|onView|onProvider|onTool|onEvent|onSchedule)(?::(.+))?$/;
+	/^(onStartup|onCommand|onView|onProvider|onQuota|onTool|onEvent|onSchedule)(?::(.+))?$/;
 
 function containsControlCharacter(value: string): boolean {
 	for (const character of value) {
@@ -961,6 +962,7 @@ const contributesSchema = z
 	.object({
 		providers: z.array(providerContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		searchProviders: z.array(searchProviderContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
+		quotaSources: z.array(providerQuotaSourceSchema).max(MAX_CONTRIBUTIONS).default([]),
 		tools: z.array(toolContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		commands: z.array(commandContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		events: z.array(eventContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
@@ -973,6 +975,7 @@ const contributesSchema = z
 const emptyContributes = () => ({
 	providers: [],
 	searchProviders: [],
+	quotaSources: [],
 	tools: [],
 	commands: [],
 	events: [],
@@ -1089,6 +1092,7 @@ function getContributionMap(manifest: {
 	contributes: {
 		providers: Array<{ id: string }>;
 		searchProviders: Array<{ id: string }>;
+		quotaSources: Array<{ id: string }>;
 		tools: Array<{ id: string }>;
 		commands: Array<{ id: string }>;
 		events: Array<{ id: string; topic: string }>;
@@ -1096,16 +1100,24 @@ function getContributionMap(manifest: {
 	};
 }): Map<
 	string,
-	{ kind: "provider" | "searchProvider" | "tool" | "command" | "event" | "view"; topic?: string }
+	{
+		kind: "provider" | "searchProvider" | "quotaSource" | "tool" | "command" | "event" | "view";
+		topic?: string;
+	}
 > {
 	const contributions = new Map<
 		string,
-		{ kind: "provider" | "searchProvider" | "tool" | "command" | "event" | "view"; topic?: string }
+		{
+			kind: "provider" | "searchProvider" | "quotaSource" | "tool" | "command" | "event" | "view";
+			topic?: string;
+		}
 	>();
 	for (const provider of manifest.contributes.providers)
 		contributions.set(provider.id, { kind: "provider" });
 	for (const search of manifest.contributes.searchProviders)
 		contributions.set(search.id, { kind: "searchProvider" });
+	for (const source of manifest.contributes.quotaSources)
+		contributions.set(source.id, { kind: "quotaSource" });
 	for (const tool of manifest.contributes.tools) contributions.set(tool.id, { kind: "tool" });
 	for (const command of manifest.contributes.commands)
 		contributions.set(command.id, { kind: "command" });
@@ -1122,6 +1134,7 @@ function validateActivationEvents(
 		contributes: {
 			providers: Array<{ id: string }>;
 			searchProviders: Array<{ id: string }>;
+			quotaSources: Array<{ id: string }>;
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string }>;
 			events: Array<{ id: string; topic: string }>;
@@ -1177,9 +1190,10 @@ function validateActivationEvents(
 			onCommand: "command",
 			onView: "view",
 			onProvider: "provider",
+			onQuota: "quotaSource",
 			onTool: "tool",
 			onSchedule: undefined,
-		}[kind as "onCommand" | "onView" | "onProvider" | "onTool" | "onSchedule"];
+		}[kind as "onCommand" | "onView" | "onProvider" | "onQuota" | "onTool" | "onSchedule"];
 
 		if (kind === "onSchedule") {
 			if (!contributionIdSchema.safeParse(reference).success) {
@@ -1209,6 +1223,7 @@ function validateContributionReferences(
 		contributes: {
 			providers: Array<{ id: string }>;
 			searchProviders: Array<{ id: string; providerId: string }>;
+			quotaSources: Array<{ id: string }>;
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
@@ -1228,6 +1243,7 @@ function validateContributionReferences(
 	const groups = [
 		["providers", manifest.contributes.providers],
 		["searchProviders", manifest.contributes.searchProviders],
+		["quotaSources", manifest.contributes.quotaSources],
 		["tools", manifest.contributes.tools],
 		["commands", manifest.contributes.commands],
 		["events", manifest.contributes.events],
@@ -1325,6 +1341,7 @@ function validateManifestCrossFields(
 		contributes: {
 			providers: unknown[];
 			searchProviders: unknown[];
+			quotaSources: unknown[];
 			tools: unknown[];
 			commands: unknown[];
 			events: unknown[];
@@ -1338,6 +1355,7 @@ function validateManifestCrossFields(
 		manifest.contributes.providers.length > 0 ||
 		// Search sources are served over `provider.search`, so they need a backend too.
 		manifest.contributes.searchProviders.length > 0 ||
+		manifest.contributes.quotaSources.length > 0 ||
 		manifest.contributes.tools.length > 0 ||
 		manifest.contributes.commands.length > 0 ||
 		manifest.contributes.events.length > 0;
@@ -1401,7 +1419,7 @@ export function isCanonicalPermissionName(value: string): boolean {
 export function parseActivationEvent(value: string):
 	| { kind: "onStartup"; reference?: undefined }
 	| {
-			kind: "onCommand" | "onView" | "onProvider" | "onTool" | "onEvent" | "onSchedule";
+			kind: "onCommand" | "onView" | "onProvider" | "onQuota" | "onTool" | "onEvent" | "onSchedule";
 			reference: string;
 	  }
 	| undefined {
@@ -1411,7 +1429,14 @@ export function parseActivationEvent(value: string):
 	if (kind === "onStartup" && reference === undefined) return { kind };
 	if (kind !== "onStartup" && reference) {
 		return {
-			kind: kind as "onCommand" | "onView" | "onProvider" | "onTool" | "onEvent" | "onSchedule",
+			kind: kind as
+				| "onCommand"
+				| "onView"
+				| "onProvider"
+				| "onQuota"
+				| "onTool"
+				| "onEvent"
+				| "onSchedule",
 			reference,
 		};
 	}
@@ -1564,6 +1589,7 @@ export function getContributionIds(manifest: Manifest): string[] {
 	return [
 		...manifest.contributes.providers,
 		...manifest.contributes.searchProviders,
+		...manifest.contributes.quotaSources,
 		...manifest.contributes.tools,
 		...manifest.contributes.commands,
 		...manifest.contributes.events,

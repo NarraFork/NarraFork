@@ -73,6 +73,8 @@ import {
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { permissionPolicyChanges } from "../services/permission-rule-service";
+import { broadcastProviderQuotaInvalidation } from "../services/provider-quota-events";
+import { customApiQuotaTargets } from "../services/provider-quota-targets";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
 	isPublicToolSourceAllowed,
@@ -1851,6 +1853,17 @@ function debouncedBrowserVisualChange(narratorId: string, sessionId: string) {
 			});
 		}, 300),
 	);
+}
+
+// Independent key: a hot upgrade must add quota invalidation even if the general bridge exists.
+if (hotOnce("narrafork.providerQuotaWs.listenersRegistered")) {
+	eventBus.on("provider:quota_changed", (event) => {
+		// Match the GET catalogue: bad configuration still needs to invalidate a former good value.
+		const visibleIds = new Set(
+			customApiQuotaTargets.list().map((entry) => entry.target.providerId),
+		);
+		broadcastProviderQuotaInvalidation(connections, event, visibleIds);
+	});
 }
 
 // === Event bus listeners ===

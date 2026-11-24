@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -52,6 +53,9 @@ function createFixtureDatabase(dbPath: string): void {
 		}
 	});
 	seed();
+	insertNarrator.finalize();
+	insertMessage.finalize();
+	insertDump.finalize();
 	db.close();
 }
 
@@ -134,7 +138,8 @@ describe("scan result determinism", () => {
 	});
 
 	afterEach(async () => {
-		rmSync(home, { recursive: true, force: true });
+		Bun.gc(true);
+		await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 	});
 
 	/**
@@ -227,7 +232,8 @@ describe("worker pool", () => {
 		setDbWorkerSpecifiersForTest(null);
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
-		rmSync(home, { recursive: true, force: true });
+		Bun.gc(true);
+		await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 	});
 
 	test("wakes queued work after cancellation during cold startup", async () => {
@@ -330,7 +336,7 @@ describe("worker pool", () => {
 			const direct = measureTable(db, table, context);
 			expect(workerResult.tables[0]).toEqual(direct);
 		} finally {
-			db.close();
+			db.close(true);
 		}
 	}, 60_000);
 

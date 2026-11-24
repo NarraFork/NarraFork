@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { resolve } from "node:path";
 import type { MiddlewareHandler } from "hono";
 import {
 	createPluginRoutes,
@@ -21,7 +22,6 @@ import { PluginProviderConfigService } from "../../../server/services/plugin-pro
  * "user" (a non-admin, which `assertPluginAdmin` turns into a 403 regardless).
  */
 const ADMIN_ACTOR_IDS = new Set(["admin-user-42", "admin-7"]);
-const SEEN_ACTOR_IDS = [...ADMIN_ACTOR_IDS, "user-7"];
 
 beforeEach(() => {
 	const store: AuthSessionStore = {
@@ -423,7 +423,7 @@ describe("plugin routes", () => {
 		expect(installed.status).toBe(201);
 		expect(manager.calls.at(-1)).toEqual({
 			method: "install",
-			value: "/safe/plugin-imports/demo.nfplugin",
+			value: resolve("/safe/plugin-imports", "demo.nfplugin"),
 		});
 		expect(JSON.stringify(await installed.json())).not.toContain("/safe/plugin-imports");
 

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { parseManifest } from "@server/lib/plugins/manifest";
 import { CAPABILITIES, capabilitySchema } from "@server/lib/plugins/permissions";
 import {
+	PLUGIN_BACKEND_HOST_REQUEST_METHODS,
+	PLUGIN_SHARED_HOST_REQUEST_METHODS,
 	PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES,
 	PLUGIN_TO_HOST_REQUEST_METHODS,
 	PUBLIC_ERROR_CODES,
@@ -89,11 +91,25 @@ const frontendErrorParity = expectedSharedBusinessErrors.every(
 );
 
 describe("C1/C2 cross-end plugin contract parity", () => {
-	test("keeps the backend Plugin→Host method inventory equal to the frozen C1 contract", () => {
-		expect([...PLUGIN_TO_HOST_REQUEST_METHODS]).toEqual([...expectedSharedMethods]);
+	test("keeps shared/iframe methods exact and strictly accounts for the backend-only extension", () => {
+		expect([...PLUGIN_SHARED_HOST_REQUEST_METHODS]).toEqual([...expectedSharedMethods]);
+		expect([...PLUGIN_BACKEND_HOST_REQUEST_METHODS]).toEqual(["provider.connection.request"]);
+		expect([...PLUGIN_TO_HOST_REQUEST_METHODS]).toEqual([
+			...expectedSharedMethods,
+			...PLUGIN_BACKEND_HOST_REQUEST_METHODS,
+		]);
 		expect(Object.keys(PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES).sort()).toEqual(
-			[...expectedSharedMethods].sort(),
+			[...PLUGIN_TO_HOST_REQUEST_METHODS].sort(),
 		);
+		expect(
+			PLUGIN_TO_HOST_REQUEST_METHODS.filter(
+				(method) => !(PLUGIN_UI_BACKEND_METHODS as readonly string[]).includes(method),
+			),
+		).toEqual([...PLUGIN_BACKEND_HOST_REQUEST_METHODS]);
+		expect(PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES["provider.connection.request"]).toEqual([
+			"host_api.requests",
+			"host_api.provider_connection",
+		]);
 	});
 
 	test("assigns at least one canonical capability example to every shared method", () => {

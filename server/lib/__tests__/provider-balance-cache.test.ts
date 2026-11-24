@@ -1,640 +1,598 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
-import { clearKeyCooldown, reportKeyFault } from "../agent/pooled-provider";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import type { ProviderQuotaData, QuotaQueryResult } from "@shared/provider-quota";
+import { parseSub2ApiBalance, relayQuotaData } from "../../../plugins/provider-quota/src/relay";
+import { parsePersistedProviderQuota } from "../../services/provider-quota-persistence";
+import { clearKeyCooldown, reportKeyFault, selectProviderKey } from "../agent/pooled-provider";
 import { ApiError } from "../agent/types";
+import { refreshAllDeepSeekBalances } from "../deepseek-balance-cache";
+import { refreshAllKimiUsages } from "../kimi-usage-cache";
 import type { outboundFetch } from "../net/outbound-fetch";
-import { BalanceProbeRequestError } from "../provider-balance-adapters";
-import { isProviderBalanceCandidate, ProviderBalanceCache } from "../provider-balance-cache";
+import { refreshAllOpencodeUsages } from "../opencode-usage-cache";
+import { createPersistedCredentialCache } from "../persisted-credential-cache";
+import {
+	isProviderBalanceCandidate,
+	providerBalanceCache,
+	toProviderBalanceSnapshot,
+} from "../provider-balance-cache";
 import { getProviderKeyStore } from "../provider-keys";
-import type { CustomApiProviderConfig } from "../settings";
+import { settings } from "../settings";
+import {
+	deferred,
+	httpQuotaFixture,
+	legacyQuotaFixture,
+	quotaConfig,
+	quotaSnapshot,
+	required,
+	walletQuota,
+} from "./provider-quota-legacy-fixture";
 
-function provider(id = "relay-test"): CustomApiProviderConfig {
-	return {
-		id,
-		name: "Relay",
-		prefix: id,
-		baseUrl: "https://relay.example/v1",
-		apiKey: "secret-current-key",
-		protocol: "completions-compatible",
-		defaultModel: "model",
-	};
-}
-const wallet = (balance = 12) => ({ mode: "unrestricted", isValid: true, balance, unit: "USD" });
-function deferred<T>() {
-	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => {
-		resolve = done;
-	});
-	return { promise, resolve };
-}
-function fixture() {
-	let providers = [provider()];
-	let globalProxy: unknown = { mode: "direct" };
-	let now = 100_000;
-	let respond = async (_url: string) => Response.json(wallet());
-	const fetch = mock(async (input: RequestInfo | URL) => respond(String(input)));
-	const cache = new ProviderBalanceCache({
-		providers: () => providers,
-		globalProxy: () => globalProxy,
-		fetch,
-		now: () => now,
-	});
-	return {
-		cache,
-		fetch,
-		setProviders: (value: CustomApiProviderConfig[]) => {
-			providers = value;
-		},
-		setProxy: (value: unknown) => {
-			globalProxy = value;
-		},
-		advance: (delta: number) => {
-			now += delta;
-		},
-		respond: (value: typeof respond) => {
-			respond = value;
-		},
-	};
-}
+let fixture: ReturnType<typeof legacyQuotaFixture>;
+const originalProxy = settings.proxy;
+beforeEach(() => {
+	fixture = legacyQuotaFixture();
+});
+afterEach(() => {
+	fixture.dispose();
+	settings.proxy = originalProxy;
+	mock.restore();
+});
 
-describe("provider balance discovery lifecycle", () => {
-	test("excludes disabled, empty and already dedicated balance sources", () => {
+describe("provider balance compatibility facade", () => {
+	test("only the legacy view excludes dedicated endpoints; the generic directory includes them", () => {
+		expect(isProviderBalanceCandidate(quotaConfig())).toBe(true);
 		for (const baseUrl of [
-			"https://api.deepseek.com/v1",
-			"https://api.kimi.com/coding/v1",
+			"https://api.deepseek.com",
+			"https://api.kimi.com",
 			"https://opencode.ai/zen/go/v1",
-		])
-			expect(isProviderBalanceCandidate({ ...provider(), baseUrl })).toBe(false);
-		expect(isProviderBalanceCandidate({ ...provider(), disabled: true })).toBe(false);
-		expect(isProviderBalanceCandidate({ ...provider(), apiKey: "" })).toBe(false);
-		expect(isProviderBalanceCandidate(provider())).toBe(true);
-	});
-
-	test("a successful discovery is coalesced and reads use only the detected endpoint", async () => {
-		const f = fixture();
-		const pending = deferred<Response>();
-		f.respond(() => pending.promise);
-		const generation = f.cache.generations()["relay-test"];
-		const first = f.cache.request("relay-test");
-		expect(f.cache.request("relay-test")).toBe(first);
-		expect(f.cache.read()["relay-test"]?.status).toBe("probing");
-		expect(f.fetch).toHaveBeenCalledTimes(1);
-		pending.resolve(Response.json(wallet(0)));
-		const result = await first;
-		expect(result).toMatchObject({ status: "supported", generation, adapter: "sub2api" });
-		expect(result?.balance?.amounts[0]?.remaining).toBe(0);
-		f.cache.read();
-		f.cache.discoverPending();
-		expect(f.fetch).toHaveBeenCalledTimes(1);
-		f.advance(60_000);
-		f.respond(async () => Response.json(wallet(-2)));
-		f.cache.read();
-		await f.cache.request("relay-test", "refresh");
-		expect(f.fetch.mock.calls.map(([url]) => String(url))).toEqual([
-			"https://relay.example/v1/usage",
-			"https://relay.example/v1/usage",
-		]);
-		expect(f.cache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(-2);
-	});
-
-	test("unsupported is discovered once, not on reads, and explicit probe is throttled", async () => {
-		const f = fixture();
-		f.respond(async () => new Response("not found", { status: 404 }));
-		await f.cache.request("relay-test");
-		const calls = f.fetch.mock.calls.length;
-		expect(calls).toBeLessThanOrEqual(4);
-		expect(f.cache.peek("relay-test")?.status).toBe("unsupported");
-		f.advance(3_600_000);
-		for (let i = 0; i < 5; i++) {
-			f.cache.read();
-			f.cache.discoverPending();
+		]) {
+			expect(isProviderBalanceCandidate(quotaConfig({ baseUrl }))).toBe(false);
 		}
-		expect(f.fetch).toHaveBeenCalledTimes(calls);
-		f.respond(async () => Response.json(wallet()));
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")?.status).toBe("supported");
-		await f.cache.request("relay-test");
-		expect(f.fetch).toHaveBeenCalledTimes(calls + 1);
+		expect(isProviderBalanceCandidate(quotaConfig({ disabled: true }))).toBe(false);
+		expect(isProviderBalanceCandidate(quotaConfig({ apiKey: "" }))).toBe(false);
 	});
 
-	test("subscription metadata stays with its generation, not a new key or wallet mode", async () => {
-		const f = fixture();
-		f.respond(async () =>
-			Response.json({
-				mode: "unrestricted",
-				isValid: true,
-				unit: "USD",
-				planName: "Pro subscription",
-				subscription: {
-					weekly_limit_usd: 50,
-					weekly_usage_usd: 4,
-					weekly_window_start: "2026-10-19T00:00:00Z",
-					expires_at: "2026-11-19T00:00:00Z",
+	test("translates format, currency, subscription metadata and window hints without private cursor state", () => {
+		const result = toProviderBalanceSnapshot(
+			quotaSnapshot({
+				data: {
+					format: "new-api",
+					scope: "subscription",
+					unlimited: false,
+					windows: [],
+					planName: "Test plan",
+					expiresAt: "2026-12-01T00:00:00Z",
+					amounts: [
+						{
+							id: "amount:0",
+							unit: "QUOTA",
+							remaining: 17,
+							used: 3,
+							total: 20,
+							window: "daily",
+							windowStart: "2026-10-31T00:00:00Z",
+						},
+					],
 				},
 			}),
 		);
-		await f.cache.request("relay-test");
-		const first = f.cache.peek("relay-test");
-		expect(first?.balance).toMatchObject({
-			scope: "subscription",
-			planName: "Pro subscription",
-			expiresAt: "2026-11-19T00:00:00.000Z",
-		});
-		f.advance(60_000);
-		f.respond(async () => new Response(null, { status: 503 }));
-		await f.cache.request("relay-test", "refresh");
-		expect(f.cache.peek("relay-test")).toMatchObject({
+		expect(result).toMatchObject({
+			adapter: "new-api",
 			status: "supported",
-			error: "request_failed",
-			balance: first?.balance,
+			balance: {
+				scope: "subscription",
+				unlimited: false,
+				planName: "Test plan",
+				expiresAt: "2026-12-01T00:00:00Z",
+				amounts: [
+					{
+						unit: "QUOTA",
+						remaining: 17,
+						used: 3,
+						total: 20,
+						window: "daily",
+						windowStart: "2026-10-31T00:00:00Z",
+					},
+				],
+			},
 		});
-		f.setProviders([{ ...provider(), apiKey: "another-account" }]);
-		expect(f.cache.peek("relay-test")?.generation).not.toBe(first?.generation);
-		expect(f.cache.peek("relay-test")?.balance).toBeNull();
-		f.respond(async () => Response.json(wallet()));
-		await f.cache.request("relay-test");
-		const next = f.cache.peek("relay-test")?.balance;
-		expect(next?.scope).toBe("wallet");
-		expect(next).not.toHaveProperty("planName");
-		expect(next).not.toHaveProperty("expiresAt");
+		expect(result).not.toHaveProperty("cursor");
+		expect(result.balance?.amounts[0]).not.toHaveProperty("id");
 	});
 
-	test("transient discovery failures are safe and do not poll automatically", async () => {
-		const f = fixture();
-		f.respond(async () => {
-			throw new Error("secret-current-key private upstream body");
+	test("normalizing Sub2API windows retains every legacy amount and real subscription metadata", () => {
+		const balance = parseSub2ApiBalance({
+			mode: "unrestricted",
+			isValid: true,
+			unit: "USD",
+			planName: "Plan",
+			subscription: {
+				daily_limit_usd: 10,
+				daily_usage_usd: 1,
+				weekly_limit_usd: 50,
+				weekly_usage_usd: 5,
+				monthly_limit_usd: 0,
+				monthly_usage_usd: 0,
+				weekly_window_start: "2026-11-09T00:00:00+08:00",
+				expires_at: "2027-01-01T00:00:00+08:00",
+			},
 		});
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")).toMatchObject({
-			status: "error",
+		if (!balance) throw new Error("expected subscription balance");
+		const data = relayQuotaData(balance, "sub2api");
+		expect(data.windows).toHaveLength(2);
+		const result = toProviderBalanceSnapshot(quotaSnapshot({ data }));
+		expect(result.status).toBe("supported");
+		expect(result.balance).toEqual(balance);
+		expect(result.balance?.amounts[2]).toEqual({
+			unit: "USD",
+			remaining: 0,
+			used: 0,
+			total: 0,
+			window: "monthly",
+		});
+	});
+
+	test("legacy projection validates new semantic fields before its explicit DTO projection", () => {
+		for (const invalid of [
+			{ id: "amount:0", unit: "USD", remaining: 1, display: "hidden" },
+			{ id: "amount:0", unit: "USD", remaining: 1, quota: "optional" },
+			{ id: "amount:0", unit: "USD", remaining: 1, remainingText: "2.00" },
+			{ id: "amount:0", unit: "USD", remaining: 1, apiKey: "private-key" },
+		]) {
+			const result = toProviderBalanceSnapshot(
+				quotaSnapshot({
+					data: { ...walletQuota, amounts: [invalid] } as unknown as ProviderQuotaData,
+				}),
+			);
+			expect(result).toMatchObject({ status: "error", balance: null, error: "invalid_response" });
+			expect(JSON.stringify(result)).not.toContain("private-key");
+		}
+	});
+
+	test("unknown amounts and third-party formats do not turn into zero or unlimited", () => {
+		const result = toProviderBalanceSnapshot(
+			quotaSnapshot({
+				data: {
+					...walletQuota,
+					amounts: [{ id: "amount:0", unit: "USD", remaining: null, used: null, total: null }],
+				},
+			}),
+		);
+		expect(result.balance).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: null }],
+		});
+		expect(
+			toProviderBalanceSnapshot(quotaSnapshot({ data: { ...walletQuota, format: "third-party" } }))
+				.balance,
+		).toBeNull();
+	});
+
+	test("reads are nonblocking and schedule only the selected provider", async () => {
+		settings.customApiProviders = [quotaConfig(), quotaConfig({ id: "second", prefix: "second" })];
+		const pending = deferred<QuotaQueryResult>();
+		fixture.query.mockImplementation(() => pending.promise);
+		const read = providerBalanceCache.read("relay-test");
+		expect(Object.keys(read)).toEqual(["relay-test"]);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(fixture.query.mock.calls[0]?.[1].providerId).toBe("relay-test");
+		pending.resolve({ status: "supported", data: walletQuota, error: null });
+		await providerBalanceCache.request("relay-test");
+		expect(providerBalanceCache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(12);
+	});
+
+	test("all concurrent facade callers share the generic source job", async () => {
+		const pending = deferred<QuotaQueryResult>();
+		fixture.query.mockImplementation(() => pending.promise);
+		const first = providerBalanceCache.request("relay-test");
+		const second = providerBalanceCache.request("relay-test");
+		providerBalanceCache.read("relay-test");
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		pending.resolve({ status: "supported", data: walletQuota, error: null });
+		expect(await second).toEqual(await first);
+	});
+
+	test("refreshing keeps a supported balance from the same generation until a result arrives", async () => {
+		await providerBalanceCache.request("relay-test");
+		const before = providerBalanceCache.peek("relay-test");
+		fixture.advance(10_000);
+		const pending = deferred<QuotaQueryResult>();
+		fixture.query.mockImplementation(() => pending.promise);
+		const refresh = providerBalanceCache.request("relay-test");
+		expect(fixture.service.peek("relay-test")?.status).toBe("probing");
+		expect(providerBalanceCache.peek("relay-test")).toMatchObject({
+			generation: before?.generation,
+			status: "supported",
+			balance: before?.balance,
+			fetchedAt: before?.fetchedAt,
+			error: null,
+		});
+		pending.resolve({ status: "supported", data: walletQuota, error: null });
+		await refresh;
+	});
+
+	test("unsupported or unavailable projections hide even a supplied previous good value", () => {
+		for (const status of ["unsupported", "unavailable"] as const) {
+			expect(toProviderBalanceSnapshot(quotaSnapshot({ status })).balance).toBeNull();
+		}
+	});
+
+	test("manual cooldown is shared with the generic endpoint and never a second timer", async () => {
+		await providerBalanceCache.request("relay-test");
+		expect(providerBalanceCache.manualRetryAfterMs("relay-test")).toBe(10_000);
+		await providerBalanceCache.request("relay-test");
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		fixture.advance(10_000);
+		await providerBalanceCache.request("relay-test");
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+	});
+
+	test("retains a safe stale balance after errors and respects service retry cadence", async () => {
+		await providerBalanceCache.request("relay-test");
+		fixture.advance(60_000);
+		fixture.query.mockRejectedValue(new Error("test-secret-key private upstream body"));
+		await fixture.service.refreshStale();
+		// refreshStale only schedules work; join the shared job before asserting its error.
+		await fixture.service.refresh("relay-test");
+		const stale = providerBalanceCache.peek("relay-test");
+		expect(stale).toMatchObject({
+			status: "supported",
 			error: "request_failed",
+			balance: { amounts: [{ remaining: 12 }] },
+		});
+		expect(JSON.stringify(stale)).not.toMatch(/test-secret-key|private upstream/);
+		await fixture.service.refreshStale();
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+	});
+
+	test("unavailable sources do not expose a previous allowance or fetch through old adapters", async () => {
+		await providerBalanceCache.request("relay-test");
+		fixture.revoke();
+		expect(providerBalanceCache.peek("relay-test")).toMatchObject({
+			status: "error",
+			error: "plugin_not_enabled",
 			balance: null,
 		});
-		const calls = f.fetch.mock.calls.length;
-		f.advance(100_000);
-		f.cache.read();
-		expect(f.fetch).toHaveBeenCalledTimes(calls);
-		expect(JSON.stringify(f.cache.read())).not.toMatch(/secret-current-key|private upstream/);
+		await providerBalanceCache.request("relay-test");
+		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
 
-	test("failed refresh retains last success and throttles retry by attempt, not success", async () => {
-		const f = fixture();
-		await f.cache.request("relay-test");
-		const before = f.cache.peek("relay-test");
-		f.advance(60_000);
-		f.respond(async () => new Response("private", { status: 500 }));
-		await f.cache.request("relay-test", "refresh");
-		const failed = f.cache.peek("relay-test");
-		expect(failed).toMatchObject({
-			status: "supported",
-			error: "request_failed",
-			fetchedAt: before?.fetchedAt,
-			balance: before?.balance,
-		});
-		f.cache.read();
-		f.advance(59_999);
-		f.cache.read();
-		expect(f.fetch).toHaveBeenCalledTimes(2);
-	});
-
-	for (const change of [
-		"apiKey",
-		"baseUrl",
-		"protocol",
-		"proxy",
-		"tls",
-		"headers",
-		"globalProxy",
-		"disable",
-		"remove",
+	for (const [field, replacement] of [
+		["apiKey", "replacement-key"],
+		["baseUrl", "https://other.invalid/v1"],
+		["protocol", "responses-compatible"],
+		["proxy", { mode: "direct" }],
+		["tlsRejectUnauthorized", false],
+		["extraHeaders", { "x-quota": "changed" }],
 	] as const) {
-		test(`${change} replaces generation and rejects late old-account data`, async () => {
-			const f = fixture();
-			const pending = deferred<Response>();
-			f.respond(() => pending.promise);
-			const original = f.cache.generations()["relay-test"];
-			const first = f.cache.request("relay-test");
-			const next = provider();
-			if (change === "apiKey") next.apiKey = "other-secret";
-			if (change === "baseUrl") next.baseUrl = "https://other.example/v1";
-			if (change === "protocol") next.protocol = "anthropic-messages";
-			if (change === "proxy") next.proxy = { mode: "direct" };
-			if (change === "tls") next.tlsRejectUnauthorized = false;
-			if (change === "headers") next.extraHeaders = { "X-Token": "another-credential" };
-			if (change === "globalProxy") f.setProxy({ mode: "system" });
-			if (change === "disable") next.disabled = true;
-			f.setProviders(change === "remove" ? [] : [next]);
-			expect(f.cache.generations()["relay-test"]).not.toBe(original);
-			pending.resolve(Response.json(wallet(999)));
-			expect(await first).toBeNull();
-			expect(f.cache.peek("relay-test")?.balance ?? null).toBeNull();
+		test(`${field} changes immediately invalidate the facade generation and balance`, async () => {
+			await providerBalanceCache.request("relay-test");
+			const generation = providerBalanceCache.generations()["relay-test"];
+			settings.customApiProviders = [quotaConfig({ [field]: replacement })];
+			const snapshot = providerBalanceCache.peek("relay-test");
+			expect(snapshot?.generation).not.toBe(generation);
+			expect(snapshot?.balance).toBeNull();
 		});
 	}
 
-	test("name, prefix, model edits and header ordering keep generation and discovery result", async () => {
-		const f = fixture();
-		f.setProviders([{ ...provider(), extraHeaders: { a: "1", b: "2" } }]);
-		await f.cache.request("relay-test");
-		const generation = f.cache.generations()["relay-test"];
-		f.setProviders([
-			{
-				...provider(),
-				name: "renamed",
-				prefix: "new-prefix",
-				defaultModel: "other",
-				extraHeaders: { b: "2", a: "1" },
-			},
-		]);
-		f.cache.discoverPending();
-		expect(f.cache.generations()["relay-test"]).toBe(generation);
-		expect(f.fetch).toHaveBeenCalledTimes(1);
-		f.setProviders([]);
-		f.cache.sync();
-		f.setProviders([provider()]);
-		expect(f.cache.generations()["relay-test"]).not.toBe(generation);
+	test("renames preserve opaque generations but account reuse never restores an earlier one", () => {
+		const generation = providerBalanceCache.generations()["relay-test"];
+		settings.customApiProviders = [quotaConfig({ name: "Renamed" })];
+		expect(providerBalanceCache.generations()["relay-test"]).toBe(generation);
+		settings.customApiProviders = [quotaConfig({ apiKey: "second-key" })];
+		const second = providerBalanceCache.generations()["relay-test"];
+		expect(second).not.toBe(generation);
+		settings.customApiProviders = [quotaConfig()];
+		expect(providerBalanceCache.generations()["relay-test"]).not.toBe(generation);
+		expect(generation).not.toContain("test-secret-key");
 	});
 
-	test("a selected active provider never refreshes another supported provider", async () => {
-		const f = fixture();
-		f.setProviders([provider(), provider("other")]);
-		f.cache.discoverPending();
-		await Promise.all([f.cache.request("relay-test"), f.cache.request("other")]);
-		expect(f.fetch).toHaveBeenCalledTimes(2);
-		f.advance(60_000);
-		expect(Object.keys(f.cache.read("relay-test"))).toEqual(["relay-test"]);
-		await f.cache.request("relay-test", "refresh");
-		expect(f.fetch).toHaveBeenCalledTimes(3);
-		expect(f.cache.peek("other")?.attemptedAt).toBe(100_000);
+	test("disabled and removed IDs cannot be read or refreshed through the facade", async () => {
+		settings.customApiProviders = [quotaConfig({ disabled: true })];
+		expect(providerBalanceCache.peek("relay-test")).toBeNull();
+		expect(await providerBalanceCache.request("relay-test")).toBeNull();
+		settings.customApiProviders = [];
+		expect(providerBalanceCache.read()).toEqual({});
+		expect(fixture.query).not.toHaveBeenCalled();
 	});
 
-	test("invalid URLs never send keys and snapshot has no credential-derived identity", async () => {
-		const f = fixture();
-		f.setProviders([
-			{ ...provider(), baseUrl: "https://user:password@relay.example/v1?key=secret" },
-		]);
-		f.cache.discoverPending();
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")).toMatchObject({
-			status: "error",
-			error: "invalid_configuration",
-		});
-		expect(f.fetch).not.toHaveBeenCalled();
-		expect(JSON.stringify(f.cache.read())).not.toMatch(/password|secret|relay\.example/);
-	});
-
-	test("only four active probes and bounded backlog eventually discovers every entry", async () => {
-		const pending = deferred<Response>();
-		const providers = Array.from({ length: 12 }, (_, i) => provider(`relay-${i}`));
-		let active = 0;
-		let maxActive = 0;
-		const fetch = mock(async () => {
-			active++;
-			maxActive = Math.max(active, maxActive);
-			const response = await pending.promise;
-			active--;
-			return response.clone();
-		});
-		const cache = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => undefined,
-			fetch,
-			maxQueued: 2,
-		});
-		cache.discoverPending();
-		expect(fetch).toHaveBeenCalledTimes(4);
-		pending.resolve(Response.json(wallet()));
-		// Await every originally scheduled job; refill also progresses entries outside the backlog.
-		await Promise.all(providers.map((p) => cache.request(p.id)));
-		await new Promise<void>((resolve) => setTimeout(resolve, 10));
-		expect(maxActive).toBe(4);
-		expect(fetch).toHaveBeenCalledTimes(12);
-		expect(Object.values(cache.read()).every((s) => s.status === "supported")).toBe(true);
-	});
-
-	test("optional metadata hitting the round deadline keeps confirmed raw new-api quota", async () => {
-		const fetch = mock(async (input: RequestInfo | URL) => {
-			const url = String(input);
-			if (url.endsWith("/api/status")) return new Promise<Response>(() => {});
-			if (url.endsWith("/v1/usage")) return new Response(null, { status: 404 });
-			return Response.json({
-				code: true,
-				data: {
-					object: "token_usage",
-					total_available: 500,
-					total_used: 100,
-					total_granted: 600,
-					unlimited_quota: false,
-				},
-			});
-		});
-		const cache = new ProviderBalanceCache({
-			providers: () => [provider()],
-			globalProxy: () => undefined,
-			fetch,
-			requestTimeoutMs: 100,
-			roundTimeoutMs: 10,
-		});
-		const result = await cache.request("relay-test");
-		expect(result).toMatchObject({ status: "supported", adapter: "new-api", error: null });
-		expect(result?.balance?.amounts[0]).toMatchObject({ unit: "QUOTA", remaining: 500 });
-	});
-
-	test("request and whole-round timeouts release slots even when transport ignores abort", async () => {
-		const fetch = mock(async () => new Promise<Response>(() => {}));
-		const cache = new ProviderBalanceCache({
-			providers: () => [provider()],
-			globalProxy: () => undefined,
-			fetch,
-			requestTimeoutMs: 5,
-			roundTimeoutMs: 10,
-		});
-		const result = await cache.request("relay-test");
-		expect(result).toMatchObject({ status: "error", error: "request_failed" });
-		expect(fetch.mock.calls.length).toBeLessThanOrEqual(2);
+	test("the compatibility module owns no active transport, persistent cache or timer", () => {
+		const source = readFileSync(new URL("../provider-balance-cache.ts", import.meta.url), "utf8");
+		expect(source).not.toMatch(
+			/outboundFetch|provider-balance-adapters|provider-balance-transport|createPersistedCredentialCache|setTimeout|setInterval|new Map/,
+		);
 	});
 });
 
-describe("site-account credit failures", () => {
-	// The base URL keeps /v1 (Codex-style preset), so the site root must be separate.
-	const siteProvider = (): CustomApiProviderConfig => ({
-		...provider(),
-		baseUrl: "https://relay.example/v1",
-		quotaSiteUrl: "https://relay.example",
-		quotaAccessToken: "site-token",
-		quotaUserId: "42",
-	});
-	const siteBody = {
-		success: true,
-		data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" },
-	};
-
-	function siteFixture() {
-		let providers = [siteProvider()];
-		let now = 100_000;
-		let respond: (url: string) => Promise<Response> = async () => Response.json(siteBody);
-		const fetch = mock(async (input: RequestInfo | URL) => respond(String(input)));
-		const persistence = {
-			restore: mock(() => undefined as never),
-			save: mock(() => {}),
-			remove: mock(() => {}),
-			flush: mock(async () => {}),
-		};
-		const cache = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => undefined,
-			fetch,
-			now: () => now,
-			persistence,
-		});
-		return {
-			cache,
-			fetch,
-			persistence,
-			advance: (delta: number) => {
-				now += delta;
-			},
-			respond: (value: typeof respond) => {
-				respond = value;
-			},
-			setProviders: (value: CustomApiProviderConfig[]) => {
-				providers = value;
-			},
-		};
+const keyProviders = new Set<string>();
+afterEach(() => {
+	const store = getProviderKeyStore();
+	for (const id of keyProviders) {
+		for (const key of store.list(id)) clearKeyCooldown(key.id);
+		store.removeProvider(id);
 	}
+	keyProviders.clear();
+});
+async function replaceWithHttp(
+	config: ReturnType<typeof quotaConfig>,
+	fetch: typeof outboundFetch,
+	persistence?: NonNullable<Parameters<typeof httpQuotaFixture>[1]>["persistence"],
+) {
+	fixture.dispose();
+	mock.restore();
+	const f = await httpQuotaFixture([config], { fetch, persistence });
+	fixture = f;
+	return f;
+}
 
-	test("probes /api/user/self on the site root and reports USD credit", async () => {
-		const f = siteFixture();
-		const requested: string[] = [];
-		f.respond(async (url) => {
-			requested.push(url);
-			return Response.json(siteBody);
+describe("upstream relay discovery lifecycle retained in the service", () => {
+	test("successful fallback discovery coalesces and stale reads reuse only its confirmed endpoint", async () => {
+		const urls: string[] = [];
+		await replaceWithHttp(quotaConfig(), async (url) => {
+			urls.push(String(url));
+			return String(url).endsWith("/v1/v1/usage")
+				? Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 })
+				: new Response(null, { status: 404 });
 		});
-		const snapshot = await f.cache.request("relay-test");
-		expect(requested).toEqual(["https://relay.example/api/user/self"]);
-		expect(snapshot).toMatchObject({ status: "supported", adapter: "new-api-user" });
-		expect(snapshot?.balance).toMatchObject({
-			scope: "wallet",
-			planName: "vip",
-			amounts: [{ unit: "USD", remaining: 10, used: 2, total: 12 }],
-		});
+		const [a, b] = await Promise.all([
+			providerBalanceCache.request("relay-test"),
+			providerBalanceCache.request("relay-test"),
+		]);
+		expect(a).toEqual(b);
+		expect(urls.at(-1)).toBe("https://relay.invalid/v1/v1/usage");
+		urls.length = 0;
+		fixture.advance(60000);
+		providerBalanceCache.read("relay-test");
+		await fixture.service.refresh("relay-test");
+		expect(urls).toEqual(["https://relay.invalid/v1/v1/usage"]);
 	});
-
-	test("a transient failure keeps the last good value inside the 10 minute window", async () => {
-		const f = siteFixture();
-		const fresh = await f.cache.request("relay-test");
-		f.advance(60_000);
-		f.respond(async () => new Response(null, { status: 503 }));
-		const failed = await f.cache.request("relay-test", "refresh");
-		expect(failed).toMatchObject({
+	test("unsupported is discovered once and reads do not probe inside the unsupported backoff", async () => {
+		let calls = 0;
+		await replaceWithHttp(quotaConfig(), async () => {
+			calls++;
+			return new Response(null, { status: 404 });
+		});
+		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+			status: "unsupported",
+			balance: null,
+		});
+		const count = calls;
+		providerBalanceCache.read();
+		fixture.advance(60000);
+		providerBalanceCache.read();
+		expect(calls).toBe(count);
+		await providerBalanceCache.request("relay-test", "probe");
+		expect(calls).toBeGreaterThan(count);
+	});
+	test("relay transient failure preserves last good value only inside the same ten-minute window", async () => {
+		let failed = false;
+		await replaceWithHttp(quotaConfig(), async () =>
+			failed
+				? new Response(null, { status: 500 })
+				: Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 }),
+		);
+		const fresh = await providerBalanceCache.request("relay-test");
+		failed = true;
+		fixture.advance(60000);
+		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
 			status: "supported",
 			error: "request_failed",
 			balance: fresh?.balance,
 			fetchedAt: fresh?.fetchedAt,
 		});
-	});
-
-	test("the last good value is withdrawn once the window closes", async () => {
-		const f = siteFixture();
-		await f.cache.request("relay-test");
-		f.advance(10 * 60_000 + 1);
-		f.respond(async () => new Response(null, { status: 500 }));
-		const failed = await f.cache.request("relay-test", "refresh");
-		expect(failed).toMatchObject({ status: "error", error: "request_failed", balance: null });
-	});
-
-	test("a rejected token clears the value instead of retrying it", async () => {
-		const f = siteFixture();
-		await f.cache.request("relay-test");
-		f.advance(60_000);
-		f.respond(async () => new Response(null, { status: 401 }));
-		const failed = await f.cache.request("relay-test", "refresh");
-		expect(failed).toMatchObject({ status: "error", error: "auth_failed", balance: null });
-		// The persisted copy must go too, or a restart would restore retired credit.
-		expect(f.persistence.remove).toHaveBeenCalledWith("relay-test");
-		// Deterministic failures are not polled again without a manual rediscovery.
-		const calls = f.fetch.mock.calls.length;
-		f.advance(120_000);
-		f.cache.read();
-		expect(f.fetch).toHaveBeenCalledTimes(calls);
-	});
-
-	test("an unparsable answer is deterministic, not a network blip", async () => {
-		const f = siteFixture();
-		await f.cache.request("relay-test");
-		f.advance(60_000);
-		f.respond(async () => Response.json({ success: true, data: { nothing: 1 } }));
-		const failed = await f.cache.request("relay-test", "refresh");
-		expect(failed).toMatchObject({ status: "error", error: "invalid_response", balance: null });
-	});
-
-	test("a half-filled site configuration reports invalid_configuration immediately", async () => {
-		const f = siteFixture();
-		f.setProviders([{ ...siteProvider(), quotaUserId: "" }]);
-		const snapshot = await f.cache.request("relay-test");
-		expect(snapshot).toMatchObject({ status: "error", error: "invalid_configuration" });
-		expect(f.fetch).not.toHaveBeenCalled();
-	});
-
-	test("rotating the access token discards the previous account's value", async () => {
-		const f = siteFixture();
-		const before = await f.cache.request("relay-test");
-		f.setProviders([{ ...siteProvider(), quotaAccessToken: "rotated-token" }]);
-		const after = f.cache.peek("relay-test");
-		expect(after?.generation).not.toBe(before?.generation);
-		expect(after?.balance).toBeNull();
-	});
-});
-
-describe("capability plugin gating", () => {
-	/**
-	 * The plugin owns quota querying, so a disabled plugin has to be observable: the snapshot
-	 * reports `plugin_not_enabled` and the previously cached allowance is dropped, exactly like
-	 * any other deterministic failure.
-	 */
-	function gatedFixture() {
-		let enabled = false;
-		let now = 100_000;
-		let engineCalls = 0;
-		const persistence = {
-			restore: mock(() => undefined as never),
-			save: mock(() => {}),
-			remove: mock(() => {}),
-			flush: mock(async () => {}),
-		};
-		const cache = new ProviderBalanceCache({
-			providers: () => [provider()],
-			globalProxy: () => undefined,
-			now: () => now,
-			persistence,
-			engine: () => ({
-				id: "test-connector",
-				probe: async () => {
-					engineCalls++;
-					if (!enabled) throw new BalanceProbeRequestError("plugin_disabled");
-					return {
-						adapter: "sub2api",
-						root: "https://relay.example",
-						balance: {
-							scope: "wallet",
-							unlimited: false,
-							amounts: [{ unit: "USD", remaining: 7 }],
-						},
-					};
-				},
-				refresh: async () => {
-					engineCalls++;
-					if (!enabled) throw new BalanceProbeRequestError("plugin_disabled");
-					return { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 7 }] };
-				},
-			}),
-		});
-		return {
-			cache,
-			persistence,
-			engineCalls: () => engineCalls,
-			setEnabled: (value: boolean) => {
-				enabled = value;
-			},
-			advance: (delta: number) => {
-				now += delta;
-			},
-		};
-	}
-
-	test("a disabled plugin is reported instead of being answered by the bundled adapters", async () => {
-		const f = gatedFixture();
-
-		const snapshot = await f.cache.request("relay-test");
-
-		expect(snapshot).toMatchObject({ status: "error", error: "plugin_not_enabled", balance: null });
-		// Deterministic: no value may survive behind the disabled state.
-		expect(f.persistence.remove).toHaveBeenCalledWith("relay-test");
-	});
-
-	test("a value cached while enabled is withdrawn once the plugin is disabled", async () => {
-		const f = gatedFixture();
-		f.setEnabled(true);
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")).toMatchObject({ status: "supported" });
-
-		f.setEnabled(false);
-		f.advance(60_000);
-		await f.cache.request("relay-test", "refresh");
-
-		expect(f.cache.peek("relay-test")).toMatchObject({
+		fixture.advance(540001);
+		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
 			status: "error",
-			error: "plugin_not_enabled",
+			error: "request_failed",
 			balance: null,
 		});
 	});
-
-	test("re-enabling the plugin restores the value on the next read", async () => {
-		const f = gatedFixture();
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")?.error).toBe("plugin_not_enabled");
-
-		f.setEnabled(true);
-		// Inside the stale window reads are served from the snapshot without touching the
-		// engine; the recovery attempt happens on the first read past it.
-		f.cache.read("relay-test");
-		expect(f.engineCalls()).toBe(1);
-		f.advance(60_000);
-		f.cache.read("relay-test");
-		await new Promise<void>((resolve) => setTimeout(resolve, 10));
-
-		expect(f.cache.peek("relay-test")).toMatchObject({
-			status: "supported",
-			error: null,
+	test("name/prefix/model and header ordering changes preserve the same discovered generation", async () => {
+		const config = quotaConfig({ extraHeaders: { "X-B": "b", "X-A": "a" } });
+		await replaceWithHttp(config, async () =>
+			Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 }),
+		);
+		const fresh = await providerBalanceCache.request(config.id);
+		settings.customApiProviders = [
+			{
+				...config,
+				name: "renamed",
+				prefix: "new-prefix",
+				defaultModel: "other-model",
+				extraHeaders: { "X-A": "a", "X-B": "b" },
+			},
+		];
+		expect(providerBalanceCache.peek(config.id)).toEqual(fresh);
+	});
+	test("optional public metadata timeout keeps already-confirmed raw new-api amounts", async () => {
+		fixture.dispose();
+		mock.restore();
+		fixture = await httpQuotaFixture([quotaConfig()], {
+			requestTimeoutMs: 10,
+			fetch: async (url) => {
+				if (String(url).endsWith("/api/usage/token/"))
+					return Response.json({
+						code: true,
+						data: {
+							object: "token_usage",
+							unlimited_quota: false,
+							total_available: 500000,
+							total_used: 100000,
+							total_granted: 600000,
+						},
+					});
+				if (String(url).endsWith("/api/status")) return new Promise(() => {});
+				return new Response(null, { status: 404 });
+			},
 		});
-		expect(f.cache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(7);
+		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+			status: "supported",
+			adapter: "new-api",
+			balance: { amounts: [{ unit: "QUOTA", remaining: 500000, used: 100000, total: 600000 }] },
+		});
 	});
 });
 
-/**
- * A provider can hold several keys and settings only ever exposes the first one. Probing
- * that field would report a balance and cache a discovery root belonging to a key requests
- * no longer use — a disabled or cooling-down key would keep a stale number on screen while
- * another key actually serves.
- */
-describe("provider balance probes the credential a request would use", () => {
-	const cleanups: Array<() => void> = [];
-	afterEach(() => {
-		for (const cleanup of cleanups.splice(0)) cleanup();
+describe("site account credit through the quota service", () => {
+	const config = () =>
+		quotaConfig({
+			quotaSiteUrl: "https://site.invalid",
+			quotaAccessToken: "site-token",
+			quotaUserId: "42",
+		});
+	const body = { success: true, data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" } };
+	test("queries the independent site root, reports USD and never sends the inference key", async () => {
+		const calls: Array<{ url: string; headers: Headers }> = [];
+		await replaceWithHttp(config(), async (url, init) => {
+			calls.push({ url: String(url), headers: new Headers(init?.headers) });
+			return Response.json(body);
+		});
+		const snapshot = await providerBalanceCache.request("relay-test");
+		expect(calls.map(({ url }) => url)).toEqual(["https://site.invalid/api/user/self"]);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer site-token");
+		expect(calls[0]?.headers.get("new-api-user")).toBe("42");
+		expect([...required(calls[0]).headers.values()]).not.toContain("Bearer test-secret-key");
+		expect(snapshot).toMatchObject({
+			status: "supported",
+			adapter: "new-api-user",
+			balance: {
+				scope: "wallet",
+				planName: "vip",
+				amounts: [{ unit: "USD", remaining: 10, used: 2, total: 12 }],
+			},
+		});
+		expect(JSON.stringify(snapshot)).not.toMatch(/site-token|test-secret-key/);
+	});
+	test("transient errors preserve credit for at most ten minutes, not indefinitely", async () => {
+		let failing = false;
+		await replaceWithHttp(config(), async () =>
+			failing ? new Response(null, { status: 503 }) : Response.json(body),
+		);
+		const good = await providerBalanceCache.request("relay-test");
+		failing = true;
+		fixture.advance(60_000);
+		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+			status: "supported",
+			error: "request_failed",
+			balance: good?.balance,
+			fetchedAt: good?.fetchedAt,
+		});
+		fixture.advance(540_001);
+		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+			status: "error",
+			error: "request_failed",
+			balance: null,
+		});
+	});
+	for (const [status, payload, code] of [
+		[401, null, "auth_failed"],
+		[403, null, "auth_failed"],
+		[200, { success: true, data: { nothing: 1 } }, "invalid_response"],
+	] as const) {
+		test(`${code}/${status} clears memory and real persistence and later network failure cannot resurrect credit`, async () => {
+			const persistence = createPersistedCredentialCache(
+				`site-credit-${crypto.randomUUID()}.json`,
+				parsePersistedProviderQuota,
+			);
+			let answer: Response | undefined;
+			const f = await replaceWithHttp(
+				config(),
+				async () => answer ?? Response.json(body),
+				persistence,
+			);
+			await providerBalanceCache.request("relay-test");
+			await persistence.flush();
+			const identity = required(f.directory.get("relay-test")).identity;
+			expect(persistence.restore("relay-test", identity)?.data).not.toBeNull();
+			answer = payload === null ? new Response(null, { status }) : Response.json(payload);
+			fixture.advance(60_000);
+			expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+				status: "error",
+				error: code,
+				balance: null,
+			});
+			await persistence.flush();
+			expect(persistence.restore("relay-test", identity)).toBeUndefined();
+			const requests = f.query.mock.calls.length;
+			fixture.advance(120_000);
+			providerBalanceCache.read();
+			expect(f.query).toHaveBeenCalledTimes(requests);
+			answer = new Response(null, { status: 503 });
+			fixture.advance(60_000);
+			expect((await providerBalanceCache.request("relay-test", "refresh"))?.balance).toBeNull();
+		});
+	}
+	test("partial site configuration fails immediately without falling back to key discovery", async () => {
+		let calls = 0;
+		await replaceWithHttp({ ...config(), quotaUserId: "" }, async () => {
+			calls++;
+			return Response.json(body);
+		});
+		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+			error: "invalid_configuration",
+			balance: null,
+		});
+		expect(calls).toBe(0);
+	});
+	test("site credit stays usable when all inference keys are disabled", async () => {
+		const cfg = { ...config(), id: `site-keys-${crypto.randomUUID()}` };
+		keyProviders.add(cfg.id);
+		const store = getProviderKeyStore();
+		const key = store.add(cfg.id, { apiKey: "disabled-inference-key" });
+		store.update(key.id, { disabled: true });
+		await replaceWithHttp(cfg, async () => Response.json(body));
+		expect(await providerBalanceCache.request(cfg.id)).toMatchObject({
+			status: "supported",
+			adapter: "new-api-user",
+			balance: { amounts: [{ remaining: 10 }] },
+		});
 	});
 
-	function credentialFixture() {
-		const config: CustomApiProviderConfig = {
-			...provider(`balance-selected-key-${crypto.randomUUID()}`),
+	test("rotating any site identity retires the previous account projection", async () => {
+		await replaceWithHttp(config(), async () => Response.json(body));
+		const before = await providerBalanceCache.request("relay-test");
+		for (const change of [
+			{ quotaAccessToken: "replacement" },
+			{ quotaUserId: "99" },
+			{ quotaSiteUrl: "https://other-site.invalid" },
+		]) {
+			settings.customApiProviders = [{ ...config(), ...change }];
+			expect(providerBalanceCache.peek("relay-test")?.generation).not.toBe(before?.generation);
+			expect(providerBalanceCache.peek("relay-test")?.balance).toBeNull();
+		}
+	});
+});
+
+describe("quota follows actual provider-key selection and transport identity", () => {
+	async function setup() {
+		const config = quotaConfig({
+			id: `selected-${crypto.randomUUID()}`,
+			prefix: "selected",
 			proxy: { mode: "custom", url: "http://provider.proxy.invalid:8080" },
 			userAgentMode: "custom",
 			customUserAgent: "provider-agent",
 			extraHeaders: { "X-Provider": "keep", "X-Identity": "provider" },
 			tlsRejectUnauthorized: false,
-		};
-		const store = getProviderKeyStore();
-		let providers = [config];
-		let respond = async (_url: string) => Response.json(wallet());
-		const fetch = mock(async (...args: Parameters<typeof outboundFetch>) =>
-			respond(String(args[0])),
-		);
-		const cache = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => ({ mode: "direct" }),
-			fetch,
-			now: () => 100_000,
 		});
-		cleanups.push(() => {
-			providers = [];
-			cache.sync();
-			for (const key of store.list(config.id)) clearKeyCooldown(key.id);
-			store.removeProvider(config.id);
+		keyProviders.add(config.id);
+		const calls: Array<Parameters<typeof outboundFetch>> = [];
+		let respond = async (_url: string) =>
+			Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 });
+		const f = await replaceWithHttp(config, async (...args) => {
+			calls.push(args);
+			return respond(String(args[0]));
 		});
 		return {
+			...f,
 			config,
-			store,
-			cache,
-			fetch,
-			request: (index = -1) => {
-				const call = fetch.mock.calls.at(index);
+			store: getProviderKeyStore(),
+			calls,
+			respond(value: typeof respond) {
+				respond = value;
+			},
+			sent() {
+				const call = calls.at(-1);
 				return {
 					url: String(call?.[0]),
 					headers: new Headers(call?.[1]?.headers),
@@ -642,16 +600,12 @@ describe("provider balance probes the credential a request would use", () => {
 					transport: call?.[2],
 				};
 			},
-			respond: (value: typeof respond) => {
-				respond = value;
-			},
 		};
 	}
-
-	test("the first selected key applies its network even when settings exposes the same secret", async () => {
-		const f = credentialFixture();
+	test("selected first key overrides proxy, User-Agent and headers without mutating provider settings", async () => {
+		const f = await setup();
 		const original = structuredClone(f.config);
-		f.store.add(f.config.id, {
+		const key = f.store.add(f.config.id, {
 			apiKey: f.config.apiKey,
 			network: {
 				proxy: { mode: "custom", url: "http://first.proxy.invalid:8080" },
@@ -660,9 +614,9 @@ describe("provider balance probes the credential a request would use", () => {
 				extraHeaders: { "X-Identity": "first-key", Host: "must-not-leave" },
 			},
 		});
-
-		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
-		const sent = f.request();
+		expect(selectProviderKey(f.config.id)?.id).toBe(key.id);
+		expect(await providerBalanceCache.request(f.config.id)).toMatchObject({ status: "supported" });
+		const sent = f.sent();
 		expect(sent.headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
 		expect(sent.headers.get("user-agent")).toBe("first-key-agent");
 		expect(sent.headers.get("x-provider")).toBe("keep");
@@ -676,12 +630,18 @@ describe("provider balance probes the credential a request would use", () => {
 		});
 		expect(f.config).toEqual(original);
 	});
-
 	for (const unavailable of ["disabled", "cooling-down"] as const) {
-		test(`a ${unavailable} first key switches credential, network, generation and discovered root`, async () => {
-			const f = credentialFixture();
+		test(`${unavailable} first key selects the next key and its own discovery/network`, async () => {
+			const f = await setup();
 			const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
-			f.store.add(f.config.id, {
+			f.respond(async (url) =>
+				url.endsWith("/v1/v1/usage")
+					? Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 })
+					: new Response(null, { status: 404 }),
+			);
+			const before = await providerBalanceCache.request(f.config.id);
+			expect(f.sent().url).toBe("https://relay.invalid/v1/v1/usage");
+			const second = f.store.add(f.config.id, {
 				apiKey: "second-key",
 				network: {
 					proxy: { mode: "direct" },
@@ -690,46 +650,36 @@ describe("provider balance probes the credential a request would use", () => {
 					extraHeaders: { "X-Identity": "second-key" },
 				},
 			});
-			// Discover the non-canonical root, making a stale-root refresh observable.
-			f.respond(async (url) =>
-				url.endsWith("/v1/v1/usage")
-					? Response.json(wallet())
-					: new Response(null, { status: 404 }),
-			);
-			await f.cache.request(f.config.id);
-			const previous = f.cache.peek(f.config.id);
-			expect(previous?.status).toBe("supported");
-			expect(f.request().url).toBe("https://relay.example/v1/v1/usage");
-
 			if (unavailable === "disabled") f.store.update(first.id, { disabled: true });
 			else reportKeyFault(first, new ApiError(429, "rate limited"));
-			expect(f.cache.peek(f.config.id)).toMatchObject({ status: "pending", balance: null });
-			expect(f.cache.peek(f.config.id)?.generation).not.toBe(previous?.generation);
-			f.respond(async () => Response.json(wallet(23)));
-			const result = await f.cache.request(f.config.id, "refresh");
-
-			expect(result?.balance?.amounts[0]?.remaining).toBe(23);
-			const sent = f.request();
-			expect(sent.url).toBe("https://relay.example/v1/usage");
+			expect(selectProviderKey(f.config.id)?.id).toBe(second.id);
+			expect(providerBalanceCache.peek(f.config.id)?.balance).toBeNull();
+			expect(providerBalanceCache.peek(f.config.id)?.generation).not.toBe(before?.generation);
+			f.respond(async () =>
+				Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 23 }),
+			);
+			expect(
+				(await providerBalanceCache.request(f.config.id, "refresh"))?.balance?.amounts[0]
+					?.remaining,
+			).toBe(23);
+			const sent = f.sent();
+			expect(sent.url).toBe("https://relay.invalid/v1/usage");
 			expect(sent.headers.get("authorization")).toBe("Bearer second-key");
 			expect(sent.headers.get("user-agent")).toBe("second-key-agent");
-			expect(sent.headers.get("x-identity")).toBe("second-key");
 			expect(sent.headers.get("x-provider")).toBe("keep");
-			expect(sent.transport).toMatchObject({ proxyUrl: undefined });
+			expect(sent.transport?.proxyUrl).toBeUndefined();
 		});
 	}
-
 	for (const field of ["proxy", "userAgent", "headers"] as const) {
-		test(`editing only the selected key's ${field} withdraws the balance and root`, async () => {
-			const f = credentialFixture();
+		test(`editing selected key ${field} retires its allowance and discovered root`, async () => {
+			const f = await setup();
 			const key = f.store.add(f.config.id, { apiKey: f.config.apiKey });
 			f.respond(async (url) =>
 				url.endsWith("/v1/v1/usage")
-					? Response.json(wallet())
+					? Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 })
 					: new Response(null, { status: 404 }),
 			);
-			await f.cache.request(f.config.id);
-			const previous = f.cache.peek(f.config.id);
+			const before = await providerBalanceCache.request(f.config.id);
 			f.store.update(key.id, {
 				network:
 					field === "proxy"
@@ -738,99 +688,143 @@ describe("provider balance probes the credential a request would use", () => {
 							? { userAgentMode: "custom", customUserAgent: "updated-agent" }
 							: { extraHeaders: { "X-Identity": "updated-device" } },
 			});
-
-			expect(f.cache.peek(f.config.id)).toMatchObject({ status: "pending", balance: null });
-			expect(f.cache.peek(f.config.id)?.generation).not.toBe(previous?.generation);
-			f.respond(async () => Response.json(wallet(25)));
-			expect((await f.cache.request(f.config.id, "refresh"))?.balance?.amounts[0]?.remaining).toBe(
-				25,
+			expect(providerBalanceCache.peek(f.config.id)?.generation).not.toBe(before?.generation);
+			expect(providerBalanceCache.peek(f.config.id)?.balance).toBeNull();
+			f.respond(async () =>
+				Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 25 }),
 			);
-			const sent = f.request();
-			expect(sent.url).toBe("https://relay.example/v1/usage");
-			expect(sent.headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
-			if (field === "proxy") expect(sent.transport).toMatchObject({ proxyUrl: undefined });
-			if (field === "userAgent") expect(sent.headers.get("user-agent")).toBe("updated-agent");
-			if (field === "headers") expect(sent.headers.get("x-identity")).toBe("updated-device");
+			expect(
+				(await providerBalanceCache.request(f.config.id, "refresh"))?.balance?.amounts[0]
+					?.remaining,
+			).toBe(25);
+			expect(f.sent().url).toBe("https://relay.invalid/v1/usage");
+			if (field === "proxy") expect(f.sent().transport?.proxyUrl).toBeUndefined();
+			if (field === "userAgent") expect(f.sent().headers.get("user-agent")).toBe("updated-agent");
+			if (field === "headers") expect(f.sent().headers.get("x-identity")).toBe("updated-device");
 		});
 	}
-
-	test("a network-only edit aborts the old round and discards its late response", async () => {
-		const f = credentialFixture();
+	test("network-only rotation aborts the old round and rejects its late amount", async () => {
+		const f = await setup();
 		const key = f.store.add(f.config.id, { apiKey: f.config.apiKey });
 		const pending = deferred<Response>();
-		f.respond(() => pending.promise);
-		const original = f.cache.generations()[f.config.id];
-		const old = f.cache.request(f.config.id);
-		const oldSignal = f.request().init?.signal;
-
+		const started = deferred<void>();
+		f.respond(() => {
+			started.resolve();
+			return pending.promise;
+		});
+		const old = providerBalanceCache.request(f.config.id);
+		await started.promise;
+		const oldSignal = f.sent().init?.signal;
 		f.store.update(key.id, { network: { extraHeaders: { "X-Identity": "new-device" } } });
-		const generation = f.cache.generations()[f.config.id];
-		expect(generation).not.toBe(original);
+		providerBalanceCache.generations();
 		expect(oldSignal?.aborted).toBe(true);
-		f.respond(async () => Response.json(wallet(26)));
-		const current = await f.cache.request(f.config.id);
+		f.respond(async () =>
+			Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 26 }),
+		);
+		const current = await providerBalanceCache.request(f.config.id);
 		expect(await old).toBeNull();
-		pending.resolve(Response.json(wallet(999)));
-		await pending.promise;
-
-		expect(f.cache.peek(f.config.id)).toEqual(current);
-		expect(current).toMatchObject({ generation, status: "supported" });
+		pending.resolve(
+			Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 999 }),
+		);
+		await Promise.resolve();
+		expect(providerBalanceCache.peek(f.config.id)).toEqual(current);
 		expect(current?.balance?.amounts[0]?.remaining).toBe(26);
-		expect(f.request().headers.get("x-identity")).toBe("new-device");
+		expect(f.sent().headers.get("x-identity")).toBe("new-device");
 	});
-
-	test("all disabled keys withdraw the cached balance instead of using the projected first key", async () => {
-		const f = credentialFixture();
-		const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
-		const second = f.store.add(f.config.id, { apiKey: "second-key" });
-		await f.cache.request(f.config.id);
-		f.store.update(first.id, { disabled: true });
-		f.store.update(second.id, { disabled: true, disabledReason: "invalid" });
-
-		expect(f.cache.peek(f.config.id)).toBeNull();
-		expect(f.cache.generations()).not.toHaveProperty(f.config.id);
-		expect(await f.cache.request(f.config.id)).toBeNull();
-		f.cache.read();
-		f.cache.discoverPending();
-		expect(f.fetch).toHaveBeenCalledTimes(1);
+	test("all disabled keys cannot fall back to the projected settings secret", async () => {
+		const f = await setup();
+		const key = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+		await providerBalanceCache.request(f.config.id);
+		f.store.update(key.id, { disabled: true });
+		const count = f.calls.length;
+		expect(selectProviderKey(f.config.id)).toBeUndefined();
+		expect(providerBalanceCache.peek(f.config.id)?.balance ?? null).toBeNull();
+		expect((await providerBalanceCache.request(f.config.id))?.balance ?? null).toBeNull();
+		providerBalanceCache.read();
+		providerBalanceCache.discoverPending();
+		expect(f.calls).toHaveLength(count);
 	});
-
-	test("all cooling-down keys keep the selector's earliest-recovery semantics", async () => {
-		const f = credentialFixture();
+	test("all cooling keys preserve earliest-recovery selection rather than settings order", async () => {
+		const f = await setup();
 		const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
 		const second = f.store.add(f.config.id, { apiKey: "second-key" });
 		const now = Date.now();
 		reportKeyFault(first, new ApiError(402, "quota exhausted"), now);
 		reportKeyFault(second, new ApiError(429, "rate limited"), now);
-
-		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
-		expect(f.request().headers.get("authorization")).toBe("Bearer second-key");
+		expect(selectProviderKey(f.config.id)?.id).toBe(second.id);
+		await providerBalanceCache.request(f.config.id);
+		expect(
+			f.calls.some(
+				(call) => new Headers(call[1]?.headers).get("authorization") === "Bearer second-key",
+			),
+		).toBe(true);
 	});
-
-	test("no stored keys preserves the configured single-key credential and network", async () => {
-		const f = credentialFixture();
-		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
-		expect(f.request().headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
-		expect(f.request().headers.get("user-agent")).toBe("provider-agent");
-		expect(f.request().transport?.proxyUrl).toBe("http://provider.proxy.invalid:8080");
-	});
-
-	test("an unreadable key store preserves the configured single-key behaviour", async () => {
-		const f = credentialFixture();
-		f.store.add(f.config.id, {
-			apiKey: "stored-key",
-			network: { proxy: { mode: "direct" } },
+	for (const unreadable of [false, true])
+		test(`${unreadable ? "unreadable" : "empty"} key store preserves single-key credential and network`, async () => {
+			const f = await setup();
+			if (unreadable)
+				f.store.add(f.config.id, { apiKey: "stored-key", network: { proxy: { mode: "direct" } } });
+			const own = Object.getOwnPropertyDescriptor(f.store, "readable");
+			if (unreadable)
+				Object.defineProperty(f.store, "readable", { value: false, configurable: true });
+			try {
+				expect(await providerBalanceCache.request(f.config.id)).toMatchObject({
+					status: "supported",
+				});
+				expect(f.sent().headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
+				expect(f.sent().headers.get("user-agent")).toBe("provider-agent");
+				expect(f.sent().transport?.proxyUrl).toBe("http://provider.proxy.invalid:8080");
+			} finally {
+				if (unreadable) {
+					if (own) Object.defineProperty(f.store, "readable", own);
+					else Reflect.deleteProperty(f.store, "readable");
+				}
+			}
 		});
-		// Shadow the getter on this instance only; Bun cannot spy on accessors.
-		const ownReadable = Object.getOwnPropertyDescriptor(f.store, "readable");
-		Object.defineProperty(f.store, "readable", { value: false, configurable: true });
-		try {
-			expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
-			expect(f.request().headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
-			expect(f.request().transport?.proxyUrl).toBe("http://provider.proxy.invalid:8080");
-		} finally {
-			if (ownReadable) Object.defineProperty(f.store, "readable", ownReadable);
-			else Reflect.deleteProperty(f.store, "readable");
-		}
-	});
 });
+
+for (const [name, baseUrl, refreshAll] of [
+	["DeepSeek", "https://api.deepseek.com", refreshAllDeepSeekBalances],
+	["Kimi", "https://api.kimi.com", refreshAllKimiUsages],
+	["OpenCode", "https://opencode.ai/zen/go/v1", refreshAllOpencodeUsages],
+] as const) {
+	test(`${name} bulk refresh visits every target without overflowing the shared queue`, async () => {
+		fixture.dispose();
+		mock.restore();
+		const providers = Array.from({ length: 136 }, (_, index) =>
+			quotaConfig({
+				id: `bulk-${index}`,
+				prefix: `bulk-${index}`,
+				baseUrl,
+			}),
+		);
+		fixture = legacyQuotaFixture(providers, walletQuota, { maxConcurrent: 1, maxQueued: 1 });
+		await refreshAll({ manual: true });
+		expect(fixture.query).toHaveBeenCalledTimes(providers.length);
+		for (const { id } of providers) {
+			expect(fixture.service.peek(id)?.status).toBe("supported");
+		}
+		expect(fixture.service.getDiagnostics()).toMatchObject({ active: 0, queued: 0 });
+	});
+
+	test(`${name} bulk refresh rejects admission failure instead of reporting success`, async () => {
+		fixture.dispose();
+		mock.restore();
+		fixture = legacyQuotaFixture(
+			[
+				quotaConfig({ id: "target", prefix: "target", baseUrl }),
+				quotaConfig({ id: "busy-a", prefix: "busy-a" }),
+				quotaConfig({ id: "busy-b", prefix: "busy-b" }),
+			],
+			walletQuota,
+			{ maxConcurrent: 1, maxQueued: 1 },
+		);
+		fixture.query.mockImplementation(() => new Promise(() => {}));
+		void fixture.service.refresh("busy-a");
+		void fixture.service.refresh("busy-b");
+		expect(fixture.service.getDiagnostics()).toMatchObject({ active: 1, queued: 1 });
+		await expect(refreshAll({ manual: true })).rejects.toThrow("Quota refresh did not complete");
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(fixture.service.peek("target")?.status).toBe("pending");
+	});
+}

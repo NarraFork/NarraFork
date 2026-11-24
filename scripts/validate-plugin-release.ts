@@ -9,6 +9,7 @@ import {
 } from "../server/services/plugin-provider-rpc";
 import { LocalProcessRunner, PluginRuntime } from "../server/services/plugin-runtime";
 import { generateSpdxSbom, parseSbom } from "../server/services/plugin-sbom";
+import { quotaQueryResultSchema } from "../shared/provider-quota";
 
 const RELEASE_OSES = ["linux", "darwin", "win32"] as const;
 const RELEASE_ARCHES = ["x64", "arm64"] as const;
@@ -45,6 +46,13 @@ export interface PluginReleaseRuntimeEvidence {
 	provider?: {
 		providerTypeId: string;
 		modelCount: number;
+	};
+	/** Offline protocol check with an invalid URL; never evidence of live upstream allowance. */
+	quotaQuery?: {
+		contributionId: string;
+		status: "unsupported" | "error";
+
+		siteAccount?: { status: "unsupported" | "error" };
 	};
 	error?: string;
 }
@@ -244,8 +252,8 @@ async function validateRuntime(
 		cwd: packageRoot,
 		runner,
 		rpcProtocol: manifest.server.protocol,
-		hostApiVersion: "1.0",
 		grantedCapabilities: manifest.permissions.host,
+		supportedPluginToHostFeatures: manifest.engine.features,
 		activationReason: `release-validation:${mode}`,
 		env: {
 			NF_PLUGIN_PACKAGE_DIR: packageRoot,
@@ -297,6 +305,65 @@ async function validateRuntime(
 				};
 
 				if (mode === "ga") {
+					const quota = manifest.contributes.quotaSources[0];
+					if (quota) {
+						const response = quotaQueryResultSchema.parse(
+							await runtime.request(
+								"quota.query",
+								{
+									protocolVersion: "1.0",
+									contributionId: quota.id,
+									target: {
+										kind: "custom-api",
+										id: "custom-api/release-validation",
+										providerId: "release-validation",
+										generation: "release-validation",
+										baseUrl: "invalid-url",
+									},
+									mode: "probe",
+									reference: "release-validation",
+									deadlineAt: Date.now() + timeoutMs,
+								},
+								{ signal: controller.signal, timeoutMs },
+							),
+						);
+						if (response.status === "supported")
+							throw new Error("quota.query invented support for an invalid target");
+						result.quotaQuery = {
+							contributionId: quota.id,
+							status: response.status,
+						};
+						if (quota.requests.some((request) => request.auth === "site-token")) {
+							// Explicit but incomplete saved-account intent must not become a successful
+							// zero balance, or fall back to an inference key. No credential/HTTP is used.
+							const siteAccount = quotaQueryResultSchema.parse(
+								await runtime.request(
+									"quota.query",
+									{
+										protocolVersion: "1.0",
+										contributionId: quota.id,
+										target: {
+											kind: "custom-api",
+											id: "custom-api/release-validation-key",
+											providerId: "release-validation",
+											keyId: "release-validation-key",
+											generation: "release-validation",
+											baseUrl: "invalid-url",
+											siteQuota: { root: null },
+										},
+										mode: "probe",
+										reference: "release-validation-site",
+										deadlineAt: Date.now() + timeoutMs,
+									},
+									{ signal: controller.signal, timeoutMs },
+								),
+							);
+							if (siteAccount.status === "supported") {
+								throw new Error("quota.query invented support for an incomplete site account");
+							}
+							result.quotaQuery.siteAccount = { status: siteAccount.status };
+						}
+					}
 					const tool = manifest.contributes.tools.find((item) => item.execution === "server");
 					if (tool) {
 						const response = await runtime.request(
@@ -500,10 +567,11 @@ export async function validatePluginRelease(
 	options: PluginReleaseValidationOptions = {},
 ): Promise<PluginReleaseValidationSummary> {
 	const normalized = normalizeOptions(options);
-	const rootEntries = await readdir(pluginsRoot, { withFileTypes: true });
+	const absoluteRoot = resolve(pluginsRoot);
+	const rootEntries = await readdir(absoluteRoot, { withFileTypes: true });
 	const packageRoots = rootEntries
 		.filter((entry) => entry.isDirectory())
-		.map((entry) => join(pluginsRoot, entry.name))
+		.map((entry) => join(absoluteRoot, entry.name))
 		.sort((left, right) => basename(left).localeCompare(basename(right)));
 	const packages = await Promise.all(
 		packageRoots.map((packageRoot) =>

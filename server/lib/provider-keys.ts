@@ -26,6 +26,11 @@ import type { ProxyOverride } from "./settings/types";
 
 export const PROVIDER_KEYS_FILE = "provider-keys.json";
 
+/** Colons are reserved for site/platform/search credential owners, never Custom API IDs. */
+export function isCustomApiKeyOwner(id: string): boolean {
+	return id.length > 0 && !id.includes(":");
+}
+
 export type ProviderKeyDisabledReason = "manual" | "invalid";
 
 export interface ProviderKey {

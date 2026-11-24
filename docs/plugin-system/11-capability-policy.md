@@ -261,6 +261,26 @@ seed 成 grant、能在 admin UI 显示。
 一对一可逆（有测试断言），两个协议字符串映射到同一个 descriptor 会直接让该测试失败。风险等级定为 `medium`
 （低于 `provider.use` 的 `high`），因为一次搜索调用携带的是查询词，而非完整对话历史。
 
+### 3.9 `quota.provide` / `provider.connection.request`：独立额度协议的 live grant
+
+可选额度扩展的 `contributes.quotaSources` 只面向 `settings.customApiProviders`，无 provider 绑定、不接管既有 provider/search 执行路径。两个能力分别映射同名 canonical descriptor，保持 adapter 一对一可逆。安装仍可从已知 manifest 声明 seed grant；安装成功不意味着被撤销或过期的 grant 继续生效。
+
+额度 registry 的发现与 `quota.query` 调用检查当前安装/不可变包/声明代次及两项 live grant；无调用资源 scope 的发现只接受 global、无附加约束的有效 grant。发给插件的连接引用绑定宿主真实 runtime principal 与 Custom API 配置代次，在异步授权后再次同步复核 binding/runtime/安装/包/grants。`provider.connection.request` 仅限协商 `host_api.provider_connection` 的后端，iframe 不可调用。
+
+这不是对 §3.8 的 search/provider 路径补加授权：它是一个新、独立、显式受控的凭据代理接口。禁用/卸载/升级/回滚/grant revoke 均取消旧查询与引用，30 秒总预算包含懒激活和取消；16 KiB 规范化结果、256 KiB 原始上游 body 与有界 JSON 出站封装余量分别检查，旧方法和全插件入站预算不放宽。
+
+可选连接扩展的 `destination: "site-account"` 不是新凭据读取能力，也不新增绕过 broker 的路径：仍要求两项 live grant 和 runtime/reference/配置代次绑定，并只命中声明的 `site-token` 规则。站点根、token 与账号 ID 来自已保存配置；请求固定为 `<root>/api/user/self`、GET、无 query，宿主注入 token 和 `New-Api-User`。插件不可提供这些头，不携带 inference 自定义头，不替换 origin，不随 redirect 发送凭据，iframe 仍拒绝本方法。
+
+默认随附插件为唯一真实安装的 `io.narrafork.provider-quota@1.0.3`，并不因此获得永久 grant。bootstrap 保留用户的禁用、卸载、撤销和版本选择；旧 catalog-only builtin/host-native 额度引擎不作失效回退。站点 token 的 HTTP 401/403 返回固定 `auth_failed`，确定性失败清除 last-good；普通 provider-key 的 401/403 仍按既有 transient 策略，不能一概视作站点身份失效。relay 的 `keepLastGoodMs: 600000` 仅保留临时失败前的成功值；保留缓存不是撤销授权后的继续执行。
+
+### 3.10 来源提示和内置标签不授予能力
+
+可选 `plugin-source.json` 是发行提示，不是凭据、签名或 grant。来源/更新由宿主管理 HTTP 接口处理，不新增插件 Host API 方法，也不提升或统一固定 Host API 版本。作者提示只进入 `sourceHint`；坏副文件只产生有界 `sourceDiagnostics`，不能因来源不可用禁用原本有效的旧插件。
+
+可信 local 身份只能来自 host-owned `BuiltinPluginCatalog`，不能从包自报的 builtin 标记注册新身份。latest 始终是当前 NF descriptor；大小/归档 SHA-256 经延迟 load 校验，不扫描任意磁盘 archive，也不导入插件 JS 在宿主执行。
+
+`origin: "builtin"` 仅说明已知 NF 发行身份。普通归档仍 `packageKind: "installed"`、`canUninstall: true`；旧目录包的 `builtin: true` 只读语义不复用于它。明确重装走正常安装/授权/启用事务，不调用 bootstrap 强行恢复卸载或撤权决定。无主页不自动添加链接；来源绑定、自动更新和更宽权限均不能由新包提示代替用户选择。
+
 ## 4. 保留的限制（不要在未读本节前撤销）
 
 ### 4.1 B 类 · 单线程存活限制

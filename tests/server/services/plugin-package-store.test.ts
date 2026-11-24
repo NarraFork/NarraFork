@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildZip } from "@server/lib/document-preview/__tests__/docx-fixture";
 import { PluginPackageStore } from "@server/services/plugin-package-store";
 
 const fixturePackage = fileURLToPath(
@@ -43,21 +44,12 @@ async function mutateManifest(
 }
 
 async function makeZipSlipArchive(root: string): Promise<string> {
-	const sourceRoot = join(root, "zip-source");
-	const evilRoot = join(sourceRoot, "evil");
-	await mkdir(evilRoot, { recursive: true });
-	await writeFile(join(evilRoot, "escape.txt"), "escape");
 	const archive = join(root, "escape.nfplugin");
-	const process = Bun.spawn(["zip", "-q", archive, "../zip-source/evil/escape.txt"], {
-		cwd: sourceRoot,
-		stdout: "ignore",
-		stderr: "pipe",
-	});
-	const exitCode = await process.exited;
-	if (exitCode !== 0)
-		throw new Error(
-			`zip failed: ${new TextDecoder().decode(await new Response(process.stderr).arrayBuffer())}`,
-		);
+	// Construct the real local and central ZIP entries without a platform-specific zip CLI.
+	const escaped = "../zip-source/evil/escape.txt";
+	const bytes = buildZip([{ name: escaped, data: "escape" }]);
+	expect(bytes.includes(Buffer.from(escaped))).toBe(true);
+	await writeFile(archive, bytes);
 	return archive;
 }
 

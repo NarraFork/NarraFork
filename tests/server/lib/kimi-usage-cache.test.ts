@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import {
-	isKimiCustomApiProvider,
-	parseKimiUsagesResponse,
-} from "../../../server/lib/kimi-usage-cache";
+import { parseKimiUsagesResponse } from "../../../plugins/provider-quota/src/kimi";
+import { isKimiCustomApiProvider } from "../../../server/lib/kimi-usage-cache";
 
 // Real response captured from GET https://api.kimi.com/coding/v1/usages.
 const KIMI_COM_RESPONSE = {

@@ -3240,6 +3240,182 @@ describe("subagent live output char count", () => {
 	});
 });
 
+test("provider switching rebinds quota once and refuses retired provider frames", async () => {
+	const { settings } = await import("../../lib/settings");
+	const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+	const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
+		"../../lib/custom-api-quota-cache"
+	);
+	const previous = settings.customApiProviders;
+	const make = (id: string) => ({
+		id,
+		prefix: id,
+		name: id,
+		apiKey: "fixture-key",
+		baseUrl: "https://relay.test/v1",
+		protocol: "completions-compatible" as const,
+		defaultModel: "model",
+	});
+	const first = make("switch-quota-a");
+	const second = make("switch-quota-b");
+	try {
+		settings.customApiProviders = [first, second];
+		const a = captureCustomApiQuotaPushTarget(first.prefix);
+		const b = captureCustomApiQuotaPushTarget(second.prefix);
+		if (!a || !b) throw new Error("Missing quota fixture identity");
+		const ctx = {
+			...makeMainContext(),
+			provider: first.prefix,
+			providerPrefix: first.prefix,
+			customApiQuotaTarget: a as typeof a | null,
+		};
+		await processEvent({ type: "model_switched", provider: second.prefix, model: "model-b" }, ctx);
+		expect(ctx.customApiQuotaTarget).toEqual(b);
+		await processEvent({ type: "quota_balance", quotaBalance: "0", customApiQuotaTarget: b }, ctx);
+		expect(getCustomApiCachedQuota(second.id)).toMatchObject({ quotaBalance: "0" });
+		const sent = broadcastMessages.length;
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "999", customApiQuotaTarget: a },
+			ctx,
+		);
+		expect(broadcastMessages).toHaveLength(sent);
+		expect(getCustomApiCachedQuota(first.id)).toBeUndefined();
+		// A same-provider model switch is not permission to relabel an old account's request.
+		second.apiKey = "rotated-fixture-key";
+		await processEvent(
+			{ type: "model_switched", provider: second.prefix, model: "other-model" },
+			ctx,
+		);
+		expect(ctx.customApiQuotaTarget).toEqual(b);
+		const beforeRotationFrame = broadcastMessages.length;
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "888", customApiQuotaTarget: b },
+			ctx,
+		);
+		expect(broadcastMessages).toHaveLength(beforeRotationFrame);
+		await processEvent(
+			{ type: "model_switched", provider: "noncustom-fixture", model: "model-c" },
+			ctx,
+		);
+		expect(ctx.customApiQuotaTarget).toBeNull();
+		const afterSwitch = broadcastMessages.length;
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "777", customApiQuotaTarget: b },
+			ctx,
+		);
+		expect(broadcastMessages).toHaveLength(afterSwitch);
+	} finally {
+		purgeCustomApiQuotaCache([first.id, second.id]);
+		settings.customApiProviders = previous;
+	}
+});
+
+describe("Custom API stream quota generation", () => {
+	test("a captured old-account balance is neither broadcast nor persisted after rotation", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
+			"../../lib/custom-api-quota-cache"
+		);
+		const provider = {
+			id: "push-rotation",
+			prefix: "push-rotation",
+			name: "Push fixture",
+			apiKey: "first-key",
+			baseUrl: "https://relay.test/v1",
+			protocol: "completions-compatible" as const,
+			defaultModel: "model",
+		};
+		settings.customApiProviders = [provider];
+		purgeCustomApiQuotaCache([provider.id]);
+		const target = captureCustomApiQuotaPushTarget(provider.prefix);
+		if (!target) throw new Error("expected captured Custom API target");
+		const ctx = {
+			...makeMainContext(),
+			providerPrefix: provider.prefix,
+			customApiQuotaTarget: target,
+		};
+		provider.apiKey = "new-key";
+		const before = broadcastMessages.length;
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "999", detailedQuotaBalance: "old account" },
+			ctx,
+		);
+		expect(broadcastMessages.length).toBe(before);
+		expect(getCustomApiCachedQuota(provider.id)).toBeUndefined();
+	});
+
+	test("current stream quota keeps zero, target identity and the existing push cache", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
+			"../../lib/custom-api-quota-cache"
+		);
+		const provider = {
+			id: "push-current",
+			prefix: "push-current",
+			name: "Push fixture",
+			apiKey: "fixture-key",
+			baseUrl: "https://relay.test/v1",
+			protocol: "completions-compatible" as const,
+			defaultModel: "model",
+		};
+		settings.customApiProviders = [provider];
+		const target = captureCustomApiQuotaPushTarget(provider.prefix);
+		if (!target) throw new Error("expected captured Custom API target");
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "live detail" },
+			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
+		);
+		expect(broadcastMessages.at(-1)).toMatchObject({
+			type: "quota_balance",
+			customApiQuotaTarget: target,
+			quotaBalance: "0",
+		});
+		expect(getCustomApiCachedQuota(provider.id)).toMatchObject({
+			quotaBalance: "0",
+			detailedQuotaBalance: "live detail",
+		});
+		purgeCustomApiQuotaCache([provider.id]);
+	});
+});
+
+test("a captured Custom API quota pass never feeds the independent NUG cache", async () => {
+	const { settings } = await import("../../lib/settings");
+	const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+	const { purgeCustomApiQuotaCache } = await import("../../lib/custom-api-quota-cache");
+	const nug = await import("../../routes/nug");
+	const update = spyOn(nug, "updateNugQuotaByPrefix").mockImplementation(() => {});
+	const provider = {
+		id: "push-scope",
+		prefix: "push-scope",
+		name: "Push fixture",
+		apiKey: "fixture-key",
+		baseUrl: "https://relay.test/v1",
+		protocol: "completions-compatible" as const,
+		defaultModel: "model",
+	};
+	settings.customApiProviders = [provider];
+	const target = captureCustomApiQuotaPushTarget(provider.prefix);
+	if (!target) throw new Error("expected captured Custom API target");
+	try {
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "999" },
+			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
+		);
+		expect(update).not.toHaveBeenCalled();
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "7" },
+			{ ...makeMainContext(), providerPrefix: "nug-fixture", customApiQuotaTarget: null },
+		);
+		expect(update).toHaveBeenCalledTimes(1);
+		expect(update.mock.calls[0]).toEqual(["nug-fixture", 7, null]);
+	} finally {
+		update.mockRestore();
+		purgeCustomApiQuotaCache([provider.id]);
+	}
+});
+
 describe("quota and payment frames stay with their own session", () => {
 	const framesOf = (type: string) =>
 		(broadcastMessages as Array<Record<string, unknown>>).filter(

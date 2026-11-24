@@ -1,17 +1,27 @@
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import type { ProviderQuotaSnapshot } from "@shared/provider-quota";
 import type { TokenDanceBalance } from "@shared/tokendance";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	isProviderQuotaCapabilityEnabled,
+	type ProviderQuotaCapabilitySettings,
+	useProviderQuotas,
+} from "../../../hooks/useProviderQuota";
+import { useQuotaNow } from "../../../hooks/useQuotaNow";
 import { useTokenDanceBalance } from "../../../hooks/useTokenDanceBalance";
 import { api } from "../../../lib/api";
-import type { DeepSeekBalanceCache } from "../../../lib/api/types";
 import { formatLocaleNumber } from "../../../lib/intl-format";
-import { formatProviderBalance } from "../../../lib/provider-balance-format";
-import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./deepseek-balance-format";
-import { isKimiProviderBaseUrl } from "./kimi-usage-format";
-import { isOpencodeProviderBaseUrl } from "./opencode-usage-format";
+import { customApiQuotaDisplayFor } from "./custom-api-usage-source";
+import { buildProviderQuotaView } from "./provider-quota-view";
+import {
+	formatQuotaBadgeText,
+	formatQuotaSummaryLines,
+	QUOTA_LEVEL_COLORS,
+} from "./quota-panel-view";
 import { tokenDanceQuotaView } from "./tokendance-quota-format";
+import type { ProviderQuotaBadge } from "./use-opencode-provider-badges";
 
 /** Pay-as-you-go balance shown in a model-picker provider header. */
 export interface ProviderBalanceBadge {
@@ -20,43 +30,31 @@ export interface ProviderBalanceBadge {
 	/** The last refresh failed or the value is old; drawn dimmed. */
 	stale?: boolean;
 }
-
 export type ProviderBalanceBadges = Record<string, ProviderBalanceBadge>;
-
 interface ProviderConfigLike {
 	id: string;
 	prefix?: string;
 	baseUrl?: string;
 	disabled?: boolean;
 }
-
 type Translate = (key: string, options?: Record<string, unknown>) => string;
-
 export interface ProviderBalanceSources {
 	customApiProviders: ProviderConfigLike[];
 	nugProviders: ProviderConfigLike[];
 	nugQuotas?: Record<string, { balance: number | null; detailedQuotaBalance?: string | null }>;
-	customApiQuotas?: Record<
-		string,
-		{ quotaBalance: string | null; detailedQuotaBalance?: string | null }
-	>;
-	deepseekBalances?: Record<string, DeepSeekBalanceCache>;
-	deepseekGenerations?: Record<string, unknown>;
-	providerBalances?: Record<string, ProviderBalanceSnapshot>;
-	providerBalanceGenerations?: Record<string, unknown>;
+	customApiQuotas?: Parameters<typeof customApiQuotaDisplayFor>[0]["pushedQuotas"];
+	providerQuotas?: Record<string, ProviderQuotaSnapshot>;
+	providerQuotaGenerations?: Record<string, string>;
+	quotaQueryFailed?: boolean;
+	/** Disabling quota sources hides their cached values, never independent push text. */
+	quotaCapabilityEnabled?: boolean;
 	tokenDance?: { generation: number; data: TokenDanceBalance | undefined };
 	isAdmin: boolean;
 	now: number;
 	t: Translate;
-	settingsT: Translate;
 }
 
-/**
- * Balance badges per provider prefix, from the same caches the status bar reads.
- * Pure for tests. Subscription allowances (Kimi, OpenCode Go) are drawn as bars
- * by their own badges and are skipped here; a value fetched for a replaced
- * account (generation mismatch) is never shown.
- */
+/** Prefixes are display keys only; normalized values are selected by provider ID + generation. */
 export function buildProviderBalanceBadges(input: ProviderBalanceSources): ProviderBalanceBadges {
 	const out: ProviderBalanceBadges = {};
 	for (const provider of input.nugProviders) {
@@ -70,43 +68,34 @@ export function buildProviderBalanceBadges(input: ProviderBalanceSources): Provi
 	}
 	for (const provider of input.customApiProviders) {
 		if (provider.disabled || !provider.prefix) continue;
-		if (isKimiProviderBaseUrl(provider.baseUrl) || isOpencodeProviderBaseUrl(provider.baseUrl)) {
-			continue;
-		}
-		if (isDeepSeekProviderBaseUrl(provider.baseUrl)) {
-			const balance = input.deepseekBalances?.[provider.id];
-			const generation = input.deepseekGenerations?.[provider.id];
-			if (!balance || balance.generation !== generation || balance.fetchedAt === 0) continue;
-			const failed = balance.error != null || balance.hasError === true;
-			if (failed && balance.balanceInfos.length === 0) continue;
-			// Show the last good numbers dimmed rather than an "unavailable" label.
-			const view = formatDeepSeekBalance({ ...balance, error: null, hasError: false }, input.t);
+		const { pushedQuota, quotaSnapshot } = customApiQuotaDisplayFor({
+			providerId: provider.id,
+			generation: input.providerQuotaGenerations?.[provider.id],
+			pushedQuotas: input.customApiQuotas,
+			snapshot: input.providerQuotas?.[provider.id],
+		});
+		if (pushedQuota) {
 			out[provider.prefix] = {
-				text: view.quotaBalance,
-				tooltip: view.detailedQuotaBalance,
-				stale: failed,
+				text: pushedQuota.quotaBalance as string,
+				tooltip: pushedQuota.detailedQuotaBalance?.trim() || undefined,
 			};
 			continue;
 		}
-		const snapshot = input.providerBalances?.[provider.id];
-		const generation = input.providerBalanceGenerations?.[provider.id];
-		if (snapshot?.balance && snapshot.generation === generation) {
-			const view = formatProviderBalance(snapshot, input.settingsT, false, input.now);
-			out[provider.prefix] = {
-				text: view.quotaBalance,
-				tooltip: view.detailedQuotaBalance,
-				stale: snapshot.error != null,
-			};
-			continue;
-		}
-		const quota = input.customApiQuotas?.[provider.id];
-		const text = quota?.quotaBalance?.trim();
-		if (text) {
-			out[provider.prefix] = {
-				text,
-				tooltip: quota?.detailedQuotaBalance?.trim() || undefined,
-			};
-		}
+		if (input.quotaCapabilityEnabled === false || !quotaSnapshot?.data) continue;
+		const view = buildProviderQuotaView(
+			quotaSnapshot,
+			input.t,
+			input.isAdmin,
+			input.quotaQueryFailed,
+			input.now,
+		);
+		// Window bars have their own slot; discovery/error status is not an amount badge.
+		if (!view || view.windows.length > 0) continue;
+		out[provider.prefix] = {
+			text: formatQuotaBadgeText(view, input.t),
+			tooltip: formatQuotaSummaryLines(view, input.now, input.t).join("\n"),
+			stale: view.failed,
+		};
 	}
 	if (input.tokenDance) {
 		const { generation, data } = input.tokenDance;
@@ -127,27 +116,53 @@ export function buildProviderBalanceBadges(input: ProviderBalanceSources): Provi
 	return out;
 }
 
-/**
- * Picker balance badges for every provider that reports a pay-as-you-go balance.
- * Fetched only while the picker is open; every source is a server-side cache
- * (stale-while-revalidate), so opening the menu never waits on an upstream.
- */
-export function useProviderBalanceBadges(
-	settingsData:
-		| {
-				customApiProviders?: unknown;
-				nugProviders?: unknown;
-				customApiQuotas?: unknown;
-				deepseekBalanceGenerations?: unknown;
-				providerBalanceGenerations?: unknown;
-				tokendance?: unknown;
-		  }
-		| undefined,
+export function buildProviderQuotaBadges(
+	input: ProviderBalanceSources,
+): Record<string, ProviderQuotaBadge> {
+	const out: Record<string, ProviderQuotaBadge> = {};
+	if (input.quotaCapabilityEnabled === false) return out;
+	for (const provider of input.customApiProviders) {
+		if (provider.disabled || !provider.prefix) continue;
+		const { quotaSnapshot } = customApiQuotaDisplayFor({
+			providerId: provider.id,
+			generation: input.providerQuotaGenerations?.[provider.id],
+			pushedQuotas: input.customApiQuotas,
+			snapshot: input.providerQuotas?.[provider.id],
+		});
+		const view = buildProviderQuotaView(
+			quotaSnapshot,
+			input.t,
+			input.isAdmin,
+			input.quotaQueryFailed,
+			input.now,
+		);
+		if (!view || view.windows.length === 0) continue;
+		out[provider.prefix] = {
+			text: formatQuotaBadgeText(view, input.t),
+			color: QUOTA_LEVEL_COLORS[view.level],
+			tooltip: formatQuotaSummaryLines(view, input.now, input.t).join("\n"),
+			bars: view.windows,
+			stale: view.failed,
+		};
+	}
+	return out;
+}
+
+export interface ProviderBadgeSettings extends ProviderQuotaCapabilitySettings {
+	customApiProviders?: unknown;
+	nugProviders?: unknown;
+	customApiQuotas?: unknown;
+	providerQuotaGenerations?: unknown;
+	tokendance?: unknown;
+}
+
+/** One paginated, cache-only read for every Custom API source, not one hook per upstream brand. */
+function useCustomApiQuotaBadgeSources(
+	settingsData: ProviderBadgeSettings | undefined,
 	enabled: boolean,
 	isAdmin: boolean,
-): ProviderBalanceBadges | undefined {
+) {
 	const { t } = useTranslation("narrator");
-	const { t: settingsT } = useTranslation("settings");
 	const customApiProviders = useMemo(
 		() =>
 			(Array.isArray(settingsData?.customApiProviders)
@@ -155,6 +170,57 @@ export function useProviderBalanceBadges(
 				: []) as ProviderConfigLike[],
 		[settingsData?.customApiProviders],
 	);
+	const providerQuotaGenerations = useMemo(() => {
+		const raw = settingsData?.providerQuotaGenerations;
+		return raw && typeof raw === "object"
+			? Object.fromEntries(
+					Object.entries(raw).filter(
+						(entry): entry is [string, string] => typeof entry[1] === "string",
+					),
+				)
+			: {};
+	}, [settingsData?.providerQuotaGenerations]);
+	const quotaCapabilityEnabled = isProviderQuotaCapabilityEnabled(settingsData);
+	const query = useProviderQuotas(
+		providerQuotaGenerations,
+		enabled && customApiProviders.some((p) => !p.disabled),
+		quotaCapabilityEnabled,
+	);
+	const now = useQuotaNow(
+		enabled &&
+			quotaCapabilityEnabled &&
+			Object.values(query.data ?? {}).some((snapshot) => Boolean(snapshot.data?.expiresAt)),
+	);
+	return {
+		customApiProviders,
+		customApiQuotas: settingsData?.customApiQuotas as ProviderBalanceSources["customApiQuotas"],
+		providerQuotaGenerations,
+		providerQuotas: query.data,
+		quotaQueryFailed: query.isError,
+		quotaCapabilityEnabled,
+		isAdmin,
+		now,
+		t,
+	};
+}
+
+export function useCustomApiQuotaBadges(
+	settingsData: ProviderBadgeSettings | undefined,
+	enabled: boolean,
+	isAdmin: boolean,
+) {
+	const input = useCustomApiQuotaBadgeSources(settingsData, enabled, isAdmin);
+	const badges = buildProviderQuotaBadges({ ...input, nugProviders: [] });
+	return Object.keys(badges).length > 0 ? badges : undefined;
+}
+
+/** Shared picker path; NUG and platform TokenDance retain their original caches and behavior. */
+export function useProviderBalanceBadges(
+	settingsData: ProviderBadgeSettings | undefined,
+	enabled: boolean,
+	isAdmin: boolean,
+): ProviderBalanceBadges | undefined {
+	const customApi = useCustomApiQuotaBadgeSources(settingsData, enabled, isAdmin);
 	const nugProviders = useMemo(
 		() =>
 			(Array.isArray(settingsData?.nugProviders)
@@ -162,38 +228,12 @@ export function useProviderBalanceBadges(
 				: []) as ProviderConfigLike[],
 		[settingsData?.nugProviders],
 	);
-	const deepseekGenerations = settingsData?.deepseekBalanceGenerations as
-		| Record<string, unknown>
-		| undefined;
-	const providerBalanceGenerations = settingsData?.providerBalanceGenerations as
-		| Record<string, unknown>
-		| undefined;
-	const hasDeepSeek = customApiProviders.some(
-		(p) => !p.disabled && isDeepSeekProviderBaseUrl(p.baseUrl),
-	);
-	const hasProviderBalances = customApiProviders.some(
-		(p) => !p.disabled && typeof providerBalanceGenerations?.[p.id] === "string",
-	);
 	const hasNug = nugProviders.some((p) => !p.disabled);
-
 	const { data: nugQuotas } = useQuery({
 		queryKey: ["nug", "quotas"],
 		queryFn: api.nugGetQuotas,
-		enabled: enabled && hasNug,
+		enabled: !REMOTE_BUILD && enabled && hasNug,
 		staleTime: 30_000,
-	});
-	const { data: deepseekBalances } = useQuery({
-		queryKey: ["deepseek", "balances", "picker"],
-		queryFn: ({ signal }) => api.deepseekGetBalances({ signal }),
-		enabled: enabled && hasDeepSeek,
-		staleTime: 30_000,
-	});
-	const { data: providerBalances } = useQuery({
-		queryKey: ["provider-balances", "picker"],
-		queryFn: ({ signal }) => api.providerGetBalances({ signal }),
-		enabled: enabled && hasProviderBalances,
-		staleTime: 30_000,
-		retry: false,
 	});
 	const tokenDanceConnection = settingsData?.tokendance as
 		| { connected?: boolean; disabled?: boolean; generation?: number }
@@ -205,40 +245,14 @@ export function useProviderBalanceBadges(
 			? (tokenDanceConnection.generation as number)
 			: undefined;
 	const tokenDanceBalance = useTokenDanceBalance(tokenDanceGeneration, enabled);
-
-	return useMemo(() => {
-		const badges = buildProviderBalanceBadges({
-			customApiProviders,
-			nugProviders,
-			nugQuotas,
-			customApiQuotas: settingsData?.customApiQuotas as ProviderBalanceSources["customApiQuotas"],
-			deepseekBalances,
-			deepseekGenerations,
-			providerBalances,
-			providerBalanceGenerations,
-			tokenDance:
-				tokenDanceGeneration !== undefined
-					? { generation: tokenDanceGeneration, data: tokenDanceBalance.data }
-					: undefined,
-			isAdmin,
-			now: Date.now(),
-			t,
-			settingsT,
-		});
-		return Object.keys(badges).length > 0 ? badges : undefined;
-	}, [
-		customApiProviders,
+	const badges = buildProviderBalanceBadges({
+		...customApi,
 		nugProviders,
 		nugQuotas,
-		settingsData?.customApiQuotas,
-		deepseekBalances,
-		deepseekGenerations,
-		providerBalances,
-		providerBalanceGenerations,
-		tokenDanceGeneration,
-		tokenDanceBalance.data,
-		isAdmin,
-		t,
-		settingsT,
-	]);
+		tokenDance:
+			tokenDanceGeneration !== undefined
+				? { generation: tokenDanceGeneration, data: tokenDanceBalance.data }
+				: undefined,
+	});
+	return Object.keys(badges).length > 0 ? badges : undefined;
 }

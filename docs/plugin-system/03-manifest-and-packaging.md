@@ -40,8 +40,10 @@
 | 版本层 | 示例 | 作用 | 不兼容时处理 |
 |---|---|---|---|
 | Manifest schema | `1` | 宿主是否能安全读取 `manifest.json` | 安装检查失败，不执行代码 |
-| Host API | `1.0` | 插件可调用的 Query/Command/Event/Storage/Secret API | 选择共同版本；无交集则 incompatible |
+| Host API | 原有版本声明 | 插件可调用的 Query/Command/Event/Storage/Secret API 与后端连接扩展 | 选择共同版本；无交集则 incompatible |
 | RPC protocol | `narrafork.rpc/1` | framing、握手、流、取消、错误和背压 | major 不同拒绝握手 |
+
+**[当前事实]** Host API 沿用原有 catalog、manager 与 runtime 的版本声明、默认值及兼容性检查。本分支不提升版本，也不新增统一固定常量。Manifest v1 新增可选 `contributes.quotaSources` 和 `onQuota:<id>`：额度源复用 [shared/provider-quota.ts](../../shared/provider-quota.ts) 的公开 schema，仅面向 Custom API 配置，要求 server，且无 provider 绑定；旧贡献默认空。`host_api.provider_connection` 是显式后端协商 feature，不是 iframe API。禁用、卸载、升级/回滚和 grant/runtime 代次变化都通过 platform 的 `quota_registry` 撤销层处理。
 
 - **[设计建议]** `schemaVersion` 是整数主版本，表示 Manifest 结构版本；同一主版本只能增加可选字段，不得改变必填字段语义。
 - **[设计建议]** `version` 遵循 SemVer，表示插件发布版本；预发布版本可以安装但默认不参与稳定通道自动升级。
@@ -439,6 +441,16 @@ manifest 校验会拒绝指向未声明 provider 的 `providerId`（悬空绑定
 
 `search.provide` 需要在 `permissions.host` 里声明，但它是声明性 capability，**不设运行时 gate** —— 与 provider 执行路径一致，详见 `11-capability-policy.md`。
 
+### 3.5.8 `quotaSources`（Custom API 额度源，可选 feature 扩展）
+
+**[当前事实]** 额度源是独立后端贡献，只要求 `server` 和两项 live grant（`quota.provide`、`provider.connection.request`），不声明 provider 贡献，不接管模型、搜索或内置 provider。现行字段、默认值和数值上限来自 [shared/provider-quota.ts](../../shared/provider-quota.ts)，JSON Schema companion 保持同形。
+
+- `match` 包含 `hosts`、`pathPrefixes`、`fallback`；贡献 ID 和匹配声明不能选择任意凭据。
+- `requests[]` 声明允许的 GET 路径、`auth`、`queryKeys` 及 harmless `headers`。`auth` 为 `none`、`bearer`、`bearer-and-api-key` 或 `site-token`；插件只可提供 `accept` 和 `user-agent`，不能提供认证或推理自定义头。
+- `site-token` 只适用于后端 `provider.connection.request` 的 `destination: "site-account"`。宿主从已保存的站点根和凭据派生固定 `<root>/api/user/self`；查询串为空，拒绝跨 origin/重定向，不把站点 token 或 `New-Api-User` 交给插件。
+- `refresh.keepLastGoodMs` 是可选整数（0–31536000000 毫秒），无默认值。relay 明确声明 `600000`；未声明的 Kimi/OpenCode 保留原有 SWR，不被全局十分钟策略截短。认证、配置、协议或授权确定性错误不保留旧成功值；临时失败才受该 retention 限制。
+- `limits` 的宿主上限为整次查询 30 秒、单请求 20 秒、原始 body 256 KiB、最多 16 请求；规范化额度最多 16 KiB。插件可声明更小预算，不能把 JSON 封装余量转作任意大响应。
+
 - `mcp`：**[建议]** v1 不允许 Manifest 直接修改 `settings.mcpServers`；如未来支持 MCP contribution，必须由宿主创建受控配置、独立授权和审计，并复用现有 MCP Manager 的连接/重连语义。
 
 完整 contribution ID 必须带命名空间，例如：
@@ -531,6 +543,37 @@ NOTICE
 - 归档解压必须逐项进行路径规范化和真实路径检查，拒绝 zip bomb、重复文件、大小写碰撞和超出总解压大小的包。
 - `manifest.json` 解析和静态检查在 staging 目录完成；在校验结束前不执行 server、UI、安装脚本或依赖脚本。
 - **[假设]** 未来可支持 `.tar.gz` 导入，但要复用现有 pack 的类型/大小/路径穿越检查；v1 建议只承诺 ZIP，减少跨平台归档差异。
+
+### 5.1.1 随主程序提供的 Provider Quota 包
+
+**[当前事实]** 只有真实可安装的 `io.narrafork.provider-quota@1.0.3` 包，没有第二套 `server/builtin-plugins/apikey-quota` 或宿主内执行的额度查询 engine。包的兼容声明为 `>=1.0 <2`，额度接口通过可选 feature 协商，宿主版本沿用原有维护机制；server 入口、锁定依赖、MPL 源码、许可证、SPDX SBOM 和可选 `plugin-source.json` 都在 `.nfplugin` 内。插件版本独立于 APP_VERSION。
+
+- [scripts/build-bundled-plugins.ts](../../scripts/build-bundled-plugins.ts) 固定并核对包身份、16 MiB archive 大小和 SHA-256；[scripts/generate-builtin-plugins.ts](../../scripts/generate-builtin-plugins.ts) 为 immutable local-runtime/release 生成同一 archive 模块，旧 builtin 数组明确为空。
+- 编译宿主使用 `with { type: "file" }` 嵌入 opaque archive 与 ID/version/size/SHA 元数据。插件 JS 不在宿主 imports 或 worker entrypoints；运行时只读取已嵌入的字节，经普通 PackageStore 校验并 materialize 到不可变安装目录，缺嵌入资源失败而不回退源码执行。
+- `.nfplugin` 和 package tree 先在带独占锁的 staging 生成；完整 archive 校验后复制到按 SHA-256 命名的内容寻址缓存，以 no-replace 方式冻结，后续对 canonical `dist/` 的重建不会改写该缓存 inode。local-runtime 的 `publishGenerated: false` 路径使用 `.narrafork/` 私有 build 输出，不改 plugin `dist/` 或 `server/generated`。同一 checkout 的并发 publisher 由输出锁串行/失败关闭，未知遗留锁不自动删除。
+- 正式生成会原子替换单个 archive、metadata、package directory 和 generated module；可恢复的发布失败回滚旧文件。它不是跨多个路径对非协作读取者可见的单一文件系统事务，因此 descriptor/archive digest 不匹配必须 fail closed。release 的所有目标复用本次冻结的同一内容寻址 archive；`--skip-frontend` 不跳过插件生成。启用 remote-peer 的 NF 宿主同样携带此材料；独立 Go remote-peer 网络代理不运行或复制另一套额度插件。
+- 默认安装、启用属于一次 bootstrap：已有禁用、卸载、grant 撤销及当前版本选择不会因重启或升级宿主被覆盖。包清单自报的 pluginId 不构成内置信任；descriptor、archive 元数据和解包 Manifest 必须一致。
+- 固定 SPDX 创建时间、ZIP 时间/权限和排序保证同源、同版本、同工具链的 archive bytes 与内容 hash 可重复。PackageStore 的同版本不同 hash 拒绝策略不放宽。
+
+### 5.1.2 可选来源副文件与可卸载的内置归档
+
+**[当前事实]** 来源是包根的可选 `plugin-source.json`，不是 Manifest 新必填字段，也不是新的运行时 Host API。其 schema 独立于 Manifest/RPC，来自 [shared/plugin-source.ts](../../shared/plugin-source.ts)；companion 定义位于 `contracts/manifest-v1.schema.json` 的 `$defs.pluginSourceMetadata`，不改变 Manifest 根结构。
+
+```json
+{
+  "schemaVersion": 1,
+  "pluginId": "io.narrafork.provider-quota",
+  "source": { "type": "local", "builtinId": "io.narrafork.provider-quota" }
+}
+```
+
+- 来源可为 `github`、`website`、`local`。GitHub 声明 owner/repo/assetName；网站声明 updateApi 和可选 downloadOrigins；local 仅声明宿主已知 builtinId，不接受任意磁盘路径或扫描最高版本。
+- `homepage` 可选，缺失不从仓库、publisher 或更新接口猜测主页；插件名称保持普通文字。随附 Provider Quota 未设置主页，包中不加入链接。
+- [server/lib/plugins/source-metadata.ts](../../server/lib/plugins/source-metadata.ts) 有界读取至多 16 KiB，核对插件身份与 local builtinId。缺失为无来源；坏 JSON/schema、错配和超限只进入 `sourceDiagnostics`，不进入决定有效插件兼容性的 `diagnostics`，不影响原上传/运行流程。
+- `sourceHint` 仅是作者提示，不替代管理员来源绑定、来源 revision、自动更新偏好或信任策略；新包不能靠提示覆盖已批准来源或自动开启更新。
+- [server/services/builtin-plugin-catalog.ts](../../server/services/builtin-plugin-catalog.ts) 是 host-owned 已知身份表。同步 `get(id)` 返回 NF 自带 descriptor 的版本、名称、本地来源和延迟 `load(signal)`；只有 load 才读取/校验归档与摘要，latest 不来自服务器磁盘上的任意包。
+- 安装标记来自真实安装记录而非残留 archive 目录；`list(installedVersions)` 返回 `installed`、`installedVersion`、`canInstall`。未安装的内置插件可由管理员明确重装，不用 bootstrap 覆盖卸载记忆。
+- 目录型旧 builtin 仍 `builtin: true`、`packageKind: "builtin-directory"`、`canUninstall: false`。NF 随附归档是普通安装包：`origin: "builtin"`、`packageKind: "installed"`、`canUninstall: true`，不设置旧只读 builtin 标记。内置标签不免授权/签名/不可变校验，也不阻止卸载。
 
 ### 5.2 完整性与签名
 

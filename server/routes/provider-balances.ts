@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { NotFoundError, RateLimitError } from "../lib/errors";
 import { providerBalanceCache } from "../lib/provider-balance-cache";
 import { requireAdmin } from "../middleware/auth";
+import { scheduleManualQuotaRefresh } from "./provider-quotas";
 
 export const providerBalanceRoutes = new Hono();
 
@@ -15,7 +16,7 @@ providerBalanceRoutes.use("*", async (c, next) => {
 providerBalanceRoutes.get("/", (c) => c.json(providerBalanceCache.read(c.req.query("providerId"))));
 
 for (const action of ["probe", "refresh"] as const) {
-	providerBalanceRoutes.post(`/:id/${action}`, requireAdmin, (c) => {
+	providerBalanceRoutes.post(`/:id/${action}`, requireAdmin, async (c) => {
 		const id = c.req.param("id");
 		if (!id || !providerBalanceCache.peek(id)) throw new NotFoundError("Provider", id ?? "");
 		const retryAfterMs = providerBalanceCache.manualRetryAfterMs(id);
@@ -28,7 +29,7 @@ for (const action of ["probe", "refresh"] as const) {
 			);
 		}
 		// Start a coalesced, bounded job but do not hold the HTTP request open.
-		void providerBalanceCache.request(id, action).catch(() => {});
+		await scheduleManualQuotaRefresh(c, [id], action);
 		return c.json(providerBalanceCache.peek(id));
 	});
 }

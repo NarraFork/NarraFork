@@ -29,35 +29,19 @@ import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
 } from "../lib/custom-api-quota-cache";
-import {
-	getDeepSeekBalanceGenerations,
-	refreshAllDeepSeekBalances,
-	syncDeepSeekBalanceCache,
-} from "../lib/deepseek-balance-cache";
+import { getDeepSeekBalanceGenerations } from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
-import {
-	getAllKimiCachedUsages,
-	purgeKimiUsageCache,
-	refreshAllKimiUsages,
-} from "../lib/kimi-usage-cache";
+import { getAllKimiCachedUsages } from "../lib/kimi-usage-cache";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
-import {
-	getOpencodeUsageGenerations,
-	refreshAllOpencodeUsages,
-	syncOpencodeUsageCache,
-} from "../lib/opencode-usage-cache";
+import { getOpencodeUsageGenerations } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
-import {
-	discoverPendingProviderBalances,
-	getProviderBalanceGenerations,
-	syncProviderBalanceCache,
-} from "../lib/provider-balance-cache";
+import { getProviderBalanceGenerations } from "../lib/provider-balance-cache";
 import { getProviderKeyStore } from "../lib/provider-keys";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
@@ -110,7 +94,7 @@ import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
-import { isApikeyQuotaCapabilityEnabled } from "../services/apikey-quota-plugin-engine";
+
 import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
@@ -123,6 +107,12 @@ import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
+import { providerQuotaService } from "../services/provider-quota-service";
+import {
+	hasSiteQuotaConfig,
+	sameSiteQuotaRoot,
+	siteQuotaRoot,
+} from "../services/provider-quota-sites";
 import { getTokenDanceConnection } from "../services/tokendance-service";
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
@@ -168,7 +158,14 @@ const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional()
 const toolResultImagesSchema = z.enum(["off", "inline", "separate"]).optional();
 
 const customApiProviderSchema = z.object({
-	id: z.string().min(1),
+	id: z
+		.string()
+		.min(1)
+		.max(256)
+		.refine(
+			(value) => !value.includes(":"),
+			"Custom API IDs cannot use private credential owner namespaces",
+		),
 	name: z.string(),
 	prefix: z.string().min(1),
 	apiKey: z.string(),
@@ -999,11 +996,12 @@ async function buildSettingsResponse(
 		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
+		providerQuotaGenerations: providerQuotaService.generations(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
-		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
-		// know whether it is on before rendering the site-quota inputs and the balance row.
-		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
+		// The provider page must use the same quota-service capability gate as its routes before
+		// rendering site-account fields or quota rows.
+		providerBalanceCapability: { enabled: providerQuotaService.capabilityEnabled() },
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1136,32 +1134,6 @@ function getGeminiTransportChangedProviderIds(
 		.map((provider) => provider.id);
 }
 
-/**
- * Custom API providers whose KIMI USAGE identity changed.
- *
- * Narrower than the quota test: the usage endpoint is addressed by `baseUrl` and
- * authenticated by `apiKey`, and nothing else affects what it returns. `disabled`
- * counts too — a disabled provider stops being refreshed, so leaving its numbers
- * cached would show a quota that is no longer being updated.
- */
-function getCustomApiProviderIdsWithKimiIdentityChanges(
-	prev: NarraForkSettings["customApiProviders"],
-	next: NarraForkSettings["customApiProviders"],
-): string[] {
-	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
-	return (prev ?? [])
-		.filter((provider) => {
-			const nextProvider = nextById.get(provider.id);
-			if (!nextProvider) return false;
-			return (
-				provider.baseUrl !== nextProvider.baseUrl ||
-				provider.apiKey !== nextProvider.apiKey ||
-				Boolean(provider.disabled) !== Boolean(nextProvider.disabled)
-			);
-		})
-		.map((provider) => provider.id);
-}
-
 function getCustomApiProviderIdsWithQuotaIdentityChanges(
 	prev: NarraForkSettings["customApiProviders"],
 	next: NarraForkSettings["customApiProviders"],
@@ -1259,22 +1231,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
-	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
-	// rather than the quota one: that set also fires on `protocol`,
-	// `geminiTransport` and `codexAccountId`, none of which changes what the usage
-	// endpoint returns — throwing the cache away for them just forces a needless
-	// upstream refetch.
-	const staleKimiUsageIds = uniqueIds([
-		...removedCustomApiIds,
-		...getCustomApiProviderIdsWithKimiIdentityChanges(
-			prev.customApiProviders,
-			next.customApiProviders,
-		),
-	]);
-	if (staleKimiUsageIds.length) {
-		purgeKimiUsageCache(staleKimiUsageIds);
-	}
-
 	// Collect prefixes of removed providers — needed to purge agent-level fields
 	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
@@ -1702,8 +1658,9 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				current.anthropicProviders,
 				current.geminiProviders,
 			);
+		const savedCustomApiById = new Map(currentCustomApiProviders.map((p) => [p.id, p] as const));
 		const findExistingCustomApiKey = (id: string): string =>
-			currentCustomApiProviders.find((p) => p.id === id)?.apiKey ??
+			savedCustomApiById.get(id)?.apiKey ??
 			current.openaiProviders?.find((p) => p.id === id)?.apiKey ??
 			current.anthropicProviders?.find((p) => p.id === id)?.apiKey ??
 			current.geminiProviders?.find((p) => p.id === id)?.apiKey ??
@@ -1719,12 +1676,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
-				// The site access token is a credential of its own: a masked display value must
-				// keep the stored token instead of overwriting it with the mask.
+				// A mask refers to the saved account, not just to a provider row with the same id.
 				if (p.quotaAccessToken?.startsWith("*")) {
+					const saved = savedCustomApiById.get(p.id);
+					const userId = saved?.quotaUserId?.trim();
 					p.quotaAccessToken =
-						currentCustomApiProviders.find((candidate) => candidate.id === p.id)
-							?.quotaAccessToken ?? "";
+						saved && userId && userId === p.quotaUserId?.trim() && sameSiteQuotaRoot(saved, p)
+							? (saved.quotaAccessToken ?? "")
+							: "";
 				}
 			}
 			validated.customApiProviders = normalizedCustomApiProviders;
@@ -1772,7 +1731,24 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				validated.openaiProviders ?? current.openaiProviders,
 				validated.anthropicProviders ?? current.anthropicProviders,
 				validated.geminiProviders ?? current.geminiProviders,
-			);
+			).map((provider) => {
+				// Split arrays have no site fields. An unchanged inference root identifies the relay;
+				// its saved quota site may be explicit and different from that relay.
+				const saved = savedCustomApiById.get(provider.id);
+				if (
+					!saved ||
+					!hasSiteQuotaConfig(saved) ||
+					!sameSiteQuotaRoot({ baseUrl: saved.baseUrl }, provider) ||
+					siteQuotaRoot(saved) === null
+				)
+					return provider;
+				return {
+					...provider,
+					quotaSiteUrl: saved.quotaSiteUrl,
+					quotaUserId: saved.quotaUserId,
+					quotaAccessToken: saved.quotaAccessToken,
+				};
+			});
 		}
 
 		// Preserve real API keys and OAuth secrets for NUG providers
@@ -1900,12 +1876,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		} else {
 			saveSettings(merged);
 		}
-		// Invalidate account/transport identities immediately after a successful save.
-		syncDeepSeekBalanceCache();
-		syncProviderBalanceCache();
+		// Reconcile the sole Custom API quota identity only after the settings save succeeds.
+		providerQuotaService.sync();
 		if (validated.customApiProviders || validated.proxy) {
-			void refreshAllDeepSeekBalances().catch(() => {});
-			discoverPendingProviderBalances();
+			void providerQuotaService.refreshStale().catch(() => {});
 		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
@@ -1923,22 +1897,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 					updateNarratorModel(row.id, row.afterModel);
 				}
 			}
-		}
-
-		// Refresh Kimi usage caches when the provider list changed, so a newly
-		// added kimi.com/kimi.ai provider shows its quota without waiting for the
-		// periodic scheduler. Fire-and-forget: a slow upstream must not delay the
-		// settings response.
-		if (validated.customApiProviders) {
-			void refreshAllKimiUsages().catch(() => {});
-		}
-
-		// Invalidate account/transport identities immediately after a successful
-		// save, then warm the new ones so a freshly added (or replaced) OpenCode Go
-		// provider shows its allowance without waiting for the next staleness window.
-		syncOpencodeUsageCache();
-		if (validated.customApiProviders || validated.proxy) {
-			void refreshAllOpencodeUsages().catch(() => {});
 		}
 
 		if (vnetChanged) {
@@ -2144,8 +2102,8 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
-	syncProviderBalanceCache();
-	discoverPendingProviderBalances();
+	providerQuotaService.sync();
+	void providerQuotaService.refreshStale([target.id]).catch(() => {});
 
 	logger.info("Provider base URL fixed with /v1 suffix", {
 		providerId: target.id,

@@ -158,16 +158,23 @@ describe("plugin GA release validation", () => {
 		}
 	});
 
-	test("rejects a runtime that omits the installer package digest", async () => {
+	test.each([
+		"\n",
+		"\r\n",
+	])("rejects a runtime that omits the installer package digest with newline=%j", async (newline) => {
 		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-hello-"));
 		try {
 			const packageRoot = join(root, "tool-command");
 			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
 			const entryPath = join(packageRoot, "server/index.js");
-			const entry = await readFile(entryPath, "utf8");
-			const digestField = "\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),\n";
-			expect(entry).toContain(digestField);
-			await writeFile(entryPath, entry.replace(digestField, ""));
+			const entry = (await readFile(entryPath, "utf8"))
+				.replaceAll("\r\n", "\n")
+				.replaceAll("\n", newline);
+			const digestField = `\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),${newline}`;
+			expect(entry.split(digestField)).toHaveLength(2);
+			const missingDigest = entry.replace(digestField, "");
+			expect(missingDigest).not.toContain("packageDigest: PACKAGE_DIGEST");
+			await writeFile(entryPath, missingDigest);
 
 			const summary = await validatePluginRelease(root, {
 				mode: "runtime",

@@ -14,6 +14,7 @@
  * (which carries queries, a WS subscription and scroll containers).
  */
 import type { ProviderBalanceSnapshot } from "../../../../shared/provider-balance";
+import type { ProviderQuotaSnapshot } from "../../../../shared/provider-quota";
 import { isSub2ApiSubscriptionSnapshot } from "./sub2api-subscription-quota-view";
 
 export function usageSourceFor(input: {
@@ -43,4 +44,48 @@ export function customApiBalanceDisplayFor(input: {
 		subscriptionSnapshot:
 			!pushedQuota && isSub2ApiSubscriptionSnapshot(input.snapshot) ? input.snapshot : null,
 	};
+}
+
+/** The already resolved runtime model chooses the provider, never the first auto source. */
+export function resolveCustomApiQuotaProviderId(
+	resolvedModel: string | null | undefined,
+	providers: readonly { id: string; prefix?: string; disabled?: boolean }[] | undefined,
+): string | null {
+	const prefix = resolvedModel?.split(":")[0];
+	if (!prefix) return null;
+	return (
+		providers?.find((provider) => provider.prefix === prefix && !provider.disabled)?.id ?? null
+	);
+}
+
+/** Inference-key text cannot replace an explicit site account or a different Key identity. */
+export function customApiQuotaDisplayFor(input: {
+	providerId: string | null;
+	generation: string | undefined;
+	pushedQuotas?: Record<
+		string,
+		{ quotaBalance: string | null; detailedQuotaBalance?: string | null; generation?: string }
+	>;
+	snapshot: ProviderQuotaSnapshot | null | undefined;
+}) {
+	const snapshot = input.snapshot;
+	const quotaSnapshot =
+		input.providerId &&
+		input.generation &&
+		snapshot?.providerId === input.providerId &&
+		snapshot.targetId === `custom-api/${input.providerId}` &&
+		snapshot.generation === input.generation
+			? snapshot
+			: null;
+	const cached = input.providerId ? input.pushedQuotas?.[input.providerId] : undefined;
+	const versionedPush = Boolean(input.generation && cached?.generation === input.generation);
+	const legacyPush =
+		cached?.generation === undefined && !snapshot?.keyId && (!snapshot || quotaSnapshot !== null);
+	const pushedQuota =
+		snapshot?.pushCompatible !== false &&
+		cached?.quotaBalance?.trim() &&
+		(versionedPush || legacyPush)
+			? cached
+			: null;
+	return { pushedQuota, quotaSnapshot: pushedQuota ? null : quotaSnapshot };
 }

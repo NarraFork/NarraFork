@@ -1,3 +1,4 @@
+import { providerQuotaSourceSchema } from "@shared/provider-quota";
 import {
 	getContributionFullId,
 	isContributionId,
@@ -37,6 +38,7 @@ export interface PluginRegistryDiagnostic extends PluginDiagnostic {
 export type ActivationEventKind =
 	| "onStartup"
 	| "onProvider"
+	| "onQuota"
 	| "onTool"
 	| "onCommand"
 	| "onView"
@@ -150,7 +152,9 @@ function contributionIdentityIsValid(
 ): boolean {
 	return (
 		isPluginId(contribution.pluginId) &&
-		isContributionId(contribution.id) &&
+		(contribution.kind === "quotaSource"
+			? providerQuotaSourceSchema.shape.id.safeParse(contribution.id).success
+			: isContributionId(contribution.id)) &&
 		contribution.pluginId === plugin.pluginId &&
 		contribution.version === packageSummary.version &&
 		contribution.hash === packageSummary.hash &&
@@ -415,16 +419,20 @@ function containsControlCharacter(value: string): boolean {
 function normalizeContributionReference(
 	pluginId: string,
 	reference: string,
+	quota = false,
 ): { contributionId: string; fullId: string } | undefined {
+	const validId = quota
+		? (id: string) => providerQuotaSourceSchema.shape.id.safeParse(id).success
+		: isContributionId;
 	if (reference.length > 256 || containsControlCharacter(reference)) return undefined;
 	if (reference.includes("/")) {
 		const prefix = `${pluginId}/`;
 		if (!reference.startsWith(prefix)) return undefined;
 		const contributionId = reference.slice(prefix.length);
-		if (!isContributionId(contributionId)) return undefined;
+		if (!validId(contributionId)) return undefined;
 		return { contributionId, fullId: getContributionFullId(pluginId, contributionId) };
 	}
-	if (!isContributionId(reference)) return undefined;
+	if (!validId(reference)) return undefined;
 	return { contributionId: reference, fullId: getContributionFullId(pluginId, reference) };
 }
 
@@ -609,12 +617,17 @@ export class ActivationIndex {
 					continue;
 				}
 
-				const normalized = normalizeContributionReference(plugin.pluginId, parsed.reference);
+				const normalized = normalizeContributionReference(
+					plugin.pluginId,
+					parsed.reference,
+					parsed.kind === "onQuota",
+				);
 				const expectedKind: Record<
-					"onProvider" | "onTool" | "onCommand" | "onView",
+					"onProvider" | "onQuota" | "onTool" | "onCommand" | "onView",
 					PluginContributionKind
 				> = {
 					onProvider: "provider",
+					onQuota: "quotaSource",
 					onTool: "tool",
 					onCommand: "command",
 					onView: "view",

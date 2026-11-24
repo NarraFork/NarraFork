@@ -236,6 +236,7 @@ import {
 	outlinePersonHourRunning,
 } from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
+import { captureCustomApiQuotaPushTarget } from "../provider-quota-push";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
@@ -1650,6 +1651,7 @@ export async function runAgentLoopUnlocked(
 				providerPrefix: resolved.provider,
 				provider: resolved.provider,
 				model: resolved.model,
+				customApiQuotaTarget: captureCustomApiQuotaPushTarget(resolved.provider),
 				// Subagent dual-broadcast fields — when set, dualBroadcast sends
 				// events to both the parent narrator and the subagent's own page.
 				parentToolUseId: placement?.parentToolUseId,

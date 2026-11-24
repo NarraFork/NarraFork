@@ -4,6 +4,7 @@ import {
 } from "@shared/subagent-model-policy";
 import { ValidationError } from "../errors";
 import { rewriteConnectionOverrides } from "../model-catalog";
+import { isCustomApiKeyOwner } from "../provider-keys";
 import type {
 	AnthropicProviderConfig,
 	CustomApiProtocol,
@@ -355,6 +356,7 @@ export function normalizeCustomApiProvider(
 
 	return {
 		...provider,
+		...(!isCustomApiKeyOwner(provider.id) ? { disabled: true } : {}),
 		protocol,
 		geminiTransport:
 			protocol === "gemini-compatible"

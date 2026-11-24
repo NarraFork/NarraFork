@@ -695,7 +695,7 @@ export function useVListLivePatches(
 			// ── Reconnect catch-up: authoritative activity snapshots ────────────
 			// The shell's own onCatchUp only decides whether to reload structurally;
 			// the activity summaries it carries would otherwise be dropped.
-			onCatchUp: (_orphanChildren, _topLevel, subagentActivities) => {
+			onCatchUp: (_orphanChildren, _topLevel, subagentActivities): undefined => {
 				// A catch-up reload may finally load the tool_use a completion missed.
 				replayPendingCompletions();
 				if (subagentActivities.length === 0) {

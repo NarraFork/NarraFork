@@ -151,13 +151,18 @@ describe("plugin acceptance workflow inputs", () => {
 			runtime.start();
 			try {
 				const deadline = Date.now() + 15000;
-				let healthy = false;
+				let responsive = false;
 				while (Date.now() < deadline) {
-					try { healthy = (await fetch(runtime.base + "/api/health", {signal: AbortSignal.timeout(1000)})).ok; } catch {}
-					if (healthy) break;
+					try {
+						const response = await fetch(runtime.base + "/api/health", {signal: AbortSignal.timeout(1000)});
+						const health = await response.json();
+						// Cleanup must also retire the real startup Worker before the application is ready.
+						responsive = response.ok || (response.status === 503 && health.status === "starting" && health.readiness === "starting");
+					} catch {}
+					if (responsive) break;
 					await Bun.sleep(100);
 				}
-				if (!healthy) throw new Error("Fixture's isolated backend did not start");
+				if (!responsive) throw new Error("Fixture's isolated backend did not respond");
 				// A real owned child exercises Browser.process()/close(), without depending on
 				// Chrome discovery or reaching any account/network in this lifecycle unit test.
 				const browserProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {stdio: "ignore"});
@@ -182,6 +187,10 @@ describe("plugin acceptance workflow inputs", () => {
 			{ cwd: root, encoding: "utf8", timeout: 30_000, maxBuffer: 32_768 },
 		);
 		expect(result.error).toBeUndefined();
+		if (result.status !== 2)
+			throw new Error(
+				`Owned smoke cleanup fixture failed (${result.status}): ${result.stdout.slice(-4096)} ${result.stderr.slice(-4096)}`,
+			);
 		expect(result.status).toBe(2);
 		expect(JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}")).toEqual({
 			cleanupFailed: true,

@@ -55,6 +55,8 @@ export interface PluginIntegrationAuthorityServiceOptions {
 export interface EnsurePluginInstallationOptions {
 	/** Explicit reinstall only: preserve the revoked tombstone and issue a fresh authority identity. */
 	replaceRevoked?: boolean;
+	/** Host-owned first installation, never a user-supplied authority or grant expansion. */
+	seedGrantedBy?: "system";
 }
 
 function hash(value: string): string {
@@ -307,7 +309,12 @@ export class PluginIntegrationAuthorityService {
 				sourceInstallationId,
 			);
 		}
-		await this.permissionStore.ensureLegacySummary(pluginId, targetInstallationId, legacySummary);
+		await this.permissionStore.ensureLegacySummary(
+			pluginId,
+			targetInstallationId,
+			legacySummary,
+			options.seedGrantedBy,
+		);
 		const legacy = await this.permissionStore.getSet(pluginId, targetInstallationId);
 		const initialRevision = Math.max(1, legacy.revision);
 		try {

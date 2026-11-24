@@ -176,7 +176,7 @@ for (const shape of shapes) {
 				started.push(request.text);
 				return { started: true, foreground: idle, terminal: idle, completion: idle };
 			});
-			stopAtModelStart().start.mockImplementation(async () => {});
+			stopAtModelStart().start.mockImplementation(async () => undefined);
 			expect((await session.retryLastMessage(ID)).ok).toBe(true);
 			for (let i = 0; i < 100 && started.length === 0; i++)
 				await new Promise((resolve) => setTimeout(resolve, 5));
@@ -211,7 +211,7 @@ for (const shape of shapes) {
 				started.push(request.text);
 				return { started: true, foreground: idle, terminal: idle, completion: idle };
 			});
-			stopAtModelStart().start.mockImplementation(async () => {});
+			stopAtModelStart().start.mockImplementation(async () => undefined);
 			expect((await session.retryLastMessage(ID)).ok).toBe(true);
 			for (let i = 0; i < 100 && started.length === 0; i++)
 				await new Promise((resolve) => setTimeout(resolve, 5));

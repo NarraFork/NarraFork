@@ -12,8 +12,16 @@ import {
 	type JsonValue,
 	jsonValueSchema,
 	PLUGIN_TO_HOST_REQUEST_METHODS,
+	PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
 	publicEventSchema,
 } from "@server/lib/plugins/protocol";
+import { ProviderQuotaError } from "@server/lib/provider-quota-async";
+import {
+	PROVIDER_CONNECTION_METHOD,
+	type ProviderConnectionRequest,
+	providerConnectionRequestSchema,
+	QUOTA_MAX_REQUEST_MS,
+} from "@shared/provider-quota";
 import { z } from "zod";
 import {
 	type CapabilityBroker,
@@ -42,6 +50,7 @@ import {
 	permissionGrantPayload,
 	type StoredPermissionGrant,
 } from "./plugin-permission-store";
+import type { PluginProviderConnectionService } from "./plugin-provider-connection-service";
 import {
 	createCommandRequest,
 	createQueryRequest,
@@ -235,6 +244,8 @@ export interface PluginHostServicesOptions {
 	) => Promise<string | undefined> | string | undefined;
 	secretWriter?: (pluginId: string, key: string, value: string) => Promise<void> | void;
 	secretDeleter?: (pluginId: string, key: string) => Promise<boolean> | boolean;
+	/** Backend-only connection leases, always called with host-bound runtime identity. */
+	providerConnectionService?: Pick<PluginProviderConnectionService, "request" | "revokePlugin">;
 	now?: () => Date;
 }
 
@@ -424,6 +435,7 @@ export class PluginHostServices {
 	readonly publicApi?: PluginPublicApi;
 	readonly eventGateway?: PluginEventGateway;
 	readonly storageFactory: PluginStorageFactoryLike;
+	readonly providerConnectionService?: PluginHostServicesOptions["providerConnectionService"];
 	private readonly providerConfigReader?: PluginHostServicesOptions["providerConfigReader"];
 	private readonly secretKeyLister?: PluginHostServicesOptions["secretKeyLister"];
 	private readonly secretReader?: PluginHostServicesOptions["secretReader"];
@@ -442,6 +454,7 @@ export class PluginHostServices {
 	constructor(options: PluginHostServicesOptions = {}) {
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
 		this.permissionStore = options.permissionStore;
+		this.providerConnectionService = options.providerConnectionService;
 		this.publicApi = options.publicApi;
 		this.eventGateway = options.eventGateway;
 		this.storageFactory =
@@ -558,6 +571,7 @@ export class PluginHostServices {
 	}
 
 	revokeRuntime(pluginId: string, runtimeId?: string, runtimeGeneration?: number): number {
+		this.providerConnectionService?.revokePlugin(pluginId);
 		let revoked = 0;
 		if (runtimeId) {
 			const key = bindingKey(pluginId, runtimeId);
@@ -589,6 +603,7 @@ export class PluginHostServices {
 	}
 
 	clearRuntimeBinding(pluginId: string, runtimeId: string): boolean {
+		this.providerConnectionService?.revokePlugin(pluginId);
 		const key = bindingKey(pluginId, runtimeId);
 		const deleted = this.bindings.delete(key);
 		this.runtimeInputs.delete(key);
@@ -630,7 +645,22 @@ export class PluginHostServices {
 			onLateResult: (entry) => this.recordAudit(entry),
 			maxAuditEntries: MAX_AUDIT_ENTRIES,
 			now: this.now,
+			// Existing methods retain explicit ceilings. Only this backend method needs the
+			// worst-case escaped upstream body allowance; inbound requests are unchanged.
+			maxResponseBytes: PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
 			methods: {
+				[PROVIDER_CONNECTION_METHOD]: {
+					method: PROVIDER_CONNECTION_METHOD,
+					paramsSchema: providerConnectionRequestSchema,
+					resultSchema: jsonValueSchema,
+					capability: "provider.connection.request",
+					maxRequestBytes: 64 * 1024,
+					maxResponseBytes: PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
+					timeoutMs: QUOTA_MAX_REQUEST_MS,
+					maxConcurrency: 4,
+					handler: (params, context) =>
+						this.requestProviderConnection(params as ProviderConnectionRequest, context),
+				},
 				"queries.execute": {
 					method: "queries.execute",
 					paramsSchema: queryParamsSchema,
@@ -861,6 +891,34 @@ export class PluginHostServices {
 		input: PluginHostResolverInput,
 	): Promise<PluginHostAuthorizationDecision> {
 		try {
+			if (input.method === PROVIDER_CONNECTION_METHOD) {
+				const principal = input.context.plugin;
+				const binding = this.getRuntimeBinding(principal.pluginId, principal.runtimeId);
+				if (!this.providerConnectionService || !this.permissionStore || !binding) {
+					return {
+						allowed: false,
+						code: "HOST_UNAVAILABLE",
+						message: "Provider connection service is unavailable",
+					};
+				}
+				const set = await this.permissionStore.getSet(principal.pluginId, principal.installationId);
+				if (
+					set.revision !== binding.grantRevision ||
+					!["quota.provide", "provider.connection.request"].every((capability) =>
+						this.permissionStore?.hasCachedUnrestrictedGlobalGrant(
+							principal.pluginId,
+							principal.installationId,
+							capability,
+						),
+					)
+				) {
+					return {
+						allowed: false,
+						code: "PERMISSION_DENIED",
+						message: "Provider connection grant is not current",
+					};
+				}
+			}
 			if (input.method === "events.subscribe") {
 				return this.eventGateway
 					? { allowed: true }
@@ -1247,6 +1305,36 @@ export class PluginHostServices {
 			}
 			this.subscriptions.delete(subscriptionId);
 			this.eventGateway?.unsubscribe(subscriptionId, "runtime-binding-revoked");
+		}
+	}
+
+	private async requestProviderConnection(
+		params: ProviderConnectionRequest,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		this.runtimeInput(context);
+		if (!this.providerConnectionService)
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Provider connection service is unavailable",
+			);
+		try {
+			return toJsonValue(
+				await this.providerConnectionService.request(params, context.plugin, context.signal),
+			);
+		} catch (error) {
+			const code = error instanceof ProviderQuotaError ? error.code : "request_failed";
+			throw new PluginHostDispatcherError(
+				code === "permission_denied"
+					? "PERMISSION_DENIED"
+					: code === "timeout"
+						? "TIMEOUT"
+						: code === "unavailable"
+							? "HOST_UNAVAILABLE"
+							: "INTERNAL_ERROR",
+				"Provider connection request failed",
+				{ retryable: code === "timeout" || code === "unavailable" },
+			);
 		}
 	}
 

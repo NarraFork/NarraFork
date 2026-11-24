@@ -212,7 +212,14 @@ export const CAPABILITY_TAXONOMY = {
 		"command.permission.decide",
 		"command.routine.write",
 	],
-	provider: ["provider.register", "provider.use", "provider.refresh_catalog"],
+	provider: [
+		"provider.register",
+		"provider.use",
+		"provider.refresh_catalog",
+		"provider.connection.request",
+	],
+	/** Quota sources require live grants; no provider contribution or binding is implied. */
+	quota: ["quota.provide"],
 	/**
 	 * Declarative only, like the rest of this taxonomy (see `capabilitySchema` below).
 	 * `plugin-search-registry` does not call `capabilityBroker.authorize` before running a
@@ -238,6 +245,7 @@ export const CAPABILITIES = [
 	...CAPABILITY_TAXONOMY.event,
 	...CAPABILITY_TAXONOMY.command,
 	...CAPABILITY_TAXONOMY.provider,
+	...CAPABILITY_TAXONOMY.quota,
 	...CAPABILITY_TAXONOMY.search,
 	...CAPABILITY_TAXONOMY.config,
 	...CAPABILITY_TAXONOMY.secret,
@@ -390,6 +398,7 @@ export function isWidePermission(permission: string): boolean {
 export const HIGH_RISK_CAPABILITIES = [
 	"query.read.message_content",
 	"query.read.audit_all",
+	"provider.connection.request",
 	"command.permission.decide",
 	"secret.use_self",
 	"device.command",

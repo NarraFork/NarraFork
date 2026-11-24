@@ -14,7 +14,6 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
-import { setProviderBalanceEngine } from "./lib/provider-balance-engine";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -71,6 +70,7 @@ import { openaiRoutes } from "./routes/openai";
 import { opencodeRoutes } from "./routes/opencode";
 import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
+import { pluginUpdateRoutes } from "./routes/plugin-updates";
 import { pluginRoutes } from "./routes/plugins";
 import { projectTeamRoutes } from "./routes/project-teams";
 import { projectRoutes } from "./routes/projects";
@@ -79,6 +79,9 @@ import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
 import { providerKeyRoutes } from "./routes/provider-keys";
+
+import { providerQuotaRoutes } from "./routes/provider-quotas";
+
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -110,12 +113,8 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
-import {
-	builtinApikeyQuotaEngine,
-	setApikeyQuotaActivation,
-} from "./services/apikey-quota-plugin-engine";
+
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
-import { pluginManager } from "./services/plugin-manager";
 
 export interface AppEnv {
 	Bindings: {
@@ -375,15 +374,6 @@ app.route("/api/auth/sso", ssoRoutes);
 // endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
 
-// Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
-// plugin, which ships with the app and is enabled by default. It is a normal plugin: the tool
-// goes through `pluginToolRegistry`, so its process lifecycle, capabilities and health are the
-// shared ones. The plugin owns the capability, so disabling it in the plugin list turns quota
-// querying off: the snapshot then reports `plugin_not_enabled` instead of quietly answering
-// from the bundled adapters, and re-enabling it restores the value on the next discovery.
-setApikeyQuotaActivation(pluginManager);
-setProviderBalanceEngine(builtinApikeyQuotaEngine);
-
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
 // here — external apps fetch metadata, exchange codes and revoke tokens without
 // a NarraFork session. Consent explicitly requires a first-party session.
@@ -484,6 +474,7 @@ app.route("/api/search", searchRoutes);
 app.route("/api/session-interchange", sessionInterchangeRoutes);
 app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
+app.route("/api/plugins", pluginUpdateRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
 // Streaming attachment staging. Deliberately outside /api/narrators: the narrator
@@ -506,6 +497,7 @@ app.route("/api/notifications", notificationRoutes);
 app.route("/api/kimi", kimiRoutes);
 app.route("/api/deepseek", deepseekRoutes);
 app.route("/api/provider-balances", providerBalanceRoutes);
+app.route("/api/provider-quotas", providerQuotaRoutes);
 app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);

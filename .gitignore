@@ -187,6 +187,13 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/build-plugin.ts
 # Standalone shared-runtime UI build pilot and its integration test entry.
 !scripts/build-plugin-ui.ts
+# Bundled plugin asset generation and the isolated Provider Quota lifecycle smoke.
+!scripts/build-bundled-plugins.ts
+!scripts/smoke-provider-quota.ts
+# Deployable reference source API and bounded, isolated public-package publisher.
+!scripts/plugin-source-server.ts
+!scripts/smoke-plugin-sources.ts
+!scripts/publish-plugin-source.ts
 # The only way to produce the VS Code extension's .vsix. `scripts/*` above is a
 # blanket ignore, so without this line the script would silently be absent from a
 # fresh clone and `bun run package` inside vscode-extension/ would fail on a missing

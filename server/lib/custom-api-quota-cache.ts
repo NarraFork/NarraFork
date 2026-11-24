@@ -5,6 +5,7 @@ import { getNarraforkHome } from "./narrafork-home";
 import { settings } from "./settings";
 
 export interface CustomApiQuotaCache {
+	generation?: string;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	fetchedAt: number;
@@ -45,6 +46,9 @@ function loadAllCachedQuotas(): void {
 				quotaBalance: normalizeQuotaBalance(cache.quotaBalance),
 				detailedQuotaBalance: normalizeDetailedQuotaBalance(cache.detailedQuotaBalance),
 				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
+				...(typeof cache.generation === "string" && cache.generation.length <= 256
+					? { generation: cache.generation }
+					: {}),
 			});
 		}
 	} catch {
@@ -92,6 +96,7 @@ export function updateCustomApiQuotaByPrefix(
 	prefix: string,
 	quotaBalance: string | null,
 	detailedQuotaBalance?: string | null,
+	generation?: string,
 ): void {
 	const config = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
 	if (!config) return;
@@ -99,6 +104,7 @@ export function updateCustomApiQuotaByPrefix(
 		quotaBalance: normalizeQuotaBalance(quotaBalance),
 		detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
 		fetchedAt: Date.now(),
+		...(generation ? { generation } : {}),
 	});
 	scheduleSaveAllCachedQuotas();
 }
@@ -107,22 +113,8 @@ export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache
 	return cachedQuotaByProvider.get(providerId);
 }
 
-export function getAllCustomApiCachedQuotas(): Record<
-	string,
-	{ quotaBalance: string | null; detailedQuotaBalance: string | null; fetchedAt: number }
-> {
-	const result: Record<
-		string,
-		{ quotaBalance: string | null; detailedQuotaBalance: string | null; fetchedAt: number }
-	> = {};
-	for (const [providerId, cache] of cachedQuotaByProvider) {
-		result[providerId] = {
-			quotaBalance: cache.quotaBalance,
-			detailedQuotaBalance: cache.detailedQuotaBalance,
-			fetchedAt: cache.fetchedAt,
-		};
-	}
-	return result;
+export function getAllCustomApiCachedQuotas(): Record<string, CustomApiQuotaCache> {
+	return Object.fromEntries([...cachedQuotaByProvider].map(([id, cache]) => [id, { ...cache }]));
 }
 
 export function purgeCustomApiQuotaCache(removedIds: string[]): void {

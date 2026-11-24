@@ -5,6 +5,9 @@ import {
 	readInputCompositionSegments,
 } from "@shared/context-usage";
 import { MEDIA_MIME_TO_EXT } from "@shared/media-attachments";
+
+import { QUOTA_MAX_RESPONSE_BYTES } from "@shared/provider-quota";
+
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -81,6 +84,7 @@ export const UI_RPC_PROTOCOL = NARRAFORK_UI_PROTOCOL;
 export const PLUGIN_TO_HOST_FEATURES = [
 	"host_api.requests",
 	"host_api.notifications",
+	"host_api.provider_connection",
 	"rpc.cancel",
 	"stream.credit",
 	"events.poll",
@@ -94,8 +98,8 @@ export const pluginToHostFeatureListSchema = z
 		message: "Plugin-to-Host features must be unique",
 	});
 
-/** First Plugin -> Host request surface. Unknown methods are dispatcher errors, not extensions. */
-export const PLUGIN_TO_HOST_REQUEST_METHODS = [
+/** Methods shared by backend plugins and the iframe bridge. */
+export const PLUGIN_SHARED_HOST_REQUEST_METHODS = [
 	"queries.execute",
 	"commands.execute",
 	"events.subscribe",
@@ -116,6 +120,14 @@ export const PLUGIN_TO_HOST_REQUEST_METHODS = [
 	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
+/** This extension is intentionally unavailable to iframe/UI callers. */
+export const PLUGIN_BACKEND_HOST_REQUEST_METHODS = ["provider.connection.request"] as const;
+export const PLUGIN_TO_HOST_REQUEST_METHODS = [
+	...PLUGIN_SHARED_HOST_REQUEST_METHODS,
+	...PLUGIN_BACKEND_HOST_REQUEST_METHODS,
+] as const;
+/** Worst-case JSON escaping of the bounded 256 KiB upstream body plus RPC metadata. */
+export const PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES = 6 * QUOTA_MAX_RESPONSE_BYTES + 4 * 1024;
 export type PluginToHostRequestMethod = (typeof PLUGIN_TO_HOST_REQUEST_METHODS)[number];
 export const pluginToHostRequestMethodSchema = z.enum(PLUGIN_TO_HOST_REQUEST_METHODS);
 
@@ -475,6 +487,7 @@ export const PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES = {
 	"secrets.delete": ["host_api.requests"],
 	"secrets.list": ["host_api.requests"],
 	"diagnostics.getOwn": ["host_api.requests"],
+	"provider.connection.request": ["host_api.requests", "host_api.provider_connection"],
 } as const satisfies Record<PluginToHostRequestMethod, readonly PluginToHostFeature[]>;
 
 export function isPluginToHostRequestMethod(method: string): method is PluginToHostRequestMethod {

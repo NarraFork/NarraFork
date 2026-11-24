@@ -80,7 +80,7 @@ import {
 	preservesRecoveryOnShutdown,
 	ShutdownActivityTracker,
 } from "./lib/shutdown-activity";
-import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
+import { injectSpaBaseHref, isSpaNavigationPath, spaIndexHeaders } from "./lib/spa-base-href";
 import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
@@ -108,6 +108,7 @@ import {
 	stopNarratorRunAdmission,
 } from "./services/agent-runtime/run";
 import { backgroundTaskService } from "./services/background-task-service";
+import { getBundledPluginDescriptors } from "./services/bundled-plugin-assets";
 import { stopBlockBackgroundJobs } from "./services/narrator-block-backfill";
 import {
 	drainBufferedFilePreparations,
@@ -116,14 +117,19 @@ import {
 	stopBufferedFilePreparations,
 } from "./services/narrator-buffer";
 import { stopOutlineLiveReplay } from "./services/outline/live/replay";
-import { pluginManager } from "./services/plugin-manager";
-import { pluginPlatformServices } from "./services/plugin-platform-services";
+import { initializePluginServices, pluginManager } from "./services/plugin-manager";
+import {
+	pluginPlatformServices,
+	stopPluginPlatformProducers,
+} from "./services/plugin-platform-services";
 import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
+import { pluginSourceService } from "./services/plugin-source-service";
 import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
+import { providerQuotaService } from "./services/provider-quota-service";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 import {
 	getResourceProtectionShutdownSnapshot,
@@ -539,7 +545,7 @@ if (isProd) {
 				}
 
 				// SPA catch-all: serve index.html for non-file routes
-				if (indexPath && !c.req.path.includes(".")) {
+				if (indexPath && isSpaNavigationPath(c.req.path)) {
 					return serveSpaIndex(Bun.file(indexPath), c.req.path);
 				}
 
@@ -587,7 +593,7 @@ if (isProd) {
 			}
 
 			// SPA catch-all: serve index.html for non-file routes
-			if (!c.req.path.includes(".")) {
+			if (isSpaNavigationPath(c.req.path)) {
 				const indexFile = Bun.file(resolve(staticDir, "index.html"));
 				if (await indexFile.exists()) {
 					return serveSpaIndex(indexFile, c.req.path);
@@ -1087,33 +1093,6 @@ try {
 	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 }
 
-try {
-	// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-	// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
-	// refresh when provider settings change).
-	const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
-	void refreshAllKimiUsages().catch(() => {});
-} catch (err) {
-	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-}
-
-try {
-	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
-	// restart re-reads it rather than trusting numbers from the previous process.
-	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
-	void refreshAllOpencodeUsages().catch(() => {});
-} catch (err) {
-	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
-}
-
-try {
-	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
-	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
-	void refreshAllDeepSeekBalances().catch(() => {});
-} catch {
-	logger.warn("DeepSeek balance startup refresh failed");
-}
-
 // A user's subagent template in a later built-in's directory (`worker`) is moved aside
 // to `worker-custom` with a warning: nothing is lost, and the built-in always wins.
 void import("./services/custom-subagent-service")
@@ -1133,12 +1112,21 @@ mcpManager.initialize().catch((err) => {
 
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.
-pluginManager
-	.initialize()
-	.then((statuses) => {
+initializePluginServices(pluginManager, getBundledPluginDescriptors(), {
+	startQuota: () => providerQuotaService.start(),
+	onBootstrapError: (descriptor, error) => {
+		logger.warn("Bundled plugin initialization failed", {
+			pluginId: descriptor.pluginId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	},
+})
+	.then(async (started) => {
+		if (!started || pluginManager.isShuttingDown()) return;
+		pluginSourceService.start();
 		logger.info("Plugin manager initialized", {
 			enabled: pluginManager.isEnabled(),
-			pluginCount: statuses.length,
+			pluginCount: (await pluginManager.list()).length,
 		});
 	})
 	.catch((err) => {
@@ -1789,8 +1777,22 @@ async function drainShutdownDatabaseWork(deadlineAt: number): Promise<void> {
 	if (failure) throw failure.error;
 }
 
-/** After reader closure, inspect state only: no query, new work, or renewed deadline. */
-function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "failed" {
+function getPluginShutdownWork() {
+	const pending = (owner: { hasPendingShutdownWork(): boolean }) => {
+		try {
+			return owner.hasPendingShutdownWork();
+		} catch {
+			return true; // Cannot prove quiescence; keep the instance lock.
+		}
+	};
+	return { source: pending(pluginSourceService), manager: pending(pluginManager) };
+}
+
+/** Inspect state only: no database query, new work, or renewed deadline. */
+function auditShutdownDatabaseWork(
+	tracker: ShutdownActivityTracker,
+	plugins = getPluginShutdownWork(),
+): "ok" | "failed" {
 	let outcome: "ok" | "failed" = "failed";
 	try {
 		const narrator = getNarratorSessionTailStatus();
@@ -1848,6 +1850,8 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 			buffered.failed ||
 			maintenancePending ||
 			integrityPending ||
+			plugins.source ||
+			plugins.manager ||
 			outlineLivePending ||
 			websocketPending
 		) {
@@ -1866,6 +1870,7 @@ function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "fa
 				notification,
 				storageHistory,
 				teamMaintenance,
+				plugins,
 				bufferedPending,
 				bufferedPreparationPending: buffered.pending,
 				bufferedPreparationActive: buffered.active,
@@ -1935,6 +1940,11 @@ async function performGracefulShutdown(
 		const producerLabel = "databaseProducers.stop";
 		let producerFailure: { error: unknown } | undefined;
 		for (const stop of [
+			// Fence late startup before stopping either scheduler. Existing RPCs drain separately.
+			() => pluginSourceService.beginShutdown(),
+			() => pluginManager.beginShutdown(),
+			() => providerQuotaService.stop(),
+			stopPluginPlatformProducers,
 			() =>
 				backgroundTaskService.stopBashCollectors({
 					preserveProcesses: options.skipBashProcessKill,
@@ -1959,6 +1969,7 @@ async function performGracefulShutdown(
 			logger.warn("Shutdown producer admission failed", { error: String(producerFailure.error) });
 		const ownerDeadlineAt = Date.now() + budget.businessRemaining();
 		// Freeze synchronous admission and initiate asynchronous teardown before any await below.
+		const pluginSourceStop = pluginSourceService.stop();
 		const maintenanceStop = stopResourceProtectionIndex({ deadlineAt: ownerDeadlineAt });
 		const integrityStop = cancelBackgroundIntegrityCheck({
 			permanent: true,
@@ -1995,6 +2006,7 @@ async function performGracefulShutdown(
 		});
 		getCodexManager().stopUsageRefreshScheduler();
 		for (const stopping of [
+			pluginSourceStop,
 			maintenanceStop,
 			integrityStop,
 			projectIndexStop,
@@ -2100,9 +2112,6 @@ async function performGracefulShutdown(
 			TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000,
 		);
 		await step("terminalService.shutdownAll", () => terminalService.shutdownAll());
-		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
-		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
-		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
 			await step("killAllBashProcesses", () =>
 				killAllBashProcesses({ preserveAgents: preserveAgentRuns }),
@@ -2116,12 +2125,14 @@ async function performGracefulShutdown(
 			true,
 		);
 		await step("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await step("pluginPlatformProducers.stop", () =>
-			import("./services/plugin-platform-services").then((owner) =>
-				owner.stopPluginPlatformProducers(),
-			),
+		await step("pluginSourceService.stop", () => pluginSourceStop, budget.businessRemaining());
+		// The shared supervisor owns every plugin process, including the bundled quota plugin.
+		await step(
+			"pluginManager.shutdown",
+			() => pluginManager.shutdown({ timeoutMs: budget.businessRemaining() }),
+			budget.businessRemaining(),
+			true,
 		);
-		await step("pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
 		unregisterExternalProviderResolver();
 		await step("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
@@ -2312,6 +2323,24 @@ async function performGracefulShutdown(
 				durationMs: Date.now() - startedAt,
 			};
 		}
+		// A skipped/timed-out plugin step is not evidence either way: there may be no work,
+		// or a real process, journal write or callback may still be owned past that deadline.
+		const retainForPlugins = (plugins: ReturnType<typeof getPluginShutdownWork>) => {
+			if (!plugins.source && !plugins.manager) return;
+			if (plugins.source) tracker.recordStep("pluginSourceService.quiescence", "failed");
+			if (plugins.manager) tracker.recordStep("pluginManager.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker, plugins);
+			logger.warn("Plugin work did not drain; retaining database ownership until exit", plugins);
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		};
+		const beforeReaders = retainForPlugins(getPluginShutdownWork());
+		if (beforeReaders) return beforeReaders;
 		// Native reader exit owns a separate slice even when the business drain expired.
 		const readerBudget = budget.readerRemaining();
 		await shutdownStep(
@@ -2336,7 +2365,10 @@ async function performGracefulShutdown(
 			() => closePostgresRuntime(),
 			Math.min(4_000, budget.globalRemaining()),
 		);
-		auditShutdownDatabaseWork(tracker);
+		const finalPlugins = getPluginShutdownWork();
+		const beforeHandoff = retainForPlugins(finalPlugins);
+		if (beforeHandoff) return beforeHandoff;
+		auditShutdownDatabaseWork(tracker, finalPlugins);
 
 		// Decide the marker now that teardown is finished. A clean shutdown (requests drained AND
 		// every step succeeded) persists the marker and releases the lock; a degraded shutdown skips

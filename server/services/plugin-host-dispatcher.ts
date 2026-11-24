@@ -205,6 +205,7 @@ interface ActiveCall {
 	started: boolean;
 	settled: boolean;
 	cancelReason?: string;
+	trackWork: NonNullable<PluginRpcDispatchOptions["trackWork"]>;
 }
 
 interface NormalizedMethodDefinition extends PluginHostMethodDefinition<unknown, unknown> {
@@ -241,6 +242,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 	private readonly lateResultSink?: PluginHostDispatcherOptions["onLateResult"];
 	private readonly now: () => Date;
 	private readonly activeByMethod = new Map<string, number>();
+	private executingCalls = 0;
 	private readonly auditEntries: PluginHostAuditEntry[] = [];
 	private readonly notificationHandlers = new Map<
 		string,
@@ -369,6 +371,25 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		return this.auditEntries.map((entry) => ({ ...entry }));
 	}
 
+	/** Response completion releases neither real execution capacity nor an ancestor's work. */
+	private ownWork(options: PluginRpcDispatchOptions, method?: string) {
+		this.executingCalls++;
+		if (method) this.incrementMethod(method);
+		let remaining = 1;
+		const settled = () => {
+			if (--remaining !== 0) return;
+			this.executingCalls--;
+			if (method) this.decrementMethod(method);
+		};
+		const trackWork = <T>(work: Promise<T>): Promise<T> => {
+			remaining++;
+			options.trackWork?.(work);
+			void work.then(settled, settled);
+			return work;
+		};
+		return { trackWork, settled };
+	}
+
 	async dispatch(
 		request: JsonRpcRequest,
 		options: PluginRpcDispatchOptions = {},
@@ -421,7 +442,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			);
 		}
 		if (
-			this.inboundActive.size >= this.maxConcurrency ||
+			this.executingCalls >= this.maxConcurrency ||
 			this.methodConcurrency(definition) >= definition.maxConcurrency
 		) {
 			return this.errorResponse(
@@ -444,6 +465,8 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		else externalAbort?.addEventListener("abort", abortExternal, { once: true });
 		const timeoutMs = this.resolveTimeout(definition, options.deadlineAt);
 		const deadlineAt = new Date(this.now().getTime() + timeoutMs).toISOString();
+		const owner = this.ownWork(options, definition.method);
+		const { trackWork } = owner;
 		const active: ActiveCall = {
 			requestId: request.id,
 			key,
@@ -452,9 +475,9 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			controller,
 			started: false,
 			settled: false,
+			trackWork,
 		};
 		this.inboundActive.set(key, active);
-		this.incrementMethod(definition.method);
 		const startedAt = this.now().getTime();
 		const deadlineError = (call: ActiveCall) =>
 			new PluginHostDispatcherError(
@@ -474,7 +497,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		let context: PluginHostCallContext | undefined;
 		try {
 			const contextOutcome = await raceWithAbort(
-				this.createContext(request, options, deadlineAt, controller.signal),
+				trackWork(this.createContext(request, options, deadlineAt, controller.signal)),
 				controller.signal,
 				remainingDeadlineMs(deadlineAt, this.now),
 			);
@@ -492,7 +515,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			}
 			context = contextOutcome.value;
 			const resourceOutcome = await raceWithAbort(
-				this.resolveResource(definition, parsedParams.data, context),
+				trackWork(this.resolveResource(definition, parsedParams.data, context)),
 				controller.signal,
 				remainingDeadlineMs(deadlineAt, this.now),
 			);
@@ -510,7 +533,9 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			}
 			const resource = resourceOutcome.value;
 			const authorizationOutcome = await raceWithAbort(
-				this.authorize(definition, parsedParams.data, context, controller.signal, resource),
+				trackWork(
+					this.authorize(definition, parsedParams.data, context, controller.signal, resource),
+				),
 				controller.signal,
 				remainingDeadlineMs(deadlineAt, this.now),
 			);
@@ -543,18 +568,17 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 				return await this.finishAbort(request, active, startedAt, requestBytes);
 			}
 			active.started = true;
-			const operation = Promise.resolve().then(() =>
-				definition.handler(parsedParams.data, context as PluginHostCallContext),
+			const operation = trackWork(
+				Promise.resolve().then(() =>
+					definition.handler(parsedParams.data, context as PluginHostCallContext),
+				),
 			);
-			operation.then(
-				() => {
-					if (active.settled) void this.recordLateResult(request, active, requestBytes);
-				},
-				() => {
-					if (active.settled) void this.recordLateResult(request, active, requestBytes);
-				},
-			);
-			operation.catch(() => undefined);
+			const recordLate = () => {
+				if (active.settled) return this.recordLateResult(request, active, requestBytes);
+			};
+			// Keep the late-result continuation owned too, so its async audit cannot appear
+			// after a false idle boundary when the handler itself resolves or rejects.
+			trackWork(operation.then(recordLate, recordLate));
 			const outcome = await raceWithAbort(
 				operation,
 				controller.signal,
@@ -624,6 +648,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 					responseBytes,
 				},
 				deadlineAt,
+				trackWork,
 			);
 			return response;
 		} catch (error) {
@@ -639,7 +664,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		} finally {
 			externalAbort?.removeEventListener("abort", abortExternal);
 			this.inboundActive.delete(key);
-			this.decrementMethod(definition.method);
+			owner.settled();
 		}
 	}
 
@@ -648,7 +673,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		options: PluginRpcDispatchOptions = {},
 	): Promise<unknown> {
 		const handler = this.notificationHandlers.get(notification.method);
-		if (!handler) return undefined;
+		if (!handler || this.executingCalls >= this.maxConcurrency) return undefined;
 		const request = {
 			jsonrpc: "2.0" as const,
 			id: options.requestId ?? `notification_${Date.now()}`,
@@ -662,21 +687,24 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		else externalSignal?.addEventListener("abort", abortExternal, { once: true });
 		const deadlineAt =
 			options.deadlineAt ?? new Date(this.now().getTime() + this.defaultTimeoutMs).toISOString();
+		const owner = this.ownWork(options);
+		const { trackWork } = owner;
 		try {
 			const contextOutcome = await raceWithAbort(
-				this.createContext(request, options, deadlineAt, controller.signal),
+				trackWork(this.createContext(request, options, deadlineAt, controller.signal)),
 				controller.signal,
 				remainingDeadlineMs(deadlineAt, this.now),
 			);
 			if (contextOutcome.kind !== "value") return undefined;
 			const handlerOutcome = await raceWithAbort(
-				Promise.resolve(handler(notification.params, contextOutcome.value)),
+				trackWork(Promise.resolve(handler(notification.params, contextOutcome.value))),
 				controller.signal,
 				remainingDeadlineMs(deadlineAt, this.now),
 			);
 			return handlerOutcome.kind === "value" ? handlerOutcome.value : undefined;
 		} finally {
 			externalSignal?.removeEventListener("abort", abortExternal);
+			owner.settled();
 		}
 	}
 
@@ -850,18 +878,22 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			},
 		};
 		active.settled = true;
-		await this.audit({
-			requestId: request.id,
-			method: request.method,
-			pluginId: this.identity.pluginId,
-			runtimeId: this.identity.runtimeId,
-			generation: this.identity.runtimeGeneration,
-			outcome: code === "UNKNOWN_RESULT" ? "unknown" : "cancelled",
-			code,
-			durationMs: this.now().getTime() - startedAt,
-			requestBytes,
-			responseBytes: jsonBytes(response),
-		});
+		await this.audit(
+			{
+				requestId: request.id,
+				method: request.method,
+				pluginId: this.identity.pluginId,
+				runtimeId: this.identity.runtimeId,
+				generation: this.identity.runtimeGeneration,
+				outcome: code === "UNKNOWN_RESULT" ? "unknown" : "cancelled",
+				code,
+				durationMs: this.now().getTime() - startedAt,
+				requestBytes,
+				responseBytes: jsonBytes(response),
+			},
+			undefined,
+			active.trackWork,
+		);
 		return response;
 	}
 
@@ -896,6 +928,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 				responseBytes: jsonBytes(response),
 			},
 			deadlineAt,
+			active?.trackWork,
 		);
 		return response;
 	}
@@ -917,7 +950,7 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 			requestBytes,
 			responseBytes: 0,
 		};
-		await this.audit(entry);
+		await this.audit(entry, undefined, active.trackWork);
 		try {
 			await this.lateResultSink?.(entry);
 		} catch {
@@ -955,11 +988,16 @@ export class PluginHostDispatcher implements PluginRpcDispatcherLike {
 		};
 	}
 
-	private async audit(entry: PluginHostAuditEntry, deadlineAt?: string): Promise<void> {
+	private async audit(
+		entry: PluginHostAuditEntry,
+		deadlineAt?: string,
+		trackWork?: PluginRpcDispatchOptions["trackWork"],
+	): Promise<void> {
 		this.auditEntries.push(entry);
 		while (this.auditEntries.length > this.maxAuditEntries) this.auditEntries.shift();
 		if (!this.auditSink) return;
 		const auditPromise = Promise.resolve().then(() => this.auditSink?.(entry));
+		trackWork?.(auditPromise);
 		auditPromise.catch(() => undefined);
 		if (!deadlineAt) return;
 		const remaining = remainingDeadlineMs(deadlineAt, this.now);

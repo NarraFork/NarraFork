@@ -2,10 +2,10 @@
  * `GET /api/kimi/usages` is readable by every signed-in user, but its `error` field is not.
  *
  * The quota numbers are what the status bar needs, and showing them to whoever is using a
- * Kimi model is the point of opening the route up. The error string is a different kind of
- * value: `kimi-usage-cache.ts` stores the caught message verbatim, so it can carry a
- * fragment of the API key, the account identifier, or an internal endpoint URL — facts about
- * the deployment's own provider account, not about the requesting user's allowance.
+ * Kimi model is the point of opening the route up. The facade now emits only a fixed safe
+ * error, but the legacy role projection remains an additional boundary. Deliberately pass
+ * credential-shaped text here so future changes cannot leak account identifiers or internal
+ * endpoint URLs if an upstream error accidentally reaches this projection.
  *
  * Withholding it is why this file exists. The route was admin-only until recently, so the
  * field was never reachable by a non-admin and nothing had to assert it; after the widening,
@@ -14,8 +14,8 @@
  * `hasError` replaces it rather than the field simply vanishing: the status bar must still
  * render "unavailable" instead of presenting the last cached numbers as current.
  *
- * Run: NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$(mktemp -d) \
- *      bun test server/routes/__tests__/kimi-usage-redaction.test.ts
+ * Run with the standard isolated preload:
+ * bun test --isolate server/routes/__tests__/kimi-usage-redaction.test.ts
  */
 
 import { describe, expect, test } from "bun:test";

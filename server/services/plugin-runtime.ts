@@ -1,7 +1,12 @@
+import { createPublicKey } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AsyncMutex } from "@server/lib/async-mutex";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "@server/lib/compiled-worker";
+import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { pluginIdSchema } from "@server/lib/plugins/manifest";
 import {
 	type JsonRpcEnvelope,
 	type JsonRpcNotification,
@@ -15,21 +20,45 @@ import {
 } from "@server/lib/plugins/protocol";
 import { spawnWindowsPluginProcess } from "@server/lib/plugins/windows-plugin-process";
 import { WorkerCleanupError, WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
-import { TaskQueue } from "@server/lib/worker-runtime/queue";
+import { TaskQueue, TaskQueueError } from "@server/lib/worker-runtime/queue";
 import {
 	type PluginHealthRegistry,
 	type PluginHealthSample,
 	pluginHealthRegistry,
 } from "./plugin-health";
 import {
+	isPluginPackageStageReady,
+	PLUGIN_PACKAGE_STAGE_EXIT_TIMEOUT_MS,
+	PLUGIN_PACKAGE_STAGE_MAX_BUFFERED_BYTES,
+	PLUGIN_PACKAGE_STAGE_MAX_CONTROL_BYTES,
+	PLUGIN_PACKAGE_STAGE_MAX_ERROR_BYTES,
+	PLUGIN_PACKAGE_STAGE_MAX_PATH_BYTES,
+	PLUGIN_PACKAGE_STAGE_MAX_RESPONSE_BYTES,
+	PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION,
+	PLUGIN_PACKAGE_STAGE_STARTUP_TIMEOUT_MS,
+	PLUGIN_PACKAGE_STAGE_TIMEOUT_MS,
+	type PluginPackageStageRequest,
+	type PluginPackageStageResponse,
+	type PluginPackageStageResult,
+	type PluginPackageStageTrustKey,
+	type PluginPackageStageTrustPolicy,
+} from "./plugin-package-stage-protocol";
+import type { PackageSource, PackageStoreLimits } from "./plugin-package-store";
+import {
 	PluginRpcConnection,
 	type PluginRpcDispatcherLike,
 	type PluginRpcRequestHandler,
 	RPC_REQUEST_NOT_HANDLED,
 } from "./plugin-rpc-connection";
+import type { SbomInstallPolicy } from "./plugin-sbom";
+import type { PluginTrustKeyring } from "./plugin-signature";
+
+export type { PluginPackageStageResult } from "./plugin-package-stage-protocol";
 
 type PluginRuntimeHealthCode =
 	| "resource_limits_disabled"
+	| "state_observer_failed"
+	| "crash_observer_failed"
 	| "restart_failed"
 	| "uninstall_stop_failed"
 	| "secret_purge_failed"
@@ -46,7 +75,9 @@ type PluginRuntimeHealthCode =
 	| "authority_retirement_failed"
 	| "runtime_revoke_failed"
 	| "revoke_state_persist_failed"
-	| "approval_request_failed";
+	| "approval_request_failed"
+	| "package_stage_timeout"
+	| "package_stage_cleanup_failed";
 
 /** Health only: user plugin logs and persisted business failure details use their own channels. */
 export function reportPluginRuntimeHealth(
@@ -557,6 +588,15 @@ export class LocalProcessRunner {
 			() => this.pending.delete(pending),
 		);
 		return pending;
+	}
+
+	/** Inspect existing ownership only; a failed stop is not proof of exit. */
+	hasPendingShutdownWork(): boolean {
+		if (this.pending.size || this.handles.size) return true;
+		for (const handle of this.uncertain) {
+			if (Bun.peek.status(handle.exited) !== "fulfilled") return true;
+		}
+		return false;
 	}
 
 	/** Final owner close, unlike a reversible plugin disable. Includes late asynchronous creates. */
@@ -1347,6 +1387,8 @@ export interface PluginRuntimeOptions {
 	idleTimeoutMs?: number;
 	totalTimeoutMs?: number;
 	maxInFlight?: number;
+	/** Supervisor-owned occupancy from previous runtime objects of this plugin. */
+	pendingInboundElsewhere?: () => number;
 	/** Host-owned identity fields used by the injected Plugin -> Host dispatcher. */
 	installationId?: string;
 	contributionId?: string;
@@ -1372,6 +1414,7 @@ export interface PluginRunner {
 	start(options: RunnerStartOptions): Promise<PluginProcessHandle>;
 	/** Permanent host shutdown, including pending creates. Normal plugin disable does not call it. */
 	close?(): Promise<void>;
+	hasPendingShutdownWork?(): boolean;
 }
 
 export interface RuntimeDiagnostics {
@@ -1411,6 +1454,7 @@ export class PluginRuntime {
 	private starting?: Promise<void>;
 	private shuttingDown?: Promise<void>;
 	private connection?: PluginRpcConnection;
+	private readonly retiredConnections = new Set<PluginRpcConnection>();
 	private readonly notificationHandlers = new Set<
 		(notification: JsonRpcNotification, bodyBytes: number) => void
 	>();
@@ -1451,6 +1495,31 @@ export class PluginRuntime {
 
 	get pid(): number | undefined {
 		return this.handle?.pid;
+	}
+
+	/** Process/tree exit, not the state projection (or even a cached PID), is the barrier. */
+	hasPendingShutdownWork(): boolean {
+		return (
+			Bun.peek.status(this.starting) === "pending" ||
+			Bun.peek.status(this.shuttingDown) === "pending" ||
+			Bun.peek.status(this.handle?.exited) !== "fulfilled" ||
+			this.pendingInboundCount > 0 ||
+			(this.runner.hasPendingShutdownWork?.() ?? false)
+		);
+	}
+
+	get pendingInboundCount(): number {
+		let pending = this.connection?.pendingInboundCount ?? 0;
+		for (const connection of this.retiredConnections) pending += connection.pendingInboundCount;
+		return pending;
+	}
+
+	/** Only used after admission closes; never block force-killing a process on its host callback. */
+	async waitForPendingInboundWork(): Promise<void> {
+		await Promise.all([
+			this.connection?.waitForPendingShutdownWork(),
+			...[...this.retiredConnections].map((connection) => connection.waitForPendingShutdownWork()),
+		]);
 	}
 
 	get rpcConnection(): PluginRpcConnection | undefined {
@@ -1520,6 +1589,7 @@ export class PluginRuntime {
 			}
 			this.handle = undefined;
 		}
+		this.clearSubscriptions();
 		this._generation += 1;
 		const generation = this._generation;
 		const operationStartedAt = Date.now();
@@ -1560,6 +1630,12 @@ export class PluginRuntime {
 				transport: this.handle,
 				generation,
 				maxInFlight: this.options.maxInFlight ?? 16,
+				pendingInboundElsewhere: () => {
+					let pending = this.options.pendingInboundElsewhere?.() ?? 0;
+					for (const connection of this.retiredConnections)
+						pending += connection.pendingInboundCount;
+					return pending;
+				},
 				maxFrameBytes: Math.min(
 					this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
 					this.handle.maxInboundFrameBytes ?? Number.MAX_SAFE_INTEGER,
@@ -1716,6 +1792,8 @@ export class PluginRuntime {
 		options: {
 			signal?: AbortSignal;
 			timeoutMs?: number;
+			/** Per-call response ceiling; never enlarges the shared inbound frame budget. */
+			maxResponseBytes?: number;
 			priority?: "control" | "unary" | "stream";
 		} = {},
 	): Promise<T> {
@@ -1738,6 +1816,7 @@ export class PluginRuntime {
 				timeoutMs: options.timeoutMs ?? this.timeouts.rpcMs,
 				signal: options.signal,
 				priority: options.priority ?? "unary",
+				maxResponseBytes: options.maxResponseBytes,
 			});
 			if ("error" in response) {
 				throw new PluginRuntimeError(response.error.message, {
@@ -1944,16 +2023,16 @@ export class PluginRuntime {
 			timeoutMs,
 			notificationMethod,
 		);
-		const responseWait = this.sendRequestWithId(
-			{ jsonrpc: "2.0", id, method, params: params as never },
-			timeoutMs,
-		);
-		// Both sides are raced and only one settles the round: the loser is cancelled in
-		// `finally`, and a rejection with no handler would surface as an unhandled rejection
-		// even though this call already got its answer.
-		responseWait.catch(() => undefined);
+		// request() can throw synchronously when the transport closes between control
+		// rounds. Own the waiter before sending, and cancel it even on that throw.
+		// Otherwise the final shutdown rejectAll rejects an orphan notification promise.
 		notificationWait.promise.catch(() => undefined);
 		try {
+			const responseWait = this.sendRequestWithId(
+				{ jsonrpc: "2.0", id, method, params: params as never },
+				timeoutMs,
+			);
+			responseWait.catch(() => undefined);
 			const response = await Promise.race([responseWait, notificationWait.promise]);
 			if ("error" in response) {
 				throw new PluginRuntimeError(response.error.message, {
@@ -2036,7 +2115,11 @@ export class PluginRuntime {
 		this.acceptingRequests = false;
 		this.clearSubscriptions();
 		this.setState("crashed");
-		this.options.onCrash?.(error);
+		try {
+			this.options.onCrash?.(error);
+		} catch {
+			reportPluginRuntimeHealth("crash_observer_failed", "warn", { generation });
+		}
 	}
 
 	private rejectAll(error: Error): void {
@@ -2046,10 +2129,14 @@ export class PluginRuntime {
 
 	private clearSubscriptions(): void {
 		const connection = this.connection;
-		this.connection = undefined;
 		if (connection) {
+			this.retiredConnections.add(connection);
+			this.connection = undefined;
 			this.lateMessages += connection.lateMessages;
 			void connection.close();
+			void connection.waitForPendingShutdownWork().then(() => {
+				this.retiredConnections.delete(connection);
+			});
 		}
 	}
 
@@ -2075,7 +2162,11 @@ export class PluginRuntime {
 		if (this._state === state) return;
 		const previous = this._state;
 		this._state = state;
-		this.options.onStateChange?.(state, previous);
+		try {
+			this.options.onStateChange?.(state, previous);
+		} catch {
+			reportPluginRuntimeHealth("state_observer_failed", "warn", { generation: this.generation });
+		}
 	}
 }
 
@@ -2161,10 +2252,14 @@ export class RuntimeSupervisor {
 			const cleanup = Promise.resolve(previous).then(() => existing.runtime.closeResources());
 			this.retired.set(existing.runtime, cleanup);
 			this.replacements.set(options.pluginId, cleanup);
-			void cleanup.then(
-				() => this.retired.delete(existing.runtime),
-				() => {},
-			);
+			// Process teardown may finish while an abort-ignoring host callback still writes.
+			// Observe its drain separately: neither replacement startup nor process stop waits on it.
+			void cleanup
+				.then(() => existing.runtime.waitForPendingInboundWork())
+				.then(
+					() => this.retired.delete(existing.runtime),
+					() => {},
+				);
 			this.records.delete(options.pluginId);
 		}
 		const runtime = this.createRuntime(options);
@@ -2178,12 +2273,14 @@ export class RuntimeSupervisor {
 		return runtime;
 	}
 
-	async start(options: PluginRuntimeOptions): Promise<PluginRuntime>;
+	async start(options: PluginRuntimeOptions, signal?: AbortSignal): Promise<PluginRuntime>;
 	async start(pluginId: string, signal?: AbortSignal): Promise<PluginRuntime>;
 	async start(
 		optionsOrPluginId: PluginRuntimeOptions | string,
 		signal?: AbortSignal,
 	): Promise<PluginRuntime> {
+		signal?.throwIfAborted();
+		if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
 		const pluginId =
 			typeof optionsOrPluginId === "string" ? optionsOrPluginId : optionsOrPluginId.pluginId;
 		let record = this.records.get(pluginId);
@@ -2196,8 +2293,10 @@ export class RuntimeSupervisor {
 		if (!record) throw new Error(`Runtime is not registered: ${pluginId}`);
 		const runtimeRecord = record;
 		return this.mutex.acquire(pluginId, async () => {
+			signal?.throwIfAborted();
 			if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
 			await this.replacements.get(pluginId);
+			signal?.throwIfAborted();
 			if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
 			if (runtimeRecord.quarantineReason) {
 				throw new PluginRuntimeError(runtimeRecord.quarantineReason, {
@@ -2210,8 +2309,20 @@ export class RuntimeSupervisor {
 				clearTimeout(runtimeRecord.restartTimer);
 				runtimeRecord.restartTimer = undefined;
 			}
-			await runtimeRecord.runtime.start(signal);
-			return runtimeRecord.runtime;
+			try {
+				await runtimeRecord.runtime.start(signal);
+				signal?.throwIfAborted();
+				return runtimeRecord.runtime;
+			} catch (error) {
+				if (signal?.aborted) {
+					// A cancelled start must not leave a failure-triggered restart scheduled.
+					runtimeRecord.desiredEnabled = false;
+					if (runtimeRecord.restartTimer) clearTimeout(runtimeRecord.restartTimer);
+					runtimeRecord.restartTimer = undefined;
+					await runtimeRecord.runtime.shutdown();
+				}
+				throw error;
+			}
 		});
 	}
 
@@ -2220,7 +2331,7 @@ export class RuntimeSupervisor {
 		signal?: AbortSignal,
 	): Promise<PluginRuntime> {
 		if (typeof optionsOrPluginId === "string") return this.start(optionsOrPluginId, signal);
-		return this.start(optionsOrPluginId);
+		return this.start(optionsOrPluginId, signal);
 	}
 
 	async disable(pluginId: string): Promise<void> {
@@ -2240,9 +2351,10 @@ export class RuntimeSupervisor {
 
 	/** Latch final admission and restart producers before manager drains/updates StateStore. */
 	stopProducers(): void {
+		// Stop new activation/restart production; active runtime records remain writable until
+		// shutdown() explicitly drains them.
 		this.admissionClosed = true;
 		for (const record of this.records.values()) {
-			record.desiredEnabled = false;
 			clearTimeout(record.restartTimer);
 			record.restartTimer = undefined;
 		}
@@ -2266,6 +2378,19 @@ export class RuntimeSupervisor {
 				);
 		})();
 		return this.closing;
+	}
+
+	/** Read-only handoff audit, including a replaced generation whose cleanup is still owned. */
+	hasPendingShutdownWork(): boolean {
+		if (this.closing && Bun.peek.status(this.closing) === "pending") return true;
+		for (const [id, record] of this.records) {
+			if (record.restartTimer || this.mutex.isLocked(id) || record.runtime.hasPendingShutdownWork())
+				return true;
+		}
+		for (const [runtime, cleanup] of this.retired) {
+			if (Bun.peek.status(cleanup) === "pending" || runtime.hasPendingShutdownWork()) return true;
+		}
+		return false;
 	}
 
 	get(pluginId: string): PluginRuntime | undefined {
@@ -2295,10 +2420,21 @@ export class RuntimeSupervisor {
 		const userStateChange = options.onStateChange;
 		const runtime = this.options.runtimeFactory({
 			...options,
+			pendingInboundElsewhere: () => {
+				let pending = options.pendingInboundElsewhere?.() ?? 0;
+				for (const retired of this.retired.keys()) {
+					if (retired.pluginId === options.pluginId && retired !== runtime)
+						pending += retired.pendingInboundCount;
+				}
+				return pending;
+			},
 			onStateChange: (state, previous) => {
-				userStateChange?.(state, previous);
-				if (state === "crashed" || state === "failed")
-					this.handleFailure(options.pluginId, runtime, state);
+				try {
+					userStateChange?.(state, previous);
+				} finally {
+					if (state === "crashed" || state === "failed")
+						this.handleFailure(options.pluginId, runtime, state);
+				}
 			},
 		});
 		return runtime;
@@ -2361,6 +2497,7 @@ export class RuntimeSupervisor {
 				// Manual start, replacement or quarantine may win while this callback
 				// waits for the mutex. Never restart a recovered or obsolete process.
 				if (
+					this.admissionClosed ||
 					this.records.get(pluginId) !== record ||
 					record.runtime !== runtime ||
 					record.restartTimer !== restartTimer ||
@@ -2468,6 +2605,527 @@ function normalizeRuntimeError(error: unknown, phase: string): PluginRuntimeErro
 		kind: phase === "handshake" ? "handshake" : "transport",
 		cause: error,
 	});
+}
+
+export interface PluginPackageStageWorker {
+	on(event: "message", listener: (input: unknown) => void): unknown;
+	on(event: "error", listener: (error: Error) => void): unknown;
+	on(event: "messageerror", listener: () => void): unknown;
+	on(event: "exit", listener: (code: number) => void): unknown;
+	off(event: "message", listener: (input: unknown) => void): unknown;
+	off(event: "error", listener: (error: Error) => void): unknown;
+	off(event: "messageerror", listener: () => void): unknown;
+	off(event: "exit", listener: (code: number) => void): unknown;
+	postMessage(message: PluginPackageStageRequest, transfer?: ArrayBuffer[]): void;
+	terminate(): Promise<number>;
+}
+export interface PluginPackageStageOptions {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	/** Fault-injection budgets are capped by the production startup/real-exit deadlines. */
+	startupTimeoutMs?: number;
+	exitTimeoutMs?: number;
+	limits?: Partial<PackageStoreLimits>;
+	oldPackagePath?: string;
+	expectedArchiveSha256?: string;
+	/** Verify an installed package in place without copying or staging its files again. */
+	inspectPackage?: { pluginId: string; version: string; hash: string };
+	workerFactory?: () => PluginPackageStageWorker | Promise<PluginPackageStageWorker>;
+	trustPolicy?: {
+		enabled: boolean;
+		requireSignature: boolean;
+		keyring?: PluginTrustKeyring;
+		sbomPolicy?: SbomInstallPolicy;
+	};
+}
+
+// A failed close retains admission across HMR until the real Worker (including a late create) exits.
+const packageStageQueue = hotSafe(
+	"narrafork.pluginPackageStage.queue",
+	() =>
+		new TaskQueue({
+			concurrency: 1,
+			maxQueued: 4,
+			maxQueuedBytes: PLUGIN_PACKAGE_STAGE_MAX_BUFFERED_BYTES,
+			maxActiveBytes: PLUGIN_PACKAGE_STAGE_MAX_BUFFERED_BYTES,
+		}),
+);
+
+type PackageStageReply = Exclude<PluginPackageStageResponse, { packageStageReady: true }>;
+interface PackageStageConnection {
+	worker: PluginPackageStageWorker;
+	handle: WorkerHandle<PluginPackageStageWorker>;
+	ready: boolean;
+}
+
+/** A source/builtin staging failure is terminal: never run ZIP, digest or trust work on this thread. */
+export async function stagePluginPackage(
+	root: string,
+	source: PackageSource,
+	options: PluginPackageStageOptions = {},
+): Promise<PluginPackageStageResult> {
+	options.signal?.throwIfAborted();
+	if (process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED === "1")
+		throw packageStageFailure("Package staging Worker is disabled", "PACKAGE_STAGE_DISABLED");
+	const timeoutMs = packageStageBudget(options.timeoutMs, PLUGIN_PACKAGE_STAGE_TIMEOUT_MS);
+	const exitTimeoutMs = packageStageBudget(
+		options.exitTimeoutMs,
+		PLUGIN_PACKAGE_STAGE_EXIT_TIMEOUT_MS,
+	);
+	const startupTimeoutMs = packageStageBudget(
+		options.startupTimeoutMs,
+		PLUGIN_PACKAGE_STAGE_STARTUP_TIMEOUT_MS,
+	);
+	const deadline = Date.now() + timeoutMs;
+	const bytes =
+		typeof source === "string" || source instanceof URL
+			? 0
+			: source instanceof File
+				? source.size
+				: source.byteLength;
+	if (bytes > PLUGIN_PACKAGE_STAGE_MAX_BUFFERED_BYTES)
+		throw packageStageFailure("Large source archives must use a bounded on-disk download");
+	const permit = await packageStageQueue.acquire({
+		bytes,
+		signal: options.signal,
+		deadlineAt: deadline,
+	});
+	let preparing: Promise<ArrayBuffer> | undefined;
+	let serialized: string | ArrayBuffer;
+	try {
+		root = resolve(root);
+		assertPackageStagePath(root);
+		if (typeof source === "string") serialized = resolve(source);
+		else if (source instanceof URL) serialized = fileURLToPath(source);
+		else if (source instanceof File) {
+			preparing = source.arrayBuffer();
+			serialized = await waitForPackageStage(preparing, deadline, permit.signal);
+		} else {
+			const view = source instanceof Uint8Array ? source : new Uint8Array(source);
+			serialized = Uint8Array.from(view).buffer;
+		}
+		if (typeof serialized === "string") assertPackageStagePath(serialized);
+		if (options.oldPackagePath) assertPackageStagePath(resolve(options.oldPackagePath));
+		permit.signal.throwIfAborted();
+	} catch (error) {
+		// A timed-out File read still reserves its bounded input memory until it actually settles.
+		if (preparing)
+			void preparing.then(
+				() => permit.release(),
+				() => permit.release(),
+			);
+		else permit.release();
+		throw error;
+	}
+	const startupDeadline = Math.min(deadline, Date.now() + startupTimeoutMs);
+	const starting: Promise<PackageStageConnection> = options.workerFactory
+		? Promise.resolve()
+				.then(options.workerFactory)
+				.then((worker) => ({
+					worker,
+					handle: ownPackageStageWorker(worker),
+					ready: false,
+				}))
+		: connectCompiledWorker(
+				compiledWorkerSpecifiers(
+					"services/plugin-package-stage-worker.ts",
+					"./plugin-package-stage-worker.ts",
+					import.meta.url,
+				),
+				{
+					signal: permit.signal,
+					timeoutMs: startupTimeoutMs,
+					deadlineAt: startupDeadline,
+					isReady: isPluginPackageStageReady,
+				},
+			).then((connection) => ({ ...connection, ready: true }));
+	// Own unresolved creation too. A known create failure has no resource to exit; a startup
+	// cleanup failure instead transfers the actual handle and its still-unconfirmed exit.
+	const owner = new WorkerHandle(
+		starting,
+		starting.then(
+			(connection) => connection.handle.exited,
+			(error: unknown) => (error instanceof WorkerCleanupError ? error.handle.exited : 0),
+		),
+		async () => {
+			let connection: PackageStageConnection;
+			try {
+				connection = await starting;
+			} catch (error) {
+				if (error instanceof WorkerCleanupError) await error.handle.close();
+				return;
+			}
+			await connection.handle.close();
+		},
+	);
+	void owner.exited.then(
+		() => permit.release(),
+		() => {},
+	);
+	let detach: (() => void) | undefined;
+	let failure: unknown;
+	let stagedResult: PluginPackageStageResult | undefined;
+	let observedWorkerError: unknown;
+	let connectedHandle: WorkerHandle<PluginPackageStageWorker> | undefined;
+	try {
+		const connection = await waitForPackageStage(starting, startupDeadline, permit.signal);
+		const { worker, handle } = connection;
+		connectedHandle = handle;
+		let stopped = handle.closed;
+		let pending:
+			| {
+					id: number;
+					expected: "staged" | "verified";
+					resolve(value: PackageStageReply): void;
+					reject(error: Error): void;
+			  }
+			| undefined;
+		const onMessage = (input: unknown) => {
+			if (!input || typeof input !== "object" || Array.isArray(input)) return;
+			const message = input as Record<string, unknown>;
+			if (!pending || message.id !== pending.id) return;
+			if (message.protocolVersion !== PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION) {
+				pending.reject(packageStageFailure("Malformed package Worker response"));
+				return;
+			}
+			if (message.type === "error") {
+				if (
+					typeof message.error !== "string" ||
+					message.error.length > PLUGIN_PACKAGE_STAGE_MAX_ERROR_BYTES ||
+					Buffer.byteLength(message.error) > PLUGIN_PACKAGE_STAGE_MAX_ERROR_BYTES ||
+					typeof message.code !== "string" ||
+					!/^[A-Z0-9_]{1,64}$/.test(message.code)
+				)
+					pending.reject(packageStageFailure("Malformed package Worker error"));
+				else pending.reject(packageStageFailure(message.error, message.code));
+				return;
+			}
+			if (
+				message.type !== pending.expected ||
+				(message.type === "staged" &&
+					(typeof message.resultJson !== "string" ||
+						message.resultJson.length > PLUGIN_PACKAGE_STAGE_MAX_RESPONSE_BYTES ||
+						Buffer.byteLength(message.resultJson) > PLUGIN_PACKAGE_STAGE_MAX_RESPONSE_BYTES)) ||
+				(message.type === "verified" && message.verified !== true)
+			)
+				pending.reject(packageStageFailure("Malformed or oversized package Worker response"));
+			else pending.resolve(input as PackageStageReply);
+		};
+		const onError = (error: Error) => {
+			observedWorkerError ??= error;
+			stopped = true;
+			pending?.reject(error);
+		};
+		const onMessageError = () =>
+			onError(packageStageFailure("Package Worker message could not be decoded"));
+		const onExit = () => {
+			stopped = true;
+			pending?.reject(packageStageFailure("Package staging Worker exited", "PACKAGE_STAGE_EXIT"));
+		};
+		worker.on("message", onMessage);
+		worker.on("error", onError);
+		worker.on("messageerror", onMessageError);
+		worker.on("exit", onExit);
+		detach = () => {
+			worker.off("message", onMessage);
+			worker.off("error", onError);
+			worker.off("messageerror", onMessageError);
+			worker.off("exit", onExit);
+		};
+		if (!connection.ready)
+			await waitForPackageStageReady(worker, handle, startupDeadline, permit.signal);
+		const call = async (
+			request: Exclude<PluginPackageStageRequest, { action: "ping" }>,
+			expected: "staged" | "verified",
+			transfer: ArrayBuffer[] = [],
+		): Promise<PackageStageReply> => {
+			permit.signal.throwIfAborted();
+			if (stopped || pending) throw packageStageFailure("Package staging Worker is unavailable");
+			const response = new Promise<PackageStageReply>((resolve, reject) => {
+				pending = { id: request.id, expected, resolve, reject };
+				try {
+					worker.postMessage(request, transfer);
+				} catch (error) {
+					reject(asError(error));
+				}
+			});
+			try {
+				return await waitForPackageStage(response, deadline, permit.signal);
+			} finally {
+				pending = undefined;
+			}
+		};
+		const response = await call(
+			options.inspectPackage
+				? {
+						action: "plugin_package_inspect",
+						protocolVersion: PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION,
+						id: 1,
+						root,
+						source: typeof serialized === "string" ? serialized : "",
+						limits: options.limits,
+						identity: options.inspectPackage,
+					}
+				: {
+						action: "plugin_package_stage",
+						protocolVersion: PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION,
+						id: 1,
+						root,
+						source: serialized,
+						limits: options.limits,
+						oldPackagePath: options.oldPackagePath ? resolve(options.oldPackagePath) : undefined,
+						expectedArchiveSha256: options.expectedArchiveSha256,
+					},
+			"staged",
+			serialized instanceof ArrayBuffer ? [serialized] : [],
+		);
+		if (response.type !== "staged")
+			throw packageStageFailure("Package Worker did not stage a package");
+		const staged = parsePackageStageResult(response.resultJson, root);
+		if (
+			options.inspectPackage &&
+			(staged.pluginId !== options.inspectPackage.pluginId ||
+				staged.version !== options.inspectPackage.version ||
+				staged.hash !== options.inspectPackage.hash ||
+				staged.path !== serialized)
+		)
+			throw packageStageFailure("Installed package identity changed during trust verification");
+		const policy = packageStageTrustPolicy(staged, options.trustPolicy);
+		const verified = await call(
+			{
+				action: "plugin_package_verify",
+				protocolVersion: PLUGIN_PACKAGE_STAGE_PROTOCOL_VERSION,
+				id: 2,
+				policy,
+			},
+			"verified",
+		);
+		if (verified.type !== "verified" || verified.verified !== true)
+			throw packageStageFailure("Package trust Worker did not verify the staged package");
+		permit.signal.throwIfAborted();
+		stagedResult = staged;
+	} catch (error) {
+		failure = error ?? packageStageFailure("Package staging Worker failed without an error");
+		if (error instanceof PluginRuntimeError && error.code === "PACKAGE_STAGE_TIMEOUT")
+			reportPluginRuntimeHealth("package_stage_timeout");
+	} finally {
+		try {
+			await waitForPackageStage(owner.close(), Date.now() + exitTimeoutMs);
+		} catch (error) {
+			reportPluginRuntimeHealth("package_stage_cleanup_failed", "error");
+			if (!(failure instanceof WorkerCleanupError))
+				failure =
+					error instanceof WorkerCleanupError ? error : new WorkerCleanupError(owner, error);
+		} finally {
+			// Keep listeners/permit on a failed stop; their teardown belongs to confirmed exit.
+			void owner.exited.then(
+				() => detach?.(),
+				() => {},
+			);
+		}
+		// A verified response is not permission to hide a later native Worker failure.
+		const error = observedWorkerError ?? connectedHandle?.error;
+		if (failure === undefined && error !== undefined) failure = asError(error);
+	}
+	if (failure !== undefined) throw failure;
+	if (!stagedResult) throw packageStageFailure("Package staging Worker did not return a result");
+	return stagedResult;
+}
+
+function packageStageFailure(message: string, code = "PACKAGE_STAGE_FAILED"): PluginRuntimeError {
+	return new PluginRuntimeError(message, { code, phase: "stage", kind: "spawn" });
+}
+
+function packageStageBudget(value: number | undefined, ceiling: number): number {
+	if (value !== undefined && !Number.isFinite(value))
+		throw new RangeError("Invalid package Worker deadline");
+	return Math.max(1, Math.min(Math.floor(value ?? ceiling), ceiling));
+}
+
+function assertPackageStagePath(path: string): void {
+	if (
+		!isAbsolute(path) ||
+		path.includes("\0") ||
+		Buffer.byteLength(path) > PLUGIN_PACKAGE_STAGE_MAX_PATH_BYTES
+	)
+		throw packageStageFailure("Invalid or oversized package Worker path");
+}
+
+function ownPackageStageWorker(
+	worker: PluginPackageStageWorker,
+): WorkerHandle<PluginPackageStageWorker> {
+	const exit = Promise.withResolvers<number>();
+	worker.on("exit", exit.resolve);
+	// As with WorkerHandle.thread, a late native error while terminating must have a lifetime sink.
+	worker.on("error", () => {});
+	return new WorkerHandle(worker, exit.promise, () => worker.terminate());
+}
+
+async function waitForPackageStageReady(
+	worker: PluginPackageStageWorker,
+	handle: WorkerHandle<PluginPackageStageWorker>,
+	deadline: number,
+	signal: AbortSignal,
+): Promise<void> {
+	const ready = Promise.withResolvers<void>();
+	// postMessage can throw before the timed waiter attaches; late exit must not reject an orphan.
+	void ready.promise.catch(() => {});
+	const onMessage = (input: unknown) => {
+		if (isPluginPackageStageReady(input)) ready.resolve();
+	};
+	const onError = (error: Error) => ready.reject(error);
+	worker.on("message", onMessage);
+	worker.on("error", onError);
+	void handle.exited.then(
+		() =>
+			ready.reject(
+				packageStageFailure("Package staging Worker exited before ready", "PACKAGE_STAGE_EXIT"),
+			),
+		onError,
+	);
+	try {
+		worker.postMessage({ action: "ping" } satisfies PluginPackageStageRequest);
+		await waitForPackageStage(ready.promise, deadline, signal);
+	} finally {
+		worker.off("message", onMessage);
+		worker.off("error", onError);
+	}
+}
+
+async function waitForPackageStage<T>(
+	work: Promise<T>,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let abort: (() => void) | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<never>((_resolve, reject) => {
+				const timeout = () =>
+					reject(
+						packageStageFailure(
+							"Package staging Worker deadline exceeded",
+							"PACKAGE_STAGE_TIMEOUT",
+						),
+					);
+				timer = setTimeout(timeout, Math.max(0, deadline - Date.now()));
+				abort = () => {
+					const reason: unknown = signal?.reason;
+					if (reason instanceof WorkerCleanupError) reject(reason);
+					else if (reason instanceof TaskQueueError && reason.code === "TASK_QUEUE_TIMEOUT")
+						timeout();
+					else reject(createAbortError(reason));
+				};
+				signal?.addEventListener("abort", abort, { once: true });
+				if (signal?.aborted) abort();
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+		if (abort) signal?.removeEventListener("abort", abort);
+	}
+}
+
+function parsePackageStageResult(json: string, root: string): PluginPackageStageResult {
+	let result: PluginPackageStageResult;
+	try {
+		result = JSON.parse(json) as PluginPackageStageResult;
+	} catch {
+		throw packageStageFailure("Malformed package staging Worker result");
+	}
+	if (
+		!result ||
+		typeof result !== "object" ||
+		Array.isArray(result) ||
+		result.currentUpdated !== false ||
+		!pluginIdSchema.safeParse(result.pluginId).success ||
+		typeof result.version !== "string" ||
+		!/^[0-9A-Za-z.+-]{1,256}$/.test(result.version) ||
+		typeof result.hash !== "string" ||
+		!/^[a-f0-9]{64}$/.test(result.hash) ||
+		typeof result.path !== "string" ||
+		typeof result.packagePath !== "string" ||
+		result.path !== resolve(root, "packages", result.pluginId, result.version, result.hash) ||
+		result.packagePath !== result.path ||
+		typeof result.alreadyInstalled !== "boolean" ||
+		!result.manifest ||
+		typeof result.manifest !== "object" ||
+		Array.isArray(result.manifest) ||
+		result.manifest.pluginId !== result.pluginId ||
+		result.manifest.version !== result.version ||
+		(result.signatureIdentity !== null && typeof result.signatureIdentity !== "string") ||
+		(result.previousSignatureIdentity !== null &&
+			typeof result.previousSignatureIdentity !== "string") ||
+		(result.signatureKeyId !== undefined && typeof result.signatureKeyId !== "string")
+	)
+		throw packageStageFailure("Malformed package staging Worker result");
+	return result;
+}
+
+function packageStageTrustPolicy(
+	staged: PluginPackageStageResult,
+	input: PluginPackageStageOptions["trustPolicy"],
+): PluginPackageStageTrustPolicy {
+	const boundedList = <T extends string>(
+		values: readonly T[] | undefined,
+	): readonly T[] | undefined => {
+		if (
+			values !== undefined &&
+			(!Array.isArray(values) ||
+				values.length > 256 ||
+				values.some((value) => typeof value !== "string" || value.length > 4096))
+		)
+			throw packageStageFailure("Package trust policy exceeds its control budget");
+		return values;
+	};
+	let key: PluginPackageStageTrustKey | undefined;
+	const trusted =
+		staged.signatureKeyId && input?.enabled ? input.keyring?.get(staged.signatureKeyId) : undefined;
+	if (trusted) {
+		const publicKey =
+			typeof trusted.publicKey === "string"
+				? trusted.publicKey
+				: (trusted.publicKey.type === "public"
+						? trusted.publicKey
+						: createPublicKey(trusted.publicKey)
+					)
+						.export({ type: "spki", format: "pem" })
+						.toString();
+		if (
+			publicKey.length > PLUGIN_PACKAGE_STAGE_MAX_CONTROL_BYTES ||
+			trusted.keyId.length > 4096 ||
+			(trusted.revokedAt?.length ?? 0) > 4096
+		)
+			throw packageStageFailure("Package trust key exceeds its control budget");
+		key = {
+			keyId: trusted.keyId,
+			publicKey,
+			pluginIds: boundedList(trusted.pluginIds),
+			revokedAt: trusted.revokedAt,
+		};
+	}
+	const sbom = input?.sbomPolicy;
+	const policy: PluginPackageStageTrustPolicy = {
+		enabled: input?.enabled ?? false,
+		requireSignature: input?.requireSignature ?? false,
+		keyringConfigured: input?.keyring !== undefined,
+		key,
+		sbomPolicy: sbom
+			? {
+					allowedFormats: boundedList(sbom.allowedFormats),
+					allowedLicenses: boundedList(sbom.allowedLicenses),
+					deniedLicenses: boundedList(sbom.deniedLicenses),
+					maxComponents: sbom.maxComponents,
+					requireSbom: sbom.requireSbom,
+					allowUnknownLicense: sbom.allowUnknownLicense,
+				}
+			: undefined,
+	};
+	if (Buffer.byteLength(JSON.stringify(policy)) > PLUGIN_PACKAGE_STAGE_MAX_CONTROL_BYTES)
+		throw packageStageFailure("Package trust policy exceeds its control budget");
+	return policy;
 }
 
 function asError(error: unknown): Error {

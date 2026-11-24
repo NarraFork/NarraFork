@@ -53,6 +53,9 @@ afterEach(async () => {
 function sandbox(options: {
 	trace: string[];
 	onPluginShutdown(): Promise<void>;
+	onPluginSourceStop?: () => Promise<void>;
+	pluginSourcePending?: () => boolean;
+	pluginManagerPending?: () => boolean;
 	onBufferedDrain(): void;
 	communicationStatus(): { pending: number; failed: boolean };
 	now?: () => number;
@@ -166,7 +169,9 @@ function sandbox(options: {
 			options.onHttpDrain?.();
 			trace.push("http.drained");
 		},
-		waitForWebSocketActivityDrain: settled,
+		waitForWebSocketActivityDrain: async () => {
+			trace.push("ws.drained");
+		},
 		prepareSignalRestartRecovery: settled,
 		getCodexManager: () => ({ stopUsageRefreshScheduler: nothing }),
 		stopScheduledTaskScheduler: async () => {
@@ -221,7 +226,24 @@ function sandbox(options: {
 		drainNarratorRunCompletions: settled,
 		getNarratorRunShutdownSnapshot: () => ({ stopped: true, pending: 0, failed: 0 }),
 		stopVNetUdpRendezvous: settled,
-		pluginManager: { shutdown: options.onPluginShutdown },
+		pluginSourceService: {
+			beginShutdown: () => trace.push("pluginSource.fence"),
+			stop: () => {
+				trace.push("pluginSource.stop");
+				return options.onPluginSourceStop?.() ?? Promise.resolve();
+			},
+			hasPendingShutdownWork: options.pluginSourcePending ?? (() => false),
+		},
+		pluginManager: {
+			beginShutdown: () => trace.push("pluginManager.fence"),
+			shutdown: () => {
+				trace.push("pluginManager.shutdown");
+				return options.onPluginShutdown();
+			},
+			hasPendingShutdownWork: options.pluginManagerPending ?? (() => false),
+		},
+		providerQuotaService: { stop: () => trace.push("quota.stop") },
+		stopPluginPlatformProducers: () => trace.push("pluginPlatform.stop"),
 		unregisterExternalProviderResolver: nothing,
 		mcpManager: { shutdown: settled },
 		preservesRecoveryOnShutdown: () => false,
@@ -258,7 +280,6 @@ function sandbox(options: {
 			closeSnapshotBuilds: settled,
 			closeTokenRecalculationWorkers: settled,
 			closeToolInputHistoricalWorkers: settled,
-			stopPluginPlatformProducers: settled,
 			stopOutlineTaskLeaseJob: settled,
 			stopOutlineInProcessRebuild: settled,
 			stopOutlineDigestJob: settled,
@@ -903,6 +924,11 @@ test("producer admission closes before request waits consume the entire business
 	try {
 		await runtime.run({ reason: "fixture-expired", skipWindowsProcessTreeKill: true });
 		for (const owner of [
+			"pluginSource.fence",
+			"pluginManager.fence",
+			"quota.stop",
+			"pluginPlatform.stop",
+			"pluginSource.stop",
 			"bash.stop",
 			"history.stop",
 			"occupancy.stop",
@@ -916,6 +942,7 @@ test("producer admission closes before request waits consume the entire business
 			expect(trace.indexOf(owner)).toBeGreaterThanOrEqual(0);
 			expect(trace.indexOf(owner)).toBeLessThan(trace.indexOf("http.drained"));
 		}
+		expect(trace).not.toContain("pluginManager.shutdown"); // No new work after the business deadline.
 		expect(trace).toContain("reader.closed");
 		expect(trace).toContain("dirty");
 		expect(runtime.cleanMarkers).toBe(0);
@@ -923,6 +950,118 @@ test("producer admission closes before request waits consume the entire business
 		await shutdownDbWorkerPool();
 		resumeDbWorkerPool();
 	}
+});
+
+test.each([
+	"source",
+	"manager",
+] as const)("a live plugin %s write retains native readers and the lock after the business deadline", async (owner) => {
+	const trace: string[] = [];
+	let now = 0;
+	const db = new Database(":memory:");
+	db.run("CREATE TABLE writes (owner TEXT)");
+	const release = Promise.withResolvers<void>();
+	const write = release.promise.then(() => db.run("INSERT INTO writes VALUES (?)", [owner]));
+	const hasWork = () => Bun.peek.status(write) === "pending";
+	const runtime = sandbox({
+		trace,
+		now: () => now,
+		onHttpDrain: () => {
+			now = 30_000;
+		},
+		onPluginSourceStop: async () => {
+			if (owner === "source") await write;
+		},
+		onPluginShutdown: async () => {},
+		pluginSourcePending: () => owner === "source" && hasWork(),
+		pluginManagerPending: () => owner === "manager" && hasWork(),
+		onBufferedDrain() {},
+		communicationStatus: () => ({ pending: 0, failed: false }),
+	});
+	try {
+		const shutdown = runtime.run({ reason: "fixture-plugin", skipWindowsProcessTreeKill: true });
+		// Both admission fences and producer stops must already have run, before the first await.
+		expect(trace.filter((entry) => entry.startsWith("plugin") || entry === "quota.stop")).toEqual([
+			"pluginSource.fence",
+			"pluginManager.fence",
+			"quota.stop",
+			"pluginPlatform.stop",
+			"pluginSource.stop",
+		]);
+		expect(await shutdown).toMatchObject({ success: false, clean: false });
+		expect(hasWork()).toBe(true);
+		expect(runtime.tracker?.summary().degradedSteps).toContainEqual({
+			label: owner === "source" ? "pluginSourceService.quiescence" : "pluginManager.quiescence",
+			outcome: "failed",
+		});
+		expect(runtime.tracker?.summary().degradedSteps).toContainEqual({
+			label: "databaseWork.finalAudit",
+			outcome: "failed",
+		});
+		for (const step of [
+			"reader.close.begin",
+			"prefixSnapshots.close",
+			"postgres.close",
+			"dirty",
+			"clean",
+		])
+			expect(trace).not.toContain(step);
+		release.resolve();
+		await write;
+		expect(db.query("SELECT owner FROM writes").all()).toEqual([{ owner }]);
+		expect(runtime.cleanMarkers).toBe(0);
+	} finally {
+		release.resolve();
+		await write;
+		db.close();
+	}
+});
+
+test.each([
+	"source",
+	"manager",
+] as const)("a settled plugin %s failure allows dirty handoff, only after request and reader drain", async (owner) => {
+	const trace: string[] = [];
+	const fail = async () => {
+		throw new Error("settled plugin failure");
+	};
+	const runtime = sandbox({
+		trace,
+		onPluginSourceStop: owner === "source" ? fail : undefined,
+		onPluginShutdown: owner === "manager" ? fail : async () => {},
+		onBufferedDrain() {},
+		communicationStatus: () => ({ pending: 0, failed: false }),
+	});
+	expect(
+		await runtime.run({ reason: "fixture-plugin-failure", skipWindowsProcessTreeKill: true }),
+	).toMatchObject({ success: true, clean: false });
+	expect(runtime.tracker?.summary().degradedSteps).toContainEqual({
+		label: owner === "source" ? "pluginSourceService.stop" : "pluginManager.shutdown",
+		outcome: "failed",
+	});
+	expect(trace.indexOf("http.drained")).toBeGreaterThanOrEqual(0);
+	expect(trace.indexOf("ws.drained")).toBeGreaterThan(trace.indexOf("http.drained"));
+	expect(trace.indexOf("pluginManager.shutdown")).toBeGreaterThan(trace.indexOf("ws.drained"));
+	expect(trace.indexOf("reader.closed")).toBeGreaterThan(trace.indexOf("pluginManager.shutdown"));
+	expect(trace.indexOf("dirty")).toBeGreaterThan(trace.indexOf("reader.closed"));
+	expect(runtime.cleanMarkers).toBe(0);
+});
+
+test("plugin ownership reported during reader closure still prevents instance-lock handoff", async () => {
+	const trace: string[] = [];
+	const runtime = sandbox({
+		trace,
+		onPluginShutdown: async () => {},
+		pluginManagerPending: () => trace.includes("reader.closed"),
+		onBufferedDrain() {},
+		communicationStatus: () => ({ pending: 0, failed: false }),
+	});
+	expect(
+		await runtime.run({ reason: "fixture-final-handoff", skipWindowsProcessTreeKill: true }),
+	).toMatchObject({ success: false, clean: false });
+	expect(trace).toContain("reader.closed");
+	expect(trace).not.toContain("dirty");
+	expect(runtime.cleanMarkers).toBe(0);
 });
 
 test("history cleanup freezes before request drain and settles before native reader closure", async () => {

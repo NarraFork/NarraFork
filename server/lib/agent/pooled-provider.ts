@@ -20,6 +20,7 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import { bindFrozenQuotaTarget, type FrozenCustomApiQuotaTarget } from "../provider-quota-async";
 import {
 	isPoolCooldownActive,
 	type PoolCooldown,
@@ -304,6 +305,15 @@ export class PooledProvider implements ProviderAdapter {
 				);
 				return !!live && JSON.stringify([live.apiKey, live.network ?? null]) === version;
 			};
+			let capturedQuota: FrozenCustomApiQuotaTarget | null = null;
+			if (params.captureCustomApiQuotaTarget) {
+				try {
+					const target = params.captureCustomApiQuotaTarget(this.providerId, key.id);
+					capturedQuota = target ? Object.freeze({ ...target }) : null;
+				} catch {
+					/* Display provenance failure must not change inference behavior. */
+				}
+			}
 			let streamed = false;
 			try {
 				for await (const event of this.adapterFor(key).chat({
@@ -316,7 +326,9 @@ export class PooledProvider implements ProviderAdapter {
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: event.credentialId ?? key.id };
+					const decorated = { ...event, credentialId: event.credentialId ?? key.id };
+					if (params.captureCustomApiQuotaTarget) bindFrozenQuotaTarget(decorated, capturedQuota);
+					yield decorated;
 				}
 				clearKeyCooldown(key.id);
 				return;

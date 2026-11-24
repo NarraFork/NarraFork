@@ -112,7 +112,6 @@ export class SmokeProcessScope {
 	}
 
 	/** Cleanup ignores the aborted test signal, but has its own finite subprocess budgets. */
-	/** Cleanup ignores the aborted test signal, but has its own finite subprocess budgets. */
 	close(): Promise<void> {
 		if (this.closePromise) return this.closePromise;
 		this.closing = true;
@@ -131,7 +130,14 @@ export class SmokeProcessScope {
 					child.process.stderr.destroy();
 				}
 			}
-			if (failures.length) throw new AggregateError(failures, "Smoke child cleanup failed");
+			if (failures.length) {
+				// Reports keep only String(error); name each underlying cause in the message.
+				const causes = failures
+					.map((failure) => (failure instanceof Error ? failure.message : String(failure)))
+					.join("; ")
+					.slice(0, 2_000);
+				throw new AggregateError(failures, `Smoke child cleanup failed: ${causes}`);
+			}
 		})();
 		return this.closePromise;
 	}
@@ -212,6 +218,84 @@ async function cleanupCommand(
 	});
 }
 
+/**
+ * Every PID a `taskkill /T` report names: each tree member and its parent. The `PID <n>`
+ * token is the same in every locale, so no localized wording is parsed. The caller's own
+ * PID appears as the root's parent and is excluded.
+ */
+export function taskkillPids(output: string, self = process.pid): number[] {
+	const pids = new Set<number>();
+	for (const match of output.matchAll(/\bPID\s+(\d+)/g)) {
+		const pid = Number(match[1]);
+		if (Number.isSafeInteger(pid) && pid > 0 && pid !== self) pids.add(pid);
+	}
+	return [...pids];
+}
+
+const MAX_VERIFIED_PIDS = 256;
+
+/** Creation time (Unix ms) of each listed PID that still exists. Read-only: kills nothing. */
+async function windowsProcessStarts(pids: readonly number[]): Promise<Map<number, number>> {
+	// Only validated integers reach the filter; -EncodedCommand avoids command-line quoting.
+	const filter = pids.map((pid) => `ProcessId=${pid}`).join(" OR ");
+	const script = [
+		"$ErrorActionPreference = 'Stop'",
+		`Get-CimInstance Win32_Process -Filter '${filter}' | ForEach-Object {`,
+		"  $created = if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }",
+		"  '{0} {1}' -f $_.ProcessId, $created",
+		"}",
+	].join("\n");
+	const result = await cleanupCommand([
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-EncodedCommand",
+		Buffer.from(script, "utf16le").toString("base64"),
+	]);
+	if (result.code !== 0)
+		throw new Error(`Cannot inspect owned processes: ${result.output.slice(0, 500)}`);
+	const starts = new Map<number, number>();
+	for (const line of result.output.split(/\r?\n/)) {
+		const [pid, created] = line.trim().split(/\s+/).map(Number);
+		if (
+			pid !== undefined &&
+			created !== undefined &&
+			pids.includes(pid) &&
+			Number.isFinite(created)
+		)
+			starts.set(pid, created);
+	}
+	return starts;
+}
+
+/**
+ * `taskkill /T /F` also exits non-zero for a member that is already exiting (it stays in the
+ * process table while another process holds a handle), even when the whole tree is gone a
+ * moment later. Judge the tree, not that exit code: once the root has closed, none of the
+ * processes taskkill named may still run. A PID created after taskkill finished was reused
+ * by an unrelated process and is not ours. Unverifiable reports still fail closed.
+ */
+export async function assertTaskkillTreeExited(
+	output: string,
+	namedBefore: number,
+	self = process.pid,
+): Promise<void> {
+	const pids = taskkillPids(output, self);
+	if (!pids.length || pids.length > MAX_VERIFIED_PIDS)
+		throw new Error(`taskkill failed: ${output.slice(0, 1_000)}`);
+	let survivors = pids;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (attempt) await delay(500);
+		const starts = await windowsProcessStarts(survivors);
+		// An unknown creation time (0) is treated as ours.
+		survivors = [...starts].filter(([, created]) => created <= namedBefore).map(([pid]) => pid);
+		if (!survivors.length) return;
+	}
+	throw new Error(
+		`Owned processes survived cleanup: ${survivors.join(", ")}; taskkill: ${output.slice(0, 1_000)}`,
+	);
+}
+
 export function descendantPids(table: string, root: number): number[] {
 	const rows = table
 		.split("\n")
@@ -237,13 +321,21 @@ async function terminateOwnedTree(child: SmokeChild): Promise<void> {
 	if (child.closed) return;
 	const pid = child.process.pid;
 	let failure: unknown;
+	let taskkillReport: { output: string; finishedAt: number } | undefined;
 	if (pid && process.platform === "win32") {
 		// No /IM, wildcards or blanket kills: this exact still-owned PID and its children only.
 		if (child.status === undefined) {
 			try {
 				const result = await cleanupCommand(["taskkill.exe", "/PID", String(pid), "/T", "/F"]);
-				if (result.code !== 0 && child.status === undefined)
-					throw new Error(`taskkill failed: ${result.output}`);
+				if (result.code !== 0) {
+					if (taskkillPids(result.output).length) {
+						// Judged below, once the root has closed and released its handles.
+						taskkillReport = { output: result.output, finishedAt: Date.now() };
+						child.process.kill("SIGKILL");
+					} else if (child.status === undefined) {
+						throw new Error(`taskkill failed: ${result.output}`);
+					}
+				}
 			} catch (error) {
 				failure = error;
 				child.process.kill("SIGKILL");
@@ -271,4 +363,6 @@ async function terminateOwnedTree(child: SmokeChild): Promise<void> {
 	if (!child.closed)
 		throw new Error(`Owned process ${pid ?? "spawn failure"} did not close after cleanup`);
 	if (failure) throw failure;
+	if (taskkillReport)
+		await assertTaskkillTreeExited(taskkillReport.output, taskkillReport.finishedAt);
 }

@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderBalanceSnapshot } from "../../../../shared/provider-balance";
-import { customApiBalanceDisplayFor, usageSourceFor } from "./custom-api-usage-source";
+import type { ProviderQuotaSnapshot } from "../../../../shared/provider-quota";
+import { capabilityModelReference } from "../interaction/use-resolved-model";
+import {
+	customApiBalanceDisplayFor,
+	customApiQuotaDisplayFor,
+	resolveCustomApiQuotaProviderId,
+	usageSourceFor,
+} from "./custom-api-usage-source";
 
 const subscriptionSnapshot = {
 	generation: "g1",
@@ -135,5 +142,97 @@ describe("usageSourceFor", () => {
 		expect(
 			usageSourceFor({ providerId: "p1", opencodeProviderId: "p1", kimiProviderId: "p1" }),
 		).toBe("opencode");
+	});
+});
+
+function quotaSnapshot(overrides: Partial<ProviderQuotaSnapshot> = {}): ProviderQuotaSnapshot {
+	return {
+		providerId: "p",
+		targetId: "custom-api/p",
+		generation: "g1",
+		sourceId: "io.narrafork.provider-quota:third-party",
+		status: "supported",
+		data: { amounts: [{ id: "credit", unit: "USD", remaining: 8 }], windows: [] },
+		fetchedAt: 1,
+		attemptedAt: 1,
+		stale: false,
+		error: null,
+		version: 1,
+		...overrides,
+	};
+}
+
+describe("normalized quota source identity", () => {
+	test("auto sessions use the service actually reported by runtimeModel, not the first candidate", () => {
+		const providers = [
+			{ id: "first", prefix: "first-service" },
+			{ id: "served", prefix: "served-service" },
+			{ id: "disabled", prefix: "disabled-service", disabled: true },
+		];
+		const concrete = capabilityModelReference("auto:gpt-5.5", undefined, {
+			model: "served-service:gpt-5.5",
+		});
+		expect(resolveCustomApiQuotaProviderId(concrete, providers)).toBe("served");
+		expect(resolveCustomApiQuotaProviderId("first-service:gpt-5.5", providers)).toBe("first");
+		expect(resolveCustomApiQuotaProviderId("disabled-service:gpt-5.5", providers)).toBeNull();
+		for (const model of [
+			"codex:gpt-5.5",
+			"CommandCode:model",
+			"tokendance:model",
+			"nug:model",
+			undefined,
+		])
+			expect(resolveCustomApiQuotaProviderId(model, providers)).toBeNull();
+	});
+
+	test("a Key quota accepts only a push with the current generation and never a legacy cross-Key cache", () => {
+		const snapshot = quotaSnapshot({ keyId: "key-1" });
+		const legacy = { quotaBalance: "Old unversioned key", detailedQuotaBalance: "Old details" };
+		const input = { providerId: "p", generation: "g1", snapshot };
+		expect(customApiQuotaDisplayFor({ ...input, pushedQuotas: { p: legacy } })).toEqual({
+			pushedQuota: null,
+			quotaSnapshot: snapshot,
+		});
+		const current = { generation: "g1", quotaBalance: "0", detailedQuotaBalance: "Live key" };
+		expect(customApiQuotaDisplayFor({ ...input, pushedQuotas: { p: current } }).pushedQuota).toBe(
+			current,
+		);
+		expect(
+			customApiQuotaDisplayFor({ ...input, generation: "g2", pushedQuotas: { p: current } })
+				.pushedQuota,
+		).toBeNull();
+		expect(
+			customApiQuotaDisplayFor({ ...input, generation: "g2", pushedQuotas: { p: legacy } })
+				.pushedQuota,
+		).toBeNull();
+		expect(snapshot.data?.amounts[0]?.remaining).toBe(8);
+	});
+
+	test("explicit site-account snapshots reject inference-key push fallback for every status", () => {
+		const pushed = { generation: "g1", quotaBalance: "Inference key amount" };
+		for (const status of ["supported", "error", "unavailable", "unsupported"] as const) {
+			const snapshot = quotaSnapshot({ status, pushCompatible: false });
+			const display = customApiQuotaDisplayFor({
+				providerId: "p",
+				generation: "g1",
+				snapshot,
+				pushedQuotas: { p: pushed },
+			});
+			expect(display.pushedQuota).toBeNull();
+			expect(display.quotaSnapshot).toBe(snapshot);
+		}
+	});
+
+	test("unversioned caches are compatible only before identity exists or within the same non-Key account", () => {
+		const pushed = { quotaBalance: "0" };
+		const input = { providerId: "p", generation: "g1", pushedQuotas: { p: pushed } };
+		expect(customApiQuotaDisplayFor({ ...input, snapshot: null }).pushedQuota).toBe(pushed);
+		expect(customApiQuotaDisplayFor({ ...input, snapshot: quotaSnapshot() }).pushedQuota).toBe(
+			pushed,
+		);
+		expect(
+			customApiQuotaDisplayFor({ ...input, snapshot: quotaSnapshot({ generation: "old" }) })
+				.pushedQuota,
+		).toBeNull();
 	});
 });

@@ -8,6 +8,7 @@ import {
 	type JsonValue,
 	jsonValueSchema,
 	NARRAFORK_UI_PROTOCOL,
+	PLUGIN_BACKEND_HOST_REQUEST_METHODS,
 	type UiRpcRequest,
 	type UiRpcResponse,
 	uiRpcRequestSchema,
@@ -425,6 +426,12 @@ export class PluginUiHost {
 		input: PluginUiHostRequest,
 		fence: PluginUiSessionRequestFence,
 	): Promise<JsonValue> {
+		if ((PLUGIN_BACKEND_HOST_REQUEST_METHODS as readonly string[]).includes(input.request.method)) {
+			throw new PluginUiHostError(
+				"METHOD_NOT_FOUND",
+				"Backend-only Host method is unavailable to plugin UI",
+			);
+		}
 		const context = this.createContext(input);
 		await this.authorizeUiPanel(context, input.request);
 		this.assertSessionRequestActive(fence);

@@ -185,6 +185,12 @@ export interface UseNarratorPanelWSOptions {
 	initialDetailedQuotaBalance?: string | null;
 	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
 	customApiProviderId?: string | null;
+	/** Identity of the saved Custom API account; pushed text cannot survive its replacement. */
+	customApiProviderGeneration?: string;
+	/** Known Key identities cannot accept quota text from an unidentified legacy request. */
+	customApiProviderKeyId?: string;
+	/** Explicit site-account queries must not fall back to inference-key push text. */
+	customApiQuotaPushCompatible?: boolean;
 	/** NUG provider ID for the current narrator model (used to sync quota back to NUG cache). */
 	nugProviderId?: string | null;
 	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
@@ -355,6 +361,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
 		customApiProviderId,
+		customApiProviderGeneration,
+		customApiProviderKeyId,
+		customApiQuotaPushCompatible,
 		nugProviderId,
 		quotaProviderKey,
 		narratorSubstatus,
@@ -1277,13 +1286,52 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onQuotaBalance: (balance, detailedBalance) => {
+			onQuotaBalance: (balance, detailedBalance, target, credentialId) => {
+				if (customApiProviderId) {
+					if (
+						customApiQuotaPushCompatible === false ||
+						(target === undefined && customApiProviderKeyId) ||
+						credentialId === null ||
+						(credentialId !== undefined &&
+							customApiProviderKeyId &&
+							credentialId !== customApiProviderKeyId)
+					)
+						return;
+					// Compare the immutable request identity BEFORE touching local state or caches.
+					// A late event is delivered through the latest callback after account switches.
+					if (
+						target !== undefined &&
+						(!target ||
+							target.providerId !== customApiProviderId ||
+							target.generation !== customApiProviderGeneration)
+					)
+						return;
+					const saved = qc.getQueryData<{ providerQuotaGenerations?: Record<string, string> }>([
+						"settings",
+					]);
+					if (
+						customApiProviderGeneration &&
+						saved?.providerQuotaGenerations?.[customApiProviderId] !== customApiProviderGeneration
+					)
+						return;
+				} else if (target) {
+					// A late Custom API pass must not be relabelled as the current NUG/platform balance.
+					return;
+				}
 				setQuotaBalance(balance);
 				setDetailedQuotaBalance(detailedBalance ?? null);
 				if (customApiProviderId) {
 					const updateSettingsQuota = (old: unknown) => {
 						if (!old || typeof old !== "object") return old;
 						const settings = old as Record<string, unknown>;
+						const generations = settings.providerQuotaGenerations as
+							| Record<string, unknown>
+							| undefined;
+						if (
+							customApiProviderGeneration &&
+							generations?.[customApiProviderId] !== customApiProviderGeneration
+						)
+							return old;
 						const customApiQuotas =
 							settings.customApiQuotas && typeof settings.customApiQuotas === "object"
 								? (settings.customApiQuotas as Record<string, unknown>)
@@ -1299,6 +1347,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								...customApiQuotas,
 								[customApiProviderId]: {
 									...existing,
+									...(customApiProviderGeneration
+										? { generation: customApiProviderGeneration }
+										: {}),
 									quotaBalance: balance,
 									detailedQuotaBalance: detailedBalance ?? null,
 								},

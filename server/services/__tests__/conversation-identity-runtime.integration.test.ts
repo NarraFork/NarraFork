@@ -190,6 +190,7 @@ test("first provider call waits for real preflight and cold DB recovery works be
 	});
 	beforeResponse = async () => {
 		await releaseResponse.promise;
+		return undefined;
 	};
 	await start();
 	await waitUntil(() => preflights > 0, "request reached identity preflight");
@@ -278,6 +279,7 @@ test("the old run teardown cannot resurrect an identity explicitly cleared durin
 			resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
 			cleared = true;
 		});
+		return undefined;
 	};
 	await start();
 	await idle(1);

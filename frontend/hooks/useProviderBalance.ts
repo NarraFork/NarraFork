@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "../lib/api";
+import { useProviderQuotaCapability } from "./useProviderQuota";
 
 export const providerBalanceKey = (providerId: string | null, generation: string | undefined) =>
 	["provider-balances", providerId, generation] as const;
@@ -133,21 +134,7 @@ export function useProbeProviderBalance(
 	return useMutation(options);
 }
 
-/**
- * Whether the quota-query capability is switched on.
- *
- * The capability belongs to the `apikey-quota` plugin, so an administrator disabling it must
- * remove the provider page's balance row and site-quota inputs rather than leave controls on
- * screen that cannot work. Shares the `["settings"]` cache with the rest of the page, so this
- * costs no extra request, and an unknown answer counts as enabled (the safe direction).
- */
+/** Historical callers share the current host-owned Custom API quota capability. */
 export function useProviderBalanceCapability(): boolean {
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		staleTime: 30_000,
-	});
-	const capability = (settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
-		?.providerBalanceCapability;
-	return capability?.enabled !== false;
+	return useProviderQuotaCapability();
 }

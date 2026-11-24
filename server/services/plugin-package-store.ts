@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
 	copyFile,
 	lstat,
 	mkdir,
 	open,
+	opendir,
 	readdir,
 	readFile,
 	realpath,
 	rename,
 	rm,
-	stat,
 	writeFile,
 } from "node:fs/promises";
 import { extname, join, relative, resolve, sep } from "node:path";
@@ -345,39 +345,90 @@ async function hashFileInto(
 	hash: ReturnType<typeof createHash>,
 	path: string,
 	limits: PackageStoreLimits,
+	remainingBytes: number,
 ): Promise<number> {
-	const info = await withTimeout(stat(path), limits.timeoutMs, "package hash stat");
-	if (!info.isFile()) throw new ValidationError("Cannot hash a non-file package entry");
-	if (info.size > limits.maxFileBytes)
-		throw new ValidationError("Package file exceeds the file-size limit");
-	let bytes = 0;
-	const stream = createReadStream(path, { highWaterMark: 64 * 1024 });
+	const info = await withTimeout(lstat(path), limits.timeoutMs, "package hash stat");
+	if (!info.isFile() || info.isSymbolicLink())
+		throw new ValidationError("Cannot hash a non-file package entry");
+	const maxBytes = Math.min(limits.maxFileBytes, remainingBytes);
+	if (info.size > maxBytes) throw new ValidationError("Package hash exceeds its byte budget");
+	const opening = open(
+		path,
+		constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+	);
+	let handle: Awaited<typeof opening>;
 	try {
+		handle = await withTimeout(opening, limits.timeoutMs, "package hash open");
+	} catch (error) {
+		// A timed-out open is still owned; close a handle that arrives afterwards.
+		void opening.then((late) => late.close()).catch(() => {});
+		throw error;
+	}
+	try {
+		const opened = await handle.stat();
+		if (
+			!opened.isFile() ||
+			opened.dev !== info.dev ||
+			opened.ino !== info.ino ||
+			opened.size !== info.size ||
+			opened.mtimeMs !== info.mtimeMs
+		)
+			throw new ValidationError("Package file changed while opening for hashing");
+		const buffer = Buffer.alloc(64 * 1024);
+		let bytes = 0;
 		await withTimeout(
 			(async () => {
-				for await (const chunk of stream) {
-					const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-					bytes += buffer.byteLength;
-					if (bytes > limits.maxFileBytes)
-						throw new ValidationError("Package file exceeds the file-size limit");
-					hash.update(buffer);
+				for (;;) {
+					const result = await handle.read(buffer, 0, buffer.length, bytes);
+					if (!result.bytesRead) break;
+					bytes += result.bytesRead;
+					if (bytes > maxBytes) throw new ValidationError("Package hash exceeds its byte budget");
+					hash.update(buffer.subarray(0, result.bytesRead));
 				}
 			})(),
 			limits.timeoutMs,
 			"package hash",
 		);
+		const after = await handle.stat();
+		if (bytes !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs)
+			throw new ValidationError("Package file changed while hashing");
+		return bytes;
 	} finally {
-		stream.destroy();
+		await handle.close();
 	}
-	return bytes;
 }
 
-async function computePackageHash(root: string, limits: PackageStoreLimits): Promise<string> {
+/** Store identity format, including trust envelopes; production inspections run in the package Worker. */
+export async function computePackageHash(
+	root: string,
+	limits: PackageStoreLimits,
+): Promise<string> {
 	const hash = createHash("sha256");
 	let totalBytes = 0;
+	let totalEntries = 0;
+	let files = 0;
 	const walk = async (directory: string): Promise<void> => {
-		const entries = await withTimeout(
-			readdir(directory, { withFileTypes: true }),
+		const info = await withTimeout(lstat(directory), limits.timeoutMs, "package hash directory");
+		if (!info.isDirectory() || info.isSymbolicLink())
+			throw new ValidationError("Cannot hash an unsafe package directory");
+		const opening = opendir(directory);
+		let handle: Awaited<typeof opening>;
+		try {
+			handle = await withTimeout(opening, limits.timeoutMs, "package hash scan");
+		} catch (error) {
+			void opening.then((late) => late.close()).catch(() => {});
+			throw error;
+		}
+		// Preserve the existing sorted depth-first digest, without an unbounded readdir array.
+		const entries: Dirent[] = [];
+		await withTimeout(
+			(async () => {
+				for await (const entry of handle) {
+					if (++totalEntries > 2 * limits.maxFiles)
+						throw new ValidationError("Package hash exceeds its entry budget");
+					entries.push(entry);
+				}
+			})(),
 			limits.timeoutMs,
 			"package hash scan",
 		);
@@ -392,14 +443,11 @@ async function computePackageHash(root: string, limits: PackageStoreLimits): Pro
 			}
 			if (!entry.isFile())
 				throw new ValidationError(`Cannot hash unsupported package entry: ${rel}`);
+			if (++files > limits.maxFiles)
+				throw new ValidationError("Package hash exceeds its file budget");
 			hash.update(rel);
 			hash.update("\0");
-			totalBytes += await hashFileInto(hash, child, limits);
-			if (totalBytes > limits.maxUnpackedBytes) {
-				throw new ValidationError(
-					`Package exceeds the ${limits.maxUnpackedBytes} byte unpacked limit`,
-				);
-			}
+			totalBytes += await hashFileInto(hash, child, limits, limits.maxUnpackedBytes - totalBytes);
 		}
 	};
 	await walk(root);

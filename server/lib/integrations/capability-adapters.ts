@@ -174,6 +174,11 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 	// canonical descriptor rather than reusing `provider.use`, because this adapter must stay
 	// one-to-one reversible — two protocol strings mapping to one descriptor breaks that.
 	"search.provide": { descriptorId: "provider.search", visibility: "integration" },
+	"quota.provide": { descriptorId: "quota.provide", visibility: "integration" },
+	"provider.connection.request": {
+		descriptorId: "provider.connection.request",
+		visibility: "integration",
+	},
 	"config.read_self": { descriptorId: "config.read", visibility: "integration" },
 	"config.write_self": { descriptorId: "config.write", visibility: "integration" },
 	"secret.use_self": { descriptorId: "secret.use", visibility: "integration" },

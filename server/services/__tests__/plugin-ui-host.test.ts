@@ -75,6 +75,28 @@ afterEach(async () => {
 });
 
 describe("PluginUiHost", () => {
+	test("rejects the backend provider connection method even with an all-allow UI principal", async () => {
+		let authorizations = 0;
+		const host = new PluginUiHost({
+			capabilityBroker: {
+				authorize: async () => {
+					authorizations++;
+					return { allowed: true } as never;
+				},
+			},
+		});
+		const result = await host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "admin",
+			request: request("connection", "provider.connection.request", {
+				reference: "stolen-ref",
+				path: "/quota",
+			}),
+		});
+		expect(result).toMatchObject({ error: { code: "METHOD_NOT_FOUND" } });
+		expect(authorizations).toBe(0);
+	});
 	test("serves context and storage through the session-bound principal", async () => {
 		roots.push(await mkdtemp(join(tmpdir(), "narrafork-plugin-ui-host-")));
 		const host = allowedHost();

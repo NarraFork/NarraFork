@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Manifest, parseManifest } from "@server/lib/plugins/manifest";
@@ -26,7 +26,7 @@ const uiFixture = join(import.meta.dir, "../../../fixtures/plugins/e2e/reference
 const tempRoots: string[] = [];
 
 async function makeTempRoot(): Promise<string> {
-	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-registry-"));
+	const root = await realpath(await mkdtemp(join(tmpdir(), "narrafork-plugin-registry-")));
 	tempRoots.push(root);
 	return root;
 }
@@ -218,17 +218,20 @@ async function createRevokeHarness(): Promise<RevokeHarness> {
 			else if (action === "revoke") toolRegistry.revokePlugin(event.pluginId);
 			else toolRegistry.disablePlugin(event.pluginId);
 		},
-		scheduler: ({ layer, action }) => {
-			stubCalls.push(`${layer}:${action}`);
+		scheduler: ({ layer, action, event }) => {
+			stubCalls.push(`${layer}:${action}:${event.pluginId}`);
 		},
-		secret_broker: ({ layer, action }) => {
-			stubCalls.push(`${layer}:${action}`);
+		secret_broker: ({ layer, action, event }) => {
+			stubCalls.push(`${layer}:${action}:${event.pluginId}`);
 		},
-		mcp_adapter: ({ layer, action }) => {
-			stubCalls.push(`${layer}:${action}`);
+		mcp_adapter: ({ layer, action, event }) => {
+			stubCalls.push(`${layer}:${action}:${event.pluginId}`);
 		},
-		provider_registry: ({ layer, action }) => {
-			stubCalls.push(`${layer}:${action}`);
+		provider_registry: ({ layer, action, event }) => {
+			stubCalls.push(`${layer}:${action}:${event.pluginId}`);
+		},
+		quota_registry: ({ layer, action, event }) => {
+			stubCalls.push(`${layer}:${action}:${event.pluginId}`);
 		},
 	};
 	const coordinator = new PluginLifecycleRevokeCoordinator({ adapters });
@@ -340,7 +343,15 @@ describe("C2 registry and lifecycle revoke acceptance", () => {
 			expect(
 				harness.toolRegistry.get(`${harness.pluginB.pluginId}/describe-selection`)?.status,
 			).toBe("available");
-			expect(harness.stubCalls).toHaveLength(4);
+			expect(harness.stubCalls).toEqual(
+				[
+					"scheduler:disable",
+					"secret_broker:revoke",
+					"mcp_adapter:disable",
+					"provider_registry:disable",
+					"quota_registry:disable",
+				].map((step) => `${step}:${harness.pluginA.pluginId}`),
+			);
 		} finally {
 			harness.eventGateway.close();
 		}

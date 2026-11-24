@@ -30,6 +30,12 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
+import { PluginSourceName } from "../../components/plugins/PluginSourceName";
+import { PluginSourceUpdatesPanel } from "../../components/plugins/PluginSourceUpdatesPanel";
+import {
+	pluginCanUninstall,
+	pluginIsCatalogOnly,
+} from "../../components/plugins/plugin-source-management";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import {
 	HighRiskWarning,
@@ -39,6 +45,7 @@ import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDia
 import { PluginProviderConfigPanel } from "../../components/plugins-admin/PluginProviderConfigPanel";
 import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/PluginSettingsSurfacePanel";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
+import { useCurrentUser } from "../../hooks/useAuth";
 
 import {
 	pluginKeys,
@@ -50,6 +57,7 @@ import {
 	usePluginGrants,
 	usePluginPermanentDenials,
 	usePluginPermissionRequests,
+	usePluginSource,
 	useRetryPlugin,
 	useUninstallPlugin,
 } from "../../hooks/usePlugins";
@@ -604,9 +612,12 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	);
 }
 
-function SettingsPluginDetailPage() {
+export function SettingsPluginDetailPage() {
 	const { t } = useTranslation("plugins");
+	const { data: user } = useCurrentUser();
+	const canManageSources = user?.role === "admin";
 	const { pluginId } = Route.useParams();
+	const sourceQuery = usePluginSource(pluginId, { enabled: canManageSources });
 	const navigate = useNavigate();
 	const confirm = useConfirmDialog();
 
@@ -697,7 +708,12 @@ function SettingsPluginDetailPage() {
 						{t("admin.detail.backToList")}
 					</Button>
 					<Group gap="sm" align="center">
-						<Title order={3}>{displayName}</Title>
+						<Title order={3}>
+							<PluginSourceName
+								name={displayName}
+								source={(sourceQuery.data ?? plugin?.sourceView)?.binding.source}
+							/>
+						</Title>
 						{plugin && <PluginStatusBadge plugin={plugin} />}
 					</Group>
 				</div>
@@ -745,16 +761,18 @@ function SettingsPluginDetailPage() {
 						>
 							{t("admin.actions.retry")}
 						</Button>
-						<Button
-							variant="light"
-							color="red"
-							size="xs"
-							leftSection={<IconTrash size={14} />}
-							onClick={handleUninstall}
-							disabled={anyMutationPending || !!pluginsDisabled}
-						>
-							{t("admin.actions.uninstall")}
-						</Button>
+						{pluginCanUninstall(plugin) && (
+							<Button
+								variant="light"
+								color="red"
+								size="xs"
+								leftSection={<IconTrash size={14} />}
+								onClick={handleUninstall}
+								disabled={anyMutationPending || !!pluginsDisabled}
+							>
+								{t("admin.actions.uninstall")}
+							</Button>
+						)}
 					</Group>
 				)}
 			</Group>
@@ -797,6 +815,7 @@ function SettingsPluginDetailPage() {
 					<Tabs.List>
 						<Tabs.Tab value="overview">{t("admin.detail.tabs.overview")}</Tabs.Tab>
 						<Tabs.Tab value="contributions">{t("admin.detail.tabs.contributions")}</Tabs.Tab>
+						<Tabs.Tab value="source-updates">{t("admin.detail.tabs.sourceUpdates")}</Tabs.Tab>
 						{hasProviders ? (
 							<Tabs.Tab value="config">{t("admin.detail.tabs.config")}</Tabs.Tab>
 						) : null}
@@ -819,6 +838,18 @@ function SettingsPluginDetailPage() {
 					</Tabs.Panel>
 					<Tabs.Panel value="contributions" pt="md">
 						<ContributionsTab plugin={plugin} />
+					</Tabs.Panel>
+					<Tabs.Panel value="source-updates" pt="md">
+						<PluginSourceUpdatesPanel
+							pluginId={plugin.pluginId}
+							canManage={canManageSources}
+							disabled={
+								anyMutationPending ||
+								!!pluginsDisabled ||
+								plugin.canUpdate === false ||
+								pluginIsCatalogOnly(plugin)
+							}
+						/>
 					</Tabs.Panel>
 					{hasProviders ? (
 						<Tabs.Panel value="config" pt="md">

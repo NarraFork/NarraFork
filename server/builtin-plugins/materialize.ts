@@ -1,9 +1,10 @@
 /**
- * Materialize the embedded builtin plugin packages onto disk for a compiled binary.
+ * Materialize legacy catalog-only builtin plugin packages onto disk for a compiled binary.
  *
  * Only compiled single-file binaries need this: their `import.meta.dir` is inside `$bunfs`,
- * so `join(import.meta.dir, "apikey-quota")` names a directory that does not exist. Running
- * from source uses the checked-out package directly and never reaches this module.
+ * so a package directory relative to the executable does not exist. Running from source uses
+ * the checked-out package directly and never reaches this module; installable bundled archives
+ * use their separate PackageStore path instead.
  *
  * Why write to disk at all instead of teaching the catalog to read from memory: a plugin
  * package is spawned as a child process, and the runtime validates the package through the

@@ -1,12 +1,115 @@
-import { describe, expect, test } from "bun:test";
-import type { outboundFetch } from "../net/outbound-fetch";
-import { probeProviderBalance } from "../provider-balance-adapters";
+import { afterEach, describe, expect, test } from "bun:test";
+import { providerQuotaSourceSchema } from "@shared/provider-quota";
+import {
+	BalanceProbeRequestError,
+	QuotaQueryError,
+} from "../../../plugins/provider-quota/src/errors";
+import type { QuotaQueryParams } from "../../../plugins/provider-quota/src/protocol";
+import {
+	type BalanceRequest,
+	probeProviderBalance,
+} from "../../../plugins/provider-quota/src/relay";
 import {
 	BALANCE_MAX_RESPONSE_BYTES,
-	balanceRequestHeaders,
-	createBalanceRequest,
-} from "../provider-balance-transport";
+	createRelayRequest,
+} from "../../../plugins/provider-quota/src/request";
+import { settle } from "../../services/__tests__/provider-quota-fixtures";
+import {
+	PluginProviderConnectionService,
+	quotaConnectionHeaders,
+} from "../../services/plugin-provider-connection-service";
+import { CustomApiQuotaTargetDirectory } from "../../services/provider-quota-targets";
+import type { outboundFetch } from "../net/outbound-fetch";
 import type { CustomApiProviderConfig } from "../settings";
+
+// Keep the former transport behaviour tests, but exercise the new split owners:
+// the host controls connection credentials/policy; the standalone plugin parses replies.
+const connectionServices: PluginProviderConnectionService[] = [];
+afterEach(() => {
+	for (const service of connectionServices.splice(0)) service.dispose();
+});
+const principal = {
+	pluginId: "io.narrafork.provider-quota",
+	installationId: "transport-test",
+	runtimeId: "transport-test",
+	runtimeGeneration: 1,
+};
+const relaySource = providerQuotaSourceSchema.parse({
+	id: "relay",
+	title: "Relay",
+	match: { fallback: true },
+	requests: [
+		{ path: "/**/v1/usage", auth: "bearer", headers: ["accept"] },
+		{ path: "/**/api/usage/token/", auth: "bearer", headers: ["accept"] },
+		{ path: "/**/api/status", auth: "none", headers: ["accept"] },
+		{ path: "/**/api/user/self", auth: "site-token", headers: ["accept"] },
+	],
+	limits: { maxResponseBytes: BALANCE_MAX_RESPONSE_BYTES, requestTimeoutMs: 8_000 },
+});
+function balanceRequestHeaders(
+	config: CustomApiProviderConfig,
+	authenticated: boolean | "provider-key",
+) {
+	const rule = relaySource.requests[authenticated ? 0 : 2];
+	if (!rule) throw new Error("missing transport fixture request rule");
+	return quotaConnectionHeaders(config, rule, undefined);
+}
+function createBalanceRequest(
+	config: CustomApiProviderConfig,
+	signal: AbortSignal,
+	options: { fetch?: typeof outboundFetch; requestTimeoutMs?: number } = {},
+): BalanceRequest {
+	const directory = new CustomApiQuotaTargetDirectory({
+		providers: () => [config],
+		globalProxy: () => ({}),
+		userAgent: () => "fixture",
+	});
+	const connection = directory.list()[0];
+	if (!connection) throw new Error("missing transport fixture target");
+	const service = new PluginProviderConnectionService({
+		directory,
+		fetch: options.fetch,
+		requestTimeoutMs: options.requestTimeoutMs,
+	});
+	connectionServices.push(service);
+	// A pre-cancelled call cannot issue authority or begin a connection request.
+	if (signal.aborted)
+		return async (): Promise<unknown> => {
+			throw new BalanceProbeRequestError("transient");
+		};
+	const lease = service.issue({
+		principal,
+		target: connection.target,
+		source: relaySource,
+		deadlineAt: Date.now() + 30_000,
+		signal,
+		isCurrent: () => true,
+	});
+	const params: QuotaQueryParams = {
+		protocolVersion: "1.0",
+		contributionId: "relay",
+		target: connection.target,
+		mode: "probe",
+		reference: lease.reference,
+		deadlineAt: Date.now() + 30_000,
+	};
+	return createRelayRequest(
+		params,
+		async (request, requestSignal) => {
+			try {
+				return await service.request(request, principal, requestSignal);
+			} catch (error) {
+				throw new QuotaQueryError(
+					error instanceof Error && "code" in error
+						? (error.code as import("../../../plugins/provider-quota/src/protocol").QuotaErrorCode)
+						: "request_failed",
+				);
+			}
+		},
+		signal,
+		{ requestTimeoutMs: options.requestTimeoutMs },
+	);
+}
 
 const config: CustomApiProviderConfig = {
 	id: "balance-transport-test",
@@ -215,7 +318,7 @@ describe("same-origin validation", () => {
 			calls++;
 			return jsonResponse();
 		});
-		await expect(request(target)).rejects.toMatchObject({ kind: "unsupported" });
+		await expect(request(target)).rejects.toMatchObject({ kind: "invalid_configuration" });
 		expect(calls).toBe(0);
 	});
 
@@ -236,7 +339,7 @@ describe("response byte caps", () => {
 			"content-length": String(BALANCE_MAX_RESPONSE_BYTES + 1),
 		});
 		const request = requestWith(async () => body.response);
-		await expect(request(endpoint)).rejects.toMatchObject({ kind: "transient" });
+		await expect(request(endpoint)).rejects.toMatchObject({ kind: "invalid_response" });
 		expect(body.cancelled).toBe(true);
 		expect(body.response.body?.locked).toBe(false);
 	});
@@ -255,7 +358,7 @@ describe("response byte caps", () => {
 			declaredLength ? { "content-length": declaredLength } : {},
 		);
 		await expect(requestWith(async () => body.response)(endpoint)).rejects.toMatchObject({
-			kind: "transient",
+			kind: "invalid_response",
 		});
 		expect(body.cancelled).toBe(true);
 		expect(body.response.body?.locked).toBe(false);
@@ -277,7 +380,7 @@ describe("response byte caps", () => {
 		expect(text.length).toBeLessThan(BALANCE_MAX_RESPONSE_BYTES);
 		const body = chunkedResponse([encoder.encode(text)]);
 		await expect(requestWith(async () => body.response)(endpoint)).rejects.toMatchObject({
-			kind: "transient",
+			kind: "invalid_response",
 		});
 	});
 });
@@ -365,6 +468,8 @@ describe("timeouts and cancellation cannot be held by abort-ignoring I/O", () =>
 		});
 		const pending = request(endpoint);
 		await reading.promise;
+		// A ReadableStream may pull eagerly before fetch hands its body to the host reader.
+		await settle(() => response.body?.locked === true);
 		controller.abort();
 		await expect(pending).rejects.toMatchObject({ kind: "transient" });
 		expect(cancelled).toBe(true);
@@ -521,13 +626,13 @@ describe("site-account authentication", () => {
 		expect(seen).toBe(siteEndpoint);
 		await expect(
 			request("https://other.invalid/api/user/self", "site-token"),
-		).rejects.toMatchObject({ kind: "unsupported" });
+		).rejects.toMatchObject({ kind: "invalid_configuration" });
 	});
 
 	test("keeps rejecting an arbitrary origin when no site root is configured", async () => {
 		await expect(
 			requestWith(async () => jsonResponse())("https://other.invalid/api/user/self"),
-		).rejects.toMatchObject({ kind: "unsupported" });
+		).rejects.toMatchObject({ kind: "invalid_configuration" });
 	});
 
 	test.each([401, 403])("HTTP %s is a deterministic auth failure", async (status) => {

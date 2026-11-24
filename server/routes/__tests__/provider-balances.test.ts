@@ -1,6 +1,19 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import type { QuotaQueryResult } from "@shared/provider-quota";
 import { Hono } from "hono";
+import { ZodError } from "zod";
+import {
+	deferred,
+	legacyQuotaFixture,
+	quotaConfig,
+	walletQuota,
+} from "../../lib/__tests__/provider-quota-legacy-fixture";
+import {
+	getCustomApiCachedQuota,
+	purgeCustomApiQuotaCache,
+	updateCustomApiQuotaByPrefix,
+} from "../../lib/custom-api-quota-cache";
 import { AppError } from "../../lib/errors";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import * as outbound from "../../lib/net/outbound-fetch";
@@ -11,35 +24,35 @@ import { quotaKeyOwner } from "../../lib/settings/provider-keys-projection";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
-import { settingsRoutes } from "../settings";
 
 const original = structuredClone(settings);
-const config = (apiKey = "key-current"): CustomApiProviderConfig => ({
-	id: "relay-balance-test",
-	name: "Relay balance test",
-	prefix: "relay-balance-test",
-	baseUrl: "https://relay.invalid/v1",
-	protocol: "completions-compatible",
-	apiKey,
-	defaultModel: "test-model",
-});
+const config = (apiKey = "key-current") =>
+	quotaConfig({
+		id: "relay-balance-test",
+		prefix: "relay-balance-test",
+		name: "Relay balance test",
+		apiKey,
+	});
+let fixture: ReturnType<typeof legacyQuotaFixture>;
 
 function appForRole(role: "admin" | "user") {
 	const app = new Hono();
-	// Distinct subs per role: assertAdmin reads the live store role, and the seam
-	// in beforeEach maps each sub to its role.
 	const sub = role === "admin" ? "balance-admin" : "balance-user";
 	app.use("*", async (c, next) => {
 		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
-	app.onError((error) => {
+	app.onError((error, c) => {
 		if (error instanceof AppError)
-			return new Response(JSON.stringify({ error: error.code }), { status: error.statusCode });
+			return new Response(JSON.stringify({ error: error.code }), {
+				status: error.statusCode,
+				headers: c.res.headers,
+			});
+		if (error instanceof ZodError)
+			return new Response(JSON.stringify({ error: "VALIDATION_ERROR" }), { status: 400 });
 		throw error;
 	});
 	app.route("/api/provider-balances", providerBalanceRoutes);
-	app.route("/api/settings", settingsRoutes);
 	return app;
 }
 
@@ -53,25 +66,22 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	settings.customApiProviders = [];
-	providerBalanceCache.sync();
-	settings.customApiProviders = [config()];
-	spyOn(outbound, "outboundFetch").mockImplementation(async () =>
-		Response.json({ mode: "unrestricted", isValid: true, balance: 12, unit: "USD" }),
-	);
+	fixture = legacyQuotaFixture([config()]);
+	// Model discovery performed by settings must never reach a real network in this suite.
+	spyOn(outbound, "outboundFetch").mockImplementation(async () => Response.json({ data: [] }));
 });
 afterEach(() => {
+	purgeCustomApiQuotaCache([config().id]);
+	fixture.dispose();
 	setAuthStores(undefined);
-	settings.customApiProviders = [];
-	providerBalanceCache.sync();
+	getProviderKeyStore().removeProvider(config().id);
+	getProviderKeyStore().removeProvider(quotaKeyOwner(config().id));
 	mock.restore();
 });
-afterAll(() => {
-	saveSettings(original);
-});
+afterAll(() => saveSettings(original));
 
-describe("provider balance API and settings integration", () => {
-	test("authenticated reader gets only safe snapshots and no-store", async () => {
+describe("legacy provider balance API", () => {
+	test("authenticated readers get only credential-free snapshots and no-store", async () => {
 		await providerBalanceCache.request(config().id);
 		const response = await appForRole("user").request("/api/provider-balances");
 		expect(response.status).toBe(200);
@@ -84,8 +94,10 @@ describe("provider balance API and settings integration", () => {
 		});
 	});
 
-	test("provider query selects only that provider, not arbitrary outbound URL", async () => {
-		settings.customApiProviders = [config(), { ...config(), id: "second", prefix: "second" }];
+	test("provider queries select saved IDs, never arbitrary outbound URLs", async () => {
+		settings.customApiProviders = [config(), config("second-key")].map((value, i) =>
+			i ? { ...value, id: "second", prefix: "second" } : value,
+		);
 		const response = await appForRole("user").request(
 			`/api/provider-balances?providerId=${config().id}`,
 		);
@@ -97,13 +109,13 @@ describe("provider balance API and settings integration", () => {
 	});
 
 	for (const action of ["probe", "refresh"]) {
-		test(`only admin may ${action} a saved configuration`, async () => {
+		test(`only administrators may ${action} a saved configuration`, async () => {
 			const response = await appForRole("user").request(
 				`/api/provider-balances/${config().id}/${action}`,
 				{ method: "POST" },
 			);
 			expect(response.status).toBe(403);
-			expect(outbound.outboundFetch).not.toHaveBeenCalled();
+			expect(fixture.query).not.toHaveBeenCalled();
 			const missing = await appForRole("admin").request(
 				`/api/provider-balances/not-saved/${action}`,
 				{
@@ -112,68 +124,38 @@ describe("provider balance API and settings integration", () => {
 				},
 			);
 			expect(missing.status).toBe(404);
-			expect(outbound.outboundFetch).not.toHaveBeenCalled();
+			expect(fixture.query).not.toHaveBeenCalled();
 		});
 	}
 
-	test("admin receives explicit cooldown rather than a silently ignored probe", async () => {
+	test("admin receives the original cooldown code rather than an ignored probe", async () => {
 		await providerBalanceCache.request(config().id);
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(1);
 		const response = await appForRole("admin").request(
 			`/api/provider-balances/${config().id}/probe`,
 			{ method: "POST" },
 		);
 		expect(response.status).toBe(429);
 		expect(await response.json()).toEqual({ error: "PROVIDER_BALANCE_THROTTLED" });
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(1);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
 
-	test("GET and admin probe return without waiting for a hanging upstream", async () => {
-		spyOn(outbound, "outboundFetch").mockImplementation(
-			async () => new Promise<Response>(() => {}),
-		);
+	test("GET and admin probe never wait for a hanging source", async () => {
+		fixture.query.mockImplementation(() => new Promise(() => {}));
 		const app = appForRole("admin");
 		const response = await app.request(`/api/provider-balances/${config().id}/probe`, {
 			method: "POST",
 		});
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({ status: "probing" });
-		const read = await app.request("/api/provider-balances");
-		expect(read.status).toBe(200);
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(1);
+		expect((await app.request("/api/provider-balances")).status).toBe(200);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
+});
 
-	test("saving new and changed credentials probes once, never waits and projects new generation", async () => {
-		settings.customApiProviders = [];
-		providerBalanceCache.sync();
-		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(
-			async () => new Promise<Response>(() => {}),
-		);
-		const app = appForRole("admin");
-		const patch = async (value: CustomApiProviderConfig) => {
-			const response = await app.request("/api/settings", {
-				method: "PATCH",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ customApiProviders: [value] }),
-			});
-			expect(response.status).toBe(200);
-			return (await response.json()).providerBalanceGenerations[config().id] as string;
-		};
-		const generation = await patch(config());
-		expect(generation).toMatch(/^[\da-f-]{36}$/);
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(1);
-		expect(await patch({ ...config(), name: "Renamed" })).toBe(generation);
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(1);
-		const next = await patch(config("key-replaced"));
-		expect(next).not.toBe(generation);
-		expect(outbound.outboundFetch).toHaveBeenCalledTimes(2);
-		const calls = fetchSpy.mock.calls;
-		const init = calls[1]?.[1];
-		expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer key-replaced");
-	});
-
-	test("settings masks site tokens and a masked PATCH preserves the separate stored credential", async () => {
-		const app = appForRole("admin");
+describe("settings quota integration", () => {
+	test("site token masks for both roles, masked PATCH preserves its distinct encrypted key owner", async () => {
+		const { settingsRoutes } = await import("../settings");
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
 		const store = getProviderKeyStore();
 		const owner = quotaKeyOwner(config().id);
 		const patch = async (value: CustomApiProviderConfig) => {
@@ -187,103 +169,311 @@ describe("provider balance API and settings integration", () => {
 			expect(JSON.stringify(body)).not.toContain("site-route-secret");
 			return body.customApiProviders[0] as CustomApiProviderConfig;
 		};
-		try {
-			await patch({ ...config(), quotaAccessToken: "site-route-secret", quotaUserId: "42" });
-			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
-			expect(store.firstKey(owner)).toBe("site-route-secret");
-			expect(store.firstKey(config().id)).toBe("key-current");
-			for (const role of ["admin", "user"] as const) {
-				const response = await appForRole(role).request("/api/settings");
-				expect(response.status).toBe(200);
-				const body = await response.json();
-				expect(JSON.stringify(body)).not.toContain("site-route-secret");
-				expect(body.customApiProviders[0].quotaAccessToken).toMatch(/^\*/);
-			}
-			const masked = (await (await app.request("/api/settings")).json())
-				.customApiProviders[0] as CustomApiProviderConfig;
-			await patch({ ...masked, name: "Renamed without re-entering credentials" });
-			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
-			expect(store.firstKey(owner)).toBe("site-route-secret");
-			expect(store.firstKey(config().id)).toBe("key-current");
-			for (const file of ["settings.json", "provider-keys.json"]) {
-				expect(readFileSync(getNarraforkPath(file), "utf8")).not.toContain("site-route-secret");
-			}
-			await patch({ ...masked, quotaAccessToken: "" });
-			expect(store.list(owner)).toEqual([]);
-			expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
-			expect(store.firstKey(config().id)).toBe("key-current");
-		} finally {
-			saveSettings({ ...settings, customApiProviders: [] });
-			store.removeProvider(config().id);
-			store.removeProvider(owner);
+		await patch({ ...config(), quotaAccessToken: "site-route-secret", quotaUserId: "42" });
+		expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+		expect(store.firstKey(owner)).toBe("site-route-secret");
+		expect(store.firstKey(config().id)).toBe("key-current");
+		for (const role of ["admin", "user"] as const) {
+			const response = await appForRole(role)
+				.route("/api/settings", settingsRoutes)
+				.request("/api/settings");
+			expect(response.status).toBe(200);
+			const body = await response.json();
+			expect(JSON.stringify(body)).not.toContain("site-route-secret");
+			expect(body.customApiProviders[0].quotaAccessToken).toMatch(/^\*/);
 		}
-	});
+		const masked = (await (await app.request("/api/settings")).json())
+			.customApiProviders[0] as CustomApiProviderConfig;
+		await patch({ ...masked, name: "Renamed without new credentials" });
+		expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+		expect(store.firstKey(owner)).toBe("site-route-secret");
+		expect(store.firstKey(config().id)).toBe("key-current");
+		for (const file of ["settings.json", "provider-keys.json"])
+			expect(readFileSync(getNarraforkPath(file), "utf8")).not.toContain("site-route-secret");
+		await patch({ ...masked, quotaAccessToken: "" });
+		expect(store.list(owner)).toEqual([]);
+		expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+		expect(store.firstKey(config().id)).toBe("key-current");
+	}, 30000);
+	test.each([
+		"explicit",
+		"derived",
+	] as const)("legacy split PATCH preserves %s quota credentials on rename but not on reassignment or deletion", async (site) => {
+		const { settingsRoutes } = await import("../settings");
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const store = getProviderKeyStore();
+		const provider = {
+			...config(),
+			baseUrl: "https://relay.invalid/tenant-a/v1",
+			...(site === "explicit" ? { quotaSiteUrl: "https://quota.invalid/account-a" } : {}),
+			quotaUserId: "42",
+			quotaAccessToken: "legacy-site-fixture-secret",
+		};
+		const owner = quotaKeyOwner(provider.id);
+		const patch = async (body: Record<string, unknown>) => {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(response.status).toBe(200);
+			const view = await response.json();
+			expect(JSON.stringify(view)).not.toContain(provider.quotaAccessToken);
+			return view;
+		};
+		await patch({ customApiProviders: [provider] });
+		const get = await app.request("/api/settings");
+		expect(get.status).toBe(200);
+		const [legacy] = (await get.json()).openaiProviders;
+		expect(legacy).not.toHaveProperty("quotaAccessToken");
+		expect(legacy).not.toHaveProperty("quotaSiteUrl");
+		expect(legacy).not.toHaveProperty("quotaUserId");
+		const renamed = await patch({ openaiProviders: [{ ...legacy, name: "Renamed" }] });
+		expect(renamed.customApiProviders[0]).toMatchObject({ name: "Renamed", quotaUserId: "42" });
+		expect(renamed.customApiProviders[0].quotaSiteUrl).toBe(provider.quotaSiteUrl);
+		expect(renamed.customApiProviders[0].quotaAccessToken).toMatch(/^\*/);
+		expect(store.firstKey(owner)).toBe(provider.quotaAccessToken);
+		expect(store.firstKey(provider.id)).toBe(provider.apiKey);
+		// A changed tenant on the same origin must not inherit the previous site account.
+		const moved = await patch({
+			openaiProviders: [{ ...legacy, baseUrl: "https://relay.invalid/tenant-b/v1" }],
+		});
+		expect(moved.customApiProviders[0].quotaAccessToken).toBe("");
+		expect(moved.customApiProviders[0].quotaSiteUrl).toBeUndefined();
+		expect(moved.customApiProviders[0].quotaUserId).toBeUndefined();
+		expect(store.list(owner)).toEqual([]);
+		await patch({ customApiProviders: [provider] });
+		await patch({ openaiProviders: [] });
+		expect(settings.customApiProviders?.some((p) => p.id === provider.id)).toBe(false);
+		expect(store.list(owner)).toEqual([]);
+	}, 30_000);
 
-	test("failed save cannot start discovery", async () => {
-		const response = await appForRole("admin").request("/api/settings", {
+	test.each([
+		"site",
+		"tenant",
+		"account",
+		"invalid",
+	] as const)("a masked site token is not reused after changing the %s in a unified PATCH", async (change) => {
+		const { settingsRoutes } = await import("../settings");
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const provider = {
+			...config(),
+			quotaSiteUrl: "https://quota.invalid/tenant-a",
+			quotaUserId: "42",
+			quotaAccessToken: "unified-fixture-secret",
+		};
+		const patch = async (value: CustomApiProviderConfig) => {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ customApiProviders: [value] }),
+			});
+			expect(response.status).toBe(200);
+			const view = await response.json();
+			expect(JSON.stringify(view)).not.toContain(provider.quotaAccessToken);
+			return view.customApiProviders[0] as CustomApiProviderConfig;
+		};
+		const masked = await patch(provider);
+		expect(masked.quotaAccessToken).toMatch(/^\*/);
+		const moved = { ...masked };
+		if (change === "site") moved.quotaSiteUrl = "https://other.invalid/tenant-a";
+		if (change === "tenant") moved.quotaSiteUrl = "https://quota.invalid/tenant-b";
+		if (change === "account") moved.quotaUserId = "43";
+		if (change === "invalid") moved.quotaSiteUrl = "not an HTTP URL";
+		expect((await patch(moved)).quotaAccessToken).toBe("");
+		expect(getProviderKeyStore().list(quotaKeyOwner(provider.id))).toEqual([]);
+		expect(getProviderKeyStore().firstKey(provider.id)).toBe(provider.apiKey);
+	}, 30_000);
+	test("settings generation and legacy endpoint represent the identical selected subject", async () => {
+		const { settingsRoutes } = await import("../settings");
+		await fixture.service.refresh(config().id);
+		const setting = await (
+			await appForRole("admin").route("/api/settings", settingsRoutes).request("/api/settings")
+		).json();
+		const route = await (await appForRole("user").request("/api/provider-balances")).json();
+		expect(setting.providerBalanceGenerations[config().id]).toBe(route[config().id].generation);
+		expect(setting.providerQuotaGenerations[config().id]).toBe(route[config().id].generation);
+		expect(route[config().id].status).toBe("supported");
+	}, 30000);
+	test("disabled quota capability reports plugin_not_enabled at every legacy entry point", async () => {
+		await fixture.service.refresh(config().id);
+		fixture.revoke();
+		const count = fixture.query.mock.calls.length;
+		const response = await appForRole("user").request("/api/provider-balances");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			[config().id]: { status: "error", error: "plugin_not_enabled", balance: null },
+		});
+		expect(providerBalanceCache.peek(config().id)).toMatchObject({
+			status: "error",
+			error: "plugin_not_enabled",
+			balance: null,
+		});
+		expect(fixture.query).toHaveBeenCalledTimes(count);
+		expect(outbound.outboundFetch).not.toHaveBeenCalled();
+	});
+	test("saving new or replaced credentials reconciles once, never waits, and projects the same generations", async () => {
+		const { settingsRoutes } = await import("../settings");
+		settings.customApiProviders = [];
+		fixture.service.sync();
+		fixture.query.mockImplementation(() => new Promise(() => {}));
+		const app = appForRole("admin");
+		app.route("/api/settings", settingsRoutes);
+		const patch = async (value: CustomApiProviderConfig) => {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ customApiProviders: [value] }),
+			});
+			expect(response.status).toBe(200);
+			const result = await response.json();
+			expect(result.providerQuotaGenerations[config().id]).toBe(
+				result.providerBalanceGenerations[config().id],
+			);
+			return result.providerQuotaGenerations[config().id] as string;
+		};
+		const generation = await patch(config());
+		expect(generation).toMatch(/^[\da-f-]{36}$/);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(await patch({ ...config(), name: "Renamed" })).toBe(generation);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(await patch(config("key-replaced"))).not.toBe(generation);
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+		expect(fixture.query.mock.calls[1]?.[1]).toMatchObject({ providerId: config().id });
+		expect(JSON.stringify(fixture.query.mock.calls)).not.toMatch(/key-current|key-replaced/);
+	}, 30_000);
+
+	test("a saved account switch drops old data and rejects a late reply from the previous generation", async () => {
+		const { settingsRoutes } = await import("../settings");
+		await fixture.service.refresh(config().id);
+		const generation = fixture.service.generations()[config().id];
+		fixture.advance(10_000);
+		const oldReply = deferred<QuotaQueryResult>();
+		const newReply = deferred<QuotaQueryResult>();
+		fixture.query
+			.mockImplementationOnce(() => oldReply.promise)
+			.mockImplementation(() => newReply.promise);
+		const oldRefresh = fixture.service.refresh(config().id);
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const response = await app.request("/api/settings", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ customApiProviders: [config("key-replaced")] }),
+		});
+		expect(response.status).toBe(200);
+		const changed = (await response.json()).providerQuotaGenerations[config().id];
+		expect(changed).not.toBe(generation);
+		expect(fixture.service.peek(config().id)).toMatchObject({ generation: changed, data: null });
+		expect(fixture.query).toHaveBeenCalledTimes(3);
+		oldReply.resolve({ status: "supported", data: walletQuota, error: null });
+		expect(await oldRefresh).toBeNull();
+		expect(fixture.service.peek(config().id)).toMatchObject({ generation: changed, data: null });
+		newReply.resolve({
+			status: "supported",
+			data: {
+				...walletQuota,
+				amounts: [{ id: "amount:0", unit: "USD", remaining: 77 }],
+			},
+			error: null,
+		});
+		await fixture.service.refresh(config().id);
+		expect(providerBalanceCache.peek(config().id)).toMatchObject({
+			generation: changed,
+			balance: { amounts: [{ remaining: 77 }] },
+		});
+	}, 30_000);
+
+	test("saving disabled or removed providers cancels shared source work and hides their quotas", async () => {
+		const { settingsRoutes } = await import("../settings");
+		fixture.query.mockImplementation(() => new Promise(() => {}));
+		const pending = fixture.service.refresh(config().id);
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		for (const customApiProviders of [[{ ...config(), disabled: true }], []]) {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ customApiProviders }),
+			});
+			expect(response.status).toBe(200);
+			expect((await response.json()).providerQuotaGenerations).toEqual({});
+			expect(fixture.service.peek(config().id)).toBeNull();
+		}
+		expect(await pending).toBeNull();
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+	}, 30_000);
+
+	test("stream-pushed Custom API quotas remain independent and still purge on identity changes", async () => {
+		const { settingsRoutes } = await import("../settings");
+		updateCustomApiQuotaByPrefix(config().prefix, "42 credits", "stream-only details");
+		const pushed = getCustomApiCachedQuota(config().id);
+		await fixture.service.refresh(config().id);
+		fixture.revoke();
+		expect(getCustomApiCachedQuota(config().id)).toEqual(pushed);
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const current = await (await app.request("/api/settings")).json();
+		expect(current.customApiQuotas[config().id]).toMatchObject({
+			quotaBalance: "42 credits",
+			detailedQuotaBalance: "stream-only details",
+		});
+		const changed = await app.request("/api/settings", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ customApiProviders: [config("key-replaced")] }),
+		});
+		expect(changed.status).toBe(200);
+		expect((await changed.json()).customApiQuotas[config().id]).toBeUndefined();
+		expect(getCustomApiCachedQuota(config().id)).toBeUndefined();
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+	}, 30_000);
+
+	test("the one-click base URL repair reconciles and warms the real quota service", async () => {
+		const { settingsRoutes } = await import("../settings");
+		settings.customApiProviders = [{ ...config(), baseUrl: "https://relay.invalid" }];
+		await fixture.service.refresh(config().id);
+		const generation = fixture.service.generations()[config().id];
+		fixture.query.mockImplementation(() => new Promise(() => {}));
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const repair = () =>
+			app.request("/api/settings/fix-provider-baseurl", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ providerId: config().id }),
+			});
+		const response = await repair();
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ ok: true, baseUrl: "https://relay.invalid/v1" });
+		expect(fixture.service.generations()[config().id]).not.toBe(generation);
+		expect(fixture.service.peek(config().id)?.data).toBeNull();
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+		expect(fixture.query.mock.calls[1]?.[1]).toMatchObject({
+			providerId: config().id,
+			baseUrl: "https://relay.invalid/v1",
+		});
+		expect((await repair()).status).toBe(200);
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+	}, 30_000);
+
+	test("settings gives users and admins matching opaque tokens without persisting them", async () => {
+		const { settingsRoutes } = await import("../settings");
+		const admin = appForRole("admin").route("/api/settings", settingsRoutes);
+		const user = appForRole("user").route("/api/settings", settingsRoutes);
+		const a = await (await admin.request("/api/settings")).json();
+		const u = await (await user.request("/api/settings")).json();
+		expect(u.providerQuotaGenerations).toEqual(a.providerQuotaGenerations);
+		expect(a.providerBalanceGenerations).toEqual(a.providerQuotaGenerations);
+		expect(settings).not.toHaveProperty("providerQuotaGenerations");
+		expect(JSON.stringify(a.providerQuotaGenerations)).not.toMatch(/key-current|relay\.invalid/);
+	}, 30_000);
+
+	test("a rejected settings save cannot start quota discovery", async () => {
+		const { settingsRoutes } = await import("../settings");
+		const app = appForRole("admin").route("/api/settings", settingsRoutes);
+		const response = await app.request("/api/settings", {
 			method: "PATCH",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ customApiProviders: [{ ...config(), protocol: "invalid-protocol" }] }),
 		});
 		expect(response.status).toBe(400);
-		expect(outbound.outboundFetch).not.toHaveBeenCalled();
-	});
-});
-
-/**
- * The bundled `apikey-quota` plugin is the default answerer for every entry point that reads
- * balance data. These cases pin the entry points themselves, so a change in the engine cannot
- * make the settings projection and the route disagree about the same provider.
- */
-describe("apikey-quota answers every entry point consistently", () => {
-	afterEach(async () => {
-		const { resetProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
-		resetProviderBalanceEngine();
-		providerBalanceCache.sync();
-	});
-
-	test("settings generation and the route snapshot are the same key", async () => {
-		await providerBalanceCache.request(config().id);
-		const settingsBody = (await (await appForRole("admin").request("/api/settings")).json()) as {
-			providerBalanceGenerations?: Record<string, unknown>;
-		};
-		const routeBody = (await (
-			await appForRole("user").request("/api/provider-balances")
-		).json()) as Record<string, { generation?: unknown; status?: unknown }>;
-
-		// The badge hook keys its query on the settings generation and treats a mismatch with
-		// the route snapshot as "settings are stale" (see useProviderBalance). Both surfaces
-		// must therefore report the same generation for the same provider.
-		expect(settingsBody.providerBalanceGenerations?.[config().id]).toBe(
-			routeBody[config().id]?.generation,
-		);
-		expect(routeBody[config().id]?.status).toBe("supported");
-	});
-
-	test("a disabled plugin reports plugin_not_enabled instead of answering the route", async () => {
-		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
-		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
-		// The plugin owns the capability, so disabling it must be visible on the route the UI
-		// reads — and the bundled transport must not answer the question behind its back.
-		const engine = createApikeyQuotaEngine({
-			commands: {
-				invoke: async () => {
-					throw Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" });
-				},
-			},
-			activator: { activate: async () => undefined },
-		});
-		setProviderBalanceEngine(engine);
-		try {
-			await providerBalanceCache.request(config().id);
-			const response = await appForRole("user").request("/api/provider-balances");
-			expect(response.status).toBe(200);
-			expect(await response.json()).toMatchObject({
-				[config().id]: { status: "error", error: "plugin_not_enabled", balance: null },
-			});
-			expect(outbound.outboundFetch).not.toHaveBeenCalled();
-		} finally {
-			await engine.dispose();
-		}
-	});
+		expect(fixture.query).not.toHaveBeenCalled();
+	}, 30_000);
 });

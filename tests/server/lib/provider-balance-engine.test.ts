@@ -1,65 +1,67 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { readFile } from "node:fs/promises";
 import {
-	builtinProviderBalanceEngine,
-	getProviderBalanceEngine,
-	resetProviderBalanceEngine,
-	setProviderBalanceEngine,
-} from "@server/lib/provider-balance-engine";
-import type { ProviderBalanceData } from "@shared/provider-balance";
+	legacyQuotaFixture,
+	quotaConfig,
+	walletQuota,
+} from "../../../server/lib/__tests__/provider-quota-legacy-fixture";
+import { toProviderBalanceSnapshot } from "../../../server/lib/provider-balance-cache";
+import { ProviderQuotaError } from "../../../server/lib/provider-quota-async";
 
-describe("provider balance engine registry", () => {
-	test("defaults to the bundled engine", () => {
-		resetProviderBalanceEngine();
-		expect(getProviderBalanceEngine()).toBe(builtinProviderBalanceEngine);
-		expect(getProviderBalanceEngine().id).toBe("builtin");
+let fixture: ReturnType<typeof legacyQuotaFixture> | undefined;
+afterEach(() => {
+	fixture?.dispose();
+	fixture = undefined;
+	mock.restore();
+});
+
+describe("provider balance engine replaced by one quota-source registry", () => {
+	test("the default is explicitly unavailable without a source, never an inline bundled engine", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.revoke();
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "unavailable",
+			data: null,
+		});
+		expect(fixture.query).not.toHaveBeenCalled();
 	});
-
-	test("can be replaced and restored", () => {
-		const fake = {
-			id: "test",
-			probe: async () => null,
-			refresh: async () => ({ scope: "key" as const, unlimited: true, amounts: [] }),
-		};
-		try {
-			setProviderBalanceEngine(fake);
-			expect(getProviderBalanceEngine().id).toBe("test");
-		} finally {
-			resetProviderBalanceEngine();
-		}
-		expect(getProviderBalanceEngine()).toBe(builtinProviderBalanceEngine);
+	test("a source can be restored only explicitly, then returns its unlimited/unknown semantics", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.revoke();
+		fixture.query.mockResolvedValue({
+			status: "supported",
+			error: null,
+			data: { ...walletQuota, scope: "key", unlimited: true, amounts: [] },
+		});
+		fixture.setEnabled(true);
+		const snapshot = await fixture.service.refresh("relay-test");
+		expect(snapshot && toProviderBalanceSnapshot(snapshot).balance).toEqual({
+			scope: "key",
+			unlimited: true,
+			amounts: [],
+		});
 	});
-
-	test("treats a null engine as 'restore builtin' rather than 'no engine'", () => {
-		try {
-			setProviderBalanceEngine({
-				id: "test",
-				probe: async () => null,
-				refresh: async () => ({ scope: "key" as const, unlimited: true, amounts: [] }),
-			});
-			setProviderBalanceEngine(null);
-			expect(getProviderBalanceEngine()).toBe(builtinProviderBalanceEngine);
-		} finally {
-			resetProviderBalanceEngine();
-		}
+	test("removing a source is unavailable, not restore-builtin", async () => {
+		fixture = legacyQuotaFixture();
+		await fixture.service.refresh("relay-test");
+		fixture.revoke();
+		expect(fixture.service.peek("relay-test")).toMatchObject({ status: "unavailable", data: null });
+		const source = await readFile(
+			new URL("../../../server/lib/provider-balance-cache.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).not.toMatch(
+			/builtinProviderBalanceEngine|setProviderBalanceEngine|inlineFallback|outboundFetch/,
+		);
 	});
-
-	test("the bundled engine still reports an unusable base URL instead of throwing raw", async () => {
-		const balance: ProviderBalanceData = { scope: "key", unlimited: true, amounts: [] };
-		expect(balance.unlimited).toBe(true);
-		// A URL with a query string is rejected by the transport before any I/O.
-		await expect(
-			builtinProviderBalanceEngine.probe({
-				config: {
-					id: "p1",
-					name: "p1",
-					prefix: "p1",
-					baseUrl: "https://relay.invalid/v1?x=1",
-					protocol: "completions-compatible",
-					apiKey: "k",
-					defaultModel: "m",
-				},
-				signal: AbortSignal.timeout(1_000),
-			}),
-		).rejects.toThrow();
+	test("invalid URL is an explicit safe configuration failure before any source I/O", async () => {
+		fixture = legacyQuotaFixture([quotaConfig({ baseUrl: "https://relay.invalid/v1?secret=1" })]);
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "error",
+			data: null,
+			error: "invalid_configuration",
+		});
+		expect(fixture.query).not.toHaveBeenCalled();
+		expect(new ProviderQuotaError("invalid_configuration").message).toBe("invalid_configuration");
 	});
 });

@@ -7,6 +7,7 @@ export const PLUGIN_LIFECYCLE_REVOKE_LAYERS = [
 	"tool_registry",
 	"mcp_adapter",
 	"provider_registry",
+	"quota_registry",
 ] as const;
 
 export type PluginLifecycleRevokeLayer = (typeof PLUGIN_LIFECYCLE_REVOKE_LAYERS)[number];
@@ -161,6 +162,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "disable",
 		mcp_adapter: "disable",
 		provider_registry: "disable",
+		quota_registry: "disable",
 	},
 	deactivate: {
 		ui_session: "revoke",
@@ -171,6 +173,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "disable",
 		mcp_adapter: "disable",
 		provider_registry: "disable",
+		quota_registry: "disable",
 	},
 	crash: {
 		ui_session: "revoke",
@@ -181,6 +184,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "disable",
 		mcp_adapter: "disable",
 		provider_registry: "disable",
+		quota_registry: "disable",
 	},
 	quarantine: {
 		ui_session: "revoke",
@@ -191,6 +195,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "disable",
 		mcp_adapter: "disable",
 		provider_registry: "disable",
+		quota_registry: "disable",
 	},
 	upgrade: {
 		ui_session: "revoke",
@@ -201,6 +206,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "disable",
 		mcp_adapter: "disable",
 		provider_registry: "invalidate",
+		quota_registry: "invalidate",
 	},
 	uninstall: {
 		ui_session: "clear",
@@ -211,6 +217,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "clear",
 		mcp_adapter: "clear",
 		provider_registry: "clear",
+		quota_registry: "clear",
 	},
 	runtime_generation: {
 		// UI sessions are bound to the stable installation UUID, NOT the runtime
@@ -224,6 +231,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "invalidate",
 		mcp_adapter: "invalidate",
 		provider_registry: "invalidate",
+		quota_registry: "invalidate",
 	},
 	grant_revision: {
 		ui_session: "revoke",
@@ -234,6 +242,7 @@ const ACTIONS_BY_KIND: Readonly<
 		tool_registry: "invalidate",
 		mcp_adapter: "invalidate",
 		provider_registry: "invalidate",
+		quota_registry: "invalidate",
 	},
 };
 

@@ -7,36 +7,42 @@ import type {
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
 import { notifications } from "@mantine/notifications";
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type { ProviderQuotaSnapshot } from "@shared/provider-quota";
 import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
+import { customApiQuotaDisplayFor } from "./model/custom-api-usage-source";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
 import { findPendingForKey } from "./vlist/vlist-permission-match";
 
 type QuotaSettings = {
-	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
+	customApiQuotas: NonNullable<Parameters<typeof customApiQuotaDisplayFor>[0]["pushedQuotas"]>;
 };
 let quotaProviderId: string | null = null;
-let balanceSnapshot: ProviderBalanceSnapshot | undefined;
-let quotaDisplay: ReturnType<typeof customApiBalanceDisplayFor>;
-function subscriptionSnapshot(): ProviderBalanceSnapshot {
+let quotaProviderGeneration = "g1";
+let balanceSnapshot: ProviderQuotaSnapshot | undefined;
+let quotaDisplay: ReturnType<typeof customApiQuotaDisplayFor>;
+function subscriptionSnapshot(): ProviderQuotaSnapshot {
 	return {
+		providerId: "p1",
+		targetId: "custom-api/p1",
 		generation: "g1",
 		status: "supported",
-		adapter: "sub2api",
-		balance: {
+		sourceId: "third.party:subscription",
+		data: {
 			scope: "subscription",
 			unlimited: false,
-			amounts: [{ unit: "USD", window: "daily", total: 10, used: 2, remaining: 8 }],
+			amounts: [{ id: "daily", unit: "USD", window: "daily", total: 10, used: 2, remaining: 8 }],
+			windows: [{ id: "daily", used: 2, limit: 10, remaining: 8, resetAt: null }],
 		},
 		fetchedAt: 1,
 		attemptedAt: 1,
 		error: null,
+		stale: false,
+		version: 1,
 	};
 }
 
@@ -106,8 +112,9 @@ function QuotaHarness() {
 		queryFn: async () => ({ customApiQuotas: {} }),
 		enabled: false,
 	});
-	quotaDisplay = customApiBalanceDisplayFor({
+	quotaDisplay = customApiQuotaDisplayFor({
 		providerId: quotaProviderId,
+		generation: quotaProviderGeneration,
 		pushedQuotas: settings?.customApiQuotas,
 		snapshot: balanceSnapshot,
 	});
@@ -116,7 +123,10 @@ function QuotaHarness() {
 		narratorStatus,
 		isAtBottomRef: { current: true },
 		customApiProviderId: quotaProviderId ?? undefined,
-		quotaProviderKey: quotaProviderId ?? undefined,
+		customApiProviderGeneration: quotaProviderGeneration,
+		customApiProviderKeyId: balanceSnapshot?.keyId,
+		customApiQuotaPushCompatible: balanceSnapshot?.pushCompatible,
+		quotaProviderKey: `${quotaProviderId}:${quotaProviderGeneration}`,
 		initialQuotaBalance: quotaDisplay.pushedQuota?.quotaBalance ?? null,
 		initialDetailedQuotaBalance: quotaDisplay.pushedQuota?.detailedQuotaBalance ?? null,
 	});
@@ -196,6 +206,7 @@ beforeEach(async () => {
 	narratorId = "n1";
 	narratorStatus = "waiting";
 	quotaProviderId = null;
+	quotaProviderGeneration = "g1";
 	balanceSnapshot = undefined;
 	connected = false;
 	listeners.clear();
@@ -306,9 +317,12 @@ describe("pushed custom API quota precedence with the real WS hook", () => {
 		quotaProviderId = "p1";
 		const snapshot = subscriptionSnapshot();
 		balanceSnapshot = snapshot;
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		qc.setQueryData(["settings"], {
+			customApiQuotas: {},
+			providerQuotaGenerations: { p1: "g1", p2: "g1" },
+		});
 		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(snapshot);
+		expect<ProviderQuotaSnapshot | null>(quotaDisplay.quotaSnapshot).toBe(snapshot);
 		expect(current.quotaBalance).toBeNull();
 
 		const pushed = {
@@ -316,24 +330,24 @@ describe("pushed custom API quota precedence with the real WS hook", () => {
 			detailedQuotaBalance: "专用套餐\n日 USD 0.004\n周 USD 1",
 		};
 		await event({ type: "quota_balance", ...pushed });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBe(pushed.quotaBalance);
 		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
 		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toMatchObject(pushed);
 
 		balanceSnapshot = { ...snapshot, fetchedAt: 2 };
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBe(pushed.quotaBalance);
 		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
 
 		await event({ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "已耗尽" });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBe("0");
 		expect(current.detailedQuotaBalance).toBe("已耗尽");
 
 		await event({ type: "quota_balance", quotaBalance: null, detailedQuotaBalance: null });
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
+		expect<ProviderQuotaSnapshot | null>(quotaDisplay.quotaSnapshot).toBe(balanceSnapshot);
 		expect(current.quotaBalance).toBeNull();
 		expect(current.detailedQuotaBalance).toBeNull();
 	});
@@ -345,23 +359,150 @@ describe("pushed custom API quota precedence with the real WS hook", () => {
 			quotaBalance: "Cached site plan",
 			detailedQuotaBalance: "Cached site details",
 		};
-		qc.setQueryData(["settings"], { customApiQuotas: { p1: pushed } });
+		qc.setQueryData(["settings"], {
+			customApiQuotas: { p1: pushed },
+			providerQuotaGenerations: { p1: "g1", p2: "g1" },
+		});
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBe(pushed.quotaBalance);
 		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
 
 		quotaProviderId = "p2";
 		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
+		// A previous provider's normalized snapshot is hidden as well as its push text.
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBeNull();
 		expect(current.detailedQuotaBalance).toBeNull();
 
 		quotaProviderId = "p1";
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
 		expect(current.quotaBalance).toBe(pushed.quotaBalance);
 		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+	});
+	test("replacing credentials under the same provider ID clears both pushed text and old plugin values", async () => {
+		quotaProviderId = "p1";
+		balanceSnapshot = subscriptionSnapshot();
+		qc.setQueryData(["settings"], { customApiQuotas: {}, providerQuotaGenerations: { p1: "g1" } });
+		await render();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "Old account balance",
+			detailedQuotaBalance: "Old details",
+		});
+		expect(current.quotaBalance).toBe("Old account balance");
+		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1?.generation).toBe("g1");
+		quotaProviderGeneration = "g2";
+		qc.setQueryData(["settings"], (old: QuotaSettings | undefined) => ({
+			...old,
+			providerQuotaGenerations: { p1: "g2" },
+		}));
+		await render();
+		expect(quotaDisplay.quotaSnapshot).toBeNull();
+		expect(quotaDisplay.pushedQuota).toBeNull();
+		expect(current.quotaBalance).toBeNull();
+		expect(current.detailedQuotaBalance).toBeNull();
+		for (const target of [
+			{ providerId: "p1", generation: "g1" },
+			{ providerId: "other", generation: "g2" },
+			null,
+		]) {
+			await event({
+				type: "quota_balance",
+				quotaBalance: "Late old private value",
+				detailedQuotaBalance: "Old private details",
+				customApiQuotaTarget: target,
+			});
+			expect(current.quotaBalance).toBeNull();
+			expect(current.detailedQuotaBalance).toBeNull();
+			expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1?.quotaBalance).toBe(
+				"Old account balance",
+			);
+		}
+		await event({
+			type: "quota_balance",
+			quotaBalance: "New account balance",
+			customApiQuotaTarget: { providerId: "p1", generation: "g2" },
+		});
+		expect(current.quotaBalance).toBe("New account balance");
+		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1?.generation).toBe("g2");
+	});
+
+	test("Key quota pushes require immutable generation and the actual credential identity", async () => {
+		quotaProviderId = "p1";
+		balanceSnapshot = { ...subscriptionSnapshot(), keyId: "key-1" };
+		const legacy = { quotaBalance: "Old unversioned key", detailedQuotaBalance: "Old details" };
+		qc.setQueryData(["settings"], {
+			customApiQuotas: { p1: legacy },
+			providerQuotaGenerations: { p1: "g1" },
+		});
+		await render();
+		expect(current.quotaBalance).toBeNull();
+		const target = { providerId: "p1", generation: "g1" };
+		for (const identity of [
+			{},
+			{ customApiQuotaTarget: target, credentialId: "other-key" },
+			{ customApiQuotaTarget: target, credentialId: false },
+			{ customApiQuotaTarget: { providerId: "p1", generation: "old" }, credentialId: "key-1" },
+		]) {
+			await event({ type: "quota_balance", quotaBalance: "Cross-key private amount", ...identity });
+			expect(current.quotaBalance).toBeNull();
+			expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toEqual(legacy);
+		}
+		await event({
+			type: "quota_balance",
+			quotaBalance: "0",
+			customApiQuotaTarget: target,
+			credentialId: "key-1",
+		});
+		expect(current.quotaBalance).toBe("0");
+		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1?.generation).toBe("g1");
+		quotaProviderGeneration = "g2";
+		balanceSnapshot = { ...subscriptionSnapshot(), generation: "g2", keyId: "key-2" };
+		qc.setQueryData(["settings"], (old: QuotaSettings | undefined) => ({
+			...old,
+			providerQuotaGenerations: { p1: "g2" },
+		}));
+		await render();
+		expect(current.quotaBalance).toBeNull();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "Late key-1",
+			customApiQuotaTarget: target,
+			credentialId: "key-1",
+		});
+		expect(current.quotaBalance).toBeNull();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "New key",
+			customApiQuotaTarget: { providerId: "p1", generation: "g2" },
+			credentialId: "key-2",
+		});
+		expect(current.quotaBalance).toBe("New key");
+	});
+
+	test("site-account quota never accepts inference-key text into local or settings caches", async () => {
+		quotaProviderId = "p1";
+		balanceSnapshot = { ...subscriptionSnapshot(), pushCompatible: false };
+		const old = { generation: "g1", quotaBalance: "Cached inference amount" };
+		qc.setQueryData(["settings"], {
+			customApiQuotas: { p1: old },
+			providerQuotaGenerations: { p1: "g1" },
+		});
+		await render();
+		for (const target of [undefined, { providerId: "p1", generation: "g1" }]) {
+			await event({
+				type: "quota_balance",
+				quotaBalance: "Inference amount",
+				customApiQuotaTarget: target,
+				credentialId: "key-1",
+			});
+			expect(current.quotaBalance).toBeNull();
+			expect(quotaDisplay.pushedQuota).toBeNull();
+			expect(quotaDisplay.quotaSnapshot).toBe(balanceSnapshot);
+			expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toEqual(old);
+		}
 	});
 });
 
@@ -615,4 +756,41 @@ describe("plan reflection handover with the real WS hook", () => {
 		);
 		expect(current.pendingPermissions).toEqual([permission]);
 	});
+});
+
+test("late Custom API quota cannot enter a NUG view or its independent cache", async () => {
+	quotaProviderId = "p1";
+	qc.setQueryData(["settings"], { customApiQuotas: {}, providerQuotaGenerations: { p1: "g1" } });
+	qc.setQueryData(["nug", "quotas"], { "nug-fixture": { balance: 8 } });
+	await render();
+	function NugHarness() {
+		current = useNarratorPanelWS({
+			narratorId,
+			narratorStatus,
+			isAtBottomRef: { current: true },
+			nugProviderId: "nug-fixture",
+			quotaProviderKey: "nug-fixture",
+		});
+		return null;
+	}
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={qc}>
+				<I18nextProvider i18n={instance}>
+					<NugHarness />
+				</I18nextProvider>
+			</QueryClientProvider>,
+		),
+	);
+	await event({
+		type: "quota_balance",
+		quotaBalance: "999",
+		detailedQuotaBalance: "old custom account",
+		customApiQuotaTarget: { providerId: "p1", generation: "g1" },
+	});
+	expect(current.quotaBalance).toBeNull();
+	expect(qc.getQueryData(["nug", "quotas"])).toEqual({ "nug-fixture": { balance: 8 } });
+	await event({ type: "quota_balance", quotaBalance: "7", customApiQuotaTarget: null });
+	expect(current.quotaBalance).toBe("7");
+	expect(qc.getQueryData(["nug", "quotas"])).toMatchObject({ "nug-fixture": { balance: 7 } });
 });

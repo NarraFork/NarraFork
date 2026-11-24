@@ -39,6 +39,7 @@ describe("safeSpawn process-tree kill", () => {
 					onChunk(chunk) {
 						grandchild = Number.parseInt(new TextDecoder().decode(chunk), 10);
 						controller.abort();
+						return undefined;
 					},
 				},
 			});

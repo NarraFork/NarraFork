@@ -1,0 +1,8 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "io.narrafork.provider-quota",
+	"source": {
+		"type": "local",
+		"builtinId": "io.narrafork.provider-quota"
+	}
+}

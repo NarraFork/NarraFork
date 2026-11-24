@@ -2,12 +2,17 @@ import { Hono } from "hono";
 import {
 	type DeepSeekBalanceCache,
 	getAllDeepSeekCachedBalances,
-	refreshAllDeepSeekBalances,
 	refreshStaleDeepSeekBalances,
 } from "../lib/deepseek-balance-cache";
 import { requireAdmin } from "../middleware/auth";
+import { scheduleManualQuotaRefresh } from "./provider-quotas";
 
 export const deepseekRoutes = new Hono();
+
+deepseekRoutes.use("*", async (c, next) => {
+	c.header("Cache-Control", "no-store");
+	await next();
+});
 
 export function redactBalancesForRole(
 	balances: Record<string, DeepSeekBalanceCache>,
@@ -25,8 +30,7 @@ export function redactBalancesForRole(
 	);
 }
 
-// Authentication is enforced by the /api middleware in app.ts.
-// Return immediately; upstream work is coalesced and throttled by the cache.
+// First-party session authentication is applied by app.ts before mounting.
 deepseekRoutes.get("/balances", (c) => {
 	void refreshStaleDeepSeekBalances().catch(() => {});
 	return c.json(
@@ -34,7 +38,7 @@ deepseekRoutes.get("/balances", (c) => {
 	);
 });
 
-deepseekRoutes.post("/balances/refresh", requireAdmin, (c) => {
-	void refreshAllDeepSeekBalances().catch(() => {});
+deepseekRoutes.post("/balances/refresh", requireAdmin, async (c) => {
+	await scheduleManualQuotaRefresh(c, Object.keys(getAllDeepSeekCachedBalances()));
 	return c.json(getAllDeepSeekCachedBalances());
 });
