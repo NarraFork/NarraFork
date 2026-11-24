@@ -45,6 +45,7 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import {
@@ -137,6 +138,7 @@ import {
 	resolveRuntimePolicy,
 	withDelegationDepth,
 } from "./agent-runtime/policy";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
@@ -178,6 +180,11 @@ import { ensureReplyContext } from "./narrator-reply-context";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { activeNarrators, withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
+import {
+	assertNarratorSurfaceObservation,
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { rememberNestedSubagentRoot } from "./nested-subagent-routing";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
@@ -1350,8 +1357,21 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 	}
 }
 
-type NarratorInsertExecutor = Pick<typeof db, "insert">;
+type NarratorInsertExecutor = Pick<typeof db, "insert" | "select">;
 export type NarratorCreationTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+function assertHandleFree(
+	executor: Pick<typeof db, "select">,
+	handleFold: string | null,
+	excludeId?: string,
+): void {
+	if (!handleFold) return;
+	const current = executor
+		.select({ id: narrators.id })
+		.from(narrators)
+		.where(eq(narrators.handleFold, handleFold))
+		.get();
+	if (current && current.id !== excludeId) throw new RuntimeReadConflictError();
+}
 
 /** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
 async function forkTraits(parent: typeof narrators.$inferSelect): Promise<string[]> {
@@ -1381,26 +1401,36 @@ async function forkTraits(parent: typeof narrators.$inferSelect): Promise<string
  * clear the source. Delegated children are deleted with the source before this runs.
  */
 async function freezePolicyDependents(sourceId: string): Promise<void> {
-	const dependents = await db.query.narrators.findMany({
-		where: eq(narrators.policySourceNarratorId, sourceId),
-		columns: { id: true },
-	});
-	if (dependents.length === 0) return;
+	const dependents = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.policySourceNarratorId, sourceId),
+			columns: { id: true, traits: true, policySourceNarratorId: true },
+			limit: 1001,
+		}),
+		narratorSurfaceReadOptions(),
+	);
+	if (dependents.length > 1000) throw new ValidationError("Policy dependent listing exceeds limit");
+	if (!dependents.length) return;
 	const { resolveNarratorCapabilities } = await import("./trait-layer-service");
 	const ceilings = parseRuntimePolicyTraits(
 		(await resolveNarratorCapabilities(sourceId)).traits.traits,
 	);
-	for (const { id } of dependents) {
-		await narratorTraitsLock.acquire(id, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, id),
-				columns: { traits: true },
+	for (const row of dependents) {
+		await narratorTraitsLock.acquire(row.id, async () => {
+			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row.traits);
+			db.transaction((tx) => {
+				const current = tx.query.narrators
+					.findFirst({
+						where: eq(narrators.id, row.id),
+						columns: { id: true, traits: true, policySourceNarratorId: true },
+					})
+					.sync();
+				assertNarratorSurfaceObservation(row, current, ["traits", "policySourceNarratorId"]);
+				tx.update(narrators)
+					.set({ traits: parseTraits(traits), policySourceNarratorId: null })
+					.where(eq(narrators.id, row.id))
+					.run();
 			});
-			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row?.traits);
-			await db
-				.update(narrators)
-				.set({ traits: parseTraits(traits), policySourceNarratorId: null })
-				.where(and(eq(narrators.id, id), eq(narrators.policySourceNarratorId, sourceId)));
 		});
 	}
 }
@@ -1578,6 +1608,7 @@ export interface PreparedNarratorCreation {
 
 export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<PreparedNarratorCreation> {
 	const type = input.type ?? "primary";
 	const now = new Date().toISOString();
@@ -1716,7 +1747,7 @@ export async function prepareNarratorCreation(
 			updatedAt: now,
 		},
 	};
-	const target = await narratorCreationWorkspaceTarget(prepared.row);
+	const target = await narratorCreationWorkspaceTarget(prepared.row, options);
 	preparedWorkspaceAdmissions.set(prepared, {
 		target,
 		fields: creationWorkspaceFields(prepared.row),
@@ -1728,6 +1759,22 @@ type CreationWorkspace = Pick<
 	typeof narrators.$inferInsert,
 	"contextProjectId" | "cwd" | "workspaceContext" | "workspaceDirectories" | "defaultDeviceId"
 >;
+type CreationProjectObservation = { id: string; gitPath: string | null | undefined };
+const creationProjectObservations = new WeakMap<CreationWorkspace, CreationProjectObservation>();
+function assertCreationProject(
+	executor: Pick<typeof db, "select">,
+	expected: CreationProjectObservation | undefined,
+): void {
+	if (!expected) return;
+	const current = executor
+		.select({ gitPath: projects.gitPath })
+		.from(projects)
+		.where(eq(projects.id, expected.id))
+		.get();
+	assertNarratorSurfaceObservation({ gitPath: expected.gitPath }, { gitPath: current?.gitPath }, [
+		"gitPath",
+	]);
+}
 const preparedWorkspaceAdmissions = new WeakMap<
 	PreparedNarratorCreation,
 	{ target: LifecycleTarget[]; fields: string }
@@ -1774,16 +1821,21 @@ function initialWorkspaceDirectories(
 
 export async function narratorCreationWorkspaceTarget(
 	row: CreationWorkspace,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<LifecycleTarget[]> {
 	const scopeProjectId = row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
 	const project = scopeProjectId
-		? db
-				.select({ path: projects.gitPath })
-				.from(projects)
-				.where(eq(projects.id, scopeProjectId))
-				.limit(1)
-				.get()
+		? await readQueryFirst(
+				db
+					.select({ path: projects.gitPath })
+					.from(projects)
+					.where(eq(projects.id, scopeProjectId))
+					.limit(1),
+				narratorSurfaceReadOptions(options),
+			)
 		: undefined;
+	if (scopeProjectId)
+		creationProjectObservations.set(row, { id: scopeProjectId, gitPath: project?.path });
 	// The row's own device decides the path grammar. A remote Windows `C:\…` is not a
 	// relative path, and a remote POSIX `/srv/app` is not this server's directory —
 	// checking with the host's grammar got both of those wrong.
@@ -1838,6 +1890,8 @@ export function createPreparedNarratorInTransaction(
 			claims: [],
 		});
 	// Synchronous assertion and insert share this transaction with no await gap.
+	assertCreationProject(executor, creationProjectObservations.get(prepared.row));
+	assertHandleFree(executor, prepared.handleFold);
 	for (const target of admission.target) assertWorkspaceAdmission(target);
 	return executor.insert(narrators).values(prepared.row).returning().get();
 }
@@ -1862,22 +1916,24 @@ export const narratorService = {
 	 */
 	async create(
 		input: CreateNarratorInput,
-		options?: {
+		options?: NarratorSurfaceReadBudget & {
+			expectedProject?: CreationProjectObservation;
 			inTransaction?: (
 				tx: NarratorCreationTransaction,
 				narrator: typeof narrators.$inferSelect,
 			) => void;
 		},
 	) {
-		const prepared = await prepareNarratorCreation(input);
+		const prepared = await prepareNarratorCreation(input, options);
 		const insertNarrator = async () => {
-			const target = await narratorCreationWorkspaceTarget(prepared.row);
+			const target = await narratorCreationWorkspaceTarget(prepared.row, options);
 			preparedWorkspaceAdmissions.set(prepared, {
 				target,
 				fields: creationWorkspaceFields(prepared.row),
 			});
 			return withWorkspaceAdmission(target, async () =>
 				db.transaction((tx) => {
+					assertCreationProject(tx, options?.expectedProject);
 					const narrator = createPreparedNarratorInTransaction(tx, prepared);
 					options?.inTransaction?.(tx, narrator);
 					return narrator;
@@ -1889,7 +1945,7 @@ export const narratorService = {
 		// pass the uniqueness check before either inserts.
 		const narrator = prepared.handleFold
 			? await narratorHandleLock.acquire("handle", async () => {
-					await this.assertHandleAvailable(prepared.handle as string);
+					await this.assertHandleAvailable(prepared.handle as string, undefined, options);
 					return insertNarrator();
 				})
 			: await insertNarrator();
@@ -1926,18 +1982,23 @@ export const narratorService = {
 					"This narrator's capability ceiling does not allow spawning agents",
 				);
 			}
+			let assertOrigin: ((tx: NarratorCreationTransaction) => void) | undefined;
 			if (input.originToolCallId != null) {
-				const origin = await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.id, input.originToolCallId),
-					columns: {
-						narratorId: true,
-						toolUseId: true,
-						toolName: true,
-						status: true,
-						executionAttempt: true,
-						executionStartedAt: true,
-					},
-				});
+				const origin = await readQueryFirst(
+					db.query.narratorToolCalls.findMany({
+						limit: 1,
+						where: eq(narratorToolCalls.id, input.originToolCallId),
+						columns: {
+							narratorId: true,
+							toolUseId: true,
+							toolName: true,
+							status: true,
+							executionAttempt: true,
+							executionStartedAt: true,
+						},
+					}),
+					narratorSurfaceReadOptions({}),
+				);
 				if (
 					!origin ||
 					origin.narratorId !== input.parentNarratorId ||
@@ -1947,6 +2008,19 @@ export const narratorService = {
 				) {
 					throw new ValidationError("Subagent origin must be its parent's executing Agent row");
 				}
+				assertOrigin = (tx) => {
+					const current = tx.query.narratorToolCalls
+						.findFirst({ where: eq(narratorToolCalls.id, input.originToolCallId as string) })
+						.sync();
+					assertNarratorSurfaceObservation(origin, current, [
+						"narratorId",
+						"toolUseId",
+						"toolName",
+						"status",
+						"executionAttempt",
+						"executionStartedAt",
+					]);
+				};
 				await narratorPersistence.validateToolCallBinding(
 					input.parentNarratorId,
 					origin.toolUseId,
@@ -2026,72 +2100,104 @@ export const narratorService = {
 			return withWorkspaceAdmission(creationTarget, async () => {
 				// Legacy initialization is a write: resource admission must accept creation first.
 				const replyContext = await ensureReplyContext(parent.id);
-				const [narrator] = await db
-					.insert(narrators)
-					.values({
-						id,
-						type: "subagent",
-						replyContext,
-						subagentType: input.subagentType,
-						variant: subagentVariant(input.subagentType),
-						traits: subTraits,
-						enabledTools: preloadTools.length > 0 ? preloadTools : undefined,
-						title: input.title ?? null,
-						model: storedModel,
-						systemPrompt: input.systemPrompt ?? null,
-						permissionMode: resolvedPermMode,
-						reasoningEffort: resolvedReasoningEffort,
-						fastModeOverride: "inherit",
-						fastMode: legacyFastModeMirror("inherit"),
-						relaxedPlan: resolvedRelaxedPlan,
-						planReflectionAutoApproveOverride:
-							input.planReflectionAutoApproveOverride ??
-							parent.planReflectionAutoApproveOverride ??
-							"inherit",
-						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-						questionReflectionOverride:
-							input.questionReflectionOverride ?? parent.questionReflectionOverride ?? "inherit",
-						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-						// Its session's (D31): the task source reads the root's anyway; the copy keeps
-						// the row from claiming a backend its session does not have.
-						taskBackend: parent.taskBackend,
-						parentNarratorId: input.parentNarratorId,
-						originToolCallId: input.originToolCallId ?? null,
-						subagentOriginKind:
-							input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
-						cwd: creationWorkspace.cwd,
-						contextProjectId: creationWorkspace.contextProjectId,
-						defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
-						// A subagent is part of its parent's work, so its access is DELEGATED to the
-						// root rather than copied: `acl_root_narrator_id` is the only thing consulted
-						// when deciding who may read or drive it. That is what makes a later sharing
-						// change on the main session reach its subagents — there is nothing to
-						// propagate, because there is no copy. Copying used to be the approach, and
-						// sharing a parent afterwards silently left its subagents unreachable.
-						//
-						// Nested subagents point at the same root, so the chain is never walked on a
-						// decision path.
-						aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
-						runtimeRegistrationJson: runtimeRegistration,
-						policySourceNarratorId: input.parentNarratorId,
-						// Kept because "whose work is this" is still read for listings, attribution
-						// and user deletion — it just no longer decides access.
-						ownerUserId: parent.ownerUserId,
-						// Frozen at their strictest values ON PURPOSE, not copied from the parent.
-						// Delegation means these are never consulted, and a copy that cannot follow
-						// the root is a trap: any future code path that reads them instead of the
-						// judged row would get a stale snapshot that may be WIDER than the root.
-						// Pinning them here makes such a mistake fail closed instead of leaking.
-						visibility: "private",
-						writeAudience: "owner",
-						inheritMode: "fresh",
-						status: "working",
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning();
+				const [narrator] = db.transaction((tx) => {
+					assertCreationProject(tx, creationProjectObservations.get(creationWorkspace));
+					assertNarratorSurfaceObservation(
+						parent,
+						tx.query.narrators.findFirst({ where: eq(narrators.id, parent.id) }).sync(),
+						[
+							"runtimeRegistrationJson",
+							"policySourceNarratorId",
+							"cwd",
+							"workspaceContext",
+							"workspaceRevision",
+							"id",
+							"permissionMode",
+							"traits",
+							"relaxedPlan",
+							"reasoningEffort",
+							"taskBackend",
+							"contextProjectId",
+							"defaultDeviceId",
+							"planReflectionAutoApproveOverride",
+							"dangerReflectionOverride",
+							"questionReflectionOverride",
+							"autoContinuationOverride",
+							"behaviorFenceIntervalOverride",
+							"behaviorFenceAttachOverride",
+							"aclRootNarratorId",
+							"ownerUserId",
+						],
+					);
+					assertOrigin?.(tx);
+					return tx
+						.insert(narrators)
+						.values({
+							id,
+							type: "subagent",
+							replyContext,
+							subagentType: input.subagentType,
+							variant: subagentVariant(input.subagentType),
+							traits: subTraits,
+							enabledTools: preloadTools.length > 0 ? preloadTools : undefined,
+							title: input.title ?? null,
+							model: storedModel,
+							systemPrompt: input.systemPrompt ?? null,
+							permissionMode: resolvedPermMode,
+							reasoningEffort: resolvedReasoningEffort,
+							fastModeOverride: "inherit",
+							fastMode: legacyFastModeMirror("inherit"),
+							relaxedPlan: resolvedRelaxedPlan,
+							planReflectionAutoApproveOverride:
+								input.planReflectionAutoApproveOverride ??
+								parent.planReflectionAutoApproveOverride ??
+								"inherit",
+							dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+							questionReflectionOverride:
+								input.questionReflectionOverride ?? parent.questionReflectionOverride ?? "inherit",
+							autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+							behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+							behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+							// Its session's (D31): the task source reads the root's anyway; the copy keeps
+							// the row from claiming a backend its session does not have.
+							taskBackend: parent.taskBackend,
+							parentNarratorId: input.parentNarratorId,
+							originToolCallId: input.originToolCallId ?? null,
+							subagentOriginKind:
+								input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
+							cwd: creationWorkspace.cwd,
+							contextProjectId: creationWorkspace.contextProjectId,
+							defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
+							// A subagent is part of its parent's work, so its access is DELEGATED to the
+							// root rather than copied: `acl_root_narrator_id` is the only thing consulted
+							// when deciding who may read or drive it. That is what makes a later sharing
+							// change on the main session reach its subagents — there is nothing to
+							// propagate, because there is no copy. Copying used to be the approach, and
+							// sharing a parent afterwards silently left its subagents unreachable.
+							//
+							// Nested subagents point at the same root, so the chain is never walked on a
+							// decision path.
+							aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+							runtimeRegistrationJson: runtimeRegistration,
+							policySourceNarratorId: input.parentNarratorId,
+							// Kept because "whose work is this" is still read for listings, attribution
+							// and user deletion — it just no longer decides access.
+							ownerUserId: parent.ownerUserId,
+							// Frozen at their strictest values ON PURPOSE, not copied from the parent.
+							// Delegation means these are never consulted, and a copy that cannot follow
+							// the root is a trap: any future code path that reads them instead of the
+							// judged row would get a stale snapshot that may be WIDER than the root.
+							// Pinning them here makes such a mistake fail closed instead of leaking.
+							visibility: "private",
+							writeAudience: "owner",
+							inheritMode: "fresh",
+							status: "working",
+							createdAt: now,
+							updatedAt: now,
+						})
+						.returning()
+						.all();
+				});
 
 				backgroundOccupancyStore.refreshNarrator(id);
 				// A nested helper's permission and reflection frames also reach its root's page.
@@ -2118,26 +2224,30 @@ export const narratorService = {
 		const scope = and(teamMembersWhere(parentNarratorId), notInArray(narrators.id, [senderId]));
 		// Match the existing last-activity convention, not incidental title/settings edits.
 		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
-		const targets = await db
-			.select(columns)
-			.from(narrators)
-			.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
-			.limit(TEAM_BROADCAST_MAX_TARGETS + 1)
-			.all();
-		const idle = await db
-			.select({ ...columns, lastActivityAt: lastActivity })
-			.from(narrators)
-			.where(
-				and(
-					scope,
-					eq(narrators.status, "idle"),
-					sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
-					sql`${lastActivity} <= ${new Date(now).toISOString()}`,
-				),
-			)
-			.orderBy(desc(lastActivity), desc(narrators.id))
-			.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1)
-			.all();
+		const targets = await readQuery(
+			db
+				.select(columns)
+				.from(narrators)
+				.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
+				.limit(TEAM_BROADCAST_MAX_TARGETS + 1),
+			narratorSurfaceReadOptions({}),
+		);
+		const idle = await readQuery(
+			db
+				.select({ ...columns, lastActivityAt: lastActivity })
+				.from(narrators)
+				.where(
+					and(
+						scope,
+						eq(narrators.status, "idle"),
+						sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
+						sql`${lastActivity} <= ${new Date(now).toISOString()}`,
+					),
+				)
+				.orderBy(desc(lastActivity), desc(narrators.id))
+				.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1),
+			narratorSurfaceReadOptions({}),
+		);
 		return {
 			targets,
 			recentIdle: idle.slice(0, TEAM_BROADCAST_RECENT_IDLE_LIMIT),
@@ -2160,35 +2270,41 @@ export const narratorService = {
 	 *
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
-	async listTeamMembers(rootId: string): Promise<TeamMemberSelectorRow[]> {
+	async listTeamMembers(
+		rootId: string,
+		options: NarratorSurfaceReadBudget = {},
+	): Promise<TeamMemberSelectorRow[]> {
+		const readBudget = narratorSurfaceReadOptions(options);
 		const members: TeamMemberSelectorRow[] = [];
 		let cursor: { createdAt: string; id: string } | null = null;
 		for (;;) {
-			const page: TeamMemberSelectorRow[] = await db
-				.select({
-					id: narrators.id,
-					title: narrators.title,
-					traits: narrators.traits,
-					createdAt: narrators.createdAt,
-				})
-				.from(narrators)
-				.where(
-					and(
-						teamMembersWhere(rootId),
-						cursor
-							? or(
-									sql`${narrators.createdAt} > ${cursor.createdAt}`,
-									and(
-										eq(narrators.createdAt, cursor.createdAt),
-										sql`${narrators.id} > ${cursor.id}`,
-									),
-								)
-							: undefined,
-					),
-				)
-				.orderBy(narrators.createdAt, narrators.id)
-				.limit(TEAM_MEMBERS_PAGE_SIZE)
-				.all();
+			const page: TeamMemberSelectorRow[] = await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						title: narrators.title,
+						traits: narrators.traits,
+						createdAt: narrators.createdAt,
+					})
+					.from(narrators)
+					.where(
+						and(
+							teamMembersWhere(rootId),
+							cursor
+								? or(
+										sql`${narrators.createdAt} > ${cursor.createdAt}`,
+										and(
+											eq(narrators.createdAt, cursor.createdAt),
+											sql`${narrators.id} > ${cursor.id}`,
+										),
+									)
+								: undefined,
+						),
+					)
+					.orderBy(narrators.createdAt, narrators.id)
+					.limit(TEAM_MEMBERS_PAGE_SIZE),
+				narratorSurfaceReadOptions(readBudget),
+			);
 			members.push(...page);
 			if (page.length < TEAM_MEMBERS_PAGE_SIZE) return members;
 			const last = page[page.length - 1];
@@ -2249,29 +2365,33 @@ export const narratorService = {
 		// reads as the ordinal of the first selected column.
 		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
 
-		const rows = await db
-			.select({
-				id: narrators.id,
-				title: narrators.title,
-				traits: narrators.traits,
-				variant: narrators.variant,
-				status: narrators.status,
-				createdAt: narrators.createdAt,
-			})
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(limit)
-			.all();
+		const rows = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					traits: narrators.traits,
+					variant: narrators.variant,
+					status: narrators.status,
+					createdAt: narrators.createdAt,
+				})
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(limit),
+			narratorSurfaceReadOptions({}),
+		);
 
-		const remainder = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
-			.offset(rows.length)
-			.all();
+		const remainder = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
+				.offset(rows.length),
+			narratorSurfaceReadOptions({}),
+		);
 
 		return {
 			subagents: rows,
@@ -2419,16 +2539,23 @@ export const narratorService = {
 	 * A denied access reports NotFoundError, identical to a missing row, so no
 	 * caller can distinguish "exists but not yours" from "does not exist".
 	 */
-	async getById(id: string, acl?: { userId: string; isAdmin: boolean; need?: NarratorAccessNeed }) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-		});
+	async getById(
+		id: string,
+		acl?: { userId: string; isAdmin: boolean; need?: NarratorAccessNeed },
+		readBudget: NarratorSurfaceReadBudget = {},
+	) {
+		const options = narratorSurfaceReadOptions(readBudget);
+		const narrator = await readQueryFirst(
+			db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, id) }),
+			options,
+		);
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (acl) {
 			await assertNarratorAccess(
 				narrator,
 				{ userId: acl.userId, isAdmin: acl.isAdmin },
 				acl.need ?? "read",
+				narratorSurfaceReadOptions(options),
 			);
 		}
 		return narrator;
@@ -2441,12 +2568,13 @@ export const narratorService = {
 	 * the folded form so "@MyBot"/"@mybot"/"@MYBOT" all resolve to the same
 	 * narrator. Returns null if no narrator owns the handle. Does not throw.
 	 */
-	async getByHandle(handle: string) {
+	async getByHandle(handle: string, readBudget: NarratorSurfaceReadBudget = {}) {
 		const folded = foldHandle(handle.trim());
 		if (!folded) return null;
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.handleFold, folded),
-		});
+		const narrator = await readQueryFirst(
+			db.query.narrators.findMany({ limit: 1, where: eq(narrators.handleFold, folded) }),
+			narratorSurfaceReadOptions(readBudget),
+		);
 		return narrator ?? null;
 	},
 
@@ -2455,22 +2583,31 @@ export const narratorService = {
 	 * (case-insensitive). `excludeNarratorId` lets a narrator keep its own handle
 	 * when re-validating.
 	 */
-	async assertHandleAvailable(handle: string, excludeNarratorId?: string) {
-		const existing = await this.getByHandle(handle);
+	async assertHandleAvailable(
+		handle: string,
+		excludeNarratorId?: string,
+		readBudget: NarratorSurfaceReadBudget = {},
+	) {
+		const existing = await this.getByHandle(handle, readBudget);
 		if (existing && existing.id !== excludeNarratorId) {
 			throw new ValidationError(`Handle "@${handle}" is already taken`);
 		}
 	},
 
 	/** List all named narrators (traits include "named"), most recent first. */
-	async listNamed() {
-		const rows = await db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
-			// IS NOT NULL made SQLite scan every narrator before sorting this small result.
-			where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
-			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
-		});
+	async listNamed(readBudget: NarratorSurfaceReadBudget = {}) {
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				columns: { runtimeRegistrationJson: false },
+				limit: 1001,
+				// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
+				// IS NOT NULL made SQLite scan every narrator before sorting this small result.
+				where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
+				orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
+			}),
+			narratorSurfaceReadOptions(readBudget),
+		);
+		if (rows.length > 1000) throw new ValidationError("Named narrator listing exceeds limit");
 		// Defensive: only return those actually flagged as named.
 		return rows.filter((n) => parseTraits(n.traits).includes("named"));
 	},
@@ -2479,9 +2616,14 @@ export const narratorService = {
 	 * Assign, change, or clear a narrator's handle. Passing null clears it and
 	 * removes the "named" trait. Uniqueness is enforced under a global lock.
 	 */
-	async setHandle(narratorId: string, handle: string | null) {
+	async setHandle(
+		narratorId: string,
+		handle: string | null,
+		options: NarratorSurfaceReadBudget = {},
+	) {
 		return narratorHandleLock.acquire("handle", async () => {
-			const narrator = await this.getById(narratorId);
+			const readBudget = narratorSurfaceReadOptions(options);
+			const narrator = await this.getById(narratorId, undefined, readBudget);
 			if (isSubagentVariant(narrator.variant)) {
 				throw new ValidationError("Subagents cannot be named");
 			}
@@ -2489,23 +2631,36 @@ export const narratorService = {
 			const displayHandle = handle === null ? null : handle.trim();
 			const foldedHandle = displayHandle ? foldHandle(displayHandle) : null;
 			if (displayHandle) {
-				await this.assertHandleAvailable(displayHandle, narratorId);
+				await this.assertHandleAvailable(displayHandle, narratorId, readBudget);
 			}
 			const currentTraits = parseTraits(narrator.traits);
 			const nextTraits = currentTraits.filter((t) => t !== "named");
 			if (displayHandle) {
 				nextTraits.push("named");
 			}
-			const [updated] = await db
-				.update(narrators)
-				.set({
-					handle: displayHandle,
-					handleFold: foldedHandle,
-					traits: nextTraits,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId))
-				.returning();
+			const [updated] = db.transaction((tx) => {
+				const current = tx.query.narrators
+					.findFirst({ where: eq(narrators.id, narratorId) })
+					.sync();
+				assertNarratorSurfaceObservation(narrator, current, [
+					"traits",
+					"variant",
+					"handle",
+					"handleFold",
+				]);
+				assertHandleFree(tx, foldedHandle, narratorId);
+				return tx
+					.update(narrators)
+					.set({
+						handle: displayHandle,
+						handleFold: foldedHandle,
+						traits: nextTraits,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId))
+					.returning()
+					.all();
+			});
 			logger.info("Narrator handle updated", { narratorId, handle: displayHandle });
 			return updated;
 		});
@@ -2518,15 +2673,24 @@ export const narratorService = {
 		// What names it once the row is gone (the `narrator:deleted` event below).
 		const title =
 			(
-				await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { title: true },
-				})
+				await readQueryFirst(
+					db.query.narrators.findMany({
+						limit: 1,
+						where: eq(narrators.id, narratorId),
+						columns: { title: true },
+					}),
+					{ ...narratorSurfaceReadOptions({}), maxRows: 1 },
+				)
 			)?.title ?? null;
-		const children = await db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, narratorId),
-			columns: { id: true, type: true, variant: true },
-		});
+		const children = await readQuery(
+			db.query.narrators.findMany({
+				where: eq(narrators.parentNarratorId, narratorId),
+				columns: { id: true, type: true, variant: true },
+				limit: 1001,
+			}),
+			narratorSurfaceReadOptions({}),
+		);
+		if (children.length > 1000) throw new ValidationError("Narrator child listing exceeds limit");
 		// A primary fork is an independent history owner, not a disposable subagent.
 		// Preserve its shared history before severing the ancestry FK.
 		const survivingForks = children.filter(
@@ -2555,6 +2719,20 @@ export const narratorService = {
 			(await hasSharedOwnedImageMessages(narratorId));
 
 		const bindingTransition = db.transaction((tx) => {
+			const currentChildren = tx.query.narrators
+				.findMany({
+					where: eq(narrators.parentNarratorId, narratorId),
+					columns: { id: true, type: true, variant: true },
+					limit: 1001,
+				})
+				.sync();
+			const ordered = (rows: typeof currentChildren) =>
+				rows.slice().sort((a, b) => a.id.localeCompare(b.id));
+			assertNarratorSurfaceObservation(
+				{ children: ordered(survivingForks) },
+				{ children: ordered(currentChildren) },
+				["children"],
+			);
 			if (survivingForks.length)
 				tx.update(narrators)
 					.set({ parentNarratorId: null })
@@ -2770,6 +2948,40 @@ export const narratorService = {
 				const replyContext = await ensureReplyContext(parent.id);
 				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
+						assertCreationProject(tx, creationProjectObservations.get(creationWorkspace));
+						assertNarratorSurfaceObservation(
+							parent,
+							tx.query.narrators.findFirst({ where: eq(narrators.id, parent.id) }).sync(),
+							[
+								"traits",
+								"cwd",
+								"defaultDeviceId",
+								"contextProjectId",
+								"workspaceContext",
+								"workspaceRevision",
+								"runtimeRegistrationJson",
+								"policySourceNarratorId",
+								"variant",
+								"model",
+								"permissionMode",
+								"id",
+								"systemPrompt",
+								"contextSystemChars",
+								"contextToolsChars",
+								"reasoningEffort",
+								"fastModeOverride",
+								"relaxedPlan",
+								"planReflectionAutoApproveOverride",
+								"dangerReflectionOverride",
+								"questionReflectionOverride",
+								"autoContinuationOverride",
+								"behaviorFenceIntervalOverride",
+								"behaviorFenceAttachOverride",
+								"ownerUserId",
+								"visibility",
+								"writeAudience",
+							],
+						);
 						// Insert first so this transaction owns SQLite's write lock before it
 						// snapshots the parent's marker state.
 						const created = tx
@@ -2971,6 +3183,45 @@ export const narratorService = {
 				const replyContext = await ensureReplyContext(parent.id);
 				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
+						assertCreationProject(tx, creationProjectObservations.get(creationWorkspace));
+						assertNarratorSurfaceObservation(
+							parent,
+							tx.query.narrators.findFirst({ where: eq(narrators.id, parent.id) }).sync(),
+							[
+								"traits",
+								"cwd",
+								"defaultDeviceId",
+								"contextProjectId",
+								"workspaceContext",
+								"workspaceRevision",
+								"runtimeRegistrationJson",
+								"policySourceNarratorId",
+								"variant",
+								"permissionMode",
+								"systemPrompt",
+								"contextSummary",
+								"model",
+								"reasoningEffort",
+								"id",
+								"fastModeOverride",
+								"relaxedPlan",
+								"planReflectionAutoApproveOverride",
+								"dangerReflectionOverride",
+								"questionReflectionOverride",
+								"autoContinuationOverride",
+								"behaviorFenceIntervalOverride",
+								"behaviorFenceAttachOverride",
+								"ownerUserId",
+								"visibility",
+								"writeAudience",
+								"contextSummaryChars",
+								"contextSystemChars",
+								"contextToolsChars",
+								"apiConversationId",
+								"refsInheritedFrom",
+								"refsBackfillCursor",
+							],
+						);
 						// Insert before reading parent refs so this transaction acquires the write
 						// lock first; a concurrent finalize then waits and cannot change the state
 						// between our final read and ref copy.
@@ -3367,47 +3618,65 @@ export const narratorService = {
 		narratorId: string,
 		toolCallId: string,
 	): Promise<string | undefined> {
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, toolCallId),
-			columns: { messageId: true },
-		});
+		const call = await readQueryFirst(
+			db.query.narratorToolCalls.findMany({
+				limit: 1,
+				where: eq(narratorToolCalls.id, toolCallId),
+				columns: { messageId: true },
+			}),
+			narratorSurfaceReadOptions({}),
+		);
 		if (!call) return undefined;
-		const stepRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, call.messageId),
-			),
-			columns: { seq: true },
-		});
-		if (!stepRef) return undefined;
-		const previous = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(
-				and(
+		const stepRef = await readQueryFirst(
+			db.query.narratorMessageRefs.findMany({
+				limit: 1,
+				where: and(
 					eq(narratorMessageRefs.narratorId, narratorId),
-					sql`${narratorMessageRefs.seq} < ${stepRef.seq}`,
+					eq(narratorMessageRefs.messageId, call.messageId),
 				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+				columns: { seq: true },
+			}),
+			narratorSurfaceReadOptions({}),
+		);
+		if (!stepRef) return undefined;
+		const previous = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						sql`${narratorMessageRefs.seq} < ${stepRef.seq}`,
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions({}),
+		);
 		return previous[0]?.messageId;
 	},
 
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
-		const latestRef = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const latestRef = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions({}),
+		);
 
 		if (!latestRef.length) return null;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, latestRef[0].messageId),
-			columns: { messageUuid: true },
-		});
+		const msg = await readQueryFirst(
+			db.query.narratorMessages.findMany({
+				limit: 1,
+				where: eq(narratorMessages.id, latestRef[0].messageId),
+				columns: { messageUuid: true },
+			}),
+			narratorSurfaceReadOptions({}),
+		);
 		return msg?.messageUuid ?? null;
 	},
 
@@ -3418,11 +3687,7 @@ export const narratorService = {
 	 */
 	async extractSubagentToPrimary(
 		sourceNarratorId: string,
-		opts?: {
-			title?: string;
-			inheritMode?: "full" | "compressed";
-			locale?: Locale;
-		},
+		opts?: import("./subagent-extract").ExtractSubagentToPrimaryOpts,
 	) {
 		const { extractSubagentToPrimary } = await import("./subagent-extract");
 		return extractSubagentToPrimary(sourceNarratorId, opts);

@@ -145,7 +145,7 @@ function active(id: string): ActiveNarrator {
 	activeNarrators.set(id, narrator);
 	return narrator;
 }
-async function publishCheckpoint() {
+async function publishCheckpoint(restarting = true) {
 	const epoch = coordinator.getUpdateCoordinationStatus().updateEpoch;
 	if (!epoch) throw new Error("Fixture update has no epoch");
 	await coordinator.waitForScheduledRecoveryHandoff();
@@ -155,12 +155,98 @@ async function publishCheckpoint() {
 		...snapshot,
 		resumeOnNextStartup: true,
 	});
-	coordinator.markUpdateRestarting();
+	if (restarting) coordinator.markUpdateRestarting();
 	// The fixture closes only the checkpoint admission latch; application main closes
 	// the actual run/publication/inbox producers before setting this latch.
 	freezeCheckpointStopAdmission();
 	return published;
 }
+
+test("signal shutdown unwinds prepared maintenance runs before database drain", async () => {
+	const entered = Promise.withResolvers<void>();
+	let passes = 0;
+	spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
+		passes++;
+		coordinator.scheduleUpdate(undefined, "system_shutdown");
+		const parked = coordinator.beginNarratorResponseActivity(config.narratorId, config.signal);
+		entered.resolve();
+		await parked;
+		throw new Error("A prepared shutdown must not reopen the model gate");
+	});
+	await session.acceptUserMessage(ids[0], "checkpoint input", { userId: "checkpoint-user" });
+	await entered.promise;
+	const snapshot = await publishCheckpoint(false);
+	expect(coordinator.getUpdateCoordinationStatus().phase).toBe("quiescing_tools");
+	expect(runs.getNarratorRunShutdownSnapshot().pending).toBe(1);
+	expect(session.getNarratorSessionTailStatus()).toEqual({ pending: 2, failed: 0 });
+	const running = activeNarrators.get(ids[0]);
+	if (!running) throw new Error("Missing live fixture session");
+	const terminalEvents: string[] = [];
+	running.events.on("event", (event) => {
+		if (event.type === "done" || event.type === "error") terminalEvents.push(event.type);
+	});
+	try {
+		// Execute the actual signal wiring without importing main or signaling a server.
+		const main = await Bun.file(new URL("../../main.ts", import.meta.url)).text();
+		const shutdownStart = main.indexOf("async function performGracefulShutdown(");
+		const start = main.indexOf("httpLifecycle.abortAll();", shutdownStart);
+		const end = main.indexOf("const shutdownRequestId", start);
+		expect(shutdownStart).toBeGreaterThanOrEqual(0);
+		expect(start).toBeGreaterThan(shutdownStart);
+		expect(end).toBeGreaterThan(start);
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+			`async function close() { ${main.slice(start, end)} }`,
+		);
+		const close = new Function(
+			"httpLifecycle",
+			"producerOutcome",
+			"step",
+			"stopCheckpointedNarratorRuns",
+			"options",
+			"prepareSignalRestartRecovery",
+			"markUpdateRestarting",
+			`${code}\nreturn close();`,
+		);
+		const { prepareSignalRestartRecovery } = await import("../restart-recovery-service");
+		const stages: string[] = [];
+		let checkpointStops: unknown;
+		await close(
+			{ abortAll() {} },
+			"ok",
+			async (label: string, action: () => unknown) => {
+				stages.push(label);
+				const result = await action();
+				if (label === "checkpointRuns.pause") checkpointStops = result;
+				return "ok";
+			},
+			coordinator.stopCheckpointedNarratorRuns,
+			{ reason: "signal" },
+			prepareSignalRestartRecovery,
+			coordinator.markUpdateRestarting,
+		);
+		expect(checkpointStops).toBe(1);
+		expect(stages).toEqual(["restartRecovery.prepare", "checkpointRuns.pause"]);
+		await runs.drainNarratorRunCompletions({ deadlineAt: Date.now() + 2_000 });
+		await session.drainNarratorSessionTails({ deadlineAt: Date.now() + 2_000 });
+		expect(runs.getNarratorRunShutdownSnapshot().pending).toBe(0);
+		expect(session.getNarratorSessionTailStatus()).toEqual({ pending: 0, failed: 0 });
+		expect(coordinator.getUpdateCoordinationStatus().phase).toBe("restarting");
+		expect(passes).toBe(1);
+		expect(terminalEvents).toEqual([]);
+		expect(running.abortController.signal.aborted).toBe(false);
+		expect(getExecutionOwner(ids[0])).toBeUndefined();
+		expect(db.select().from(narrators).where(eq(narrators.id, ids[0])).get()).toMatchObject({
+			status: "working",
+			logicalRunId: snapshot.narrators[0]?.logicalRunId,
+		});
+	} finally {
+		// A regression must not leave this fixture's real run/session promises parked.
+		coordinator.markUpdateRestarting();
+		coordinator.stopCheckpointedNarratorRuns();
+		await runs.drainNarratorRunCompletions({ deadlineAt: Date.now() + 2_000 });
+		await session.drainNarratorSessionTails({ deadlineAt: Date.now() + 2_000 });
+	}
+});
 
 test("one parked loop retains both real session tails until checkpoint unwind finishes", async () => {
 	const entered = Promise.withResolvers<void>();

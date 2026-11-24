@@ -2,12 +2,19 @@
  * Service templates: how one kind of upstream is used, without any user data
  * (docs/PROVIDER-SOURCING-DESIGN.md §15.2).
  *
- * Data fields only for now. The behaviours (quota probe, model list, availability,
- * import dedupe) are attached by later S2 PRs as each caller moves onto templates.
+ * The behaviours (quota probe, then model list, availability, import dedupe) are attached
+ * by the S2 PRs as each caller moves onto templates.
  */
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
 import type { CredentialAuth } from "../credential-store";
+import { probeDeepSeekQuota } from "../deepseek-balance-cache";
+import { probeKimiQuota } from "../kimi-usage-cache";
+import { probeOpencodeQuota } from "../opencode-usage-cache";
+import { probeRelayQuota } from "../provider-balance-cache";
+import type { UsageSubject } from "../provider-key-subjects";
 import type { CustomApiProviderConfig } from "../settings/types";
+import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
 
@@ -37,7 +44,36 @@ export interface ServiceTemplate {
 	defaults?: Partial<Pick<CustomApiProviderConfig, "userAgentMode">>;
 	/** A user may add a personal credential here (S4). */
 	personal: boolean;
+	/**
+	 * Read one credential's allowance (sourcing/quota-store.ts keeps the result). Templates
+	 * without it have no quota to show. Throws when the upstream cannot answer.
+	 */
+	probeQuota?: (
+		group: SourceGroupView,
+		credential: UsageSubject,
+		signal: AbortSignal,
+	) => Promise<QuotaSnapshot>;
 }
+
+type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
+
+/**
+ * Kimi Code and OpenCode Go answer per key; DeepSeek and relay balances per provider, so
+ * their caches probe the group's first credential (§15.4). Relays are probed on every
+ * endpoint that is not a dedicated service, official APIs included, as before.
+ */
+const relay: ProbeQuota = (_group, credential, signal) => probeRelayQuota(credential, signal);
+const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
+	"kimi-code": (_group, credential, signal) => probeKimiQuota(credential, signal),
+	"opencode-go": (_group, credential, signal) => probeOpencodeQuota(credential, signal),
+	deepseek: (_group, credential, signal) => probeDeepSeekQuota(credential, signal),
+	openai: relay,
+	anthropic: relay,
+	gemini: relay,
+	"openai-compatible": relay,
+	"anthropic-compatible": relay,
+	"gemini-compatible": relay,
+};
 
 const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"anthropic-messages": `https://${host}/coding/v1`,
@@ -64,7 +100,7 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		authKinds: ["api_key"],
 		multiCredential: true,
 		subscription: true,
-		// The plan preset's creation default (provider-connection-presets.ts).
+		// Token Plan keys present NarraFork's own User-Agent (presets.ts).
 		defaults: { userAgentMode: "narrafork" },
 		personal: true,
 	},
@@ -204,7 +240,10 @@ function deepFreeze<T>(value: T): T {
 }
 
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
-	TEMPLATES.map((template) => [template.id, deepFreeze(template)]),
+	TEMPLATES.map((template) => {
+		const probeQuota = QUOTA_PROBES[template.id];
+		return [template.id, deepFreeze(probeQuota ? { ...template, probeQuota } : template)];
+	}),
 );
 
 export function listServiceTemplates(): readonly ServiceTemplate[] {

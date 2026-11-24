@@ -38,15 +38,21 @@ export async function trackFileChange(
 		if (ctx.parentNarratorId) {
 			const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
 			const remoteCwd = ctx.executionTarget?.cwd ?? backend.defaultCwd;
-			recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
-				deviceId: backend.deviceId,
-				workspacePath:
-					backend.kind === "local"
-						? ctx.cwd
-						: remoteCwd
-							? backend.paths.identityKey(remoteCwd)
-							: null,
-			});
+			await recordTeamFileChange(
+				ctx.parentNarratorId,
+				ctx.narratorId,
+				filePath,
+				{
+					deviceId: backend.deviceId,
+					workspacePath:
+						backend.kind === "local"
+							? ctx.cwd
+							: remoteCwd
+								? backend.paths.identityKey(remoteCwd)
+								: null,
+				},
+				{ signal: ctx.signal },
+			);
 		}
 	} catch {
 		// Rebuildable team display, not mutation evidence.

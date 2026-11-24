@@ -10,7 +10,7 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
-import { expectRuntimeTestFailure } from "./agent-runtime-test-database";
+import { drainRuntimeTestWork, expectRuntimeTestFailure } from "./agent-runtime-test-database";
 import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 const fixture = getNarratorWorkerTestDb();
@@ -326,6 +326,8 @@ beforeEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
 afterEach(async () => {
+	// Receipt bookkeeping is detached and CAS-checked; the next cleanDb must not land mid-write.
+	await drainRuntimeTestWork();
 	activeNarrators.delete(narratorId);
 	backgroundOccupancyStore.setRuntimeLive(narratorId, false);
 	await backgroundOccupancyStore.flush();

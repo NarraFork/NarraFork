@@ -446,11 +446,14 @@ async function buildAwaitAgentResult(
 	knownLabel?: string,
 	receipt?: Pick<AwaitAgentResult, "terminalResultReceived" | "publicationRun" | "sourceResultRef">,
 	knownTitle?: string | null,
+	signal?: AbortSignal,
 ): Promise<AwaitAgentResult> {
 	let recentActivity: string | undefined;
 	if (status === "timeout" || status === "running") {
 		try {
-			recentActivity = formatRecentSubagentActivity(await getRecentSubagentToolActivity(id));
+			recentActivity = formatRecentSubagentActivity(
+				await getRecentSubagentToolActivity(id, undefined, { signal }),
+			);
 		} catch (err) {
 			logger.warn("Failed to load recent subagent activity for Await timeout", {
 				subagentId: id,
@@ -458,7 +461,7 @@ async function buildAwaitAgentResult(
 			});
 		}
 	}
-	const label = knownLabel ?? (await resolveAgentLabel(scopeNarratorId, id));
+	const label = knownLabel ?? (await resolveAgentLabel(scopeNarratorId, id, { signal }));
 	return {
 		id,
 		label,
@@ -950,6 +953,7 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			undefined,
 			background,
 			background.title,
+			opts.signal,
 		);
 	}
 
@@ -977,6 +981,7 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			label,
 			receipt,
 			target.title,
+			opts.signal,
 		);
 	// Every background run is projected by a task row (creation, detach, recovery and
 	// each later run of the session), handled above; the session row alone never

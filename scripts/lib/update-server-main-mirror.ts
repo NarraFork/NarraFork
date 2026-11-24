@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	MIRROR_ASSET_HEADERS,
-	type MirrorSnapshotV2,
+	type MirrorSnapshot,
 	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 } from "../../shared/independent-update-mirror";
@@ -23,6 +23,7 @@ import {
 	timeReleasePhase,
 } from "./ci-release-io";
 import type { GhRunner } from "./github-release";
+import { downloadMirrorPatchFromSource } from "./mirror-patch-proxy";
 import {
 	currentPublicRelease,
 	matchPublicAsset,
@@ -138,6 +139,9 @@ export interface MirrorPublishedOptions {
 	relay?: MirrorRelayStageOptions;
 	platforms?: string[];
 	dryRun?: boolean;
+	/** Main releases omit full binaries unless explicitly set to false. */
+	patchOnly?: boolean;
+	patchProxyOrigin?: string;
 	signal?: AbortSignal;
 	run?: GhRunner;
 	/** Test transports retain the exact production read-only contract. */
@@ -260,7 +264,8 @@ export async function mirrorPublishedMainRelease(
 		)
 			throw new Error("Canonical snapshot requires the complete target platform projection");
 		for (const file of target.files) matchPublicAsset(remote, file);
-		const assets = mirrorAssetsForTarget(snapshot.index, version, 2);
+		const schemaVersion = options.patchOnly === false ? 2 : 1;
+		const assets = mirrorAssetsForTarget(snapshot.index, version, schemaVersion);
 		// Reserve source download + transport upload; assets are never downloaded back.
 		const total = 2 * assets.reduce((sum, a) => sum + a.size, 0);
 		const budget = options.maxTotalBytes ?? MIRROR_TOTAL_BYTES;
@@ -327,18 +332,27 @@ export async function mirrorPublishedMainRelease(
 			try {
 				if (asset.kind === "patch" || asset.kind === "main-binary") {
 					const github = matchPublicAsset(remote, asset);
-					path = join(directory as string, `${index}-${asset.sha256}`);
+					const outputPath = join(directory as string, `${index}-${asset.sha256}`);
+					path = outputPath;
+					const download = options.downloadAsset ?? downloadReleaseAsset;
+					const request = {
+						repository: options.repository,
+						assetId: github.id,
+						size: asset.size,
+						outputPath,
+						signal,
+					};
 					await timeReleasePhase(
 						asset.kind === "patch" ? "mirror.github-patch" : "mirror.github-binary",
 						{ inputBytes: asset.size },
 						() =>
-							(options.downloadAsset ?? downloadReleaseAsset)({
-								repository: options.repository,
-								assetId: github.id,
-								size: asset.size,
-								outputPath: path as string,
-								signal,
-							}),
+							asset.kind === "patch"
+								? downloadMirrorPatchFromSource(
+										{ ...request, tag: options.tag, name: asset.name, sha256: asset.sha256 },
+										options.patchProxyOrigin,
+										download,
+									)
+								: download(request),
 						signal,
 					);
 					const actual = await hashReleaseFile(path, mirrorAssetLimit(asset.kind), signal);
@@ -452,8 +466,8 @@ export async function mirrorPublishedMainRelease(
 			if (!freshTarget || JSON.stringify(freshTarget) !== JSON.stringify(target))
 				throw new Error("Canonical target changed or left the index window before snapshot commit");
 			snapshot = fresh;
-			const projection: MirrorSnapshotV2 = {
-				schemaVersion: 2,
+			const projection: MirrorSnapshot = {
+				schemaVersion,
 				repository: options.repository,
 				...snapshot,
 				targetVersion: version,

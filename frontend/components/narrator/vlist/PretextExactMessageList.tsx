@@ -296,6 +296,7 @@ import {
 	useTracePermissionSlots,
 } from "./vlist-permission-bridge";
 import { predictInlinePermission } from "./vlist-permission-prediction";
+import { usePersistedToolLive } from "./vlist-persisted-tool-live";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
@@ -3947,11 +3948,19 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				setStreamAnimMountEpoch(nextStreamAnimEpoch());
 			}, [narratorId]);
+			// A tool still executing after its message persisted has no synthetic card
+			// left; its live output reaches the committed card through a coalesced patch.
+			const onPersistedToolLive = usePersistedToolLive(
+				narratorId,
+				pretextDocument.applyLivePatch,
+				pretextDocument.messages,
+			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,
 				committedMessages: pretextDocument.messages,
 				fetchTextDocumentRange: textDocumentRangeReader,
+				onPersistedToolLive,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {

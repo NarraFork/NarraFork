@@ -76,6 +76,25 @@ function addMessage(
 	return messageId;
 }
 
+// Budget fixtures need >5k rows; per-row inserts cost ~2.5s locally and exceed the 5s
+// test timeout on slower CI runners, so batch them into multi-row statements.
+const BULK_INSERT_ROWS = 500;
+function insertBulkHistory(
+	messages: (typeof narratorMessages.$inferInsert)[],
+	refs: (typeof narratorMessageRefs.$inferInsert)[] = [],
+) {
+	db.transaction((tx) => {
+		for (let start = 0; start < messages.length; start += BULK_INSERT_ROWS)
+			tx.insert(narratorMessages)
+				.values(messages.slice(start, start + BULK_INSERT_ROWS))
+				.run();
+		for (let start = 0; start < refs.length; start += BULK_INSERT_ROWS)
+			tx.insert(narratorMessageRefs)
+				.values(refs.slice(start, start + BULK_INSERT_ROWS))
+				.run();
+	});
+}
+
 function addTool(narratorId: string, messageId: string, toolUseId: string, filePath: string) {
 	const id = generateId();
 	db.insert(narratorToolCalls)
@@ -491,19 +510,16 @@ describe("origin-bound derived history cleanup", () => {
 		]);
 		const origin = addAgentCall(narratorId, selected, "many-children");
 		const child = addChild(cwd, narratorId, origin);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++)
-				tx.insert(narratorMessages)
-					.values({
-						id: generateId(),
-						narratorId: child,
-						parentToolUseId: "many-children",
-						role: "assistant",
-						contentJson: [],
-						createdAt: now,
-					})
-					.run();
-		});
+		insertBulkHistory(
+			Array.from({ length: 5_001 }, () => ({
+				id: generateId(),
+				narratorId: child,
+				parentToolUseId: "many-children",
+				role: "assistant" as const,
+				contentJson: [],
+				createdAt: now,
+			})),
+		);
 		await expect(
 			narratorService.deleteMessage(narratorId, selected, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);
@@ -515,17 +531,22 @@ describe("origin-bound derived history cleanup", () => {
 	test("an oversized caller ref range is rejected before loading message bodies", async () => {
 		const { narratorId } = fixture();
 		const boundary = addMessage(narratorId, [{ type: "text", text: "boundary" }], 0);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++) {
-				const id = generateId();
-				tx.insert(narratorMessages)
-					.values({ id, narratorId, role: "assistant", contentJson: [], createdAt: now })
-					.run();
-				tx.insert(narratorMessageRefs)
-					.values({ id: generateId(), narratorId, messageId: id, seq: index + 1 })
-					.run();
-			}
-		});
+		const messages = Array.from({ length: 5_001 }, () => ({
+			id: generateId(),
+			narratorId,
+			role: "assistant" as const,
+			contentJson: [],
+			createdAt: now,
+		}));
+		insertBulkHistory(
+			messages,
+			messages.map((message, index) => ({
+				id: generateId(),
+				narratorId,
+				messageId: message.id,
+				seq: index + 1,
+			})),
+		);
 		await expect(
 			narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);

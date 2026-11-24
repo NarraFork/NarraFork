@@ -1679,8 +1679,14 @@ test.each([
 				await page.keyboard.press("Enter");
 			}
 			await page.waitForSelector('[data-git-staging-unit-targets] [data-git-staging-target="C"]');
+			// Mantine's focus trap moves focus into the dropdown on a timer; an Escape that lands
+			// before it closes the menu with focus lost to <body>, so the next Enter does nothing.
+			await page.waitForFunction(() =>
+				document.activeElement?.closest("[data-git-staging-unit-targets]"),
+			);
 			await page.keyboard.press("Escape");
 			await page.waitForSelector("[data-git-staging-unit-targets]", { hidden: true });
+			await page.waitForFunction((trigger) => document.activeElement?.matches(trigger), {}, menu);
 			expect((await snapshot(page)).network.stagingActionRequests).toEqual([]);
 			if (touch) await page.tap(menu);
 			else await page.keyboard.press("Enter");
@@ -3448,6 +3454,12 @@ test.each([
 			await page.focus('[data-git-staging-unit="block-0"] button[data-git-staging-unit-menu]');
 			await page.keyboard.press("Enter");
 			await page.waitForSelector("[data-git-staging-unit-targets]", { visible: true });
+			// Mantine focuses the dropdown asynchronously. Wait for its focus and
+			// opening transition before explicitly testing Escape on the trigger.
+			await page.waitForFunction(() => {
+				const menu = document.querySelector("[data-git-staging-unit-targets]");
+				return menu?.contains(document.activeElement) && getComputedStyle(menu).opacity === "1";
+			});
 			await page.focus('[data-git-staging-unit="block-0"] button[data-git-staging-unit-menu]');
 			expect(
 				await page.evaluate(() => document.activeElement?.matches("[data-git-staging-unit-menu]")),

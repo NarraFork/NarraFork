@@ -400,6 +400,7 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
+import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
 import { recoverBlockStorage } from "./narrator-block-sync";
 import {
 	lastTargetElement,
@@ -425,6 +426,7 @@ import {
 	removeBufferedMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
+	withCurrentBufferedGuidance,
 } from "./narrator-buffer";
 import {
 	awaitCompactCompletion,
@@ -747,6 +749,8 @@ export async function executeQueuedNewCommand(
 					await resolveSubagentModelForRun(
 						sourceNarrator,
 						buffered.createdBy ?? sourceNarrator.ownerUserId,
+						undefined,
+						{ signal: active.abortController.signal },
 					)
 				).model
 			: (sourceNarrator.model ?? undefined);
@@ -1604,7 +1608,9 @@ async function createNarrator(
 	const stickyProvider = await lastServedProvider(narratorId);
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider)
+			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider, {
+					signal: abortController.signal,
+				})
 			: null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const narratorModel =
@@ -3668,7 +3674,15 @@ async function feedMessageUnlocked(
 		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "principal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	},
@@ -3852,6 +3866,10 @@ async function feedMessageUnlocked(
 		const deliverTo = await readSessionDeliverTo(narratorId);
 		recoveryStart?.check();
 		userMsg = (await persistClaimedUserInput({
+			recoveryGuard: {
+				narrator: internalOptions?.run?.recoveryObservation,
+				parentTurn: internalOptions?.run?.parentRecoveryTurn,
+			},
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
 			narratorId,
@@ -3882,7 +3900,7 @@ async function feedMessageUnlocked(
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		if (
-			recoveryStart &&
+			(recoveryStart || internalOptions?.run?.recoveryObservation) &&
 			acceptedInputId &&
 			!internalOptions?.bufferedId &&
 			!internalOptions?.bufferedRow
@@ -3915,16 +3933,16 @@ async function feedMessageUnlocked(
 
 		const narrator = await narratorService.getById(narratorId);
 		recoveryStart?.check();
-		await narratorService.updateStatus(
-			narratorId,
-			"working",
-			internalOptions?.preserveTurnStart
+		await narratorService.updateStatus(narratorId, "working", {
+			recoveryObservation: internalOptions?.run?.recoveryObservation,
+			parentRecoveryTurn: internalOptions?.run?.parentRecoveryTurn,
+			...(internalOptions?.preserveTurnStart
 				? {
 						turnStartedAt: active._turnStartedAt,
 						resumeTurn: true,
 					}
-				: { setTurnStart: true },
-		);
+				: { setTurnStart: true }),
+		});
 		recoveryStart?.check();
 		// The user message above is already persisted, so "first turn" means exactly one
 		// user message exists. `messageCount` cannot answer this any more — it now counts
@@ -6297,12 +6315,34 @@ export async function continueNarrator(
 	humanReplyContext?: ReplyContext,
 ): ReturnType<typeof continueNarratorUnlocked> {
 	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
-	return withNarratorStartAdmission(narratorId, () =>
-		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
-			run,
+	return withNarratorStartAdmission(narratorId, async () => {
+		let registered!: () => void;
+		const admitted = new Promise<void>((resolve) => {
+			registered = resolve;
+		});
+		const result = await continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
+			run: run?.recoveryObservation
+				? {
+						...run,
+						onRegistered: () => {
+							run.onRegistered?.();
+							registered();
+						},
+					}
+				: run,
 			humanReplyContext: frozenHumanReplyContext,
-		}),
-	);
+		});
+		if (run?.recoveryObservation && result.ok) {
+			if (!result.terminal) throw new Error("Recovery run did not expose its admission");
+			await Promise.race([
+				admitted,
+				result.terminal.then(() => {
+					throw new Error("Recovery run was not registered");
+				}),
+			]);
+		}
+		return result;
+	});
 }
 
 interface RecoveryContinuationStart {
@@ -6378,7 +6418,14 @@ async function continueNarratorUnlocked(
 		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	} = {},
@@ -6500,13 +6547,13 @@ async function continueNarratorUnlocked(
 	active._turnStartedAt = continueTiming.preserveTurnStart
 		? continueTiming.turnStartedAt
 		: new Date().toISOString();
-	await narratorService.updateStatus(
-		narratorId,
-		"working",
-		continueTiming.preserveTurnStart
+	await narratorService.updateStatus(narratorId, "working", {
+		recoveryObservation: run?.recoveryObservation,
+		parentRecoveryTurn: run?.parentRecoveryTurn,
+		...(continueTiming.preserveTurnStart
 			? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
-			: { setTurnStart: true },
-	);
+			: { setTurnStart: true }),
+	});
 
 	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
 	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
@@ -9424,22 +9471,24 @@ export async function failUnownedStartupRecovery(
  * the current tool call" messages. If the user cancels the queued message before
  * the boundary is reached, there is nothing left and the loop must keep running.
  */
-export function hasPendingBufferedWork(narratorId: string): boolean {
+export async function hasPendingBufferedWork(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres")
 		throw new Error(
 			"hasPendingBufferedWork is synchronous and cannot inspect the PostgreSQL mailbox; use getBufferedMessagesAsync",
 		);
-	return getBufferedMessages(narratorId).length > 0;
+	return (await getBufferedMessages(narratorId)).length > 0;
 }
 
 /** A queued next-step or failed input must never keep a guidance stop armed. */
-export function hasPendingBufferedGuidance(narratorId: string): boolean {
+export async function hasPendingBufferedGuidance(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres") {
 		// Updated after durable admission, queue mutations and consumption. The
 		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
 		return activeNarrators.get(narratorId)?._bufferGuidancePending === true;
 	}
-	return getBufferedMessages(narratorId).some(
+	return (await getBufferedMessages(narratorId)).some(
 		(message) =>
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
@@ -9489,6 +9538,7 @@ export function evaluateSoftStopRequest(flags: {
 }
 
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
@@ -9504,6 +9554,7 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
  * ending a run is an explicit Stop/cancel (`controlRun`).
  */
 export function requestUrgentBufferedGuidance(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) {
 		// No live turn: an in-flight planned-update recovery is the current activity.
@@ -9527,17 +9578,18 @@ export function urgentActivitySignal(active: ActiveNarrator, turnSignal: AbortSi
 	return AbortSignal.any([turnSignal, urgent.signal]);
 }
 
-export function applyBufferedQueueModeControl(
+export async function applyBufferedQueueModeControl(
 	narratorId: string,
 	mode: "turn" | "tool" | "interrupt",
 	hasPendingGuidance = true,
 	targetQueued = true,
-): void {
+): Promise<void> {
+	if (isBufferConsumptionHeld(narratorId)) hasPendingGuidance = targetQueued = false;
 	const active = activeNarrators.get(narratorId);
 	if (active) active._bufferGuidancePending = hasPendingGuidance;
 	if (!targetQueued) return;
 	if (mode === "turn") {
-		clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
 		return;
 	}
 	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
@@ -9561,23 +9613,111 @@ export function applyBufferedQueueModeControl(
  * `hasPendingBufferedWork` holds), and the stepping-in producer keeps its priority:
  * its own text still rides on the turn being started here.
  */
-export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
-	if (!active._bufferSoftStopTaken) return;
-	if (!hasPendingBufferedGuidance(active.narratorId)) return;
-	active._bufferSoftStopTaken = false;
-	active._bufferSoftStop = true;
+export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): Promise<void> {
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStopTaken) return;
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		if (active._bufferGuidancePending) {
+			active._bufferSoftStopTaken = false;
+			active._bufferSoftStop = true;
+		}
+		return;
+	}
+	await withCurrentBufferedGuidance(active.narratorId, (pending) => {
+		if (!active._bufferSoftStopTaken || !pending) return undefined;
+		active._bufferSoftStopTaken = false;
+		active._bufferSoftStop = true;
+		return undefined;
+	});
 }
 
-export function clearBufferedMessageSoftStopIfIdle(
+export async function abortPendingBufferedGuidance(active: ActiveNarrator): Promise<void> {
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStop) return;
+	const apply = (pending: boolean) => {
+		if (active._bufferSoftStop && pending)
+			active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
+		return undefined;
+	};
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		apply(active._bufferGuidancePending === true);
+		return;
+	}
+	await withCurrentBufferedGuidance(active.narratorId, apply);
+}
+
+export async function consumeBufferedSoftStopRequest(active: ActiveNarrator): Promise<boolean> {
+	const apply = (hasPending: boolean) => {
+		const decision = evaluateSoftStopRequest({
+			feedbackSoftStop: active._feedbackSoftStop,
+			bufferSoftStop: active._bufferSoftStop,
+			hasPendingBufferedWork: hasPending,
+		});
+		active._feedbackSoftStop = decision.feedbackSoftStop;
+		active._bufferSoftStop = decision.bufferSoftStop;
+		if (decision.softStopTaken) active._bufferSoftStopTaken = true;
+		return decision.stop;
+	};
+	if (
+		isBufferConsumptionHeld(active.narratorId) ||
+		active._feedbackSoftStop ||
+		!active._bufferSoftStop
+	)
+		return apply(false);
+	if (resolveRuntimeQueueBackend() === "postgres")
+		return apply(active._bufferGuidancePending === true);
+	return withCurrentBufferedGuidance(active.narratorId, apply);
+}
+
+export async function clearBufferedMessageSoftStopIfIdle(
 	narratorId: string,
 	pendingGuidance?: boolean,
-): void {
+): Promise<void> {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
-	const pending = pendingGuidance ?? hasPendingBufferedGuidance(narratorId);
-	active._bufferGuidancePending = pending;
-	if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
+	const apply = (pending: boolean) => {
+		active._bufferGuidancePending = pending;
+		if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
+	};
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		apply(
+			!isBufferConsumptionHeld(narratorId) &&
+				(pendingGuidance ?? active._bufferGuidancePending === true),
+		);
+		return;
+	}
+	await withCurrentBufferedGuidance(narratorId, (pending) => {
+		apply(pending);
+		return undefined;
+	});
 }
+
+// Edit holds only defer user input; they never cancel the current model/tool activity.
+// Re-read durable modes after release (including TTL expiry), then wake outside admission.
+bufferEditHolds.setListener(async (narratorId) => {
+	if (isBufferConsumptionHeld(narratorId)) {
+		const active = activeNarrators.get(narratorId);
+		if (active) {
+			active._bufferGuidancePending = false;
+			active._bufferSoftStop = false;
+		}
+		return;
+	}
+	await withNarratorStartAdmission(narratorId, async () => {
+		if (isBufferConsumptionHeld(narratorId)) return;
+		const remaining = (await getBufferedMessagesAsync(narratorId)).filter(
+			(message) => message.state !== "failed",
+		);
+		const modes = remaining.map((message) =>
+			resolveBufferQueueMode(message.queueMode, message.priority),
+		);
+		const mode = modes.includes("interrupt")
+			? "interrupt"
+			: modes.includes("tool")
+				? "tool"
+				: "turn";
+		await applyBufferedQueueModeControl(narratorId, mode, mode !== "turn", remaining.length > 0);
+	});
+	await wakeInboxIfEligible(narratorId);
+});
 
 // === Dynamic narrator controls ===
 

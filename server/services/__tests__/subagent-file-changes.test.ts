@@ -817,8 +817,8 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				await getCurrentSubagentFileChangeOptions(["sub-a"], "wrong-parent")
 			).executionBoundariesBySubagent?.get("sub-a"),
 		).toBeNull();
-		recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
-		recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1680,7 +1680,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 			["remote-a", WORKSPACE],
 			["remote-a", OTHER_WORKSPACE],
 		]) {
-			recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
+			await recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
 			await attribute({
 				narratorId: "sub-a",
 				filePath: "same.ts",
@@ -1689,7 +1689,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 				linesAdded: 1,
 			});
 		}
-		recordTeamFileChange(PARENT, "sub-a", "same.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "same.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1711,11 +1711,11 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		} = await import("../subagent-team");
 		clearTeamFileChanges(PARENT);
 		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
-		recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
+		await recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
-		recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
 		expect(getTeamFileChanges(PARENT).has("ordinary-fork")).toBe(false);
 		expect(getTeamFileChangeEntries(PARENT).get("sub-a")?.[0]).toEqual({
 			deviceId: null,
@@ -1737,7 +1737,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 
 		// One change, recorded the way `trackFileChange` records it: the in-memory team
 		// map AND an attribution row.
-		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1774,7 +1774,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		clearTeamFileChanges(PARENT);
 		clearTeamFileChanges("other-parent");
 
-		recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
+		await recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
 		expect(getTeamFileChanges(PARENT).size).toBe(0);
 		expect((await getSubagentFileChanges(PARENT)).totalFiles).toBe(0);
 

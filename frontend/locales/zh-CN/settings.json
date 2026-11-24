@@ -1481,6 +1481,7 @@
 	"addProviderSearch": "搜索",
 	"addProviderSearchPlaceholder": "搜索供应商",
 	"addProviderCustom": "自定义",
+	"addProviderCatalogLoadFailed": "供应商预设加载失败",
 	"addProviderNoResults": "无匹配结果",
 	"addProviderAttribution": "预设来自 Cherry Studio（MIT），详见开源协议。",
 	"addProviderConfigure": "配置",

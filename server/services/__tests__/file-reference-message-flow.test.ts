@@ -281,10 +281,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		return active;
 	}
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		sqlite.exec("DELETE FROM saved_messages");
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
+		await buffer.clearBufferedMessages("child");
 		frames.length = 0;
 		failPersist = false;
 		suppressLoop = false;
@@ -304,7 +304,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	});
 	afterAll(async () => {
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
+		await buffer.clearBufferedMessages("child");
 		await disposeWorkerDb();
 	});
 

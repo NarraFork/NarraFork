@@ -1,15 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildLicenseManifestFromDisk } from "../../../server/lib/licenses/manifest";
-import enSettings from "../../locales/en/settings.json";
-import zhSettings from "../../locales/zh-CN/settings.json";
-import {
-	getProviderPresetName,
-	PROVIDER_PRESETS,
-	type ProviderPreset,
-	searchProviderPresets,
-} from "./provider-presets";
+import { buildLicenseManifestFromDisk } from "../licenses/manifest";
+import { getSourcingCatalog } from "./presets";
+import { getServiceTemplate } from "./templates";
+
+const PROVIDER_PRESETS = getSourcingCatalog().presets;
 
 const root = join(import.meta.dir, "../../..");
 const commit = "4edb3b85630469e1a784577ec47540cb646d9781";
@@ -44,8 +40,11 @@ describe("provider presets", () => {
 			"completions-compatible",
 			"gemini-compatible",
 		]);
-		for (const entry of PROVIDER_PRESETS) {
-			for (const [protocol, value] of Object.entries(entry.endpoints)) {
+		for (const set of PROVIDER_PRESETS.flatMap((entry) => [
+			entry.endpoints,
+			...(entry.connections ?? []).map((connection) => connection.endpoints),
+		])) {
+			for (const [protocol, value] of Object.entries(set)) {
 				expect(supported.has(protocol)).toBe(true);
 				const url = new URL(value);
 				expect(["http:", "https:"]).toContain(url.protocol);
@@ -134,107 +133,34 @@ describe("provider presets", () => {
 			"https://api.moonshot.cn/anthropic/v1",
 		);
 	});
-});
 
-describe("localized preset names", () => {
-	for (const [locale, names] of [
-		["en", enSettings.providerNames],
-		["zh-CN", zhSettings.providerNames],
-	] as const) {
-		test(`${locale} translates every built-in provider name`, () => {
-			expect(Object.keys(names).sort()).toEqual(PROVIDER_PRESETS.map((entry) => entry.id).sort());
-			const translate = (key: string) =>
-				names[key.slice("providerNames.".length) as keyof typeof names];
-			for (const entry of PROVIDER_PRESETS) {
-				expect(entry.nameKey).toBe(`providerNames.${entry.id}`);
-				expect(getProviderPresetName(entry, translate)).toBe(names[entry.id as keyof typeof names]);
-				expect(getProviderPresetName(entry, translate).trim()).not.toBe("");
+	test("known services take their endpoints from the service template", () => {
+		for (const [id, templateId] of [
+			["deepseek", "deepseek"],
+			["openai", "openai"],
+			["anthropic", "anthropic"],
+			["gemini", "gemini"],
+			["opencode", "opencode-go"],
+		] as const) {
+			expect(endpoints(id)).toEqual({ ...getServiceTemplate(templateId).endpoints });
+		}
+		const kimi = PROVIDER_PRESETS.find((entry) => entry.id === "moonshot")?.connections;
+		for (const region of ["china", "international"] as const) {
+			expect(
+				kimi?.find((entry) => entry.region === region && entry.billing === "token-plan")?.endpoints,
+			).toEqual({ ...getServiceTemplate("kimi-code").regions?.[region] });
+		}
+	});
+
+	test("every variant is a valid creation target", () => {
+		for (const entry of PROVIDER_PRESETS) {
+			for (const connection of entry.connections ?? []) {
+				expect(connection.endpoints[connection.defaultProtocol]).toBeTruthy();
+				expect(connection.userAgentMode).toBe(
+					connection.billing === "token-plan" ? "narrafork" : undefined,
+				);
 			}
-		});
-	}
-
-	test("custom names without a translation key bypass translation", () => {
-		const custom: ProviderPreset = {
-			id: "custom",
-			name: "My custom gateway",
-			endpoints: {},
-			defaultProtocol: "completions-compatible",
-		};
-		expect(
-			getProviderPresetName(custom, () => {
-				throw new Error("Custom names must not be translated");
-			}),
-		).toBe("My custom gateway");
-	});
-});
-
-describe("preset search", () => {
-	test("localized names participate in search while raw names remain searchable", () => {
-		const names = zhSettings.providerNames;
-		const translate = (key: string) =>
-			names[key.slice("providerNames.".length) as keyof typeof names];
-		expect(searchProviderPresets("天翼云息壤")).toEqual([]);
-		expect(searchProviderPresets("天翼云息壤", translate).map((entry) => entry.id)).toEqual([
-			"xirang",
-		]);
-		expect(searchProviderPresets("腾讯TokenHub", translate).map((entry) => entry.id)).toEqual([
-			"tokenhub",
-		]);
-		expect(searchProviderPresets("Xirang", translate).map((entry) => entry.id)).toEqual(["xirang"]);
-		expect(searchProviderPresets("", translate)).toEqual(PROVIDER_PRESETS);
-		const uniqueName = (key: string) => (key === "providerNames.openai" ? "LOCALIZED BRAND" : key);
-		expect(searchProviderPresets("localized brand", uniqueName).map((entry) => entry.id)).toEqual([
-			"openai",
-		]);
-	});
-	test("empty or whitespace returns the full list without sharing the array", () => {
-		for (const query of ["", " \t\n "]) {
-			expect(searchProviderPresets(query)).toEqual(PROVIDER_PRESETS);
-			expect(searchProviderPresets(query)).not.toBe(PROVIDER_PRESETS);
 		}
-	});
-
-	test("searches id, name, URL and protocol case-insensitively", () => {
-		expect(searchProviderPresets("  OPENAI  ").map((entry) => entry.id)).toContain("openai");
-		expect(searchProviderPresets("hugging face").map((entry) => entry.id)).toEqual(["huggingface"]);
-		expect(searchProviderPresets("api.minimax.io").map((entry) => entry.id)).toEqual([
-			"minimax-global",
-		]);
-		expect(searchProviderPresets("radeon-cloud").map((entry) => entry.id)).toEqual([
-			"radeon-cloud",
-		]);
-		expect(searchProviderPresets("gemini-compatible").map((entry) => entry.id)).toEqual(["gemini"]);
-	});
-
-	test("Chinese and English local aliases match without changing original display names", () => {
-		const examples: Array<[string, string]> = [
-			["硅基流动", "silicon"],
-			["SiliconFlow", "silicon"],
-			["智谱", "zhipu"],
-			["深度求索", "deepseek"],
-			["通义", "dashscope"],
-			["百炼", "dashscope"],
-			["豆包", "doubao"],
-			["月之暗面", "moonshot"],
-			["阶跃", "stepfun"],
-			["英伟达", "nvidia"],
-			["魔搭", "modelscope"],
-			["千帆", "baidu-cloud"],
-		];
-		for (const [query, id] of examples) {
-			expect(searchProviderPresets(query).map((entry) => entry.id)).toContain(id);
-		}
-		expect(searchProviderPresets("月之暗面 .ai").map((entry) => entry.id)).toEqual([
-			"moonshot-global",
-		]);
-		expect(searchProviderPresets("硅基流动")[0]?.name).toBe("Silicon");
-	});
-
-	test("all terms must match and search does not reorder or mutate the catalog", () => {
-		const ids = PROVIDER_PRESETS.map((entry) => entry.id);
-		expect(searchProviderPresets("moonshot .cn").map((entry) => entry.id)).toEqual(["moonshot"]);
-		expect(searchProviderPresets("no-such-provider")).toEqual([]);
-		expect(PROVIDER_PRESETS.map((entry) => entry.id)).toEqual(ids);
 	});
 });
 
@@ -248,7 +174,7 @@ describe("provider registry MIT disclosure", () => {
 		expect(entry?.license).toBe("MIT");
 		expect(entry?.author).toBe("Cherry Studio");
 		expect(entry?.version).toContain(commit);
-		expect(entry?.distributedVia).toContain("provider-presets.ts");
+		expect(entry?.distributedVia).toContain("server/lib/sourcing/presets.ts");
 		const text = manifest.texts[entry?.textId ?? ""];
 		expect(text).toContain(commit);
 		expect(text).toContain("packages/provider-registry/data/providers.json");

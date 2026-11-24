@@ -24,6 +24,7 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { users as pgUsers } from "../db/postgres-schema";
 import { narratorBufferedMessages as mailbox, narrators, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
@@ -42,6 +43,7 @@ import type { ImageRef } from "../lib/uploads";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxRow } from "./agent-runtime/mailbox-types";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	getRuntimeQueuePort,
 	type RuntimeBufferedDeliveryReceipt,
@@ -49,6 +51,7 @@ import {
 	type RuntimeMailboxStagingLookup,
 	type RuntimeQueuePort,
 } from "./agent-runtime/runtime-queue-port";
+import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
 import {
 	activeNarrators,
 	type BufferCreator,
@@ -65,6 +68,59 @@ const STAGING_RECONCILE_ATTEMPTS = 3;
 const STAGING_RECONCILE_DELAYS_MS = [0, 25, 100] as const;
 const store = createMailboxStore(db);
 const pending = ["queued", "failed"] as const;
+
+export interface BufferReadOptions {
+	signal?: AbortSignal;
+	deadlineAt?: number;
+	timeoutMs?: number;
+}
+function bufferReadOptions(options: BufferReadOptions = {}) {
+	return {
+		executionPolicy: "worker-required" as const,
+		signal: options.signal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: Math.min(options.timeoutMs ?? 30_000, 30_000),
+	};
+}
+type BufferTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type BufferObservation = Pick<
+	RuntimeMailboxRow,
+	| "id"
+	| "narratorId"
+	| "kind"
+	| "state"
+	| "deliveryId"
+	| "contentRevision"
+	| "metadataJson"
+	| "textFilePathsJson"
+>;
+function assertBufferObservation(tx: BufferTx, row: BufferObservation | undefined, id: string) {
+	const current = tx
+		.select({
+			id: mailbox.id,
+			narratorId: mailbox.narratorId,
+			kind: mailbox.kind,
+			state: mailbox.state,
+			deliveryId: mailbox.deliveryId,
+			contentRevision: mailbox.contentRevision,
+			metadataJson: mailbox.metadataJson,
+			textFilePathsJson: mailbox.textFilePathsJson,
+		})
+		.from(mailbox)
+		.where(eq(mailbox.id, id))
+		.get();
+	const fields = [
+		"id",
+		"narratorId",
+		"kind",
+		"state",
+		"deliveryId",
+		"contentRevision",
+		"metadataJson",
+		"textFilePathsJson",
+	] as const;
+	if (fields.some((key) => current?.[key] !== row?.[key])) throw new RuntimeReadConflictError();
+}
 
 /** Runtime callers can carry extra fields; only portable references enter the queue. */
 function copyMediaRef(item: MediaRef, fallbackNarratorId?: string): MediaRef {
@@ -354,11 +410,11 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const write = Promise.resolve()
 		.then(() => Bun.write(path, value))
-		.finally(() => {
+		.finally(async () => {
 			release();
 			if (expired) {
-				deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
-				cleanupBufferedTextFiles(basename(dirname(path)));
+				await deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
+				await cleanupBufferedTextFiles(basename(dirname(path)));
 			}
 		});
 	trackBufferedPreparation(write);
@@ -401,21 +457,30 @@ function ownedPath(path: string): boolean {
 function json<T>(value: string | null, fallback: T): T {
 	return value ? JSON.parse(value) : fallback;
 }
-function rowById(id: string): MailboxRow | undefined {
-	return db.select().from(mailbox).where(eq(mailbox.id, id)).get();
+function rowById(id: string, options?: BufferReadOptions): Promise<MailboxRow | undefined> {
+	return readQueryFirst(
+		db.select().from(mailbox).where(eq(mailbox.id, id)).limit(1),
+		bufferReadOptions(options),
+	);
 }
-/** Cleanup needs only the ownership fields, never the buffered payload. */
-function stagingOwnerById(id: string) {
-	return db
-		.select({
-			id: mailbox.id,
-			kind: mailbox.kind,
-			state: mailbox.state,
-			metadataJson: mailbox.metadataJson,
-		})
-		.from(mailbox)
-		.where(eq(mailbox.id, id))
-		.get();
+function stagingOwnerById(id: string): Promise<BufferObservation | undefined> {
+	return readQueryFirst(
+		db
+			.select({
+				id: mailbox.id,
+				narratorId: mailbox.narratorId,
+				kind: mailbox.kind,
+				state: mailbox.state,
+				deliveryId: mailbox.deliveryId,
+				contentRevision: mailbox.contentRevision,
+				metadataJson: mailbox.metadataJson,
+				textFilePathsJson: mailbox.textFilePathsJson,
+			})
+			.from(mailbox)
+			.where(eq(mailbox.id, id))
+			.limit(1),
+		bufferReadOptions(),
+	);
 }
 function writeStagingOwnerMarker(stagingId: string, rowId: string | null): void {
 	const dir = stagingPath(stagingId);
@@ -537,14 +602,22 @@ async function persistBufferedTextFilesUntracked(
 		}
 		return saved;
 	} catch (error) {
-		for (const file of saved) deleteBufferedTextFile(file);
+		for (const file of saved) await deleteBufferedTextFile(file);
 		throw error;
 	}
 }
 /** Only clean a known, unreferenced mailbox staging directory, never uploads/history. */
-export function cleanupBufferedTextFiles(id: string): void {
-	assertSqliteBufferRead("cleanupBufferedTextFiles");
-	const row = stagingOwnerById(id);
+export function cleanupBufferedTextFiles(id: string): Promise<void> {
+	return trackBufferedCleanup(async () => {
+		assertSqliteBufferRead("cleanupBufferedTextFiles");
+		const row = await stagingOwnerById(id);
+		await cleanupObservedBufferedTextFiles(id, row);
+	});
+}
+async function cleanupObservedBufferedTextFiles(
+	id: string,
+	row: BufferObservation | undefined,
+): Promise<void> {
 	const stagingId = row
 		? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
 		: id;
@@ -570,9 +643,13 @@ export function cleanupBufferedTextFiles(id: string): void {
 	}
 	// A null marker without a row-id match is unknown ownership, not an orphan.
 	if (stagingPending && !row) return;
-	const owner = ownerId ? stagingOwnerById(ownerId) : undefined;
+	const owner = ownerId === id ? row : ownerId ? await stagingOwnerById(ownerId) : undefined;
 	if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
-	rmSync(path, { recursive: true, force: true });
+	db.transaction((tx) => {
+		assertBufferObservation(tx, row, id);
+		if (ownerId) assertBufferObservation(tx, owner, ownerId);
+		rmSync(path, { recursive: true, force: true });
+	});
 }
 /** Backend-neutral asynchronous cleanup used after mailbox consumption. */
 export function cleanupBufferedTextFilesAsync(id: string): Promise<void> {
@@ -585,48 +662,56 @@ async function cleanupBufferedTextFilesUntracked(id: string): Promise<void> {
 		await cleanupStagingPg(port, id);
 		return;
 	}
-	cleanupBufferedTextFiles(id);
+	await cleanupBufferedTextFiles(id);
 }
-export function persistAdditionalBufferedTextFiles(
+export async function persistAdditionalBufferedTextFiles(
 	messageId: string,
 	files: File[],
 	reserved: Iterable<string>,
 ): Promise<SavedBufferedFile[]> {
 	assertSqliteBufferRead("persistAdditionalBufferedTextFiles");
-	const row = rowById(messageId);
+	const row = await rowById(messageId);
 	if (!row || row.kind !== "user_input" || !pending.includes(row.state as "queued" | "failed"))
 		throw new Error("Buffered message is no longer editable");
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
 	if (files.length) {
-		mkdirSync(stagingPath(id), { recursive: true });
-		writeStagingOwnerMarker(id, row.id);
+		db.transaction((tx) => {
+			assertBufferObservation(tx, row, row.id);
+			mkdirSync(stagingPath(id), { recursive: true });
+			writeStagingOwnerMarker(id, row.id);
+		});
 	}
 	return persistBufferedTextFiles(id, files, reserved);
 }
-export function deleteBufferedTextFile(saved: SavedBufferedFile): void {
-	assertSqliteBufferRead("deleteBufferedTextFile");
-	if (!ownedPath(saved.path)) return;
-	const marker = join(dirname(saved.path), STAGING_OWNER_FILE);
-	let ownerId: string | null = basename(dirname(saved.path));
-	if (!existsSync(marker) && !rowById(ownerId)) return;
-	if (existsSync(marker)) {
-		if (!ownedPath(marker) || statSync(marker).size > 1024) return;
-		try {
-			ownerId = JSON.parse(readFileSync(marker, "utf8")).rowId ?? ownerId;
-		} catch {
-			return;
+export function deleteBufferedTextFile(saved: SavedBufferedFile): Promise<void> {
+	return trackBufferedCleanup(async () => {
+		assertSqliteBufferRead("deleteBufferedTextFile");
+		if (!ownedPath(saved.path)) return;
+		const marker = join(dirname(saved.path), STAGING_OWNER_FILE);
+		let ownerId: string | null = basename(dirname(saved.path));
+		if (!existsSync(marker) && !(await stagingOwnerById(ownerId))) return;
+		if (existsSync(marker)) {
+			if (!ownedPath(marker) || statSync(marker).size > 1024) return;
+			try {
+				ownerId = JSON.parse(readFileSync(marker, "utf8")).rowId ?? ownerId;
+			} catch {
+				return;
+			}
+			if (ownerId !== null && typeof ownerId !== "string") return;
 		}
-		if (ownerId !== null && typeof ownerId !== "string") return;
-	}
-	const owner = ownerId ? rowById(ownerId) : undefined;
-	if (
-		owner &&
-		json<SavedBufferedFile[]>(owner.textFilePathsJson, []).some(
-			(file) => resolve(file.path) === resolve(saved.path),
+		const owner = ownerId ? await stagingOwnerById(ownerId) : undefined;
+		if (
+			owner &&
+			json<SavedBufferedFile[]>(owner.textFilePathsJson, []).some(
+				(file) => resolve(file.path) === resolve(saved.path),
+			)
 		)
-	)
-		return;
-	rmSync(saved.path, { force: true });
+			return;
+		db.transaction((tx) => {
+			if (ownerId) assertBufferObservation(tx, owner, ownerId);
+			rmSync(saved.path, { force: true });
+		});
+	});
 }
 export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 	return saved.flatMap((s) => {
@@ -711,30 +796,73 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 			: {}),
 	};
 }
-export function getBufferedMessages(narratorId: string): BufferedMessage[] {
-	assertSqliteBufferRead("getBufferedMessages");
-	return db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
-		)
-		.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-		.limit(MAILBOX_LIMITS.userPending)
-		.all()
-		.map(projectMailboxUserMessage);
+export function getBufferedMessages(
+	narratorId: string,
+	options?: BufferReadOptions,
+): Promise<BufferedMessage[]> {
+	return getBufferedMessagesAsync(narratorId, options);
+}
+
+/** The callback must not suspend between validation and its dependent decision. */
+export async function withCurrentBufferedGuidance<T extends boolean | undefined>(
+	narratorId: string,
+	apply: (pending: boolean) => T,
+): Promise<T> {
+	if (isBufferConsumptionHeld(narratorId)) return apply(false);
+	assertSqliteBufferRead("withCurrentBufferedGuidance");
+	const columns = {
+		id: mailbox.id,
+		state: mailbox.state,
+		revision: mailbox.contentRevision,
+		priority: mailbox.priority,
+		seq: mailbox.seq,
+		arrivalSeq: mailbox.arrivalSeq,
+		metadataJson: mailbox.metadataJson,
+	};
+	const filter = and(
+		eq(mailbox.narratorId, narratorId),
+		eq(mailbox.kind, "user_input"),
+		inArray(mailbox.state, pending),
+	);
+	const rows = await readQuery(
+		db
+			.select(columns)
+			.from(mailbox)
+			.where(filter)
+			.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+			.limit(MAILBOX_LIMITS.userPending),
+		bufferReadOptions(),
+	);
+	const hasGuidance = (snapshot: typeof rows) =>
+		snapshot.some(
+			(row) =>
+				row.state !== "failed" &&
+				resolveBufferQueueMode(
+					json<{ queueMode?: BufferQueueMode }>(row.metadataJson, {}).queueMode,
+					row.priority,
+				) !== "turn",
+		);
+	const pendingGuidance = hasGuidance(rows);
+	return db.transaction((tx) => {
+		const current = tx
+			.select(columns)
+			.from(mailbox)
+			.where(filter)
+			.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+			.limit(MAILBOX_LIMITS.userPending)
+			.all();
+		if (hasGuidance(current) !== pendingGuidance) throw new RuntimeReadConflictError();
+		return apply(!isBufferConsumptionHeld(narratorId) && pendingGuidance);
+	});
 }
 
 /** Public user identity only; never read credentials or infer an author from a narrator owner. */
-async function loadBufferCreators(createdBy: readonly string[]): Promise<BufferCreator[]> {
+async function loadBufferCreators(
+	createdBy: readonly string[],
+	options?: BufferReadOptions,
+): Promise<BufferCreator[]> {
 	const ids = [...new Set(createdBy)].slice(0, MAILBOX_LIMITS.userPending);
 	if (!ids.length) return [];
-	// The SQLite db is a fail-closed proxy on PG. Use the already-started canonical
-	// runtime directly, with its PG schema, rather than probing the SQLite handle.
 	const { postgresRuntime } = await import("../db");
 	if (postgresRuntime) {
 		return await postgresRuntime.client.db
@@ -748,20 +876,25 @@ async function loadBufferCreators(createdBy: readonly string[]): Promise<BufferC
 			.where(inArray(pgUsers.id, ids))
 			.limit(ids.length);
 	}
-	return await db
-		.select({
-			id: users.id,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(users)
-		.where(inArray(users.id, ids))
-		.limit(ids.length);
+	return readQuery(
+		db
+			.select({
+				id: users.id,
+				username: users.username,
+				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
+			})
+			.from(users)
+			.where(inArray(users.id, ids))
+			.limit(ids.length),
+		bufferReadOptions(options),
+	);
 }
 
-/** Backend-neutral async projection used by production callers on both SQLite and PG. */
-export async function getBufferedMessagesAsync(narratorId: string): Promise<BufferedMessage[]> {
+export async function getBufferedMessagesAsync(
+	narratorId: string,
+	options?: BufferReadOptions,
+): Promise<BufferedMessage[]> {
 	const port = pgQueue();
 	const rows = port
 		? await port.mailbox.listPending(narratorId, {
@@ -769,25 +902,27 @@ export async function getBufferedMessagesAsync(narratorId: string): Promise<Buff
 				includeFailed: true,
 				limit: MAILBOX_LIMITS.userPending,
 			})
-		: db
-				.select()
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						eq(mailbox.kind, "user_input"),
-						inArray(mailbox.state, pending),
-					),
-				)
-				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-				.limit(MAILBOX_LIMITS.userPending)
-				.all();
+		: await readQuery(
+				db
+					.select()
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							inArray(mailbox.state, pending),
+						),
+					)
+					.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+					.limit(MAILBOX_LIMITS.userPending),
+				bufferReadOptions(options),
+			);
 	const messages = rows.map(projectMailboxUserMessage);
 	const missingAuthors = messages.flatMap((message) =>
 		!message.creator && message.createdBy ? [message.createdBy] : [],
 	);
 	const creators = new Map(
-		(await loadBufferCreators(missingAuthors)).map((creator) => [creator.id, creator]),
+		(await loadBufferCreators(missingAuthors, options)).map((creator) => [creator.id, creator]),
 	);
 	for (const message of messages) {
 		if (!message.creator && message.createdBy)
@@ -1000,6 +1135,7 @@ export async function enqueueBufferedMessage(
 	}
 }
 export interface BufferedMessageAttachmentUpdate {
+	signal?: AbortSignal;
 	composerDocument?: ComposerDocument;
 	images?: ImageRef[];
 	media?: MediaRef[];
@@ -1007,14 +1143,62 @@ export interface BufferedMessageAttachmentUpdate {
 	savedFiles?: SavedBufferedFile[];
 	fileReferences?: FileReferenceSnapshot[];
 }
-export async function updateBufferedMessage(
+export async function beginBufferedMessageEdit(
+	narratorId: string,
+	messageId: string,
+	userId: string,
+	token: string,
+	expectedRevision?: number,
+) {
+	return bufferEditHolds.begin(
+		narratorId,
+		{ messageId, userId, token },
+		() => readBufferedMessageEditRevision(narratorId, messageId),
+		expectedRevision,
+	);
+}
+async function readBufferedMessageEditRevision(
+	narratorId: string,
+	messageId: string,
+): Promise<number | undefined> {
+	const row = await rowByIdRuntime(messageId);
+	if (
+		!row ||
+		row.narratorId !== narratorId ||
+		row.kind !== "user_input" ||
+		!pending.includes(row.state as "queued" | "failed")
+	)
+		return undefined;
+	return row.contentRevision;
+}
+export async function canEditBufferedMessage(
+	narratorId: string,
+	messageId: string,
+): Promise<boolean> {
+	const revision = await readBufferedMessageEditRevision(narratorId, messageId);
+	if (revision === undefined) return false;
+	bufferEditHolds.assertMutationRevision(revision);
+	return true;
+}
+
+export function updateBufferedMessage(
+	narratorId: string,
+	messageId: string,
+	text: string,
+	opts: BufferedMessageAttachmentUpdate = {},
+): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		updateBufferedMessageUnlocked(narratorId, messageId, text, opts),
+	);
+}
+async function updateBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 	text: string,
 	opts: BufferedMessageAttachmentUpdate = {},
 ): Promise<boolean> {
 	const port = pgQueue();
-	const row = port ? await port.mailbox.getById(messageId) : rowById(messageId);
+	const row = port ? await port.mailbox.getById(messageId) : await rowById(messageId);
 	if (
 		!row ||
 		row.narratorId !== narratorId ||
@@ -1022,6 +1206,7 @@ export async function updateBufferedMessage(
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return false;
+	bufferEditHolds.assertMutationRevision(row.contentRevision);
 	const current = projectMailboxUserMessage(row);
 	opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
 	validateComposerProjection(
@@ -1130,6 +1315,8 @@ export async function updateBufferedMessage(
 			MAILBOX_LIMITS.metadataBytes
 		)
 			throw new Error("Attachment metadata exceeds mailbox budget");
+		opts.signal?.throwIfAborted();
+		bufferEditHolds.mutationSignal()?.throwIfAborted();
 		const ok = port
 			? await port.mailbox.updateUserBuffered(
 					messageId,
@@ -1147,6 +1334,7 @@ export async function updateBufferedMessage(
 					row.contentRevision,
 				)
 			: db.transaction((tx) => {
+					assertBufferObservation(tx, row, messageId);
 					const changed =
 						tx
 							.update(mailbox)
@@ -1184,8 +1372,7 @@ export async function updateBufferedMessage(
 				JSON.stringify({ rowId: row.id }),
 			);
 		if (!ok) {
-			for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
-			return false;
+			throw new RuntimeReadConflictError();
 		}
 		const oldBody = json<{ path: string } | null>(row.payloadRefJson, null);
 		if (oldBody) superseded.push(oldBody.path);
@@ -1196,7 +1383,12 @@ export async function updateBufferedMessage(
 		throw error;
 	}
 }
-export async function removeBufferedMessage(
+export function removeBufferedMessage(narratorId: string, messageId: string): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		removeBufferedMessageUnlocked(narratorId, messageId),
+	);
+}
+async function removeBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<boolean> {
@@ -1214,12 +1406,17 @@ export async function removeBufferedMessage(
 		return true;
 	}
 	store.initializeLegacy(narratorId);
-	const row = rowById(messageId);
+	const row = await rowById(messageId);
 	if (!row || row.narratorId !== narratorId || row.kind !== "user_input" || !row.deliveryId)
 		return false;
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
-	if (!store.cancel(row.deliveryId, "Removed by user")) return false;
-	cleanupBufferedTextFiles(id);
+	const deliveryId = row.deliveryId;
+	const cancelled = db.transaction((tx) => {
+		assertBufferObservation(tx, row, row.id);
+		return store.cancel(deliveryId, "Removed by user");
+	});
+	if (!cancelled) return false;
+	await cleanupBufferedTextFiles(id);
 	return true;
 }
 export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
@@ -1227,26 +1424,29 @@ export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
 export async function readBufferedMessageDeliveryReceipt(
 	narratorId: string,
 	messageId: string,
+	options?: BufferReadOptions,
 ): Promise<RuntimeBufferedDeliveryReceipt | undefined> {
 	const port = pgQueue();
 	if (port) return port.mailbox.readUserBufferedDeliveryReceipt(narratorId, messageId);
-	return db
-		.select({
-			id: mailbox.id,
-			state: mailbox.state,
-			recipientMessageId: mailbox.recipientMessageId,
-			lastError: mailbox.lastError,
-		})
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.id, messageId),
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-			),
-		)
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select({
+				id: mailbox.id,
+				state: mailbox.state,
+				recipientMessageId: mailbox.recipientMessageId,
+				lastError: mailbox.lastError,
+			})
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.id, messageId),
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+				),
+			)
+			.limit(1),
+		bufferReadOptions(options),
+	);
 }
 
 /** Wait OUTSIDE mutation admission. A busy wake is not a delivery acknowledgement. */
@@ -1295,7 +1495,12 @@ export async function waitForBufferedMessageDelivery(
 			});
 		while (true) {
 			if (signal.aborted) throw cancellation();
-			const receipt = await bounded(readBufferedMessageDeliveryReceipt(narratorId, messageId));
+			const receipt = await bounded(
+				readBufferedMessageDeliveryReceipt(narratorId, messageId, {
+					signal,
+					deadlineAt: startedAt + timeoutMs,
+				}),
+			);
 			if (!receipt)
 				throw new AppError("Buffered input no longer exists", 409, "BUFFER_DELIVERY_MISSING");
 			if (receipt.state === "materialized" && receipt.recipientMessageId) {
@@ -1330,7 +1535,16 @@ export async function waitForBufferedMessageDelivery(
 	}
 }
 
-export async function updateBufferedMessageMode(
+export function updateBufferedMessageMode(
+	narratorId: string,
+	messageId: string,
+	mode: BufferQueueMode,
+): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		updateBufferedMessageModeUnlocked(narratorId, messageId, mode),
+	);
+}
+async function updateBufferedMessageModeUnlocked(
 	narratorId: string,
 	messageId: string,
 	mode: BufferQueueMode,
@@ -1373,7 +1587,15 @@ export async function updateBufferedMessageMode(
 	});
 }
 
-export async function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+export function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, undefined, () =>
+		reorderBufferedMessagesUnlocked(narratorId, ids),
+	);
+}
+async function reorderBufferedMessagesUnlocked(
+	narratorId: string,
+	ids: string[],
+): Promise<boolean> {
 	const port = pgQueue();
 	if (port) return port.mailbox.reorderUserPending(narratorId, ids);
 	return db.transaction((tx) => {
@@ -1396,7 +1618,23 @@ export async function reorderBufferedMessages(narratorId: string, ids: string[])
 		return true;
 	});
 }
-export async function clearBufferedMessages(narratorId: string): Promise<void> {
+const BUFFER_CLEAR_CLEANUP_PENDING = "Removed by user; attachment cleanup pending";
+/** Authorization loss must cancel/settle in-flight edits, not fail on their UI hold. */
+export function clearBufferedMessagesForAuthorizationLoss(
+	narratorId: string,
+	stop: () => void | Promise<void>,
+): Promise<void> {
+	return bufferEditHolds.quiesceForAuthorizationLoss(narratorId, stop, () =>
+		clearBufferedMessagesUnlocked(narratorId),
+	);
+}
+
+export function clearBufferedMessages(narratorId: string): Promise<void> {
+	return bufferEditHolds.mutate(narratorId, undefined, () =>
+		clearBufferedMessagesUnlocked(narratorId),
+	);
+}
+async function clearBufferedMessagesUnlocked(narratorId: string): Promise<void> {
 	const port = pgQueue();
 	if (port) {
 		await port.mailbox.initializeLegacy(narratorId);
@@ -1409,22 +1647,99 @@ export async function clearBufferedMessages(narratorId: string): Promise<void> {
 		return;
 	}
 	store.initializeLegacy(narratorId);
-	const rows = db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
-		)
-		.limit(MAILBOX_LIMITS.userPending)
-		.all();
-	for (const row of rows) await removeBufferedMessage(narratorId, row.id);
+	const rows = await readQuery(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+					inArray(mailbox.state, pending),
+				),
+			)
+			.limit(MAILBOX_LIMITS.userPending),
+		bufferReadOptions(),
+	);
+	db.transaction((tx) => {
+		for (const row of rows) {
+			assertBufferObservation(tx, row, row.id);
+			if (row.deliveryId && store.cancel(row.deliveryId, BUFFER_CLEAR_CLEANUP_PENDING)) {
+				tx.update(mailbox)
+					.set({
+						dedupeExpiresAt: null,
+						metadataJson: JSON.stringify({
+							stagingId: json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id,
+							cleanupDedupeExpiresAt: row.dedupeExpiresAt,
+						}),
+					})
+					.where(eq(mailbox.id, row.id))
+					.run();
+			}
+		}
+	});
+	for (;;) {
+		const cleanupRows = await readQuery(
+			db
+				.select({
+					id: mailbox.id,
+					narratorId: mailbox.narratorId,
+					kind: mailbox.kind,
+					state: mailbox.state,
+					deliveryId: mailbox.deliveryId,
+					contentRevision: mailbox.contentRevision,
+					metadataJson: mailbox.metadataJson,
+					textFilePathsJson: mailbox.textFilePathsJson,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+						eq(mailbox.state, "cancelled"),
+						eq(mailbox.lastError, BUFFER_CLEAR_CLEANUP_PENDING),
+					),
+				)
+				.limit(MAILBOX_LIMITS.userPending),
+			bufferReadOptions(),
+		);
+		if (!cleanupRows.length) return;
+		for (let offset = 0; offset < cleanupRows.length; offset += 4) {
+			const results = await Promise.allSettled(
+				cleanupRows.slice(offset, offset + 4).map((row) =>
+					trackBufferedCleanup(async () => {
+						if (!row.metadataJson) throw new RuntimeReadConflictError();
+						const metadata = json<{ cleanupDedupeExpiresAt?: string | null }>(row.metadataJson, {});
+						await cleanupObservedBufferedTextFiles(row.id, row);
+						db.update(mailbox)
+							.set({
+								metadataJson: null,
+								lastError: "Removed by user",
+								dedupeExpiresAt: metadata.cleanupDedupeExpiresAt ?? null,
+							})
+							.where(
+								and(
+									eq(mailbox.id, row.id),
+									eq(mailbox.state, "cancelled"),
+									eq(mailbox.lastError, BUFFER_CLEAR_CLEANUP_PENDING),
+									eq(mailbox.metadataJson, row.metadataJson),
+								),
+							)
+							.run();
+					}),
+				),
+			);
+			for (const result of results) if (result.status === "rejected") throw result.reason;
+		}
+	}
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */
-export async function retryBufferedMessage(
+export function retryBufferedMessage(narratorId: string, messageId: string): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		retryBufferedMessageUnlocked(narratorId, messageId),
+	);
+}
+async function retryBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<boolean> {
@@ -1451,7 +1766,11 @@ export async function retryBufferedMessage(
 			);
 	}
 	if (port) return port.mailbox.retryFailed(row.deliveryId);
-	return store.retryFailed(row.deliveryId);
+	const deliveryId = row.deliveryId;
+	return db.transaction((tx) => {
+		assertBufferObservation(tx, row, row.id);
+		return store.retryFailed(deliveryId);
+	});
 }
 export const dbClearAllBuffered = clearBufferedMessages;
 export async function releaseBufferedMessage(
@@ -1496,7 +1815,7 @@ export async function dropBufferedMessage(
 		return true;
 	}
 	if (!store.cancelClaim(claim, reason)) return false;
-	cleanupBufferedTextFiles(stagingId);
+	await cleanupBufferedTextFiles(stagingId);
 	return true;
 }
 

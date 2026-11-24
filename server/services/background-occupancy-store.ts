@@ -193,6 +193,10 @@ export class BackgroundOccupancyStore {
 		if (this.failure) throw this.failure;
 	}
 
+	async drain(): Promise<void> {
+		while (this.worker) await this.worker;
+	}
+
 	refreshTask(id: string): void {
 		if (!id) return;
 		this.dirtyTasks.add(id);
@@ -552,6 +556,7 @@ export class BackgroundOccupancyStore {
 			const next = new Set<string>();
 			const checked: string[] = [];
 			const missing = new Set<string>();
+			const withoutProjection = new Set<string>();
 			for (let offset = 0; offset < frontier.length; offset += PAGE_SIZE) {
 				const batch = frontier.slice(offset, offset + PAGE_SIZE).filter((id) => !visited.has(id));
 				if (batch.length === 0) continue;
@@ -566,6 +571,7 @@ export class BackgroundOccupancyStore {
 				const found = new Set(rows.map((row) => row.id));
 				for (const id of batch) if (!found.has(id) && !removed.has(id)) missing.add(id);
 				for (const row of rows) {
+					if (!row.hasProjection) withoutProjection.add(row.id);
 					remember(row.id);
 					target.upsertNarrator(row);
 					if (row.type === "subagent" && row.parentNarratorId && !visited.has(row.parentNarratorId))
@@ -597,6 +603,7 @@ export class BackgroundOccupancyStore {
 					if (old) remember(old.parentNarratorId);
 					target.deleteTask(taskId);
 				}
+				if (withoutProjection.has(id)) continue;
 				await this.scan(
 					`projections:${id}`,
 					generation,

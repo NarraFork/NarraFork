@@ -20,7 +20,6 @@ import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 const fixture = getNarratorWorkerTestDb();
 const { db, sqlite } = fixture;
 await fixture.ready;
-afterAll(() => fixture.close());
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher, createRuntimePublicationService } = await import(
@@ -29,6 +28,27 @@ const { runtimePublication: publisher, createRuntimePublicationService } = await
 publisher.stop(); // Tests explicitly step the production worker; no clock races.
 tasks.setBroadcastFnForTests(() => {});
 const mailbox = createMailboxStore(db);
+const pendingBroadcasts = new Set<Promise<void>>();
+const broadcasts = tasks as unknown as Record<
+	"broadcastTaskUpsert" | "broadcastListDelta",
+	(...args: unknown[]) => Promise<void>
+>;
+for (const method of ["broadcastTaskUpsert", "broadcastListDelta"] as const) {
+	const original = broadcasts[method].bind(tasks);
+	broadcasts[method] = (...args) => {
+		const work = original(...args);
+		pendingBroadcasts.add(work);
+		void work.then(
+			() => pendingBroadcasts.delete(work),
+			() => pendingBroadcasts.delete(work),
+		);
+		return work;
+	};
+}
+async function drain() {
+	await backgroundOccupancyStore.drain();
+	while (pendingBroadcasts.size) await Promise.allSettled([...pendingBroadcasts]);
+}
 const time = "2026-09-09T00:00:00.000Z";
 function pending(kind: "agent" | "bash") {
 	return db
@@ -58,7 +78,8 @@ function fill(kind: "agent" | "bash") {
 async function startBash(id: string) {
 	return tasks.createBashTask({ id, parentNarratorId: "parent", command: "true", alias: id });
 }
-beforeEach(() => {
+beforeEach(async () => {
+	await drain();
 	cleanDb(sqlite);
 	db.insert(narrators)
 		.values([
@@ -73,10 +94,11 @@ beforeEach(() => {
 		])
 		.run();
 });
-afterAll(() => {
+afterAll(async () => {
 	publisher.stop();
-	sqlite.close();
+	await drain();
 	mock.restore();
+	await fixture.close();
 });
 
 test("transferred terminal notice still wakes its idle recipient when Worker metadata fails", async () => {
@@ -577,7 +599,7 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	for (const changed of ["status", "publication"] as const)
-		test(`retention rejects a concurrent ${changed} change after its Worker observation`, async () => {
+		test(`retention rechecks a concurrent ${changed} change after its Worker observation`, async () => {
 			await startBash("retained");
 			await tasks.markCompleted("retained", "result");
 			await publisher.flushRecipient("parent");
@@ -586,32 +608,28 @@ describe("real task producers use publication outbox", () => {
 				.where(eq(backgroundTasks.id, "retained"))
 				.run();
 			db.update(narratorBufferedMessages).set({ state: "materialized", adoptedAt: time }).run();
-			const original = workerRead.readDbAll;
+			const original = workerRead.readQuery;
 			let injected = false;
-			const probe = spyOn(workerRead, "readDbAll").mockImplementation(
-				async <T = Record<string, unknown>>(
-					source: Parameters<typeof workerRead.readDbAll>[0],
-					query: Parameters<typeof workerRead.readDbAll>[1],
-					options?: workerRead.ReadQueryOptions,
-				): Promise<T[]> => {
-					const row = await original<T>(source, query, options);
-					if (!injected) {
-						expect(row[0]).toHaveProperty("pending", 0);
-						injected = true;
-						if (changed === "status")
-							db.update(backgroundTasks)
-								.set({ status: "running" })
-								.where(eq(backgroundTasks.id, "retained"))
-								.run();
-						else db.update(narratorBufferedMessages).set({ adoptedAt: null }).run();
-					}
-					return row;
-				},
-			);
+			const probe = spyOn(workerRead, "readQuery").mockImplementation((async (query, options) => {
+				const rows = await original(query as Parameters<typeof original>[0], options);
+				if (!injected && query.toSQL().sql.includes('from "background_tasks"')) {
+					expect(rows[0]).toHaveProperty("id", "retained");
+					injected = true;
+					if (changed === "status")
+						db.update(backgroundTasks)
+							.set({ status: "running" })
+							.where(eq(backgroundTasks.id, "retained"))
+							.run();
+					else db.update(narratorBufferedMessages).set({ adoptedAt: null }).run();
+				}
+				return rows;
+			}) as typeof workerRead.readQuery);
 			try {
-				const error = await tasks.cleanupCompleted(0).catch((error) => error);
+				const result = await tasks.cleanupCompleted(0).catch((error) => error);
 				expect(injected).toBe(true);
-				expect(error).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+				if (changed === "status")
+					expect(result).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+				else expect(result).toBe(0);
 				expect(
 					db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "retained")).get()?.status,
 				).toBe(changed === "status" ? "running" : "completed");

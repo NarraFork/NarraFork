@@ -126,6 +126,93 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("background occupancy coordinator", () => {
+	test("terminal narrator invalidations do not issue one empty projection read per leaf", async () => {
+		const { source, store } = fixture();
+		for (let index = 0; index < 512; index++) {
+			const id = `terminal-${index}`;
+			source.narrators.set(id, narrator(id, "root", { backgroundStatus: "completed" }));
+			store.refreshNarrator(id);
+		}
+		source.tasks.set("live", task("live", "root"));
+		await store.start();
+		expect(store.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		expect(source.calls.filter((label) => label === "getProjections")).toHaveLength(0);
+		await store.stop();
+	});
+
+	test("drain waits for unpublished startup before fixture reset", async () => {
+		const { source, store } = fixture();
+		const entered = deferred();
+		const release = deferred();
+		source.onRead = async (label) => {
+			if (label === "scanNarrators") {
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		const starting = store.start();
+		await entered.promise;
+		let reset = false;
+		const cleanup = (async () => {
+			await store.drain();
+			store.resetForTests();
+			reset = true;
+		})();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(reset).toBe(false);
+		release.resolve();
+		await starting;
+		await cleanup;
+		expect(reset).toBe(true);
+		expect(store.isReady).toBe(false);
+	});
+
+	test("a projection inserted after a negative existence read is replayed before publication", async () => {
+		const { source, store } = fixture();
+		await store.start();
+		const entered = deferred();
+		const release = deferred();
+		let blocked = false;
+		source.onRead = async (label) => {
+			if (label === "getNarrators" && !blocked) {
+				blocked = true;
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		store.refreshNarrator("child");
+		await entered.promise;
+		source.tasks.set(
+			"projection",
+			task("projection", "root", {
+				type: "agent",
+				subagentNarratorId: "child",
+			}),
+		);
+		store.refreshTask("projection");
+		release.resolve();
+		await store.flush();
+		expect(store.getActiveTaskIds("root")).toEqual(["projection"]);
+		await store.stop();
+	});
+
+	test("drain does not start cold stores and propagates pending read failures", async () => {
+		const { source, store } = fixture();
+		await store.drain();
+		expect(source.calls).toHaveLength(0);
+		const failure = new Error("read unavailable");
+		source.onRead = async () => {
+			throw failure;
+		};
+		const starting = store.start().catch((error: unknown) => error);
+		const drained = await store.drain().then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(drained).toBe(failure);
+		expect(await starting).toBe(failure);
+	});
+
 	test("cold flush and reads never trigger the explicitly scheduled initial scan", async () => {
 		const { source, store } = fixture();
 		await expect(store.flush()).rejects.toThrow("not initialized");

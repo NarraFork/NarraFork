@@ -19,11 +19,13 @@
 
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import { isTurnTimingSubstatus } from "../narrator-turn-timing";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -97,7 +99,8 @@ afterEach(() => {
 	sqlite.run("DELETE FROM narrators");
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });

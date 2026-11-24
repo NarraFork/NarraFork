@@ -58,6 +58,7 @@ scripts/lib/*
 !scripts/lib/publication-receipt.ts
 !scripts/lib/local-github-patch-source.ts
 !scripts/lib/mirror-public-github.ts
+!scripts/lib/mirror-patch-proxy.ts
 !scripts/lib/mirror-workflow.ts
 !scripts/lib/mirror-relay-stage.ts
 !scripts/lib/mirror-upload-pool.ts

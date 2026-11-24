@@ -59,6 +59,14 @@ import type {
 	StorageScanResult,
 } from "./types";
 
+/** OAuth state of a remote MCP server; `required` means it refused us until an admin authorizes. */
+export interface McpServerAuthStatus {
+	supported: boolean;
+	authorized: boolean;
+	hasClientSecret: boolean;
+	required?: boolean;
+}
+
 /**
  * One workspace with its membership and arrangement.
  *
@@ -460,6 +468,8 @@ export const miscApi = {
 				url?: string;
 				envKeys: string[];
 				headerKeys: string[];
+				oauth?: { clientId?: string; scope?: string };
+				auth?: McpServerAuthStatus;
 				mode?: McpLoadingMode;
 				enabled: boolean;
 				defaultBehavior?: string;
@@ -483,6 +493,17 @@ export const miscApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
+	// Returns the URL to open, or `authorized` when stored credentials were refreshed.
+	mcpStartOAuth: (id: string) =>
+		request<{ authorizationUrl: string } | { authorized: true }>(`/mcp/servers/${id}/oauth/start`, {
+			method: "POST",
+			// Built from the mount prefix the app runs under, so the provider returns behind the proxy.
+			body: JSON.stringify({
+				redirectUrl: new URL(`${apiBase()}/mcp/oauth/callback`, window.location.href).href,
+			}),
+		}),
+	mcpSignOutOAuth: (id: string) =>
+		request<{ ok: boolean }>(`/mcp/servers/${id}/oauth`, { method: "DELETE" }),
 	mcpDeleteServer: (id: string) =>
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>

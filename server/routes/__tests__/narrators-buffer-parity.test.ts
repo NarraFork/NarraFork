@@ -8,6 +8,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
 
@@ -19,7 +20,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 // Imported after NARRAFORK_HOME is redirected so the DB never touches a real instance.
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
-const { narrators, users } = await import("../../db/schema");
+const { narratorBufferedMessages, narrators, users } = await import("../../db/schema");
 const { enqueueBufferedMessage, getBufferedMessagesAsync } = await import(
 	"../../services/narrator-buffer"
 );
@@ -66,15 +67,21 @@ beforeAll(async () => {
 	]);
 });
 
-function app() {
+function app(userId = OWNER) {
 	const instance = new Hono();
 	instance.use("*", async (c, next) => {
-		c.set("user", { sub: OWNER, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", { sub: userId, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	instance.onError((error) => {
 		const status = error instanceof AppError ? error.statusCode : 500;
-		return new Response(JSON.stringify({ error: error.message }), { status });
+		return new Response(
+			JSON.stringify({
+				error: error.message,
+				...(error instanceof AppError ? { code: error.code } : {}),
+			}),
+			{ status },
+		);
 	});
 	instance.route("/narrators", narratorRoutes);
 	return instance;
@@ -131,4 +138,207 @@ test("edit, reorder, delete and clear behave the same for delegated and ordinary
 		{ slot: 1, text: "second edited", state: "queued" },
 	]);
 	expect(ordinary.at(-1)?.queue).toEqual([]);
+});
+
+test("edit leases protect the whole queue, authenticate renew/release, reject bypasses and survive failed saves", async () => {
+	const { bufferEditHolds } = await import("../../services/buffer-edit-hold");
+	const inbox = await import("../../services/agent-runtime/inbox");
+	const { tryClaimExecution } = await import("../../services/agent-runtime/ownership");
+	const previousListener = bufferEditHolds.setListener(undefined);
+	const first = await enqueueBufferedMessage(ORDINARY, "edit this");
+	if (!first.ok) throw new Error("enqueue failed");
+	const path = `/${ORDINARY}/buffer/${first.id}`;
+	const request = (
+		method: string,
+		suffix: string,
+		body?: unknown,
+		token?: string,
+		userId = OWNER,
+	) =>
+		app(userId).request(`http://localhost/narrators${path}${suffix}`, {
+			method,
+			headers: {
+				"content-type": "application/json",
+				...(token ? { "X-Buffer-Edit-Token": token } : {}),
+			},
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+		});
+	let owner: ReturnType<typeof tryClaimExecution> = null;
+	try {
+		const start = await request("POST", "/edit", { token: "editor" });
+		expect(start.status).toBe(200);
+		expect(await start.json()).toMatchObject({ ok: true, token: "editor", leaseMs: 120000 });
+		expect((await request("POST", "/edit", { token: "editor" })).status).toBe(200);
+		expect((await request("PATCH", "/edit", { token: "editor" })).status).toBe(200);
+		expect((await request("PATCH", "/edit", { token: "other" })).status).toBe(409);
+		expect(
+			(await request("POST", "/edit", { token: "editor" }, undefined, "stranger")).status,
+		).toBe(404);
+		const oversized = await request("POST", "/edit", { token: "x".repeat(1100) });
+		expect(oversized.status, await oversized.text()).toBe(413);
+		expect((await request("PATCH", "", { text: "stolen" })).status).toBe(409);
+		expect((await request("PATCH", "", { text: "stolen" }, "other")).status).toBe(409);
+		expect((await request("PATCH", "/mode", { mode: "interrupt" })).status).toBe(409);
+		expect((await request("POST", "/retry")).status).toBe(409);
+		expect((await request("DELETE", "")).status).toBe(409);
+		expect((await send("DELETE", `/${ORDINARY}/buffer`)).status).toBe(409);
+		expect(
+			(await send("PUT", `/${ORDINARY}/buffer/reorder`, { orderedIds: [first.id] })).status,
+		).toBe(409);
+		const later = await enqueueBufferedMessage(
+			ORDINARY,
+			"later urgent",
+			undefined,
+			undefined,
+			OWNER,
+			undefined,
+			undefined,
+			"front",
+		);
+		if (!later.ok) throw new Error("enqueue failed");
+		owner = tryClaimExecution(ORDINARY, "tool-replay");
+		expect(owner).toBeTruthy();
+		expect(await inbox.claimInboxHead(ORDINARY, () => true)).toBeUndefined();
+		expect(await inbox.hasInboxKind(ORDINARY, ["user_input", "agent_message"])).toBe(false);
+		expect(await inbox.hasWakeEligibleInboxInput(ORDINARY)).toBe(false);
+		expect(await inbox.peekInbox(ORDINARY)).toBeUndefined();
+		// Validation failure cannot accidentally cancel the hold.
+		expect((await request("PATCH", "", { text: "" }, "editor")).status).toBe(400);
+		expect(bufferEditHolds.held(ORDINARY)).toBe(true);
+		expect((await request("PATCH", "", { text: "saved" }, "editor")).status).toBe(200);
+		expect(bufferEditHolds.held(ORDINARY)).toBe(false);
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === first.id)?.text,
+		).toBe("saved");
+		expect((await request("POST", "/edit", { token: "replacement" })).status).toBe(200);
+		expect((await request("DELETE", "/edit", undefined, "editor")).status).toBe(200);
+		expect(bufferEditHolds.held(ORDINARY)).toBe(true);
+		expect((await request("DELETE", "/edit", undefined, "replacement")).status).toBe(200);
+		expect(bufferEditHolds.held(ORDINARY)).toBe(false);
+		expect((await inbox.claimInboxHead(ORDINARY, () => true))?.id).toBe(later.id);
+	} finally {
+		owner?.release();
+		await bufferEditHolds.release(ORDINARY, {
+			messageId: first.id,
+			userId: OWNER,
+			token: "editor",
+		});
+		await bufferEditHolds.release(ORDINARY, {
+			messageId: first.id,
+			userId: OWNER,
+			token: "replacement",
+		});
+		bufferEditHolds.setListener(previousListener);
+	}
+});
+
+test("lease reacquisition and saving reject stale revisions without changing newer durable content", async () => {
+	const { bufferEditHolds } = await import("../../services/buffer-edit-hold");
+	const previous = bufferEditHolds.setListener(undefined);
+	const entry = await enqueueBufferedMessage(ORDINARY, "original baseline");
+	if (!entry.ok) throw new Error("enqueue failed");
+	const path = `http://localhost/narrators/${ORDINARY}/buffer/${entry.id}`;
+	const request = (method: string, suffix: string, body?: unknown, token?: string) =>
+		app().request(`${path}${suffix}`, {
+			method,
+			headers: {
+				"content-type": "application/json",
+				...(token ? { "X-Buffer-Edit-Token": token } : {}),
+			},
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+		});
+	try {
+		expect((await request("POST", "/edit", { token: "a", expectedRevision: -1 })).status).toBe(400);
+		const initial = await request("POST", "/edit", { token: "a" });
+		expect(initial.status).toBe(200);
+		const baseline = (await initial.json()).contentRevision;
+		expect(typeof baseline).toBe("number");
+		expect((await (await request("PATCH", "/edit", { token: "a" })).json()).contentRevision).toBe(
+			baseline,
+		);
+		const wrongBaseline = await request("POST", "/edit", {
+			token: "a",
+			expectedRevision: baseline + 1,
+		});
+		expect(wrongBaseline.status).toBe(409);
+		expect(await wrongBaseline.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		// The editor can recover a lost lease while its authoritative version is unchanged.
+		await request("DELETE", "/edit", undefined, "a");
+		expect(
+			(await request("POST", "/edit", { token: "a", expectedRevision: baseline })).status,
+		).toBe(200);
+		await request("DELETE", "/edit", undefined, "a");
+		expect((await request("POST", "/edit", { token: "b" })).status).toBe(200);
+		expect((await request("PATCH", "", { text: "newer editor saved" }, "b")).status).toBe(200);
+		const stale = await request("POST", "/edit", { token: "a", expectedRevision: baseline });
+		expect(stale.status).toBe(409);
+		expect(await stale.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		expect(bufferEditHolds.held(ORDINARY)).toBe(false);
+		expect((await request("PATCH", "", { text: "stale draft" }, "a")).status).toBe(409);
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === entry.id)?.text,
+		).toBe("newer editor saved");
+		const fresh = await request("POST", "/edit", { token: "fresh" });
+		const revision = (await fresh.json()).contentRevision;
+		expect(revision).toBe(baseline + 1);
+		// Simulate a mutation outside this single-process lease and verify the commit guard too.
+		db.update(narratorBufferedMessages)
+			.set({ text: "external newer edit", contentRevision: revision + 1 })
+			.where(eq(narratorBufferedMessages.id, entry.id))
+			.run();
+		const staleSave = await request("PATCH", "", { text: "stale draft" }, "fresh");
+		expect(staleSave.status).toBe(409);
+		expect(await staleSave.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === entry.id)?.text,
+		).toBe("external newer edit");
+		expect(bufferEditHolds.held(ORDINARY)).toBe(true);
+		await request("DELETE", "/edit", undefined, "fresh");
+		expect((await request("PATCH", "", { text: "legacy accepted" })).status).toBe(200);
+	} finally {
+		for (const token of ["a", "b", "fresh"])
+			await bufferEditHolds.release(ORDINARY, { messageId: entry.id, userId: OWNER, token });
+		bufferEditHolds.setListener(previous);
+	}
+});
+
+test("aborting a streamed legacy save cancels its reader and releases the pin without a late write", async () => {
+	const { bufferEditHolds } = await import("../../services/buffer-edit-hold");
+	const previous = bufferEditHolds.setListener(undefined);
+	const entry = await enqueueBufferedMessage(ORDINARY, "unchanged");
+	if (!entry.ok) throw new Error("enqueue failed");
+	const abort = new AbortController();
+	let cancelled = false;
+	const body = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode('{"text":"unfinished'));
+		},
+		cancel() {
+			cancelled = true;
+		},
+	});
+	const timeout = setTimeout(
+		() => abort.abort(new AppError("request timed out", 408, "BUFFER_EDIT_TIMEOUT")),
+		30,
+	);
+	try {
+		const response = await app().request(
+			`http://localhost/narrators/${ORDINARY}/buffer/${entry.id}`,
+			{
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body,
+				signal: abort.signal,
+			},
+		);
+		expect(response.status, await response.text()).toBe(408);
+		expect(cancelled).toBe(true);
+		expect(bufferEditHolds.held(ORDINARY)).toBe(false);
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === entry.id)?.text,
+		).toBe("unchanged");
+	} finally {
+		clearTimeout(timeout);
+		bufferEditHolds.setListener(previous);
+	}
 });

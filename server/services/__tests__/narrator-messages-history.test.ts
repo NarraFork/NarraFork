@@ -1,15 +1,18 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 for (const statement of [
 	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
@@ -70,10 +73,10 @@ async function seedMessage(params: {
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("narrator model history projection", () => {

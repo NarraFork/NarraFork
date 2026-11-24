@@ -65,6 +65,7 @@ test("real canonical CAS conflict makes producer refresh GitHub once and retry w
 		const http = new UpdateServerMirrorHttp(config, { fetchImpl });
 		const receipt = await mirrorPublishedMainRelease({
 			kind: "main",
+			patchOnly: false,
 			repository,
 			tag: fixture.release.tag,
 			config,
@@ -127,6 +128,7 @@ for (const withPatch of [true, false]) {
 			const http = new UpdateServerMirrorHttp(config, { fetchImpl });
 			const receipt = await mirrorPublishedMainRelease({
 				kind: "main",
+				patchOnly: false,
 				repository,
 				tag: fixture.release.tag,
 				config,
@@ -202,6 +204,7 @@ test("actual upload acknowledgement identity failure prevents snapshot publicati
 		try {
 			await mirrorPublishedMainRelease({
 				kind: "main",
+				patchOnly: false,
 				repository,
 				tag: fixture.release.tag,
 				config,

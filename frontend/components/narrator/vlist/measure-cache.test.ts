@@ -49,6 +49,37 @@ describe("text preview cache keys", () => {
 		);
 	});
 
+	it("re-keys a meta row when only its progress bar moves", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (completed: number, currentItem: string) => ({
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "meta.progress",
+						body: {
+							kind: "meta-rows",
+							rows: [
+								{
+									text: "",
+									progress: {
+										ratio: completed / 3,
+										percent: Math.round((completed / 3) * 100),
+										figures: [`${completed}/3`, currentItem],
+									},
+								},
+							],
+						},
+					},
+				],
+			},
+		});
+		const base = extractDataRevision(data(1, "batch-2"));
+		expect(extractDataRevision(data(1, "batch-2"))).toBe(base);
+		expect(extractDataRevision(data(2, "batch-2"))).not.toBe(base);
+		expect(extractDataRevision(data(1, "batch-3"))).not.toBe(base);
+	});
+
 	it("keys direct text expansion independently from card expansion", async () => {
 		const { buildCacheKey } = await import("./measure-cache");
 		const key = (opts: Record<string, unknown>) => buildCacheKey("body", "reasoning", 400, 5, opts);

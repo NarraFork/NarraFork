@@ -15,11 +15,15 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators, projects } from "../../db/schema";
 import { settings } from "../../lib/settings";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getRuntimeTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -106,7 +110,8 @@ afterEach(() => {
 	narratorContext.generateCompactSummary = realGenerateCompactSummary;
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	narratorContext.generateCompactSummary = realGenerateCompactSummary;
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
@@ -216,7 +221,7 @@ describe("runCustomCompact drains the queue on exit", () => {
 		const promise = runCustomCompact(NARRATOR_ID, "en", "m-target", { mode: "background" });
 		await requestStarted;
 		expect(cancelCompact(NARRATOR_ID)).toBe(true);
-		await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+		expect(await captureWorkerRejection(promise)).toMatchObject({ name: "AbortError" });
 
 		expect(drainCalls).toEqual([NARRATOR_ID]);
 		expect(compactLocks.has(NARRATOR_ID)).toBe(false);

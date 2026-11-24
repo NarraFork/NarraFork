@@ -49,6 +49,7 @@ import type {
 	ApiEntity,
 	BlacklistCmd,
 	BlacklistDir,
+	BufferedMessageEditLease,
 	BufferMessageSummary,
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -1362,6 +1363,26 @@ export const narratorsApi = {
 		),
 	getBufferedMessages: (id: string, signal?: AbortSignal) =>
 		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
+	beginBufferedMessageEdit: (
+		narratorId: string,
+		messageId: string,
+		token: string,
+		expectedRevision?: number,
+	) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "POST", body: JSON.stringify({ token, expectedRevision }) },
+		),
+	renewBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "PATCH", body: JSON.stringify({ token }) },
+		),
+	releaseBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "DELETE", headers: { "X-Buffer-Edit-Token": token }, keepalive: true },
+		),
 	/**
 	 * Edit a queued message's text and/or its attachments.
 	 *
@@ -1383,6 +1404,7 @@ export const narratorsApi = {
 			fileReferences?: FileReference[];
 			composerDocument?: ComposerDocument;
 		},
+		editToken?: string,
 	) => {
 		const uploadError = mediaUploadError({
 			media: opts?.newMedia,
@@ -1396,9 +1418,11 @@ export const narratorsApi = {
 		});
 		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
+		const headers = editToken ? { "X-Buffer-Edit-Token": editToken } : undefined;
 		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
+				headers,
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
@@ -1435,7 +1459,11 @@ export const narratorsApi = {
 		// Content-Type is left unset so the browser adds the multipart boundary.
 		let res: Response;
 		try {
-			res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
+			res = await authorizedFetch(`${apiBase()}${path}`, {
+				method: "PATCH",
+				headers,
+				body: formData,
+			});
 		} catch (error) {
 			discardStagedAttachments(narratorId, staged);
 			throw error;

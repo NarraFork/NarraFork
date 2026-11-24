@@ -12,24 +12,43 @@
  * that read plausibly and are silently wrong.
  */
 
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const { backgroundTaskService } = await import("../background-task-service");
 const { narratorService } = await import("../narrator-service");
+const workerRead = await import("../../db/worker-read");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+const { runtimePublication, flushRuntimePublications } = await import(
+	"../agent-runtime/publication"
+);
+const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
 
-afterAll(() => {
+runtimePublication.stop();
+runtimePublication.setWake(() => {});
+
+afterAll(async () => {
+	runtimePublication.setWake(async (narratorId) => {
+		await wakeInboxIfEligible(narratorId);
+	});
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await flushRuntimePublications(PARENT);
+	await backgroundTaskService.drainBashCollectors();
+	await backgroundOccupancyStore.drain();
 	cleanDb(sqlite);
 });
 
@@ -556,21 +575,13 @@ describe("listTeamBashTasks team scope", () => {
 		await seedBashTask({ id: "stranger-task", createdAt: isoAt(3), parentNarratorId: "stranger" });
 
 		const statements: Array<{ sql: string; bindings: number }> = [];
-		const prepare = sqlite.prepare.bind(sqlite);
-		const query = sqlite.query.bind(sqlite);
-		const record = (text: string) => {
-			if (text.includes("background_tasks")) {
-				statements.push({ sql: text, bindings: (text.match(/\?/g) ?? []).length });
-			}
-		};
-		sqlite.prepare = ((text: string, ...rest: unknown[]) => {
-			record(text);
-			return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
-		}) as typeof sqlite.prepare;
-		sqlite.query = ((text: string) => {
-			record(text);
-			return query(text);
-		}) as typeof sqlite.query;
+		const readQuery = workerRead.readQuery;
+		const read = spyOn(workerRead, "readQuery").mockImplementation(((query, options) => {
+			const compiled = query.toSQL();
+			if (compiled.sql.includes("background_tasks"))
+				statements.push({ sql: compiled.sql, bindings: compiled.params.length });
+			return readQuery(query as Parameters<typeof workerRead.readQuery>[0], options);
+		}) as typeof workerRead.readQuery);
 		let view: Awaited<ReturnType<typeof backgroundTaskService.listTeamBashTasks>>;
 		try {
 			view = await backgroundTaskService.listTeamBashTasks({
@@ -580,8 +591,7 @@ describe("listTeamBashTasks team scope", () => {
 				recentTerminalLimit: 5,
 			});
 		} finally {
-			sqlite.prepare = prepare;
-			sqlite.query = query;
+			read.mockRestore();
 		}
 
 		expect(view.tasks.map((t) => t.id).sort()).toEqual(["far-member-task", "root-task"]);

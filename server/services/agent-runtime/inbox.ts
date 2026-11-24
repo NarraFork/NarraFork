@@ -22,9 +22,12 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
+import { bufferEditHolds, isBufferConsumptionHeld } from "../buffer-edit-hold";
+import type { MessagePlacementOptions } from "../narrator-persistence";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
 import { trackCommunicationWork } from "./async-work";
+import { MAILBOX_LIMITS } from "./limits";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -497,20 +500,24 @@ export async function peekInbox(
 ): Promise<RuntimeMailboxRow | undefined> {
 	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
-	if (port) return port.mailbox.peekQueued(narratorId);
+	const visible = (row: RuntimeMailboxRow | undefined) =>
+		row?.kind === "user_input" && isBufferConsumptionHeld(narratorId) ? undefined : row;
+	if (port) return visible(await port.mailbox.peekQueued(narratorId));
 	runtimeInbox.initializeLegacy(narratorId);
-	return readQueryFirst(
-		db
-			.select()
-			.from(mailbox)
-			.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-			.orderBy(
-				desc(mailbox.priority),
-				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-				asc(mailbox.arrivalSeq),
-			)
-			.limit(1),
-		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	return visible(
+		await readQueryFirst(
+			db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+				.orderBy(
+					desc(mailbox.priority),
+					sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+					asc(mailbox.arrivalSeq),
+				)
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		),
 	);
 }
 export async function hasInboxKind(
@@ -519,6 +526,11 @@ export async function hasInboxKind(
 	options: InboxReadOptions = {},
 ): Promise<boolean> {
 	options.signal?.throwIfAborted();
+	if (isBufferConsumptionHeld(narratorId)) {
+		kinds = kinds.filter((kind) => kind !== "user_input");
+		// Do not advertise work behind the blocked global head to boundary/held-run loops.
+		if (!kinds.length || !(await peekInbox(narratorId, options))) return false;
+	}
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasQueuedKind(narratorId, kinds);
 	return !!(await readQueryFirst(
@@ -543,6 +555,33 @@ export async function hasWakeEligibleInboxInput(
 ): Promise<boolean> {
 	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
+	if (isBufferConsumptionHeld(narratorId)) {
+		if (port) return port.mailbox.hasWakeEligibleInput(narratorId, true);
+		// Broadcasts/notices ahead of a direct report are not a user barrier. Inspect
+		// only the bounded, lightweight prefix before the first queued user input.
+		const limit = MAILBOX_LIMITS.agentPending + MAILBOX_LIMITS.noticePending + 1;
+		const rows = await readQuery(
+			db
+				.select({
+					kind: mailbox.kind,
+					direct: sql<boolean>`(${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1)`,
+				})
+				.from(mailbox)
+				.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+				.orderBy(
+					desc(mailbox.priority),
+					sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+					asc(mailbox.arrivalSeq),
+				)
+				.limit(limit),
+			{ ...options, executionPolicy: "worker-required", maxRows: limit },
+		);
+		for (const row of rows) {
+			if (row.kind === "user_input") return false;
+			if (row.direct) return true;
+		}
+		return false;
+	}
 	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
 	return !!(await readQueryFirst(
 		db
@@ -594,12 +633,16 @@ export async function claimInboxHead(
 	narratorId: string,
 	accepts: (row: InboxEligibleHead) => boolean,
 ): Promise<RuntimeMailboxRow | undefined> {
-	const owner = getExecutionOwner(narratorId);
-	if (!owner) throw new Error("Mailbox claim requires shared execution owner");
-	const claimOwner = { token: `${inboxProcessTokenPrefix}${generateId()}`, epoch: owner.epoch };
-	const port = getRuntimeQueuePort();
-	if (port) return port.mailbox.claimEligibleHead(narratorId, claimOwner, accepts);
-	return runtimeInbox.claimEligibleHead(narratorId, claimOwner, accepts);
+	return bufferEditHolds.exclusive(narratorId, async () => {
+		const owner = getExecutionOwner(narratorId);
+		if (!owner) throw new Error("Mailbox claim requires shared execution owner");
+		const claimOwner = { token: `${inboxProcessTokenPrefix}${generateId()}`, epoch: owner.epoch };
+		const eligible = (row: InboxEligibleHead) =>
+			!(row.kind === "user_input" && isBufferConsumptionHeld(narratorId)) && accepts(row);
+		const port = getRuntimeQueuePort();
+		if (port) return port.mailbox.claimEligibleHead(narratorId, claimOwner, eligible);
+		return runtimeInbox.claimEligibleHead(narratorId, claimOwner, eligible);
+	});
 }
 /**
  * The publication barrier ahead of mailbox work. The facade keeps its synchronous API, but
@@ -1046,6 +1089,7 @@ export interface MaterializedInboxUserMessage {
  * unattributed.
  */
 export async function materializeClaimedInboxUserMessage(input: {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	claim: MailboxClaim;
 	/** The claim row's reserved recipient identity; re-read by claim id when omitted. */
 	reservedMessageId?: string | null;
@@ -1096,7 +1140,10 @@ export async function materializeClaimedInboxUserMessage(input: {
 	const placed = capturePlacedRef();
 	const row = await queue.mailbox.materialize(
 		input.claim,
-		createPgPlacedMessageMaterializer(message, { onPersist: placed.hook }),
+		createPgPlacedMessageMaterializer(message, {
+			onPersist: placed.hook,
+			recoveryGuard: input.recoveryGuard,
+		}),
 	);
 	if (placed.captured.refId === undefined || placed.captured.seq === undefined)
 		throw new Error("Mailbox materialize committed without a recipient ref");
@@ -1155,6 +1202,7 @@ export interface ClaimedUserInputMessage {
  * branch into either dialect or pass transaction handles themselves.
  */
 export async function persistClaimedUserInput(input: {
+	recoveryGuard?: MessagePlacementOptions["recoveryGuard"];
 	claim: MailboxClaim;
 	reservedMessageId?: string | null;
 	narratorId: string;
@@ -1215,6 +1263,7 @@ export async function persistClaimedUserInput(input: {
 		input.origin,
 		{
 			mailboxClaim: input.claim,
+			recoveryGuard: input.recoveryGuard,
 			composerDocument: input.composerDocument,
 			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
 		},
@@ -1326,6 +1375,8 @@ export function wakeInboxIfEligible(
 		if (!canProbe()) return false;
 		await flushInboxPublicationBarrier(narratorId);
 		if (!canProbe()) return false;
+		if (isBufferConsumptionHeld(narratorId) && !(await peekInbox(narratorId, readOptions())))
+			return false;
 		// A held run keeps its owner while parked: queued input wakes that same run.
 		const { wakeHeldRun } = await import("./run");
 		if (!canProbe()) return false;

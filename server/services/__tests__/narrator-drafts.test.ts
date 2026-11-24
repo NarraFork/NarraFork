@@ -1,12 +1,15 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
 import { and, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { migrateLegacyNarratorDraftTraits } from "../../db/migrate-narrator-drafts";
 import { narratorDrafts, narrators, users } from "../../db/schema";
 import { upsertDraftTrait } from "../../lib/narrator-utils";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 // Snapshot the real db module before mocking so afterAll can re-point it back.
 // Bun's mock.module is process-wide and mock.restore() does NOT undo it, so this
 // FTS-less test db would otherwise leak into later real-db suites (e.g. the
@@ -40,10 +43,10 @@ async function seedNarrator(id: string, traits: string[] = []): Promise<void> {
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("per-user narrator drafts", () => {

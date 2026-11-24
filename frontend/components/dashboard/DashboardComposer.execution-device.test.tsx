@@ -135,6 +135,7 @@ mock.module("../narrator/CreateNarratorLazyModal", () => ({
 	CreateNarratorLazyModal: () => null,
 	preloadCreateNarratorModal: () => {},
 }));
+mock.module("../narrator/interaction/DropOverlay", () => ({ DropOverlay: () => null }));
 mock.module("../narrator/interaction/PermissionModePickerMenu", () => ({
 	PermissionModePickerMenu: () => null,
 }));

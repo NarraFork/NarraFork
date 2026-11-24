@@ -1,9 +1,12 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import { clearAgentMessageOrigins, registerAgentMessageOrigin } from "../agent-message-origin";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const { narratorService } = await import("../narrator-service");
@@ -41,7 +44,8 @@ beforeEach(() => {
 		)
 		.run("u1", "alice", "x", "admin", now);
 });
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	clearAgentMessageOrigins();
 	mock.module("../../db", () => realDbModule);
 });

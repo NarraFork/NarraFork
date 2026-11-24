@@ -32,6 +32,7 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import * as spawn from "../lib/spawn";
 import { projectRoutes } from "../routes/projects";
+import { captureWorkerRejection } from "./__tests__/narrator-worker-fixture";
 import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
 import * as narratorSession from "./narrator-session";
 import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
@@ -475,7 +476,7 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 		expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		await withProjectRetirement(projectId, async () => {
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
@@ -525,7 +526,7 @@ for (const kind of ["create", "subagent", "extract"] as const) {
 					})
 					.where(eq(narrators.id, narratorId));
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});

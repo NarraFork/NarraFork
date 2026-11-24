@@ -4,6 +4,7 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import { ApiError } from "../../../lib/api/client";
 import { moveQueuedTurn, queuedMessageMode } from "./queue-message-mode";
 import {
 	type UseQueuedMessageActionsOptions,
@@ -37,6 +38,23 @@ beforeEach(async () => {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
 	spyOn(notifications, "show").mockReturnValue("notice");
+	spyOn(api, "beginBufferedMessageEdit").mockImplementation(async (_narrator, _message, token) => ({
+		ok: true,
+		token,
+		expiresAt: Date.now() + 120_000,
+		leaseMs: 120_000,
+		contentRevision: 0,
+	}));
+	spyOn(api, "renewBufferedMessageEdit").mockImplementation(async (_narrator, _message, token) => ({
+		ok: true,
+		token,
+		expiresAt: Date.now() + 120_000,
+		leaseMs: 120_000,
+		contentRevision: 0,
+	}));
+	spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+	spyOn(api, "clearBufferedMessages").mockResolvedValue({ ok: true });
+	spyOn(api, "getBufferedMessages").mockImplementation(async () => queue);
 	queue = [entry("a"), entry("guide", "tool"), entry("b")];
 	options = {
 		narratorId: "n",
@@ -135,6 +153,7 @@ test("edit conflict after consumption refreshes state without resurrecting the m
 			}),
 	);
 	const message = queue[0];
+	await act(async () => actions.handleStartEditQueued(message));
 	let result: Promise<boolean> | undefined;
 	await act(async () => {
 		result = actions.handleSaveEditQueued(message, "edited draft", {
@@ -144,7 +163,8 @@ test("edit conflict after consumption refreshes state without resurrecting the m
 			newTextFiles: [],
 		});
 	});
-	expect(queue[0].text).toBe("edited draft");
+	// Keep the accepted row untouched; the editor owns the unsaved draft.
+	expect(queue[0].text).toBe(message.text);
 	expect(queue[0].bufferedAt).toBe(message.bufferedAt);
 	// WS consumed this entry while the edit request was pending.
 	queue = queue.filter((entry) => entry.id !== message.id);
@@ -164,6 +184,7 @@ test("edit conflict after consumption refreshes state without resurrecting the m
 test("successful edit also refreshes attachments and preserves acceptance time", async () => {
 	spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
 	const message = queue[0];
+	await act(async () => actions.handleStartEditQueued(message));
 	await act(async () => {
 		expect(
 			await actions.handleSaveEditQueued(message, "edited", {
@@ -180,6 +201,7 @@ test("successful edit also refreshes attachments and preserves acceptance time",
 
 test("structured edit forwards the exact document and explicit empty keep lists; ok:false retains the draft", async () => {
 	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: false });
+	await act(async () => actions.handleStartEditQueued(queue[0]));
 	const document = {
 		version: 1 as const,
 		paragraphs: [{ children: [{ type: "text" as const, text: " mixed body " }] }],
@@ -196,7 +218,9 @@ test("structured edit forwards the exact document and explicit empty keep lists;
 	await act(async () => {
 		expect(await actions.handleSaveEditQueued(queue[0], " mixed body ", payload)).toBe(false);
 	});
-	expect(update).toHaveBeenCalledWith("n", "a", " mixed body ", payload);
+	expect(update).toHaveBeenCalledWith("n", "a", " mixed body ", payload, expect.any(String));
+	expect(actions.editingQueuedId).toBe("a");
+	expect(actions.queuedEditProtected).toBe(true);
 	expect(update.mock.calls[0][3]?.composerDocument).toBe(document);
 	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
 });
@@ -420,4 +444,537 @@ test("remove and reorder failures refresh authoritative state and notify", async
 		message: "reorder rejected",
 	});
 	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(2);
+});
+
+const editPayload = { keepImageIds: [], keepTextFiles: [], newImages: [], newTextFiles: [] };
+const leaseResponse = (token: string, contentRevision = 0) => ({
+	ok: true as const,
+	token,
+	expiresAt: Date.now() + 120_000,
+	leaseMs: 120_000,
+	contentRevision,
+});
+
+test("LAN HTTP without randomUUID uses getRandomValues for a UUIDv4 edit token", async () => {
+	const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+	const entropy = mock((bytes: Uint8Array) => getRandomValues(bytes));
+	originals.set("crypto", Object.getOwnPropertyDescriptor(globalThis, "crypto"));
+	Object.defineProperty(globalThis, "crypto", {
+		configurable: true,
+		value: { getRandomValues: entropy },
+	});
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	const token = spyOn(api, "beginBufferedMessageEdit").mock.calls[0][2];
+	expect(token).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+	expect(entropy).toHaveBeenCalledTimes(1);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test.each([
+	"acquiring",
+	"active",
+])("%s edit blocks mutations of every queue row, including urgent admission", async (phase) => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const begin = spyOn(api, "beginBufferedMessageEdit").mockReturnValue(admission.promise);
+	const mode = spyOn(api, "setBufferedMessageMode").mockResolvedValue({
+		ok: true,
+		delivered: true,
+	});
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue({ ok: true, resumed: false });
+	const remove = spyOn(api, "removeBufferedMessage").mockResolvedValue({ ok: true });
+	const reorder = spyOn(api, "reorderBufferedMessages").mockResolvedValue({ ok: true });
+	let pending: Promise<void> | undefined;
+	await act(async () => {
+		pending = actions.handleStartEditQueued(queue[0]);
+	});
+	if (phase === "active")
+		await act(async () => {
+			admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+			await pending;
+		});
+	const before = queue;
+	await act(async () => {
+		expect(await actions.handleChangeMode("b", "interrupt")).toBe(false);
+		actions.handleRemoveQueued("b");
+		await expect(actions.handleRetryQueued("b")).rejects.toThrow("queuedEditPaused");
+		actions.handleMoveQueued("b", -1);
+		actions.handleDragEndQueued({ active: { id: "b" }, over: { id: "a" } } as Parameters<
+			typeof actions.handleDragEndQueued
+		>[0]);
+		await actions.handleCancelAllQueued();
+	});
+	expect(queue).toBe(before);
+	expect(actions.queueMutationsDisabled).toBe(true);
+	expect(actions.urgentDispatches).toEqual([]);
+	for (const operation of [mode, retry, remove, reorder, api.clearBufferedMessages])
+		expect(operation).not.toHaveBeenCalled();
+	if (phase === "acquiring")
+		await act(async () => {
+			admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+			await pending;
+		});
+});
+
+test("mixed clear waits for each delete ACK, preserves urgent rows, and reconciles once", async () => {
+	queue = [...queue, entry("urgent", "interrupt")];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<Probe />));
+	const first = Promise.withResolvers<void>();
+	let inflight = 0;
+	let maximum = 0;
+	const remove = spyOn(api, "removeBufferedMessage").mockImplementation(async (_n, id) => {
+		inflight++;
+		maximum = Math.max(maximum, inflight);
+		try {
+			if (id === "a") await first.promise;
+			return { ok: true };
+		} finally {
+			inflight--;
+		}
+	});
+	let clearing: Promise<void> | undefined;
+	await act(async () => {
+		clearing = actions.handleCancelAllQueued();
+	});
+	expect(remove.mock.calls.map((call) => call[1])).toEqual(["a"]);
+	expect(queue.map((message) => message.id)).toEqual(["a", "guide", "b", "urgent"]);
+	await act(async () => actions.handleCancelAllQueued());
+	expect(remove).toHaveBeenCalledTimes(1);
+	await act(async () => {
+		first.resolve();
+		await clearing;
+	});
+	expect(remove.mock.calls.map((call) => call[1])).toEqual(["a", "guide", "b"]);
+	expect(maximum).toBe(1);
+	expect(queue.map((message) => message.id)).toEqual(["urgent"]);
+	expect(api.clearBufferedMessages).not.toHaveBeenCalled();
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+	"reject",
+	"ok:false",
+])("mixed clear %s retains failed/unattempted rows and reports failure", async (failure) => {
+	queue = [...queue, entry("urgent", "interrupt")];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<Probe />));
+	const remove = spyOn(api, "removeBufferedMessage")
+		.mockResolvedValueOnce({ ok: true })
+		.mockImplementationOnce(async () => {
+			if (failure === "reject") throw new Error("mutation denied");
+			return { ok: false };
+		});
+	await act(async () => actions.handleCancelAllQueued());
+	expect(remove.mock.calls.map((call) => call[1])).toEqual(["a", "guide"]);
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b", "urgent"]);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ color: "red", title: "queuedRemoveFailed" }),
+	);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test("ordinary clear stays a single request and failure does not hide unacknowledged rows", async () => {
+	const clear = spyOn(api, "clearBufferedMessages").mockRejectedValue(new Error("clear denied"));
+	const remove = spyOn(api, "removeBufferedMessage").mockResolvedValue({ ok: true });
+	const before = queue;
+	await act(async () => actions.handleCancelAllQueued());
+	expect(clear).toHaveBeenCalledTimes(1);
+	expect(remove).not.toHaveBeenCalled();
+	expect(queue).toBe(before);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "clear denied" }),
+	);
+});
+
+for (const [status, code, refused] of [
+	[409, "BUFFER_EDIT_CONFLICT", true],
+	[409, "UNKNOWN", false],
+	[504, "BUFFER_EDIT_CONFLICT", false],
+] as const) {
+	test(`urgent ${status}/${code} only rolls back a definite edit conflict`, async () => {
+		spyOn(api, "setBufferedMessageMode").mockRejectedValue(
+			new ApiError("protected by another client", status, { code }),
+		);
+		await act(async () => {
+			expect(await actions.handleChangeMode("a", "interrupt")).toBe(false);
+		});
+		expect(actions.visibleQueuedMessages.some((message) => message.id === "a")).toBe(refused);
+		expect(actions.urgentDispatches).toHaveLength(refused ? 0 : 1);
+		if (!refused) expect(actions.urgentDispatches[0].status).toBe("failed");
+		expect(queue[0].queueMode).toBeUndefined();
+	});
+}
+
+test.each([
+	"reacquire",
+	"save",
+	"renew",
+])("BUFFER_EDIT_STALE during %s latches the original draft revision until explicit exit", async (trigger) => {
+	const tick = captureRenewal();
+	const begin = spyOn(api, "beginBufferedMessageEdit").mockImplementation(async (_n, _m, token) =>
+		leaseResponse(token, 7),
+	);
+	const renew = spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(new Error("lease lost"));
+	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(begin.mock.calls[0][3]).toBeUndefined();
+	const stale = new ApiError("content changed", 409, { code: "BUFFER_EDIT_STALE" });
+	if (trigger === "reacquire") {
+		await act(async () => tick());
+		begin.mockRejectedValueOnce(stale);
+		await act(async () => actions.handleStartEditQueued(queue[0]));
+		expect(begin.mock.calls[1][3]).toBe(7);
+	} else if (trigger === "save") {
+		update.mockRejectedValueOnce(stale);
+		await act(async () => {
+			expect(await actions.handleSaveEditQueued(queue[0], "my draft", editPayload)).toBe(false);
+		});
+	} else {
+		renew.mockRejectedValueOnce(stale);
+		await act(async () => tick());
+	}
+	expect(actions.editingQueuedId).toBe("a");
+	expect(actions.queuedEditProtected).toBe(false);
+	expect(actions.queuedEditStale).toBe(true);
+	expect(actions.queuedEditError).toBe("queuedEditStale");
+	const begins = begin.mock.calls.length;
+	const saves = update.mock.calls.length;
+	await act(async () => {
+		await actions.handleStartEditQueued(queue[0]);
+		expect(await actions.handleSaveEditQueued(queue[0], "cannot overwrite", editPayload)).toBe(
+			false,
+		);
+	});
+	expect(begin).toHaveBeenCalledTimes(begins);
+	expect(update).toHaveBeenCalledTimes(saves);
+	await act(async () => actions.handleCancelEditQueued());
+	begin.mockImplementation(async (_n, _m, token) => leaseResponse(token, 8));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(begin.mock.calls.at(-1)?.[3]).toBeUndefined();
+	expect(actions.queuedEditProtected).toBe(true);
+	expect(actions.queuedEditStale).toBe(false);
+});
+
+test("a mismatched successful reacquire response cannot replace the original revision baseline", async () => {
+	const tick = captureRenewal();
+	const begin = spyOn(api, "beginBufferedMessageEdit").mockImplementation(async (_n, _m, token) =>
+		leaseResponse(token, 7),
+	);
+	spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(new Error("lease lost"));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	await act(async () => tick());
+	begin.mockImplementationOnce(async (_n, _m, token) => leaseResponse(token, 8));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(begin.mock.calls[1][3]).toBe(7);
+	expect(actions.queuedEditStale).toBe(true);
+	expect(actions.queuedEditProtected).toBe(false);
+	expect(api.getBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test("edit waits for server protection and fresh row, and duplicate clicks share one token", async () => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const begin = spyOn(api, "beginBufferedMessageEdit").mockReturnValue(admission.promise);
+	const snapshot = Promise.withResolvers<BufferMessageSummary[]>();
+	spyOn(api, "getBufferedMessages").mockReturnValue(snapshot.promise);
+	let pending: Promise<void> | undefined;
+	await act(async () => {
+		pending = actions.handleStartEditQueued(queue[0]);
+		void actions.handleStartEditQueued(queue[0]);
+	});
+	expect(begin).toHaveBeenCalledTimes(1);
+	expect(actions.editingQueuedId).toBeNull();
+	expect(actions.startingQueuedId).toBe("a");
+	const token = begin.mock.calls[0][2];
+	expect(token).toMatch(/^[0-9a-f-]{36}$/);
+	await act(async () => admission.resolve(leaseResponse(token)));
+	expect(actions.editingQueuedId).toBeNull();
+	await act(async () => {
+		snapshot.resolve([{ ...entry("a"), text: "latest accepted text" }]);
+		await pending;
+	});
+	expect(actions.editingQueuedId).toBe("a");
+	expect(actions.queuedEditProtected).toBe(true);
+	expect(queue[0].text).toBe("latest accepted text");
+});
+
+test("rapid A-B-A switching releases late admission before opening only the latest editor", async () => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const begin = spyOn(api, "beginBufferedMessageEdit")
+		.mockReturnValueOnce(admission.promise)
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	let latest: Promise<void> | undefined;
+	await act(async () => {
+		void actions.handleStartEditQueued(queue[0]);
+	});
+	await act(async () => {
+		void actions.handleStartEditQueued(queue[2]);
+		latest = actions.handleStartEditQueued(queue[0]);
+	});
+	expect(begin).toHaveBeenCalledTimes(1);
+	await act(async () => {
+		admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+		await latest;
+	});
+	expect(begin.mock.calls.map((args) => args[1])).toEqual(["a", "a"]);
+	expect(begin.mock.calls[0][2]).not.toBe(begin.mock.calls[1][2]);
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledWith("n", "a", begin.mock.calls[0][2]);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test("late acquisition after unmount releases its original scope and never opens an editor", async () => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const begin = spyOn(api, "beginBufferedMessageEdit").mockReturnValue(admission.promise);
+	let pending: Promise<void> | undefined;
+	await act(async () => {
+		pending = actions.handleStartEditQueued(queue[0]);
+	});
+	await act(async () => root.unmount());
+	await act(async () => {
+		admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+		await pending;
+		await Promise.resolve();
+	});
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledWith("n", "a", begin.mock.calls[0][2]);
+	expect(api.getBufferedMessages).not.toHaveBeenCalled();
+});
+
+test("cancel releases a granted lease without waiting for a stalled fresh snapshot", async () => {
+	const snapshot = Promise.withResolvers<BufferMessageSummary[]>();
+	const get = spyOn(api, "getBufferedMessages").mockReturnValue(snapshot.promise);
+	let pending: Promise<void> | undefined;
+	await act(async () => {
+		pending = actions.handleStartEditQueued(queue[0]);
+	});
+	expect(get).toHaveBeenCalledTimes(1);
+	await act(async () => actions.handleCancelEditQueued());
+	expect(get.mock.calls[0][1]?.aborted).toBe(true);
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledTimes(1);
+	await act(async () => {
+		snapshot.resolve(queue);
+		await pending;
+	});
+	expect(actions.editingQueuedId).toBeNull();
+	expect(actions.queuedEditLockedId).toBeUndefined();
+});
+
+test("narrator switch releases the old token and late results cannot overwrite the new editor", async () => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const begin = spyOn(api, "beginBufferedMessageEdit")
+		.mockReturnValueOnce(admission.promise)
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	let pending: Promise<void> | undefined;
+	await act(async () => {
+		pending = actions.handleStartEditQueued(queue[0]);
+	});
+	options = { ...options, narratorId: "other" };
+	await act(async () => root.render(<Probe />));
+	await act(async () => actions.handleStartEditQueued(queue[2]));
+	await act(async () => {
+		admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+		await pending;
+	});
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledWith("n", "a", begin.mock.calls[0][2]);
+	expect(actions.editingQueuedId).toBe("b");
+	expect(actions.queuedEditProtected).toBe(true);
+});
+
+test("same-tick cancel followed by reopening waits for the cancelled token to release", async () => {
+	const admission = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	const released = Promise.withResolvers<{ ok: true }>();
+	const begin = spyOn(api, "beginBufferedMessageEdit")
+		.mockReturnValueOnce(admission.promise)
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	spyOn(api, "releaseBufferedMessageEdit")
+		.mockReturnValueOnce(released.promise)
+		.mockResolvedValue({ ok: true });
+	let reopening: Promise<void> | undefined;
+	await act(async () => {
+		void actions.handleStartEditQueued(queue[0]);
+	});
+	await act(async () => {
+		actions.handleCancelEditQueued();
+		reopening = actions.handleStartEditQueued(queue[0]);
+	});
+	await act(async () => {
+		admission.resolve(leaseResponse(begin.mock.calls[0][2]));
+	});
+	expect(begin).toHaveBeenCalledTimes(1);
+	expect(actions.editingQueuedId).toBeNull();
+	await act(async () => {
+		released.resolve({ ok: true });
+		await reopening;
+	});
+	expect(begin).toHaveBeenCalledTimes(2);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test("uncertain begin retries with the same token, not a new lease", async () => {
+	const begin = spyOn(api, "beginBufferedMessageEdit")
+		.mockRejectedValueOnce(new Error("network lost"))
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(actions.editingQueuedId).toBeNull();
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(begin.mock.calls[0][2]).toBe(begin.mock.calls[1][2]);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test("save failure keeps lease/editor and blocks cancel, switching, clear and edited-row delete while saving", async () => {
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	const save = Promise.withResolvers<{ ok: boolean }>();
+	const update = spyOn(api, "updateBufferedMessage").mockReturnValue(save.promise);
+	const remove = spyOn(api, "removeBufferedMessage").mockResolvedValue({ ok: true });
+	let pending: Promise<boolean> | undefined;
+	await act(async () => {
+		pending = actions.handleSaveEditQueued(queue[0], "unsaved", editPayload);
+		actions.handleCancelEditQueued();
+		void actions.handleStartEditQueued(queue[2]);
+		actions.handleRemoveQueued("a");
+		actions.handleCancelAllQueued();
+	});
+	expect(actions.editingQueuedId).toBe("a");
+	expect(remove).not.toHaveBeenCalled();
+	expect(options.cancelBuffer).not.toHaveBeenCalled();
+	expect(api.beginBufferedMessageEdit).toHaveBeenCalledTimes(1);
+	expect(update).toHaveBeenCalledWith("n", "a", "unsaved", editPayload, expect.any(String));
+	await act(async () => {
+		save.reject(new Error("upload failed"));
+		expect(await pending).toBe(false);
+	});
+	expect(actions.editingQueuedId).toBe("a");
+	expect(actions.queuedEditProtected).toBe(true);
+	expect(api.releaseBufferedMessageEdit).not.toHaveBeenCalled();
+});
+
+test.each([
+	"retry",
+	"cancel",
+])("synchronous save errors release the busy ref so users can %s", async (next) => {
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	const update = spyOn(api, "updateBufferedMessage")
+		.mockImplementationOnce(() => {
+			throw new Error("synchronous validation failure");
+		})
+		.mockResolvedValue({ ok: true });
+	await act(async () => {
+		expect(await actions.handleSaveEditQueued(queue[0], "draft", editPayload)).toBe(false);
+	});
+	expect(actions.editingQueuedId).toBe("a");
+	if (next === "retry") {
+		await act(async () => {
+			expect(await actions.handleSaveEditQueued(queue[0], "fixed", editPayload)).toBe(true);
+		});
+		expect(update).toHaveBeenCalledTimes(2);
+	} else {
+		await act(async () => actions.handleCancelEditQueued());
+	}
+	expect(actions.editingQueuedId).toBeNull();
+	expect(actions.queuedEditLockedId).toBeUndefined();
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledTimes(1);
+});
+
+test("synchronous begin errors do not strand the acquisition ref", async () => {
+	const begin = spyOn(api, "beginBufferedMessageEdit")
+		.mockImplementationOnce(() => {
+			throw new Error("synchronous begin failure");
+		})
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(begin).toHaveBeenCalledTimes(2);
+	expect(begin.mock.calls[0][2]).toBe(begin.mock.calls[1][2]);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test("synchronous renewal errors allow reacquisition and subsequent renewals", async () => {
+	const tick = captureRenewal();
+	const renew = spyOn(api, "renewBufferedMessageEdit")
+		.mockImplementationOnce(() => {
+			throw new Error("synchronous renewal failure");
+		})
+		.mockImplementation(async (_n, _m, token) => leaseResponse(token));
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	await act(async () => tick());
+	expect(actions.queuedEditProtected).toBe(false);
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	await act(async () => tick());
+	expect(renew).toHaveBeenCalledTimes(2);
+	expect(actions.queuedEditProtected).toBe(true);
+});
+
+function captureRenewal() {
+	let callback: (() => void) | undefined;
+	spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number) => {
+		if (delay === 20_000) callback = handler;
+		return 1;
+	}) as typeof setInterval);
+	return () => {
+		if (!callback) throw new Error("renewal timer missing");
+		callback();
+	};
+}
+
+test("lost renewal retains the editor after WS consumption, blocks saving and reacquires with the same token", async () => {
+	const tick = captureRenewal();
+	const renew = spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(
+		new Error("lease missing"),
+	);
+	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	const token = spyOn(api, "beginBufferedMessageEdit").mock.calls[0][2];
+	await act(async () => tick());
+	expect(renew).toHaveBeenCalledWith("n", "a", token);
+	expect(actions.queuedEditProtected).toBe(false);
+	expect(actions.queuedEditError).toContain("queuedEditProtectionLost");
+	queue = [];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<Probe />));
+	expect(actions.visibleQueuedMessages.map((row) => row.id)).toEqual(["a"]);
+	await act(async () => {
+		expect(await actions.handleSaveEditQueued(entry("a"), "retained draft", editPayload)).toBe(
+			false,
+		);
+	});
+	expect(update).not.toHaveBeenCalled();
+	await act(async () => actions.handleStartEditQueued(entry("a")));
+	expect(api.beginBufferedMessageEdit).toHaveBeenLastCalledWith("n", "a", token, 0);
+	expect(actions.editingQueuedId).toBe("a");
+	expect(actions.queuedEditProtected).toBe(true);
+	expect(api.getBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test("expired protection fails closed even when a renewal response is delayed", async () => {
+	const tick = captureRenewal();
+	const renewal = Promise.withResolvers<ReturnType<typeof leaseResponse>>();
+	spyOn(api, "renewBufferedMessageEdit").mockReturnValue(renewal.promise);
+	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	await act(async () => tick());
+	const now = Date.now();
+	spyOn(Date, "now").mockReturnValue(now + 121_000);
+	await act(async () => {
+		expect(await actions.handleSaveEditQueued(queue[0], "expired", editPayload)).toBe(false);
+	});
+	expect(update).not.toHaveBeenCalled();
+	await act(async () => {
+		const token = spyOn(api, "beginBufferedMessageEdit").mock.calls[0][2];
+		renewal.resolve(leaseResponse(token));
+	});
+	expect(actions.queuedEditProtected).toBe(false);
+	expect(actions.editingQueuedId).toBe("a");
+});
+
+test("failed release prevents another admission and switching can retry safely", async () => {
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	const release = spyOn(api, "releaseBufferedMessageEdit")
+		.mockRejectedValueOnce(new Error("offline"))
+		.mockResolvedValue({ ok: true });
+	await act(async () => actions.handleStartEditQueued(queue[2]));
+	expect(api.beginBufferedMessageEdit).toHaveBeenCalledTimes(1);
+	expect(actions.editingQueuedId).toBeNull();
+	expect(actions.queuedEditError).toContain("queuedEditReleaseFailed");
+	await act(async () => actions.handleStartEditQueued(queue[2]));
+	expect(release).toHaveBeenCalledTimes(2);
+	expect(actions.editingQueuedId).toBe("b");
 });
