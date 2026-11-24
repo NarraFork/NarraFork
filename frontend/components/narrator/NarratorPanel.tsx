@@ -163,6 +163,7 @@ import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+import { NarratorTeamBadge, useNarratorTeamBadge } from "./header/NarratorTeamBadge";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
 	getNarratorStatusBarDisplay,
@@ -2081,6 +2082,17 @@ function NarratorPanelBody({
 	 * is just a directory of links, which is noise in the toolbar menu.
 	 */
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
+	/**
+	 * Coordinator → team page link after the title. Decided here (not inside the badge) because
+	 * the header budgets its fixed width. Not in the Remote Access build: its router has no
+	 * team page.
+	 */
+	const teamBadge = useNarratorTeamBadge({
+		narratorId,
+		narrator,
+		projectId: compatibilityProjectId,
+		enabled: !REMOTE_BUILD && !isWorkspacePreview,
+	});
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
 	/**
@@ -3252,6 +3264,7 @@ function NarratorPanelBody({
 						showBack={showLeadingChrome}
 						showMenu={showMobileNav}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+						titleBadgeWidth={teamBadge?.width ?? 0}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
 						onHeaderPointerDown={onHeaderPointerDown}
@@ -3342,6 +3355,9 @@ function NarratorPanelBody({
 										isWorkspacePreview={isWorkspacePreview}
 										titleFullWidth={headerLayout.titleWidth}
 									/>
+									{teamBadge && headerLayout.showTitleBadge && (
+										<NarratorTeamBadge target={teamBadge} />
+									)}
 									{disconnected && !isWorkspacePreview && (
 										<Badge
 											size="xs"
@@ -3684,6 +3700,8 @@ function NarratorPanelBody({
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
 						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
+						// Write access to the narrator (the terminal access read answers exactly that).
+						readOnly={canOpenTerminals === false}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}

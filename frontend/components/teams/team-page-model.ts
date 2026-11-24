@@ -14,6 +14,10 @@ import {
 	boardColumnIsFinished,
 	boardColumnOf,
 	TEAM_BOARD_COLUMNS,
+	TEAM_LEVEL_EVENT_KINDS,
+	TEAM_OVERLAP_EVENT_KINDS,
+	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_WORK_EVENT_KINDS,
 	type TeamActivityEvent,
 	type TeamBoardColumn,
 	type TeamBoardItem,
@@ -120,31 +124,15 @@ export function cappedCount(count: number, limit: number): string {
 
 // ── Activity ────────────────────────────────────────────────────────────────
 
-/** Event kinds with their own wording; anything else is shown by its kind. */
-const KNOWN_EVENT_KINDS = new Set([
-	"team.created",
-	"team.brief",
-	"team.settings",
-	"team.archived",
-	"team.unarchived",
-	"team.decision",
-	"team.checkin",
-	"work.created",
-	"work.started",
-	"work.start_failed",
-	"work.review",
-	"work.ready",
-	"work.sync",
-	"work.cancelled",
-	"work.cleanup",
-	"approval.allowed",
-	"approval.denied",
-	"question.answered",
-	"question.dismissed",
-	"question.ignored",
-	"question.supplemented",
-	"question.deferred",
-	"question.answered_by_ai",
+/**
+ * Every event kind the server records has its own wording (a test holds both locales to it). An
+ * unknown kind, from a newer server, gets the generic `other` headline, never its raw name.
+ */
+const KNOWN_EVENT_KINDS: ReadonlySet<string> = new Set([
+	...TEAM_LEVEL_EVENT_KINDS,
+	...TEAM_WORK_EVENT_KINDS,
+	...TEAM_OVERLAP_EVENT_KINDS,
+	...TEAM_PERSON_DECISION_EVENT_KINDS,
 ]);
 
 /** The i18n key (under `teams.event.`) of an event's headline. */
@@ -314,17 +302,15 @@ export function pauseNotice(outcome: PauseOutcome): {
 	return { color: "green", key: "paused" };
 }
 
-/** Widths of the team page's columns (px). */
-export const TEAM_TEAMS_WIDTH = 232;
+/** Width of the team page's side panel (board / activity), px. */
 export const TEAM_SIDE_WIDTH = 380;
 /** The conversation never gets narrower than this beside other columns. */
 export const TEAM_CONVERSATION_MIN_WIDTH = 480;
 
-export type TeamWorkspaceLayout = "columns" | "split" | "tabs";
+export type TeamWorkspaceLayout = "split" | "tabs";
 
 /** The layout for the frame's own width (not the viewport's: the app sidebar takes some). */
 export function teamWorkspaceLayout(width: number): TeamWorkspaceLayout {
-	if (width >= TEAM_TEAMS_WIDTH + TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "columns";
 	if (width >= TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "split";
 	return "tabs";
 }

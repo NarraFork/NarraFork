@@ -14,6 +14,7 @@ import {
 	TEAM_CHECKIN_MIN_MINUTES,
 	TEAM_REVIEW_VERDICTS,
 	TEAM_TOOL_ACTIONS,
+	TEAM_WORK_BRANCH_HINT_MAX_LENGTH,
 	TEAM_WORK_TITLE_MAX_LENGTH,
 	type TeamToolAction,
 } from "@shared/project-teams";
@@ -63,6 +64,13 @@ export const teamToolParameters = z.object({
 		.max(TEAM_WORK_TITLE_MAX_LENGTH)
 		.optional()
 		.describe("work.create: the item's title (also names its branch)."),
+	branchHint: z
+		.string()
+		.max(TEAM_WORK_BRANCH_HINT_MAX_LENGTH)
+		.optional()
+		.describe(
+			'work.create: a few English words for the branch (e.g. "login unit tests"); give them when the title is not in English, since only ASCII words name a branch.',
+		),
 	verdict: z
 		.enum(TEAM_REVIEW_VERDICTS)
 		.optional()
@@ -194,6 +202,7 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 			const item = await items.createWorkItem({
 				coordinatorId,
 				title: requireField(input, "title", action),
+				branchHint: input.branchHint,
 				actor,
 				principal: await principalOf(ctx),
 				signal: ctx.signal,

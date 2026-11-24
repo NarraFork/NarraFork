@@ -1,7 +1,7 @@
 /**
  * A project's teams (docs/PROJECT_TEAMS-PLAN.md §二.11; P4): on the project home page beside the
- * sessions, and as the team page's left column. Project writers can create a team, which is
- * creating its coordinator session (P1's route).
+ * sessions. Project writers can create a team, which is creating its coordinator session (P1's
+ * route).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
 import { teamsUnavailable, useCreateTeam, useProjectTeams } from "@frontend/hooks/useTeams";
@@ -71,22 +71,15 @@ export function CreateTeamModal({
 	);
 }
 
-/**
- * The teams list. `variant="nav"` is the team page's compact left column (the current team
- * highlighted); the default is the project page's section with its heading.
- */
+/** The project page's teams section with its heading. */
 export function ProjectTeamsList({
 	projectId,
 	canCreate,
-	currentTeamId,
-	variant = "section",
 	onOpenTeam,
 	onCreated,
 }: {
 	projectId: string;
 	canCreate: boolean;
-	currentTeamId?: string;
-	variant?: "section" | "nav";
 	onOpenTeam: (teamId: string) => void;
 	onCreated?: (team: TeamDetail) => void;
 }) {
@@ -94,22 +87,21 @@ export function ProjectTeamsList({
 	const teams = useProjectTeams(projectId);
 	const [creating, setCreating] = useState(false);
 	const rows = teams.data?.pages.flatMap((page) => page.teams) ?? [];
-	const nav = variant === "nav";
 	// Teams are not available on this deployment (PostgreSQL): no section, no "new team".
 	if (teams.isError && teamsUnavailable(teams.error)) return null;
 	return (
-		<Stack gap={nav ? 4 : "xs"} data-testid="project-teams" data-variant={variant}>
+		<Stack gap="xs" data-testid="project-teams">
 			<Group justify="space-between" gap="xs" wrap="nowrap">
 				<Group gap={6} wrap="nowrap">
-					<IconUsersGroup size={nav ? 16 : 20} aria-hidden />
-					<Text fw={600} size={nav ? "sm" : "lg"}>
+					<IconUsersGroup size={20} aria-hidden />
+					<Text fw={600} size="lg">
 						{t("teams.title")}
 					</Text>
 				</Group>
 				{canCreate && (
 					<Button
 						size="xs"
-						variant={nav ? "subtle" : "light"}
+						variant="light"
 						leftSection={<IconPlus size={14} aria-hidden />}
 						onClick={() => setCreating(true)}
 						data-testid="new-team"
@@ -125,37 +117,32 @@ export function ProjectTeamsList({
 					{t("teams.noTeams")}
 				</Text>
 			)}
-			{rows.map((team) => {
-				const current = team.id === currentTeamId;
-				return (
-					<UnstyledButton
-						key={team.id}
-						onClick={() => onOpenTeam(team.id)}
-						aria-current={current ? "page" : undefined}
-						data-testid="project-team-row"
-						data-team-id={team.id}
-						px={nav ? 6 : "sm"}
-						py={nav ? 4 : "xs"}
-						style={{
-							borderRadius: "var(--mantine-radius-sm)",
-							border: nav ? undefined : "1px solid var(--mantine-color-default-border)",
-							background: current ? "var(--mantine-primary-color-light)" : undefined,
-						}}
-					>
-						<Group gap={8} wrap="nowrap">
-							<NarratorStatusIcon size={nav ? 14 : 16} status={team.coordinatorStatus} />
-							<Text size="sm" fw={current ? 600 : 500} truncate style={{ flex: 1 }}>
-								{team.name || team.id}
-							</Text>
-							{team.access === "read" && (
-								<Badge size="xs" variant="light" color="gray" tt="none">
-									{t("teams.onlooker")}
-								</Badge>
-							)}
-						</Group>
-					</UnstyledButton>
-				);
-			})}
+			{rows.map((team) => (
+				<UnstyledButton
+					key={team.id}
+					onClick={() => onOpenTeam(team.id)}
+					data-testid="project-team-row"
+					data-team-id={team.id}
+					px="sm"
+					py="xs"
+					style={{
+						borderRadius: "var(--mantine-radius-sm)",
+						border: "1px solid var(--mantine-color-default-border)",
+					}}
+				>
+					<Group gap={8} wrap="nowrap">
+						<NarratorStatusIcon size={16} status={team.coordinatorStatus} />
+						<Text size="sm" fw={500} truncate style={{ flex: 1 }}>
+							{team.name || team.id}
+						</Text>
+						{team.access === "read" && (
+							<Badge size="xs" variant="light" color="gray" tt="none">
+								{t("teams.onlooker")}
+							</Badge>
+						)}
+					</Group>
+				</UnstyledButton>
+			))}
 			{teams.hasNextPage && (
 				<Button
 					size="xs"
