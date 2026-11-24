@@ -30,7 +30,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - `none`：只写行，下次请求时自然读到；
   - `onNextTurn`：同时把文本返回给运行中的循环，加入它的下一轮缓冲；
   - `interject`：写行并请求运行中循环在下一个工具边界停下来；
-  - `wakeIfIdle`：写行，叙述者空闲则起一轮，忙则退化为 `none`；子代理收件人经 `resumeSubagent` 恢复。
+  - `wakeIfIdle`：写行，叙述者空闲则起一轮，忙则退化为 `none`。`wakeIfIdle` 经 `narrator-injection.ts:resolveScheduler` 调 `narrator-session.ts:startInjectionContinuationIfPossible`，后者对空闲叙述者 `runAgentLoop(active, "")`；该函数体内未见子代理分支，源码注释所说“子代理改走 `resumeSubagent`”未核实。
 - 子代理收件人通过 `subagent` 参数指定放置位置，否则按主叙述者的顶层行写并单次广播。
 
 ## 从哪读起

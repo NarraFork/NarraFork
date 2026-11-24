@@ -7,7 +7,6 @@ anchors:
   - server/services/narrator-question-service.ts
   - server/services/narrator-plan-mode.ts
   - server/lib/agent/tools/plan-mode.ts
-  - server/services/context-ask-service.ts
   - server/lib/plan-file-path.ts
   - shared/question-protocol.ts
   - server/services/__tests__/narrator-question-service.test.ts

@@ -23,7 +23,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 三种压缩：整段历史压缩 `runCustomCompact`（模式 blocking / background）、对选定消息的分段压缩 `runSegmentCompact`、由计划批准触发的 `runPlanCompact`（`narrator-compact.ts`）。
 - 每个叙述者同一时刻只有一把压缩锁 `compactLocks`：已有压缩在跑时，blocking 请求会等待它，并把后台压缩升级为 blocking；`triggerMidTurnCompact` 遇到锁直接跳过（避免第二个 `[Compacting]` 标记）。
 - 压缩标记有 compacting / compacted / failed 状态；超时或停滞由 watchdog 判定并把原因写进失败标记（`createCompactWatchdog`，中止后另有 60s 宽限 `COMPACT_ABORT_GRACE_MS`），测试用 `__setCompactWatchdogTimingsForTests` 缩短时限（`compact-timeout-failure.test.ts`）。从未流出任何字符就失败时，错误信息会追加“检查摘要模型的上下文窗口设置”的提示（`enrichCompactFailureMessage`）。
-- 计划压缩：`persistPlanMessage` 一次性插入消息、置 `isCompact=1`、更新 `narrators.contextSummary` 并清除 `apiConversationId`，之后重置上游会话（`runPlanCompact`）。
+- 计划压缩：`narrator-persistence.ts:persistPlanMessage` 的实现里设置 `isCompact: 1`、`contextSummary` 与 `apiConversationId: null`（已核对），之后重置上游会话（`runPlanCompact`）。
 - 压缩期间叙述者可能是空闲的但不能起新一轮（会基于即将被替换的历史运行），所以用户输入进队列；每次压缩退出（成功、失败、取消、超时）都要重查队列并唤醒（`compact-queue-drain.ts:drainQueuedMessagesAfterCompact`，测试 `compact-exit-drains-queue.test.ts`）。
 - 撤回压缩：`DELETE /:id/compact/:messageId` → `narrator-messages.ts:deleteCompactMessage`，只删本叙述者对该标记的引用（分叉兄弟保留自己的视图），正在进行（compacting）的压缩须先取消，否则 409 `COMPACT_IN_PROGRESS`。
 - 压缩流式进度：`compact-live-state.ts` 在内存里按消息缓存输出/思考文本，总量上限 200k 字符、单个增量上限 32k 字符。
