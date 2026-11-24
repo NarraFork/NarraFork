@@ -121,6 +121,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { recentTabMenuKey, useRecentTabMenuTarget } from "./recent-tab-menu-target";
 import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
@@ -625,11 +626,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[qc],
 	);
 
-	const [ctxMenu, setCtxMenu] = useState<{
-		x: number;
-		y: number;
-		tab: RecentTab;
-	} | null>(null);
+	// The menu holds the row's key; the tab is read from the live list on each render, so its
+	// details follow runtime patches and a row that leaves the list closes it.
+	const [ctxMenu, ctxTab, setCtxMenu] = useRecentTabMenuTarget(tabs);
 
 	// Rename / archive-from-context-menu modal state
 	const [renameTab, setRenameTab] = useState<{ id: string; title: string } | null>(null);
@@ -747,36 +746,42 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[removeTab, navigate],
 	);
 
-	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
-		e.preventDefault();
-		e.stopPropagation();
-		setCtxMenu({ x: e.clientX, y: e.clientY, tab });
-	}, []);
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent, tab: RecentTab) => {
+			e.preventDefault();
+			e.stopPropagation();
+			setCtxMenu({ x: e.clientX, y: e.clientY, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	/** Touch: a left swipe opens the same menu at the release point. */
-	const handleSwipeMenu = useCallback((tab: RecentTab, x: number, y: number) => {
-		setCtxMenu({ x, y, tab });
-	}, []);
+	const handleSwipeMenu = useCallback(
+		(tab: RecentTab, x: number, y: number) => {
+			setCtxMenu({ x, y, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	const handleMoveToTop = useCallback(() => {
-		if (!ctxMenu) return;
-		moveTab(tabSortId(ctxMenu.tab), { position: "top" });
+		if (!ctxMenu || !ctxTab) return;
+		moveTab(tabSortId(ctxTab), { position: "top" });
 		setCtxMenu(null);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const pinTabToggle = useCallback(
 		(tab: RecentTab) => pinTab(tabSortId(tab), !tab.pinned),
 		[pinTab],
 	);
 	const handlePin = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		pinTabToggle(ctxMenu.tab);
-	}, [ctxMenu, pinTabToggle]);
+		pinTabToggle(ctxTab);
+	}, [ctxMenu, ctxTab, pinTabToggle, setCtxMenu]);
 
 	const handleLeaveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!tab.folderId) return;
 		const folder = tabsRef.current.find(
@@ -789,21 +794,21 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			tabSortId(tab),
 			folder?.pinned ? { folderId: null } : { afterKey: `folder:${tab.folderId}`, folderId: null },
 		);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const handleEditFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		setEditFolder(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		setEditFolder(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu]);
+	}, [ctxMenu, ctxTab, setCtxMenu]);
 
 	const handleDissolveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		setFolderDisplay(tab.id, null);
 		void dissolveFolder(tab.id).catch(() => {});
-	}, [ctxMenu, dissolveFolder, setFolderDisplay]);
+	}, [ctxMenu, ctxTab, dissolveFolder, setFolderDisplay, setCtxMenu]);
 
 	const toggleFolderCollapsed = useCallback(
 		(folder: RecentTab) => {
@@ -814,20 +819,20 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	);
 
 	const handleCtxFolderToggle = useCallback(() => {
-		if (!ctxMenu) return;
-		toggleFolderCollapsed(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		toggleFolderCollapsed(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu, toggleFolderCollapsed]);
+	}, [ctxMenu, ctxTab, toggleFolderCollapsed, setCtxMenu]);
 
 	const closeTabRow = useCallback(
 		(tab: RecentTab) => handleRemove(tab.type, tab.id),
 		[handleRemove],
 	);
 	const handleCtxClose = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		closeTabRow(ctxMenu.tab);
-	}, [ctxMenu, closeTabRow]);
+		closeTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, closeTabRow, setCtxMenu]);
 
 	/**
 	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
@@ -898,10 +903,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[requireSetup, resolveTabDirectory, closeNewNarratorHere, t],
 	);
 	const handleNewNarratorHere = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void newNarratorHereFor(ctxMenu.tab);
-	}, [ctxMenu, newNarratorHereFor]);
+		void newNarratorHereFor(ctxTab);
+	}, [ctxMenu, ctxTab, newNarratorHereFor, setCtxMenu]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
@@ -942,8 +947,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
@@ -957,7 +962,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		} catch {
 			// ignore
 		}
-	}, [ctxMenu, revealAvailable]);
+	}, [ctxMenu, ctxTab, revealAvailable, setCtxMenu]);
 
 	/** 复制工作目录到剪贴板（narrator/subagent） */
 	const copyTabCwd = useCallback(
@@ -979,10 +984,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[resolveTabDirectory, t],
 	);
 	const handleCopyCwd = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void copyTabCwd(ctxMenu.tab);
-	}, [ctxMenu, copyTabCwd]);
+		void copyTabCwd(ctxTab);
+	}, [ctxMenu, ctxTab, copyTabCwd, setCtxMenu]);
 
 	/** 在外部窗口打开该标签（叙述者 → chat 面板窗口；project → 主应用窗口） */
 	const openTabInWindow = useCallback((tab: RecentTab) => {
@@ -990,10 +995,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
 	}, []);
 	const handleOpenInWindow = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		openTabInWindow(ctxMenu.tab);
-	}, [ctxMenu, openTabInWindow]);
+		openTabInWindow(ctxTab);
+	}, [ctxMenu, ctxTab, openTabInWindow, setCtxMenu]);
 
 	/** 打开重命名对话框 */
 	const renameTabRow = useCallback((tab: RecentTab) => {
@@ -1002,10 +1007,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setRenameTab({ id: tab.id, title: tab.title || "" });
 	}, []);
 	const handleRename = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		renameTabRow(ctxMenu.tab);
-	}, [ctxMenu, renameTabRow]);
+		renameTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, renameTabRow, setCtxMenu]);
 
 	/** 提交重命名 */
 	const handleRenameSubmit = useCallback(async () => {
@@ -1037,10 +1042,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setArchiveConfirmTab({ id: tab.id });
 	}, []);
 	const handleArchive = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		archiveTabRow(ctxMenu.tab);
-	}, [ctxMenu, archiveTabRow]);
+		archiveTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, archiveTabRow, setCtxMenu]);
 
 	/** 执行归档 */
 	const handleArchiveConfirm = useCallback(() => {
@@ -1315,7 +1320,6 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		],
 	);
 
-	const ctxTab = ctxMenu?.tab;
 	const ctxIsFolder = ctxTab?.type === "folder";
 	const ctxInFolder = !!ctxTab?.folderId;
 	const ctxUnitKey = ctxTab ? (ctxInFolder ? `folder:${ctxTab.folderId}` : tabSortId(ctxTab)) : "";
