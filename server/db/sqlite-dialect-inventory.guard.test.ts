@@ -767,6 +767,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"sessionFn",
 	],
 	"server/services/storage-history-service.ts": ["rowid"],
+	// Exact upload-reference check; the PostgreSQL branch is written out beside it.
+	"server/services/storage/upload-reference-predicate.ts": ["json1"],
 	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
