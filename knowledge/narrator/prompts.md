@@ -23,6 +23,29 @@ anchors:
   - server/services/prompt-library.ts
   - shared/native-injection.ts
   - shared/sidecar-body.ts
+  - server/lib/message-language-read.ts
+  - server/services/narrator-reply-context.ts
+  - shared/reply-context.ts
+keywords:
+  - 系统提示词
+  - buildEffectiveSystemPrompt
+  - deliverInjection
+  - system_injection
+  - InjectionSchedule
+  - wakeIfIdle
+  - onNextTurn
+  - interject
+  - context_update
+  - AGENTS.md
+  - AGENTS.override.md
+  - 提示词库
+  - /api/prompt-library
+  - /api/prompt-optimize/draft
+  - reply_context
+  - replyInUserLanguage
+  - 回复语言
+  - side-car
+  - InjectionCadence
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -46,10 +69,23 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - `wakeIfIdle`：写行，叙述者空闲则起一轮，忙则退化为 `none`。`wakeIfIdle` 经 `narrator-injection.ts:resolveScheduler` 调 `narrator-session.ts:startInjectionContinuationIfPossible`，后者对空闲叙述者 `runAgentLoop(active, "")`；该函数体内未见子代理分支，源码注释所说“子代理改走 `resumeSubagent`”未核实。
 - 子代理收件人通过 `subagent` 参数指定放置位置，否则按主叙述者的顶层行写并单次广播。
 
+- 项目指令文件名优先级：`AGENTS.override.md`、`AGENTS.md`、`AGENT.md`、`CLAUDE.md`（`lib/global-prompt-paths.ts:PROJECT_PROMPT_FILENAMES`）；读取走带签名（dev/ino/size/mtime/ctime）的进程内缓存，只缓存指令文件字节，不缓存拼好的提示词（`lib/instruction-file-cache.ts`）。
+- 语言段：`replyInUserLanguage` 为真或 locale 不是 `en` 时才追加 `language` 段（`narrator-prompt.ts`）。这两个值来自叙述者持久化的 `narrators.reply_context`（`{ locale, replyInUserLanguage }`）：缺失时由 `ensureReplyContext` 用所有者的 `user_preferences` 补一次（CAS 写入，已有值不被覆盖；没有偏好行时：有所有者则 `replyInUserLanguage: true`，无所有者为 false），只有可信的人类入队才会 `adoptHumanReplyContext` 改写，发送者身份不算证据（`narrator-reply-context.ts`、`shared/reply-context.ts`）。HTTP 发消息时的语言偏好经 `lib/message-language-read.ts` 读，并发 1、排队 4、超时 5 秒，满则 `DbReadTaskOverloadedError`。
+- 频率注入：`InjectionCadence` 是“每 N 次完成的工具调用做一次”的闸门，`due()` 即消费；间隔 `> 0` 生效，`-1` 与 `0` 都视为关闭；间隔每次检查时现读，所以会话级覆盖在下个边界生效（`lib/injection-cadence.ts`，`narrator-session.ts` 里的 Dynamic Spec 摘要与行为围栏各用一个实例）。
+- 发送者显示名冻结：`collectSenderContext` 记录首次见到的人类显示名（JSON 映射），`projectFrozenSenders` 只改展示用户名，不改来源行、身份、角色和 origin（`lib/agent/sender-context.ts`、`sender-projection.ts`）。
+- 注入块的结构：持久化为自包含的原生块，`modelText` 为模型文本、`body` 为结构化展示体，旧行可能带相邻文本块并经 `normalizeLegacyInjectionBlock` 归一（`shared/native-injection.ts`）；`shared/sidecar-body.ts:renderSideCarBodyToText` 决定结构化体怎样拼成文本，文案由 `lib/sidecar-templates.ts:getSideCarModelTemplates(locale)` 提供。
+- 提示词库：每条一个 markdown 文件 `~/.narrafork/prompt-library/<id>.md`，正文上限 `MAX_PROMPT_CHARS` = 10000（与 `createNarratorSchema.systemPrompt` 上限对齐）、名称 ≤ 100、描述 ≤ 500；路由 `/api/prompt-library`（列表、`POST /summarize` 无状态摘要、`/:id` 读写删，只要求登录）与 `/api/prompt-optimize/draft`（无会话时的提示词优化）；前端 `usePromptLibrary` 共用查询键 `["prompt-library"]`。
+
 ## 从哪读起
 - `server/services/narrator-prompt.ts:buildEffectiveSystemPrompt`。
 - `server/services/narrator-injection.ts:deliverInjection`、`InjectionSchedule`。
 - 测试：`narrator-prompt.test.ts`、`narrator-injection.test.ts`、`injection-wake-dispatch.test.ts`、`subagent-injection.test.ts`。
+
+## 改它时
+- 新增动态段：在 `narrator-prompt.ts` 用 `appendPart` 加一个固定 key，并考虑 `unreadable` 时沿用旧值；前缀基线/更新的合并在 `shared/prefix-context.ts`，`narrator-prompt.test.ts` 会检查段序与内容。
+- 新增注入类型：经 `deliverInjection`，别直接写消息行；先定 `role` 与 `schedule`，结构化体加到 `shared/sidecar-body.ts` 并补 `lib/sidecar-templates.ts` 各 locale 文案，前端渲染要认这个块；`narrator-injection.test.ts`、`injection-wake-dispatch.test.ts` 覆盖。
+- 新增模型提示词文本：放 `server/lib/prompts/` 并经 `prompt-i18n.ts` 取，保证 zh-CN 缺失时回落英文；用户可见文案走 `lib/i18n`，不要混。
+- 改项目指令文件名：只在 `PROJECT_PROMPT_FILENAMES`（顺序即优先级）；全局指令的候选路径与 PUT 可写判定在 `getGlobalPromptCandidates` / `isWritableGlobalPromptPath`，两者须一致。
 
 ## 相关
 - [会话生命周期](lifecycle.md)

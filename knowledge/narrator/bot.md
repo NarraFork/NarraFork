@@ -9,6 +9,18 @@ anchors:
   - server/lib/prompts/bot.ts
   - server/services/agent-runtime/policy.ts
   - server/services/__tests__/bot-chat.test.ts
+keywords:
+  - bot trait
+  - BOT_TRAIT
+  - BOT_RUNTIME_CEILING
+  - admitBotPost
+  - sendAsBot
+  - postBotMessage
+  - bot:<narratorId>:<userId>
+  - /api/chat/rooms/bot/:narratorId
+  - CHAT_BOT_MESSAGE_MAX_CHARS
+  - 监控视图
+  - 聊天房间
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -31,6 +43,12 @@ Bot 是带 `bot` trait 的叙述者：人们在聊天房间里和它对话，只
 - `server/services/bot-chat.ts`：入站 `admitBotPost` 与出站 `sendAsBot`。
 - `server/services/chat-service.ts:postBotMessage`：写入房间。
 - `server/services/__tests__/bot-chat.test.ts`：房间解析、访问、Send 行为的测试。
+
+## 改它时
+- 房间路由 `GET /api/chat/rooms/bot/:narratorId`（`server/routes/chat.ts`）按调用者首次打开时创建房间；改房间键格式必须同步 `buildBotRoomKey` / `resolveBotRoom` 和前端用到该键的地方。
+- 新增会让 bot 停下等人的能力（提问、审批类工具）：在 `agent-runtime/policy.ts` 的 `BOT_RUNTIME_CEILING` 里拒绝，否则会话会卡在没人读的记录里；`bot-chat.test.ts` 覆盖房间与 Send。
+- 新增创建/分叉路径：bot trait 创建后不可切换，分叉不继承（`forkTraits`）；别在新路径里补写 `BOT_TRAIT`。
+- 改 Send 的 `user` 参数语义：`send.ts:sendToUser` 的互斥检查、`sendAsBot` 的二次 trait 校验和 `narrator-permission.ts` 的免审批分支要一起看。
 
 ## 相关
 - [提问与计划模式](questions-plan.md)

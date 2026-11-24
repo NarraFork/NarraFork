@@ -3,6 +3,17 @@ id: narrator
 title: 叙述者（会话）
 summary: NarraFork 的核心对象：一个绑定工作目录的 AI 会话。它的生命周期、消息存储、上下文、提示词与提问。
 anchors: []
+keywords:
+  - 叙述者
+  - 会话
+  - narrators
+  - narrator
+  - 子代理
+  - subagent
+  - Agent Loop
+  - narrators.status
+  - traits
+  - 工作目录
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
