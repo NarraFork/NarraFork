@@ -2,13 +2,24 @@
 id: platform
 title: 运行平台
 summary: 后端进程怎么启动、怎么接请求、怎么在线程之间分工，以及所有后端代码都要遵守的性能与隔离规则。
-anchors: []
-status: stub
-verified_at: null
+anchors:
+  - server/index.ts
+  - server/app.ts
+  - server/http-dispatcher.ts
+  - server/lib/worker-runtime/
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 运行平台
 
-> 待填写：后端进程怎么启动、怎么接请求、怎么在线程之间分工，以及所有后端代码都要遵守的性能与隔离规则。
+后端是单个 Bun 进程。`server/index.ts` 按标志选择角色（管理器、服务、各类子进程入口），服务角色经 `serve.ts` 先起启动状态页再加载 `main.ts`；`main.ts` 等待数据库就绪、绑定端口，之后所有请求进入 `http-dispatcher.ts`：WebSocket 升级在这里验证令牌，其余交给 `app.ts` 的 Hono 路由。
+
+各部分怎么配合：
+- 服务之间不直接互相调用的部分通过事件总线解耦，WebSocket 通道订阅总线事件再广播给浏览器。
+- 配置来自 `settings` 单例，数据都放在 `NARRAFORK_HOME` 下；设置在模块加载时同步读取，所以启动序列把它放在 try 里统一处理失败。
+- 因为 HTTP、WS、SQLite 共用一个 JS 线程，重活（大范围读库、目录扫描、编译、diff）放 Worker 池或子进程；Worker 失败就让任务失败，不回主线程重跑。主线程规则与 Worker 规则是同一个问题的两面。
+- 终端是平台能力的一个例子：PTY、缓冲和 WebSocket 通道都在服务进程内，部分终端（dtach）可在重启后重新接上。
+- 所有业务错误统一为 `AppError` 家族，由 `app.onError` 序列化，请求体用 Zod 校验。
 
 ## 下面有什么
 
