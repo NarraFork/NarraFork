@@ -15,7 +15,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: 776dbf07e
+verified_at: 9400a828b
 ---
 # 团队
 
@@ -26,14 +26,14 @@ verified_at: 776dbf07e
 注意：`server/lib/agent/tools/team-status.ts` 的 `TeamStatus` 工具与项目团队无关，它查询的是当前会话的子代理和后台 bash 任务（见子代理节点）；团队的 `team_status` 是写进协调者历史的系统行，见协调者子节点。
 
 ## 几部分怎么配合
-1. 先有团队：创建时同事务建协调者叙述者和 `project_teams` 行；成员不另存，全部取自协调者的叙述者 ACL（团队与成员）。
+1. 先有团队：创建时同事务建协调者叙述者和 `project_teams` 行；也可以把已有的空闲会话升级为团队（同事务加 `team` trait 和团队行），或解散团队、保留会话（同事务删团队行和 trait）；成员不另存，全部取自协调者的叙述者 ACL（团队与成员）。
 2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。
 3. 活动工作项的改动路径被后台定期刷新，跨团队比较重叠；项目设了独占路径时，`ready` 要抢独占锁（重叠与独占路径）。
 4. 协调者被软限制约束，超大输出落盘，`team_status` 行把团队全貌注入它的历史（协调者）。
 5. 看板、活动、待批抽屉、成员、「全部暂停」都由团队页读模型和前端提供；任何成员可批团队树里的待决调用（团队页与审批）。
 
 ## 读哪个子节点
-- 谁能看、谁算成员、创建/归档/删除、数据导入怎么处理团队行 → [团队与成员](records.md)。
+- 谁能看、谁算成员、创建/升级/解散/归档/删除、数据导入怎么处理团队行 → [团队与成员](records.md)。
 - 工作项状态、`Team` 工具动作、`work.sync`、cleanup、check-in → [工作项](work-items.md)。
 - 改动路径、重叠提醒、`exclusive_key`、`TEAM_EXCLUSIVE_LOCK_HELD`、强制释放 → [重叠与独占路径](overlap.md)。
 - 协调者超限提醒、`coordinator-outputs/`、`team_status` 行 → [协调者](coordinator.md)。
@@ -47,7 +47,7 @@ verified_at: 776dbf07e
 
 ## 改它时
 - 团队三张表（`project_teams`、`team_work_items`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。
-- 新增团队写路由：沿用 `project-teams.ts` 顶部的 `requireSqliteProjectMutation`，再做 `loadTeamForAccess` 访问判定。
+- 新增团队写路由：沿用 `project-teams.ts` 顶部的 `requireSqliteProjectMutation`，再做 `loadTeamForAccess` 访问判定（升级与解散在 `teams/team-conversion.ts`，另要求会话 owner 或管理员）。
 - 不变量：成员关系永远取自协调者的叙述者 ACL，不要加团队成员表；服务端不合并、不删分支、不直接跑 `git worktree`；所有团队读取必须带 LIMIT 并且 SQLite 专用；IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
 
 ## 相关
