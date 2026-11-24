@@ -13,6 +13,7 @@ import {
 	projects,
 	users,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import type { PendingDangerReflection, PendingPermission } from "../narrator-session-state";
 import {
 	captureWorkerRejection,
@@ -695,13 +696,14 @@ describe("bounded paging and detail", () => {
 	test("query plan seeks narrators then probes open-question index, never historical question bodies", async () => {
 		await narrator("n");
 		await question("n");
-		const all = db.all.bind(db);
+		// The page query runs through the Worker read bridge; capture it there.
+		const all = workerRead.readDbAll;
 		const queries: { sql: string; params: unknown[] }[] = [];
 		const dialect = new SQLiteSyncDialect();
-		const capture = spyOn(db, "all").mockImplementation((query) => {
-			if (typeof query !== "string") queries.push(dialect.sqlToQuery(query.getSQL()));
-			return all(query);
-		});
+		const capture = spyOn(workerRead, "readDbAll").mockImplementation(((source, query, options) => {
+			queries.push(dialect.sqlToQuery(query.getSQL()));
+			return all(source, query, options);
+		}) as typeof workerRead.readDbAll);
 		try {
 			await list(owner);
 		} finally {

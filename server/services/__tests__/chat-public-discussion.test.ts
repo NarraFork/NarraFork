@@ -27,6 +27,8 @@ import {
 	softDeleteMessage,
 } from "../chat-service";
 import { PUBLIC_SHARE_LIMITS } from "../public-narrator-share-limits";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const timestamp = () => new Date().toISOString();
 
@@ -86,7 +88,7 @@ describe("public discussion authorization and isolation", () => {
 
 	test("public GET does not lazily create a missing discussion", async () => {
 		const f = await fixture(false);
-		await expect(listPublicDiscussion(f)).rejects.toMatchObject({
+		expect(await captureWorkerRejection(listPublicDiscussion(f))).toMatchObject({
 			code: "PUBLIC_SHARE_UNAVAILABLE",
 		});
 		expect(
@@ -105,26 +107,34 @@ describe("public discussion authorization and isolation", () => {
 			{ ...f, tokenHash: "wrong" },
 			{ ...f, shareId: "unknown" },
 		]) {
-			await expect(listPublicDiscussion(bad)).rejects.toMatchObject({
+			expect(await captureWorkerRejection(listPublicDiscussion(bad))).toMatchObject({
 				code: "PUBLIC_SHARE_UNAVAILABLE",
 			});
-			await expect(postPublicDiscussion({ ...bad, text: "bad" })).rejects.toMatchObject({
+			expect(
+				await captureWorkerRejection(postPublicDiscussion({ ...bad, text: "bad" })),
+			).toMatchObject({
 				code: "PUBLIC_SHARE_UNAVAILABLE",
 			});
 		}
 		await db.update(narrators).set({ type: "subagent" }).where(eq(narrators.id, f.narratorId));
-		await expect(listPublicDiscussion(f)).rejects.toThrow();
-		await expect(postPublicDiscussion({ ...f, text: "bad" })).rejects.toThrow();
-		await expect(ensureNarratorDiscussionRoomForShare(f.narratorId)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(listPublicDiscussion(f))).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(postPublicDiscussion({ ...f, text: "bad" })),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(ensureNarratorDiscussionRoomForShare(f.narratorId)),
+		).toThrow();
 		await db.update(narrators).set({ type: "primary" }).where(eq(narrators.id, f.narratorId));
 		await db
 			.update(narratorPublicShares)
 			.set({ revokedAt: timestamp() })
 			.where(eq(narratorPublicShares.id, f.shareId));
-		await expect(listPublicDiscussion(f)).rejects.toThrow();
-		await expect(postPublicDiscussion({ ...f, text: "bad" })).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(listPublicDiscussion(f))).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(postPublicDiscussion({ ...f, text: "bad" })),
+		).toThrow();
 		await db.delete(narrators).where(eq(narrators.id, f.narratorId));
-		await expect(listPublicDiscussion(f)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(listPublicDiscussion(f))).toThrow();
 	});
 
 	test("forged identity/room/kind/attachments are ignored; only chat rows and room tail change", async () => {
@@ -162,9 +172,11 @@ describe("public discussion authorization and isolation", () => {
 			lastMessageSenderId: null,
 		});
 		// A share id never authenticates the ordinary station-internal send path.
-		await expect(
-			postMessage({ roomId: f.roomId, senderUserId: f.shareId, text: "not a user" }),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: f.roomId, senderUserId: f.shareId, text: "not a user" }),
+			),
+		).toThrow();
 	});
 
 	test("same-room replies only: DM, another narrator and missing ids are rejected atomically", async () => {
@@ -178,9 +190,11 @@ describe("public discussion authorization and isolation", () => {
 			text: "private DM",
 		});
 		for (const replyToMessageId of [foreign.id, privateMessage.id, "does-not-exist"]) {
-			await expect(postPublicDiscussion({ ...f, text: "reply", replyToMessageId })).rejects.toThrow(
-				"not in this room",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					postPublicDiscussion({ ...f, text: "reply", replyToMessageId }),
+				),
+			).toThrow("not in this room");
 		}
 		expect((await listPublicDiscussion(f)).messages).toEqual([]);
 		expect(db.select().from(chatRooms).where(eq(chatRooms.id, f.roomId)).get()?.nextSeq).toBe(1);
@@ -210,7 +224,9 @@ describe("public discussion authorization and isolation", () => {
 				return transaction(callback, config);
 			});
 			try {
-				await expect(postPublicDiscussion({ ...f, text: "too late" })).rejects.toThrow();
+				expect(
+					await captureWorkerRejectionThrower(postPublicDiscussion({ ...f, text: "too late" })),
+				).toThrow();
 			} finally {
 				intercepted.mockRestore();
 			}
@@ -362,9 +378,13 @@ describe("public projection and live identity", () => {
 	test("body, cursor and response budgets hold without pagination gaps", async () => {
 		const f = await fixture();
 		for (const text of ["", " ", "x".repeat(PUBLIC_SHARE_LIMITS.discussionChars + 1)])
-			await expect(postPublicDiscussion({ ...f, text })).rejects.toThrow();
-		await expect(listPublicDiscussion({ ...f, beforeSeq: -1 })).rejects.toThrow();
-		await expect(listPublicDiscussion({ ...f, limit: Number.NaN })).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(postPublicDiscussion({ ...f, text }))).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(listPublicDiscussion({ ...f, beforeSeq: -1 })),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(listPublicDiscussion({ ...f, limit: Number.NaN })),
+		).toThrow();
 		for (let i = 0; i < 30; i++) await postPublicDiscussion({ ...f, text: "\u0001".repeat(8000) });
 		const first = await listPublicDiscussion({ ...f, limit: 100 });
 		expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(

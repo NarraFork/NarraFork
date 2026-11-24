@@ -9,9 +9,17 @@ import {
 	users,
 	workspaces,
 } from "../../../server/db/schema";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejection } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const broadcasts: Array<{ userId: string; event: Record<string, unknown> }> = [];
 const realDbModule = { ...(await import("../../../server/db")) };
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
@@ -92,7 +100,8 @@ beforeEach(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
@@ -459,13 +468,17 @@ describe("recent-tabs pagination and folders", () => {
 		const first = await recentTabs.listPage("user-1", "work", undefined, 1);
 		expect(first.nextCursor).toBeString();
 
-		await expect(
-			recentTabs.listPage("user-1", "projects", first.nextCursor ?? undefined, 1),
-		).rejects.toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
+		expect(
+			await captureWorkerRejection(
+				recentTabs.listPage("user-1", "projects", first.nextCursor ?? undefined, 1),
+			),
+		).toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
 		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"));
-		await expect(
-			recentTabs.listPage("user-1", "work", first.nextCursor ?? undefined, 1),
-		).rejects.toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
+		expect(
+			await captureWorkerRejection(
+				recentTabs.listPage("user-1", "work", first.nextCursor ?? undefined, 1),
+			),
+		).toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
 	});
 
 	it("pages the pinned block first even when stored sort keys disagree", async () => {
@@ -501,7 +514,9 @@ describe("recent-tabs pagination and folders", () => {
 		const legacy = Buffer.from(
 			JSON.stringify({ s: "work", r: revision, o: 0, k: "narrator:n-1" }),
 		).toString("base64url");
-		await expect(recentTabs.listPage("user-1", "work", legacy, 1)).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(recentTabs.listPage("user-1", "work", legacy, 1)),
+		).toMatchObject({
 			statusCode: 409,
 			code: "STALE_CURSOR",
 		});
@@ -660,9 +675,11 @@ describe("recent-tabs capacity and undo", () => {
 		const cleared = await recentTabs.clearRecentTabs("user-1", "all");
 		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"));
 
-		await expect(
-			recentTabs.restoreRecentTabs("user-1", { token: cleared.undoToken }),
-		).rejects.toMatchObject({ statusCode: 409, code: "RECENT_TABS_UNDO_CONFLICT" });
+		expect(
+			await captureWorkerRejection(
+				recentTabs.restoreRecentTabs("user-1", { token: cleared.undoToken }),
+			),
+		).toMatchObject({ statusCode: 409, code: "RECENT_TABS_UNDO_CONFLICT" });
 		expect(storedKeys()).toEqual(["narrator:n-new"]);
 	});
 

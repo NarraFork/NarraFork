@@ -663,7 +663,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The dependent scan reads a narrator's committed directory out of the JSON context column.
 	"server/services/narrator-worktree-retirement.ts": ["json1"],
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
-	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
