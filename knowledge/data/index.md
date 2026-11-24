@@ -3,8 +3,6 @@ id: data
 title: 数据与存储
 summary: 数据库表、迁移、两种数据库后端、全文搜索、导入导出与存储清理。
 anchors:
-  - drizzle/
-  - drizzle-postgres/
   - server/db/index.ts
 keywords:
   - 数据库

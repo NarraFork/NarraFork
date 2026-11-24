@@ -293,14 +293,26 @@ export function sourceFiles(root: string): string[] {
 }
 
 /** Anchors that match more than {@link BROAD_ANCHOR_FILES} source files. */
+function otherFiles(): string[] {
+	const root = git(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
+	return lines(git(root, ["ls-files"])).filter(
+		(f) => !SOURCE_ROOTS.some((r) => f.startsWith(`${r}/`)) && !NOT_SOURCE.test(f),
+	);
+}
+
 export function broadAnchors(
 	source: string[],
 	nodes: KnowledgeNode[],
 ): Array<{ node: KnowledgeNode; anchor: string; count: number }> {
 	const out: Array<{ node: KnowledgeNode; anchor: string; count: number }> = [];
+	let others: string[] | undefined;
 	for (const node of nodes)
 		for (const anchor of node.anchors) {
-			const count = source.filter((f) => anchorMatches(anchor, f)).length;
+			// Outside the source roots (scripts/, .github/, …) every tracked non-test file counts.
+			const pool = SOURCE_ROOTS.some((r) => anchorPath(anchor).startsWith(`${r}/`))
+				? source
+				: (others ??= otherFiles());
+			const count = pool.filter((f) => anchorMatches(anchor, f)).length;
 			if (count > BROAD_ANCHOR_FILES) out.push({ node, anchor, count });
 		}
 	return out;

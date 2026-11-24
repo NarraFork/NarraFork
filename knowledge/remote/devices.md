@@ -12,7 +12,8 @@ anchors:
   - server/routes/executor-bootstrap.ts
   - server/lib/agent/execution/device-auth.ts
   - server/lib/agent/execution/rpc-types.ts
-  - remote-executor/
+  - remote-executor/cmd/
+  - remote-executor/go.mod
   - frontend/components/settings/DevicePathRulesEditor.tsx
   - frontend/components/settings/ExecutorInstallModal.tsx
   - frontend/components/settings/executor-install-command.ts

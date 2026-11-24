@@ -3,6 +3,8 @@ id: knowledge.repo-knowledge
 title: 仓库知识树
 summary: 本目录：放什么、格式、事实来源、何时更新。
 anchors:
+  - scripts/knowledge.ts
+  - tests/scripts/knowledge.test.ts
   - knowledge/README.md
   - knowledge/index.md
 keywords:

@@ -2,10 +2,7 @@
 id: engineering
 title: 工程与发布
 summary: 开发命令与代码规范、测试、构建、发布与更新、第三方许可。
-anchors:
-  - package.json
-  - scripts/
-  - .github/workflows/
+anchors: []
 keywords:
   - package.json
   - scripts/

@@ -8,7 +8,6 @@ anchors:
   - scripts/lib/stable-baseline-patch.ts
   - scripts/mirror-update-server.ts
   - .github/workflows/release.yml
-  - changelogs/
   - update-server/
   - server/services/update-service.ts
   - server/services/github-release-update.ts

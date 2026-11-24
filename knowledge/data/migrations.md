@@ -3,8 +3,10 @@ id: data.migrations
 title: 迁移（SQLite 与 PostgreSQL）
 summary: 只能经生成器生成迁移；PG 单快照谱系；禁止手改 drizzle 目录。
 anchors:
-  - drizzle/
-  - drizzle-postgres/
+  - drizzle/meta/_journal.json
+  - scripts/generate-sqlite-migrations.ts
+  - scripts/postgres-migrations.ts
+  - drizzle-postgres/meta/
   - drizzle.config.ts
   - drizzle.pg.config.ts
   - scripts/generate-sqlite-migrations.ts
