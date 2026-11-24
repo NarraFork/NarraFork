@@ -280,7 +280,7 @@
 			"pauseError": "Could not read the running sessions; nothing was stopped",
 			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped",
 			"members": "Team members",
-			"archivedHint": "This team is archived: nothing runs and its work items cannot change. Restore the coordinator's session to continue."
+			"archivedHint": "This team is archived: its work items cannot change. Workers it started may still be running. Restore the coordinator's session to continue."
 		},
 		"approvals": {
 			"title": "Pending approvals",

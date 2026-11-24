@@ -499,6 +499,20 @@ describe("top bar", () => {
 		);
 		expect(live).not.toContain("team-archived");
 	});
+
+	test("an archived team with workers still running keeps pause all", async () => {
+		// Archiving the coordinator does not stop background workers it started.
+		const stillRunning = summary({
+			coordinatorStatus: "archived",
+			pendingApprovalCount: 0,
+			runningCount: 2,
+		});
+		const html = await render(
+			<TeamTopBar projectId="p" teamId="lead" title="Release crew" summary={stillRunning} />,
+		);
+		expect(html).toContain('data-testid="team-archived"');
+		expect(html).toContain("team-pause-all");
+	});
 });
 
 describe("activity", () => {
