@@ -400,6 +400,7 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
+import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
 import { recoverBlockStorage } from "./narrator-block-sync";
 import {
 	lastTargetElement,
@@ -9471,6 +9472,7 @@ export async function failUnownedStartupRecovery(
  * the boundary is reached, there is nothing left and the loop must keep running.
  */
 export async function hasPendingBufferedWork(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres")
 		throw new Error(
 			"hasPendingBufferedWork is synchronous and cannot inspect the PostgreSQL mailbox; use getBufferedMessagesAsync",
@@ -9480,6 +9482,7 @@ export async function hasPendingBufferedWork(narratorId: string): Promise<boolea
 
 /** A queued next-step or failed input must never keep a guidance stop armed. */
 export async function hasPendingBufferedGuidance(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres") {
 		// Updated after durable admission, queue mutations and consumption. The
 		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
@@ -9535,6 +9538,7 @@ export function evaluateSoftStopRequest(flags: {
 }
 
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
@@ -9550,6 +9554,7 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
  * ending a run is an explicit Stop/cancel (`controlRun`).
  */
 export function requestUrgentBufferedGuidance(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) {
 		// No live turn: an in-flight planned-update recovery is the current activity.
@@ -9579,6 +9584,7 @@ export async function applyBufferedQueueModeControl(
 	hasPendingGuidance = true,
 	targetQueued = true,
 ): Promise<void> {
+	if (isBufferConsumptionHeld(narratorId)) hasPendingGuidance = targetQueued = false;
 	const active = activeNarrators.get(narratorId);
 	if (active) active._bufferGuidancePending = hasPendingGuidance;
 	if (!targetQueued) return;
@@ -9608,7 +9614,7 @@ export async function applyBufferedQueueModeControl(
  * its own text still rides on the turn being started here.
  */
 export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): Promise<void> {
-	if (!active._bufferSoftStopTaken) return;
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStopTaken) return;
 	if (resolveRuntimeQueueBackend() === "postgres") {
 		if (active._bufferGuidancePending) {
 			active._bufferSoftStopTaken = false;
@@ -9625,7 +9631,7 @@ export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator)
 }
 
 export async function abortPendingBufferedGuidance(active: ActiveNarrator): Promise<void> {
-	if (!active._bufferSoftStop) return;
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStop) return;
 	const apply = (pending: boolean) => {
 		if (active._bufferSoftStop && pending)
 			active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
@@ -9650,7 +9656,12 @@ export async function consumeBufferedSoftStopRequest(active: ActiveNarrator): Pr
 		if (decision.softStopTaken) active._bufferSoftStopTaken = true;
 		return decision.stop;
 	};
-	if (active._feedbackSoftStop || !active._bufferSoftStop) return apply(false);
+	if (
+		isBufferConsumptionHeld(active.narratorId) ||
+		active._feedbackSoftStop ||
+		!active._bufferSoftStop
+	)
+		return apply(false);
 	if (resolveRuntimeQueueBackend() === "postgres")
 		return apply(active._bufferGuidancePending === true);
 	return withCurrentBufferedGuidance(active.narratorId, apply);
@@ -9667,7 +9678,10 @@ export async function clearBufferedMessageSoftStopIfIdle(
 		if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
 	};
 	if (resolveRuntimeQueueBackend() === "postgres") {
-		apply(pendingGuidance ?? active._bufferGuidancePending === true);
+		apply(
+			!isBufferConsumptionHeld(narratorId) &&
+				(pendingGuidance ?? active._bufferGuidancePending === true),
+		);
 		return;
 	}
 	await withCurrentBufferedGuidance(narratorId, (pending) => {
@@ -9675,6 +9689,35 @@ export async function clearBufferedMessageSoftStopIfIdle(
 		return undefined;
 	});
 }
+
+// Edit holds only defer user input; they never cancel the current model/tool activity.
+// Re-read durable modes after release (including TTL expiry), then wake outside admission.
+bufferEditHolds.setListener(async (narratorId) => {
+	if (isBufferConsumptionHeld(narratorId)) {
+		const active = activeNarrators.get(narratorId);
+		if (active) {
+			active._bufferGuidancePending = false;
+			active._bufferSoftStop = false;
+		}
+		return;
+	}
+	await withNarratorStartAdmission(narratorId, async () => {
+		if (isBufferConsumptionHeld(narratorId)) return;
+		const remaining = (await getBufferedMessagesAsync(narratorId)).filter(
+			(message) => message.state !== "failed",
+		);
+		const modes = remaining.map((message) =>
+			resolveBufferQueueMode(message.queueMode, message.priority),
+		);
+		const mode = modes.includes("interrupt")
+			? "interrupt"
+			: modes.includes("tool")
+				? "tool"
+				: "turn";
+		await applyBufferedQueueModeControl(narratorId, mode, mode !== "turn", remaining.length > 0);
+	});
+	await wakeInboxIfEligible(narratorId);
+});
 
 // === Dynamic narrator controls ===
 

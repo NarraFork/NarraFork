@@ -66,6 +66,10 @@ export interface QueuedMessageRowProps {
 	narratorId?: string;
 	index: number;
 	isEditing: boolean;
+	isStartingEdit?: boolean;
+	isEditLocked?: boolean;
+	editProtected?: boolean;
+	editError?: string;
 	onStartEdit: (msg: BufferMessageSummary) => void;
 	onCancelEdit: () => void;
 	/** Resolves false when the server rejected the edit, so the editor stays open. */
@@ -159,6 +163,10 @@ export function QueuedMessageRow({
 	narratorId,
 	index,
 	isEditing,
+	isStartingEdit = false,
+	isEditLocked = false,
+	editProtected = true,
+	editError,
 	onStartEdit,
 	onCancelEdit,
 	onSaveEdit,
@@ -185,7 +193,8 @@ export function QueuedMessageRow({
 				: "var(--mantine-color-default-border)";
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
-		disabled: mode !== "turn" || isEditing || urgentStatus !== undefined,
+		disabled:
+			mode !== "turn" || isEditing || isStartingEdit || isEditLocked || urgentStatus !== undefined,
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),
@@ -219,6 +228,8 @@ export function QueuedMessageRow({
 			urgentStatus === "sending" ||
 			(urgentOnly && next !== "interrupt") ||
 			isEditing ||
+			isStartingEdit ||
+			isEditLocked ||
 			(next === "interrupt" && failed && !urgentOnly)
 		)
 			return;
@@ -244,10 +255,16 @@ export function QueuedMessageRow({
 		}
 	};
 	const canEdit =
-		!isEditing && !retrying && changingMode === null && !urgentCommitted && !urgentOnly;
+		!isEditing &&
+		!isStartingEdit &&
+		!retrying &&
+		changingMode === null &&
+		!urgentCommitted &&
+		!urgentOnly;
 	const startEditing = () => {
 		if (
 			isEditing ||
+			isStartingEdit ||
 			retryingRef.current ||
 			changingModeRef.current ||
 			urgentRequestedRef.current ||
@@ -275,7 +292,8 @@ export function QueuedMessageRow({
 	);
 	const [retryError, setRetryError] = useState<string | null>(null);
 	const retry = async () => {
-		if (retryingRef.current || changingModeRef.current || !failed) return;
+		if (retryingRef.current || changingModeRef.current || isStartingEdit || isEditLocked || !failed)
+			return;
 		retryingRef.current = true;
 		setRetrying(true);
 		setRetryError(null);
@@ -312,6 +330,8 @@ export function QueuedMessageRow({
 	const msgRef = useRef(msg);
 	msgRef.current = msg;
 	const canSubmit =
+		editProtected &&
+		!isStartingEdit &&
 		!!snapshot &&
 		(!!snapshot.text.trim() ||
 			snapshot.fileReferences.length > 0 ||
@@ -440,6 +460,26 @@ export function QueuedMessageRow({
 							{urgentError && `: ${urgentError}`}
 						</Text>
 					)}
+					{isStartingEdit && (
+						<Text size="xs" c="dimmed" role="status">
+							{t("queuedEditStarting")}
+						</Text>
+					)}
+					{editError && (
+						<Stack gap={2}>
+							<Text size="xs" c="red" role="alert">
+								{editError}
+							</Text>
+							<Group gap="xs">
+								<Button size="compact-xs" variant="light" onClick={startEditing}>
+									{t("queuedEditReacquire")}
+								</Button>
+								<Button size="compact-xs" variant="subtle" onClick={onCancelEdit}>
+									{t("queuedEditDismiss")}
+								</Button>
+							</Group>
+						</Stack>
+					)}
 					{failureNotice}
 				</Stack>
 				{failed && !urgentOnly && (
@@ -448,7 +488,7 @@ export function QueuedMessageRow({
 						color="red"
 						variant="light"
 						loading={retrying}
-						disabled={retrying || changingMode !== null}
+						disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
 						onClick={() => void retry()}
 					>
 						{t("queuedRetry")}
@@ -461,7 +501,7 @@ export function QueuedMessageRow({
 							variant="subtle"
 							color={mode === "turn" ? "indigo" : "gray"}
 							aria-label={toggleLabel}
-							disabled={retrying || changingMode !== null}
+							disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
 							loading={changingMode !== null && changingMode !== "interrupt"}
 							onClick={() => void changeMode(nextMode)}
 						>
@@ -481,7 +521,12 @@ export function QueuedMessageRow({
 						color="orange"
 						aria-label={urgentLabel}
 						disabled={
-							(failed && !urgentOnly) || retrying || changingMode !== null || urgentCommitted
+							isStartingEdit ||
+							isEditLocked ||
+							(failed && !urgentOnly) ||
+							retrying ||
+							changingMode !== null ||
+							urgentCommitted
 						}
 						loading={changingMode === "interrupt"}
 						onClick={() => void changeMode("interrupt")}
@@ -495,7 +540,7 @@ export function QueuedMessageRow({
 							size="sm"
 							variant="subtle"
 							color="gray"
-							disabled={retrying || changingMode !== null}
+							disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
 							aria-label={t("queuedActions")}
 						>
 							<IconDotsVertical size={14} />
@@ -522,7 +567,11 @@ export function QueuedMessageRow({
 							</>
 						)}
 						<Menu.Divider />
-						<Menu.Item color="red" onClick={() => onRemove(msg.id)}>
+						<Menu.Item
+							color="red"
+							disabled={isStartingEdit || isEditLocked}
+							onClick={() => onRemove(msg.id)}
+						>
 							{cancelBufferLabel}
 						</Menu.Item>
 						{onClearAll && (
@@ -538,7 +587,7 @@ export function QueuedMessageRow({
 						variant="subtle"
 						aria-label={cancelBufferLabel}
 						title={cancelBufferLabel}
-						disabled={retrying || changingMode !== null}
+						disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
 						onClick={(event) => {
 							event.stopPropagation();
 							if (!retryingRef.current && !changingModeRef.current) onRemove(msg.id);
@@ -568,6 +617,26 @@ export function QueuedMessageRow({
 				)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
 				{senderHeader}
+				{editProtected ? (
+					<Text size="xs" c="dimmed" role="status">
+						{t("queuedEditPaused")}
+					</Text>
+				) : (
+					<Stack gap={2}>
+						<Text size="xs" c="red" role="alert">
+							{editError ?? t("queuedEditProtectionLost")}
+						</Text>
+						<Button
+							size="compact-xs"
+							variant="light"
+							loading={isStartingEdit}
+							disabled={submitting}
+							onClick={() => onStartEdit(msgRef.current)}
+						>
+							{t("queuedEditReacquire")}
+						</Button>
+					</Stack>
+				)}
 				{failureNotice}
 				<EditableComposerDocument
 					key={msg.id}

@@ -16,16 +16,16 @@ import { disconnectDevice } from "./device-connection-service";
 import { integrationAuthorizationService } from "./integration-authorization-service";
 import { integrationEventDispatcher } from "./integration-event-dispatcher";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import { clearBufferedMessages } from "./narrator-buffer";
+import { clearBufferedMessagesForAuthorizationLoss } from "./narrator-buffer";
 import { interruptManualBash, narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 
 const REVOCATION_PAGE_SIZE = 100;
 
 /**
- * Hard-stop all work owned by one OAuth narrator. Clearing the durable/in-memory
- * buffer happens synchronously before abort so the normal interrupt finalizer
- * cannot auto-resume the next queued message.
+ * Hard-stop all work owned by one OAuth narrator. Block input consumption before
+ * aborting activity, cancel/settle any in-flight editor, then clear the durable
+ * queue without a lease-release wake. UI edit holds can never block revocation.
  */
 export async function stopOAuthNarratorForAuthorizationLoss(
 	narratorId: string,
@@ -43,10 +43,12 @@ export async function stopOAuthNarratorForAuthorizationLoss(
 					{ executionPolicy: "worker-required" },
 				)
 			: null;
-	await clearBufferedMessages(narratorId);
-	interruptManualBash(narratorId);
-	const interrupted = interruptNarrator(narratorId);
-	await backgroundTaskService.cancelRunningByParent(narratorId);
+	let interrupted = false;
+	await clearBufferedMessagesForAuthorizationLoss(narratorId, async () => {
+		interruptManualBash(narratorId);
+		interrupted = interruptNarrator(narratorId);
+		await backgroundTaskService.cancelRunningByParent(narratorId);
+	});
 	if (!interrupted) {
 		const narrator = await narratorService.getById(narratorId).catch(() => null);
 		if (narrator && (narrator.status === "working" || narrator.status === "waiting")) {

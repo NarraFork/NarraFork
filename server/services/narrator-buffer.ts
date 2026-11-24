@@ -51,6 +51,7 @@ import {
 	type RuntimeMailboxStagingLookup,
 	type RuntimeQueuePort,
 } from "./agent-runtime/runtime-queue-port";
+import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
 import {
 	activeNarrators,
 	type BufferCreator,
@@ -807,6 +808,7 @@ export async function withCurrentBufferedGuidance<T extends boolean | undefined>
 	narratorId: string,
 	apply: (pending: boolean) => T,
 ): Promise<T> {
+	if (isBufferConsumptionHeld(narratorId)) return apply(false);
 	assertSqliteBufferRead("withCurrentBufferedGuidance");
 	const columns = {
 		id: mailbox.id,
@@ -850,7 +852,7 @@ export async function withCurrentBufferedGuidance<T extends boolean | undefined>
 			.limit(MAILBOX_LIMITS.userPending)
 			.all();
 		if (hasGuidance(current) !== pendingGuidance) throw new RuntimeReadConflictError();
-		return apply(pendingGuidance);
+		return apply(!isBufferConsumptionHeld(narratorId) && pendingGuidance);
 	});
 }
 
@@ -1133,6 +1135,7 @@ export async function enqueueBufferedMessage(
 	}
 }
 export interface BufferedMessageAttachmentUpdate {
+	signal?: AbortSignal;
 	composerDocument?: ComposerDocument;
 	images?: ImageRef[];
 	media?: MediaRef[];
@@ -1140,7 +1143,40 @@ export interface BufferedMessageAttachmentUpdate {
 	savedFiles?: SavedBufferedFile[];
 	fileReferences?: FileReferenceSnapshot[];
 }
-export async function updateBufferedMessage(
+export async function beginBufferedMessageEdit(
+	narratorId: string,
+	messageId: string,
+	userId: string,
+	token: string,
+) {
+	return bufferEditHolds.begin(narratorId, { messageId, userId, token }, () =>
+		canEditBufferedMessage(narratorId, messageId),
+	);
+}
+export async function canEditBufferedMessage(
+	narratorId: string,
+	messageId: string,
+): Promise<boolean> {
+	const row = await rowByIdRuntime(messageId);
+	return (
+		!!row &&
+		row.narratorId === narratorId &&
+		row.kind === "user_input" &&
+		pending.includes(row.state as "queued" | "failed")
+	);
+}
+
+export function updateBufferedMessage(
+	narratorId: string,
+	messageId: string,
+	text: string,
+	opts: BufferedMessageAttachmentUpdate = {},
+): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		updateBufferedMessageUnlocked(narratorId, messageId, text, opts),
+	);
+}
+async function updateBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 	text: string,
@@ -1263,6 +1299,8 @@ export async function updateBufferedMessage(
 			MAILBOX_LIMITS.metadataBytes
 		)
 			throw new Error("Attachment metadata exceeds mailbox budget");
+		opts.signal?.throwIfAborted();
+		bufferEditHolds.mutationSignal()?.throwIfAborted();
 		const ok = port
 			? await port.mailbox.updateUserBuffered(
 					messageId,
@@ -1329,7 +1367,12 @@ export async function updateBufferedMessage(
 		throw error;
 	}
 }
-export async function removeBufferedMessage(
+export function removeBufferedMessage(narratorId: string, messageId: string): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		removeBufferedMessageUnlocked(narratorId, messageId),
+	);
+}
+async function removeBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<boolean> {
@@ -1476,7 +1519,16 @@ export async function waitForBufferedMessageDelivery(
 	}
 }
 
-export async function updateBufferedMessageMode(
+export function updateBufferedMessageMode(
+	narratorId: string,
+	messageId: string,
+	mode: BufferQueueMode,
+): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		updateBufferedMessageModeUnlocked(narratorId, messageId, mode),
+	);
+}
+async function updateBufferedMessageModeUnlocked(
 	narratorId: string,
 	messageId: string,
 	mode: BufferQueueMode,
@@ -1519,7 +1571,15 @@ export async function updateBufferedMessageMode(
 	});
 }
 
-export async function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+export function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, undefined, () =>
+		reorderBufferedMessagesUnlocked(narratorId, ids),
+	);
+}
+async function reorderBufferedMessagesUnlocked(
+	narratorId: string,
+	ids: string[],
+): Promise<boolean> {
 	const port = pgQueue();
 	if (port) return port.mailbox.reorderUserPending(narratorId, ids);
 	return db.transaction((tx) => {
@@ -1543,7 +1603,22 @@ export async function reorderBufferedMessages(narratorId: string, ids: string[])
 	});
 }
 const BUFFER_CLEAR_CLEANUP_PENDING = "Removed by user; attachment cleanup pending";
-export async function clearBufferedMessages(narratorId: string): Promise<void> {
+/** Authorization loss must cancel/settle in-flight edits, not fail on their UI hold. */
+export function clearBufferedMessagesForAuthorizationLoss(
+	narratorId: string,
+	stop: () => void | Promise<void>,
+): Promise<void> {
+	return bufferEditHolds.quiesceForAuthorizationLoss(narratorId, stop, () =>
+		clearBufferedMessagesUnlocked(narratorId),
+	);
+}
+
+export function clearBufferedMessages(narratorId: string): Promise<void> {
+	return bufferEditHolds.mutate(narratorId, undefined, () =>
+		clearBufferedMessagesUnlocked(narratorId),
+	);
+}
+async function clearBufferedMessagesUnlocked(narratorId: string): Promise<void> {
 	const port = pgQueue();
 	if (port) {
 		await port.mailbox.initializeLegacy(narratorId);
@@ -1643,7 +1718,12 @@ export async function clearBufferedMessages(narratorId: string): Promise<void> {
 	}
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */
-export async function retryBufferedMessage(
+export function retryBufferedMessage(narratorId: string, messageId: string): Promise<boolean> {
+	return bufferEditHolds.mutate(narratorId, messageId, () =>
+		retryBufferedMessageUnlocked(narratorId, messageId),
+	);
+}
+async function retryBufferedMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<boolean> {

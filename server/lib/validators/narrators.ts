@@ -520,6 +520,8 @@ export const updateBlacklistCmdSchema = z.object({
  * `basename` so names are unique there, but a taken-over subagent's queue holds
  * the original File objects where two same-named files can coexist.
  */
+export const bufferEditLeaseSchema = z.object({ token: z.string().min(1).max(200) });
+
 export const updateBufferedMessageSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),

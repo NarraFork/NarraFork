@@ -2069,6 +2069,176 @@ describe("urgent dispatch real hook and panel", () => {
 	}
 });
 
+describe("queued edit protection real hook and editor", () => {
+	test("failed first admission has explicit retry/exit even after its raw row disappears; exit clears the ghost lock", async () => {
+		const message: BufferMessageSummary = {
+			id: "lost-admission",
+			text: "Original",
+			imageCount: 0,
+			bufferedAt: "now",
+		};
+		const begin = spyOn(api, "beginBufferedMessageEdit").mockRejectedValue(
+			new Error("network lost"),
+		);
+		const release = spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+		spyOn(notifications, "show").mockReturnValue("notice");
+		let actions: ReturnType<typeof useQueuedMessageActions> | undefined;
+		let consume: (() => void) | undefined;
+		function View() {
+			const [messages, setMessages] = useState([message]);
+			consume = () => setMessages([]);
+			actions = useQueuedMessageActions({
+				narratorId: "narrator",
+				queuedMessages: messages,
+				setQueuedMessages: setMessages,
+				reconcileBufferedMessages: () => {},
+				cancelBuffer: () => {},
+				composerRef: { current: null },
+				handleSendRef: { current: () => {} },
+				handleSendWithModeRef: { current: () => {} },
+				ctrlEnterQueueModeRef: { current: "tool" },
+				t: (key) => i18n.t(key),
+			});
+			return queuePanel({
+				narratorId: "narrator",
+				...actions,
+				queuedMessages: actions.visibleQueuedMessages,
+			});
+		}
+		await render(<View />);
+		await act(async () => {
+			await actions?.handleStartEditQueued(message);
+			consume?.();
+		});
+		expect(host?.querySelector(".ProseMirror")).toBeNull();
+		expect(host?.textContent).toContain("network lost");
+		expect(button(en.queuedEditReacquire).disabled).toBe(false);
+		expect(actions?.queuedEditLockedId).toBe(message.id);
+		await click(button(en.queuedEditDismiss));
+		expect(release).toHaveBeenCalledWith("narrator", message.id, begin.mock.calls[0][2]);
+		expect(actions?.queuedEditLockedId).toBeUndefined();
+		expect(host?.textContent).not.toContain("network lost");
+	});
+	for (const [language, strings] of [
+		["en", en],
+		["zh-CN", zh],
+	] as const) {
+		test(`${language}: failed saves and lost leases retain body, files and editor across WS consumption and reacquisition`, async () => {
+			await i18n.changeLanguage(language);
+			const message: BufferMessageSummary = {
+				id: "protected",
+				text: "Original",
+				imageCount: 0,
+				bufferedAt: "now",
+			};
+			const begin = spyOn(api, "beginBufferedMessageEdit").mockImplementation(
+				async (_n, _m, token) => ({
+					ok: true,
+					token,
+					expiresAt: Date.now() + 120_000,
+					leaseMs: 120_000,
+				}),
+			);
+			const release = spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+			spyOn(api, "getBufferedMessages").mockResolvedValue([message]);
+			spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(new Error("offline"));
+			spyOn(notifications, "show").mockReturnValue("notice");
+			const update = spyOn(api, "updateBufferedMessage")
+				.mockRejectedValueOnce(new Error("upload failed"))
+				.mockResolvedValue({ ok: true });
+			let renew: (() => void) | undefined;
+			const nativeInterval = globalThis.setInterval;
+			spyOn(globalThis, "setInterval").mockImplementation(((
+				handler: () => void,
+				delay?: number,
+			) => {
+				if (delay === 20_000) renew = handler;
+				return nativeInterval(handler, delay);
+			}) as typeof setInterval);
+			let actions: ReturnType<typeof useQueuedMessageActions> | undefined;
+			let consume: (() => void) | undefined;
+			function View() {
+				const [messages, setMessages] = useState([message]);
+				consume = () => setMessages([]);
+				actions = useQueuedMessageActions({
+					narratorId: "narrator",
+					queuedMessages: messages,
+					setQueuedMessages: setMessages,
+					reconcileBufferedMessages: () => {},
+					cancelBuffer: () => {},
+					composerRef: { current: null },
+					handleSendRef: { current: () => {} },
+					handleSendWithModeRef: { current: () => {} },
+					ctrlEnterQueueModeRef: { current: "tool" },
+					t: (key) => i18n.t(key),
+				});
+				return queuePanel({
+					narratorId: "narrator",
+					...actions,
+					queuedMessages: actions.visibleQueuedMessages,
+				});
+			}
+			await render(<View />);
+			await act(async () => {
+				await actions?.handleStartEditQueued(message);
+				await flush();
+			});
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			await editRange(0, "Original".length, "Unsaved body");
+			const image = new File(["gif"], "draft.gif", { type: "image/gif" });
+			const textFile = new File(["content"], "draft.txt", { type: "text/plain" });
+			await act(async () => {
+				const { textarea, props } = textareaProps();
+				props.onPaste?.({
+					currentTarget: textarea,
+					clipboardData: {
+						items: [image, textFile].map((file) => ({
+							kind: "file",
+							type: file.type,
+							getAsFile: () => file,
+						})),
+					},
+					preventDefault() {},
+				} as unknown as Parameters<NonNullable<typeof props.onPaste>>[0]);
+				await flush();
+			});
+			const editorBefore = textareaProps().textarea;
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(actions?.editingQueuedId).toBe("protected");
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			expect(host?.textContent).toContain("draft.txt");
+			expect(release).not.toHaveBeenCalled();
+			await act(async () => {
+				if (!renew || !consume) throw new Error("Editor not initialized");
+				renew();
+				await flush();
+				consume();
+			});
+			expect(host?.textContent).toContain(strings.queuedEditProtectionLost);
+			expect(host?.textContent).not.toContain(strings.queuedEditPaused);
+			expect(textareaProps().textarea).toBe(editorBefore);
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
+			expect(host?.textContent).toContain("draft.txt");
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(1);
+			await click(button(strings.queuedEditReacquire));
+			expect(begin).toHaveBeenCalledTimes(2);
+			expect(begin.mock.calls[1][2]).toBe(begin.mock.calls[0][2]);
+			expect(textareaProps().textarea).toBe(editorBefore);
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(2);
+			expect(update.mock.calls[1][3]?.newImages).toEqual([image]);
+			expect(update.mock.calls[1][3]?.newTextFiles).toEqual([textFile]);
+			expect(update.mock.calls[1][4]).toBe(begin.mock.calls[0][2]);
+			expect(host?.querySelector(".ProseMirror")).toBeNull();
+			expect(release).toHaveBeenCalledWith("narrator", "protected", begin.mock.calls[0][2]);
+		});
+	}
+});
+
 describe("real queued panel composition", () => {
 	for (const change of [
 		"cancel head",

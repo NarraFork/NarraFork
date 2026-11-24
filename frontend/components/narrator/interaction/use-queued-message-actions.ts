@@ -8,6 +8,7 @@ import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { moveQueuedTurn, queuedMessageMode } from "./queue-message-mode";
+import { useQueuedMessageEdit } from "./use-queued-message-edit";
 
 export interface UrgentDispatch {
 	message: BufferMessageSummary;
@@ -78,6 +79,8 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		t,
 	} = options;
 
+	const editActions = useQueuedMessageEdit(options);
+	const { isQueuedEditLocked } = editActions;
 	const scopeRef = useRef({
 		narratorId,
 		dispatches: new Map<string, UrgentDispatch>(),
@@ -92,6 +95,14 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		const status = dispatches.get(message.id)?.status;
 		return status !== "sending" && status !== "sent" && status !== "failed";
 	});
+	// A lost lease may let WS consumption remove the raw row. Keep the keyed
+	// editor mounted, with its local document/files, until the user leaves it.
+	if (
+		editActions.editingQueuedMessage &&
+		!visibleQueuedMessages.some((message) => message.id === editActions.editingQueuedMessage?.id)
+	) {
+		visibleQueuedMessages.push(editActions.editingQueuedMessage);
+	}
 	useEffect(() => {
 		const scope = scopeRef.current;
 		if (scope.narratorId !== narratorId) return;
@@ -178,6 +189,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	useEffect(() => cancelQueueHold, [cancelQueueHold]);
 
 	const handleCancelAllQueued = useCallback(() => {
+		if (isQueuedEditLocked()) return;
 		const ordinary = queuedMessages.filter(
 			(m) => queuedMessageMode(m) !== "interrupt" && !scopeRef.current.dispatches.has(m.id),
 		);
@@ -191,10 +203,18 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 				void api.removeBufferedMessage(narratorId, id).catch(() => reconcileBufferedMessages());
 			}
 		}
-	}, [queuedMessages, cancelBuffer, narratorId, setQueuedMessages, reconcileBufferedMessages]);
+	}, [
+		queuedMessages,
+		cancelBuffer,
+		narratorId,
+		setQueuedMessages,
+		reconcileBufferedMessages,
+		isQueuedEditLocked,
+	]);
 
 	const handleRemoveQueued = useCallback(
 		(messageId: string) => {
+			if (isQueuedEditLocked(messageId)) return;
 			const status = scopeRef.current.dispatches.get(messageId)?.status;
 			if (status === "sending" || status === "sent") return;
 			setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
@@ -207,17 +227,18 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 				});
 			});
 		},
-		[setQueuedMessages, narratorId, reconcileBufferedMessages, t],
+		[setQueuedMessages, narratorId, reconcileBufferedMessages, t, isQueuedEditLocked],
 	);
 
 	const handleRetryQueued = useCallback(
 		async (messageId: string) => {
+			if (isQueuedEditLocked(messageId)) throw new Error(t("queuedEditPaused"));
 			const result = await api.retryBufferedMessage(narratorId, messageId);
 			// Refresh authoritative state; do not resurrect a row already consumed over WS.
 			reconcileBufferedMessages();
 			return result;
 		},
-		[narratorId, reconcileBufferedMessages],
+		[narratorId, reconcileBufferedMessages, isQueuedEditLocked, t],
 	);
 
 	const reorderQueued = useCallback(
@@ -279,6 +300,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	);
 	const handleChangeMode = useCallback(
 		async (id: string, mode: QueueMode) => {
+			if (isQueuedEditLocked(id)) return false;
 			const scope = scopeRef.current;
 			const previous = scope.dispatches.get(id);
 			if (previous?.status === "sending" || previous?.status === "sent") return false;
@@ -326,64 +348,33 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 				return false;
 			}
 		},
-		[narratorId, queuedMessages, setQueuedMessages, reconcileBufferedMessages, t],
+		[
+			narratorId,
+			queuedMessages,
+			setQueuedMessages,
+			reconcileBufferedMessages,
+			t,
+			isQueuedEditLocked,
+		],
 	);
 
-	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
 	const [queueExpanded, setQueueExpanded] = useState(true);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator changes invalidate the previous editor scope.
-	useEffect(() => setEditingQueuedId(null), [narratorId]);
 	const handleStartEditQueued = useCallback(
 		(msg: { id: string }) => {
+			const message = queuedMessages.find((message) => message.id === msg.id);
 			if (
 				scopeRef.current.dispatches.has(msg.id) ||
-				queuedMessages.some((m) => m.id === msg.id && queuedMessageMode(m) === "interrupt")
+				(message && queuedMessageMode(message) === "interrupt")
 			)
-				return;
-			setEditingQueuedId(msg.id);
+				return Promise.resolve();
+			// A lost editor can outlive its consumed buffer row and still offer retry.
+			const editable = message ?? editActions.editingQueuedMessage;
+			if (!editable || editable.id !== msg.id) return Promise.resolve();
+			return editActions.handleStartEditQueued(editable);
 		},
-		[queuedMessages],
+		[queuedMessages, editActions],
 	);
-
-	const handleCancelEditQueued = useCallback(() => {
-		setEditingQueuedId(null);
-	}, []);
-
-	/**
-	 * Persist an edited queued message.
-	 *
-	 * Only the text is updated optimistically. Attachments are not: the client
-	 * cannot invent the imageId of an upload the server has not accepted yet, and
-	 * a wrong guess would render a broken thumbnail. The authoritative
-	 * `buffer_set` broadcast that follows a successful edit carries the real set.
-	 *
-	 * Returns false on failure so the row keeps the draft open with the user's
-	 * selected files intact.
-	 */
-	const handleSaveEditQueued = useCallback(
-		async (
-			msg: BufferMessageSummary,
-			text: string,
-			payload: QueuedEditPayload,
-		): Promise<boolean> => {
-			setQueuedMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, text } : m)));
-			try {
-				const result = await api.updateBufferedMessage(narratorId, msg.id, text, payload);
-				reconcileBufferedMessages();
-				return result.ok === true;
-			} catch (err) {
-				reconcileBufferedMessages();
-				notifications.show({
-					color: "red",
-					title: t("editQueuedFailed"),
-					message: err instanceof Error ? err.message : String(err),
-				});
-				return false;
-			}
-		},
-		[setQueuedMessages, narratorId, reconcileBufferedMessages, t],
-	);
+	const { handleCancelEditQueued, handleSaveEditQueued } = editActions;
 
 	// Fill the panel's bridge refs with the live handlers (render-time
 	// assignment mirrors the pattern the panel uses for its own send refs).
@@ -408,7 +399,11 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		handleDragEndQueued,
 		handleMoveQueued,
 		handleChangeMode,
-		editingQueuedId,
+		editingQueuedId: editActions.editingQueuedId,
+		startingQueuedId: editActions.startingQueuedId,
+		queuedEditLockedId: editActions.queuedEditLockedId,
+		queuedEditProtected: editActions.queuedEditProtected,
+		queuedEditError: editActions.queuedEditError,
 		queueExpanded,
 		setQueueExpanded,
 		handleStartEditQueued,
