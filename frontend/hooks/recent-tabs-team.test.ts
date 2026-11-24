@@ -138,13 +138,16 @@ describe("live window", () => {
 	});
 
 	test("project tabs get runtime details apart from the live window, bounded", () => {
-		const projects = Array.from({ length: 25 }, (_, i): RecentTab => ({
-			type: "project",
-			id: `p${i}`,
-			title: `P${i}`,
-			lastVisitedAt: 1,
-			pinned: i === 24,
-		}));
+		const projects = Array.from(
+			{ length: 25 },
+			(_, i): RecentTab => ({
+				type: "project",
+				id: `p${i}`,
+				title: `P${i}`,
+				lastVisitedAt: 1,
+				pinned: i === 24,
+			}),
+		);
 		const picked = selectProjectRuntimeTabs([session, ...projects], "/projects/p23");
 		// The current page's project, then pinned ones, then the rest, at most 20.
 		expect(picked.map((tab) => tab.id).slice(0, 3)).toEqual(["p23", "p24", "p0"]);

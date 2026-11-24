@@ -404,7 +404,7 @@ test("a persisted project row gets its card details: runtime key, then a read wh
 		}),
 	);
 	await act(async () => render());
-	expect(cachedTab("p1")?.activeSessionCount).toBe(4);
+	expect((cachedTab("p1") as RecentTab | undefined)?.activeSessionCount).toBe(4);
 	expect(host.textContent).toContain("4 session(s) running");
 	await act(async () => cardRoot.unmount());
 });
