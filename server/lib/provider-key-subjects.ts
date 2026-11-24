@@ -6,11 +6,11 @@
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
-export interface UsageSubject {
+export interface UsageSubject<TConfig = CustomApiProviderConfig> {
 	/** The key's id (a migrated first key carries the provider's id). */
 	id: string;
 	providerId: string;
-	config: CustomApiProviderConfig;
+	config: TConfig;
 }
 
 export function usageSubjects(

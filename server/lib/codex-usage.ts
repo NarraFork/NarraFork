@@ -1,6 +1,7 @@
 // Codex Usage API — fetch ChatGPT account usage limits
 // Based on https://chatgpt.com/backend-api/wham/usage
 
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { logger } from "./logger";
 import { applyProxyExemptions } from "./net/proxy";
 
@@ -288,6 +289,23 @@ export function getCodexUsageWindows(usage?: CodexUsageResult): CodexUsageWindow
 	return [usage.primary_window, usage.secondary_window].filter(
 		(window): window is CodexUsageWindow => !!window,
 	);
+}
+
+/** Project the canonical credential-state usage without storing a second snapshot. */
+export function projectCodexUsageSnapshot(usage: CodexUsageResult): QuotaSnapshot {
+	const fetchedAt = Date.parse(usage.queriedAt);
+	return {
+		fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : 0,
+		scope: "subscription",
+		windows: getCodexUsageWindows(usage).map((window) => ({
+			kind: window.window_type === "unknown" ? "other" : window.window_type,
+			usedRatio: window.used_percent / 100,
+			resetsAt: window.reset_at * 1000,
+		})),
+		balances: [],
+		plan: usage.plan_type,
+		detail: usage,
+	};
 }
 
 async function readResponseTextWithLimit(response: Response): Promise<string> {

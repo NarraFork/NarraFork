@@ -1,7 +1,10 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { getNarraforkPath } from "../lib/narrafork-home";
+import { createPersistedCredentialCache } from "../lib/persisted-credential-cache";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import type { NarraForkSettings } from "../lib/settings/types";
+import { quotaStore } from "../lib/sourcing/quota-store";
 
 const fakeSettings = {
 	server: { allowedOrigins: ["https://ui.example"] },
@@ -88,6 +91,53 @@ function paymentFixture(overrides: Record<string, unknown> = {}) {
 	};
 }
 describe("TokenDance billing", () => {
+	test("legacy balance imports into a credential snapshot and the old DTO is unchanged", async () => {
+		const generation = connectBilling();
+		const updatedAt = Date.now() - 1000;
+		const legacy = createPersistedCredentialCache("tokendance-balance.json", (raw) => raw);
+		legacy.save("tokendance", JSON.stringify(["billing-secret-key", generation]), {
+			credits: 8_000_000,
+			creditsUsed: 3_000_000,
+			balance: 5_000_000,
+			updatedAt,
+		});
+		await legacy.flush();
+		let finish!: (response: Response) => void;
+		fetchMock(
+			() =>
+				new Promise<Response>((resolve) => {
+					finish = resolve;
+				}),
+		);
+		expect(service.getTokenDanceBalance()).toEqual({
+			generation,
+			credits: 8_000_000,
+			creditsUsed: 3_000_000,
+			balance: 5_000_000,
+			updatedAt,
+			loading: true,
+			hasError: false,
+		});
+		const task = service.refreshTokenDanceBalance();
+		finish(json({ balance: { credits: 10, credits_used: 4, balance: 6 } }));
+		const refreshed = await task;
+		expect(refreshed).toEqual({
+			generation,
+			credits: 10,
+			creditsUsed: 4,
+			balance: 6,
+			updatedAt: expect.any(Number),
+			loading: false,
+			hasError: false,
+		});
+		expect(quotaStore.peek("tokendance")?.balances).toEqual([
+			{ unit: "CNY", remaining: 0.000006, total: 0.00001 },
+		]);
+		expect(quotaStore.peek("tokendance")?.detail).toEqual(refreshed);
+		await quotaStore.flush();
+		expect(existsSync(getNarraforkPath("tokendance-balance.json"))).toBe(false);
+	});
+
 	test.each([
 		"create",
 		"status",
@@ -544,6 +594,30 @@ describe("TokenDance billing", () => {
 		finish(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
 		await task;
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
+	});
+	test("replacing only the key withdraws the old balance and rejects its late answer", async () => {
+		connectBilling();
+		let finishOld!: (value: Response) => void;
+		fetchMock(
+			() =>
+				new Promise<Response>((resolve) => {
+					finishOld = resolve;
+				}),
+		);
+		const oldTask = service.refreshTokenDanceBalance();
+		const current = fakeSettings.tokendance;
+		if (!current) throw new Error("TokenDance test connection missing");
+		fakeSettings.tokendance = { ...current, apiKey: "replacement-secret-key" };
+		fetchMock(() => json({ balance: { credits: 20, credits_used: 0, balance: 20 } }));
+		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: true });
+		expect(await service.refreshTokenDanceBalance()).toMatchObject({ balance: 20 });
+		finishOld(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
+		await oldTask;
+		expect(service.getTokenDanceBalance()).toMatchObject({
+			balance: 20,
+			hasError: false,
+			loading: false,
+		});
 	});
 	test("confirmed payment is deduplicated including concurrent and conflicting retries", async () => {
 		const generation = connectBilling();

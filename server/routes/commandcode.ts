@@ -12,7 +12,11 @@ import {
 	resolveCommandCodeToken,
 } from "../lib/commandcode-manager";
 import { invalidateCommandCodeModelsCache, listCommandCodeModels } from "../lib/commandcode-models";
-import { CommandCodeUsageError, fetchCommandCodeUsage } from "../lib/commandcode-usage";
+import {
+	CommandCodeUsageError,
+	fetchCommandCodeUsage,
+	getCommandCodeUsageFromSettings,
+} from "../lib/commandcode-usage";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
@@ -52,10 +56,12 @@ commandCodeRoutes.get("/usage", async (c) => {
 		return c.json({ loggedIn: false, reason: auth.reason });
 	}
 	try {
-		return c.json({
-			loggedIn: true,
-			...(await fetchCommandCodeUsage(auth.credential.token, settings.commandCode?.baseUrl)),
-		});
+		const usage =
+			auth.credential.source === "settings"
+				? await getCommandCodeUsageFromSettings()
+				: // CLI auth has no unified credential: keep the original uncached path.
+					await fetchCommandCodeUsage(auth.credential.token, settings.commandCode?.baseUrl);
+		return c.json({ loggedIn: true, ...usage });
 	} catch (error) {
 		const code = error instanceof CommandCodeUsageError ? error.message : "usage_unavailable";
 		const upstreamStatus = error instanceof CommandCodeUsageError ? error.status : 0;
