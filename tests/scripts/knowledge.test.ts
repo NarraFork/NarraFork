@@ -10,6 +10,7 @@ import {
 	loadNodes,
 	parseNode,
 	stale,
+	termIn,
 } from "../../scripts/knowledge";
 
 let root: string;
@@ -90,6 +91,13 @@ describe("knowledge tree tool", () => {
 		const nodes = loadNodes(root);
 		expect(find(nodes, ["FILE_HISTORY_DISABLED"])[0]?.node.id).toBe("area.alpha");
 		expect(find(nodes, ["server/services/beta/one.ts"])[0]?.node.id).toBe("area.beta");
+	});
+
+	test("short English terms match whole words only", () => {
+		expect(termIn("pooled provider", "OLED")).toBe(false);
+		expect(termIn("OLED/调色板", "OLED")).toBe(true);
+		expect(termIn("FILE_HISTORY_DISABLED", "FILE_HISTORY_DISABLED")).toBe(true);
+		expect(termIn("团队会话", "团队")).toBe(true);
 	});
 
 	test("affected lists touched nodes and changed files no node anchors", () => {

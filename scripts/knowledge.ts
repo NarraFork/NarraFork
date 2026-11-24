@@ -142,6 +142,18 @@ function toPathspecs(anchors: string[], tracked: () => string[]): string[] {
 
 // ── commands ─────────────────────────────────────────────────────────────────
 
+/**
+ * Whether a field contains a search term. Plain ASCII words match on word boundaries, so a short
+ * term such as `OLED` does not match inside `pooled`; other terms (CJK, paths, identifiers with
+ * punctuation) match as substrings.
+ */
+export function termIn(value: string, term: string): boolean {
+	if (/^[A-Za-z][A-Za-z0-9]*$/.test(term)) {
+		return new RegExp(`(^|[^A-Za-z0-9])${term}([^A-Za-z0-9]|$)`, "i").test(value);
+	}
+	return value.toLowerCase().includes(term.toLowerCase());
+}
+
 export interface FindHit {
 	node: KnowledgeNode;
 	score: number;
@@ -164,6 +176,13 @@ export function find(nodes: KnowledgeNode[], terms: string[]): FindHit[] {
 					why.push(`anchor ${a}`);
 				}
 			}
+			// The node whose body talks about the file explains it; the others only anchor it.
+			const base = p.split("/").filter(Boolean).pop() ?? p;
+			const mentions = score > 0 ? node.body.split(base).length - 1 : 0;
+			if (mentions > 0) {
+				score += 4 + Math.min(mentions, 6);
+				why.push(`body~${base}×${mentions}`);
+			}
 		}
 		const fields: Array<[string, string, number]> = [
 			["id", node.id, 5],
@@ -176,8 +195,7 @@ export function find(nodes: KnowledgeNode[], terms: string[]): FindHit[] {
 		// Each term scores by the strongest field it appears in; nodes matching more terms rank first.
 		let matched = 0;
 		for (const term of terms) {
-			const t = term.toLowerCase();
-			const field = fields.find(([, v]) => v.toLowerCase().includes(t));
+			const field = fields.find(([, v]) => termIn(v, term));
 			if (!field) continue;
 			matched++;
 			score += field[2];
