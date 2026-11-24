@@ -355,5 +355,8 @@
 			"manageExplain": "Give someone write access to make them a member, read access to let them look on. Removing access takes effect at once.",
 			"onlyOwnerManages": "Only the coordinator's owner or an administrator can change who is in the team."
 		}
-	}
+	},
+	"skills": "Skills",
+	"routines": "Routines",
+	"commands": "Commands"
 }
