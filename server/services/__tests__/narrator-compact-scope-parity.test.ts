@@ -15,9 +15,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -25,6 +26,7 @@ import {
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { publicationDedupeKey } from "../agent-runtime/publication-key";
 
 // Prefix/history workers need the same file-backed database as the run/compact paths.
 const { db, sqlite } = await import("../../db");
@@ -35,6 +37,7 @@ const { narratorService } = await import("../narrator-service");
 const { narratorContext } = await import("../narrator-context");
 const { compactLocks, runCustomCompact } = await import("../narrator-compact");
 const { startNarratorRun } = await import("../agent-runtime/run");
+const { getRuntimePublicationService } = await import("../agent-runtime/publication");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
@@ -251,13 +254,37 @@ for (const shape of shapes) {
 				.where(eq(narratorToolCalls.id, ORIGIN_ROW))
 				.get()?.outputJson;
 			expect(output).not.toBe("PENDING");
+			expect(terminal.logicalRunId).toBeTruthy();
+			const publicationRun = {
+				producerKind: "agent" as const,
+				taskId: ID,
+				recipientId: CALLER,
+				logicalRunId: terminal.logicalRunId ?? "",
+			};
+			// Publishing moves dedupe authority from outbox to mailbox; do not race that timer.
+			await getRuntimePublicationService().flushRecipient(CALLER);
 			const terminals = db
 				.select()
 				.from(runtimePublicationOutbox)
-				.where(eq(runtimePublicationOutbox.logicalRunId, terminal.logicalRunId ?? ""))
+				.where(eq(runtimePublicationOutbox.logicalRunId, publicationRun.logicalRunId))
 				.all()
 				.filter((entry) => entry.eventKind !== "started" && entry.state !== "reserved");
-			expect(terminals).toHaveLength(1);
+			expect(terminals).toHaveLength(0);
+			const terminalKeys = (["completed", "failed", "timed_out", "cancelled"] as const).map(
+				(event) => publicationDedupeKey(publicationRun, event),
+			);
+			const receipts = db
+				.select({ dedupeKey: narratorBufferedMessages.dedupeKey })
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, CALLER),
+						inArray(narratorBufferedMessages.dedupeKey, terminalKeys),
+					),
+				)
+				.all();
+			expect(receipts).toHaveLength(1);
+			expect(receipts[0]?.dedupeKey).toBe(publicationDedupeKey(publicationRun, "failed"));
 		});
 
 		test("a blocking compact failure on an idle session is recorded on the session", async () => {
