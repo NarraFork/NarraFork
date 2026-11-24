@@ -21,6 +21,7 @@ import { createInstance } from "i18next";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
+import { RECENT_TABS_QUERY_KEY } from "../../hooks/useRecentTabs";
 import { teamKeys } from "../../hooks/useTeams";
 import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
@@ -472,6 +473,31 @@ describe("top bar", () => {
 		expect(html).toContain("1 个待批");
 		expect(html).toContain("1 个运行中");
 		expect(html).toContain("全部暂停");
+	});
+	test("pin to sidebar sits beside the title and reads the sidebar's pin", async () => {
+		const bar = (client: QueryClient) =>
+			render(
+				<TeamTopBar
+					projectId="p"
+					teamId="lead"
+					title="Release crew"
+					teamName="Release crew"
+					summary={summary()}
+				/>,
+				client,
+			);
+		expect(await bar(new QueryClient())).toContain('data-pinned="false"');
+		const pinned = new QueryClient();
+		pinned.setQueryData(RECENT_TABS_QUERY_KEY, [
+			{ type: "team", id: "lead", title: "Release crew", lastVisitedAt: 1, pinned: true },
+		]);
+		const html = await bar(pinned);
+		expect(html).toContain('data-testid="pin-to-sidebar"');
+		expect(html).toContain('data-pinned="true"');
+		// Without a name yet (still loading) there is nothing to pin.
+		expect(
+			await render(<TeamTopBar projectId="p" teamId="lead" title="…" summary={summary()} />),
+		).not.toContain("pin-to-sidebar");
 	});
 });
 
