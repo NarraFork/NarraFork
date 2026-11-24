@@ -197,22 +197,20 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		personal: true,
 	},
 	{
-		// Prepaid balance. One key until TokenDance joins the credential pool (S2 PR 7).
 		id: "tokendance",
 		kind: "known",
 		preferredPrefix: "tokendance",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
 	{
-		// Routed as pay-per-use today; one key until the credential pool takes it (S2 PR 7).
 		id: "command-code",
 		kind: "known",
 		preferredPrefix: "CommandCode",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
@@ -241,12 +239,11 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		personal: true,
 	},
 	{
-		// NUG is excluded from the key pool until S2 PR 7.
 		id: "nug",
 		kind: "api",
 		preferredPrefix: "nug",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: true,
 	},

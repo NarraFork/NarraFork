@@ -167,6 +167,12 @@ export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now())
  */
 export class PooledProvider implements ProviderAdapter {
 	private readonly adapters = new Map<string, { signature: string; adapter: ProviderAdapter }>();
+	private preparedModel?: string;
+	private readonly preparations = new WeakMap<
+		ProviderAdapter,
+		{ model: string; ready: Promise<void> }
+	>();
+	isDiagnosticConnectionCurrent?: ProviderAdapter["isDiagnosticConnectionCurrent"];
 	readonly mayLeakXmlToolCalls?: boolean;
 	supportsNativeMediaInput?: ProviderAdapter["supportsNativeMediaInput"];
 	toolLoadingTarget?: ProviderAdapter["toolLoadingTarget"];
@@ -191,10 +197,11 @@ export class PooledProvider implements ProviderAdapter {
 			this.getActiveReasoningSource = () => this.current().getActiveReasoningSource?.();
 		}
 		if (probe.generateImage) {
-			this.generateImage = (params) => {
+			this.generateImage = async (params) => {
 				const key = selectProviderKey(this.providerId, params.conversationId);
 				if (!key) throw new Error("This provider has no usable API key");
 				const adapter = this.adapterFor(key);
+				await this.prepareAdapter(adapter, params.chatModel ?? params.model);
 				const generateImage = adapter.generateImage;
 				if (!generateImage) throw new Error("This provider does not support image generation");
 				return generateImage.call(adapter, params).then((result) => ({
@@ -205,12 +212,12 @@ export class PooledProvider implements ProviderAdapter {
 		}
 		if (probe.generateWithHistoryWithMeta) {
 			this.generateWithHistoryWithMeta = (systemInstruction, content, model, locale, options) =>
-				this.withFailover((adapter) =>
+				this.withFailover(model, (adapter) =>
 					(
 						adapter.generateWithHistoryWithMeta as NonNullable<
 							ProviderAdapter["generateWithHistoryWithMeta"]
 						>
-					)(systemInstruction, content, model, locale, options),
+					).call(adapter, systemInstruction, content, model, locale, options),
 				);
 		}
 	}
@@ -221,7 +228,25 @@ export class PooledProvider implements ProviderAdapter {
 		if (cached?.signature === signature) return cached.adapter;
 		const adapter = this.build(key);
 		this.adapters.set(key.id, { signature, adapter });
+		if (this.preparedModel !== undefined) this.prepareAdapter(adapter, this.preparedModel);
 		return adapter;
+	}
+
+	/** Routing stays synchronous; each actual request awaits its selected adapter below. */
+	prepareForModel(model: string): void {
+		this.preparedModel = model;
+		this.prepareAdapter(this.current(), model);
+	}
+
+	private prepareAdapter(adapter: ProviderAdapter, model: string): Promise<void> {
+		const previous = this.preparations.get(adapter);
+		if (previous && previous.model === model) return previous.ready;
+		const ready = Promise.resolve(adapter.prepareForModel?.(model));
+		// Resolution cannot await, but a rejected preparation must reach the request, not
+		// become an unhandled rejection before buildHistory/chat starts.
+		void ready.catch(() => {});
+		this.preparations.set(adapter, { model, ready });
+		return ready;
 	}
 
 	/** The adapter for formatting work that does not depend on the key. */
@@ -232,6 +257,7 @@ export class PooledProvider implements ProviderAdapter {
 	}
 
 	private async withFailover<T extends object | string>(
+		model: string,
 		run: (adapter: ProviderAdapter) => Promise<T>,
 	): Promise<T> {
 		const tried = new Set<string>();
@@ -240,7 +266,9 @@ export class PooledProvider implements ProviderAdapter {
 			if (!key) throw new Error("This provider has no usable API key");
 			tried.add(key.id);
 			try {
-				const result = await run(this.adapterFor(key));
+				const adapter = this.adapterFor(key);
+				await this.prepareAdapter(adapter, model);
+				const result = await run(adapter);
 				clearKeyCooldown(key.id);
 				// The key is the credential; an inner adapter's own id is the connection's.
 				return typeof result === "object" && result !== null
@@ -258,8 +286,14 @@ export class PooledProvider implements ProviderAdapter {
 		return this.current().formatTools(tools);
 	}
 
-	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory> {
-		return this.current().buildHistory(dbMessages, model, narratorId);
+	async buildHistory(
+		dbMessages: DbMessage[],
+		model: string,
+		narratorId?: string,
+	): Promise<BuiltHistory> {
+		const adapter = this.current();
+		await this.prepareAdapter(adapter, model);
+		return adapter.buildHistory(dbMessages, model, narratorId);
 	}
 
 	injectSystemPrompt(history: unknown[], systemPrompt: string, model: string, locale?: string) {
@@ -279,6 +313,7 @@ export class PooledProvider implements ProviderAdapter {
 			);
 			if (!key) throw new Error("The parent diagnostic credential is unavailable");
 			const adapter = this.adapterFor(key);
+			await this.prepareAdapter(adapter, params.model);
 			if (!adapter.supportsDiagnosticFork?.(params.model, key.id)) {
 				throw new Error("The parent diagnostic credential cannot safely fork this request");
 			}
@@ -306,13 +341,17 @@ export class PooledProvider implements ProviderAdapter {
 			};
 			let streamed = false;
 			try {
-				for await (const event of this.adapterFor(key).chat({
+				const adapter = this.adapterFor(key);
+				await this.prepareAdapter(adapter, params.model);
+				for await (const event of adapter.chat({
 					...params,
 					onRequestStart: (info) =>
 						params.onRequestStart?.({
 							credentialId: key.id,
 							validateDiagnosticCredential: () =>
-								validateDiagnosticCredential() && info?.validateDiagnosticCredential?.() !== false,
+								validateDiagnosticCredential() &&
+								this.isDiagnosticConnectionCurrent?.() !== false &&
+								info?.validateDiagnosticCredential?.() !== false,
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
@@ -335,7 +374,7 @@ export class PooledProvider implements ProviderAdapter {
 	}
 
 	generate(text: string, model: string): Promise<string> {
-		return this.withFailover((adapter) => adapter.generate(text, model));
+		return this.withFailover(model, (adapter) => adapter.generate(text, model));
 	}
 
 	generateWithMeta(
@@ -344,7 +383,7 @@ export class PooledProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.withFailover((adapter) =>
+		return this.withFailover(model, (adapter) =>
 			adapter.generateWithMeta(text, model, systemInstruction, options),
 		);
 	}
@@ -356,7 +395,7 @@ export class PooledProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string> {
-		return this.withFailover((adapter) =>
+		return this.withFailover(model, (adapter) =>
 			adapter.generateWithHistory(systemInstruction, content, model, locale, options),
 		);
 	}

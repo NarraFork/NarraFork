@@ -163,6 +163,59 @@ describe("pooled provider", () => {
 		expect(store().get(PROVIDER)?.disabled).not.toBe(true);
 	});
 
+	test("awaits model preparation for each newly selected or replaced adapter", async () => {
+		const second = store().add(PROVIDER, { apiKey: "sk-two" });
+		const order: string[] = [];
+		const { build } = fakeBuild({
+			"sk-one": [new ApiError(402, "exhausted")],
+			"sk-two": [{ text: "ok" } as ParsedStreamEvent],
+		});
+		const pool = new PooledProvider(PROVIDER, (key) => {
+			const adapter = build(key);
+			let prepared: string | undefined;
+			adapter.prepareForModel = async (model) => {
+				order.push(`prepare:${key.apiKey}:${model}`);
+				await Promise.resolve();
+				prepared = model;
+			};
+			const chat = adapter.chat.bind(adapter);
+			adapter.chat = async function* (params) {
+				expect(prepared).toBe(params.model);
+				order.push(`chat:${key.apiKey}`);
+				yield* chat(params);
+			};
+			adapter.generateWithMeta = async (_text, model) => {
+				expect(prepared).toBe(model);
+				return { text: key.apiKey };
+			};
+			return adapter;
+		});
+		pool.prepareForModel("pooltest:m");
+		await drain(pool.chat({ ...params("prepared"), model: "pooltest:m" }));
+		expect(order).toEqual([
+			"prepare:sk-one:pooltest:m",
+			"chat:sk-one",
+			"prepare:sk-two:pooltest:m",
+			"chat:sk-two",
+		]);
+		store().update(second.id, { network: { extraHeaders: { "X-Key": "replacement" } } });
+		expect((await pool.generateWithMeta("hi", "pooltest:m")).credentialId).toBe(second.id);
+		expect(order.at(-1)).toBe("prepare:sk-two:pooltest:m");
+	});
+
+	test("a rejected asynchronous preparation is observed before an upstream request", async () => {
+		const { build, calls } = fakeBuild({ "sk-one": [] });
+		const pool = new PooledProvider(PROVIDER, (key) => ({
+			...build(key),
+			prepareForModel: async () => {
+				throw new Error("model preparation failed");
+			},
+		}));
+		pool.prepareForModel("m");
+		await expect(pool.generateWithMeta("hi", "m")).rejects.toThrow("model preparation failed");
+		expect(calls).toEqual([]);
+	});
+
 	test("server errors say nothing about the key", () => {
 		expect(classifyKeyFault(new ApiError(500, "boom"))).toBeNull();
 		expect(classifyKeyFault(new Error("network"))).toBeNull();

@@ -49,7 +49,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
-import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -4302,11 +4302,18 @@ async function* agentLoopInMetadataSnapshot(
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
-			const markRequestStarted = (info?: { credentialId?: string }) => {
+			const markRequestStarted = (info?: {
+				credentialId?: string;
+				validateDiagnosticCredential?: () => boolean;
+			}) => {
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
-				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
+				// A pooled retry can start on a different key before yielding output.
+				requestQuotaProviderIdentity = streamQuotaIdentityForRequest(effectiveProvider, {
+					...info,
+					credentialId,
+				});
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;

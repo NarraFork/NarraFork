@@ -458,7 +458,10 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					autoComplete="off"
 					onChange={(e) => updateProvider("apiKey", e.currentTarget.value)}
 				/>
-				<ProviderKeysPanel providerId={provider.id} />
+				<ProviderKeysPanel
+					providerId={provider.id}
+					onFirstKeyChanged={(apiKey) => updateProvider("apiKey", apiKey)}
+				/>
 				<TextInput
 					label={t("customApiBaseUrl")}
 					placeholder={t("customApiBaseUrlPlaceholder")}

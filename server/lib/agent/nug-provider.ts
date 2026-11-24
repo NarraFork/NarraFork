@@ -163,12 +163,13 @@ export class NugProvider implements ProviderAdapter {
 	private activeMeta: ResolvedNugModelMeta | null = null;
 	private activeDelegate: ProviderAdapter | null = null;
 
-	constructor(config: NUGProviderConfig) {
+	constructor(config: NUGProviderConfig, relayConfig: NUGProviderConfig = config) {
 		this.config = config;
 		// Client-egress relay lifecycle follows provider construction: with
 		// egressMode local-* a relay channel to the gateway is established (or
 		// reused); reverting to "nug" tears it down. Idempotent per provider id.
-		ensureNugRelayClient(config);
+		// Inference keys may rotate without replacing the connection's egress relay.
+		ensureNugRelayClient(relayConfig);
 	}
 
 	/**

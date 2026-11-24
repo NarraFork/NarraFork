@@ -15,6 +15,7 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps } from "react";
 import type { Root } from "react-dom/client";
 import { getSourcingCatalog } from "../../../server/lib/sourcing/presets";
+import { type ProviderKeyInfo, providerKeysApi } from "../../lib/api/provider-keys";
 import commonLocale from "../../locales/en/common.json";
 import settingsLocale from "../../locales/en/settings.json";
 import { SOURCING_CATALOG_QUERY_KEY } from "./provider-catalog";
@@ -97,6 +98,7 @@ function installDom() {
 			setItem: (key: string, value: string) => storage.set(key, value),
 			removeItem: (key: string) => storage.delete(key),
 		},
+		MutationObserver: window.MutationObserver,
 		ResizeObserver: class {
 			observe() {}
 			unobserve() {}
@@ -148,6 +150,9 @@ const auth = await import("../../hooks/useAuth");
 const models = await import("../../hooks/useModels");
 const customSection = await import("./CustomApiProviderSection");
 const nugSection = await import("./NUGProvidersSection");
+const RealCustomApiProviderSection = customSection.CustomApiProviderSection;
+const RealNUGProvidersSection = nugSection.NUGProvidersSection;
+let useRealProviderDetails = false;
 const { api, ApiError } = await import("../../lib/api");
 const { Route: parentFileRoute } = await import("../../routes/settings/providers");
 const { Route: addFileRoute } = await import("../../routes/settings/providers.add");
@@ -254,6 +259,7 @@ function makeRouter(href: string) {
 
 beforeEach(() => {
 	installDom();
+	useRealProviderDetails = false;
 	saveCalls = 0;
 	confirmAnswer = false;
 	serverSettings = clone(initialSettings);
@@ -326,13 +332,21 @@ beforeEach(() => {
 		props: ComponentProps<typeof customSection.CustomApiProviderSection>,
 	) => {
 		customDetail = props;
-		return <output data-custom-detail>{props.provider.name}</output>;
+		return useRealProviderDetails ? (
+			<RealCustomApiProviderSection {...props} />
+		) : (
+			<output data-custom-detail>{props.provider.name}</output>
+		);
 	}) as unknown as typeof customSection.CustomApiProviderSection);
 	const nugSpy = spyOn(nugSection, "NUGProvidersSection").mockImplementation(((
 		props: ComponentProps<typeof nugSection.NUGProvidersSection>,
 	) => {
 		nugDetail = props;
-		return <output data-nug-detail>{props.providers[0]?.name}</output>;
+		return useRealProviderDetails ? (
+			<RealNUGProvidersSection {...props} />
+		) : (
+			<output data-nug-detail>{props.providers[0]?.name}</output>
+		);
 	}) as unknown as typeof nugSection.NUGProvidersSection);
 	for (const spy of [authSpy, modelsSpy, getSpy, saveSpy, customSpy, nugSpy])
 		restorers.push(() => spy.mockRestore());
@@ -393,10 +407,11 @@ async function openAdd() {
 	await click(link);
 	expect(router.state.location.pathname).toBe("/settings/providers/add");
 }
-async function type(key: string, value: string) {
-	const label = [...container.querySelectorAll("label")].find((node) =>
+async function type(key: string, value: string, last = false) {
+	const labels = [...container.querySelectorAll("label")].filter((node) =>
 		node.textContent?.startsWith(text(key)),
 	);
+	const label = last ? labels.at(-1) : labels[0];
 	const input = document.getElementById(label?.getAttribute("for") ?? "");
 	if (!(input instanceof HTMLInputElement)) throw new Error(`Missing input: ${key}`);
 	if (!input.getAttribute("type")) input.setAttribute("type", "text");
@@ -463,6 +478,223 @@ const currentCustomDetail = () => customDetail;
 const resetCustomDetail = () => {
 	customDetail = undefined;
 };
+
+describe("immediate key pool changes keep the real settings draft safe", () => {
+	const entry = (id: string, masked: string, priority = 0): ProviderKeyInfo => ({
+		id,
+		masked,
+		priority,
+		label: null,
+		disabled: false,
+		disabledReason: null,
+		network: {},
+		cooldown: null,
+		usage: null,
+	});
+	for (const [groupId, section] of [
+		["CommandCode", "command-code"],
+		["pool-nug", "nug"],
+		["existing", "custom"],
+	] as const) {
+		test(`${section}: an empty draft adds a first key and saves its mask without dropping pending edits`, async () => {
+			useRealProviderDetails = true;
+			serverSettings.nugProviders = [
+				{
+					id: "pool-nug",
+					name: "Empty NUG",
+					prefix: "pool-nug",
+					apiKey: "",
+					baseUrl: "https://nug.example",
+					defaultModel: "",
+				},
+				{
+					id: "untouched-nug",
+					name: "Other NUG draft",
+					prefix: "other-nug",
+					apiKey: "",
+					baseUrl: "https://other.example",
+					defaultModel: "keep-model",
+				},
+			];
+			queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+			let pool: ProviderKeyInfo[] = [];
+			const masked = "********-key";
+			let releaseAdd = () => {};
+			const addGate = new Promise<void>((resolve) => {
+				releaseAdd = resolve;
+			});
+			const list = spyOn(providerKeysApi, "list").mockImplementation(async () => ({
+				keys: clone(pool),
+			}));
+			const add = spyOn(providerKeysApi, "add").mockImplementation(async () => {
+				await addGate;
+				const key = entry("new-key", masked);
+				pool = [key];
+				if (section === "command-code") serverSettings.commandCode = { apiKey: masked };
+				else {
+					const field = section === "nug" ? "nugProviders" : "customApiProviders";
+					serverSettings[field] = persistedProviders(field).map((p) =>
+						p.id === groupId ? { ...p, apiKey: masked } : p,
+					);
+				}
+				return { key };
+			});
+			const usage = spyOn(api, "commandCodeUsage").mockResolvedValue({ loggedIn: false });
+			const quota = spyOn(api, "nugGetQuota").mockResolvedValue({ balance: 0, totalGranted: 0 });
+			const channels = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
+			for (const mock of [list, add, usage, quota, channels])
+				restorers.push(() => mock.mockRestore());
+			await mount(`/settings/providers?provider=${groupId}`);
+			await click(button("providerKeys.add"));
+			await type("providerKeys.key", "new-live-pool-key", true);
+			await click(button("providerKeys.addButton"));
+			expect(add).toHaveBeenCalledTimes(1);
+			// These edits happen while the server add is pending. Replacing the whole
+			// reducer from the refreshed settings would silently discard them.
+			if (section === "command-code") {
+				const enabled = container.querySelector(`[aria-label="${text("commandcode.enabled")}"]`);
+				if (!enabled) throw new Error("Missing Command Code enable switch");
+				await click(enabled);
+			} else
+				await type(
+					section === "nug" ? "nugProviderName" : "customApiProviderName",
+					"Unsaved local name",
+				);
+			await act(async () => {
+				releaseAdd();
+				await addGate;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+			expect(list.mock.calls.length).toBeGreaterThanOrEqual(2);
+			const fresh = queryClient.getQueryData<Record<string, unknown>>(["admin", "settings"]);
+			if (section === "command-code")
+				expect((fresh?.commandCode as { apiKey?: string })?.apiKey).toBe(masked);
+			else
+				expect(
+					(
+						fresh?.[section === "nug" ? "nugProviders" : "customApiProviders"] as Array<{
+							id: string;
+							apiKey: string;
+						}>
+					).find((p) => p.id === groupId)?.apiKey,
+				).toBe(masked);
+			await click(button("unsavedSave"));
+			expect(savedPayloads).toHaveLength(1);
+			const payload = savedPayloads[0];
+			if (section === "command-code")
+				expect(payload?.commandCode).toMatchObject({ apiKey: masked, disabled: true });
+			else {
+				const saved = (
+					payload?.[section === "nug" ? "nugProviders" : "customApiProviders"] as Array<{
+						id: string;
+						apiKey: string;
+						name: string;
+					}>
+				).find((p) => p.id === groupId);
+				expect(saved).toMatchObject({ apiKey: masked, name: "Unsaved local name" });
+			}
+			expect(JSON.stringify(payload)).not.toContain("new-live-pool-key");
+			expect(payload?.nugProviders).toContainEqual(
+				expect.objectContaining({
+					id: "untouched-nug",
+					name: "Other NUG draft",
+					defaultModel: "keep-model",
+				}),
+			);
+		});
+	}
+	for (const readPhase of ["pending", "failed"]) {
+		test(`a successful add preserves the server key when the final key-list read is ${readPhase}`, async () => {
+			useRealProviderDetails = true;
+			let releaseRead = () => {};
+			const readGate = new Promise<void>((resolve) => {
+				releaseRead = resolve;
+			});
+			let reads = 0;
+			const list = spyOn(providerKeysApi, "list").mockImplementation(async () => {
+				if (++reads === 1) return { keys: [] };
+				await readGate;
+				throw new Error("metadata unavailable");
+			});
+			const add = spyOn(providerKeysApi, "add").mockImplementation(async () => {
+				const key = entry("persisted-key", "********-key");
+				serverSettings.customApiProviders = persistedProviders().map((p) => ({
+					...p,
+					apiKey: key.masked,
+				}));
+				return { key };
+			});
+			for (const mock of [list, add]) restorers.push(() => mock.mockRestore());
+			await mount("/settings/providers?provider=existing");
+			await click(button("providerKeys.add"));
+			await type("providerKeys.key", "new-live-pool-key", true);
+			await click(button("providerKeys.addButton"));
+			expect(reads).toBe(2);
+			const finishRead = async () => {
+				await act(async () => {
+					releaseRead();
+					await readGate;
+					await new Promise((resolve) => setTimeout(resolve, 0));
+				});
+			};
+			if (readPhase === "failed") await finishRead();
+			await click(button("unsavedSave"));
+			expect((savedPayloads[0]?.customApiProviders as Array<{ apiKey: string }>)[0]?.apiKey).toBe(
+				"*",
+			);
+			expect(JSON.stringify(savedPayloads)).not.toContain("new-live-pool-key");
+			if (readPhase === "pending") await finishRead();
+		});
+	}
+
+	test("reorder and successive removals save the current first key mask, then an empty field", async () => {
+		useRealProviderDetails = true;
+		let pool = [
+			{ ...entry("key-a", "********aaaa"), disabled: true },
+			{ ...entry("key-b", "********bbbb", 1), disabled: true },
+		];
+		const project = () => {
+			serverSettings.customApiProviders = persistedProviders().map((p) => ({
+				...p,
+				apiKey: pool[0]?.masked ?? "",
+			}));
+		};
+		project();
+		queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+		const list = spyOn(providerKeysApi, "list").mockImplementation(async () => ({
+			keys: clone(pool),
+		}));
+		const reorder = spyOn(providerKeysApi, "reorder").mockImplementation(async (_id, ids) => {
+			pool.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+			project();
+			return { keys: clone(pool) };
+		});
+		const remove = spyOn(providerKeysApi, "remove").mockImplementation(async (id) => {
+			pool = pool.filter((key) => key.id !== id);
+			project();
+			return { ok: true };
+		});
+		for (const mock of [list, reorder, remove]) restorers.push(() => mock.mockRestore());
+		await mount("/settings/providers?provider=existing");
+		const up = container.querySelectorAll(`[aria-label="${text("providerKeys.moveUp")}"]`)[1];
+		if (!up) throw new Error("Missing second key's reorder button");
+		const listsBeforeOrder = list.mock.calls.length;
+		await click(up);
+		expect(list.mock.calls.length).toBe(listsBeforeOrder);
+		await click(button("unsavedSave"));
+		for (const _remaining of [1, 0]) {
+			const removeButton = container.querySelector(`[aria-label="${text("providerKeys.remove")}"]`);
+			if (!removeButton) throw new Error("Missing key remove button");
+			await click(removeButton);
+			await click(button("unsavedSave"));
+		}
+		expect(
+			savedPayloads.map(
+				(payload) => (payload.customApiProviders as Array<{ apiKey: string }>)[0]?.apiKey,
+			),
+		).toEqual(["********bbbb", "********aaaa", ""]);
+	});
+});
 
 describe("provider deep link", () => {
 	test("`?provider=` opens the provider and follows URL changes while mounted", async () => {

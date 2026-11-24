@@ -72,6 +72,8 @@ beforeEach(() => {
 	dispose = registerTokenDanceRuntime({
 		getTokenDanceRuntimeConfig: () => config,
 		getTokenDanceCatalogModels: () => models,
+		setTokenDanceRecoveryAction: (_action, generation, selectedKey) =>
+			!!config && config.generation === generation && selectedKey === config.apiKey,
 		assertTokenDanceConnection: assert,
 		registerTokenDanceRequest(controller, generation) {
 			assert(generation);
@@ -120,6 +122,211 @@ function params(): ChatParams {
 		signal: new AbortController().signal,
 	};
 }
+
+describe("credential-isolated TokenDance providers", () => {
+	for (const action of ["top_up_balance", "reauthorize_api_key", "api_key_quota"] as const) {
+		for (const bridge of [true, false]) {
+			test(`manual key ${action} cannot trigger portal recovery (bridge=${bridge})`, async () => {
+				if (!bridge) dispose();
+				let cancelled = false;
+				try {
+					await runTransport(
+						transport("manual-other-user-key", 1),
+						"https://example.test",
+						{},
+						async () =>
+							new Response(
+								new ReadableStream({
+									cancel() {
+										cancelled = true;
+									},
+								}),
+								{ status: 402, headers: { "TokenDance-Recovery-Action": action } },
+							),
+					);
+					throw new Error("expected failure");
+				} catch (error) {
+					const diagnostics = diagnosticsFromError(error);
+					expect(error).toHaveProperty("status", 402);
+					expect(diagnostics?.tokendanceRecoveryAction).toBeUndefined();
+					expect(diagnostics?.retryable).not.toBe(false);
+					expect(diagnostics?.resumable).not.toBe(false);
+					expect(String(error)).not.toContain("requires user action");
+					const { classifyKeyFault } = await import("../pooled-provider");
+					expect(classifyKeyFault(error)).toMatchObject({ kind: "cooldown", reason: "quota" });
+				}
+				expect(cancelled).toBe(true);
+				expect(controllers.size).toBe(0);
+			});
+		}
+	}
+
+	test("manual recovery headers still allow the pool to fail over to another credential", async () => {
+		catalog("openai:chat-completions");
+		const { getProviderKeyStore } = await import("../../provider-keys");
+		const { PooledProvider } = await import("../pooled-provider");
+		const store = getProviderKeyStore();
+		const group = "tokendance-manual-recovery-failover";
+		store.add(group, { apiKey: "manual-other-user-key" });
+		store.add(group, { apiKey });
+		const seen: string[] = [];
+		setFetch(async (_input, init) => {
+			const authorization = new Headers(init?.headers).get("Authorization") ?? "";
+			seen.push(authorization);
+			return authorization.includes("manual-other-user-key")
+				? new Response("insufficient balance", {
+						status: 402,
+						headers: { "TokenDance-Recovery-Action": "top_up_balance" },
+					})
+				: new Response("data: [DONE]\n\n");
+		});
+		try {
+			const provider = new PooledProvider(
+				group,
+				(key) =>
+					new TokenDanceProvider(key.apiKey, {
+						apiKey: key.apiKey,
+						generation: 1,
+						disabled: false,
+					}),
+			);
+			for await (const _ of provider.chat(params())) {
+			}
+			expect(seen).toEqual(["Bearer manual-other-user-key", `Bearer ${apiKey}`]);
+		} finally {
+			store.removeProvider(group);
+		}
+	});
+
+	test("explicit key and network do not follow a reordered runtime projection", async () => {
+		catalog("openai:responses");
+		const second = "second-user-secret-key";
+		const provider = new TokenDanceProvider(second, {
+			apiKey: second,
+			generation: 1,
+			disabled: false,
+			extraHeaders: { "X-Credential-Network": "second", Authorization: "Bearer wrong-user" },
+		});
+		const requests: { authorization: string | null; body: string; network: string | null }[] = [];
+		setFetch(async (_input, init) => {
+			const headers = new Headers(init?.headers);
+			requests.push({
+				authorization: headers.get("Authorization"),
+				network: headers.get("X-Credential-Network"),
+				body: String(init?.body),
+			});
+			return new Response("data: [DONE]\n\n", {
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+		for await (const _ of provider.chat(params())) {
+		}
+		config = { apiKey: "new-first-key", generation: 1, disabled: false };
+		for await (const _ of provider.chat(params())) {
+		}
+		const other = new TokenDanceProvider(apiKey, {
+			apiKey,
+			generation: 1,
+			disabled: false,
+		});
+		for await (const _ of other.chat(params())) {
+		}
+		expect(requests[0].authorization).toBe(`Bearer ${second}`);
+		expect(requests[1]).toEqual(requests[0]);
+		expect(requests[0].network).toBe("second");
+		expect(JSON.parse(requests[0].body).prompt_cache_key).not.toBe(
+			JSON.parse(requests[2].body).prompt_cache_key,
+		);
+	});
+
+	test("explicit credential keeps its identity while image preferences update live", async () => {
+		catalog("openai:chat-completions");
+		const selected = "fixed-nonfirst-credential";
+		const provider = new TokenDanceProvider(selected, {
+			apiKey: selected,
+			generation: 1,
+			disabled: false,
+			toolResultImages: "off",
+			extraHeaders: { "X-Credential-Network": "fixed" },
+		});
+		const bodies: string[] = [];
+		setFetch(async (_input, init) => {
+			const headers = new Headers(init?.headers);
+			expect(headers.get("Authorization")).toBe(`Bearer ${selected}`);
+			expect(headers.get("X-Credential-Network")).toBe("fixed");
+			bodies.push(String(init?.body));
+			return new Response("data: [DONE]\n\n");
+		});
+		for (const mode of ["off", "inline", "separate", "off"] as const) {
+			config = {
+				apiKey: "changed-first-key",
+				generation: 1,
+				disabled: false,
+				toolResultImages: mode,
+			};
+			for await (const _ of provider.chat({
+				...params(),
+				toolResults: [
+					{
+						tool_call_id: "call-1",
+						content: "read",
+						_images: [{ format: "png", mediaType: "image/png", base64: "aGVsbG8=" }],
+					},
+				],
+			})) {
+			}
+			expect(bodies.at(-1)?.includes("data:image/png;base64,aGVsbG8=")).toBe(mode !== "off");
+		}
+	});
+
+	test("explicit config works without the optional runtime service", async () => {
+		catalog("openai:chat-completions");
+		const provider = new TokenDanceProvider(apiKey, {
+			apiKey,
+			generation: 1,
+			disabled: false,
+			models,
+		});
+		dispose();
+		setFetch(async () => new Response("data: [DONE]\n\n"));
+		for await (const _ of provider.chat(params())) {
+		}
+		expect(provider.getActiveReasoningSource()).toBe("tokendance:completions-compatible");
+	});
+
+	test("chat and generation await asynchronous delegate preparation", async () => {
+		catalog("openai:chat-completions");
+		const provider = new TokenDanceProvider();
+		provider.prepareForModel(params().model);
+		const delegate = (provider as unknown as { delegate: import("../provider").ProviderAdapter })
+			.delegate;
+		let prepared = false;
+		let release!: () => void;
+		delegate.prepareForModel = async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			prepared = true;
+		};
+		delegate.chat = async function* () {
+			expect(prepared).toBe(true);
+			yield* [];
+		};
+		const chat = provider.chat(params()).next();
+		expect(prepared).toBe(false);
+		release();
+		await chat;
+		prepared = false;
+		delegate.generateWithMeta = async () => {
+			expect(prepared).toBe(true);
+			return { text: "ready" };
+		};
+		const generated = provider.generateWithMeta("hello", params().model);
+		expect(prepared).toBe(false);
+		release();
+		expect(await generated).toEqual({ text: "ready" });
+	});
+});
 
 describe("strict TokenDance protocol mapping", () => {
 	for (const mode of [undefined, "off", "inline", "separate"] as const) {

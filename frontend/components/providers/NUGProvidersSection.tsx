@@ -51,6 +51,7 @@ import type { ChannelHealth } from "./channel-health";
 import { channelHealthKey, normalizeChannelHealth } from "./channel-health";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 
 /* ── Types ─────────────────────────────────────────────── */
 
@@ -1227,6 +1228,11 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									</Tooltip>
 								)}
 							</Group>
+
+							<ProviderKeysPanel
+								providerId={p.id}
+								onFirstKeyChanged={(apiKey) => updateProvider(p.id, { apiKey })}
+							/>
 
 							{/* OAuth config (collapsible) */}
 							<Group gap="xs">

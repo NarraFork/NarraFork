@@ -14,6 +14,7 @@ import { ApiError, api } from "../../lib/api";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { TokenDanceRechargeDialog } from "../settings/TokenDanceRechargeDialog";
 import { ModelList, type ModelListProps } from "./ModelList";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 export function TokenDanceSection({
 	connection,
 	/** 启用开关的草稿值（保存条统一提交，避免一拨就落库）。 */
@@ -198,6 +199,7 @@ export function TokenDanceSection({
 					{t("tokendance.delete")}
 				</Button>
 			</Group>
+			{isAdmin && <ProviderKeysPanel providerId="tokendance" />}
 			<ModelList
 				{...modelListProps}
 				models={connection.models.map((model) => ({

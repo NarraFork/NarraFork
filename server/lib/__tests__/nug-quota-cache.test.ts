@@ -11,7 +11,7 @@ import {
 import { streamQuotaIdentity, streamQuotaIdentityForPrefix } from "../provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
-import { quotaStore } from "../sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "../sourcing/quota-store";
 import { getServiceTemplate } from "../sourcing/templates";
 
 const original = structuredClone(settings);
@@ -48,7 +48,10 @@ function reportNugQuota(
 }
 
 afterEach(() => {
-	for (const key of getProviderKeyStore().list(nugKeyOwner(providerId))) quotaStore.remove(key.id);
+	for (const key of getProviderKeyStore().list(nugKeyOwner(providerId))) {
+		quotaStore.remove(key.id);
+		quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
+	}
 	quotaStore.remove(providerId);
 	getProviderKeyStore().removeProvider(nugKeyOwner(providerId));
 	saveSettings(original);
@@ -90,6 +93,30 @@ describe("NUG quota snapshots", () => {
 		});
 		await quotaStore.flush();
 		expect(existsSync(getNarraforkPath("nug-quotas.json"))).toBe(false);
+	});
+
+	test("a non-first inference key owns stream balances without replacing its direct probe", () => {
+		const config = useProvider();
+		const store = getProviderKeyStore();
+		const first = store.list(nugKeyOwner(providerId))[0];
+		if (!first) throw new Error("Missing first NUG key");
+		const second = store.add(nugKeyOwner(providerId), { apiKey: "key-two" });
+		const expected = streamQuotaIdentityForPrefix("nug-quota", second.id);
+		quotaStore.set(second.id, JSON.stringify([config.baseUrl, second.apiKey]), {
+			fetchedAt: Date.now(),
+			scope: "key",
+			windows: [],
+			balances: [{ unit: "", remaining: 22 }],
+		});
+		store.reorder(nugKeyOwner(providerId), [second.id, first.id]);
+		store.reorder(nugKeyOwner(providerId), [first.id, second.id]);
+		reportNugQuota("nug-quota", 7, null, undefined, expected);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
+		expect(quotaStore.peek(second.id)?.balances[0]?.remaining).toBe(22);
+		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		store.update(second.id, { apiKey: "key-replaced" });
+		reportNugQuota("nug-quota", 99, null, undefined, expected);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
 	});
 
 	test("storage follows the first credential and rejects a late old-key publication", () => {

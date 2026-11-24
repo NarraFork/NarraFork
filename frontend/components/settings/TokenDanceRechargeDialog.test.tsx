@@ -6,6 +6,7 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../../lib/api";
+import { providerKeysApi } from "../../lib/api/provider-keys";
 import { openTokenDanceRecharge, TOKENDANCE_RECOVERY_EVENT } from "../../lib/tokendance-recovery";
 import errors from "../../locales/en/errors.json";
 import narratorEn from "../../locales/en/narrator.json";
@@ -111,6 +112,7 @@ let poll: ReturnType<typeof spyOn<typeof api, "tokenDancePaymentSession">>;
 let refresh: ReturnType<typeof spyOn<typeof api, "tokenDanceRefreshBalance">>;
 let getBalance: ReturnType<typeof spyOn<typeof api, "tokenDanceBalance">>;
 let getConnection: ReturnType<typeof spyOn<typeof api, "tokenDanceConnection">>;
+let getKeys: ReturnType<typeof spyOn<typeof providerKeysApi, "list">>;
 let timers: Map<number, { callback: () => void; delay: number }>;
 let nextTimer: number;
 let intervals: Map<number, { callback: () => void; delay: number }>;
@@ -138,6 +140,7 @@ beforeEach(() => {
 	refresh = spyOn(api, "tokenDanceRefreshBalance").mockResolvedValue(balance);
 	getBalance = spyOn(api, "tokenDanceBalance").mockResolvedValue(balance);
 	getConnection = spyOn(api, "tokenDanceConnection").mockResolvedValue(connection);
+	getKeys = spyOn(providerKeysApi, "list").mockResolvedValue({ keys: [] });
 	timers = new Map();
 	intervals = new Map();
 	nextTimer = 100000;
@@ -180,6 +183,7 @@ afterEach(async () => {
 		refresh,
 		getBalance,
 		getConnection,
+		getKeys,
 		timerSpy,
 		clearSpy,
 		fetchSpy,

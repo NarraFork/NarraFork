@@ -18,7 +18,12 @@ import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
 import { logger } from "../logger";
-import { getProviderKeyStore } from "../provider-keys";
+import {
+	COMMAND_CODE_KEY_OWNER,
+	getProviderKeyStore,
+	nugKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "../provider-keys";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -31,6 +36,8 @@ import {
 	resolveProvider,
 	settings,
 } from "../settings";
+import { getSourceGroup } from "../sourcing/source-groups";
+import { getServiceTemplate } from "../sourcing/templates";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
@@ -244,6 +251,8 @@ export interface GenerateMetaResult {
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** Prepare model-dependent routing. Request methods must await asynchronous preparation. */
+	prepareForModel?(model: string): void | Promise<void>;
 	/** This adapter can append the diagnostic suffix without replacing the request prefix. */
 	supportsDiagnosticFork?(model: string, credentialId?: string): boolean;
 	/** Production configured adapters carry a read-only check against live settings. */
@@ -364,11 +373,36 @@ function hasTokenDancePrefixConflict(): boolean {
 
 builtinProviderSources.register("tokendance", {
 	resolve: (provider) => {
-		if (provider !== "tokendance" || !getTokenDanceRuntimeConfig()) return null;
+		if (provider !== "tokendance" || settings.tokendance?.disabled) return null;
+		const runtime = getTokenDanceRuntimeConfig();
+		const stored = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+		if (!runtime && stored.length === 0) return null;
 		if (hasTokenDancePrefixConflict()) {
 			throw new Error(
 				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
 			);
+		}
+		if (getServiceTemplate("tokendance").multiCredential && stored.length > 0) {
+			const keys = usableProviderKeys(TOKENDANCE_KEY_OWNER);
+			const first = keys[0];
+			if (!first) throw new Error("This provider has no usable API key");
+			const build = (key: (typeof keys)[number]) =>
+				new TokenDanceProvider(
+					key.apiKey,
+					withProviderKey(
+						{
+							...runtime,
+							...settings.tokendance,
+							apiKey: key.apiKey,
+							generation: runtime?.generation ?? 0,
+							disabled: false,
+						},
+						key,
+					),
+				);
+			return stored.length === 1 && !first.network
+				? reportCredentialId(build(first), "tokendance")
+				: new PooledProvider(TOKENDANCE_KEY_OWNER, build);
 		}
 		return reportCredentialId(new TokenDanceProvider(), "tokendance");
 	},
@@ -407,6 +441,23 @@ builtinProviderSources.register("codex", {
 builtinProviderSources.register("CommandCode", {
 	resolve: (provider, model) => {
 		if (provider !== "CommandCode") return null;
+		if (settings.commandCode?.disabled) return null;
+		const stored = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER);
+		if (getServiceTemplate("command-code").multiCredential && stored.length > 0) {
+			const keys = usableProviderKeys(COMMAND_CODE_KEY_OWNER);
+			const first = keys[0];
+			if (!first) throw new Error("This provider has no usable API key");
+			const build = (key: (typeof keys)[number]) => {
+				const config = withProviderKey({ ...settings.commandCode, apiKey: key.apiKey }, key);
+				const adapter = buildCommandCodeProvider(model, config, key.apiKey);
+				if (!adapter) throw new Error("This provider has no usable API key");
+				return adapter;
+			};
+			return stored.length === 1 && !first.network
+				? reportCredentialId(build(first), "CommandCode")
+				: new PooledProvider(COMMAND_CODE_KEY_OWNER, build);
+		}
+		// CLI auth is a fallback only when no managed credentials exist, not when disabled.
 		const adapter = buildCommandCodeProvider(model, settings.commandCode);
 		return adapter ? reportCredentialId(adapter, "CommandCode") : null;
 	},
@@ -465,36 +516,51 @@ function registerCredentialProviderSource<
 		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
 			if (!config) return null;
-			// Custom API providers can hold several keys. One plain key (the one settings
-			// shows, with no network identity of its own) keeps the direct adapter.
-			const keys = kind === "nug" ? [] : usableProviderKeys(config.id);
+			// Storage owners retain their S1 compatibility names until S5; whether a group
+			// supports a pool is a template capability, not a provider-kind exception.
+			const owner = kind === "nug" ? nugKeyOwner(config.id) : config.id;
+			const template = getServiceTemplate(
+				getSourceGroup(config.id)?.templateId ?? "openai-compatible",
+			);
+			const stored = template.multiCredential ? getProviderKeyStore().list(owner) : [];
+			const keys = template.multiCredential ? usableProviderKeys(owner) : [];
+			if (stored.length > 0 && keys.length === 0) {
+				throw new Error("This provider has no usable API key");
+			}
+			// Custom APIs retain their historical single-usable-first-key fast path.
+			// Newly pooled namespaced owners use real ids whenever multiple keys exist.
 			const plain =
-				keys.length === 0 ||
-				(keys.length === 1 && keys[0]?.apiKey === config.apiKey && !keys[0]?.network);
+				stored.length === 0 ||
+				(keys.length === 1 &&
+					keys[0]?.apiKey === config.apiKey &&
+					!keys[0]?.network &&
+					(owner === config.id || stored.length === 1));
+			const selectedConfig = keys[0] ? withProviderKey(config, keys[0]) : config;
 			const configVersion = JSON.stringify(config);
+			const proxyVersion = JSON.stringify(settings.proxy);
 			const protocolVersion = resolveModelProtocol(prefix, model);
 			// A single-credential connection is billed to the connection itself.
 			const adapter: ProviderAdapter = plain
-				? reportCredentialId(adapterFor(prefix, model, config), config.id)
-				: new PooledProvider(config.id, (key) =>
+				? reportCredentialId(adapterFor(prefix, model, selectedConfig), config.id)
+				: new PooledProvider(owner, (key) =>
 						adapterFor(prefix, model, withProviderKey(config, key)),
 					);
-			if (adapter.supportsDiagnosticFork) {
-				adapter.isDiagnosticConnectionCurrent = () => {
-					const live = getConfig(prefix);
-					if (
-						!live ||
-						JSON.stringify(live) !== configVersion ||
-						resolveModelProtocol(prefix, model) !== protocolVersion
-					)
-						return false;
-					if (!plain || kind === "nug") return true;
-					const stored = getProviderKeyStore().list(config.id);
-					return stored.length === 0
-						? keys.length === 0
-						: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
-				};
-			}
+			// Also protects stream quota publication for families without diagnostic forks.
+			adapter.isDiagnosticConnectionCurrent = () => {
+				const live = getConfig(prefix);
+				if (
+					!live ||
+					JSON.stringify(live) !== configVersion ||
+					JSON.stringify(settings.proxy) !== proxyVersion ||
+					resolveModelProtocol(prefix, model) !== protocolVersion
+				)
+					return false;
+				if (!plain) return true;
+				const stored = getProviderKeyStore().list(owner);
+				return stored.length === 0
+					? keys.length === 0
+					: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
+			};
 			return adapter;
 		},
 		listReadiness: () =>
@@ -517,7 +583,11 @@ registerCredentialProviderSource(
 	"nug",
 	() => settings.nugProviders ?? [],
 	getNugProviderConfig,
-	(config) => new NugProvider(config),
+	(config) =>
+		new NugProvider(
+			config,
+			settings.nugProviders?.find((entry) => entry.id === config.id) ?? config,
+		),
 	(config) => !!config.apiKey.trim() && !!config.baseUrl.trim(),
 );
 registerCredentialProviderSource(
@@ -640,9 +710,7 @@ function buildResolution(
 		provider === requestedProvider
 			? requestedModel
 			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
-	if (adapter instanceof NugProvider || adapter instanceof TokenDanceProvider) {
-		adapter.prepareForModel(model);
-	}
+	adapter.prepareForModel?.(model);
 	return {
 		requestedProvider,
 		requestedModel,

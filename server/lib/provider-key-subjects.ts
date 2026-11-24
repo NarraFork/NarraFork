@@ -3,7 +3,7 @@
  * config with that key's secret and network identity. Usage caches (Kimi, OpenCode Go)
  * keep one entry per subject; a provider without stored keys is its own subject.
  */
-import { getProviderKeyStore, withProviderKey } from "./provider-keys";
+import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 export interface UsageSubject<TConfig = CustomApiProviderConfig> {
@@ -22,13 +22,62 @@ export function streamQuotaIdentity(config: {
 	return JSON.stringify([config.id, config.baseUrl, config.apiKey]);
 }
 
-export function streamQuotaIdentityForPrefix(prefix: string): string | undefined {
+export function streamQuotaIdentityForPrefix(
+	prefix: string,
+	credentialId?: string,
+): string | undefined {
 	const custom = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
-	if (custom) return streamQuotaIdentity(custom);
-	const nug = (settings.nugProviders ?? []).find(
-		(provider) => provider.prefix === prefix || provider.id === prefix,
-	);
-	return nug ? streamQuotaIdentity(nug) : undefined;
+	const nug =
+		!custom &&
+		(settings.nugProviders ?? []).find(
+			(provider) => provider.prefix === prefix || provider.id === prefix,
+		);
+	const config = custom || nug;
+	if (!config) return undefined;
+	const keys = getProviderKeyStore().list(custom ? config.id : nugKeyOwner(config.id));
+	const key =
+		credentialId === undefined ? keys[0] : keys.find((entry) => entry.id === credentialId);
+	if (key && !key.disabled) return streamQuotaIdentity(withProviderKey(config, key));
+	// Plain single-key adapters preserve the historical connection id for accounting.
+	const first = keys[0];
+	if (
+		keys.length === 1 &&
+		credentialId === config.id &&
+		first &&
+		!first.disabled &&
+		!first.network
+	) {
+		return streamQuotaIdentity(withProviderKey(config, first));
+	}
+	return keys.length === 0 ? streamQuotaIdentity(config) : undefined;
+}
+
+/** A prepared transport can outlive an edit; never publish its balance under the new identity. */
+export function streamQuotaIdentityForRequest(
+	prefix: string,
+	info?: { credentialId?: string; validateDiagnosticCredential?: () => boolean },
+): string | undefined {
+	return info?.validateDiagnosticCredential?.() === false
+		? undefined
+		: streamQuotaIdentityForPrefix(prefix, info?.credentialId);
+}
+
+/** Match the exact request identity, not whichever key is first when the stream ends. */
+export function credentialForStream<T extends { id: string; baseUrl: string; apiKey: string }>(
+	config: T,
+	expectedIdentity: string | undefined,
+	owner = config.id,
+): UsageSubject<T> | undefined {
+	const keys = getProviderKeyStore().list(owner);
+	for (const key of keys) {
+		const selected = withProviderKey(config, key);
+		if (!key.disabled && streamQuotaIdentity(selected) === expectedIdentity) {
+			return { id: key.id, providerId: config.id, config: selected };
+		}
+	}
+	return keys.length === 0 && streamQuotaIdentity(config) === expectedIdentity
+		? { id: config.id, providerId: config.id, config }
+		: undefined;
 }
 
 export function usageSubjects(

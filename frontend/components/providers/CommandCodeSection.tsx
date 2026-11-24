@@ -42,6 +42,7 @@ import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
 import { COMMAND_CODE_PROTOCOL_OPTIONS } from "./ModelProtocolSelect";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 import type { CommandCodeState } from "./providers-reducer";
 import type { CustomApiProtocol } from "./types";
 
@@ -230,6 +231,10 @@ export function CommandCodeSection({
 					type="password"
 					value={value.apiKey}
 					onChange={(event) => onChange({ ...value, apiKey: event.currentTarget.value })}
+				/>
+				<ProviderKeysPanel
+					providerId="CommandCode"
+					onFirstKeyChanged={(apiKey) => onChange({ ...value, apiKey })}
 				/>
 				<Anchor
 					size="xs"
