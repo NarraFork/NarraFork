@@ -1,9 +1,4 @@
-import {
-	executionPrincipalOf,
-	isTeamMember,
-	runDeliverToOf,
-	teamRootOf,
-} from "@server/lib/runtime-source";
+import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
 import {
 	formatWatchTarget,
 	WATCH_DEADLINE_OUTPUT_PREFIX,
@@ -42,8 +37,7 @@ export interface TaskWatchInput {
 
 /**
  * Who is observing. A tool call passes its whole `ToolContext`; a watch re-attached
- * after a restart has no tool call and acts as the watcher's registered execution
- * identity.
+ * after a restart has no tool call and acts as the identity that registered it.
  */
 type WatchActor = Pick<ToolContext, "narratorId" | "signal" | "currentToolUseId"> & {
 	userId?: string | null;
@@ -200,6 +194,7 @@ async function observeTarget(opts: ObserveTargetOptions): Promise<ToolResult> {
 		toolUseId: ctx.currentToolUseId,
 		dedupKey: opts.conditionKey,
 		timeoutMs: input.timeout,
+		principal: { userId: ctx.userId ?? null },
 		onDeadline: () => void reachDeadline(),
 		...(opts.adopt ? { adopt: opts.adopt } : {}),
 	});
@@ -422,17 +417,15 @@ export async function resumeWatchAfterRestart(
 	};
 	// Only the time left: a merge into another re-attached observation must not extend it.
 	const timeout = Math.max(1, adopt.deadlineAt - Date.now());
-	// Authorize as the watcher's own execution identity, as a live Watch call would, so
-	// user-level revocation still applies. An unknown identity is never treated as
-	// anonymous: the watch then ends as interrupted instead of being re-attached.
+	// Authorize as the identity that registered the watch, as its live observation
+	// would, so a user-level revocation still applies and a later collaborator's policy
+	// is never borrowed. A row that does not record it is never re-attached.
+	if (!row.principal) return false;
 	const { narratorService } = await import("./narrator-service");
-	const watcher = await narratorService.getById(row.parentNarratorId);
-	const principal = watcher ? executionPrincipalOf(watcher) : undefined;
-	if (!principal) return false;
 	const actor: WatchActor = {
 		narratorId: row.parentNarratorId,
 		signal: new AbortController().signal,
-		userId: principal.userId,
+		userId: row.principal.userId,
 	};
 	await checkObservationAuthorization(actor, target.type);
 	if (target.type === "terminal") return resumeTerminalWatch(row, target.id, adopt, timeout);

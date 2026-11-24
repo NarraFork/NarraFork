@@ -383,6 +383,8 @@ export interface StartWatchInput {
 	registrationSignal?: AbortSignal;
 	/** Re-attach a lifecycle watch row left by the previous server process. */
 	adopt?: AdoptedWatchRow;
+	/** Who registers the watch; restart re-attachment re-authorizes as this identity. */
+	principal?: { userId: string | null };
 }
 
 type TerminalLifecycleService = Pick<
@@ -478,6 +480,7 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 			}),
 			toolUseId: input.toolUseId,
 			timeoutMs: input.timeoutMs,
+			principal: input.principal,
 			onDeadline: () => {
 				if (observation) void timeOut(observation.taskId);
 			},

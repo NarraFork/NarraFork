@@ -6,6 +6,17 @@ export interface RestartWatchRow {
 	parentNarratorId: string;
 	alias: string | null;
 	createdAt: string;
+	/** Who registered the watch; undefined when the row does not record it. */
+	principal: { userId: string | null } | undefined;
+}
+
+/** The stored registrant of a watch row, or undefined when absent or malformed. */
+export function restartWatchPrincipal(value: unknown): { userId: string | null } | undefined {
+	if (!value || typeof value !== "object" || !("userId" in value)) return undefined;
+	const { userId } = value as { userId: unknown };
+	return userId === null || (typeof userId === "string" && userId.length > 0)
+		? { userId }
+		: undefined;
 }
 
 export type ResumableWatchTarget = WatchTarget & { timeoutMs: number } & (

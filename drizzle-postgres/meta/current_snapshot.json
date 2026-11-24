@@ -1,6 +1,6 @@
 {
-  "id": "f040e99e-e551-4687-99f8-ee370353a9c1",
-  "prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+  "id": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+  "prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1150,6 +1150,12 @@
         },
         "title": {
           "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "principal_json": {
+          "name": "principal_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false

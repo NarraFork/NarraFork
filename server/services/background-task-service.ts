@@ -78,6 +78,7 @@ import {
 	type RestartWatchRow,
 	type ResumableWatchTarget,
 	restartResumableWatch,
+	restartWatchPrincipal,
 } from "./watch-restart";
 
 // Only claim what the watch itself did: the restart's own shutdown may have ended
@@ -949,6 +950,8 @@ class BackgroundTaskService {
 		executionTarget?: ToolExecutionTarget;
 		alias?: string;
 		title?: string;
+		/** Watch rows: who registered the observation (see `principalJson`). */
+		principal?: { userId: string | null };
 	}): Promise<BackgroundTaskRecord> {
 		this.bashLifecycle.assertAdmission();
 		const binding = opts.toolCallBinding;
@@ -978,6 +981,7 @@ class BackgroundTaskService {
 				executionAttempt: binding?.attempt ?? null,
 				alias: opts.alias ?? null,
 				title: opts.title ?? null,
+				principalJson: opts.principal ?? null,
 				output: null,
 				outputBytes: 0,
 				outputTruncated: false,
@@ -1017,6 +1021,7 @@ class BackgroundTaskService {
 			executionAttempt: binding?.attempt ?? null,
 			alias: opts.alias ?? null,
 			title: opts.title ?? null,
+			principalJson: opts.principal ?? null,
 			output: null,
 			outputBytes: 0,
 			outputTruncated: false,
@@ -4494,6 +4499,7 @@ class BackgroundTaskService {
 					parentNarratorId: row.parentNarratorId,
 					alias: row.alias,
 					createdAt: row.createdAt,
+					principal: restartWatchPrincipal(row.principalJson),
 				},
 				target,
 			});

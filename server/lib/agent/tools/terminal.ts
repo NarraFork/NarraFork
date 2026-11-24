@@ -542,6 +542,7 @@ async function startWatch(
 		prefixUnknown: point?.prefixUnknown,
 		start,
 		toolUseId: ctx.currentToolUseId,
+		principal: { userId: ctx.userId ?? null },
 		registrationSignal: ctx.signal,
 	});
 	if (ctx.signal.aborted) {

@@ -56,6 +56,8 @@ export interface WatchObservationInput {
 	 * grants the observation extra time.
 	 */
 	adopt?: AdoptedWatchRow;
+	/** Who registers this watch; restart re-attachment re-authorizes as this identity. */
+	principal?: { userId: string | null };
 }
 
 export interface AdoptedWatchRow {
@@ -369,6 +371,7 @@ export async function createWatchObservation(
 				toolUseId: input.toolUseId,
 				alias,
 				title: input.title,
+				principal: input.principal,
 			});
 		service.registerAbortController(taskId, controller);
 		service.registerKillHandler(taskId, observation.release);

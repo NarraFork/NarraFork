@@ -55,8 +55,8 @@ const wakes: string[] = [];
 runtimePublication.stop();
 backgroundTaskService.setBroadcastFnForTests(() => {});
 
-const context = (narratorId = PARENT): ToolContext =>
-	({ narratorId, signal: new AbortController().signal }) as ToolContext;
+const context = (narratorId = PARENT, userId?: string): ToolContext =>
+	({ narratorId, userId, signal: new AbortController().signal }) as ToolContext;
 
 function task(id: string) {
 	return db.select().from(backgroundTasks).where(eq(backgroundTasks.id, id)).get();
@@ -1219,7 +1219,13 @@ describe("lifecycle watches are re-attached after a restart", () => {
 		if (!row || !restartResumableWatch(target, row.createdAt)) throw new Error("not resumable");
 		expect(
 			await resumeWatchAfterRestart(
-				{ id, parentNarratorId: PARENT, alias: row.alias, createdAt: row.createdAt },
+				{
+					id,
+					parentNarratorId: PARENT,
+					alias: row.alias,
+					createdAt: row.createdAt,
+					principal: { userId: null },
+				},
 				target,
 			),
 		).toBe(true);
@@ -1255,21 +1261,66 @@ describe("lifecycle watches are re-attached after a restart", () => {
 });
 
 describe("re-attachment keeps identity, authority and extended deadlines", () => {
-	test("a watcher with no known execution identity is not re-attached", async () => {
+	test("a watch row that does not record its registrant is not re-attached", async () => {
 		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		expect(task(id)?.principalJson).toEqual({ userId: null });
+		db.update(backgroundTasks).set({ principalJson: null }).where(eq(backgroundTasks.id, id)).run();
 		await restart();
 		expect(task(id)?.status).toBe("failed");
 		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
 	});
 
-	test("user-level revocation of agent watches applies to re-attachment", async () => {
-		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
-		ownWatcher(
-			upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, { version: 1, deny: ["watchAgent"] }),
+	test("the registrant's user-level revocation applies to re-attachment", async () => {
+		ownWatcher();
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD }, context(PARENT, OWNER)),
 		);
+		expect(task(id)?.principalJson).toEqual({ userId: OWNER });
+		db.insert(userPreferences)
+			.values({
+				id: `${OWNER}-prefs`,
+				userId: OWNER,
+				traits: upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, {
+					version: 1,
+					deny: ["watchAgent"],
+				}),
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			})
+			.run();
+		invalidateUserTraitLayer(OWNER);
 		await restart();
 		expect(task(id)?.status).toBe("failed");
 		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a later collaborator's policy is never borrowed for another user's watch", async () => {
+		ownWatcher();
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD }, context(PARENT, OWNER)),
+		);
+		// A collaborator whose own policy denies agent watches now drives the session.
+		const now = new Date().toISOString();
+		db.insert(users)
+			.values({ id: "collab", username: "collab", passwordHash: "x", createdAt: now })
+			.run();
+		db.insert(userPreferences)
+			.values({
+				id: "collab-prefs",
+				userId: "collab",
+				traits: upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, {
+					version: 1,
+					deny: ["watchAgent"],
+				}),
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		invalidateUserTraitLayer("collab");
+		db.update(narrators).set({ ownerUserId: "collab" }).where(eq(narrators.id, PARENT)).run();
+		await restart();
+		// Re-authorized as the registrant, whose policy still allows it.
+		expect(task(id)?.status).toBe("running");
 	});
 
 	test("a repeated watch's extended deadline survives a restart", async () => {
