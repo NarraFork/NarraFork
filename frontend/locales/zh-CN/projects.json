@@ -284,7 +284,8 @@
 			"pauseMore": "已停止 {{stopped}} 个；运行中的会话超过一次能读取的数量，请再暂停一次",
 			"pauseError": "无法读取运行中的会话，没有停止任何会话",
 			"pausedSomeIdle": "已停止 {{stopped}} 个；{{idle}} 个本来已经停了",
-			"members": "团队成员"
+			"members": "团队成员",
+			"archivedHint": "团队已归档：工作项不能再改动，它启动的工作者可能仍在运行。恢复协调者会话即可继续。"
 		},
 		"approvals": {
 			"title": "待批",

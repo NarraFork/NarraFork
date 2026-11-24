@@ -284,7 +284,8 @@
 			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
 			"pauseError": "Could not read the running sessions; nothing was stopped",
 			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped",
-			"members": "Team members"
+			"members": "Team members",
+			"archivedHint": "This team is archived: its work items cannot change. Workers it started may still be running. Restore the coordinator's session to continue."
 		},
 		"approvals": {
 			"title": "Pending approvals",

@@ -333,6 +333,9 @@ export function TeamTopBar({
 	const [confirmPause, setConfirmPause] = useState(false);
 	const pause = usePauseTeam(projectId, teamId);
 	const member = summary?.access === "write";
+	// The coordinator is archived: its work items cannot change until it is restored. Background
+	// workers it started may still be running, so 全部暂停 stays while any session runs.
+	const archived = summary?.coordinatorStatus === "archived";
 	const pending = summary?.pendingApprovalCount ?? 0;
 	const running = summary?.runningCount ?? 0;
 	const pauseAll = () => {
@@ -369,6 +372,20 @@ export function TeamTopBar({
 				<Text fw={600} truncate data-testid="team-title">
 					{title}
 				</Text>
+				{archived && (
+					<Tooltip label={t("teams.top.archivedHint")} withinPortal multiline maw={280}>
+						<Badge
+							size="sm"
+							variant="light"
+							color="gray"
+							tt="none"
+							style={{ flexShrink: 0 }}
+							data-testid="team-archived"
+						>
+							{t("teams.archived")}
+						</Badge>
+					</Tooltip>
+				)}
 			</Group>
 			<Group gap={6} wrap="wrap" justify="flex-end" style={{ rowGap: 6 }}>
 				{member && (
@@ -445,7 +462,7 @@ export function TeamTopBar({
 						</Stack>
 					</Popover.Dropdown>
 				</Popover>
-				{member && (
+				{member && (!archived || running > 0) && (
 					<Button
 						size="xs"
 						variant="light"

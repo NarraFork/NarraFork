@@ -302,17 +302,15 @@ export function pauseNotice(outcome: PauseOutcome): {
 	return { color: "green", key: "paused" };
 }
 
-/** Widths of the team page's columns (px). */
-export const TEAM_TEAMS_WIDTH = 232;
+/** Width of the team page's side panel (board / activity), px. */
 export const TEAM_SIDE_WIDTH = 380;
 /** The conversation never gets narrower than this beside other columns. */
 export const TEAM_CONVERSATION_MIN_WIDTH = 480;
 
-export type TeamWorkspaceLayout = "columns" | "split" | "tabs";
+export type TeamWorkspaceLayout = "split" | "tabs";
 
 /** The layout for the frame's own width (not the viewport's: the app sidebar takes some). */
 export function teamWorkspaceLayout(width: number): TeamWorkspaceLayout {
-	if (width >= TEAM_TEAMS_WIDTH + TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "columns";
 	if (width >= TEAM_CONVERSATION_MIN_WIDTH + TEAM_SIDE_WIDTH) return "split";
 	return "tabs";
 }
