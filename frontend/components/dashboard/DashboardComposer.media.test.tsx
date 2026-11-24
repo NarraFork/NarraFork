@@ -276,6 +276,8 @@ async function dragFiles(type: "dragenter" | "dragleave") {
 }
 
 test("Dashboard highlights its drop zone while files are dragged over it", async () => {
+	const zone = host.firstElementChild as HTMLElement | null;
+	expect(zone?.style.position).toBe("relative");
 	expect(host.querySelector("[data-drop-overlay]")).toBeNull();
 	await dragFiles("dragenter");
 	expect(host.querySelector("[data-drop-overlay]")).not.toBeNull();
