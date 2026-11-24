@@ -113,6 +113,14 @@ describe("knowledge tree tool", () => {
 		expect(stale(root, loadNodes(root))).toEqual([]);
 	});
 
+	test("brace-glob anchors are dated like any other anchor", () => {
+		write("knowledge/area/beta.md", node("area.beta", ["server/services/{alpha,gamma}.ts"]));
+		git("commit", "-qam", "brace anchor");
+		write("server/services/gamma.ts", "export const g = 2;\n");
+		git("commit", "-qam", "change gamma");
+		expect(stale(root, loadNodes(root)).map((x) => x.node.id)).toEqual(["area.beta"]);
+	});
+
 	test("a code change committed together with its node keeps the node fresh", () => {
 		write("server/services/beta/one.ts", "export const b = 2;\n");
 		write("knowledge/area/beta.md", node("area.beta", ["server/services/beta/"], "updated"));

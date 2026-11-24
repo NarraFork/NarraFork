@@ -33,7 +33,8 @@ const SOURCE_ROOTS = ["server", "frontend", "shared"];
 const SOURCE_FILE = /\.(ts|tsx|go)$/;
 /** An anchor matching more source files than this is too broad to locate or date anything. */
 export const BROAD_ANCHOR_FILES = 40;
-const NOT_SOURCE = /(__tests__|\.test\.|\.browser\.|\.fixture\.|\/fixtures?\/|\.d\.ts$|routeTree\.gen\.ts$)/;
+const NOT_SOURCE =
+	/(__tests__|\.test\.|\.browser\.|\.fixture\.|\/fixtures?\/|\.d\.ts$|routeTree\.gen\.ts$)/;
 
 // ── git ──────────────────────────────────────────────────────────────────────
 
@@ -125,9 +126,18 @@ export function anchorMatches(anchor: string, path: string): boolean {
 	return path === a;
 }
 
-function toPathspec(anchor: string): string {
-	const a = anchorPath(anchor);
-	return /[*?[]/.test(a) ? `:(glob)${a}` : a;
+/**
+ * Git pathspecs for anchors. Git's glob magic has no `{a,b}` alternatives, so a glob that uses
+ * them is expanded to the tracked files it matches now.
+ */
+function toPathspecs(anchors: string[], tracked: () => string[]): string[] {
+	const out: string[] = [];
+	for (const anchor of anchors) {
+		const a = anchorPath(anchor);
+		if (a.includes("{")) out.push(...tracked().filter((f) => anchorMatches(a, f)));
+		else out.push(/[*?[]/.test(a) ? `:(glob)${a}` : a);
+	}
+	return out;
 }
 
 // ── commands ─────────────────────────────────────────────────────────────────
@@ -190,17 +200,23 @@ export interface StaleNode {
 /** Nodes whose anchored code changed in a commit after the node file's last commit. */
 export function stale(root: string, nodes: KnowledgeNode[]): StaleNode[] {
 	const dirty = new Set(lines(git(root, ["status", "--porcelain"])).map((l) => l.slice(3)));
+	let trackedCache: string[] | null = null;
+	const tracked = () => {
+		trackedCache ??= lines(git(root, ["ls-files"]));
+		return trackedCache;
+	};
 	const out: StaleNode[] = [];
 	for (const node of nodes) {
 		if (node.anchors.length === 0 || dirty.has(node.file)) continue;
 		const since = git(root, ["log", "-1", "--format=%H", "--", node.file]).trim();
 		if (!since) continue;
-		const specs = node.anchors.map(toPathspec);
+		const specs = toPathspecs(node.anchors, tracked);
+		if (specs.length === 0) continue;
 		const commits = lines(git(root, ["rev-list", `${since}..HEAD`, "--", ...specs]));
 		if (commits.length === 0) continue;
-		const files = lines(
-			git(root, ["diff", "--name-only", since, "HEAD", "--", ...specs]),
-		).filter((f) => !f.startsWith(`${KNOWLEDGE_DIR}/`));
+		const files = lines(git(root, ["diff", "--name-only", since, "HEAD", "--", ...specs])).filter(
+			(f) => !f.startsWith(`${KNOWLEDGE_DIR}/`),
+		);
 		if (files.length > 0) out.push({ node, commits, files });
 	}
 	return out;
@@ -241,7 +257,10 @@ export function changedFiles(root: string, base: string): string[] {
 	return [...files].filter((f) => !f.startsWith(`${KNOWLEDGE_DIR}/`)).sort();
 }
 
-export function coverage(root: string, nodes: KnowledgeNode[]): { total: number; uncovered: string[] } {
+export function coverage(
+	root: string,
+	nodes: KnowledgeNode[],
+): { total: number; uncovered: string[] } {
 	const source = sourceFiles(root);
 	const broad = new Set(broadAnchors(source, nodes).map((b) => b.anchor));
 	const anchors = nodes.flatMap((n) => n.anchors).filter((a) => !broad.has(a));
@@ -256,7 +275,10 @@ export function sourceFiles(root: string): string[] {
 }
 
 /** Anchors that match more than {@link BROAD_ANCHOR_FILES} source files. */
-export function broadAnchors(source: string[], nodes: KnowledgeNode[]): Array<{ node: KnowledgeNode; anchor: string; count: number }> {
+export function broadAnchors(
+	source: string[],
+	nodes: KnowledgeNode[],
+): Array<{ node: KnowledgeNode; anchor: string; count: number }> {
 	const out: Array<{ node: KnowledgeNode; anchor: string; count: number }> = [];
 	for (const node of nodes)
 		for (const anchor of node.anchors) {
@@ -330,9 +352,16 @@ function main(argv: string[]): number {
 			}
 			const hits = find(nodes, args).slice(0, 12);
 			if (hits.length === 0) console.log("没有匹配的节点。");
-			const staleIds = new Set(stale(root, hits.map((h) => h.node)).map((s) => s.node.id));
+			const staleIds = new Set(
+				stale(
+					root,
+					hits.map((h) => h.node),
+				).map((s) => s.node.id),
+			);
 			for (const h of hits)
-				console.log(`${staleIds.has(h.node.id) ? "[过期] " : ""}${line(h.node)}\n    ${h.why.join(", ")}`);
+				console.log(
+					`${staleIds.has(h.node.id) ? "[过期] " : ""}${line(h.node)}\n    ${h.why.join(", ")}`,
+				);
 			return 0;
 		}
 		case "affected": {
@@ -354,7 +383,9 @@ function main(argv: string[]): number {
 			const list = stale(root, nodes);
 			if (list.length === 0) console.log("没有过期节点。");
 			for (const s of list) {
-				console.log(`${line(s.node)}\n    ${s.commits.length} 个提交改了：${s.files.slice(0, 6).join(", ")}${s.files.length > 6 ? " …" : ""}`);
+				console.log(
+					`${line(s.node)}\n    ${s.commits.length} 个提交改了：${s.files.slice(0, 6).join(", ")}${s.files.length > 6 ? " …" : ""}`,
+				);
 			}
 			return 0;
 		}
@@ -368,14 +399,19 @@ function main(argv: string[]): number {
 				byDir.set(d, (byDir.get(d) ?? 0) + 1);
 			}
 			const top = [...byDir].sort((a, b) => b[1] - a[1]);
-			for (const [d, c] of args.includes("--list") ? top : top.slice(0, 15)) console.log(`    ${c}\t${d}`);
+			for (const [d, c] of args.includes("--list") ? top : top.slice(0, 15))
+				console.log(`    ${c}\t${d}`);
 			if (args.includes("--list")) for (const f of uncovered) console.log(f);
 			return 0;
 		}
 		case "check": {
 			const errors = check(root, nodes);
 			for (const e of errors) console.error(e);
-			console.log(errors.length === 0 ? `知识树检查通过（${nodes.length} 个节点）。` : `${errors.length} 个问题。`);
+			console.log(
+				errors.length === 0
+					? `知识树检查通过（${nodes.length} 个节点）。`
+					: `${errors.length} 个问题。`,
+			);
 			return errors.length === 0 ? 0 : 1;
 		}
 		default:

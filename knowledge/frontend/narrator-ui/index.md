@@ -1,45 +1,67 @@
 ---
 id: frontend.narrator-ui
 title: 会话界面
-summary: 叙述者面板、懒加载的精确虚拟消息列表（零 DOM 测量）、LOD 细节级别、输入框、工具卡片。
+summary: 一个叙述者在界面上的组成：NarratorPanel 如何装配消息列表、输入区、工具卡片、文件面板与外框，以及未归入子节点的零散部分。
 anchors:
-  - frontend/components/narrator/
   - frontend/components/narrator/NarratorPanel.tsx
-  - frontend/components/narrator/vlist/
-  - frontend/components/narrator/lod/
-  - frontend/components/narrator/dock/FocusChatHost.tsx
-  - frontend/hooks/useNarratorLod.ts
-status: stub
+  - frontend/components/narrator/NarratorPanelSkeleton.tsx
+  - frontend/components/narrator/narrator-panel-*
+  - frontend/components/narrator/useNarratorPanelWS.ts
+  - frontend/components/narrator/panel-source.ts
+  - frontend/components/narrator/split-tree.ts
+  - frontend/components/narrator/remote-ui-*
+  - frontend/components/narrator/RemoteUnsupported.tsx
+  - frontend/components/narrator/narrator-message-helpers.ts
+  - frontend/components/narrator/list/
+  - frontend/components/narrator/knowledge/
+  - frontend/components/narrator/mock/
+status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+keywords:
+  - NarratorPanel
+  - useNarratorPanelWS
+  - narrator-ws-manager
+  - REMOTE_BUILD
+  - RemoteUnsupported
+  - 叙述者列表
+  - NarratorListCard
+  - narrafork_mock_stream
+  - 模拟流
+  - MockStreamPanel
+  - 浏览器测试
+  - browser-fixture
 ---
 # 会话界面
 
-`frontend/components/narrator/` 是体量最大的前端目录：一个叙述者在界面上是一个 `NarratorPanel`，里面是消息列表、输入框、权限/提问卡片和若干侧面板；多个面板如何并排见[面板与布局](../panels.md)。
+`frontend/components/narrator/` 是体量最大的前端目录（约 650 个非测试文件）。一个叙述者在界面上是一个 `NarratorPanel`；它自己只负责装配与状态汇集，具体功能分在下面五个子节点。多个面板如何并排、工作区如何保存见[面板与布局](../panels.md)。
 
-## 关键规则
-- 消息列表由 `vlist/PretextExactMessageList.tsx` 渲染，`NarratorPanel.tsx` 用动态 `import()` 懒加载它；`vlist/vlist-isolation.guard.test.ts` 强制 vlist 目录之外不得静态 import vlist（避免首屏带上整个 vlist 模块图）。
-- 列表高度是纯算术：整段文档在当前 LOD 和宽度下用 `@chenglou/pretext` 预测量，前缀索引决定画布总高，可见项按精确偏移绝对定位（见 `vlist/PretextExactMessageList.tsx` 文件头与 `vlist/CONTRACT.md`）。测量路径禁止 DOM 测量，由 `vlist/zero-dom-measure.guard.test.ts` 与 `shared/pretext-layout/shared-core.guard.test.ts` 扫描强制；内核在 `shared/pretext-layout/`。
-- LOD（渲染细节级别）取值 1–5，默认 4（`lod/RenderLodCtx.ts`）。每个叙述者各记一个等级（localStorage `narrafork_lod:<id>`），“设为默认”才写 `narrafork_lod_default`（`hooks/useNarratorLod.ts`）；调节入口是 `lod/` 下的指示器（按住 Alt 滚轮/捏合，或点击步进按钮）。
-- 实时数据来自 `hooks/useNarratorWS.ts` / `components/narrator/useNarratorPanelWS.ts`，经 `lib/narrator-ws-manager.ts` 订阅；消息树整理在 `message/message-tree-utils.ts`，子代理消息通过父工具调用嵌套显示。
-- 输入框 `composer/NarratorComposer.tsx`（编辑器内核是 `InlineComposerEditor`，基于 ProseMirror）：草稿持久化（`narrator-draft-storage.ts`）、文件引用、引用选中文本、图片/媒体附件、发送选项。
-- 工具调用的展示逻辑集中在 `tool-call/tool-display.ts`，详情查看器 `ToolCallInspector`；权限审批卡片在 `permission/`，提问在 `question/`；压缩标记与操作在 `compact/`；时间线面板在 `timeline/`。
-- 多面板 dock、工作区布局与布局持久化见[面板与布局](../panels.md)。
-- 浏览器类测试（`*.browser.test.ts`）用 puppeteer-core 加载 `*.browser-fixture.tsx`，在真实 Chromium 里验证布局。
+## 面板如何组成
+- `NarratorPanel.tsx`（约 4000 行）：用 `useNarratorPanelWS`（再经 `hooks/useNarratorWS.ts`、`lib/narrator-ws-manager.ts` 订阅）取得实时状态，向下装配：
+  - 头部与工具栏：`header/HeaderToolbar`、`NarratorHeaderLayout`（见[会话外框](session-chrome.md)）。
+  - 消息区：`vlist/PretextExactMessageList`，用 `lazy()` 动态加载，并在文件里预加载（见[消息列表](message-list.md)）。
+  - 输入区：`NarratorInteractionArea` → `composer/` + `interaction/`（见[输入框与交互](composer.md)）。
+  - 权限与提问：内联在消息列表里的 `permission/`、`question/`（见[工具卡片](tool-cards.md)）。
+  - 侧面板：详情、Spec、文件面板等同样 `lazy()` 加载；`REMOTE_BUILD` 下被替换为 `RemoteUnsupported`（`remote-ui-panels.tsx`、`remote-ui-contexts.tsx` 提供构建别名），不加载这些模块（见[文件面板](file-panels.md)、[会话外框](session-chrome.md)）。
+- 同一个叙述者可以出现在 dock（桌面）、工作区预览、抽屉（手机/分离窗口）等不同宿主，面板通过 `NarratorDockContext` 等上下文与兄弟面板协作，无 Provider 时回退为旧的 prop 回调。
 
-## 从哪读起
-- `frontend/components/narrator/NarratorPanel.tsx`（超大文件）：面板装配，懒加载点集中在文件前部。
-- `frontend/components/narrator/vlist/`：虚拟列表（`vlist-exact-*`、`measure/`、`render/`、`registry.ts`）。
-- `frontend/components/narrator/dock/FocusChatHost.tsx`：聊天面板在 dock 里的承载（dock 本身见[面板与布局](../panels.md)）。
+## 本节点直接覆盖的部分
+- `narrator-panel-types.ts`：面板对外属性与快照类型；`narrator-panel-overrides.ts`：每叙述者设置的三态（跟随默认 `inherit` / 开 / 关）归一化，未知的存储值回落为“跟随默认”而不是当成显式覆盖；`narrator-panel-visibility.tsx`：嵌套的面板可见性上下文（父级与自身都可见才算可见）。
+- `panel-source.ts`：给面板源码守卫测试读取源文件的辅助（面板本身无法单元挂载，若干不变量靠读源码断言）；移动 `NarratorPanel.tsx` 前要全仓搜旧路径。
+- `list/`：叙述者列表页的卡片与筛选（`NarratorListCard`、`narrator-list-utils`），被 `routes/narrators/index.tsx`、`archived.tsx` 使用。
+- `knowledge/`：把知识库条目嵌入面板的内容视图（`KnowledgeEntryPanelContent`）。
+- `split-tree.ts`：旧式递归分栏数据结构，仍被终端/窗口/工作区若干组件引用。
+- `mock/`：临时的流式回放调试台（`MockStreamPanel` 等，内容固定的脚本，不写数据库）；需本地偏好 `narrafork_mock_stream` 开启才可达，`mock/README-REMOVAL.md` 写明它将被删除，界面文案不走 i18n。
+- `narrator-message-helpers.ts`：流式文本预览、内容块处理等消息辅助函数。
+- 测试：`*.browser.test.ts` 用 puppeteer-core 加载 `*.browser-fixture.tsx`，在真实 Chromium 里验证布局。
+
+## 子节点
+- [消息列表](message-list.md)：虚拟列表、细节级别（LOD）、滚动、消息与内容渲染、Markdown、流式输出。
+- [输入框与交互](composer.md)：输入框、草稿与附件、发送与排队、斜杠控制命令、状态栏控件。
+- [工具卡片](tool-cards.md)：工具调用展示与详情、编辑差异、权限审批与提问卡片、错误请求转储。
+- [文件面板](file-panels.md)：文件树、文件查看（预览/节点/归档）与 Monaco 编辑器面板。
+- [会话外框](session-chrome.md)：头部与工具栏、模型与额度、dock 与工作区、后台任务、上下文与压缩、Spec、详情、时间线、会话导入导出。
 
 ## 相关
 - [面板与布局](../panels.md)
 - [数据获取与实时同步](../data-flow.md)
 - [通用组件与主题](../components-theme.md)
-
-## 下面有什么
-
-- [消息列表](message-list.md)：虚拟列表、细节级别、滚动、消息与内容渲染、Markdown、流式输出。
-- [输入框与交互](composer.md)：输入框、草稿、附件、斜杠命令，以及提问与审批的交互面板。
-- [工具卡片](tool-cards.md)：工具调用卡片、详情、差异、权限与提问卡片、请求追踪。
-- [文件面板](file-panels.md)：文件树、文件查看与编辑器面板。
-- [会话外框](session-chrome.md)：会话头部、模型选择、dock 与工作区、后台任务、上下文管理与压缩入口、Spec。
