@@ -2,7 +2,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { registerTaskAlias } from "./subagent-alias";
+import { registerTaskAlias, restoreTaskAlias } from "./subagent-alias";
 import { WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
 
 export const DEFAULT_WATCH_TIMEOUT_MS = 600_000;
@@ -132,6 +132,19 @@ export function resumeWatchObservationsForTests(): void {
 }
 
 /**
+ * Store an extension so a restart re-attaches with it. A failed write only loses the
+ * extension across a restart; the live observation already uses it.
+ */
+async function persistExtendedDeadline(taskId: string, deadlineAt: number): Promise<void> {
+	try {
+		const { backgroundTaskService } = await import("./background-task-service");
+		await backgroundTaskService.extendWatchDeadline(taskId, deadlineAt);
+	} catch (error) {
+		logger.warn("Watch deadline extension was not persisted", { taskId, error: String(error) });
+	}
+}
+
+/**
  * Admit a watch, reusing this watcher's live observation with the same key. Only the
  * watcher's own repeats merge: other watchers of the same target stay independent.
  */
@@ -144,8 +157,10 @@ export async function registerWatchObservation(
 		if (!current) break;
 		const existing = await current.ready.catch(() => undefined);
 		const remainingMs = existing?.extendDeadline(input.timeoutMs);
-		if (existing && remainingMs !== undefined)
+		if (existing && remainingMs !== undefined) {
+			await persistExtendedDeadline(existing.taskId, Date.now() + remainingMs);
 			return { observation: existing, reused: true, remainingMs };
+		}
 		if (registrations.get(key) === current) registrations.delete(key);
 	}
 	const registration: Registration = {
@@ -186,7 +201,10 @@ export async function createWatchObservation(
 	}
 
 	const taskId = input.adopt?.taskId ?? `bash_${generateShortId()}`;
-	const { alias } = registerTaskAlias(input.narratorId, taskId, input.adopt?.alias ?? input.title);
+	// An adopted row keeps the exact handle the session was given before the restart.
+	const { alias } = input.adopt?.alias
+		? restoreTaskAlias(input.narratorId, taskId, input.adopt.alias)
+		: registerTaskAlias(input.narratorId, taskId, input.title);
 	const controller = new AbortController();
 	let released = false;
 	let sourceReleased = false;

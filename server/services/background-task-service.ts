@@ -14,7 +14,7 @@ import {
 	isBackgroundTaskActiveStatus,
 } from "@shared/background-task-list";
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import { parseWatchCommand, type WatchTargetType } from "@shared/watch-command";
+import { formatWatchTarget, parseWatchCommand, type WatchTargetType } from "@shared/watch-command";
 import {
 	and,
 	asc,
@@ -2447,6 +2447,34 @@ class BackgroundTaskService {
 			taskReadOptions(options, 1),
 		);
 		return row ?? null;
+	}
+
+	/**
+	 * Record an extended Watch deadline on its running row, so restart recovery
+	 * re-attaches the watch until the extended deadline rather than the first one.
+	 * The command's `timeout` keeps its meaning, "ms from registration"; the write is
+	 * a compare-and-set on the command it read, and never shortens a deadline.
+	 */
+	async extendWatchDeadline(taskId: string, deadlineAt: number): Promise<void> {
+		const row = await this.getById(taskId);
+		if (!row || row.status !== "running" || !row.command) return;
+		const target = parseWatchCommand(row.command);
+		if (!target || target.timeoutMs == null) return;
+		const timeoutMs = Math.ceil(deadlineAt - Date.parse(row.createdAt));
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= target.timeoutMs) return;
+		await db
+			.update(backgroundTasks)
+			.set({
+				command: `${WATCH_COMMAND_PREFIX} ${formatWatchTarget({ ...target, timeoutMs })}`,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(
+				and(
+					eq(backgroundTasks.id, taskId),
+					eq(backgroundTasks.status, "running"),
+					eq(backgroundTasks.command, row.command),
+				),
+			);
 	}
 
 	/**

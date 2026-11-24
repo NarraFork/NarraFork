@@ -8,12 +8,16 @@ import {
 	narratorBufferedMessages,
 	narrators,
 	runtimePublicationOutbox,
+	userPreferences,
+	users,
 } from "../../db/schema";
 import { stopTool } from "../../lib/agent/tools/stop";
 import { watchTool } from "../../lib/agent/tools/watch";
 import type { ToolContext, ToolResult } from "../../lib/agent/types";
 import * as workerPool from "../../lib/db-worker/pool";
 import { eventBus } from "../../lib/event-bus";
+import { upsertEncodedTrait } from "../../lib/narrator-custom-traits";
+import { RUNTIME_POLICY_TRAIT_PREFIX } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { MAILBOX_LIMITS } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
@@ -25,8 +29,9 @@ import {
 } from "../agent-runtime/publication";
 import { backgroundTaskService } from "../background-task-service";
 import { projectPendingInjection } from "../parent-injection-queue";
-import { clearAliasRegistry } from "../subagent-alias";
+import { clearAliasRegistry, resolveTaskAlias, restoreTaskAlias } from "../subagent-alias";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
+import { invalidateUserTraitLayer } from "../trait-layer-service";
 import {
 	createWatchObservation,
 	MAX_PUBLISH_RETRY_DELAY_MS,
@@ -1093,6 +1098,21 @@ describe("Watch follows an agent's registered current run", () => {
 	});
 });
 
+const OWNER = "watch-task-owner";
+
+/** Give the watcher a known execution identity: re-attachment authorizes as it. */
+function ownWatcher(traits: string[] = []) {
+	const now = new Date().toISOString();
+	db.insert(users).values({ id: OWNER, username: OWNER, passwordHash: "x", createdAt: now }).run();
+	if (traits.length)
+		db.insert(userPreferences)
+			.values({ id: `${OWNER}-prefs`, userId: OWNER, traits, createdAt: now, updatedAt: now })
+			.run();
+	db.update(narrators).set({ ownerUserId: OWNER }).where(eq(narrators.id, PARENT)).run();
+	// Preference writes invalidate the cached user layer; this direct insert must too.
+	invalidateUserTraitLayer(OWNER);
+}
+
 /** Shut down, then recover as a fresh process would: observation state starts empty. */
 async function restart(): Promise<void> {
 	suspendWatchObservationsForShutdown();
@@ -1103,6 +1123,8 @@ async function restart(): Promise<void> {
 }
 
 describe("lifecycle watches are re-attached after a restart", () => {
+	beforeEach(() => ownWatcher());
+
 	test("an agent watch keeps its row and reports the agent's later completion", async () => {
 		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
 		await restart();
@@ -1229,6 +1251,50 @@ describe("lifecycle watches are re-attached after a restart", () => {
 		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
 			"working",
 		);
+	});
+});
+
+describe("re-attachment keeps identity, authority and extended deadlines", () => {
+	test("a watcher with no known execution identity is not re-attached", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("user-level revocation of agent watches applies to re-attachment", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		ownWatcher(
+			upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, { version: 1, deny: ["watchAgent"] }),
+		);
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a repeated watch's extended deadline survives a restart", async () => {
+		ownWatcher();
+		const first = await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		const id = watchId(first);
+		await watchTool.execute({ type: "agent", id: CHILD, timeout: 60_000 }, context());
+		expect(parseWatchCommand(task(id)?.command)?.timeoutMs).toBeGreaterThanOrEqual(60_000);
+		// Restart after the first deadline but well before the extended one.
+		const createdAt = Date.parse(task(id)?.createdAt ?? "");
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(createdAt - 5_000).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("running");
+	});
+
+	test("persisted handles are restored exactly, whatever order rows are recovered in", () => {
+		const long = "w".repeat(40);
+		// Registered first: `long`; registered second: `long-2`. Recovered in reverse order.
+		expect(restoreTaskAlias(PARENT, "second", `${long}-2`).alias).toBe(`${long}-2`);
+		expect(restoreTaskAlias(PARENT, "first", long).alias).toBe(long);
+		expect(resolveTaskAlias(PARENT, long)).toBe("first");
+		expect(resolveTaskAlias(PARENT, `${long}-2`)).toBe("second");
 	});
 });
 

@@ -1,4 +1,9 @@
-import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
+import {
+	executionPrincipalOf,
+	isTeamMember,
+	runDeliverToOf,
+	teamRootOf,
+} from "@server/lib/runtime-source";
 import {
 	formatWatchTarget,
 	WATCH_DEADLINE_OUTPUT_PREFIX,
@@ -37,8 +42,8 @@ export interface TaskWatchInput {
 
 /**
  * Who is observing. A tool call passes its whole `ToolContext`; a watch re-attached
- * after a restart has no acting user or tool call, so authorization falls back to the
- * session's own policy (the same fallback used when no live session records a user).
+ * after a restart has no tool call and acts as the watcher's registered execution
+ * identity.
  */
 type WatchActor = Pick<ToolContext, "narratorId" | "signal" | "currentToolUseId"> & {
 	userId?: string | null;
@@ -417,10 +422,17 @@ export async function resumeWatchAfterRestart(
 	};
 	// Only the time left: a merge into another re-attached observation must not extend it.
 	const timeout = Math.max(1, adopt.deadlineAt - Date.now());
+	// Authorize as the watcher's own execution identity, as a live Watch call would, so
+	// user-level revocation still applies. An unknown identity is never treated as
+	// anonymous: the watch then ends as interrupted instead of being re-attached.
+	const { narratorService } = await import("./narrator-service");
+	const watcher = await narratorService.getById(row.parentNarratorId);
+	const principal = watcher ? executionPrincipalOf(watcher) : undefined;
+	if (!principal) return false;
 	const actor: WatchActor = {
 		narratorId: row.parentNarratorId,
 		signal: new AbortController().signal,
-		userId: null,
+		userId: principal.userId,
 	};
 	await checkObservationAuthorization(actor, target.type);
 	if (target.type === "terminal") return resumeTerminalWatch(row, target.id, adopt, timeout);
@@ -439,14 +451,13 @@ export async function resumeWatchAfterRestart(
 		result = await observeBashTask(task, input, actor, adopt);
 	} else {
 		const { awaitAgentResultDetailed } = await import("./agent-communication");
-		const { narratorService } = await import("./narrator-service");
 		const narrator = await narratorService.getById(target.id);
 		if (!narrator || narrator.logicalRunId !== target.runId) return false;
 		if (!isTeamMember(narrator, row.parentNarratorId)) return false;
 		const snapshot = await awaitAgentResultDetailed({
 			callerNarratorId: row.parentNarratorId,
 			id: target.id,
-			userId: null,
+			userId: actor.userId,
 			signal: actor.signal,
 			snapshotOnly: true,
 		});

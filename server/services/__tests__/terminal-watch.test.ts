@@ -958,7 +958,13 @@ describe("terminal watch", () => {
 
 describe("terminal lifecycle watches are re-attached after a restart", () => {
 	async function seedTerminal(status: "running" | "exited" = "running") {
-		const { terminals } = await import("../../db/schema");
+		const { terminals, users } = await import("../../db/schema");
+		// Re-attachment authorizes as the watcher's own execution identity.
+		const now = new Date().toISOString();
+		db.insert(users)
+			.values({ id: "tw-owner", username: "tw-owner", passwordHash: "x", createdAt: now })
+			.run();
+		db.update(narrators).set({ ownerUserId: "tw-owner" }).where(eq(narrators.id, PARENT)).run();
 		db.insert(terminals)
 			.values({
 				id: TERMINAL,
