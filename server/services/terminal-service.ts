@@ -7,6 +7,7 @@ import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
@@ -153,9 +154,16 @@ interface ActiveTerminal {
 	resizeChain?: Promise<void>;
 }
 
-const activeTerminals = new Map<string, ActiveTerminal>();
-let startupRecovery: Promise<void> | undefined;
-let startupRecoverySettled: Promise<void> = Promise.resolve();
+// Keep the actual PTYs/buffers and any in-flight recovery owned across --hot evaluations.
+const terminalState = hotSafe<{
+	activeTerminals: Map<string, ActiveTerminal>;
+	startupRecovery?: Promise<void>;
+	startupRecoverySettled: Promise<void>;
+}>("narrafork.terminalService", () => ({
+	activeTerminals: new Map(),
+	startupRecoverySettled: Promise.resolve(),
+}));
+const activeTerminals = terminalState.activeTerminals;
 const RECOVERY_CONCURRENCY = 4;
 
 /**
@@ -922,18 +930,18 @@ export const terminalService = {
 
 	/** Concurrent startup callers share one scan and one attach per terminal. */
 	recoverOnStartup(): Promise<void> {
-		if (!startupRecovery) {
-			startupRecovery = recoverTerminalsOnStartup().finally(() => {
-				startupRecovery = undefined;
+		if (!terminalState.startupRecovery) {
+			terminalState.startupRecovery = recoverTerminalsOnStartup().finally(() => {
+				terminalState.startupRecovery = undefined;
 			});
-			startupRecoverySettled = startupRecovery.catch(() => {});
+			terminalState.startupRecoverySettled = terminalState.startupRecovery.catch(() => {});
 		}
-		return startupRecovery;
+		return terminalState.startupRecovery;
 	},
 
 	/** Resolves once the latest startup recovery has settled (immediately if none ran). */
 	whenStartupRecoverySettled(): Promise<void> {
-		return startupRecoverySettled;
+		return terminalState.startupRecoverySettled;
 	},
 
 	async cleanupForNarrator(narratorId: string) {

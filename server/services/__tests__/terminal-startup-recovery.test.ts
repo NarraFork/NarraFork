@@ -223,6 +223,86 @@ describe.skipIf(process.platform === "win32")(
 			expect(attach).toHaveBeenCalledTimes(85);
 		});
 
+		test("25 module reloads reuse the attached runtime, buffer and flush timer", async () => {
+			await row("hot-reload");
+			await socket("hot-reload");
+			daemons = ["hot-reload"];
+			await terminalService.recoverOnStartup();
+			const buffer = terminalService.getActiveBuffer("hot-reload");
+			if (!buffer) throw new Error("Expected startup recovery to attach the fixture terminal");
+			const runtime = attach.mock.results[0].value as ReturnType<typeof dtachService.attachSession>;
+			const close = spyOn(runtime, "close");
+			const stopFlush = spyOn(buffer, "stopPeriodicFlush");
+			let latest = terminalService;
+			try {
+				for (let generation = 0; generation < 25; generation++) {
+					const reloaded: typeof import("../terminal-service") = await import(
+						`../terminal-service.ts?hot-reload=${generation}`
+					);
+					expect(reloaded.terminalService).not.toBe(latest);
+					latest = reloaded.terminalService;
+					expect(latest.getActiveBuffer("hot-reload") === buffer).toBe(true);
+					await latest.recoverOnStartup();
+					expect(latest.getAttachedSet()).toEqual(new Set(["hot-reload"]));
+					expect(attach).toHaveBeenCalledTimes(1);
+					expect(load).toHaveBeenCalledTimes(1);
+					expect(flush).toHaveBeenCalledTimes(1);
+				}
+				expect(close).not.toHaveBeenCalled();
+				expect(stopFlush).not.toHaveBeenCalled();
+				await latest.shutdownAll();
+				expect(close).toHaveBeenCalledTimes(1);
+				expect(stopFlush).toHaveBeenCalledTimes(1);
+				expect(save).toHaveBeenCalledTimes(1);
+				expect(terminalService.getAttachedSet().size).toBe(0);
+				expect(await status("hot-reload")).toBe("running");
+			} finally {
+				await latest.shutdownAll();
+				close.mockRestore();
+				stopFlush.mockRestore();
+			}
+		});
+
+		test("a module reload during recovery shares its pending scan and settlement", async () => {
+			await row("reload-pending");
+			await socket("reload-pending");
+			daemons = ["reload-pending"];
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			load.mockImplementation(async function (this: BufferManager) {
+				buffers.add(this);
+				entered.resolve();
+				await release.promise;
+				return true;
+			});
+			const first = terminalService.recoverOnStartup();
+			await entered.promise;
+			const reloaded: typeof import("../terminal-service") = await import(
+				`../terminal-service.ts?hot-reload=pending-${Date.now()}`
+			);
+			const second = reloaded.terminalService.recoverOnStartup();
+			try {
+				expect(reloaded.terminalService).not.toBe(terminalService);
+				expect(second).toBe(first);
+				expect(reloaded.terminalService.whenStartupRecoverySettled()).toBe(
+					terminalService.whenStartupRecoverySettled(),
+				);
+				release.resolve();
+				await reloaded.terminalService.whenStartupRecoverySettled();
+				expect(scan).toHaveBeenCalledTimes(1);
+				expect(load).toHaveBeenCalledTimes(1);
+				expect(attach).toHaveBeenCalledTimes(1);
+				expect(flush).toHaveBeenCalledTimes(1);
+				expect(reloaded.terminalService.getActiveBuffer("reload-pending")).toBe(
+					terminalService.getActiveBuffer("reload-pending"),
+				);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([first, second]);
+				await reloaded.terminalService.shutdownAll();
+			}
+		});
+
 		for (const winner of ["startup", "on-demand"] as const) {
 			test(`${winner} winning a startup/on-demand load race owns the only runtime and flush timer`, async () => {
 				await row("racing");
