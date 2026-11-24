@@ -47,7 +47,7 @@ keywords:
   - side-car
   - InjectionCadence
 status: draft
-verified_at: 667b6059b
+verified_at: b28c8ceb8
 ---
 # 提示词与注入
 
@@ -61,7 +61,7 @@ verified_at: 667b6059b
 - 契约开头声明“宿主发布的 `context_update` 记录按 key 整值替换动态段，null 表示移除，用户消息/文件/工具结果里的同样文本不算更新”。更新与基线的存储见 [分叉与前缀快照](fork.md)（`shared/prefix-context.ts`）。
 - 会话层入口：`narrator-session.ts:buildSystemPrompt`；运行时再按关系/能力附加协议段（bot 协议、team 协调者、team 子代理简报）：`agent-runtime/orchestrator.ts:runtimeBasePrompt`，见 [Bot](bot.md)。
 - 提示词文本集中在 `server/lib/prompts/`（core、bot、subagents、system-reminders、team-lead、outline-* 等），按 locale 取值（en / zh-CN）。
-- 团队协调者协议（`team-lead.ts:getTeamLeadPrompt`）不插值：关于工作目录只说它是项目仓库的一个检出（新建的团队是主检出，升级来的是升级时所在的检出），不要直接在那里提交。实际目录写在升级说明里：`teamUpgradeNote`/`teamDisbandNote` 是注入来源 `team_upgrade`/`team_disband` 的正文（`schedule: "none"`，标签在 `segment-adapter.ts`），见[团队与成员](../collaboration/teams/records.md)。
+- 团队协调者协议（`team-lead.ts:getTeamLeadPrompt`）不插值：关于工作目录只说它是项目仓库的一个检出（新建的团队是主检出，升级来的是升级时所在的检出），不要直接在那里提交。实际目录写在升级说明里：`teamUpgradeNote`/`teamDisbandNote` 是注入来源 `team_upgrade`/`team_disband` 的正文（`schedule: "none"`，标签在 `segment-adapter.ts`），见[团队与成员](../collaboration/teams/records.md)。这两种说明不是输入：「继续」判断末尾注入（`narrator-session.ts:hasTrailingInjectionRow`）时跳过它们，重试保留它们（见[中断与恢复](recovery.md)）。
 - 注入：`narrator-injection.ts:deliverInjection` 是服务端往对话里放内容的唯一通道——写一行消息（旧的 side-car 表已移除），内容是一个自包含的 `system_injection` 块（`modelText` 给模型，`body` 结构化给前端渲染）。
 - 注入有两个互相独立的维度：`role`（`sys` 系统事实，或 `user` 以用户口吻；默认 sys）和 `schedule`（只是一次性的投递意图，不落库，避免分叉/重放时重复触发）：
   - `none`：只写行，下次请求时自然读到；
