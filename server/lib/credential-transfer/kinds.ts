@@ -250,7 +250,9 @@ function normalizedUrl(value: unknown): string {
 
 /** Group id wins within a template; otherwise the same template and endpoint is the group. */
 export function targetTransferGroup(item: CredentialTransferData): SourceGroupView | undefined {
-	if (item.templateId === "tokendance" && !settings.tokendance) return undefined;
+	// DEFAULTS contains a placeholder TokenDance connection. With no local key it is not
+	// configured yet, so createGroup must also restore the imported model catalog and metadata.
+	if (item.templateId === "tokendance" && !settings.tokendance?.apiKey) return undefined;
 	if (item.templateId === "command-code" && !settings.commandCode) return undefined;
 	const groups = listSourceGroups().filter((group) => group.templateId === item.templateId);
 	return (

@@ -152,7 +152,19 @@ describe("unified credential transfer", () => {
 						oauthClientSecret: "oauth-secret",
 					},
 				],
-				tokendance: { apiKey: "td-secret", disabled: false, generation: 1 },
+				tokendance: {
+					apiKey: "td-secret",
+					disabled: false,
+					generation: 1,
+					models: [
+						{
+							id: "td-model",
+							name: "TokenDance model",
+							context_length: 128_000,
+							supported_protocols: ["openai:responses"],
+						},
+					],
+				},
 				commandCode: { apiKey: "cc-secret", baseUrl: "https://cc.example" },
 			});
 			const exported = kind
@@ -173,7 +185,7 @@ describe("unified credential transfer", () => {
 			saveSettings({
 				...settings,
 				nugProviders: [],
-				tokendance: undefined,
+				tokendance: { apiKey: "", disabled: false, generation: 0 },
 				commandCode: undefined,
 			});
 			for (const id of ["nug-source", "tokendance", "CommandCode"]) store.removeGroup(id);
@@ -184,6 +196,9 @@ describe("unified credential transfer", () => {
 			expect(settings.nugProviders?.[0]?.apiKey).toBe("nug-secret");
 			expect(settings.nugProviders?.[0]?.oauthClientSecret).toBe("oauth-secret");
 			expect(settings.tokendance?.apiKey).toBe("td-secret");
+			expect(settings.tokendance?.models?.map((model) => model.id)).toEqual(["td-model"]);
+			const { getTokenDanceCatalogModels } = await import("../../services/tokendance-service");
+			expect(getTokenDanceCatalogModels().map((model) => model.id)).toEqual(["td-model"]);
 			expect(settings.commandCode?.apiKey).toBe("cc-secret");
 			expect(store.groupSecrets("nug-source")).toEqual({ oauthClientSecret: "oauth-secret" });
 			const oldIds = new Set(exported.map((item) => item.id));
