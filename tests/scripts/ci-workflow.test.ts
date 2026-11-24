@@ -441,11 +441,12 @@ describe("generic CI workflow", () => {
 		}
 		expect(checked).toBe(4);
 	});
-	test("enforces migration assets, whole-repository lint and translation checks", () => {
+	test("enforces migration assets, whole-repository lint, translation and knowledge tree checks", () => {
 		for (const run of [
 			"bun scripts/check-sqlite-migration-assets.ts",
 			"bunx @biomejs/biome check .",
 			"bun run i18n:check",
+			"bun scripts/knowledge.ts check",
 		]) {
 			expect(command("static-checks", run).if).toBeUndefined();
 		}

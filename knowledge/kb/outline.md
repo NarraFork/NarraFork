@@ -1,0 +1,254 @@
+---
+id: knowledge.outline
+title: 大纲
+summary: 块大纲的存储、任务、agent 工具、实时编辑与汇报（默认关闭；定位正在重新考虑）。
+anchors:
+  - server/services/plugin-spec-compat-telemetry.ts
+  - server/services/plugin-spec-compat.ts
+  - server/lib/agent/tools/outline.ts
+  - server/routes/outline.ts
+  - server/routes/outline-digest.ts
+  - server/db/schema.ts
+  - frontend/components/outline-dock/
+  - frontend/components/outline/OpenInOutline.tsx
+  - frontend/components/outline/OutlineBlockBody.tsx
+  - frontend/components/outline/OutlineBlockTree.tsx
+  - frontend/components/outline/OutlineBreadcrumbs.tsx
+  - frontend/components/outline/OutlineDigestRow.tsx
+  - frontend/components/outline/OutlineGate.tsx
+  - frontend/components/outline/OutlineHome.tsx
+  - frontend/components/outline/OutlinePanelContent.tsx
+  - frontend/components/outline/OutlinePendingPanel.tsx
+  - frontend/components/outline/OutlineQuestions.tsx
+  - frontend/components/outline/OutlineSidePanel.tsx
+  - frontend/components/outline/OutlineSpaceHome.tsx
+  - frontend/components/outline/OutlineSpaceName.tsx
+  - frontend/components/outline/OutlineStatusIcon.tsx
+  - frontend/components/outline/OutlineSurface.tsx
+  - frontend/components/outline/OutlineTimeline.tsx
+  - frontend/components/outline/OutlineView.tsx
+  - frontend/components/outline/QuickSwitcher.tsx
+  - frontend/components/outline/delegation.browser-fixture.tsx
+  - frontend/components/outline/digest/
+  - frontend/components/outline/edit-surface.ts
+  - frontend/components/outline/editor/
+  - frontend/components/outline/fold-controls.ts
+  - frontend/components/outline/mindmap/
+  - frontend/components/outline/outline-answer-draft.ts
+  - frontend/components/outline/outline-dock.browser-fixture.tsx
+  - frontend/components/outline/outline-host.tsx
+  - frontend/components/outline/outline-icons.ts
+  - frontend/components/outline/outline-inbox.browser-fixture.tsx
+  - frontend/components/outline/outline-mindmap-harness.browser-fixture.ts
+  - frontend/components/outline/outline-mindmap.browser-fixture.tsx
+  - frontend/components/outline/outline-nav.tsx
+  - frontend/components/outline/outline-pending.browser-fixture.tsx
+  - frontend/components/outline/outline-tree.browser-fixture.tsx
+  - frontend/components/outline/plan/
+  - frontend/components/outline/quick-switcher-index.ts
+  - frontend/components/outline/task-board/
+  - frontend/components/outline/transition.ts
+  - frontend/components/outline/tree/
+  - frontend/components/outline/view-state.ts
+  - frontend/components/settings/OutlineDigestSettingsSection.tsx
+  - frontend/components/settings/SpecImportAdminSection.tsx
+  - frontend/components/settings/SpecLossAdminSection.tsx
+  - frontend/components/settings/spec-import-admin.browser-fixture.tsx
+  - frontend/components/settings/spec-loss.browser-fixture.tsx
+  - frontend/hooks/useOutline.ts
+  - frontend/hooks/useOutlineEnabled.ts
+  - frontend/hooks/useOutlineReports.ts
+  - frontend/lib/api/outline.ts
+  - frontend/lib/outline-crumbs.ts
+  - frontend/lib/outline-href.ts
+  - frontend/lib/outline-opener.tsx
+  - frontend/lib/outline-page-subscription.ts
+  - frontend/lib/outline-panel.ts
+  - frontend/lib/outline-recents.ts
+  - frontend/lib/outline-report-line.ts
+  - frontend/lib/outline-router.tsx
+  - frontend/lib/outline-view.ts
+  - frontend/routes/outline/
+  - frontend/routes/outline/$spaceId/$blockId.tsx
+  - frontend/routes/outline/$spaceId/index.tsx
+  - frontend/routes/settings/outline-import.tsx
+  - server/lib/agent/tools/outline-names.ts
+  - server/lib/validators/outline/
+  - server/routes/admin-outline-spec-import.ts
+  - server/services/outline-plan-mode.ts
+  - server/services/outline-task-edits.ts
+  - server/services/outline/access-reads.ts
+  - server/services/outline/access.ts
+  - server/services/outline/agent-edit.ts
+  - server/services/outline/agent-merge.ts
+  - server/services/outline/agent-read.ts
+  - server/services/outline/agent-scope.ts
+  - server/services/outline/assigned.ts
+  - server/services/outline/assignee.ts
+  - server/services/outline/delegation-text.ts
+  - server/services/outline/delegation.ts
+  - server/services/outline/digest-job.ts
+  - server/services/outline/digest-time.ts
+  - server/services/outline/digest-view.ts
+  - server/services/outline/digest.ts
+  - server/services/outline/edit-text-runner.ts
+  - server/services/outline/edit-text-worker.ts
+  - server/services/outline/edit-text.ts
+  - server/services/outline/errors.ts
+  - server/services/outline/feature.ts
+  - server/services/outline/hand-out.ts
+  - server/services/outline/handoff.ts
+  - server/services/outline/in-process.ts
+  - server/services/outline/inbox.ts
+  - server/services/outline/keys.ts
+  - server/services/outline/lease-keeper.ts
+  - server/services/outline/link-display.ts
+  - server/services/outline/links.ts
+  - server/services/outline/live-barrier.ts
+  - server/services/outline/live/
+  - server/services/outline/locks.ts
+  - server/services/outline/messages.ts
+  - server/services/outline/model.ts
+  - server/services/outline/note-rules.ts
+  - server/services/outline/overlap.ts
+  - server/services/outline/pending-hold.ts
+  - server/services/outline/pending-overlay.ts
+  - server/services/outline/pending.ts
+  - server/services/outline/person-tasks.ts
+  - server/services/outline/plan-diff.ts
+  - server/services/outline/plans.ts
+  - server/services/outline/plugin-task-events.ts
+  - server/services/outline/plugin-tasks.ts
+  - server/services/outline/questions.ts
+  - server/services/outline/read-ledger.ts
+  - server/services/outline/read.ts
+  - server/services/outline/release.ts
+  - server/services/outline/render.ts
+  - server/services/outline/report-authors.ts
+  - server/services/outline/report-text.ts
+  - server/services/outline/resolve.ts
+  - server/services/outline/revert.ts
+  - server/services/outline/search.ts
+  - server/services/outline/session-scope.ts
+  - server/services/outline/space-tree.ts
+  - server/services/outline/spaces.ts
+  - server/services/outline/spec-import/
+  - server/services/outline/store/
+  - server/services/outline/task-board.ts
+  - server/services/outline/task-finished.ts
+  - server/services/outline/task-json.ts
+  - server/services/outline/task-session.ts
+  - server/services/outline/tasks.ts
+  - server/services/outline/team-activity.ts
+  - server/services/outline/team-events.ts
+  - server/services/outline/team-wake.ts
+  - server/services/outline/transfer.ts
+  - server/services/outline/tree.ts
+  - server/services/outline/view-state.ts
+  - server/services/outline/views.ts
+  - server/services/outline/write.ts
+  - server/services/workspace-title-outline.ts
+  - shared/outline-api.ts
+  - shared/outline-digest.ts
+  - shared/outline-fold.ts
+  - shared/outline-links.ts
+  - shared/outline-live-protocol.ts
+  - shared/outline-note-structure.ts
+  - shared/outline-page-events.ts
+  - shared/outline-plan-structure.ts
+  - shared/outline-plan-submission.ts
+  - shared/outline-plan-tree.ts
+  - shared/outline-report-line.ts
+  - shared/outline-report-note.ts
+  - shared/outline-spec-import.ts
+  - shared/outline-status.ts
+  - shared/outline-task-board.ts
+  - shared/outline-task-notice.ts
+  - shared/outline-tasks-view-diff.ts
+  - shared/outline-tool-display.ts
+  - shared/outline/
+  - server/services/task-source/backend.ts
+  - server/services/task-source/index.ts
+  - server/services/task-source/outline-behavior.ts
+  - server/services/task-source/outline-plugin-rules.ts
+  - server/services/task-source/outline-read.ts
+  - server/services/task-source/outline-views.ts
+  - server/services/task-source/outline.ts
+  - server/services/task-source/types.ts
+  - frontend/hooks/useTaskBoard.ts
+  - server/websocket/outline-live-ws.ts
+  - server/websocket/outline-page-ws.ts
+keywords:
+  - outline.enabled
+  - outline.specImport
+  - /api/outline
+  - OutlineRead
+  - OutlineEdit
+  - OutlineSearch
+  - outline_blocks
+  - outline_commits
+  - outline_block_versions
+  - outline_pending
+  - outline_task_claims
+  - 汇报
+  - 任务看板
+  - 待确认变更
+  - Dynamic Spec 导入
+  - task_backend
+  - outline:committed
+status: draft
+verified_at: 2e6441ad0
+---
+# 大纲
+
+大纲是按"空间"组织的块树：每个空间的每次写入都是一次提交，块有完整版本历史；块上可挂任务（勾选、负责人、前置、截止）、问题、锁与待确认变更；页面支持多人 Yjs 实时编辑；agent 通过专用工具读写。整套功能由 `outline.enabled` 总开关控制，默认关闭。**大纲的角色正在被重新考虑**，下面只描述当前代码做了什么。
+
+## 关键规则
+- 开关：`settings.outline.enabled` 为 false（默认）时，`/api/outline` 全部返回 404、agent 工具不出现、页面订阅结束；每次请求/帧都重读，关闭立即生效（`outline/feature.ts:isOutlineEnabled`、`server/lib/settings/defaults.ts`）。
+- 空间类型：project / personal / session（`outline_spaces.kind`）；读写权限逐人判定：项目空间跟项目 ACL、session 空间跟叙述者 ACL、personal 仅 owner（admin 也不读他人 personal）；孤儿空间 admin 可读、无人可写（`outline/access.ts`，与 `project-acl`/`narrator-acl` 的一致性由 `access-parity.test.ts` 守住）。无权读的空间对外表现为 404，和不存在无异。
+- 存储模型（`outline/model.ts` 列出写入不变量）：块表 + 每块版本表（`outline_block_versions`，`from_seq`/`to_seq` 区间，每块恰好一个开放版本）+ 提交表 + 链接表；删除向下闭合（删块即删整棵活子树并为每个后代写墓碑版本）；同级活块顺序键唯一；提交序号 `seq` 来自空间的 `next_seq` 计数器，在同一事务内领取。
+- 写入路径（`outline/write.ts`）：先无库校验与规范化 → 按当前状态规划 → `OutlineStore.applyCommit` 以乐观计数器认领并原子写入（别的提交先到则重新规划，几次后 `OutlineBusyError`）→ 提交后发 `outline:committed`。`baseVersionSeq` 不符整笔拒绝并给出冲突块（`OutlineConflictError`）。回退是同一规划器写出的补偿提交（`revert.ts`）。
+- 任务认领：开始任务在同一提交里认领，会话与其子代理视为同一持有者，认领有代次 `epoch`；锁定的计划里 agent 的改动变成待确认变更，由锁定人或其指定会话确认，会话不能确认自己的变更（`write.ts`、`pending.ts`、`lease-keeper.ts`）。
+- 实时编辑：页面一个 Yjs 会话（每块一个 `Y.Text`），文本更新窄窗口内合并广播，静默后作为编辑者的人类提交落库；结构变更逐笔校验并作为一次提交写入；外部写入（agent、回退）经 `live-barrier.ts` 先冲刷未落盘文本再推入会话；Yjs 更新记入 `outline_live_updates` 以便崩溃后重放（`outline/live/session.ts`）。HTTP 面是只读视图 + 回退/锁/待确认/任务看板/问题/汇报；编辑页面走 WebSocket，不走 HTTP（`routes/outline.ts` 头注释）。
+- agent 工具：`OutlineRead`、`OutlineSearch`（核心，只读，跨会话可读的所有空间）、`OutlineEdit`（可选，大纲根会话里为核心）、`Ask`（向人提问，仅大纲根会话）；实现按需加载自 `outline/agent-*.ts`（`lib/agent/tools/outline.ts`、`outline-names.ts`）。
+- 委派：`Agent({ task })` 只允许大纲根会话把活的任务交给子代理，先做完所有检查再创建子代理，之后一次系统提交把任务置为进行中并把认领交给子代理，子代理的结果作为汇报挂回任务下（`outline/delegation.ts`）。
+- 汇报（digest）：由提交区间而非正文文本推导，仅本人可见（`outline/digest.ts`、`routes/outline-digest.ts`）。
+- 旧 Dynamic Spec（`spec://`）会话按 `outline.specImport`（默认 `auto`）导入大纲（`outline/spec-import/`、`routes/admin-outline-spec-import.ts`）。
+- 存储端口有 SQLite 与 PG 两种实现，`outline/store/` 下由契约测试覆盖（`__tests__/store-contract.test.ts`）；大文本规范化放在 worker（`edit-text-worker.ts`）。
+
+- 任务来源：会话的任务存在哪由 `narrators.task_backend`（`spec` | `outline`，创建根会话时在大纲开启时记为 `outline`，之后不变，导入才改）决定；`task-source/backend.ts` 读它并做内存缓存（最多 4096 个叙述者，`outline.enabled` 每次调用都重读、不缓存），`task-source/index.ts:taskSourceForNarrator` 选实现，解析失败回退 spec。续跑、任务摘要、行为边界、中断守卫、compact 都读这个接口，大纲实现分在 `outline.ts`（任务）、`outline-views.ts`（视图）、`outline-behavior.ts`（旧 `spec://behavior_fence` 导入为行为页）、`outline-plugin-rules.ts`（插件规则页）、`outline-read.ts`。子代理沿用根会话的后端；大纲下子代理没有自己的任务（`task-source/index.ts` 头注释）。
+- 页面通道：`/ws/narrator` 上有两条与大纲有关的通道——只读页面订阅（`websocket/outline-page-ws.ts`：只发页面 id、最新 seq 和提交 id，不带内容，客户端再经 HTTP 重读；合并窗口、每连接/页订阅上限、发送缓冲超限即关闭连接）和 Yjs 二进制实时会话（`websocket/outline-live-ws.ts`，以魔数字节分流，匿名公开分享连接不会进入会话）。
+
+## 组成（按目录，描述性）
+服务端 `server/services/outline/`：
+- 访问与存储：`access.ts`/`access-reads.ts`（判定与两种数据库共用的 SQL 读）、`spaces.ts`、`model.ts`、`keys.ts`（块地址 `key/sid`）、`store/`（`port.ts` 端口、`sqlite-store`/`postgres-store`、读端口 `sqlite-read`/`postgres-read`、汇报端口 `*-digest`）。
+- 写与读：`write.ts`、`revert.ts`、`links.ts`、`tree.ts`/`render.ts`/`read.ts`/`views.ts`/`space-tree.ts`、`search.ts`、`resolve.ts`、`view-state.ts`（每人每页的折叠状态）、`edit-text*.ts`（OutlineEdit 的文本解析，worker 执行）。
+- 实时：`live/`（`session`、`registry`、`mirror`、`replay`、`normalize`、`lane`、`agent-presence`）与 `live-barrier.ts`。
+- agent 面：`agent-read/edit/merge/scope.ts`、`read-ledger.ts`、`session-scope.ts`、`link-display.ts`、`messages.ts`、`note-rules.ts`。
+- 任务与协作：`tasks.ts`、`task-json.ts`、`task-board.ts`、`person-tasks.ts`、`assignee.ts`/`assigned.ts`、`transfer.ts`、`hand-out.ts`、`handoff.ts`、`release.ts`、`lease-keeper.ts`、`task-session.ts`、`task-finished.ts`、`delegation*.ts`、`report-text.ts`/`report-authors.ts`、`team-activity.ts`/`team-events.ts`/`team-wake.ts`、`overlap.ts`、`plugin-tasks.ts`/`plugin-task-events.ts`、`in-process.ts`。
+- 计划与确认：`plans.ts`、`plan-diff.ts`、`locks.ts`、`pending*.ts`、`questions.ts`、`inbox.ts`。会话侧的计划模式在 `server/services/outline-plan-mode.ts`，人对任务的编辑回告会话在 `outline-task-edits.ts`。
+- 汇报：`digest*.ts`（作业按切片后台运行，一人一日一份，时区见用户偏好）。
+- 导入：`spec-import/`（导入器、触发器、管理端、被吞内容排查 `loss-*`）。
+- 其他：`workspace-title-outline.ts` 在大纲提交后让受影响工作区的自动标题失效（只扫按 kind 索引的成员、分页让出）。
+
+前端：`frontend/components/outline/`（页面 `OutlineView`/`OutlineSurface`、`tree/`、`editor/`（Yjs 编辑器与 `live-*`）、`mindmap/`、`plan/`、`task-board/`、`digest/`、`QuickSwitcher`）、`outline-dock/`（会话旁的页面坞）、`routes/outline/`（`/outline`、`/outline/$spaceId[/$blockId]`、`digest`、`ref`）、设置页 `settings/outline-import`（`SpecImportAdminSection`/`SpecLossAdminSection`，仅管理员）与 `OutlineDigestSettingsSection`、`hooks/useOutline*.ts`、`lib/outline-*.ts`。共享类型在 `shared/outline*.ts` 与 `shared/outline/`（后者须保持纯净，守卫测试 `shared/outline/__tests__/purity.guard.test.ts`）。
+
+## 从哪读起
+- `server/services/outline/model.ts`：词汇与写入不变量。
+- `server/services/outline/write.ts`：写入路径。
+- `server/services/outline/access.ts`：访问判定。
+- `server/routes/outline.ts`：HTTP 门禁顺序（头注释列出）。
+- `server/lib/agent/tools/outline.ts`：工具定义。
+- 测试：`server/services/outline/__tests__/`（`access-parity`、`store-contract`、`task-*`、`digest.e2e`）。
+
+## 改它时
+- 动大纲表（`outline_*`，SQLite 在 `server/db/schema.ts`，PG 在 `postgres-schema.ts`）：两种存储实现（`store/sqlite-store.ts`、`store/postgres-store.ts`）与契约测试 `__tests__/store-contract.test.ts` 一起改；SQLite 读端用到 FTS5/json1 的位置登记在 `server/db/sqlite-dialect-inventory.guard.test.ts`，改写法会让它失败。
+- 大纲会话附属表不进数据导出：`outline_spec_imports`、`outline_spec_loss_*` 由 `data-portability.ts` 在覆盖/清空时单独处理，新增同类表要在那里补。
+- `shared/outline/` 只能 import 自身与 `marked`、不得用 DOM 或 Node 内置，`purity.guard.test.ts` 枚举全部模块。
+- 新增 agent 工具名放 `outline-names.ts`；`OutlineEdit` 文本解析走 worker，失败不得回退主线程，见 `tests/worker-main-thread-fallback.guard.test.ts`、`server/lib/compiled-worker.guard.test.ts`（登记 `edit-text-worker.ts`）。
+- 新增 HTTP 路由要放在 `routes/outline.ts` 头注释列出的门禁顺序里（开关 → 鉴权 → 逐人访问判定）；新增访问规则同步 `__tests__/access-matrix.ts`（SQLite 的 `access.test.ts` 与 PG 套件共用）和 `access-parity.test.ts`。
+- 新增 WS 帧/事件：页面订阅帧在 `shared/outline-page-events.ts`，实时帧在 `shared/outline-live-protocol.ts`。
+
+## 相关
+- [团队知识库](knowledge-base.md)：知识库不受大纲开关影响。
+- [项目](../collaboration/projects.md)
