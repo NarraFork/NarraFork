@@ -85,4 +85,15 @@ describe("计划反思 button visibility", () => {
 			}),
 		).toBe(false);
 	});
+
+	test("an edited draft keeps the button off: the review would approve the original", () => {
+		expect(
+			shouldShowPlanReflectButton({
+				permission: planPermission(),
+				hasHandler: true,
+				editing: false,
+				planEdited: true,
+			}),
+		).toBe(false);
+	});
 });

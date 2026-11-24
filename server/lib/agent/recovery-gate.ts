@@ -25,7 +25,10 @@ export function recoveryReflection(gate?: PersistedRecoveryGate): RecoveryReflec
 			value != null &&
 			typeof value === "object" &&
 			["danger_reflection", "plan_reflection", "task_reflection"].includes(value.type) &&
-			typeof value.status === "string",
+			typeof value.status === "string" &&
+			// An on-demand plan review ran against a permission that was ALREADY waiting for a
+			// person; it is transient, not a gate. Recovery restores that person's approval.
+			value.onDemand !== true,
 	);
 }
 

@@ -2614,18 +2614,25 @@ export async function reflectPendingExitPlanMode(
 				reason: "Plan reflection is not enabled for this permission",
 			};
 		}
-		if (abort.signal.aborted || !pendingPermissions.has(requestId)) {
-			// Decided while the permission-mode check ran: nothing is left to review.
+		// Identity, not the id: reprocessing (e.g. a switch to Bypass) re-registers the SAME tool-call
+		// id with a freshly resolved input, which this review never read.
+		if (abort.signal.aborted || pendingPermissions.get(requestId) !== pending) {
+			// Decided or replaced while the permission-mode check ran: nothing is left to review.
 			return { status: "awaiting_user", reason: "Already resolved" };
 		}
 		// The card's own resolved input: the reviewer must read the plan the person is looking at.
 		const reviewed = await runner(pending.input, { signal: abort.signal });
-		if (!pendingPermissions.has(requestId)) {
-			// The person decided while the review ran; its verdict describes a wait that is over.
+		// Load what the verdict needs BEFORE the identity check, so no await separates the check
+		// from `resolvePermission` (which reads the entry synchronously).
+		const { pendingPlanApproverSource } = await import("./narrator-session-state");
+		const { buildExitPlanReflectionDeniedToolResult } = await import("../lib/agent/loop");
+		if (pendingPermissions.get(requestId) !== pending) {
+			// The person decided, or the request was reprocessed into a new wait under the same id
+			// (possibly with a re-read plan), while the review ran: its verdict describes a wait
+			// that is over and must not settle the replacement.
 			return { status: "awaiting_user", reason: "Already resolved" };
 		}
 		if (reviewed.decision.action === "confirm" || reviewed.decision.action === "confirm_compact") {
-			const { pendingPlanApproverSource } = await import("./narrator-session-state");
 			// Attribute the restart's "plan approved, begin execution" turn to the reflection.
 			pendingPlanApproverSource.set(pending.narratorId, "reflection");
 			const resolved = await resolvePermission(requestId, "allow", {
@@ -2641,7 +2648,6 @@ export async function reflectPendingExitPlanMode(
 			return { status: "approved", decision: reviewed.decision.action };
 		}
 		if (reviewed.decision.action === "revise") {
-			const { buildExitPlanReflectionDeniedToolResult } = await import("../lib/agent/loop");
 			const denied = buildExitPlanReflectionDeniedToolResult(
 				reviewed.decision,
 				pending.locale ?? "en",
@@ -6734,6 +6740,9 @@ export async function handlePermission(
 				clearTimeout(pendingEntry.questionReflectionTimer);
 				pendingEntry.questionReflectionTimer = undefined;
 			}
+			// Every way this wait ends (decided, reprocessed into a new wait, aborted) retires an
+			// on-demand plan review still running against it; the review then persists nothing.
+			pendingEntry?.planReflectionAbort?.abort(new Error("Permission request ended"));
 			signal.removeEventListener("abort", onAbort);
 			if (pendingPermissions.delete(toolCallId)) notifyHumanAttentionChanged();
 		};

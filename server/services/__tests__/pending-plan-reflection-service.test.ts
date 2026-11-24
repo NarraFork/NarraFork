@@ -271,6 +271,38 @@ describe("reflecting on a pending plan approval", () => {
 		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
 	});
 
+	test("a verdict never settles a replacement wait registered under the same id", async () => {
+		const fixture = registerPending();
+		let release: (() => void) | undefined;
+		fixture.setRunner(async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { decision: { action: "confirm" }, input: PLAN_INPUT };
+		});
+		const reflecting = reflectPendingExitPlanMode(TOOL_CALL_ID);
+		while (!release) await new Promise((resolve) => setTimeout(resolve, 0));
+		// Reprocessing (e.g. a switch to Bypass) re-resolves the plan file into a NEW pending entry
+		// under the same tool-call id; the running review never read that version.
+		const replacementResolved: PermissionResult[] = [];
+		const original = pendingPermissions.get(TOOL_CALL_ID);
+		if (!original) throw new Error("Expected the original pending entry");
+		original.cleanup();
+		pendingPermissions.set(TOOL_CALL_ID, {
+			...original,
+			input: { plan: "Version B, saved while the review ran." },
+			planReflectionRunning: undefined,
+			planReflectionAbort: undefined,
+			resolve: (result) => replacementResolved.push(result),
+		});
+		release();
+		expect(await reflecting).toEqual({ status: "awaiting_user", reason: "Already resolved" });
+		expect(replacementResolved).toHaveLength(0);
+		expect(fixture.resolved).toHaveLength(0);
+		expect(pendingPermissions.has(TOOL_CALL_ID)).toBe(true);
+		expect(pendingPlanApproverSource.has(NARRATOR_ID)).toBe(false);
+	});
+
 	test("turning the switch on reflects every blocked plan of the session", async () => {
 		const fixture = registerPending();
 		let calls = 0;

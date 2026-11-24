@@ -44,15 +44,18 @@ const noop = () => {};
  * Only a plan approval that is still backed by a live reflection runner qualifies: an outline
  * session's plan is decided through `OutlinePlanApproval` (its review writes comments and never
  * approves, so there is nothing to auto-approve), a request restored without a runner has nothing
- * to run, and while the person edits the plan locally they are mid-decision.
+ * to run, and while the person edits the plan locally they are mid-decision. Once they have
+ * edited it, the card shows their draft but the reviewer would read (and approve) the original
+ * submission, so the entry stays off until the edit is discarded.
  */
 export function shouldShowPlanReflectButton(args: {
 	permission: PendingPermission;
 	hasHandler: boolean;
 	editing: boolean;
+	planEdited?: boolean;
 }): boolean {
-	const { permission, hasHandler, editing } = args;
-	if (editing || !hasHandler) return false;
+	const { permission, hasHandler, editing, planEdited } = args;
+	if (editing || planEdited || !hasHandler) return false;
 	if (permission.toolName !== "ExitPlanMode") return false;
 	if (permission.planReflectionAvailable !== true) return false;
 	return !isOutlinePlanApproval(permission);
@@ -530,7 +533,12 @@ export function InlinePermission({
 						}
 						if (
 							onPlanReflect &&
-							shouldShowPlanReflectButton({ permission, hasHandler: true, editing })
+							shouldShowPlanReflectButton({
+								permission,
+								hasHandler: true,
+								editing,
+								planEdited,
+							})
 						) {
 							btns.push({
 								label: t("planReflect"),

@@ -49,6 +49,12 @@ interface ExitPlanReflectionMeta {
 	abortController?: AbortController;
 	/** Original persisted start time when restoring this gate. */
 	restoredStartedAt?: string;
+	/**
+	 * Started on demand against an ExitPlanMode permission that is already waiting (计划反思 button
+	 * or switch). Persisted on the suggestion so restart recovery restores the person's approval
+	 * instead of resuming this transient review as a pre-permission gate.
+	 */
+	onDemand?: boolean;
 }
 
 interface ExitPlanReflectionPending extends ExitPlanReflectionMeta {
@@ -100,7 +106,7 @@ function getActiveExitPlanReflectionRequestId(
 }
 
 function planReflectionSuggestions(
-	pending: Pick<ExitPlanReflectionPending, "requestId" | "startedAt">,
+	pending: Pick<ExitPlanReflectionPending, "requestId" | "startedAt" | "onDemand">,
 	status: PlanReflectionStatus,
 	reason?: string,
 	compactAfter?: boolean,
@@ -119,6 +125,7 @@ function planReflectionSuggestions(
 				: {}),
 			...(reason ? { reason } : {}),
 			...(compactAfter ? { compactAfter: true } : {}),
+			...(pending.onDemand ? { onDemand: true } : {}),
 		},
 	];
 }

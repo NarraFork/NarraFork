@@ -2199,6 +2199,7 @@ async function runPendingExitPlanReflection(args: {
 		inputJson: input,
 		toolCallId: toolCallId ?? undefined,
 		abortController: reflectionAbort,
+		onDemand: true,
 	});
 	// The wait this review answers can end under it: the person decides first (`args.signal`) or
 	// the pass is aborted. The real tool-call row then belongs to whoever ended the wait, so the
