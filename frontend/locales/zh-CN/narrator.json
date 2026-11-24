@@ -3320,5 +3320,7 @@
 			"showWhole": "显示全文",
 			"showLess": "收起"
 		}
-	}
+	},
+	"followDefaultUnset": "默认模型（未配置）",
+	"followSummaryUnset": "摘要模型（未配置）"
 }

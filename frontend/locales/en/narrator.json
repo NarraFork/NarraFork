@@ -3323,5 +3323,7 @@
 			"showWhole": "Show all",
 			"showLess": "Show less"
 		}
-	}
+	},
+	"followDefaultUnset": "Default model (not configured)",
+	"followSummaryUnset": "Summary model (not configured)"
 }
