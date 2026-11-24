@@ -23,3 +23,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [暂存与变更列表](staging.md)：暂存列表、变更列表归属与提交。
 - [会话 worktree](worktrees.md)：worktree 资源、创建与删除（唯一删除通道）、叙事线遗留目录。
 - [分支与引用查询](refs.md)：引用解析、合并基、祖先、领先落后、身份。
+- [工作区归属与监听](workspace-watch.md)：git 工作区的访问范围、改动归属、文件监听，以及 git 管理服务。

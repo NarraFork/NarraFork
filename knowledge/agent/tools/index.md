@@ -39,5 +39,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [命令与终端工具](shell.md)：Bash、后台任务、Await、Terminal 工具。
 - [浏览器与网页](web.md)：Browser、WebFetch、WebSearch。
 - [与人交互的工具](interaction.md)：Notification、Send、ShareFile、GenUI。
+- [流程与协作工具](workflow.md)：计划模式、定时任务、技能、知识包、团队、worktree 与设备切换、回忆、生图。
+- [管理工具](admin.md)：让会话管理 NarraFork 自身的工具：各类 *Admin、插件安装、引导设置。
 
 其余工具（子代理 Task/Agent、知识库、定时任务、插件与 MCP 管理、Team、worktree 等）不在本层子节点内，分别见 [子代理](../subagents.md)、[MCP 集成](../mcp.md) 等。

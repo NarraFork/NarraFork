@@ -31,3 +31,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [主线程性能规则](main-thread.md)：SQLite、JSON、同步 IO 都在主线程；列表不读大字段、游标分页、子进程限流、WebSocket 节流。
 - [终端运行时](terminal.md)：PTY 抽象（Bun.Terminal / bun-pty）、dtach、终端生命周期。
 - [错误与校验](errors-validation.md)：AppError 子类与全局序列化、Zod 校验器目录约定。
+- [实例锁、完整性与重启恢复](instance-recovery.md)：单实例锁、正常关闭标记、SQLite 完整性检查与修复、进程重启和更新后的恢复。

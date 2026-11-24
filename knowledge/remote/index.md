@@ -24,3 +24,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [设备与远程执行](devices.md)：设备注册与连接、remote-executor、文件传输。
 - [远程访问](remote-access.md)：WebRTC 远程访问、vnet。
 - [VS Code 插件](vscode.md)：插件结构与和服务端的连接。
+- [虚拟网络中转](vnet.md)：基于 WebSocket 中转的虚拟网络（/ws/vnet），与 WebRTC 远程访问无关。

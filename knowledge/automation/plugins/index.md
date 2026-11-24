@@ -19,7 +19,7 @@ anchors:
   - server/plugin-runtime-worker.ts
   - server/routes/plugins.ts
   - server/routes/plugin-ui.ts
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 插件系统
@@ -48,3 +48,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [基准测试与容器](benchmarks-containers.md)
 - [定时任务](scheduled.md)
+
+## 下面有什么
+
+- [插件运行时](runtime.md)：插件包、进程与 Podman 运行、握手与超时、生命周期与升级。
+- [插件授权与密钥](permissions-secrets.md)：能力代理、授权存储、密钥保管、签名与加固。
+- [提供商插件](providers.md)：以插件形式接入的模型提供商：清单、注册、凭证、就绪检查。
+- [插件贡献点](contributions.md)：插件提供的工具、命令、搜索源、事件、界面与 MCP 适配。

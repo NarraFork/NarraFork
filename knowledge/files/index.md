@@ -26,3 +26,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [文件引用与附件](references.md)：会话里引用文件、上传附件。
 - [编辑器文档](editor.md)：编辑器文档服务、Worker、远程持久化。
 - [工作区布局](workspaces.md)：多叙述者面板布局的保存与恢复。
+- [文件变更证据](change-evidence.md)：写入证据的存储：blob 存储与目录、物理审计、保留清单、改动归属视图。
+- [Tree 快照](tree-snapshots.md)：worktree 的树快照：Bash 观测、编辑预览、快照回退、写入认领。

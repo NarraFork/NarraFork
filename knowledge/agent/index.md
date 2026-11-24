@@ -29,3 +29,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [MCP 集成](mcp.md)：MCP 服务器接入与工具暴露。
 - [程序化执行与沙箱](programmatic.md)：程序化工具调用、沙箱与 VM 运行时。
 - [用量与费用](usage.md)：api_requests、token 记账、费用、额度。
+- [模型目录与来源](model-catalog.md)：模型目录、模型元数据、来源分组；从「凭证池」中拆出。

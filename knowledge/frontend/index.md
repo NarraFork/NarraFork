@@ -22,3 +22,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [国际化](i18n.md)：en / zh-CN 命名空间、检测顺序、加字符串的规则。
 - [会话界面](narrator-ui.md)：会话时间线、输入框、工具卡片。
 - [通用组件与主题](components-theme.md)：通用组件、样式、暗色主题。
+- [面板与布局](panels.md)：dockview 面板、拖放与布局、终端面板、编辑器面板。
+- [插件界面宿主](plugin-host.md)：前端如何加载和承载插件界面、插件运行时约定。
+- [PWA 与远程前端](pwa-remote.md)：Service Worker、安装为应用、远程访问用的独立前端入口。

@@ -13,7 +13,7 @@ anchors:
   - server/lib/ldap/
   - server/services/step-up-service.ts
   - shared/session-auth.ts
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 登录与会话令牌
@@ -42,3 +42,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [OAuth 与开放 API](oauth-api.md)
 - [访问控制](acl.md)
+
+## 下面有什么
+
+- [会话令牌](sessions.md)：nfs_ 令牌、哈希存储、滑动续期、登出与全部吊销、首个用户为管理员。
+- [登录方式与第二因子](login-methods.md)：密码与登录限流、MFA/TOTP、Passkey、LDAP、SSO、注册与邀请。
