@@ -3,6 +3,8 @@ id: automation.benchmarks-containers
 title: 基准测试与容器
 summary: 基准测试服务、Podman 容器。
 anchors:
+  - server/routes/runtime.ts
+  - frontend/components/settings/RuntimeSection.tsx
   - server/services/benchmark-service.ts
   - server/services/benchmark-container.ts
   - server/services/benchmark-limits.ts

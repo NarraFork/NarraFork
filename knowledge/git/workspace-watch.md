@@ -16,7 +16,6 @@ anchors:
   - server/services/git-workspace-access-scan.test.ts
   - frontend/lib/api/git.ts
   - frontend/lib/git-workspace-subscription.ts
-  - server/lib/watcher/
   - server/services/narrator-git-summary.ts
   - shared/git-workspace-events.ts
   - shared/git-workspace.ts

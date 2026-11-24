@@ -12,7 +12,6 @@ anchors:
   - frontend/components/settings/DataPortabilityCard.tsx
   - frontend/lib/api/storage-transfer.ts
   - server/db/snapshot-builder-worker.ts
-  - shared/export-turn-range.ts
   - shared/storage-transfer.ts
 keywords:
   - 导入导出

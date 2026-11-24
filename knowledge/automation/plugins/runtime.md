@@ -19,8 +19,6 @@ anchors:
   - server/lib/plugins/windows-plugin-process.ts
   - server/services/plugin-health.ts
   - server/services/plugin-rpc-connection.ts
-  - server/services/plugin-spec-compat-telemetry.ts
-  - server/services/plugin-spec-compat.ts
   - server/services/plugin-state-store.ts
   - server/services/plugin-storage.ts
 keywords:

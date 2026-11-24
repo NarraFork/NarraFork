@@ -18,6 +18,7 @@ keywords:
   - 保存冲突
   - notifyAgent
 anchors:
+  - server/lib/watcher/
   - server/services/editor-document-service.ts
   - server/services/editor-document-jobs.ts
   - server/services/editor-document-worker.ts
@@ -29,7 +30,6 @@ anchors:
   - shared/editor-document.ts
   - frontend/hooks/useTextDocumentView.ts
   - frontend/lib/api/editor-documents.ts
-  - frontend/lib/api/grammars.ts
   - frontend/lib/editor-file-subscription.ts
   - frontend/lib/text-document-pure-core.ts
   - frontend/lib/text-document-store.ts
@@ -38,7 +38,6 @@ anchors:
   - frontend/lib/text-document-worker-core.ts
   - frontend/lib/text-document-worker-protocol.ts
   - frontend/lib/text-document.worker.ts
-  - frontend/routes/settings/grammars.tsx
   - server/websocket/editor-file-ws.ts
   - server/lib/validators/editor-documents.ts
   - server/routes/editor-cache-browser-acceptance.ts
@@ -47,15 +46,11 @@ anchors:
   - server/routes/editor-native-fixture.ts
   - server/routes/editor-native-rpc-fixture.ts
   - server/routes/editor-remote-browser-acceptance.ts
-  - server/routes/grammars.ts
-  - server/services/buffer-edit-hold.ts
-  - server/services/buffer-edit-request.ts
   - server/services/editor-document-panel.ts
   - server/services/editor-document-stream-worker.ts
   - server/services/editor-file-subscription.ts
   - server/services/editor-source-path.ts
   - server/services/file-edit-interject.ts
-  - server/services/narrator-buffer.ts
   - shared/editor-file-events.ts
   - shared/editor-provider-contracts.ts
   - shared/editor-stream-codec.ts

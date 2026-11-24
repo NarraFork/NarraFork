@@ -3,6 +3,7 @@ id: platform.terminal
 title: 终端运行时
 summary: PTY 抽象（Bun.Terminal / bun-pty）、dtach、终端生命周期。
 anchors:
+  - server/services/terminal-view-service.ts
   - server/terminal/
   - server/routes/terminals.ts
   - server/services/terminal-service.ts

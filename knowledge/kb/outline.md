@@ -3,6 +3,8 @@ id: knowledge.outline
 title: 大纲
 summary: 块大纲的存储、任务、agent 工具、实时编辑与汇报（默认关闭；定位正在重新考虑）。
 anchors:
+  - server/services/plugin-spec-compat-telemetry.ts
+  - server/services/plugin-spec-compat.ts
   - server/lib/agent/tools/outline.ts
   - server/routes/outline.ts
   - server/routes/outline-digest.ts

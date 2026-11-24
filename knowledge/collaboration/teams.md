@@ -13,7 +13,6 @@ anchors:
   - frontend/hooks/useTeams.ts
   - frontend/lib/api/teams.ts
   - frontend/routes/projects/$projectId_.teams.$teamId.tsx
-  - server/lib/agent/tools/team-status.ts
   - server/lib/coordinator-outputs-path.ts
   - server/lib/validators/project-teams.ts
 keywords:

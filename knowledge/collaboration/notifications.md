@@ -14,7 +14,6 @@ anchors:
   - frontend/components/notifications/
   - frontend/components/settings/NotificationSection.tsx
   - frontend/hooks/useHumanAttention.ts
-  - frontend/lib/api/integrations.ts
   - frontend/lib/api/notifications.ts
   - frontend/lib/notification-sound.ts
   - frontend/lib/notification.ts

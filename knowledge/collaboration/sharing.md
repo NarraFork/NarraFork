@@ -17,7 +17,6 @@ anchors:
   - frontend/routes/shared.narrators.$shareId.tsx
   - server/lib/share-preview-html.ts
   - server/lib/share-preview-worker.ts
-  - server/lib/svg-sanitize.ts
   - server/lib/validators/public-narrator-shares.ts
   - server/services/public-narrator-share-gen-ui.ts
   - server/services/public-narrator-share-rate-limit.ts

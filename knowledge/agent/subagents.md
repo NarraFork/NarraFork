@@ -3,6 +3,7 @@ id: agent.subagents
 title: 子代理
 summary: Task 工具、模板、嵌套两层、委派深度、子代理资源。
 anchors:
+  - server/lib/agent/tools/team-status.ts
   - server/lib/agent/tools/task.ts
   - server/services/subagent-runner.ts
   - server/services/subagent-resources.ts
@@ -35,7 +36,6 @@ anchors:
   - server/services/subagent-team.ts
   - server/services/subagent-terminals.ts
   - server/services/subagent-tools.ts
-  - shared/agent-reference.ts
   - shared/subagent-model-policy.ts
   - shared/subagent-nested.ts
   - shared/subagent-output-counts.ts

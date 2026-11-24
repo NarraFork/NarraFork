@@ -3,6 +3,11 @@ id: platform.os-integration
 title: 操作系统集成
 summary: 在文件管理器中定位（Windows 的 narrafork:// 协议激活）、关闭后钩子、操作系统关机命令等与宿主系统打交道的部分。
 anchors:
+  - shared/browser-paths.ts
+  - server/lib/windows-child-job.ts
+  - server/lib/win-env.ts
+  - server/lib/shell-exec.ts
+  - server/services/file-clipboard.ts
   - server/lib/post-shutdown-hooks.ts
   - server/lib/power-off.ts
   - server/lib/reveal-protocol-client.ts

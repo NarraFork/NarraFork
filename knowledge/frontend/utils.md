@@ -3,6 +3,7 @@ id: frontend.utils
 title: 前端通用工具
 summary: 没有业务归属的前端小工具：日期数字格式化、剪贴板、文件下载、安全区与视口、窗口控件覆盖、z-index 层级、品牌（实例名与图标色）。
 anchors:
+  - frontend/lib/session-store.ts
   - frontend/hooks/useBranding.ts
   - frontend/hooks/useClipboard.ts
   - frontend/hooks/useLocalPref.ts
@@ -19,7 +20,6 @@ anchors:
   - server/routes/branding.ts
   - frontend/lib/clipboard.ts
   - frontend/lib/compact-number.ts
-  - frontend/lib/constants.ts
   - frontend/lib/dnd-modifiers.ts
   - frontend/lib/dom-text.ts
   - frontend/lib/file-download.ts

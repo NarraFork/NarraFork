@@ -3,6 +3,7 @@ id: engineering.release
 title: 发布与更新
 summary: scripts/release.ts 的两种目标、changelog 文件、GitHub Release 工作流、更新索引与补丁、更新服务器镜像、客户端更新源。
 anchors:
+  - shared/github-repository.ts
   - scripts/release.ts
   - scripts/lib/stable-baseline-patch.ts
   - scripts/mirror-update-server.ts

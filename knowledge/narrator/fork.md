@@ -3,6 +3,7 @@ id: narrator.fork
 title: 分叉与前缀快照
 summary: full / compressed / fresh 三种继承；前缀快照。
 anchors:
+  - shared/fork-worktree-source.ts
   - server/lib/agent/tools/fork-narrator.ts
   - server/lib/agent/fork-narrator-depth.ts
   - server/services/narrator-service.ts

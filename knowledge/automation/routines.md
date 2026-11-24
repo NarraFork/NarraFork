@@ -3,6 +3,7 @@ id: automation.routines
 title: 例程与可选工具
 summary: manual / auto / resident 三段式、项目层覆盖。
 anchors:
+  - server/services/command-service.ts
   - server/services/routine-service.ts
   - shared/routine-modes.ts
   - server/routes/routines.ts
@@ -10,7 +11,6 @@ anchors:
   - server/services/tool-loading-service.ts
   - frontend/hooks/useRoutines.ts
   - frontend/routes/routines/index.tsx
-  - server/routes/narrator-manual-resources.ts
 keywords:
   - /api/routines
   - toolModes

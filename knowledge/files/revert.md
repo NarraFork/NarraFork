@@ -18,6 +18,7 @@ keywords:
   - permission-file-preview
   - revert_operations
 anchors:
+  - server/services/file-read-snapshots.ts
   - server/services/revert-transaction-service.ts
   - server/services/revert-plan-service.ts
   - server/services/revert-selection-service.ts

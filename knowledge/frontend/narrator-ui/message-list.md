@@ -3,6 +3,7 @@ id: frontend.narrator-ui.message-list
 title: 消息列表
 summary: 虚拟列表、细节级别、滚动、消息与内容渲染、Markdown、流式输出。
 anchors:
+  - shared/agent-reference.ts
   - frontend/components/narrator/vlist/measure/
   - frontend/components/narrator/vlist/render/R*.tsx
   - frontend/components/narrator/vlist/render/[!R]*

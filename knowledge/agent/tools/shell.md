@@ -3,6 +3,7 @@ id: agent.tools.shell
 title: 命令与终端工具
 summary: Bash、后台任务、Watch、Stop、Terminal 工具（Await 已退役）。
 anchors:
+  - server/routes/narrator-manual-resources.ts
   - server/lib/agent/tools/bash.ts
   - server/lib/agent/tools/await.ts
   - server/lib/agent/tools/terminal.ts
@@ -23,7 +24,6 @@ anchors:
   - server/services/bg-completion-queue.ts
   - server/services/manual-background-task.ts
   - server/services/stop-task-policy.ts
-  - server/services/terminal-view-service.ts
   - server/services/terminal-watch-constants.ts
   - server/services/terminal-watch-service.ts
   - server/services/watch-service.ts

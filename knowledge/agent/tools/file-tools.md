@@ -3,6 +3,9 @@ id: agent.tools.file-tools
 title: 文件工具
 summary: Read / Write / Edit / Glob / Grep / 结构化编辑。
 anchors:
+  - shared/streaming-edit-origin.ts
+  - frontend/routes/settings/grammars.tsx
+  - frontend/lib/api/grammars.ts
   - server/lib/agent/tools/read.ts
   - server/lib/agent/tools/write.ts
   - server/lib/agent/tools/edit.ts
@@ -18,7 +21,6 @@ anchors:
   - server/lib/agent/tools/file-diff-stats.ts
   - server/lib/ripgrep.ts
   - server/lib/vfs-grep.ts
-  - server/services/file-read-snapshots.ts
   - server/routes/grammars.ts
 keywords:
   - Read

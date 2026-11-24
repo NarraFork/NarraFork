@@ -8,7 +8,6 @@ anchors:
   - server/db/schema.ts
   - frontend/components/settings/GatewaySection.tsx
   - frontend/routes/settings/gateway.tsx
-  - frontend/routes/settings/integrations.tsx
 keywords:
   - /api/gateway
   - /api/gateway/webhook

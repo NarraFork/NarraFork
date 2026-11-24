@@ -3,6 +3,7 @@ id: agent.tools.web
 title: 浏览器与网页
 summary: Browser、WebFetch、WebSearch。
 anchors:
+  - frontend/routes/settings/search.tsx
   - server/lib/agent/tools/browser.ts
   - server/lib/agent/tools/web-fetch.ts
   - server/lib/agent/tools/web-search.ts
@@ -14,7 +15,6 @@ anchors:
   - server/lib/agent/tools/browser-memory.ts
   - server/lib/search/
   - server/services/browser-session-recovery.ts
-  - shared/browser-paths.ts
 keywords:
   - Browser
   - WebFetch

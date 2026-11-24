@@ -3,6 +3,7 @@ id: platform.boot
 title: 启动与进程
 summary: 入口、启动顺序、迁移、关闭；manager 进程与运行时。
 anchors:
+  - server/lib/runtime-target.ts
   - server/index.ts
   - server/main.ts
   - server/serve.ts
@@ -11,7 +12,6 @@ anchors:
   - server/lib/startup-status/
   - server/dev-all.ts
   - server/db/index.ts
-  - frontend/components/settings/RuntimeSection.tsx
   - server/lib/http-listener-rebind.ts
   - server/lib/logger.ts
   - server/lib/manager-control-server.ts
@@ -20,7 +20,6 @@ anchors:
   - server/lib/startup-readiness.ts
   - server/lib/windows-excluded-ports.ts
   - server/routes/dependencies.ts
-  - server/routes/runtime.ts
   - server/services/dependency-service.ts
   - shared/server-host.ts
   - shared/startup-status.ts

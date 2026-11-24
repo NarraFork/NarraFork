@@ -16,7 +16,6 @@ anchors:
   - frontend/components/settings/RemoteAccessSettingsPanel.tsx
   - frontend/hooks/useRemoteAccess.ts
   - frontend/lib/api/remote-access.ts
-  - frontend/lib/qr.ts
   - frontend/routes/settings/remote-access.tsx
   - server/lib/remote-peer-binaries.ts
   - server/lib/remote-request-context.ts

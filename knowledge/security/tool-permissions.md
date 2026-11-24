@@ -19,7 +19,6 @@ anchors:
   - server/lib/boolean-override.ts
   - server/lib/fs-secret-paths.ts
   - server/lib/robot-diagnostic-policy.ts
-  - server/lib/validators/diagnostics.ts
   - server/lib/validators/permission-rule-requests.ts
   - server/scripts/approve-all.ts
   - server/services/narrator-review-boundary.ts

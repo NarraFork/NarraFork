@@ -3,6 +3,7 @@ id: agent.providers
 title: 模型提供商
 summary: 各模型提供商适配器（Anthropic / OpenAI / Gemini / Codex / NUG / TokenDance / CommandCode）、来源注册、协议切换与上游拒绝降级，以及提供商设置页。
 anchors:
+  - frontend/lib/qr.ts
   - server/lib/agent/provider.ts
   - server/lib/agent/provider-source-registry.ts
   - server/lib/agent/anthropic-provider.ts

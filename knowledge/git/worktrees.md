@@ -17,7 +17,6 @@ anchors:
   - server/services/worktree-lifecycle-guard.ts
   - server/services/worktree-resource-metadata-store.ts
   - server/services/worktree-resource-owner.ts
-  - shared/fork-worktree-source.ts
   - shared/narrator-worktrees.ts
   - server/db/resource-protection-index.ts
 keywords:

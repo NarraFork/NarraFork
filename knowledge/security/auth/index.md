@@ -24,7 +24,6 @@ anchors:
   - frontend/lib/api/auth.ts
   - frontend/lib/current-user-cache.ts
   - frontend/lib/random-password.ts
-  - frontend/lib/session-store.ts
   - frontend/routes/admin/users.tsx
   - frontend/routes/login.tsx
   - frontend/routes/settings/authentication.tsx

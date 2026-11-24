@@ -3,6 +3,7 @@ id: agent.credentials-models
 title: 凭证池与存储
 summary: 模型凭证的存放、多凭证之间怎么选与降级（Codex 账号池、自定义 API 多密钥）、冷却、credentials.json 与跨实例搬运；额度另见供应商额度节点。
 anchors:
+  - server/lib/secret-store.ts
   - server/lib/agent/credential-pool.ts
   - server/lib/agent/pooled-provider.ts
   - frontend/components/providers/CredentialMigrationAlert.tsx

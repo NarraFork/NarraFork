@@ -6,8 +6,6 @@ anchors:
   - server/lib/agent/execution/
   - server/lib/agent/tool-executor.ts
   - server/services/device-connection-service.ts
-  - server/lib/platform-path.ts
-  - server/lib/runtime-target.ts
   - server/lib/tool-execution-target-projection.ts
 keywords:
   - ExecutionBackend

@@ -3,6 +3,7 @@ id: agent.model-catalog
 title: 模型目录与来源
 summary: 模型卡的分层解析（目录、网关发现、本地覆盖）、目录更新与快照、来源组与 auto 模型列表。
 anchors:
+  - frontend/lib/constants.ts
   - server/lib/model-catalog/
   - server/lib/sourcing/
   - server/lib/model-sourcing/

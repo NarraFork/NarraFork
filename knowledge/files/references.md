@@ -19,6 +19,7 @@ keywords:
   - .narrafork/attached
   - chat_attachments
 anchors:
+  - server/lib/svg-sanitize.ts
   - server/services/file-reference-service.ts
   - server/routes/narrator-file-references.ts
   - shared/file-reference.ts
@@ -30,7 +31,6 @@ anchors:
   - frontend/lib/api/media-upload-validation.ts
   - server/lib/agent/file-reference-projection.ts
   - server/lib/attached-files.ts
-  - server/lib/chat-attachments.ts
   - server/lib/file-reference-input.ts
   - server/lib/fs-download-ticket.ts
   - server/lib/legacy-file-attachments.ts
@@ -38,7 +38,6 @@ anchors:
   - server/lib/uploads.ts
   - server/lib/validators/file-references.ts
   - server/routes/fs.ts
-  - server/services/file-clipboard.ts
   - server/services/file-reference-context.ts
   - server/services/narrator-media-access.ts
   - shared/document-file-extensions.ts

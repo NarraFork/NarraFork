@@ -48,7 +48,6 @@ anchors:
   - server/services/git-tool-refresh-policy.ts
   - server/services/git-untracked-line-worker.ts
   - server/services/remote-git-service.ts
-  - shared/github-repository.ts
   - server/services/git-commit-boundary-cache.ts
   - server/services/git-commit-preview-parse.ts
   - shared/git-commit-preview.ts

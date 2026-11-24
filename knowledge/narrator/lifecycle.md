@@ -3,6 +3,7 @@ id: narrator.lifecycle
 title: 会话生命周期
 summary: 创建、运行、停止、归档；narrator-service 的拆分（session/executor/subagent/context/prompt/title/recovery/event-handler）。
 anchors:
+  - server/services/workspace-context-transition.ts
   - server/services/narrator-service.ts
   - server/services/narrator-session.ts
   - server/services/narrator-executor.ts
@@ -25,7 +26,6 @@ anchors:
   - server/lib/narrator-utils.ts
   - server/lib/validators/manual-narrator-resources.ts
   - server/lib/validators/narrators.ts
-  - server/services/command-service.ts
   - server/services/narrator-composer-document.ts
   - server/services/narrator-cwd.ts
   - server/services/narrator-draft-service.ts

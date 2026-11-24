@@ -18,6 +18,9 @@ keywords:
   - narrator_file_snapshots
   - fileChangeEvidence
 anchors:
+  - server/lib/agent/disk-safety.ts
+  - server/lib/disk-safety-config.ts
+  - server/lib/disk-safety.ts
   - server/services/file-write-queue.ts
   - server/services/file-change-runtime.ts
   - server/services/file-change-apply-result.ts
@@ -37,7 +40,6 @@ anchors:
   - server/services/file-change-write-footprint.ts
   - server/services/struct-sed-remote-change.ts
   - server/routes/fs.ts
-  - server/services/workspace-context-transition.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

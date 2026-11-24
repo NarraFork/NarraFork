@@ -3,6 +3,15 @@ id: security.oauth-api
 title: OAuth 与开放 API
 summary: OAuth 2.0 应用与授权、External API v1。
 anchors:
+  - frontend/lib/api/integrations.ts
+  - frontend/routes/settings/integrations.tsx
+  - server/services/integration-authority-invalidation.ts
+  - server/services/integration-summary-service.ts
+  - server/services/integration-resource-service.ts
+  - server/services/integration-resource-binding-service.ts
+  - server/services/integration-authorization-service.ts
+  - server/services/integration-authority-service.ts
+  - server/services/integration-audit-service.ts
   - server/websocket/external-narrator-ws.ts
   - server/websocket/external-narrator-ws-types.ts
   - server/routes/oauth.ts

@@ -3,6 +3,7 @@ id: platform.network
 title: 出站网络与代理
 summary: 服务端发出的请求：代理策略与 no_proxy 规则、启动时中和环境代理、outboundFetch 的重放规则、TLS 握手错误、局域网监听地址、诊断信息脱敏。
 anchors:
+  - server/routes/tls.ts
   - server/lib/net/diagnostic-redaction.ts
   - server/lib/net/lan-addresses.ts
   - server/lib/net/listen-host.ts

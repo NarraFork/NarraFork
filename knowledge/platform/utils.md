@@ -3,6 +3,8 @@ id: platform.utils
 title: 后端通用工具
 summary: 没有业务归属的小工具：互斥锁、HMR 安全的全局状态、UTF-8 字节预算、附件头、ZIP 读取与解压、slug、服务端文案表。
 anchors:
+  - server/lib/platform-path.ts
+  - server/lib/sql-like.ts
   - server/lib/async-mutex.ts
   - server/lib/avatar-colors.ts
   - server/lib/content-disposition.ts

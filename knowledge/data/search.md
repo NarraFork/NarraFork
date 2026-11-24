@@ -15,8 +15,6 @@ anchors:
   - frontend/lib/search-page-focus.ts
   - frontend/lib/search-utils.tsx
   - frontend/routes/search.tsx
-  - frontend/routes/settings/search.tsx
-  - server/lib/sql-like.ts
   - server/lib/validators/search.ts
 keywords:
   - 搜索

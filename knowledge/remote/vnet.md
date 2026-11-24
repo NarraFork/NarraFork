@@ -7,7 +7,6 @@ anchors:
   - server/routes/vnet.ts
   - server/websocket/vnet-ws.ts
   - server/http-dispatcher.ts
-  - server/routes/settings.ts
   - tests/server/lib/vnet-relay.test.ts
 keywords:
   - vnet

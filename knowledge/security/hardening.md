@@ -7,12 +7,7 @@ anchors:
   - server/lib/spawn.ts
   - server/services/narrator-worktree-service.ts
   - server/services/teams/team-git.ts
-  - server/lib/shell-exec.ts
-  - server/lib/win-env.ts
   - server/lib/win-handle-guard.ts
-  - server/lib/windows-child-job.ts
-  - server/lib/windows-process-identity.ts
-  - server/routes/tls.ts
 keywords:
   - GIT_NO_EXEC_CONFIG
   - GIT_CONFIG_COUNT
