@@ -53,6 +53,9 @@ export function parseQuotaSnapshot(raw: unknown): QuotaSnapshot | null {
 		windows,
 		balances,
 		...(typeof value.plan === "string" ? { plan: value.plan } : {}),
+		...(typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)
+			? { expiresAt: value.expiresAt }
+			: {}),
 		...(value.detail !== undefined ? { detail: value.detail } : {}),
 	};
 }

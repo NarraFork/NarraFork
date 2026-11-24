@@ -93,6 +93,18 @@ test("probe wins only with data, including when source is omitted", () => {
 	expect(selectQuotaEntries([legacy, stream])).toEqual([legacy]);
 });
 
+test("known probe expiry cannot be hidden by a positive stream balance without validity metadata", () => {
+	const stream = entry("group", "key", "quota_balance");
+	for (const windows of [[], [{ kind: "weekly" as const, usedRatio: null, resetsAt: null }]]) {
+		const probe: QuotaSnapshotEntry = {
+			...entry(),
+			snapshot: { fetchedAt: 1, scope: "subscription", windows, balances: [], expiresAt: 10 },
+		};
+		expect(selectQuotaEntries([probe, stream])).toEqual([probe]);
+		expect(selectQuotaEntries([stream, probe])).toEqual([probe]);
+	}
+});
+
 test("disabled observers never poll cached refreshing snapshots", () => {
 	const poll = quotaSnapshotsOptions(false).refetchInterval;
 	if (typeof poll !== "function") throw new Error("Expected interval function");

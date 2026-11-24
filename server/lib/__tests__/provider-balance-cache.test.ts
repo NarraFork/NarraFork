@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { clearKeyCooldown, reportKeyFault } from "../agent/pooled-provider";
 import { ApiError } from "../agent/types";
 import type { outboundFetch } from "../net/outbound-fetch";
@@ -27,7 +28,7 @@ function deferred<T>() {
 	});
 	return { promise, resolve };
 }
-function fixture() {
+function fixture(store?: QuotaStore) {
 	let providers = [provider()];
 	let globalProxy: unknown = { mode: "direct" };
 	let now = 100_000;
@@ -37,6 +38,7 @@ function fixture() {
 		providers: () => providers,
 		globalProxy: () => globalProxy,
 		fetch,
+		store,
 		now: () => now,
 	});
 	return {
@@ -159,6 +161,100 @@ describe("provider balance discovery lifecycle", () => {
 		expect(next).not.toHaveProperty("expiresAt");
 	});
 
+	test("subscription periods become labelled windows and plan expiry survives snapshot restoration", async () => {
+		let stored: QuotaSnapshot | undefined;
+		const persistence = {
+			restore: () => stored,
+			save: (_id: string, _identity: string, snapshot: QuotaSnapshot) => {
+				stored = structuredClone(snapshot);
+			},
+			remove: () => {},
+			flush: async () => {},
+		};
+		const f = fixture(new QuotaStore(persistence));
+		f.respond(async () =>
+			Response.json({
+				mode: "unrestricted",
+				isValid: true,
+				unit: "USD",
+				planName: "Period plan",
+				subscription: {
+					daily_limit_usd: 10,
+					daily_usage_usd: 2,
+					weekly_limit_usd: 50,
+					weekly_usage_usd: 4,
+					monthly_limit_usd: 0,
+					monthly_usage_usd: 0,
+					weekly_window_start: "2026-10-19T00:00:00Z",
+					expires_at: "2026-11-19T00:00:00Z",
+				},
+			}),
+		);
+		await f.cache.request("relay-test");
+		const expected = {
+			plan: "Period plan",
+			expiresAt: Date.parse("2026-11-19T00:00:00Z"),
+			balances: [],
+			windows: [
+				{ kind: "other", label: "daily", usedRatio: 0.2, resetsAt: null },
+				{ kind: "weekly", label: "weekly", usedRatio: 0.08, resetsAt: null },
+				{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+			],
+		};
+		expect(f.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject(expected);
+		const restarted = fixture(new QuotaStore(persistence));
+		expect(restarted.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject(expected);
+		expect(restarted.cache.peek("relay-test")?.balance?.expiresAt).toBe("2026-11-19T00:00:00.000Z");
+		expect(restarted.fetch).not.toHaveBeenCalled();
+	});
+	test("period ratios fall back to remaining/total without fabricating missing limits", async () => {
+		const f = new ProviderBalanceCache({
+			providers: () => [provider()],
+			globalProxy: () => undefined,
+			engine: () => ({
+				id: "period-test",
+				probe: async () => ({
+					adapter: "sub2api",
+					root: "https://relay.example",
+					balance: {
+						scope: "subscription",
+						unlimited: false,
+						amounts: [
+							{ unit: "USD", remaining: 6, total: 10, window: "weekly" },
+							{ unit: "USD", remaining: 6, window: "monthly" },
+						],
+					},
+				}),
+				refresh: async () => {
+					throw new Error("not used");
+				},
+			}),
+		});
+		await f.request("relay-test");
+		expect(f.quotaSnapshot("relay-test")?.snapshot?.windows).toEqual([
+			{ kind: "weekly", label: "weekly", usedRatio: 0.4, resetsAt: null },
+			{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+		]);
+		expect(f.quotaSnapshot("relay-test")?.snapshot).not.toHaveProperty("expiresAt");
+		expect(f.quotaSnapshot("relay-test")?.snapshot?.balances).toEqual([]);
+	});
+	test("unlimited plans without finite periods retain their unlimited balance", async () => {
+		const f = fixture();
+		f.respond(async () =>
+			Response.json({
+				mode: "unrestricted",
+				isValid: true,
+				unit: "USD",
+				planName: "Unlimited",
+				remaining: -1,
+			}),
+		);
+		await f.cache.request("relay-test");
+		expect(f.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject({
+			windows: [],
+			balances: [{ unit: "", remaining: null, unlimited: true }],
+		});
+	});
 	test("transient discovery failures are safe and do not poll automatically", async () => {
 		const f = fixture();
 		f.respond(async () => {

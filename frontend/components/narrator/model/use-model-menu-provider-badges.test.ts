@@ -73,6 +73,24 @@ describe("unified model-menu quota badges", () => {
 		expect(selectQuotaEntries([unknownProbe, stream])).toEqual([stream]);
 	});
 
+	test("expiration follows the picker clock and never advertises cached positive allowance", () => {
+		const value = entry(
+			"relay",
+			snapshot({
+				expiresAt: 1_000,
+				windows: [{ kind: "other", label: "daily", usedRatio: 0.3, resetsAt: null }],
+				balances: [{ unit: "USD", remaining: 7 }],
+			}),
+		);
+		const before = buildModelMenuProviderBadges([value], 999, t);
+		expect(before.providerBadges?.relay.bars?.[0]?.remainingPercent).toBe(70);
+		expect(before.providerBalances?.relay.text).toContain("7 USD");
+		const expired = buildModelMenuProviderBadges([value], 1_000, t);
+		expect(expired.providerBadges?.relay.text).toBe(t("quotaSnapshot.expired"));
+		expect(expired.providerBadges?.relay.bars).toBeUndefined();
+		expect(expired.providerBalances).toBeUndefined();
+	});
+
 	test("keeps credentials separate and never sums a shared account wallet", () => {
 		const values = ["one", "two"].map((credentialId) =>
 			entry(

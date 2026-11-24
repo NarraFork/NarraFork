@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
-import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -33,6 +33,7 @@ function render(
 	status: ProviderBalanceSnapshot["status"] = "supported",
 	queryState: "cached" | "loading" | "error" = "cached",
 	capabilityEnabled?: boolean,
+	entries?: QuotaSnapshotEntry[],
 ) {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["auth", "me"], { role });
@@ -43,7 +44,7 @@ function render(
 			: { providerBalanceCapability: { enabled: capabilityEnabled } }),
 	});
 	client.setQueryData(quotaSnapshotsKey, {
-		entries: [
+		entries: entries ?? [
 			{
 				groupId: "p",
 				prefix: "p",
@@ -109,6 +110,35 @@ test("noncandidate official providers show no unsupported status or operation", 
 	expect(html).not.toContain("Rediscover balance");
 	expect(html).not.toContain("Balance discovery not supported");
 });
+test("the group summary follows the selected key, not the disabled first key or its stale balance", () => {
+	const selected: QuotaSnapshotEntry = {
+		groupId: "p",
+		prefix: "p",
+		templateId: "openai-compatible",
+		credentialId: "B",
+		primary: true,
+		supported: true,
+		snapshot: {
+			scope: "key",
+			fetchedAt: 1,
+			windows: [],
+			balances: [{ unit: "USD", remaining: 20 }],
+		},
+	};
+	for (const snapshot of [
+		null,
+		{ scope: "key" as const, fetchedAt: 1, windows: [], balances: [{ unit: "USD", remaining: 7 }] },
+	]) {
+		const html = render("admin", false, "A", "supported", "cached", true, [
+			{ ...selected, credentialId: "A", primary: false, snapshot },
+			selected,
+		]);
+		expect(html).toContain("20 USD");
+		expect(html).not.toContain("7 USD");
+		expect(html).not.toContain("Quota unknown");
+	}
+});
+
 test("a disabled capability plugin removes the row and its rediscover action", () => {
 	const html = render("admin", false, "A", "error", "cached", false);
 	// Mantine still emits its style tags around a null render, so assert on the content.

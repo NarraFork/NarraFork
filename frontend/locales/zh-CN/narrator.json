@@ -3075,7 +3075,9 @@
 		"total": "总量",
 		"used": "已用",
 		"resetsAt": "重置于 {{time}}",
-		"window": { "5h": "5小时", "weekly": "周", "monthly": "月", "other": "额度" }
+		"expired": "订阅已过期",
+		"expiresAt": "到期时间",
+		"window": { "5h": "5小时", "daily": "日", "weekly": "周", "monthly": "月", "other": "额度" }
 	},
 	"quotaPanel": {
 		"short5h": "5h",

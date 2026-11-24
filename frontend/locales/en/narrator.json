@@ -3078,7 +3078,15 @@
 		"total": "Total",
 		"used": "Used",
 		"resetsAt": "Resets at {{time}}",
-		"window": { "5h": "5h", "weekly": "Weekly", "monthly": "Monthly", "other": "Quota" }
+		"expired": "Subscription expired",
+		"expiresAt": "Expires at",
+		"window": {
+			"5h": "5h",
+			"daily": "Daily",
+			"weekly": "Weekly",
+			"monthly": "Monthly",
+			"other": "Quota"
+		}
 	},
 	"quotaPanel": {
 		"short5h": "5h",

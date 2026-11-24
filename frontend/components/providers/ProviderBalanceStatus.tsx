@@ -27,9 +27,10 @@ export function ProviderBalanceStatus({
 		(settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
 			?.providerBalanceCapability?.enabled !== false;
 	const query = useQuotaSnapshots(capabilityEnabled && !!generation);
-	const entry = selectQuotaEntries(query.data?.entries ?? []).find(
+	const entries = selectQuotaEntries(query.data?.entries ?? []).filter(
 		(item) => item.groupId === providerId,
 	);
+	const entry = entries.find((item) => item.primary) ?? entries[0];
 	const canProbe =
 		user?.role === "admin" && !dirty && !!generation && !query.isPending && !query.isError;
 	const probe = useProbeProviderBalance(providerId, generation, canProbe);

@@ -12,6 +12,7 @@ import { getProviderKeyStore, TOKENDANCE_KEY_OWNER } from "../../lib/provider-ke
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
 import { readQuotaSnapshots, refreshCommandCodeCliQuota } from "../../lib/sourcing/quota-snapshots";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../lib/sourcing/quota-store";
+import * as templates from "../../lib/sourcing/templates";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { pluginProviderRegistry } from "../../services/plugin-provider-registry";
@@ -267,7 +268,93 @@ describe("unified quota API", () => {
 		expect(response.status).toBe(200);
 		expect(byGroup(await response.json(), "tokendance")[0].snapshot?.hasError).toBe(false);
 	});
-	test("anonymous Codex projection has unknown coverage without enumerating accounts or mutating state", () => {
+	test("ordinary Codex API aggregates Plus five-hour and Team monthly plans by applicable window", async () => {
+		const manager = getCodexManager();
+		Object.defineProperty(manager, "quotaCredentialIds", {
+			configurable: true,
+			value: ["private-plus", "private-team"],
+		});
+		spyOn(manager, "usageOf").mockImplementation((id) => ({
+			plan_type: id === "private-plus" ? "plus" : "team",
+			queriedAt: new Date().toISOString(),
+			primary_window:
+				id === "private-plus"
+					? {
+							window_type: "5h",
+							limit_window_seconds: 18000,
+							used_percent: 20,
+							remaining_percent: 80,
+							reset_at: 1800000000,
+							reset_after_seconds: 100,
+						}
+					: {
+							window_type: "monthly",
+							limit_window_seconds: 30 * 86400,
+							used_percent: 70,
+							remaining_percent: 30,
+							reset_at: 1800000000,
+							reset_after_seconds: 100,
+						},
+		}));
+		const response = await app("user").request("/api/quota-snapshots");
+		expect(response.status).toBe(200);
+		const text = await response.text();
+		const entry = byGroup(JSON.parse(text), "codex")[0];
+		expect(entry).toMatchObject({
+			credentialId: null,
+			snapshot: {
+				balances: [],
+				windows: [
+					{ kind: "5h", usedRatio: 0.2, resetsAt: 1800000000000 },
+					{ kind: "monthly", usedRatio: 0.7, resetsAt: 1800000000000 },
+				],
+			},
+		});
+		expect(text).not.toMatch(/private-plus|private-team|"plan"|detail|accountId/);
+	});
+	test("Codex custom windows aggregate by label, with unnamed and null-ratio coverage kept unknown", () => {
+		const manager = getCodexManager();
+		Object.defineProperty(manager, "quotaCredentialIds", { configurable: true, value: ["a", "b"] });
+		const data: Record<string, QuotaSnapshot> = {
+			a: {
+				...snap(),
+				windows: [
+					{ kind: "5h", usedRatio: 0.2, resetsAt: null },
+					{ kind: "other", label: "review", usedRatio: 0.1, resetsAt: null },
+					{ kind: "other", label: "special", usedRatio: null, resetsAt: null },
+					{ kind: "other", usedRatio: 0.2, resetsAt: null },
+				],
+			},
+			b: {
+				...snap(),
+				windows: [
+					{ kind: "monthly", usedRatio: 0.7, resetsAt: null },
+					{ kind: "other", label: "review", usedRatio: 0.3, resetsAt: null },
+					{ kind: "other", label: "special", usedRatio: 0.5, resetsAt: null },
+					{ kind: "other", usedRatio: 0.8, resetsAt: null },
+				],
+			},
+		};
+		const original = templates.getServiceTemplate;
+		const codex = original("codex");
+		spyOn(templates, "getServiceTemplate").mockImplementation((id) =>
+			id === "codex"
+				? { ...codex, projectQuota: (credentialId) => data[credentialId] }
+				: original(id),
+		);
+		const entry = byGroup(readQuotaSnapshots(false, false), "codex")[0];
+		expect(entry.snapshot?.windows).toEqual([
+			{ kind: "5h", usedRatio: 0.2, resetsAt: null },
+			{ kind: "other", label: "review", usedRatio: 0.2, resetsAt: null },
+			{ kind: "other", label: "special", usedRatio: null, resetsAt: null },
+			{ kind: "other", usedRatio: null, resetsAt: null },
+			{ kind: "monthly", usedRatio: 0.7, resetsAt: null },
+		]);
+	});
+	test.each([
+		"missing",
+		"empty",
+	] as const)("anonymous Codex projection keeps %s account coverage unknown without exposing accounts", (coverage) => {
 		const manager = getCodexManager();
 		Object.defineProperty(manager, "quotaCredentialIds", {
 			configurable: true,
@@ -287,7 +374,9 @@ describe("unified quota API", () => {
 							reset_after_seconds: 100,
 						},
 					}
-				: undefined,
+				: coverage === "missing"
+					? undefined
+					: { plan_type: "team", queriedAt: new Date().toISOString() },
 		);
 		const status = spyOn(manager, "snapshot");
 		const getUsage = spyOn(manager, "getUsage");

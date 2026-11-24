@@ -75,6 +75,7 @@ export function publicQuotaSnapshot(
 			...(unlimited !== undefined ? { unlimited } : {}),
 		})),
 		...(snapshot.plan ? { plan: snapshot.plan } : {}),
+		...(snapshot.expiresAt !== undefined ? { expiresAt: snapshot.expiresAt } : {}),
 		hasError: !!snapshot.error,
 		...(snapshot.error ? { error: "quota_unavailable" } : {}),
 	};
@@ -161,22 +162,33 @@ function codexOverview(): PublicQuotaSnapshot | null {
 		.filter((snapshot): snapshot is QuotaSnapshot => !!snapshot);
 	if (!snapshots.length) return null;
 	const windows: PublicQuotaSnapshot["windows"] = [];
-	for (const kind of ["5h", "weekly", "monthly", "other"] as const) {
-		const matched = snapshots.flatMap((snapshot) =>
-			snapshot.windows.filter((window) => window.kind === kind),
-		);
+	const groups = new Map<string, PublicQuotaSnapshot["windows"]>();
+	for (const snapshot of snapshots) {
+		for (const window of snapshot.windows) {
+			const key = JSON.stringify([window.kind, window.label ?? null]);
+			const group = groups.get(key);
+			if (group) group.push(window);
+			else groups.set(key, [window]);
+		}
+	}
+	for (const matched of groups.values()) {
+		const { kind, label } = matched[0];
 		const ratios = matched.flatMap((window) =>
 			window.usedRatio === null ? [] : [window.usedRatio],
 		);
-		if (!matched.length) continue;
+		// Known plans without this window do not participate. An entirely missing account
+		// or an account with no known windows still leaves coverage unknown, as does an
+		// unknown ratio in an applicable window.
+		// Unnamed `other` periods cannot safely be assumed to represent the same allowance.
 		const complete =
 			snapshots.length === ids.length &&
-			snapshots.every((snapshot) =>
-				snapshot.windows.some((window) => window.kind === kind && window.usedRatio !== null),
-			);
+			snapshots.every((snapshot) => snapshot.windows.length > 0) &&
+			ratios.length === matched.length &&
+			(kind !== "other" || !!label);
 		const resets = matched.flatMap((window) => (window.resetsAt === null ? [] : [window.resetsAt]));
 		windows.push({
 			kind,
+			...(label ? { label } : {}),
 			usedRatio: complete ? ratios.reduce((sum, ratio) => sum + ratio, 0) / ratios.length : null,
 			resetsAt: resets.length ? Math.min(...resets) : null,
 		});
@@ -220,6 +232,7 @@ export function readQuotaSnapshots(
 	for (const group of listSourceGroups()) {
 		const template = getServiceTemplate(group.templateId);
 		const ids = credentialIds(group);
+		const selected = providerBalanceCache.quotaSnapshot(group.id)?.credentialId;
 		let shown = ids;
 		if (!isAdmin) {
 			// The old ordinary-user endpoints showed one credential per provider, not the pool.
@@ -227,10 +240,7 @@ export function readQuotaSnapshots(
 				shown = usageSubjects((p) => p.id === group.id)
 					.slice(0, 1)
 					.map((s) => s.id);
-			else {
-				const selected = providerBalanceCache.quotaSnapshot(group.id)?.credentialId;
-				shown = selected ? [selected] : ids.slice(0, 1);
-			}
+			else shown = selected ? [selected] : ids.slice(0, 1);
 		}
 		const base = { groupId: group.id, prefix: group.prefix, templateId: group.templateId };
 		if (group.templateId === "codex" && !isAdmin) {
@@ -256,6 +266,7 @@ export function readQuotaSnapshots(
 				...base,
 				credentialId: isAdmin ? id : null,
 				source: "probe",
+				...(selected ? { primary: id === selected } : {}),
 				...(group.templateId === "command-code" &&
 				!group.disabled &&
 				ids.length === 0 &&
@@ -276,7 +287,7 @@ export function readQuotaSnapshots(
 					relay?.status === "pending",
 			});
 			// Use the stream's identity-checked accessor, never quotaStore.peek or the probe slot.
-			const streamId = isAdmin ? id : ids[0];
+			const streamId = id;
 			const stream =
 				streamId && !group.disabled ? getCustomApiQuotaSnapshot(group.id, streamId) : undefined;
 			if (stream)
@@ -284,6 +295,7 @@ export function readQuotaSnapshots(
 					...base,
 					credentialId: isAdmin ? id : null,
 					source: "quota_balance",
+					...(selected ? { primary: streamId === selected } : {}),
 					supported: true,
 					snapshot: publicQuotaSnapshot(stream),
 				});

@@ -47,6 +47,21 @@ test("renders unknown instead of zero and supports balance-only unlimited snapsh
 	expect(html).not.toContain("data-quota-bar=");
 });
 
+test("expired plans render unavailable instead of positive quota bars or spendable amounts", () => {
+	const html = render({
+		scope: "subscription",
+		fetchedAt: 1,
+		expiresAt: 1_000,
+		plan: "Pro",
+		windows: [{ kind: "other", label: "daily", usedRatio: 0.3, resetsAt: null }],
+		balances: [{ unit: "USD", remaining: 7, total: 10 }],
+	});
+	expect(html).toContain("Subscription expired");
+	expect(html).not.toContain("7 USD");
+	expect(html).not.toContain("data-quota-bar=");
+	expect(html).toContain("Expires at");
+});
+
 test("failed refresh marks previous window values stale without losing known values", () => {
 	const html = render({
 		scope: "key",

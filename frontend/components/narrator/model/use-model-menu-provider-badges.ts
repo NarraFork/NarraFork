@@ -6,6 +6,7 @@ import {
 	useCommandCodeCliQuota,
 	useQuotaSnapshots,
 } from "../../../hooks/useQuotaSnapshots";
+import { useQuotaNow } from "./QuotaPanelIndicator";
 import type { QuotaBarSpec } from "./QuotaWindowBars";
 import {
 	formatQuotaBadgeText,
@@ -68,7 +69,7 @@ export function buildModelMenuProviderBadges(
 	const providerBadges: Record<string, ProviderQuotaBadge> = {};
 	const providerBalances: Record<string, ProviderBalanceBadge> = {};
 	for (const [prefix, group] of groups) {
-		const views = group.map((entry) => quotaSnapshotView(entry.snapshot, prefix, t));
+		const views = group.map((entry) => quotaSnapshotView(entry.snapshot, prefix, t, now));
 		const windows = views.flatMap((view, index) =>
 			view.windows.map((window) => ({
 				...window,
@@ -95,8 +96,11 @@ export function buildModelMenuProviderBadges(
 			};
 		}
 		const balances = group.flatMap((entry) =>
-			entry.snapshot?.balances.length
-				? [quotaSnapshotText({ ...entry.snapshot, windows: [] }, t)]
+			entry.snapshot?.balances.length &&
+			(entry.snapshot.expiresAt == null ||
+				!Number.isFinite(entry.snapshot.expiresAt) ||
+				entry.snapshot.expiresAt > now)
+				? [quotaSnapshotText({ ...entry.snapshot, windows: [] }, t, now)]
 				: [],
 		);
 		if (balances.length) {
@@ -129,8 +133,9 @@ export function useModelMenuProviderBadges(
 	const { t } = useTranslation("narrator");
 	const { data } = useQuotaSnapshots(enabled);
 	useCommandCodeCliQuota(enabled);
+	const now = useQuotaNow(enabled);
 	return useMemo(
-		() => buildModelMenuProviderBadges(data?.entries ?? [], Date.now(), t, settingsData),
-		[data, settingsData, t],
+		() => buildModelMenuProviderBadges(data?.entries ?? [], now, t, settingsData),
+		[data, settingsData, t, now],
 	);
 }

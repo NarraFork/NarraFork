@@ -5,6 +5,7 @@ import { createPersistedCredentialCache } from "../persisted-credential-cache";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import {
 	importLegacyQuotaCache,
+	parseQuotaSnapshot,
 	QuotaStore,
 	quotaStore,
 	STREAM_QUOTA_SOURCE,
@@ -18,6 +19,23 @@ const snapshot = (usedRatio: number | null, resetsAt: number | null) => ({
 });
 
 describe("quota store", () => {
+	test("public expiry survives persisted parsing, while legacy and invalid expiries stay unknown", async () => {
+		const expiresAt = Date.parse("2027-01-01T00:00:00Z");
+		const raw = { ...snapshot(0.4, null), expiresAt };
+		expect(parseQuotaSnapshot(raw)?.expiresAt).toBe(expiresAt);
+		for (const legacy of [
+			snapshot(0.4, null),
+			{ ...raw, expiresAt: "2027-01-01" },
+			{ ...raw, expiresAt: Number.NaN },
+		])
+			expect(parseQuotaSnapshot(legacy)).not.toHaveProperty("expiresAt");
+		const file = `quota-expiry-test-${crypto.randomUUID()}.json`;
+		const store = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		store.set("expiring", "same-identity", raw);
+		await store.flush();
+		const restored = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		expect(restored.get("expiring", "same-identity")?.expiresAt).toBe(expiresAt);
+	});
 	test("persists snapshots as fingerprints only, and reads them back under the same identity", async () => {
 		const file = `quota-store-test-${crypto.randomUUID()}.json`;
 		const store = new QuotaStore(createPersistedCredentialCache(file, (raw) => raw as never));

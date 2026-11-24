@@ -1,11 +1,12 @@
 import type {
 	ProviderBalanceAdapter,
+	ProviderBalanceAmount,
 	ProviderBalanceData,
 	ProviderBalanceError,
 	ProviderBalanceSnapshot,
 	ProviderBalanceStatus,
 } from "@shared/provider-balance";
-import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { epochOf, type QuotaSnapshot, type QuotaWindow } from "@shared/quota-snapshot";
 import { selectProviderKey } from "./agent/pooled-provider";
 import { isDeepSeekCustomApiProvider } from "./deepseek-balance-cache";
 import { isKimiCustomApiProvider } from "./kimi-usage-cache";
@@ -166,7 +167,16 @@ export function parsePersistedProviderBalance(raw: unknown): PersistedProviderBa
 					((a as { remaining?: unknown }).remaining === null ||
 						typeof (a as { remaining?: unknown }).remaining === "number"),
 			);
-			balance = { scope: b.scope, unlimited: b.unlimited, amounts };
+			const expiresAt = typeof b.expiresAt === "string" ? epochOf(b.expiresAt) : null;
+			balance = {
+				scope: b.scope,
+				unlimited: b.unlimited,
+				amounts,
+				...(typeof b.planName === "string" && b.planName.length <= 128
+					? { planName: b.planName }
+					: {}),
+				...(expiresAt !== null ? { expiresAt: new Date(expiresAt).toISOString() } : {}),
+			};
 		}
 	}
 	return {
@@ -180,26 +190,64 @@ export function parsePersistedProviderBalance(raw: unknown): PersistedProviderBa
 
 type BalanceState = Omit<ProviderBalanceSnapshot, "generation">;
 
+function relayPeriod(amount: ProviderBalanceAmount): QuotaWindow {
+	let usedRatio: number | null = null;
+	if (amount.total !== undefined && Number.isFinite(amount.total) && amount.total > 0) {
+		const ratio =
+			amount.used !== undefined && Number.isFinite(amount.used)
+				? amount.used / amount.total
+				: amount.remaining !== null && Number.isFinite(amount.remaining)
+					? 1 - amount.remaining / amount.total
+					: null;
+		if (ratio !== null && Number.isFinite(ratio)) usedRatio = Math.max(0, Math.min(1, ratio));
+	}
+	return {
+		kind:
+			amount.window === "5h"
+				? "5h"
+				: amount.window === "weekly" || amount.window === "7d"
+					? "weekly"
+					: amount.window === "monthly"
+						? "monthly"
+						: "other",
+		label: amount.window,
+		usedRatio,
+		// windowStart is not a promise of when a quota refills, nor is plan expiry.
+		resetsAt: null,
+	};
+}
+
 /** Relay allowances in the shared shape; the original state stays in `detail`. */
 function relaySnapshot(state: BalanceState, endpoint?: Endpoint): QuotaSnapshot {
 	const { status, adapter, balance, fetchedAt, attemptedAt, error } = state;
 	const unlimited = balance?.unlimited ? { unlimited: true } : {};
-	const balances = (balance?.amounts ?? []).map((amount) => ({
-		unit: amount.unit,
-		remaining: amount.remaining,
-		...(amount.total !== undefined ? { total: amount.total } : {}),
-		...unlimited,
-	}));
-	if (balance?.unlimited && balances.length === 0) {
+	const periods = (balance?.amounts ?? []).filter((amount) => !!amount.window).map(relayPeriod);
+	const windows =
+		balance?.unlimited && !periods.some((period) => period.usedRatio !== null) ? [] : periods;
+	const balances = (balance?.amounts ?? [])
+		.filter((amount) => !amount.window)
+		.map((amount) => ({
+			unit: amount.unit,
+			remaining: amount.remaining,
+			...(amount.total !== undefined ? { total: amount.total } : {}),
+			...unlimited,
+		}));
+	const expiresAt = epochOf(balance?.expiresAt);
+	if (
+		balance?.unlimited &&
+		balances.length === 0 &&
+		!windows.some((period) => period.usedRatio !== null)
+	) {
 		balances.push({ unit: "", remaining: null, unlimited: true });
 	}
 	return {
 		fetchedAt,
 		...(error ? { error } : {}),
 		scope: balance?.scope ?? "key",
-		windows: [],
+		windows,
 		balances,
 		...(balance?.planName ? { plan: balance.planName } : {}),
+		...(expiresAt !== null ? { expiresAt } : {}),
 		detail: {
 			status,
 			...(adapter ? { adapter } : {}),

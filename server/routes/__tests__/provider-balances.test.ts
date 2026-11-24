@@ -2,13 +2,16 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { readFileSync } from "node:fs";
 import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { Hono } from "hono";
+import { updateCustomApiQuotaByPrefix } from "../../lib/custom-api-quota-cache";
 import { AppError } from "../../lib/errors";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
+import { streamQuotaIdentity } from "../../lib/provider-key-subjects";
 import { getProviderKeyStore } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
 import { quotaKeyOwner } from "../../lib/settings/provider-keys-projection";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "../../lib/sourcing/quota-store";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
@@ -112,6 +115,122 @@ describe("relay balance through the unified quota API", () => {
 			supported: true,
 			snapshot: { balances: [{ unit: "USD", remaining: 12 }] },
 		});
+	});
+	for (const expiry of ["past", "future", "unknown"] as const) {
+		test(`public subscription periods preserve ${expiry} expiry without unlabelled USD balances`, async () => {
+			const expiresAt =
+				expiry === "unknown" ? undefined : Date.now() + (expiry === "past" ? -60_000 : 60_000);
+			spyOn(outbound, "outboundFetch").mockImplementation(async () =>
+				Response.json({
+					mode: "unrestricted",
+					isValid: true,
+					unit: "USD",
+					planName: "Period plan",
+					subscription: {
+						daily_limit_usd: 10,
+						daily_usage_usd: 2,
+						weekly_limit_usd: 50,
+						weekly_usage_usd: 4,
+						monthly_limit_usd: 0,
+						monthly_usage_usd: 0,
+						weekly_window_start: "2026-10-19T00:00:00Z",
+						...(expiresAt !== undefined ? { expires_at: new Date(expiresAt).toISOString() } : {}),
+					},
+				}),
+			);
+			await providerBalanceCache.request(config().id);
+			for (const role of ["admin", "user"] as const) {
+				const text = await (await appForRole(role).request("/api/quota-snapshots")).text();
+				const snapshot = findRelay(JSON.parse(text))?.snapshot;
+				expect(snapshot).toMatchObject({
+					plan: "Period plan",
+					balances: [],
+					windows: [
+						{ kind: "other", label: "daily", usedRatio: 0.2, resetsAt: null },
+						{ kind: "weekly", label: "weekly", usedRatio: 0.08, resetsAt: null },
+						{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+					],
+				});
+				if (expiresAt !== undefined) {
+					expect(snapshot?.expiresAt).toBe(expiresAt);
+					expect((snapshot?.expiresAt ?? Infinity) <= Date.now()).toBe(expiry === "past");
+				} else expect(snapshot).not.toHaveProperty("expiresAt");
+				expect(text).not.toMatch(
+					/detail|windowStart|weekly_window_start|key-current|relay\.invalid/,
+				);
+			}
+		});
+	}
+	test("primary follows the selected second credential, not the disabled first key", async () => {
+		const store = getProviderKeyStore();
+		const first = store.list(config().id)[0];
+		const second = store.add(config().id, { apiKey: "second-relay-secret" });
+		store.update(first.id, { disabled: true });
+		try {
+			const provider = settings.customApiProviders?.find((p) => p.id === config().id);
+			if (!provider) throw new Error("missing provider");
+			updateCustomApiQuotaByPrefix(provider.prefix, "3", null, streamQuotaIdentity(provider));
+			quotaStore.set(
+				second.id,
+				JSON.stringify([provider.baseUrl, second.apiKey]),
+				{
+					fetchedAt: Date.now(),
+					scope: "key",
+					windows: [],
+					balances: [{ unit: "", remaining: 7 }],
+					detail: { quotaBalance: "7", detailedQuotaBalance: null },
+				},
+				false,
+				STREAM_QUOTA_SOURCE,
+			);
+			await providerBalanceCache.request(provider.id);
+			const admin = (await (
+				await appForRole("admin").request("/api/quota-snapshots")
+			).json()) as QuotaSnapshotsResponse;
+			const entries = admin.entries.filter((entry) => entry.groupId === provider.id);
+			expect(
+				entries.find((entry) => entry.credentialId === first.id && entry.source === "probe")
+					?.primary,
+			).toBe(false);
+			expect(
+				entries.find((entry) => entry.credentialId === first.id && entry.source === "quota_balance")
+					?.primary,
+			).toBe(false);
+			expect(
+				entries.find((entry) => entry.credentialId === second.id && entry.source === "probe"),
+			).toMatchObject({ primary: true, snapshot: { balances: [{ unit: "USD", remaining: 12 }] } });
+			const user = (await (
+				await appForRole("user").request("/api/quota-snapshots")
+			).json()) as QuotaSnapshotsResponse;
+			const anonymous = user.entries.filter((entry) => entry.groupId === provider.id);
+			expect(anonymous.find((entry) => entry.source === "probe")).toMatchObject({
+				credentialId: null,
+				primary: true,
+			});
+			expect(anonymous.find((entry) => entry.source === "quota_balance")).toMatchObject({
+				credentialId: null,
+				primary: true,
+				snapshot: { balances: [{ unit: "", remaining: 7 }] },
+			});
+			expect(anonymous).toHaveLength(2);
+			expect(anonymous.every((entry) => entry.credentialId === null)).toBe(true);
+			expect(JSON.stringify(anonymous)).not.toContain(second.id);
+			expect(JSON.stringify(anonymous)).not.toMatch(/second-relay-secret|key-current|detail/);
+			store.update(second.id, { apiKey: "replaced-second-secret" });
+			const replaced = (await (
+				await appForRole("user").request("/api/quota-snapshots")
+			).json()) as QuotaSnapshotsResponse;
+			expect(
+				replaced.entries.filter(
+					(entry) => entry.groupId === provider.id && entry.source === "quota_balance",
+				),
+			).toEqual([]);
+		} finally {
+			store.update(first.id, { disabled: false });
+			store.remove(second.id);
+			quotaStore.remove(first.id, STREAM_QUOTA_SOURCE);
+			quotaStore.remove(second.id, STREAM_QUOTA_SOURCE);
+		}
 	});
 	test("only administrators may explicitly refresh saved relay configurations", async () => {
 		expect((await refresh(appForRole("user"))).status).toBe(403);

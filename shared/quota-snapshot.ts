@@ -34,6 +34,8 @@ export interface QuotaSnapshot {
 	balances: QuotaBalance[];
 	/** Plan tier, when the upstream names one. */
 	plan?: string;
+	/** Epoch ms when the allowance expires; distinct from a window's refill time. */
+	expiresAt?: number;
 	/** Template-private original data. */
 	detail?: unknown;
 }
@@ -51,6 +53,8 @@ export interface QuotaSnapshotEntry {
 	source?: "probe" | "quota_balance";
 	/** Omitted while support is unknown; false is not a zero allowance. */
 	supported?: boolean;
+	/** The relay credential currently selected for the group summary, not its first key. */
+	primary?: boolean;
 	refreshing?: boolean;
 	/** CLI-only Command Code has no cache; an active view may request a one-shot refresh. */
 	refreshOnRead?: boolean;

@@ -69,7 +69,7 @@ export async function invalidateQuotaSnapshots(client: QueryClient): Promise<voi
 	await client.invalidateQueries({ queryKey: quotaSnapshotsKey });
 }
 
-/** Probe results win only when they contain usable quota data; otherwise keep the stream. */
+/** A probe's known validity deadline is authoritative even without numbers; otherwise use data. */
 export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshotEntry[] {
 	const selected = new Map<string, QuotaSnapshotEntry>();
 	for (const entry of entries) {
@@ -77,9 +77,10 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 		const previous = selected.get(key);
 		const hasData = (value: QuotaSnapshotEntry) =>
 			!!value.snapshot &&
-			(value.snapshot.windows.some(
-				(window) => window.usedRatio != null && Number.isFinite(window.usedRatio),
-			) ||
+			(Number.isFinite(value.snapshot.expiresAt) ||
+				value.snapshot.windows.some(
+					(window) => window.usedRatio != null && Number.isFinite(window.usedRatio),
+				) ||
 				value.snapshot.balances.some(
 					(balance) =>
 						balance.unlimited || (balance.remaining != null && Number.isFinite(balance.remaining)),

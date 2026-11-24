@@ -93,6 +93,46 @@ test("public totals retain total and consumed amounts without losing micro-unit 
 	}
 });
 
+test("expired allowances hide spendable numbers without fabricating zero or a reset", () => {
+	const value = { ...snapshot, expiresAt: 2_000 };
+	const before = quotaSnapshotView(value, "Provider", t, 1_999);
+	expect(before.windows[0]?.remainingPercent).toBe(20);
+	expect(before.rows.some((row) => row.label === "Expires at")).toBe(true);
+	const expired = quotaSnapshotView(value, "Provider", t, 2_000);
+	expect(expired.unavailableText).toBe("Subscription expired");
+	expect(expired.level).toBe("exhausted");
+	expect(expired.windows).toEqual([]);
+	expect(expired.rows.map((row) => row.label)).toEqual(["Plan", "Expires at"]);
+	expect(quotaSnapshotText(value, t, 2_000).balance).toBe("Subscription expired");
+	expect(quotaSnapshotText(value, t, 2_000).detailsText).not.toContain("USD");
+	expect(snapshot.balances[0]?.remaining).toBe(9.999999);
+	for (const expiresAt of [undefined, Number.NaN]) {
+		const unknownExpiry = quotaSnapshotView({ ...snapshot, expiresAt }, "Provider", t, 9_000);
+		expect(unknownExpiry.windows.length).toBe(2);
+		expect(unknownExpiry.unavailableText).not.toContain("expired");
+	}
+});
+
+test("named periods stay distinct and do not invent reset times", () => {
+	const view = quotaSnapshotView(
+		{
+			...snapshot,
+			balances: [],
+			windows: [
+				{ kind: "other", label: "daily", usedRatio: 0.3, resetsAt: null },
+				{ kind: "weekly", label: "weekly", usedRatio: 0.5, resetsAt: null },
+				{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+			],
+		},
+		"Provider",
+		t,
+		1_000,
+	);
+	expect(view.windows.map((window) => window.label)).toEqual(["Daily", "Weekly", "Monthly"]);
+	expect(view.windows.map((window) => window.resetAt)).toEqual([null, null, null]);
+	expect(view.windows[2]?.remainingPercent).toBeNull();
+});
+
 test("clamps out-of-range windows and leaves non-finite numbers unknown", () => {
 	const view = quotaSnapshotView(
 		{

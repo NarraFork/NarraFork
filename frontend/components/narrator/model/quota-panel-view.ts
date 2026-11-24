@@ -68,6 +68,8 @@ export interface QuotaPanelView {
 	level: QuotaLevel;
 	/** Extra label/value rows under the windows (balance, monthly credits …). */
 	rows: Array<{ label: string; value: string }>;
+	/** A known validity deadline passed; this is not a missing or zero-valued allowance. */
+	expired?: boolean;
 	/** The last refresh failed; any numbers shown are from an earlier fetch. */
 	failed: boolean;
 	/** Why it failed, when the viewer may see it (admins only). */

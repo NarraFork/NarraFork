@@ -123,11 +123,15 @@ function QuotaDetails({
 					{waitingText}
 				</Text>
 			)}
-			{view.windows.length === 0 && (
+			{view.expired ? (
+				<Text size="xs" c="red">
+					{t("quotaSnapshot.expired")}
+				</Text>
+			) : view.windows.length === 0 ? (
 				<Text size="xs" c="dimmed">
 					{t("quotaPanel.noWindows")}
 				</Text>
-			)}
+			) : null}
 			{view.windows.map((window) => (
 				<WindowRow key={window.id} window={window} now={now} locale={i18n.language} />
 			))}
