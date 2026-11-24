@@ -11,10 +11,12 @@
  * functions with `gitService`'s read bounds (60 s, 1 MB).
  *
  * `changedPaths` (X) lists what a branch changed since its merge base with the base: a diff of
- * two commits, which never reads the working tree, the index or a filter. `branchFileChanges`
- * and `treeFiles` feed the knowledge check of `work.ready` (`team-knowledge.ts`): the full,
- * uncollapsed listing with what was added, and the files a commit holds under a directory. Both
- * read commits only and fail rather than return a partial listing.
+ * two commits, which never reads the working tree, the index or a filter. `branchFileChanges`,
+ * `treeEntry`, `treeBlobs` and `readBlob` feed the knowledge check of `work.ready`
+ * (`team-knowledge.ts`): the full, uncollapsed listing with what was added, one path of a commit,
+ * the files (with blob ids and sizes) a commit holds under a directory, and one blob's bytes.
+ * All of them read commits and objects only, never the working tree, and fail rather than return
+ * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
 import { isAbsolute, resolve } from "node:path";
 import {
@@ -53,6 +55,10 @@ const TOP_LEVEL_LISTING_MAX_BYTES = 256 * 1024;
 const FILE_CHANGES_MAX_BYTES = READ_MAX_OUTPUT_BYTES;
 /** Tree listing cap for the knowledge check: over it, the check fails. */
 const TREE_LISTING_MAX_BYTES = 512 * 1024;
+/** One-path `ls-tree` cap (a single record). */
+const TREE_ENTRY_MAX_BYTES = 16 * 1024;
+/** Stderr kept from a blob read. */
+const BLOB_STDERR_MAX_BYTES = 16 * 1024;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 async function spawnGit(
@@ -60,6 +66,7 @@ async function spawnGit(
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
 	maxOutputBytes: number,
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
 ) {
 	await ensureConfigOverridesHonored();
 	const result = await safeSpawn({
@@ -78,6 +85,7 @@ async function spawnGit(
 		},
 		timeout: READ_TIMEOUT_MS,
 		maxOutputBytes,
+		...(stdoutStream ? { stdoutStream, maxStderrBytes: BLOB_STDERR_MAX_BYTES } : {}),
 		killProcessTree: true,
 	});
 	return {
@@ -118,6 +126,24 @@ export interface BranchFileChanges {
 	added: string[];
 }
 
+/** One entry of a commit's tree (`ls-tree -l`). */
+export interface TreeEntry {
+	path: string;
+	/** `100644`, `100755`, `120000` (symlink), `040000` (tree), `160000` (submodule). */
+	mode: string;
+	type: string;
+	oid: string;
+	/** Bytes of a blob; null for a tree or a submodule. */
+	size: number | null;
+}
+
+/** A regular file of a commit: blob mode 100644 or 100755 (no symlink, no submodule). */
+export interface TreeBlob {
+	path: string;
+	oid: string;
+	size: number;
+}
+
 /** One worktree's hardened, read-only git: G1's queries. */
 export interface TeamGit {
 	resolveCommit(ref: string): Promise<string | null>;
@@ -125,23 +151,35 @@ export interface TeamGit {
 	countCommitsNotIn(tip: string, reachableFrom: readonly string[]): Promise<number>;
 	uncommittedChanges(): Promise<{ count: number; exact: boolean }>;
 	/**
-	 * Paths changed between the merge base of HEAD and `baseRef`, and HEAD (`diff --name-only
-	 * --no-renames`: a rename counts as both paths). Null when either does not resolve or the
-	 * histories are unrelated.
+	 * Paths changed between the merge base of the head and `baseRef`, and the head (`diff
+	 * --name-only --no-renames`: a rename counts as both paths). The head is `at` (a full commit
+	 * SHA) when given, else HEAD as it is now. Null when either does not resolve or the histories
+	 * are unrelated.
 	 */
-	changedPaths(baseRef: string): Promise<ChangedPaths | null>;
+	changedPaths(baseRef: string, at?: string): Promise<ChangedPaths | null>;
 	/**
-	 * Every path changed between the merge base of HEAD and `baseRef`, and HEAD, with the added
-	 * ones (`diff --name-status --no-renames`). Null when either does not resolve or the
-	 * histories are unrelated; throws when git fails or the listing is over its byte cap.
+	 * Every path changed between the merge base of `head` (a full commit SHA) and `baseRef`, and
+	 * `head`, with the added ones (`diff --name-status --no-renames`). Null when the base does not
+	 * resolve or the histories are unrelated; throws when git fails or the listing is over its
+	 * byte cap.
 	 */
-	branchFileChanges(baseRef: string): Promise<BranchFileChanges | null>;
+	branchFileChanges(baseRef: string, head: string): Promise<BranchFileChanges | null>;
+	/**
+	 * The entry at exactly `path` (repository-relative, no trailing `/`) of a commit, or null
+	 * when the commit has nothing there. Lists one level only, whatever `path` is.
+	 */
+	treeEntry(commit: string, path: string): Promise<TreeEntry | null>;
 	/**
 	 * The regular files (blob modes 100644/100755; no symlink or submodule) a commit holds under
-	 * `dir` (a repository-relative directory ending in `/`), sorted. Throws when git fails or the
-	 * listing is over its byte cap.
+	 * `dir` (a repository-relative directory ending in `/`), with blob ids and sizes, sorted by
+	 * path. Throws when git fails or the listing is over its byte cap.
 	 */
-	treeFiles(commit: string, dir: string): Promise<string[]>;
+	treeBlobs(commit: string, dir: string): Promise<TreeBlob[]>;
+	/**
+	 * The bytes of one blob (`cat-file blob`, no filter or textconv), decoded as UTF-8. `size` is
+	 * the blob's size from a listing: reading stops past it, and any other length throws.
+	 */
+	readBlob(oid: string, size: number): Promise<string>;
 }
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -154,8 +192,19 @@ function nulRecords(stdout: string, truncated: boolean): string[] {
 	return records;
 }
 
-async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<ChangedPaths | null> {
-	const head = await resolveCommit(run, "HEAD");
+/** `at` (a full commit SHA) when given, else HEAD as it is now. */
+async function headAt(run: GitQueryRunner, at: string | undefined): Promise<string | null> {
+	if (at === undefined) return resolveCommit(run, "HEAD");
+	if (!SHA.test(at)) throw new GitError("Expected a full commit SHA");
+	return at;
+}
+
+async function changedPathsOf(
+	run: GitQueryRunner,
+	baseRef: string,
+	at?: string,
+): Promise<ChangedPaths | null> {
+	const head = await headAt(run, at);
 	const base = await resolveCommit(run, baseRef);
 	if (!head || !base) return null;
 	const fork = await mergeBase(run, head, base);
@@ -200,8 +249,9 @@ async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<Cha
 async function branchFileChangesOf(
 	run: GitQueryRunner,
 	baseRef: string,
+	at: string,
 ): Promise<BranchFileChanges | null> {
-	const head = await resolveCommit(run, "HEAD");
+	const head = await headAt(run, at);
 	const base = await resolveCommit(run, baseRef);
 	if (!head || !base) return null;
 	const fork = await mergeBase(run, head, base);
@@ -227,24 +277,84 @@ async function branchFileChangesOf(
 	return { head, mergeBase: fork, changed: [...changed].sort(), added: [...added].sort() };
 }
 
-async function treeFilesOf(run: GitQueryRunner, commit: string, dir: string): Promise<string[]> {
+function assertRelativePath(path: string): void {
+	if (!path || path.startsWith("/") || path.startsWith("-") || path.split("/").includes(".."))
+		throw new GitError("Expected a repository-relative path");
+}
+
+/** `<mode> SP <type> SP <object> SP+ <size> TAB <path>` (`ls-tree -l -z`). */
+function treeEntryOf(record: string): TreeEntry {
+	const tab = record.indexOf("\t");
+	const [mode, type, oid, size, extra] = record.slice(0, Math.max(0, tab)).split(/ +/);
+	if (tab < 0 || !mode || !type || !oid || !size || extra !== undefined || !SHA.test(oid))
+		throw new GitError("git ls-tree returned an unreadable listing");
+	const bytes = size === "-" ? null : Number(size);
+	if (bytes !== null && !(Number.isSafeInteger(bytes) && bytes >= 0))
+		throw new GitError("git ls-tree returned an unreadable listing");
+	return { path: record.slice(tab + 1), mode, type, oid, size: bytes };
+}
+
+const isRegularBlob = (entry: TreeEntry): entry is TreeEntry & { size: number } =>
+	entry.type === "blob" &&
+	(entry.mode === "100644" || entry.mode === "100755") &&
+	entry.size !== null;
+
+async function treeEntryAt(
+	run: GitQueryRunner,
+	commit: string,
+	path: string,
+): Promise<TreeEntry | null> {
 	if (!SHA.test(commit)) throw new GitError("Expected a full commit SHA");
-	if (!dir.endsWith("/") || dir.startsWith("/") || dir.startsWith("-") || dir.includes(".."))
-		throw new GitError("Expected a repository-relative directory");
-	const listing = await run(["ls-tree", "-r", "-z", "--full-tree", commit, "--", dir], {
+	assertRelativePath(path);
+	if (path.endsWith("/")) throw new GitError("Expected a path without a trailing /");
+	// Without `-r` a directory is listed as its own entry, never descended into.
+	const listing = await run(["ls-tree", "-l", "-z", "--full-tree", commit, "--", path], {
+		maxOutputBytes: TREE_ENTRY_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not read ${path}`);
+	if (listing.truncated) throw new GitError(`git ls-tree listed more than ${path}`);
+	const entries = nulRecords(listing.stdout, false).map(treeEntryOf);
+	return entries.find((entry) => entry.path === path) ?? null;
+}
+
+async function treeBlobsOf(run: GitQueryRunner, commit: string, dir: string): Promise<TreeBlob[]> {
+	if (!SHA.test(commit)) throw new GitError("Expected a full commit SHA");
+	assertRelativePath(dir);
+	if (!dir.endsWith("/")) throw new GitError("Expected a repository-relative directory");
+	const listing = await run(["ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", dir], {
 		maxOutputBytes: TREE_LISTING_MAX_BYTES,
 	});
 	if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not list ${dir}`);
 	if (listing.truncated) throw new GitError(`${dir} holds more files than the listing reads`);
-	const files: string[] = [];
-	// `<mode> SP <type> SP <object> TAB <path>` per record.
+	const files: TreeBlob[] = [];
 	for (const record of nulRecords(listing.stdout, false)) {
-		const tab = record.indexOf("\t");
-		if (tab < 0) throw new GitError("git ls-tree returned an unreadable listing");
-		const mode = record.slice(0, record.indexOf(" "));
-		if (mode === "100644" || mode === "100755") files.push(record.slice(tab + 1));
+		const entry = treeEntryOf(record);
+		if (isRegularBlob(entry)) files.push({ path: entry.path, oid: entry.oid, size: entry.size });
 	}
-	return files.sort();
+	return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+async function readBlobOf(
+	cwd: string,
+	config: ReadonlyArray<readonly [string, string]>,
+	oid: string,
+	size: number,
+): Promise<string> {
+	if (!SHA.test(oid)) throw new GitError("Expected a full object id");
+	if (!Number.isSafeInteger(size) || size < 0) throw new GitError("Expected a blob size");
+	const chunks: Buffer[] = [];
+	// Raw bytes, at most one past the size: a longer blob is cut off and refused.
+	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, {
+		maxBytes: size + 1,
+		onChunk: (chunk) => {
+			chunks.push(Buffer.from(chunk));
+			return true;
+		},
+	});
+	const bytes = Buffer.concat(chunks);
+	if (result.exitCode !== 0 || result.truncated || bytes.byteLength !== size)
+		throw new GitError(`git cat-file could not read blob ${oid}`);
+	return bytes.toString("utf8");
 }
 
 export function teamGit(cwd: string): TeamGit {
@@ -268,9 +378,11 @@ export function teamGit(cwd: string): TeamGit {
 		isAncestor: (ancestor, descendant) => isAncestor(run, ancestor, descendant),
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
-		changedPaths: (baseRef) => changedPathsOf(run, baseRef),
-		branchFileChanges: (baseRef) => branchFileChangesOf(run, baseRef),
-		treeFiles: (commit, dir) => treeFilesOf(run, commit, dir),
+		changedPaths: (baseRef, at) => changedPathsOf(run, baseRef, at),
+		branchFileChanges: (baseRef, head) => branchFileChangesOf(run, baseRef, head),
+		treeEntry: (commit, path) => treeEntryAt(run, commit, path),
+		treeBlobs: (commit, dir) => treeBlobsOf(run, commit, dir),
+		readBlob: async (oid, size) => readBlobOf(cwd, await config(), oid, size),
 	};
 }
 

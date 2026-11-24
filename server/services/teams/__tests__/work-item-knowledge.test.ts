@@ -2,21 +2,25 @@
  * The knowledge check of `work.ready` (`team-knowledge.ts`), against the migrated test database
  * and real git repositories: a branch that changes code a node anchors must update the node in
  * the same branch, and a source file it adds must be anchored; a repository without
- * `knowledge/index.md` is not checked; a check that cannot run refuses instead of passing.
+ * `knowledge/index.md` is not checked; a check that cannot run refuses instead of passing; and
+ * readiness is checked and recorded at one pinned head commit.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { eq } from "drizzle-orm";
+import { dirname, isAbsolute, join } from "node:path";
+import { and, eq } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
-import { narratorWorktreeResources, teamWorkItems } from "../../../db/schema";
+import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { teamTool } from "../../../lib/agent/tools/team";
 import type { ToolContext } from "../../../lib/agent/types";
 import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
+import { teamGit } from "../team-git";
 import { setKnowledgeCheckLimitsForTests } from "../team-knowledge";
+import { setChangedPathsSourceForTests } from "../team-overlap";
 import {
 	createWorkItem,
 	markReady,
@@ -37,11 +41,11 @@ const NOW = "2026-11-24T00:00:00.000Z";
 let temporary: string;
 let source: string;
 
-async function git(args: string[], cwd = source) {
+async function git(args: string[], cwd = source, maxOutputBytes = 1024 * 1024) {
 	const result = await safeSpawn({
 		cmd: ["git", "-C", cwd, "-c", "user.name=T", "-c", "user.email=t@e.test", ...args],
-		timeout: 10_000,
-		maxOutputBytes: 1024 * 1024,
+		timeout: 30_000,
+		maxOutputBytes,
 	});
 	if (result.exitCode !== 0) throw new Error(result.stderr);
 	return result.stdout.trim();
@@ -131,6 +135,36 @@ async function refusal(itemId: string): Promise<AppError> {
 const stateOf = (id: string) =>
 	db.select().from(teamWorkItems).where(eq(teamWorkItems.id, id)).get()?.state;
 
+const readyEvents = (id: string) =>
+	db
+		.select()
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.workItemId, id), eq(teamWorkEvents.kind, "work.ready")))
+		.all();
+
+/**
+ * The worker commits once more in `worktree` after the knowledge check, while `work.ready` reads
+ * the changed paths (the real hardened git otherwise).
+ */
+function commitDuringReady(worktree: string, files: Record<string, string>) {
+	let done = false;
+	setChangedPathsSourceForTests((at) => {
+		const real = teamGit(at);
+		return {
+			head: () => real.resolveCommit("HEAD"),
+			resolve: (ref) => real.resolveCommit(ref),
+			isAncestor: (ancestor, descendant) => real.isAncestor(ancestor, descendant),
+			changed: async (baseRef, commitSha) => {
+				if (at === worktree && !done) {
+					done = true;
+					await commit(at, files, "after the check");
+				}
+				return real.changedPaths(baseRef, commitSha);
+			},
+		};
+	});
+}
+
 beforeAll(() => setWorkItemPortsForTests(ports));
 afterAll(() => {
 	setWorkItemPortsForTests(null);
@@ -175,6 +209,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	setKnowledgeCheckLimitsForTests(null);
+	setChangedPathsSourceForTests(null);
 	for (const table of [
 		"team_work_events",
 		"team_work_items",
@@ -357,6 +392,51 @@ describe("work.ready knowledge check", () => {
 		expect((await ready(work.id)).item.state).toBe("ready");
 	});
 
+	test("a large knowledge/ without index.md is skipped without listing it", async () => {
+		// Long names: the recursive listing of knowledge/ is past the 512 KiB listing cap.
+		const files: Record<string, string> = {};
+		for (let index = 0; index < 2200; index++)
+			files[`knowledge/big/${"n".repeat(200)}-${String(index).padStart(4, "0")}.md`] = "x\n";
+		await commit(source, files, "a big knowledge directory without a root node");
+		const listing = await git(["ls-tree", "-r", "-z", "HEAD", "--", "knowledge/"], source, 4e6);
+		expect(Buffer.byteLength(listing)).toBeGreaterThan(512 * 1024);
+		const work = await item();
+		await commit(work.path, { "server/new.ts": "export {};\n" }, "change");
+		expect((await ready(work.id)).item.state).toBe("ready");
+	});
+
+	test("an oversized node blob fails closed before any blob is read", async () => {
+		await commit(source, TREE, "tree");
+		const work = await item();
+		const big = `${node("api", ["server/api.ts", "shared/types/"], "abc123")}\n${randomBytes(150_000).toString("base64")}\n`;
+		await commit(
+			work.path,
+			{ "server/api.ts": "export const api = 2;\n", "knowledge/api.md": big },
+			"grow the node",
+		);
+		// Make the blob unreadable while its size stays listed: had the check read it before
+		// enforcing the byte cap, it would fail on the read instead.
+		const oid = await git(["rev-parse", "HEAD:knowledge/api.md"], work.path);
+		const common = await git(["rev-parse", "--git-common-dir"], work.path);
+		const objects = join(isAbsolute(common) ? common : join(work.path, common), "objects");
+		const loose = join(objects, oid.slice(0, 2), oid.slice(2));
+		const bytes = await readFile(loose);
+		await chmod(loose, 0o644);
+		await writeFile(loose, bytes.subarray(0, 100));
+		await expect(git(["cat-file", "blob", oid], work.path)).rejects.toThrow();
+
+		setKnowledgeCheckLimitsForTests({ maxNodeBytes: 100_000 });
+		const capped = await refusal(work.id);
+		expect(capped.code).toBe("TEAM_KNOWLEDGE_CHECK_UNAVAILABLE");
+		expect(capped.message).toContain("bytes of node files (knowledge/api.md is");
+		// Under the cap the blob is read, and a read that fails fails closed too.
+		setKnowledgeCheckLimitsForTests(null);
+		const unreadable = await refusal(work.id);
+		expect(unreadable.code).toBe("TEAM_KNOWLEDGE_CHECK_UNAVAILABLE");
+		expect(unreadable.message).toContain("cat-file");
+		expect(stateOf(work.id)).toBe("in_review");
+	});
+
 	test("uncommitted changes are refused as DIRTY before the knowledge check", async () => {
 		await commit(source, TREE, "tree");
 		const work = await item();
@@ -364,4 +444,49 @@ describe("work.ready knowledge check", () => {
 		await write(work.path, "server/api.ts", "export const api = 3;\n");
 		expect((await refusal(work.id)).code).toBe("TEAM_WORK_ITEM_DIRTY");
 	});
+});
+
+describe("work.ready pins one head commit", () => {
+	for (const withTree of [false, true])
+		test(`a commit made after the check is refused, not recorded (${withTree ? "with" : "without"} a knowledge tree)`, async () => {
+			if (withTree) await commit(source, TREE, "tree");
+			const work = await item();
+			await commit(
+				work.path,
+				withTree
+					? {
+							"server/api.ts": "export const api = 2;\n",
+							"knowledge/api.md": node("api", ["server/api.ts", "shared/types/"], "abc123"),
+						}
+					: { "server/api.ts": "export const api = 2;\n" },
+				"checked",
+			);
+			const checked = await git(["rev-parse", "HEAD"], work.path);
+			// The later commit adds a source file no node anchors: stale, had it been checked.
+			commitDuringReady(work.path, { "server/later.ts": "export {};\n" });
+			const error = await refusal(work.id);
+			const moved = await git(["rev-parse", "HEAD"], work.path);
+			expect(moved).not.toBe(checked);
+			expect(error.statusCode).toBe(409);
+			expect(error.code).toBe("TEAM_WORK_ITEM_HEAD_MOVED");
+			expect(error.message).toContain(checked.slice(0, 12));
+			expect(error.message).toContain(moved.slice(0, 12));
+			const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, work.id)).get();
+			expect(row?.state).toBe("in_review");
+			expect(row?.headSha).not.toBe(moved);
+			expect(row?.changedPathsAtSha ?? null).not.toBe(moved);
+			expect(readyEvents(work.id)).toHaveLength(0);
+
+			// Asked again, the new head is the one checked.
+			setChangedPathsSourceForTests(null);
+			if (withTree) {
+				expect((await refusal(work.id)).code).toBe("TEAM_WORK_ITEM_KNOWLEDGE_STALE");
+				return;
+			}
+			const result = await ready(work.id);
+			expect(result.item.state).toBe("ready");
+			expect(result.item.headSha).toBe(moved);
+			expect(result.item.changedPathsAtSha).toBe(moved);
+			expect(readyEvents(work.id).map((event) => event.detailJson?.head)).toEqual([moved]);
+		});
 });

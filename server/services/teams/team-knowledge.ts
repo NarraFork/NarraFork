@@ -2,23 +2,24 @@
  * The knowledge check of `work.ready`: a work item's branch must not leave the repository's
  * knowledge tree (`knowledge/`, conventions in `knowledge/README.md`) stale.
  *
- * On the item's branch, against the merge base of the branch and its base commit:
- * - a node (as it is at the branch head) one of whose anchors matches a changed path needs the
- *   node file changed in the same branch (touching it counts, even only `verified_at`);
+ * Everything is read at one head commit `work.ready` pinned (`head`), against the merge base of
+ * that commit and the item's base commit:
+ * - a node (as it is at the head) one of whose anchors matches a changed path needs the node
+ *   file changed in the same branch (touching it counts, even only `verified_at`);
  * - a source file the branch added under `server/`, `frontend/` or `shared/` needs a node that
  *   anchors it.
- * Either gap refuses readiness with 409 `TEAM_WORK_ITEM_KNOWLEDGE_STALE`. A repository without
- * `knowledge/index.md` at the head has no tree and is not checked.
+ * Either gap refuses readiness with 409 `TEAM_WORK_ITEM_KNOWLEDGE_STALE`. A head without a
+ * regular file at exactly `knowledge/index.md` has no tree and is not checked; that is decided
+ * before anything under `knowledge/` is listed.
  *
- * Git is read only through the hardened `team-git.ts` (two-commit diff and a tree listing). Node
- * files are read from the worktree, which `work.ready` has just found clean, asynchronously and
- * within hard caps on file count, bytes and matching work. The check fails closed: when it cannot
- * run (git error, unreadable or oversized tree, a branch that moved), readiness is refused with
- * 409 `TEAM_KNOWLEDGE_CHECK_UNAVAILABLE`, never passed. The rules themselves (header parsing,
- * anchor matching, source files) are `shared/knowledge-tree.ts`, the same as the tool's.
+ * Git is read only through the hardened `team-git.ts`: one tree entry, a two-commit diff, a tree
+ * listing with blob sizes, and the node blobs themselves, never the worktree. The count and byte
+ * caps are enforced on the listed sizes before any blob is read, and each read stops past its
+ * blob's size; matching work is capped too. The check fails closed: when it cannot run (git
+ * error, oversized tree or listing), readiness is refused with 409
+ * `TEAM_KNOWLEDGE_CHECK_UNAVAILABLE`, never passed. The rules themselves (header parsing, anchor
+ * matching, source files) are `shared/knowledge-tree.ts`, the same as the tool's.
  */
-import { lstat, readFile } from "node:fs/promises";
-import { join } from "node:path";
 import {
 	indexAnchors,
 	isNodeFile,
@@ -30,7 +31,7 @@ import {
 	parseNode,
 } from "@shared/knowledge-tree";
 import { AppError } from "../../lib/errors";
-import { teamGit } from "./team-git";
+import { type TeamGit, type TreeBlob, teamGit } from "./team-git";
 
 /** At most this many node files are read; a larger tree fails the check. */
 export const KNOWLEDGE_CHECK_MAX_NODE_FILES = 2000;
@@ -45,7 +46,7 @@ export const KNOWLEDGE_CHECK_MAX_MATCH_TESTS = 250_000;
 export const KNOWLEDGE_STALE_LIST_MAX = 20;
 /** Changed files listed per node in the refusal; the rest are counted. */
 export const KNOWLEDGE_STALE_FILES_PER_NODE = 10;
-/** Node files read at once. */
+/** Node blobs read at once. */
 const READ_CONCURRENCY = 16;
 
 const DEFAULT_LIMITS = {
@@ -86,41 +87,32 @@ function unavailable(itemId: string, reason: string): AppError {
 	);
 }
 
-/** Read and parse the node files at the worktree, within the caps. */
-async function readNodes(worktree: string, files: readonly string[]): Promise<KnowledgeNode[]> {
+/** Refuse a node listing over the count or byte caps, from the listed sizes alone. */
+function assertWithinReadCaps(files: readonly TreeBlob[]): void {
 	if (files.length > limits.maxNodeFiles)
 		throw new KnowledgeCheckUnavailable(
 			`${KNOWLEDGE_DIR}/ holds ${files.length} node files, over the check's limit of ${limits.maxNodeFiles}`,
 		);
 	let bytes = 0;
-	const overBytes = () =>
-		new KnowledgeCheckUnavailable(
-			`${KNOWLEDGE_DIR}/ holds more than ${limits.maxNodeBytes} bytes of node files, over the check's limit`,
-		);
+	for (const file of files) {
+		bytes += file.size;
+		if (bytes > limits.maxNodeBytes)
+			throw new KnowledgeCheckUnavailable(
+				`${KNOWLEDGE_DIR}/ holds more than ${limits.maxNodeBytes} bytes of node files (${file.path} is ${file.size} bytes), over the check's limit`,
+			);
+	}
+}
+
+/** Read and parse the node blobs of the head; call it only after {@link assertWithinReadCaps}. */
+async function readNodes(git: TeamGit, files: readonly TreeBlob[]): Promise<KnowledgeNode[]> {
 	const nodes: KnowledgeNode[] = [];
 	for (let start = 0; start < files.length; start += READ_CONCURRENCY) {
 		const batch = files.slice(start, start + READ_CONCURRENCY);
 		const texts = await Promise.all(
-			batch.map(async (file) => {
-				const absolute = join(worktree, file);
-				const stat = await lstat(absolute).catch(() => null);
-				// The listing names regular files at the head and the worktree is clean, so anything
-				// else here means the worktree changed under the check.
-				if (!stat?.isFile())
-					throw new KnowledgeCheckUnavailable(`${file} is not a readable file in the worktree`);
-				bytes += stat.size;
-				if (bytes > limits.maxNodeBytes) throw overBytes();
-				const text = await readFile(absolute, "utf8").catch(() => {
-					throw new KnowledgeCheckUnavailable(`${file} could not be read`);
-				});
-				// Grown between the stat and the read: count what was read.
-				const extra = Buffer.byteLength(text, "utf8") - stat.size;
-				if (extra > 0) {
-					bytes += extra;
-					if (bytes > limits.maxNodeBytes) throw overBytes();
-				}
-				return { file, text };
-			}),
+			batch.map(async (file) => ({
+				file: file.path,
+				text: await git.readBlob(file.oid, file.size),
+			})),
 		);
 		for (const { file, text } of texts) {
 			// A Markdown file without a node header anchors nothing (`check` reports it).
@@ -172,35 +164,39 @@ function staleError(itemId: string, gaps: KnowledgeGaps, details: KnowledgeStale
 }
 
 /**
- * Refuse readiness when the item's branch leaves the knowledge tree stale (see the module
- * comment). Call it only on a clean worktree. Resolves when there is no tree or nothing is stale;
- * throws `TEAM_WORK_ITEM_KNOWLEDGE_STALE` or `TEAM_KNOWLEDGE_CHECK_UNAVAILABLE` otherwise.
+ * Refuse readiness when the branch at `head` leaves the knowledge tree stale (see the module
+ * comment). `head` is the commit `work.ready` pinned; the worktree's files are never read, only
+ * git objects. Resolves when there is no tree or nothing is stale; throws
+ * `TEAM_WORK_ITEM_KNOWLEDGE_STALE` or `TEAM_KNOWLEDGE_CHECK_UNAVAILABLE` otherwise.
  */
 export async function assertKnowledgeFresh(input: {
 	itemId: string;
 	worktree: string;
+	head: string;
 	baseRef: string;
 }): Promise<KnowledgeCheckResult> {
 	const git = teamGit(input.worktree);
+	const head = input.head;
 	let gaps: KnowledgeGaps;
-	let head: string;
 	let mergeBase: string;
 	let nodeCount: number;
 	try {
-		const resolved = await git.resolveCommit("HEAD");
-		if (!resolved) throw new KnowledgeCheckUnavailable("the worktree's HEAD does not resolve");
-		head = resolved;
-		const treeFiles = await git.treeFiles(head, `${KNOWLEDGE_DIR}/`);
-		if (!treeFiles.includes(KNOWLEDGE_INDEX)) return { checked: false };
-		const changes = await git.branchFileChanges(input.baseRef);
+		// The marker first, by its exact path: a large knowledge/ without it is never listed.
+		const marker = await git.treeEntry(head, KNOWLEDGE_INDEX);
+		const isRegularFile =
+			marker?.type === "blob" && (marker.mode === "100644" || marker.mode === "100755");
+		if (!isRegularFile) return { checked: false };
+		const files = (await git.treeBlobs(head, `${KNOWLEDGE_DIR}/`)).filter((file) =>
+			isNodeFile(file.path),
+		);
+		assertWithinReadCaps(files);
+		const changes = await git.branchFileChanges(input.baseRef, head);
 		if (!changes)
 			throw new KnowledgeCheckUnavailable(
 				`the base ${input.baseRef} does not resolve to a commit sharing history with the branch`,
 			);
-		if (changes.head !== head)
-			throw new KnowledgeCheckUnavailable("the branch moved while it was checked");
 		mergeBase = changes.mergeBase;
-		const nodes = await readNodes(input.worktree, treeFiles.filter(isNodeFile));
+		const nodes = await readNodes(git, files);
 		nodeCount = nodes.length;
 		const index = indexAnchors(nodes);
 		const tests = (changes.changed.length + changes.added.length) * index.patternAnchors;
