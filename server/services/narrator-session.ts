@@ -10130,7 +10130,7 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 	const { recoverPermissionRuleRequests } = await import("./permission-rule-request-service");
 	let after: string | undefined;
 	do {
-		const page = recoverPermissionRuleRequests({
+		const page = await recoverPermissionRuleRequests({
 			after,
 			limit: 100,
 			reason: "Interrupted by server restart",
