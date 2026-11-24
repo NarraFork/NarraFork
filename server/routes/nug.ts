@@ -31,10 +31,17 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { listCachedTemplateModels } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
 
 export const nugRoutes = new Hono();
 export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
+
+registerModelListReader("nug", (group) =>
+	getNugCachedModelsByProvider(group.id).map((model) => String(model.id ?? "")),
+);
 
 function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 	return (baseUrl ?? "")
@@ -520,9 +527,21 @@ nugRoutes.post("/models/refresh-if-stale", async (c) => {
 	});
 });
 
-nugRoutes.get("/providers/:id/models", (c) => {
+nugRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getNugCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? nugProviderPrefix(config) : id },
+		"nug",
+	);
+	return c.json({
+		models: await listCachedTemplateModels(
+			group,
+			getNugCachedModelsByProvider(id),
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 nugRoutes.post("/providers/:id/models/refresh", async (c) => {
