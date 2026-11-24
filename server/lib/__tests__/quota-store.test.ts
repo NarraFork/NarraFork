@@ -3,7 +3,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { getNarraforkPath } from "../narrafork-home";
 import { createPersistedCredentialCache } from "../persisted-credential-cache";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
-import { importLegacyQuotaCache, QuotaStore, quotaStore } from "../sourcing/quota-store";
+import {
+	importLegacyQuotaCache,
+	QuotaStore,
+	quotaStore,
+	STREAM_QUOTA_SOURCE,
+} from "../sourcing/quota-store";
 
 const snapshot = (usedRatio: number | null, resetsAt: number | null) => ({
 	fetchedAt: 100,
@@ -35,6 +40,31 @@ describe("quota store", () => {
 		expect(store.get("key-2", "identity-a")).toBeDefined();
 		expect(store.get("key-2", "identity-b")).toBeUndefined();
 		expect(store.peek("key-2")).toBeUndefined();
+	});
+
+	test("probe and stream snapshots coexist under one credential and purge independently", async () => {
+		const file = `quota-store-sources-${crypto.randomUUID()}.json`;
+		const store = new QuotaStore(createPersistedCredentialCache(file, (raw) => raw as never));
+		store.set("key-sources", "probe-identity", snapshot(1, 500));
+		store.set(
+			"key-sources",
+			"stream-identity",
+			{ ...snapshot(0, null), detail: { quotaBalance: "12.5" } },
+			true,
+			STREAM_QUOTA_SOURCE,
+		);
+		expect(store.get("key-sources", "probe-identity")?.windows[0]?.usedRatio).toBe(1);
+		expect(
+			store.get("key-sources", "stream-identity", undefined, STREAM_QUOTA_SOURCE)?.detail,
+		).toEqual({ quotaBalance: "12.5" });
+		store.remove("key-sources", STREAM_QUOTA_SOURCE);
+		expect(store.peek("key-sources")?.windows[0]?.usedRatio).toBe(1);
+		await store.flush();
+		const restarted = new QuotaStore(createPersistedCredentialCache(file, (raw) => raw as never));
+		expect(restarted.get("key-sources", "probe-identity")?.windows[0]?.usedRatio).toBe(1);
+		expect(
+			restarted.get("key-sources", "stream-identity", undefined, STREAM_QUOTA_SOURCE),
+		).toBeUndefined();
 	});
 
 	test("unpersisted states stay in memory only; unpersist drops the disk copy", async () => {

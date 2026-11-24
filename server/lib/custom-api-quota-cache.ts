@@ -1,8 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
-import { getNarraforkHome } from "./narrafork-home";
-import { settings } from "./settings";
+import { unlink } from "node:fs/promises";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { getNarraforkPath } from "./narrafork-home";
+import { firstCredential, streamQuotaIdentity } from "./provider-key-subjects";
+import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface CustomApiQuotaCache {
 	quotaBalance: string | null;
@@ -10,16 +11,8 @@ export interface CustomApiQuotaCache {
 	fetchedAt: number;
 }
 
-const cacheDir = getNarraforkHome();
-const cachePath = resolve(cacheDir, "custom-api-quotas.json");
-const SAVE_DEBOUNCE_MS = 250;
-
-const cachedQuotaByProvider = new Map<string, CustomApiQuotaCache>();
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let saveInFlight = false;
-let saveRequested = false;
-
-loadAllCachedQuotas();
+// The plaintext file had no credential identity; future stream events rebuild the cache.
+void unlink(getNarraforkPath("custom-api-quotas.json")).catch(() => {});
 
 function normalizeQuotaBalance(value: unknown): string | null {
 	if (value == null) return null;
@@ -28,107 +21,108 @@ function normalizeQuotaBalance(value: unknown): string | null {
 }
 
 function normalizeDetailedQuotaBalance(value: unknown): string | null {
-	if (value == null) return null;
-	const balance = String(value).trim();
-	return balance.length > 0 ? balance : null;
+	return normalizeQuotaBalance(value);
 }
 
-function loadAllCachedQuotas(): void {
-	try {
-		if (!existsSync(cachePath)) return;
-		const data = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<
-			string,
-			Partial<CustomApiQuotaCache>
-		>;
-		for (const [providerId, cache] of Object.entries(data)) {
-			cachedQuotaByProvider.set(providerId, {
-				quotaBalance: normalizeQuotaBalance(cache.quotaBalance),
-				detailedQuotaBalance: normalizeDetailedQuotaBalance(cache.detailedQuotaBalance),
-				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
-			});
-		}
-	} catch {
-		// Corrupt or unreadable cache — ignore; quota will be refreshed by future stream events.
-	}
+const identity = (config: CustomApiProviderConfig) =>
+	JSON.stringify([config.baseUrl, config.apiKey]);
+const knownCredentialIds = new Map<string, string>();
+
+function customApiQuotaSnapshot(cache: CustomApiQuotaCache): QuotaSnapshot {
+	const remaining = cache.quotaBalance === null ? null : Number(cache.quotaBalance);
+	return {
+		fetchedAt: cache.fetchedAt,
+		scope: "key",
+		windows: [],
+		balances:
+			cache.quotaBalance === null
+				? []
+				: [
+						{
+							unit: "",
+							remaining: remaining !== null && Number.isFinite(remaining) ? remaining : null,
+						},
+					],
+		detail: {
+			quotaBalance: cache.quotaBalance,
+			detailedQuotaBalance: cache.detailedQuotaBalance,
+		},
+	};
 }
 
-function serializeCachedQuotas(): string {
-	const data: Record<string, CustomApiQuotaCache> = {};
-	for (const [providerId, cache] of cachedQuotaByProvider) {
-		data[providerId] = cache;
-	}
-	return JSON.stringify(data);
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
+	if (!snapshot.detail || typeof snapshot.detail !== "object") return null;
+	const detail = snapshot.detail as Record<string, unknown>;
+	return customApiQuotaSnapshot({
+		quotaBalance: normalizeQuotaBalance(detail.quotaBalance),
+		detailedQuotaBalance: normalizeDetailedQuotaBalance(detail.detailedQuotaBalance),
+		fetchedAt: snapshot.fetchedAt,
+	});
 }
 
-async function flushCachedQuotas(): Promise<void> {
-	if (saveInFlight) return;
-	saveInFlight = true;
-	try {
-		while (saveRequested) {
-			saveRequested = false;
-			try {
-				await mkdir(cacheDir, { recursive: true });
-				await writeFile(cachePath, serializeCachedQuotas());
-			} catch {
-				// Non-critical: failing to persist quota must not break an active narrator run.
-			}
-		}
-	} finally {
-		saveInFlight = false;
-	}
-}
-
-function scheduleSaveAllCachedQuotas(): void {
-	saveRequested = true;
-	if (saveTimer || saveInFlight) return;
-	saveTimer = setTimeout(() => {
-		saveTimer = null;
-		void flushCachedQuotas();
-	}, SAVE_DEBOUNCE_MS);
-	saveTimer.unref?.();
+function provider(providerId: string): CustomApiProviderConfig | undefined {
+	return (settings.customApiProviders ?? []).find((config) => config.id === providerId);
 }
 
 export function updateCustomApiQuotaByPrefix(
 	prefix: string,
 	quotaBalance: string | null,
 	detailedQuotaBalance?: string | null,
+	expectedProviderIdentity?: string,
 ): void {
 	const config = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
-	if (!config) return;
-	cachedQuotaByProvider.set(config.id, {
-		quotaBalance: normalizeQuotaBalance(quotaBalance),
-		detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
-		fetchedAt: Date.now(),
-	});
-	scheduleSaveAllCachedQuotas();
+	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
+	const credential = firstCredential(config);
+	knownCredentialIds.set(config.id, credential.id);
+	quotaStore.set(
+		credential.id,
+		identity(credential.config),
+		customApiQuotaSnapshot({
+			quotaBalance: normalizeQuotaBalance(quotaBalance),
+			detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
+			fetchedAt: Date.now(),
+		}),
+		true,
+		STREAM_QUOTA_SOURCE,
+	);
 }
 
 export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache | undefined {
-	return cachedQuotaByProvider.get(providerId);
+	const config = provider(providerId);
+	if (!config) return undefined;
+	const credential = firstCredential(config);
+	knownCredentialIds.set(providerId, credential.id);
+	const snapshot = quotaStore.get(
+		credential.id,
+		identity(credential.config),
+		restoreSnapshot,
+		STREAM_QUOTA_SOURCE,
+	);
+	return snapshot
+		? {
+				...(snapshot.detail as Omit<CustomApiQuotaCache, "fetchedAt">),
+				fetchedAt: snapshot.fetchedAt,
+			}
+		: undefined;
 }
 
 export function getAllCustomApiCachedQuotas(): Record<
 	string,
 	{ quotaBalance: string | null; detailedQuotaBalance: string | null; fetchedAt: number }
 > {
-	const result: Record<
-		string,
-		{ quotaBalance: string | null; detailedQuotaBalance: string | null; fetchedAt: number }
-	> = {};
-	for (const [providerId, cache] of cachedQuotaByProvider) {
-		result[providerId] = {
-			quotaBalance: cache.quotaBalance,
-			detailedQuotaBalance: cache.detailedQuotaBalance,
-			fetchedAt: cache.fetchedAt,
-		};
+	const result: ReturnType<typeof getAllCustomApiCachedQuotas> = {};
+	for (const config of settings.customApiProviders ?? []) {
+		const cache = getCustomApiCachedQuota(config.id);
+		if (cache) result[config.id] = cache;
 	}
 	return result;
 }
 
 export function purgeCustomApiQuotaCache(removedIds: string[]): void {
-	let changed = false;
 	for (const id of removedIds) {
-		if (cachedQuotaByProvider.delete(id)) changed = true;
+		const config = provider(id);
+		const credentialId = knownCredentialIds.get(id) ?? (config ? firstCredential(config).id : id);
+		knownCredentialIds.delete(id);
+		quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
 	}
-	if (changed) scheduleSaveAllCachedQuotas();
 }

@@ -49,6 +49,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
+import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -4296,6 +4297,7 @@ async function* agentLoopInMetadataSnapshot(
 			let malformedRetryCount = 0;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestQuotaProviderIdentity: string | undefined;
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -4304,6 +4306,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
+				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -4925,6 +4928,7 @@ async function* agentLoopInMetadataSnapshot(
 				nextToolArrivalOrder = 0;
 				messageId = undefined;
 				credentialId = undefined;
+				requestQuotaProviderIdentity = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -5932,6 +5936,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "quota_balance",
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
+								providerIdentity: requestQuotaProviderIdentity,
 							};
 						}
 						// Billing updates can be output-only; occupancy still requires a real prompt.

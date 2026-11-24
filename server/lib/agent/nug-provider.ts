@@ -629,9 +629,10 @@ export class NugProvider implements ProviderAdapter {
 		);
 	}
 
-	async getQuota(): Promise<NugQuota> {
+	async getQuota(signal?: AbortSignal): Promise<NugQuota> {
 		const response = await this.pfetch(`${this.baseUrl}/v1/quota`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+			signal,
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,9 +11,13 @@ const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-commandcode-routes-"));
 process.env.NARRAFORK_HOME = testHome;
 
+const actualCommandCodeManager = await import("../../lib/commandcode-manager");
 const { saveSettings, settings } = await import("../../lib/settings");
 const { commandCodeRoutes } = await import("../commandcode");
 const { invalidateCommandCodeModelsCache } = await import("../../lib/commandcode-models");
+const { quotaStore } = await import("../../lib/sourcing/quota-store");
+const { COMMAND_CODE_KEY_OWNER, getProviderKeyStore } = await import("../../lib/provider-keys");
+const { COMMAND_CODE_USAGE_STALE_MS } = await import("../../lib/commandcode-usage");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -97,6 +101,176 @@ test("model refresh is admin-only and can use an unsaved key without storing it"
 	} finally {
 		globalThis.fetch = originalFetch;
 		invalidateCommandCodeModelsCache();
+		saveSettings(original);
+	}
+});
+
+function usageResponses() {
+	return {
+		credits: {
+			credits: {
+				monthlyCredits: 25,
+				purchasedCredits: 5,
+				freeCredits: 20,
+				creditThreshold: 1,
+				belowThreshold: false,
+			},
+			windowLimits: {
+				limited: false,
+				fiveHour: { used: 1, cap: 10, exceeded: false, resetAt: 1_800_000_000_000 },
+				weekly: { used: 2, cap: 20, exceeded: false },
+			},
+			sandboxAccess: true,
+		},
+		summary: {
+			totalCount: 4,
+			totalTokens: 100,
+			totalTokensIn: 60,
+			totalTokensOut: 40,
+			successRate: 100,
+			completedCount: 4,
+			failedCount: 0,
+			totalMonthlyCredits: 3,
+			periodStart: "2026-11-01T00:00:00.000Z",
+		},
+	};
+}
+
+test("settings-key usage is a 60-second snapshot cache with the exact legacy response", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalNow = Date.now;
+	const original = structuredClone(settings);
+	const now = originalNow();
+	const bodies = usageResponses();
+	let calls = 0;
+	globalThis.fetch = (async () => {
+		calls++;
+		return Response.json(calls % 2 === 1 ? bodies.credits : bodies.summary);
+	}) as unknown as typeof fetch;
+	Date.now = () => now;
+	quotaStore.remove("CommandCode");
+	let credentialId = "CommandCode";
+	try {
+		saveSettings({
+			...settings,
+			commandCode: { ...settings.commandCode, apiKey: "usage-settings-key" },
+		});
+		const app = appForRole("user");
+		const first = await app.request("/commandcode/usage");
+		expect(first.status).toBe(200);
+		const body = (await first.json()) as Record<string, unknown>;
+		expect(body).toEqual({
+			loggedIn: true,
+			credits: bodies.credits.credits,
+			windowLimits: bodies.credits.windowLimits,
+			sandboxAccess: true,
+			summary: bodies.summary,
+		});
+		const second = await app.request("/commandcode/usage");
+		expect(await second.json()).toEqual(body);
+		expect(calls).toBe(2);
+		credentialId = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0]?.id ?? "CommandCode";
+		const snapshot = quotaStore.peek(credentialId);
+		expect(snapshot?.windows).toEqual([
+			{ kind: "5h", usedRatio: 0.1, resetsAt: 1_800_000_000_000 },
+			{ kind: "weekly", usedRatio: 0.1, resetsAt: null },
+		]);
+		expect(snapshot?.balances).toEqual([{ unit: "credits", remaining: 25, total: 28 }]);
+		const { loggedIn: _loggedIn, ...usage } = body;
+		expect(snapshot?.detail).toEqual(usage);
+
+		Date.now = () => now + COMMAND_CODE_USAGE_STALE_MS + 1;
+		expect((await app.request("/commandcode/usage")).status).toBe(200);
+		expect(calls).toBe(4);
+	} finally {
+		Date.now = originalNow;
+		globalThis.fetch = originalFetch;
+		quotaStore.remove(credentialId);
+		saveSettings(original);
+	}
+});
+
+test("a late old-key refresh cannot overwrite the current key's snapshot", async () => {
+	const originalFetch = globalThis.fetch;
+	const original = structuredClone(settings);
+	const bodies = usageResponses();
+	const bodyFor = (monthlyCredits: number) => ({
+		...bodies.credits,
+		credits: { ...bodies.credits.credits, monthlyCredits },
+	});
+	let calls = 0;
+	let finishOldCredits!: () => void;
+	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		calls++;
+		const authorization = new Headers(init?.headers).get("Authorization");
+		if (authorization === "Bearer key-a" && String(input).endsWith("/alpha/billing/credits")) {
+			return new Promise<Response>((resolve) => {
+				finishOldCredits = () => resolve(Response.json(bodyFor(5)));
+			});
+		}
+		return Response.json(
+			String(input).endsWith("/alpha/usage/summary") ? bodies.summary : bodyFor(30),
+		);
+	}) as unknown as typeof fetch;
+	let credentialId = "CommandCode";
+	quotaStore.remove(credentialId);
+	try {
+		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-a" } });
+		const app = appForRole("user");
+		const oldRequest = app.request("/commandcode/usage");
+		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-b" } });
+		credentialId = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0]?.id ?? "CommandCode";
+		expect((await app.request("/commandcode/usage")).status).toBe(200);
+		const callsAfterFresh = calls;
+		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
+			credits: { monthlyCredits: 30 },
+		});
+		finishOldCredits();
+		expect((await oldRequest).status).toBe(200);
+		const current = await app.request("/commandcode/usage");
+		expect(current.status).toBe(200);
+		expect(await current.json()).toMatchObject({ credits: { monthlyCredits: 30 } });
+		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
+			credits: { monthlyCredits: 30 },
+		});
+		// Only the old request's summary was added; the current snapshot stayed fresh.
+		expect(calls).toBe(callsAfterFresh + 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+		quotaStore.remove(credentialId);
+		saveSettings(original);
+	}
+});
+
+test("CLI auth falls back to the original uncached requests and writes no snapshot", async () => {
+	const originalFetch = globalThis.fetch;
+	const original = structuredClone(settings);
+	const bodies = usageResponses();
+	const authorization: string[] = [];
+	let calls = 0;
+	globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+		calls++;
+		authorization.push(new Headers(init?.headers).get("Authorization") ?? "");
+		return Response.json(calls % 2 === 1 ? bodies.credits : bodies.summary);
+	}) as typeof fetch;
+	const auth = spyOn(actualCommandCodeManager, "resolveCommandCodeToken").mockReturnValue({
+		credential: { token: "cli-token", source: "cli", userName: "CLI User" },
+	});
+	quotaStore.remove("CommandCode");
+	try {
+		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "" } });
+		const app = appForRole("user");
+		const first = await app.request("/commandcode/usage");
+		const second = await app.request("/commandcode/usage");
+		expect(first.status).toBe(200);
+		expect(await second.json()).toEqual(await first.json());
+		expect(calls).toBe(4);
+		expect(authorization).toEqual(Array(4).fill("Bearer cli-token"));
+		expect(quotaStore.peek("CommandCode")).toBeUndefined();
+	} finally {
+		auth.mockRestore();
+		globalThis.fetch = originalFetch;
+		quotaStore.remove("CommandCode");
 		saveSettings(original);
 	}
 });
