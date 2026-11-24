@@ -15,6 +15,7 @@ import {
 	type RecentTabViewer,
 } from "@frontend/hooks/recent-tabs-utils";
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
+import { refreshProjectTabDetails } from "@frontend/hooks/useRecentTabs";
 import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import { ActionIcon, Avatar, Box, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
@@ -37,7 +38,8 @@ import {
 	IconWindowMaximize,
 	IconX,
 } from "@tabler/icons-react";
-import { useLayoutEffect, useState, useSyncExternalStore } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { UserAvatar } from "../UserAvatar";
 import type { RecentTabHoverStore } from "./recent-tab-hover";
@@ -161,6 +163,13 @@ function ProjectTabDetails({ tab, t }: { tab: RecentTab; t: T }) {
  */
 export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; compact?: boolean }) {
 	const { t } = useTranslation("common");
+	const qc = useQueryClient();
+	// A project's details are read when its card or touch details open (bounded, see
+	// `refreshProjectTabDetails`), on top of the sidebar's runtime request.
+	useEffect(() => {
+		if (tab.type !== "project") return;
+		return refreshProjectTabDetails(qc, tab.id);
+	}, [qc, tab.type, tab.id]);
 	const tt = t as T;
 	const isSession = tab.type === "narrator" || tab.type === "subagent";
 	// A team tab shows its coordinator's state, as its icon does.

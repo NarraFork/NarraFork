@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { MantineProvider } from "@mantine/core";
 import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -19,6 +20,8 @@ import {
 } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import commonEn from "../../locales/en/common.json";
+import { RecentTabDetails } from "./RecentTabDetailCard";
 import { RecentTabsWSProvider } from "./RecentTabs";
 
 const i18n = i18next.createInstance();
@@ -340,4 +343,68 @@ test("a team tab follows its coordinator: title and status only, no promotion", 
 	expect(live?.hasDraft).toBeUndefined();
 	// A session tab of the coordinator would be promoted; a pinned team is not a session.
 	expect(move).not.toHaveBeenCalled();
+});
+
+test("a persisted project row gets its card details: runtime key, then a read when the card opens", async () => {
+	const project: RecentTab = {
+		type: "project",
+		id: "p1",
+		title: "Acme App",
+		pinned: true,
+		lastVisitedAt: 1,
+	};
+	await mount([project, tab("a")]);
+	// No socket for a project, but its key is in the runtime request.
+	expect(narratorWSManager.subscribe).toHaveBeenLastCalledWith(["a"], { kind: "list" });
+	expect(runtimeRequests[0]?.keys).toEqual(["narrator:a", "project:p1"]);
+	await resolveRuntime(0, [
+		{
+			key: "project:p1",
+			patch: {
+				projectPath: "/repos/acme-app",
+				activeSessionCount: 3,
+				waitingSessionCount: 1,
+				teamCount: 2,
+				projectCountsCapped: false,
+			},
+		},
+	]);
+	expect(cachedTab("p1")).toMatchObject({ projectPath: "/repos/acme-app", activeSessionCount: 3 });
+
+	// Open the card on the cached row: it renders the details and reads that one key again.
+	const cardI18n = i18next.createInstance();
+	await cardI18n.init({ lng: "en", resources: { en: { common: commonEn } } });
+	const host = document.createElement("div");
+	const cardRoot = createRoot(host);
+	const Card = () => {
+		const row = cachedTab("p1") as RecentTab;
+		return <RecentTabDetails tab={row} />;
+	};
+	const render = () =>
+		cardRoot.render(
+			<QueryClientProvider client={client}>
+				<I18nextProvider i18n={cardI18n}>
+					<MantineProvider>
+						<Card />
+					</MantineProvider>
+				</I18nextProvider>
+			</QueryClientProvider>,
+		);
+	await act(async () => render());
+	expect(host.textContent).toContain("/repos/acme-app");
+	expect(host.textContent).toContain("3 session(s) running");
+	expect(host.textContent).toContain("1 waiting for input or approval");
+	expect(host.textContent).toContain("2 team(s)");
+	const opened = runtimeRequests.at(-1);
+	expect(opened?.keys).toEqual(["project:p1"]);
+	await act(async () =>
+		opened?.resolve({
+			revision: 0,
+			patches: [{ key: "project:p1", patch: { activeSessionCount: 4, teamCount: 2 } }],
+		}),
+	);
+	await act(async () => render());
+	expect(cachedTab("p1")?.activeSessionCount).toBe(4);
+	expect(host.textContent).toContain("4 session(s) running");
+	await act(async () => cardRoot.unmount());
 });

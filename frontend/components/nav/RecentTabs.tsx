@@ -6,6 +6,7 @@ import {
 	isTeamOnlookerTab,
 	recentTabHref,
 	recentTabLiveNarratorId,
+	selectProjectRuntimeTabs,
 	statusAttention,
 } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
@@ -25,6 +26,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
 	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
+	RECENT_TABS_LIVE_LIMIT,
 	type RecentTabsDelta as RecentTabsDeltaFrame,
 } from "@shared/recent-tabs";
 import {
@@ -182,7 +184,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	userPrefsRef.current = userPrefs;
 	const deltaBatchesRef = useRef<Parameters<typeof collectRecentTabsDeltaFrame>[0]>(new Map());
 
-	const liveTabs = useMemo(() => selectRecentTabsLiveWindow(tabs, pathname), [tabs, pathname]);
+	// Project tabs have no narrator socket; their hover-card details still come with the
+	// runtime patches, within the same per-request key budget.
+	const projectRuntimeTabs = useMemo(
+		() => selectProjectRuntimeTabs(tabs, pathname),
+		[tabs, pathname],
+	);
+	const liveTabs = useMemo(
+		() =>
+			selectRecentTabsLiveWindow(
+				tabs,
+				pathname,
+				RECENT_TABS_LIVE_LIMIT - projectRuntimeTabs.length,
+			),
+		[tabs, pathname, projectRuntimeTabs.length],
+	);
 	// A team tab follows its coordinator, so the socket subscribes to it as well.
 	const narratorIds = useMemo(
 		() => [...new Set(liveTabs.map(recentTabLiveNarratorId).filter((id): id is string => !!id))],
@@ -192,9 +208,11 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const runtimeTargetsKey = useMemo(
 		() =>
 			JSON.stringify(
-				liveTabs.map((tab) => [tabSortId(tab), recentTabLiveNarratorId(tab)] as const).sort(),
+				[...liveTabs, ...projectRuntimeTabs]
+					.map((tab) => [tabSortId(tab), recentTabLiveNarratorId(tab)] as const)
+					.sort(),
 			),
-		[liveTabs],
+		[liveTabs, projectRuntimeTabs],
 	);
 	const runtimeTargets = useMemo(
 		() => JSON.parse(runtimeTargetsKey) as Array<[string, string | null]>,

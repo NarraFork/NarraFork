@@ -414,6 +414,30 @@ function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
 	return href !== null && pathname === href;
 }
 
+/**
+ * Project tabs whose runtime details (path and counts for the hover card,
+ * `recent-tab-projects.ts`) the sidebar requests with the rest of its runtime patches. They have
+ * no narrator socket, so they are chosen apart from the live window: the current page's first,
+ * then pinned ones, then the rest, at most the server's per-request cap
+ * (`PROJECT_TAB_DETAIL_LIMIT`). The sidebar takes their slots out of the live window's budget so
+ * one request stays within `RECENT_TABS_LIVE_LIMIT` keys.
+ */
+export const PROJECT_TAB_RUNTIME_LIMIT = 20;
+
+export function selectProjectRuntimeTabs(
+	tabs: readonly RecentTab[],
+	pathname: string,
+	limit = PROJECT_TAB_RUNTIME_LIMIT,
+): RecentTab[] {
+	const projects = tabs.filter((tab) => tab.type === "project");
+	const ordered = [
+		...projects.filter((tab) => recentTabMatchesPath(tab, pathname)),
+		...projects.filter((tab) => tab.pinned),
+		...projects,
+	];
+	return [...new Map(ordered.map((tab) => [tab.id, tab])).values()].slice(0, limit);
+}
+
 export function selectRecentTabsLiveWindow(
 	tabs: RecentTab[],
 	pathname: string,

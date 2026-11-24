@@ -562,6 +562,41 @@ export function applyRecentTabsRuntimePatches(
 	syncCompatibilityCache(qc);
 }
 
+/** How long a project card's own read of its details counts as fresh. */
+const PROJECT_TAB_DETAILS_FRESH_MS = 10_000;
+const projectTabDetailReads = new WeakMap<QueryClient, Map<string, number>>();
+
+/**
+ * Read one project tab's runtime details now (its hover card or touch details just opened) and
+ * merge them into the tab cache: the sidebar's own runtime request refreshes them only when its
+ * targets change. One key, at most once per {@link PROJECT_TAB_DETAILS_FRESH_MS} per key.
+ * Returns the cancel for the opener's cleanup; a cancelled or failed read does not count.
+ */
+export function refreshProjectTabDetails(qc: QueryClient, projectId: string): () => void {
+	const key = `project:${projectId}`;
+	let reads = projectTabDetailReads.get(qc);
+	if (!reads) {
+		reads = new Map();
+		projectTabDetailReads.set(qc, reads);
+	}
+	const last = reads.get(key);
+	if (last !== undefined && Date.now() - last < PROJECT_TAB_DETAILS_FRESH_MS) return () => {};
+	const startedAt = Date.now();
+	reads.set(key, startedAt);
+	const controller = new AbortController();
+	const forget = () => {
+		if (reads.get(key) === startedAt) reads.delete(key);
+	};
+	api
+		.getRecentTabsRuntime([key], controller.signal)
+		.then(({ patches }) => {
+			if (controller.signal.aborted) return forget();
+			applyRecentTabsRuntimePatches(qc, patches);
+		})
+		.catch(forget);
+	return () => controller.abort();
+}
+
 function applyFolderPatch(
 	tab: RecentTab,
 	folderId: string,
