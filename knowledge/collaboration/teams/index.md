@@ -15,7 +15,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: a5b512406
+verified_at: 69715f280
 ---
 # 团队
 
@@ -44,6 +44,7 @@ verified_at: a5b512406
 - `server/services/teams/team-service.ts`：团队创建与读取，`loadTeamForAccess` 是访问判定入口。
 - `shared/project-teams.ts`：状态、上限、事件种类、`Team` 动作表，前后端共用。
 - 测试目录 `server/services/teams/__tests__/`，其中 `team-tables-contract.test.ts` 在 SQLite 与 PG 上对同一组约束。
+- `shared/project-teams.ts` 也定义 `TEAM_TRAIT` 与 `hasTeamTrait`（服务端 `narrator-utils.ts` 原样转出，前端会话头部的团队标记靠它），以及事件种类的运行时列表 `TEAM_LEVEL_EVENT_KINDS`、`TEAM_WORK_EVENT_KINDS`、`TEAM_OVERLAP_EVENT_KINDS`、`TEAM_PERSON_DECISION_EVENT_KINDS`（对应类型由它们推出），团队页活动据此给每种事件配文案。
 
 ## 改它时
 - 团队三张表（`project_teams`、`team_work_items`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。

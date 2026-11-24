@@ -41,6 +41,7 @@ anchors:
   - frontend/components/settings/ModelAggregationsSection.tsx
   - frontend/components/settings/ModelsSection.tsx
   - frontend/components/settings/broken-model-selection.ts
+  - frontend/lib/follow-model-label.ts
 keywords:
   - 来源组
   - sourceGroupForConnection
@@ -65,7 +66,7 @@ keywords:
   - auto 参与
   - settings.agent.modelProtocols
 status: draft
-verified_at: 776dbf07e
+verified_at: 69715f280
 ---
 # 来源组与模型列表
 
@@ -84,6 +85,7 @@ verified_at: 776dbf07e
 - `auto:` 路由排序（`shared/auto-route-strategy.ts:orderAutoCandidates`），依次：不可用的排最后；订阅制（Codex、Kimi Code、OpenCode Go）先于按量付费；同组内参考价低者先、未知价排在已知价之后；其余保持提供商原顺序。可用性的实时事实在 `agent/auto-route-signals.ts`（全部读内存，不碰网络和数据库）：Codex 看是否有未停在已用尽窗口上的启用账号；自定义 API 看是否有既未额度耗尽也未因 403 休息的启用密钥（短 429 休息不算）；NUG 在网关模型被记为下线时不可用；其余恒可用。会话已有回复后沿用上次出回复的提供商（`services/auto-sticky-source.ts:lastServedProvider`，compact 之后重新选）。
 - NUG 模型缓存（`nug-model-cache.ts`）保存网关发现的模型、渠道与思考档位（`[]` 表示明确没有，缺省表示网关没报）；模型选择器打开时机会式刷新，冷却 60 秒在服务端统一管（`nug-model-refresh-coordinator.ts`，冷却在尝试开始时消耗，并发调用共享同一个进行中的请求），前端 `nug-model-refresh.ts` 只是少发一次无意义请求的标签页内守卫。模型整池不可用时循环挂起，共享轮询器每 15 秒（首次 3 秒）只拉 `/v1/models` 等其恢复（`nug-availability-poller.ts`）；已知下线的模型在首个请求前就进入同一等待路径（`nug-model-availability.ts`）。
 - `model-sourcing/auto-models.ts:listAutoModels` 为 `GET /api/model-catalog/auto` 列出 `auto:` 模型及按当前路由顺序排列的来源，最多 500 个逻辑模型。
+- 「跟随默认 / 跟随摘要」选项（`hooks/useModels.ts:useAllModels` 的 `buildFollowOption`）的标签是目标模型的标签，再退到目标值；目标为空（还没配置默认或摘要模型）时显示 `followDefaultUnset` / `followSummaryUnset`（「默认模型（未配置）」），从不显示 `__default__` 这类哨兵值（`lib/follow-model-label.ts`）。Default / Summary / Aggregations 分组标题走 `narrator` 命名空间翻译。状态栏、模型菜单触发器与列表卡片的「默认（模型）」都经 `followDefaultLabel`，未配置时同样显示未配置文案。
 
 ## 从哪读起
 - `server/lib/sourcing/source-groups.ts`、`model-list-readers.ts`、`templates.ts`。

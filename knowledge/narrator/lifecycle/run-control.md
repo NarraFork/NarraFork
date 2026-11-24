@@ -41,7 +41,7 @@ keywords:
   - archivedWithNarratorId
   - narrator:status_changed
 status: draft
-verified_at: 878917e97
+verified_at: 69715f280
 ---
 # 运行与停止
 
@@ -58,6 +58,7 @@ verified_at: 878917e97
 - 控制：叙述者对另一叙述者的 stop / steer / archive 必须持有目标登记的 controller 授权，且调用方上限允许编排、未到最大委派深度、其执行用户当前对目标有写权限；用户正接管（run hold）时 stop/archive 被拒（`narrator-control.ts:authorizeAgentControl`）。人通过 HTTP 的操作走普通写 ACL，不经此处。
 - 归档：`narrator-archive.ts:transitionNarratorArchiveGroup` 对父会话和满足条件的“顺带提问”子会话（`isAskInPassing`，最多 200 个，超出报错）成组切换 `archived` / `idle`。先做运行时取消（`prepareNarratorArchive`），再在单个事务内改状态，仅提交后才发 `narrator:status_changed` 和 WS `status_change`；归档子会话记 `archivedWithNarratorId`，只有它们会随父会话一起恢复。
 - 所属项目、权限等不在此展开，见各自节点。
+- `TEAM_TRAIT` 定义在 `shared/project-teams.ts`，`narrator-utils.ts` 原样转出，`isTeamNarrator` 的判断不变。
 
 ## 从哪读起
 - `server/services/narrator-service.ts:narratorService`（CRUD 与状态）、`prepareNarratorCreation`。
