@@ -155,6 +155,7 @@ interface ActiveTerminal {
 
 const activeTerminals = new Map<string, ActiveTerminal>();
 let startupRecovery: Promise<void> | undefined;
+let startupRecoverySettled: Promise<void> = Promise.resolve();
 const RECOVERY_CONCURRENCY = 4;
 
 /**
@@ -925,8 +926,14 @@ export const terminalService = {
 			startupRecovery = recoverTerminalsOnStartup().finally(() => {
 				startupRecovery = undefined;
 			});
+			startupRecoverySettled = startupRecovery.catch(() => {});
 		}
 		return startupRecovery;
+	},
+
+	/** Resolves once the latest startup recovery has settled (immediately if none ran). */
+	whenStartupRecoverySettled(): Promise<void> {
+		return startupRecoverySettled;
 	},
 
 	async cleanupForNarrator(narratorId: string) {

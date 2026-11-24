@@ -12,6 +12,7 @@ import {
 	MIN_WATCH_TIMEOUT_MS,
 	normalizeWatchPattern,
 	startTerminalWatch,
+	terminalLifecycleReader,
 	type WatchStart,
 } from "../../../services/terminal-watch-service";
 import { cancelWatchRegistration } from "../../../services/watch-observation";
@@ -524,21 +525,13 @@ async function startWatch(
 		buffer,
 		readLifecycleState:
 			pattern === undefined
-				? async () => {
+				? terminalLifecycleReader(terminalId, buffer, terminalService, async () => {
 						const current = await db.query.terminals.findFirst({
 							where: eq(terminals.id, terminalId),
 							columns: { status: true },
 						});
-						if (current?.status === "exited") return "exited";
-						if (
-							!current ||
-							!terminalService.isAttached(terminalId) ||
-							(buffer && terminalService.getActiveBuffer(terminalId) !== buffer)
-						) {
-							return "disconnected";
-						}
-						return "running";
-					}
+						return current?.status;
+					})
 				: undefined,
 		cursor: point,
 		matchFrame,

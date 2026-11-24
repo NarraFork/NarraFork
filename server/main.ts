@@ -1357,6 +1357,16 @@ async function initializeDatabaseStartup(): Promise<void> {
 						restoreOrdinaryRestartRecovery(ordinaryRestart),
 					])
 				: [];
+			// A notice can be durable in the mailbox while its post-commit wake was lost to
+			// the previous process. Re-probe those recipients once recovery owners are mounted.
+			if (automaticResumeEnabled())
+				void import("./services/agent-runtime/inbox")
+					.then(({ wakeQueuedTaskNoticeRecipientsOnStartup }) =>
+						wakeQueuedTaskNoticeRecipientsOnStartup(),
+					)
+					.catch((err) =>
+						logger.warn("Startup task-notice wake reconciliation failed", { error: String(err) }),
+					);
 			const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
 			if (completions.length) startupReadiness.markRecovering();
 			else startupReadiness.markReady();

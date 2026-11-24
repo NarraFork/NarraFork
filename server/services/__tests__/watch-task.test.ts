@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { parseWatchCommand } from "@shared/watch-command";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
@@ -34,6 +35,8 @@ import {
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 } from "../watch-observation";
+import { restartResumableWatch } from "../watch-restart";
+import { resumeWatchAfterRestart } from "../watch-service";
 import { activeWatchSourceCount, subscribeWatchSource } from "../watch-source";
 import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
@@ -1072,16 +1075,157 @@ describe("Watch follows an agent's registered current run", () => {
 		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
 	});
 
-	test("shutdown releases an observation and restart reports interruption without stopping the agent", async () => {
+	test("shutdown releases an observation and restart reports interruption when no process can re-attach it", async () => {
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
 		const id = watchId(result);
+		// Still suspended: this process is shutting down, so re-attachment is refused and
+		// the row ends exactly as before re-attachment existed.
 		suspendWatchObservationsForShutdown();
 		await backgroundTaskService.killAll();
 		expect(task(id)?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
 		expect(task(id)?.status).toBe("failed");
 		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
-		expect(task(id)?.output).toContain("target was not stopped");
+		expect(task(id)?.output).toContain("The watch did not stop the target");
+		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
+			"working",
+		);
+	});
+});
+
+/** Shut down, then recover as a fresh process would: observation state starts empty. */
+async function restart(): Promise<void> {
+	suspendWatchObservationsForShutdown();
+	await backgroundTaskService.killAll();
+	resumeWatchObservationsForTests();
+	clearAliasRegistry(PARENT);
+	await backgroundTaskService.recoverStaleTasksAfterRestart();
+}
+
+describe("lifecycle watches are re-attached after a restart", () => {
+	test("an agent watch keeps its row and reports the agent's later completion", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		expect(observations().filter((row) => row.status === "running")).toHaveLength(1);
+		completeAgent("finished after the restart");
+		const row = await settled(id);
+		// The agent's own completion notice fulfils the observation: one notice, no duplicate.
+		expect(row?.status).toBe("completed");
+		expect(row?.output).toContain("Observation fulfilled by the ordinary agent completion notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("an agent watch keeps its original deadline instead of restarting the clock", async () => {
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD, timeout: 60_000 }, context()),
+		);
+		// The row was registered 59.7s ago: only ~300ms of its 60s deadline remain.
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(Date.now() - 59_700).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		const row = await settled(id);
+		expect(row?.status).toBe("completed");
+		expect(row?.output).toMatch(/deadline/i);
+		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
+			"working",
+		);
+	});
+
+	test("a watch whose deadline passed while the server was down ends as interrupted", async () => {
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context()),
+		);
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(Date.now() - 5_000).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("an agent watch is not moved onto a different run of the same agent", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		db.update(narrators).set({ logicalRunId: "a-later-run" }).where(eq(narrators.id, CHILD)).run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a Bash watch whose target did not survive the restart ends with a waking interruption", async () => {
+		await bashTask();
+		const id = watchId(await watchTool.execute({ type: "bash", id: BASH }, context()));
+		await restart();
+		// Shutdown cancelled the ordinary command; its cancelled notice never wakes the
+		// watcher, so the watch must still report the interruption itself.
+		expect(task(BASH)?.status).toBe("cancelled");
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+		wakes.length = 0;
+		const texts = (await notices()).map((notice) => notice.text ?? "");
+		// The watch publishes its own failed notice, which wakes the watcher.
+		const alias = task(id)?.alias ?? id;
+		expect(texts.some((text) => text.includes(`(ID: ${alias}) failed`))).toBe(true);
+		expect(wakes).toContain(PARENT);
+	});
+
+	test("an agent watch whose agent the restart cancelled ends with a waking interruption", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		db.update(narrators)
+			.set({ status: "idle", backgroundStatus: "cancelled" })
+			.where(eq(narrators.id, CHILD))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a Bash watch of a still-running target is re-attached and completes once", async () => {
+		await bashTask();
+		const id = watchId(await watchTool.execute({ type: "bash", id: BASH }, context()));
+		// Drop in-memory observation state as a new process would, keeping both rows running
+		// (as for a durable service that restart recovery re-attached).
+		suspendWatchObservationsForShutdown();
+		resumeWatchObservationsForTests();
+		clearAliasRegistry(PARENT);
+		const row = task(id);
+		const target = parseWatchCommand(row?.command);
+		if (!row || !restartResumableWatch(target, row.createdAt)) throw new Error("not resumable");
+		expect(
+			await resumeWatchAfterRestart(
+				{ id, parentNarratorId: PARENT, alias: row.alias, createdAt: row.createdAt },
+				target,
+			),
+		).toBe(true);
+		expect(observations().filter((watch) => watch.status === "running")).toHaveLength(1);
+		await backgroundTaskService.markCompleted(BASH, "service output");
+		const done = await settled(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("Observation fulfilled by the ordinary bash completion notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a Bash text watch still ends as interrupted: missed output cannot be replayed", async () => {
+		await bashTask();
+		const id = watchId(
+			await watchTool.execute({ type: "bash", id: BASH, pattern: "READY" }, context()),
+		);
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a re-attached watch can still be cancelled with Stop", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		expect(await backgroundTaskService.cancel(id)).toBe(true);
+		expect(task(id)?.status).toBe("cancelled");
+		expect(observations().filter((row) => row.status === "running")).toHaveLength(0);
 		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
 			"working",
 		);

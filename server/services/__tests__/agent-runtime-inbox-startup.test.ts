@@ -247,3 +247,67 @@ test("edit begin and asynchronous PostgreSQL claim are mutually exclusive in bot
 		bufferEditHolds.setListener(previous);
 	}
 });
+
+test("startup re-probes each recipient of a queued actionable task notice once, across pages", async () => {
+	const ids = ["notice-a", "notice-b", "notice-started", "notice-claimed"];
+	for (const id of ids) db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	const notice = (narratorId: string, sourceKey: string, eventKind: string) => {
+		const result = store.enqueue({
+			kind: "task_notice",
+			noticeKind: "bash",
+			narratorId,
+			sourceKey,
+			text: `${eventKind} notice`,
+			projectedByteSize: 16,
+			metadata: { producerKind: "bash", taskId: sourceKey, logicalRunId: "run", eventKind },
+		});
+		if (!("delivery" in result)) throw new Error("full");
+		return result.delivery;
+	};
+	// Two notices for one recipient: one wake. Started/cancelled notices never spend a turn,
+	// and a claimed notice already has an owner.
+	notice("notice-a", "a-1", "completed");
+	notice("notice-a", "a-2", "failed");
+	notice("notice-b", "b-1", "timed_out");
+	notice("notice-started", "s-1", "started");
+	notice("notice-started", "s-2", "cancelled");
+	notice("notice-claimed", "c-1", "completed");
+	store.claimBatch("notice-claimed", { token: "process:live:token", epoch: "live-epoch" });
+	const woken: string[] = [];
+	const count = await inbox.wakeQueuedTaskNoticeRecipientsOnStartup({
+		pageSize: 1,
+		wake: async (id) => {
+			woken.push(id);
+			return id !== "notice-b";
+		},
+	});
+	expect(woken.filter((id) => ids.includes(id)).sort()).toEqual(["notice-a", "notice-b"]);
+	expect(woken.filter((id) => id === "notice-a")).toHaveLength(1);
+	expect(count).toBe(woken.filter((id) => id !== "notice-b").length);
+});
+
+test("a failing startup wake does not stop the reconciliation of later recipients", async () => {
+	for (const id of ["throws-first", "after-throw"])
+		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	for (const id of ["throws-first", "after-throw"]) {
+		const result = store.enqueue({
+			kind: "task_notice",
+			noticeKind: "agent",
+			narratorId: id,
+			sourceKey: `${id}-notice`,
+			text: "completed",
+			projectedByteSize: 9,
+			metadata: { producerKind: "agent", taskId: id, logicalRunId: "run", eventKind: "completed" },
+		});
+		if (!("delivery" in result)) throw new Error("full");
+	}
+	const woken: string[] = [];
+	await inbox.wakeQueuedTaskNoticeRecipientsOnStartup({
+		wake: async (id) => {
+			if (id === "throws-first") throw new Error("wake failed");
+			woken.push(id);
+			return true;
+		},
+	});
+	expect(woken).toContain("after-throw");
+});

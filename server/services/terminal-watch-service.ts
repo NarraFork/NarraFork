@@ -28,6 +28,7 @@ import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { BufferManager, BufferReadCursor, BufferReadFrame } from "../terminal/buffer-manager";
 import {
+	type AdoptedWatchRow,
 	cancelWatchRegistration,
 	createWatchObservation,
 	registerWatchObservation,
@@ -380,6 +381,37 @@ export interface StartWatchInput {
 	toolUseId?: string;
 	/** Only cancels asynchronous registration; an accepted watch outlives its tool call. */
 	registrationSignal?: AbortSignal;
+	/** Re-attach a lifecycle watch row left by the previous server process. */
+	adopt?: AdoptedWatchRow;
+}
+
+type TerminalLifecycleService = Pick<
+	typeof import("./terminal-service")["terminalService"],
+	"isAttached" | "getActiveBuffer"
+>;
+
+/**
+ * Lifecycle probe shared by the Terminal tool and restart re-attachment: exited is read
+ * from the terminal row; a missing row, a detached PTY or a replaced buffer is reported
+ * as disconnected, never as an exit.
+ */
+export function terminalLifecycleReader(
+	terminalId: string,
+	buffer: BufferManager | undefined,
+	service: TerminalLifecycleService,
+	readStatus: () => Promise<string | null | undefined>,
+): () => Promise<"running" | "exited" | "disconnected"> {
+	return async () => {
+		const status = await readStatus();
+		if (status === "exited") return "exited";
+		if (
+			status === undefined ||
+			!service.isAttached(terminalId) ||
+			(buffer && service.getActiveBuffer(terminalId) !== buffer)
+		)
+			return "disconnected";
+		return "running";
+	};
 }
 
 export type StartWatchResult =
@@ -459,6 +491,7 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		} else {
 			const registered = await registerWatchObservation({
 				...observationInput,
+				...(input.adopt ? { adopt: input.adopt } : {}),
 				dedupKey: `terminal ${JSON.stringify(input.terminalId)} lifecycle`,
 			});
 			if (registered.reused) {
@@ -553,7 +586,10 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 			}
 		}
 	}
-	return { status: "started", taskId, alias, observation, remainingMs: input.timeoutMs };
+	const remainingMs = input.adopt
+		? Math.max(0, input.adopt.deadlineAt - Date.now())
+		: input.timeoutMs;
+	return { status: "started", taskId, alias, observation, remainingMs };
 }
 
 const bufferIds = hotSafe("narrafork:terminal-watch-buffer-ids", () => ({

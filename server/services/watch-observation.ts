@@ -50,6 +50,19 @@ export interface WatchObservationInput {
 	/** Deadline owned by the observation, so a merged registration can extend it. */
 	timeoutMs?: number;
 	onDeadline?: () => void;
+	/**
+	 * Re-attach to a watch row left `running` by the previous server process instead
+	 * of creating a new one. The original absolute deadline is kept: a restart never
+	 * grants the observation extra time.
+	 */
+	adopt?: AdoptedWatchRow;
+}
+
+export interface AdoptedWatchRow {
+	taskId: string;
+	alias?: string | null;
+	/** Epoch ms: the row's creation time plus its recorded timeout. */
+	deadlineAt: number;
 }
 
 /** A cancelled admission must not strand a task before its source observer exists. */
@@ -146,7 +159,11 @@ export async function registerWatchObservation(
 	};
 	registrations.set(key, registration);
 	try {
-		return { observation: await registration.ready, reused: false, remainingMs: input.timeoutMs };
+		const observation = await registration.ready;
+		const remainingMs = input.adopt
+			? Math.max(0, input.adopt.deadlineAt - Date.now())
+			: input.timeoutMs;
+		return { observation, reused: false, remainingMs };
 	} catch (error) {
 		if (registrations.get(key) === registration) registrations.delete(key);
 		throw error;
@@ -168,8 +185,8 @@ export async function createWatchObservation(
 		);
 	}
 
-	const taskId = `bash_${generateShortId()}`;
-	const { alias } = registerTaskAlias(input.narratorId, taskId, input.title);
+	const taskId = input.adopt?.taskId ?? `bash_${generateShortId()}`;
+	const { alias } = registerTaskAlias(input.narratorId, taskId, input.adopt?.alias ?? input.title);
 	const controller = new AbortController();
 	let released = false;
 	let sourceReleased = false;
@@ -181,7 +198,7 @@ export async function createWatchObservation(
 	let frozen: ObservationResult | undefined;
 	let attempts = 0;
 	let retryTimer: ReturnType<typeof setTimeout> | undefined;
-	let deadlineAt = Date.now() + (input.timeoutMs ?? 0);
+	let deadlineAt = input.adopt?.deadlineAt ?? Date.now() + (input.timeoutMs ?? 0);
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	const clearDeadline = () => {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -324,14 +341,17 @@ export async function createWatchObservation(
 
 	try {
 		service = (await import("./background-task-service")).backgroundTaskService;
-		await service.createBashTask({
-			id: taskId,
-			parentNarratorId: input.narratorId,
-			command: `${WATCH_COMMAND_PREFIX} ${input.command}`,
-			toolUseId: input.toolUseId,
-			alias,
-			title: input.title,
-		});
+		// An adopted row already exists and is still `running`: restart recovery skipped
+		// it so this process can finish it through the ordinary publication path.
+		if (!input.adopt)
+			await service.createBashTask({
+				id: taskId,
+				parentNarratorId: input.narratorId,
+				command: `${WATCH_COMMAND_PREFIX} ${input.command}`,
+				toolUseId: input.toolUseId,
+				alias,
+				title: input.title,
+			});
 		service.registerAbortController(taskId, controller);
 		service.registerKillHandler(taskId, observation.release);
 		controller.signal.addEventListener("abort", observation.release, { once: true });

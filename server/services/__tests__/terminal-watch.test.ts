@@ -453,7 +453,8 @@ describe("terminal watch", () => {
 		expect((await row(id))?.status).toBe("running");
 		expect(await notices()).toEqual([]);
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		const done = await row(id);
+		// Terminal watches are settled after narrator recovery, off the startup path.
+		const done = await waitForStatus(id);
 		expect(done?.status).toBe("failed");
 		expect(done?.output).toMatch(/restart|interrupted/i);
 	});
@@ -950,6 +951,80 @@ describe("terminal watch", () => {
 		const recovered = await row(id);
 		expect(recovered?.status).toBe("failed");
 		expect(recovered?.output).toMatch(/interrupted.*server restart/i);
-		expect(recovered?.output).toContain("target was not stopped");
+		// A text watch cannot prove it saw output produced while no server ran.
+		expect(recovered?.output).toContain("The watch did not stop the target");
+	});
+});
+
+describe("terminal lifecycle watches are re-attached after a restart", () => {
+	async function seedTerminal(status: "running" | "exited" = "running") {
+		const { terminals } = await import("../../db/schema");
+		db.insert(terminals)
+			.values({
+				id: TERMINAL,
+				narratorId: PARENT,
+				name: "T",
+				status,
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+	}
+
+	/** Shut down, then recover as a fresh process: the dtach session is attached again. */
+	async function restartWith(buffer: BufferManager | undefined, attached: boolean) {
+		suspendTerminalWatchesForShutdown();
+		await backgroundTaskService.killAll();
+		resumeTerminalWatchesForTests();
+		const { terminalService } = await import("../terminal-service");
+		spyOn(terminalService, "isAttached").mockReturnValue(attached);
+		spyOn(terminalService, "getActiveBuffer").mockReturnValue(buffer);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		// Terminal re-attachment runs after narrator recovery, off the startup path.
+		const deadline = Date.now() + 3_000;
+		while (Date.now() < deadline) {
+			const pending = db
+				.select()
+				.from(backgroundTasks)
+				.all()
+				.filter((task) => task.status === "running" && !activeWatchIds(TERMINAL).includes(task.id));
+			if (pending.length === 0) return;
+			await Bun.sleep(10);
+		}
+	}
+
+	test("a live terminal keeps its watch and reports the later exit", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		const id = await startLifecycle(buffer);
+		await restartWith(buffer, true);
+		expect((await row(id))?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toEqual([id]);
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("completed");
+		expect(ended?.output).toContain("the terminal exited or was closed");
+	});
+
+	test("a terminal that exited while the server was down reports that exit, not an interruption", async () => {
+		await seedTerminal();
+		const id = await startLifecycle(newBuffer());
+		const { terminals } = await import("../../db/schema");
+		db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, TERMINAL)).run();
+		await restartWith(undefined, false);
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("completed");
+		expect(ended?.output).toContain("the terminal exited or was closed");
+		expect(ended?.output).not.toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a terminal that no longer belongs to the watcher ends as interrupted", async () => {
+		await seedTerminal();
+		const id = await startLifecycle(newBuffer());
+		const { terminals } = await import("../../db/schema");
+		db.update(terminals).set({ narratorId: null }).where(eq(terminals.id, TERMINAL)).run();
+		await restartWith(undefined, false);
+		const ended = await row(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
 	});
 });
