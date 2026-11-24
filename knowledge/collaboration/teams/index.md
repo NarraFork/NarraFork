@@ -5,6 +5,7 @@ summary: 协调者 + 子代理树、工作项、跨团队重叠、团队页、�
 anchors:
   - server/routes/project-teams.ts
   - shared/project-teams.ts
+  - shared/team-trait.ts
   - server/services/teams/team-service.ts
 keywords:
   - project_teams
@@ -15,11 +16,11 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: 69715f280
+verified_at: 412d79d6a
 ---
 # 团队
 
-项目团队 = 一个带 `team` trait（`TEAM_TRAIT`）的协调者叙述者 + 它在 `project_teams` 表里的一行。协调者自己只做统筹，具体工作由它派出的子代理完成；每个工作项对应一条分支和一个 worktree，由评审、同步、合并判定推进到收尾。团队页把这一切放在一个页面里给多人看和批。
+项目团队 = 一个带 `team` trait（`TEAM_TRAIT`，与 `hasTeamTrait` 一起在无依赖叶子 `shared/team-trait.ts`，`shared/project-teams.ts` 转出；DB 读 worker 只能引这个叶子）的协调者叙述者 + 它在 `project_teams` 表里的一行。协调者自己只做统筹，具体工作由它派出的子代理完成；每个工作项对应一条分支和一个 worktree，由评审、同步、合并判定推进到收尾。团队页把这一切放在一个页面里给多人看和批。
 
 仅 SQLite：`/api/projects/:projectId/teams*`、`team-overlaps`、`team-locks/*` 在 PostgreSQL 上经 `requireSqliteProjectMutation` 返回 503 `POSTGRES_UNSUPPORTED`（`server/routes/project-teams.ts` 文件顶部的四个 `use`）。
 

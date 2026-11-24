@@ -12,16 +12,8 @@
 
 // ── P1: teams ────────────────────────────────────────────────────────────────
 
-/**
- * Trait marking a team coordinator: the narrator that IS a project team, whose id is the team's
- * id. Set at creation with its `project_teams` row and never toggled.
- */
-export const TEAM_TRAIT = "team";
-
-/** Whether a narrator's traits (as the API returns them) mark it as a team coordinator. */
-export function hasTeamTrait(traits: unknown): boolean {
-	return Array.isArray(traits) && traits.includes(TEAM_TRAIT);
-}
+/** The coordinator trait lives in a leaf module the DB read worker may import. */
+export { hasTeamTrait, TEAM_TRAIT } from "./team-trait";
 
 export const TEAM_STATUSES = ["active", "archived"] as const;
 export type TeamStatus = (typeof TEAM_STATUSES)[number];
