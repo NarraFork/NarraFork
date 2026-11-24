@@ -73,7 +73,7 @@ keywords:
   - modelProtocols
   - catalog.json
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 776dbf07e
 ---
 # 模型目录与来源
 
@@ -90,6 +90,12 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 用法限制在 `agent/provider-model-metadata.ts`：输出上限取请求值与卡上限的较小者；输入预算取工作窗口、输入上限、总窗口减预留输出三者最小；显式声明的空档位列表表示「不可选推理强度」，此时丢弃 effort；`assertModelInputModalities` 在模型不支持图/音/视频输入时直接抛错。Anthropic、Gemini 等适配器调用这些函数。
 - 来源组（`sourcing/source-groups.ts`）是旧 settings 数组派生的只读视图：Codex、TokenDance、Command Code 三个单例，加自定义 API、NUG 与可执行插件提供商；settings 或插件注册表修订号变化才重建；重复 id/前缀保留先出现者。
 - `sourcing/allocate-group.ts:createGroupAllocator` 在数据导入与凭证导入时统一分配 id 和前缀，避开宿主保留前缀，冲突时前缀加 `-2`、`-3`。
+- 缓存模型列表经模板读取（`sourcing/templates.ts:listCachedTemplateModels`，`sourcing/model-list-readers.ts`）：各目录持有者用 `registerModelListReader(来源, 读取函数)` 注册同步读取器（只读已有缓存，不触发刷新、不应用 agent 的隐藏/禁用过滤），重新注册会替换旧读取器，旧持有者的注销函数不会删掉替换者。`readTemplateModelList` 选读取器的分支，每条一行：
+  - 模板是 `codex`、`tokendance`、`command-code`、`nug`、`plugin`：用同名单例读取器（`singletonSources`）。
+  - 其余：按连接实际协议（`group.endpoint.protocol`）选，缺省 `completions-compatible`；同一已识别服务（如 Kimi）可有多种协议，由协议而非服务决定目录持有者。
+  - 没有对应读取器：返回空列表。
+  - 注册处：`routes/anthropic.ts`（`anthropic-messages`）、`routes/openai.ts`（`openai-responses`、`completions-compatible`）、`routes/gemini.ts`（`gemini-compatible`）、`routes/nug.ts`（`nug`）、`lib/settings/provider.ts`（codex、tokendance、command-code）、`services/plugin-platform-services.ts`（`plugin`，读插件注册表里 `providerInstanceId` 与组 id 完全相等的实例的全部模型，含已禁用）。
+- `GET /api/anthropic|openai|gemini|nug/providers/:id/models` 用 `source-groups.ts:sourceGroupForConnection` 为当前连接（含已禁用、未保存的草稿）构造来源组视图，再由 `listCachedTemplateModels` 按模板读到的 id 过滤该路由自己的缓存模型，保留其完整元数据和顺序，返回 `fromCache: true`；OpenAI 路由的协议由 `customApiProtocolFromOpenAI(config)` 决定，没有配置时按 `completions-compatible`。
 - `sourcing/templates.ts` 描述一类上游（`known`/`api`、官方端点、是否多凭证、是否订阅），来源组与预设都从它取类型和端点；`presets.ts` 经 `GET /api/sourcing/templates` 提供添加提供商的预设目录。模板上的额度探测函数（`probeQuota`）在运行时代码里没有调用方，只有测试用到（未核实是否仍在接入中）。
 - `auto:` 路由排序（`shared/auto-route-strategy.ts:orderAutoCandidates`），依次：不可用的排最后；订阅制（Codex、Kimi Code、OpenCode Go）先于按量付费；同组内参考价低者先、未知价排在已知价之后；其余保持提供商原顺序。可用性的实时事实在 `agent/auto-route-signals.ts`（全部读内存，不碰网络和数据库）：Codex 看是否有未停在已用尽窗口上的启用账号；自定义 API 看是否有既未额度耗尽也未因 403 休息的启用密钥（短 429 休息不算）；NUG 在网关模型被记为下线时不可用；其余恒可用。会话已有回复后沿用上次出回复的提供商（`services/auto-sticky-source.ts:lastServedProvider`，compact 之后重新选）。
 - NUG 模型缓存（`nug-model-cache.ts`）保存网关发现的模型、渠道与思考档位（`[]` 表示明确没有，缺省表示网关没报）；模型选择器打开时机会式刷新，冷却 60 秒在服务端统一管（`nug-model-refresh-coordinator.ts`，冷却在尝试开始时消耗，并发调用共享同一个进行中的请求），前端 `nug-model-refresh.ts` 只是少发一次无意义请求的标签页内守卫。模型整池不可用时循环挂起，共享轮询器每 15 秒（首次 3 秒）只拉 `/v1/models` 等其恢复（`nug-availability-poller.ts`）；已知下线的模型在首个请求前就进入同一等待路径（`nug-model-availability.ts`）。
@@ -100,11 +106,11 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 迁移：改前缀 `provider-prefix-migration-service.ts`、旧 `__agg__:` 聚合值 `aggregation-migration-service.ts`（启动时后台运行一次）、模型已不可用的叙述者批量修复 `broken-model-migration-service.ts`（`provider_missing` 默认勾选，`model_not_listed` 默认不勾，规则在前端 `broken-model-selection.ts`）。
 - `server/lib/model-catalog/index.ts`：`getEffectiveModelCard`、`setModelOverride`、更新函数。
 - `shared/model-catalog/resolve.ts`：分层合并。
-- `server/lib/sourcing/source-groups.ts`
+- `server/lib/sourcing/source-groups.ts`、`model-list-readers.ts`
 
 ## 改它时
 - 加模型卡字段：改 `shared/model-catalog/` 的 schema 与 `resolveModelCard`（每个字段都要有来源层），再改 `provider-model-metadata.ts` 的使用点和覆盖编辑器（`ModelOverrideEditor.tsx`）；基线 `dist/catalog.json` 是构建产物，不要手改。
-- 加一类来源：`sourcing/templates.ts` 描述它，`source-groups.ts` 派生视图，`presets.ts` 经 `GET /api/sourcing/templates` 给前端；设置或插件注册表修订号变化才重建来源组。
+- 加一类来源：`sourcing/templates.ts` 描述它（每个模板都带 `listModels`，由 `byId` 统一补上），目录持有者要 `registerModelListReader` 注册读取器，`source-groups.ts` 派生视图，`presets.ts` 经 `GET /api/sourcing/templates` 给前端；设置或插件注册表修订号变化才重建来源组。
 - 改 `auto:` 排序或可用性：`auto-route-strategy.ts` 与 `auto-route-signals.ts` 一起看，`routes/model-catalog.ts` 的 `GET /auto` 最多 500 个逻辑模型。
 - 覆盖写入口与更新类接口要管理员，`GET /card`、`/status`、`/auto` 只需登录；覆盖每次提交 `revision` 加一，状态对象不可变。
 - 相关测试：`shared/model-catalog/resolve.test.ts`、`card.test.ts`，`server/lib/sourcing/*.test.ts`（`templates`、`presets`、`source-groups`、`allocate-group`），`server/lib/agent/__tests__/provider-model-metadata.test.ts`。

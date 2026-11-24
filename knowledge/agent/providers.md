@@ -135,7 +135,7 @@ keywords:
   - NonJsonResponseError
   - nug-relay
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 776dbf07e
 ---
 # 模型提供商
 
@@ -169,7 +169,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - NUG 客户端出口中继（`server/lib/nug-relay/`）：出口模式为本地直连/代理的 NUG 提供商，保持一条到网关 `/v1/relay` 的 WSS 连接，按严格白名单（默认只有 `chatgpt.com`）响应拨号请求；客户端随 `NugProvider` 构造惰性创建。
 - 前端配置页：`AddProviderPage` + `provider-catalog.ts`（预设取自 `GET /api/sourcing/templates`）建立连接；`ProviderOverviewView` + `ProviderConfigView` 排布，`ProviderCard`、`ProviderStatusBadge` 显示状态；协议族区块为 `CustomApiProviderSection`（Anthropic/OpenAI/Gemini 等都是它的协议选项）、`NUGProvidersSection`、`CodexSection`、`CommandCodeSection`、`TokenDanceSection`、`PluginProviderSection`。`AnthropicProvidersSection.tsx`、`GeminiSection.tsx`、`OpenAIProvidersSection.tsx`、`ProviderDetailPanel.tsx` 已退役，文件内容为空导出。草稿重放与保存见 `provider-settings-rebase.ts`、`provider-settings-save.ts`、`provider-create-flow.ts`。
 - 本机导入：`/api/provider-import/local/{detect,scan,resolve}`（管理员）扫描本机 claude、codex、opencode、deepseek-harness 的配置，`resolve` 一次最多 32 个 id（`local-provider-import.ts`、`shared/local-provider-import.ts`、`LocalProviderImport.tsx`）。
-- 模型列表路由：`/api/anthropic|openai|gemini|nug/models` 与 `/providers/:id/models(/refresh)` 缓存各连接发现的模型；NUG 另有 `/relay-status`、渠道健康、账单订单、登录与 OAuth（`routes/nug.ts`）。
+- 模型列表路由：`/api/anthropic|openai|gemini|nug/models` 与 `/providers/:id/models(/refresh)` 缓存各连接发现的模型；其中 `GET /providers/:id/models` 经来源模板过滤缓存（`listCachedTemplateModels`，细节见 [模型目录与来源](model-catalog.md)），各路由文件在加载时用 `registerModelListReader` 登记自己的缓存读取器；NUG 另有 `/relay-status`、渠道健康、账单订单、登录与 OAuth（`routes/nug.ts`）。
 - TokenDance：`/api/tokendance/*`（OAuth 开始/完成/取消/恢复、连接、模型刷新、支付会话、余额）；恢复动作 `top_up_balance` / `reauthorize_api_key` / `api_key_quota` 由前端 `tokendance-recovery.ts` 转成对话框事件，只认自家诊断（`shared/tokendance.ts`、`services/tokendance-service.ts`）。
 - CommandCode：`/api/commandcode/{status,usage,models/refresh}`；凭据取设置页 API key，缺省回退 CLI 的 `~/.commandcode/auth.json`（`commandcode-manager.ts`）；按模型选 Anthropic 或 OpenAI 端点（`commandcode-protocol.ts`、`commandcode-models.ts`）。
 - 快速模式（priority service tier）：`narrators.fastModeOverride` 为准，`inherit` 时请求时刻再取用户默认，`on`/`off` 钉死；旧布尔列只是镜像（`server/lib/fast-mode.ts`）。

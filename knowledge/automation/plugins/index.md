@@ -32,14 +32,14 @@ keywords:
   - 插件覆盖层
   - plugin-event
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 776dbf07e
 ---
 # 插件系统
 
 插件是带 `manifest.json` 的包，作为独立子进程与宿主用 stdio RPC（`narrafork.rpc/1`）通信，通过“贡献点”扩展宿主，每次对宿主的调用都要经能力代理授权。一个插件从落盘到发挥作用分四段，下面各有一个子节点。
 
 ## 各部分怎么配合
-- 管理入口：`PluginManager`（`plugin-manager.ts`）是总状态机：安装、启停、激活、卸载、重试、授权变更都在它里面按插件 ID 串行；`plugin-platform-services.ts` 把状态库、授权库、运行时监督、各注册表、调度器组装成一张服务图；`PluginCatalog` 扫描已安装与内置包并校验清单。
+- 管理入口：`PluginManager`（`plugin-manager.ts`）是总状态机：安装、启停、激活、卸载、重试、授权变更都在它里面按插件 ID 串行；`plugin-platform-services.ts` 把状态库、授权库、运行时监督、各注册表、调度器组装成一张服务图；`PluginCatalog` 扫描已安装与内置包并校验清单；组装时还用 `registerModelListReader("plugin", …)` 登记模型列表读取器，读提供商注册表里该实例的全部缓存模型（含已禁用，不同于 agent 的可用性过滤列表），供 `/providers/:id/models` 这类管理读取使用（`sourcing/model-list-readers.ts`）。
 - 清单（`lib/plugins/manifest.ts`，zod `.strict()`）是各部分共同的契约：`engine` 决定怎么运行，`permissions.host` 决定初始授权，`contributes` 决定提供什么。
 - 开关：设置 `plugins.enabled`（环境变量 `NF_PLUGINS_ENABLED`/`NARRAFORK_PLUGINS_ENABLED` 优先，默认开）；关闭时安装与生命周期等变更接口返回 503 `PLUGINS_DISABLED`。安装、启停、卸载、授权、提供商配置均要求管理员，列表与详情只要登录（`routes/plugins.ts`）。
 - 内置插件：仓库里只有一个，`server/builtin-plugins/apikey-quota`（`com.narrafork.apikey-quota`），只贡献一个 `query-balance` 命令；它走同一套清单与生命周期，只是随应用分发、首次默认启用。
