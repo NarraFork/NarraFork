@@ -76,6 +76,10 @@ class View {
 	cursor = new Signal<editor.ICursorSelectionChangedEvent>();
 	focusEvent = new Signal<void>();
 	mouse = new Signal<editor.IEditorMouseEvent>();
+	configuration = new Signal<editor.ConfigurationChangedEvent>();
+	stopRenderingLineAfter = 10_000;
+	onDidChangeConfiguration = this.configuration.on;
+	getOption = (_option: number) => this.stopRenderingLineAfter;
 	onDidChangeCursorSelection = this.cursor.on;
 	onDidFocusEditorText = this.focusEvent.on;
 	onMouseDown = this.mouse.on;
@@ -106,7 +110,17 @@ class View {
 			endColumn: p.column,
 		};
 	});
-	updateOptions = mock((_options: unknown) => {});
+	updateOptions = mock((options: editor.IEditorOptions) => {
+		if (
+			options.stopRenderingLineAfter !== undefined &&
+			options.stopRenderingLineAfter !== this.stopRenderingLineAfter
+		) {
+			this.stopRenderingLineAfter = options.stopRenderingLineAfter;
+			this.configuration.emit({
+				hasChanged: (option: number) => option === 133,
+			});
+		}
+	});
 	layout = mock((_dimensions: unknown) => {});
 	trigger = mock((_source: string, _command: string, _payload: unknown) => {});
 	focus = mock(() => {});
@@ -234,6 +248,7 @@ beforeEach(() => {
 			},
 			setTheme() {},
 			setModelLanguage() {},
+			EditorOption: { stopRenderingLineAfter: 133 },
 			CursorChangeReason: { ContentFlush: 1, RecoverFromMarkers: 2 },
 			MouseTargetType: { CONTENT_TEXT: 6, CONTENT_EMPTY: 7, GUTTER_LINE_NUMBERS: 2 },
 			GlyphMarginLane: { Center: 2 },
@@ -517,6 +532,32 @@ test("long-line display protection toggles without replacing text, cursor or his
 	expect(toggle()?.getAttribute("aria-pressed")).toBe("false");
 	await act(async () => models.at(-1)?.setValue("short"));
 	expect(toggle()).toBeNull();
+});
+
+test.each([
+	false,
+	true,
+])("native long-line expansion synchronizes protection (readOnly=%s)", async (readOnly) => {
+	const text = "x".repeat(20_000);
+	await render({ initialValue: text, readOnly });
+	const view = views[0];
+	const toggle = () => host.querySelector<HTMLButtonElement>("[data-monaco-long-line-toggle]");
+	// The native longLinesHelper changes editor options, not React state.
+	await act(async () => view.updateOptions({ stopRenderingLineAfter: -1 }));
+	expect(toggle()?.getAttribute("aria-pressed")).toBe("true");
+	await render({ initialValue: text, readOnly, lineWrapping: true });
+	expect(view.stopRenderingLineAfter).toBe(-1);
+	await act(async () => toggle()?.click());
+	expect(view.stopRenderingLineAfter).toBe(10_000);
+	expect(toggle()?.getAttribute("aria-pressed")).toBe("false");
+	await act(async () => view.updateOptions({ stopRenderingLineAfter: -1 }));
+	expect(toggle()?.getAttribute("aria-pressed")).toBe("true");
+	expect(models[0].text).toBe(text);
+	expect(models[0].setValue).not.toHaveBeenCalled();
+	await render({ documentKey: "another-file", initialValue: text, readOnly });
+	expect(view.configuration.listeners.size).toBe(0);
+	expect(toggle()?.getAttribute("aria-pressed")).toBe("false");
+	expect(views[1].stopRenderingLineAfter).toBe(10_000);
 });
 
 for (const [label, cryptoValue] of [
