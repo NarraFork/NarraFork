@@ -65,6 +65,7 @@ function TeamPage() {
 			conversation={<CoordinatorConversation teamId={teamId} onOpenSession={openSession} />}
 			onOpenSession={openSession}
 			onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
+			onDisbanded={openSession}
 		/>
 	);
 }

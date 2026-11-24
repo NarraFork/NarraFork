@@ -667,6 +667,38 @@ async function announceAccessChange(
 export const TEAM_AUDIENCE_NOTICE_LIMIT = 200;
 
 /**
+ * A session became a team coordinator, or its team was disbanded and the session kept
+ * (`teams/team-conversion.ts`). Access did not change, but whether its tree is a team did, and a
+ * browser's recent tabs carry that (`teamSession`, `teamOnlooker`): the people who have the
+ * session or one of its subagents in their recent tabs (most recent first, at most
+ * {@link TEAM_AUDIENCE_NOTICE_LIMIT}) and the person who made the change are told to re-read.
+ * Never throws: the change is committed and clients converge on their next read anyway.
+ */
+export async function announceTeamChange(
+	narratorId: string,
+	actingUserId: string | null,
+): Promise<void> {
+	try {
+		const { getRecentTabUserIdsForTeamTrees } = await import("./recent-tabs-service");
+		const recipients = new Set(
+			await getRecentTabUserIdsForTeamTrees(
+				{ coordinatorId: narratorId },
+				TEAM_AUDIENCE_NOTICE_LIMIT,
+			),
+		);
+		if (actingUserId) recipients.add(actingUserId);
+		for (const userId of recipients)
+			broadcastToUser(userId, {
+				type: "narrator_access_changed",
+				narratorId,
+				reason: "team_changed",
+			});
+	} catch (err) {
+		logger.warn("Failed to announce a team change", { narratorId, error: String(err) });
+	}
+}
+
+/**
  * Cap on how many subagents get their subscriptions swept on one ACL change.
  *
  * Not a hot path, but it must not become an unbounded scan. Beyond the cap the

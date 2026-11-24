@@ -22,12 +22,15 @@ export function TeamPageView({
 	conversation,
 	onOpenSession,
 	onBack,
+	onDisbanded,
 }: {
 	projectId: string;
 	teamId: string;
 	conversation: ReactNode;
 	onOpenSession?: (narratorId: string) => void;
 	onBack: () => void;
+	/** After the team was disbanded: its session is kept (the route opens it). */
+	onDisbanded?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const team = useTeam(projectId, teamId);
@@ -65,6 +68,7 @@ export function TeamPageView({
 						teamName={teamPinTitle(team.data, summary.data?.coordinatorStatus)}
 						summary={summary.data}
 						onOpenSession={openSession}
+						onDisbanded={onDisbanded}
 						leading={
 							<>
 								{/* Phones: the page's own title row carries the menu button (no floating one). */}

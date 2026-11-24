@@ -8,7 +8,7 @@
  * paused while the tab is hidden). The board refetches only when work items changed (new event
  * or column counts), the activity on a new event, the approvals when their count changed.
  */
-import type { CreateTeamPayload } from "@frontend/lib/api/teams";
+import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/teams";
 import type { TeamBoardColumn } from "@shared/project-teams";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
@@ -67,6 +67,36 @@ export function useCreateTeam(projectId: string) {
 		onSuccess: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
 			void queryClient.invalidateQueries({ queryKey: ["narrators", "project", projectId] });
+		},
+	});
+}
+
+/** Turn an existing session into a team's coordinator (the session overflow menu). */
+export function useUpgradeToTeam(projectId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (payload: UpgradeToTeamPayload) => api.upgradeSessionToTeam(projectId, payload),
+		// The dialog shows the failure.
+		meta: { suppressErrorToast: true },
+		onSuccess: (team) => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			void queryClient.invalidateQueries({ queryKey: ["narrators", team.id], exact: true });
+		},
+	});
+}
+
+/** Disband a team and keep its coordinator as an ordinary session (the team page's menu). */
+export function useDisbandTeam(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.disbandTeam(projectId, teamId),
+		// The dialog shows the failure.
+		meta: { suppressErrorToast: true },
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			queryClient.removeQueries({ queryKey: teamKeys.team(teamId) });
+			queryClient.removeQueries({ queryKey: teamKeys.page(teamId) });
+			void queryClient.invalidateQueries({ queryKey: ["narrators", teamId], exact: true });
 		},
 	});
 }

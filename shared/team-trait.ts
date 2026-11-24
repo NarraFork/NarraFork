@@ -9,7 +9,9 @@
 
 /**
  * Trait marking a team coordinator: the narrator that IS a project team, whose id is the team's
- * id. Set at creation with its `project_teams` row and never toggled.
+ * id. Always written with its `project_teams` row in one transaction: at creation, when a session
+ * is upgraded to a team, and removed with the row when the team is disbanded and the session kept
+ * (`server/services/teams/team-conversion.ts`).
  */
 export const TEAM_TRAIT = "team";
 

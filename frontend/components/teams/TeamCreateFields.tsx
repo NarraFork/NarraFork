@@ -31,9 +31,10 @@ export interface TeamDraft {
 	reset: () => void;
 }
 
-export function useTeamDraft(): TeamDraft {
+/** `initialName` prefills the name as a real value (the upgrade dialog's session title). */
+export function useTeamDraft({ initialName = "" }: { initialName?: string } = {}): TeamDraft {
 	const { t } = useTranslation("projects");
-	const [name, setName] = useState("");
+	const [name, setName] = useState(initialName);
 	const [baseBranch, setBaseBranch] = useState("");
 	const [brief, setBrief] = useState("");
 	const [touched, setTouched] = useState(false);
@@ -59,7 +60,7 @@ export function useTeamDraft(): TeamDraft {
 			return check.ok ? check.payload : null;
 		},
 		reset: () => {
-			setName("");
+			setName(initialName);
 			setBaseBranch("");
 			setBrief("");
 			setTouched(false);

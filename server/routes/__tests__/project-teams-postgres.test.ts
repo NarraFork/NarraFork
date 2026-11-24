@@ -35,10 +35,12 @@ test("every team route is refused with 503 on PostgreSQL", async () => {
 	const cases: Array<[string, string, unknown?]> = [
 		["GET", "/projects/p1/teams"],
 		["POST", "/projects/p1/teams", { name: "Team" }],
+		["POST", "/projects/p1/teams", { fromNarratorId: "n1" }],
 		["GET", "/projects/p1/teams/t1"],
 		["PATCH", "/projects/p1/teams/t1", { brief: "x" }],
 		["POST", "/projects/p1/teams/t1/archive"],
 		["POST", "/projects/p1/teams/t1/unarchive"],
+		["POST", "/projects/p1/teams/t1/disband"],
 		["GET", "/projects/p1/teams/t1/summary"],
 		["GET", "/projects/p1/teams/t1/board?column=queued"],
 		["GET", "/projects/p1/teams/t1/events"],
