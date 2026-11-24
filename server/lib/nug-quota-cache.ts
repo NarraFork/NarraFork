@@ -2,7 +2,7 @@ import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { NugProvider } from "./agent/nug-provider";
 import { getNarraforkPath } from "./narrafork-home";
-import type { UsageSubject } from "./provider-key-subjects";
+import { streamQuotaIdentity, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type NUGProviderConfig, settings } from "./settings";
 import { quotaStore } from "./sourcing/quota-store";
@@ -203,11 +203,12 @@ export function updateNugQuotaByPrefix(
 	quotaBalance: number | null,
 	detailedQuotaBalance?: string | null,
 	extra?: unknown,
+	expectedProviderIdentity?: string,
 ): void {
 	const config = (settings.nugProviders ?? []).find(
 		(provider) => provider.prefix === prefix || provider.id === prefix,
 	);
-	if (!config) return;
+	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
 	setNugCachedQuota(
 		config.id,
 		buildNugQuotaCache(

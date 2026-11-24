@@ -788,7 +788,13 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
-	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
+	| {
+			type: "quota_balance";
+			quotaBalance: string | null;
+			detailedQuotaBalance?: string | null;
+			/** Request-start provider identity; stale events must not write a replacement's cache. */
+			providerIdentity?: string;
+	  }
 	| {
 			type: "invalid_state";
 			reason: string;

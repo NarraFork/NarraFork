@@ -1,9 +1,9 @@
 import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { getNarraforkPath } from "./narrafork-home";
-import { firstCredential } from "./provider-key-subjects";
+import { firstCredential, streamQuotaIdentity } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
-import { quotaStore } from "./sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface CustomApiQuotaCache {
 	quotaBalance: string | null;
@@ -68,9 +68,10 @@ export function updateCustomApiQuotaByPrefix(
 	prefix: string,
 	quotaBalance: string | null,
 	detailedQuotaBalance?: string | null,
+	expectedProviderIdentity?: string,
 ): void {
 	const config = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
-	if (!config) return;
+	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
 	const credential = firstCredential(config);
 	knownCredentialIds.set(config.id, credential.id);
 	quotaStore.set(
@@ -81,6 +82,8 @@ export function updateCustomApiQuotaByPrefix(
 			detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
 			fetchedAt: Date.now(),
 		}),
+		true,
+		STREAM_QUOTA_SOURCE,
 	);
 }
 
@@ -89,7 +92,12 @@ export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache
 	if (!config) return undefined;
 	const credential = firstCredential(config);
 	knownCredentialIds.set(providerId, credential.id);
-	const snapshot = quotaStore.get(credential.id, identity(credential.config), restoreSnapshot);
+	const snapshot = quotaStore.get(
+		credential.id,
+		identity(credential.config),
+		restoreSnapshot,
+		STREAM_QUOTA_SOURCE,
+	);
 	return snapshot
 		? {
 				...(snapshot.detail as Omit<CustomApiQuotaCache, "fetchedAt">),
@@ -115,6 +123,6 @@ export function purgeCustomApiQuotaCache(removedIds: string[]): void {
 		const config = provider(id);
 		const credentialId = knownCredentialIds.get(id) ?? (config ? firstCredential(config).id : id);
 		knownCredentialIds.delete(id);
-		quotaStore.remove(credentialId);
+		quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
 	}
 }

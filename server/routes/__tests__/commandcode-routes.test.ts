@@ -190,6 +190,58 @@ test("settings-key usage is a 60-second snapshot cache with the exact legacy res
 	}
 });
 
+test("a late old-key refresh cannot overwrite the current key's snapshot", async () => {
+	const originalFetch = globalThis.fetch;
+	const original = structuredClone(settings);
+	const bodies = usageResponses();
+	const bodyFor = (monthlyCredits: number) => ({
+		...bodies.credits,
+		credits: { ...bodies.credits.credits, monthlyCredits },
+	});
+	let calls = 0;
+	let finishOldCredits!: () => void;
+	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		calls++;
+		const authorization = new Headers(init?.headers).get("Authorization");
+		if (authorization === "Bearer key-a" && String(input).endsWith("/alpha/billing/credits")) {
+			return new Promise<Response>((resolve) => {
+				finishOldCredits = () => resolve(Response.json(bodyFor(5)));
+			});
+		}
+		return Response.json(
+			String(input).endsWith("/alpha/usage/summary") ? bodies.summary : bodyFor(30),
+		);
+	}) as unknown as typeof fetch;
+	let credentialId = "CommandCode";
+	quotaStore.remove(credentialId);
+	try {
+		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-a" } });
+		const app = appForRole("user");
+		const oldRequest = app.request("/commandcode/usage");
+		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-b" } });
+		credentialId = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0]?.id ?? "CommandCode";
+		expect((await app.request("/commandcode/usage")).status).toBe(200);
+		const callsAfterFresh = calls;
+		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
+			credits: { monthlyCredits: 30 },
+		});
+		finishOldCredits();
+		expect((await oldRequest).status).toBe(200);
+		const current = await app.request("/commandcode/usage");
+		expect(current.status).toBe(200);
+		expect(await current.json()).toMatchObject({ credits: { monthlyCredits: 30 } });
+		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
+			credits: { monthlyCredits: 30 },
+		});
+		// Only the old request's summary was added; the current snapshot stayed fresh.
+		expect(calls).toBe(callsAfterFresh + 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+		quotaStore.remove(credentialId);
+		saveSettings(original);
+	}
+});
+
 test("CLI auth falls back to the original uncached requests and writes no snapshot", async () => {
 	const originalFetch = globalThis.fetch;
 	const original = structuredClone(settings);

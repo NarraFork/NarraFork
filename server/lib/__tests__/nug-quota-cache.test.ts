@@ -8,6 +8,7 @@ import {
 	setNugCachedQuota,
 	updateNugQuotaByPrefix,
 } from "../nug-quota-cache";
+import { streamQuotaIdentity, streamQuotaIdentityForPrefix } from "../provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
 import { quotaStore } from "../sourcing/quota-store";
@@ -34,6 +35,16 @@ function useProvider() {
 	const config = settings.nugProviders?.[0];
 	if (!config) throw new Error("NUG test provider was not saved");
 	return config;
+}
+
+function reportNugQuota(
+	prefix: string,
+	balance: number | null,
+	detail?: string | null,
+	extra?: unknown,
+	identity = streamQuotaIdentityForPrefix(prefix),
+): void {
+	updateNugQuotaByPrefix(prefix, balance, detail, extra, identity);
 }
 
 afterEach(() => {
@@ -69,7 +80,7 @@ describe("NUG quota snapshots", () => {
 			{ unit: "", remaining: 12, total: 30 },
 		]);
 
-		updateNugQuotaByPrefix("nug-quota", 7);
+		reportNugQuota("nug-quota", 7);
 		expect(getNugCachedQuota(providerId)).toEqual({
 			balance: 7,
 			totalGranted: 30,
@@ -95,6 +106,16 @@ describe("NUG quota snapshots", () => {
 		getProviderKeyStore().update(second.id, { apiKey: "key-other" });
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 		quotaStore.remove(second.id);
+	});
+
+	test("a stream event from before a provider identity change is discarded", () => {
+		const config = structuredClone(useProvider());
+		const expectedIdentity = streamQuotaIdentity(config);
+		saveSettings({ ...settings, nugProviders: [{ ...config, apiKey: "key-replacement" }] });
+		reportNugQuota("nug-quota", 99, null, undefined, expectedIdentity);
+		expect(getNugCachedQuota(providerId)).toBeUndefined();
+		updateNugQuotaByPrefix("nug-quota", 100, null, undefined, undefined);
+		expect(getNugCachedQuota(providerId)).toBeUndefined();
 	});
 
 	test("the nug template probes into the shared shape", async () => {

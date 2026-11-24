@@ -11,6 +11,7 @@ import {
 	commandCodeUsageSnapshot,
 	parseCommandCodeCredits,
 	parseCommandCodeSummary,
+	probeCommandCodeQuota,
 	readResponseJsonLimited,
 } from "../commandcode-usage";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
@@ -211,5 +212,31 @@ describe("Command Code 额度解析（结构取自实测响应）", () => {
 		const snapshot = commandCodeUsageSnapshot({ credits, windowLimits });
 		expect(snapshot.windows[0]).toEqual({ kind: "5h", usedRatio: null, resetsAt: null });
 		expect(snapshot.balances).toEqual([{ unit: "credits", remaining: 2 }]);
+	});
+
+	test("summary 阶段的取消不会被降级成一次成功探测", async () => {
+		const originalFetch = globalThis.fetch;
+		const controller = new AbortController();
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			if (calls === 1) return Response.json({ credits: { monthlyCredits: 1 } });
+			controller.abort();
+			throw new Error("summary abort");
+		}) as unknown as typeof fetch;
+		try {
+			await expect(
+				probeCommandCodeQuota(
+					{
+						id: "CommandCode",
+						providerId: "CommandCode",
+						config: { apiKey: "key" },
+					},
+					controller.signal,
+				),
+			).rejects.toThrow("summary abort");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });

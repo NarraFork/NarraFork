@@ -13,6 +13,24 @@ export interface UsageSubject<TConfig = CustomApiProviderConfig> {
 	config: TConfig;
 }
 
+/** Request-time identity for stream balances; kept internal and never broadcast. */
+export function streamQuotaIdentity(config: {
+	id: string;
+	baseUrl: string;
+	apiKey: string;
+}): string {
+	return JSON.stringify([config.id, config.baseUrl, config.apiKey]);
+}
+
+export function streamQuotaIdentityForPrefix(prefix: string): string | undefined {
+	const custom = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
+	if (custom) return streamQuotaIdentity(custom);
+	const nug = (settings.nugProviders ?? []).find(
+		(provider) => provider.prefix === prefix || provider.id === prefix,
+	);
+	return nug ? streamQuotaIdentity(nug) : undefined;
+}
+
 export function usageSubjects(
 	belongs: (provider: CustomApiProviderConfig) => boolean,
 ): UsageSubject[] {

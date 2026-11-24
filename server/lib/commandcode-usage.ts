@@ -236,7 +236,8 @@ export async function fetchCommandCodeUsage(
 	let summary: CommandCodeUsageSummary | undefined;
 	try {
 		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token, origin, signal));
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		// 用量摘要失败不阻塞额度展示。
 	}
 	return { credits, windowLimits, sandboxAccess, summary };
@@ -331,7 +332,10 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 	if (existing) return existing;
 	const task = probeCommandCodeQuota(subject, new AbortController().signal)
 		.then((snapshot) => {
-			quotaStore.set(subject.id, key, snapshot);
+			const current = settingsSubject();
+			if (current?.id === subject.id && identity(current.config) === key) {
+				quotaStore.set(subject.id, key, snapshot);
+			}
 			return snapshot.detail as CommandCodeUsage;
 		})
 		.finally(() => refreshes.delete(key));
