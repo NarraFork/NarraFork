@@ -33,6 +33,29 @@ anchors:
   - server/services/reasoning-translation-runtime.ts
   - server/services/reasoning-translation-scheduler.ts
   - shared/stream-timeout.ts
+  - shared/citations.ts
+keywords:
+  - agentLoop
+  - AgentEvent
+  - 最大轮数
+  - maxTurns
+  - 重试
+  - chatRetryCount
+  - isRetryableError
+  - 空响应
+  - MAX_MALFORMED_REPLAYS
+  - 反思循环
+  - runReflectionLoop
+  - 历史构造
+  - buildAdapterHistory
+  - LoopTranscript
+  - 流水线
+  - Pipeline
+  - StreamStallPhase
+  - tool_use id 去重
+  - retry-after
+  - 首 token 超时
+  - tool-output 截断
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -57,6 +80,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/agent/tool-executor.ts:executeTool`：单个工具调用的准入、权限、执行目标冻结（`freezeToolExecutionTarget`）与结果截断。
 - `server/lib/agent/history-build.ts`、`loop-transcript.ts`：历史构造。
 - `server/lib/agent/__tests__/loop-*.test.ts`：按行为拆分的循环测试（重试、空响应、反思、并行预检、工具结算等）。
+- 流式与超时：`stream-progress.ts` 记录一次流式尝试的传输层进度，只用于说明卡在哪个阶段（`no_response_headers` / `headers_only` / `heartbeat_only` / `unparsed_data`），心跳不会延长任何计时器；`stream-timeout.ts`（实现在 `shared/stream-timeout.ts`）给读取加空闲超时与字节预算；`generate-first-token-timeout.ts` 只限制等首个输出的时间，不限整个生成；`stream-wakeups.ts:interleaveWakeups` 让循环在提供商事件之间也能处理中途启动的工具的结算。
+- 流内容整理：`output-content.ts` 按车道累积输出（原生标识只在请求内有效，`outputIndex` 只是顺序）；`tool-input-stream.ts` 按 UTF-16 偏移增量解码工具入参字段；`citation-stream.ts` / `strip-citation-markers.ts` 与 `shared/citations.ts` 处理助手文本的来源引用（结构化注释与旧的文本标记两种来源，送模型前剥离旧标记）；`tool-use-id-dedup.ts` 保证历史里 tool_use id 唯一且字符集合法（`^[a-zA-Z0-9_-]+$`，跨提供商重放不被拒）。
+- 重试相关：`retry-after.ts` 解析 `retry-after-ms`、`retry-after`、`ratelimit-reset`、`x-ratelimit-reset*` 等时间提示，只回答「何时可重试」，不判断是否瞬时；`abortable-sleep.ts` 是所有退避共用的可中断睡眠；`malformed-request.ts` 识别上游不透明的「请求畸形」并生成结构摘要；`error-diagnostics.ts` 与 `diagnostic-fetch.ts` 提供有界的错误诊断与连接密钥脱敏；`execution-timeout.ts` 里 0/缺省表示无墙钟期限，显式期限分块调度（单个 setTimeout 有 32 位上限）。
+- 工具输出截断：`truncate.ts` 默认最多 2000 行 / 50KB，超出的完整输出落到临时目录 `narrafork-tool-output`，并有启动清理。
+- 类型：`types.ts` 是 `AgentEvent`、`ApiError`、`ToolContext` 等宿主侧类型的汇集（协议部分的定义在 `shared/agent-protocol/types.ts`）。设置页 `frontend/components/settings/AgentSection.tsx` 编辑 `settings.agent` 的最大轮数等项。
+- `server/services/reasoning-translation-*.ts`：按「可见性目标」调度的推理翻译（`translateDemand` 调用 `summaryGenerate`，经 publish 回调推补丁，由 `narrator-ws.ts` 与 `narrator-event-handler.ts` 使用）；不属于循环本身，归属未核实。
+
+## 改它时
+- 加一种 `AgentEvent`：改 `types.ts` 的联合类型，再在宿主的 `narrator-event-handler.ts:processEvent` 与 WebSocket/前端消费处处理；循环不负责持久化，只产出事件。
+- 改重试规则：判定在 `error-handling.ts:isRetryableError`，策略违规与 TokenDance 恢复动作必须排在自定义重试规则之前；退避走 `abortable-sleep.ts`；畸形请求重放里宣告的 `delayMs` 与实际睡眠只算一次、共用同一个值。
+- 改历史投影要同时看 `history-build.ts` 与各适配器的 `buildHistory`；`loop-transcript.ts` 的内存行必须与数据库行同形，不要另造一套历史构造。
+- 工具并行规则的单一来源是 `shared/tool-parallel-groups.ts`，改它要跑 `tool-execution-groups.test.ts` 与 `loop-*` 并行预检测试。
+- 任何新增的主线程长耗时（压缩、哈希、大 JSON 序列化）按仓库规则放工作线程，且工作线程失败不得回退主线程（`tests/worker-main-thread-fallback.guard.test.ts` 扫描遗留的回退标识）。
+- 测试：`agent/__tests__/loop-*.test.ts`、`tool-execution-groups.test.ts`、`tool-use-id-dedup.test.ts`、`error-handling.test.ts`、`retry-after.test.ts`。
 
 ## 相关
 - [模型提供商](providers.md)

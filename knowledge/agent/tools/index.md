@@ -13,6 +13,22 @@ anchors:
   - shared/routine-modes.ts
   - server/lib/agent/tools/learning-guide.ts
   - server/lib/agent/tools/number-param.ts
+keywords:
+  - toolRegistry
+  - ToolRegistry
+  - OPTIONAL_TOOLS
+  - ToolSearch
+  - /load
+  - 工具加载
+  - manual auto resident
+  - routine-modes
+  - 前缀保持
+  - anthropic_tool_addition
+  - custom_injection
+  - LearningGuide
+  - looseNumber
+  - 工具名规则
+  - tool-load-markers
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -33,16 +49,24 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 从哪读起
 - `server/lib/agent/tools/index.ts`：全部内置工具的清单。
 - `server/services/tool-loading-service.ts:changeLoadedToolGroup`：加载/卸载一个工具组的服务端实现。
-- `server/lib/agent/__tests__/loop-tool-loading.test.ts`、`tool-routing.test.ts`
+- `server/lib/agent/__tests__/loop-tool-loading.test.ts`、`server/lib/agent/tool-routing.test.ts`
+- `tools/learning-guide.ts`：core 工具，按语言检索与读取内置学习文档（`@shared/learning-content`）；`tools/number-param.ts`：`looseNumber` 宽松接受字符串数字与浮点，`normalizeNumber` 在执行时按范围取整截断，避免模型的小偏差白白浪费一轮（browser、grep、knowledge 等工具使用）。
 
 ## 下面有什么
 
 - [文件工具](file-tools.md)：Read / Write / Edit / Glob / Grep / 结构化编辑。
-- [命令与终端工具](shell.md)：Bash、后台任务、Await、Terminal 工具。
+- [命令与终端工具](shell.md)：Bash、后台任务、Watch、Stop、Terminal 工具（Await 已退役）。
 - [浏览器与网页](web.md)：Browser、WebFetch、WebSearch。
 - [与人交互的工具](interaction.md)：Notification、Send、ShareFile、GenUI。
 - [流程与协作工具](workflow.md)：计划模式、定时任务、技能、知识包、团队、worktree 与设备切换、回忆、生图。
 - [管理工具](admin.md)：让会话管理 NarraFork 自身的工具：各类 *Admin、插件安装、引导设置。
-- [工具执行日志](execution-log.md)：工具调用的执行日志：记录、游标分页读取与设置页展示。
+- [工具执行日志](execution-log.md)：管理员对 `narrator_tool_calls` 的全局只读视图：游标分页、过滤、凭证脱敏与设置页展示。
 
 其余工具（子代理 Task/Agent、知识库读写与审阅、MCP 服务器提供的工具等）不在本层子节点内，分别见 [子代理](../subagents.md)、[MCP 集成](../mcp.md) 等。
+
+## 改它时
+- 加一个内置工具：在 `tools/index.ts` 的 core 或 optional provider 里登记；不默认加载的要进 `OPTIONAL_TOOLS`；工具名必须符合 `^[a-zA-Z0-9_-]+$`（`tool-name.test.ts`）；工具定义必须是静态数据属性，不能用 getter 读设置或模型池（`tools/__tests__/static-definitions.test.ts` 会失败）；只管理员可加载的要加进 `services/tool-load-markers.ts:ADMIN_ONLY_LOAD_TOOLS`。
+- 同时要看的外围：权限分类在 `services/narrator-permission.ts`，并行/串行屏障在 `shared/tool-parallel-groups.ts`（`tool-execution-groups.test.ts`），可选工具的加载与装载状态在 `tool-loading-service.ts`（`tool-search-service.test.ts`、`optional-tool-state.test.ts`、`loop-tool-loading.test.ts`），ToolSearch 排序在 `tool-search-index.ts`（`tool-search-index.test.ts`）。
+- 前缀保持是缓存不变量：同一上下文纪元内请求的 `tools` 数组固定，卸载不缩减声明，只由执行器拒绝已卸载的工具；改加载逻辑别破坏它。
+- 旧别名 `Shell` 回退到 `Bash`，改名要保留（`tool-registry-legacy-alias.test.ts`）。
+- 新增一类工具时在对应子节点（文件/命令/网页/交互/流程/管理）补充说明。

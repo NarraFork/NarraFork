@@ -15,7 +15,23 @@ anchors:
   - server/lib/search/
   - server/services/browser-session-recovery.ts
   - shared/browser-paths.ts
-  - shared/citations.ts
+keywords:
+  - Browser
+  - WebFetch
+  - WebSearch
+  - browser_session
+  - launch
+  - puppeteer
+  - readability
+  - screenshot
+  - webFetchPolicy
+  - browserProxy
+  - memory_profile
+  - heap snapshot
+  - 堆快照
+  - browser-sessions-handoff
+  - search router
+  - 搜索渠道
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -38,6 +54,16 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/agent/tools/web-search.ts`、`server/lib/search/router.ts`
 - `server/lib/agent/tools/browser.ts`、`server/lib/browser/session.ts`、`pool.ts`
 - 测试：`server/lib/search/__tests__/`、`server/lib/browser/__tests__/`
+- 内存诊断（Browser 的 `memory_*` 动作）：`tools/browser-memory.ts` 取页面指标（JS 堆、文档/帧/节点/事件监听数，范围只是当前页面目标，不是浏览器 RSS）或堆快照，快照以分享链接交付、有效 24 小时、内容不脱敏（`HEAP_SNAPSHOT_PRIVACY_NOTICE`）；`browser-memory-profile.ts` 提供 `memory_profile_start` / `stop` / `status` / `cancel`。
+- 更新重启交接：`services/browser-session-recovery.ts` 在旧进程因 `replacement_started` 关停时写交接文件并让 Chrome 保持存活（清空内存会话表但不关上下文），新进程启动时读一次、按 wsEndpoint 重连并重建会话，恢复不了的会话通知所属叙述者（见上一条的 5 分钟过期规则）。
+- 前端 `frontend/hooks/useBrowserSessions.ts`：查询某叙述者的浏览器会话（`["browser-sessions", narratorId]`）及关闭、聚焦等变更，另有「可选工具是否已加载并一键加载」的 `useOptionalToolState` / `useLoadOptionalTool`。
+
+## 改它时
+- 加一个 Browser 动作：改 `browser.ts:ACTIONS` 与分发，会话级状态放 `browser/session.ts`；重活（内存、堆快照、追踪）放 `browser/` 下的工作线程，不得回到主线程，工作线程不可用时按失败处理。
+- 改 WebFetch 的模式或协议白名单：`file:` 必须继续被排除，本地文件只能走 Read 的路径黑白名单；代理解析走 `web-fetch/proxy.ts`，不要在工具里硬编码。
+- 改 WebSearch 渠道：路由在 `search/router.ts`，`isAvailable` 在没有可用渠道时必须让工具不可用；搜索子代理运行时不得再进入普通渠道路由。
+- 改交接文件格式要同时看 `browser/handoff.ts`（读一次即删、5 分钟过期）与 `browser-session-recovery.ts`。
+- 测试：`tools/__tests__/web-fetch.test.ts`、`web-search.test.ts`、`browser-memory*.test.ts`，`server/lib/browser/__tests__/`、`server/lib/search/__tests__/`。
 
 ## 相关
 - [工具体系](index.md)

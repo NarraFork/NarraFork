@@ -1,7 +1,7 @@
 ---
 id: agent.providers
 title: 模型提供商
-summary: Anthropic / OpenAI / Gemini / Codex / NUG 等适配，历史构造与图片处理差异。
+summary: 各模型提供商适配器（Anthropic / OpenAI / Gemini / Codex / NUG / TokenDance / CommandCode）、来源注册、协议切换与上游拒绝降级，以及提供商设置页。
 anchors:
   - server/lib/agent/provider.ts
   - server/lib/agent/provider-source-registry.ts
@@ -28,7 +28,6 @@ anchors:
   - frontend/components/providers/NUGProvidersSection.tsx
   - frontend/components/providers/OpenAIProvidersSection.tsx
   - frontend/components/providers/PluginProviderSection.tsx
-  - frontend/components/providers/ProviderBalanceStatus.tsx
   - frontend/components/providers/ProviderCard.tsx
   - frontend/components/providers/ProviderConfigView.tsx
   - frontend/components/providers/ProviderDetailPanel.tsx
@@ -64,13 +63,11 @@ anchors:
   - server/lib/agent/reasoning-source.ts
   - server/lib/agent/response-body.ts
   - server/lib/agent/response-format.ts
-  - server/lib/agent/session-affinity.ts
   - server/lib/agent/structured-output-fallback.ts
   - server/lib/agent/switchable-protocols.ts
   - server/lib/agent/tool-schema-compat.ts
   - server/lib/agent/unsupported-parameter-fallback.ts
   - server/lib/agent/user-content-order.ts
-  - server/lib/codex-network.ts
   - server/lib/commandcode-models.ts
   - server/lib/commandcode-protocol.ts
   - server/lib/fingerprint.ts
@@ -91,6 +88,51 @@ anchors:
   - shared/reasoning-credentials.ts
   - shared/reasoning-effort-support.ts
   - shared/reasoning-effort.ts
+  - server/lib/fast-mode.ts
+  - server/lib/provider-availability-error.ts
+  - server/routes/nug.ts
+  - server/routes/tokendance.ts
+  - server/routes/commandcode.ts
+  - server/services/tokendance-service.ts
+  - shared/tokendance.ts
+  - server/lib/commandcode-manager.ts
+  - frontend/components/providers/channel-health.ts
+  - frontend/lib/api/commandcode.ts
+  - frontend/lib/api/provider-import.ts
+  - frontend/lib/api/tokendance.ts
+  - frontend/lib/tokendance-recovery.ts
+  - frontend/routes/admin/providers.tsx
+  - frontend/routes/settings/providers.add.tsx
+  - frontend/routes/settings/providers.tokendance.callback.tsx
+  - frontend/routes/settings/providers.tsx
+keywords:
+  - 提供商
+  - 添加提供商
+  - ProviderAdapter
+  - resolveProviderAndModel
+  - provider_not_configured
+  - PROVIDER_NOT_FOUND
+  - PROVIDER_UNAVAILABLE
+  - NugProvider
+  - TokenDance
+  - CommandCode
+  - Codex WebSocket
+  - responsesApi
+  - apiMode
+  - modelProtocols
+  - toolResultImages
+  - fast mode
+  - fastModeOverride
+  - /api/anthropic
+  - /api/openai
+  - /api/gemini
+  - /api/nug
+  - /api/tokendance
+  - /api/commandcode
+  - /api/provider-import
+  - x-opencode-session
+  - NonJsonResponseError
+  - nug-relay
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -104,17 +146,50 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 适配器族：`AnthropicProvider`；`OpenAIProvider`（`apiMode` 为 responses / completions / codex，缺省 responses，旧的 `responsesApi:false` 映射为 completions）；`GeminiProvider` 与 `GeminiInteractionsProvider`（`createGeminiProvider` 按 `geminiTransport === "interactions"` 选择）；`CodexProvider`；`NugProvider`（内部委托 Anthropic/OpenAI 并走 NUG 网关）；`TokenDanceProvider`（按所选协议委托 Anthropic/Gemini/OpenAI）；CommandCode 不写新适配器，按模型选 Anthropic 或 OpenAI 适配器。
 - 逐模型协议覆盖：`resolveModelProtocol` 与连接本身协议不符时换一族适配器并沿用代理等连接字段；构造失败则记录警告并回退到提供商默认适配器。
 - Codex：`useWebSocket` 缺省 true，`useWebSearch`、`useImageGeneration` 缺省 true，取自 `settings.codex`（`provider.ts` 的 codex 来源）。WebSocket 传输在 `codex-websocket.ts`。
-- 多密钥连接包 `PooledProvider`，单密钥直连（见 [凭证池](credentials.md)）。
+- 多密钥连接包 `PooledProvider`，单密钥直连（判定分支见 [凭证池与存储](credentials.md)）。
 - 历史构造差异：共享的模型侧投影在 `history-build.ts`；各适配器的 `buildHistory` 再做自己的线格式。工具结果里的图片：OpenAI Chat Completions 按 `toolResultImages` 配置 `off`（默认）/ `inline` / `separate` 三种形状（`shared/tool-result-images.ts`，`openai-provider.ts` 的 `expandChatToolResults`）。
 - 原生媒体（音视频等）：适配器不支持时，`projectUnsupportedNativeMediaForModel` 在历史里降级并产生警告；`rejectNativeMedia` 对不支持的协议直接抛错，提示选择 Gemini 等（`native-media.ts`）。
 - NUG 图片去重：每张图带内容哈希 `imageRef`，网关确认缓存后才去掉内联数据只发引用，请求结束（成败皆然）必须还原；网关 409 缓存未命中则丢弃该确认并内联重发（`nug-image-dedup.ts`）。该逻辑只在 NUG 路径使用。
 - 工具加载策略依赖适配器报告的线协议（`toolLoadingTarget`），见 [工具体系](tools/index.md)。
+- 逐模型协议切换：可选协议集合由 `switchable-protocols.ts:switchableModelProtocols` 给出，每个分支一行：
+  - tokendance：取目录里该模型声明支持的协议。
+  - CommandCode：除 `gemini-compatible` 外的全部协议。
+  - 自定义的 Anthropic / OpenAI / Gemini 连接：全部协议。
+  - 其他（NUG 按网关渠道路由、Codex 与插件提供商只有一种线协议）：空，不可切换。
+  - 换适配器时代理、指纹、额外头、官方 API 标志留在连接上；选中协议与连接原适配器一致时不重建（`protocol-override.ts`）。
+- 上游拒绝时的降级，都是进程内、重启即忘（故意不落盘，避免上游已放开后仍被压制）：
+  - 拒绝 `reasoningEffort: "none"`（"Reasoning is mandatory"）：去掉推理偏好重发，不替换成某个档位（`reasoning-mandatory-fallback.ts`）。
+  - 拒绝某个请求字段（如 `max_output_tokens`）：学到后剥掉该字段重试，记忆表有上限（`unsupported-parameter-fallback.ts`）。
+  - 中转站忽略或拒绝 JSON-Schema 输出约束：按模型记住并降级，原生结构化输出仍是首选（`structured-output-fallback.ts`）。
+  - 顶层联合类型的工具 schema 在提供商边界处展平，嵌套组合保持；展平会丢失属性间关联，不支持的约束只留诊断不猜测（`tool-schema-compat.ts`）；Gemini 另有 schema 清洗（`gemini-tool-schema.ts`）。
+- 响应体：非 JSON 响应（如 2xx 下的 HTML 挑战页）抛 `NonJsonResponseError`，JSON 上限 2MB、预览 4000 字符（`response-body.ts`）；用户内容里图片占位符 `[image #N: name]` 之后紧跟对应图片（`user-content-order.ts`）。
+- 上游身份头：Codex 稳定请求身份（`x-codex-window-id` 由会话 id 确定性派生，`x-codex-installation-id`，不发 `turn_id`，`codex-request.ts`）；OpenCode Go 的 `x-opencode-session` 路由头让同一会话落到同一上游以命中缓存，按主机判断是否 OpenCode 网关（`opencode-session.ts`）；Anthropic 请求的 3 字符归因指纹在 `server/lib/fingerprint.ts`，UA 与 originator 在 `user-agent.ts`。
+- Codex 额度故障转移的外层重试错误 `CodexRebuildHistoryRetryError` 见 `codex-errors.ts`，换账号的选择在 [凭证池与存储](credentials.md)。
+- NUG 客户端出口中继（`server/lib/nug-relay/`）：出口模式为本地直连/代理的 NUG 提供商，保持一条到网关 `/v1/relay` 的 WSS 连接，按严格白名单（默认只有 `chatgpt.com`）响应拨号请求；客户端随 `NugProvider` 构造惰性创建。
+- 前端配置页：`AddProviderPage` + `provider-catalog.ts`（预设取自 `GET /api/sourcing/templates`）建立连接；`ProviderOverviewView` + `ProviderConfigView` 排布，`ProviderCard`、`ProviderStatusBadge` 显示状态；协议族区块为 `CustomApiProviderSection`（Anthropic/OpenAI/Gemini 等都是它的协议选项）、`NUGProvidersSection`、`CodexSection`、`CommandCodeSection`、`TokenDanceSection`、`PluginProviderSection`。`AnthropicProvidersSection.tsx`、`GeminiSection.tsx`、`OpenAIProvidersSection.tsx`、`ProviderDetailPanel.tsx` 已退役，文件内容为空导出。草稿重放与保存见 `provider-settings-rebase.ts`、`provider-settings-save.ts`、`provider-create-flow.ts`。
+- 本机导入：`/api/provider-import/local/{detect,scan,resolve}`（管理员）扫描本机 claude、codex、opencode、deepseek-harness 的配置，`resolve` 一次最多 32 个 id（`local-provider-import.ts`、`shared/local-provider-import.ts`、`LocalProviderImport.tsx`）。
+- 模型列表路由：`/api/anthropic|openai|gemini|nug/models` 与 `/providers/:id/models(/refresh)` 缓存各连接发现的模型；NUG 另有 `/relay-status`、渠道健康、账单订单、登录与 OAuth（`routes/nug.ts`）。
+- TokenDance：`/api/tokendance/*`（OAuth 开始/完成/取消/恢复、连接、模型刷新、支付会话、余额）；恢复动作 `top_up_balance` / `reauthorize_api_key` / `api_key_quota` 由前端 `tokendance-recovery.ts` 转成对话框事件，只认自家诊断（`shared/tokendance.ts`、`services/tokendance-service.ts`）。
+- CommandCode：`/api/commandcode/{status,usage,models/refresh}`；凭据取设置页 API key，缺省回退 CLI 的 `~/.commandcode/auth.json`（`commandcode-manager.ts`）；按模型选 Anthropic 或 OpenAI 端点（`commandcode-protocol.ts`、`commandcode-models.ts`）。
+- 快速模式（priority service tier）：`narrators.fastModeOverride` 为准，`inherit` 时请求时刻再取用户默认，`on`/`off` 钉死；旧布尔列只是镜像（`server/lib/fast-mode.ts`）。
+- 引用模型却解析不出提供商时（PROVIDER_NOT_FOUND / PROVIDER_UNAVAILABLE / PROVIDER_CONFIG_INVALID）是不可重试的注册表错误，与瞬时上游失败区分（`provider-availability-error.ts`）。
 
 ## 从哪读起
 - `server/lib/agent/provider.ts`：接口、来源注册、解析。
 - `server/lib/agent/__tests__/`：按提供商分的测试（`anthropic-*`、`codex-*`、`gemini-provider`、`nug-*`、`openai-*`）。
 - 未核实：`docs/AGENT_PROVIDERS.md` 中的细节未逐条对照，本节未采用。
+- `server/lib/agent/projection/`：所有适配器共用的历史第一段投影（存储行解码、图片字节预取、可见块与顺序），各适配器的 `buildHistory` 只做线格式；`shared/agent-protocol/` 是协议层与宿主共享的类型与诊断（插件也可复用，不得依赖 `server/`）。
+- 前端设置页入口：`frontend/routes/settings/providers.tsx`、`providers.add.tsx`、`providers.tokendance.callback.tsx`、`routes/admin/providers.tsx`；API 客户端 `frontend/lib/api/provider-import.ts`、`tokendance.ts`、`commandcode.ts`。
+- 测试：`agent/__tests__/provider-resolution.test.ts`、`provider-source-registry.test.ts`、`provider-source-readiness.test.ts`、`protocol-override.test.ts`、`*-fallback.test.ts`、`tokendance-provider.test.ts`、`nug-*.test.ts`。
+
+## 改它时
+- 加一种提供商来源：在 `provider.ts` 注册来源时路由与就绪状态必须一起注册（`provider-source-registry.ts`，`provider-source-registry.test.ts`、`provider-source-readiness.test.ts` 会拦），前缀不得与内置前缀冲突，`tutorial` 已退役；再补 `shared/provider-readiness.ts` 的投影与前端 `provider-catalog.ts`、对应设置区块。
+- 改某个适配器的 `buildHistory` 或线格式：先对照 `projection/` 的共享投影，按提供商对应的 `*-provider-history.test.ts`、`provider-images.test.ts`、`provider-content-boundaries.test.ts` 回归。
+- 改 NUG 图片去重要保证「请求结束（成败皆然）必须还原内联数据」，见 `nug-image-dedup.test.ts`；改 Codex WebSocket 看 `codex-websocket*.test.ts`。
+- 新增上游拒绝降级时沿用「进程内记忆、不落盘、有上限」的写法，别把学到的限制写进设置。
+- 新增会拉取或展示额度的提供商，额度部分放 [供应商余额与额度](provider-quota.md)，不要放进适配器。
 
 ## 相关
 - [Agent Loop](loop.md)
-- [凭证池与模型目录](credentials.md)
+- [凭证池与存储](credentials.md)
+- [供应商余额与额度](provider-quota.md)

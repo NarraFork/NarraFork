@@ -5,6 +5,18 @@ summary: 程序化工具调用、沙箱与 VM 运行时。
 anchors:
   - server/lib/agent/programmatic/
   - server/lib/agent/tools/eval.ts
+keywords:
+  - Eval
+  - NF_READONLY_EVAL_IMAGE
+  - NF_READONLY_EVAL_NARRATORS
+  - tools.Read
+  - Podman 沙箱
+  - source-guard
+  - PROGRAMMATIC_LIMITS
+  - CAPACITY
+  - verifyIsolation
+  - createProgrammaticService
+  - closeProgrammaticServices
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -26,6 +38,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `protocol.ts`：帧格式与限额。
 - `server/lib/agent/tools/eval.ts`
 - 测试：`programmatic/__tests__/`（`service*.test.ts`、`gateway.test.ts`、`source-guard.test.ts`、`podman-driver.lifecycle.test.ts`）
+
+## 改它时
+- 给沙箱加一个 receiver 方法（现在只有 `tools.Read`）：在 `eval.ts` 暴露，经 `gateway.ts` 的 authorize 与审计事件，并受 `protocol.ts:PROGRAMMATIC_LIMITS` 约束；调用方必须提供真实的授权与审计回调，不得为测试便利留空实现。
+- 改容器策略（只读根、无网络、`--cap-drop=ALL`、用户 65532、内存/进程/CPU 上限）要同步 `podman-driver.ts` 的 `POLICY` 与启动参数，并保留启动后发送源码前的 `verifyIsolation`；跑 `programmatic/__tests__/podman-driver.lifecycle.test.ts`。
+- 源码守卫只在隔离 Worker 内解析，不能挪到服务器主线程；放宽语法限制要跑 `source-guard.test.ts`。
+- 新增上限要放进 `protocol.ts`，并让并发与队列行为（`maxQueued: 0`，超出报 `CAPACITY`）保持不变，见 `service*.test.ts`。
+- `vm-runtime.ts` 随工具定义一起序列化，不得引入外部依赖或闭包外引用。
 
 ## 相关
 - [工具体系](tools/index.md)

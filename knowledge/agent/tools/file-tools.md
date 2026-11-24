@@ -19,6 +19,25 @@ anchors:
   - server/lib/ripgrep.ts
   - server/lib/vfs-grep.ts
   - server/services/file-read-snapshots.ts
+  - server/routes/grammars.ts
+keywords:
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - StructView
+  - StructSed
+  - spec://
+  - ripgrep
+  - replace_all
+  - file_busy
+  - queue_full
+  - legacyEncoding
+  - /api/grammars
+  - tree-sitter 语法
+  - 结构化编辑
+  - line-endings
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -43,6 +62,18 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/services/file-change-runtime.ts:executeLocalFileChange`
 - `server/lib/agent/tools/struct-sed/tool.ts`、`struct-view/tool.ts`
 - 测试：`tools/__tests__/struct-sed*.test.ts`、`struct-view-*.test.ts`、`line-endings.test.ts`、`encoding.test.ts`、`read-media.test.ts`；`structural/__tests__/`
+- 编码：默认按 UTF-8 读；`settings.agent.legacyEncoding` 打开时检测编码（GBK、Shift_JIS 等，置信度阈值 70）并按原编码写回（`tools/encoding.ts`，不依赖设置的字符集原语在 `encoding-core.ts`，编辑器文档工作线程只用后者）。
+- 行数统计：Write/Edit 结果附带的 `+N -N` 由服务端算（`tools/file-diff-stats.ts`），因为客户端只拿到被截断的前缀；算不出时返回 null 且两个键都省略，`{added:0, removed:0}` 只表示确实没改任何行；整文件统计有 64000 字符上限。
+- `server/lib/vfs-grep.ts`：对内存文件列表的极简 grep，供 `spec://` 虚拟路径用（JS 正则、三种输出模式、路径前缀与简单 glob、分页；不支持上下文行、文件类型过滤和编码检测，这些只在 ripgrep 路径）。
+- 语法包管理：StructView 从不在工具调用中下载 tree-sitter 语法，设置页 `StructuralGrammarsSection.tsx` 是唯一安装入口，对应 `/api/grammars`（`routes/grammars.ts`：列出、`POST /:lang/download`、`DELETE /:lang`）。
+- `server/services/file-read-snapshots.ts` 只是对 `lib/db-worker/file-read-snapshots` 里编辑器/回退读取快照类型的再导出。
+
+## 改它时
+- 加一个文件工具：参数 schema 套 `withDeviceParam`，通过 `getToolBackend` 取后端，写盘走 `file-change-runtime.ts:executeLocalFileChange` 与 `file-write-queue.ts`（不要自己写盘），并在写后调用 `trackFileChange` 记录归因；工具要加进 `tools/index.ts`，并按 [工具体系](index.md) 的清单同步权限分类与并行规则。
+- 改 Edit 的替换器链顺序要保证「不唯一就换下一个、都不唯一才报多个匹配」，跑 `edit` 相关用例与 `write-serialization.test.ts`；改 Read 的上限同步工具描述（以代码常量为准）。
+- 改结构解析：新语言要经 `structural/` 的提供者注册（tree-sitter 在前、启发式兜底），语法包按需下载；`struct-view-*.test.ts`、`struct-sed*.test.ts` 与 `structural/__tests__/` 覆盖。
+- Write/Edit 返回的行数统计必须保持「未知即省略」，别用 0 代替。
+- 编码相关改动跑 `tools/__tests__/encoding.test.ts`、`line-endings.test.ts`；Glob 对平台密钥目录拒绝枚举的规则不要放宽。
 
 ## 相关
 - [执行后端](../execution.md)

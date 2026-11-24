@@ -13,6 +13,20 @@ anchors:
   - server/lib/agent/tools/admin-common.ts
   - server/lib/agent/tools/setup-kind.ts
   - server/services/tool-load-markers.ts
+keywords:
+  - NarraForkAdmin
+  - McpAdmin
+  - HookAdmin
+  - ScheduledTaskAdmin
+  - KnowledgeAdmin
+  - PluginInstall
+  - ADMIN_ONLY_LOAD_TOOLS
+  - isAdminToolExecutionAllowed
+  - ***MASKED***
+  - permissionRuleAutoApprove
+  - setup 叙述者
+  - 引导设置
+  - restricted to administrators
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -36,6 +50,14 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/agent/tools/admin-common.ts`：三个工具共用的管理员判断与写入审批。
 - `server/services/tool-load-markers.ts`：管理员工具清单。
 - 测试：`lib/agent/tools/__tests__/` 下的 `mcp-admin`、`hook-admin`、`scheduled-task-admin`、`plugin-install`、`narrafork-admin-secrets`
+- `server/lib/agent/tools/knowledge-admin.ts`：`KnowledgeAdmin`（分类等级、标签与标签类型、授权、按用户与按条目的 ACL）；读写动作划分只认 `knowledge-actions.ts`，权限层与工具共用。
+
+## 改它时
+- 加一个管理工具：名字加进 `services/tool-load-markers.ts:ADMIN_ONLY_LOAD_TOOLS`（加载闸，非管理员不能 `/load`），工具文件里写动作前调用 `admin-common.ts:requestWritePermission`，读写动作划分放叶子模块（如 `knowledge-actions.ts`），再进 `tools/index.ts` 的 `OPTIONAL_TOOLS`；执行闸 `isAdminToolExecutionAllowed` 在 `tool-executor.ts`，按名字清单判断，漏登记就没有这道闸。
+- 返回值不得带密钥：读设置要走掩码（`***MASKED***`），MCP/Hook 的 env 与 headers 只列键名；改掩码规则跑 `tools/__tests__/narrafork-admin-secrets.test.ts`。
+- `agent.permissionRuleAutoApprove` 不能被 `NarraForkAdmin` 改（含整体重置 `agent`），这条要保持。
+- `PluginInstall` 的路径与 URL 限制（`~/.narrafork/plugin-imports`、拒私有地址、64 MiB、3 次重定向）是安全边界，改动要补 `plugin-install.test.ts`。
+- 测试：`tools/__tests__/` 下的 `mcp-admin`、`hook-admin`、`scheduled-task-admin`、`plugin-install`、`narrafork-admin-secrets`。
 
 ## 相关
 - [工具体系](index.md)

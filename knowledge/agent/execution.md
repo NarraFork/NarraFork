@@ -7,9 +7,25 @@ anchors:
   - server/lib/agent/tool-executor.ts
   - server/services/device-connection-service.ts
   - server/lib/platform-path.ts
-  - server/lib/runtime-source.ts
   - server/lib/runtime-target.ts
   - server/lib/tool-execution-target-projection.ts
+keywords:
+  - ExecutionBackend
+  - executionBackend
+  - 远程设备
+  - 设备执行
+  - device 参数
+  - withDeviceParam
+  - ExecutionTargetError
+  - REMOTE_DEVICE_UNAVAILABLE
+  - REMOTE_DEVICE_UNAUTHORIZED
+  - ToolExecutionTarget
+  - 路径语义
+  - TargetPathSemantics
+  - durable service
+  - background-services
+  - executionTargetsJson
+  - SwitchDevice
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -35,6 +51,14 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `registry.ts`、`tool-backend.ts`：选择规则。
 - `local-backend.ts`：本机实现。
 - 测试：`execution/__tests__/registry.test.ts`、`path-semantics.test.ts`、`device-auth.test.ts`、`durable-service.test.ts`
+- `server/lib/tool-execution-target-projection.ts`：工具调用记录的执行目标有两份（结构化的 `executionTargetsJson` 计划，和更早的平铺列 `executionDeviceId`/`executionCwd`…），`toolCallWithExecutionTargets` 是把它们还原成 API 形状（`ApiExecutionTarget`）的唯一入口，按叙述者的消息视图与全局执行日志都走它，`selectionSource` 取 `explicit` / `session_default` / `local_default`。
+- 设备侧：`server/services/device-connection-service.ts` 把远程设备注册成后端并注入解析器；设备令牌互证见 `device-auth.ts`。
+
+## 改它时
+- 加一个文件/命令类工具：参数 schema 用 `withDeviceParam` 加 `device`，经 `getToolBackend(ctx, device)` 取后端，路径一律走 `backend.paths` 或 `path-resolve.ts`，不要直接 `fs` 或用宿主路径函数；后端新增原语要在 `backend.ts` 接口、`local-backend.ts` 与远程后端（`device-connection-service.ts` 与设备 RPC 类型 `rpc-types.ts`）同时实现。
+- 远程目标未知或离线必须抛 `ExecutionTargetError`，不得回退本机（`execution/__tests__/registry.test.ts` 守着选择顺序）；路径语义改动跑 `path-semantics.test.ts`，设备认证改动跑 `device-auth.test.ts`，持久服务改动跑 `durable-service.test.ts`。
+- 执行目标冻结发生在权限审批之前（`tool-executor.ts`）：新增会影响执行位置的字段要纳入 `ToolExecutionTarget` 与 `describeExecutionTargetDrift`，否则重放时发现不了漂移。
+- `selectionSource` 只用于审计，不能当安全属性使用。
 
 ## 相关
 - [文件工具](tools/file-tools.md)
