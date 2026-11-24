@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: 7fab16d5b
+verified_at: 8d618cddc
 ---
 # 团队与成员
 
@@ -157,7 +157,7 @@ verified_at: 7fab16d5b
 - 它们不在数据导出清单里：保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
 - 不要加团队成员表；成员判定变化要同步 `team-members.ts` 的拼装来源与 `team-status-members.test.ts`。
 - 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改；两个创建入口共用 `TeamCreateFields.tsx`，新字段加在那里。人填的字段规则改在 `shared/project-team-draft.ts`，不要在前端另写一份正则（`team-draft.test.ts` 用路由校验器对照）。
-- `createTeam` 的 git 检查必须在 `narratorService.create` 之前；新增从零创建团队的入口也只能经 `createTeam`。「升级为团队」（`team-conversion.ts:upgradeSessionToTeam`）是另一条路径，不经过 `createTeam`，但调同一个 `assertTeamProjectUsable`；新增别的建团队路径同样要调它，并在事务里复核检查所依据的项目字段。`project-teams-upgrade.test.ts` 覆盖两个拒绝码（不写 trait、团队行、事件和说明）与 `TEAM_PROJECT_CHANGED`，以及 submodule 会话被拒、linked worktree 通过、检查后所有权转移时升级/解散都 403。
+- `createTeam` 的 git 检查必须在 `narratorService.create` 之前；新增从零创建团队的入口也只能经 `createTeam`。「升级为团队」（`team-conversion.ts:upgradeSessionToTeam`）是另一条路径，不经过 `createTeam`，但调同一个 `assertTeamProjectUsable`；新增别的建团队路径同样要调它，并在事务里复核检查所依据的项目字段。`project-teams-upgrade.test.ts` 覆盖两个拒绝码（不写 trait、团队行、事件和说明）与 `TEAM_PROJECT_CHANGED`，以及 submodule 会话被拒、linked worktree 通过、检查后所有权转移时升级/解散都 403；重试跨过升级/解散保留说明与通知、重试后的模型输入里原提示只出现一次（`buildRuntimeHistory`）、「继续」看过说明。
 - 新建会话弹窗的团队部分：`CreateNarratorModal` 的测试大量 `mock.module` 了 `@mantine/core`、`@tanstack/react-query`、`@tanstack/react-router`，弹窗静态导入链里只能用这些 mock 已提供的导出；所以 `create-narrator-team.ts` 不导入路由与 `useTeams`，用到路由的 `CreateTeamFromDirectory.tsx` 懒加载。测试：`create-narrator-team.test.ts`（各原因）、`create-team-start.browser.test.ts`（Chromium，真实路由）。
 - 改升级/解散：`team` trait 与团队行必须在同一事务、同一 `narratorTraitsLock` 下一起变；提交后清 `team-session-memo` 的缓存；`project-teams-upgrade.test.ts` 覆盖每个拒绝码、事务原子性、并发 trait 写入、说明只写一次与「升级→解散→再升级」。
 - IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
