@@ -182,3 +182,40 @@ test.each([
 		);
 	}
 });
+
+test.each([
+	"openai-responses",
+	"completions-compatible",
+] as const)("canonical OpenAI %s selects its matching reader after legacy projection", async (protocol) => {
+	const configured = settings.customApiProviders?.find((config) => config.id === "openai");
+	if (!configured) throw new Error("fixture missing");
+	configured.protocol = protocol;
+	const { normalizeCustomApiProviderSettings } = await import(
+		"../../lib/settings/custom-api-providers"
+	);
+	normalizeCustomApiProviderSettings(settings);
+	expect(settings.openaiProviders?.[0]?.apiMode).toBe(
+		protocol === "openai-responses" ? "codex" : "completions",
+	);
+	const { registerModelListReader } = await import("../../lib/sourcing/model-list-readers");
+	const reads: string[] = [];
+	const sources = ["openai-responses", "completions-compatible"] as const;
+	const disposers = sources.map((source) =>
+		registerModelListReader(source, () => {
+			reads.push(source);
+			return fixtures.openai.map((model) => model.id);
+		}),
+	);
+	try {
+		const res = await app.request("/openai/providers/openai/models");
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ models: fixtures.openai, fromCache: true });
+		expect(reads).toEqual([protocol]);
+	} finally {
+		for (const dispose of disposers) dispose();
+		for (const source of sources)
+			registerModelListReader(source, (group) =>
+				cachedByFamily.openai(group.id).map((model) => String(model.id ?? "")),
+			);
+	}
+});

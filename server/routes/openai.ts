@@ -6,6 +6,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
+	customApiProtocolFromOpenAI,
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
 	openaiProviderPrefix,
@@ -367,7 +368,7 @@ openaiRoutes.get("/providers/:id/models", async (c) => {
 	const config = (settings.openaiProviders ?? []).find((provider) => provider.id === id);
 	const group = sourceGroupForConnection(
 		{ id, name: config?.name ?? id, ...config, prefix: config ? openaiProviderPrefix(config) : id },
-		config?.apiMode === "responses" ? "openai-responses" : "completions-compatible",
+		config ? customApiProtocolFromOpenAI(config) : "completions-compatible",
 	);
 	return c.json({
 		models: await listCachedTemplateModels(
