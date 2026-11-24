@@ -53,12 +53,6 @@ import { invalidateNarratorFolderCache } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser } from "../websocket/narrator-ws";
-import {
-	authorizeTeamTabs,
-	loadTeamTabTargets,
-	teamVerdicts,
-	usersWhoLostTeam,
-} from "./recent-tab-teams";
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const UNDO_TTL_MS = 30_000;
@@ -1089,6 +1083,20 @@ function insertNewTab(
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
+/**
+ * Team tabs only for teams the user may hold, with the team's own title and project (see
+ * `recent-tab-teams.ts`). Loaded lazily, like the ACL modules elsewhere in this file: most writes
+ * carry no team tab, and the ACL graph is heavy.
+ */
+async function authorizeTeams<T extends PersistedRecentTab>(
+	userId: string,
+	tabs: T[],
+): Promise<T[]> {
+	if (!tabs.some((tab) => tab.type === "team")) return tabs;
+	const { authorizeTeamTabs } = await import("./recent-tab-teams");
+	return authorizeTeamTabs(userId, tabs);
+}
+
 /** 列表里看不见的叙述者（ModelTrace 舱）也不进侧边栏。 */
 function withoutHiddenNarratorTabs(inputs: RecentTabUpsertInput[]): RecentTabUpsertInput[] {
 	const narratorIds = inputs
@@ -1116,7 +1124,7 @@ export async function upsertRecentTabsBatch(
 	if (inputs.length === 0 || inputs.length > RECENT_TABS_WS_BATCH_SIZE) {
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
-	const visible = await authorizeTeamTabs(userId, withoutHiddenNarratorTabs(inputs));
+	const visible = await authorizeTeams(userId, withoutHiddenNarratorTabs(inputs));
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
 		if (visible.length === 0) {
@@ -1474,7 +1482,7 @@ export async function restoreRecentTabs(
 		});
 	}
 	if (!input.tabs) throw new ValidationError("tabs or token required");
-	const authorized = await authorizeTeamTabs(userId, input.tabs.map(cloneTab));
+	const authorized = await authorizeTeams(userId, input.tabs.map(cloneTab));
 	const normalized = normalizeAndLimitTabs(authorized).tabs;
 	return mutate(userId, () => ({ tabs: normalized }));
 }
@@ -1930,6 +1938,7 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 	// A team is read through its coordinator's ACL, not the project gate: ask that, for the
 	// teams of this project.
 	if (teamTabs.length > 0) {
+		const { loadTeamTabTargets, teamVerdicts } = await import("./recent-tab-teams");
 		const targets = await loadTeamTabTargets(teamTabs);
 		const inProject = [...targets.values()].filter((target) => target.projectId === projectId);
 		const verdicts = await teamVerdicts(principal, inProject);
@@ -1961,6 +1970,8 @@ export async function removeTabFromAllUsers(
  */
 export async function pruneTeamTabs(teamId: string): Promise<void> {
 	const holders = await getRecentTabUserIds("team", teamId);
+	if (holders.length === 0) return;
+	const { usersWhoLostTeam } = await import("./recent-tab-teams");
 	for (const userId of await usersWhoLostTeam(teamId, holders)) {
 		await removeRecentTab(userId, "team", teamId);
 	}
