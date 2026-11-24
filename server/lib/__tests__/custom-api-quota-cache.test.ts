@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
 import {
@@ -65,6 +65,7 @@ function expectLateQuotaRejected(expectedIdentity: string): void {
 }
 
 afterEach(() => {
+	purgeCustomApiQuotaCache([providerId]);
 	for (const key of getProviderKeyStore().list(providerId)) {
 		quotaStore.remove(key.id);
 		quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
@@ -121,6 +122,104 @@ describe("response quota_balance snapshots", () => {
 		getProviderKeyStore().update(second.id, { apiKey: "key-other" });
 		expect(getCustomApiCachedQuota(providerId)).toBeUndefined();
 		quotaStore.remove(second.id);
+	});
+
+	test("an explicit secondary credential owns only its stream slot; the DTO still shows first", () => {
+		useProvider();
+		reportQuota("custom-quota", "11", "first account");
+		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
+		const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+		updateCustomApiQuotaByPrefix("custom-quota", "0", "second account", identity, second.id);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances).toEqual([
+			{ unit: "", remaining: 0 },
+		]);
+		expect(getCustomApiCachedQuota(providerId)?.quotaBalance).toBe("11");
+		expect(getAllCustomApiCachedQuotas()[providerId]?.detailedQuotaBalance).toBe("first account");
+		// Rotating A does not change B's effective request identity.
+		getProviderKeyStore().update(providerId, { apiKey: "first-replaced" });
+		expect(streamQuotaIdentityForPrefix("custom-quota", second.id)).toBe(identity);
+		updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity, second.id);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(2);
+	});
+
+	for (const change of ["key", "network", "removed"] as const) {
+		test(`a secondary credential's late quota after ${change} never reaches either key`, () => {
+			useProvider();
+			const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
+			const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+			if (change === "key") getProviderKeyStore().update(second.id, { apiKey: "changed" });
+			else if (change === "network")
+				getProviderKeyStore().update(second.id, {
+					network: { userAgentMode: "custom", customUserAgent: "changed-agent" },
+				});
+			else getProviderKeyStore().remove(second.id);
+			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity, second.id);
+			expect(quotaStore.peek(providerId, STREAM_QUOTA_SOURCE)).toBeUndefined();
+			expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		});
+	}
+
+	test("stream identity reads and explicit-key updates never initialize credentials or restore quota", async () => {
+		useProvider();
+		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
+		const keys = await import("../provider-keys");
+		const initialize = spyOn(keys, "getProviderKeyStore").mockImplementation(() => {
+			throw new Error("stream attribution initialized credentials");
+		});
+		const restore = spyOn(quotaStore, "get").mockImplementation(() => {
+			throw new Error("stream attribution restored quota");
+		});
+		try {
+			const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+			expect(identity).toBeDefined();
+			updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity, second.id);
+			expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(2);
+			expect(initialize).not.toHaveBeenCalled();
+			expect(restore).not.toHaveBeenCalled();
+		} finally {
+			initialize.mockRestore();
+			restore.mockRestore();
+		}
+	});
+
+	test("an explicit foreign or unknown id cannot fall back to the first credential", () => {
+		useProvider();
+		const identity = streamQuotaIdentityForPrefix("custom-quota");
+		for (const credentialId of ["unknown-key", "", "another-provider-key"]) {
+			expect(streamQuotaIdentityForPrefix("custom-quota", credentialId)).toBeUndefined();
+			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity, credentialId);
+			expect(quotaStore.peek(providerId, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		}
+	});
+
+	test("purging a pooled provider removes all recorded stream keys but retains their probe slots", () => {
+		useProvider();
+		reportQuota("custom-quota", "11");
+		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
+		updateCustomApiQuotaByPrefix(
+			"custom-quota",
+			"2",
+			null,
+			streamQuotaIdentityForPrefix("custom-quota", second.id),
+			second.id,
+		);
+		quotaStore.set(
+			second.id,
+			"probe-only",
+			{
+				fetchedAt: Date.now(),
+				scope: "key",
+				windows: [],
+				balances: [{ unit: "USD", remaining: 5 }],
+			},
+			false,
+		);
+		// A first-key DTO read must not forget which secondary stream slot needs cleanup.
+		expect(getCustomApiCachedQuota(providerId)?.quotaBalance).toBe("11");
+		purgeCustomApiQuotaCache([providerId]);
+		expect(quotaStore.peek(providerId, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(quotaStore.peek(second.id)?.balances[0]?.remaining).toBe(5);
 	});
 
 	test("settings reads and purges never evict the direct probe's exhaustion window", () => {

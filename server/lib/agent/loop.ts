@@ -4298,6 +4298,7 @@ async function* agentLoopInMetadataSnapshot(
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestQuotaProviderIdentity: string | undefined;
+			let requestQuotaCredentialId: string | undefined;
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -4306,7 +4307,13 @@ async function* agentLoopInMetadataSnapshot(
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
-				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
+				// A pooled adapter may start another key before producing any visible output.
+				// Capture each attempt, not only the first request-level start notification.
+				requestQuotaCredentialId = info?.credentialId ?? credentialId;
+				requestQuotaProviderIdentity = streamQuotaIdentityForPrefix(
+					effectiveProvider,
+					requestQuotaCredentialId,
+				);
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -4929,6 +4936,7 @@ async function* agentLoopInMetadataSnapshot(
 				messageId = undefined;
 				credentialId = undefined;
 				requestQuotaProviderIdentity = undefined;
+				requestQuotaCredentialId = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -5937,6 +5945,7 @@ async function* agentLoopInMetadataSnapshot(
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 								providerIdentity: requestQuotaProviderIdentity,
+								credentialId: requestQuotaCredentialId,
 							};
 						}
 						// Billing updates can be output-only; occupancy still requires a real prompt.

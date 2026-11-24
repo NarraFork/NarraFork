@@ -4,7 +4,8 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { firstCredential, type UsageSubject } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
-import { quotaNetworkIdentity } from "./sourcing/quota-identity";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -147,6 +148,18 @@ export function deepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
 	]);
 }
 
+/** Byte-for-byte serializer used to fingerprint deepseek-balances.json before the quota store. */
+function legacyDeepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.protocol,
+		config.apiKey,
+		config.proxy,
+		config.tlsRejectUnauthorized,
+		settings.proxy,
+	]);
+}
+
 let legacyImported = false;
 
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
@@ -167,15 +180,28 @@ export function syncDeepSeekBalanceCache(): void {
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedBalance,
-			[...providers].map(([id, p]) => ({
-				legacyKey: id,
-				id: p.credentialId,
-				// Legacy files were keyed by the provider config, before per-key networks applied.
-				identity: deepSeekQuotaIdentity(
-					settings.customApiProviders?.find((c) => c.id === id) ?? p.config,
-				),
-				storeIdentity: deepSeekQuotaIdentity(p.config),
-			})),
+			[...providers].flatMap(([id, p]) => {
+				// Legacy files described the provider, not a key's overriding network. Both
+				// the old covered fields and the newly tracked fields must be compatible.
+				const configured = settings.customApiProviders?.find((c) => c.id === id) ?? p.config;
+				const identity = legacyDeepSeekQuotaIdentity(configured);
+				if (
+					!legacyQuotaNetworkCompatible(p.config, {
+						defaultUserAgentMode: defaultUserAgentModeForProtocol(p.config.protocol),
+					}) ||
+					identity !== legacyDeepSeekQuotaIdentity(p.config)
+				) {
+					return [];
+				}
+				return [
+					{
+						legacyKey: id,
+						id: p.credentialId,
+						identity,
+						storeIdentity: deepSeekQuotaIdentity(p.config),
+					},
+				];
+			}),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
 	}

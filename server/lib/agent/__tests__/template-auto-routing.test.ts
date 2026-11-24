@@ -427,7 +427,9 @@ describe("template auto routing", () => {
 					"global-proxy",
 				]) {
 					const oldIdentity = stream ? streamIdentity() : entry.identity(key);
-					remember(key.id, oldIdentity, emptyWallet, stream);
+					const exhausted =
+						entry.id === "route-go" && !stream ? fullWindow(now + 600_000) : emptyWallet;
+					remember(key.id, oldIdentity, exhausted, stream);
 					expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 					if (change === "key") store.update(key.id, { apiKey: `${key.apiKey}-rotated` });
 					else if (change === "endpoint") {
@@ -477,7 +479,7 @@ describe("template auto routing", () => {
 							oldIdentity,
 							stream ? STREAM_QUOTA_SOURCE : undefined,
 						),
-					).toBe(emptyWallet);
+					).toBe(exhausted);
 					quotaStore.forget(key.id, stream ? STREAM_QUOTA_SOURCE : undefined);
 				}
 			}

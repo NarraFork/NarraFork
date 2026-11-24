@@ -3420,6 +3420,7 @@ export async function processEvent(
 					event.quotaBalance,
 					event.detailedQuotaBalance,
 					event.providerIdentity,
+					event.credentialId,
 				);
 				try {
 					const { updateNugQuotaByPrefix } = await import("../routes/nug");
@@ -3432,6 +3433,7 @@ export async function processEvent(
 								event.detailedQuotaBalance ?? null,
 								undefined,
 								event.providerIdentity,
+								event.credentialId,
 							);
 						}
 					}

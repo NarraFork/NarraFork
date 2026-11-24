@@ -14,32 +14,57 @@ export interface UsageSubject<TConfig = CustomApiProviderConfig> {
 	config: TConfig;
 }
 
-/** Request-time identity for stream balances; kept internal and never broadcast. */
-export function streamQuotaIdentity(config: {
-	id: string;
-	baseUrl: string;
-	apiKey: string;
-}): string {
-	// Match the stream caches' first-key attribution without initializing the key store.
-	const key = peekProviderKeyStore()?.listGroup(config.id)[0];
-	const effectiveConfig = key ? withProviderKey(config, key) : config;
+/** Resolve an actual stream credential from memory; an explicit unknown id never picks first. */
+export function streamQuotaCredential<T extends { id: string; apiKey: string }>(
+	config: T,
+	credentialId?: string,
+): UsageSubject<T> | undefined {
+	const keys = peekProviderKeyStore()?.listGroup(config.id) ?? [];
+	let key = credentialId === undefined ? keys[0] : keys.find((key) => key.id === credentialId);
+	// Direct adapters report the connection id for the one plain credential they use.
+	// Stored ids may differ after imports; this alias must not admit an arbitrary pool id.
+	if (!key && credentialId === config.id) {
+		const usable = keys.filter((candidate) => !candidate.disabled && !!candidate.apiKey);
+		if (usable.length === 1 && usable[0]?.apiKey === config.apiKey && !usable[0]?.network) {
+			key = usable[0];
+		}
+	}
+	if (key) {
+		return key.disabled
+			? undefined
+			: { id: key.id, providerId: config.id, config: withProviderKey(config, key) };
+	}
+	// Legacy non-pooled providers report their connection id rather than a stored key id.
+	if (keys.length || (credentialId !== undefined && credentialId !== config.id)) return undefined;
+	return { id: config.id, providerId: config.id, config };
+}
+
+/** Request-attempt identity for stream balances; kept internal and never broadcast. */
+export function streamQuotaIdentity(
+	config: { id: string; baseUrl: string; apiKey: string },
+	credentialId?: string,
+): string | undefined {
+	const credential = streamQuotaCredential(config, credentialId);
+	if (!credential) return undefined;
 	return JSON.stringify([
 		config.id,
 		config.baseUrl,
-		config.apiKey,
-		key?.id ?? config.id,
-		effectiveConfig.apiKey,
-		quotaNetworkIdentity(effectiveConfig, settings.proxy),
+		credential.id,
+		credential.config.apiKey,
+		quotaNetworkIdentity(credential.config, settings.proxy),
 	]);
 }
 
-export function streamQuotaIdentityForPrefix(prefix: string): string | undefined {
+export function streamQuotaIdentityForPrefix(
+	prefix: string,
+	credentialId?: string,
+): string | undefined {
 	const custom = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
-	if (custom) return streamQuotaIdentity(custom);
+	if (custom) return streamQuotaIdentity(custom, credentialId);
 	const nug = (settings.nugProviders ?? []).find(
 		(provider) => provider.prefix === prefix || provider.id === prefix,
 	);
-	return nug ? streamQuotaIdentity(nug) : undefined;
+	return nug ? streamQuotaIdentity(nug, credentialId) : undefined;
 }
 
 export function usageSubjects(

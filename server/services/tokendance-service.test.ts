@@ -97,7 +97,7 @@ describe("TokenDance billing", () => {
 		const updatedAt = Date.now() - 1000;
 		const legacy = createPersistedCredentialCache("tokendance-balance.json", (raw) => raw);
 		if (!fakeSettings.tokendance) throw new Error("billing fixture is not connected");
-		legacy.save("tokendance", service.tokenDanceQuotaIdentity(fakeSettings.tokendance), {
+		legacy.save("tokendance", JSON.stringify([fakeSettings.tokendance.apiKey, generation]), {
 			credits: 8_000_000,
 			creditsUsed: 3_000_000,
 			balance: 5_000_000,

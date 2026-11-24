@@ -19,11 +19,15 @@ export interface CredentialRouting {
 type KeyConfig = { apiKey: string };
 type Block = { blocked: boolean; until?: number };
 
+/** Stream-only balances have no refill probe of their own; periodically allow a fresh attempt. */
+export const STREAM_BALANCE_MAX_AGE_MS = 60_000;
+
 /** Unknown/error/unlimited balances are not zero; different currencies may fund a request. */
-function quotaBlock(snapshot: QuotaSnapshot | undefined, now: number): Block {
+function quotaBlock(snapshot: QuotaSnapshot | undefined, now: number, checkBalances = true): Block {
 	if (!snapshot || snapshot.error) return { blocked: false };
 	const balances = snapshot.balances;
 	if (
+		checkBalances &&
 		balances.length > 0 &&
 		balances.every(
 			(balance) =>
@@ -68,6 +72,8 @@ export function keyRouting<T extends KeyConfig>(
 	options: {
 		/** Command Code can use CLI auth; do not read auth.json to prove readiness here. */
 		allowUnconfigured?: boolean;
+		/** OpenCode's optional wallet is a fallback, not a prerequisite for its plan. */
+		probeBalanceIsFallback?: boolean;
 		streamIdentity?: (config: T) => string;
 	} = {},
 ): CredentialRouting {
@@ -82,22 +88,22 @@ export function keyRouting<T extends KeyConfig>(
 		const candidates = keys.map((key) => {
 			const current = config && withProviderKey(config, key);
 			const failure = keyCooldown(key.id, now, false);
+			const stream =
+				current && options.streamIdentity
+					? quotaStore.peekForIdentity(key.id, options.streamIdentity(current), STREAM_QUOTA_SOURCE)
+					: undefined;
 			const block = combine([
 				{
 					blocked: !!failure && failure.reason !== "rate_limited",
 					until: failure?.until,
 				},
-				quotaBlock(current && quotaStore.peekForIdentity(key.id, identity(current)), now),
 				quotaBlock(
-					current && options.streamIdentity
-						? quotaStore.peekForIdentity(
-								key.id,
-								options.streamIdentity(current),
-								STREAM_QUOTA_SOURCE,
-							)
-						: undefined,
+					current && quotaStore.peekForIdentity(key.id, identity(current)),
 					now,
+					!options.probeBalanceIsFallback,
 				),
+				// Do not merge sources or let a wallet refresh clear an independent key window.
+				quotaBlock(stream, now, !!stream && now - stream.fetchedAt < STREAM_BALANCE_MAX_AGE_MS),
 			]);
 			return { key, block, rateLimited: failure?.reason === "rate_limited" };
 		});

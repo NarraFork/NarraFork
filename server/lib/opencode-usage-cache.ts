@@ -5,7 +5,8 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
-import { quotaNetworkIdentity } from "./sourcing/quota-identity";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -234,6 +235,17 @@ export function opencodeQuotaIdentity(config: CustomApiProviderConfig): string {
 	]);
 }
 
+/** Byte-for-byte serializer used to fingerprint opencode-usages.json before the quota store. */
+function legacyOpencodeQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		config.proxy,
+		config.tlsRejectUnauthorized,
+		settings.proxy,
+	]);
+}
+
 let legacyImported = false;
 
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
@@ -247,11 +259,18 @@ export function syncOpencodeUsageCache(): void {
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedUsage,
-			subjects.map((s) => ({
-				legacyKey: s.id,
-				id: s.id,
-				identity: opencodeQuotaIdentity(s.config),
-			})),
+			subjects
+				.filter((s) =>
+					legacyQuotaNetworkCompatible(s.config, {
+						defaultUserAgentMode: defaultUserAgentModeForProtocol(s.config.protocol),
+					}),
+				)
+				.map((s) => ({
+					legacyKey: s.id,
+					id: s.id,
+					identity: legacyOpencodeQuotaIdentity(s.config),
+					storeIdentity: opencodeQuotaIdentity(s.config),
+				})),
 			opencodeSnapshot,
 		);
 	}

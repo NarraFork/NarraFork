@@ -141,6 +141,7 @@ const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 		streamIdentity: customApiStreamQuotaIdentity,
 	}),
 	"opencode-go": keyRouting(customConfig, opencodeQuotaIdentity, {
+		probeBalanceIsFallback: true,
 		streamIdentity: customApiStreamQuotaIdentity,
 	}),
 	deepseek: keyRouting(customConfig, deepSeekQuotaIdentity, {

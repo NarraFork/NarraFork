@@ -26,7 +26,7 @@ import type { UsageSubject } from "../lib/provider-key-subjects";
 import { getProviderKeyStore, TOKENDANCE_KEY_OWNER, withProviderKey } from "../lib/provider-keys";
 import { saveSettings, settings, type TokenDanceSettings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
-import { quotaNetworkIdentity } from "../lib/sourcing/quota-identity";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "../lib/sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "../lib/sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
 
@@ -148,11 +148,23 @@ let legacyImported = false;
 function importLegacyBalance(subject: TokenDanceSubject): void {
 	if (legacyImported) return;
 	legacyImported = true;
-	const identity = tokenDanceQuotaIdentity(subject.config);
+	const compatible = legacyQuotaNetworkCompatible(subject.config, {
+		proxyAndTlsCovered: false,
+		globalProxy: settings.proxy,
+	});
 	void importLegacyQuotaCache(
 		"tokendance-balance.json",
 		parsePersistedBalance,
-		[{ legacyKey: TOKENDANCE_PREFIX, id: subject.id, identity }],
+		compatible
+			? [
+					{
+						legacyKey: TOKENDANCE_PREFIX,
+						id: subject.id,
+						identity: JSON.stringify([subject.config.apiKey, subject.config.generation]),
+						storeIdentity: tokenDanceQuotaIdentity(subject.config),
+					},
+				]
+			: [],
 		(value) =>
 			tokenDanceSnapshot(
 				{

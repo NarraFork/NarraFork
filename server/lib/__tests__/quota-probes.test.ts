@@ -37,17 +37,12 @@ const {
 const {
 	getAllOpencodeCachedUsages,
 	getOpencodeKeyUsages,
-	opencodeQuotaIdentity,
 	parseOpencodeUsageResponse,
 	refreshOpencodeKeyUsage,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const {
-	deepSeekQuotaIdentity,
-	getAllDeepSeekCachedBalances,
-	refreshDeepSeekBalance,
-	syncDeepSeekBalanceCache,
-} = await import("../deepseek-balance-cache");
+const { getAllDeepSeekCachedBalances, refreshDeepSeekBalance, syncDeepSeekBalanceCache } =
+	await import("../deepseek-balance-cache");
 const { probeRelayQuota } = await import("../provider-balance-cache");
 const { firstCredential } = await import("../provider-key-subjects");
 
@@ -105,7 +100,13 @@ describe("legacy cache files", () => {
 	test("an OpenCode legacy file moves into the snapshot store and is deleted", async () => {
 		useProvider(provider("oc-legacy", "https://opencode.ai/zen/go/v1"));
 		const config = saved("oc-legacy");
-		const identity = opencodeQuotaIdentity(config);
+		const identity = JSON.stringify([
+			config.baseUrl,
+			config.apiKey,
+			config.proxy,
+			config.tlsRejectUnauthorized,
+			settings.proxy,
+		]);
 		const legacy = createPersistedCredentialCache<unknown>("opencode-usages.json", (raw) => raw);
 		const usage = {
 			rolling: { status: "ok" as const, percent: 37, resetsAt: RESET_5H },
@@ -126,7 +127,14 @@ describe("legacy cache files", () => {
 	test("a DeepSeek legacy file moves to the first credential and is deleted", async () => {
 		useProvider(provider("ds-legacy", "https://api.deepseek.com/v1"));
 		const config = saved("ds-legacy");
-		const identity = deepSeekQuotaIdentity(config);
+		const identity = JSON.stringify([
+			config.baseUrl,
+			config.protocol,
+			config.apiKey,
+			config.proxy,
+			config.tlsRejectUnauthorized,
+			settings.proxy,
+		]);
 		const legacy = createPersistedCredentialCache<unknown>("deepseek-balances.json", (raw) => raw);
 		legacy.save(config.id, identity, {
 			isAvailable: true,

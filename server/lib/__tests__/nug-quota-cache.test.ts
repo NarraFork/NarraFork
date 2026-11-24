@@ -4,6 +4,7 @@ import type { CredentialNetwork } from "@shared/credential-network";
 import { getNarraforkPath } from "../narrafork-home";
 import {
 	buildNugQuotaCache,
+	captureNugQuotaSubject,
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
 	nugQuotaIdentity,
@@ -184,6 +185,112 @@ describe("NUG quota snapshots", () => {
 		updateNugQuotaByPrefix("nug-quota", 100, null, undefined, undefined);
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 	});
+
+	test("an actual secondary-key stream balance never overwrites the first key's wallet", () => {
+		const config = useProvider();
+		const keys = getProviderKeyStore();
+		const first = keys.listGroup(config.id)[0];
+		if (!first) throw new Error("NUG quota test key missing");
+		const second = keys.add(nugKeyOwner(config.id), {
+			apiKey: "secondary-key",
+			network: { extraHeaders: { "X-Account": "secondary" } },
+		});
+		setNugCachedQuota(config.id, buildNugQuotaCache({ balance: 12, totalGranted: 30 }));
+		const identity = streamQuotaIdentity(config, second.id);
+		updateNugQuotaByPrefix(config.prefix, 0, "secondary balance", undefined, identity, second.id);
+		expect(getNugCachedQuota(config.id)?.balance).toBe(12);
+		expect(
+			quotaStore.peekForIdentity(second.id, nugQuotaIdentity(withProviderKey(config, second)))
+				?.balances[0]?.remaining,
+		).toBe(0);
+		keys.update(second.id, { network: { userAgentMode: "codex" } });
+		updateNugQuotaByPrefix(config.prefix, 99, null, undefined, identity, second.id);
+		expect(
+			quotaStore.peekForIdentity(second.id, nugQuotaIdentity(withProviderKey(config, second))),
+		).toBeUndefined();
+		expect(getNugCachedQuota(config.id)?.balance).toBe(12);
+	});
+
+	test("a captured quota request cannot publish after a same-secret first-key switch", () => {
+		const config = useProvider();
+		const request = captureNugQuotaSubject(config);
+		const replacement = getProviderKeyStore().add(nugKeyOwner(config.id), {
+			apiKey: config.apiKey,
+		});
+		getProviderKeyStore().reorder(nugKeyOwner(config.id), [replacement.id]);
+		setNugCachedQuota(config.id, buildNugQuotaCache({ balance: 99 }), request);
+		expect(getNugCachedQuota(config.id)).toBeUndefined();
+	});
+
+	for (const endpoint of ["quota", "billing/config", "startup"] as const) {
+		test(`${endpoint} requests use the effective credential proxy and publish matching snapshots`, async () => {
+			settings.proxy = { mode: "direct" };
+			const config = useProvider();
+			const keys = getProviderKeyStore();
+			const key = keys.listGroup(config.id)[0];
+			if (!key) throw new Error("NUG quota test key missing");
+			keys.update(key.id, {
+				apiKey: "effective-request-key",
+				network: { proxy: { mode: "custom", url: "http://quota-proxy.example:8080" } },
+			});
+			globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+				expect(new URL(String((init as RequestInit & { proxy?: string }).proxy)).host).toBe(
+					"quota-proxy.example:8080",
+				);
+				expect(new Headers(init?.headers).get("Authorization")).toBe(
+					"Bearer effective-request-key",
+				);
+				return Response.json({ balance: 5, totalGranted: 20 });
+			}) as unknown as typeof fetch;
+			const { nugRoutes, fetchAllNugQuotas } = await import("../../routes/nug");
+			if (endpoint === "startup") {
+				await fetchAllNugQuotas();
+			} else {
+				const response = await nugRoutes.request(`/providers/${config.id}/${endpoint}`);
+				expect(response.status).toBe(200);
+				expect(await response.json()).toMatchObject({ balance: 5, totalGranted: 20 });
+			}
+			expect(getNugCachedQuota(config.id)?.balance).toBe(5);
+			expect(
+				quotaStore.peekForIdentity(key.id, nugQuotaIdentity(withProviderKey(config, key)))
+					?.balances[0]?.remaining,
+			).toBe(5);
+		});
+
+		for (const change of ["global proxy", "key network"] as const) {
+			test(`${endpoint} discards a response after its ${change} changes in flight`, async () => {
+				settings.proxy = { mode: "direct" };
+				const config = useProvider();
+				const key = getProviderKeyStore().listGroup(config.id)[0];
+				if (!key) throw new Error("NUG quota test key missing");
+				let settle!: (response: Response) => void;
+				let started!: () => void;
+				const reached = new Promise<void>((resolve) => {
+					started = resolve;
+				});
+				globalThis.fetch = (async () => {
+					started();
+					return new Promise<Response>((resolve) => {
+						settle = resolve;
+					});
+				}) as unknown as typeof fetch;
+				const { nugRoutes, fetchAllNugQuotas } = await import("../../routes/nug");
+				const task =
+					endpoint === "startup"
+						? fetchAllNugQuotas()
+						: nugRoutes.request(`/providers/${config.id}/${endpoint}`);
+				await reached;
+				if (change === "global proxy") {
+					settings.proxy = { mode: "custom", url: "http://new-global-proxy.example:8080" };
+				} else {
+					getProviderKeyStore().update(key.id, { network: { userAgentMode: "codex" } });
+				}
+				settle(Response.json({ balance: 99, totalGranted: 100 }));
+				await task;
+				expect(getNugCachedQuota(config.id)).toBeUndefined();
+			});
+		}
+	}
 
 	test("the nug template probes into the shared shape", async () => {
 		const config = useProvider();
