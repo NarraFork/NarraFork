@@ -1083,14 +1083,9 @@ function collectInlineLines(
 					if (agentId) {
 						// The whole authored title is one body-font atom, never a status item
 						// followed by separately wrapping bold/code/link-label fragments.
-						const imageState = emitImage ? { found: false } : undefined;
-						let label = agentReferenceLabel(link.tokens ?? [], imageState);
-						if (imageState?.found) {
-							// An image is body content, even inside a reference label. Do not
-							// flatten it into the otherwise atomic agent-title chip.
-							walk(link.tokens ?? [], linkMarks);
-							continue;
-						}
+						// A session reference is a single title chip, not a Markdown document:
+						// image labels contribute their alt text just like the flowing renderer.
+						let label = agentReferenceLabel(link.tokens ?? []);
 						if (ctx.formulas) {
 							label = label.replace(MATH_SENTINEL_RE, (source, index) => {
 								const latex = ctx.formulas?.[Number(index)];
@@ -1144,14 +1139,13 @@ function collectInlineLines(
 }
 
 /** Keep explicit Markdown breaks as word boundaries while discarding label styling. */
-function agentReferenceLabel(tokens: readonly Token[], imageState?: { found: boolean }): string {
+function agentReferenceLabel(tokens: readonly Token[]): string {
 	return inlineTokensToPlainText(
 		tokens.map((token) => {
-			if (imageState && token.type === "image") imageState.found = true;
 			if (token.type === "br") return { type: "text", text: " " };
 			const nested = "tokens" in token ? token.tokens : undefined;
 			if (Array.isArray(nested) && nested.length > 0 && token.type !== "codespan") {
-				return { type: token.type, text: agentReferenceLabel(nested, imageState) };
+				return { type: token.type, text: agentReferenceLabel(nested) };
 			}
 			return token;
 		}),

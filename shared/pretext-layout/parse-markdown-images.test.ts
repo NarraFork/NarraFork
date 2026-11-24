@@ -89,7 +89,9 @@ describe("Markdown image fixed previews", () => {
 		expect(text(required(after))).toBe("后末");
 		expect(before?.fonts[0]).toBe(after?.fonts[1]);
 		expect(before?.fonts[1]).toBe(after?.fonts[0]);
-		expect(images(parse("[**前 ![图](agent.png) 后**](nf-agent://open?id=child)"))).toHaveLength(1);
+		const reference = parse("[**前 ![图](agent.png) 后**](nf-agent://open?id=child)");
+		expect(images(reference)).toHaveLength(0);
+		expect(inlines(reference).map(text)).toEqual(["前 图 后"]);
 		const linked = parse("[前 ![图](c.png) 后](https://outer.test)");
 		expect(images(linked)).toHaveLength(1);
 		expect(inlines(linked).flatMap((block) => block.hrefs)).toEqual([
