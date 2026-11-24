@@ -37,6 +37,10 @@
 #define PORT_SCAN_SPAN 11
 #define PROBE_TIMEOUT_MS 300
 #define LOG_FILE_NAME "narrafork-app.log"
+#define LOCK_FILE_NAME "narrafork.lock"
+// After a lock-file event, retry the health probe this many times (400 ms
+// apart) — the lock lands before the HTTP listener binds.
+#define STARTUP_PROBE_MAX_ATTEMPTS 25
 
 // ── Config / health probing (unchanged from the bare launcher) ───────────────
 
@@ -237,7 +241,7 @@ static void setLoginItem(BOOL enabled) {
 
 // ── App delegate ─────────────────────────────────────────────────────────────
 
-@interface AppDelegate : NSObject <NSApplicationDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(nonatomic) int basePort;
 @property(nonatomic) int foundPort; // port that answered health, 0 = stopped
 @property(nonatomic) BOOL ownServer; // we spawned the running server
@@ -253,6 +257,8 @@ static void setLoginItem(BOOL enabled) {
 @property(nonatomic) NSString *logPath;
 @property(nonatomic) NSString *serverPath;
 @property(nonatomic) NSURL *pageURL;
+@property(nonatomic) dispatch_source_t lockSource;
+@property(nonatomic) unsigned long probeGeneration;
 @end
 
 @implementation AppDelegate
@@ -319,25 +325,23 @@ static void setLoginItem(BOOL enabled) {
 								keyEquivalent:@"q"];
 	quit.target = self;
 
+	menu.delegate = self;
 	self.item.menu = menu;
+
+	[self watchLockDir];
 
 	// Attach to a running server, or start ours. Either way the server itself
 	// opens the browser when it becomes ready (server.openBrowser).
 	self.foundPort = find_server_port(self.basePort, PORT_SCAN_SPAN);
 	if (!self.foundPort) [self startServer];
 
-	// Light polling keeps status/port correct across port retries and crashes.
-	[NSTimer scheduledTimerWithTimeInterval:2.0
-									 target:self
-								   selector:@selector(tick:)
-								   userInfo:nil
-									repeats:YES];
-	[self tick:nil];
+	[self refreshStatus];
 }
 
-- (void)tick:(NSTimer *)timer {
-	int port = find_server_port(self.basePort, PORT_SCAN_SPAN);
-	self.foundPort = port;
+// No polling timer: status is refreshed by events — our NSTask's termination
+// handler, lock-file changes in the narrafork home dir, and each menu open.
+- (void)refreshStatus {
+	int port = self.foundPort;
 
 	BOOL running = port != 0;
 	BOOL starting = !running && self.serverTask != nil && self.serverTask.isRunning;
@@ -352,6 +356,67 @@ static void setLoginItem(BOOL enabled) {
 	self.toggleItem.title = running ? L(@"Stop server", @"停止服务") : L(@"Start server", @"启动服务");
 	self.toggleItem.enabled = running ? self.ownServer : YES;
 	self.toggleItem.target = self;
+}
+
+// ── Event-driven probing ─────────────────────────────────────────────────────
+
+// NSMenuDelegate: one live probe per menu open keeps the status line honest
+// without a background timer (cheap — refused connects return instantly).
+- (void)menuWillOpen:(NSMenu *)menu {
+	self.foundPort = find_server_port(self.basePort, PORT_SCAN_SPAN);
+	[self refreshStatus];
+}
+
+- (NSString *)lockPath {
+	return [self.homeDir stringByAppendingPathComponent:@LOCK_FILE_NAME];
+}
+
+// VNODE watch on the home dir: the server creates/removes narrafork.lock as
+// it starts and stops, so each change is a signal to re-probe once.
+- (void)watchLockDir {
+	mkdir(self.homeDir.fileSystemRepresentation, 0755);
+	int fd = open(self.homeDir.fileSystemRepresentation, O_EVTONLY);
+	if (fd < 0) return;
+	dispatch_source_t src = dispatch_source_create(
+		DISPATCH_SOURCE_TYPE_VNODE,
+		fd,
+		DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME,
+		dispatch_get_main_queue());
+	__weak AppDelegate *weak = self;
+	dispatch_source_set_event_handler(src, ^{
+		AppDelegate *s = weak;
+		s.probeGeneration += 1;
+		[s probeAfterLockEventWithGeneration:s.probeGeneration attempt:0];
+	});
+	dispatch_source_set_cancel_handler(src, ^{ close(fd); });
+	dispatch_resume(src);
+	self.lockSource = src;
+}
+
+// Probe once; while the lock exists but nothing answers yet (server still
+// mid-startup), schedule a bounded retry. Superseded generations bail out.
+- (void)probeAfterLockEventWithGeneration:(unsigned long)gen attempt:(int)attempt {
+	if (gen != self.probeGeneration) return;
+	int port = find_server_port(self.basePort, PORT_SCAN_SPAN);
+	if (port || attempt >= STARTUP_PROBE_MAX_ATTEMPTS) {
+		self.foundPort = port;
+		[self refreshStatus];
+		return;
+	}
+	BOOL lockGone = ![[NSFileManager defaultManager] fileExistsAtPath:self.lockPath];
+	if (lockGone) {
+		self.foundPort = 0;
+		[self refreshStatus];
+		return;
+	}
+	__weak AppDelegate *weak = self;
+	dispatch_after(
+		dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+		dispatch_get_main_queue(),
+		^{
+			AppDelegate *s = weak;
+			[s probeAfterLockEventWithGeneration:gen attempt:attempt + 1];
+		});
 }
 
 // ── Server lifecycle ─────────────────────────────────────────────────────────
@@ -380,12 +445,16 @@ static void setLoginItem(BOOL enabled) {
 			AppDelegate *s = weak;
 			s.serverTask = nil;
 			s.ownServer = NO;
+			s.foundPort = 0;
+			[s refreshStatus];
 		});
 	};
 	@try {
 		[task launch];
 		self.serverTask = task;
 		self.ownServer = YES;
+		self.foundPort = 0;
+		[self refreshStatus]; // ◐ starting until the lock event flips it
 	} @catch (NSException *e) {
 		NSLog(@"narrafork launcher: spawn failed: %@", e);
 	}

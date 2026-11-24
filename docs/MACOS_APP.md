@@ -38,7 +38,7 @@ NarraFork.app/
 
 - **状态栏常驻**：`NSApplicationActivationPolicyAccessory`（LSUIElement=true）——无 Dock 图标、无 Cmd-Tab 项，只在菜单栏放一个 18pt template 图标（按 favicon 的 fork 形状用 NSBezierPath 手绘，自动适配深浅菜单栏）。图标 tooltip 为「NarraFork」。
 - **状态栏菜单**（中英文随系统语言）：
-  - 状态行（只读）：`● NarraFork · localhost:7778` / `◐ …starting…` / `○ …stopped`，每 2s 探测刷新
+  - 状态行（只读）：`● NarraFork · localhost:7778` / `◐ …starting…` / `○ …stopped`；**无轮询**——刷新由三个事件源驱动：① 自家 NSTask 的 terminationHandler、② `~/.narrafork/` 目录的 VNODE dispatch source（实例锁 `narrafork.lock` 增删即事件）、③ 每次展开菜单时 `menuWillOpen:` 按需探测一次
   - `Open NarraFork` ⌘O — `open http://localhost:<port>/`
   - `Open in app window` ⇧⌘O — 用 `open -a <浏览器> url --args --app=<url>` 开 Chrome/Edge/Chromium 无边窗口（找到第一个装了的浏览器）
   - `View log` ⌘L — `open ~/.narrafork/narrafork-app.log`（系统默认关联，一般为控制台.app）
@@ -79,6 +79,7 @@ NarraFork.app/
 - `bun scripts/build-macos-app.ts --dmg` → `dist/macos-app-arm64/NarraFork.app`（173 MB，ad-hoc 签名）+ `dist/narrafork-0.9.15-macos-arm64.dmg`（63 MB）
 - `open dist/macos-app-arm64/NarraFork.app`：服务起来、`GET /api/health` 200、浏览器自动打开页面；状态栏出现 fork 形 template 图标（tooltip「NarraFork」），Dock 中无图标
 - 状态栏菜单实测：7 项全部渲染——状态行「● NarraFork · localhost:7778」、Open NarraFork ⌘O、Open in app window ⇧⌘O、View log ⌘L、Launch at login、Stop server ⌘S、Quit NarraFork ⌘Q；AX 树可列出全部 selector
-- `Quit NarraFork`：NSTask 收到 SIGTERM，服务端走完整 graceful shutdown、释放实例锁（`narrafork-app.log` 记录 `clean`）；launcher 与 server 进程均退出
+- 事件驱动状态迁移实测（无定时器）：外部 SIGTERM 杀服务 → lock 删除 → 状态变 ○ stopped；菜单 Start server → lock 出现 → 有界探测链到 ● running；菜单 Stop server → terminationHandler → ○ stopped
+- `Quit NarraFork`：NSTask 收到 SIGTERM，服务端走完整 graceful shutdown、释放实例锁（`narrafork-app.log` 记录 `clean`）；launcher 与 server 进程均退出（Apple Event quit 同路径验证）
 - 服务运行中再次 `open`：同 bundle-id 实例探测后只打开页面即退出，进程数保持 1
 - 实测坑：服务端 `host=localhost` 在 macOS 绑的是 `[::1]`（IPv6），探测必须双栈；`open` 目标用 `localhost` 而非 `127.0.0.1`
