@@ -26,7 +26,7 @@ keywords:
   - brief
   - sweepOrphanCoordinatorOutputs
 status: draft
-verified_at: a5b512406
+verified_at: 667b6059b
 ---
 # 协调者
 
@@ -43,10 +43,11 @@ verified_at: a5b512406
 - 读/搜索/Bash 的超大输出整份存到 `~/.narrafork/coordinator-outputs/<narratorId>/`，内容哈希命名、按部分分块。
 - 每个协调者 200MB，旧文件先淘汰；单部分约 9 万字符，超过 64 部分的文本不保存，改为返回全文。
 - 路径助手只做路径判断：读自己保存的输出被自动允许，别的叙述者的目录没有这种待遇。
-- 叙述者删除时一并清掉其保存输出与内存记账；启动时后台分批扫掉已无叙述者的目录（`coordinator-maintenance.ts`）。
+- 叙述者删除时一并清掉其保存输出与内存记账；团队解散（会话保留）时同样清掉（`team-conversion.ts:disbandTeam`）；启动时后台分批扫掉已无叙述者的目录（`coordinator-maintenance.ts`）。
 
 团队状态（`team-status.ts`）：
 - 系统在运行开始、压缩/清空上下文后、长运行的工具边界（至少相隔 10 分钟且文本有变）把一行 `team_status` 系统行写进协调者历史，不进系统提示词。
+- 由已有会话升级来的协调者没有上一次记录，下一次运行开始就写第一行（含简报）；解散后不再写（没有团队行）。
 - 文本确定、≤6KB。内容：团队简介（≤4KB，子代理也会拿到）、本周超限计数、待批准调用、工作项、成员（最多列 12 人）、重叠与独占锁、最近决策。
 
 ## 从哪读起

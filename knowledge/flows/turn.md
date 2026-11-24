@@ -25,7 +25,7 @@ keywords:
   - POST /api/narrators/:id/messages
   - 流式输出
 status: draft
-verified_at: 878917e97
+verified_at: 7fab16d5b
 ---
 # 一轮对话
 

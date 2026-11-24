@@ -21,6 +21,7 @@ import {
 	teamActivityQuerySchema,
 	teamBoardQuerySchema,
 	updateProjectTeamSchema,
+	upgradeProjectTeamSchema,
 } from "../lib/validators";
 import { hasProjectAccess } from "../services/project-acl";
 import {
@@ -31,6 +32,7 @@ import {
 	readTeamPageSummary,
 	readTeamRunning,
 } from "../services/teams/team-board";
+import { disbandTeam, upgradeSessionToTeam } from "../services/teams/team-conversion";
 import { forceReleaseExclusiveLock, readProjectOverlaps } from "../services/teams/team-overlap";
 import {
 	archiveTeam,
@@ -86,10 +88,21 @@ projectTeamRoutes.get("/:projectId/teams", async (c) => {
 	return c.json(result);
 });
 
+/**
+ * Create a team, or (with `fromNarratorId`) turn an existing session into its coordinator: the
+ * session's owner or an admin, an idle ordinary session of this project (`team-conversion.ts`).
+ */
 projectTeamRoutes.post("/:projectId/teams", async (c) => {
 	const projectId = c.req.param("projectId");
 	await requireProjectAccess(c, projectId, "write");
-	const parsed = createProjectTeamSchema.safeParse(await jsonBody(c));
+	const body = await jsonBody(c);
+	if (body && typeof body === "object" && "fromNarratorId" in body) {
+		const upgrade = upgradeProjectTeamSchema.safeParse(body);
+		if (!upgrade.success) throw new ValidationError(upgrade.error.message);
+		const team = await upgradeSessionToTeam({ projectId, ...upgrade.data }, narratorPrincipalOf(c));
+		return c.json(team, 201);
+	}
+	const parsed = createProjectTeamSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const team = await createTeam({ projectId, ...parsed.data }, narratorPrincipalOf(c));
 	return c.json(team, 201);
@@ -132,6 +145,16 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/unarchive", async (c) => {
 		c.req.param("projectId"),
 	);
 	return c.json(team);
+});
+
+/**
+ * Disband the team and keep its coordinator as an ordinary session: the session's owner or an
+ * admin, the coordinator idle, no live work. The team's work items and activity are deleted.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/disband", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "write");
+	return c.json(await disbandTeam(c.req.param("teamId"), narratorPrincipalOf(c), projectId));
 });
 
 // ── P4: the team page (read-only, bounded, cursor-paged) ─────────────────────

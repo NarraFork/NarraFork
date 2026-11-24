@@ -20,6 +20,8 @@ keywords:
   - pauseOrder
   - 全部暂停
   - 待批抽屉
+  - TeamDisbandMenu
+  - UpgradeToTeamModal
   - teamOnlooker
   - narrator_access_changed
   - project_access_changed
@@ -50,11 +52,13 @@ verified_at: 69715f280
 - `TeamWorkspace.tsx` 是顶栏 + 协调者对话 + 看板与动态：按自身宽度（不是视口，侧栏会占掉一部分）在 `split`（对话至少 `TEAM_CONVERSATION_MIN_WIDTH` 480px，旁边 `TEAM_SIDE_WIDTH` 380px 的看板/动态切换面板，对话占满其余宽度）与 `tabs`（对话 / 看板 / 动态三个标签）之间选（`team-page-model.ts:teamWorkspaceLayout`）。对话在各布局里都挂在 React 树的同一位置，换布局不重挂；对话用普通叙述者面板。
 - 顶栏 `leading` 槽由 `TeamPageView.tsx` 填：手机上先放 `MobileNavButton`（页面自己的标题行带菜单按钮，外壳的悬浮 `MobileNavFallback` 因此不出现、不会盖住返回箭头），再放返回项目的箭头。
 - `TeamTopBar.tsx` 含待批抽屉和「全部暂停」。协调者已归档（`summary.coordinatorStatus === "archived"`，服务端的团队状态也只看协调者）时，标题旁显示「已归档」徽标（`teams.archived`，悬停说明 `teams.top.archivedHint`）；此时只有还有运行中的会话（`runningCount > 0`，归档协调者不会停掉它在后台启动的工作者）才显示「全部暂停」；成员按钮保留（归档不拦共享设置，所有者仍可管理访问）。服务端对已归档团队拒绝修改团队（`TEAM_ARCHIVED`）和工作项变更。「全部暂停」：协调者排在最前，先于工作者停下（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore（`team-page-model.ts`）。
-- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗和新建会话弹窗的「以团队开始」共用（见[团队与成员](records.md)）；不含查询与路由导入。`submit()` 先用 `team-draft.ts:checkTeamDraft`（规则来自 `shared/project-team-draft.ts`，与路由同一份）检查，不合规返回 null 并在名称/基线分支/说明字段上显示错误。
+- 成员在顶栏还有一个菜单（`TeamDisbandMenu.tsx`），里面只有「解散团队」：确认框说明工作项和动态会被删除、会话和对话保留；成功后路由打开该会话（`onDisbanded`），拒绝码在框里按码显示中英文（`UpgradeToTeamModal.tsx:teamErrorMessage`）。
+- 「升级为团队」不在团队页上：入口是会话溢出菜单（见[会话外框](../../frontend/narrator-ui/session-chrome.md)），对话框 `UpgradeToTeamModal.tsx` 用与新建团队相同的 `TeamCreateFields`/`useTeamDraft`（提交前 `checkTeamDraft`，基线分支按同一规则校验；名称以会话标题预填为真实值，`useTeamDraft({ initialName })`，未改动时请求不带 `name`，由服务端沿用当时的标题，`buildUpgradePayload`），成功后跳到团队页；菜单项只给 `team-upgrade-eligibility.ts:canOfferTeamUpgrade` 为真的会话（primary、未归档、有项目、不是 team/bot/knowledge-steward/setup/modeltrace/ask-in-passing/scheduled、无定时任务、非 OAuth），其余由服务端判定。
+- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗、新建会话弹窗的「以团队开始」和「升级为团队」对话框共用（见[团队与成员](records.md)）；不含查询与路由导入。`submit()` 先用 `team-draft.ts:checkTeamDraft`（规则来自 `shared/project-team-draft.ts`，与路由同一份）检查，不合规返回 null 并在名称/基线分支/说明字段上显示错误。
 - `ProjectTeamsList.tsx` 只用于项目页团队区块（含「新建团队」弹窗 `CreateTeamModal`），只列活跃团队；在 PG 上（列表查询 503）整块不渲染。
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
-- `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
-- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
+- `hooks/useTeams.ts`：`useUpgradeToTeam`/`useDisbandTeam` 两个变更（解散后移除该团队的页面缓存）；摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
+- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记；`narrator_access_changed` 的 `reason: "team_changed"`（会话升级为团队或团队解散）总是刷新，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
 - 活动标题（`team-page-model.ts:eventLabelKey`）：已知种类由 shared 的事件种类列表拼成，每一种在 en / zh-CN 的 `teams.event.*` 都有文案（`team-page-model.test.ts` 核对，含 `work.merged` 与重叠、独占路径事件）；未知种类（更新的服务端）显示通用的 `teams.event.other`（「其他团队动态」），原始种类名只放在 tooltip 里（`TeamActivity.tsx`）。
 
 ## 从哪读起

@@ -2400,6 +2400,8 @@
 			"outline_task_finished": "Tasks this session created were finished elsewhere",
 			"outline_team_activity": "Team activity",
 			"team_status": "Team status",
+			"team_upgrade": "Became a team coordinator",
+			"team_disband": "Team disbanded",
 			"outline_team": "Task events for this session",
 			"outline_task_brief": "Opening brief",
 			"spec_import": "Dynamic Spec moved to the outline",

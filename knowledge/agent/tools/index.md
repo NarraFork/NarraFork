@@ -30,7 +30,7 @@ keywords:
   - 工具名规则
   - tool-load-markers
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 9400a828b
 ---
 # 工具体系
 
@@ -49,6 +49,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 从哪读起
 - `server/lib/agent/tools/index.ts`：全部内置工具的清单。
 - `server/services/tool-loading-service.ts:changeLoadedToolGroup`：加载/卸载一个工具组的服务端实现。
+- `tool-loading-service.ts:requestToolDeclarationRebaseline`：一个 core 工具会话中途才可用（会话升级为团队协调者后的 `Team`）而当前 epoch 是 `replace_tools` 时，写一条与显式加载相同的 `tool_loaded{rebaseline: true}` 通知，下一次请求开新 epoch 声明它；能追加的 epoch、已声明或已有待办时什么都不写（`tool-declaration-rebaseline.test.ts`）。
 - `server/lib/agent/__tests__/loop-tool-loading.test.ts`、`server/lib/agent/tool-routing.test.ts`
 - `tools/learning-guide.ts`：core 工具，按语言检索与读取内置学习文档（`@shared/learning-content`）；`tools/number-param.ts`：`looseNumber` 宽松接受字符串数字与浮点，`normalizeNumber` 在执行时按范围取整截断，避免模型的小偏差白白浪费一轮（browser、grep、knowledge 等工具使用）。
 
