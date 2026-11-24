@@ -1,3 +1,4 @@
+import { hotTimer } from "./hot-safe";
 import { logger } from "./logger";
 
 /*
@@ -70,7 +71,7 @@ export function startEventLoopMonitor(options: EventLoopMonitorOptions = {}): vo
 	state.startedAt = new Date().toISOString();
 	expectedAt = performance.now() + intervalMs;
 
-	timer = setInterval(() => {
+	const onTick = () => {
 		const now = performance.now();
 		const lagMs = Math.max(0, now - expectedAt);
 		const roundedLag = roundMs(lagMs);
@@ -102,7 +103,9 @@ export function startEventLoopMonitor(options: EventLoopMonitorOptions = {}): vo
 		}
 
 		expectedAt = now + intervalMs;
-	}, intervalMs);
+	};
+	// Replace the previous module generation's interval without changing normal start semantics.
+	timer = hotTimer("narrafork.eventLoopMonitor.timer", () => setInterval(onTick, intervalMs));
 
 	if (typeof timer === "object" && "unref" in timer) timer.unref();
 }
