@@ -483,6 +483,20 @@ export class ProviderBalanceCache {
 		return Object.fromEntries([...this.entries].map(([id, e]) => [id, e.generation]));
 	}
 
+	/** Read the direct probe slot only under the live selected credential identity. */
+	quotaSnapshot(
+		id: string,
+	): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+		this.sync();
+		const entry = this.entries.get(id);
+		return entry
+			? {
+					credentialId: entry.credentialId,
+					snapshot: this.store.get(entry.credentialId, entry.identity, restoreSnapshot),
+				}
+			: undefined;
+	}
+
 	/** Does not schedule network activity; useful immediately after scheduling a mutation. */
 	peek(id: string): ProviderBalanceSnapshot | null {
 		this.sync();

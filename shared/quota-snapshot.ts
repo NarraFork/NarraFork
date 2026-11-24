@@ -38,6 +38,30 @@ export interface QuotaSnapshot {
 	detail?: unknown;
 }
 
+/** Public API boundary: template-private upstream payloads never leave the server. */
+export type PublicQuotaSnapshot = Omit<QuotaSnapshot, "detail"> & { hasError?: boolean };
+
+export interface QuotaSnapshotEntry {
+	groupId: string;
+	prefix: string;
+	templateId: string;
+	credentialId: string | null;
+	snapshot: PublicQuotaSnapshot | null;
+	/** Stream-reported allowance is separate from the direct quota probe. */
+	source?: "probe" | "quota_balance";
+	/** Omitted while support is unknown; false is not a zero allowance. */
+	supported?: boolean;
+	refreshing?: boolean;
+	/** CLI-only Command Code has no cache; an active view may request a one-shot refresh. */
+	refreshOnRead?: boolean;
+	/** Opaque process-local CLI identity generation; never a raw credential fingerprint. */
+	generation?: string;
+}
+
+export interface QuotaSnapshotsResponse {
+	entries: QuotaSnapshotEntry[];
+}
+
 /** Epoch ms for an upstream timestamp string, or null. */
 export function epochOf(value: string | null | undefined): number | null {
 	const ms = value ? Date.parse(value) : Number.NaN;

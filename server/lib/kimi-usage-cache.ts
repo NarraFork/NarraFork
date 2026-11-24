@@ -512,6 +512,17 @@ export function getAllKimiCachedUsages(): Record<string, KimiUsageCache> {
 	return result;
 }
 
+export const isKimiQuotaRefreshing = (keyId: string): boolean =>
+	refreshInFlightByProvider.has(keyId);
+
+/** Identity-checked snapshot for the public quota projection. */
+export function getKimiQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	const subject = kimiSubjects().find((s) => s.id === keyId);
+	return subject
+		? quotaStore.get(subject.id, identity(subject.config), restoreSnapshot)
+		: undefined;
+}
+
 /** Key id → its usage (key list). */
 export function getKimiKeyUsages(): Record<string, KimiUsageCache> {
 	const result: Record<string, KimiUsageCache> = {};

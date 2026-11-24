@@ -63,7 +63,7 @@ const {
 	refreshStaleOpencodeUsages,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const { opencodeRoutes } = await import("../../routes/opencode");
+const { quotaSnapshotRoutes } = await import("../../routes/quota-snapshots");
 
 beforeEach(() => {
 	settings.customApiProviders = [];
@@ -94,13 +94,14 @@ function appForRole(role: "admin" | "user") {
 	app.use("*", async (c, next) => {
 		const sub = role === "admin" ? OPENCODE_ADMIN_ID : OPENCODE_USER_ID;
 		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("auth", { type: "session", user: c.get("user") });
 		await next();
 	});
 	app.onError((error) => {
 		const status = (error as { statusCode?: number }).statusCode;
 		return new Response("denied", { status: status ?? 500 });
 	});
-	app.route("/api/opencode", opencodeRoutes);
+	app.route("/api/quota-snapshots", quotaSnapshotRoutes);
 	return app;
 }
 
@@ -450,21 +451,24 @@ describe("OpenCode Go usage", () => {
 		const pending = deferred();
 		respond = () => pending.promise;
 		// A cold read must not block on the upstream call it just started.
-		const cold = await appForRole("user").request("/api/opencode/usages");
-		expect((await cold.json())["opencode-test"]).toEqual({
-			rolling: null,
-			weekly: null,
-			monthly: null,
-			fetchedAt: 0,
-			generation: getOpencodeUsageGenerations()["opencode-test"],
-			hasError: false,
-		});
+		const cold = await appForRole("user").request("/api/quota-snapshots");
+		expect(
+			(await cold.json()).entries.find(
+				(entry: { groupId: string }) => entry.groupId === "opencode-test",
+			),
+		).toMatchObject({ snapshot: null, credentialId: null });
 		pending.resolve(Response.json(body));
 		await refreshAllOpencodeUsages();
-		const warm = await appForRole("user").request("/api/opencode/usages");
-		expect(await warm.json()).toMatchObject({
-			"opencode-test": { rolling: { percent: 37, status: "ok" }, hasError: false },
+		const warm = await appForRole("user").request("/api/quota-snapshots");
+		const entry = (await warm.json()).entries.find(
+			(entry: { groupId: string }) => entry.groupId === "opencode-test",
+		);
+		expect(entry.snapshot.windows).toContainEqual({
+			kind: "5h",
+			usedRatio: 0.37,
+			resetsAt: Date.parse(body.usage.rolling.resetsAt),
 		});
+		expect(entry.snapshot.hasError).toBe(false);
 	});
 
 	test("a failed refresh becomes hasError for users and stays visible only to admins", async () => {
@@ -473,34 +477,34 @@ describe("OpenCode Go usage", () => {
 		};
 		await refreshAllOpencodeUsages();
 
-		const userBody = await (await appForRole("user").request("/api/opencode/usages")).text();
-		const userEntry = JSON.parse(userBody)["opencode-test"];
+		const userBody = await (await appForRole("user").request("/api/quota-snapshots")).text();
+		const userEntry = JSON.parse(userBody).entries.find(
+			(entry: { groupId: string }) => entry.groupId === "opencode-test",
+		).snapshot;
 		expect(userEntry).toMatchObject({ hasError: true });
-		expect(userEntry).not.toHaveProperty("error");
+		expect(userEntry.error).toBe("quota_unavailable");
 		// The failure text is the deployment's business, not the reader's.
 		expect(userBody).not.toContain("internal.example");
 		expect(userBody).not.toContain("sk-live-abc");
 
 		const adminEntry = JSON.parse(
-			await (await appForRole("admin").request("/api/opencode/usages")).text(),
-		)["opencode-test"];
-		// An admin gets the raw entry: the error text is present, and `hasError` is
-		// the non-admin substitute for it, so it is absent here rather than false.
-		expect(adminEntry).toMatchObject({ error: "OpenCode usage request failed" });
-		expect(adminEntry).not.toHaveProperty("hasError");
+			await (await appForRole("admin").request("/api/quota-snapshots")).text(),
+		).entries.find((entry: { groupId: string }) => entry.groupId === "opencode-test").snapshot;
+		// Administrators also receive only a fixed safe error code.
+		expect(adminEntry).toMatchObject({ error: "quota_unavailable", hasError: true });
 	});
 
 	test("POST refresh is admin-only", async () => {
 		expect(
-			(await appForRole("user").request("/api/opencode/usages/refresh", { method: "POST" })).status,
+			(await appForRole("user").request("/api/quota-snapshots/refresh", { method: "POST" })).status,
 		).toBe(403);
 		expect(
-			(await appForRole("admin").request("/api/opencode/usages/refresh", { method: "POST" }))
+			(await appForRole("admin").request("/api/quota-snapshots/refresh", { method: "POST" }))
 				.status,
 		).toBe(200);
 	});
 
-	test("settings projects the same opaque generations to users and admins", async () => {
+	test("settings retires legacy quota generations for users and admins without exposing credentials", async () => {
 		const { settingsRoutes } = await import("../../routes/settings");
 		for (const role of ["user", "admin"] as const) {
 			const app = appForRole(role);
@@ -508,10 +512,11 @@ describe("OpenCode Go usage", () => {
 			const response = await app.request("/api/settings");
 			expect(response.status).toBe(200);
 			const projection = await response.json();
-			expect(projection.opencodeUsageGenerations).toEqual(getOpencodeUsageGenerations());
+			expect(projection).not.toHaveProperty("opencodeUsageGenerations");
+			expect(projection).not.toHaveProperty("deepseekBalanceGenerations");
 			expect(projection.customApiProviders[0].apiKey).not.toBe(provider().apiKey);
 		}
-		// Generations are a runtime projection, never persisted into settings.
+		// Legacy source-specific generations are no longer part of the settings response.
 		expect(settings).not.toHaveProperty("opencodeUsageGenerations");
 		expect(settings.customApiProviders?.[0]).not.toHaveProperty("generation");
 	});

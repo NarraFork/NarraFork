@@ -9,9 +9,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { formatTokenDanceMoney, useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
+import {
+	invalidateQuotaSnapshots,
+	useQuotaSnapshot,
+	useRefreshQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { ApiError, api } from "../../lib/api";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 import { TokenDanceRechargeDialog } from "../settings/TokenDanceRechargeDialog";
 import { ModelList, type ModelListProps } from "./ModelList";
 export function TokenDanceSection({
@@ -35,15 +40,26 @@ export function TokenDanceSection({
 	onChanged: () => Promise<void>;
 	onDeleted: () => void;
 }) {
-	const { t, i18n } = useTranslation("settings");
+	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
-	const qc = useQueryClient();
-	const balance = useTokenDanceBalance(
-		connection.generation,
+	const balance = useQuotaSnapshot(
+		"tokendance",
+		undefined,
 		connection.connected && !connection.disabled,
 	);
+	const identity = `${connection.generation}:${user?.id ?? ""}`;
+	const previousIdentity = useRef(identity);
+	const identityChanged = previousIdentity.current !== identity;
+	const qc = useQueryClient();
+	useEffect(() => {
+		if (previousIdentity.current === identity) return;
+		previousIdentity.current = identity;
+		void invalidateQuotaSnapshots(qc);
+	}, [identity, qc]);
+	const snapshot = identityChanged ? null : balance.data;
+	const refresh = useRefreshQuotaSnapshots(identity);
 	const [rechargeOpened, setRechargeOpened] = useState(false);
 	const [balanceRefreshFailed, setBalanceRefreshFailed] = useState(false);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: Credential and actor changes close confirmation UI.
@@ -83,36 +99,20 @@ export function TokenDanceSection({
 	return (
 		<Stack>
 			<Text>{connection.name || "TokenDance"}</Text>
-			<Group wrap="wrap">
-				<Text>
-					{t("tokendance.balance")}:{" "}
-					{formatTokenDanceMoney(balance.data?.balance, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-				<Text>
-					{t("tokendance.credits")}:{" "}
-					{formatTokenDanceMoney(balance.data?.credits, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-				<Text>
-					{t("tokendance.creditsUsed")}:{" "}
-					{formatTokenDanceMoney(balance.data?.creditsUsed, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-			</Group>
-			{(balance.isError || balance.data?.hasError) && (
+			<QuotaSnapshotIndicator snapshot={snapshot} title={t("tokendance.balance")} />
+			{(balance.isError || snapshot?.hasError || snapshot?.error) && (
 				<Alert color="red">{t("tokendance.operationFailed")}</Alert>
 			)}
 			{balanceRefreshFailed && <Alert color="red">{t("tokendance.balanceRefreshFailed")}</Alert>}
-			{balance.data?.balance != null &&
-				(balance.isError || balance.data.hasError || balanceRefreshFailed) && (
+			{!!snapshot?.balances.length &&
+				(balance.isError || snapshot.hasError || snapshot.error || balanceRefreshFailed) && (
 					<Text c="yellow" size="sm">
 						{t("tokendance.balanceStale")}
 					</Text>
 				)}
-			{balance.data?.balance != null && balance.data.balance <= 0 && (
-				<Alert color="yellow">{t("tokendance.balanceInsufficient")}</Alert>
-			)}
+			{snapshot?.balances.some(
+				(entry) => !entry.unlimited && entry.remaining != null && entry.remaining <= 0,
+			) && <Alert color="yellow">{t("tokendance.balanceInsufficient")}</Alert>}
 			{isAdmin && (
 				<Group>
 					<Button
@@ -121,11 +121,16 @@ export function TokenDanceSection({
 							void run(async () => {
 								setBalanceRefreshFailed(false);
 								try {
-									const result = await api.tokenDanceRefreshBalance();
-									if (result.generation !== connection.generation)
-										throw new Error("Balance generation changed");
-									qc.setQueryData(["tokendance", "balance", connection.generation], result);
-									if (result.hasError) throw new Error("Balance refresh failed");
+									const result = await refresh.mutateAsync({ groupId: "tokendance" });
+									if (
+										result.entries.some(
+											(entry) =>
+												entry.groupId === "tokendance" &&
+												!entry.refreshing &&
+												(entry.snapshot?.hasError || entry.snapshot?.error),
+										)
+									)
+										throw new Error("Balance refresh failed");
 								} catch {
 									setBalanceRefreshFailed(true);
 									throw new Error("Balance refresh failed");

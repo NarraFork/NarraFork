@@ -18,6 +18,7 @@ import { IconCheck, IconExternalLink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { quotaSnapshotsKey } from "../../../hooks/useQuotaSnapshots";
 import { api } from "../../../lib/api";
 import { createQrDataUrl } from "../../../lib/qr";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
@@ -168,25 +169,7 @@ export function NugRechargeDialog({
 					quota.totalGranted,
 					quota.detailedQuotaBalance ?? null,
 				);
-				qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-					const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-					const existing =
-						quotas[providerId] && typeof quotas[providerId] === "object"
-							? (quotas[providerId] as Record<string, unknown>)
-							: {};
-					return {
-						...quotas,
-						[providerId]: {
-							...existing,
-							balance: quota.balance,
-							totalGranted: quota.totalGranted,
-							detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
-							...(quota.extra !== undefined ? { extra: quota.extra } : {}),
-						},
-					};
-				});
-				qc.invalidateQueries({ queryKey: ["settings"] });
-				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+				void qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
 				notifications.show({
 					color: "green",
 					title: t("recharge.success"),

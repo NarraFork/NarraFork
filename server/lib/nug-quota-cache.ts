@@ -148,6 +148,79 @@ function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
 	return quotaStore.get(credential.id, identity(credential.config), restoreSnapshot);
 }
 
+/** No polling here: NUG is updated by streams, startup and explicit refresh. */
+export function getNugQuotaSnapshot(
+	providerId: string,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!config) return undefined;
+	const credential = subject(config);
+	return { credentialId: credential.id, snapshot: snapshotOf(config) };
+}
+
+const refreshes = new Map<
+	string,
+	{ identity: string; controller: AbortController; task: Promise<void> }
+>();
+
+export const isNugQuotaRefreshing = (providerId: string): boolean => refreshes.has(providerId);
+
+/** Explicit refresh, bounded and coalesced by the live credential identity. */
+export function refreshNugQuota(providerId: string): Promise<void> {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!config || config.disabled) return Promise.resolve();
+	const credential = subject(config);
+	if (!credential.config.apiKey) return Promise.resolve();
+	const key = identity(credential.config);
+	const previous = refreshes.get(providerId);
+	if (previous?.identity === key) return previous.task;
+	previous?.controller.abort();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 15_000);
+	const current = () => {
+		const live = getNugQuotaSnapshot(providerId);
+		const liveConfig = (settings.nugProviders ?? []).find((p) => p.id === providerId);
+		return (
+			live?.credentialId === credential.id &&
+			liveConfig &&
+			identity(subject(liveConfig).config) === key
+		);
+	};
+	const cancelled = new Promise<never>((_resolve, reject) => {
+		controller.signal.addEventListener("abort", () => reject(new Error("quota_cancelled")), {
+			once: true,
+		});
+	});
+	const task = Promise.race([probeNugQuota(credential, controller.signal), cancelled])
+		.then((snapshot) => {
+			if (!controller.signal.aborted && current()) quotaStore.set(credential.id, key, snapshot);
+		})
+		.catch(() => {
+			if (current()) {
+				const old = quotaStore.get(credential.id, key, restoreSnapshot);
+				quotaStore.set(
+					credential.id,
+					key,
+					{
+						scope: "wallet",
+						windows: [],
+						balances: [],
+						...old,
+						fetchedAt: Date.now(),
+						error: "quota_unavailable",
+					},
+					false,
+				);
+			}
+		})
+		.finally(() => {
+			clearTimeout(timer);
+			if (refreshes.get(providerId)?.controller === controller) refreshes.delete(providerId);
+		});
+	refreshes.set(providerId, { identity: key, controller, task });
+	return task;
+}
+
 export function setNugCachedQuota(
 	providerId: string,
 	cache: NugQuotaCache,

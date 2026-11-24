@@ -78,6 +78,7 @@ import {
 	useProviderModelRefreshCapability,
 	useSettingsFeatureCapability,
 } from "../../hooks/usePlatform";
+import { invalidateQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { replaceCurrentHistoryState } from "../../lib/history-entry";
@@ -446,8 +447,9 @@ function SettingsProvidersPage() {
 				providersStateFromSettings(response as Record<string, unknown>),
 			);
 			dispatch({ type: "SYNC_FROM_SETTINGS", settings: response as Record<string, unknown> });
-			// 凭据可能刚被替换，额度要按新的 key 重新拉取。
-			void qc.invalidateQueries({ queryKey: ["commandcode", "usage"] });
+			// A replaced credential must never retain the previous account's quota while refetching.
+			await invalidateQuotaSnapshots(qc);
+			void qc.invalidateQueries({ queryKey: ["commandcode", "usage-summary"] });
 			// Prefix renames and removed providers move or drop provider-model overrides.
 			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 			// Joining or leaving auto changes which sources each auto: model has.

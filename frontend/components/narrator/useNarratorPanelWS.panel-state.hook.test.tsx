@@ -7,38 +7,35 @@ import type {
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
 import { notifications } from "@mantine/notifications";
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
-import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
+import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
 import { findPendingForKey } from "./vlist/vlist-permission-match";
 
-type QuotaSettings = {
-	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
-};
 let quotaProviderId: string | null = null;
-let balanceSnapshot: ProviderBalanceSnapshot | undefined;
-let quotaDisplay: ReturnType<typeof customApiBalanceDisplayFor>;
-function subscriptionSnapshot(): ProviderBalanceSnapshot {
-	return {
-		generation: "g1",
-		status: "supported",
-		adapter: "sub2api",
-		balance: {
-			scope: "subscription",
-			unlimited: false,
-			amounts: [{ unit: "USD", window: "daily", total: 10, used: 2, remaining: 8 }],
+const quotaData: QuotaSnapshotsResponse = {
+	entries: [
+		{
+			groupId: "p1",
+			prefix: "provider",
+			templateId: "custom",
+			credentialId: "key1",
+			source: "probe",
+			snapshot: {
+				fetchedAt: 1,
+				scope: "subscription",
+				windows: [{ kind: "weekly", usedRatio: 0.2, resetsAt: null }],
+				balances: [],
+			},
 		},
-		fetchedAt: 1,
-		attemptedAt: 1,
-		error: null,
-	};
-}
+	],
+};
 
 let root: Root;
 let host: HTMLElement;
@@ -101,24 +98,11 @@ function Harness() {
 	return null;
 }
 function QuotaHarness() {
-	const { data: settings } = useQuery<QuotaSettings>({
-		queryKey: ["settings"],
-		queryFn: async () => ({ customApiQuotas: {} }),
-		enabled: false,
-	});
-	quotaDisplay = customApiBalanceDisplayFor({
-		providerId: quotaProviderId,
-		pushedQuotas: settings?.customApiQuotas,
-		snapshot: balanceSnapshot,
-	});
 	current = useNarratorPanelWS({
 		narratorId,
 		narratorStatus,
 		isAtBottomRef: { current: true },
-		customApiProviderId: quotaProviderId ?? undefined,
-		quotaProviderKey: quotaProviderId ?? undefined,
-		initialQuotaBalance: quotaDisplay.pushedQuota?.quotaBalance ?? null,
-		initialDetailedQuotaBalance: quotaDisplay.pushedQuota?.detailedQuotaBalance ?? null,
+		quotaProviderKey: quotaProviderId,
 	});
 	return null;
 }
@@ -196,7 +180,6 @@ beforeEach(async () => {
 	narratorId = "n1";
 	narratorStatus = "waiting";
 	quotaProviderId = null;
-	balanceSnapshot = undefined;
 	connected = false;
 	listeners.clear();
 	connections.clear();
@@ -301,94 +284,55 @@ describe("upstream timed wait notifications with the real WS hook", () => {
 	});
 });
 
-describe("pushed custom API quota precedence with the real WS hook", () => {
-	test("a live push replaces the subscription and survives subsequent auto-balance polling", async () => {
+describe("shared quota snapshots with the real WS hook", () => {
+	test("quota pushes invalidate snapshots without injecting unscoped text or writing legacy caches", async () => {
 		quotaProviderId = "p1";
-		const snapshot = subscriptionSnapshot();
-		balanceSnapshot = snapshot;
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		const settings = { customApiQuotas: {} };
+		const nug = { p1: { balance: 3 } };
+		qc.setQueryData(["settings"], settings);
+		qc.setQueryData(["admin", "settings"], settings);
+		qc.setQueryData(["nug", "quotas"], nug);
+		qc.setQueryData(quotaSnapshotsKey, quotaData);
+		const invalidate = spyOn(qc, "invalidateQueries");
 		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(snapshot);
-		expect(current.quotaBalance).toBeNull();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "75%",
+			detailedQuotaBalance: "private upstream text",
+		});
+		expect(invalidate).toHaveBeenCalledWith({ queryKey: quotaSnapshotsKey });
+		expect(qc.getQueryState(quotaSnapshotsKey)?.isInvalidated).toBe(true);
+		expect(qc.getQueryData(quotaSnapshotsKey)).toEqual(quotaData);
+		expect(qc.getQueryData(["settings"])).toEqual(settings);
+		expect(qc.getQueryData(["admin", "settings"])).toEqual(settings);
+		expect(qc.getQueryData(["nug", "quotas"])).toEqual(nug);
+		invalidate.mockRestore();
+	});
 
-		const pushed = {
-			quotaBalance: "站点额度 75%",
-			detailedQuotaBalance: "专用套餐\n日 USD 0.004\n周 USD 1",
-		};
-		await event({ type: "quota_balance", ...pushed });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toMatchObject(pushed);
-
-		balanceSnapshot = { ...snapshot, fetchedAt: 2 };
+	test("null pushes still re-read snapshots, never erase the credential probe", async () => {
+		qc.setQueryData(quotaSnapshotsKey, quotaData);
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-
-		await event({ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "已耗尽" });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe("0");
-		expect(current.detailedQuotaBalance).toBe("已耗尽");
-
 		await event({ type: "quota_balance", quotaBalance: null, detailedQuotaBalance: null });
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
+		expect(qc.getQueryState(quotaSnapshotsKey)?.isInvalidated).toBe(true);
+		expect(qc.getQueryData(quotaSnapshotsKey)).toEqual(quotaData);
 	});
 
-	test("cached pushes win on mount and never leak when switching providers", async () => {
-		quotaProviderId = "p1";
-		balanceSnapshot = subscriptionSnapshot();
-		const pushed = {
-			quotaBalance: "Cached site plan",
-			detailedQuotaBalance: "Cached site details",
-		};
-		qc.setQueryData(["settings"], { customApiQuotas: { p1: pushed } });
+	test("a subagent's quota frame never invalidates this panel's snapshot", async () => {
+		qc.setQueryData(quotaSnapshotsKey, quotaData);
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-
-		quotaProviderId = "p2";
-		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
-
-		quotaProviderId = "p1";
-		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-	});
-});
-
-describe("quota isolation between a main agent and its subagent side by side", () => {
-	test("a subagent's quota frame never reaches this panel's balance or its provider cache", async () => {
-		quotaProviderId = "p1";
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
-		await render();
-		expect(current.quotaBalance).toBeNull();
-
 		await event({
 			type: "quota_balance",
 			quotaBalance: "subagent balance",
 			detailedQuotaBalance: "subagent details",
 			isSubagent: true,
 		});
-
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
-		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toBeUndefined();
+		expect(qc.getQueryState(quotaSnapshotsKey)?.isInvalidated).toBe(false);
+		expect(qc.getQueryData(quotaSnapshotsKey)).toEqual(quotaData);
 	});
 
 	test("a subagent's payment_required never arms this panel's recharge state", async () => {
 		quotaProviderId = "p1";
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
 		await render();
-
 		await event({
 			type: "payment_required",
 			providerId: "p1",
@@ -397,7 +341,27 @@ describe("quota isolation between a main agent and its subagent side by side", (
 			resumeAction: "retry",
 			isSubagent: true,
 		});
+		expect(current.paymentRequired).toBeNull();
+	});
 
+	test("payment-required still arms recharge and resets when the provider changes", async () => {
+		quotaProviderId = "p1";
+		await render();
+		await event({
+			type: "payment_required",
+			providerId: "p1",
+			balance: 0,
+			required: 5,
+			resumeAction: "continue",
+		});
+		expect(current.paymentRequired).toMatchObject({
+			providerId: "p1",
+			balance: 0,
+			required: 5,
+			resumeAction: "continue",
+		});
+		quotaProviderId = "p2";
+		await render();
 		expect(current.paymentRequired).toBeNull();
 	});
 });

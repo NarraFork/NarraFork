@@ -48,7 +48,6 @@ import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
-import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -75,7 +74,6 @@ import {
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
-import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
@@ -86,10 +84,13 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalance } from "../../hooks/useProviderBalance";
+import {
+	selectQuotaEntries,
+	useCommandCodeCliQuota,
+	useQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
 import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
-import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	currentWorkspaceContext,
@@ -116,7 +117,6 @@ import {
 	useOutlineOpener,
 } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
-import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -200,13 +200,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
-import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
-import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
-import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
-import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -455,7 +449,6 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -663,8 +656,8 @@ function NarratorPanelBody({
 	// resolves the actual member at request time). A follow-parent subagent
 	// resolves through its server-reported inheritance instead of the raw
 	// `__parent__` sentinel, which no capability lookup can parse.
-	// Only the model *resolution* stays in the panel: resolvedModel feeds the NUG
-	// quota, Kimi usage and context-threshold queries and the WS state below. The
+	// Only the model *resolution* stays in the panel: resolvedModel selects public
+	// quota snapshots, the recharge target and context-threshold queries. The
 	// reasoning/codex/fast-mode/permission control derivations moved down into the
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
@@ -689,139 +682,32 @@ function NarratorPanelBody({
 		placeholderData: DEFAULT_CONTEXT_THRESHOLDS.standard,
 	});
 
-	// NUG quota data layer (provider config + quota queries + cache writeback +
-	// derived provider info). Kept lifted here because the derived info feeds the
-	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(
-		resolvedModel,
-		settingsData?.nugProviders,
-		firstScreenActivity,
-	);
-	const tokenDanceConnection = settingsData?.tokendance;
-	const tokenDanceGeneration =
-		resolvedModel?.startsWith("tokendance:") &&
-		tokenDanceConnection?.connected &&
-		!tokenDanceConnection.disabled &&
-		Number.isSafeInteger(tokenDanceConnection.generation)
-			? (tokenDanceConnection.generation as number)
-			: undefined;
-	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
-	const tokenDanceQuota = tokenDanceQuotaView(
-		tokenDanceBalanceQuery.data,
-		tokenDanceGeneration,
-		currentUser?.role === "admin",
-		t,
-	);
-
-	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
-	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
-	const commandCodeUsageQuery = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
-		enabled: !REMOTE_BUILD && commandCodeEnabled,
-		refetchInterval: commandCodeEnabled ? 60_000 : false,
-	});
-	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
-	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
-	// stays disabled unless the current narrator's provider is a Kimi provider,
-	// so nothing polls while Kimi is not in use.
-	const currentKimiProviderId = useMemo(() => {
+	// Quotas are public, provider-neutral snapshots; NUG identity is only for recharge.
+	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const { data: quotaSnapshots } = useQuotaSnapshots(firstScreenActivity);
+	// CLI-only accounts have no reusable server cache. Only this active consumer may
+	// request the one-shot read; ordinary snapshot readers never start CLI work.
+	useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode");
+	const currentQuotaEntries = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isKimiProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const { data: kimiUsagesData } = useQuery({
-		queryKey: ["kimi", "usages"],
-		queryFn: api.kimiGetUsages,
-		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
-		staleTime: 30_000,
-		refetchInterval: 60_000,
-	});
-
-	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
-	// generation token so an allowance fetched for a replaced account is never shown.
-	// The current window lives in the status bar; weekly/monthly are in the popover.
-	const currentOpencodeProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const opencodeGeneration = currentOpencodeProviderId
-		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
-		: undefined;
-	const opencodeUsageQuery = useOpencodeUsage(
-		currentOpencodeProviderId,
-		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
-		firstScreenActivity,
-	);
-
-	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
-	// generation so a balance fetched for a replaced account is never shown.
-	const currentDeepSeekProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const deepseekGeneration = currentDeepSeekProviderId
-		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
-		: undefined;
-	const deepseekBalancesQuery = useDeepSeekBalance(
-		currentDeepSeekProviderId,
-		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
-		firstScreenActivity,
-	);
-
-	const currentBalanceProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (settingsData?.customApiProviders ?? []).find(
-			(p: { id: string; prefix?: string; disabled?: boolean }) =>
-				p.prefix === prefix && !p.disabled,
+		if (!prefix) return [];
+		return selectQuotaEntries(quotaSnapshots?.entries ?? []).filter(
+			(entry) => entry.prefix === prefix && entry.supported !== false,
 		);
-		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
-			? (cfg.id as string)
-			: null;
-	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
-	const balanceGeneration = currentBalanceProviderId
-		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
-		: undefined;
-	const providerBalanceQuery = useProviderBalance(
-		currentBalanceProviderId,
-		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
-		firstScreenActivity,
+	}, [resolvedModel, quotaSnapshots]);
+	const nugQuotaSnapshot = currentQuotaEntries.find(
+		(entry) => entry.groupId === nugProviderInfo?.providerId,
+	)?.snapshot;
+	const tokenDanceRechargeEnabled = Boolean(
+		!REMOTE_BUILD &&
+			resolvedModel?.startsWith("tokendance:") &&
+			settingsData?.tokendance?.connected &&
+			!settingsData.tokendance.disabled &&
+			currentUser?.role === "admin",
 	);
-	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
-		customApiBalanceDisplayFor({
-			providerId: currentBalanceProviderId,
-			pushedQuotas: settingsData?.customApiQuotas,
-			snapshot: providerBalanceQuery.data,
-		});
+	const tokenDanceRemaining = currentQuotaEntries[0]?.snapshot?.balances[0]?.remaining;
+	const tokenDanceBalanceKnown =
+		typeof tokenDanceRemaining === "number" && Number.isFinite(tokenDanceRemaining);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1237,81 +1123,6 @@ function NarratorPanelBody({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-	// Resolve custom API provider info for initial generic quota balance
-	const customApiProviderInfo = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const customApiProviders: Array<{ id: string; prefix?: string }> =
-			settingsData?.customApiProviders ?? [];
-		const cfg = customApiProviders.find((p) => p.prefix === prefix);
-		if (!cfg) return null;
-		if (cfg.id === currentDeepSeekProviderId) {
-			return {
-				providerId: cfg.id,
-				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
-			};
-		}
-		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
-		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
-		// Go one would otherwise fall through to the previous account's Kimi allowance.
-		const usageSource = usageSourceFor({
-			providerId: cfg.id,
-			opencodeProviderId: currentOpencodeProviderId,
-			kimiProviderId: currentKimiProviderId,
-		});
-		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
-		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
-		// generic text-balance slot — showing both would duplicate the 5h figure.
-		if (usageSource === "opencode") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
-		if (usageSource === "kimi") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && pushedQuota) {
-			return { providerId: cfg.id, ...pushedQuota };
-		}
-		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
-			// The shared window panel owns subscription amounts, including unknown/stale
-			// placeholders. Do not duplicate them in the generic balance text slot.
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
-			return {
-				providerId: cfg.id,
-				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
-			};
-		}
-		const quotas = settingsData?.customApiQuotas as
-			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
-			| undefined;
-		const quota = quotas?.[cfg.id];
-		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
-		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quota?.quotaBalance ?? null,
-			detailedQuotaBalance,
-		};
-	}, [
-		resolvedModel,
-		settingsData?.customApiProviders,
-		settingsData?.customApiQuotas,
-		currentKimiProviderId,
-		currentOpencodeProviderId,
-		currentDeepSeekProviderId,
-		deepseekBalancesQuery.data,
-		deepseekBalancesQuery.isError,
-		currentBalanceProviderId,
-		pushedQuota,
-		sub2ApiSubscriptionSnapshot,
-		providerBalanceQuery.data,
-		providerBalanceQuery.isError,
-		balanceT,
-		t,
-	]);
-
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -1320,12 +1131,7 @@ function NarratorPanelBody({
 		isAtBottomRef,
 		isSubagent,
 		narratorSubstatus,
-		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
-		initialDetailedQuotaBalance:
-			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
-		customApiProviderId: customApiProviderInfo?.providerId,
-		nugProviderId: nugProviderInfo?.providerId,
-		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
+		quotaProviderKey: resolvedModel?.split(":")[0],
 		onDraftChanged: forwardDraftChanged,
 		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
@@ -1363,8 +1169,6 @@ function NarratorPanelBody({
 		activeCompactStart,
 		compactProgress,
 		compactFailure,
-		quotaBalance,
-		detailedQuotaBalance,
 		retryInfo,
 		quotaWaitInfo,
 		paymentRequired,
@@ -1376,11 +1180,9 @@ function NarratorPanelBody({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
-	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
+	// NUG recharge derivations (flags, dialog disclosure, and the
 	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
 	const {
-		quotaDetailsText,
-		hasQuotaDetailsPopover,
 		shouldShowNugRechargeButton,
 		shouldShowNugRechargeInQuotaDetails,
 		nugRechargeOpened,
@@ -1388,8 +1190,7 @@ function NarratorPanelBody({
 		closeNugRecharge,
 	} = useNarratorQuota({
 		nugProviderInfo,
-		quotaBalance,
-		detailedQuotaBalance,
+		snapshot: nugQuotaSnapshot,
 		paymentRequired,
 		setPaymentRequired,
 		narratorSubstatus,
@@ -2967,65 +2768,6 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
-	/**
-	 * Which plan the narrator is parked on, so only that provider's allowance
-	 * indicator turns red: the live event names the plan, and after a reload the
-	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
-	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
-	 */
-	const quotaWaitProvider = (() => {
-		if (!isWaitingForQuota) return undefined;
-		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
-		if (!narrator?.errorMessage) return undefined;
-		try {
-			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
-			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
-				return parsed.quotaProvider;
-			}
-		} catch {
-			// Not a waiting payload; leave the provider unknown.
-		}
-		return undefined;
-	})();
-
-	/**
-	 * Props for the OpenCode Go allowance indicator, or undefined when the current
-	 * model is not on a Go endpoint.
-	 */
-	const opencodeQuotaProps = (() => {
-		if (!currentOpencodeProviderId) return undefined;
-		const waitingForQuota = quotaWaitProvider === "opencode";
-		return {
-			usage: opencodeUsageQuery.data,
-			waitingForQuota,
-			waitingText: waitingForQuota ? quotaWaitText : null,
-		};
-	})();
-
-	/**
-	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
-	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
-	 * for, like the generic quota slot above, so a disabled query's stale entry
-	 * for a re-pointed provider is never shown.
-	 */
-	const kimiQuotaView = currentKimiProviderId
-		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
-		: null;
-	const quotaPanelProps = (() => {
-		if (currentKimiProviderId) {
-			const waitingForQuota = quotaWaitProvider === "kimi";
-			return {
-				view: kimiQuotaView,
-				waitingForQuota,
-				waitingText: waitingForQuota ? quotaWaitText : null,
-			};
-		}
-		if (commandCodeEnabled) {
-			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
-		}
-		return undefined;
-	})();
-
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3752,26 +3494,17 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								// Structured subscription quotas are rendered by the status bar, not this text slot.
-								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
-								sub2api: sub2ApiSubscriptionSnapshot
-									? {
-											snapshot: sub2ApiSubscriptionSnapshot,
-											queryFailed: providerBalanceQuery.isError,
-										}
-									: undefined,
-								opencode: opencodeQuotaProps,
-								panel: quotaPanelProps,
+								entries: currentQuotaEntries,
+								waitingForQuota: isWaitingForQuota,
+								waitingText: isWaitingForQuota ? quotaWaitText : null,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
-								...(tokenDanceQuota
+								...(tokenDanceRechargeEnabled
 									? {
 											recharge: {
-												showButton: tokenDanceQuota.showRechargeButton,
-												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												showButton: !tokenDanceBalanceKnown || tokenDanceRemaining <= 0,
+												showInDetails: tokenDanceBalanceKnown && tokenDanceRemaining > 0,
 												onOpen: openTokenDanceRecharge,
 											},
 										}

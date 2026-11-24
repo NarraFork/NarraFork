@@ -87,6 +87,24 @@ export function updateCustomApiQuotaByPrefix(
 	);
 }
 
+/** Stream allowances never overwrite the credential's direct probe slot. */
+export function getCustomApiQuotaSnapshot(
+	providerId: string,
+	credentialId: string,
+): QuotaSnapshot | undefined {
+	const config = provider(providerId);
+	if (!config) return undefined;
+	const credential = firstCredential(config);
+	return credential.id === credentialId
+		? quotaStore.get(
+				credentialId,
+				identity(credential.config),
+				restoreSnapshot,
+				STREAM_QUOTA_SOURCE,
+			)
+		: undefined;
+}
+
 export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache | undefined {
 	const config = provider(providerId);
 	if (!config) return undefined;

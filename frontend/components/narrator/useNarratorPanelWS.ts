@@ -12,6 +12,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
+import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
@@ -179,14 +180,6 @@ export interface UseNarratorPanelWSOptions {
 	isAtBottomRef: React.RefObject<boolean>;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
-	/** Initial generic gateway/API quota balance from settings cache. */
-	initialQuotaBalance?: string | null;
-	/** Initial generic gateway/API quota details from settings cache. */
-	initialDetailedQuotaBalance?: string | null;
-	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
-	customApiProviderId?: string | null;
-	/** NUG provider ID for the current narrator model (used to sync quota back to NUG cache). */
-	nugProviderId?: string | null;
 	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
 	quotaProviderKey?: string | null;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
@@ -258,8 +251,6 @@ export interface UseNarratorPanelWSReturn {
 	 * besides the inline timeline marker.
 	 */
 	compactFailure: { error: string } | null;
-	quotaBalance: string | null;
-	detailedQuotaBalance: string | null;
 	// Browser sessions
 	browserSessionCount: number;
 	browserVisualChange: { sessionId: string; seq: number } | null;
@@ -352,10 +343,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorErrorMessage,
 		initialMessageStatus,
 		isSubagent,
-		initialQuotaBalance,
-		initialDetailedQuotaBalance,
-		customApiProviderId,
-		nugProviderId,
 		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
@@ -638,17 +625,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sessionId: string;
 		seq: number;
 	} | null>(null);
-	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
-	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
-		initialDetailedQuotaBalance ?? null,
-	);
-	// Sync initial generic quota when switching narrators or custom API providers.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/providerId must reset same-balance stale runtime state.
+	// Payment state belongs to the current narrator/provider, unlike the shared quota query.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes must reset payment state.
 	useEffect(() => {
-		setQuotaBalance(initialQuotaBalance ?? null);
-		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
 		setPaymentRequired(null);
-	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
+	}, [narratorId, quotaProviderKey]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [quotaWaitInfo, setQuotaWaitInfo] = useState<QuotaWaitInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
@@ -1277,58 +1258,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onQuotaBalance: (balance, detailedBalance) => {
-				setQuotaBalance(balance);
-				setDetailedQuotaBalance(detailedBalance ?? null);
-				if (customApiProviderId) {
-					const updateSettingsQuota = (old: unknown) => {
-						if (!old || typeof old !== "object") return old;
-						const settings = old as Record<string, unknown>;
-						const customApiQuotas =
-							settings.customApiQuotas && typeof settings.customApiQuotas === "object"
-								? (settings.customApiQuotas as Record<string, unknown>)
-								: {};
-						const existing =
-							customApiQuotas[customApiProviderId] &&
-							typeof customApiQuotas[customApiProviderId] === "object"
-								? (customApiQuotas[customApiProviderId] as Record<string, unknown>)
-								: {};
-						return {
-							...settings,
-							customApiQuotas: {
-								...customApiQuotas,
-								[customApiProviderId]: {
-									...existing,
-									quotaBalance: balance,
-									detailedQuotaBalance: detailedBalance ?? null,
-								},
-							},
-						};
-					};
-					qc.setQueryData(["settings"], updateSettingsQuota);
-					qc.setQueryData(["admin", "settings"], updateSettingsQuota);
-				}
-				if (nugProviderId && balance != null) {
-					const numericBalance = Number(balance);
-					if (Number.isFinite(numericBalance)) {
-						qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-							const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-							const existing =
-								quotas[nugProviderId] && typeof quotas[nugProviderId] === "object"
-									? (quotas[nugProviderId] as Record<string, unknown>)
-									: {};
-							return {
-								...quotas,
-								[nugProviderId]: {
-									...existing,
-									balance: numericBalance,
-									totalGranted: existing.totalGranted ?? null,
-									detailedQuotaBalance: detailedBalance ?? existing.detailedQuotaBalance ?? null,
-								},
-							};
-						});
-					}
-				}
+			onQuotaBalance: () => {
+				// WS has no credential identity: re-read the server projection, never inject
+				// a request's stream text into another credential or overwrite a quota probe.
+				void qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
 			},
 			onPaymentRequired: (info) => {
 				setPaymentRequired(info);
@@ -1822,8 +1755,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			compactProgress,
 			compactFailure,
-			quotaBalance,
-			detailedQuotaBalance,
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,
@@ -1859,8 +1790,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			compactProgress,
 			compactFailure,
-			quotaBalance,
-			detailedQuotaBalance,
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,

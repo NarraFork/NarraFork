@@ -833,6 +833,22 @@ function balanceSummary(cache: BalanceCache): TokenDanceBalance {
 		...(recoveryAction ? { recoveryAction } : {}),
 	};
 }
+export const isTokenDanceQuotaRefreshing = (): boolean => !!currentBalanceCache().task;
+
+/** Identity-checked snapshot; scheduling stays in the existing balance cache. */
+export function getTokenDanceQuotaSnapshot():
+	| { credentialId: string; snapshot: QuotaSnapshot | undefined }
+	| undefined {
+	currentBalanceCache();
+	const subject = balanceSubject();
+	return subject
+		? {
+				credentialId: subject.id,
+				snapshot: quotaStore.get(subject.id, balanceIdentity(subject.config), restoreSnapshot),
+			}
+		: undefined;
+}
+
 /** Stale-while-revalidate: never waits on the upstream in ordinary user requests. */
 export function getTokenDanceBalance(): TokenDanceBalance {
 	const cache = currentBalanceCache();

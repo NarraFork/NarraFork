@@ -111,6 +111,21 @@ function cacheOf(entry: Entry): DeepSeekBalanceCache {
 	};
 }
 
+export const isDeepSeekQuotaRefreshing = (providerId: string): boolean =>
+	!!entries.get(providerId)?.inFlight;
+
+/** The provider probe belongs only to its current first credential. */
+export function getDeepSeekQuotaSnapshot(
+	providerId: string,
+	credentialId: string,
+): QuotaSnapshot | undefined {
+	syncDeepSeekBalanceCache();
+	const entry = entries.get(providerId);
+	return entry?.credentialId === credentialId
+		? quotaStore.get(credentialId, entry.identity, restoreSnapshot)
+		: undefined;
+}
+
 /** Never-fetched numbers are not worth a disk write. */
 function store(entry: Entry, balance: PersistedBalance): void {
 	quotaStore.set(

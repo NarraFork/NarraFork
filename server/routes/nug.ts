@@ -561,20 +561,30 @@ nugRoutes.get("/providers/:id/channels/health", async (c) => {
 	}
 });
 
-/** Proxy quota balance from NUG service (updates cache). */
+/**
+ * Payment confirmation only: NugRechargeDialog re-reads this after an order becomes paid,
+ * then resumes the paused narrator. It must remain available to ordinary session users,
+ * like the billing/order endpoints; ordinary quota displays use /api/quota-snapshots.
+ */
 nugRoutes.get("/providers/:id/quota", async (c) => {
 	const id = c.req.param("id");
 	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	if (!entry) return c.json({ error: "quota_subject_not_found" }, 404);
 	try {
-		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
-		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
-		return c.json(responseData);
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG quota fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		const data = (await entry.provider.getQuota(AbortSignal.timeout(15_000))) as unknown as Record<
+			string,
+			unknown
+		>;
+		const response = normalizeNugQuotaResponse(data);
+		setNugCachedQuota(id, buildNugQuotaCache(response, getNugCachedQuota(id)), entry.config);
+		// Keep the payment consumer's contract, not the template-private upstream payload.
+		return c.json({
+			balance: response.balance,
+			totalGranted: response.totalGranted,
+			detailedQuotaBalance: response.detailedQuotaBalance,
+		});
+	} catch {
+		return c.json({ error: "quota_unavailable" }, 502);
 	}
 });
 
@@ -799,11 +809,6 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 		logger.error("NUG API key creation failed", { error: msg, provider: config.name });
 		return c.json({ error: msg }, 502);
 	}
-});
-
-/** Get cached quotas for all NUG providers. */
-nugRoutes.get("/quotas", (c) => {
-	return c.json(getAllNugCachedQuotas());
 });
 
 // ─── OAuth Flow ───

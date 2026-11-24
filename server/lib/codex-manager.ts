@@ -2739,6 +2739,11 @@ export class CodexManager {
 
 	// ==================== Accessors ====================
 
+	/** Read-only credential ids for quota projection; never builds status/forecast state. */
+	get quotaCredentialIds(): string[] {
+		return this.poolEntries.map((entry) => entry.id);
+	}
+
 	/** The live usage projection's source; no forecast, network request or write. */
 	usageOf(id: string): CodexUsageResult | undefined {
 		return this.entries.find((entry) => entry.id === id)?.usage;

@@ -30,6 +30,7 @@ const { useChatUnread } = await import("./useChat");
 const { useSpecTasks } = await import("./useSpec");
 const { useNarratorCurrentTask } = await import("./useTaskBoard");
 const { useNugQuota } = await import("../components/narrator/model/use-nug-quota");
+const { useQuotaSnapshots } = await import("./useQuotaSnapshots");
 const providers = [{ id: "provider", prefix: "nug" }];
 let root: Root;
 let client: InstanceType<typeof QueryClient>;
@@ -38,7 +39,8 @@ function Harness({ enabled }: { enabled?: boolean }) {
 	useChatUnread(enabled);
 	useSpecTasks("real-narrator", enabled);
 	useNarratorCurrentTask("real-narrator", enabled);
-	useNugQuota("nug:model", providers, enabled);
+	useNugQuota("nug:model", providers);
+	useQuotaSnapshots(enabled);
 	return null;
 }
 async function flush() {
@@ -59,7 +61,7 @@ beforeEach(() => {
 	spyOn(api, "getChatUnread").mockImplementation(() => new Promise<never>(() => {}));
 	spyOn(api, "readSpecTasks").mockImplementation(() => new Promise<never>(() => {}));
 	spyOn(api, "getNarratorCurrentTask").mockImplementation(() => new Promise<never>(() => {}));
-	spyOn(api, "nugGetQuotas").mockImplementation(() => new Promise<never>(() => {}));
+	spyOn(api, "quotaSnapshots").mockImplementation(() => new Promise<never>(() => {}));
 });
 afterEach(async () => {
 	root.unmount();
@@ -81,7 +83,7 @@ test("optional enabled defers companion GETs but never unbinds the real Spec WS 
 	expect(api.getChatUnread).not.toHaveBeenCalled();
 	expect(api.readSpecTasks).not.toHaveBeenCalled();
 	expect(api.getNarratorCurrentTask).not.toHaveBeenCalled();
-	expect(api.nugGetQuotas).not.toHaveBeenCalled();
+	expect(api.quotaSnapshots).not.toHaveBeenCalled();
 	expect([...subscriptions]).toContainEqual({
 		narratorIds: ["real-narrator"],
 		types: ["spec_changed"],
@@ -97,7 +99,7 @@ test("optional enabled defers companion GETs but never unbinds the real Spec WS 
 	expect(api.getChatUnread).toHaveBeenCalledTimes(1);
 	expect(api.readSpecTasks).toHaveBeenCalledTimes(1);
 	expect(api.getNarratorCurrentTask).toHaveBeenCalledTimes(1);
-	expect(api.nugGetQuotas).toHaveBeenCalledTimes(1);
+	expect(api.quotaSnapshots).toHaveBeenCalledTimes(1);
 	expect([...subscriptions]).toEqual(before);
 });
 test("existing callers retain immediate GETs when enabled is omitted", async () => {
@@ -105,5 +107,5 @@ test("existing callers retain immediate GETs when enabled is omitted", async () 
 	await flush();
 	expect(api.getChatUnread).toHaveBeenCalledTimes(1);
 	expect(api.readSpecTasks).toHaveBeenCalledTimes(1);
-	expect(api.nugGetQuotas).toHaveBeenCalledTimes(1);
+	expect(api.quotaSnapshots).toHaveBeenCalledTimes(1);
 });

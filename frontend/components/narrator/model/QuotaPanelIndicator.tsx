@@ -8,7 +8,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { formatFullLocaleDateTime } from "../../../lib/format";
 import { QuotaWindowBars } from "./QuotaWindowBars";
@@ -176,6 +176,8 @@ export interface QuotaPanelIndicatorProps {
 	isMobile?: boolean;
 	/** Popover open/close animation in ms; tests pass 0 so no transition is scheduled. */
 	transitionDuration?: number;
+	/** Provider actions stay separate from the public snapshot display. */
+	detailsFooter?: ReactNode;
 }
 
 /**
@@ -191,6 +193,7 @@ export function QuotaPanelIndicator({
 	waitingText = null,
 	isMobile = false,
 	transitionDuration,
+	detailsFooter,
 }: QuotaPanelIndicatorProps) {
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
@@ -283,6 +286,7 @@ export function QuotaPanelIndicator({
 				}}
 			>
 				<QuotaDetails view={view} now={now} waitingText={waitingForQuota ? waitingText : null} />
+				{detailsFooter}
 			</Popover.Dropdown>
 		</Popover>
 	);

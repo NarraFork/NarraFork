@@ -324,6 +324,28 @@ function cachedSnapshot(subject: CommandCodeUsageSubject): QuotaSnapshot | undef
 	return quotaStore.get(subject.id, identity(subject.config), restoreSnapshot);
 }
 
+export function getCommandCodeQuotaSnapshot():
+	| { credentialId: string; snapshot: QuotaSnapshot | undefined }
+	| undefined {
+	const subject = settingsSubject();
+	return subject ? { credentialId: subject.id, snapshot: cachedSnapshot(subject) } : undefined;
+}
+
+export function isCommandCodeQuotaRefreshing(): boolean {
+	const subject = settingsSubject();
+	return !!subject && refreshes.has(identity(subject.config));
+}
+
+/** Reuse the settings-key cache and in-flight deduplication, without awaiting it on GET. */
+export function refreshCommandCodeQuota(force = false): Promise<CommandCodeUsage | undefined> {
+	const subject = settingsSubject();
+	if (!subject) return Promise.resolve(undefined);
+	const cached = cachedSnapshot(subject);
+	if (!force && cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS)
+		return Promise.resolve(cached.detail as CommandCodeUsage);
+	return refreshUsage(subject);
+}
+
 const refreshes = new Map<string, Promise<CommandCodeUsage>>();
 
 async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCodeUsage> {
@@ -337,6 +359,27 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 				quotaStore.set(subject.id, key, snapshot);
 			}
 			return snapshot.detail as CommandCodeUsage;
+		})
+		.catch(() => {
+			const current = settingsSubject();
+			if (current?.id === subject.id && identity(current.config) === key) {
+				const previous = cachedSnapshot(subject);
+				quotaStore.set(
+					subject.id,
+					key,
+					{
+						scope: "subscription",
+						windows: [],
+						balances: [],
+						...previous,
+						error: "quota_unavailable",
+						// Failed attempts must also obey the request-driven TTL.
+						fetchedAt: Date.now(),
+					},
+					false,
+				);
+			}
+			throw new CommandCodeUsageError(502, "usage_unavailable");
 		})
 		.finally(() => refreshes.delete(key));
 	refreshes.set(key, task);

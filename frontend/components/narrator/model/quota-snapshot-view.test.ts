@@ -1,0 +1,110 @@
+import { expect, test } from "bun:test";
+import type { PublicQuotaSnapshot } from "@shared/quota-snapshot";
+import { createInstance } from "i18next";
+import locale from "../../../locales/en/narrator.json";
+import { quotaSnapshotText, quotaSnapshotView } from "./quota-snapshot-view";
+
+const i18n = createInstance();
+await i18n.init({ lng: "en", resources: { en: { narrator: locale } }, defaultNS: "narrator" });
+const t = i18n.t.bind(i18n);
+const snapshot: PublicQuotaSnapshot = {
+	fetchedAt: 1,
+	scope: "account",
+	plan: "Pro",
+	windows: [
+		{ kind: "5h", usedRatio: 0.8, resetsAt: 1_800_000 },
+		{ kind: "weekly", usedRatio: null, resetsAt: null },
+	],
+	balances: [{ unit: "USD", remaining: 9.999999, total: 100 }],
+};
+
+test("maps public windows, resets, balances and plan using the shared severity thresholds", () => {
+	const view = quotaSnapshotView(snapshot, "Provider", t);
+	expect(view.title).toBe("Provider");
+	expect(view.windows[0]).toMatchObject({
+		remainingPercent: 20,
+		resetAt: 1_800_000,
+		level: "warning",
+	});
+	expect(view.windows[1]).toMatchObject({ remainingPercent: null, level: "unknown" });
+	expect(view.rows).toContainEqual({ label: "Plan", value: "Pro" });
+	expect(view.unavailableText).toBe("9.999999 USD");
+	expect(view.level).toBe("critical");
+});
+
+test("unknown quota is never represented as zero and an exhausted balance is explicit", () => {
+	expect(quotaSnapshotText(null, t).balance).toBe("Quota unknown");
+	const view = quotaSnapshotView(
+		{ ...snapshot, windows: [], balances: [{ unit: "CNY", remaining: 0 }] },
+		"",
+		t,
+	);
+	expect(view.level).toBe("exhausted");
+	expect(view.unavailableText).toBe("0 CNY");
+	expect(quotaSnapshotView({ ...snapshot, balances: [], windows: [] }, "", t).level).toBe(
+		"unknown",
+	);
+});
+
+test("unlimited balances do not become zero or exhausted", () => {
+	const value = {
+		...snapshot,
+		windows: [],
+		balances: [{ unit: "requests", remaining: 0, unlimited: true }],
+	};
+	expect(quotaSnapshotView(value, "", t).level).toBe("ok");
+	expect(quotaSnapshotText(value, t).balance).toBe("Unlimited requests");
+});
+
+test("preserves stale values and safe errors without looking at template-private detail", () => {
+	const value = { ...snapshot, error: "Quota refresh failed", detail: { secret: "NEVER RENDER" } };
+	const text = quotaSnapshotText(value, t);
+	expect(text.detailsText).toContain("Quota refresh failed");
+	expect(text.detailsText).toContain("figures may be out of date");
+	expect(text.detailsText).not.toContain("NEVER RENDER");
+	expect(text.detailsText).toContain("1970-01-01T00:30:00.000Z");
+	expect(quotaSnapshotView({ ...snapshot, hasError: true }, "", t).failed).toBe(true);
+});
+
+test("public totals retain total and consumed amounts without losing micro-unit precision", () => {
+	const view = quotaSnapshotView(
+		{ ...snapshot, windows: [], balances: [{ unit: "CNY", remaining: 9.999999, total: 10 }] },
+		"",
+		t,
+	);
+	expect(view.rows).toContainEqual({ label: "Total (CNY)", value: "10 CNY" });
+	expect(view.rows).toContainEqual({ label: "Used (CNY)", value: "0.000001 CNY" });
+	const zero = quotaSnapshotView(
+		{ ...snapshot, windows: [], balances: [{ unit: "requests", remaining: 0, total: 0 }] },
+		"",
+		t,
+	);
+	expect(zero.rows).toContainEqual({ label: "Used (requests)", value: "0 requests" });
+	for (const balance of [
+		{ unit: "USD", remaining: null, total: 10 },
+		{ unit: "USD", remaining: 0, total: Number.POSITIVE_INFINITY },
+		{ unit: "USD", remaining: 0, total: 10, unlimited: true },
+	]) {
+		expect(
+			quotaSnapshotView({ ...snapshot, windows: [], balances: [balance] }, "", t).rows.some((row) =>
+				row.label.startsWith("Used"),
+			),
+		).toBe(false);
+	}
+});
+
+test("clamps out-of-range windows and leaves non-finite numbers unknown", () => {
+	const view = quotaSnapshotView(
+		{
+			...snapshot,
+			windows: [
+				{ kind: "other", label: "Custom", usedRatio: 1.2, resetsAt: null },
+				{ kind: "monthly", usedRatio: Number.NaN, resetsAt: null },
+			],
+		},
+		"",
+		t,
+	);
+	expect(view.windows[0]).toMatchObject({ label: "Custom", usedPercent: 100, level: "exhausted" });
+	expect(view.windows[1]?.usedPercent).toBeNull();
+});

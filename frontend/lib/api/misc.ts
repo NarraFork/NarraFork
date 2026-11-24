@@ -33,15 +33,12 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
-	DeepSeekBalanceCache,
 	HookApiRecord,
-	KimiUsageCache,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
-	OpencodeUsageCache,
 	PromptLibraryEntryData,
 	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
@@ -819,6 +816,7 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
+	/** Explicit payment confirmation refresh; ordinary quota readers use quotaSnapshots. */
 	nugGetQuota: (providerId: string) =>
 		request<{
 			balance: number;
@@ -828,18 +826,6 @@ export const miscApi = {
 			username?: string;
 			role?: string;
 		}>(`/nug/providers/${providerId}/quota`),
-	nugGetQuotas: () =>
-		request<
-			Record<
-				string,
-				{
-					balance: number | null;
-					totalGranted: number | null;
-					detailedQuotaBalance?: string | null;
-					extra?: unknown;
-				}
-			>
-		>("/nug/quotas"),
 	// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md).
 	nugGetRelayStatus: () =>
 		request<
@@ -849,39 +835,8 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
-	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
-		request<Record<string, ProviderBalanceSnapshot>>(
-			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
-			pickRequestOptions(options),
-		),
 	providerProbeBalance: (providerId: string) =>
 		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
-			method: "POST",
-		}),
-	providerRefreshBalance: (providerId: string) =>
-		request<ProviderBalanceSnapshot>(
-			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
-			{ method: "POST" },
-		),
-
-	deepseekGetBalances: (options?: object) =>
-		request<Record<string, DeepSeekBalanceCache>>(
-			"/deepseek/balances",
-			pickRequestOptions(options),
-		),
-	deepseekRefreshBalances: () =>
-		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
-	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
-	kimiRefreshUsages: () =>
-		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
-
-	// OpenCode Go plan allowance — per-provider server-side cache
-	opencodeGetUsages: (options?: object) =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
-	opencodeRefreshUsages: () =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
 			method: "POST",
 		}),
 	nugGetBillingConfig: (providerId: string) =>

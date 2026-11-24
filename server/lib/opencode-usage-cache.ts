@@ -176,6 +176,15 @@ function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
 	};
 }
 
+export const isOpencodeQuotaRefreshing = (keyId: string): boolean => !!entries.get(keyId)?.inFlight;
+
+/** Reconcile live credential identity before exposing a snapshot. */
+export function getOpencodeQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	syncOpencodeUsageCache();
+	const entry = entries.get(keyId);
+	return entry ? quotaStore.get(keyId, entry.identity, restoreSnapshot) : undefined;
+}
+
 /** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
 export async function probeOpencodeQuota(
 	credential: UsageSubject,

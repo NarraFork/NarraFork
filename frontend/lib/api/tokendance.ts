@@ -1,5 +1,4 @@
 import type {
-	TokenDanceBalance,
 	TokenDanceCatalogModel,
 	TokenDanceDraftRestore,
 	TokenDanceDraftSnapshot,
@@ -35,10 +34,6 @@ function post<T>(path: string, data: unknown, options?: RequestOptions) {
 	});
 }
 export const tokendanceApi = {
-	tokenDanceBalance: (options?: RequestOptions) =>
-		request<TokenDanceBalance>("/tokendance/balance", transport(options, 32_768)),
-	tokenDanceRefreshBalance: (options?: RequestOptions) =>
-		post<TokenDanceBalance>("balance/refresh", {}, options),
 	tokenDanceCreatePayment: (data: TokenDancePaymentCreate, options?: RequestOptions) =>
 		post<{ session: TokenDancePaymentSession }>("payment/sessions", data, options),
 	tokenDancePaymentSession: (id: string, options?: RequestOptions) =>

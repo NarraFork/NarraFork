@@ -1,11 +1,13 @@
 import { afterAll, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
-import { providerBalanceKey } from "../../hooks/useProviderBalance";
+import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
+import narrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/settings.json";
 import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
 
@@ -19,7 +21,11 @@ afterAll(() => {
 	else Reflect.deleteProperty(globalThis, "localStorage");
 });
 const i18n = createInstance();
-await i18n.init({ lng: "en", resources: { en: { settings: en } }, defaultNS: "settings" });
+await i18n.init({
+	lng: "en",
+	resources: { en: { settings: en, narrator } },
+	defaultNS: "settings",
+});
 function render(
 	role: string,
 	dirty = false,
@@ -36,20 +42,29 @@ function render(
 			? {}
 			: { providerBalanceCapability: { enabled: capabilityEnabled } }),
 	});
-	client.setQueryData(providerBalanceKey("p", "A"), {
-		generation: "A",
-		status,
-		adapter: "new-api",
-		balance: null,
-		fetchedAt: 0,
-		attemptedAt: 0,
-		error: null,
-	} satisfies ProviderBalanceSnapshot);
-	if (queryState === "loading") client.removeQueries({ queryKey: providerBalanceKey("p", "A") });
+	client.setQueryData(quotaSnapshotsKey, {
+		entries: [
+			{
+				groupId: "p",
+				prefix: "p",
+				templateId: "custom-api",
+				credentialId: "key",
+				supported: status !== "unsupported",
+				refreshing: status === "pending" || status === "probing",
+				snapshot: {
+					scope: "key",
+					fetchedAt: 1,
+					windows: [],
+					balances: [{ unit: "USD", remaining: 3 }],
+				},
+			},
+		],
+	} satisfies QuotaSnapshotsResponse);
+	if (queryState === "loading") client.removeQueries({ queryKey: quotaSnapshotsKey });
 	if (queryState === "error")
 		client
 			.getQueryCache()
-			.find({ queryKey: providerBalanceKey("p", "A") })
+			.find({ queryKey: quotaSnapshotsKey })
 			?.setState({ status: "error", error: new Error("private transport exception") });
 	try {
 		return renderToStaticMarkup(

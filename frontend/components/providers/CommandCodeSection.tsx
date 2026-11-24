@@ -14,7 +14,7 @@
  */
 
 import { formatCompactNumber } from "@frontend/lib/compact-number";
-import { formatCountdown, relativeTime } from "@frontend/lib/relative-time";
+import { relativeTime } from "@frontend/lib/relative-time";
 import {
 	Alert,
 	Anchor,
@@ -23,7 +23,6 @@ import {
 	Divider,
 	Group,
 	Loader,
-	Progress,
 	Select,
 	Stack,
 	Switch,
@@ -36,8 +35,14 @@ import { IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useCommandCodeCliQuota,
+	useQuotaSnapshot,
+	useRefreshQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
@@ -84,58 +89,6 @@ export interface CommandCodeSectionProps {
 	onRefreshModels?: () => Promise<void>;
 }
 
-/** 剩余额度越少越红，与 CodexUsageDisplay 的进度着色一致。 */
-function progressColor(usedPercent: number): string {
-	const remaining = 100 - usedPercent;
-	if (remaining < 10) return "red";
-	if (remaining < 30) return "yellow";
-	return "green";
-}
-
-/** 单个用量维度：标题 / 已用 / 进度 / 重置倒计时。 */
-function UsageMeter({
-	label,
-	used,
-	cap,
-	resetAt,
-}: {
-	label: string;
-	used: number;
-	cap: number;
-	resetAt?: number;
-}) {
-	const { t } = useTranslation("settings");
-	if (!(cap > 0)) return null;
-	const usedPercent = Math.min(100, Math.max(0, (used / cap) * 100));
-	return (
-		<Stack gap={2} maw="100%">
-			<Text size="xs" fw={500}>
-				{label}
-			</Text>
-			<Text size="xs">
-				{t("commandcode.windowUsed", {
-					used: used.toFixed(2),
-					total: cap.toFixed(2),
-					percent: usedPercent.toFixed(0),
-				})}
-			</Text>
-			<Progress
-				value={usedPercent}
-				size="xs"
-				color={progressColor(usedPercent)}
-				style={{ width: "100%" }}
-			/>
-			{resetAt !== undefined && (
-				<Text size="xs" c="dimmed">
-					{t("commandcode.resetAt", {
-						time: formatCountdown(resetAt) ?? t("commandcode.resetUnknown"),
-					})}
-				</Text>
-			)}
-		</Stack>
-	);
-}
-
 export function CommandCodeSection({
 	value,
 	onChange,
@@ -153,10 +106,13 @@ export function CommandCodeSection({
 }: CommandCodeSectionProps) {
 	const { t } = useTranslation("settings");
 	const { data, isLoading, dataUpdatedAt } = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
+		queryKey: ["commandcode", "usage-summary"],
+		queryFn: () => api.commandCodeUsageSummary(),
 		refetchInterval: 60_000,
 	});
+	const quota = useQuotaSnapshot("CommandCode");
+	const refreshQuota = useRefreshQuotaSnapshots();
+	useCommandCodeCliQuota(!value.disabled && !!data?.loggedIn);
 	const [refreshing, setRefreshing] = useState(false);
 	const handleRefreshModels = useCallback(async () => {
 		if (!onRefreshModels || refreshing) return;
@@ -175,12 +131,7 @@ export function CommandCodeSection({
 	}, [onRefreshModels, refreshing, t]);
 
 	const models = modelItems ?? [];
-	const credits = data?.credits;
 	const summary = data?.summary;
-	// 月度展示"已用 / 总共"：总配额 = 本周期已用 + 当前余额。
-	const monthlyUsed = summary?.totalMonthlyCredits;
-	const monthlyTotal =
-		credits && monthlyUsed !== undefined ? credits.monthlyCredits + monthlyUsed : undefined;
 
 	return (
 		<Stack>
@@ -291,54 +242,35 @@ export function CommandCodeSection({
 						{t("commandcode.usageDesc")}
 					</Text>
 
-					{credits ? (
-						<Stack gap="sm" maw="100%">
-							{monthlyUsed !== undefined && monthlyTotal !== undefined && (
-								<UsageMeter
-									label={t("commandcode.monthlyCredits")}
-									used={monthlyUsed}
-									cap={monthlyTotal}
-								/>
-							)}
-							{data?.windowLimits?.fiveHour && (
-								<UsageMeter
-									label={t("commandcode.fiveHour")}
-									used={data.windowLimits.fiveHour.used}
-									cap={data.windowLimits.fiveHour.cap}
-									resetAt={data.windowLimits.fiveHour.resetAt}
-								/>
-							)}
-							{data?.windowLimits?.weekly && (
-								<UsageMeter
-									label={t("commandcode.weekly")}
-									used={data.windowLimits.weekly.used}
-									cap={data.windowLimits.weekly.cap}
-									resetAt={data.windowLimits.weekly.resetAt}
-								/>
-							)}
-							{summary && (
-								<Group gap="lg">
-									<Text size="xs" c="dimmed">
-										{t("commandcode.requests")}: {summary.totalCount}
-									</Text>
-									<Text size="xs" c="dimmed">
-										{t("commandcode.tokens")}: {formatCompactNumber(summary.totalTokens).compact}
-									</Text>
-									<Text size="xs" c="dimmed">
-										{t("commandcode.successRate")}: {summary.successRate}%
-									</Text>
-								</Group>
-							)}
+					<Group gap="xs">
+						<QuotaSnapshotIndicator snapshot={quota.data} title={t("commandcode.usageTitle")} />
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							loading={refreshQuota.isPending}
+							disabled={value.disabled}
+							onClick={() => refreshQuota.mutate({ groupId: "CommandCode" })}
+						>
+							<IconRefresh size={14} />
+						</Button>
+					</Group>
+					{summary && (
+						<Group gap="lg">
 							<Text size="xs" c="dimmed">
-								{relativeTime(new Date(dataUpdatedAt).toISOString())}
+								{t("commandcode.requests")}: {summary.totalCount}
 							</Text>
-						</Stack>
-					) : (
-						!isLoading && (
 							<Text size="xs" c="dimmed">
-								{t("commandcode.usageUnavailable")}
+								{t("commandcode.tokens")}: {formatCompactNumber(summary.totalTokens).compact}
 							</Text>
-						)
+							<Text size="xs" c="dimmed">
+								{t("commandcode.successRate")}: {summary.successRate}%
+							</Text>
+						</Group>
+					)}
+					{dataUpdatedAt > 0 && (
+						<Text size="xs" c="dimmed">
+							{relativeTime(new Date(dataUpdatedAt).toISOString())}
+						</Text>
 					)}
 				</Stack>
 
