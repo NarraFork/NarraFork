@@ -95,12 +95,26 @@ const serverDest = join(macosDir, "narrafork-server");
 cpSync(binaryPath, serverDest);
 chmodSync(serverDest, 0o755);
 
-// 2. Compiled Mach-O launcher as CFBundleExecutable. A Mach-O (not a script) is
+// 2. Compiled Mach-O launcher as CFBundleExecutable: an NSApplication living in
+//    the menu bar and supervising the bundled server. A Mach-O (not a script) is
 //    required for later Developer-ID signing/notarization of the whole bundle.
-const launcherSrc = join(ROOT, "scripts/macos-app/launcher.c");
-execFileSync("clang", ["-O2", "-Wall", "-arch", arch, "-o", join(macosDir, appName), launcherSrc], {
-	stdio: "inherit",
-});
+const launcherSrc = join(ROOT, "scripts/macos-app/launcher.m");
+execFileSync(
+	"clang",
+	[
+		"-O2",
+		"-Wall",
+		"-fobjc-arc",
+		"-arch",
+		arch,
+		"-framework",
+		"Cocoa",
+		"-o",
+		join(macosDir, appName),
+		launcherSrc,
+	],
+	{ stdio: "inherit" },
+);
 
 // 3. Info.plist
 const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -131,6 +145,8 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 	<string>11.0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsSuddenTermination</key>
