@@ -16,7 +16,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 工具体系
 
-工具是 `ToolDefinition`（名称、描述、zod 参数、`execute`），集中注册在单例 `toolRegistry`。一部分工具始终可用（core），一部分默认不进会话，需要加载（optional）；加载方式分手动 `/load`、常驻、以及经 ToolSearch 按需发现。
+工具是 `ToolDefinition`（名称、描述、zod 参数、`execute`），集中注册在单例 `toolRegistry`。一部分工具始终可用（core），一部分默认不进会话，需要加载（optional）；加载方式分手动 `/load`、常驻、以及经 ToolSearch 按需发现。按职责分成几类：文件、命令、网页、与人交互四类各有子节点；会话自己组织工作的流程与协作工具（计划模式、定时任务、技能、团队、worktree、回忆、生图等）见 [流程与协作工具](workflow.md)；让会话管理 NarraFork 自身（设置、MCP、钩子、知识库 ACL、插件安装）的管理工具由管理员闸门保护，见 [管理工具](admin.md)。
 
 ## 关键规则
 - 注册：`tools/index.ts` 在模块末尾调用 `registerCoreTools`，注册 `core` 与 `optional` 两个 provider。provider 的工具是惰性实体化的（首次 `get/all` 才调用 `tools()`），避免循环导入时读到未初始化的绑定；显式 `register` 的工具优先于 provider 里的同名工具；每次变更递增 `revision`（`tool-registry.ts`）。
@@ -42,4 +42,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [流程与协作工具](workflow.md)：计划模式、定时任务、技能、知识包、团队、worktree 与设备切换、回忆、生图。
 - [管理工具](admin.md)：让会话管理 NarraFork 自身的工具：各类 *Admin、插件安装、引导设置。
 
-其余工具（子代理 Task/Agent、知识库、定时任务、插件与 MCP 管理、Team、worktree 等）不在本层子节点内，分别见 [子代理](../subagents.md)、[MCP 集成](../mcp.md) 等。
+其余工具（子代理 Task/Agent、知识库读写与审阅、MCP 服务器提供的工具等）不在本层子节点内，分别见 [子代理](../subagents.md)、[MCP 集成](../mcp.md) 等。

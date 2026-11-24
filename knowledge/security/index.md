@@ -21,6 +21,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 - [工具调用审批](tool-permissions.md)：权限请求流程、模式（readOnly/dontAsk/plan…）、危险反思、执行策略、规则申请。
 - [访问控制](acl.md)：叙述者与项目的读写授权、可见范围与受众、共享。
-- [登录与会话令牌](auth/index.md)：nfs_ 会话令牌、滑动续期、MFA、Passkey、LDAP、SSO、首个用户为管理员。
+- [登录与会话令牌](auth/index.md)：第一方登录换会话令牌、每个请求如何认证；下分会话令牌，以及登录方式与第二因子（MFA、Passkey、LDAP、SSO、注册）。
 - [OAuth 与开放 API](oauth-api.md)：OAuth 2.0 应用与授权、External API v1。
 - [外部进程加固](hardening.md)：git 执行加固、终端访问控制、子进程限制。
