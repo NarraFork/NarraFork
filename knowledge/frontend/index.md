@@ -1,14 +1,19 @@
 ---
 id: frontend
 title: 前端
-summary: React 19 + Mantine 应用：框架与路由、数据流、国际化、会话界面、组件与主题。
-anchors: []
-status: stub
-verified_at: null
+summary: React 19 + Mantine 单页应用：框架与路由、数据流、国际化、会话界面、组件与主题。
+anchors:
+  - frontend/
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 前端
 
-> 待填写：React 19 + Mantine 应用：框架与路由、数据流、国际化、会话界面、组件与主题。
+`frontend/` 是用 Vite 构建、由后端静态托管的单页应用（React 19、Mantine v9、TanStack Router 与 Query、dockview、xterm.js）。构建产物在 `dist/frontend/`；同一套代码还有一个“远程访问”构建（`frontend/remote/`、`vite.remote.config.ts`），用另一份传输实现替换 `lib/business-transport.ts`。
+
+几部分的配合：`main.tsx` 启动后挂载 `App.tsx` 的路由器；根路由决定走公开页还是登录后 AppShell（[应用框架与路由](shell-routing.md)）；页面里的数据经 `lib/api` + React Query，实时事件经单例 WebSocket 管理器（[数据获取与实时同步](data-flow.md)）；文案按命名空间懒加载（[国际化](i18n.md)）；最重的界面是叙述者面板（[会话界面](narrator-ui.md)）；全局 Provider 与令牌化样式见[通用组件与主题](components-theme.md)。
+
+其余目录：`frontend/hooks/`（一个领域一个 hook）、`frontend/lib/`（无 UI 工具）、`frontend/plugin-runtime/` 与 `frontend/components/plugins/`（插件 UI 宿主）、`frontend/src-sw.ts`（PWA service worker）、`frontend/locales/`。别名 `@frontend/*`、`@shared/*`（前后端共享代码在 `shared/`）。
 
 ## 下面有什么
 

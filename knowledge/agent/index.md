@@ -2,13 +2,21 @@
 id: agent
 title: 代理运行时
 summary: 自定义 Agent Loop、多模型提供商、工具体系、子代理与执行后端。
-anchors: []
-status: stub
-verified_at: null
+anchors:
+  - server/lib/agent/
+  - server/lib/agent/index.ts
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 代理运行时
 
-> 待填写：自定义 Agent Loop、多模型提供商、工具体系、子代理与执行后端。
+叙述者的“大脑”：一个自己实现的 Agent Loop，加上围绕它的模型适配、工具、委派与隔离执行。代码主要在 `server/lib/agent/`，业务侧配套在 `server/services/`。
+
+怎么配合：
+- 宿主（叙述者服务）把数据库里的消息行交给循环，循环经 `buildAdapterHistory` 投影出请求历史，调用由 `provider.ts` 解析出的提供商适配器流式取回模型输出（见 [Agent Loop](loop.md)、[模型提供商](providers.md)）。多密钥连接由池包装器在密钥层面选择与降级（见 [凭证池与模型目录](credentials-models.md)），模型能力与价格取自目录卡。
+- 模型发出的 tool_use 由 `tool-executor.ts` 准入、做权限与目标冻结后，在 [工具体系](tools/index.md) 注册的工具里执行；文件和命令类工具通过 [执行后端](execution.md) 落到本机或远程设备，且远程不可用时不回退本机。可选工具、MCP 工具与按需加载由前缀保持机制处理，MCP 见 [MCP 集成](mcp.md)。
+- 委派给 [子代理](subagents.md) 时，只是创建另一条叙述者记录并按模板收紧能力上限，嵌套最多两层；[程序化执行与沙箱](programmatic.md) 是目前唯一的容器内代码执行路径（Eval，默认关闭）。
+- 每次请求结束，[用量与费用](usage.md) 在一个事务里写明细与汇总。
 
 ## 下面有什么
 
