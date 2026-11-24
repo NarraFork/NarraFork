@@ -35,4 +35,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [国际化](i18n.md)：命名空间门与路径到命名空间的映射。
 - [数据获取与实时同步](data-flow.md)
-- [会话界面](narrator-ui.md)
+- [会话界面](narrator-ui/index.md)

@@ -34,6 +34,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [应用框架与路由](shell-routing.md)
-- [会话界面](narrator-ui.md)
+- [会话界面](narrator-ui/index.md)
 - [面板与布局](panels.md)：终端连接与布局持久化。
 - [国际化](i18n.md)：错误文案经 `describeApiError` 本地化。

@@ -36,4 +36,4 @@ UI 基于 Mantine v9，颜色统一从设计令牌派生。`components/common/` 
 
 ## 相关
 - [应用框架与路由](shell-routing.md)
-- [会话界面](narrator-ui.md)
+- [会话界面](narrator-ui/index.md)

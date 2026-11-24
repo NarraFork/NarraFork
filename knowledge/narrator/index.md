@@ -27,3 +27,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [提问与计划模式](questions-plan.md)：AskUserQuestion、异步提问、计划模式与审批。
 - [中断与恢复](recovery.md)：进程重启、输出中断、子代理恢复。
 - [Bot 叙述者](bot.md)：bot trait、聊天房间、Send({ user })、监控视图。
+- [会话运行时](runtime/index.md)：agent-runtime：一次运行怎么被调度和执行，收件箱与唤醒，输出发布，模型历史。
+- [工作区布局](workspaces.md)：多个会话的面板布局：服务端存储、成员、版本号与 409 冲突规则。

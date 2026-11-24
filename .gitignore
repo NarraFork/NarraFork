@@ -45,6 +45,8 @@ scripts/*
 !scripts/build-alpha.ts
 !scripts/benchmark-token-repair-bulk.ts
 !scripts/benchmark-token-recalculation.ts
+# Repository knowledge tree tool (knowledge/): find, affected, stale, coverage, check.
+!scripts/knowledge.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts

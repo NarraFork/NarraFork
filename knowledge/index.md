@@ -55,8 +55,9 @@ NarraFork 是一个自托管的 AI 编程协作工作台：用 Bun 运行一个�
 - [文件与编辑](files/index.md)：受控文件写入、变更记录与回退、文件引用、编辑器文档、工作区布局。
 - [代码仓库](git/index.md)：git 服务、状态与暂存、会话 worktree、分支与引用查询。
 - [协作](collaboration/index.md)：项目、团队、聊天、通知与注意力、分享、IM 网关。
-- [知识](knowledge/index.md)：团队知识库、大纲，以及这棵仓库知识树本身。
+- [知识](kb/index.md)：团队知识库、大纲，以及这棵仓库知识树本身。
 - [扩展与自动化](automation/index.md)：技能、例程与可选工具、定时任务、插件系统、钩子、基准测试与容器。
 - [远程与设备](remote/index.md)：远程设备执行、远程访问、VS Code 插件。
 - [前端](frontend/index.md)：React 19 + Mantine 应用：框架与路由、数据流、国际化、会话界面、组件与主题。
 - [工程与发布](engineering/index.md)：开发命令与代码规范、测试、构建、发布与更新、第三方许可。
+- [核心流程](flows/index.md)：跨主题的端到端路径：按发生顺序串起各个节点，改一个功能前先看它在哪条路径上。
