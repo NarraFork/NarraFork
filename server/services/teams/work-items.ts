@@ -52,6 +52,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { teamGit } from "./team-git";
+import { assertKnowledgeFresh } from "./team-knowledge";
 import {
 	describeHolderFor,
 	exclusiveHits,
@@ -633,9 +634,11 @@ function lastReviewedHead(itemId: string): string | null {
 }
 
 /**
- * Mark an item ready: its newest review round is clear and its worktree has no uncommitted
- * change. Commits made after that review do not block (soft, like every coordinator rule) but
- * are counted in the result, so the coordinator sees when it should review again.
+ * Mark an item ready: its newest review round is clear, its worktree has no uncommitted change,
+ * and its branch leaves no knowledge node stale (`team-knowledge.ts`; only in a repository with
+ * `knowledge/index.md`). Commits made after that review do not block (soft, like every
+ * coordinator rule) but are counted in the result, so the coordinator sees when it should review
+ * again.
  */
 export async function markReady(input: {
 	coordinatorId: string;
@@ -662,6 +665,12 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_DIRTY",
 		);
+	// After DIRTY: node files are read from the worktree, which must match the head.
+	await assertKnowledgeFresh({
+		itemId: item.id,
+		worktree: path,
+		baseRef: item.baseRef ?? team.baseBranch,
+	});
 	const head = await git.resolveCommit("HEAD");
 	const reviewed = lastReviewedHead(item.id);
 	// Commits made after the review, not counting what a base sync brought in from the base.

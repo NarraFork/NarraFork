@@ -11,7 +11,10 @@
  * functions with `gitService`'s read bounds (60 s, 1 MB).
  *
  * `changedPaths` (X) lists what a branch changed since its merge base with the base: a diff of
- * two commits, which never reads the working tree, the index or a filter.
+ * two commits, which never reads the working tree, the index or a filter. `branchFileChanges`
+ * and `treeFiles` feed the knowledge check of `work.ready` (`team-knowledge.ts`): the full,
+ * uncollapsed listing with what was added, and the files a commit holds under a directory. Both
+ * read commits only and fail rather than return a partial listing.
  */
 import { isAbsolute, resolve } from "node:path";
 import {
@@ -46,6 +49,11 @@ const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 const CHANGED_LISTING_MAX_BYTES = 512 * 1024;
 /** Top-level listing cap (one raw record per changed top-level entry). */
 const TOP_LEVEL_LISTING_MAX_BYTES = 256 * 1024;
+/** Full name-status listing cap for the knowledge check: over it, the check fails. */
+const FILE_CHANGES_MAX_BYTES = READ_MAX_OUTPUT_BYTES;
+/** Tree listing cap for the knowledge check: over it, the check fails. */
+const TREE_LISTING_MAX_BYTES = 512 * 1024;
+const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 async function spawnGit(
 	cwd: string,
@@ -100,6 +108,16 @@ export interface ChangedPaths {
 	collapsed: boolean;
 }
 
+/** Every file a branch changed since its merge base with the base, uncollapsed. */
+export interface BranchFileChanges {
+	head: string;
+	mergeBase: string;
+	/** Sorted; a rename counts as both paths (`--no-renames`). */
+	changed: string[];
+	/** Sorted; the paths the branch added, the new side of a rename included. */
+	added: string[];
+}
+
 /** One worktree's hardened, read-only git: G1's queries. */
 export interface TeamGit {
 	resolveCommit(ref: string): Promise<string | null>;
@@ -112,6 +130,18 @@ export interface TeamGit {
 	 * histories are unrelated.
 	 */
 	changedPaths(baseRef: string): Promise<ChangedPaths | null>;
+	/**
+	 * Every path changed between the merge base of HEAD and `baseRef`, and HEAD, with the added
+	 * ones (`diff --name-status --no-renames`). Null when either does not resolve or the
+	 * histories are unrelated; throws when git fails or the listing is over its byte cap.
+	 */
+	branchFileChanges(baseRef: string): Promise<BranchFileChanges | null>;
+	/**
+	 * The regular files (blob modes 100644/100755; no symlink or submodule) a commit holds under
+	 * `dir` (a repository-relative directory ending in `/`), sorted. Throws when git fails or the
+	 * listing is over its byte cap.
+	 */
+	treeFiles(commit: string, dir: string): Promise<string[]>;
 }
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -167,6 +197,56 @@ async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<Cha
 	return { head, mergeBase: fork, paths: collapsed, collapsed: true };
 }
 
+async function branchFileChangesOf(
+	run: GitQueryRunner,
+	baseRef: string,
+): Promise<BranchFileChanges | null> {
+	const head = await resolveCommit(run, "HEAD");
+	const base = await resolveCommit(run, baseRef);
+	if (!head || !base) return null;
+	const fork = await mergeBase(run, head, base);
+	if (!fork) return null;
+	const listing = await run(["diff", "--name-status", "--no-renames", "-z", fork, head], {
+		maxOutputBytes: FILE_CHANGES_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError("git diff could not list the changed files");
+	if (listing.truncated)
+		throw new GitError("The branch changes more files than the knowledge check reads");
+	// `-z --name-status`: a status record, then its path, each NUL-terminated.
+	const records = nulRecords(listing.stdout, false);
+	const changed = new Set<string>();
+	const added = new Set<string>();
+	for (let index = 0; index + 1 < records.length; index += 2) {
+		const status = records[index] ?? "";
+		const path = records[index + 1] ?? "";
+		if (!status || !path) throw new GitError("git diff returned an unreadable listing");
+		changed.add(path);
+		if (status === "A") added.add(path);
+	}
+	if (records.length % 2 !== 0) throw new GitError("git diff returned an unreadable listing");
+	return { head, mergeBase: fork, changed: [...changed].sort(), added: [...added].sort() };
+}
+
+async function treeFilesOf(run: GitQueryRunner, commit: string, dir: string): Promise<string[]> {
+	if (!SHA.test(commit)) throw new GitError("Expected a full commit SHA");
+	if (!dir.endsWith("/") || dir.startsWith("/") || dir.startsWith("-") || dir.includes(".."))
+		throw new GitError("Expected a repository-relative directory");
+	const listing = await run(["ls-tree", "-r", "-z", "--full-tree", commit, "--", dir], {
+		maxOutputBytes: TREE_LISTING_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not list ${dir}`);
+	if (listing.truncated) throw new GitError(`${dir} holds more files than the listing reads`);
+	const files: string[] = [];
+	// `<mode> SP <type> SP <object> TAB <path>` per record.
+	for (const record of nulRecords(listing.stdout, false)) {
+		const tab = record.indexOf("\t");
+		if (tab < 0) throw new GitError("git ls-tree returned an unreadable listing");
+		const mode = record.slice(0, record.indexOf(" "));
+		if (mode === "100644" || mode === "100755") files.push(record.slice(tab + 1));
+	}
+	return files.sort();
+}
+
 export function teamGit(cwd: string): TeamGit {
 	let overrides: Promise<Array<readonly [string, string]>> | null = null;
 	const config = () => {
@@ -189,6 +269,8 @@ export function teamGit(cwd: string): TeamGit {
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
 		changedPaths: (baseRef) => changedPathsOf(run, baseRef),
+		branchFileChanges: (baseRef) => branchFileChangesOf(run, baseRef),
+		treeFiles: (commit, dir) => treeFilesOf(run, commit, dir),
 	};
 }
 

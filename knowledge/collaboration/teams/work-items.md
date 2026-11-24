@@ -1,13 +1,15 @@
 ---
 id: collaboration.teams.work-items
 title: 工作项
-summary: 工作项状态机、Team 工具、worktree 端口、检查提醒、合并判定与清理。
+summary: 工作项状态机、Team 工具、worktree 端口、ready 的知识检查、检查提醒、合并判定与清理。
 anchors:
   - server/services/teams/work-items.ts
   - server/services/teams/work-item-ports.ts
   - server/services/teams/team-git.ts
+  - server/services/teams/team-knowledge.ts
   - server/lib/agent/tools/team.ts
   - server/services/teams/__tests__/work-item-lifecycle.test.ts
+  - server/services/teams/__tests__/work-item-knowledge.test.ts
   - server/services/teams/__tests__/team-checkin-brief.test.ts
 keywords:
   - team_work_items
@@ -20,6 +22,10 @@ keywords:
   - TEAM_WORK_ITEM_CHANGED
   - TEAM_WORK_ITEM_NOT_REVIEWED
   - TEAM_WORK_ITEM_DIRTY
+  - TEAM_WORK_ITEM_KNOWLEDGE_STALE
+  - TEAM_KNOWLEDGE_CHECK_UNAVAILABLE
+  - assertKnowledgeFresh
+  - 知识检查
   - TEAM_WORK_ITEM_STATES
   - attachWorker
   - settleIsolatedWorkItem
@@ -50,7 +56,23 @@ verified_at: 776dbf07e
 - `work.ready` 需要最新一轮评审为 clear，否则 409 `TEAM_WORK_ITEM_NOT_REVIEWED`。
 - `work.ready` 还要 worktree 无未提交改动，否则 409 `TEAM_WORK_ITEM_DIRTY`。
 - 评审之后的新提交不拦，只在结果里计数。
+- 知识检查排在 DIRTY 之后、独占路径之前（`teams/team-knowledge.ts:assertKnowledgeFresh`），见下一节。
 - 独占路径与路径不可读的拒绝见 [重叠与独占路径](overlap.md)。
+
+`work.ready` 的知识检查（`teams/team-knowledge.ts`，规则本身在 `shared/knowledge-tree.ts`，与 `scripts/knowledge.ts` 同一份）：
+- 分支头的树里没有 `knowledge/index.md` 就整个跳过（`treeFiles` 列分支头 `knowledge/` 下的普通文件）。
+- 改动路径：合并基（基线提交与 head）→ head 的 `diff --name-status --no-renames`，改名两边都算；状态 `A` 的算新增，改名的新路径也是（`team-git.ts:branchFileChanges`）。
+- 节点是分支头 `knowledge/` 下除 `README.md` 外的 `.md` 普通文件（模式 100644/100755，符号链接与子模块不读），从 worktree 异步读（ready 已要求干净）；没有节点头部的文件跳过。
+- 某节点的锚点命中改动路径、而节点文件本身不在改动路径里，就要更新；改了节点文件就算，哪怕只改 `verified_at`。
+- 分支新增的源文件（`server/`、`frontend/`、`shared/` 下的 `.ts/.tsx/.go`，排除测试等，同工具）没有任何节点锚定，就是缺口；只看新增，不看修改。宽锚点也算覆盖（`coverage` 不算）。
+- 有要更新的节点或缺口：409 `TEAM_WORK_ITEM_KNOWLEDGE_STALE`。`details` 为 `head`、`mergeBase`、`nodes`（最多 20 个，每个 `{ file, files, moreFiles }`，`files` 最多 10 个）、`moreNodes`、`uncovered`（最多 20 个）、`moreUncovered`。消息是英文（团队错误不走错误目录、不本地化），写明让工作者更新节点（或核对后只改 `verified_at`）、给新文件加锚点、提交后再 ready。
+- 检查跑不了时不放行：409 `TEAM_KNOWLEDGE_CHECK_UNAVAILABLE`。情形：
+  - 基线解析不出或与分支无共同历史；
+  - 检查期间分支 head 变了；
+  - git 失败，或 diff 列表超 1MB、`ls-tree` 列表超 512KB；
+  - 节点文件超 2000 个或合计超 8MiB，或节点不是可读的普通文件；
+  - （改动 + 新增路径数）×（目录与 glob 锚点数）超过 200 万次匹配。
+- `Team` 工具的错误结果带上 `AppError.details`，协调者由此拿到节点清单。
 
 同步、清理、并发：
 - `work.sync`：服务端从不合并。基线已在分支内就返回 up_to_date，否则把一条确定性的 `git merge --no-ff <基线提交>` 指令交给工作者。
@@ -64,22 +86,27 @@ verified_at: 776dbf07e
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
 - check-in 是一个团队只保留一个的定时唤醒（5 分钟到 1 天），记为 `team.checkin` 事件，重启与取消归档时重新装填。
-- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB）。`changedPaths` 只比较两个提交，不读工作区。
+- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB）。`changedPaths`、`branchFileChanges`、`treeFiles` 只读提交，不读工作区。
 
 `Team` 工具（`server/lib/agent/tools/team.ts`，仅 team trait 会话提供）：
 - 动作：work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision；`work.list` 最多 30 项。
+- 工具描述与协调者提示词（`lib/prompts/team-lead.ts` 中英文）都写了 ready 的拒绝条件；提示词还让协调者在仓库有 `knowledge/` 时，在工作者简报里要求完成前跑 `bun scripts/knowledge.ts affected` 并更新列出的节点。工作者自己只拿到通用的 worker 提示词和团队简报，没有团队专用的固定说明。
 - 权限逐动作判定（`narrator-permission.ts`）：记账类与团队自己的 worktree 创建/同步在只读之外也允许，`cleanup` 总要人批准。
 
 ## 从哪读起
 - `teams/work-items.ts`：生命周期、check-in、合并判定。
 - `teams/work-item-ports.ts`：与 worktree 服务的端口；`teams/team-git.ts`：只读 git。
-- 测试：`work-item-lifecycle.test.ts`、`team-checkin-brief.test.ts`。
+- `teams/team-knowledge.ts`：ready 的知识检查与它的上限。
+- 测试：`work-item-lifecycle.test.ts`、`work-item-knowledge.test.ts`、`team-checkin-brief.test.ts`。
 
 ## 改它时
 - 加一个 `Team` 工具动作：`shared/project-teams.ts:TEAM_TOOL_ACTIONS`、`tools/team.ts` 的参数与分发、`narrator-permission.ts` 的逐动作分类（`isTeamReadAction`/`isTeamCleanupCall`，漏了会被当成写动作或绕过批准）、`team-status.ts` 与前端 `team-page-model.ts` 里对事件种类的文案。
 - 加工作项状态或事件种类：`TEAM_WORK_ITEM_STATES`/`TeamWorkEventKind`、表上的 check 约束（SQLite 与 `drizzle-postgres` 两边，`team-tables-contract.test.ts` 会失败）、看板列映射 `TEAM_BOARD_COLUMN_STATES`。
+- 加 ready 的前置条件：保持顺序（NOT_REVIEWED → DIRTY → 知识检查 → 独占路径），同步 `tools/team.ts` 的工具描述与 `team-lead.ts` 中英文提示词。
+- 改知识检查的判定（锚点、源文件规则）改 `shared/knowledge-tree.ts`，工具与 ready 一起变；`tests/shared/knowledge-tree.test.ts`、`tests/scripts/knowledge.test.ts`、`work-item-knowledge.test.ts` 会拦。检查失败只能拒绝，不能放行。
 - 不变量：服务端不合并、不删分支、不直接跑 `git worktree`；读 git 只经 `team-git.ts`；状态更新必须带「状态 + `updated_at`」条件。
 
 ## 相关
 - [团队与成员](records.md)：删除团队前对未收尾工作项的检查。
 - [协调者](coordinator.md)：`team_status` 行里的工作项摘要。
+- [仓库知识树](../../kb/repo-knowledge.md)：ready 检查所依据的节点与锚点约定。
