@@ -38,6 +38,7 @@ anchors:
   - server/services/update-mirror-client.ts
   - shared/independent-update-mirror.ts
   - shared/mirror-relay.ts
+  - shared/mirror-transfer-pool.ts
   - shared/release-patch.ts
   - shared/release-version.ts
   - shared/update-identity.ts
@@ -78,7 +79,7 @@ keywords:
   - /changelog
   - embedded-changelog.ts
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: cbee4b47b5594056cb1d92a41d222b876789c0a6
 ---
 # 发布与更新
 
@@ -95,6 +96,8 @@ GitHub Release 是发布的权威来源；更新服务器（`update-server/`）�
 - GitHub 源的数据面：客户端读仓库 `narrafork-updates` 分支上的 `update-index-v1.json`（上限 256KB、最多 32 个 Release，`shared/update-index-types.ts`），`github-release-patch-planner.ts` 规划补丁链（最多 16 步，`MAX_RELEASE_PATCH_STEPS`），`github-release-patch-apply.ts` 应用（总时限 15 分钟）；镜像源走 `update-mirror-client.ts`、`shared/independent-update-mirror.ts`、`mirror-relay.ts`、`webdav-transport.ts`。
 - 前端：`UpdateBadge` / `UpdateModal` / `VersionUpdateBanner` 展示更新；`useUpdateSchedule` 轮询已准备更新的状态；`lib/version-match.ts` 比较前后端构建版本（前端用短哈希、发布服务端二进制用完整 40 位提交，所以基础版本相同且提交哈希互为前缀就算匹配，一方缺提交哈希时只与同样缺的匹配）；`lib/version-refresh.ts` 对同一对版本每个标签页只自动刷新一次，避免陈旧代理造成刷新循环；设置页 `routes/settings/about.tsx` 与 `useUpdateSourcePrompt` 处理更新源。
 - 更新服务器（`update-server/index.ts`，Hono + Bun.serve，默认端口参数 `--port=7780`）：公开路由 `GET /api/v2/products/:product/releases/latest?channel=&platform=&version=`（`routes/check.ts`）、下载与补丁下载、`/api/v3/products` 镜像写入（`routes/mirror.ts`，需 `requireAuth` 令牌）、`/api/v2/tokens`、`/health`；存储是本地文件系统（`storage/local.ts`）。契约测试在 `tests/update-server-*.test.ts`。
+
+- WebDAV 服务端拉取（`update-server/services/mirror-relay-pull.ts`）：作业保持单并发，作业内资产通过 `shared/mirror-transfer-pool.ts:MirrorTransferPool` 有界并发，`mirrorRelay.downloadConcurrency` 默认 8、严格接受数字整数 1–8；未启用 relay 时不解析。相同 SHA256/size 的对象只传一次，冲突大小在资产派发前拒绝；失败取消同批传输并等待清理，全部成功才提交 main/tools。runner 上传仍独立使用 `NF_MIRROR_UPLOAD_CONCURRENCY`（direct 默认 2、WebDAV 默认 3，可显式设为 8），`scripts/lib/mirror-upload-pool.ts` 保留共享池的兼容导出。
 
 ## 从哪读起
 - `scripts/release.ts`：按 “Step 1…5” 注释读；CLI 参数校验在文件前 150 行。
