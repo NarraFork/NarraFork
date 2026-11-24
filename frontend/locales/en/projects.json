@@ -166,6 +166,38 @@
 			"cancel": "Cancel",
 			"failed": "Could not create the team"
 		},
+		"upgrade": {
+			"menu": "Upgrade to a team",
+			"title": "Upgrade this session to a team",
+			"intro": "This session becomes the team's coordinator. Its conversation, working directory and sharing are kept; from the next message on it delegates the work to agents and tracks it on the team page.",
+			"name": "Team name",
+			"nameDescription": "Empty keeps the session's title. Renaming the session later renames the team.",
+			"submit": "Upgrade to a team",
+			"failed": "Could not upgrade the session",
+			"errors": {
+				"TEAM_ALREADY": "This session is already a team coordinator.",
+				"TEAM_SESSION_ARCHIVED": "Unarchive the session first.",
+				"NARRATOR_EXECUTION_BUSY": "The session is running or waiting. Try again once it is idle.",
+				"TEAM_WORKSPACE_UNAVAILABLE": "The session's working directory is not a local Git checkout of this project.",
+				"TEAM_SESSION_OTHER_PROJECT": "The session belongs to another project.",
+				"TEAM_SESSION_KIND_UNSUPPORTED": "This kind of session cannot become a team coordinator.",
+				"TEAM_NAME_INVALID": "Give the team a name of up to 120 characters.",
+				"PROJECT_ARCHIVED": "The project is archived."
+			}
+		},
+		"disband": {
+			"menu": "Disband team",
+			"title": "Disband this team?",
+			"confirm": "The team's work items and its activity history are deleted. The coordinator's session and its conversation are kept and continue as an ordinary session; branches are not touched.",
+			"confirmButton": "Disband team",
+			"failed": "Could not disband the team",
+			"done": "Team disbanded; its session is kept",
+			"errors": {
+				"TEAM_HAS_LIVE_WORK": "The team still has unfinished work items or work items holding a worktree. Finish, cancel or clean them up first.",
+				"NARRATOR_EXECUTION_BUSY": "The coordinator is running or waiting. Try again once it is idle.",
+				"TEAM_ARCHIVED": "Unarchive the team first."
+			}
+		},
 		"tabs": {
 			"conversation": "Conversation",
 			"board": "Board",

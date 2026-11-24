@@ -47,6 +47,7 @@ import {
 } from "@tabler/icons-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TeamDisbandMenu } from "./TeamDisbandMenu";
 import { TeamMembersPanel } from "./TeamMembers";
 import {
 	cappedCount,
@@ -318,6 +319,7 @@ export function TeamTopBar({
 	summary,
 	leading,
 	onOpenSession,
+	onDisbanded,
 }: {
 	projectId: string;
 	teamId: string;
@@ -326,6 +328,8 @@ export function TeamTopBar({
 	/** Before the title (a back link on narrow screens). */
 	leading?: ReactNode;
 	onOpenSession?: (narratorId: string) => void;
+	/** After the team was disbanded (its session kept): members get the menu with 解散团队. */
+	onDisbanded?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const [approvalsOpen, setApprovalsOpen] = useState(false);
@@ -456,6 +460,9 @@ export function TeamTopBar({
 					>
 						{t("teams.top.pauseAll")}
 					</Button>
+				)}
+				{member && onDisbanded && (
+					<TeamDisbandMenu projectId={projectId} teamId={teamId} onDisbanded={onDisbanded} />
 				)}
 			</Group>
 			<Drawer

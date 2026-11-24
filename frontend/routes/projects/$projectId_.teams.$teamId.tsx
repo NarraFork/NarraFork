@@ -76,6 +76,7 @@ function TeamPage() {
 			onOpenSession={openSession}
 			onOpenTeam={openTeam}
 			onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
+			onDisbanded={openSession}
 		/>
 	);
 }

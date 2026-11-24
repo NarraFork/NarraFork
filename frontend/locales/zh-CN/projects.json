@@ -166,6 +166,38 @@
 			"cancel": "取消",
 			"failed": "无法创建团队"
 		},
+		"upgrade": {
+			"menu": "升级为团队",
+			"title": "把这个会话升级为团队",
+			"intro": "这个会话会成为团队的协调者。对话、工作目录和分享设置都保留；从下一条消息起，它把工作派给代理去做，并在团队页上跟踪。",
+			"name": "团队名称",
+			"nameDescription": "留空则沿用会话标题。之后重命名会话也会重命名团队。",
+			"submit": "升级为团队",
+			"failed": "无法升级这个会话",
+			"errors": {
+				"TEAM_ALREADY": "这个会话已经是团队协调者。",
+				"TEAM_SESSION_ARCHIVED": "请先取消归档这个会话。",
+				"NARRATOR_EXECUTION_BUSY": "会话正在运行或等待中，等它空闲后再试。",
+				"TEAM_WORKSPACE_UNAVAILABLE": "会话的工作目录不是这个项目在本机上的 Git 检出。",
+				"TEAM_SESSION_OTHER_PROJECT": "这个会话属于另一个项目。",
+				"TEAM_SESSION_KIND_UNSUPPORTED": "这类会话不能成为团队协调者。",
+				"TEAM_NAME_INVALID": "请给团队起一个不超过 120 个字符的名称。",
+				"PROJECT_ARCHIVED": "项目已归档。"
+			}
+		},
+		"disband": {
+			"menu": "解散团队",
+			"title": "解散这个团队？",
+			"confirm": "团队的工作项和动态记录会被删除。协调者的会话和对话会保留，作为普通会话继续；分支不受影响。",
+			"confirmButton": "解散团队",
+			"failed": "无法解散团队",
+			"done": "团队已解散，会话已保留",
+			"errors": {
+				"TEAM_HAS_LIVE_WORK": "团队还有未完成或仍占用 worktree 的工作项。请先完成、取消或清理它们。",
+				"NARRATOR_EXECUTION_BUSY": "协调者正在运行或等待中，等它空闲后再试。",
+				"TEAM_ARCHIVED": "请先取消归档这个团队。"
+			}
+		},
 		"tabs": {
 			"conversation": "对话",
 			"board": "看板",

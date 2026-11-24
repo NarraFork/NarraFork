@@ -138,6 +138,8 @@ import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
+import { canOfferTeamUpgrade } from "../teams/team-upgrade-eligibility";
+import { UpgradeToTeamModal } from "../teams/UpgradeToTeamModal";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -2082,6 +2084,19 @@ function NarratorPanelBody({
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
 	/**
+	 * "Upgrade to a team" (the overflow menu): offered for an ordinary session of a known project
+	 * (its resolved primary project, from the detail read). The dialog lives here, outside the
+	 * menu's dropdown, for the same reason as the project settings modal above.
+	 */
+	const [upgradeToTeamOpen, setUpgradeToTeamOpen] = useState(false);
+	const teamUpgradeProjectId =
+		(fetchedNarrator?.navigationSummary?.projectId as string | null | undefined) ??
+		compatibilityProjectId ??
+		null;
+	const teamUpgradeOffered =
+		!isWorkspacePreview && canOfferTeamUpgrade(narrator, teamUpgradeProjectId);
+	const openUpgradeToTeam = useCallback(() => setUpgradeToTeamOpen(true), []);
+	/**
 	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
 	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
 	 * workspace cluster, the outline page), else in this panel's own drawer (a phone, a detached
@@ -3354,6 +3369,7 @@ function NarratorPanelBody({
 										mockStreamEnabled={mockStreamEnabled}
 										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
 										onOpenOutline={outlineEnabled ? openOutline : undefined}
+										onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3425,6 +3441,23 @@ function NarratorPanelBody({
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
 					/>
+
+					{upgradeToTeamOpen && teamUpgradeProjectId && (
+						<UpgradeToTeamModal
+							projectId={teamUpgradeProjectId}
+							narratorId={narratorId}
+							title={typeof narrator?.title === "string" ? narrator.title : null}
+							opened={upgradeToTeamOpen}
+							onClose={() => setUpgradeToTeamOpen(false)}
+							onUpgraded={(team) => {
+								setUpgradeToTeamOpen(false);
+								void navigate({
+									to: "/projects/$projectId/teams/$teamId",
+									params: { projectId: team.projectId, teamId: team.id },
+								});
+							}}
+						/>
+					)}
 
 					{!REMOTE_BUILD && (
 						<NarratorProjectSettingsModal

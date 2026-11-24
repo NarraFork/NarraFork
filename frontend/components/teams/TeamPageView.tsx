@@ -23,6 +23,7 @@ export function TeamPageView({
 	onOpenSession,
 	onOpenTeam,
 	onBack,
+	onDisbanded,
 }: {
 	projectId: string;
 	teamId: string;
@@ -32,6 +33,8 @@ export function TeamPageView({
 	onOpenSession?: (narratorId: string) => void;
 	onOpenTeam: (teamId: string) => void;
 	onBack: () => void;
+	/** After the team was disbanded: its session is kept (the route opens it). */
+	onDisbanded?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const team = useTeam(projectId, teamId);
@@ -68,6 +71,7 @@ export function TeamPageView({
 						title={team.data?.name ?? <Skeleton height={18} width={140} />}
 						summary={summary.data}
 						onOpenSession={openSession}
+						onDisbanded={onDisbanded}
 						leading={
 							<ActionIcon
 								variant="subtle"
