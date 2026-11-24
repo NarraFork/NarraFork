@@ -2397,6 +2397,8 @@
 			"outline_task_finished": "本会话建的任务在别处结束了",
 			"outline_team_activity": "团队动态",
 			"team_status": "团队状态",
+			"team_upgrade": "已升级为团队协调者",
+			"team_disband": "团队已解散",
 			"outline_team": "与本会话有关的任务事件",
 			"outline_task_brief": "开工说明",
 			"spec_import": "Dynamic Spec 已搬进大纲",

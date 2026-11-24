@@ -19,7 +19,7 @@ Your job is the whole picture, not the work itself:
 - Keep track of every unit's state, what each person and each agent is doing, which tool calls are waiting for approval, and which files other teams are changing.
 - Do not do context-heavy work yourself: no reading of large files, no long commands, no code changes beyond tiny immediate fixes. Design, implementation, testing and review go to subagents.
 
-Your team has suggested limits for your own work: how much one edit may change, how many files a turn touches, how much one read, search or command output returns, and how full the context may get before you compact. They are soft — nothing is refused or cut off — but stay inside them and hand larger work to a subagent. Your working directory is the project's main checkout: never commit there directly. Once the team has work items, small edits go into the worktree of the work item they belong to.
+Your team has suggested limits for your own work: how much one edit may change, how many files a turn touches, how much one read, search or command output returns, and how full the context may get before you compact. They are soft — nothing is refused or cut off — but stay inside them and hand larger work to a subagent. Your working directory is a checkout of this project's repository: the main checkout for a team created on the project page, or the checkout this session already worked in when it became the coordinator. Either way, never commit there directly. Once the team has work items, small edits go into the worktree of the work item they belong to.
 
 Delegating:
 - Start subagents in the background and do not Await them; their completion wakes you with their report. Stay free to answer people meanwhile, and relay the key points of a report yourself instead of forwarding it.
@@ -52,7 +52,7 @@ People and permissions:
 - 掌握每个单元的状态、每个人和每个代理在做什么、哪些工具调用在等审批、其他团队在改哪些文件。
 - 不亲自做占上下文的事：不读大文件、不跑长命令，除了极小的即时修正不改代码。设计、实现、测试、评审都交给子代理。
 
-团队给你自己动手的工作定了建议上限：一次改动能改多少、一轮动几个文件、一次读取、搜索或命令输出返回多少，以及上下文用到多满时该压缩。这些是软约束——不会被拒绝或截断——但请守住，超出的工作交给子代理。你的工作目录是项目的主检出：不要直接在那里提交。团队有了工作项以后，小改动放进它所属工作项的 worktree。
+团队给你自己动手的工作定了建议上限：一次改动能改多少、一轮动几个文件、一次读取、搜索或命令输出返回多少，以及上下文用到多满时该压缩。这些是软约束——不会被拒绝或截断——但请守住，超出的工作交给子代理。你的工作目录是这个项目仓库的一个检出：在项目页新建的团队是主检出，由已有会话升级来的团队是升级时会话所在的检出。无论哪种，都不要直接在那里提交。团队有了工作项以后，小改动放进它所属工作项的 worktree。
 
 派活：
 - 子代理一律在后台派出，不要 Await 等它；它完成时会带着报告唤醒你。等待期间随时回应成员，报告由你转述要点，不要原样转发。
@@ -113,4 +113,73 @@ export function checkinText(locale: Locale, minutes: number, note: string | null
 			: `Team check-in: the check-in you scheduled ${minutes} minutes ago is due. Look at the team status and the open work items; schedule another only if something is still pending (about 50 minutes first, then about 4 hours; stop after 3 in a row with no change).`;
 	if (!note) return head;
 	return locale === "zh-CN" ? `${head}\n你留的备注：${note}` : `${head}\nYour note: ${note}`;
+}
+
+// ─── Upgrade and disband notes ───
+//
+// One `sys` history row each (sources `team_upgrade` / `team_disband`, `schedule: "none"`),
+// written when a person turns an existing session into a team coordinator or disbands its team
+// while keeping the session (`teams/team-conversion.ts`). They state only the facts the
+// coordinator protocol cannot know; the protocol itself reaches the session through its system
+// prompt (a `context_update` row until the next compaction). Deterministic: the same inputs
+// give the same bytes.
+
+export interface TeamUpgradeNoteInput {
+	/** The team name (the session's title from now on). */
+	name: string;
+	/** Who converted the session, or null when no person is known. */
+	convertedBy: string | null;
+	/** The session's working directory. */
+	cwd: string;
+	/** Whether that directory is in the project's main checkout (not a linked worktree). */
+	mainCheckout: boolean;
+	/** The project's main checkout, named when the working directory is another one. */
+	mainCheckoutPath: string;
+}
+
+/** The note an upgraded session reads before its first coordinator request. */
+export function teamUpgradeNote(locale: Locale, input: TeamUpgradeNoteInput): string {
+	if (locale === "zh-CN") {
+		const who = input.convertedBy ? `由 ${input.convertedBy} ` : "";
+		const where = input.mainCheckout
+			? `你的工作目录是 ${input.cwd}，在项目的主检出里。`
+			: `你的工作目录是 ${input.cwd}，在项目的另一个检出里，不是主检出（主检出在 ${input.mainCheckoutPath}）。`;
+		return [
+			`团队升级：这个会话已${who}升级为本项目团队「${input.name}」的协调者。`,
+			"上面的消息都写于升级之前；之前的指示仍然有效，除非系统提示词里的团队协调者规则另有规定。",
+			"从现在起，把工作拆开交给子代理去做，用 Team 工具记录工作项。",
+			where,
+		].join("\n");
+	}
+	const who = input.convertedBy ? ` by ${input.convertedBy}` : "";
+	const where = input.mainCheckout
+		? `Your working directory is ${input.cwd}, in the project's main checkout.`
+		: `Your working directory is ${input.cwd}, in a checkout of the project other than its main checkout (${input.mainCheckoutPath}).`;
+	return [
+		`Team upgrade: this session was turned into the coordinator of the team "${input.name}" in this project${who}.`,
+		"The messages above were written before that; earlier instructions still apply unless the team coordinator protocol in your system prompt says otherwise.",
+		"From now on, split the work and delegate it to subagents, and record the units of work with the Team tool.",
+		where,
+	].join("\n");
+}
+
+/** The note a session reads after its team was disbanded and the session kept. */
+export function teamDisbandNote(
+	locale: Locale,
+	input: { name: string; disbandedBy: string | null },
+): string {
+	if (locale === "zh-CN") {
+		const who = input.disbandedBy ? `${input.disbandedBy} ` : "";
+		return [
+			`团队已解散：${who}解散了团队「${input.name}」，这个会话不再是团队协调者。`,
+			"团队协调者规则和 Team 工具不再适用；团队的工作项和动态已删除，它们的分支都保留着。",
+			"对话作为普通会话继续，按人接下来的指示做。",
+		].join("\n");
+	}
+	const who = input.disbandedBy ? ` by ${input.disbandedBy}` : "";
+	return [
+		`Team disbanded: the team "${input.name}" was disbanded${who}, and this session is no longer a team coordinator.`,
+		"The team coordinator protocol and the Team tool no longer apply; the team's work items and activity were deleted; their branches were kept.",
+		"The conversation continues as an ordinary session: follow the person's next instructions.",
+	].join("\n");
 }

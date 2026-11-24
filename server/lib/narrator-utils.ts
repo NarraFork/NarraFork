@@ -91,8 +91,11 @@ export function isBotNarrator(raw: unknown): boolean {
 
 /**
  * Trait marking a team coordinator: the narrator that IS a project team
- * (docs/PROJECT_TEAMS-PLAN.md). Set at creation together with its `project_teams` row and
- * never toggled; forks and imports do not carry it (they have no team row).
+ * (docs/PROJECT_TEAMS-PLAN.md). Always written together with its `project_teams` row, in one
+ * transaction: at creation, when a person turns an existing session into a team, and removed
+ * with the row when a person disbands the team and keeps the session
+ * (`services/teams/team-conversion.ts`, both under `narratorTraitsLock`). Forks and imports do
+ * not carry it (they have no team row).
  */
 export const TEAM_TRAIT = "team";
 

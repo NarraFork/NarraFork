@@ -607,6 +607,8 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
 			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
 			sidecarSourceTeamStatus: t("sidecar.sources.team_status"),
+			sidecarSourceTeamUpgrade: t("sidecar.sources.team_upgrade"),
+			sidecarSourceTeamDisband: t("sidecar.sources.team_disband"),
 			sidecarSourceOutlineTeam: t("sidecar.sources.outline_team"),
 			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
 			sidecarSourceSpecImport: t("sidecar.sources.spec_import"),

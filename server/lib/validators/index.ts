@@ -209,6 +209,7 @@ export {
 	teamBriefSchema,
 	teamSettingsSchema,
 	updateProjectTeamSchema,
+	upgradeProjectTeamSchema,
 } from "./project-teams";
 export {
 	createProjectSchema,

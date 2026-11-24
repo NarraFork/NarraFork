@@ -115,7 +115,7 @@ function toDetail(team: TeamRow, coordinator: CoordinatorRow, access: TeamAccess
 type EventExecutor = Pick<typeof db, "insert">;
 
 /** Append one team-level event. Synchronous so it can share a caller's transaction. */
-function recordTeamEvent(
+export function recordTeamEvent(
 	executor: EventExecutor,
 	teamId: string,
 	kind: TeamEventKind,
