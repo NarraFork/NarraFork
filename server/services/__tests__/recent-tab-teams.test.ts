@@ -277,7 +277,9 @@ describe("team and project tabs behave like other tabs", () => {
 		await upsertRecentTab(user, teamTab(teamId));
 		await upsertRecentTab(user, { type: "project", id: projectId, title: "p", lastVisitedAt: 2 });
 		await clearRecentTabs(user, "inactive_narrators");
-		expect(new Set(await keysOf(user))).toEqual(new Set([`team:${teamId}`, `project:${projectId}`]));
+		expect(new Set(await keysOf(user))).toEqual(
+			new Set([`team:${teamId}`, `project:${projectId}`]),
+		);
 	});
 
 	test("trim: an unpinned team tab ages out like any tab, a pinned one stays", async () => {
@@ -456,10 +458,7 @@ describe("team tabs follow the team", () => {
 		const teamId = await makeTeam(projectId);
 		const otherTeam = await makeTeam(otherProject);
 		// Project-wide audience: readable through the project grant only.
-		await db
-			.update(narrators)
-			.set({ visibility: "project" })
-			.where(eq(narrators.id, teamId));
+		await db.update(narrators).set({ visibility: "project" }).where(eq(narrators.id, teamId));
 		const grant = generateId();
 		await db.insert(aclGrants).values({
 			id: grant,

@@ -304,3 +304,40 @@ test("a failed runtime read releases the shared slot without retrying until a ne
 	expect(cachedTab("a")?.title).toBe("recovered");
 	expect(runtimeRequests).toHaveLength(2);
 });
+
+test("a team tab follows its coordinator: title and status only, no promotion", async () => {
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: false,
+		baseRevision: 0,
+		revision: 0,
+		operations: [],
+	});
+	const team: RecentTab = {
+		type: "team",
+		id: "coord",
+		projectId: "p1",
+		title: "Crew",
+		pinned: true,
+		lastVisitedAt: 1,
+	};
+	await mount([team, tab("a")]);
+	// The coordinator is subscribed and its runtime is read under the team's own key.
+	expect(narratorWSManager.subscribe).toHaveBeenLastCalledWith(["coord", "a"], { kind: "list" });
+	expect(runtimeRequests[0]?.keys).toEqual(["narrator:a", "team:coord"]);
+	await resolveRuntime(0, [
+		{ key: "team:coord", patch: { status: "waiting", pendingApprovalCount: 2 } },
+	]);
+	expect(cachedTab("coord")).toMatchObject({ status: "waiting", pendingApprovalCount: 2 });
+
+	await act(async () => {
+		onListEvent({ type: "title_updated", narratorId: "coord", title: "Renamed crew" });
+		onListEvent({ type: "draft_changed", narratorId: "coord", hasDraft: true });
+		onListEvent({ type: "status_change", narratorId: "coord", status: "working" });
+		frame?.(0);
+	});
+	const live = cachedTab("coord");
+	expect(live).toMatchObject({ title: "Renamed crew", status: "working" });
+	expect(live?.hasDraft).toBeUndefined();
+	// A session tab of the coordinator would be promoted; a pinned team is not a session.
+	expect(move).not.toHaveBeenCalled();
+});
