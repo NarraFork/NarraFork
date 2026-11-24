@@ -161,6 +161,7 @@ import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+import { NarratorTeamBadge } from "./header/NarratorTeamBadge";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
 	getNarratorStatusBarDisplay,
@@ -3327,6 +3328,13 @@ function NarratorPanelBody({
 										isWorkspacePreview={isWorkspacePreview}
 										titleFullWidth={headerLayout.titleWidth}
 									/>
+									{!isWorkspacePreview && (
+										<NarratorTeamBadge
+											narratorId={narratorId}
+											narrator={narrator}
+											projectId={compatibilityProjectId}
+										/>
+									)}
 									{disconnected && !isWorkspacePreview && (
 										<Badge
 											size="xs"

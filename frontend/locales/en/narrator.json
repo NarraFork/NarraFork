@@ -3326,5 +3326,7 @@
 	},
 	"followDefaultUnset": "Default model (not configured)",
 	"followSummaryUnset": "Summary model (not configured)",
-	"composerReadOnly": "Read-only: you can follow this session but not send it messages."
+	"composerReadOnly": "Read-only: you can follow this session but not send it messages.",
+	"teamBadge": "Team",
+	"teamBadgeOpen": "Open the team page of {{name}}"
 }
