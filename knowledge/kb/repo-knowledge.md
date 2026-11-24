@@ -34,7 +34,7 @@ verified_at: 2e6441ad0
 - 锚点：文件、以 `/` 结尾的目录、或 glob；只统计 `server/`、`frontend/`、`shared/` 下的 `.ts/.tsx/.go`，排除测试、`.browser.`、`.fixture.`、fixtures 目录、`.d.ts`、`routeTree.gen.ts`（`scripts/knowledge.ts:SOURCE_ROOTS`、`NOT_SOURCE`）。一个锚点匹配的源文件超过 40 个（`BROAD_ANCHOR_FILES`）时 `check` 报错，且这种锚点不计入覆盖率。
 - 过期按 git 判断：节点文件最后一次提交之后，若有提交改了它的锚点，就是过期（`stale()`），节点与代码在同一提交里一起改则不算；未提交的节点文件（工作区有改动）不参与判断。
 - `find` 的评分：id、title 5 分，keywords 4 分，summary 3 分，anchors 2 分，正文 1 分；单个词按它命中的最强字段计；只有一个含 `/` 或 `.` 的参数时按路径匹配锚点（精确 10、目录前缀 6）。所以 `keywords` 比正文更容易被搜到。
-- `check` 检查：头部必填项（id、title、summary、status）、状态取值、id 唯一、锚点必须真实存在、正文里的相对 `.md` 链接、每个目录有 `index.md` 且列出全部下级、锚点不过宽。它不检查 `keywords`、`verified_at` 是否填写，也不检查「改它时」是否存在。
+- `check` 检查：`knowledge/` 下除 README 外每个 `.md` 都必须有节点头部（否则报「no node header」）、头部必填项（id、title、summary、status）、状态取值、id 唯一、锚点必须真实存在、正文里的相对 `.md` 链接、每个目录有 `index.md` 且列出全部下级、锚点不过宽。节点路径一律用正斜杠（`repoPath`），CRLF 换行与 LF 一样解析，所以 Windows 检出结果相同。它不检查 `keywords`、`verified_at` 是否填写，也不检查「改它时」是否存在。
 - 更新：改动合并前跑 `affected`，在同一个 PR 里核对被碰到的节点并更新 `verified_at`；新功能需要新节点就加在最合适的主题下，放不进现有主题则提出来，不随手加顶层。
 
 ## 从哪读起

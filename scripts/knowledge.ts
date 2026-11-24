@@ -13,7 +13,7 @@
  * when a commit after the node file's last commit touches one of its anchors.
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, normalize, relative } from "node:path";
+import { join, posix, relative, sep } from "node:path";
 
 export interface KnowledgeNode {
 	/** Path relative to the repository root. */
@@ -51,7 +51,9 @@ function lines(s: string): string[] {
 // ── parsing ──────────────────────────────────────────────────────────────────
 
 /** Parses the small YAML subset the headers use: `key: value`, `key: []`, `key:` + `  - item`. */
-export function parseNode(file: string, text: string): KnowledgeNode | null {
+export function parseNode(file: string, raw: string): KnowledgeNode | null {
+	// Checkouts with core.autocrlf have CRLF line endings.
+	const text = raw.replace(/\r\n/g, "\n");
 	const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
 	if (!m) return null;
 	const fields: Record<string, string | string[]> = {};
@@ -99,15 +101,25 @@ function walk(dir: string, out: string[] = []): string[] {
 	return out;
 }
 
-export function loadNodes(root: string): KnowledgeNode[] {
+/** A native relative path as the repository path every node uses: forward slashes everywhere. */
+export function repoPath(nativeRelative: string, separator: string = sep): string {
+	return nativeRelative.split(separator).join("/");
+}
+
+/**
+ * Loads every node under `knowledge/`. Paths are repository-relative with forward slashes on
+ * every platform. Markdown files that do not parse as a node are collected in `invalid`.
+ */
+export function loadNodes(root: string, invalid: string[] = []): KnowledgeNode[] {
 	const dir = join(root, KNOWLEDGE_DIR);
 	if (!existsSync(dir)) return [];
 	const nodes: KnowledgeNode[] = [];
 	for (const abs of walk(dir).sort()) {
-		const file = relative(root, abs);
-		if (file === join(KNOWLEDGE_DIR, "README.md")) continue;
+		const file = repoPath(relative(root, abs));
+		if (file === `${KNOWLEDGE_DIR}/README.md`) continue;
 		const node = parseNode(file, readFileSync(abs, "utf8"));
 		if (node) nodes.push(node);
+		else invalid.push(file);
 	}
 	return nodes;
 }
@@ -320,8 +332,10 @@ export function broadAnchors(
 	return out;
 }
 
-export function check(root: string, nodes: KnowledgeNode[]): string[] {
-	const errors: string[] = [];
+export function check(root: string, nodes: KnowledgeNode[], invalid: string[] = []): string[] {
+	const errors: string[] = invalid.map(
+		(f) => `${f}: no node header (--- id/title/summary/anchors/status ---)`,
+	);
 	const tracked = lines(git(root, ["ls-files"]));
 	for (const b of broadAnchors(sourceFiles(root), nodes))
 		errors.push(`${b.node.file}: anchor too broad (${b.count} source files): ${b.anchor}`);
@@ -341,22 +355,22 @@ export function check(root: string, nodes: KnowledgeNode[]): string[] {
 		}
 		for (const [, href] of n.body.matchAll(/\]\(([^)#\s]+\.md)(#[^)]*)?\)/g)) {
 			if (/^[a-z]+:/.test(href)) continue;
-			if (!existsSync(join(root, normalize(join(dirname(n.file), href)))))
+			if (!existsSync(join(root, posix.normalize(posix.join(posix.dirname(n.file), href)))))
 				errors.push(`${n.file}: broken link ${href}`);
 		}
 	}
 	// Every node directory has an index.md that lists each child.
 	for (const n of nodes) {
-		if (n.file === join(KNOWLEDGE_DIR, "index.md")) continue;
+		if (n.file === `${KNOWLEDGE_DIR}/index.md`) continue;
 		const isIndex = n.file.endsWith("/index.md");
-		const parentDir = isIndex ? dirname(dirname(n.file)) : dirname(n.file);
-		const parentIndex = join(parentDir, "index.md");
+		const parentDir = isIndex ? posix.dirname(posix.dirname(n.file)) : posix.dirname(n.file);
+		const parentIndex = posix.join(parentDir, "index.md");
 		const parent = nodes.find((p) => p.file === parentIndex);
 		if (!parent) {
 			errors.push(`${n.file}: no ${parentIndex}`);
 			continue;
 		}
-		const rel = relative(parentDir, n.file);
+		const rel = posix.relative(parentDir, n.file);
 		if (!parent.body.includes(`](${rel})`)) errors.push(`${parentIndex}: child not listed: ${rel}`);
 	}
 	return errors;
@@ -375,7 +389,8 @@ function line(n: KnowledgeNode): string {
 function main(argv: string[]): number {
 	const [cmd, ...args] = argv;
 	const root = repoRoot();
-	const nodes = loadNodes(root);
+	const invalid: string[] = [];
+	const nodes = loadNodes(root, invalid);
 	switch (cmd) {
 		case "find": {
 			if (args.length === 0) {
@@ -437,7 +452,7 @@ function main(argv: string[]): number {
 			return 0;
 		}
 		case "check": {
-			const errors = check(root, nodes);
+			const errors = check(root, nodes, invalid);
 			for (const e of errors) console.error(e);
 			console.log(
 				errors.length === 0

@@ -9,6 +9,7 @@ import {
 	find,
 	loadNodes,
 	parseNode,
+	repoPath,
 	stale,
 	termIn,
 } from "../../scripts/knowledge";
@@ -134,6 +135,28 @@ describe("knowledge tree tool", () => {
 		write("knowledge/area/beta.md", node("area.beta", ["server/services/beta/"], "updated"));
 		git("commit", "-qam", "change beta with its node");
 		expect(stale(root, loadNodes(root))).toEqual([]);
+	});
+
+	test("CRLF headers parse like LF headers", () => {
+		const n = parseNode("x.md", node("x", ["a.ts"], "body", ["k1"]).replace(/\n/g, "\r\n"));
+		expect(n?.id).toBe("x");
+		expect(n?.anchors).toEqual(["a.ts"]);
+		expect(n?.keywords).toEqual(["k1"]);
+	});
+
+	test("node paths use forward slashes, so nested index nodes check out", () => {
+		const nodes = loadNodes(root);
+		expect(nodes.every((n) => !n.file.includes("\\"))).toBe(true);
+		expect(nodes.map((n) => n.file)).toContain("knowledge/area/index.md");
+		expect(repoPath("knowledge\\area\\index.md", "\\")).toBe("knowledge/area/index.md");
+	});
+
+	test("check reports markdown files that are not nodes", () => {
+		write("knowledge/area/loose.md", "# Loose page\n");
+		const invalid: string[] = [];
+		const errors = check(root, loadNodes(root, invalid), invalid).join("\n");
+		expect(invalid).toEqual(["knowledge/area/loose.md"]);
+		expect(errors).toContain("knowledge/area/loose.md: no node header");
 	});
 
 	test("check catches broken anchors, links, duplicate ids and unlisted children", () => {
