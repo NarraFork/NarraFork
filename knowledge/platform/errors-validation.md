@@ -29,7 +29,7 @@ keywords:
   - 错误码
   - 错误本地化
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 56f264c49
 ---
 # 错误与校验
 

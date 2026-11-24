@@ -11,6 +11,11 @@ anchors:
   - server/lib/validators/project-teams.ts
   - server/services/teams/__tests__/team-tables-contract.test.ts
   - server/services/teams/__tests__/team-status-members.test.ts
+  - frontend/components/narrator/CreateTeamFromDirectory.tsx
+  - frontend/components/narrator/create-narrator-team.ts
+  - frontend/components/narrator/create-narrator-team.test.ts
+  - frontend/components/narrator/create-team-start.browser-fixture.tsx
+  - frontend/components/narrator/create-team-start.browser.test.ts
 keywords:
   - 团队成员
   - onlooker
@@ -27,8 +32,12 @@ keywords:
   - reconcileImportedTeamTraits
   - teamWorktreePathsForNarrator
   - 归档团队
+  - 以团队开始
+  - start as a team
+  - CreateTeamFromDirectory
+  - teamStartEligibility
 status: draft
-verified_at: 2e6441ad0
+verified_at: 56f264c49
 ---
 # 团队与成员
 
@@ -41,6 +50,14 @@ verified_at: 2e6441ad0
   - 只读者改动：403（`teams/team-service.ts:loadTeamForAccess`）。
 - 创建要求项目写权限；项目必须有 git 仓库目录（`gitPath`）。
 - 已归档项目不能新建团队（409 `PROJECT_ARCHIVED`）。
+- 协调者的 cwd 永远是项目的 `gitPath`，不是用户选的子目录（`createTeam`）。
+
+两个创建入口，都调同一条 `POST /api/projects/:projectId/teams`，字段都来自 `components/teams/TeamCreateFields.tsx`（名称、基线分支、说明）：
+- 项目页团队区块的「新建团队」弹窗（`ProjectTeamsList.tsx:CreateTeamModal`）。
+- 新建会话弹窗的「会话 / 以团队开始」切换（`narrator/CreateNarratorModal.tsx`）：
+  - 选目录与建会话完全一样；`create-narrator-team.ts:useTeamStartEligibility` 防抖 300ms 后用 `resolve-directory`（`create: false`，见[项目](../projects.md)）查目录，不写库。
+  - 选项始终可见；不可用时禁用并写明原因（`teamStartEligibility`）：远程执行设备、未选目录、正在检查、PG（503）、查询失败、不是目录、不在 git 仓库、读不到项目、项目已归档、只读。
+  - 选中后右侧换成懒加载的 `CreateTeamFromDirectory.tsx`：提交时先 `resolve-directory`（`create: true`，没有项目的仓库此时才建项目），再按结果复判一次，然后建团队，关闭弹窗并打开团队页 `/projects/$projectId/teams/$teamId`（调用方给了 `onTeamCreated` 时改为回调，浏览器测试夹具用它）。
 - 协调者叙述者与团队行在同一事务内创建，基线分支默认取项目 `defaultBranch`，再缺省 `main`（`createTeam`）。
 - 没有独立的团队成员表。成员列表由四路拼出：协调者 owner、协调者上的显式授权、协调者最近 500 条消息里的发言者、以及（协调者属于项目且受众为 project/public 时）项目 owner 与授权。
   - 逐个按叙述者 ACL 批量判定，上限 `TEAM_MEMBERS_LIST_LIMIT` = 100，`more` 标记被截断。
@@ -68,7 +85,8 @@ verified_at: 2e6441ad0
 - 动团队三张表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步，再按流程生成 SQLite 与 PG 迁移；`team-tables-contract.test.ts` 在两边对同一组约束，漏一边会失败。
 - 它们不在数据导出清单里：保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
 - 不要加团队成员表；成员判定变化要同步 `team-members.ts` 的拼装来源与 `team-status-members.test.ts`。
-- 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改。
+- 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改；两个创建入口共用 `TeamCreateFields.tsx`，新字段加在那里。
+- 新建会话弹窗的团队部分：`CreateNarratorModal` 的测试大量 `mock.module` 了 `@mantine/core`、`@tanstack/react-query`、`@tanstack/react-router`，弹窗静态导入链里只能用这些 mock 已提供的导出；所以 `create-narrator-team.ts` 不导入路由与 `useTeams`，用到路由的 `CreateTeamFromDirectory.tsx` 懒加载。测试：`create-narrator-team.test.ts`（各原因）、`create-team-start.browser.test.ts`（Chromium，真实路由）。
 - IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
 
 ## 相关
