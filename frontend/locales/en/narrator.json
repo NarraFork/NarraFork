@@ -1498,6 +1498,8 @@
 	"planEdited": "Edited",
 	"planExecute": "Execute Plan",
 	"planRevise": "Revise Plan",
+	"planReflect": "Reflect on Plan",
+	"planReflectFailed": "Plan reflection could not be started",
 	"planFeedbackConfirmTitle": "You entered feedback text",
 	"planFeedbackConfirmMessage": "You have entered feedback text. Would you like the agent to revise the plan?",
 	"planExecuteWithoutRevision": "Execute Without Revision",

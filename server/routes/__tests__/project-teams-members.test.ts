@@ -1490,6 +1490,62 @@ describe("asking the AI to answer (M1)", () => {
 	});
 });
 
+describe("plan reflection started by a member (M1)", () => {
+	/** A waiting plan whose review blocks until released with the given verdict. */
+	async function waitingPlan() {
+		const plan = await pendingCall(workerId, "ExitPlanMode", { plan: "Ship it in two steps." });
+		const entry = pendingPermissions.get(plan.id);
+		if (!entry) throw new Error("Expected the pending plan");
+		let release: (() => void) | undefined;
+		const reviewing = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		entry.planReflection = async (input) => {
+			await reviewing;
+			return { decision: { action: "confirm" }, input };
+		};
+		const settled = async () => {
+			release?.();
+			for (let i = 0; i < 200 && pendingPermissions.get(plan.id)?.planReflectionRunning; i++)
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		};
+		return { ...plan, settled };
+	}
+
+	test("a verdict landing after the member's access was revoked is dropped", async () => {
+		const plan = await waitingPlan();
+		try {
+			const started = await call(GRANTED, `/narrators/permissions/${plan.id}/reflect-plan`, {
+				method: "POST",
+			});
+			expect(started.status).toBe(200);
+			// Revoked while the review runs: the route's gate passed minutes before the verdict.
+			db.delete(aclGrants).where(eq(aclGrants.id, grantId)).run();
+			await plan.settled();
+			expect(plan.decisions).toEqual([]);
+			expect(pendingPermissions.has(plan.id)).toBe(true);
+		} finally {
+			pendingPermissions.delete(plan.id);
+			grantId = await grantWrite(GRANTED);
+		}
+	});
+
+	test("a member who keeps access gets the verdict applied", async () => {
+		const plan = await waitingPlan();
+		try {
+			const started = await call(MEMBER, `/narrators/permissions/${plan.id}/reflect-plan`, {
+				method: "POST",
+			});
+			expect(started.status).toBe(200);
+			await plan.settled();
+			expect(plan.decisions).toEqual(["allow"]);
+		} finally {
+			pendingPermissions.delete(plan.id);
+		}
+	});
+});
+
 describe("project visibility changes reach team tab holders (M1)", () => {
 	test("the people with a team session of the project open are told; nobody else", async () => {
 		const narratorWs = await import("../../websocket/narrator-ws");

@@ -1497,6 +1497,8 @@
 	"planEdited": "已编辑",
 	"planExecute": "执行计划",
 	"planRevise": "修正计划",
+	"planReflect": "计划反思",
+	"planReflectFailed": "计划反思启动失败",
 	"planFeedbackConfirmTitle": "您输入了反馈文本",
 	"planFeedbackConfirmMessage": "您输入了反馈文本，请问您是否希望让 agent 修改计划？",
 	"planExecuteWithoutRevision": "不修改计划",
