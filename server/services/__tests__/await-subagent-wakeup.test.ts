@@ -20,14 +20,17 @@
  * status-based path fails the middle test while the first still passes, which is
  * exactly the asymmetry the bug had.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, users } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { eventBus } = await import("../../lib/event-bus");
 const { waitForSubagentResult } = await import("../agent-communication");
@@ -35,9 +38,10 @@ const { setRunHold } = await import("../agent-runtime/ownership");
 const markTakenOver = (id: string) => setRunHold(id, { released: false });
 const clearTakenOver = (id: string) => setRunHold(id, undefined);
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 const OWNER_ID = "owner-await-wakeup";
@@ -107,16 +111,24 @@ function startWait(signal?: AbortSignal) {
 	});
 }
 
-/** Let the waiter finish its initial read and attach its listeners. */
+let listenersAttached = Promise.withResolvers<void>();
 async function afterListenersAttached(): Promise<void> {
-	await new Promise((resolve) => setTimeout(resolve, 30));
+	await listenersAttached.promise;
 }
 
 beforeEach(async () => {
+	listenersAttached = Promise.withResolvers<void>();
+	const on = eventBus.on.bind(eventBus);
+	spyOn(eventBus, "on").mockImplementation(((...args: Parameters<typeof eventBus.on>) => {
+		const result = on(...args);
+		if (args[0] === "narrator:status_changed") listenersAttached.resolve();
+		return result;
+	}) as typeof eventBus.on);
 	await seedRunningSubagent();
 });
 
 afterEach(() => {
+	mock.restore();
 	clearTakenOver(SUBAGENT_ID);
 	cleanDb(sqlite);
 });

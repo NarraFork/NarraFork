@@ -49,7 +49,7 @@ test("named list searches by handle instead of scanning every narrator", () => {
 		"utf-8",
 	);
 	const namedList = service.slice(
-		service.indexOf("async listNamed()"),
+		service.indexOf("async listNamed("),
 		service.indexOf("async setHandle("),
 	);
 	expect(namedList).toContain('gt(narrators.handle, "")');
