@@ -1355,7 +1355,8 @@ async function captureUnlocked(
  * `add -A` records its removal (verified), so the force-add is only ever needed to
  * *introduce* an entry.
  */
-async function assertSnapshotStagingUntracked(worktreePath: string) {
+async function assertSnapshotStagingUntracked(worktreePath: string, signal?: AbortSignal) {
+	signal?.throwIfAborted();
 	const internal = await safeSpawn({
 		cmd: [
 			"git",
@@ -1369,7 +1370,9 @@ async function assertSnapshotStagingUntracked(worktreePath: string) {
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: 16_384,
 		env: { ...process.env, LC_ALL: "C" },
+		signal,
 	});
+	signal?.throwIfAborted();
 	if (
 		internal.exitCode !== 0 ||
 		internal.stdoutTruncated ||
@@ -1394,7 +1397,7 @@ async function addAllUnlocked(
 	if (excludeStaging) {
 		const indexKey = realIndexIdentity(worktreePath);
 		if (indexKey === null || trackedIgnoredCache.get(dir)?.indexKey !== indexKey)
-			await assertSnapshotStagingUntracked(worktreePath);
+			await assertSnapshotStagingUntracked(worktreePath, signal);
 		const removed = await runGit(
 			[
 				"rm",
@@ -1493,7 +1496,8 @@ async function trackedButIgnoredPaths(
 	const cached = trackedIgnoredCache.get(dir);
 	if (indexKey !== null && cached?.indexKey === indexKey) return [];
 
-	if (existsSync(resolve(worktreePath, ".git"))) await assertSnapshotStagingUntracked(worktreePath);
+	if (existsSync(resolve(worktreePath, ".git")))
+		await assertSnapshotStagingUntracked(worktreePath, signal);
 
 	const result = await safeSpawn({
 		cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
