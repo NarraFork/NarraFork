@@ -1,0 +1,1 @@
+ALTER TABLE "user_recent_tabs" ADD COLUMN "project_id" text;
