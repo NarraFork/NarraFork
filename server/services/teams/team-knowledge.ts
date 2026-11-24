@@ -40,7 +40,7 @@ export const KNOWLEDGE_CHECK_MAX_NODE_BYTES = 8 * 1024 * 1024;
  * At most this many (path × directory-or-glob anchor) tests, the only part of matching that
  * grows with both sides; over it the check fails instead of holding the event loop.
  */
-export const KNOWLEDGE_CHECK_MAX_MATCH_TESTS = 2_000_000;
+export const KNOWLEDGE_CHECK_MAX_MATCH_TESTS = 250_000;
 /** Listed nodes and uncovered files in the refusal; the rest are counted. */
 export const KNOWLEDGE_STALE_LIST_MAX = 20;
 /** Changed files listed per node in the refusal; the rest are counted. */
