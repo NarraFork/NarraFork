@@ -2,13 +2,22 @@
 id: files
 title: 文件与编辑
 summary: 受控文件写入、变更记录与回退、文件引用、编辑器文档、工作区布局。
-anchors: []
-status: stub
-verified_at: null
+anchors:
+  - server/services/file-write-queue.ts
+  - server/services/file-change-runtime.ts
+  - server/services/revert-transaction-service.ts
+  - server/services/editor-document-service.ts
+  - server/services/workspace-panel-service.ts
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 文件与编辑
 
-> 待填写：受控文件写入、变更记录与回退、文件引用、编辑器文档、工作区布局。
+文件相关能力围绕一条主线：**任何改文件的动作都先过同一个进程内单文件写队列，再由文件变更运行时记录“实际发生了什么”**。
+
+- 写入侧：工具（Write/Edit 等）、编辑器保存、回退执行和技能创建都用 `withFileWrite` 串行化同一文件；变更运行时把磁盘结果、历史可用性和证据分开记录。本地设备不保留文件历史，远程设备才有。
+- 回退侧：回退读取上述证据（和 tree 快照）生成预览，用户确认后按文件逐项恢复，部分成功保留，历史改写在文件全部校验后再提交。
+- 读取/交互侧：文件引用与附件把文件内容带进会话；编辑器文档提供前端编辑与分块保存，最终回到写入侧；工作区布局是独立的面板成员与 dockview 排布，与文件写入无直接耦合。
 
 ## 下面有什么
 

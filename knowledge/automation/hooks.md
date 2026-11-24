@@ -3,11 +3,30 @@ id: automation.hooks
 title: 钩子
 summary: 钩子配置与触发。
 anchors:
-  - server/services/hook-*.ts
+  - server/services/hook-service.ts
+  - server/services/attention-hook-bridge.ts
   - server/routes/hooks.ts
-status: stub
-verified_at: null
+  - server/services/agent-runtime/orchestrator.ts
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 钩子
 
-> 待填写：钩子配置与触发。
+用户配置的命令或 HTTP 回调，在叙述者运行的固定事件点被触发；`PreToolUse` 的钩子可以阻止工具调用。配置存在 `hooks` 表。
+
+## 关键规则
+- 事件五种：`PreToolUse | PostToolUse | Stop | Attention | AttentionResolved`；类型两种：`command`、`http`（`hook-service.ts:HookEvent`、`hookService.create`）。
+- 匹配：事件相同且 `enabled`；钩子带 `projectId` 时只匹配该项目，`projectId` 为空的是全局钩子；`matcher` 非空时必须与工具名全等（Attention 类事件把原因 `waiting_permission|done|error` 当作匹配键）（`getMatchingHooks`、`attention-hook-bridge.ts`）。按 `sortOrder`、`createdAt` 顺序串行执行。
+- 只有 `PreToolUse` 可阻塞：一旦某个钩子返回 `blocked` 就立即返回；其它事件的 `blocked` 被忽略，`error` 只记录告警、不中断，最后返回最后一个 error 或 success（`runHooks`）。
+- command 钩子：用 `bash -c` 执行，输入的 JSON 通过 stdin 传入，cwd 为叙述者目录，默认超时 30s；退出码 0 成功，2 为阻塞（原因取 stderr 否则 stdout），其它为 error；stdout/stderr 各最多保留 64KiB（`executeCommandHook`）。
+- http 钩子：POST JSON，可带自定义头和代理覆盖；响应非 2xx 为 error；响应体 `decision: "block"` 为阻塞（`executeHttpHook`）。
+- 每次执行发 `hook:executed` 事件（含结果与耗时），并写调试日志。
+- 触发点：工具循环的 `hookHandler`（受运行时策略 `capabilities.stopHooks` 约束，关闭时直接返回 success）、回合结束的 `Stop`、注意力事件桥接（`orchestrator.ts`、`attention-hook-bridge.ts`）。
+- 路由 `/api/hooks` 整体要求管理员（`routes/hooks.ts`：`requireAdmin`），含列表、`/all`、读取、创建、更新、删除。
+
+## 从哪读起
+- `server/services/hook-service.ts`：配置 CRUD、匹配、两种执行器。
+- `server/services/attention-hook-bridge.ts`：事件总线的 attention 意图转成钩子调用。
+
+## 相关
+- 钩子用 `bash` 执行命令，在 Windows 上依赖环境里有 bash（未核实是否有回退）。
