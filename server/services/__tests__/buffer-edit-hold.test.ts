@@ -35,6 +35,74 @@ test("begin is serialized with the complete async claim/validation section", asy
 	expect(await followingClaim).toBe(false);
 });
 
+test("same-token begin restores a lease expired during its revision read before a queued claim can run", async () => {
+	let now = 0;
+	const holds = createBufferEditHolds(() => now, 100);
+	await holds.begin("n", identity, async () => 7);
+	now = 99;
+	const reading = gate();
+	const resumeRead = gate();
+	const begin = holds.begin(
+		"n",
+		identity,
+		async () => {
+			reading.release();
+			await resumeRead.promise;
+			return 7;
+		},
+		7,
+	);
+	await reading.promise;
+	now = 101;
+	holds.expire();
+	expect(holds.held("n")).toBe(false);
+	const claim = holds.exclusive("n", () => !holds.held("n"));
+	resumeRead.release();
+	expect(await begin).toMatchObject({ ok: true, contentRevision: 7, expiresAt: 201 });
+	expect(holds.held("n")).toBe(true);
+	expect(await claim).toBe(false);
+	expect((await holds.renew("n", identity, 7)).contentRevision).toBe(7);
+});
+
+for (const initiallyHeld of [false, true])
+	test(`authorization loss during a ${initiallyHeld ? "same-token" : "new"} begin revision read cannot grant a lease`, async () => {
+		const holds = createBufferEditHolds();
+		if (initiallyHeld) await holds.begin("n", identity, async () => 7);
+		const reading = gate();
+		const resumeRead = gate();
+		const events: string[] = [];
+		const begin = holds.begin(
+			"n",
+			identity,
+			async () => {
+				reading.release();
+				await resumeRead.promise;
+				return 7;
+			},
+			7,
+		);
+		await reading.promise;
+		const revoked = holds.quiesceForAuthorizationLoss(
+			"n",
+			() => {
+				events.push("stop");
+			},
+			async () => {
+				events.push("clear");
+			},
+		);
+		expect(events).toEqual([]);
+		resumeRead.release();
+		const outcome = await begin.then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		await revoked;
+		expect(outcome).toMatchObject({ error: { statusCode: 409, code: "BUFFER_EDIT_CONFLICT" } });
+		expect(events).toEqual(["stop", "clear"]);
+		expect(holds.held("n")).toBe(false);
+	});
+
 test("same token renews idempotently; users and replacement tokens cannot steal or release a hold", async () => {
 	let now = 0;
 	const holds = createBufferEditHolds(() => now, 100);

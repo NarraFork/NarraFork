@@ -157,7 +157,8 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 				const existing = leases.get(id);
 				if (existing ? !matches(existing, identity) : mutations.has(id)) throw conflict();
 				const contentRevision = await readRevision();
-				if (contentRevision === undefined) throw conflict();
+				// Revocation can install its barrier synchronously while this lock awaits the read.
+				if (authorizationBarriers.has(id) || contentRevision === undefined) throw conflict();
 				// A retried begin is not permission to replace an editor's original snapshot.
 				if (
 					(expectedRevision !== undefined && expectedRevision !== contentRevision) ||
@@ -165,7 +166,13 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 				)
 					throw staleBufferEdit();
 				if (existing) {
+					const registered = leases.get(id);
+					if (registered && registered !== existing) throw conflict();
 					existing.expiresAt = now() + leaseMs;
+					// The unlocked expiry sweep may have removed this lease during the read.
+					// Restore it before success/claim admission, retaining its validated baseline.
+					leases.set(id, existing);
+					if (!registered) changed(id);
 					return response(existing);
 				}
 				const lease = { ...identity, expiresAt: now() + leaseMs, contentRevision };
