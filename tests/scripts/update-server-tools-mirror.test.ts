@@ -623,6 +623,7 @@ describe("canonical auxiliary binary mirror", () => {
 									webdav,
 									signingKey,
 									pollIntervalMs: 60_000,
+									downloadConcurrency: 3,
 									products: [{ product: "narrafork", repository }],
 								},
 								{ fetchImpl: dav.fetchImpl },

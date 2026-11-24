@@ -50,6 +50,24 @@ describe("optional update server WebDAV configuration", () => {
 		expect(JSON.stringify(config)).not.toContain(env.DAV_PASSWORD);
 	});
 
+	test("download concurrency defaults to 8 and accepts only numeric integers from 1 to 8", () => {
+		expect(resolveMirrorRelaySettings(config, env)?.downloadConcurrency).toBe(8);
+		for (const value of [1, 3, 8])
+			expect(
+				resolveMirrorRelaySettings(
+					{ ...config, mirrorRelay: { ...relay, downloadConcurrency: value } },
+					env,
+				)?.downloadConcurrency,
+			).toBe(value);
+		for (const value of [0, 9, -1, 1.5, NaN, Infinity, null, "", "3", true]) {
+			const mirrorRelay = { ...relay, downloadConcurrency: value } as unknown as MirrorRelayConfig;
+			expect(() => resolveMirrorRelaySettings({ ...config, mirrorRelay }, env)).toThrow();
+			expect(
+				resolveMirrorRelaySettings({ mirrorRelay: { ...mirrorRelay, enabled: false } }, {}),
+			).toBeUndefined();
+		}
+	});
+
 	test("download redirects stay disabled unless the operator explicitly configures CDN hosts", () => {
 		expect(resolveMirrorRelaySettings(config, env)?.webdav.downloadRedirectHosts).toBeUndefined();
 		const settings = resolveMirrorRelaySettings(

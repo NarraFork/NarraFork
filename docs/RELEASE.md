@@ -210,7 +210,8 @@ runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满�
     "usernameEnv": "MIRROR_DAV_USER",
     "passwordEnv": "MIRROR_DAV_PASSWORD",
     "signingKeyEnv": "MIRROR_RELAY_KEY",
-    "pollIntervalSeconds": 60
+    "pollIntervalSeconds": 60,
+    "downloadConcurrency": 8
   }
 }
 ```
@@ -221,7 +222,7 @@ runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满�
 
 1. runner 在 `narrafork-mirror-v1/<feed>/batches/<product>/<kind>/<UTC日期>/<jobId>/objects/` 上传原始文件及独立 commit payload；不读取 WebDAV 资产做回传验证。
 2. 最后上传 `ready/.../<manifestHash>.json`，其 HMAC 覆盖 feed、仓库、目标、jobId、时间和 payload 的大小/SHA256；ready ≤8 KiB，不内嵌最高 1 MiB 的 payload。没有完整合法 ready，服务器不会导入。
-3. 服务器自启动可取消的单并发拉取任务，验签、验证运营者配置仓库、拉取对象并校验大小/SHA256，复用 direct 的同一入库/提交锁。成功状态本地原子记录，重启重试幂等；同 catalog 不同 target 的 availability 不互相抹除，辅助 metadata 按精确 tag 不可变保存。
+3. 服务器自启动可取消的单作业拉取任务，验签、验证运营者配置仓库后，在作业内以有界并发拉取对象并校验大小/SHA256，复用 direct 的同一入库/提交锁。成功状态本地原子记录，重启重试幂等；同 catalog 不同 target 的 availability 不互相抹除，辅助 metadata 按精确 tag 不可变保存。
 4. workflow 成功只代表 `STAGED_FOR_PULL`（已暂存、待拉取），不等待服务器在线，不冒称 `MIRRORED`。服务器实际导入结果看本地 `Mirror relay pull` 日志及 `mirror-relay-state/<feed>/<product>.json`，不新增向 runner 回调或回传文件。
 
 容量与保留：ready 自创建起精确有效 7×24 小时，容许 5 分钟时钟偏差；离线超过期限需重新暂存。每产品/类型/日期最多 32 项，过大目录明确失败，不静默截断。轮询扫描通常 8 个、午夜偏差时最多 9 个 UTC 桶，每轮最多导入 4 项；失败退避不阻塞其他任务。默认单任务 main 25 分钟、helpers/executor 120 分钟；单 DAV 对象上传/下载及 relay 流式入库默认15分钟，direct 上传仍限120秒。可用受保护 Environment/repository 变量 `NF_MIRROR_TOTAL_TIMEOUT_MINUTES`（整数1–300）和 `NF_MIRROR_TRANSFER_TIMEOUT_MINUTES`（整数1–100，仅DAV）显式覆盖；本地 CLI 使用同名环境变量。空值保留默认，NaN、负数、小数和越界值失败，不自动降级。总预算贯穿 CLI→main/tools→签名 ready，工作流硬限330分钟，较最大300分钟预留30分钟安装依赖、保存失败receipt与artifact；仍可能硬取消，缺失/partial receipt不代表成功。
@@ -229,6 +230,8 @@ runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满�
 服务器独立配置 `mirrorRelay.totalTimeoutMinutes`（1–300）和 `mirrorRelay.transferTimeoutMinutes`（1–100），默认同上；不能从远端payload改变本地预算。显式单对象预算不得大于总任务预算（服务器不设置总预算时以兼容的main25分钟核对），只提高runner预算不能自动放宽服务器。显式 `mirrorLimits.uploadTimeoutMs` 始终是额外运营者上限（旧120000仍生效），调大relay配置不绕过它；主程序全量包direct上传/下载最多15分钟，v2提交最多25分钟；小metadata请求体和其他资产仍保留各自短预算。GitHub原始资产下载仍各有15分钟预算。各层父取消贯穿流式读写；runner不原地重试取消/超时，客户端取消/整体deadline不fallback；relay保留既有失败退避/幂等重放，stop取消不继续轮询。不回传资产校验，也不因更大预算放宽大小/总量/签名/保留期约束。总导入字节数最多 16 GiB，仍受服务器磁盘配额/空闲量限制。
 
 runner 清理只在**该日期桶次日 UTC 零点 +7 天 +24 小时宽限 +10 分钟时钟余量**之后进行；每次最多 12 个日期桶、30 秒，任务对象独占避免误删新引用。权限不足、预算耗尽或部分失败记为 `RETENTION_INCOMPLETE`，并不表示清理成功或 WebDAV 配额必然有界；运营者仍需监测容量。WebDAV 实际厂商网络/权限兼容性与本地 fixture 验收分开报告。
+
+并行拉取：服务器配置 `mirrorRelay.downloadConcurrency` 控制 WebDAV → 更新服务器的作业内对象下载，默认 **8**，仅接受数字整数 **1–8**；非法值明确失败，未启用 relay 时不解析。它与下述 runner 上传并发独立，不能由签名 payload 修改。主程序和辅助组件共用相同的有界调度语义；相同 SHA256/size 的对象只拉取一次，重复摘要大小冲突在资产传输前拒绝，完整逻辑资产仍在最终提交时验证。任一下载或入库失败，停止派发、取消在途传输并等待流清理完成；全部对象成功后才提交 snapshot/tools。作业及最终提交仍串行，磁盘预留、配额、大小/摘要与总任务期限不放宽。部署新版更新服务器后生效，不自动重启服务。
 
 并行上传：独立 workflow 的受保护 Environment/repository 变量及本地 CLI 环境变量 `NF_MIRROR_UPLOAD_CONCURRENCY` 未显式配置时 **direct默认2、WebDAV默认3**，只接受整数 **1–8**（空值使用默认；0、负数、小数、NaN、越界或含空白的字符串拒绝）。同一个有界池覆盖 main 的 binary/metadata/patch 与 helpers/executor 的完整“源下载→hash→上传”任务，不先把所有大文件下载落盘。临时文件逐任务独占；按最大N个去重物理文件之和 +64 MiB预留本地磁盘（N为并发数），单文件/总字节预算不变。相同SHA/size只传一次物理对象，逻辑资产仍完整校验；回执按canonical资产顺序输出，不依赖完成先后。
 
