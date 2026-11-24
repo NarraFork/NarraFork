@@ -129,11 +129,22 @@ for (const method of ["completion", "text"] as const) {
 			.update(backgroundTasks)
 			.set({ status: "running", output: null })
 			.where(eq(backgroundTasks.id, taskId));
+		const row = await backgroundTaskService.getById(taskId);
+		const initialRead = Promise.withResolvers<typeof row>();
+		spyOn(backgroundTaskService, "getById").mockReturnValueOnce(initialRead.promise);
+		const subscribed = Promise.withResolvers<void>();
+		const subscribe = eventBus.on.bind(eventBus);
+		spyOn(eventBus, "on").mockImplementation((type, handler) => {
+			subscribe(type, handler);
+			if (type === "background_task:completed") subscribed.resolve();
+		});
 		const waiting =
 			method === "text"
 				? backgroundTaskService.waitForText(taskId, "needle", 1000)
 				: backgroundTaskService.waitForCompletion(taskId, 1000);
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		// Worker reads may outlast a fixed sleep; publish only after the actual subscription.
+		initialRead.resolve(row);
+		await subscribed.promise;
 		await db
 			.update(backgroundTasks)
 			.set({ logicalRunId: "bash-run-2" })
