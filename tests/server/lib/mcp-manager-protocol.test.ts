@@ -2,9 +2,11 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
 	CallToolRequestSchema,
 	type CallToolResult,
+	type JSONRPCMessage,
 	ListToolsRequestSchema,
 	type ListToolsResult,
 	type Tool,
@@ -27,7 +29,7 @@ const config: McpServerConfig = {
 	mode: "auto",
 };
 const settings = { mcpServers: [config] };
-let clientTransport: InMemoryTransport;
+let clientTransport: Transport;
 let server: Server;
 let pages: Map<string | undefined, ListToolsResult | Error>;
 let result: CallToolResult;
@@ -43,6 +45,63 @@ const { mcpManager } = await import("../../../server/lib/mcp/manager");
 
 function tool(name: string, extra: Partial<Tool> = {}): Tool {
 	return { name, inputSchema: { type: "object", properties: {} }, ...extra };
+}
+
+/**
+ * Delivers a progress notification and its tools/call result in one synchronous
+ * burst, the way `StdioClientTransport.processReadBuffer` walks one stdout read.
+ */
+class SameReadTransport implements Transport {
+	onmessage?: Transport["onmessage"];
+	onclose?: () => void;
+	onerror?: (error: Error) => void;
+
+	async start(): Promise<void> {}
+
+	async close(): Promise<void> {
+		this.onclose?.();
+	}
+
+	async send(message: JSONRPCMessage): Promise<void> {
+		const deliver = this.onmessage;
+		if (!deliver || !("method" in message)) return;
+		if (message.method === "initialize") {
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: {
+					protocolVersion: "2025-11-25",
+					capabilities: { tools: {} },
+					serverInfo: { name: "same-read", version: "1" },
+				},
+			});
+			return;
+		}
+		if (message.method === "notifications/initialized") return;
+		if (message.method === "tools/list") {
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { tools: [tool("plain")] },
+			});
+			return;
+		}
+		if (message.method === "tools/call") {
+			const token = (message.params as { _meta?: { progressToken?: unknown } } | undefined)?._meta
+				?.progressToken;
+			if (token === undefined) throw new Error("tools/call had no progressToken");
+			deliver({
+				jsonrpc: "2.0",
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 2, total: 3, message: "batch-3" },
+			});
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { content: [{ type: "text", text: "ok" }] },
+			});
+		}
+	}
 }
 
 beforeEach(async () => {
@@ -429,5 +488,28 @@ describe("MCP uses one published directory without output-schema compilation", (
 		expect(await run([{ progress: 1, total: 2, message }])).toEqual([
 			{ completed: 1, total: 2, currentItem: `${"𐍈".repeat(80)}…` },
 		]);
+	});
+
+	test("progress delivered in the same read as the tools/call result still reaches execute", async () => {
+		clientTransport = new SameReadTransport();
+		const { prepareMcpTools } = await import("../../../server/lib/mcp/tool-bridge");
+		const { toolRegistry } = await import("../../../server/lib/agent/tool-registry");
+		mcpManager.prepareTools = prepareMcpTools;
+		await mcpManager.connect(config);
+		const definition = toolRegistry
+			.all()
+			.find((entry) => entry.metadata?.mcpServerId === config.id);
+		if (!definition) throw new Error("MCP definition was not published");
+		const payloads: ToolProgressPayload[] = [];
+		const ctx = {
+			signal: new AbortController().signal,
+			emitStructuredProgress: (progress: ToolProgressPayload) => {
+				payloads.push(progress);
+			},
+		} as ToolContext;
+		const output = await definition.execute({}, ctx);
+		expect(payloads).toEqual([{ completed: 2, total: 3, currentItem: "batch-3" }]);
+		expect(output.output).toBe("ok");
+		expect(output.isError).toBeUndefined();
 	});
 });

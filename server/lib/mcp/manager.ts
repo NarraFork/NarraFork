@@ -4,6 +4,9 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Progress, Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
 	CallToolResultSchema,
+	isJSONRPCErrorResponse,
+	isJSONRPCNotification,
+	isJSONRPCResultResponse,
 	ListToolsResultSchema,
 	ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -305,6 +308,13 @@ class McpManager {
 					CONNECT_TIMEOUT_MS,
 					`MCP connect to "${config.name}"`,
 				);
+				// SDK 1.29 runs notifications/progress in a microtask and deletes that
+				// handler as soon as the matching result is applied. Stdio's
+				// processReadBuffer and a streamable-HTTP JSON body both hand every
+				// frame in one read to onmessage before that microtask runs, so the
+				// result wins and the notice is dropped. Hold only that matching
+				// result for one microtask. Any other message is delivered unchanged.
+				holdResultBehindSameReadProgress(transport);
 				if (!this.isCurrent(entry) || entry.status === "error")
 					throw new Error("MCP connection superseded");
 				client.setNotificationHandler(ToolListChangedNotificationSchema, () => this.notify(entry));
@@ -667,6 +677,47 @@ class McpManager {
 }
 
 export const mcpManager = new McpManager();
+
+function finiteRpcId(value: unknown): number | undefined {
+	if (typeof value !== "number" && typeof value !== "string") return undefined;
+	const id = Number(value);
+	return Number.isFinite(id) ? id : undefined;
+}
+
+/**
+ * Keep a `notifications/progress` that shares a read with its tools/call result.
+ *
+ * The SDK invokes the progress handler on a microtask and drops it if the result
+ * has already removed the handler. Stdio and a JSON streamable-HTTP body deliver
+ * both frames synchronously. The matching result waits until that microtask has
+ * run. Other messages, including a result with no progress token in this turn,
+ * are passed through immediately.
+ */
+function holdResultBehindSameReadProgress(transport: Transport): void {
+	const deliver = transport.onmessage;
+	if (!deliver) return;
+	const pending = new Set<number>();
+	transport.onmessage = (message, extra) => {
+		if (isJSONRPCNotification(message) && message.method === "notifications/progress") {
+			const token = finiteRpcId(
+				(message.params as { progressToken?: unknown } | undefined)?.progressToken,
+			);
+			if (token !== undefined) pending.add(token);
+			deliver(message, extra);
+			if (token !== undefined) queueMicrotask(() => pending.delete(token));
+			return;
+		}
+		const responseId =
+			isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)
+				? finiteRpcId(message.id)
+				: undefined;
+		if (responseId !== undefined && pending.has(responseId)) {
+			queueMicrotask(() => deliver(message, extra));
+			return;
+		}
+		deliver(message, extra);
+	};
+}
 
 /** Bound each SDK request, not the total directory: a healthy next page may continue. */
 async function listAllTools(client: Client): Promise<Tool[]> {
