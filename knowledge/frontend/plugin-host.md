@@ -1,13 +1,38 @@
 ---
 id: frontend.plugin-host
 title: 插件界面宿主
-summary: 前端如何加载和承载插件界面、插件运行时约定。
+summary: 插件面板在沙箱 iframe 里运行、与宿主经 MessagePort RPC 通信；贡献快照存储、资产外壳与 CSP、共享 React/Mantine 运行时、浮层与主题。
 anchors:
   - frontend/plugin-runtime/
   - frontend/components/plugins/
-status: stub
-verified_at: null
+  - frontend/build/plugin-ui-runtime.ts
+  - frontend/App.tsx
+status: draft
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 插件界面宿主
 
-> 待填写：前端如何加载和承载插件界面、插件运行时约定。
+插件贡献的视图由前端放进沙箱 iframe 里渲染：宿主持有“有哪些贡献”的权威快照，为每个面板建一条会话，用 MessageChannel 上的 JSON-RPC 与 iframe 通信。服务端的插件生命周期与权限见[插件运行时](../automation/plugins/runtime.md)。
+
+## 关键规则
+- 隔离：iframe 为 `sandbox="allow-scripts"`、无 `allow-same-origin`（`PluginDockPanel.tsx`），内容走 `srcDoc`。`asset-shell.ts:createPluginAssetShell` 生成的外壳带 CSP：`default-src 'none'`，脚本只许 nonce 与资产源，`connect-src 'none'`，禁嵌套 frame/worker；资产 URL 必须同源 http(s)（`isAllowedPluginAssetUrl`）。CSP 里的 `sandbox` 在 meta 中无效，隔离只靠 iframe 属性。
+- 握手：`runtime.ts` 的会话控制器在 iframe `onLoad` 时建 `MessageChannel`，把 port2 连同 `{nonce, pluginId, contributionId, panelInstanceId}` 用 `postMessage` 交给 iframe；`handshake` 请求里 nonce 与三个标识必须与会话一致，否则回 `INCOMPATIBLE` 并置崩溃；握手超时默认 10s（`PLUGIN_UI_DEFAULT_TIMEOUT_MS`）。
+- 协议 `narrafork.ui/1`（`protocol.ts`）：消息经 zod 严格校验；负载上限（`runtime.ts:assertPayload`）请求 5 MiB、响应 1 MiB，面板参数里的 `viewState` 上限 16 KiB；JSON 值深度 ≤32，禁 `__proto__/prototype/constructor` 键。方法分两类：宿主本地（`context.*`、`panel.*`、`notifications.show`、`ui.navigate`、`overlay.setBounds` 等，宿主直接处理）和后端转发（`queries/commands/events/storage/config/secrets/diagnostics`，经 `session-client.ts` 走 `/plugins/ui/sessions/<id>/request`）。不在两张表里的方法不被接受。
+- 会话与资产：`session-client.ts` 向 `POST /plugins/ui/sessions` 取 `sessionId`、`connectNonce`、`sessionToken`、`assetToken`；资产 URL 形如 `/plugins/ui/<pluginId>/<version>/<hash>/asset/<sessionId>/<assetToken>/<path>`。
+- 贡献快照：`PluginContributionStore.ts:pluginContributionStore` 是宿主自有的外部存储（上限 `PLUGIN_CONTRIBUTION_LIMIT` = 200），`registry.ts:syncPluginUiContributions` 从 `/plugins/ui/contributions` 整体替换；iframe 无法改它。`App.tsx:PluginRuntimeShell` 在收到 WS 事件 `plugin_contributions_changed`、以及 WS 重连时让快照失效重取；找不到贡献按“缺失”状态处理而不是通用错误。
+- 共享运行时：只有声明 `runtime: "host-react"` 的视图才加载 `/plugin-runtime/vendor.js|css`（`runtime.ts` 里 `usesHostRuntime`）；`plugin-runtime/vendor.ts` 把 React、ReactDOM client、JSX runtime、`@mantine/core`、`@mantine/hooks` 挂到 `globalThis.__nfPluginRuntime`（冻结，带 `PLUGIN_UI_RUNTIME_VERSION`）；这两个文件名不带哈希，靠 `no-cache` 重验证（`paths.ts`）。`@mantine/notifications` 不暴露，通知走宿主。
+- 主题与语言：`host-tokens.ts` 从实时 `<html>` 读计算后的颜色令牌（所以 OLED、插件主题自动传导）注入 iframe；`PluginThemeInjector.tsx` 是另一件事——把服务端编译的插件主题 CSS 注入宿主文档，用 `data-plugin-theme` 切换。
+- 面板挂载点：`plugin-dockview-components.ts` 以组件键 `plugin` 注册 `PluginDockPanel`；绑定范围 `host-surface` 的取值是 focus、workspace、director、settings、provider-settings、overlay（`protocol.ts:HOST_SURFACE_VALUES`）。
+- 浮层：`PluginOverlayHost.tsx` 把 `overlay` 视图放在全视口、`pointer-events: none` 的 iframe 里，视图用 `overlay.setBounds` 声明一块可交互矩形，宿主在该处放透明命中区转发指针；宿主始终提供“隐藏”按钮，是否显示是每用户偏好（`usePluginOverlayVisibility`）。
+
+## 从哪读起
+- `frontend/components/plugins/PluginDockPanel.tsx`：面板视图与 iframe。
+- `frontend/components/plugins/runtime.ts`、`session-client.ts`、`protocol.ts`：会话、后端请求、协议。
+- `frontend/components/plugins/PluginUiRuntimeProvider.tsx`：把宿主能力（导航、通知、上下文）接给会话。
+- `frontend/components/plugins/asset-shell.ts`：外壳 HTML 与 CSP。
+
+## 相关
+- [插件运行时](../automation/plugins/runtime.md)、[插件贡献](../automation/plugins/contributions.md)：服务端一侧。
+- [面板与布局](panels.md)：dockview 里的 `plugin` 面板。
+- [PWA 与远程前端](pwa-remote.md)：远程构建不含插件宿主（用 `remote/plugin-boundary.tsx` 的空实现替换）。
+- [通用组件与主题](components-theme.md)
