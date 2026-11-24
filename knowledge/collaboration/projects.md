@@ -41,7 +41,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 7a8bdfb90
+verified_at: 0bb5312c7
 ---
 # 项目
 
@@ -85,6 +85,7 @@ verified_at: 7a8bdfb90
 - 改项目 ACL：`project-acl.ts` 是唯一判定入口，大纲 `outline/access.ts` 与 `narrator-acl.ts` 依赖它的语义（`outline/__tests__/access-parity.test.ts`）；成员变更必须保留审计与通知（`project-membership-authority.test.ts`）。
 - 新增项目写路由：先调 `requireSqliteProjectMutation`（PG 返回 503），再做权限检查；不存在与不可见都抛 NotFound。
 - 列表接口形状是契约（裸数组、`updatedAt` 降序、无参返回全部），改成分页信封会破坏现有调用方。
+- 项目页加东西：`frontend/components/project/project-page.test.tsx` 把 Mantine、React Query、i18n 都换成了桩，新引入的组件要么不依赖真实的 i18n 初始化，要么在那里 mock 掉（固定到侧栏按钮就是 mock 的）。
 
 ## 相关
 - [团队](teams/index.md)
