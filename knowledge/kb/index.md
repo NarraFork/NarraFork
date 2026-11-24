@@ -3,6 +3,13 @@ id: knowledge
 title: 知识
 summary: 团队知识库、大纲，以及这棵仓库知识树本身。
 anchors: []
+keywords:
+  - 知识库
+  - 大纲
+  - outline.enabled
+  - /api/knowledge
+  - /api/outline
+  - 仓库知识树
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

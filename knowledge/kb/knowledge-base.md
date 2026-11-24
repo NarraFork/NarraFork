@@ -51,6 +51,24 @@ anchors:
   - server/lib/validators/knowledge-packs.ts
   - server/lib/validators/knowledge.ts
   - shared/knowledge-excerpt.ts
+keywords:
+  - /api/knowledge
+  - /api/knowledge/packs
+  - knowledge.injectMode
+  - knowledge_entries
+  - knowledge_revisions
+  - knowledge_submissions
+  - knowledge_grants
+  - knowledge_drafts
+  - knowledge_entry_links
+  - 密级
+  - 受控 tag
+  - 发布申请
+  - 个人条目
+  - 知识包
+  - KnowledgeSearch
+  - KnowledgeAdmin
+  - 关键词注入
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -72,12 +90,23 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 审计与通知：授权变更写追加式审计，只记录密级名、tag id 与布尔值，写失败不影响主操作（`knowledge-audit.ts`）；评审相关推送只发 id 类失效信号，不含标题正文，客户端经带 ACL 的 HTTP 重取，不进通知中心表（`knowledge-notify.ts`）。
 - Agent 工具：KnowledgeSearch / KnowledgeRead / KnowledgeLibrary / KnowledgeCreate / KnowledgeEdit / KnowledgeReview / KnowledgeAdmin（`server/lib/agent/tools/knowledge*.ts`）。
 
+- 前端：路由在 `frontend/routes/knowledge/`（`index` 浏览、`$entryId/{index,edit,history,settings}`、`mine/*` 个人条目、`requests/$submissionId` 发布申请、`review` 评审、`admin/{levels,tags,users}`）；旧 URL 的重定向判定集中在 `frontend/lib/knowledge-review-nav.ts`（纯函数，有单测）。组件按 `browse/ entry/ editor/ personal/ admin/` 分目录，申请/评审面板在 `components/knowledge/` 根下；API 客户端 `lib/api/knowledge.ts`，注入命中摘要的纯文本化在 `shared/knowledge-excerpt.ts`。
+- 知识库的路由 `/api/knowledge` 里：集合、条目（含修订、链接、图）、个人条目、草稿（drafts：diff/rebase/submit）、submissions（review/resolve/withdraw/resubmit）、levels/tags/tag-types/grants/users acl（管理员）、acl-events、review-inbox、my-* 系列；知识包在 `/api/knowledge/packs`（上传/替换归档/下载/激活列表/停用）（`routes/knowledge.ts`、`knowledge-packs.ts`）。
+
 ## 从哪读起
 - `server/services/knowledge-acl.ts`：权限判定。
 - `server/services/knowledge-service.ts`：集合/条目/修订/搜索。
 - `server/services/knowledge-branch-service.ts`：个人条目、发布申请、评审。
 - `server/routes/knowledge.ts`：HTTP 面。
 - 测试：`server/services/__tests__/knowledge-acl.test.ts`、`knowledge-review-lifecycle.test.ts`、`knowledge-drift-rebase.test.ts`、`knowledge-pack.test.ts`。
+
+## 改它时
+- 动 `knowledge_*` 表：SQLite（`server/db/schema.ts`）与 PG（`postgres-schema.ts`）两套；读写存储端口在 `server/services/knowledge/`（`sqlite-*-store` / `postgres-*-store`，`store.ts` 选择），两边实现一起改；`sqlite-read-store.ts` 与 `server/lib/db-worker/knowledge-entry-*.ts` 的方言特性登记在 `server/db/sqlite-dialect-inventory.guard.test.ts`。
+- 知识库表不在 `SNAPSHOT_TABLES`（`server/db/snapshot-protocol.ts` 里没有 knowledge 表），不随数据导出；这是现状，不是自动覆盖。
+- 加或改 agent 工具：`server/lib/agent/tools/index.ts` 的注册表、`knowledge-kind.ts`（工具名常量，供权限/策略模块免 import 注册表）、`server/services/__tests__/knowledge-agent-tools.test.ts`。
+- 改授权判定：`knowledge-acl.ts:canRead` 等是唯一来源，路由与工具都经它；对应测试 `knowledge-acl.test.ts`、`knowledge-viewer-caps.test.ts`、`knowledge-collection-acl.test.ts`。无权读时必须仍是 NotFound，不能变 403。
+- 改发布申请状态机：`knowledge-branch-service.ts` 与 `knowledge/write-store.ts` 状态集一起改，前端 `SubmissionStatusBadge.tsx` 是状态到颜色的唯一映射；`request-actions.ts` 的可用动作只由服务端返回的 `viewerCaps` 推出，新增动作要服务端先给能力位。
+- 新增设置键 `knowledge.*`：`server/lib/settings/defaults.ts` 的默认值与说明一起加。
 
 ## 相关
 - [大纲](outline.md)

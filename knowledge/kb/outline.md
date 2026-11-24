@@ -165,6 +165,35 @@ anchors:
   - shared/outline-tasks-view-diff.ts
   - shared/outline-tool-display.ts
   - shared/outline/
+  - server/services/task-source/backend.ts
+  - server/services/task-source/index.ts
+  - server/services/task-source/outline-behavior.ts
+  - server/services/task-source/outline-plugin-rules.ts
+  - server/services/task-source/outline-read.ts
+  - server/services/task-source/outline-views.ts
+  - server/services/task-source/outline.ts
+  - server/services/task-source/types.ts
+  - frontend/hooks/useTaskBoard.ts
+  - server/websocket/outline-live-ws.ts
+  - server/websocket/outline-page-ws.ts
+keywords:
+  - outline.enabled
+  - outline.specImport
+  - /api/outline
+  - OutlineRead
+  - OutlineEdit
+  - OutlineSearch
+  - outline_blocks
+  - outline_commits
+  - outline_block_versions
+  - outline_pending
+  - outline_task_claims
+  - 汇报
+  - 任务看板
+  - 待确认变更
+  - Dynamic Spec 导入
+  - task_backend
+  - outline:committed
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -185,6 +214,23 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 旧 Dynamic Spec（`spec://`）会话按 `outline.specImport`（默认 `auto`）导入大纲（`outline/spec-import/`、`routes/admin-outline-spec-import.ts`）。
 - 存储端口有 SQLite 与 PG 两种实现，`outline/store/` 下由契约测试覆盖（`__tests__/store-contract.test.ts`）；大文本规范化放在 worker（`edit-text-worker.ts`）。
 
+- 任务来源：会话的任务存在哪由 `narrators.task_backend`（`spec` | `outline`，创建根会话时在大纲开启时记为 `outline`，之后不变，导入才改）决定；`task-source/backend.ts` 读它并做内存缓存（最多 4096 个叙述者，`outline.enabled` 每次调用都重读、不缓存），`task-source/index.ts:taskSourceForNarrator` 选实现，解析失败回退 spec。续跑、任务摘要、行为边界、中断守卫、compact 都读这个接口，大纲实现分在 `outline.ts`（任务）、`outline-views.ts`（视图）、`outline-behavior.ts`（旧 `spec://behavior_fence` 导入为行为页）、`outline-plugin-rules.ts`（插件规则页）、`outline-read.ts`。子代理沿用根会话的后端；大纲下子代理没有自己的任务（`task-source/index.ts` 头注释）。
+- 页面通道：`/ws/narrator` 上有两条与大纲有关的通道——只读页面订阅（`websocket/outline-page-ws.ts`：只发页面 id、最新 seq 和提交 id，不带内容，客户端再经 HTTP 重读；合并窗口、每连接/页订阅上限、发送缓冲超限即关闭连接）和 Yjs 二进制实时会话（`websocket/outline-live-ws.ts`，以魔数字节分流，匿名公开分享连接不会进入会话）。
+
+## 组成（按目录，描述性）
+服务端 `server/services/outline/`：
+- 访问与存储：`access.ts`/`access-reads.ts`（判定与两种数据库共用的 SQL 读）、`spaces.ts`、`model.ts`、`keys.ts`（块地址 `key/sid`）、`store/`（`port.ts` 端口、`sqlite-store`/`postgres-store`、读端口 `sqlite-read`/`postgres-read`、汇报端口 `*-digest`）。
+- 写与读：`write.ts`、`revert.ts`、`links.ts`、`tree.ts`/`render.ts`/`read.ts`/`views.ts`/`space-tree.ts`、`search.ts`、`resolve.ts`、`view-state.ts`（每人每页的折叠状态）、`edit-text*.ts`（OutlineEdit 的文本解析，worker 执行）。
+- 实时：`live/`（`session`、`registry`、`mirror`、`replay`、`normalize`、`lane`、`agent-presence`）与 `live-barrier.ts`。
+- agent 面：`agent-read/edit/merge/scope.ts`、`read-ledger.ts`、`session-scope.ts`、`link-display.ts`、`messages.ts`、`note-rules.ts`。
+- 任务与协作：`tasks.ts`、`task-json.ts`、`task-board.ts`、`person-tasks.ts`、`assignee.ts`/`assigned.ts`、`transfer.ts`、`hand-out.ts`、`handoff.ts`、`release.ts`、`lease-keeper.ts`、`task-session.ts`、`task-finished.ts`、`delegation*.ts`、`report-text.ts`/`report-authors.ts`、`team-activity.ts`/`team-events.ts`/`team-wake.ts`、`overlap.ts`、`plugin-tasks.ts`/`plugin-task-events.ts`、`in-process.ts`。
+- 计划与确认：`plans.ts`、`plan-diff.ts`、`locks.ts`、`pending*.ts`、`questions.ts`、`inbox.ts`。会话侧的计划模式在 `server/services/outline-plan-mode.ts`，人对任务的编辑回告会话在 `outline-task-edits.ts`。
+- 汇报：`digest*.ts`（作业按切片后台运行，一人一日一份，时区见用户偏好）。
+- 导入：`spec-import/`（导入器、触发器、管理端、被吞内容排查 `loss-*`）。
+- 其他：`workspace-title-outline.ts` 在大纲提交后让受影响工作区的自动标题失效（只扫按 kind 索引的成员、分页让出）。
+
+前端：`frontend/components/outline/`（页面 `OutlineView`/`OutlineSurface`、`tree/`、`editor/`（Yjs 编辑器与 `live-*`）、`mindmap/`、`plan/`、`task-board/`、`digest/`、`QuickSwitcher`）、`outline-dock/`（会话旁的页面坞）、`routes/outline/`（`/outline`、`/outline/$spaceId[/$blockId]`、`digest`、`ref`）、设置页 `settings/outline-import`（`SpecImportAdminSection`/`SpecLossAdminSection`，仅管理员）与 `OutlineDigestSettingsSection`、`hooks/useOutline*.ts`、`lib/outline-*.ts`。共享类型在 `shared/outline*.ts` 与 `shared/outline/`（后者须保持纯净，守卫测试 `shared/outline/__tests__/purity.guard.test.ts`）。
+
 ## 从哪读起
 - `server/services/outline/model.ts`：词汇与写入不变量。
 - `server/services/outline/write.ts`：写入路径。
@@ -192,6 +238,14 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/routes/outline.ts`：HTTP 门禁顺序（头注释列出）。
 - `server/lib/agent/tools/outline.ts`：工具定义。
 - 测试：`server/services/outline/__tests__/`（`access-parity`、`store-contract`、`task-*`、`digest.e2e`）。
+
+## 改它时
+- 动大纲表（`outline_*`，SQLite 在 `server/db/schema.ts`，PG 在 `postgres-schema.ts`）：两种存储实现（`store/sqlite-store.ts`、`store/postgres-store.ts`）与契约测试 `__tests__/store-contract.test.ts` 一起改；SQLite 读端用到 FTS5/json1 的位置登记在 `server/db/sqlite-dialect-inventory.guard.test.ts`，改写法会让它失败。
+- 大纲会话附属表不进数据导出：`outline_spec_imports`、`outline_spec_loss_*` 由 `data-portability.ts` 在覆盖/清空时单独处理，新增同类表要在那里补。
+- `shared/outline/` 只能 import 自身与 `marked`、不得用 DOM 或 Node 内置，`purity.guard.test.ts` 枚举全部模块。
+- 新增 agent 工具名放 `outline-names.ts`；`OutlineEdit` 文本解析走 worker，失败不得回退主线程，见 `tests/worker-main-thread-fallback.guard.test.ts`、`server/lib/compiled-worker.guard.test.ts`（登记 `edit-text-worker.ts`）。
+- 新增 HTTP 路由要放在 `routes/outline.ts` 头注释列出的门禁顺序里（开关 → 鉴权 → 逐人访问判定）；新增访问规则同步 `__tests__/access-matrix.ts`（SQLite 的 `access.test.ts` 与 PG 套件共用）和 `access-parity.test.ts`。
+- 新增 WS 帧/事件：页面订阅帧在 `shared/outline-page-events.ts`，实时帧在 `shared/outline-live-protocol.ts`。
 
 ## 相关
 - [团队知识库](knowledge-base.md)：知识库不受大纲开关影响。

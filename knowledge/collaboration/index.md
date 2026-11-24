@@ -3,6 +3,14 @@ id: collaboration
 title: 协作
 summary: 项目、团队、聊天、通知与注意力、分享、IM 网关（钉钉只是通知渠道，不在网关内）。
 anchors: []
+keywords:
+  - 协作
+  - 多人协作
+  - POSTGRES_UNSUPPORTED
+  - 团队
+  - 通知
+  - 分享
+  - IM 网关
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -21,10 +29,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 下面有什么
 
-- [项目](projects.md)：会话按工作目录自动归入项目、项目链接索引、项目页。
-- [团队](teams.md)：协调者 + 子代理树、工作项、跨团队重叠、团队页、多人使用。
+- [项目](projects.md)：会话按工作目录自动归入项目、项目链接索引、项目页、项目列表读适配器、默认项目目录与收藏目录。
+- [团队](teams.md)：协调者 + 子代理树、工作项、跨团队重叠与独占路径、协调者软限制与团队状态、团队页、多人使用。
 - [聊天与站内消息](chat.md)：聊天房间种类、成员间消息。
 - [通知与注意力](notifications.md)：通知中心、注意力列表、最近标签页提醒、扇出。
 - [分享](sharing.md)：公开会话分享、文件分享。
-- [IM 网关](gateway.md)：钉钉/飞书接入、会话映射、命令。
+- [IM 网关](gateway.md)：Telegram/Discord/Slack/飞书/微信/QQ/Webhook 接入、会话映射、命令（钉钉不在网关里）。
 - [最近标签页](recent-tabs.md)：每个用户最近打开的会话标签页：记录、运行时信息、作为通知和提醒的接收人来源。
