@@ -1,6 +1,7 @@
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { modelCatalogApi } from "../lib/api/model-catalog";
 import {
@@ -13,6 +14,7 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
+import { followOptionLabel } from "../lib/follow-model-label";
 import { createModelOptionsFilter } from "../lib/model-search";
 import type { ProviderCapabilityKey } from "./usePlatform";
 
@@ -212,6 +214,8 @@ export function classifyFallbackModelPresence(args: {
  */
 export function useAllModels() {
 	const qc = useQueryClient();
+	// The follow-default/summary rows and their groups are shown to people: never the sentinel.
+	const { t } = useTranslation("narrator");
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -731,13 +735,14 @@ export function useAllModels() {
 			value: string,
 			provider: string,
 			targetValue: string,
+			unsetLabel: string,
 		): ModelOption => {
 			const target = visibleModels.find((m) => m.value === targetValue);
 			return {
 				value,
-				// `|| targetValue` guards against an empty target label; `|| value`
-				// guards against an empty targetValue so the label is never "".
-				label: target?.label || targetValue || value,
+				// The target's label, else its value; with no target configured, the role's
+				// "not configured" text — never the sentinel `value` itself.
+				label: followOptionLabel(target?.label, targetValue, unsetLabel),
 				provider,
 				...(target?.pricing ? { pricing: target.pricing } : {}),
 				...(target?.officialInputUsd != null ? { officialInputUsd: target.officialInputUsd } : {}),
@@ -762,13 +767,14 @@ export function useAllModels() {
 		// hardcoded fallback: showing a concrete model here would present a
 		// provider the user never configured as the current default, and the
 		// resulting failure would name that phantom model instead of the real
-		// cause. `buildFollowOption` already falls back to labelling the entry
-		// with its own sentinel when the target is empty.
+		// cause. `buildFollowOption` labels the entry "not configured" when the
+		// target is empty.
 		const defaultModelValue = settingsData?.agent?.defaultModel || "";
 		const followDefaultOption = buildFollowOption(
 			FOLLOW_DEFAULT_MODEL,
 			"__default__",
 			defaultModelValue,
+			t("followDefaultUnset"),
 		);
 
 		// Use `||` (not `??`) so a stored empty string (e.g. after the summary
@@ -777,12 +783,13 @@ export function useAllModels() {
 		// summary model follows the default model. Never surface a hardcoded
 		// model that is not actually configured: it would masquerade as a real
 		// selection and mislead the user. Both may be "" pre-setup, in which case
-		// `buildFollowOption` labels the entry with its sentinel value.
+		// `buildFollowOption` labels the entry "not configured".
 		const summaryModelValue = settingsData?.agent?.summaryModel || defaultModelValue;
 		const followSummaryOption = buildFollowOption(
 			FOLLOW_SUMMARY_MODEL,
 			"__summary__",
 			summaryModelValue,
+			t("followSummaryUnset"),
 		);
 
 		// --- auto:<model> (docs/PROVIDER-SOURCING-DESIGN.md §4.1, §10.2) ---
@@ -813,10 +820,10 @@ export function useAllModels() {
 		];
 		const groupedModels = groupModelsByProvider(visibleWithDefault, {
 			...providerLabels,
-			__default__: "Default",
-			__summary__: "Summary",
+			__default__: t("modelGroupDefault"),
+			__summary__: t("modelGroupSummary"),
 			__auto__: "Auto",
-			__agg__: "Aggregations",
+			__agg__: t("modelGroupAggregations"),
 		});
 
 		// Provider prefix → NUG provider id. Model pickers group by prefix, so this
@@ -901,5 +908,5 @@ export function useAllModels() {
 			/** `auto:<model>` rows, each with its sources in routing order. */
 			autoModels: autoOptions,
 		};
-	}, [settingsData, autoModelsData]);
+	}, [settingsData, autoModelsData, t]);
 }

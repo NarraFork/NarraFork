@@ -11,6 +11,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { MODEL_MENU_POSITIONING } from "./model-menu-selection";
@@ -63,7 +64,7 @@ export function ModelPickerMenu({
 			value: m.value,
 			label:
 				m.value === FOLLOW_DEFAULT_MODEL
-					? t("followDefault", { model: defaultModelValue })
+					? followDefaultLabel(t, defaultModelValue)
 					: m.provider === "__agg__"
 						? `⚡ ${m.label}`
 						: m.provider === "__auto__"

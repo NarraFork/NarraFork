@@ -236,5 +236,6 @@
 			"archived": "the project of this directory is archived.",
 			"readOnly": "you can only read the project of this directory."
 		}
-	}
+	},
+	"followDefaultUnset": "Default model (not configured)"
 }

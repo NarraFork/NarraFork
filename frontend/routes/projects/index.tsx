@@ -329,6 +329,7 @@ function ProjectListPage() {
 							/>
 						}
 					>
+						{/* Suggestions open upwards: the dialog's Create button sits right below. */}
 						<DirectoryPicker
 							label={t("repositoryPath")}
 							placeholder={pathPlaceholder}
@@ -338,6 +339,7 @@ function ProjectListPage() {
 							error={repoPathError}
 							required
 							disabled={isCloning}
+							dropdownPosition="top"
 						/>
 					</Suspense>
 					{isCloning && (

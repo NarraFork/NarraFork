@@ -3,9 +3,16 @@
  * columns, the state icons, card marks, activity wording, the poll backoff and the pause order.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { OUTLINE_STATUS_KEYS } from "@shared/outline-status";
 import {
+	COORDINATOR_OVERRUN_EVENT_PREFIX,
+	COORDINATOR_OVERRUN_KINDS,
 	TEAM_BOARD_COLUMN_STATES,
+	TEAM_LEVEL_EVENT_KINDS,
+	TEAM_OVERLAP_EVENT_KINDS,
+	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_WORK_EVENT_KINDS,
 	TEAM_WORK_ITEM_STATES,
 	type TeamBoardItem,
 	type TeamPageSummary,
@@ -141,6 +148,39 @@ describe("activity wording", () => {
 		expect(eventLabelKey("team.decision")).toBe("team_decision");
 		expect(eventLabelKey("coordinator.overrun.readLines")).toBe("overrun");
 		expect(eventLabelKey("x.future")).toBe("other");
+	});
+
+	test("every recorded kind has a headline in both locales, and unknown kinds a generic one", () => {
+		const kinds = [
+			...TEAM_LEVEL_EVENT_KINDS,
+			...TEAM_WORK_EVENT_KINDS,
+			...TEAM_OVERLAP_EVENT_KINDS,
+			...TEAM_PERSON_DECISION_EVENT_KINDS,
+			...COORDINATOR_OVERRUN_KINDS.map((kind) => `${COORDINATOR_OVERRUN_EVENT_PREFIX}${kind}`),
+		];
+		expect(kinds).toContain("work.merged");
+		for (const locale of ["en", "zh-CN"]) {
+			const labels = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.event as Record<string, string>;
+			for (const kind of kinds) {
+				const key = eventLabelKey(kind);
+				expect({ locale, kind, key: key === "other" ? null : key }).toEqual({
+					locale,
+					kind,
+					key: expect.any(String),
+				});
+				expect({ locale, kind, label: labels[key] }).toEqual({
+					locale,
+					kind,
+					label: expect.any(String),
+				});
+				expect(labels[key]).not.toContain(kind);
+			}
+			// The fallback is readable text with no interpolation of the raw kind.
+			expect(labels.other).toBeString();
+			expect(labels.other).not.toContain("{{");
+		}
 	});
 
 	test("notes from the details", () => {
