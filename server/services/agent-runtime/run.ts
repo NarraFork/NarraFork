@@ -16,7 +16,7 @@ import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-co
  * registers those facts; any two sessions can be related the same way.
  */
 
-import { readQuery, readQueryFirst } from "@server/db/worker-read";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq, inArray } from "drizzle-orm";
@@ -99,6 +99,9 @@ export interface StartNarratorRunRequest {
 	registeredStart?: RegisteredAgentStart;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
+	recoveryObservation?: import("../recovery-observation").RestartNarrator;
+	parentRecoveryTurn?: import("../recovery-observation").ParentRecoveryTurn;
+	onRegistered?: () => void;
 	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
 	convergeOnlyActiveProjections?: boolean;
 	/** Recovery that must not deliver into a call that already has its result. */
@@ -244,7 +247,10 @@ async function prepareLogicalRun(
 			resumeRunId: req.resumeRunId,
 			binding,
 			expectedSource: row,
+			recoveryObservation: req.recoveryObservation,
+			parentRecoveryTurn: req.parentRecoveryTurn,
 		});
+	req.onRegistered?.();
 	if (!deliverTo || !publicationRun) return { binding: registered };
 	// A caller waiting in the foreground receives the result itself, never via a task.
 	// A new run that only inherits a destination which already holds an earlier
@@ -2055,7 +2061,9 @@ async function deliverHeldResult(
 }
 
 /** Restore holds after a restart from their durable `taken_over` mirror; returns the ids. */
-export async function hydrateRunHolds(): Promise<Set<string>> {
+export async function hydrateRunHolds(
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<Set<string>> {
 	const { asc, gt } = await import("drizzle-orm");
 	const PAGE = 500;
 	const startedAt = Date.now();
@@ -2071,7 +2079,7 @@ export async function hydrateRunHolds(): Promise<Set<string>> {
 				.where(gt(narrators.id, after))
 				.orderBy(asc(narrators.id))
 				.limit(PAGE),
-			{ executionPolicy: "worker-required", maxRows: PAGE },
+			{ ...options, executionPolicy: "worker-required", maxRows: PAGE },
 		);
 		scanned += rows.length;
 		for (const row of rows) {

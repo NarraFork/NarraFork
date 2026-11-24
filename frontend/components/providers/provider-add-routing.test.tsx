@@ -14,8 +14,10 @@ import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ComponentProps } from "react";
 import type { Root } from "react-dom/client";
+import { getSourcingCatalog } from "../../../server/lib/sourcing/presets";
 import commonLocale from "../../locales/en/common.json";
 import settingsLocale from "../../locales/en/settings.json";
+import { SOURCING_CATALOG_QUERY_KEY } from "./provider-catalog";
 import { createSnapshot, providersStateFromSettings } from "./providers-reducer";
 import { TOKENDANCE_FLOW_MARKER, tokenDanceDraftSnapshot } from "./tokendance-flow";
 
@@ -338,6 +340,7 @@ beforeEach(() => {
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
 	queryClient.setQueryData(["admin", "settings"], initialSettings);
+	queryClient.setQueryData(SOURCING_CATALOG_QUERY_KEY, getSourcingCatalog());
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);

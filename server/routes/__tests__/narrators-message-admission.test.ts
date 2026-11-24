@@ -21,6 +21,7 @@ import { DbReadTaskOverloadedError } from "../../lib/db-worker/pool";
 import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
+import { narratorSurfaceReadOptions } from "../../services/narrator-surface-reads";
 
 // Run the real parser/HTTP handler with injected service boundaries, without
 // initializing the database or mocking process-global agent modules.
@@ -193,6 +194,8 @@ function fixture(
 		getUserLanguage: async () => "zh-CN",
 		getUserReplyInLanguage: async () => true,
 		readMessageLanguagePreferences,
+		narratorSurfaceReadOptions,
+		readQueryFirst: async (query: Promise<unknown[]>) => (await query)[0],
 		acceptUserMessage: accept,
 		sendMessage: legacySend,
 		pushBufferedMessage: legacyPush,
@@ -203,6 +206,9 @@ function fixture(
 		db: {
 			query: {
 				users: {
+					findMany: async () => [
+						{ id: "owner", username: "Alice", avatarColor: "blue", avatarImageId: null },
+					],
 					findFirst: async () => ({
 						id: "owner",
 						username: "Alice",

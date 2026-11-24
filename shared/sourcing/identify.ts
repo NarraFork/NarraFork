@@ -79,9 +79,11 @@ const RULES: readonly IdentifyRule[] = [
 	{ templateId: "kimi-code", region: "china", matches: onDomain("kimi.com") },
 	{ templateId: "kimi-code", region: "international", matches: onDomain("kimi.ai") },
 	{ templateId: "opencode-go", matches: (_url, baseUrl) => isOpencodeGoBaseUrl(baseUrl) },
-	// The add page's `/anthropic/v1` preset is not listed: the balance check this replaced
-	// never matched it, and widening that is a behaviour change for its own PR.
-	{ templateId: "deepseek", matches: officialRoot("api.deepseek.com", ["/", "/v1", "/anthropic"]) },
+	{
+		templateId: "deepseek",
+		// `/anthropic/v1` is the add page's Anthropic preset.
+		matches: officialRoot("api.deepseek.com", ["/", "/v1", "/anthropic", "/anthropic/v1"]),
+	},
 	{ templateId: "openai", matches: officialRoot("api.openai.com", ["/", "/v1"]) },
 	{ templateId: "anthropic", matches: officialRoot("api.anthropic.com", ["/", "/v1"]) },
 	{

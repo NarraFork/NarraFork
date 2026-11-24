@@ -1,16 +1,22 @@
 import { describe, expect, test } from "bun:test";
+import type { SourceRegion } from "@shared/sourcing/identify";
+import type { ProviderBilling, ProviderPreset } from "@shared/sourcing/presets";
+import { sourcingRoutes } from "../../../server/routes/sourcing";
 import en from "../../locales/en/settings.json";
 import zh from "../../locales/zh-CN/settings.json";
 import {
-	getConnectionFamily,
-	getInitialConnectionSelection,
-	getPopularProviderPresets,
-	POPULAR_PROVIDER_IDS,
-	type ProviderBilling,
-	type ProviderRegion,
+	connectionClusters,
+	getProviderPresetName,
+	initialConnectionSelection,
+	popularProviderPresets,
 	resolveProviderConnection,
-} from "./provider-connection-presets";
-import { PROVIDER_PRESETS, type ProviderPreset } from "./provider-presets";
+	searchProviderPresets,
+} from "./provider-catalog";
+
+// What the add page receives from GET /api/sourcing/templates.
+const PROVIDER_PRESETS = (
+	(await (await sourcingRoutes.request("/templates")).json()) as { presets: ProviderPreset[] }
+).presets;
 
 function preset(id: string): ProviderPreset {
 	const found = PROVIDER_PRESETS.find((entry) => entry.id === id);
@@ -23,7 +29,7 @@ const C = "completions-compatible";
 const R = "openai-responses";
 
 // Explicit independent fixtures cover all four families × two regions × two billing modes.
-const cases: [string, ProviderRegion, ProviderBilling, string, string, string?][] = [
+const cases: [string, SourceRegion, ProviderBilling, string, string, string?][] = [
 	[
 		"moonshot",
 		"china",
@@ -144,7 +150,7 @@ const cases: [string, ProviderRegion, ProviderBilling, string, string, string?][
 
 describe("provider connection metadata", () => {
 	test("popular providers use the exact stable order without international duplicates", () => {
-		expect(POPULAR_PROVIDER_IDS).toEqual([
+		expect(popularProviderPresets(PROVIDER_PRESETS).map((entry) => entry.id)).toEqual([
 			"tokendance",
 			"deepseek",
 			"zhipu",
@@ -154,26 +160,25 @@ describe("provider connection metadata", () => {
 			"openai",
 			"anthropic",
 		]);
-		expect(getPopularProviderPresets().map((entry) => entry.id)).toEqual([...POPULAR_PROVIDER_IDS]);
 	});
 
 	test("language defaults and international aliases", () => {
 		for (const id of ["moonshot", "minimax", "mimo", "zhipu"]) {
 			for (const language of ["zh", "zh-CN", "zh-TW", "ZH-cn"]) {
-				expect(getInitialConnectionSelection(id, language)).toEqual({
+				expect(initialConnectionSelection(preset(id), language)).toEqual({
 					region: "china",
 					billing: "payg",
 				});
 			}
 			for (const language of ["en", "en-US", "ja", ""]) {
-				expect(getInitialConnectionSelection(id, language)).toEqual({
+				expect(initialConnectionSelection(preset(id), language)).toEqual({
 					region: "international",
 					billing: "payg",
 				});
 			}
 		}
 		for (const id of ["moonshot-global", "minimax-global", "zai"]) {
-			expect(getInitialConnectionSelection(id, "zh-CN")).toEqual({
+			expect(initialConnectionSelection(preset(id), "zh-CN")).toEqual({
 				region: "international",
 				billing: "payg",
 			});
@@ -193,7 +198,7 @@ describe("provider connection metadata", () => {
 			});
 			// Kimi is created on Chat Completions even though it also serves Responses:
 			// only that route gives it dynamic tool loading.
-			const kimi = getConnectionFamily(id) === "kimi";
+			const kimi = id === "moonshot";
 			expect(result?.preset.defaultProtocol).toBe(kimi ? C : responses ? R : A);
 			expect(result?.preset.creationProtocol).toBe(kimi ? C : undefined);
 			expect(result?.userAgentMode).toBe(billing === "token-plan" ? "narrafork" : undefined);
@@ -208,13 +213,12 @@ describe("provider connection metadata", () => {
 		});
 	}
 
-	test("aliases resolve the same family while retaining their own identity", () => {
-		for (const [alias, canonical, family] of [
-			["moonshot-global", "moonshot", "kimi"],
-			["minimax-global", "minimax", "minimax"],
-			["zai", "zhipu", "zhipu"],
+	test("aliases resolve the same variants while retaining their own identity", () => {
+		for (const [alias, canonical] of [
+			["moonshot-global", "moonshot"],
+			["minimax-global", "minimax"],
+			["zai", "zhipu"],
 		] as const) {
-			expect(getConnectionFamily(alias ?? "")).toBe(family);
 			for (const region of ["china", "international"] as const) {
 				for (const billing of ["payg", "token-plan"] as const) {
 					const selection = { region, billing };
@@ -226,18 +230,17 @@ describe("provider connection metadata", () => {
 				}
 			}
 		}
-		expect(getConnectionFamily("mimo")).toBe("mimo");
-		expect(getConnectionFamily("unknown")).toBeUndefined();
 	});
 
 	test("only international MiMo Token Plan requires an explicit subscription cluster", () => {
 		for (const [id, region, billing] of cases) {
 			const result = resolveProviderConnection(preset(id), { region, billing });
-			if (id === "mimo" && region === "international" && billing === "token-plan") {
-				expect(result).toBeNull();
-			} else {
-				expect(result).not.toBeNull();
-			}
+			const clusterRequired =
+				id === "mimo" && region === "international" && billing === "token-plan";
+			expect(result === null).toBe(clusterRequired);
+			expect(connectionClusters(preset(id), { region, billing })).toEqual(
+				clusterRequired ? ["sgp", "ams"] : [],
+			);
 		}
 		for (const cluster of ["sgp", "ams"] as const) {
 			const result = resolveProviderConnection(preset("mimo"), {
@@ -283,5 +286,119 @@ describe("provider connection metadata", () => {
 		}
 		expect(en.providerNames.moonshot).toBe("KIMI");
 		expect(zh.providerNames.moonshot).toBe("KIMI");
+	});
+});
+
+describe("localized preset names", () => {
+	for (const [locale, names] of [
+		["en", en.providerNames],
+		["zh-CN", zh.providerNames],
+	] as const) {
+		test(`${locale} translates every built-in provider name`, () => {
+			expect(Object.keys(names).sort()).toEqual(PROVIDER_PRESETS.map((entry) => entry.id).sort());
+			const translate = (key: string) =>
+				names[key.slice("providerNames.".length) as keyof typeof names];
+			for (const entry of PROVIDER_PRESETS) {
+				expect(entry.nameKey).toBe(`providerNames.${entry.id}`);
+				expect(getProviderPresetName(entry, translate)).toBe(names[entry.id as keyof typeof names]);
+				expect(getProviderPresetName(entry, translate).trim()).not.toBe("");
+			}
+		});
+	}
+
+	test("custom names without a translation key bypass translation", () => {
+		const custom: ProviderPreset = {
+			id: "custom",
+			name: "My custom gateway",
+			endpoints: {},
+			defaultProtocol: "completions-compatible",
+		};
+		expect(
+			getProviderPresetName(custom, () => {
+				throw new Error("Custom names must not be translated");
+			}),
+		).toBe("My custom gateway");
+	});
+});
+
+describe("preset search", () => {
+	test("localized names participate in search while raw names remain searchable", () => {
+		const names = zh.providerNames;
+		const translate = (key: string) =>
+			names[key.slice("providerNames.".length) as keyof typeof names];
+		expect(searchProviderPresets(PROVIDER_PRESETS, "天翼云息壤")).toEqual([]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "天翼云息壤", translate).map((entry) => entry.id),
+		).toEqual(["xirang"]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "腾讯TokenHub", translate).map((entry) => entry.id),
+		).toEqual(["tokenhub"]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "Xirang", translate).map((entry) => entry.id),
+		).toEqual(["xirang"]);
+		expect(searchProviderPresets(PROVIDER_PRESETS, "", translate)).toEqual(PROVIDER_PRESETS);
+		const uniqueName = (key: string) => (key === "providerNames.openai" ? "LOCALIZED BRAND" : key);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "localized brand", uniqueName).map(
+				(entry) => entry.id,
+			),
+		).toEqual(["openai"]);
+	});
+	test("empty or whitespace returns the full list without sharing the array", () => {
+		for (const query of ["", " \t\n "]) {
+			expect(searchProviderPresets(PROVIDER_PRESETS, query)).toEqual(PROVIDER_PRESETS);
+			expect(searchProviderPresets(PROVIDER_PRESETS, query)).not.toBe(PROVIDER_PRESETS);
+		}
+	});
+
+	test("searches id, name, URL and protocol case-insensitively", () => {
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "  OPENAI  ").map((entry) => entry.id),
+		).toContain("openai");
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "hugging face").map((entry) => entry.id),
+		).toEqual(["huggingface"]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "api.minimax.io").map((entry) => entry.id),
+		).toEqual(["minimax-global"]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "radeon-cloud").map((entry) => entry.id),
+		).toEqual(["radeon-cloud"]);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "gemini-compatible").map((entry) => entry.id),
+		).toEqual(["gemini"]);
+	});
+
+	test("Chinese and English local aliases match without changing original display names", () => {
+		const examples: Array<[string, string]> = [
+			["硅基流动", "silicon"],
+			["SiliconFlow", "silicon"],
+			["智谱", "zhipu"],
+			["深度求索", "deepseek"],
+			["通义", "dashscope"],
+			["百炼", "dashscope"],
+			["豆包", "doubao"],
+			["月之暗面", "moonshot"],
+			["阶跃", "stepfun"],
+			["英伟达", "nvidia"],
+			["魔搭", "modelscope"],
+			["千帆", "baidu-cloud"],
+		];
+		for (const [query, id] of examples) {
+			expect(searchProviderPresets(PROVIDER_PRESETS, query).map((entry) => entry.id)).toContain(id);
+		}
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "月之暗面 .ai").map((entry) => entry.id),
+		).toEqual(["moonshot-global"]);
+		expect(searchProviderPresets(PROVIDER_PRESETS, "硅基流动")[0]?.name).toBe("Silicon");
+	});
+
+	test("all terms must match and search does not reorder or mutate the catalog", () => {
+		const ids = PROVIDER_PRESETS.map((entry) => entry.id);
+		expect(
+			searchProviderPresets(PROVIDER_PRESETS, "moonshot .cn").map((entry) => entry.id),
+		).toEqual(["moonshot"]);
+		expect(searchProviderPresets(PROVIDER_PRESETS, "no-such-provider")).toEqual([]);
+		expect(PROVIDER_PRESETS.map((entry) => entry.id)).toEqual(ids);
 	});
 });

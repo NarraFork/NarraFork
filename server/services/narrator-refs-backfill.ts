@@ -1,14 +1,19 @@
 /** Contiguous, bounded materialization of lazy fork history. Never retain sparse COW patches. */
 import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
-import { and, eq, gte, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, gte, isNull, lt, or, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { initializeRefSeqFloor } from "./narrator-refs/seq-store";
 import { assertNarratorNotReverting, withNarratorWorkAdmission } from "./narrator-session-state";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 
 const BACKFILL_WINDOW_REFS = 400;
 const MAX_PAGE_ROWS = 2000;
@@ -19,11 +24,12 @@ export interface RefsBackfillOptions {
 	signal?: AbortSignal;
 	/** Absolute Date.now() deadline, including time spent on ancestors and children. */
 	deadlineAt?: number;
+	timeoutMs?: number;
 	maxRows?: number;
 	maxPages?: number;
 	pageSize?: number;
 }
-type Budget = Required<Omit<RefsBackfillOptions, "signal">> & {
+type Budget = Required<Omit<RefsBackfillOptions, "signal" | "timeoutMs">> & {
 	signal?: AbortSignal;
 	rows: number;
 	pages: number;
@@ -44,7 +50,10 @@ function budget(options: RefsBackfillOptions): Budget {
 		);
 	const result = {
 		signal: options.signal,
-		deadlineAt: options.deadlineAt ?? Date.now() + 10_000,
+		deadlineAt: Math.min(
+			options.deadlineAt ?? Number.POSITIVE_INFINITY,
+			Date.now() + Math.min(options.timeoutMs ?? 10_000, 30_000),
+		),
 		maxRows: options.maxRows ?? 20_000,
 		maxPages: options.maxPages ?? 1000,
 		pageSize: options.pageSize ?? BACKFILL_WINDOW_REFS,
@@ -63,6 +72,16 @@ function check(work: Budget): void {
 	work.signal?.throwIfAborted();
 	if (Date.now() >= work.deadlineAt)
 		throw failure("TIMEOUT", "Inherited history preparation timed out");
+}
+function readOptions(work?: Budget, maxRows = 1) {
+	if (work) check(work);
+	return {
+		executionPolicy: "worker-required" as const,
+		maxRows,
+		signal: work?.signal,
+		deadlineAt: work?.deadlineAt,
+		timeoutMs: work ? Math.max(1, Math.min(30_000, work.deadlineAt - Date.now())) : 30_000,
+	};
 }
 function reserve(work: Budget, rows: number): void {
 	check(work);
@@ -99,7 +118,7 @@ function toActive(state: LazyRefsState | undefined): ActiveLazyState | null {
 		throw failure("INCOMPLETE", "Inherited history cursor is invalid");
 	return { parentNarratorId: state.refsInheritedFrom, cursor: state.refsBackfillCursor };
 }
-function readLazyState(narratorId: string, tx: RefsReader = db): ActiveLazyState | null {
+function readLazyStateTx(narratorId: string, tx: RefsReader): ActiveLazyState | null {
 	return toActive(
 		tx.query.narrators
 			.findFirst({
@@ -109,19 +128,52 @@ function readLazyState(narratorId: string, tx: RefsReader = db): ActiveLazyState
 			.sync(),
 	);
 }
+async function readLazyState(narratorId: string, work?: Budget): Promise<ActiveLazyState | null> {
+	return toActive(
+		await readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, narratorId),
+				columns: { refsInheritedFrom: true, refsBackfillCursor: true },
+			}),
+			readOptions(work),
+		),
+	);
+}
 export type LineageStep = {
 	narratorId: string;
 	parentNarratorId: string;
 	upperBoundSeq: number;
 };
-export async function resolveLazyLineage(narratorId: string): Promise<LineageStep[]> {
+async function readLineage(
+	narratorId: string,
+	work?: Budget,
+	options: Pick<RefsBackfillOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<LineageStep[]> {
 	requireSqliteLazyRefsBackfill();
+	const source = sql`(WITH RECURSIVE lineage(id, refs_inherited_from, refs_backfill_cursor, depth) AS (
+		SELECT id, refs_inherited_from, refs_backfill_cursor, 0 FROM narrators WHERE id = ${narratorId}
+		UNION ALL SELECT n.id, n.refs_inherited_from, n.refs_backfill_cursor, l.depth + 1
+		FROM narrators n JOIN lineage l ON n.id = l.refs_inherited_from WHERE l.depth < ${MAX_LINEAGE_DEPTH}
+	) SELECT * FROM lineage)`;
+	const rows = await readQuery(
+		db
+			.select({
+				id: sql<string>`id`,
+				refsInheritedFrom: sql<string | null>`refs_inherited_from`,
+				refsBackfillCursor: sql<number | null>`refs_backfill_cursor`,
+			})
+			.from(source)
+			.limit(MAX_LINEAGE_DEPTH + 1),
+		work ? readOptions(work, MAX_LINEAGE_DEPTH + 1) : narratorSurfaceReadOptions(options),
+	);
+	const states = new Map(rows.map((row) => [row.id, row]));
 	const steps: LineageStep[] = [];
 	const seen = new Set([narratorId]);
 	let currentId = narratorId;
 	let bound = Number.POSITIVE_INFINITY;
 	for (;;) {
-		const state = readLazyState(currentId);
+		const state = toActive(states.get(currentId));
 		if (!state) return steps;
 		if (seen.has(state.parentNarratorId))
 			throw failure("LINEAGE_CYCLE", "Inherited history contains a lineage cycle");
@@ -137,25 +189,38 @@ export async function resolveLazyLineage(narratorId: string): Promise<LineageSte
 		currentId = state.parentNarratorId;
 	}
 }
+export async function resolveLazyLineage(
+	narratorId: string,
+	options: NarratorSurfaceReadBudget = {},
+): Promise<LineageStep[]> {
+	return readLineage(narratorId, undefined, options);
+}
 export async function hasUnmaterializedRefsBelow(
 	narratorId: string,
 	seq: number,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<boolean> {
-	for (const step of await resolveLazyLineage(narratorId)) {
-		const older = db
+	const readBudget = narratorSurfaceReadOptions(options);
+	const clauses = (await resolveLazyLineage(narratorId, readBudget)).flatMap((step) => {
+		const ceiling = Math.min(step.upperBoundSeq, seq);
+		return ceiling > 0
+			? [
+					and(
+						eq(narratorMessageRefs.narratorId, step.parentNarratorId),
+						lt(narratorMessageRefs.seq, ceiling),
+					),
+				]
+			: [];
+	});
+	if (!clauses.length) return false;
+	return !!(await readQueryFirst(
+		db
 			.select({ seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, step.parentNarratorId),
-					lt(narratorMessageRefs.seq, Math.min(step.upperBoundSeq, seq)),
-				),
-			)
-			.limit(1)
-			.get();
-		if (older) return true;
-	}
-	return false;
+			.where(or(...clauses))
+			.limit(1),
+		narratorSurfaceReadOptions(readBudget),
+	));
 }
 
 /** The whole same-seq group is checked against the actual row budget before any insert. */
@@ -164,9 +229,9 @@ function copyWindow(narratorId: string, parentId: string, target: number, work: 
 	dbTransactionWithSeqFloor(narratorId, (tx) => {
 		check(work);
 		assertNarratorNotReverting(narratorId);
-		const current = readLazyState(narratorId, tx);
+		const current = readLazyStateTx(narratorId, tx);
 		if (!current || current.parentNarratorId !== parentId || current.cursor <= target) return;
-		const parentState = readLazyState(parentId, tx);
+		const parentState = readLazyStateTx(parentId, tx);
 		if (parentState && parentState.cursor > target)
 			throw failure("INCOMPLETE", "Ancestor history changed during preparation");
 		// Page/budget all indexed refs, including hidden ones. Filtering them before
@@ -259,19 +324,19 @@ async function coverSeq(
 	if (ancestors.size > MAX_LINEAGE_DEPTH)
 		throw failure("BUDGET_EXCEEDED", "Inherited history lineage is too deep");
 	const nextAncestors = new Set(ancestors).add(narratorId);
-	const initial = readLazyState(narratorId);
+	const initial = await readLazyState(narratorId, work);
 	if (!initial || (initial.cursor <= target && initial.cursor !== 0)) return;
 	await withNarratorWorkAdmission(narratorId, async () => {
 		for (;;) {
 			check(work);
 			assertNarratorNotReverting(narratorId);
-			const current = readLazyState(narratorId);
+			const current = await readLazyState(narratorId, work);
 			if (!current) return;
 			if (current.cursor === 0) {
 				dbTransactionWithSeqFloor(narratorId, (tx) => {
 					check(work);
 					assertNarratorNotReverting(narratorId);
-					if (readLazyState(narratorId, tx)?.cursor !== 0) return;
+					if (readLazyStateTx(narratorId, tx)?.cursor !== 0) return;
 					reserve(work, 0);
 					tx.update(narrators)
 						.set({
@@ -288,7 +353,7 @@ async function coverSeq(
 			if (current.cursor <= target) return;
 			await coverSeq(current.parentNarratorId, target, work, nextAncestors);
 			copyWindow(narratorId, current.parentNarratorId, target, work);
-			const after = readLazyState(narratorId);
+			const after = await readLazyState(narratorId, work);
 			if (
 				after &&
 				after.parentNarratorId === current.parentNarratorId &&
@@ -299,7 +364,7 @@ async function coverSeq(
 		}
 	});
 	check(work);
-	if ((readLazyState(narratorId)?.cursor ?? 0) > target)
+	if (((await readLazyState(narratorId, work))?.cursor ?? 0) > target)
 		throw failure("INCOMPLETE", "Inherited history preparation did not cover the requested range");
 }
 export async function ensureRefsCoverSeq(
@@ -313,55 +378,61 @@ export async function ensureRefsCoverSeq(
 	targetSeq = Math.max(0, targetSeq);
 	const work = budget(options);
 	check(work);
-	const initial = readLazyState(narratorId);
+	const initial = await readLazyState(narratorId, work);
 	if (!initial || (initial.cursor <= targetSeq && initial.cursor !== 0)) return;
-	await resolveLazyLineage(narratorId);
+	await readLineage(narratorId, work);
 	await coverSeq(narratorId, targetSeq, work);
 }
 async function coverMessage(narratorId: string, messageId: string, work: Budget): Promise<void> {
 	check(work);
-	const local = db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		)
-		.limit(1)
-		.get();
-	if (local) {
-		await coverSeq(narratorId, local.seq, work);
-		return;
-	}
-	for (const step of await resolveLazyLineage(narratorId)) {
-		check(work);
-		const ref = db
+	const local = await readQueryFirst(
+		db
 			.select({ seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(narratorMessageRefs.narratorId, step.parentNarratorId),
+					eq(narratorMessageRefs.narratorId, narratorId),
 					eq(narratorMessageRefs.messageId, messageId),
-					isNull(narratorMessageRefs.segmentCompactId),
 				),
 			)
-			.limit(1)
-			.get();
-		if (ref && ref.seq < step.upperBoundSeq) {
-			await coverSeq(narratorId, ref.seq, work);
-			const copied = db
-				.select({ id: narratorMessageRefs.id })
+			.limit(1),
+		readOptions(work),
+	);
+	if (local) {
+		await coverSeq(narratorId, local.seq, work);
+		return;
+	}
+	for (const step of await readLineage(narratorId, work)) {
+		check(work);
+		const ref = await readQueryFirst(
+			db
+				.select({ seq: narratorMessageRefs.seq })
 				.from(narratorMessageRefs)
 				.where(
 					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.narratorId, step.parentNarratorId),
 						eq(narratorMessageRefs.messageId, messageId),
+						isNull(narratorMessageRefs.segmentCompactId),
 					),
 				)
-				.limit(1)
-				.get();
+				.limit(1),
+			readOptions(work),
+		);
+		if (ref && ref.seq < step.upperBoundSeq) {
+			await coverSeq(narratorId, ref.seq, work);
+			const copied = await readQueryFirst(
+				db
+					.select({ id: narratorMessageRefs.id })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+					)
+					.limit(1),
+				readOptions(work),
+			);
 			if (!copied) throw failure("INCOMPLETE", "Requested inherited message could not be prepared");
 			return;
 		}
@@ -415,11 +486,14 @@ export async function prepareRevertRefs(
 		let lookedUp = 0;
 		for (const id of selector.toolCallIds) {
 			check(work);
-			const tool = db
-				.select({ messageId: narratorToolCalls.messageId })
-				.from(narratorToolCalls)
-				.where(eq(narratorToolCalls.id, id))
-				.get();
+			const tool = await readQueryFirst(
+				db
+					.select({ messageId: narratorToolCalls.messageId })
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.id, id))
+					.limit(1),
+				readOptions(work),
+			);
 			if (tool) await coverMessage(narratorId, tool.messageId, work);
 			if (++lookedUp % BACKFILL_WINDOW_REFS === 0) {
 				reserve(work, 0);
@@ -430,8 +504,8 @@ export async function prepareRevertRefs(
 	check(work);
 }
 
-function lazyChildren(tx: RefsReader, parentId: string, minSeq: number) {
-	const children = tx
+function lazyChildrenQuery(tx: RefsReader, parentId: string, minSeq: number) {
+	return tx
 		.select({ id: narrators.id, cursor: narrators.refsBackfillCursor })
 		.from(narrators)
 		.where(
@@ -446,18 +520,14 @@ function lazyChildren(tx: RefsReader, parentId: string, minSeq: number) {
 			),
 		)
 		.orderBy(narrators.id)
-		.limit(MAX_CHILDREN + 1)
-		.all();
+		.limit(MAX_CHILDREN + 1);
+}
+function checkChildrenBudget(children: readonly { id: string }[]): void {
 	if (children.length > MAX_CHILDREN)
 		throw failure("BUDGET_EXCEEDED", "Too many derived history readers");
-	return children;
 }
-export function assertNoLazyChildrenForHistoryRewriteTx(
-	tx: RefsReader,
-	parentNarratorId: string,
-	minAffectedSeq: number,
-): void {
-	const children = lazyChildren(tx, parentNarratorId, minAffectedSeq);
+function assertNoLazyChildren(children: readonly { id: string }[]): void {
+	checkChildrenBudget(children);
 	for (const child of children) assertNarratorNotReverting(child.id);
 	if (children.length)
 		throw new AppError(
@@ -465,6 +535,13 @@ export function assertNoLazyChildrenForHistoryRewriteTx(
 			409,
 			"HISTORY_LAZY_DEPENDENCY_CHANGED",
 		);
+}
+export function assertNoLazyChildrenForHistoryRewriteTx(
+	tx: RefsReader,
+	parentNarratorId: string,
+	minAffectedSeq: number,
+): void {
+	assertNoLazyChildren(lazyChildrenQuery(tx, parentNarratorId, minAffectedSeq).all());
 }
 export async function prepareLazyChildrenForHistoryRewrite(
 	parentNarratorId: string,
@@ -474,28 +551,39 @@ export async function prepareLazyChildrenForHistoryRewrite(
 	requireSqliteLazyRefsBackfill();
 	const work = budget(options);
 	check(work);
-	const children = lazyChildren(db, parentNarratorId, minAffectedSeq);
+	const children = await readQuery(
+		lazyChildrenQuery(db, parentNarratorId, minAffectedSeq),
+		readOptions(work, MAX_CHILDREN + 1),
+	);
+	checkChildrenBudget(children);
 	for (const child of children) {
 		assertNarratorNotReverting(child.id);
 		await coverSeq(child.id, minAffectedSeq, work);
 	}
 	check(work);
-	assertNoLazyChildrenForHistoryRewriteTx(db, parentNarratorId, minAffectedSeq);
+	assertNoLazyChildren(
+		await readQuery(
+			lazyChildrenQuery(db, parentNarratorId, minAffectedSeq),
+			readOptions(work, MAX_CHILDREN + 1),
+		),
+	);
 }
 export async function materializeChildrenOf(
 	parentNarratorId: string,
 	options: RefsBackfillOptions = {},
 ): Promise<string[]> {
 	requireSqliteLazyRefsBackfill("Materializing inherited narrator refs");
-	const children = db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.where(eq(narrators.refsInheritedFrom, parentNarratorId))
-		.limit(MAX_CHILDREN + 1)
-		.all();
+	const work = budget(options);
+	const children = await readQuery(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.refsInheritedFrom, parentNarratorId))
+			.limit(MAX_CHILDREN + 1),
+		readOptions(work, MAX_CHILDREN + 1),
+	);
 	if (children.length > MAX_CHILDREN)
 		throw failure("BUDGET_EXCEEDED", "Too many inherited history readers");
-	const work = budget(options);
 	for (const child of children) await coverSeq(child.id, 0, work);
 	check(work);
 	return children.map((child) => child.id);

@@ -5,6 +5,7 @@ import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -143,7 +144,7 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 			providerCalls.length === expectedCalls &&
 			row?.status === "idle" &&
 			!getExecutionOwner(narratorId) &&
-			!hasPendingBufferedWork(narratorId)
+			!(await hasPendingBufferedWork(narratorId))
 		)
 			return;
 		await Bun.sleep(10);
@@ -1129,12 +1130,12 @@ test.each([
 	}
 });
 
-test("gates the synchronous pending-work probe on PostgreSQL", () => {
+test("gates the synchronous pending-work probe on PostgreSQL", async () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {
-		expect(() => hasPendingBufferedWork("mailbox-send-pg-gate")).toThrow(
-			"cannot inspect the PostgreSQL mailbox",
-		);
+		expect(
+			await captureWorkerRejectionThrower(hasPendingBufferedWork("mailbox-send-pg-gate")),
+		).toThrow("cannot inspect the PostgreSQL mailbox");
 	} finally {
 		bindRuntimeQueue({ backend: "sqlite" });
 	}
@@ -1187,7 +1188,7 @@ test.each([
 		} else {
 			expect(await updateBufferedMessageMode(narratorId, accepted.id, "turn")).toBe(true);
 		}
-		clearBufferedMessageSoftStopIfIdle(narratorId, false);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, false);
 		expect(providerCalls).toEqual([]);
 		releasePreflight.resolve();
 		await waitForIdle(narratorId, operation === "remove" ? 2 : 3);

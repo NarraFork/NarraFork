@@ -850,10 +850,39 @@ describe("terminal watch", () => {
 		// Output that lands right before exit, with no check run yet.
 		buffer.append("BYE\r\n");
 		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
-		expect((await row(lastMinute))?.status).toBe("completed");
-		const failed = await row(missed);
+		expect((await waitForStatus(lastMinute))?.status).toBe("completed");
+		const failed = await waitForStatus(missed);
 		expect(failed?.status).toBe("failed");
 		expect(failed?.output).toContain("the terminal exited");
+	});
+
+	test("ending a buffer preserves an in-flight frozen match until publication commits", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "BYE", { kind: "offset", offset: 0 });
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		const completed = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (...args) => {
+				entered.resolve();
+				await gate.promise;
+				return publish(...args);
+			},
+		);
+		try {
+			output(buffer, "BYE\r\n");
+			await entered.promise;
+			await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+			expect((await row(id))?.status).toBe("running");
+			expect(completed).toHaveBeenCalledTimes(1);
+		} finally {
+			gate.resolve();
+		}
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain('"BYE" appeared');
+		expect(completed).toHaveBeenCalledTimes(1);
 	});
 
 	test("a different buffer for the same terminal does not end the watch", async () => {

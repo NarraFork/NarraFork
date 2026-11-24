@@ -62,7 +62,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
@@ -498,6 +498,10 @@ import {
 	resumeRecoverySubagents,
 	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
+import {
+	assertNarratorSurfaceObservation,
+	narratorSurfaceReadOptions,
+} from "../services/narrator-surface-reads";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { readCommittedToolDetail } from "../services/narrator-tool-detail";
 import { permissionRuleService } from "../services/permission-rule-service";
@@ -1090,7 +1094,11 @@ narratorRoutes.get("/:id/context-composition", async (c) => {
 narratorRoutes.use("/permissions/:requestId/*", async (c, next) => {
 	const requestId = c.req.param("requestId");
 	if (!requestId) return next();
-	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	await requireOwningNarratorAccess(
+		c,
+		() => resolveDecisionNarratorId(requestId, { signal: c.req.raw.signal }),
+		"write",
+	);
 	return next();
 });
 
@@ -1108,7 +1116,11 @@ for (const segment of [
 	narratorRoutes.use(`/${segment}/:entryId`, async (c, next) => {
 		const entryId = c.req.param("entryId");
 		if (!entryId) return next();
-		await requireOwningNarratorAccess(c, () => resolveRuleNarratorId(segment, entryId), "write");
+		await requireOwningNarratorAccess(
+			c,
+			() => resolveRuleNarratorId(segment, entryId, c.req.raw.signal),
+			"write",
+		);
 		return next();
 	});
 }
@@ -1117,34 +1129,51 @@ for (const segment of [
 async function resolveRuleNarratorId(
 	segment: "whitelist-dirs" | "blacklist-dirs" | "cmd-whitelist" | "cmd-blacklist",
 	entryId: string,
+	signal?: AbortSignal,
 ): Promise<string | null> {
 	switch (segment) {
 		case "whitelist-dirs": {
-			const row = await db.query.narratorWhitelistDirs.findFirst({
-				where: eq(narratorWhitelistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorWhitelistDirs.findMany({
+					limit: 1,
+					where: eq(narratorWhitelistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "blacklist-dirs": {
-			const row = await db.query.narratorBlacklistDirs.findFirst({
-				where: eq(narratorBlacklistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorBlacklistDirs.findMany({
+					limit: 1,
+					where: eq(narratorBlacklistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-whitelist": {
-			const row = await db.query.narratorWhitelistCmds.findFirst({
-				where: eq(narratorWhitelistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorWhitelistCmds.findMany({
+					limit: 1,
+					where: eq(narratorWhitelistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-blacklist": {
-			const row = await db.query.narratorBlacklistCmds.findFirst({
-				where: eq(narratorBlacklistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorBlacklistCmds.findMany({
+					limit: 1,
+					where: eq(narratorBlacklistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 	}
@@ -1329,7 +1358,7 @@ async function askInPassingChildrenByParent(
 
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
-	const readOptions = { signal: c.req.raw.signal };
+	const readOptions = narratorSurfaceReadOptions({ signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
@@ -1574,7 +1603,7 @@ narratorRoutes.get("/", async (c) => {
 					.map((row) => row.id),
 				principal,
 				status === "archived",
-				readOptions.signal,
+				c.req.raw.signal,
 			)
 		: undefined;
 
@@ -1829,13 +1858,19 @@ narratorRoutes.post("/", async (c) => {
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
 	let projectDir: string | undefined;
+	let expectedProject: { id: string; gitPath: string | null | undefined } | undefined;
 	if (input.contextProjectId) {
 		await requireProjectAccess(c, input.contextProjectId, "write");
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				limit: 1,
+				where: eq(projects.id, input.contextProjectId),
+				columns: { gitPath: true },
+			}),
+			narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+		);
 		projectDir = project?.gitPath ?? undefined;
+		expectedProject = { id: input.contextProjectId, gitPath: project?.gitPath };
 	}
 	// The device comes first: it decides what the directory even means.
 	const deviceId = await resolveCreationDevice(
@@ -1862,25 +1897,31 @@ narratorRoutes.post("/", async (c) => {
 	if (input.kind) {
 		const user = c.get("user");
 		const locale = await getUserLanguage(user.sub);
-		const narrator = await narratorService.create({
+		const narrator = await narratorService.create(
+			{
+				...input,
+				...audiences,
+				cwd: resolvedCwd,
+				defaultDeviceId: deviceId === "local" ? null : deviceId,
+				ownerUserId,
+				creatorIsAdmin: user.role === "admin",
+				locale,
+			},
+			{ expectedProject, signal: c.req.raw.signal },
+		);
+		return c.json(publicNarratorResponse(narrator), 201);
+	}
+
+	const narrator = await narratorService.create(
+		{
 			...input,
 			...audiences,
 			cwd: resolvedCwd,
 			defaultDeviceId: deviceId === "local" ? null : deviceId,
 			ownerUserId,
-			creatorIsAdmin: user.role === "admin",
-			locale,
-		});
-		return c.json(publicNarratorResponse(narrator), 201);
-	}
-
-	const narrator = await narratorService.create({
-		...input,
-		...audiences,
-		cwd: resolvedCwd,
-		defaultDeviceId: deviceId === "local" ? null : deviceId,
-		ownerUserId,
-	});
+		},
+		{ expectedProject, signal: c.req.raw.signal },
+	);
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
@@ -1974,7 +2015,7 @@ narratorRoutes.post("/setup-assistant", requireAdmin, async (c) => {
 // does not become a directory of other people's private sessions.
 narratorRoutes.get("/by-handle/:handle", async (c) => {
 	const handle = c.req.param("handle");
-	const narrator = await narratorService.getByHandle(handle);
+	const narrator = await narratorService.getByHandle(handle, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Named narrator", handle);
 	await requireAccessToNarratorRow(c, narrator, "read").catch(() => {
 		throw new NotFoundError("Named narrator", handle);
@@ -1988,7 +2029,7 @@ narratorRoutes.get("/named", async (c) => {
 	// Bounded set (named narrators are deliberately few), so filtering in memory is
 	// fine here; the paginated list endpoint pushes the same predicate into SQL.
 	const named = await filterReadableNarrators(
-		await narratorService.listNamed(),
+		await narratorService.listNamed({ signal: c.req.raw.signal }),
 		narratorPrincipalOf(c),
 	);
 	const draftNarratorIds = await getNarratorIdsWithDraft(
@@ -2172,10 +2213,15 @@ narratorRoutes.get("/:id/tasks/current", async (c) => {
 
 narratorRoutes.get("/:id/panel-state", async (c) => {
 	const id = c.req.param("id");
-	const result = await getNarratorPanelState(id, c.get("user").sub, {
-		permissionsCursor: c.req.query("permissionsCursor"),
-		bufferCursor: c.req.query("bufferCursor"),
-	});
+	const result = await getNarratorPanelState(
+		id,
+		c.get("user").sub,
+		{
+			permissionsCursor: c.req.query("permissionsCursor"),
+			bufferCursor: c.req.query("bufferCursor"),
+		},
+		{ signal: c.req.raw.signal },
+	);
 	await requireNarratorAccess(c, id, "read");
 	return c.json(result);
 });
@@ -2225,7 +2271,7 @@ narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
 
 narratorRoutes.get("/:id/draft", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(await getNarratorDraft(c.get("user").sub, id));
 });
 
@@ -2235,7 +2281,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = updateNarratorDraftSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const update = await updateNarratorDraft(
 		userId,
 		id,
@@ -2282,7 +2328,7 @@ narratorRoutes.post("/:id/draft/restore", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = restoreNarratorDraftSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const update = await restoreNarratorDraftPrevious(userId, id, parsed.data.sourceId);
 	if (!update) throw new NotFoundError("Draft undo slot", id);
 	broadcastToUser(userId, {
@@ -2391,9 +2437,10 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const userId = c.get("user").sub;
 
 	// ACL: narrator must exist and user must have access
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, narratorId) }),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	await requireAccessToNarratorRow(c, narrator, "read");
 
@@ -2428,7 +2475,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 // Get usage stats for this narrator, optionally including direct subagents.
 narratorRoutes.get("/:id/usage-stats", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const includeSubagents = c.req.query("includeSubagents") !== "false";
 	const stats = await usageHistoryService.getUsageStats({ narratorId, includeSubagents });
 	return c.json(stats);
@@ -2445,7 +2492,7 @@ narratorRoutes.get("/:id/commands", async (c) => {
 // Get skills available to this narrator's current project/cwd context.
 narratorRoutes.get("/:id/skills", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const refresh = c.req.query("refresh") === "true";
 	const context = await skillService.resolveSkillContextForNarrator(id);
 	const result = await skillService.loadSkillSummariesForContext(context, {
@@ -2462,20 +2509,32 @@ function customTraitsResponse(traits: unknown) {
 	return buildCustomTraitsResponse(traits);
 }
 
-async function updateNarratorTraits(id: string, update: (traits: string[]) => string[]) {
+async function updateNarratorTraits(
+	id: string,
+	signal: AbortSignal,
+	update: (traits: string[]) => string[],
+) {
 	const traits = await narratorTraitsLock.acquire(id, async () => {
-		const narrator = await narratorService.getById(id);
+		const narrator = await narratorService.getById(id, undefined, { signal });
 		const nextTraits = update(parseTraits(narrator.traits));
-		await db
-			.update(narrators)
-			.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, id));
+		db.transaction((tx) => {
+			const current = tx
+				.select({ traits: narrators.traits })
+				.from(narrators)
+				.where(eq(narrators.id, id))
+				.get();
+			assertNarratorSurfaceObservation({ traits: narrator.traits }, current, ["traits"]);
+			tx.update(narrators)
+				.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+				.where(eq(narrators.id, id))
+				.run();
+		});
 		return nextTraits;
 	});
 	// The in-memory session state must reflect the *resolved* traits, otherwise an
 	// edit here would appear to relax a restriction that the project/user layer
 	// enforces. The narrator's own row keeps only what was written above.
-	const narratorRow = await narratorService.getById(id);
+	const narratorRow = await narratorService.getById(id, undefined, { signal });
 	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
 		"../services/trait-layer-service"
 	);
@@ -2499,7 +2558,7 @@ async function updateNarratorTraits(id: string, update: (traits: string[]) => st
 
 narratorRoutes.get("/:id/custom-traits", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(customTraitsResponse(narrator.traits));
 });
 
@@ -2508,7 +2567,7 @@ narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) =>
 	const body = await c.req.json().catch(() => ({}));
 	validateSubagentModelRestrictionInput(body);
 	const restriction = normalizeSubagentModelRestriction(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		Object.keys(restriction.pools).length === 0
 			? removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX)
 			: upsertEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction),
@@ -2528,7 +2587,7 @@ narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) =>
 
 narratorRoutes.patch("/:id/avatar", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Narrator", id);
 
 	const formData = await c.req.formData();
@@ -2548,7 +2607,7 @@ narratorRoutes.patch("/:id/avatar", async (c) => {
 
 narratorRoutes.delete("/:id/avatar", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Narrator", id);
 
 	deleteAvatarImage(id);
@@ -2561,7 +2620,7 @@ narratorRoutes.delete("/:id/avatar", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/subagent-model-restriction", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2575,7 +2634,7 @@ narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
 	const disabledTools = normalizeDisabledTools(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		upsertEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX, disabledTools),
 	);
 	return c.json({
@@ -2587,7 +2646,7 @@ narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2601,7 +2660,7 @@ narratorRoutes.put("/:id/custom-traits/blocked-skills", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
 	const blockedSkills = normalizeBlockedSkills(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		!blockedSkills.all && blockedSkills.names.length === 0
 			? removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX)
 			: upsertEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX, blockedSkills),
@@ -2615,7 +2674,7 @@ narratorRoutes.put("/:id/custom-traits/blocked-skills", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2628,7 +2687,7 @@ narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // throws NotFoundError if missing
 
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
@@ -3102,10 +3161,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Every session takes the same admission: a running one (including a run the
 		// user holds) queues the input for its next safe boundary, an idle one starts.
 		// Model overrides belong to the accepted input, not to the running turn.
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+			narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+		);
 		const creator: BufferCreator | null = user
 			? {
 					id: user.id,
@@ -3199,7 +3262,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 // Retry last user message — re-run agent loop without creating a new message
 narratorRoutes.post("/:id/retry", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -3220,7 +3283,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 narratorRoutes.post("/:id/continue", async (c) => {
 	const id = c.req.param("id");
 	const recoveryMessageId = c.req.query("recoveryMessageId");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Reconcile FIRST, then judge. This repairs a status that disagrees with the
 	// runtime in either direction: a stale idle status is promoted back to working (so
@@ -3228,7 +3291,9 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	// runtime owner is dropped to idle (so this request is admitted instead of being
 	// rejected forever by a row that outlived its writer).
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	// Busy = DB status running OR a loop actually running in memory (authoritative,
 	// catches a stale-idle DB status that would otherwise start a second loop).
@@ -3304,14 +3369,16 @@ narratorRoutes.post("/:id/continue", async (c) => {
 // Legacy "await" requests normalize to "watch"; no blocking tool is synthesized.
 narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	// Reconcile FIRST, then judge. The recovery card is shown precisely when a turn
 	// died, and a subagent's permission gate used to mirror `working` onto this
 	// narrator afterwards — leaving a status with no runtime owner that rejected this
 	// request forever. Reconciling before the check repairs such a zombie status and
 	// admits the click, while a genuinely running narrator is still refused.
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
@@ -3322,7 +3389,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const { resumed, skipped } = await resumeRecoverySubagents({
+	const { resumed, skipped, conflict } = await resumeRecoverySubagents({
 		narratorId: id,
 		subagentIds: body.subagentIds,
 		locale,
@@ -3338,6 +3405,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	});
 
 	if (resumed.length === 0) {
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
 	}
 
@@ -3350,6 +3418,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			userId,
 			humanReplyContext: { locale, replyInUserLanguage },
 		});
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: "watch", resumed: resumed.length, skipped });
 	}
 
@@ -3370,6 +3439,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		null,
 		{ origin: "system", originLabel: formatOriginLabel("recovery") },
 	);
+	if (conflict) throw conflict;
 	return c.json({ ok: true, mode: "notify", resumed: resumed.length, skipped });
 });
 
@@ -3383,13 +3453,15 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", (c) =>
 
 /** Re-execute a denied tool call. */
 async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Reconcile FIRST, then judge: repair a stale idle status (so the user regains the
 	// interrupt button) or a running status with no runtime owner (so a denied tool can
 	// still be retried after the turn that owned it died).
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
 		throw new ValidationError("Cannot re-execute a tool call while narrator is already running");
@@ -3420,13 +3492,17 @@ async function resolveEditedFileReferences(
 	signal: AbortSignal,
 ): Promise<FileReferenceSnapshot[] | undefined> {
 	if (requested === undefined) return undefined;
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { messageId: true },
-	});
+	const ref = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { messageId: true },
+		}),
+		narratorSurfaceReadOptions({ signal }),
+	);
 	if (!ref) throw new NotFoundError("Message", messageId);
 	const message = fillBody(
 		await db.query.narratorMessages.findFirst({
@@ -3599,7 +3675,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	// of a remote session default. Reject its disabled actual backend before interruption.
 	if (revertFiles || revertPlan) assertFileHistoryEnabledForDevice(localBackend.deviceId);
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	validateComposerProjection(composerDocument, content, fileReferences);
 	// Invalid/new references must fail before interrupting or rewriting history.
@@ -3661,7 +3737,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const body = await c.req.json();
 	const { content } = editAssistantMessageSchema.parse(body);
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -3678,7 +3754,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -4070,7 +4146,7 @@ async function applyPendingBufferModeControl(
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
 	);
-	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	await applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
 	return targetQueued && effectiveMode !== "turn";
 }
 
@@ -4177,7 +4253,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4194,7 +4270,7 @@ narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
 	const id = c.req.param("id");
 	const [{ listPendingAgentMessages, blockingStopReason }, narrator] = await Promise.all([
 		import("../services/agent-runtime/inbox"),
-		narratorService.getById(id),
+		narratorService.getById(id, undefined, { signal: c.req.raw.signal }),
 	]);
 	const pending = await listPendingAgentMessages(id);
 	const running =
@@ -4210,7 +4286,7 @@ narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
 // Explicit user resume: lets queued agent messages restart a failed or user-stopped session.
 narratorRoutes.post("/:id/inbox/resume", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") throw new ValidationError("Narrator is archived");
 	const { wakeInboxIfEligible, notifyAgentInboxChanged } = await import(
 		"../services/agent-runtime/inbox"
@@ -4254,7 +4330,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const { clearBufferedMessages } = await import("../services/narrator-buffer");
 	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4299,10 +4375,10 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// window in which any unrelated write on a live narrator turned a good page into
 	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQueryFirst(
+		db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, id), columns: { id: true } }),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
 	return c.json(toBlockPage(result));
@@ -4362,7 +4438,7 @@ narratorRoutes.get("/:id/export-turns", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const id = c.req.param("id");
 	// 先确认会话存在，再走可能很长的遍历。
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(await listNarratorExportTurns(id, parsed.data.scope, c.req.raw.signal));
 });
 
@@ -4385,7 +4461,7 @@ narratorRoutes.get("/:id/export", async (c) => {
 
 	// Resolve the narrator up front so a bad id is a clean 404 rather than an
 	// attachment whose body happens to contain an error.
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	const fileName = buildExportFileName(narrator.title, options.format, new Date(), options.range);
 	// One controller shared by start() and cancel(): a client that closes the tab
@@ -4711,7 +4787,7 @@ export function buildRetryFailedCompactResponse(
 narratorRoutes.post("/:id/compact/:messageId/retry", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	if (isCompactInProgress(narratorId)) {
 		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
 	}
@@ -4843,7 +4919,7 @@ narratorRoutes.post("/:id/blocks/rollback", async (c) => {
 	// The reviewed-plan executor is the local adapter, not the session default.
 	if (revertPlan || !historyOnly) assertFileHistoryEnabledForDevice(localBackend.deviceId);
 	if (!historyOnly) await assertWorkspaceHistoryRevertSupported(id);
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	// As for the index route: the rollback discards the running turn it lands in.
 	await prepareHistoryRewrite(id);
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
@@ -4923,7 +4999,7 @@ narratorRoutes.get("/:id/blocks/:blockId/delete-preview", async (c) => {
 narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 	const id = c.req.param("id");
 	const { content } = editAssistantMessageSchema.parse(await c.req.json());
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await editOutputBlock(id, c.req.param("blockId"), content, c.get("user").sub));
 });
@@ -4931,7 +5007,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 // Put an edited output block back to its text before its first edit.
 narratorRoutes.post("/:id/blocks/:blockId/restore", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await restoreOutputBlock(id, c.req.param("blockId")));
 });
@@ -5062,7 +5138,7 @@ narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 // Trigger manual compact
 narratorRoutes.post("/:id/compact", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json().catch(() => ({}));
@@ -5087,7 +5163,7 @@ narratorRoutes.post("/:id/compact", async (c) => {
 // doRunCustomCompact's abort branch once the aborted request rejects.
 narratorRoutes.post("/:id/compact/cancel", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const cancelled = cancelCompact(narratorId);
 	if (!cancelled) {
 		return c.json({ ok: false, reason: "no_compact_in_progress" }, 409);
@@ -5100,7 +5176,7 @@ narratorRoutes.post("/:id/compact/cancel", async (c) => {
 // (discarding earlier context up to that point); otherwise it is appended at the end.
 narratorRoutes.post("/:id/clear-context", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json().catch(() => ({}));
 	const beforeMessageId = body.beforeMessageId ?? undefined;
 	const msg = beforeMessageId
@@ -5122,7 +5198,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 // Create a plan compact message
 narratorRoutes.post("/:id/plan", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const { content } = await c.req.json();
 	if (!content || typeof content !== "string") throw new ValidationError("content is required");
 	const msg = await narratorService.persistPlanMessage(narratorId, content);
@@ -5134,7 +5210,7 @@ narratorRoutes.post("/:id/plan", async (c) => {
 // Trigger segment compact for selected messages
 narratorRoutes.post("/:id/segment-compact", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json();
@@ -5209,7 +5285,7 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// hot reload or unhandled error). Force-reset to interrupted. A held run is
 	// never a zombie: overwriting its status would erase `taken_over`.
 	if (!interrupted && !parked && !getRunHold(id)) {
-		const narrator = await narratorService.getById(id);
+		const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 		if (narrator.status === "working" || narrator.status === "waiting") {
 			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 			interrupted = true;
@@ -5268,7 +5344,7 @@ const TAKEOVER_OWNER_POLL_MS = 50;
  */
 narratorRoutes.post("/:id/takeover", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const { readSessionDeliverTo } = await import("../services/narrator-session");
 	const deliverTo = await readSessionDeliverTo(id);
 	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
@@ -5352,7 +5428,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 // is refreshed with what the user produced since.
 narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const {
 		getSubagentFinalText,
 		prepareSubagentConclusionReference,
@@ -5394,7 +5470,7 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 // User left the narrator page — reset interrupted status to idle
 narratorRoutes.post("/:id/leave", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator?.substatus?.includes("interrupted")) {
 		await narratorService.updateStatus(id, "idle", { substatus: [] });
 	}
@@ -5631,7 +5707,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorModelSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (parsed.data.model === FOLLOW_PARENT_MODEL) {
 		// Following is relative to the registered source, whatever created the session.
 		if (!policySourceIdOf(narrator)) {
@@ -5657,7 +5733,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	if (!isPermissionMode(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${PERMISSION_MODES.join(", ")}`);
 	}
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Ask-in-passing narrators are locked to readOnly until promoted
 	if (hasTrait(parseTraits(narrator.traits), "ask-in-passing")) {
@@ -5690,7 +5766,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 // Enter plan mode as a narrator trait (not a permission mode)
 narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const planState = await enterNarratorPlanMode(id);
 	const active = activeNarrators.get(id);
 	if (active) {
@@ -5741,14 +5817,18 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			],
 		},
 	});
-	const manualToolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.messageId, msg.id),
-			eq(narratorToolCalls.narratorId, id),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true },
-	});
+	const manualToolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorToolCalls.messageId, msg.id),
+				eq(narratorToolCalls.narratorId, id),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
 	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
 	// now, and the result names it instead of a plan file.
@@ -5820,7 +5900,7 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 // Cancel plan mode trait without changing the narrator's permission policy.
 narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const message = getToolMessage("planModeCancelled", locale);
@@ -5894,7 +5974,7 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	) {
 		throw new ValidationError(`reasoningEffort must be one of: ${validEfforts.join(", ")} or null`);
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	await narratorService.updateReasoningEffort(id, reasoningEffort);
 	updateNarratorReasoningEffort(id, reasoningEffort ?? null);
 	return c.json({ ok: true });
@@ -5916,7 +5996,7 @@ narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	} else {
 		throw new ValidationError("fastModeOverride must be one of: inherit, on, off");
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	await narratorService.updateFastModeOverride(id, override);
 	const fastMode = await resolveNarratorFastMode(id, { signal: c.req.raw.signal });
 	return c.json({
@@ -5934,7 +6014,7 @@ narratorRoutes.patch("/:id/relaxed-plan", async (c) => {
 	if (typeof relaxedPlan !== "boolean") {
 		throw new ValidationError("relaxedPlan must be a boolean");
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const effectiveRelaxedPlan = await narratorService.updateRelaxedPlan(id, relaxedPlan);
 	broadcastToNarrator(id, {
 		type: "relaxed_plan_changed",
@@ -6010,7 +6090,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	) {
 		throw new ValidationError("At least one override must be provided");
 	}
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateReflectionOverrides(id, updates);
 	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
 	return c.json({ ok: true });
@@ -6058,7 +6138,7 @@ narratorRoutes.patch("/:id/behavior-fence", async (c) => {
 	) {
 		throw new ValidationError("At least one behavior-fence setting must be provided");
 	}
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateBehaviorFenceSettings(id, updates);
 	broadcastToNarrator(id, { type: "behavior_fence_settings_changed", narratorId: id, ...updates });
 	return c.json({ ok: true });
@@ -6069,7 +6149,7 @@ narratorRoutes.patch("/:id/title", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorTitleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await persistTitle(id, parsed.data.title);
 	return c.json({ ok: true, title: parsed.data.title });
 });
@@ -6079,7 +6159,9 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorHandleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updated = await narratorService.setHandle(id, parsed.data.handle);
+	const updated = await narratorService.setHandle(id, parsed.data.handle, {
+		signal: c.req.raw.signal,
+	});
 	return c.json(publicNarratorResponse(updated));
 });
 
@@ -6095,7 +6177,7 @@ narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
 // Regenerate narrator title via AI
 narratorRoutes.post("/:id/generate-title", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const title = await generateTitle(id, locale, userId);
@@ -6122,7 +6204,7 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 // Delete narrator (must be archived)
 narratorRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status !== "archived") {
 		throw new ValidationError("Only archived narrators can be deleted");
 	}
@@ -6137,7 +6219,7 @@ narratorRoutes.delete("/:id", async (c) => {
 // outcome and must be preserved for follow-up Send.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (await readSessionDeliverTo(id)) return c.json({ ok: true });
 	const currentSubstatus = parseSubstatus(narrator.substatus);
 	if (narrator.status === "idle" && currentSubstatus.includes("unread") && !narrator.errorMessage) {
@@ -6191,6 +6273,7 @@ narratorRoutes.post("/:id/extract-primary", async (c) => {
 	const { extractPrimarySchema } = await import("../lib/validators");
 	const parsed = extractPrimarySchema.parse(body ?? {});
 	const newNarrator = await narratorService.extractSubagentToPrimary(id, {
+		signal: c.req.raw.signal,
 		title: parsed.title,
 		inheritMode: parsed.inheritMode ?? "full",
 		locale: parsed.locale ?? "en",
@@ -6539,7 +6622,7 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 // Unlocks the narrator (drops the ask-in-passing label); never broadens its execution policy.
 narratorRoutes.post("/:id/promote", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	const narratorTraits = parseTraits(narrator.traits);
 
@@ -6548,7 +6631,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	}
 
 	await narratorTraitsLock.acquire(id, async () => {
-		const current = await narratorService.getById(id);
+		const current = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 		const unlockedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
 		await db
 			.update(narrators)
@@ -6563,7 +6646,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	// Promotion removes the ask label, never broadens the existing execution policy.
 	await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
 
-	const updated = await narratorService.getById(id);
+	const updated = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	broadcastToNarrator(id, {
 		type: "permission_mode_changed",
 		narratorId: id,
@@ -6610,6 +6693,7 @@ narratorRoutes.get("/:id/questions", async (c) => {
 	if (parsed.data.filter || !parsed.data.status) {
 		return c.json(
 			await listQuestionSummaries({
+				signal: c.req.raw.signal,
 				narratorId: id,
 				filter: parsed.data.filter ?? "all",
 				cursor: parsed.data.cursor,
@@ -6618,12 +6702,13 @@ narratorRoutes.get("/:id/questions", async (c) => {
 		);
 	}
 	const { items, nextCursor } = await listAsyncQuestions({
+		signal: c.req.raw.signal,
 		narratorId: id,
 		status: parsed.data.status,
 		cursor: parsed.data.cursor,
 		limit: parsed.data.limit,
 	});
-	const openCount = await countOpenAsyncQuestions(id);
+	const openCount = await countOpenAsyncQuestions(id, { signal: c.req.raw.signal });
 	return c.json({ items, nextCursor, openCount });
 });
 
@@ -6633,6 +6718,7 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	c.header("Cache-Control", "no-store");
 	const detail = await getBoundedQuestionDetail(c.req.param("questionId"), {
+		signal: c.req.raw.signal,
 		narratorId,
 		cursor: parsed.data.cursor,
 		limit: parsed.data.limit,
@@ -6641,10 +6727,14 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 		return c.json({ error: "Question detail exceeds the byte limit", tooLarge: true }, 413);
 	}
 	if (!detail.record) return c.json({ error: "Question not found" }, 404);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	const canAct = !!narrator && (await canWriteNarrator(narrator, narratorPrincipalOf(c)));
 	return c.json({
 		question: detail.record,
@@ -6676,11 +6766,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const questionId = c.req.param("questionId");
 	const parsed = asyncQuestionSupplementSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const [existing] = await db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1);
+	const [existing] = await readQuery(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6689,6 +6782,8 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	// Last await before deciding: the gate ran before the body arrived.
 	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
+		signal: c.req.raw.signal,
+		narratorId,
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
 		userId,
@@ -6715,12 +6810,14 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Ownership is checked against the question's own narrator rather than trusting the
 	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
 	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6729,6 +6826,8 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Last await before deciding: the gate ran before the body arrived.
 	await requireNarratorAccess(c, narratorId, "write");
 	const result = await answerAsyncQuestion(questionId, {
+		signal: c.req.raw.signal,
+		narratorId,
 		answers: parsed.data.answers,
 		annotations: parsed.data.annotations ?? null,
 		userId,
@@ -6749,12 +6848,14 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6762,7 +6863,12 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const locale = (await getUserLanguage(userId)) as Locale;
 	// Last await before deciding (the gate ran before the request was read).
 	await requireNarratorAccess(c, narratorId, "write");
-	const result = await dismissAsyncQuestion(questionId, { userId, locale });
+	const result = await dismissAsyncQuestion(questionId, {
+		userId,
+		locale,
+		narratorId,
+		signal: c.req.raw.signal,
+	});
 	if (!result.ok) {
 		return c.json(
 			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
@@ -6780,12 +6886,14 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6793,7 +6901,12 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const locale = (await getUserLanguage(userId)) as Locale;
 	// Last await before deciding (the gate ran before the request was read).
 	await requireNarratorAccess(c, narratorId, "write");
-	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
+	const result = await ignoreAsyncQuestion(questionId, {
+		userId,
+		locale,
+		narratorId,
+		signal: c.req.raw.signal,
+	});
 	if (!result.ok) {
 		return c.json(
 			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
@@ -6815,7 +6928,11 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 async function prepareDecision(c: Context, requestId: string) {
 	const target = await readDecisionTarget(requestId);
 	const assertStillAllowed = () =>
-		requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+		requireOwningNarratorAccess(
+			c,
+			() => resolveDecisionNarratorId(requestId, { signal: c.req.raw.signal }),
+			"write",
+		);
 	await assertStillAllowed();
 	return { target, assertStillAllowed };
 }
@@ -7007,7 +7124,7 @@ narratorRoutes.post("/permissions/:requestId/stop-task-reflection", async (c) =>
 // Suggest best-practice answers for AskUserQuestion
 narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = (await getUserLanguage(userId)) as Locale;
 
@@ -7650,7 +7767,12 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	}
 
 	const subagentId = task?.type === "agent" ? (task.subagentNarratorId ?? task.id) : taskId;
-	const subagent = await narratorService.getById(subagentId).catch(() => null);
+	const subagent = await narratorService
+		.getById(subagentId, undefined, { signal: c.req.raw.signal })
+		.catch((error: unknown) => {
+			if (error instanceof NotFoundError) return null;
+			throw error;
+		});
 	if (!task && subagent?.parentNarratorId !== parentNarratorId) {
 		return c.json({ error: "Task is not running or does not exist" }, 404);
 	}
@@ -7751,14 +7873,14 @@ narratorRoutes.get("/:id/background-tasks/:taskId/output/tail", async (c) => {
 
 narratorRoutes.get("/:id/whitelist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.directoryWhitelist);
 });
 
 narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7774,23 +7896,35 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistDirs.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistDirs.id, dirId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "directoryWhitelist",
-		value: { ...existing, ...parsed.data, id: dirId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "directoryWhitelist",
+			value: { ...existing, ...parsed.data, id: dirId },
+		},
+		{ ruleType: "directoryWhitelist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistDirs.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryWhitelist", dirId);
 	return c.json({ ok: true });
@@ -7800,14 +7934,14 @@ narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 
 narratorRoutes.get("/:id/blacklist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.directoryBlacklist);
 });
 
 narratorRoutes.post("/:id/blacklist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7823,23 +7957,35 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistDirs.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistDirs.id, dirId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "directoryBlacklist",
-		value: { ...existing, ...parsed.data, id: dirId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "directoryBlacklist",
+			value: { ...existing, ...parsed.data, id: dirId },
+		},
+		{ ruleType: "directoryBlacklist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistDirs.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryBlacklist", dirId);
 	return c.json({ ok: true });
@@ -7849,14 +7995,14 @@ narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 
 narratorRoutes.get("/:id/cmd-whitelist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.commandWhitelist);
 });
 
 narratorRoutes.post("/:id/cmd-whitelist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7872,23 +8018,35 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistCmds.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistCmds.id, entryId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "commandWhitelist",
-		value: { ...existing, ...parsed.data, id: entryId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "commandWhitelist",
+			value: { ...existing, ...parsed.data, id: entryId },
+		},
+		{ ruleType: "commandWhitelist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistCmds.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandWhitelist", entryId);
 	return c.json({ ok: true });
@@ -7898,14 +8056,14 @@ narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 
 narratorRoutes.get("/:id/cmd-blacklist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.commandBlacklist);
 });
 
 narratorRoutes.post("/:id/cmd-blacklist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7921,23 +8079,35 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistCmds.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistCmds.id, entryId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "commandBlacklist",
-		value: { ...existing, ...parsed.data, id: entryId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "commandBlacklist",
+			value: { ...existing, ...parsed.data, id: entryId },
+		},
+		{ ruleType: "commandBlacklist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistCmds.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandBlacklist", entryId);
 	return c.json({ ok: true });
@@ -7953,7 +8123,7 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 narratorRoutes.get("/:id/optional-tools/:toolId", async (c) => {
 	const id = c.req.param("id");
 	const toolId = c.req.param("toolId");
-	await narratorService.getById(id); // 404 if missing
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // 404 if missing
 
 	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
 	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);
@@ -7981,7 +8151,7 @@ narratorRoutes.post("/:id/optional-tools/:toolId/load", async (c) => {
 	const id = c.req.param("id");
 	const toolId = c.req.param("toolId");
 	const userId = c.get("user").sub;
-	await narratorService.getById(id); // 404 if missing
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // 404 if missing
 
 	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
 	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);

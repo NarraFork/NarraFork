@@ -55,6 +55,7 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
@@ -159,6 +160,10 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { toolDetailSelectionRequired, validateToolDetailReference } from "./narrator-tool-detail";
 import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
@@ -3511,15 +3516,21 @@ const narratorMessageQueriesUnlocked = {
 		}));
 	},
 
-	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+	async getLatestCompactSeq(
+		narratorId: string,
+		options: NarratorSurfaceReadBudget = {},
+	): Promise<number | null> {
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
@@ -3918,17 +3929,20 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
-	async _getPostCompactTopLevelRefs(narratorId: string) {
+	async _getPostCompactTopLevelRefs(narratorId: string, options: NarratorSurfaceReadBudget = {}) {
 		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 

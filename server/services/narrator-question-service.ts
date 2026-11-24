@@ -56,6 +56,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
@@ -66,10 +67,15 @@ import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { assertRuntimeCanAskQuestion, type RuntimePolicy } from "./agent-runtime/policy";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { coerceAskQuestions } from "./ask-user-question-coerce";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 
 /** One question as the tool defined it. Header + description only. */
 export interface AsyncQuestionDefinition {
@@ -356,9 +362,25 @@ function toRecord(row: Omit<QuestionRow, "executionPrincipalJson">): AsyncQuesti
  * site) so a test can observe it without module-mocking the websocket layer — see
  * `QuestionServiceSeam` for what that mock did to unrelated suites.
  */
+async function readQuestionBroadcastOwner(
+	narratorId: string,
+	options: NarratorSurfaceReadBudget = {},
+) {
+	return readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { variant: true, parentNarratorId: true },
+		}),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
+}
+
 async function broadcastChange(
 	record: AsyncQuestionRecord,
 	change: AsyncQuestionChange,
+	knownNarrator?: Awaited<ReturnType<typeof readQuestionBroadcastOwner>> | null,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<void> {
 	// Global discovery must not depend on a narrator subscription or successful local delivery.
 	notifyHumanAttentionChanged();
@@ -386,10 +408,10 @@ async function broadcastChange(
 		awaited,
 	};
 	seam.broadcastToNarrator(record.narratorId, event);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, record.narratorId),
-		columns: { variant: true, parentNarratorId: true },
-	});
+	const narrator =
+		knownNarrator === undefined
+			? await readQuestionBroadcastOwner(record.narratorId, options)
+			: knownNarrator;
 	if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		// Parent visibility is an event about the child, never a synthetic user answer
 		// in the parent's history. The actual answer remains owned by the child.
@@ -417,15 +439,23 @@ export async function assertNarratorCanAskQuestion(narratorId: string): Promise<
 export async function getAsyncQuestionExecutionPrincipal(
 	questionId: string,
 	narratorId: string,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<QuestionExecutionPrincipal | null> {
-	const row = await db.query.narratorQuestions.findFirst({
-		where: and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)),
-		columns: { executionPrincipalJson: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narratorQuestions.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorQuestions.id, questionId),
+				eq(narratorQuestions.narratorId, narratorId),
+			),
+			columns: { executionPrincipalJson: true },
+		}),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return parseQuestionExecutionPrincipal(row?.executionPrincipalJson);
 }
 
-export interface CreateAsyncQuestionArgs {
+export interface CreateAsyncQuestionArgs extends NarratorSurfaceReadBudget {
 	narratorId: string;
 	toolCallId: string;
 	toolUseId: string;
@@ -447,21 +477,34 @@ export interface CreateAsyncQuestionArgs {
 export async function createAsyncQuestion(
 	args: CreateAsyncQuestionArgs,
 ): Promise<{ record: AsyncQuestionRecord; created: boolean }> {
+	const readBudget = narratorSurfaceReadOptions(args);
 	await assertNarratorCanAskQuestion(args.narratorId);
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, args.toolCallId),
-			eq(narratorToolCalls.narratorId, args.narratorId),
-			eq(narratorToolCalls.toolUseId, args.toolUseId),
-			eq(narratorToolCalls.toolName, "AskUserQuestion"),
-		),
-		columns: { id: true },
-	});
+	const call = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorToolCalls.id, args.toolCallId),
+				eq(narratorToolCalls.narratorId, args.narratorId),
+				eq(narratorToolCalls.toolUseId, args.toolUseId),
+				eq(narratorToolCalls.toolName, "AskUserQuestion"),
+			),
+			columns: { id: true },
+		}),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
 	if (!call) throw new Error("Question tool call does not belong to this narrator.");
-	const existing = await db.query.narratorQuestions.findFirst({
-		where: eq(narratorQuestions.toolCallId, args.toolCallId),
-	});
-	if (existing) return { record: toRecord(existing), created: false };
+	const existing = await readQueryFirst(
+		db.query.narratorQuestions.findMany({
+			limit: 1,
+			where: eq(narratorQuestions.toolCallId, args.toolCallId),
+		}),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
+	if (existing) {
+		if (existing.narratorId !== args.narratorId || existing.toolUseId !== args.toolUseId)
+			throw new Error("Question tool call does not belong to this narrator.");
+		return { record: toRecord(existing), created: false };
+	}
 
 	assertQuestionBudget(args.context ?? "", QUESTION_CONTEXT_MAX_BYTES, "Question context");
 	const context = args.context?.trim() || null;
@@ -523,14 +566,36 @@ export async function createAsyncQuestion(
 	};
 
 	try {
-		await db.insert(narratorQuestions).values(row);
+		db.transaction((tx) => {
+			// The Worker preflight cannot authorize an insert after tool ownership changes.
+			const current = tx
+				.select({ id: narratorToolCalls.id })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						eq(narratorToolCalls.id, args.toolCallId),
+						eq(narratorToolCalls.narratorId, args.narratorId),
+						eq(narratorToolCalls.toolUseId, args.toolUseId),
+						eq(narratorToolCalls.toolName, "AskUserQuestion"),
+					),
+				)
+				.get();
+			if (!current) throw new RuntimeReadConflictError();
+			tx.insert(narratorQuestions).values(row).run();
+		});
 	} catch (err) {
+		if (err instanceof RuntimeReadConflictError) throw err;
 		// Lost the insert race against a concurrent replay of the same tool call: the
 		// unique index did its job, so read the winner back instead of failing.
-		const winner = await db.query.narratorQuestions.findFirst({
-			where: eq(narratorQuestions.toolCallId, args.toolCallId),
-		});
-		if (winner) return { record: toRecord(winner), created: false };
+		const winner = await readQueryFirst(
+			db.query.narratorQuestions.findMany({
+				limit: 1,
+				where: eq(narratorQuestions.toolCallId, args.toolCallId),
+			}),
+			{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+		);
+		if (winner && winner.narratorId === args.narratorId && winner.toolUseId === args.toolUseId)
+			return { record: toRecord(winner), created: false };
 		throw err;
 	}
 
@@ -543,7 +608,7 @@ export async function createAsyncQuestion(
 // Reads
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface ListAsyncQuestionsArgs {
+export interface ListAsyncQuestionsArgs extends NarratorSurfaceReadBudget {
 	narratorId: string;
 	status?: AsyncQuestionStatus;
 	/** Keyset cursor: `createdAt|id` of the last row of the previous page. */
@@ -595,29 +660,32 @@ export async function listAsyncQuestions(args: ListAsyncQuestionsArgs): Promise<
 	const budget = QUESTION_RECEIPT_MAX_BYTES + 4096;
 	const bounded = (column: SQLWrapper) =>
 		sql<string | null>`case when ${bytes} <= ${budget} then ${column} else null end`;
-	const rows = await db
-		.select({
-			...getTableColumns(narratorQuestions),
-			questionsJson: bounded(narratorQuestions.questionsJson).mapWith(
-				narratorQuestions.questionsJson,
-			),
-			answersJson: bounded(narratorQuestions.answersJson).mapWith(narratorQuestions.answersJson),
-			annotationsJson: bounded(narratorQuestions.annotationsJson).mapWith(
-				narratorQuestions.annotationsJson,
-			),
-			context: bounded(narratorQuestions.context),
-			resolutionJson: bounded(narratorQuestions.resolutionJson).mapWith(
-				narratorQuestions.resolutionJson,
-			),
-			withdrawReason: bounded(narratorQuestions.withdrawReason),
-			summaryJson: sql<null>`null`,
-			executionPrincipalJson: sql<null>`null`,
-			withinBudget: sql<number>`${bytes} <= ${budget}`,
-		})
-		.from(narratorQuestions)
-		.where(and(...conditions))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				...getTableColumns(narratorQuestions),
+				questionsJson: bounded(narratorQuestions.questionsJson).mapWith(
+					narratorQuestions.questionsJson,
+				),
+				answersJson: bounded(narratorQuestions.answersJson).mapWith(narratorQuestions.answersJson),
+				annotationsJson: bounded(narratorQuestions.annotationsJson).mapWith(
+					narratorQuestions.annotationsJson,
+				),
+				context: bounded(narratorQuestions.context),
+				resolutionJson: bounded(narratorQuestions.resolutionJson).mapWith(
+					narratorQuestions.resolutionJson,
+				),
+				withdrawReason: bounded(narratorQuestions.withdrawReason),
+				summaryJson: sql<null>`null`,
+				executionPrincipalJson: sql<null>`null`,
+				withinBudget: sql<number>`${bytes} <= ${budget}`,
+			})
+			.from(narratorQuestions)
+			.where(and(...conditions))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(limit + 1),
+		{ ...narratorSurfaceReadOptions(args), maxRows: limit + 1 },
+	);
 
 	const hasMore = rows.length > limit;
 	const page = hasMore ? rows.slice(0, limit) : rows;
@@ -645,21 +713,33 @@ export async function listAsyncQuestions(args: ListAsyncQuestionsArgs): Promise<
 }
 
 /** How many questions are still open for this narrator (badge + soft-limit check). */
-export async function countOpenAsyncQuestions(narratorId: string): Promise<number> {
+export async function countOpenAsyncQuestions(
+	narratorId: string,
+	options: NarratorSurfaceReadBudget = {},
+): Promise<number> {
 	// A narrow `COUNT(*)` over the `(narrator_id, status)` index. The exception to the
 	// no-count rule is deliberate: this is an index-only probe of a set the soft limit
 	// keeps small, and the number itself is the product feature (the inbox badge).
-	const [row] = await db
-		.select({ n: sql<number>`count(*)` })
-		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.narratorId, narratorId), eq(narratorQuestions.status, "open")));
+	const [row] = await readQuery(
+		db
+			.select({ n: sql<number>`count(*)` })
+			.from(narratorQuestions)
+			.where(
+				and(eq(narratorQuestions.narratorId, narratorId), eq(narratorQuestions.status, "open")),
+			),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return row?.n ?? 0;
 }
 
-export async function getAsyncQuestion(id: string): Promise<AsyncQuestionRecord | null> {
-	const row = await db.query.narratorQuestions.findFirst({
-		where: eq(narratorQuestions.id, id),
-	});
+export async function getAsyncQuestion(
+	id: string,
+	options: NarratorSurfaceReadBudget = {},
+): Promise<AsyncQuestionRecord | null> {
+	const row = await readQueryFirst(
+		db.query.narratorQuestions.findMany({ limit: 1, where: eq(narratorQuestions.id, id) }),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return row ? toRecord(row) : null;
 }
 
@@ -669,6 +749,7 @@ export async function getBoundedOpenAsyncQuestion(
 	maxBytes: number,
 	status: AsyncQuestionStatus | null = "open",
 	narratorId?: string,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<{ record: AsyncQuestionRecord | null; tooLarge: boolean }> {
 	const bytes = sql`coalesce(length(cast(${narratorQuestions.questionsJson} as blob)), 0)
 		+ coalesce(length(cast(${narratorQuestions.answersJson} as blob)), 0)
@@ -678,36 +759,38 @@ export async function getBoundedOpenAsyncQuestion(
 		+ coalesce(length(cast(${narratorQuestions.withdrawReason} as blob)), 0)`;
 	const bounded = (column: SQLWrapper) =>
 		sql<string | null>`case when ${bytes} <= ${maxBytes} then ${column} else null end`;
-	const row = await db
-		.select({
-			id: narratorQuestions.id,
-			narratorId: narratorQuestions.narratorId,
-			toolCallId: narratorQuestions.toolCallId,
-			toolUseId: narratorQuestions.toolUseId,
-			context: bounded(narratorQuestions.context),
-			resolutionJson: bounded(narratorQuestions.resolutionJson),
-			withdrawReason: bounded(narratorQuestions.withdrawReason),
-			questionsJson: bounded(narratorQuestions.questionsJson),
-			answersJson: bounded(narratorQuestions.answersJson),
-			annotationsJson: bounded(narratorQuestions.annotationsJson),
-			withinBudget: sql<number>`${bytes} <= ${maxBytes}`,
-			status: narratorQuestions.status,
-			origin: narratorQuestions.origin,
-			answerMessageId: narratorQuestions.answerMessageId,
-			decidedBy: narratorQuestions.decidedBy,
-			decidedAt: narratorQuestions.decidedAt,
-			createdAt: narratorQuestions.createdAt,
-		})
-		.from(narratorQuestions)
-		.where(
-			and(
-				eq(narratorQuestions.id, id),
-				...(status ? [eq(narratorQuestions.status, status)] : []),
-				...(narratorId !== undefined ? [eq(narratorQuestions.narratorId, narratorId)] : []),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				id: narratorQuestions.id,
+				narratorId: narratorQuestions.narratorId,
+				toolCallId: narratorQuestions.toolCallId,
+				toolUseId: narratorQuestions.toolUseId,
+				context: bounded(narratorQuestions.context),
+				resolutionJson: bounded(narratorQuestions.resolutionJson),
+				withdrawReason: bounded(narratorQuestions.withdrawReason),
+				questionsJson: bounded(narratorQuestions.questionsJson),
+				answersJson: bounded(narratorQuestions.answersJson),
+				annotationsJson: bounded(narratorQuestions.annotationsJson),
+				withinBudget: sql<number>`${bytes} <= ${maxBytes}`,
+				status: narratorQuestions.status,
+				origin: narratorQuestions.origin,
+				answerMessageId: narratorQuestions.answerMessageId,
+				decidedBy: narratorQuestions.decidedBy,
+				decidedAt: narratorQuestions.decidedAt,
+				createdAt: narratorQuestions.createdAt,
+			})
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.id, id),
+					...(status ? [eq(narratorQuestions.status, status)] : []),
+					...(narratorId !== undefined ? [eq(narratorQuestions.narratorId, narratorId)] : []),
+				),
+			)
+			.limit(1),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	if (!row) return { record: null, tooLarge: false };
 	if (!row.withinBudget) return { record: null, tooLarge: true };
 	const parse = (value: string | null): unknown => {
@@ -733,38 +816,47 @@ export async function getBoundedOpenAsyncQuestion(
 export async function getBoundedQuestionReceipt(
 	messageId: string,
 	narratorId: string,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<string | null> {
-	const row = await db
-		.select({
-			text: sql<
-				string | null
-			>`case when length(cast(${narratorMessages.contentText} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES} then ${narratorMessages.contentText} else null end`,
-		})
-		.from(narratorMessages)
-		.where(
-			and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "user"),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				text: sql<
+					string | null
+				>`case when length(cast(${narratorMessages.contentText} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES} then ${narratorMessages.contentText} else null end`,
+			})
+			.from(narratorMessages)
+			.where(
+				and(
+					eq(narratorMessages.id, messageId),
+					eq(narratorMessages.narratorId, narratorId),
+					eq(narratorMessages.role, "user"),
+				),
+			)
+			.limit(1),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return row?.text ?? null;
 }
 
 export async function getBoundedQuestionDetail(
 	id: string,
-	options: { narratorId?: string; cursor?: string; limit?: number } = {},
+	options: NarratorSurfaceReadBudget & {
+		narratorId?: string;
+		cursor?: string;
+		limit?: number;
+	} = {},
 ) {
+	const readBudget = narratorSurfaceReadOptions(options);
 	const detail = await getBoundedOpenAsyncQuestion(
 		id,
 		QUESTION_RECEIPT_MAX_BYTES + 4 * 1024,
 		null,
 		options.narratorId,
+		readBudget,
 	);
 	if (!detail.record) return { ...detail, events: [], nextCursor: null };
-	const events = await listQuestionEvents(id, options);
+	const events = await listQuestionEvents(id, { ...options, ...readBudget });
 	return { ...detail, ...events };
 }
 
@@ -784,7 +876,7 @@ function receiptSupplementSql() {
 /** Event payloads are bounded in SQL, before fetching or parsing legacy JSON. */
 export async function listQuestionEvents(
 	id: string,
-	options: { cursor?: string; limit?: number } = {},
+	options: NarratorSurfaceReadBudget & { cursor?: string; limit?: number } = {},
 ) {
 	const limit = Math.min(Math.max(options.limit ?? 5, 1), 10);
 	const conditions = [eq(narratorQuestionEvents.questionId, id)];
@@ -794,27 +886,30 @@ export async function listQuestionEvents(
 			throw new Error("Invalid question event cursor.");
 		conditions.push(sql`${narratorQuestionEvents}.rowid > ${cursor}`);
 	}
-	const rows = await db
-		.select({
-			messageId: narratorQuestionEvents.messageId,
-			cursor: sql<number>`${narratorQuestionEvents}.rowid`,
-			resolution: sql<
-				string | null
-			>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
-			kind: narratorQuestionEvents.kind,
-			createdAt: narratorQuestionEvents.createdAt,
-			text: blockReadsEnabled()
-				? receiptSupplementSql()
-				: sql<
-						string | null
-					>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
-			actor: narratorMessages.createdBy,
-		})
-		.from(narratorQuestionEvents)
-		.innerJoin(narratorMessages, eq(narratorQuestionEvents.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.orderBy(sql`${narratorQuestionEvents}.rowid`)
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorQuestionEvents.messageId,
+				cursor: sql<number>`${narratorQuestionEvents}.rowid`,
+				resolution: sql<
+					string | null
+				>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
+				kind: narratorQuestionEvents.kind,
+				createdAt: narratorQuestionEvents.createdAt,
+				text: blockReadsEnabled()
+					? receiptSupplementSql()
+					: sql<
+							string | null
+						>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
+				actor: narratorMessages.createdBy,
+			})
+			.from(narratorQuestionEvents)
+			.innerJoin(narratorMessages, eq(narratorQuestionEvents.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(sql`${narratorQuestionEvents}.rowid`)
+			.limit(limit + 1),
+		{ ...narratorSurfaceReadOptions(options), maxRows: limit + 1 },
+	);
 	const page = rows.slice(0, limit);
 	const last = page.at(-1);
 	return {
@@ -827,15 +922,18 @@ export async function listQuestionEvents(
 }
 
 /** Summaries avoid loading previews, answers, context and raw event payloads. */
-export async function listQuestionSummaries(args: {
-	narratorId?: string;
-	principal?: { userId: string; isAdmin: boolean };
-	filter?: QuestionFilter;
-	cursor?: string;
-	limit?: number;
-}) {
+export async function listQuestionSummaries(
+	args: NarratorSurfaceReadBudget & {
+		narratorId?: string;
+		principal?: { userId: string; isAdmin: boolean };
+		filter?: QuestionFilter;
+		cursor?: string;
+		limit?: number;
+	},
+) {
 	if (!args.narratorId && !args.principal)
 		throw new Error("Question query requires an owner or principal.");
+	const readBudget = narratorSurfaceReadOptions(args);
 	const limit = Math.min(Math.max(args.limit ?? 20, 1), 32);
 	const conditions = [];
 	if (args.narratorId) conditions.push(eq(narratorQuestions.narratorId, args.narratorId));
@@ -850,52 +948,64 @@ export async function listQuestionSummaries(args: {
 			sql`(${narratorQuestions.createdAt}, ${narratorQuestions.id}) < (${createdAt}, ${id})`,
 		);
 	}
-	const rows = await db
-		.select({
-			id: narratorQuestions.id,
-			narratorId: narratorQuestions.narratorId,
-			toolCallId: narratorQuestions.toolCallId,
-			toolUseId: narratorQuestions.toolUseId,
-			status: narratorQuestions.status,
-			origin: narratorQuestions.origin,
-			createdAt: narratorQuestions.createdAt,
-			answerMessageId: narratorQuestions.answerMessageId,
-			context: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.context} as blob)) <= ${QUESTION_CONTEXT_MAX_BYTES} then ${narratorQuestions.context} else null end`,
-			resolution: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
-			withdrawReason: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
-			resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
-			questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
-			narratorTitle: narrators.title,
-		})
-		.from(narratorQuestions)
-		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
-		.where(and(...conditions))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narratorQuestions.id,
+				narratorId: narratorQuestions.narratorId,
+				toolCallId: narratorQuestions.toolCallId,
+				toolUseId: narratorQuestions.toolUseId,
+				status: narratorQuestions.status,
+				origin: narratorQuestions.origin,
+				createdAt: narratorQuestions.createdAt,
+				answerMessageId: narratorQuestions.answerMessageId,
+				context: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.context} as blob)) <= ${QUESTION_CONTEXT_MAX_BYTES} then ${narratorQuestions.context} else null end`,
+				resolution: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
+				withdrawReason: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
+				resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
+				questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
+				narratorTitle: narrators.title,
+			})
+			.from(narratorQuestions)
+			.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
+			.where(and(...conditions))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(limit + 1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: limit + 1 },
+	);
 	const page = rows.slice(0, limit);
+	const owners =
+		args.principal && page.length
+			? await readQuery(
+					db.query.narrators.findMany({
+						where: inArray(narrators.id, [...new Set(page.map((row) => row.narratorId))]),
+						columns: {
+							id: true,
+							ownerUserId: true,
+							visibility: true,
+							writeAudience: true,
+							type: true,
+							aclRootNarratorId: true,
+							contextProjectId: true,
+						},
+						limit: limit,
+					}),
+					narratorSurfaceReadOptions(readBudget),
+				)
+			: [];
+	const ownersById = new Map(owners.map((owner) => [owner.id, owner]));
 	const items = [];
 	const { canReadNarrator, canWriteNarrator } = await import("./narrator-acl");
 	for (const row of page) {
 		let canAct = true;
 		if (args.principal) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, row.narratorId),
-				columns: {
-					id: true,
-					ownerUserId: true,
-					visibility: true,
-					writeAudience: true,
-					type: true,
-					aclRootNarratorId: true,
-					contextProjectId: true,
-				},
-			});
+			const narrator = ownersById.get(row.narratorId);
 			if (!narrator || !(await canReadNarrator(narrator, args.principal))) continue;
 			canAct = await canWriteNarrator(narrator, args.principal);
 		}
@@ -922,10 +1032,12 @@ export async function listQuestionSummaries(args: {
 export async function buildPendingQuestionHint(
 	narratorId: string,
 	locale: Locale = "en",
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<string> {
+	const readBudget = narratorSurfaceReadOptions(options);
 	const [open, pending] = await Promise.all([
-		listQuestionSummaries({ narratorId, filter: "open", limit: 8 }),
-		listQuestionSummaries({ narratorId, filter: "pending", limit: 8 }),
+		listQuestionSummaries({ ...readBudget, narratorId, filter: "open", limit: 8 }),
+		listQuestionSummaries({ ...readBudget, narratorId, filter: "pending", limit: 8 }),
 	]);
 	const lines = [
 		locale === "zh-CN"
@@ -954,15 +1066,20 @@ export async function buildPendingQuestionHint(
 	return lines.length === 1 ? "" : lines.join("\n");
 }
 
-export async function resolveAsyncQuestion(args: {
-	id: string;
-	narratorId: string;
-	answerMessageId: string;
-	note: string;
-}) {
+export async function resolveAsyncQuestion(
+	args: NarratorSurfaceReadBudget & {
+		id: string;
+		narratorId: string;
+		answerMessageId: string;
+		note: string;
+	},
+) {
 	assertQuestionBudget(args.note, QUESTION_NOTE_MAX_BYTES, "Resolution note");
 	if (!args.note.trim()) throw new Error("Resolution note must be non-empty.");
-	const detail = await getBoundedQuestionDetail(args.id, { narratorId: args.narratorId });
+	const detail = await getBoundedQuestionDetail(args.id, {
+		...narratorSurfaceReadOptions(args),
+		narratorId: args.narratorId,
+	});
 	if (detail.tooLarge) throw new Error("Question detail exceeds the byte budget.");
 	if (!detail.record) return { ok: false as const, reason: "not_found", answerMessageId: null };
 	const resolution: QuestionResolution = {
@@ -1025,11 +1142,16 @@ export async function supplementAsyncQuestion(
 		locale?: Locale;
 		answerMessageId?: string;
 		expectedAnswerMessageId?: string;
-	},
+		narratorId?: string;
+	} & NarratorSurfaceReadBudget,
 ) {
+	const readBudget = narratorSurfaceReadOptions(args);
 	assertQuestionBudget(args.text, QUESTION_ANSWER_MAX_BYTES, "Question supplement");
 	if (!args.text.trim()) throw new Error("Supplement must be non-empty.");
-	const { record } = await getBoundedQuestionDetail(id);
+	const { record } = await getBoundedQuestionDetail(id, {
+		...readBudget,
+		narratorId: args.narratorId,
+	});
 	if (!record) return { ok: false as const, reason: "not_found" };
 	if (
 		record.status !== "answered" ||
@@ -1049,6 +1171,7 @@ export async function supplementAsyncQuestion(
 			args.userId ?? null,
 			seam,
 			(tx, messageId) => {
+				assertQuestionOwner(tx, record);
 				const claimed = tx
 					.update(narratorQuestions)
 					.set({ answerMessageId: messageId, resolutionJson: null })
@@ -1097,6 +1220,7 @@ export async function supplementAsyncQuestion(
 				committed = messageId;
 			},
 			args.text,
+			readBudget,
 		);
 	} catch (error) {
 		if (error instanceof QuestionAlreadyDecidedError)
@@ -1133,46 +1257,57 @@ export interface AsyncQuestionWithContext extends AsyncQuestionRecord {
  * question asked is exactly the shape that turns into "all requests hang". A user with
  * more than 200 waiting questions has a problem the inbox cannot solve anyway.
  */
-export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
-	userId: string;
-	isAdmin: boolean;
-}): Promise<AsyncQuestionWithContext[]> {
+export async function listAllOpenAsyncQuestionsForPrincipal(
+	principal: {
+		userId: string;
+		isAdmin: boolean;
+	},
+	options: NarratorSurfaceReadBudget = {},
+): Promise<AsyncQuestionWithContext[]> {
+	const readBudget = narratorSurfaceReadOptions(options);
 	const HARD_LIMIT = 200;
-	const rows = await db
-		.select({
-			question: narratorQuestions,
-			narratorTitle: narrators.title,
-			// The ACL columns, so the filter below needs no second query per row.
-			narratorId: narrators.id,
-			ownerUserId: narrators.ownerUserId,
-			visibility: narrators.visibility,
-			writeAudience: narrators.writeAudience,
-			type: narrators.type,
-			aclRootNarratorId: narrators.aclRootNarratorId,
-			contextProjectId: narrators.contextProjectId,
-		})
-		.from(narratorQuestions)
-		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
-		.where(eq(narratorQuestions.status, "open"))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(HARD_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({
+				question: narratorQuestions,
+				narratorTitle: narrators.title,
+				// The ACL columns, so the filter below needs no second query per row.
+				narratorId: narrators.id,
+				ownerUserId: narrators.ownerUserId,
+				visibility: narrators.visibility,
+				writeAudience: narrators.writeAudience,
+				type: narrators.type,
+				aclRootNarratorId: narrators.aclRootNarratorId,
+				contextProjectId: narrators.contextProjectId,
+			})
+			.from(narratorQuestions)
+			.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
+			.where(eq(narratorQuestions.status, "open"))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(HARD_LIMIT),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: HARD_LIMIT },
+	);
 
-	const { canReadNarrator } = await import("./narrator-acl");
+	const { narratorReadableWhere } = await import("./narrator-acl");
+	const readable = rows.length
+		? await readQuery(
+				db
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(
+						and(
+							inArray(narrators.id, [...new Set(rows.map((row) => row.narratorId))]),
+							narratorReadableWhere(principal),
+						),
+					)
+					.limit(HARD_LIMIT),
+				{ ...narratorSurfaceReadOptions(readBudget), maxRows: HARD_LIMIT },
+			)
+		: [];
+	const readableIds = new Set(readable.map((row) => row.id));
 	const visible: AsyncQuestionWithContext[] = [];
 	for (const row of rows) {
-		const allowed = await canReadNarrator(
-			{
-				id: row.narratorId,
-				ownerUserId: row.ownerUserId,
-				visibility: row.visibility,
-				writeAudience: row.writeAudience,
-				type: row.type,
-				aclRootNarratorId: row.aclRootNarratorId,
-				contextProjectId: row.contextProjectId,
-			},
-			principal,
-		);
-		if (!allowed) continue;
+		if (!readableIds.has(row.narratorId)) continue;
 		visible.push({
 			...toRecord(row.question),
 			narratorTitle: row.narratorTitle,
@@ -1195,6 +1330,18 @@ class QuestionAlreadyDecidedError extends Error {
 	constructor() {
 		super("Question already decided");
 	}
+}
+
+function assertQuestionOwner(
+	tx: Parameters<NonNullable<DeliverInjectionOptions["onPersist"]>>[0],
+	expected: { id: string; narratorId: string },
+) {
+	const current = tx
+		.select({ narratorId: narratorQuestions.narratorId })
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, expected.id))
+		.get();
+	if (!current || current.narratorId !== expected.narratorId) throw new RuntimeReadConflictError();
 }
 
 /** Flatten one question's answer for the injected message. */
@@ -1269,7 +1416,9 @@ async function deliverDecision(
 	seam: QuestionServiceSeam,
 	onPersist: NonNullable<DeliverInjectionOptions["onPersist"]>,
 	supplement?: string,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<string> {
+	const readBudget = narratorSurfaceReadOptions(options);
 	const messageId = generateId();
 	const body: SideCarBody = {
 		kind: "asyncQuestionAnswers",
@@ -1283,11 +1432,19 @@ async function deliverDecision(
 	};
 	const { content } = sideCarBodyWithText("async_question", body, locale);
 	assertQuestionBudget(content, QUESTION_RECEIPT_MAX_BYTES, "Question receipt");
-	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, record.narratorId),
-		columns: { variant: true },
-	});
+	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(
+		record.id,
+		record.narratorId,
+		readBudget,
+	);
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, record.narratorId),
+			columns: { variant: true },
+		}),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
 	const unknownChildPrincipal =
 		!!narrator && isSubagentVariant(narrator.variant) && !executionPrincipal;
 	if (unknownChildPrincipal)
@@ -1314,6 +1471,7 @@ async function deliverDecision(
 		seam,
 		locale,
 		content,
+		readBudget,
 	);
 	return result.messageId;
 }
@@ -1334,16 +1492,23 @@ async function scheduleSavedQuestionDecision(
 	seam: QuestionServiceSeam,
 	locale: Locale,
 	content?: string,
+	options: NarratorSurfaceReadBudget = {},
 ) {
+	const readBudget = narratorSurfaceReadOptions(options);
 	if (!record.answerMessageId) return { ready: false, started: false };
 	const text =
-		content ?? (await getBoundedQuestionReceipt(record.answerMessageId, record.narratorId));
+		content ??
+		(await getBoundedQuestionReceipt(record.answerMessageId, record.narratorId, readBudget));
 	if (text === null) {
 		notifyQuestionDecided({ ...record, receiptReady: false });
 		return { ready: false, started: false };
 	}
 	try {
-		const principal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
+		const principal = await getAsyncQuestionExecutionPrincipal(
+			record.id,
+			record.narratorId,
+			readBudget,
+		);
 		const delivery = await seam.scheduleQuestionAnswerDelivery(
 			record.narratorId,
 			record.answerMessageId,
@@ -1366,16 +1531,28 @@ export async function retryQuestionAnswerDelivery(
 	narratorId: string,
 	questionId: string,
 	locale: Locale = "en",
+	options: NarratorSurfaceReadBudget = {},
 ) {
-	const row = await db
-		.select(questionStateColumns)
-		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)))
-		.limit(1)
-		.get();
+	const readBudget = narratorSurfaceReadOptions(options);
+	const row = await readQueryFirst(
+		db
+			.select(questionStateColumns)
+			.from(narratorQuestions)
+			.where(
+				and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)),
+			)
+			.limit(1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
 	if (!row || (row.status !== "answered" && row.status !== "dismissed"))
 		return { ready: false, started: false };
-	return scheduleSavedQuestionDecision(toStateRecord(row), await resolveSeam(), locale);
+	return scheduleSavedQuestionDecision(
+		toStateRecord(row),
+		await resolveSeam(),
+		locale,
+		undefined,
+		readBudget,
+	);
 }
 
 export interface QuestionServiceSeam {
@@ -1434,11 +1611,12 @@ async function resolveSeam(): Promise<QuestionServiceSeam> {
 	};
 }
 
-export interface AnswerAsyncQuestionArgs {
+export interface AnswerAsyncQuestionArgs extends NarratorSurfaceReadBudget {
 	answers: Record<string, string>;
 	annotations?: Record<string, AsyncQuestionAnnotation> | null;
 	userId?: string | null;
 	locale?: Locale;
+	narratorId?: string;
 }
 
 /** Answer an open question, committing the decision with its model-visible message. */
@@ -1452,7 +1630,7 @@ export async function answerAsyncQuestion(
 /** Dismissal is also a user instruction and must reach the model durably. */
 export async function dismissAsyncQuestion(
 	id: string,
-	args: { userId?: string | null; locale?: Locale } = {},
+	args: Omit<AnswerAsyncQuestionArgs, "answers" | "annotations"> = {},
 ): Promise<AsyncQuestionTransition> {
 	return decideAsyncQuestion(id, "dismissed", args);
 }
@@ -1476,30 +1654,42 @@ export async function dismissAsyncQuestion(
  */
 export async function ignoreAsyncQuestion(
 	id: string,
-	args: { userId?: string | null; locale?: Locale } = {},
+	args: Omit<AnswerAsyncQuestionArgs, "answers" | "annotations"> = {},
 ): Promise<AsyncQuestionTransition> {
-	const row = await db
-		.select(questionStateColumns)
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, id))
-		.limit(1)
-		.get();
+	const readBudget = narratorSurfaceReadOptions(args);
+	const row = await readQueryFirst(
+		db
+			.select(questionStateColumns)
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.id, id),
+					args.narratorId ? eq(narratorQuestions.narratorId, args.narratorId) : undefined,
+				),
+			)
+			.limit(1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
 	if (!row) return { ok: false, reason: "not_found" };
 	if (row.status !== "open") return { ok: false, reason: "stale" };
-	const claimed = await db
-		.update(narratorQuestions)
-		.set({
-			status: "withdrawn",
-			withdrawReason: t("sidecar.asyncQuestionIgnoreReason", args.locale ?? "en"),
-			decidedBy: args.userId ?? null,
-			decidedAt: new Date().toISOString(),
-		})
-		.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
-		.returning(questionStateColumns);
+	const claimed = db.transaction((tx) => {
+		assertQuestionOwner(tx, row);
+		return tx
+			.update(narratorQuestions)
+			.set({
+				status: "withdrawn",
+				withdrawReason: t("sidecar.asyncQuestionIgnoreReason", args.locale ?? "en"),
+				decidedBy: args.userId ?? null,
+				decidedAt: new Date().toISOString(),
+			})
+			.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
+			.returning(questionStateColumns)
+			.all();
+	});
 	const updated = claimed[0];
 	if (!updated) return { ok: false, reason: "stale" };
 	const record = toStateRecord(updated);
-	await broadcastChange(record, "withdrawn");
+	await broadcastChange(record, "withdrawn", undefined, readBudget);
 	notifyQuestionDecided(record);
 	return { ok: true, record };
 }
@@ -1515,7 +1705,8 @@ async function decideAsyncQuestion(
 	outcome: "answered" | "dismissed",
 	args: Partial<AnswerAsyncQuestionArgs>,
 ): Promise<AsyncQuestionTransition> {
-	const detail = await getBoundedQuestionDetail(id);
+	const readBudget = narratorSurfaceReadOptions(args);
+	const detail = await getBoundedQuestionDetail(id, { ...readBudget, narratorId: args.narratorId });
 	if (detail.tooLarge) throw new Error("Question detail exceeds the byte budget.");
 	const existing = detail.record;
 	if (!existing) return { ok: false, reason: "not_found" };
@@ -1537,6 +1728,8 @@ async function decideAsyncQuestion(
 						existing,
 						await resolveSeam(),
 						args.locale ?? "en",
+						undefined,
+						readBudget,
 					);
 					return { ok: true, record: { ...existing, receiptReady: delivery.ready } };
 				} catch (error) {
@@ -1575,6 +1768,7 @@ async function decideAsyncQuestion(
 			args.userId ?? null,
 			seam,
 			(tx, messageId) => {
+				assertQuestionOwner(tx, existing);
 				const claimed = tx
 					.update(narratorQuestions)
 					.set({
@@ -1600,6 +1794,8 @@ async function decideAsyncQuestion(
 					.run();
 				persistedMessageId = messageId;
 			},
+			undefined,
+			readBudget,
 		);
 	} catch (error) {
 		if (error instanceof QuestionAlreadyDecidedError) {
@@ -1661,11 +1857,12 @@ export async function withdrawAsyncQuestions(
 		)
 		.returning(questionStateColumns);
 
+	const owner = rows.length ? ((await readQuestionBroadcastOwner(narratorId)) ?? null) : null;
 	const withdrawn = new Set<string>();
 	for (const row of rows) {
 		const record = toStateRecord(row);
 		withdrawn.add(record.id);
-		await broadcastChange(record, "withdrawn");
+		await broadcastChange(record, "withdrawn", owner);
 		// A withdraw also ends a wait: the agent that withdrew may not be the one
 		// blocked on it (a withdraw can arrive from a later turn), and leaving that
 		// waiter parked until its timeout would strand it on a question that is gone.
@@ -1873,48 +2070,60 @@ export async function notifyQuestionHistoryChanged(
 	narratorId: string,
 	questionIds: string[],
 ): Promise<void> {
-	for (const [index, id] of [...new Set(questionIds)].entries()) {
-		// Prepared reverts can affect thousands of questions. Process every ID while
-		// yielding between small batches instead of silently dropping later waiters.
-		if (index > 0 && index % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-		const row = await db
-			.select(questionStateColumns)
-			.from(narratorQuestions)
-			.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.narratorId, narratorId)))
-			.limit(1)
-			.get();
-		const record: AsyncQuestionRecord = row
-			? toStateRecord(row)
-			: {
-					id,
-					narratorId,
-					toolCallId: "",
-					toolUseId: "",
-					questions: [],
-					answers: null,
-					annotations: null,
-					context: null,
-					resolution: null,
-					withdrawReason: "history removed",
-					status: "withdrawn",
-					origin: "agent_async",
-					answerMessageId: null,
-					decidedBy: null,
-					decidedAt: null,
-					createdAt: "",
-					awaited: isAsyncQuestionAwaited(id),
-				};
-		await broadcastChange(
-			record,
-			record.status === "withdrawn"
-				? "withdrawn"
-				: record.status === "dismissed"
-					? "dismissed"
-					: record.status === "open"
-						? "opened"
-						: "answered",
+	const readBudget = narratorSurfaceReadOptions();
+	const unique = [...new Set(questionIds)];
+	if (!unique.length) return;
+	const owner = (await readQuestionBroadcastOwner(narratorId, readBudget)) ?? null;
+	for (let index = 0; index < unique.length; index += 32) {
+		if (index > 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		const ids = unique.slice(index, index + 32);
+		const rows = await readQuery(
+			db
+				.select(questionStateColumns)
+				.from(narratorQuestions)
+				.where(
+					and(inArray(narratorQuestions.id, ids), eq(narratorQuestions.narratorId, narratorId)),
+				)
+				.limit(ids.length),
+			{ ...narratorSurfaceReadOptions(readBudget), maxRows: ids.length },
 		);
-		if (record.status !== "open") notifyQuestionDecided(record);
+		const byId = new Map(rows.map((row) => [row.id, row]));
+		for (const id of ids) {
+			const row = byId.get(id);
+			const record: AsyncQuestionRecord = row
+				? toStateRecord(row)
+				: {
+						id,
+						narratorId,
+						toolCallId: "",
+						toolUseId: "",
+						questions: [],
+						answers: null,
+						annotations: null,
+						context: null,
+						resolution: null,
+						withdrawReason: "history removed",
+						status: "withdrawn",
+						origin: "agent_async",
+						answerMessageId: null,
+						decidedBy: null,
+						decidedAt: null,
+						createdAt: "",
+						awaited: isAsyncQuestionAwaited(id),
+					};
+			await broadcastChange(
+				record,
+				record.status === "withdrawn"
+					? "withdrawn"
+					: record.status === "dismissed"
+						? "dismissed"
+						: record.status === "open"
+							? "opened"
+							: "answered",
+				owner,
+			);
+			if (record.status !== "open") notifyQuestionDecided(record);
+		}
 	}
 }
 

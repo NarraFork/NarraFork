@@ -10,6 +10,7 @@ import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { and, eq } from "drizzle-orm";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import {
 	normalizeCommandBlacklistRule,
@@ -137,10 +138,11 @@ class PermissionRuleService {
 		narratorId: string,
 		ruleType: PermissionRuleType,
 		ruleId: string,
+		store: Pick<typeof db, "select"> = db,
 	): void {
 		if (ruleType !== "directoryBlacklist") return;
 		// Check the stored row, never the replacement path/selector supplied by the API.
-		const row = db
+		const row = store
 			.select()
 			.from(narratorBlacklistDirs)
 			.where(
@@ -211,6 +213,7 @@ class PermissionRuleService {
 	async updateNarratorRule(
 		narratorId: string,
 		input: PermissionRuleInput & { value: { id?: string } },
+		expected?: PermissionRuleInput,
 	): Promise<ExecutionPermissionRule> {
 		const normalized = normalizePermissionRuleInput(input);
 		if (!normalized.id) throw new ValidationError("Permission rule id is required");
@@ -219,11 +222,43 @@ class PermissionRuleService {
 		if (
 			!current.some((rule) => rule.ruleType === normalized.ruleType && rule.id === normalized.id)
 		) {
+			if (expected) throw new RuntimeReadConflictError();
 			throw new NotFoundError("Permission rule", normalized.id);
 		}
 		assertNoPermissionRuleConflict(current, normalized, normalized.id);
 		const now = new Date().toISOString();
-		await this.replaceRule(narratorId, { ...normalized, updatedAt: now });
+		db.transaction((tx) => {
+			if (expected) {
+				const table = {
+					directoryWhitelist: narratorWhitelistDirs,
+					directoryBlacklist: narratorBlacklistDirs,
+					commandWhitelist: narratorWhitelistCmds,
+					commandBlacklist: narratorBlacklistCmds,
+				}[normalized.ruleType];
+				const row = tx
+					.select()
+					.from(table)
+					.where(and(eq(table.id, normalized.id as string), eq(table.narratorId, narratorId)))
+					.get();
+				const decision = (rule: ExecutionPermissionRule) => {
+					const { createdAt: _createdAt, updatedAt: _updatedAt, ...fields } = rule;
+					return JSON.stringify(fields);
+				};
+				if (
+					expected.ruleType !== normalized.ruleType ||
+					!row ||
+					decision(
+						normalizePermissionRuleInput({
+							ruleType: normalized.ruleType,
+							value: row,
+						} as PermissionRuleInput),
+					) !== decision(normalizePermissionRuleInput(expected))
+				)
+					throw new RuntimeReadConflictError();
+			}
+			this.assertEditableNarratorRule(narratorId, normalized.ruleType, normalized.id as string, tx);
+			this.replaceRule(tx, narratorId, { ...normalized, updatedAt: now });
+		});
 		const saved = { ...normalized, updatedAt: now };
 		permissionPolicyChanges.emit({
 			type: "permission:policy_changed",
@@ -331,14 +366,18 @@ class PermissionRuleService {
 		}
 	}
 
-	private async replaceRule(narratorId: string, rule: ExecutionPermissionRule): Promise<void> {
+	private replaceRule(
+		store: Pick<typeof db, "update">,
+		narratorId: string,
+		rule: ExecutionPermissionRule,
+	): void {
 		if (!rule.id || !rule.updatedAt) throw new ValidationError("Permission rule id is required");
 		const target = selectorToStorage(rule.selector);
 		const where = (column: typeof narratorWhitelistDirs.id) =>
 			and(eq(column, rule.id as string), eq(narratorWhitelistDirs.narratorId, narratorId));
 		switch (rule.ruleType) {
 			case "directoryWhitelist":
-				await db
+				store
 					.update(narratorWhitelistDirs)
 					.set({
 						path: rule.path,
@@ -349,10 +388,11 @@ class PermissionRuleService {
 						...target,
 						updatedAt: rule.updatedAt,
 					})
-					.where(where(narratorWhitelistDirs.id));
+					.where(where(narratorWhitelistDirs.id))
+					.run();
 				return;
 			case "directoryBlacklist":
-				await db
+				store
 					.update(narratorBlacklistDirs)
 					.set({
 						path: rule.path,
@@ -368,10 +408,11 @@ class PermissionRuleService {
 							eq(narratorBlacklistDirs.id, rule.id),
 							eq(narratorBlacklistDirs.narratorId, narratorId),
 						),
-					);
+					)
+					.run();
 				return;
 			case "commandWhitelist":
-				await db
+				store
 					.update(narratorWhitelistCmds)
 					.set({
 						pattern: rule.pattern,
@@ -384,10 +425,11 @@ class PermissionRuleService {
 							eq(narratorWhitelistCmds.id, rule.id),
 							eq(narratorWhitelistCmds.narratorId, narratorId),
 						),
-					);
+					)
+					.run();
 				return;
 			case "commandBlacklist":
-				await db
+				store
 					.update(narratorBlacklistCmds)
 					.set({
 						pattern: rule.pattern,
@@ -401,7 +443,8 @@ class PermissionRuleService {
 							eq(narratorBlacklistCmds.id, rule.id),
 							eq(narratorBlacklistCmds.narratorId, narratorId),
 						),
-					);
+					)
+					.run();
 		}
 	}
 

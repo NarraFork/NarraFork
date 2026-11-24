@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { z } from "zod/v4";
 import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -18,6 +19,10 @@ import {
 	getSearchExecutionScope,
 	withSearchExecutionScope,
 } from "../../lib/search/execution-scope";
+import {
+	publicationDedupeKey,
+	publicationEventFromDedupeKey,
+} from "../agent-runtime/publication-outbox";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
@@ -62,6 +67,28 @@ const CHILD = "runtime-owner-child";
 const SIBLING = "runtime-owner-sibling";
 const ids = [ROOT, CHILD, SIBLING];
 
+function terminalPublications(logicalRunId: string) {
+	const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((eventKind) =>
+		publicationDedupeKey(
+			{ producerKind: "agent", taskId: CHILD, logicalRunId, recipientId: ROOT },
+			eventKind,
+		),
+	);
+	return db.transaction((tx) => [
+		...tx
+			.select({ eventKind: runtimePublicationOutbox.eventKind })
+			.from(runtimePublicationOutbox)
+			.where(inArray(runtimePublicationOutbox.dedupeKey, keys))
+			.all(),
+		...tx
+			.select({ dedupeKey: narratorBufferedMessages.dedupeKey })
+			.from(narratorBufferedMessages)
+			.where(inArray(narratorBufferedMessages.dedupeKey, keys))
+			.all()
+			.map((row) => ({ eventKind: publicationEventFromDedupeKey(row.dedupeKey) })),
+	]);
+}
+
 beforeEach(async () => {
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
@@ -95,7 +122,8 @@ beforeEach(async () => {
 			.run();
 	}
 });
-afterEach(() => {
+afterEach(async () => {
+	await sessionModule.drainNarratorSessionTails({ deadlineAt: Date.now() + 10_000 });
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		state.activeNarrators.delete(id);
@@ -616,9 +644,8 @@ describe("signal shutdown keeps recoverable runs nonterminal", () => {
 					expect(
 						await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
 					).toMatchObject({ status: ending === "timeout" ? "timeout" : "cancelled" });
-					const published = await db.query.runtimePublicationOutbox.findMany({
-						where: eq(runtimePublicationOutbox.taskId, CHILD),
-					});
+					await (await import("../agent-runtime/publication")).flushRuntimePublications(ROOT);
+					const published = terminalPublications(agent.logicalRunId as string);
 					expect(
 						published.filter(
 							(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),
@@ -698,9 +725,8 @@ test.each([
 		expect(await db.query.narrators.findFirst({ where: eq(narrators.id, CHILD) })).toMatchObject({
 			status: "idle",
 		});
-		const published = await db.query.runtimePublicationOutbox.findMany({
-			where: eq(runtimePublicationOutbox.taskId, CHILD),
-		});
+		await (await import("../agent-runtime/publication")).flushRuntimePublications(ROOT);
+		const published = terminalPublications(agent.logicalRunId as string);
 		expect(
 			published.filter(
 				(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),

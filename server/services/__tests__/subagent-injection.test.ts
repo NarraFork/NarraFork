@@ -26,10 +26,13 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 // Captured before the mock lands: `mock.module` is process-wide, so leaving the
 // in-memory schema installed would hand it to every later file in the same run.
 const realDbModule = { ...(await import("../../db")) };
@@ -182,7 +185,8 @@ beforeEach(() => {
 	wakes.length = 0;
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	setInjectionScheduler(previousScheduler);

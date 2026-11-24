@@ -6,9 +6,12 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { assembleContent, inAssembledOrder } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -131,10 +134,10 @@ beforeEach(() => {
 			NOW,
 		]);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 const reasoningStep = [

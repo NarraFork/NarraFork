@@ -494,13 +494,20 @@ describe("bounded paging and detail", () => {
 		const p = await permission("b", { id: "urgent" });
 		const abort = new AbortController();
 		controllers.push(abort);
+		const registered = Promise.withResolvers<void>();
+		setQuestionServiceSeam({
+			isLoopRunning: () => false,
+			broadcastToNarrator: () => {},
+			emitAttention: () => registered.resolve(),
+			emitAttentionResolved: () => {},
+		});
 		const wait = awaitAsyncQuestion({
 			questionId: awaitedId,
 			narratorId: "b",
 			timeoutMs: 0,
 			signal: abort.signal,
 		});
-		for (let i = 0; i < 20 && !isAsyncQuestionAwaited(awaitedId); i++) await Promise.resolve();
+		await registered.promise;
 		expect(isAsyncQuestionAwaited(awaitedId)).toBe(true);
 		const seen: string[] = [];
 		let cursor: string | undefined;

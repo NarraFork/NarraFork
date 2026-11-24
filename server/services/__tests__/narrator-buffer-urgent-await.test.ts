@@ -14,6 +14,7 @@ import type { ToolResult } from "../../lib/agent/types";
 import { AppError, ValidationError } from "../../lib/errors";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -319,7 +320,7 @@ beforeAll(async () => {
 					bufferSoftStop: active?._bufferSoftStop,
 					guidancePending: active?._bufferGuidancePending,
 				},
-				pendingHead: getBufferedMessages(parent)[0]?.text ?? null,
+				pendingHead: (await getBufferedMessages(parent))[0]?.text ?? null,
 				queue: rows.map((row) => ({
 					text: row.text,
 					state: row.state,
@@ -340,9 +341,9 @@ beforeAll(async () => {
 			oldOwnerReleased: !owner?.isCurrent(),
 			selectedId: selected.id,
 			selectedState: rows.find((row) => row.id === selected.id)?.state,
-			selectedPending: getBufferedMessages(parent).some((row) => row.id === selected.id),
+			selectedPending: (await getBufferedMessages(parent)).some((row) => row.id === selected.id),
 			users,
-			queueOrder: getBufferedMessages(parent).map((row) => row.text),
+			queueOrder: (await getBufferedMessages(parent)).map((row) => row.text),
 		};
 	} finally {
 		closeNarrator(parent);
@@ -412,7 +413,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 	);
 	const newer = await queued("newer urgent B", narratorId);
 	await updateBufferedMessageMode(narratorId, newer.id, "interrupt");
-	expect(getBufferedMessages(narratorId).map((row) => row.text)).toEqual([
+	expect((await getBufferedMessages(narratorId)).map((row) => row.text)).toEqual([
 		"newer urgent B",
 		"retry selected urgent A",
 	]);
@@ -433,7 +434,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 			"retry A and B dispatched",
 		);
 		expect(calls.slice(callStart)).toEqual(["retry selected urgent A", "newer urgent B"]);
-		expect(getBufferedMessages(narratorId)).toHaveLength(0);
+		expect(await getBufferedMessages(narratorId)).toHaveLength(0);
 	} finally {
 		closeNarrator(narratorId);
 		await until(() => !getExecutionOwner(narratorId), "retry cleanup");
@@ -457,12 +458,14 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 		.from(narratorBufferedMessages)
 		.where(eq(narratorBufferedMessages.id, input.id))
 		.get();
-	await expect(
-		waitForBufferedMessageDelivery(parent, input.id, {
-			timeoutMs: 60,
-			wake: async () => false,
-		}),
-	).rejects.toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
+	expect(
+		await captureWorkerRejection(
+			waitForBufferedMessageDelivery(parent, input.id, {
+				timeoutMs: 60,
+				wake: async () => false,
+			}),
+		),
+	).toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
 	const after = db
 		.select()
 		.from(narratorBufferedMessages)
@@ -472,7 +475,7 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 	expect(after?.imagesJson).toBe(before?.imagesJson);
 	expect(after?.textFilePathsJson).toBe(before?.textFilePathsJson);
 	expect(after?.metadataJson).toBe(before?.metadataJson);
-	const projected = getBufferedMessages(parent).find((row) => row.id === input.id);
+	const projected = (await getBufferedMessages(parent)).find((row) => row.id === input.id);
 	expect(projected?.textFiles?.[0] && (await projected.textFiles[0].text())).toBe("keep me");
 });
 
@@ -491,7 +494,7 @@ test("request cancellation does not cancel or retry the durable urgent input", a
 	});
 	await wakeStarted.promise;
 	controller.abort();
-	await expect(waiting).rejects.toMatchObject({
+	expect(await captureWorkerRejection(waiting)).toMatchObject({
 		statusCode: 499,
 		code: "BUFFER_DELIVERY_CANCELLED",
 	});
@@ -504,14 +507,16 @@ test("failed or cancelled receipts reject without automatic retry or wake", asyn
 		const input = await queued(`terminal ${state}`);
 		sqlite.run("UPDATE narrator_buffered_messages SET state = ? WHERE id = ?", [state, input.id]);
 		let wakes = 0;
-		await expect(
-			waitForBufferedMessageDelivery(parent, input.id, {
-				wake: async () => {
-					wakes++;
-					return false;
-				},
-			}),
-		).rejects.toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				waitForBufferedMessageDelivery(parent, input.id, {
+					wake: async () => {
+						wakes++;
+						return false;
+					},
+				}),
+			),
+		).toMatchObject({ statusCode: 409 });
 		expect(wakes).toBe(0);
 		expect((await readBufferedMessageDeliveryReceipt(parent, input.id))?.state).toBe(state);
 	}
@@ -619,7 +624,7 @@ test("taken-over child's model turn is interrupted without ending takeover or it
 			"child selected urgent guidance",
 			"child older tool guidance",
 		]);
-		expect(getBufferedMessages(child)).toHaveLength(0);
+		expect(await getBufferedMessages(child)).toHaveLength(0);
 		// Releasing the hold ends the same run normally.
 		expect(await controlRun(child, { kind: "release" })).toBe(true);
 		const result = await handle.terminal;

@@ -1,3 +1,4 @@
+import type { AddProviderType } from "@shared/sourcing/presets";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import {
 	type AddProviderDraft,
@@ -6,7 +7,6 @@ import {
 	nugProviderFromDraft,
 	sanitizeProviderPrefix,
 } from "./provider-add-draft";
-import type { AddProviderType } from "./provider-presets";
 import { type ProvidersState, providersStateFromSettings } from "./providers-reducer";
 
 export interface ProviderCreateDependencies {

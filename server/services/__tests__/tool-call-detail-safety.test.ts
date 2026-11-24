@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { testEnvironment } from "../../../tests/preload";
 import { db, sqlite } from "../../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -19,6 +20,7 @@ import { delegationRegistration } from "../../lib/validators/runtime-registratio
 import { narratorRoutes } from "../../routes/narrators";
 import { getRunHold, setRunHold } from "../agent-runtime/ownership";
 import { runtimePublication } from "../agent-runtime/publication";
+import { publicationDedupeKey } from "../agent-runtime/publication-key";
 import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
@@ -1176,7 +1178,14 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 					),
 				)
 				.all();
-			expect(published).toEqual([{ eventKind: "completed" }]);
+			const delivered = db
+				.select({ id: narratorBufferedMessages.id })
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.dedupeKey, publicationDedupeKey(run, "completed")))
+				.all();
+			expect([...published, ...delivered.map(() => ({ eventKind: "completed" }))]).toEqual([
+				{ eventKind: "completed" },
+			]);
 			const reference = await narratorPersistence.resolveSubagentConclusionReference(
 				f.subagent.id,
 				f.own.id,
