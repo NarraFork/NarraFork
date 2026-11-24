@@ -158,10 +158,13 @@
 			"namePlaceholder": "e.g. Release crew",
 			"nameDescription": "The name of the coordinator's session; renaming the session renames the team.",
 			"nameRequired": "A team needs a name",
+			"nameInvalid": "A team name is at most {{max}} characters",
 			"baseBranch": "Base branch",
 			"baseBranchDescription": "Where work merges back. Empty uses the project's default branch.",
+			"baseBranchInvalid": "Not a valid branch name: use letters, digits, . _ - / (no spaces, no leading - or /, no ..)",
 			"brief": "Brief",
 			"briefDescription": "Shared rules for the coordinator and every agent it sends (up to 4 KB).",
+			"briefTooLong": "The brief is limited to 4 KB",
 			"submit": "Create team",
 			"cancel": "Cancel",
 			"failed": "Could not create the team"

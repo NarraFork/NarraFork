@@ -16,18 +16,13 @@ import {
 	Modal,
 	Stack,
 	Text,
-	Textarea,
-	TextInput,
 	UnstyledButton,
 } from "@mantine/core";
-import {
-	TEAM_BRANCH_MAX_LENGTH,
-	TEAM_NAME_MAX_LENGTH,
-	type TeamDetail,
-} from "@shared/project-teams";
+import type { TeamDetail } from "@shared/project-teams";
 import { IconPlus, IconUsersGroup } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TeamCreateFields, useTeamDraft } from "./TeamCreateFields";
 import { teamPinTitle } from "./team-page-model";
 
 export function CreateTeamModal({
@@ -43,22 +38,11 @@ export function CreateTeamModal({
 }) {
 	const { t } = useTranslation("projects");
 	const create = useCreateTeam(projectId);
-	const [name, setName] = useState("");
-	const [baseBranch, setBaseBranch] = useState("");
-	const [brief, setBrief] = useState("");
-	const [touched, setTouched] = useState(false);
-	const nameError = touched && !name.trim() ? t("teams.create.nameRequired") : null;
+	const draft = useTeamDraft();
 	const submit = () => {
-		setTouched(true);
-		if (!name.trim()) return;
-		create.mutate(
-			{
-				name: name.trim(),
-				...(baseBranch.trim() ? { baseBranch: baseBranch.trim() } : {}),
-				...(brief.trim() ? { brief } : {}),
-			},
-			{ onSuccess: (team) => onCreated(team) },
-		);
+		const payload = draft.submit();
+		if (!payload) return;
+		create.mutate(payload, { onSuccess: (team) => onCreated(team) });
 	};
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("teams.create.title")}>
@@ -69,34 +53,7 @@ export function CreateTeamModal({
 				}}
 			>
 				<Stack>
-					<TextInput
-						label={t("teams.create.name")}
-						description={t("teams.create.nameDescription")}
-						placeholder={t("teams.create.namePlaceholder")}
-						value={name}
-						maxLength={TEAM_NAME_MAX_LENGTH}
-						onChange={(event) => setName(event.currentTarget.value)}
-						error={nameError}
-						data-autofocus
-						data-testid="create-team-name"
-					/>
-					<TextInput
-						label={t("teams.create.baseBranch")}
-						description={t("teams.create.baseBranchDescription")}
-						value={baseBranch}
-						maxLength={TEAM_BRANCH_MAX_LENGTH}
-						onChange={(event) => setBaseBranch(event.currentTarget.value)}
-						styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
-					/>
-					<Textarea
-						label={t("teams.create.brief")}
-						description={t("teams.create.briefDescription")}
-						value={brief}
-						autosize
-						minRows={3}
-						maxRows={8}
-						onChange={(event) => setBrief(event.currentTarget.value)}
-					/>
+					<TeamCreateFields draft={draft} />
 					{create.isError && (
 						<Alert color="red" title={t("teams.create.failed")}>
 							{describeApiError(create.error, t).message}

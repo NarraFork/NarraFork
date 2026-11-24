@@ -357,7 +357,8 @@ export const teamTool: ToolDefinition = {
 	description:
 		"Team coordinator only: manage the team's work items, brief, decisions and check-ins. " +
 		"work.list lists items; work.create makes an item with its own branch and worktree from the team's base branch; " +
-		"work.review records one review round (verdict, findings, reviewer); work.ready marks an item done after a clear review; " +
+		"work.review records one review round (verdict, findings, reviewer); work.ready marks an item done after a clear review " +
+		"(refused while its worktree has uncommitted changes, or, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors: details lists them for the worker to fix); " +
 		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); " +
 		"work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (never its branch) and always asks a person; " +
 		"brief reads or replaces the team brief every subagent follows; decision records a decision taken on people's behalf; " +
@@ -387,6 +388,11 @@ export const teamTool: ToolDefinition = {
 						code: cause instanceof AppError ? cause.code : "TEAM_REQUEST_FAILED",
 						message: (cause instanceof Error ? cause.message : String(cause)).slice(0, 1024),
 					},
+					// What a refusal lists for the coordinator to act on (e.g. the stale knowledge
+					// nodes of work.ready), bounded by the service.
+					...(cause instanceof AppError && cause.details !== undefined
+						? { details: cause.details }
+						: {}),
 				},
 				true,
 			);

@@ -216,6 +216,7 @@ export {
 	projectMembersSchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "./projects";
 export {

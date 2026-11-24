@@ -43,6 +43,7 @@ verified_at: 009a3f4f7
 - 全局处理器 `app.onError`：先识别磁盘满（转 `DiskSpaceError`）、`AppError`、`RateLimitError`（带 `Retry-After` 和 `retryAfterSeconds`）、数据库读取暂不可用（503 + `Retry-After`）；客户端中断的 `AbortError` 返回 499；其余记日志并返回通用 `INTERNAL_ERROR` 500，不暴露内部信息（`server/app.ts:app.onError`、`buildAppErrorResponse`）。
 - 校验失败用 `zodValidationError(parsed.error)` 抛出：frame 本地化为 `VALIDATION_FAILED`，字段明细保持 Zod 原文（`errors.ts:zodValidationError`；路由示例 `server/routes/auth.ts`）。`formatZodError` 只拼 `path: message`。
 - Zod schema 按资源拆在 `server/lib/validators/*.ts`（如 `auth.ts`、`narrators.ts`、`projects.ts`），`validators/index.ts` 是桶式再导出；路由处理器内 `safeParse`。
+- 前端也要按同一规则校验的字段，schema 放在 `shared/`，校验器从那里再导出，不复制正则：例如 `gitBranchName`（`validators/common.ts` 转出）与团队名称/基线分支/说明（`shared/project-team-draft.ts`）。
 - 有测试守卫：每个 catalog 的 `messageCode` 都必须在源码里被 `catalogError("X")` 或 `messageCode: "X"` 引用（`server/lib/__tests__/error-catalog-reachability.test.ts`）。
 
 - 参数上限：`messageParams` 最多 `MAX_PARAM_KEYS = 12` 个键、值最长 `MAX_PARAM_VALUE_CHARS = 200` 字符，超出截断；对象和数组不允许（错误响应与其他请求共用主线程，不能带大载荷）（`shared/error-catalog.ts`）。

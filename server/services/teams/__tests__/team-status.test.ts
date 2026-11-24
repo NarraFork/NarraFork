@@ -4,9 +4,10 @@
  * of a long run — never in the system prompt; at most 6 KB.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initTeamRepo } from "./team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-status-"));
@@ -63,7 +64,7 @@ afterAll(() => {
 });
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	await db.insert(users).values({
 		id: OWNER,
