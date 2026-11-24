@@ -15,7 +15,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 模型目录与来源
 
-回答「这个 `provider:model` 的上下文窗口、输出上限、推理档位、输入模态、价格是多少」，以及「有哪些连接（来源）、`auto:` 模型从哪些来源出」。凭证怎么选见 [凭证池与模型目录](credentials-models.md)。
+回答「这个 `provider:model` 的上下文窗口、输出上限、推理档位、输入模态、价格是多少」，以及「有哪些连接（来源）、`auto:` 模型从哪些来源出」。凭证怎么选见 [凭证池与模型目录](credentials.md)。
 
 ## 关键规则
 - 模型卡按层合并，后者覆盖前者：目录模型（`preset-model`）、目录变体（`preset-variant`）、网关/列表发现的元数据（`discovered`）、模型级本地覆盖（`local-model`）、连接级覆盖（`local-connection`）；每个字段记录来源层（`shared/model-catalog/resolve.ts:resolveModelCard`）。与目录自相矛盾的发现值（输出上限大于总窗口）整体忽略；用户的输出上限超过总窗口时被截到总窗口。
@@ -37,6 +37,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/sourcing/source-groups.ts`
 
 ## 相关
-- [凭证池与模型目录](credentials-models.md)
+- [凭证池与模型目录](credentials.md)
 - [模型提供商](providers.md)
 - [用量与费用](usage.md)

@@ -22,6 +22,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 因此「生命周期绑定服务器进程」只对直连/远程终端成立；dtach 终端可存活于重启。
 - 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放，并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
 - WebSocket 协议：客户端 `subscribe/unsubscribe/input/resize/create/kill/rename`，服务端 `output/exit/error/scrollback/bufferState/created/killed/renamed`，消息体经 `terminalWsMessageSchema` 校验，订阅和创建都要通过 `terminal-access` 的权限判断（`websocket/terminal-ws.ts`）。
+- 谁能使用某个终端（跟随叙述者 ACL、独立终端只属创建者与管理员）由 `terminal-access.ts` 判断，规则见 [访问控制](../security/acl.md)。
 - 终端的 REST 管理在 `routes/terminals.ts`（列表、树、创建、改名、删除、进程列表、视图状态）。
 - 用户终端的 shell 环境会恢复被 NarraFork 清空的环境代理变量（`envWithAmbientProxy`）。
 
@@ -31,5 +32,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/websocket/terminal-ws.ts`：浏览器通道。
 
 ## 相关
+- [访问控制](../security/acl.md)：终端访问控制。
 - [HTTP 路由与 WebSocket](http-ws.md)
 - [启动与进程](boot.md)

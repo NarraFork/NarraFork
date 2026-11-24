@@ -25,7 +25,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `serve()` 先加载 settings，在配置地址上起「启动状态页」worker（迁移期间展示进度或失败原因），然后才 `import("./main")`；失败走 `exitWithStartupProblem`：写日志、在状态页展示、最多等 30 秒让页面读取，再 `exit(1)`（`server/serve.ts`、`lib/startup-status/index.ts:PROBLEM_LINGER_MS`）。
 - 实例锁冲突（锁本身的判定见 [实例锁、完整性与重启恢复](instance-recovery.md)）时，仅「编译产物、非本地运行时、非管理器托管」才会探测 `/api/health` 并打开已在运行的实例，否则照常报冲突（`serve.ts:openRunning`、`isNarraForkHealth`）。
 - `main.ts` 依赖 `./db` 的顶层 await：迁移、FTS 在首个查询前完成。PostgreSQL 后端须显式选择，失败即中止启动，不回退 SQLite（`server/db/index.ts` 文件头说明）。
-- 端口：启动状态页在 `Bun.serve` 之前关闭；显式指定端口则绑定失败直接报错，否则最多重试 `MAX_PORT_RETRIES` 次顺延下一个端口，并跳过 Windows 保留段（`main.ts` 中 `startServerWithHostFallback` 附近的循环）。`maxRequestBodySize` 取导入上限 `MAX_IMPORT_BYTES`，普通请求另在 `limitOrdinaryRequestBody` 中按 128MB 拒绝（`main.ts:startServer` 注释，未单独核对该函数实现）。
+- 端口：启动状态页在 `Bun.serve` 之前关闭；显式指定端口则绑定失败直接报错，否则最多重试 `MAX_PORT_RETRIES` 次顺延下一个端口，并跳过 Windows 保留段（`main.ts` 中 `startServerWithHostFallback` 附近的循环）。`maxRequestBodySize` 取导入上限 `MAX_IMPORT_BYTES`（Bun 只有一个全局上限）；普通请求另由 `http-dispatcher.ts:limitOrdinaryRequestBody` 限制到 `MAX_ORDINARY_BODY_BYTES`（128 MiB，`shared/storage-transfer.ts`）：
+  - 声明的 `content-length` 超限：直接 413。
+  - 未声明或偏小的长度：读流时累计，超限则让流报错。
+  - 豁免：存储导入上传（`isStorageImportUpload`）；流式附件上传（`isStreamingAttachmentUpload`，在暂存层按实际字节执行 1 GiB 上限）；无正文方法 GET/HEAD/OPTIONS。
 - 数据库完整性检查在端口绑定后后台执行，细节见 [实例锁、完整性与重启恢复](instance-recovery.md)。
 - 关闭：SIGINT/SIGTERM/SIGHUP 与 `exit` 钩子在 `main.ts` 末尾注册，`hotOnce` 防热重载重复注册；`performGracefulShutdown` 先 `httpLifecycle.stopAccepting()`，再逐步停各生产者。干净关闭标记与锁释放见 [实例锁、完整性与重启恢复](instance-recovery.md)。
 

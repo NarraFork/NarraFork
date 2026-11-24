@@ -25,6 +25,16 @@ SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`
 - PG 的 `server/db/postgres-schema.ts` 是由 `scripts/generate-postgres-schema.ts` 从本文件转译出的生成物，文件头写明不可手改；`scripts/check-postgres-schema-parity.ts` 检查两边一致。
 - 迁移文件不手写，流程见 [迁移](migrations.md)。
 
+## 加一个字段的步骤
+1. 改 `server/db/schema.ts`（SQLite 是唯一来源，见上文；关系变化再改 `relations.ts`）。不要手改 `drizzle/`，见 [迁移](migrations.md)。
+2. 运行 `bun run db:generate` 生成 SQLite 增量迁移，再 `bun run db:migrate`（流程与资产检查见 [迁移](migrations.md)）。
+3. 重新生成 PG schema：`bun scripts/generate-postgres-schema.ts`，再 `bun run db:generate:pg --name <name>` 生成 PG 增量迁移；`scripts/check-postgres-schema-parity.ts` 检查两边一致（见 [PostgreSQL 后端](postgres.md)）。
+4. 核对数据导入导出（见 [数据导入导出](portability.md)）：
+   - 新表：加进 `snapshot-protocol.ts:SNAPSHOT_TABLES`，并在 `applyImport` 补 `copyTable`。
+   - `copyTable` 按两库列交集拷贝：旧快照缺的新列导入后取默认值，快照里多出的列会丢。
+   - 新增 NOT NULL 且无默认值的列：旧快照缺该列，导入会失败；要给默认值，或拒绝旧版本快照。
+   - 需要清空的数据：在 `clearData` 处理。
+
 ## 从哪读起
 - `server/db/schema.ts`：全部表。文件头注释列了改 schema 时的导入导出检查项。
 - `server/db/relations.ts`：Drizzle relations（只覆盖部分表）。

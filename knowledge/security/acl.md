@@ -1,13 +1,16 @@
 ---
 id: security.acl
 title: 访问控制
-summary: 叙述者与项目的读写授权、可见范围与受众、共享。
+summary: 叙述者与项目的读写授权、可见范围与受众、共享，以及终端访问控制。
 anchors:
   - server/services/acl/
   - server/services/narrator-acl.ts
   - server/services/narrator-sharing.ts
   - server/services/project-acl.ts
   - shared/narrator-access.ts
+  - server/services/terminal-access.ts
+  - server/websocket/terminal-ws.ts
+  - server/routes/terminals.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -30,12 +33,18 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 列表过滤下推到 SQL（`narratorReadableWhere`/`narratorReadableSqlFragment`），不在取出的页上过滤，以保持 `LIMIT n+1` 与总数正确。
 - 授权变更审计只写 id、布尔、角色名和计数，不写标题与内容；写入失败只记日志、不使被审计操作失败，并在事务提交之后调用（`acl/acl-audit.ts`）。
 - 单主体与批量判断共用 `readVerdict`/`writeVerdict`，有一致性测试 `services/__tests__/narrator-acl-batch-parity.test.ts`。
+- 终端权限（`services/terminal-access.ts`）：叙述者的终端跟随该叙述者 ACL，子代理用其根叙述者；`read` 只看元数据，`write` 覆盖开启、看输出和滚动缓冲、输入、改名、关闭、读进程列表，因为终端等同于在会话工作区的 shell。
+- 无叙述者的独立终端只属于创建者加管理员；创建者只记在内存里（上限 1000 条，超出丢最旧），重启后只有管理员可用。未知 id 与被拒绝给同样答案，防止探测 id。
+- REST（`routes/terminals.ts`）与终端 WebSocket（`websocket/terminal-ws.ts`）都调 `terminalAccessAllowed`；WebSocket 在连接期间还会重新校验。
 
 ## 从哪读起
 - `server/services/acl/acl-core.ts:resolveCaps`：内核。
 - `server/services/narrator-acl.ts:canReadNarrator`、`canWriteNarrator`。
 - `server/services/narrator-sharing.ts`：可见性、受众、授权、转让 owner。
+- `server/services/terminal-access.ts:terminalAccessAllowed`：终端访问判断。
 
 ## 相关
 - [登录与会话令牌](auth/index.md)
+- [外部进程加固](hardening.md)：git 执行加固与子进程封装。
+- [终端运行时](../platform/terminal.md)：终端的创建、PTY 与缓冲。
 - [工具调用审批](tool-permissions.md)：审批权限请求需要叙述者写权限。

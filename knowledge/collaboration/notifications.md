@@ -23,8 +23,9 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 与角标不同，通知中心不排除正在查看的人，它是事件历史而不是实时角标。
 - 路由 `/api/notifications`：列表（游标分页）、unread-count、read、`:id/delete`，均按当前用户限定；另有 `test-dingtalk`/`test-feishu`。
 - 人类注意力（`human-attention-service.ts`）：把待处理的权限请求、危险操作反思、被等待的异步问题投影成一个收件箱，按调用者的叙述者 ACL 过滤；单次最多检查 400 个候选、2 秒协作式时间预算，因此一页可能很短或为空却仍带 `nextCursor`；游标不是快照。它只是投影，决策仍走各自原有的受保护端点；暴露在 `GET /api/narrators/human-attention[/:id]`。变更通过 `human_attention:changed` 事件（不带数据，观察者按自己的 ACL 重取）通知。
-- 外部提醒（`notification-service.ts:handleAttention`）：叙述者 `done` 或 `waiting_permission` 时触发（`error` 不发）；收件人 = [最近标签页](recent-tabs.md)里有该叙述者的用户，再去掉已无读权限的人（撤权后不得继续送达），按用户偏好（`notifyOnDone/Waiting`、钉钉/飞书开关与 webhook）分别投递。
-- 团队会话例外：协调者及其子代理只发"等待成员"一种提醒，收件人是团队成员，且需有写权限，只读旁观者不通知（`handleAttention` 的 teamId 分支）。
+- 外部提醒（`notification-service.ts:handleAttention`）：叙述者 `done` 或 `waiting_permission` 时触发（`error` 不发）。收件人按会话类型分两支，之后按用户偏好（`notifyOnDone/Waiting`、钉钉/飞书开关与 webhook）分别投递：
+  - 非团队会话：[最近标签页](recent-tabs.md)里有该叙述者的用户（`getRecentTabUserIdsForNarrator`），再去掉已无读权限的人（撤权后不得继续送达）。
+  - 团队会话：只发"等待成员"一种提醒（`done` 等其他提醒不发）；候选 = 团队成员（`readTeamMemberIds`，上限 `TEAM_ATTENTION_MEMBERS`）加最近标签页持有者（`TEAM_ATTENTION_TAB_HOLDERS`，最多 200 人，按最近度取）；先过读权限，再过写权限（`filterUsersWhoCanRead` 后 `filterUsersWhoCanWrite`），只读旁观者不通知（`notification-service.ts:326-339`）。
 - 投递（`notification-delivery.ts`）：超时 10s、响应体上限 8KB、排队上限 32，渠道为 dingtalk / feishu。
 
 ## 从哪读起
@@ -35,6 +36,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 测试：`server/services/__tests__/notification-*.test.ts`、`human-attention-*.test.ts`。
 
 ## 相关
+- [钩子](../automation/hooks.md)：`Attention` / `AttentionResolved` 钩子经 `attention-hook-bridge.ts` 消费同一组 `narrator:attention` 事件。
 - [聊天与站内消息](chat.md)
 - [最近标签页](recent-tabs.md)
 - [团队](teams.md)

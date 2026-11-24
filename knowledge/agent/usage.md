@@ -25,7 +25,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 数据导入时，`addImportedRequestsToUsageDaily` 用一条 SQL 把新插入的行（rowid 大于导入前最大值，重复导入不会重复计入）并入日汇总；旧导出没有付费人时依次用叙述者 owner、发起人兜底。
 - 查询（`usage-history-service.ts`、`routes/usage-history.ts`）：整个路由需要登录且为管理员。提供列表（page 或 cursor 分页）、`/stats`、`/timeseries`、`/timeseries-stacked`、`/breakdown`、`/providers`、`/credential-totals`、`/user-totals`（终身合计，与可删除的明细无关）、`/:id`。按时区分桶（`usage-bucket-sql.ts`、`shared/usage-time-zone`）。读取走 `readQuery` 工作线程读路径。
 - token 重算：用于把“旧的输入含缓存”的区间转成当前记账口径。`recalculateTokenCounters` 按协议扣减：anthropic 不扣；其他协议扣缓存读；openai 额外扣缓存写；任一计数非安全整数则跳过。每批 500 行、批超时 30s，按 `(created_at, id)` 游标分页，每批提交后才更新进度，取消不会撤销已提交批次，批间让出事件循环；作业在工作线程的 store 上执行，失败时已完成批次保留、重跑会跳过（`token-recalculation*.ts`）。同一时刻只有一个作业，范围用 UTC 日期。
-- 额度（余额/套餐窗口）不在这里：额度快照按凭证身份存放，见 [凭证池与模型目录](credentials-models.md)（`sourcing/quota-store.ts`）。
+- 额度（余额/套餐窗口）不在这里：额度快照按凭证身份存放，见 [凭证池与模型目录](credentials.md)（`sourcing/quota-store.ts`）。
 
 ## 从哪读起
 - `server/db/schema.ts`：`apiRequests`、`userUsageTotals`、`usageDaily`。
@@ -33,5 +33,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 测试：`server/services/usage-daily.test.ts`、`usage-history-service.test.ts`、`token-recalculation.test.ts`
 
 ## 相关
-- [凭证池与模型目录](credentials-models.md)
+- [凭证池与模型目录](credentials.md)
 - [Agent Loop](loop.md)

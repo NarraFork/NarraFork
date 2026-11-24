@@ -1,7 +1,7 @@
 ---
 id: files.workspaces
 title: 工作区布局
-summary: 多叙述者面板布局的保存与恢复。
+summary: 工作区面板布局的服务端存储：成员（workspace_panels）、布局 blob、版本号与 409 冲突规则。
 anchors:
   - server/services/workspace-panel-service.ts
   - server/services/workspace-title.ts
@@ -13,6 +13,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 工作区布局
 
+本节点是工作区面板布局的服务端存储与保存规则（成员、版本号、409）。客户端的防抖、重试与界面行为见 [面板与布局](../frontend/panels.md)。
+
 “工作区”是用户自己拼出来的面板集合（`workspaces` 表，归属某个用户）。成员关系和排布分开存：成员是 `workspace_panels` 表的行，排布是 `workspaces.tree` 里序列化的 dockview 布局。
 
 ## 关键规则
@@ -22,7 +24,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 布局保存成功后向该用户广播 workspace 变更（`broadcastWorkspaceChanged`）；成员新增、移除、配置更新（`addWorkspacePanel`、`removeWorkspacePanel`、`updateWorkspacePanelConfig`）都会调用 `workspaceTitleInputsChanged(…, "membership")`；成员增删是否也广播 workspace 变更未核实。叙述者面板没有 config，更新它报 `WORKSPACE_PANEL_NOT_CONFIGURABLE`。
 - 所有操作先校验工作区归属当前用户（`requireOwnedWorkspace`）。
 - 标题：`titleSource` 为 `default | auto | manual`；成员变化触发防抖（750ms）后调用摘要模型自动命名，最多取 32 个面板、输入 8KiB、超时 30s；URL 只保留主机名；手动命名不会被自动覆盖（`workspace-title.ts`）。
-- 前端 `frontend/components/dockview/` 是共享的 Dockview 外壳与拖拽语义（交换/合并/拆分三区落点），不含持久化逻辑。
+- 成员与布局分离的后果：布局里出现的非成员条目、或布局没放置的成员，由客户端在读取时对账（见 [面板与布局](../frontend/panels.md)）；服务端只保证成员行与布局版本各自一致。
+- 前端 `frontend/components/dockview/` 是共享的 Dockview 外壳与拖拽语义，不含持久化逻辑。
 
 ## 从哪读起
 - `server/routes/workspaces.ts`：`/api/workspaces` 路由（列表、CRUD、`/panels`、`/layout`、`/generate-title`）。
@@ -30,4 +33,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `shared/workspace-panels.ts`：成员种类与上限，前后端共用。
 
 ## 相关
+- [面板与布局](../frontend/panels.md)：客户端保存（防抖、重试）、对账与拖放。
 - 叙述者的工作目录上下文不属于面板布局，见[会话生命周期](../narrator/lifecycle.md)；改动归属视图见[文件变更证据](change-evidence.md)。

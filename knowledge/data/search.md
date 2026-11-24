@@ -24,7 +24,12 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 启动时 `ensureFts` 不读索引来判断好坏；只有 `NARRAFORK_DB_FULL_INTEGRITY_CHECK=1` 或 `NARRAFORK_FTS_FULL_REBUILD=1` 才在非干净关闭后全量重建。后台完整性检查发现的坏索引经 `repairFtsTables` 重建（`ftsIndexFindings`）。
 - trigram 至少 3 个字符才能用索引（`search/query.ts:INDEX_MIN_QUERY_CHARS`），含 CJK；更短的查询走 `LIKE` 子串路径。查询文本由调用方 `sanitizeQuery` 清洗，后端不自行清洗。
 - 权限闸门必须在查询内部应用（端口文档约定）；知识库命中是例外，返回后由 `knowledgeService.filterReadable` 过滤。
-- 端口方法全是异步。SQLite 实现通过读 worker 执行，单次超时 30s、并发上限 32，超限分别抛 503 `SEARCH_QUERY_BUSY` / 413 `SEARCH_QUERY_BUDGET_EXCEEDED`（`search/sqlite-worker-runner.ts`）。
+- 端口方法全是异步。SQLite 实现通过读 worker 执行（`search/sqlite-worker-runner.ts`），单次超时 30s（`SEARCH_QUERY_TIMEOUT_MS`）、并发上限 32（`SEARCH_MAX_OUTSTANDING`）。各情形的错误：
+  - 并发中的查询已达 32 个：503 `SEARCH_QUERY_BUSY`。
+  - 单次执行超过 30s：504 `SEARCH_QUERY_TIMEOUT`。
+  - 查询过大或不合法（读预算校验不通过）：413 `SEARCH_QUERY_BUDGET_EXCEEDED`，与上面两个上限无关。
+  - 调用方取消：499 `SEARCH_QUERY_CANCELLED`。
+  - worker 其他故障：503 `SEARCH_QUERY_UNAVAILABLE`。
 - 后端按主数据库选择；没有注册实现会抛错而不是回退 SQLite（`search/backend.ts`）。PG 的影子表与触发器由 `pg-fts.ts:ensurePgFts` 幂等创建，漂移可用 `probePgFtsDrift` / `repairPgFts` 检测修复。
 - 系统内部叙述者（`hidden_from_lists`、modeltrace）不参与搜索（`search/scope.ts`）。
 

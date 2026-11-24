@@ -30,7 +30,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 适配器族：`AnthropicProvider`；`OpenAIProvider`（`apiMode` 为 responses / completions / codex，缺省 responses，旧的 `responsesApi:false` 映射为 completions）；`GeminiProvider` 与 `GeminiInteractionsProvider`（`createGeminiProvider` 按 `geminiTransport === "interactions"` 选择）；`CodexProvider`；`NugProvider`（内部委托 Anthropic/OpenAI 并走 NUG 网关）；`TokenDanceProvider`（按所选协议委托 Anthropic/Gemini/OpenAI）；CommandCode 不写新适配器，按模型选 Anthropic 或 OpenAI 适配器。
 - 逐模型协议覆盖：`resolveModelProtocol` 与连接本身协议不符时换一族适配器并沿用代理等连接字段；构造失败则记录警告并回退到提供商默认适配器。
 - Codex：`useWebSocket` 缺省 true，`useWebSearch`、`useImageGeneration` 缺省 true，取自 `settings.codex`（`provider.ts` 的 codex 来源）。WebSocket 传输在 `codex-websocket.ts`。
-- 多密钥连接包 `PooledProvider`，单密钥直连（见 [凭证池](credentials-models.md)）。
+- 多密钥连接包 `PooledProvider`，单密钥直连（见 [凭证池](credentials.md)）。
 - 历史构造差异：共享的模型侧投影在 `history-build.ts`；各适配器的 `buildHistory` 再做自己的线格式。工具结果里的图片：OpenAI Chat Completions 按 `toolResultImages` 配置 `off`（默认）/ `inline` / `separate` 三种形状（`shared/tool-result-images.ts`，`openai-provider.ts` 的 `expandChatToolResults`）。
 - 原生媒体（音视频等）：适配器不支持时，`projectUnsupportedNativeMediaForModel` 在历史里降级并产生警告；`rejectNativeMedia` 对不支持的协议直接抛错，提示选择 Gemini 等（`native-media.ts`）。
 - NUG 图片去重：每张图带内容哈希 `imageRef`，网关确认缓存后才去掉内联数据只发引用，请求结束（成败皆然）必须还原；网关 409 缓存未命中则丢弃该确认并内联重发（`nug-image-dedup.ts`）。该逻辑只在 NUG 路径使用。
@@ -43,4 +43,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [Agent Loop](loop.md)
-- [凭证池与模型目录](credentials-models.md)
+- [凭证池与模型目录](credentials.md)

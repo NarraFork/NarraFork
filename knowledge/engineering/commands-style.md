@@ -23,7 +23,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - Biome（`biome.json`）：recommended 规则，tab 缩进，行宽 100，开启 organizeImports；忽略 `server/generated`、`routeTree.gen.ts`、`drizzle` 与 `drizzle-postgres` 的 SQL/元数据 JSON。
 - 路径别名（`tsconfig.json`）：`@server/*`、`@frontend/*`、`@shared/*`；Vite 里 `@frontend`、`@shared` 同样配置。TS 为 strict + `isolatedModules`，tsconfig 覆盖 server、frontend、shared、tests、update-server。
 - 数据库迁移命令：`db:generate`（`scripts/generate-sqlite-migrations.ts`）、`db:migrate`（`server/db/migrate.ts`），PG 侧 `db:generate:pg / db:check:pg / db:baseline:pg / db:resume:pg` 都走 `scripts/postgres-migrations.ts`；CI 里 `scripts/check-sqlite-migration-assets.ts` 校验迁移资产。
-- 仓库约定“用 `bunx` 不用 `npx`”：代码里没有机制强制，只是约定（未核实是否有守卫测试）。
+- 仓库约定“用 `bunx` 不用 `npx`”：没有守卫测试，也没有脚本或 CI 检查强制，只是约定。
 
 ## 从哪读起
 - `package.json:scripts`：全部入口命令。
