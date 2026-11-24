@@ -22,7 +22,7 @@ keywords:
   - 子进程超时
   - 输出上限
 status: draft
-verified_at: a5b512406
+verified_at: 9166435ad
 ---
 # 外部进程加固
 
@@ -32,7 +32,7 @@ verified_at: a5b512406
 - 只读/维护类 git 命令（status、rev-list、diff --name-only、worktree list/remove）带命令级配置覆盖 `GIT_NO_EXEC_CONFIG`：`core.hooksPath` 指向空设备、关闭 fsmonitor 与 untrackedCache、清空 `diff.external`、`core.sshCommand`、`credential.helper`、`core.askPass`；同时设 `GIT_OPTIONAL_LOCKS=0` 避免状态查询写索引（`lib/git-exec-hardening.ts:gitConfigEnv`）。
 - 读工作树的命令（`status`、`worktree remove`）额外把配置里所有 filter 的 clean/smudge/process 清空，并按名字禁用配置定义的 hook；名字来自先跑一次只读的 `git config --get-regexp`（`PROGRAM_CONFIG_QUERY`、`untrustedProgramOverrides`，`narrator-worktree-service.ts:hardenedConfig`）。读不出来就失败（`WORKTREE_GIT_CONFIG_UNREADABLE`），不降级。
 - `worktree add` 不加固，保留仓库自己的检出 hook 与 filter（`hardenedConfig` 开头）。
-- git 低于 2.31 会静默忽略 `GIT_CONFIG_COUNT`，所以每进程探测一次哨兵配置，不通过就拒绝并报 `GIT_TOO_OLD_FOR_HARDENING`（409，失败不缓存）（`ensureConfigOverridesHonored`）。团队 worktree 的 git 同样套用（`services/teams/team-git.ts`，含建团队前对项目目录的 `isGitWorkTree` 与基线分支解析）。
+- git 低于 2.31 会静默忽略 `GIT_CONFIG_COUNT`，所以每进程探测一次哨兵配置，不通过就拒绝并报 `GIT_TOO_OLD_FOR_HARDENING`（409，失败不缓存）（`ensureConfigOverridesHonored`）。团队 worktree 的 git 同样套用（`services/teams/team-git.ts`，含建团队前对项目目录的 `isGitWorkTree` 与基线分支解析；它读 blob 用 `cat-file blob`，不走 filter 与 textconv，经 `safeSpawn` 的 `stdoutStream` 按 blob 大小 +1 字节限额）。
 - `diff` 用 `noExternalDiffArgs` 加 `--no-ext-diff --no-textconv`。
 - `safeSpawn` 在每次启动子进程和 `killWindowsProcessTree` 前调用 `win-handle-guard.ts:clearInheritableHandlesBeforeSpawn`（仅 Windows）：清掉可继承句柄，免得子进程带走服务端的句柄；非 Windows 为空操作。
 - 子进程统一走 `lib/spawn.ts:safeSpawn`：可选硬超时、`maxOutputBytes`（默认 10 MB，stderr 可单独限额）、中止信号、watchdog，终止原因记录为 timeout/abort/watchdog/output-limit。调用方应显式给超时与输出上限（如上面探测的 10 秒、4096 字节）。

@@ -52,6 +52,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { teamGit } from "./team-git";
+import { assertKnowledgeFresh } from "./team-knowledge";
 import {
 	describeHolderFor,
 	exclusiveHits,
@@ -633,9 +634,17 @@ function lastReviewedHead(itemId: string): string | null {
 }
 
 /**
- * Mark an item ready: its newest review round is clear and its worktree has no uncommitted
- * change. Commits made after that review do not block (soft, like every coordinator rule) but
- * are counted in the result, so the coordinator sees when it should review again.
+ * Mark an item ready: its newest review round is clear, its worktree has no uncommitted change,
+ * and its branch leaves no knowledge node stale (`team-knowledge.ts`; only in a repository with
+ * `knowledge/index.md`). Commits made after that review do not block (soft, like every
+ * coordinator rule) but are counted in the result, so the coordinator sees when it should review
+ * again.
+ *
+ * One head commit is pinned for the whole of readiness: the knowledge check, the changed paths
+ * and the exclusive paths are all read at it, and it is the head recorded (the evidence a later
+ * automatic merge relies on). The worker may commit meanwhile, so HEAD is read again right before
+ * the synchronous write: when it is no longer the pinned commit, nothing is marked (409
+ * `TEAM_WORK_ITEM_HEAD_MOVED`).
  */
 export async function markReady(input: {
 	coordinatorId: string;
@@ -662,19 +671,36 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_DIRTY",
 		);
-	const head = await git.resolveCommit("HEAD");
+	// The one commit everything below is read at and the row records.
+	const head = await git.resolveCommit("HEAD").catch(() => null);
+	if (!head)
+		throw new AppError(
+			`The head commit of work item ${item.id} could not be read; nothing was marked. Try work.ready again.`,
+			409,
+			"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+		);
+	await assertKnowledgeFresh({
+		itemId: item.id,
+		worktree: path,
+		head,
+		baseRef: item.baseRef ?? team.baseBranch,
+	});
 	const reviewed = lastReviewedHead(item.id);
 	// Commits made after the review, not counting what a base sync brought in from the base.
 	const baseSha = await git.resolveCommit(item.baseRef ?? team.baseBranch).catch(() => null);
 	let commitsSinceReview: number | null = null;
-	if (head && reviewed && head !== reviewed)
+	if (reviewed && head !== reviewed)
 		commitsSinceReview = await git
 			.countCommitsNotIn(head, baseSha ? [reviewed, baseSha] : [reviewed])
 			.catch(() => null);
-	else if (head && reviewed) commitsSinceReview = 0;
-	// X: the paths this item changed, and the project's exclusive lock when they touch it.
+	else if (reviewed) commitsSinceReview = 0;
+	// X: the paths this item changed at the pinned head, and the project's exclusive lock when
+	// they touch it. Paths read at any other commit count as unreadable.
 	const globs = projectExclusivePaths(team.projectId);
-	const changed = await readChangedPaths(path, item.baseRef ?? team.baseBranch).catch(() => null);
+	const read = await readChangedPaths(path, item.baseRef ?? team.baseBranch, head).catch(
+		() => null,
+	);
+	const changed = read?.head === head ? read : null;
 	if (!changed && globs.length > 0)
 		throw new AppError(
 			`The changed paths of work item ${item.id} could not be read, so it is not known whether it touches the project's exclusive paths; try work.ready again`,
@@ -684,6 +710,14 @@ export async function markReady(input: {
 	const hits = changed ? exclusiveHits(changed.paths, globs) : [];
 	const takeLock = hits.length > 0 && item.exclusiveKey === null;
 	if (takeLock) await refuseWhileHeld(team, item, hits, input.actor);
+	// The last await before the write: from here to the end of the transaction nothing yields.
+	const current = await git.resolveCommit("HEAD").catch(() => null);
+	if (current !== head)
+		throw new AppError(
+			`The branch of work item ${item.id} moved while it was checked (head ${head.slice(0, 12)}, now ${current ? current.slice(0, 12) : "unreadable"}); nothing was marked. Call work.ready again so the new head is checked.`,
+			409,
+			"TEAM_WORK_ITEM_HEAD_MOVED",
+		);
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
@@ -696,7 +730,7 @@ export async function markReady(input: {
 				item,
 				{
 					state: "ready",
-					...(head ? { headSha: head } : {}),
+					headSha: head,
 					...(takeLock ? { exclusiveKey: TEAM_EXCLUSIVE_LOCK_KEY } : {}),
 				},
 				now,
