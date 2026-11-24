@@ -200,6 +200,8 @@ export const TEAM_DEFAULT_WORK_KIND = "change";
 
 /** Longest work item title. */
 export const TEAM_WORK_TITLE_MAX_LENGTH = 200;
+/** Longest branch hint (English words naming a work item's branch) `work.create` takes. */
+export const TEAM_WORK_BRANCH_HINT_MAX_LENGTH = 80;
 /** Text budget (UTF-8 bytes) of a decision recorded on people's behalf. */
 export const TEAM_DECISION_MAX_BYTES = 2 * 1024;
 /** Bounds of a check-in delay in minutes: at least five minutes, at most one day. */

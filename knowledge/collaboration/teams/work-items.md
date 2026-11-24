@@ -9,6 +9,7 @@ anchors:
   - server/services/teams/team-knowledge.ts
   - server/lib/agent/tools/team.ts
   - server/services/teams/__tests__/work-item-lifecycle.test.ts
+  - server/services/teams/__tests__/work-item-branch-name.test.ts
   - server/services/teams/__tests__/work-item-knowledge.test.ts
   - server/services/teams/__tests__/team-checkin-brief.test.ts
 keywords:
@@ -48,7 +49,8 @@ verified_at: 9166435ad
 - 状态：queued / in_progress / in_review / ready / merged / cancelled（`shared/project-teams.ts:TEAM_WORK_ITEM_STATES`）。
 - 看板五列：queued、in_progress、review（含 in_review 与 ready）、done（merged）、cancelled。
 - `work.create`：
-  - 先经现有 narrator worktree 创建通道建分支 `team/<标题 slug>-<id 哈希 8 位>` 与 worktree；
+  - 先经现有 narrator worktree 创建通道建分支 `team/<slug>-<id 哈希 8 位>` 与 worktree；
+  - slug 只取 ASCII 单词（`workBranchSlug`：NFKD 去重音、全角折半，其余文字不音译，最多 40 字符），先取协调者给的 `branchHint`，再取标题，都没有就是 `work`；全 ASCII 是为了过 `gitBranchName`、worktree 服务的 ref 检查和 `git check-ref-format`，哈希保证唯一。`Agent({ isolation })` 的标题没有 ASCII 单词时用 description 当 hint。已有分支不改名；
   - 再写行与 `work.created` 事件，初始 `queued`。
 - `Agent({ isolation: "worktree" })` 建的是 kind=`isolated` 的项，初始 `in_progress`。子代理结束时若没有提交也没有未提交改动，就清理 worktree 并取消该项（`settleIsolatedWorkItem`）。
 - 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。
