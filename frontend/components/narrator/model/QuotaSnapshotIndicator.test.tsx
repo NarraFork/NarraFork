@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import locale from "../../../locales/en/narrator.json";
 import { QuotaSnapshotIndicator } from "./QuotaSnapshotIndicator";
+import { quotaSnapshotText, quotaSnapshotView } from "./quota-snapshot-view";
 
 const i18n = createInstance();
 await i18n.init({ lng: "en", resources: { en: { narrator: locale } }, defaultNS: "narrator" });
@@ -55,5 +56,22 @@ test("failed refresh marks previous window values stale without losing known val
 		balances: [],
 	});
 	expect(html).toContain("10% left");
+	expect(html).toContain("figures may be out of date");
+});
+
+test("the API's safe error code uses the localized failure hint, not internal identifiers", () => {
+	const snapshot: PublicQuotaSnapshot = {
+		scope: "key",
+		fetchedAt: 1,
+		error: "quota_unavailable",
+		hasError: true,
+		windows: [],
+		balances: [],
+	};
+	const t = (key: string, options?: Record<string, unknown>) => String(i18n.t(key, options));
+	expect(quotaSnapshotView(snapshot, "Provider quota", t).failureDetail).toBeNull();
+	expect(quotaSnapshotText(snapshot, t).detailsText).not.toContain("quota_unavailable");
+	const html = render(snapshot);
+	expect(html).not.toContain("quota_unavailable");
 	expect(html).toContain("figures may be out of date");
 });

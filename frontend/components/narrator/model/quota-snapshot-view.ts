@@ -99,7 +99,8 @@ export function quotaSnapshotView(
 		level: worstQuotaLevel([...windows.map((window) => window.level), ...balanceLevels]),
 		rows,
 		failed: !!(snapshot?.error || snapshot?.hasError),
-		failureDetail: snapshot?.error ?? null,
+		// The public API's safe status code is not user-facing failure detail.
+		failureDetail: snapshot?.error === "quota_unavailable" ? null : (snapshot?.error ?? null),
 		fetchedAt: snapshot?.fetchedAt ?? 0,
 	};
 }
