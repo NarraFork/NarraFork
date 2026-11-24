@@ -1,7 +1,7 @@
 ---
 id: files.revert
 title: 回退与文件历史
-summary: 逐项恢复、部分成功保留、消息 COW、Tree 快照。
+summary: 逐项恢复、部分成功保留、消息 COW、历史可用性策略。
 anchors:
   - server/services/revert-transaction-service.ts
   - server/services/revert-plan-service.ts
@@ -11,9 +11,6 @@ anchors:
   - server/services/revert-blockers.ts
   - server/services/narrator-scoped-revert.ts
   - server/services/file-history-policy.ts
-  - server/services/tree-snapshot-paths.ts
-  - server/services/tree-snapshot-loop-hooks.ts
-  - server/services/worktree-tree-snapshot.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -30,14 +27,15 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 阻塞条件：叙述者有 `initializing/pending/running` 的工具调用、叙述者忙或另一预览在跑（`revert-blockers.ts:collectRevertBlockers`）。
 - 消息改写/COW 单行不得超过 4MiB（`historyCowBytes`），选择上限见 `REVERT_SELECTION_LIMITS`（子叙述者 1000、超时 30s）。
 - 仅启用文件历史的设备才能恢复文件；否则带 `skipRevert` 的路径只改消息（`file-history-policy.ts:resolveNarratorMessageOnlyRevert`，未启用时显式要求恢复报 409 `FILE_HISTORY_DISABLED`）。
-- Tree 快照：用不共享历史的影子 git 仓库对工作区做 `add -A` + `write-tree` 得到内容哈希，工具前后各记一次，用于 Bash 观测和编辑预览；热路径捕获预算 4s，失败后 15 分钟冷却；设置 `workspace.treeSnapshotsEnabled` 可关闭（`worktree-tree-snapshot.ts`）。远程设备暂不支持。
+- Tree 快照（整树内容哈希、Bash 观测、编辑预览、写入认领）不在本节点，见 [Tree 快照](tree-snapshots.md)。
 
 ## 从哪读起
 - `narrator-scoped-revert.ts`：叙述者回退的对外入口（预览、按块/按消息/按 seq 回退）。
 - `revert-planner-local-access.ts`、`revert-plan-service.ts`：预览与计划持久化。
 - `revert-transaction-service.ts`：事务执行；`revert-transaction-worker.ts` 在 Worker 里校验清单。
 - `revert-history-commit.ts`：历史提交；`file-change-local-restore.ts`：单文件恢复。
-- `tree-snapshot-loop-hooks.ts`：主/子叙述者循环共用的 tree 边界钩子。
 
 ## 相关
 - [文件写入与变更记录](write-queue.md)
+- [文件变更证据](change-evidence.md)
+- [Tree 快照](tree-snapshots.md)

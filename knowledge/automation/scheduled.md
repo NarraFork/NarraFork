@@ -33,4 +33,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/services/scheduled-task-cleanup.ts`：任务产出叙述者的保留与清理。
 
 ## 相关
-- 插件有自己的调度（`server/services/plugin-scheduler.ts`），见[插件系统](plugins.md)；不要与这里混淆。
+- 插件有自己的调度（`server/services/plugin-scheduler.ts`），见[插件系统](plugins/index.md)；不要与这里混淆。

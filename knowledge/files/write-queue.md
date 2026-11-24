@@ -1,12 +1,11 @@
 ---
 id: files.write-queue
 title: 文件写入与变更记录
-summary: 单文件写队列、写入结果与历史可用性、变更证据。
+summary: 单文件写队列、写入结果与历史可用性、变更运行时的单次尝试语义。
 anchors:
   - server/services/file-write-queue.ts
   - server/services/file-change-runtime.ts
   - server/services/file-change-apply-result.ts
-  - server/services/file-change-evidence.ts
   - server/services/file-history-policy.ts
   - shared/file-change-protocol.ts
 status: draft
@@ -25,15 +24,14 @@ Write/Edit/StructSed/GenUI 等改文件的工具、编辑器保存和回退都�
 - 同一请求只允许尝试一次：键为 `sourceKind:sourceId:attempt`，重复则抛错且不重试变更（`attempts` 缓存，上限 `MAX_ATTEMPTS=8192`）。
 - 历史准备有 1500ms 预算（`HISTORY_BUDGET_MS`、`boundedFileHistory`），超时只让历史变 `unavailable`，不影响磁盘写入结果。
 - 本地 IO 的返回要带“执行证明”：被拒/异常的适配器不算“没有发生写入”，一律归为 `target_mutation_unknown`，回执为 `unknown`（`file-change-apply-result.ts:applyLocalFileChange`）。新建的父目录必须落在已声明的写入足迹内（`file-change-write-footprint.ts`）。
-- 证据有大小上限：单 blob 32MiB，单操作 256MiB，blob 软配额 5GiB（`FILE_CHANGE_LIMITS`）。证据表见 `server/db/schema.ts` 的 `fileChangeScopes/Operations/Effects/Blobs`。
+- 证据（范围/操作/结果与内容 blob）的存储、配额与审计见 [文件变更证据](change-evidence.md)。
 
 ## 从哪读起
 - `server/services/file-write-queue.ts`：队列，`withFileWrite` 是入口。
 - `server/services/file-change-runtime.ts`：`LocalFileChangeRuntime`，一次写入的完整流程（命名空间初始化、前后状态、证据）。
-- `server/services/file-change-evidence.ts`：operation/effect 记录的持久化。
-- `server/services/file-change-blob-store.ts`、`file-change-blob-catalog.ts`：内容 blob 存储与配额目录。
 - `server/lib/agent/tools/write.ts`：工具如何接入 `executeLocalFileChange` 与 `withFileWrite`。
 
 ## 相关
+- [文件变更证据](change-evidence.md)
 - [回退与文件历史](revert.md)
 - [编辑器文档](editor.md)
