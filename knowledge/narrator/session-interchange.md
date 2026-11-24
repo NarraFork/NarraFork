@@ -60,5 +60,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 不变量：导出不得静默节选；导入失败不得留下半个叙述者（失败路径在 `import.ts` 清理）；写出不得覆盖现有文件。
 
 ## 相关
-- [消息存储](messages.md)：导出与 Markdown/JSON 导出共用的只读分页
+- [消息存储](messages/index.md)：导出与 Markdown/JSON 导出共用的只读分页
 - [Bot](bot.md)、[会话特性层](traits.md)：`imported` 等 trait

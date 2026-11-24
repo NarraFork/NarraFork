@@ -89,4 +89,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [会话令牌](sessions.md)
-- [OAuth 与开放 API](../oauth-api.md)
+- [OAuth 与开放 API](../oauth-api/index.md)

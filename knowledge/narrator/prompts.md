@@ -88,5 +88,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 改项目指令文件名：只在 `PROJECT_PROMPT_FILENAMES`（顺序即优先级）；全局指令的候选路径与 PUT 可写判定在 `getGlobalPromptCandidates` / `isWritableGlobalPromptPath`，两者须一致。
 
 ## 相关
-- [会话生命周期](lifecycle.md)
-- [消息存储](messages.md)
+- [会话生命周期](lifecycle/index.md)
+- [消息存储](messages/index.md)

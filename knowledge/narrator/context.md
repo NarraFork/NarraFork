@@ -88,6 +88,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 新增压缩退出路径：必须重查队列并唤醒（`drainQueuedMessagesAfterCompact`），否则用户输入会卡在队列里。
 
 ## 相关
-- [消息存储](messages.md)
+- [消息存储](messages/index.md)
 - [分叉与前缀快照](fork.md)
 - [提示词与注入](prompts.md)

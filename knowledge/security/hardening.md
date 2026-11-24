@@ -50,4 +50,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [访问控制](acl.md)：终端访问控制（`terminal-access.ts`）在那里。
 - [会话 worktree](../git/worktrees.md)
-- [工具调用审批](tool-permissions.md)
+- [工具调用审批](tool-permissions/index.md)

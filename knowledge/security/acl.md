@@ -81,4 +81,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [登录与会话令牌](auth/index.md)
 - [外部进程加固](hardening.md)：git 执行加固与子进程封装。
 - [终端运行时](../platform/terminal.md)：终端的创建、PTY 与缓冲。
-- [工具调用审批](tool-permissions.md)：审批权限请求需要叙述者写权限。
+- [工具调用审批](tool-permissions/index.md)：审批权限请求需要叙述者写权限。

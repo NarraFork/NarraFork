@@ -54,7 +54,7 @@ keywords:
   - RULE_CONFLICT
   - robotDiagnostic
   - bun run approve
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 工具调用审批
@@ -94,7 +94,13 @@ Agent 每次调用工具前都经过 `handlePermission`：先由纯函数 `resol
 - 不变量：灾难性 Bash 恒 `fatal`；受保护路径与评审边界先于白名单；OAuth 运行时约束是硬上限；规则申请不能放宽继承的 deny。
 
 ## 相关
-- [访问控制](acl.md)
-- [OAuth 与开放 API](oauth-api.md)
-- [外部进程加固](hardening.md)
+- [访问控制](../acl.md)
+- [OAuth 与开放 API](../oauth-api/index.md)
+- [外部进程加固](../hardening.md)
 - 「未核实」：挂起中的权限请求的整体超时（项目说明称 5 分钟），本次未在代码中逐一核对。
+
+## 下面有什么
+
+- [审批流程](flow.md)：权限模式、待批请求、批准与拒绝（HTTP 与 WebSocket）、超时与复查。
+- [反思门](reflection.md)：危险反思、任务反思、计划退出反思与评审边界。
+- [规则与执行策略](rules.md)：权限规则与规则申请、执行策略、预设与行为边界。

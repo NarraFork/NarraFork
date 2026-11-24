@@ -52,7 +52,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 登录与会话令牌
 
-认证回答「这个请求是谁发的」。它分两段：登录阶段用密码、Passkey、LDAP 或 SSO 证明身份，换到一个会话令牌；之后每个请求只带这个令牌，由中间件对着数据库认证。第三方走 OAuth 访问令牌（见 [OAuth 与开放 API](../oauth-api.md)），由同一个入口区分。
+认证回答「这个请求是谁发的」。它分两段：登录阶段用密码、Passkey、LDAP 或 SSO 证明身份，换到一个会话令牌；之后每个请求只带这个令牌，由中间件对着数据库认证。第三方走 OAuth 访问令牌（见 [OAuth 与开放 API](../oauth-api/index.md)），由同一个入口区分。
 
 ## 一个请求怎么被认证
 1. 登录（[登录方式与第二因子](login-methods.md)）：`POST /api/auth/login` 先校验本地密码，不通过再试 LDAP；用户启用了 MFA 就只返回 `mfaToken`，再用 TOTP、备份码或 Passkey 换会话。Passkey 无用户名登录与 SSO 直接发会话。各种登录方式的出口都是 `lib/auth.ts:buildSessionResult`（注册走 `createToken`）。
@@ -61,7 +61,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 4. 路由再选门：只收会话主体、只收 OAuth、两者都收、管理员；管理员判断永不接受 OAuth 主体。
 5. 临近到期的会话在请求里顺带续期，续期失败不影响请求。
 
-高风险操作（导出凭据）在以上之外还要 step-up 再验证，见登录方式一节。认证之后的资源授权与操作审批见 [访问控制](../acl.md)、[工具调用审批](../tool-permissions.md)。
+高风险操作（导出凭据）在以上之外还要 step-up 再验证，见登录方式一节。认证之后的资源授权与操作审批见 [访问控制](../acl.md)、[工具调用审批](../tool-permissions/index.md)。
 
 ## 前端与用户管理
 - 登录成功后 `hooks/useAuth.ts:applySession` 存令牌、清掉上一个账号的偏好缓存、把用户写进查询 `["auth","me"]` 与本地缓存、再切换界面语言；远程构建（`REMOTE_BUILD`）改走 `remote/session` 建立会话。
@@ -82,7 +82,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 改登录后行为不得绕过 `buildSessionResult`；会话相关守卫见 `middleware/__tests__/session-gate.integration.test.ts`。
 
 ## 相关
-- [OAuth 与开放 API](../oauth-api.md)
+- [OAuth 与开放 API](../oauth-api/index.md)
 - [访问控制](../acl.md)
 
 ## 下面有什么

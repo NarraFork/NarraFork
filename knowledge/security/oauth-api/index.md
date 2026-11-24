@@ -67,7 +67,7 @@ keywords:
   - detail 参数
   - message.summary.read
   - external-narrators
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # OAuth 与开放 API
@@ -88,7 +88,7 @@ NarraFork 自带一个 OAuth 2.0 授权服务器，第三方应用拿到访问�
 - 资源授权（`services/oauth-resource-access.ts`）：解析实时授权与客户端上下文，授权关联的项目白名单有限（`EXTERNAL_OAUTH_MAX_PROJECTS`=100）；`requireOwnedExternalNarrator`/`requireOwnedExternalDevice` 对不属于该授权的资源隐藏存在性。OAuth 创建的设备另由 `oauth-device-runtime-policy.ts:resolveOAuthDeviceRuntimeAuthorization` 在运行时重查所有者授权，普通设备不经这条边界。
 - 客户端清单（`lib/oauth-client-manifest.ts`）：管理员导入导出的可移植注册描述，kind `narrafork.oauth-client` 版本 1，只含公共客户端、`authorization_code`+`refresh_token`、重定向 URI 1–20 个，不含密钥与数据库元数据。
 - 外部 WebSocket：入口 `/ws/external/v1/narrators?ticket=`（`http-dispatcher.ts`），先校验 Origin 白名单与容量，再一次性兑换票据并重验访问令牌仍有效且含 `narrator.read`、`event.subscribe`；帧由 `lib/validators/external-websocket.ts` 严格校验，类型 pong/subscribe/unsubscribe/sync_check/send_message/interrupt；单帧上限 160 KiB（超出 1009 关闭），连接与订阅上限各 100，连接数满关闭 1013。每个连接按帧消耗预算，超限回 `rate_limited` 帧。
-- OAuth 叙述者的运行时约束：外部权限模式只有 readOnly / dontAsk / bypassPermissions；headless 的 bypassPermissions 退回危险反思而不是无检查，灾难性命令仍被拒（`lib/oauth-client-policy.ts`）；每个叙述者最多 16 台设备；设备按访问组（host/global/selfRegistered）有各自的操作上限（`oauth-narrator-runtime-policy.ts`）。这些约束进入 `handlePermission` 的 `runtimeConstraint`，见 [工具调用审批](tool-permissions.md)。
+- OAuth 叙述者的运行时约束：外部权限模式只有 readOnly / dontAsk / bypassPermissions；headless 的 bypassPermissions 退回危险反思而不是无检查，灾难性命令仍被拒（`lib/oauth-client-policy.ts`）；每个叙述者最多 16 台设备；设备按访问组（host/global/selfRegistered）有各自的操作上限（`oauth-narrator-runtime-policy.ts`）。这些约束进入 `handlePermission` 的 `runtimeConstraint`，见 [工具调用审批](../tool-permissions/index.md)。
 - 授权被撤销或收窄时，`oauth-runtime-revocation.ts` 会硬停所属叙述者的活动、清空排队消息并断开设备。
 
 ## 前端
@@ -109,5 +109,11 @@ NarraFork 自带一个 OAuth 2.0 授权服务器，第三方应用拿到访问�
 - 不变量：OAuth 主体永远不是管理员；公共客户端只支持 S256 PKCE；票据一次性、30–60 秒。
 
 ## 相关
-- [登录与会话令牌](auth/index.md)
-- [工具调用审批](tool-permissions.md)
+- [登录与会话令牌](../auth/index.md)
+- [工具调用审批](../tool-permissions/index.md)
+
+## 下面有什么
+
+- [OAuth 服务端](oauth-server.md)：OAuth 应用与授权、令牌与 PKCE、作用域、WebSocket 票据。
+- [External API v1](external-v1.md)：对外 API 路由、外部会话 WebSocket、限额与限流。
+- [集成授权层](integrations.md)：统一的授权层：集成主体、能力内核、授权与资源绑定、审计与摘要；OAuth 与插件共用。

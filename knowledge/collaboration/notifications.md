@@ -83,5 +83,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [钩子](../automation/hooks.md)：`Attention` / `AttentionResolved` 钩子经 `attention-hook-bridge.ts` 消费同一组 `narrator:attention` 事件。
 - [聊天与站内消息](chat.md)
 - [最近标签页](recent-tabs.md)
-- [团队](teams.md)
+- [团队](teams/index.md)
 - [IM 网关](gateway.md)

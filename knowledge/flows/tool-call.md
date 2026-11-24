@@ -35,12 +35,12 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 模型在一轮里发出 tool_use，到结果作为 tool_result 写回历史、模型进入下一轮。权限判断是执行前的必经关口，执行在本机或远程设备上。
 
 ## 路径
-1. 参数流：provider 流式给出 tool_use，`loop.ts` 产出 `tool_use_chunk`；`narrator-event-handler.ts:processEvent` 在 `block_complete` 的 tool 块上经 `writeAttemptItem` 先落一行 `narrator_tool_calls`（初始状态），并广播。见 [消息存储](../narrator/messages.md)。
+1. 参数流：provider 流式给出 tool_use，`loop.ts` 产出 `tool_use_chunk`；`narrator-event-handler.ts:processEvent` 在 `block_complete` 的 tool 块上经 `writeAttemptItem` 先落一行 `narrator_tool_calls`（初始状态），并广播。见 [消息存储](../narrator/messages/index.md)。
 2. 分组：同一轮的调用经 `groupToolExecutions` 分成并行组与串行屏障；参数流已成形的调用可由 `selectStreamingToolExecutions` 提前启动（`shouldEagerExecuteTool`）。见 [Agent Loop](../agent/loop.md)。
 3. 反思前置：`loop.ts:executeToolAfterReflections` 在进入执行器前处理 ExitPlanMode 的计划反思；反思确认则带 `preGrantedPermission` 直接执行，要人工则走普通审批。
 4. 准入与查表：`tool-executor.ts:executeTool` 先做更新准入（`preAdmitToolExecution`），再 `toolRegistry.get(name)`；不存在、MCP 工具被禁用或未加载、可选工具未加载，都直接返回错误结果（"Tool is not loaded in this session…"），不进入权限。见 [工具体系](../agent/tools/index.md)。
 5. 冻结执行目标：需要路由的工具在审批**前**解析并持久化 `ToolExecutionTarget`（设备、cwd、规范路径）；审批后返回的输入必须与冻结的目标一致，否则报错。见 [执行后端](../agent/execution.md)。
-6. 权限判定：`config.permissionHandler` → `narrator-permission.ts:handlePermission`，内部 `resolvePermissionDecision` 给出 allow / deny / ask / fatal。见 [工具调用审批](../security/tool-permissions.md)。
+6. 权限判定：`config.permissionHandler` → `narrator-permission.ts:handlePermission`，内部 `resolvePermissionDecision` 给出 allow / deny / ask / fatal。见 [工具调用审批](../security/tool-permissions/index.md)。
 7. 分支，allow：直接到步骤 10。
 8. 分支，deny / fatal：执行器返回拒绝文本作为 tool_result（`isError`），跳到步骤 11。
 9. 分支，ask：`handlePermission` 登记到 `pendingPermissions`，广播 `permission_request`，Promise 挂起；前端渲染审批卡片，用户经 `POST /api/narrators/permissions/:requestId/approve|deny`（`routes/narrators.ts`）或 WebSocket 决定入口，两者都调 `resolvePermissionOrDangerReflection` 解除挂起，再广播 `permission_resolved`。挂起期间执行器释放更新准入（`onAwaitingUserDecision`）。若命中危险反思，则先走反思，仅 `DangerConfirm` / `DangerCancel` 可用。

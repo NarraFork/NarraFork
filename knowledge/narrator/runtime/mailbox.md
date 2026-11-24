@@ -78,4 +78,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [输出发布](publication.md)
 - [调度与执行](orchestrator.md)
-- [消息存储](../messages.md)
+- [消息存储](../messages/index.md)

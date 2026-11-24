@@ -68,6 +68,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 改前缀快照存储格式：哈希始终寻址完整不可变 JSON；`narrator-prefix-snapshots*.test.ts`、`prefix-epochs.test.ts` 与 `data-portability-prefix.test.ts`（数据导入导出会带快照）会失败。
 
 ## 相关
-- [消息存储](messages.md)
+- [消息存储](messages/index.md)
 - [上下文与压缩](context.md)
 - [提示词与注入](prompts.md)

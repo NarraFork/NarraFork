@@ -56,5 +56,5 @@ verified_at: 776dbf07e
 ## 相关
 - [上下文与压缩](../narrator/context.md)
 - [一轮对话](turn.md)
-- [消息存储](../narrator/messages.md)
+- [消息存储](../narrator/messages/index.md)
 - 「未核实」：步骤 6 中摘要模型请求的具体重试层次与 watchdog 时限数值；步骤 10 中钩子在每个请求前被调用的确切条件（只确认了 `rebuildRequestHistory` 在 `buildContextManagementHooks` 里清待应用标记）。

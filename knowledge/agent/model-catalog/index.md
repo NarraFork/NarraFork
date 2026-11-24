@@ -72,12 +72,12 @@ keywords:
   - __agg__
   - modelProtocols
   - catalog.json
-status: draft
+status: stub
 verified_at: 776dbf07e
 ---
 # 模型目录与来源
 
-回答「这个 `provider:model` 的上下文窗口、输出上限、推理档位、输入模态、价格是多少」，以及「有哪些连接（来源）、`auto:` 模型从哪些来源出」。凭证怎么选见 [凭证池与存储](credentials.md)，额度见 [供应商余额与额度](provider-quota.md)。
+回答「这个 `provider:model` 的上下文窗口、输出上限、推理档位、输入模态、价格是多少」，以及「有哪些连接（来源）、`auto:` 模型从哪些来源出」。凭证怎么选见 [凭证池与存储](../credentials.md)，额度见 [供应商余额与额度](../provider-quota.md)。
 
 ## 关键规则
 - 模型卡按层合并，后者覆盖前者：目录模型（`preset-model`）、目录变体（`preset-variant`）、网关/列表发现的元数据（`discovered`）、模型级本地覆盖（`local-model`）、连接级覆盖（`local-connection`）；每个字段记录来源层（`shared/model-catalog/resolve.ts:resolveModelCard`）。与目录自相矛盾的发现值（输出上限大于总窗口）整体忽略；用户的输出上限超过总窗口时被截到总窗口。
@@ -116,7 +116,12 @@ verified_at: 776dbf07e
 - 相关测试：`shared/model-catalog/resolve.test.ts`、`card.test.ts`，`server/lib/sourcing/*.test.ts`（`templates`、`presets`、`source-groups`、`allocate-group`），`server/lib/agent/__tests__/provider-model-metadata.test.ts`。
 
 ## 相关
-- [凭证池与存储](credentials.md)
-- [供应商余额与额度](provider-quota.md)
-- [模型提供商](providers.md)
-- [用量与费用](usage.md)
+- [凭证池与存储](../credentials.md)
+- [供应商余额与额度](../provider-quota.md)
+- [模型提供商](../providers/index.md)
+- [用量与费用](../usage.md)
+
+## 下面有什么
+
+- [模型目录](catalog.md)：模型卡的分层解析、目录更新与快照、本地覆盖。
+- [来源组与模型列表](sourcing.md)：来源组与模板、模型列表读取器、auto 模型列表、模型继承。

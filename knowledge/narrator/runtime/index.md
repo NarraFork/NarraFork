@@ -26,7 +26,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 运行结束由 `run.ts:finishRun` 提交终态：结果经 [输出发布](publication.md) 的 outbox 与 `runtimePublication` 写成通知，再转入接收方的收件箱；随后释放所有权并按需唤醒收件箱。
 - 存储后端：SQLite 为默认同步实现，PostgreSQL 通过 `runtime-queue-port.ts` 绑定的异步队列；两者共用同一套领域规则，见各叶子。
 
-- 运行时注册信息：`narrators` 上存一份严格校验的 JSON（≤ 64 KiB，`version: 1`），只存关系与事实——模型池 `modelPool`、控制授权 `controller`（`steer` / `stop` / `archive`，另见 [会话生命周期](../lifecycle.md) 的 `authorizeAgentControl`）、历史落点 `historyPlacement`、本次运行的绑定 `run`（`logicalRunId`、`cancelWith`、`deliverTo`、`principal`、绝对 `deadlineAt`、`historyStartSeq`；新运行整体替换旧运行的事实）、outline 委派任务 `delegatedTask`；能力上限在 trait 里，策略来源链深度上限 16（`lib/validators/runtime-registration.ts`）。
+- 运行时注册信息：`narrators` 上存一份严格校验的 JSON（≤ 64 KiB，`version: 1`），只存关系与事实——模型池 `modelPool`、控制授权 `controller`（`steer` / `stop` / `archive`，另见 [会话生命周期](../lifecycle/index.md) 的 `authorizeAgentControl`）、历史落点 `historyPlacement`、本次运行的绑定 `run`（`logicalRunId`、`cancelWith`、`deliverTo`、`principal`、绝对 `deadlineAt`、`historyStartSeq`；新运行整体替换旧运行的事实）、outline 委派任务 `delegatedTask`；能力上限在 trait 里，策略来源链深度上限 16（`lib/validators/runtime-registration.ts`）。
 
 ## 下面有什么
 - [调度与执行](orchestrator.md)：orchestrator、run、transition、ownership：一次运行从开始到结束的状态与边界。
@@ -35,5 +35,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [模型历史](model-history.md)：model-history-*：发给模型的历史怎么查询、增量与修订。
 
 ## 相关
-- [会话生命周期](../lifecycle.md)
+- [会话生命周期](../lifecycle/index.md)
 - [Agent 循环](../../agent/loop.md)

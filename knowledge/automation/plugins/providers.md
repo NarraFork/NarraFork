@@ -69,4 +69,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [插件系统](index.md)
 - [插件授权与密钥](permissions-secrets.md)
-- [模型提供商](../../agent/providers.md)
+- [模型提供商](../../agent/providers/index.md)

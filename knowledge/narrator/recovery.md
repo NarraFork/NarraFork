@@ -67,5 +67,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [上下文与压缩](context.md)
-- [会话生命周期](lifecycle.md)
+- [会话生命周期](lifecycle/index.md)
 - [实例锁、完整性与重启恢复](../platform/instance-recovery.md)

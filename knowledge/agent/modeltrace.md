@@ -62,6 +62,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 诊断叙述者与会话列表、ACL 的关系（私有、`hiddenFromLists`、不进最近标签页）不能放宽。
 
 ## 相关
-- [模型提供商](providers.md)
+- [模型提供商](providers/index.md)
 - [Agent Loop](loop.md)
 - [用量与费用](usage.md)

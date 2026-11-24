@@ -33,7 +33,7 @@ keywords:
   - team_status
   - POSTGRES_UNSUPPORTED
   - TEAM_TRAIT
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 团队
@@ -80,7 +80,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 前端
 - 团队页路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `components/teams/TeamPageView.tsx`；`TeamWorkspace.tsx` 按自身宽度选三栏（团队列表 / 协调者对话 / 看板与动态）、两栏或标签页；对话用普通叙述者面板。`team-page-model.ts` 是纯规则（状态图标、轮询退避、「全部暂停」顺序）。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
-- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](notifications.md)、[最近标签页](recent-tabs.md)）。
+- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
 
 ## 从哪读起
 - `server/services/teams/team-service.ts`：团队创建与读取。
@@ -94,12 +94,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 加一个 `Team` 工具动作：`shared/project-teams.ts:TEAM_TOOL_ACTIONS`、`tools/team.ts` 的参数与分发、`narrator-permission.ts` 的逐动作分类（`isTeamReadAction`/`isTeamCleanupCall`，漏了会被当成写动作或绕过批准）、`team-status.ts` 与前端 `team-page-model.ts` 里对事件种类的文案。
 - 加工作项状态或事件种类：`TEAM_WORK_ITEM_STATES`/`TeamWorkEventKind`、表上的 check 约束（SQLite 与 `drizzle-postgres` 两边，`team-tables-contract.test.ts` 会失败）、看板列映射 `TEAM_BOARD_COLUMN_STATES`。
 - 动团队三张表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步；它们不在数据导出清单里，保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
-- 不变量：成员关系永远取自协调者的叙述者 ACL，不要加团队成员表；服务端不合并、不删分支、不直接跑 `git worktree`；所有团队读取必须带 LIMIT 并且 SQLite 专用；IM 网关不得驱动团队会话（见 [IM 网关](gateway.md)）。
+- 不变量：成员关系永远取自协调者的叙述者 ACL，不要加团队成员表；服务端不合并、不删分支、不直接跑 `git worktree`；所有团队读取必须带 LIMIT 并且 SQLite 专用；IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
 - 新增团队写路由：沿用文件顶部的 `requireSqliteProjectMutation` 中间件，再做 `loadTeamForAccess` 访问判定。
 
 ## 相关
-- [项目](projects.md)
-- [聊天与站内消息](chat.md)
-- [IM 网关](gateway.md)：团队会话不能从 IM 驱动。
-- [通知与注意力](notifications.md)：团队的「等待成员」提醒。
-- [大纲](../kb/outline.md)：任务来源（`task-source`）与任务看板的锚点已移到大纲节点。
+- [项目](../projects.md)
+- [聊天与站内消息](../chat.md)
+- [IM 网关](../gateway.md)：团队会话不能从 IM 驱动。
+- [通知与注意力](../notifications.md)：团队的「等待成员」提醒。
+- [大纲](../../kb/outline.md)：任务来源（`task-source`）与任务看板的锚点已移到大纲节点。
+
+## 下面有什么
+
+- [团队与成员](records.md)：团队即协调者会话：创建、名称、访问控制与成员、生命周期、IM 拒绝。
+- [工作项](work-items.md)：工作项状态机、Team 工具、worktree 端口、检查提醒、合并判定与清理。
+- [重叠与独占路径](overlap.md)：工作项的改动路径、跨团队重叠提醒、独占路径锁与强制释放。
+- [协调者](coordinator.md)：协调者的软限制、保存的输出、团队状态行与提示词。
+- [团队页与审批](page.md)：看板、活动、待批抽屉、谁批的记录、暂停全部与团队页前端。

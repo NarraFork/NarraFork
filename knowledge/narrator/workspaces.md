@@ -65,4 +65,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [面板与布局](../frontend/panels.md)：客户端保存（防抖、重试）、对账与拖放。
-- 叙述者的工作目录上下文不属于面板布局，见[会话生命周期](lifecycle.md)；改动归属视图见[文件变更证据](../files/change-evidence.md)。
+- 叙述者的工作目录上下文不属于面板布局，见[会话生命周期](lifecycle/index.md)；改动归属视图见[文件变更证据](../files/change-evidence.md)。

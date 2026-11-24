@@ -113,4 +113,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [凭证池与存储](credentials.md)
 - [用量与费用](usage.md)
-- [模型提供商](providers.md)
+- [模型提供商](providers/index.md)

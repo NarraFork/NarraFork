@@ -59,7 +59,7 @@ keywords:
   - "@handle"
   - 快速模式
   - 会话标题
-status: draft
+status: stub
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 会话生命周期
@@ -74,7 +74,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 运行失败兜底：仍处 working/waiting 的叙述者被置回 `idle` 并带 `substatus: ["error"]`（`reportUnsettledRunLoopError`）。
 - 控制：叙述者对另一叙述者的 stop / steer / archive 必须持有目标登记的 controller 授权，且调用方上限允许编排、未到最大委派深度、其执行用户当前对目标有写权限；用户正接管（run hold）时 stop/archive 被拒（`narrator-control.ts:authorizeAgentControl`）。人通过 HTTP 的操作走普通写 ACL，不经此处。
 - 归档：`narrator-archive.ts:transitionNarratorArchiveGroup` 对父会话和满足条件的“顺带提问”子会话（`isAskInPassing`，最多 200 个，超出报错）成组切换 `archived` / `idle`。先做运行时取消（`prepareNarratorArchive`），再在单个事务内改状态，仅提交后才发 `narrator:status_changed` 和 WS `status_change`；归档子会话记 `archivedWithNarratorId`，只有它们会随父会话一起恢复。
-- 工作目录上下文：`workspaceContextService`（`workspace-context-service.ts`）管叙述者的工作目录与设备目录映射，修订号存 `narrators.workspaceRevision`；`withRevision` 在变更准入内比对修订号，变了报 `WORKSPACE_CONTEXT_CONFLICT`，忙碌报 `WORKSPACE_CONTEXT_BUSY`；`switch` 仅限 primary 且无 `background` 特征、非知识管家的叙述者，HTTP 来源在运行/等待中被拒，agent 来源不受此限（`supportsDirectorySwitch`、`switch`）。它不读写 `workspaces` 面板表，面板见[工作区布局](workspaces.md)。
+- 工作目录上下文：`workspaceContextService`（`workspace-context-service.ts`）管叙述者的工作目录与设备目录映射，修订号存 `narrators.workspaceRevision`；`withRevision` 在变更准入内比对修订号，变了报 `WORKSPACE_CONTEXT_CONFLICT`，忙碌报 `WORKSPACE_CONTEXT_BUSY`；`switch` 仅限 primary 且无 `background` 特征、非知识管家的叙述者，HTTP 来源在运行/等待中被拒，agent 来源不受此限（`supportsDirectorySwitch`、`switch`）。它不读写 `workspaces` 面板表，面板见[工作区布局](../workspaces.md)。
 - 文本/推理块的落库点是 `block_complete`，不是流式增量：`narrator-event-handler.ts:processEvent` 的 `stream_text` 分支只更新内存快照并广播 `stream_event`；`block_complete` 分支先 `openStep` 保证存在部分消息，再经 `persistContentCheckpoint`（调用 `narratorStore.writeStepItem`）写入 text / reasoning 块。`narrator-executor.ts:executeAgentLoop` 里“文本块不在流式期间增量落库、只在内存里等到回合末”的注释已过时，以此为准。
 - 中断后的排空：`config.signal` 已 abort 时，executor 仍继续处理 `tool_result`、`block_complete`、`error` 三类事件，其余事件丢弃（`narrator-executor.ts:executeAgentLoop`）；`block_complete` / `assistant_message` 处理抛错则升级为 `CriticalEventPersistenceError` 中止循环，其他事件只记日志（`tool_result` 失败另向前端发 `warning`）。
 - 标题：首条用户消息先 `setProvisionalTitleFromUserMessage`（首句，超过 50 字符截成 49 加 `…`）写占位标题；再由摘要模型 `generateQuickTitle`（输入截 500 字符）或 `generateTitle`（首 1 条加末 6 条消息）生成，各 30 秒超时，引号去掉、超 80 字符截 50；均经 `persistTitle` 写库并发 WS `title_updated` 和事件 `narrator:title_updated`。生成失败只记日志不抛（`narrator-title.ts`）。
@@ -104,7 +104,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 其他：先读 `narrator-session-loop.test.ts`、`narrator-executor.test.ts`。
 
 ## 相关
-- [消息存储](messages.md)
-- [中断与恢复](recovery.md)
-- [提示词与注入](prompts.md)
-- [会话运行时](runtime/index.md)：`agent-runtime/` 的调度、收件箱、发布与模型历史
+- [消息存储](../messages/index.md)
+- [中断与恢复](../recovery.md)
+- [提示词与注入](../prompts.md)
+- [会话运行时](../runtime/index.md)：`agent-runtime/` 的调度、收件箱、发布与模型历史
+
+## 下面有什么
+
+- [运行与停止](run-control.md)：创建会话、启动一次运行、停止与中断、归档与删除；narrator-service 各部分的分工。
+- [会话外观与状态](session-surface.md)：标题、别名、快捷模式、草稿与输入框文档、面板状态、手动资源。
+- [执行工作区](workspace-context.md)：会话在哪个目录、哪台设备上执行：工作目录与设备目录上下文、切换。

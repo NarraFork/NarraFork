@@ -67,4 +67,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [通知与注意力](notifications.md)
-- [团队](teams.md)
+- [团队](teams/index.md)

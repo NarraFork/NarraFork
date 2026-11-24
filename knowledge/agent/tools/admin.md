@@ -62,4 +62,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 相关
 - [工具体系](index.md)
 - [MCP 集成](../mcp.md)
-- [工具调用审批](../../security/tool-permissions.md)
+- [工具调用审批](../../security/tool-permissions/index.md)

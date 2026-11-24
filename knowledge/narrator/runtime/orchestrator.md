@@ -79,4 +79,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [收件箱与唤醒](mailbox.md)
 - [输出发布](publication.md)
 - [模型历史](model-history.md)
-- [会话生命周期](../lifecycle.md)
+- [会话生命周期](../lifecycle/index.md)

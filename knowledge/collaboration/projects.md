@@ -67,7 +67,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 前端
 - `frontend/routes/projects/index.tsx`（项目列表）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
-- `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams.md)。
+- `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams/index.md)。
 
 ## 从哪读起
 - `server/services/project-index.ts`：目录到项目的推导、链接同步与重建。
@@ -86,4 +86,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 列表接口形状是契约（裸数组、`updatedAt` 降序、无参返回全部），改成分页信封会破坏现有调用方。
 
 ## 相关
-- [团队](teams.md)
+- [团队](teams/index.md)

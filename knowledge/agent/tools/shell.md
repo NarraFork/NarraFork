@@ -82,7 +82,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 改它时
 - 改 Bash 超时或输出上限：`bash.ts` 顶部常量、`resolveBashTimeoutMs`、`background-bash-result.ts` 的采集上限（注释要求与 `MAX_OUTPUT_BYTES` 一致）要一起改；工具描述里写的上限与代码不一致时以代码为准并顺手改描述。
 - 改 Bash 并行规则：单一来源是 `shared/tool-parallel-groups.ts`（`tool-execution-groups.test.ts`）。
-- 改自动放行（`bash-analyze.ts`）会影响权限判定，跑 `agent/__tests__/bash-analyze.test.ts`，并看 [工具调用审批](../../security/tool-permissions.md)。
+- 改自动放行（`bash-analyze.ts`）会影响权限判定，跑 `agent/__tests__/bash-analyze.test.ts`，并看 [工具调用审批](../../security/tool-permissions/index.md)。
 - 新增后台任务种类要同步任务列表分页与占用索引（`shared/background-task-list.ts`、`background-occupancy-*.ts`），列表读取不得带出消息或输出大字段。
 - Watch/Stop 新增目标类型要同时改 `watch-observation.ts` 的校验、`stop-task-policy.ts` 的授权与 `shared/watch-command.ts` 的前缀过滤；Watch 观察超时只结束观察，不停止目标。
 - 测试：`tools/__tests__/bash-stop-teamstatus.test.ts`、`bash-workspace-activity.test.ts`、`terminal-watch-tool.test.ts`、`pipeline*.test.ts`，`agent/__tests__/execution-timeout.test.ts`。

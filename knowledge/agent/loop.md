@@ -96,7 +96,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 测试：`agent/__tests__/loop-*.test.ts`、`tool-execution-groups.test.ts`、`tool-use-id-dedup.test.ts`、`error-handling.test.ts`、`retry-after.test.ts`。
 
 ## 相关
-- [模型提供商](providers.md)
+- [模型提供商](providers/index.md)
 - [工具体系](tools/index.md)
 - [执行后端](execution.md)
 - [会话运行时](../narrator/runtime/index.md)：循环之外的运行调度、收件箱、发布与模型历史

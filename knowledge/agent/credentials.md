@@ -68,7 +68,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 # 凭证池与存储
 
-模型凭证的存放、选择与降级：同一连接下有多个凭证（Codex 账号、自定义 API 的多把密钥）时怎么选、坏了怎么冷却、凭证存在哪、怎么搬到另一个实例。余额与套餐额度的查询、缓存、展示见 [供应商余额与额度](provider-quota.md)；模型元数据、目录更新、来源组与 `auto:` 模型列表见 [模型目录与来源](model-catalog.md)。
+模型凭证的存放、选择与降级：同一连接下有多个凭证（Codex 账号、自定义 API 的多把密钥）时怎么选、坏了怎么冷却、凭证存在哪、怎么搬到另一个实例。余额与套餐额度的查询、缓存、展示见 [供应商余额与额度](provider-quota.md)；模型元数据、目录更新、来源组与 `auto:` 模型列表见 [模型目录与来源](model-catalog/index.md)。
 
 ## 关键规则
 - 选择算法在 `agent/credential-pool.ts:selectPoolEntry`，Codex 账号池与自定义提供商多密钥共用：过滤 disabled/archived/exclude，再排除冷却中的；会话粘性条目优先；模式 `priority`（取优先级数值最小）/ `balanced`（随机）/ `tier-balanced`（先取最优档位再随机）。密钥池传 `fallbackToCooling`，全部冷却时选最早恢复的，Codex 不这样做，没有可用条目就返回空。
@@ -112,6 +112,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 相关
 - [供应商余额与额度](provider-quota.md)
-- [模型目录与来源](model-catalog.md)
-- [模型提供商](providers.md)
+- [模型目录与来源](model-catalog/index.md)
+- [模型提供商](providers/index.md)
 - [用量与费用](usage.md)
