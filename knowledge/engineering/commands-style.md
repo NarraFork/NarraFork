@@ -34,7 +34,7 @@ keywords:
   - 41221
   - static-checks
 status: draft
-verified_at: 2e6441ad0
+verified_at: 9955fd5d5
 ---
 # 开发命令与代码规范
 
