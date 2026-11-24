@@ -138,20 +138,6 @@ export function anchorMatches(anchor: string, path: string): boolean {
 	return path === a;
 }
 
-/**
- * Git pathspecs for anchors. Git's glob magic has no `{a,b}` alternatives, so a glob that uses
- * them is expanded to the tracked files it matches now.
- */
-function toPathspecs(anchors: string[], tracked: () => string[]): string[] {
-	const out: string[] = [];
-	for (const anchor of anchors) {
-		const a = anchorPath(anchor);
-		if (a.includes("{")) out.push(...tracked().filter((f) => anchorMatches(a, f)));
-		else out.push(/[*?[{]/.test(a) ? `:(glob)${a}` : a);
-	}
-	return out;
-}
-
 // ── commands ─────────────────────────────────────────────────────────────────
 
 /**
@@ -230,24 +216,43 @@ export interface StaleNode {
 /** Nodes whose anchored code changed in a commit after the node file's last commit. */
 export function stale(root: string, nodes: KnowledgeNode[]): StaleNode[] {
 	const dirty = new Set(lines(git(root, ["status", "--porcelain"])).map((l) => l.slice(3)));
-	let trackedCache: string[] | null = null;
-	const tracked = () => {
-		trackedCache ??= lines(git(root, ["ls-files"]));
-		return trackedCache;
+	// Each commit since a node's last commit, with every path it touched. Paths come from git
+	// itself, so deletions and both sides of a rename are included, and anchors (globs with
+	// braces too) are matched against them directly.
+	const history = new Map<string, Array<{ commit: string; files: string[] }>>();
+	const commitsSince = (since: string) => {
+		let entries = history.get(since);
+		if (!entries) {
+			entries = [];
+			const out = git(root, [
+				"log",
+				"--format=@@%H",
+				"--name-only",
+				"--no-renames",
+				`${since}..HEAD`,
+			]);
+			for (const l of lines(out)) {
+				if (l.startsWith("@@")) entries.push({ commit: l.slice(2), files: [] });
+				else entries[entries.length - 1]?.files.push(l);
+			}
+			history.set(since, entries);
+		}
+		return entries;
 	};
 	const out: StaleNode[] = [];
 	for (const node of nodes) {
 		if (node.anchors.length === 0 || dirty.has(node.file)) continue;
 		const since = git(root, ["log", "-1", "--format=%H", "--", node.file]).trim();
 		if (!since) continue;
-		const specs = toPathspecs(node.anchors, tracked);
-		if (specs.length === 0) continue;
-		const commits = lines(git(root, ["rev-list", `${since}..HEAD`, "--", ...specs]));
-		if (commits.length === 0) continue;
-		const files = lines(git(root, ["diff", "--name-only", since, "HEAD", "--", ...specs])).filter(
-			(f) => !f.startsWith(`${KNOWLEDGE_DIR}/`),
-		);
-		if (files.length > 0) out.push({ node, commits, files });
+		const commits: string[] = [];
+		const files = new Set<string>();
+		for (const entry of commitsSince(since)) {
+			const hit = entry.files.filter((f) => node.anchors.some((a) => anchorMatches(a, f)));
+			if (hit.length === 0) continue;
+			commits.push(entry.commit);
+			for (const f of hit) files.add(f);
+		}
+		if (commits.length > 0) out.push({ node, commits, files: [...files].sort() });
 	}
 	return out;
 }
@@ -279,12 +284,14 @@ export function affected(nodes: KnowledgeNode[], changed: string[]): Affected {
 }
 
 export function changedFiles(root: string, base: string): string[] {
+	// --no-renames keeps the old path of a rename, so nodes anchored to it are reported.
+	// Knowledge files stay in: a node may anchor them (the tree's own guide does).
 	const files = new Set<string>([
-		...lines(git(root, ["diff", "--name-only", `${base}...HEAD`])),
-		...lines(git(root, ["diff", "--name-only", "HEAD"])),
+		...lines(git(root, ["diff", "--name-only", "--no-renames", `${base}...HEAD`])),
+		...lines(git(root, ["diff", "--name-only", "--no-renames", "HEAD"])),
 		...lines(git(root, ["ls-files", "--others", "--exclude-standard"])),
 	]);
-	return [...files].filter((f) => !f.startsWith(`${KNOWLEDGE_DIR}/`)).sort();
+	return [...files].sort();
 }
 
 export function coverage(

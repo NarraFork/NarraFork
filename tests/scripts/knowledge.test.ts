@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import {
 	affected,
 	anchorMatches,
+	changedFiles,
 	check,
 	find,
 	loadNodes,
@@ -127,6 +128,35 @@ describe("knowledge tree tool", () => {
 		git("commit", "-qam", "brace anchor");
 		write("server/services/gamma.ts", "export const g = 2;\n");
 		git("commit", "-qam", "change gamma");
+		expect(stale(root, loadNodes(root)).map((x) => x.node.id)).toEqual(["area.beta"]);
+	});
+
+	test("deleting one file of a brace-glob anchor makes the node stale", () => {
+		write("knowledge/area/beta.md", node("area.beta", ["server/services/{alpha,gamma}.ts"]));
+		git("commit", "-qam", "brace anchor");
+		git("rm", "-q", "server/services/gamma.ts");
+		git("commit", "-qm", "delete gamma");
+		const s = stale(root, loadNodes(root));
+		expect(s.map((x) => x.node.id)).toEqual(["area.beta"]);
+		expect(s[0].files).toEqual(["server/services/gamma.ts"]);
+	});
+
+	test("a renamed anchored file is reported by its old path", () => {
+		git("checkout", "-qb", "feature");
+		git("mv", "server/services/alpha.ts", "server/services/alpha-renamed.ts");
+		git("commit", "-qm", "rename alpha");
+		const files = changedFiles(root, "main");
+		expect(files).toContain("server/services/alpha.ts");
+		expect(affected(loadNodes(root), files).nodes.map((n) => n.node.id)).toContain("area.alpha");
+	});
+
+	test("a node anchored to a knowledge file goes stale when that file changes", () => {
+		write("knowledge/area/beta.md", node("area.beta", ["knowledge/README.md"]));
+		write("knowledge/README.md", "# rules\n");
+		git("add", "-A");
+		git("commit", "-qm", "guide anchor");
+		write("knowledge/README.md", "# rules v2\n");
+		git("commit", "-qam", "change guide");
 		expect(stale(root, loadNodes(root)).map((x) => x.node.id)).toEqual(["area.beta"]);
 	});
 
