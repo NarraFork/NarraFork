@@ -19,10 +19,25 @@ import {
 	type TeamBoardItem,
 	type TeamPageSummary,
 	type TeamPersonDecisionEventKind,
+	type TeamSummary,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 
 export { boardColumnOf, TEAM_BOARD_COLUMNS };
+
+/**
+ * The title "pin to sidebar" offers for a team, or undefined when it offers none: the team is not
+ * loaded yet, or it is archived (the server keeps no tab of an archived team, so a pin would only
+ * fail). `coordinatorStatus` is the page's live summary, which can see the archive first.
+ */
+export function teamPinTitle(
+	team: Pick<TeamSummary, "id" | "name" | "status" | "coordinatorStatus"> | undefined,
+	coordinatorStatus?: string,
+): string | undefined {
+	if (!team || team.status !== "active") return undefined;
+	if (team.coordinatorStatus === "archived" || coordinatorStatus === "archived") return undefined;
+	return team.name || team.id;
+}
 
 /** A work item state as the outline's state badge (icon on a tinted background). */
 export const WORK_ITEM_STATUS_ICON: Record<TeamWorkItemState, OutlineStatusKey> = {

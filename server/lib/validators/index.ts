@@ -242,6 +242,7 @@ export {
 	pinRecentTabSchema,
 	pluginOverlayVisibilityPatchSchema,
 	recentTabSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,

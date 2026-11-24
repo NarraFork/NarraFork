@@ -32,6 +32,7 @@ const {
 	projectTeams,
 	userPreferences,
 	userRecentTabs,
+	userRecentTabsMeta,
 	users,
 } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
@@ -190,6 +191,28 @@ describe("team tabs: what is stored", () => {
 		expect(await keysOf(outsider)).toEqual([]);
 	});
 
+	test("pinning a team the server refuses is an error, not a silent no-op", async () => {
+		const reader = await makeUser();
+		const projectId = await makeProject();
+		const archived = await makeTeam(projectId);
+		await grantNarrator(archived, reader, "read");
+		await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, archived));
+		const hidden = await makeTeam(projectId);
+
+		for (const teamId of [archived, hidden, "no-such-team"]) {
+			const refused = upsertRecentTab(reader, teamTab(teamId), { pin: true });
+			await expect(refused).rejects.toMatchObject({
+				statusCode: 409,
+				code: service.RECENT_TAB_REFUSED_CODE,
+			});
+			// A plain team upsert is refused the same way.
+			await expect(upsertRecentTab(reader, teamTab(teamId))).rejects.toMatchObject({
+				statusCode: 409,
+			});
+		}
+		expect(await keysOf(reader)).toEqual([]);
+	});
+
 	test("a reader may pin a team: read access is enough to look at it", async () => {
 		const reader = await makeUser();
 		const projectId = await makeProject();
@@ -207,6 +230,78 @@ describe("team tabs: what is stored", () => {
 			tabs: [teamTab(teamId), { type: "project", id: projectId, title: "p", lastVisitedAt: 1 }],
 		});
 		expect(await keysOf(outsider)).toEqual([`project:${projectId}`]);
+	});
+});
+
+describe("the pin state of one tab", () => {
+	test("reads a pinned tab outside the first page, an unpinned one and a missing one", async () => {
+		const user = await makeUser();
+		const projectId = await makeProject();
+		const teamId = await makeTeam(projectId);
+		await grantNarrator(teamId, user, "read");
+		await upsertRecentTab(user, { type: "project", id: projectId, title: "p", lastVisitedAt: 1 });
+		// More pinned sessions than a page holds, then the team: it is pinned at the end of the
+		// pinned block, past the first page of the list.
+		const sessions = Array.from({ length: 55 }, (_, index) => ({
+			type: "narrator" as const,
+			id: `state-${index}`,
+			title: `s${index}`,
+			lastVisitedAt: index + 2,
+			pin: true,
+		}));
+		for (let start = 0; start < sessions.length; start += 50) {
+			await upsertRecentTabsBatch(user, sessions.slice(start, start + 50));
+		}
+		await upsertRecentTab(user, teamTab(teamId), { pin: true });
+		const firstPage = await listPage(user, "work");
+		expect(firstPage.hasMore).toBe(true);
+		expect(firstPage.items.some((item) => item.id === teamId)).toBe(false);
+
+		expect(service.getRecentTabState(user, "team", teamId)).toEqual({
+			present: true,
+			pinned: true,
+		});
+		expect(service.getRecentTabState(user, "project", projectId)).toEqual({
+			present: true,
+			pinned: false,
+		});
+		expect(service.getRecentTabState(user, "project", "elsewhere")).toEqual({
+			present: false,
+			pinned: false,
+		});
+		// Another user's tab is not this user's.
+		expect(service.getRecentTabState(ownerId, "team", teamId)).toEqual({
+			present: false,
+			pinned: false,
+		});
+	});
+
+	test("an old unpinned project visit reads as gone before its conversion runs", async () => {
+		const user = await makeUser();
+		await db.insert(userRecentTabs).values(
+			(["old", "kept"] as const).map((name) => ({
+				id: generateId(),
+				userId: user,
+				tabKey: `project:${name}`,
+				section: "projects" as const,
+				type: "project" as const,
+				entityId: name,
+				title: name,
+				lastVisitedAt: 1,
+				pinned: name === "kept",
+				sortOrder: name === "kept" ? 0 : 1,
+				createdAt: now(),
+				updatedAt: now(),
+			})),
+		);
+		expect(service.getRecentTabState(user, "project", "old")).toEqual({
+			present: false,
+			pinned: false,
+		});
+		expect(service.getRecentTabState(user, "project", "kept")).toEqual({
+			present: true,
+			pinned: true,
+		});
 	});
 });
 
@@ -530,5 +625,79 @@ describe("the retired projects section", () => {
 			.where(eq(userRecentTabs.userId, user))
 			.all();
 		expect(sections.every((entry) => entry.section === "work")).toBe(true);
+	});
+
+	test("before the folder conversion too: old project visits never reach the list", async () => {
+		const user = await makeUser();
+		await db.insert(userPreferences).values({
+			id: generateId(),
+			userId: user,
+			recentTabs: "[]",
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		await listAllRecentTabs(user);
+		// A user from before folders: the workspace-group conversion has not run yet.
+		await db
+			.update(userRecentTabsMeta)
+			.set({ foldersMigrated: false })
+			.where(eq(userRecentTabsMeta.userId, user));
+		const base = (key: string, order: number) => ({
+			id: generateId(),
+			userId: user,
+			tabKey: key,
+			entityId: key.split(":")[1],
+			title: key,
+			lastVisitedAt: order,
+			sortOrder: order,
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		await db.insert(userRecentTabs).values([
+			{ ...base("workspace:ws", 1), section: "work", type: "workspace", title: "Old group" },
+			{
+				...base("narrator:inside", 2),
+				section: "work",
+				type: "narrator",
+				representedNarratorId: "inside",
+				workspaceId: "ws",
+			},
+			{ ...base("project:kept", 3), section: "projects", type: "project", pinned: true },
+			{ ...base("project:old", 4), section: "projects", type: "project", pinned: false },
+		]);
+
+		const tabs = await listAllRecentTabs(user);
+		expect(tabs.map((tab) => `${tab.type}:${tab.id}`)).toEqual([
+			"project:kept",
+			"folder:ws",
+			"narrator:inside",
+		]);
+		expect(tabs.find((tab) => tab.id === "ws")).toMatchObject({
+			type: "folder",
+			title: "Old group",
+		});
+		expect(tabs.find((tab) => tab.id === "inside")?.folderId).toBe("ws");
+		const rows = db
+			.select({ key: userRecentTabs.tabKey, section: userRecentTabs.section })
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.userId, user))
+			.all();
+		// The workspace header became a folder row with the same id.
+		expect(rows.map((row) => row.key).sort()).toEqual([
+			"folder:ws",
+			"narrator:inside",
+			"project:kept",
+		]);
+		expect(rows.every((row) => row.section === "work")).toBe(true);
+		const meta = db
+			.select({ foldersMigrated: userRecentTabsMeta.foldersMigrated })
+			.from(userRecentTabsMeta)
+			.where(eq(userRecentTabsMeta.userId, user))
+			.get();
+		expect(meta?.foldersMigrated).toBe(true);
+		// Idempotent: a second read changes nothing.
+		const revision = (await listPage(user, "work")).revision;
+		expect(await keysOf(user)).toEqual(["project:kept", "folder:ws", "narrator:inside"]);
+		expect((await listPage(user, "work")).revision).toBe(revision);
 	});
 });

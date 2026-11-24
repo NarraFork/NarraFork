@@ -6,6 +6,7 @@ import type {
 	PersistedRecentTab,
 	RecentTabFolderColor,
 	RecentTabFolderIcon,
+	RecentTabStateResult,
 	RecentTabsMutationResult,
 	RecentTabsPageResult,
 	RecentTabsRuntimeResult,
@@ -566,6 +567,12 @@ export const settingsApi = {
 			body: JSON.stringify({ key, ...target }),
 			signal,
 		}),
+	/** Whether one tab is in the sidebar and pinned, wherever it sits in the list. */
+	getRecentTabState: (type: "project" | "team", id: string, signal?: AbortSignal) =>
+		request<RecentTabStateResult>(
+			`/user-preferences/recent-tabs/state?${new URLSearchParams({ type, id }).toString()}`,
+			signal ? { signal } : undefined,
+		),
 	pinRecentTab: (key: string, pinned: boolean) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
 			method: "PATCH",

@@ -426,6 +426,12 @@ export const recentTabsPageQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(RECENT_TABS_PAGE_SIZE).default(RECENT_TABS_PAGE_SIZE),
 });
 
+/** `GET /recent-tabs/state`: one tab's presence and pin, by its type and id. */
+export const recentTabStateQuerySchema = z.object({
+	type: recentTabSchema.shape.type,
+	id: z.string().min(1).max(50),
+});
+
 export const recentTabsRuntimeSchema = z.object({
 	keys: z.array(z.string().min(1).max(100)).max(RECENT_TABS_LIVE_LIMIT),
 });

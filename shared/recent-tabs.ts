@@ -145,6 +145,15 @@ export interface RecentTabsPageResult {
 	nextCursor: string | null;
 }
 
+/**
+ * One tab's place in a user's sidebar, wherever it sits in the list
+ * (`GET /api/user-preferences/recent-tabs/state`).
+ */
+export interface RecentTabStateResult {
+	present: boolean;
+	pinned: boolean;
+}
+
 export interface RecentTabsMutationResult {
 	changed: boolean;
 	baseRevision: number;

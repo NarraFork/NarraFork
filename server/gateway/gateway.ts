@@ -1700,7 +1700,9 @@ class Gateway {
 		}
 
 		// The authoritative store is bounded to 500 rows and preserves global folder ordering.
-		const tabs = await listAllRecentTabs(appUserId, 500);
+		// Team tabs are never listed: IM cannot drive a team session, and the account may have
+		// been picked automatically (`resolveAppUserId`), so its teams are not the sender's to see.
+		const tabs = (await listAllRecentTabs(appUserId, 500)).filter((tab) => tab.type !== "team");
 
 		if (tabs.length === 0) {
 			await adapter.send(msg.chatId, t("gateway.noRecentTabs", locale));
@@ -1771,12 +1773,6 @@ class Gateway {
 			if (type === "project") {
 				const indent = tab.folderId ? "    " : "  ";
 				lines.push(`${indent}📂 ${tab.title ?? tab.id ?? "?"}`);
-				continue;
-			}
-
-			// A pinned team: named, never numbered — IM cannot drive a team session.
-			if (type === "team") {
-				lines.push(`  👥 ${tab.title || tab.id || "?"}`);
 				continue;
 			}
 

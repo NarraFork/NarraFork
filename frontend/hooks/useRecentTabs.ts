@@ -77,6 +77,31 @@ export {
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"] as const;
 export const recentTabsSectionQueryKey = (section: RecentTabsSection) =>
 	[...RECENT_TABS_QUERY_KEY, section] as const;
+/**
+ * One tab's authoritative pin state (`api.getRecentTabState`), read by the "pin to sidebar"
+ * buttons for a tab outside the loaded pages. Its own root, outside `RECENT_TABS_QUERY_KEY`,
+ * so nothing that walks the sidebar's caches mistakes it for a section.
+ */
+const RECENT_TAB_STATE_QUERY_ROOT = ["recent-tab-state"] as const;
+export const recentTabStateQueryKey = (key: string) =>
+	[...RECENT_TAB_STATE_QUERY_ROOT, key] as const;
+
+/**
+ * Mark the pin-state reads of these tab keys stale (all of them without keys): after any delta
+ * that touches a key, from this page or another client, and after a gap that reloads the list.
+ */
+export function invalidateRecentTabStates(qc: QueryClient, keys?: readonly string[]): void {
+	if (!keys) {
+		void qc.invalidateQueries({ queryKey: RECENT_TAB_STATE_QUERY_ROOT });
+		return;
+	}
+	if (keys.length === 0) return;
+	const touched = new Set(keys);
+	void qc.invalidateQueries({
+		queryKey: RECENT_TAB_STATE_QUERY_ROOT,
+		predicate: (query) => touched.has(String(query.queryKey[1])),
+	});
+}
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
 const RECENT_TABS_REFRESH_DEDUPE_MS = 500;
 const loadedWindowRefreshes = new WeakMap<
@@ -746,6 +771,8 @@ function withCachedRuntimeFields(
 }
 
 export async function refreshRecentTabsAfterReconnect(qc: QueryClient): Promise<void> {
+	// Frames may have been missed while the socket was down.
+	invalidateRecentTabStates(qc);
 	try {
 		await refreshRecentTabsLoadedWindow(qc);
 	} finally {
@@ -763,6 +790,9 @@ export function refreshRecentTabsLoadedWindow(
 	qc: QueryClient,
 	options: { reset?: boolean; minimumRevision?: number } = {},
 ): Promise<void> {
+	// A reset rebuilds the list from page one after missed deltas: the pin-state reads may have
+	// missed them as well.
+	if (options.reset) invalidateRecentTabStates(qc);
 	const now = Date.now();
 	const minimumRevision = options.minimumRevision ?? 0;
 	const existing = loadedWindowRefreshes.get(qc);
@@ -859,6 +889,13 @@ export function applyRecentTabsDeltaAndFollowUp(
 	delta: RecentTabsDelta,
 ): Promise<void> {
 	const { gaps, backfill } = applyRecentTabsDelta(qc, delta);
+	// A gap reloads the list from page one, which marks every pin-state read stale too.
+	if (gaps.length === 0) {
+		invalidateRecentTabStates(
+			qc,
+			delta.operations.map((operation) => operation.key),
+		);
+	}
 	if (gaps.length === 0 && backfill.length === 0) return Promise.resolve();
 	return refreshRecentTabsLoadedWindow(qc, {
 		reset: gaps.length > 0,

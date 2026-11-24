@@ -6,7 +6,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { navRowHref } from "../components/nav/recent-tab-keyboard-nav";
-import { isPinnedInSidebar } from "../components/nav/recent-tab-page-pin";
+import { loadedSidebarPin, resolvePagePin } from "../components/nav/recent-tab-page-pin";
 import { isTabActive } from "../components/nav/recent-tabs-logic";
 import { recentTabWindowHref } from "../components/window/panel-window";
 import { api } from "../lib/api";
@@ -144,11 +144,36 @@ describe("live window", () => {
 });
 
 describe("pin from the page", () => {
-	test("pinned means a pinned tab of that exact entity", () => {
-		expect(isPinnedInSidebar([{ ...team, pinned: true }], "team", "coord")).toBe(true);
-		expect(isPinnedInSidebar([team], "team", "coord")).toBe(false);
-		expect(isPinnedInSidebar([{ ...session, pinned: true }], "team", "coord")).toBe(false);
-		expect(isPinnedInSidebar(undefined, "project", "proj")).toBe(false);
+	test("a loaded row answers for that exact entity; an unloaded one is unknown", () => {
+		expect(loadedSidebarPin([{ ...team, pinned: true }], "team", "coord")).toBe(true);
+		expect(loadedSidebarPin([team], "team", "coord")).toBe(false);
+		// The coordinator's session tab is not the team tab.
+		expect(loadedSidebarPin([{ ...session, pinned: true }], "team", "coord")).toBeUndefined();
+		expect(loadedSidebarPin(undefined, "project", "proj")).toBeUndefined();
+	});
+
+	test("the loaded row wins; otherwise the server's read; otherwise unknown", () => {
+		expect(resolvePagePin(false, { present: true, pinned: true })).toEqual({
+			pinned: false,
+			known: true,
+		});
+		expect(resolvePagePin(undefined, { present: true, pinned: true })).toEqual({
+			pinned: true,
+			known: true,
+		});
+		expect(resolvePagePin(undefined, { present: false, pinned: false })).toEqual({
+			pinned: false,
+			known: true,
+		});
+		expect(resolvePagePin(undefined, undefined)).toEqual({ pinned: false, known: false });
+	});
+
+	test("a pin the server refuses rejects, so the page can say so", async () => {
+		const refused = Object.assign(new Error("refused"), { status: 409 });
+		spyOn(api, "upsertRecentTab").mockRejectedValue(refused);
+		await expect(
+			setRecentTabPinnedFromPage({ type: "team", id: "coord", title: "Docs crew" }, true),
+		).rejects.toBe(refused);
 	});
 
 	test("pinning is one upsert carrying `pin`; unpinning is the ordinary unpin", async () => {

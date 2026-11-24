@@ -29,6 +29,7 @@ import {
 	type RecentTabFolderColor,
 	type RecentTabFolderIcon,
 	type RecentTabRuntimePatch,
+	type RecentTabStateResult,
 	type RecentTabsDelta,
 	type RecentTabsMutationResult,
 	type RecentTabsOperation,
@@ -683,7 +684,11 @@ function readMeta(userId: string): { revision: number; foldersMigrated: boolean 
 function convertLegacyWorkspaceRowsLocked(userId: string, revision: number): number {
 	const oldRows = readRows(userId);
 	const before = oldRows.map(rowToTab);
-	const after = normalizeAndLimitTabs(oldRows.map(legacyRowToTab)).tabs;
+	// Every row it keeps is rewritten into `work`, so the retired `projects` rule has to be
+	// applied here, while the rows still carry their old section (see `isRetiredProjectVisit`).
+	const after = normalizeAndLimitTabs(
+		oldRows.filter((row) => !isRetiredProjectVisit(row)).map(legacyRowToTab),
+	).tabs;
 	return persistMutationLocked(userId, oldRows, before, after, revision, {
 		markFoldersMigrated: true,
 	}).revision;
@@ -702,6 +707,15 @@ function convertLegacyWorkspaceRowsLocked(userId: string, revision: number): num
  * The rewrite is forced even when the visible list stays the same (only pinned rows), because
  * the rows' `section` still has to change.
  */
+/**
+ * The one rule for rows of the retired `projects` section: an unpinned one is an old automatic
+ * visit and is dropped; a pinned one was a deliberate choice and joins `work`. Both one-time
+ * conversions below apply it, and the pin-state read answers as if it had already run.
+ */
+function isRetiredProjectVisit(row: Pick<RecentTabRow, "section" | "pinned">): boolean {
+	return row.section === "projects" && !row.pinned;
+}
+
 function convertLegacyProjectSectionLocked(userId: string, revision: number): number {
 	const legacy = db
 		.select({ id: userRecentTabs.id })
@@ -712,14 +726,18 @@ function convertLegacyProjectSectionLocked(userId: string, revision: number): nu
 	if (!legacy) return revision;
 	const oldRows = readRows(userId);
 	const before = oldRows.map(rowToTab);
-	const dropped = new Set(
-		oldRows.filter((row) => row.section === "projects" && !row.pinned).map((row) => row.tabKey),
-	);
+	const dropped = new Set(oldRows.filter(isRetiredProjectVisit).map((row) => row.tabKey));
 	const after = normalizeAndLimitTabs(before.filter((tab) => !dropped.has(tabKey(tab)))).tabs;
 	return persistMutationLocked(userId, oldRows, before, after, revision, { forceRowSync: true })
 		.revision;
 }
 
+/**
+ * Bring one user's rows to the current shape, under the user's lock. Idempotent: each
+ * conversion records that it ran (the `folders_migrated` flag; no row left in `projects`).
+ * The workspace conversion drops retired project visits itself (it rewrites every row into
+ * `work`, which would otherwise hide them from the project conversion that follows).
+ */
 function ensureMigratedLocked(userId: string): number {
 	const meta = readMeta(userId);
 	if (meta) {
@@ -1117,6 +1135,9 @@ function withoutHiddenNarratorTabs(inputs: RecentTabUpsertInput[]): RecentTabUps
 	);
 }
 
+/** The code of a single upsert the server refuses (see `upsertRecentTab`). */
+export const RECENT_TAB_REFUSED_CODE = "RECENT_TAB_REFUSED";
+
 export async function upsertRecentTabsBatch(
 	userId: string,
 	inputs: RecentTabUpsertInput[],
@@ -1124,7 +1145,14 @@ export async function upsertRecentTabsBatch(
 	if (inputs.length === 0 || inputs.length > RECENT_TABS_WS_BATCH_SIZE) {
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
-	const visible = await authorizeTeams(userId, withoutHiddenNarratorTabs(inputs));
+	return upsertVisibleTabs(userId, await authorizeTeams(userId, withoutHiddenNarratorTabs(inputs)));
+}
+
+/** Apply upserts already filtered to the tabs this user may hold. */
+function upsertVisibleTabs(
+	userId: string,
+	visible: RecentTabUpsertInput[],
+): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
 		if (visible.length === 0) {
@@ -1138,20 +1166,52 @@ export async function upsertRecentTabsBatch(
 	});
 }
 
+/**
+ * Upsert one tab.
+ *
+ * A tab the user may not hold is filtered out like in a batch, but when it was asked for on
+ * purpose (a team tab, or any `pin`: the "pin to sidebar" of a project or team page) the
+ * refusal is an error (409 `RECENT_TAB_REFUSED`), so the page can say so instead of doing
+ * nothing. A page visit of a hidden session stays a silent no-op.
+ */
 export async function upsertRecentTab(
 	userId: string,
 	tabInput: PersistedRecentTab,
 	options: { updateOnly?: boolean; beforeKey?: string; afterKey?: string; pin?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return upsertRecentTabsBatch(userId, [
-		{
-			...tabInput,
-			updateOnly: options.updateOnly,
-			...(options.pin !== undefined ? { pin: options.pin } : {}),
-			...(options.beforeKey ? { beforeKey: options.beforeKey } : {}),
-			...(options.afterKey ? { afterKey: options.afterKey } : {}),
-		},
-	]);
+	const input: RecentTabUpsertInput = {
+		...tabInput,
+		updateOnly: options.updateOnly,
+		...(options.pin !== undefined ? { pin: options.pin } : {}),
+		...(options.beforeKey ? { beforeKey: options.beforeKey } : {}),
+		...(options.afterKey ? { afterKey: options.afterKey } : {}),
+	};
+	const visible = await authorizeTeams(userId, withoutHiddenNarratorTabs([input]));
+	if (visible.length === 0 && (input.type === "team" || input.pin !== undefined)) {
+		throw new AppError("This tab cannot be kept in the sidebar", 409, RECENT_TAB_REFUSED_CODE);
+	}
+	return upsertVisibleTabs(userId, visible);
+}
+
+/**
+ * Whether one tab is in the user's sidebar and pinned, wherever it sits in the list (the page
+ * buttons cannot rely on the sidebar's loaded pages). One read of the unique
+ * `(user_id, tab_key)` index, no lock; a row of the retired `projects` section reads as the
+ * one-time conversion will leave it (`isRetiredProjectVisit`).
+ */
+export function getRecentTabState(
+	userId: string,
+	type: RecentTabType,
+	id: string,
+): RecentTabStateResult {
+	const row = db
+		.select({ section: userRecentTabs.section, pinned: userRecentTabs.pinned })
+		.from(userRecentTabs)
+		.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.tabKey, tabKey({ type, id }))))
+		.limit(1)
+		.get();
+	if (!row || isRetiredProjectVisit(row)) return { present: false, pinned: false };
+	return { present: true, pinned: row.pinned };
 }
 
 /**

@@ -28,6 +28,7 @@ import {
 import { IconPlus, IconUsersGroup } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { teamPinTitle } from "./team-page-model";
 
 export function CreateTeamModal({
 	projectId,
@@ -171,6 +172,8 @@ export function ProjectTeamsList({
 			)}
 			{rows.map((team) => {
 				const current = team.id === currentTeamId;
+				// The list asks for active teams, but a cached page can outlive an archive.
+				const pinTitle = teamPinTitle(team);
 				return (
 					// The pin is a sibling of the row's button, not inside it (no nested buttons).
 					<Group
@@ -206,7 +209,9 @@ export function ProjectTeamsList({
 								)}
 							</Group>
 						</UnstyledButton>
-						<PinToSidebarButton type="team" id={team.id} title={team.name || team.id} size="sm" />
+						{pinTitle !== undefined && (
+							<PinToSidebarButton type="team" id={team.id} title={pinTitle} size="sm" />
+						)}
 					</Group>
 				);
 			})}

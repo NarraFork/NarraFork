@@ -324,7 +324,10 @@ export function TeamTopBar({
 	projectId: string;
 	teamId: string;
 	title: ReactNode;
-	/** The team's name once known: shows "pin to sidebar" beside the title. */
+	/**
+	 * The team's name once known and the team is active (`teamPinTitle`): shows "pin to sidebar"
+	 * beside the title. An archived team offers no pin.
+	 */
 	teamName?: string;
 	summary: TeamPageSummary | undefined;
 	/** Before the title (a back link on narrow screens). */

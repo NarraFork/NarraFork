@@ -27,7 +27,7 @@ keywords:
   - /teams/:teamId/approvals
   - permission_decided_by
 status: draft
-verified_at: 7a8bdfb90
+verified_at: 009a3f4f7
 ---
 # 团队页与审批
 
@@ -47,7 +47,7 @@ verified_at: 7a8bdfb90
 前端：
 - 团队页路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `components/teams/TeamPageView.tsx`。
 - `TeamWorkspace.tsx` 按自身宽度选三栏（团队列表 / 协调者对话 / 看板与动态）、两栏或标签页；对话用普通叙述者面板。
-- 固定到侧栏：`TeamTopBar.tsx` 标题旁（名字载入后，`TeamPageView` 传 `teamName`）和 `ProjectTeamsList.tsx` 每行（固定按钮与打开团队的按钮是并列的兄弟，不嵌套）都有 `PinToSidebarButton`，固定的是 `team:<id>` 标签；侧栏里它显示协调者状态和成员的待批数（`team-board.ts:teamPendingApprovalCount`，与顶栏同一个计数），见[最近标签页](../recent-tabs.md)。
+- 固定到侧栏：`TeamTopBar.tsx` 标题旁（`TeamPageView` 传 `teamName`）和 `ProjectTeamsList.tsx` 每行（固定按钮与打开团队的按钮是并列的兄弟，不嵌套）都有 `PinToSidebarButton`；只有活跃的团队才有这个按钮（`team-page-model.ts:teamPinTitle`：团队未载入、`status` 不是 active、或协调者已归档——团队详情或页面实时摘要任一方看到都算——就不给），因为服务端不存归档团队的标签；列表只取 active 团队，但缓存页可能比归档晚，每行也过同一条规则。固定的是 `team:<id>` 标签；侧栏里它显示协调者状态和成员的待批数（`team-board.ts:teamPendingApprovalCount`，与顶栏同一个计数），见[最近标签页](../recent-tabs.md)。
 - `TeamTopBar.tsx` 含待批抽屉和「全部暂停」：协调者排在最前，先于工作者停下（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore（`team-page-model.ts`）。
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
