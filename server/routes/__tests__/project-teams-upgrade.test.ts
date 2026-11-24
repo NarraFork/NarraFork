@@ -630,13 +630,11 @@ describe("disbanding a team and keeping its session", () => {
 	test("a pinned team tab disappears with the team; the session's own tab stays", async () => {
 		const id = await session("Pinned then disbanded");
 		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
-		await upsertRecentTab(OWNER, {
-			type: "team",
-			id,
-			title: "client title",
-			lastVisitedAt: Date.now(),
-			pin: true,
-		});
+		await upsertRecentTab(
+			OWNER,
+			{ type: "team", id, title: "client title", lastVisitedAt: Date.now() },
+			{ pin: true },
+		);
 		await upsertRecentTab(OWNER, { type: "narrator", id, title: "x", lastVisitedAt: Date.now() });
 		const keys = async () => (await listAllRecentTabs(OWNER)).map((tab) => `${tab.type}:${tab.id}`);
 		expect(await keys()).toContain(`team:${id}`);
