@@ -86,7 +86,7 @@ verified_at: 99e33f8fc
   - 标题与 `project_id`（新列，只有团队标签有值）由服务端从 `project_teams` 和协调者标题写入，客户端传的不算；upsert 和整表恢复都先过 `authorizeTeamTabs`：团队不存在、已归档、或用户读不了协调者，就不写（`upsertRecentTabsBatch`、`restoreRecentTabs`）；
   - 协调者改名时持有者的团队标签跟着改（`syncNarratorTitleToRecentTabs` 另按 `(type, entity_id)` 索引找团队标签持有者）；
   - 运行时补丁（`enrichTeamTabs`）：读得了才给协调者的 `status/substatus`；只读者加 `teamOnlooker`；成员加 `pendingApprovalCount`（团队页顶栏同一个计数 `teamPendingApprovalCount`，每次请求最多算 20 个团队，`TEAM_TAB_PENDING_COUNT_LIMIT`），其他人为 null；读不了的团队补丁为空状态；
-  - 何时移除：团队归档（`startTeamStatusSync` 发现归档后调 `pruneTeamTabs`，取消归档不恢复）、删除协调者（`narrator-service` 删除时 `removeTabFromAllUsers("team", id)`）、协调者共享变化后读不了（`narrator-sharing.ts:announceAccessChange` 调 `pruneTeamTabs`，逐个持有者重新判读）、失去项目（`pruneUnreadableProjectTabs` 对该项目的团队标签按协调者 ACL 判读，`usersWithTabsInProject` 也把团队标签持有者算进去）。
+  - 何时移除：团队归档（`startTeamStatusSync` 发现归档后调 `pruneTeamTabs`，取消归档不恢复）、删除协调者（`narrator-service` 删除时 `removeTabFromAllUsers("team", id)`）、解散团队（`team-conversion.ts:disbandTeam` 提交后同样调用，会话自己的标签保留）、协调者共享变化后读不了（`narrator-sharing.ts:announceAccessChange` 调 `pruneTeamTabs`，逐个持有者重新判读）、失去项目（`pruneUnreadableProjectTabs` 对该项目的团队标签按协调者 ACL 判读，`usersWithTabsInProject` 也把团队标签持有者算进去）。
 - 每次写入都在用户级锁内进行：读行 → 变换 → 去重加限额 → 在一个事务里只更新有差异的行并把 `user_recent_tabs_meta.revision` +1，再向该用户广播 `user:recent_tabs_delta`（每批 100 个操作）（`persistMutationLocked`、`broadcastDelta`）。无变化不增版本。
 - 读取走游标分页：每页最多 50 行，游标绑定分区和版本，版本变了返回 409 `stale cursor`，客户端须从第一页重载（`listPage`）；文件夹成员不在顶层分页里。
 - 运行时信息与记录分开：`getRuntimePatches` 一次最多 100 个键，返回状态、草稿、终端/后台任务计数、在线查看者、团队只读旁观者标记等，不写库（`POST /api/user-preferences/recent-tabs/runtime`）。

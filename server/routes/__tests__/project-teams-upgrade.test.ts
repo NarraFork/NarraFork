@@ -54,6 +54,7 @@ const {
 } = await import("../../services/teams/team-conversion");
 const { narratorPersistence } = await import("../../services/narrator-persistence");
 const { narratorStore } = await import("../../services/narrator-store");
+const { listAllRecentTabs, upsertRecentTab } = await import("../../services/recent-tabs-service");
 const {
 	hasTrailingInjectionRow,
 	resolveContinuationTail,
@@ -624,6 +625,25 @@ describe("disbanding a team and keeping its session", () => {
 		expect(teamIdOfNarrator(id)).toBeNull();
 		// Now an ordinary session: it can be deleted, which a coordinator with a row restricts.
 		expect((await disband(OWNER, id)).status).toBe(404);
+	});
+
+	test("a pinned team tab disappears with the team; the session's own tab stays", async () => {
+		const id = await session("Pinned then disbanded");
+		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
+		await upsertRecentTab(OWNER, {
+			type: "team",
+			id,
+			title: "client title",
+			lastVisitedAt: Date.now(),
+			pin: true,
+		});
+		await upsertRecentTab(OWNER, { type: "narrator", id, title: "x", lastVisitedAt: Date.now() });
+		const keys = async () => (await listAllRecentTabs(OWNER)).map((tab) => `${tab.type}:${tab.id}`);
+		expect(await keys()).toContain(`team:${id}`);
+
+		expect((await disband(OWNER, id)).status).toBe(200);
+		expect(await keys()).not.toContain(`team:${id}`);
+		expect(await keys()).toContain(`narrator:${id}`);
 	});
 
 	test("upgrade → disband → upgrade again", async () => {
