@@ -4,6 +4,7 @@ import type { Subprocess } from "bun";
 import { startCoordinator } from "../remote-coordinator/index";
 import type { Invitation } from "../remote-prototype/client";
 import { startFixture } from "../remote-prototype/fixture";
+import { startCiStage, withCiStage } from "./ci-stage";
 
 const ROOT = resolve(import.meta.dir, "..");
 const MAX_OUTPUT = 1024 * 1024;
@@ -22,11 +23,15 @@ export function isTransientPeerBuildFailure(error: unknown): boolean {
 
 export async function buildPeer(output: string, signal?: AbortSignal): Promise<void> {
 	for (let attempt = 1; ; attempt++) {
+		const finish = startCiStage("go-peer-build", attempt);
 		try {
 			await buildPeerOnce(output, signal);
+			finish("end");
 			return;
 		} catch (error) {
-			if (attempt >= PEER_BUILD_ATTEMPTS || !isTransientPeerBuildFailure(error)) throw error;
+			const retry = attempt < PEER_BUILD_ATTEMPTS && isTransientPeerBuildFailure(error);
+			finish(retry ? "retry" : "error");
+			if (!retry) throw error;
 		}
 	}
 }
@@ -101,7 +106,7 @@ export async function startPrototype(
 	options.signal?.addEventListener("abort", abort, { once: true });
 	function stop(): Promise<void> {
 		if (stopPromise) return stopPromise;
-		stopPromise = (async () => {
+		stopPromise = withCiStage("prototype-cleanup", async () => {
 			stopped = true;
 			options.signal?.removeEventListener("abort", abort);
 			if (child) {
@@ -122,15 +127,17 @@ export async function startPrototype(
 			fixture?.stop();
 			await coordinator?.stop();
 			await rm(directory, { recursive: true, force: true });
-		})();
+		});
 		return stopPromise;
 	}
+	let finishStartup: ReturnType<typeof startCiStage> | undefined;
 	try {
 		const binary =
 			options.peerBinary ??
 			join(directory, process.platform === "win32" ? "remote-peer.exe" : "remote-peer");
 		if (!options.peerBinary) await buildPeer(binary, options.signal);
 		checkStartup();
+		finishStartup = startCiStage("prototype-services");
 		const clientBuild = await Bun.build({
 			entrypoints: [join(ROOT, "remote-prototype/entry.ts")],
 			target: "browser",
@@ -169,6 +176,8 @@ export async function startPrototype(
 			},
 		});
 		checkStartup();
+		finishStartup("end");
+		finishStartup = startCiStage("prototype-registration");
 		child = Bun.spawn([binary], {
 			cwd: directory,
 			stdin: "pipe",
@@ -279,6 +288,7 @@ export async function startPrototype(
 		} finally {
 			clearTimeout(deadline);
 		}
+		finishStartup("end");
 		return {
 			directory,
 			origin: coordinator.origin,
@@ -292,6 +302,7 @@ export async function startPrototype(
 			stop,
 		};
 	} catch (error) {
+		finishStartup?.("error");
 		await stop();
 		throw error;
 	}

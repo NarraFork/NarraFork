@@ -23,9 +23,13 @@ anchors:
   - server/routes/favorites.ts
   - server/services/project-dir.ts
   - server/services/read/
+  - shared/project-directory.ts
+  - server/routes/__tests__/projects-resolve-directory.test.ts
 keywords:
   - /api/projects
   - /api/projects/hidden-existence
+  - /api/projects/resolve-directory
+  - resolveProjectForDirectory
   - /api/favorites
   - /api/fs/project-dir
   - narrator_project_links
@@ -41,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: a5b512406
 ---
 # 项目
 
@@ -49,6 +53,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 关键规则
 - 目录归属顺序：先取包含该目录的最长已有项目根（按路径段边界、归档项目也参与）；否则取该目录 git 仓库的主仓库根（linked worktree 归主仓库）并就地建项目（公开，owner 为会话所有者）；非 git 目录不属于任何项目（`project-index.ts:resolveDirectoryProject`）。
+- 就地建项目时 `defaultBranch` 取主仓库检出的符号 HEAD（`probeDefaultBranch`：`git symbolic-ref --quiet --short HEAD`，与根探测同样的 2s 超时、8KB 输出上限；无提交的仓库也能读到分支名），所以只有 `master` 的仓库得到 `master`；HEAD 游离或探测失败时不写该列，保留 schema 默认 `main`（`project-index.test.ts`）。手动 `POST /api/projects` 关联已有目录（`repoMode` 非 init/clone）不探测 git，`defaultBranch` 仍为 `main`。
 - 只索引本地目录；远程设备的 cwd 不参与（`isLocalDevice`、`deriveLinks`）。
 - 主链接：有 `contextProjectId` 时它是 primary（source=explicit），cwd 推导出的其他项目是 additional；否则 cwd 推导的是 primary（`deriveLinks`）。每个会话至多一条 primary（表上的唯一部分索引 `uq_narrator_project_links_primary`）。
 - 会话属于哪个项目只经 `narrator-project.ts:resolveNarratorProjectId`（SQL 侧 `narratorProjectIdColumn`）：`contextProjectId` 优先，否则读 primary 链接；additional 不参与。PG 后端上没有链接表，只认 `contextProjectId`。
@@ -60,12 +65,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
 - 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。
 - PG 模式下创建、更新、删除、改可见性、成员变更、转让 owner 一律返回 503 `POSTGRES_UNSUPPORTED`（`requireSqliteProjectMutation`，在权限检查之前）；读取仍可用。
+- 会话之外问"这个目录属于哪个项目"：`POST /api/projects/resolve-directory { cwd, create }`（`routes/projects.ts`，校验 `validators/projects.ts:resolveProjectDirectorySchema`，响应形状 `shared/project-directory.ts`），新建会话弹窗的「以团队开始」用它（见[团队与成员](teams/records.md)）。
+  - 与在该目录建本地会话同一道门：登录即可（无用户 401），PG 先 503 `POSTGRES_UNSUPPORTED`。
+  - `~` 展开后 `stat`，不是已存在目录 → `not_directory`。
+  - 归属只经 `project-index.ts:resolveProjectForDirectory`（与会话同一套推导）：`create: false`（默认）只看，没有项目的 git 仓库回 `repository` 与根路径，不写库；`create: true` 像在那里建会话一样建项目（公开，owner 为调用者）。
+  - 非 git 目录 → `not_git`，带不带 `create` 都不建项目。
+  - 项目存在但调用者读不到 → 与非 git 目录完全相同的 `not_git`（响应字节一致，测试逐字节比对），不能借此探出私有项目的位置；共享类型里没有单独的"无权限"状态。
+  - 读得到 → `project`，带 `canWrite`、`archived`、`gitWorkTree`（项目目录是否本地 git 工作树，`teams/team-git.ts:isGitWorkTree`，10s 超时；项目可以关联任意已有文件夹，团队需要 git）。
 - 手动指定项目目录会认领 rootKey 并在后台重推全部会话链接（`indexNewProjectRoot`）。
 - 默认项目目录（与项目归属无关的邻近功能）：`settings.paths.defaultProjectDir` 初始不设置、服务端不再创建；`project-dir.ts:getProjectDirStatus` 判 `valid/unset/missing/not_directory`，`/api/fs/project-dir[/candidates]` 暴露，候选扫描有上限（主目录 500 项、最多扫 60 个目录、每目录 200 子项、每候选最多数 50 个仓库、返回 8 个）；设置页 `ProjectDirChooser` 只能从已存在目录里选，前端用 `useProjectDirStatus` 判断是否可用。
 - 收藏目录：`/api/favorites` 的 GET/POST/PATCH/DELETE/PUT reorder 管每个用户自己的目录收藏（`user_favorite_directories`），供目录选择器使用，与项目归属无关。
 - 旧"章节"路由只剩跳转：`/chapters/$chapterId` 跳 `/projects`，`/settings/chapters` 跳 `/settings/workspace`。
 
 ## 前端
+- 侧栏「项目」入口（`nav-items.tsx` 的 `projects` → `/projects`）是进入项目页和团队的唯一导航入口，见[应用框架与路由](../frontend/shell-routing.md)。
 - `frontend/routes/projects/index.tsx`（项目列表）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
 - `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams/index.md)。
 
@@ -76,13 +89,15 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/routes/projects.ts`：项目 CRUD、成员、可见性、转让 owner。
 - `server/services/read/`：项目列表读适配器（`acl-sql.ts` 是 ACL 与 `narratorProjectIdText` 的 SQL 片段，`read-collect.ts`/`read-cursor.ts` 是分页）。
 - `server/lib/narrator-project-sql.ts`：另一份 SQL 侧会话到项目的表达式（`narratorProjectIdSql`）。
-- 测试：`server/services/__tests__/project-index.test.ts`、`project-acl.test.ts`、`project-membership-authority.test.ts`。
+- 测试：`server/services/__tests__/project-index.test.ts`、`project-acl.test.ts`、`project-membership-authority.test.ts`；目录查询路由 `server/routes/__tests__/projects-resolve-directory.test.ts`（PG 503 在 `project-teams-postgres.test.ts`）。
 
 ## 改它时
 - 会话属于哪个项目的判定有三处 SQL/代码出口要一致：`narrator-project.ts`（`resolveNarratorProjectId`、`narratorProjectIdColumn`）、`services/read/acl-sql.ts`（`narratorProjectIdText`）、`lib/narrator-project-sql.ts`（`narratorProjectIdSql`）；改归属规则要同时改并跑 `narrator-project.test.ts`、`narrator-project-gate.test.ts`、`project-index.test.ts`。
 - 改链接表 `narrator_project_links`：SQLite 与 PG schema 两边；索引要保持"可整表重建"（`project-index-rebuild-scale.test.ts`），不得把它当事实来源。
 - 改项目 ACL：`project-acl.ts` 是唯一判定入口，大纲 `outline/access.ts` 与 `narrator-acl.ts` 依赖它的语义（`outline/__tests__/access-parity.test.ts`）；成员变更必须保留审计与通知（`project-membership-authority.test.ts`）。
 - 新增项目写路由：先调 `requireSqliteProjectMutation`（PG 返回 503），再做权限检查；不存在与不可见都抛 NotFound。
+- `resolve-directory` 不得另写路径→项目的推导：只调 `resolveProjectForDirectory`；`create: false` 必须不写库（新建会话弹窗每次换目录都会问）。
+- 读不到的项目必须继续回与非 git 目录逐字节相同的响应：不要加字段、状态或不同的错误码来区分两者。
 - 列表接口形状是契约（裸数组、`updatedAt` 降序、无参返回全部），改成分页信封会破坏现有调用方。
 
 ## 相关

@@ -18,7 +18,7 @@ keywords:
   - chapterSettings
   - work.exclusive_released
 status: draft
-verified_at: 776dbf07e
+verified_at: 12e8a02d8
 ---
 # 重叠与独占路径
 
@@ -28,7 +28,7 @@ verified_at: 776dbf07e
 改动路径与重叠（`teams/team-overlap.ts`）：
 - 后台每两分钟分批（每批 50 项）刷新活动工作项相对基线的改动路径，按项目比较重叠；卡住的项会被跳过若干轮。
 - 每项上限 2000 条或 128KiB，超出退化为顶层目录（目录以 `/` 结尾）。
-- 读路径只经 `team-git.ts` 的两提交比较，不读工作区。
+- 读路径只经 `team-git.ts` 的两提交比较，不读工作区。后台刷新按当时的 HEAD 读；`work.ready` 经 `readChangedPaths(worktree, baseRef, at)` 按它钉住的提交读（见 [工作项](work-items.md)）。
 
 独占路径与锁：
 - 独占路径来自项目设置（`projects.chapterSettings` 里的独占路径 glob）。
