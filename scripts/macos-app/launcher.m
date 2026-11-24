@@ -20,6 +20,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#import <WebKit/WebKit.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -259,6 +260,12 @@ static void setLoginItem(BOOL enabled) {
 @property(nonatomic) NSURL *pageURL;
 @property(nonatomic) dispatch_source_t lockSource;
 @property(nonatomic) unsigned long probeGeneration;
+@property(nonatomic) NSMenu *actionMenu;
+@property(nonatomic) NSPopover *popover;
+@property(nonatomic) WKWebView *webView;
+@property(nonatomic) NSTextField *popoverStatus;
+@property(nonatomic) NSButton *popoverToggle;
+@property(nonatomic) int lastLoadedPort;
 @end
 
 @implementation AppDelegate
@@ -279,6 +286,10 @@ static void setLoginItem(BOOL enabled) {
 	self.item.button.image = statusBarIcon();
 	self.item.button.imagePosition = NSImageOnly;
 	self.item.button.toolTip = @"NarraFork";
+	// Left click -> popover panel; right click -> the quick-action menu.
+	self.item.button.target = self;
+	self.item.button.action = @selector(statusItemClicked:);
+	[self.item.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
 
 	NSMenu *menu = [NSMenu new];
 
@@ -326,7 +337,7 @@ static void setLoginItem(BOOL enabled) {
 	quit.target = self;
 
 	menu.delegate = self;
-	self.item.menu = menu;
+	self.actionMenu = menu;
 
 	[self watchLockDir];
 
@@ -360,6 +371,8 @@ static void setLoginItem(BOOL enabled) {
 	self.toggleItem.title = running ? L(@"Stop server", @"停止服务") : L(@"Start server", @"启动服务");
 	self.toggleItem.enabled = running ? self.ownServer : YES;
 	self.toggleItem.target = self;
+
+	if (self.popover) [self updatePopoverContent:running starting:starting port:port];
 }
 
 // ── Event-driven probing ─────────────────────────────────────────────────────
@@ -448,6 +461,81 @@ static void setLoginItem(BOOL enabled) {
 																attempt:attempt + 1];
 									   });
 							   }];
+}
+
+// ── Status item click routing + popover panel ──────────────────────────────
+
+- (void)statusItemClicked:(id)sender {
+	if (NSApp.currentEvent.type == NSEventTypeRightMouseUp) {
+		// Manual popup — item.menu is deliberately unset so left click is ours.
+		[self.actionMenu
+			popUpMenuPositioningItem:nil
+					  atLocation:NSMakePoint(0, self.item.button.bounds.size.height + 6)
+							  inView:self.item.button];
+		return;
+	}
+	if (self.popover.isShown) {
+		[self.popover close];
+		return;
+	}
+	[self ensurePopover];
+	[self updatePopoverContent:self.foundPort != 0 starting:self.serverTask.isRunning
+						port:self.foundPort];
+	[self.popover showRelativeToRect:self.item.button.bounds
+							  ofView:self.item.button
+					   preferredEdge:NSRectEdgeMinY];
+}
+
+// Menu-bar panel: status/action bar on top, the live web frontend below.
+- (void)ensurePopover {
+	if (self.popover) return;
+	const CGFloat w = 560, h = 680, barH = 40;
+
+	NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+
+	self.popoverStatus = [NSTextField labelWithString:@""];
+	self.popoverStatus.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+	self.popoverStatus.frame = NSMakeRect(12, h - barH + 10, w - 250, 20);
+	self.popoverStatus.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+	[root addSubview:self.popoverStatus];
+
+	NSButton *(^button)(CGFloat, NSString *, SEL) = ^NSButton *(CGFloat x, NSString *t, SEL a) {
+		NSButton *b = [[NSButton alloc] initWithFrame:NSMakeRect(x, h - barH + 8, 74, 26)];
+		b.title = t;
+		b.bezelStyle = NSBezelStyleRounded;
+		b.font = [NSFont systemFontOfSize:12];
+		b.target = self;
+		b.action = a;
+		b.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+		[root addSubview:b];
+		return b;
+	};
+	button(w - 242, L(@"Open", @"打开"), @selector(openPage:));
+	self.popoverToggle = button(w - 164, @"", @selector(toggleServer:));
+	button(w - 86, L(@"Quit", @"退出"), @selector(quit:));
+
+	self.webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, w, h - barH)];
+	self.webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+	[root addSubview:self.webView];
+
+	NSViewController *vc = [NSViewController new];
+	vc.view = root;
+	self.popover = [NSPopover new];
+	self.popover.contentViewController = vc;
+	self.popover.behavior = NSPopoverBehaviorTransient;
+}
+
+- (void)updatePopoverContent:(BOOL)running starting:(BOOL)starting port:(int)port {
+	self.popoverStatus.stringValue =
+		running ? [NSString stringWithFormat:@"● localhost:%d", port]
+				: (starting ? L(@"◐ starting…", @"◐ 启动中…") : L(@"○ stopped", @"○ 已停止"));
+	self.popoverToggle.title = running ? L(@"Stop", @"停止") : L(@"Start", @"启动");
+	if (running && port != self.lastLoadedPort) {
+		self.lastLoadedPort = port;
+		[self.webView loadRequest:
+			[NSURLRequest requestWithURL:
+				[NSURL URLWithString:[NSString stringWithFormat:@"http://localhost:%d/", port]]]];
+	}
 }
 
 // ── Server lifecycle ─────────────────────────────────────────────────────────

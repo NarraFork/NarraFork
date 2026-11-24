@@ -109,6 +109,8 @@ execFileSync(
 		arch,
 		"-framework",
 		"Cocoa",
+		"-framework",
+		"WebKit",
 		"-o",
 		join(macosDir, appName),
 		launcherSrc,

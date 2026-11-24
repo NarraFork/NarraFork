@@ -34,11 +34,12 @@ NarraFork.app/
       AppIcon.icns             — 由 frontend/public/pwa-512x512.png 经 iconset/iconutil 生成
 ```
 
-启动器行为（launcher.m，~470 行 Objective-C，打包时用 `clang -fobjc-arc -framework Cocoa -arch <arch>` 编译）：
+启动器行为（launcher.m，~600 行 Objective-C，打包时用 `clang -fobjc-arc -framework Cocoa -framework WebKit -arch <arch>` 编译）：
 
 - **状态栏常驻**：`NSApplicationActivationPolicyAccessory`（LSUIElement=true）——无 Dock 图标、无 Cmd-Tab 项，只在菜单栏放一个 18pt template 图标（按 favicon 的 fork 形状用 NSBezierPath 手绘，自动适配深浅菜单栏）。图标 tooltip 为「NarraFork」。
-- **状态栏菜单**（中英文随系统语言）：
-  - 状态行（只读）：`● NarraFork · localhost:7778` / `◐ …starting…` / `○ …stopped`；**无轮询**——刷新由三个事件源驱动：① 自家 NSTask 的 terminationHandler、② `~/.narrafork/` 目录的 VNODE dispatch source（实例锁 `narrafork.lock` 增删即事件）、③ 每次展开菜单时 `menuWillOpen:` 按需探测一次
+- **左键 → NSPopover 面板**：点击图标弹菜单栏面板——顶部状态/操作条（状态点、Open/Stop-Start/Quit 按钮）+ 内嵌 **WKWebView** 直接加载 `http://localhost:<port>/`，即把整个现有前端装进状态栏。端口变化时自动重载对应 URL。
+- **右键 → 快捷菜单**（中英文随系统语言）：
+  - 状态行（只读）：`● NarraFork · localhost:7778` / `◐ …starting…` / `○ …stopped`；**无轮询**——刷新由三个事件源驱动：① 自家 NSTask 的 terminationHandler、② `~/.narrafork/` 目录的 VNODE dispatch source（实例锁 `narrafork.lock` 增删即事件）、③ 每次展开菜单时 `menuWillOpen:` 按需探测一次（探测在后台线程，完成后就地刷新 live menu）
   - `Open NarraFork` ⌘O — `open http://localhost:<port>/`
   - `Open in app window` ⇧⌘O — 用 `open -a <浏览器> url --args --app=<url>` 开 Chrome/Edge/Chromium 无边窗口（找到第一个装了的浏览器）
   - `View log` ⌘L — `open ~/.narrafork/narrafork-app.log`（系统默认关联，一般为控制台.app）
@@ -57,7 +58,7 @@ NarraFork.app/
 | 安装 | 拖进 /Applications 即可 | — |
 | 首次启动 | 双击即起服务 + 自动开浏览器 | **未签名/未公证**：下载来的 app 带 quarantine，首次需「右键 → 打开」或 `xattr -dr com.apple.quarantine NarraFork.app`。ad-hoc `codesign -` 只把「已损坏」降级为「无法验证开发者」，不消除拦截 |
 | 再次启动 | 探测到服务 → 只打开页面；同 bundle-id 已运行则直接退出 | 服务端在启动中途（几秒内）探测未命中仍会尝试拉起并撞实例锁（错误进 app.log，无 GUI 提示） |
-| 状态栏 | template 图标 + 菜单：状态/打开/应用窗口/日志/开机自启/停启服务/退出 | 菜单内无会话列表/通知等更深层 UI |
+| 状态栏 | template 图标；左键 NSPopover（WKWebView 内嵌整个前端 + 操作条），右键快捷菜单 | popover 是通用容器——要更深层原生 UI（会话列表、通知）可在同一 ViewController 里加 view；快捷菜单内容目前与 popover 操作条重复 |
 | 更新 | 沿用既有自更新机制（二进制级） | 更新替换的是 `Contents/MacOS/narrafork-server`；如自更新改写的是整个 dist 路径而非就地更新，需要确认落点在 app 包内（未验证） |
 | 图标 | pwa-512x512 生成，1024 槽位为放大 | 正式版应提供 1024px 源图（渲染 favicon.svg）；状态栏图标目前是路径手绘、较小的笔画可再调 |
 | 退出 | 状态栏菜单 ⌘Q → SIGTERM 本 app 拉起的进程 | 若服务由外部方式启动，退出 app 不影响服务（设计如此） |
