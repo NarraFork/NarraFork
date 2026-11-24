@@ -11,6 +11,7 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, activeDatabaseBackend: "postgres" }));
 const { AppError } = await import("../../lib/errors");
 const { projectTeamRoutes } = await import("../project-teams");
+const { projectRoutes } = await import("../projects");
 
 afterAll(() => {
 	mock.module("../../db", () => realDb);
@@ -28,6 +29,7 @@ app.onError((error) =>
 		: Response.json({ error: String(error) }, { status: 500 }),
 );
 app.route("/projects", projectTeamRoutes);
+app.route("/projects", projectRoutes);
 
 test("every team route is refused with 503 on PostgreSQL", async () => {
 	const cases: Array<[string, string, unknown?]> = [
@@ -52,6 +54,19 @@ test("every team route is refused with 503 on PostgreSQL", async () => {
 				: { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
 		});
 		expect({ method, path, status: response.status }).toEqual({ method, path, status: 503 });
+		expect(((await response.json()) as { code: string }).code).toBe("POSTGRES_UNSUPPORTED");
+	}
+});
+
+test("the new-session dialog's directory lookup is refused with 503 on PostgreSQL", async () => {
+	// "Start as a team" asks this first; on PostgreSQL it must say why, not answer `not_git`.
+	for (const create of [false, true]) {
+		const response = await app.request("http://localhost/projects/resolve-directory", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ cwd: "/", create }),
+		});
+		expect(response.status).toBe(503);
 		expect(((await response.json()) as { code: string }).code).toBe("POSTGRES_UNSUPPORTED");
 	}
 });

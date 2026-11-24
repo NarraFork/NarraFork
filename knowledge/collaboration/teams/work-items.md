@@ -37,7 +37,7 @@ keywords:
   - Team 工具
   - Agent isolation worktree
 status: draft
-verified_at: 12e8a02d8
+verified_at: 9166435ad
 ---
 # 工作项
 
@@ -90,7 +90,7 @@ verified_at: 12e8a02d8
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
 - check-in 是一个团队只保留一个的定时唤醒（5 分钟到 1 天），记为 `team.checkin` 事件，重启与取消归档时重新装填。
-- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob` 只读提交与对象，不读工作区；前两者可传入钉住的提交。
+- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob` 只读提交与对象，不读工作区；前两者可传入钉住的提交。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
 
 `Team` 工具（`server/lib/agent/tools/team.ts`，仅 team trait 会话提供）：
 - 动作：work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision；`work.list` 最多 30 项。

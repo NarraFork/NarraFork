@@ -18,6 +18,7 @@
  * All of them read commits and objects only, never the working tree, and fail rather than return
  * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
 	TEAM_CHANGED_DIR_SUFFIX,
@@ -46,6 +47,8 @@ import {
 } from "../git-ref-queries";
 
 const READ_TIMEOUT_MS = 60_000;
+/** The work-tree probe answers a dialog's lookup: a stuck filesystem must not hold it a minute. */
+const WORK_TREE_PROBE_TIMEOUT_MS = 10_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** Name-only listing cap: well past {@link TEAM_CHANGED_PATHS_MAX} typical paths. */
 const CHANGED_LISTING_MAX_BYTES = 512 * 1024;
@@ -66,6 +69,7 @@ async function spawnGit(
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
 	maxOutputBytes: number,
+	timeout = READ_TIMEOUT_MS,
 	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
 ) {
 	await ensureConfigOverridesHonored();
@@ -83,7 +87,7 @@ async function spawnGit(
 			LC_ALL: "C",
 			...gitConfigEnv(config),
 		},
-		timeout: READ_TIMEOUT_MS,
+		timeout,
 		maxOutputBytes,
 		...(stdoutStream ? { stdoutStream, maxStderrBytes: BLOB_STDERR_MAX_BYTES } : {}),
 		killProcessTree: true,
@@ -104,6 +108,27 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 	if (result.exitCode !== 0 || result.truncated)
 		throw new GitError("git config could not list the configured filters and hooks");
 	return parseProgramConfig(result.stdout);
+}
+
+/**
+ * Whether `dir` is an existing directory inside a local git work tree: what a team needs from its
+ * project's directory (a project may be associated with any existing folder). A bare repository,
+ * a `.git` directory, a missing path, a timeout or any other failure all answer false. Asking
+ * runs no program of the repository's configuration.
+ */
+export async function isGitWorkTree(dir: string): Promise<boolean> {
+	const info = await stat(dir).catch(() => null);
+	if (!info?.isDirectory()) return false;
+	const result = await spawnGit(
+		dir,
+		["rev-parse", "--is-inside-work-tree"],
+		GIT_NO_EXEC_CONFIG,
+		1024,
+		WORK_TREE_PROBE_TIMEOUT_MS,
+	).catch(() => null);
+	return (
+		result !== null && result.exitCode === 0 && !result.truncated && result.stdout.trim() === "true"
+	);
 }
 
 /** What a branch changed since its merge base with the base (committed changes only). */
@@ -344,7 +369,7 @@ async function readBlobOf(
 	if (!Number.isSafeInteger(size) || size < 0) throw new GitError("Expected a blob size");
 	const chunks: Buffer[] = [];
 	// Raw bytes, at most one past the size: a longer blob is cut off and refused.
-	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, {
+	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, READ_TIMEOUT_MS, {
 		maxBytes: size + 1,
 		onChunk: (chunk) => {
 			chunks.push(Buffer.from(chunk));

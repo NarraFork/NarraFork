@@ -11,11 +11,12 @@
  *    bounded preview of the input, and an approval goes through the ordinary permission route.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { initTeamRepo } from "../../services/teams/__tests__/team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-board-"));
@@ -152,7 +153,7 @@ async function pendingCall(narratorId: string, input: Record<string, unknown>, t
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	for (const id of [OWNER, MEMBER, READER, OUTSIDER])
 		await db

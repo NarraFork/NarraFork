@@ -1,3 +1,7 @@
+import type {
+	ResolveProjectDirectoryRequest,
+	ResolveProjectDirectoryResponse,
+} from "@shared/project-directory";
 import {
 	ApiError,
 	apiBase,
@@ -18,6 +22,15 @@ export const projectsApi = {
 	listProjects: (status?: string) =>
 		request<ApiEntity[]>(`/projects${status ? `?status=${status}` : ""}`),
 	getProject: (id: string) => request<ApiEntity>(`/projects/${id}`),
+	/**
+	 * Which project a local directory belongs to (`create: true` makes the project of a git
+	 * repository that has none). See `shared/project-directory.ts`.
+	 */
+	resolveProjectDirectory: (data: ResolveProjectDirectoryRequest) =>
+		request<ResolveProjectDirectoryResponse>("/projects/resolve-directory", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 	createProject: (data: Record<string, unknown>) =>
 		request<ApiEntity>("/projects", { method: "POST", body: JSON.stringify(data) }),
 	/**
