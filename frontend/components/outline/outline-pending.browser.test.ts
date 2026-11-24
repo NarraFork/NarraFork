@@ -290,17 +290,29 @@ test("the side panel locks a focused task's plan with a delegate and unlocks it;
 	const { page, errors } = await openPage(p.root, "all");
 	try {
 		await until(page, "the lock section", (f) => f.count("[data-testid=outline-lock]") === 1);
-		// Pick the session confirming on the person's behalf, then lock.
-		await page.click(
-			"[data-testid=outline-lock-delegate] input, input[data-testid=outline-lock-delegate]",
+		// Focus the real input before opening with the keyboard: a coordinate click can miss
+		// while the live editor above the lock section is still settling its layout.
+		const delegateInput =
+			"[data-testid=outline-lock-delegate] input, input[data-testid=outline-lock-delegate]";
+		await page.focus(delegateInput);
+		await page.waitForFunction(
+			(selector) => document.activeElement?.matches(selector),
+			{ timeout: 5000 },
+			delegateInput,
 		);
-		await page.waitForSelector("[role=option]", { timeout: 5000 });
+		await page.keyboard.press("ArrowDown");
+		await page.waitForSelector("[role=option]", { visible: true, timeout: 5000 });
 		await page.evaluate(() => {
 			const option = [...document.querySelectorAll<HTMLElement>("[role=option]")].find((o) =>
 				o.textContent?.includes("Lead session"),
 			);
 			option?.click();
 		});
+		await page.waitForFunction(
+			(selector) => document.querySelector<HTMLInputElement>(selector)?.value === "Lead session",
+			{ timeout: 5000 },
+			delegateInput,
+		);
 		await call(page, (f) => f.click("[data-testid=outline-lock]"));
 		await until(page, "locked", (f) => f.count("[data-testid=outline-unlock]") === 1);
 		const lock = (await outlineStore.getBlock(p.root))?.taskJson?.lock;
