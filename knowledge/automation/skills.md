@@ -12,6 +12,17 @@ anchors:
   - server/lib/agent/tools/skill.ts
   - frontend/hooks/useSkills.ts
   - server/lib/validators/skills.ts
+keywords:
+  - /api/skills
+  - SKILL.md
+  - SKILL.md.disabled
+  - skill_directory_caches
+  - SKILL_LINK_PRIVATE_HOST
+  - SKILL_GITHUB_LIMIT
+  - validateImportedSkillPath
+  - Skill 工具
+  - 技能导入
+  - $NARRAFORK_HOME/skills
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -29,10 +40,19 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 路由全部要求登录；项目级接口必须带 `projectId`，读需 read 权限，写需 write 权限；全局技能的导入/按链接更新需管理员（`routes/skills.ts`）。
 - 项目例程可覆盖内置技能（`applyProjectRoutineSkillOverrides`），与[例程](routines.md)相连。
 
+- 按链接导入（`skill-link-download.ts`）：只接受公网地址，私网/保留网段报 `SKILL_LINK_PRIVATE_HOST`，URL ≤2048 字符，SKILL.md ≤200000 字节（`SKILL_LINK_LIMIT`），最多 3 次重定向、HTTPS 不得降到 HTTP（`SKILL_LINK_REDIRECT`），必须是 UTF-8 文本（`SKILL_LINK_ENCODING`），HTML 页面被拒（`SKILL_LINK_HTML`）；GitHub 目录链接走 `skill-github-import.ts`（错误码 `SKILL_GITHUB_URL/PATH/LIMIT/METADATA/ABORTED`）。
+- 前端：`useSkills.ts` 以查询键 `skills`（带 `projectId`）缓存并在写入后失效；校验在 `validators/skills.ts`。
+
 ## 从哪读起
 - `server/services/skill-service.ts`：扫描、解析、缓存、CRUD；`skillService` 对象是对外入口。
 - `server/lib/agent/tools/skill.ts`：叙述者侧的 Skill 工具。
 - `server/services/skill-directory-sync.ts`：替换技能目录时的快照与原子替换。
+
+## 改它时
+- 加技能搜索根或文件名约定：`getSkillSearchDirs`/`resolveSkillRootsForContext` 与 `skill-directory-sync.ts`、`skill_directory_caches` 缓存一起改；`skill-load-bounds.test.ts`、`skill-disable-precedence.test.ts`、`skill-narrafork-home.test.ts`、`skill-directory-sync.test.ts` 断言限额、禁用优先级与目录。
+- 改导入：`skill-github-import.test.ts`、`skill-link-download.test.ts`、`skill-import-install.test.ts`、`skill-url-update.test.ts`、`server/routes/__tests__/skill-import.test.ts`。
+- 技能创建必须走 `skill-write-scope.ts` 的写入范围（`withFileWrite` 固定本地键），只串行本地提交，不含下载。
+- 不变量：技能不入库；禁用靠改名 `SKILL.md.disabled`；导入路径必须过 `validateImportedSkillPath`；导入全程有超时（45s）。
 
 ## 相关
 - [例程与可选工具](routines.md)

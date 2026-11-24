@@ -23,6 +23,23 @@ anchors:
   - server/services/plugin-spec-compat.ts
   - server/services/plugin-state-store.ts
   - server/services/plugin-storage.ts
+keywords:
+  - manifest.json
+  - narrafork.rpc/1
+  - LocalProcessRunner
+  - PodmanRunner
+  - RuntimeSupervisor
+  - quarantine
+  - IDLE_TIMEOUT
+  - NF_PLUGIN_PODMAN_IMAGE
+  - PLUGIN_PODMAN_CONFIGURATION_MISSING
+  - current.json
+  - state.json
+  - .nfplugin
+  - --plugin-runtime-worker
+  - --windows-plugin-launcher
+  - plugin-storage
+  - Job Object
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -46,10 +63,22 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - Podman 运行器只在清单声明 `podman` 时用，且需要环境变量 `NF_PLUGIN_PODMAN_IMAGE` 与 `NF_PLUGIN_PODMAN_IMAGE_DIGEST`，缺失则 503 `PLUGIN_PODMAN_CONFIGURATION_MISSING`。命令带 `--read-only`、`--network none`、`--cap-drop ALL`、`no-new-privileges`，默认 512MiB 内存、1 CPU、pids 128、tmpfs 64MiB，包以只读挂 `/plugin`、数据目录读写挂 `/data`；镜像必须带 `sha256:` 摘要；Podman 不可用就报错，不回退到本地执行（`buildPodmanCommand`、`PodmanRunner.start`）。
 - `PluginUpgradeCoordinator`（暂存新包 → CAS 改指针 → 健康检查 → 起新进程，失败补偿回滚）和 `PluginProcessRunner` 在仓库里只被测试和 `plugin-hardening.ts` 的再导出引用，`PluginManager` 的安装路径并不经过它们。
 
+- Windows 本地运行：插件进程被放进插件私有的 Job Object（带 `KILL_ON_JOB_CLOSE`），经内部启动器 `--windows-plugin-launcher <jobName> <命令…>` 先加入作业再起目标；根 PID 消失不算整树退出的确认（`lib/plugins/windows-plugin-job.ts`、`windows-plugin-launcher.ts`、`windows-plugin-process.ts`，由 `plugin-runtime.ts` 调用）。这只提供整树终止，不提供 CPU/内存限额。
+- RPC 连接（`plugin-rpc-connection.ts`）：每个运行时代际一条，两个方向的请求分开登记；写队列有界（默认 16 个在途、8MiB、1024 条消息），并给控制帧预留 256KiB/32 条，保证取消与关停不被普通帧淹没。
+- 健康与断路（`plugin-health.ts`）：按插件与面（`runtime/provider/tool/event`）统计请求、失败、耗时，状态 `closed/open/half-open`；管理器与事件网关使用。
+- 状态与存储：`plugin-state-store.ts` 写 `state.json`（原子写 + 日志 + 损坏恢复，默认状态文件 ≤1MiB、日志 ≤4MiB、JSON 深度 ≤12，含提供商配置，以贡献 id 为键以便升级后不丢）；`plugin-storage.ts` 是插件的键值缓存（单值 ≤64KiB、每作用域 ≤1MiB/1000 项、每插件 ≤8MiB）。
+- 协议常量与 RPC/提供商限额在 `lib/plugins/protocol.ts`（`narrafork.rpc/1`、提供商请求体上限 64MiB），`lib/plugins/index.ts` 只是再导出。`plugin-spec-compat*.ts`（把旧 Dynamic Spec 插件命令转换到大纲会话任务，并按小时记告警）不属于运行时，见报告说明。
+
 ## 从哪读起
 - `server/services/plugin-manager.ts`：安装、启停、状态机总入口。
 - `server/services/plugin-runtime.ts`：`LocalProcessRunner`、`PluginRuntime`、`RuntimeSupervisor`。
 - `server/services/plugin-package-store.ts`：包与 `current.json`。
+
+## 改它时
+- 改清单 `engine`/`server` 字段：`lib/plugins/manifest.ts`（zod `.strict()`，加字段要同步所有消费方）、`plugin-manager.ts:defaultRuntimeOptions`、内置包 `builtin-plugins/registry.ts` 的清单一起；协议版本改动要同步 `lib/plugins/protocol.ts`。
+- 改超时/重启预算：`plugin-runtime.ts` 的 `PluginRuntime` 默认值与 `RuntimeSupervisor` 参数；`plugin-health.test.ts`、`plugin-process-runner.test.ts`、`plugin-podman-runner.test.ts`、`plugin-upgrade-coordinator.test.ts`（`server/services/__tests__/`）断言具体行为；Windows 启动器有 `windows-plugin-launcher.compiled.test.ts`。
+- 改 Podman 参数：只读根、`--network none`、`--cap-drop ALL`、`no-new-privileges` 与摘要必填是安全不变量，不能回退到本地执行。
+- 不变量：安装只落盘、不启动；编译版插件用自身可执行文件启动且不开数据库；`IDLE_TIMEOUT` 走重启预算而不是直接隔离。
 
 ## 相关
 - [插件系统](index.md)

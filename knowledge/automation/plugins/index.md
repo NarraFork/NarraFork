@@ -19,6 +19,18 @@ anchors:
   - frontend/routes/settings/plugins.$pluginId.tsx
   - frontend/routes/settings/plugins.index.tsx
   - frontend/routes/settings/plugins.tsx
+keywords:
+  - manifest.json
+  - PluginManager
+  - plugins.enabled
+  - NF_PLUGINS_ENABLED
+  - PLUGINS_DISABLED
+  - /api/plugins
+  - apikey-quota
+  - 插件管理
+  - com.narrafork.apikey-quota
+  - 插件覆盖层
+  - plugin-event
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -33,6 +45,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 内置插件：仓库里只有一个，`server/builtin-plugins/apikey-quota`（`com.narrafork.apikey-quota`），只贡献一个 `query-balance` 命令；它走同一套清单与生命周期，只是随应用分发、首次默认启用。
 - 数据位置：包与状态在 `<narrafork-home>/plugins`（`packages/`、`current.json`、`state.json`、`permissions.json`、`secrets.json`）。
 - 界面插件由 `routes/plugin-ui.ts` 的会话与资源路由承载，细节在贡献点一节；插件自己的调度器（`plugin-scheduler.ts`）与宿主定时任务无关，见[定时任务](../scheduled.md)。
+
+- 前端：`frontend/lib/api/plugins.ts` + `hooks/usePlugins.ts` 调 `/api/plugins` 并缓存；`usePluginEventRefresh.ts` 监听宿主广播的插件生命周期事件（`narrafork:plugin-event`）使查询失效，轮询只作漏事件的兜底；管理页在 `frontend/routes/settings/plugins*.tsx`，组件在 `frontend/components/plugins-admin/`（安装弹窗、授权请求队列与弹窗、配置表单、提供商配置、诊断面板、状态徽标）；`settings/PluginOverlaySettings.tsx` 是普通用户的“插件覆盖层”开关（管理页只有管理员能进，覆盖层是否启用是个人选择）。`plugin-catalog.ts` 扫描内置与已装包、限清单 ≤1MiB、每包 ≤1 万文件、读超时 10s。
+
+## 改它时
+- 加一个插件管理接口：`routes/plugins.ts`（安装/启停/授权类要求管理员、插件系统关闭时 503 `PLUGINS_DISABLED`）、`plugin-manager.ts` 状态机（同一插件 ID 串行）、前端 `lib/api/plugins.ts` 与 `usePlugins.ts` 一起改。
+- 加内置插件：`server/builtin-plugins/registry.ts` 登记；编译版要能把内置包写回磁盘（`materialize`）；首次默认启用，之后显式停用保持有效。
+- 改数据落点（`plugins/` 下的 `packages/`、`current.json`、`state.json`、`permissions.json`、`secrets.json`）：同看数据导入导出与备份是否覆盖这些文件（未核实）。
 
 ## 下面有什么
 

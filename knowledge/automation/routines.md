@@ -11,6 +11,21 @@ anchors:
   - frontend/hooks/useRoutines.ts
   - frontend/routes/routines/index.tsx
   - server/routes/narrator-manual-resources.ts
+keywords:
+  - /api/routines
+  - toolModes
+  - enabledRoutines
+  - disabledRoutines
+  - BUILTIN_ROUTINES
+  - /load
+  - ToolSearch
+  - global-prompt
+  - tool-permissions
+  - 工具模式
+  - 常驻
+  - 手动
+  - 自动
+  - 例程
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -28,11 +43,18 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 路由 `/api/routines`：`GET /`、`POST /:id/toggle`、`POST /:id/mode`（值只能是 manual/auto/resident）、`/project/:projectId...`（项目 mode 额外允许 `global`，需项目 manage 权限）、`/global-prompt`（读取上限 200000 字节，写入需管理员）。
 - 会话级临时装载（`narrators.enabledTools`）与此正交，由 `command-service.ts` 的 `/load <toolName>` 触发。
 
+- 前端：`frontend/hooks/useRoutines.ts` 以查询键 `routines`、`project-routines` 缓存并乐观更新；页面 `frontend/routes/routines/index.tsx`（同目录另有 `tool-permissions.tsx`）。
+
 ## 从哪读起
 - `shared/routine-modes.ts`：纯函数的模式解析与写入（无依赖，前后端共用）。
 - `server/lib/builtin-routines.ts`：内置清单（本版本含 20 个 tool 类）。
 - `server/services/routine-service.ts`：全局/项目状态与写入。
 - `server/services/narrator-session.ts`：新会话按 resident 预加载工具（搜 `isPreloadedMode`）。
+
+## 改它时
+- 加一个内置例程：`server/lib/builtin-routines.ts` 的清单（类型 tool/command/skill、`defaultEnabled`）；`tool-loading-service.ts:buildCandidates` 决定 `auto` 的可发现范围。
+- 改模式语义或存储：`shared/routine-modes.ts`（前后端共用，纯函数）、`routine-service.ts`、旧的 `enabledRoutines/disabledRoutines` 双向投射、项目 `chapterSettings.routines` 一起；`shared/routine-modes.test.ts` 守着解析与写入规则。
+- 不变量：只有 `resident` 算预加载；项目层先于全局层；设置模式必须是 tool 例程；`auto` 不进旧列表。
 
 ## 相关
 - [技能](skills.md)

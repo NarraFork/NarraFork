@@ -20,6 +20,23 @@ anchors:
   - server/services/benchmark-read.ts
   - server/services/benchmark-suite-stream.ts
   - server/services/runtime-service.ts
+keywords:
+  - /api/benchmarks
+  - /api/containers
+  - /api/runtime
+  - benchmark_runs
+  - humaneval
+  - swe-bench
+  - agencybench
+  - BENCHMARK_READ_BUDGET
+  - CONTAINERS_UNSUPPORTED
+  - podman
+  - nf-bench
+  - SWE-bench
+  - 容器
+  - 基准测试
+  - compose
+  - rootless
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -39,10 +56,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 在无 systemd cgroup 委派的环境，会写用户级 `~/.config/containers/containers.conf` 切到 cgroupfs，已有文件不覆盖（`ensureRootlessEnv`）。
 - 本模块的容器用途之外，插件也有自己的 Podman 运行器，见[插件系统](plugins/index.md)。
 
+- 设置页的安装体验：`WorkspaceContainersSection.tsx`（设置页“工作区与容器”）、`DependencyStatus.tsx`（检测结果）、`DependencyInstallTerminal.tsx` + `dependency-install-progress.ts`（在 xterm 终端里发安装命令，靠提示符规则判断何时发送；漏掉第一个提示符会留下空白终端，所以规则抽成了可单测的纯函数）；API 在 `frontend/lib/api/containers.ts`，管理页 `frontend/routes/admin/containers.tsx`。
+- `benchmark-read.ts` 与 `benchmark-suite-stream.ts`：结果读取走预算（见上），不在主线程一次读完大 suite。
+- 运行时扫描：`runtime-service.ts` 对应 `/api/runtime/scan`、`/cached`（管理员），汇总终端（运行/已退出/孤儿 socket）、容器（按 `containerInstances` 与 `podman --version` 探测）、浏览器进程与会话数，并支持按目标清理；它不是基准测试的一部分，只是与容器检测放在同一管理页。
+
 ## 从哪读起
 - `server/services/benchmark-service.ts`：run 生命周期与任务执行。
 - `server/services/benchmark-container.ts`：podman 封装（create/exec/destroy）。
 - `server/services/container-service.ts`：Podman 检测、安装、compose 解析。
+
+## 改它时
+- 加一个评测器：在 `benchmark-evaluators/` 实现 `evaluate(task, agentOutput, workDir)` 并登记到注册表（按 suite 名选取），`benchmark-evaluators.test.ts` 会断言各评测器行为；评分结果结构（`passed/score/maxScore/details`）被结果读取与前端对比页消费。
+- 改 run 状态机或启动清理：`benchmark-service.ts` 的原子认领（`UPDATE ... WHERE status='pending'`）与 `reconcileStaleBenchmarkRuns`（SQLite 才做）；读取侧预算改动要同步 `benchmark-limits.ts` 并看 `benchmark-worker-reads.test.ts`。
+- 改容器检测/安装：`container-service.ts`、`routes/containers.ts` 与设置页组件一起；不变量是平台不支持容器时返回 `CONTAINERS_UNSUPPORTED`，且不得自动改写已有的 `containers.conf`。
+- 基准测试路由整体要求管理员，新增路由不要漏掉 `requireAdmin`。
 
 ## 相关
 - [插件系统](plugins/index.md)

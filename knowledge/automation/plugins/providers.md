@@ -12,11 +12,26 @@ anchors:
   - server/services/plugin-provider-catalog-refresh.ts
   - server/services/plugin-provider-config-service.ts
   - server/services/plugin-provider-proxy-policy.ts
+  - server/services/plugin-command-config-writes.ts
   - server/main.ts
   - server/lib/agent/remote-provider-adapter.ts
   - server/services/plugin-provider-model-source.ts
   - server/services/plugin-provider-rpc.ts
   - shared/apikey-quota-plugin.ts
+keywords:
+  - executable-plugin
+  - provider.describe
+  - provider.listModels
+  - PROVIDER_CONFLICT
+  - HOST_RESERVED_PREFIXES
+  - RemoteProviderAdapter
+  - __narrafork_secret_set__
+  - x-narrafork-secret
+  - hostHints
+  - network.egress.allowlist
+  - configWrites
+  - apikey-quota
+  - 模型提供商插件
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -35,10 +50,21 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 就绪检查 `listPluginProviderReadiness`：只看注册状态、是否有适配器工厂、配置是否齐备，不拉模型、不激活插件；并发 4、总预算 1.5s（超时保留已得结果）、最多 1000 个。
 - 管理接口（均要求管理员）：`GET/PUT /:pluginId/providers/config`、`POST .../catalog/refresh`（校验提供商确属该插件）、`PUT .../proxy`、`PUT .../prefix`（`routes/plugins.ts`）。
 
+- 命令返回的 `configWrites`（`plugin-command-config-writes.ts`）：键同为 `provider.<贡献id>.<字段>` 且属本插件；字段必须在该贡献的 `configSchema` 里声明，**声明为密钥的字段被拒绝**（两条通道必须不相交，否则凭证会进明文配置并经 `config.get` 回显）；单值序列化后 ≤16KiB（`MAX_COMMAND_CONFIG_VALUE_BYTES`）；写入是合并到已存配置之上再整体走同一套 schema 校验，不是替换。
+- 模型来源与 RPC：`plugin-provider-model-source.ts` 让模型目录能枚举插件提供商而不让通用代码依赖插件平台；`plugin-provider-rpc.ts` 是调用 `provider.*` 的传输封装；`lib/agent/remote-provider-adapter.ts` 是宿主侧的聊天适配器，`shared/apikey-quota-plugin.ts` 是内置 `apikey-quota` 插件与前端共享的类型。
+- 就绪检查的实现在 `plugin-provider-readiness.ts`；凭证合并在 `plugin-provider-credential-resolver.ts`（每次请求现解，不缓存）。
+
 ## 从哪读起
 - `server/services/plugin-provider-registry.ts`：`PluginProviderRegistry`。
 - `server/services/plugin-provider-adapter-factory.ts`：适配器与激活时机。
 - `server/services/plugin-provider-config-service.ts`：配置/密钥的分流。
+
+## 改它时
+- 新增提供商相关的清单字段：`plugin-provider-manifest.ts:providerRegistrationsFromManifest` 与 `lib/plugins/manifest.ts` 一起改；实例 ID 含版本与哈希，升级会得到新实例，别假设目录继承。
+- 新增保留前缀：`HOST_RESERVED_PREFIXES`（`auto/default/summary/codex` 等）；前缀冲突报 `PROVIDER_CONFLICT`。
+- 改密钥字段判定（`format: "password"`、`writeOnly`、`x-narrafork-secret`）：`plugin-provider-config-service.ts:secretFieldsOf` 同时被 `configWrites` 校验引用，两边要一致。
+- 改就绪检查预算（并发 4、1.5s、1000 个）：`plugin-provider-readiness.test.ts`（`server/services/`）断言。
+- 不变量：登记只看清单、不启动进程；出站代理是宿主策略，不进插件 config；读密钥失败按“无凭证”处理。
 
 ## 相关
 - [插件系统](index.md)

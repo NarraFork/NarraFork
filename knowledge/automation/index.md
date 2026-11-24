@@ -9,6 +9,19 @@ anchors:
   - server/services/plugin-manager.ts
   - server/services/hook-service.ts
   - server/services/benchmark-service.ts
+keywords:
+  - 技能
+  - 例程
+  - 定时任务
+  - 插件
+  - 钩子
+  - 基准测试
+  - 扩展
+  - 自动化
+  - Skill
+  - Routine
+  - Hook
+  - Plugin
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -20,6 +33,9 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 触发型自动化：[定时任务](scheduled.md)按 cron 启动叙述者；[钩子](hooks.md)在工具调用、回合结束、需要关注等事件点执行命令或 HTTP，并可阻止 PreToolUse。
 - 代码型扩展：[插件系统](plugins/index.md)以独立进程、清单声明贡献点、能力代理授权；运行、授权、提供商、贡献点各有子节点；插件可用 Podman 运行器。[基准测试与容器](benchmarks-containers.md)是另一处使用 Podman 的地方（SWE-bench 隔离），容器服务只做检测、安装与 compose 解析。
 - 共同点：持久配置多落在设置文件、项目 chapterSettings 或专用表；管理类接口多要求管理员。
+
+## 改它时
+- 这一块各机制彼此独立，改某一机制先读对应子节点的「改它时」；跨机制的共同点只有配置落点（设置文件、项目 `chapterSettings`、专用表）和“管理类接口要求管理员”。
 
 ## 下面有什么
 

@@ -22,13 +22,28 @@ anchors:
   - server/services/integration-resource-binding-service.ts
   - server/services/integration-resource-service.ts
   - server/services/integration-summary-service.ts
-  - server/services/plugin-command-config-writes.ts
   - server/services/plugin-command-secret-writes.ts
   - server/services/plugin-host-dispatcher.ts
   - server/services/plugin-host-services.ts
   - server/services/plugin-integration-authority-service.ts
   - server/services/plugin-lifecycle-revoke-coordinator.ts
   - server/services/plugin-sbom.ts
+keywords:
+  - CapabilityBroker
+  - permissions.json
+  - secrets.json
+  - credentials.json
+  - SCOPE_ESCALATION
+  - PLUGIN_TRUST_CONFIGURATION_MISSING
+  - NF_PLUGIN_TRUST_ENFORCED
+  - NF_PLUGIN_REQUIRE_SIGNATURE
+  - NF_PLUGIN_REQUIRE_SBOM
+  - secretWrites
+  - installationId
+  - repair-plugin-authority
+  - SBOM
+  - 授权
+  - 密钥
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -47,10 +62,24 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 签名与 SBOM 只在设置环境变量 `NF_PLUGIN_TRUST_ENFORCED`、`NF_PLUGIN_REQUIRE_SIGNATURE` 或 `NF_PLUGIN_REQUIRE_SBOM` 之一时启用。强制签名时缺 `signature.json` 报 422；包里带签名则要求配置信任密钥环，而环境变量路径不构造密钥环，所以会报 503 `PLUGIN_TRUST_CONFIGURATION_MISSING`（`plugin-manager.ts:assertPackageTrust`、`pluginTrustPolicyFromEnvironment`）。校验算法为 ed25519（`plugin-signature.ts`）。
 - `plugin-hardening.ts` 只是一组再导出（health、podman、process、sbom、signature、upgrade），本身没有逻辑。
 
+- 宿主 RPC 面（`plugin-host-services.ts` 注册、`plugin-host-dispatcher.ts` 派发）：插件能调的方法有 `queries.execute`、`commands.execute`、`events.subscribe/unsubscribe/poll`、`storage.get/set/delete/list`、`config.get`、`secrets.list/get/set/delete`、`diagnostics.getOwn`；调用方由宿主绑定的主体标识，参数里不带 `pluginId`，所以插件无法指向别人的命名空间；密钥值 ≤64KiB（保管库是主线程同步读写 JSON）。
+- 命令返回的 `secretWrites`（`plugin-command-secret-writes.ts`）：键必须是 `provider.<贡献id>.<字段>` 且该贡献确属本插件（“不属于”与“格式不对”报同一条错，防探测），单值 ≤64KiB（`MAX_COMMAND_SECRET_VALUE_BYTES`），超限拒绝而不截断；校验通过后按序应用，**批次不是原子的**，中途 IO 失败会留下已写的条目；值不进日志。对应的非密钥 `configWrites` 见 [提供商插件](providers.md)。
+- 规范授权的数据库镜像：`plugin-integration-authority-service.ts` 把插件安装对应成稳定的授权主体（`plugin_installation`，以 `installationId` 为键，旧状态里以包哈希充当安装 ID 的记录据 `isStableInstallationId` 区分并迁移），`server/scripts/repair-plugin-authority.ts` 能从 `permissions.json` 兼容镜像重建并清理旧的包哈希键授权。通用的集成授权/资源绑定/审计/摘要服务（`integration-*.ts`）与 OAuth 共用，归 [OAuth 与对外 API](../../security/oauth-api.md) 一侧，见报告。
+- 生命周期撤销：`plugin-lifecycle-revoke-coordinator.ts` 把停用/崩溃/隔离/升级/卸载/代际变化/授权修订这些事件，依次派到八层撤销适配器——UI 会话、能力代理、事件网关、调度器、密钥代理、工具注册表、MCP 适配器、提供商注册表。
+- SBOM（`plugin-sbom.ts`）：解析与生成 SPDX、CycloneDX，`checkSbomInstallPolicy` 判定安装策略，仅在 `NF_PLUGIN_REQUIRE_SBOM` 启用时生效。
+- `lib/plugin-credentials.ts` 把提供商声明的密钥字段映射成凭证库（`credential-store`）里的 `opaque` 凭证条目（`pluginCredentialId`），保管库（`plugin-secret-vault.ts`）与适配器工厂都经它读写。`lib/secret-store.ts` 是通用的“凭证 JSON 默认 AES-256-GCM 加密存放”工具，不是插件专属，归凭证存储一侧，见报告。
+
 ## 从哪读起
 - `server/services/plugin-capability-broker.ts:CapabilityBroker.authorize`。
 - `server/services/plugin-permission-store.ts`：授权文件。
 - `server/services/plugin-manager.ts`：授权的播种、升级时的待审批请求。
+
+## 改它时
+- 加一个能力名：能力是开放字符串，`CAPABILITIES` 只是名单；要被自动授予需在清单 `permissions.host` 里有规范适配器（`seedGrantsFromManifest`）。`plugin-seed-grants.test.ts`、`plugin-integration-authority-service.test.ts`、`plugin-signature.test.ts`、`plugin-sbom.test.ts` 在 `server/services/__tests__/`。
+- 加一个宿主 RPC 方法：`plugin-host-services.ts` 注册（schema、副作用级别、所需能力）、`plugin-host-dispatcher.ts` 的授权决定、`lib/plugins/protocol.ts` 的参数类型一起改；参数里不得带 `pluginId`。
+- 改授权文件格式或上限：`plugin-permission-store.ts`；超限会把文件当损坏重置并清空授权，所以改上限前先看已决请求保留数。
+- 改撤销层：`PLUGIN_LIFECYCLE_REVOKE_LAYERS` 与各层适配器注册一起；漏层意味着停用后仍有旧授权在用。
+- 不变量：缺授权必须拒绝并触发待审批；用户调用不得越权到别的 userId；值永不进日志。
 
 ## 相关
 - [插件系统](index.md)

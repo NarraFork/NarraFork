@@ -17,6 +17,19 @@ anchors:
   - server/lib/validators/scheduled-tasks.ts
   - shared/scheduled-task-cleanup.ts
   - shared/scheduled-task-run-context.ts
+keywords:
+  - /api/scheduled-tasks
+  - scheduled_tasks
+  - scheduled_task_runs
+  - cron
+  - cleanupPolicy
+  - narratorMode
+  - permissionMode
+  - circuit breaker
+  - 断路器
+  - ScheduledTask 工具
+  - runContext
+  - 定时
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -36,10 +49,19 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 清理策略是任务级、需显式开启的破坏性保留；每次运行结束后尝试清理，失败只告警；设置 `cleanupPolicy` 与手动 `POST /:id/cleanup` 仅限创建者或管理员（`routes/scheduled-tasks.ts`、`scheduled-task-cleanup.ts`，每次扫描根上限 `TASK_CLEANUP_ROOT_LIMIT=10`）。
 - 路由 `/api/scheduled-tasks`：列表、读取、创建、更新、`/toggle`、`/run`、`/runs`、`/cleanup`、删除。
 
+- 前端：`useScheduledTasks.ts` 与 `lib/api/scheduled-tasks.ts` 调 `/api/scheduled-tasks`；列表页与 `$taskId` 详情页在 `frontend/routes/scheduled-tasks/`；`cron-presets.ts` 把“每 N 分钟/每小时/每天/每周/自定义”与 cron 互转（`presetToCron`、`cronToPreset`）。
+- 运行上下文：`shared/scheduled-task-run-context.ts:normalizeRunContext` 把非 `standalone` 的旧值（含已移除的 `chapter`）一律当 `project`。
+- 叙述者也能通过 `ScheduledTask` 工具（`server/lib/agent/tools/scheduled-task.ts`，归 [流程与协作工具](../agent/tools/workflow.md)）管理任务。
+
 ## 从哪读起
 - `server/services/scheduled-task-service.ts`：`scheduledTaskService`（CRUD、`runTask`、`launchNarrator`）。
 - `server/services/scheduled-task-scheduler.ts`：轮询器。
 - `server/services/scheduled-task-cleanup.ts`：任务产出叙述者的保留与清理。
+
+## 改它时
+- 加任务字段：`schema.ts:scheduledTasks` → `bun run db:generate`，`validators/scheduled-tasks.ts`、`routes/scheduled-tasks.ts`、前端 `lib/api/scheduled-tasks.ts` 与创建/详情页一起改；表要进数据导入导出时看 `data-portability.ts`（是否包含这两张表：未核实）。
+- 改调度节奏（30s 轮询）、断路器阈值（5 次）或启动恢复：`scheduled-task-scheduler.ts`、`scheduled-task-service.ts`；`scheduled-task-principal.test.ts`、`scheduled-task-cleanup.test.ts`、`scheduled-task-list-cap.test.ts` 会断言身份判定、清理和列表上限。
+- 不变量：错过的任务启动时不补跑；`runTask` 按任务 id 加锁；“成功”只代表已派发；清理策略默认 `none`，只有创建者或管理员能设。
 
 ## 相关
 - 插件有自己的调度（`server/services/plugin-scheduler.ts`），见[插件系统](plugins/index.md)；不要与这里混淆。
