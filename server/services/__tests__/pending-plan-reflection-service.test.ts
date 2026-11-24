@@ -44,6 +44,13 @@ const {
 const { pendingPermissions, pendingPlanApproverSource, pendingPlanCompact } = await import(
 	"../narrator-session-state"
 );
+const {
+	cleanupExitPlanReflection,
+	confirmExitPlanReflection,
+	createExitPlanReflectionDecision,
+	handOverExitPlanReflection,
+	markExitPlanReflectionStarted,
+} = await import("../../lib/agent/tools/exit-plan-reflection");
 
 const NARRATOR_ID = "plan-reflection-pending-narrator";
 const MESSAGE_ID = "plan-reflection-pending-message";
@@ -135,7 +142,13 @@ function registerPending(): PendingFixture {
 async function toolCallRow() {
 	return db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, TOOL_CALL_ID),
-		columns: { status: true, permissionDecidedBy: true, permissionDenyMessage: true },
+		columns: {
+			status: true,
+			permissionDecidedBy: true,
+			permissionDenyMessage: true,
+			permissionSuggestions: true,
+			permissionDecisionReason: true,
+		},
 	});
 }
 
@@ -320,5 +333,41 @@ describe("reflecting on a pending plan approval", () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(calls).toBe(1);
 		expect(fixture.resolved).toHaveLength(1);
+	});
+
+	test("an on-demand review never writes the person's approval row", async () => {
+		// The row is the person's pending approval: the panel hides rows carrying a non-awaiting
+		// reflection, and restart recovery reads them as reflection gates. A review started on
+		// demand must leave it exactly as the approval wrote it, whatever the review does.
+		const meta = {
+			narratorId: NARRATOR_ID,
+			broadcastTargetId: NARRATOR_ID,
+			toolUseId: TOOL_USE_ID,
+			toolName: "ExitPlanMode",
+			inputJson: PLAN_INPUT,
+			toolCallId: TOOL_CALL_ID,
+			onDemand: true,
+		};
+		const started = createExitPlanReflectionDecision("exit_plan_on_demand_a", meta);
+		expect(await markExitPlanReflectionStarted("exit_plan_on_demand_a")).toBe(true);
+		expect(await handOverExitPlanReflection("exit_plan_on_demand_a", { reason: "undecided" })).toBe(
+			true,
+		);
+		expect((await started).action).toBe("human");
+		const confirmed = createExitPlanReflectionDecision("exit_plan_on_demand_b", meta);
+		await markExitPlanReflectionStarted("exit_plan_on_demand_b");
+		expect(await confirmExitPlanReflection("exit_plan_on_demand_b", "Ready")).toBe(true);
+		expect((await confirmed).action).toBe("confirm");
+		cleanupExitPlanReflection("exit_plan_on_demand_a");
+		cleanupExitPlanReflection("exit_plan_on_demand_b");
+		const row = await toolCallRow();
+		expect(row?.status).toBe("pending");
+		expect(row?.permissionSuggestions ?? null).toBeNull();
+		expect(row?.permissionDecidedBy ?? null).toBeNull();
+		expect(row?.permissionDecisionReason ?? null).toBeNull();
+		// Live clients still follow the review.
+		expect(broadcasts.map((entry) => entry.message.type)).toEqual(
+			expect.arrayContaining(["plan_reflection_started", "plan_reflection_stopped"]),
+		);
 	});
 });

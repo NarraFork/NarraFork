@@ -51,8 +51,8 @@ interface ExitPlanReflectionMeta {
 	restoredStartedAt?: string;
 	/**
 	 * Started on demand against an ExitPlanMode permission that is already waiting (计划反思 button
-	 * or switch). Persisted on the suggestion so restart recovery restores the person's approval
-	 * instead of resuming this transient review as a pre-permission gate.
+	 * or switch). Such a review is transient: it never writes the tool-call row, which stays the
+	 * person's pending approval (panel visibility and restart recovery read it as such).
 	 */
 	onDemand?: boolean;
 }
@@ -106,7 +106,7 @@ function getActiveExitPlanReflectionRequestId(
 }
 
 function planReflectionSuggestions(
-	pending: Pick<ExitPlanReflectionPending, "requestId" | "startedAt" | "onDemand">,
+	pending: Pick<ExitPlanReflectionPending, "requestId" | "startedAt">,
 	status: PlanReflectionStatus,
 	reason?: string,
 	compactAfter?: boolean,
@@ -125,7 +125,6 @@ function planReflectionSuggestions(
 				: {}),
 			...(reason ? { reason } : {}),
 			...(compactAfter ? { compactAfter: true } : {}),
-			...(pending.onDemand ? { onDemand: true } : {}),
 		},
 	];
 }
@@ -181,7 +180,12 @@ async function markExitPlanReflectionStatus(
 ): Promise<void> {
 	const message = statusReason(status, reason);
 	try {
-		const toolCallId = await resolveExitPlanReflectionToolCallId(pending);
+		// An on-demand review runs against a permission that is ALREADY waiting for a person, and
+		// that row belongs to the person's approval: its state (pending/decided), its visibility
+		// in the panel and its restart recovery all read the row. The review therefore persists
+		// nothing there; its verdict reaches the row through `resolvePermission`, and live clients
+		// follow it through the frames below.
+		const toolCallId = pending.onDemand ? null : await resolveExitPlanReflectionToolCallId(pending);
 		if (toolCallId) {
 			const { eq } = await import("drizzle-orm");
 			const { db } = await import("@server/db");

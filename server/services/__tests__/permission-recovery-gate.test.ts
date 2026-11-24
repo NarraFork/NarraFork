@@ -348,15 +348,4 @@ describe("persisted permission gates", () => {
 		expect(recoveryReflection(automatic)?.type).toBe("plan_reflection");
 		expect(isRecoveredHumanPermission(automatic)).toBe(false);
 	});
-
-	test("an interrupted on-demand plan review restores the person's approval", () => {
-		// 计划反思 started against a plan that was already waiting: a restart mid-review must
-		// not resume it as a pre-permission gate (which fails closed by sending the plan back).
-		const onDemand = {
-			...gate,
-			permissionSuggestions: [{ type: "plan_reflection", status: "running", onDemand: true }],
-		};
-		expect(recoveryReflection(onDemand)).toBeUndefined();
-		expect(isRecoveredHumanPermission(onDemand)).toBe(true);
-	});
 });
