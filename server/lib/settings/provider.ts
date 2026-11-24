@@ -28,6 +28,7 @@ import {
 	resolveEffectiveModelCard,
 } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { registerModelListReader } from "../sourcing/model-list-readers";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
@@ -160,6 +161,14 @@ registerExtraModelSource("tokendance", {
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
 registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
+
+registerModelListReader("codex", () => getBuiltinCodexModels());
+registerModelListReader("tokendance", () => getTokenDanceCatalogModels().map((model) => model.id));
+// Keep Command Code's existing stale-while-revalidate semantics in its catalog owner.
+registerModelListReader("command-code", () => {
+	const config = s().commandCode;
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models;
+});
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
