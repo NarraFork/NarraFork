@@ -37,5 +37,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/services/narrator-sharing.ts`：可见性、受众、授权、转让 owner。
 
 ## 相关
-- [登录与会话令牌](auth.md)
+- [登录与会话令牌](auth/index.md)
 - [工具调用审批](tool-permissions.md)：审批权限请求需要叙述者写权限。

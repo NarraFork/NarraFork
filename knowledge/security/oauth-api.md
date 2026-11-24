@@ -38,5 +38,5 @@ NarraFork 自带一个 OAuth 2.0 授权服务器，第三方应用拿到访问�
 - `server/middleware/auth.ts:authenticateRequest` 的 OAuth 分支。
 
 ## 相关
-- [登录与会话令牌](auth.md)
+- [登录与会话令牌](auth/index.md)
 - [工具调用审批](tool-permissions.md)

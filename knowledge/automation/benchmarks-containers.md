@@ -27,7 +27,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `/api/benchmarks` 整体要求管理员（`routes/benchmarks.ts`：suites、runs、`/start`、`/cancel`、`/results`、`/summary`、`/compare`）。
 - `/api/containers`：`GET /setup`（Podman、compose、passt、rootless 网络是否就绪）、`GET /podman/status`、`POST /podman/install`（管理员）。平台不支持容器时返回 `CONTAINERS_UNSUPPORTED`（`container-service.ts:getContainerSetupStatus`、`lib/platform.ts:supportsContainers`）。
 - 在无 systemd cgroup 委派的环境，会写用户级 `~/.config/containers/containers.conf` 切到 cgroupfs，已有文件不覆盖（`ensureRootlessEnv`）。
-- 本模块的容器用途之外，插件也有自己的 Podman 运行器，见[插件系统](plugins.md)。
+- 本模块的容器用途之外，插件也有自己的 Podman 运行器，见[插件系统](plugins/index.md)。
 
 ## 从哪读起
 - `server/services/benchmark-service.ts`：run 生命周期与任务执行。
@@ -35,4 +35,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/services/container-service.ts`：Podman 检测、安装、compose 解析。
 
 ## 相关
-- [插件系统](plugins.md)
+- [插件系统](plugins/index.md)
