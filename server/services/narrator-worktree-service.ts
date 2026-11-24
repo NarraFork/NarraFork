@@ -74,7 +74,7 @@ export const WORKTREE_MAX_ENTRIES = 128;
 export const WORKTREE_READ_TIMEOUT_MS = 10_000;
 export const WORKTREE_CREATE_TIMEOUT_MS = 120_000;
 export const WORKTREE_NAME_TIMEOUT_MS = 5000;
-/** Listing is not the fail-closed inventory used to authorize mutations. */
+/** Shared bound for read-only listings and the fail-closed inventory used by mutations. */
 export const WORKTREE_LIST_MAX_ENTRIES = 4096;
 export const WORKTREE_LIST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const WORKTREE_LIST_CACHE_TTL_MS = 60_000;
@@ -902,7 +902,6 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		result: SafeSpawnResult,
 		signal: AbortSignal,
-		listing = false,
 	): Promise<ReturnType<typeof parseWorktreePorcelain>> {
 		const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
 		if (result.stdoutTruncated || result.stderrTruncated) return incomplete;
@@ -922,8 +921,8 @@ export class NarratorWorktreeService<Principal> {
 				readLegacyRegisteredPaths(
 					target,
 					limited,
-					listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
-					listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES,
+					WORKTREE_LIST_MAX_ENTRIES,
+					WORKTREE_LIST_MAX_OUTPUT_BYTES,
 				),
 				cancelled,
 			]);
@@ -933,7 +932,7 @@ export class NarratorWorktreeService<Principal> {
 				false,
 				registered,
 				target.backend?.paths.identityKey,
-				listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+				WORKTREE_LIST_MAX_ENTRIES,
 			);
 		} catch (cause) {
 			signal.throwIfAborted();
@@ -948,8 +947,8 @@ export class NarratorWorktreeService<Principal> {
 				logger.warn("Slow legacy Git registration verification", { elapsedMs });
 		}
 	}
-	private async entries(target: WorktreeTarget, signal: AbortSignal, listing = false) {
-		const maxBytes = listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES;
+	private async entries(target: WorktreeTarget, signal: AbortSignal) {
+		const maxBytes = WORKTREE_LIST_MAX_OUTPUT_BYTES;
 		let result = await this.run(
 			target,
 			["worktree", "list", "--porcelain", "-z"],
@@ -969,11 +968,11 @@ export class NarratorWorktreeService<Principal> {
 			result = await this.run(target, ["worktree", "list", "--porcelain"], signal, false, maxBytes);
 		}
 		if (result.exitCode !== 0) worktreeListError(result);
-		if (legacy) return this.legacyEntries(target, result, signal, listing);
+		if (legacy) return this.legacyEntries(target, result, signal);
 		return parseWorktreePorcelain(
 			result.stdout,
 			!!(result.stdoutTruncated || result.stderrTruncated),
-			listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+			WORKTREE_LIST_MAX_ENTRIES,
 		);
 	}
 
@@ -1159,7 +1158,7 @@ export class NarratorWorktreeService<Principal> {
 					signal,
 					AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
 				]);
-				const result = await this.entries(target, listSignal, true);
+				const result = await this.entries(target, listSignal);
 				startStage("metadataMs");
 				await this.enrichListEntries(target, result.entries, listSignal);
 				startStage("snapshotMs");
