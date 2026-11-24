@@ -41,3 +41,4 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [消息存储](messages.md)
 - [中断与恢复](recovery.md)
 - [提示词与注入](prompts.md)
+- [会话运行时](runtime/index.md)：`agent-runtime/` 的调度、收件箱、发布与模型历史
