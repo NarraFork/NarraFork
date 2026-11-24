@@ -37,7 +37,7 @@ keywords:
   - injectSpaBaseHref
   - base href
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: e379608cd1cd4cad5fdff4b46dfd504d451d387d
 ---
 # PWA 与远程前端
 
