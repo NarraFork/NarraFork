@@ -2,6 +2,7 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
 import {
 	hasDirectorySubtitle,
+	isCoordinatorSessionTab,
 	isTeamOnlookerTab,
 	recentTabHref,
 	recentTabLiveNarratorId,
@@ -1701,14 +1702,33 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 }
 
 /** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
-function RecentTabTitle({ tab }: { tab: RecentTab }) {
+export function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
 	const { data: userPrefs } = useUserPreferences();
 	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
+	// A coordinator's session sits next to its team's tab with the same title: label it.
+	const coordinator = isCoordinatorSessionTab(tab);
 	return (
 		<Stack gap={0} style={{ minWidth: 0 }}>
-			<Text size="sm" truncate>
-				{tab.title}
-			</Text>
+			{coordinator ? (
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+					<Text size="sm" truncate style={{ minWidth: 0 }}>
+						{tab.title}
+					</Text>
+					<Text
+						size="xs"
+						c="dimmed"
+						style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+						data-testid="recent-tab-coordinator-label"
+					>
+						{t("recentTabCoordinatorLabel")}
+					</Text>
+				</Group>
+			) : (
+				<Text size="sm" truncate>
+					{tab.title}
+				</Text>
+			)}
 			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
 				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
 			)}

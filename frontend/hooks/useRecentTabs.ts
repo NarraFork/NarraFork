@@ -79,12 +79,17 @@ export const recentTabsSectionQueryKey = (section: RecentTabsSection) =>
 	[...RECENT_TABS_QUERY_KEY, section] as const;
 /**
  * One tab's authoritative pin state (`api.getRecentTabState`), read by the "pin to sidebar"
- * buttons for a tab outside the loaded pages. Its own root, outside `RECENT_TABS_QUERY_KEY`,
- * so nothing that walks the sidebar's caches mistakes it for a section.
+ * buttons for a tab outside the loaded pages. Per-user data, so:
+ * - it lives under `["user-preferences"]`, which a session change removes as a whole
+ *   (`useAuth.ts:applySession`, the token observer in `useUserPreferences.ts`): another
+ *   account never sees the previous account's pin state;
+ * - the key carries the user id as well, so even a cached read cannot cross accounts.
+ * It stays outside `RECENT_TABS_QUERY_KEY`, so nothing that walks the sidebar's caches mistakes
+ * it for a section.
  */
-const RECENT_TAB_STATE_QUERY_ROOT = ["recent-tab-state"] as const;
-export const recentTabStateQueryKey = (key: string) =>
-	[...RECENT_TAB_STATE_QUERY_ROOT, key] as const;
+export const RECENT_TAB_STATE_QUERY_ROOT = ["user-preferences", "recent-tab-state"] as const;
+export const recentTabStateQueryKey = (userId: string, key: string) =>
+	[...RECENT_TAB_STATE_QUERY_ROOT, userId, key] as const;
 
 /**
  * Mark the pin-state reads of these tab keys stale (all of them without keys): after any delta
@@ -99,7 +104,8 @@ export function invalidateRecentTabStates(qc: QueryClient, keys?: readonly strin
 	const touched = new Set(keys);
 	void qc.invalidateQueries({
 		queryKey: RECENT_TAB_STATE_QUERY_ROOT,
-		predicate: (query) => touched.has(String(query.queryKey[1])),
+		predicate: (query) =>
+			touched.has(String(query.queryKey[RECENT_TAB_STATE_QUERY_ROOT.length + 1])),
 	});
 }
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;

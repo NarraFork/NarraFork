@@ -15,6 +15,7 @@ import { IconPin, IconPinnedFilled } from "@tabler/icons-react";
 import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useCurrentUser";
 import {
 	invalidateRecentTabStates,
 	RECENT_TABS_QUERY_KEY,
@@ -48,10 +49,13 @@ export function PinToSidebarButton({
 		queryFn: skipToken,
 	});
 	const loaded = loadedSidebarPin(tabs, type, id);
+	// Keyed by the signed-in user: a cached read never crosses accounts.
+	const { data: user } = useCurrentUser();
+	const userId = user?.id ?? "";
 	const state = useQuery({
-		queryKey: recentTabStateQueryKey(key),
+		queryKey: recentTabStateQueryKey(userId, key),
 		queryFn: ({ signal }) => api.getRecentTabState(type, id, signal),
-		enabled: loaded === undefined,
+		enabled: loaded === undefined && !!userId,
 		staleTime: PIN_STATE_STALE_MS,
 		// A failed read leaves the button unpinned and usable; it is not worth a toast.
 		meta: { suppressErrorToast: true },

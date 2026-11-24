@@ -192,5 +192,6 @@
 	"unpinFromSidebar": "Unpin from sidebar",
 	"pinToSidebarFailed": "Could not pin it to the sidebar",
 	"unpinFromSidebarFailed": "Could not unpin it from the sidebar",
-	"teamTabPendingApprovals": "{{count}} pending approval(s)"
+	"teamTabPendingApprovals": "{{count}} pending approval(s)",
+	"recentTabCoordinatorLabel": "coordinator"
 }

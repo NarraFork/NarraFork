@@ -1745,6 +1745,10 @@ export async function getRuntimePatches(
 		tabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
 		userId,
 	);
+	// Project tabs: path and live counts for the hover card. Only on this runtime path (not on
+	// list pages), bounded, never throws.
+	const { enrichProjectTabs } = await import("./recent-tab-projects");
+	await enrichProjectTabs(enriched, userId);
 	const patches: RecentTabRuntimePatch[] = enriched.map((tab) => ({
 		key: `${String(tab.type)}:${String(tab.id)}`,
 		patch: {
@@ -1768,9 +1772,24 @@ export async function getRuntimePatches(
 							typeof tab.pendingApprovalCount === "number" ? tab.pendingApprovalCount : null,
 					}
 				: {}),
+			// Project tabs: the hover card's path and counts (`recent-tab-projects.ts`); null when
+			// the user can no longer read the project.
+			...(tab.type === "project"
+				? {
+						projectPath: typeof tab.projectPath === "string" ? tab.projectPath : null,
+						activeSessionCount: numberOrNull(tab.activeSessionCount),
+						waitingSessionCount: numberOrNull(tab.waitingSessionCount),
+						teamCount: numberOrNull(tab.teamCount),
+						projectCountsCapped: tab.projectCountsCapped === true,
+					}
+				: {}),
 		},
 	}));
 	return { revision: snapshot.revision, patches };
+}
+
+function numberOrNull(value: unknown): number | null {
+	return typeof value === "number" ? value : null;
 }
 
 /** Move the unit containing `index` to the top of the non-pinned section. */

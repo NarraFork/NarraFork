@@ -806,5 +806,10 @@
 	"imageViewer_downloadFailed": "Failed to download image",
 	"botBadge": "Bot",
 	"swipeMenu": "Menu",
-	"recentTabTeamPendingApprovals": "{{count}} pending approval(s)"
+	"recentTabTeamPendingApprovals": "{{count}} pending approval(s)",
+	"recentTabProjectActiveSessions": "{{countLabel}} session(s) running",
+	"recentTabProjectNoActiveSessions": "No sessions running",
+	"recentTabProjectWaitingSessions": "{{countLabel}} waiting for input or approval",
+	"recentTabProjectTeams": "{{countLabel}} team(s)",
+	"recentTabCoordinatorSession": "The coordinator session of a team. The team's own tab opens its board."
 }

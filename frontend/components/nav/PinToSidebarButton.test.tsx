@@ -3,6 +3,7 @@
  * is among them, and otherwise from one authoritative read of that tab: a pinned tab past the
  * loaded pages must read as pinned (so a click unpins it instead of pinning it again). Deltas
  * touching the tab and the button's own toggle refresh that read; a refused pin is reported.
+ * The read is per user: another account signing in never sees the previous account's answer.
  */
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type { RecentTabStateResult, RecentTabsMutationResult } from "@shared/recent-tabs";
@@ -52,11 +53,18 @@ mock.module("@mantine/core", () => ({
 	),
 }));
 
+// The language loader needs Vite's import.meta.glob; `applySession` is otherwise the real one.
+const realI18n = await import("../../lib/i18n");
+mock.module("../../lib/i18n", () => ({
+	...realI18n,
+	changeAppLanguage: async () => {},
+}));
+
 const { api } = await import("../../lib/api");
 const { queryClient } = await import("../../lib/query-client");
-const { applyRecentTabsDeltaAndFollowUp, RECENT_TABS_QUERY_KEY } = await import(
-	"../../hooks/useRecentTabs"
-);
+const { applyRecentTabsDeltaAndFollowUp, RECENT_TABS_QUERY_KEY, recentTabStateQueryKey } =
+	await import("../../hooks/useRecentTabs");
+const { applySession } = await import("../../hooks/useAuth");
 const { PinToSidebarButton } = await import("./PinToSidebarButton");
 
 const unchanged: RecentTabsMutationResult = {
@@ -70,11 +78,22 @@ let root: Root;
 let container: HTMLDivElement;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 
+const storage = new Map<string, string>();
+
 beforeEach(() => {
 	notify.mockClear();
 	queryClient.clear();
+	storage.clear();
+	// Signed in as user A (the button keys its read by the user).
+	queryClient.setQueryData(["auth", "me"], { id: "user-a" });
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
+		localStorage: {
+			getItem: (item: string) => storage.get(item) ?? null,
+			setItem: (item: string, value: string) => storage.set(item, String(value)),
+			removeItem: (item: string) => storage.delete(item),
+			clear: () => storage.clear(),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -242,4 +261,48 @@ test("a pin the server refuses is reported, not silently dropped", async () => {
 	expect(notify).toHaveBeenCalledWith({ color: "red", message: "pinToSidebarFailed" });
 	expect(button().getAttribute("data-pinned")).toBe("false");
 	expect(button().getAttribute("data-loading")).toBe("false");
+});
+
+test("another account signing in does not see the previous account's pin state", async () => {
+	const state = spyOn(api, "getRecentTabState").mockResolvedValue({
+		present: true,
+		pinned: true,
+	});
+	spyOn(api, "me").mockResolvedValue({ id: "user-b" } as Awaited<ReturnType<typeof api.me>>);
+	await renderButton();
+	expect(button().getAttribute("data-pinned")).toBe("true");
+	expect(queryClient.getQueryData(recentTabStateQueryKey("user-a", "team:far"))).toEqual({
+		present: true,
+		pinned: true,
+	});
+
+	// User A's session ends and user B signs in, in the same tab.
+	let answer: (value: RecentTabStateResult) => void = () => {};
+	state.mockReturnValue(
+		new Promise<RecentTabStateResult>((resolve) => {
+			answer = resolve;
+		}),
+	);
+	await act(async () => {
+		await applySession(queryClient, {
+			token: "token-b",
+			user: { id: "user-b" },
+			language: "en",
+		} as Parameters<typeof applySession>[1]);
+	});
+	await settle();
+	// A's answer is gone, and B's button waits for B's own read instead of showing A's pin.
+	expect(queryClient.getQueryData(recentTabStateQueryKey("user-a", "team:far"))).toBeUndefined();
+	expect(state).toHaveBeenCalledTimes(2);
+	expect(button().getAttribute("data-pinned")).toBe("false");
+	expect(button().disabled).toBe(true);
+
+	await act(async () => answer({ present: true, pinned: false }));
+	await settle();
+	expect(queryClient.getQueryData(recentTabStateQueryKey("user-b", "team:far"))).toEqual({
+		present: true,
+		pinned: false,
+	});
+	expect(button().getAttribute("data-pinned")).toBe("false");
+	expect(button().disabled).toBe(false);
 });

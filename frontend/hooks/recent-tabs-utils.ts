@@ -33,6 +33,17 @@ export interface RecentTab extends PersistedRecentTab {
 	 * (null for an onlooker, who cannot decide them).
 	 */
 	pendingApprovalCount?: number | null;
+	/**
+	 * Project tabs only, runtime-enriched for the hover card (`recent-tab-projects.ts`): the
+	 * repository directory, this user's readable sessions running or waiting now, and readable
+	 * active teams. Null when the project can no longer be read; `projectCountsCapped` means a
+	 * read hit its cap, so the counts are lower bounds.
+	 */
+	projectPath?: string | null;
+	activeSessionCount?: number | null;
+	waitingSessionCount?: number | null;
+	teamCount?: number | null;
+	projectCountsCapped?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
 }
@@ -45,6 +56,17 @@ export function isTeamOnlookerTab(tabs: readonly RecentTab[], narratorId: string
 			tab.id === narratorId &&
 			tab.teamOnlooker === true,
 	);
+}
+
+/**
+ * A session tab of a team coordinator: a `narrator` tab of a team session (a coordinator is the
+ * only primary session of a team tree; its subagents are `subagent` tabs). The sidebar can hold
+ * it next to the team's own tab, with the same title: the row labels it "coordinator" so the two
+ * are told apart. The session tab stays a session tab (it drives notification recipients).
+ * Known once the runtime patch has said `teamSession`.
+ */
+export function isCoordinatorSessionTab(tab: Pick<RecentTab, "type" | "teamSession">): boolean {
+	return tab.type === "narrator" && tab.teamSession === true;
 }
 
 /**
@@ -204,6 +226,12 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"viewerCount",
 	"hasDraft",
 	"pendingApprovalCount",
+	"teamSession",
+	"projectPath",
+	"activeSessionCount",
+	"waitingSessionCount",
+	"teamCount",
+	"projectCountsCapped",
 ] as const satisfies ReadonlyArray<keyof RecentTab>;
 
 function asFields(tab: RecentTab): Record<string, unknown> {

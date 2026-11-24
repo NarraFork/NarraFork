@@ -6,6 +6,7 @@ anchors:
   - server/services/user-preferences-service.ts
   - server/services/recent-tabs-service.ts
   - server/services/recent-tab-teams.ts
+  - server/services/recent-tab-projects.ts
   - shared/recent-tabs.ts
   - server/routes/user-preferences.ts
   - server/db/schema.ts
@@ -53,12 +54,15 @@ keywords:
   - useRecentTabs
   - 固定到侧栏
   - PinToSidebarButton
+  - enrichProjectTabs
+  - isCoordinatorSessionTab
+  - RECENT_TAB_STATE_QUERY_ROOT
   - 团队标签
   - team tab
   - pendingApprovalCount
   - project_id
 status: draft
-verified_at: 009a3f4f7
+verified_at: 99e33f8fc
 ---
 # 最近标签页
 
@@ -85,6 +89,7 @@ verified_at: 009a3f4f7
 - 每次写入都在用户级锁内进行：读行 → 变换 → 去重加限额 → 在一个事务里只更新有差异的行并把 `user_recent_tabs_meta.revision` +1，再向该用户广播 `user:recent_tabs_delta`（每批 100 个操作）（`persistMutationLocked`、`broadcastDelta`）。无变化不增版本。
 - 读取走游标分页：每页最多 50 行，游标绑定分区和版本，版本变了返回 409 `stale cursor`，客户端须从第一页重载（`listPage`）；文件夹成员不在顶层分页里。
 - 运行时信息与记录分开：`getRuntimePatches` 一次最多 100 个键，返回状态、草稿、终端/后台任务计数、在线查看者、团队只读旁观者标记等，不写库（`POST /api/user-preferences/recent-tabs/runtime`）。
+  - 项目标签的悬停卡片数据只在这条运行时路径上算（`recent-tab-projects.ts:enrichProjectTabs`，不在分页列表里）：读得了项目（`resolveProjectGate`）才给 `projectPath`（项目目录）、`activeSessionCount` / `waitingSessionCount`（链到该项目、此刻 `working`/`waiting`、本人读得了的 primary 会话，`narratorReadableWhere`）、`teamCount`（活跃且协调者读得了的团队）；读不了或已删的项目全为 null。上限：每次请求最多 20 个项目标签（`PROJECT_TAB_DETAIL_LIMIT`），两条连接查询经读 worker（`readQuery`，`worker-required`，5s 超时）各最多读 `PROJECT_TAB_ROW_CAP` + 1 = 201 行，只读正在运行的会话，不对项目历史做 `COUNT(*)`；碰到上限时 `projectCountsCapped`，卡片显示「N+」。卡片（`RecentTabDetailCard.tsx:ProjectTabDetails`）没有进行中的会话时写「没有进行中的会话」，等待数和团队数为 0 时不显示。测试 `recent-tab-projects.test.ts`（真实 ACL：别人的私有会话/团队不计，失去项目读权限后为空）、`recent-tab-project-coordinator.test.tsx`。
 - 关闭、清空、解散文件夹会生成撤销令牌，内存里每用户一份、30 秒过期、全局最多 1000 份；令牌只在版本未变时可还原，否则 409（`restoreRecentTabs`）。进程重启后令牌失效。
 - 被标记为 `hiddenFromLists` 的叙述者不会写入标签（`withoutHiddenNarratorTabs`）；归档前会记下它所在的文件夹，取消归档时放回，文件夹已不存在则回到顶部（`rememberArchivedTabPlacement`、`restoreArchivedTabPlacement`）。
 - 旧版把标签存在偏好 JSON 里；首次访问时在锁内迁移，启动后还会分批（每批 100 个用户）补迁，找人的函数都会先等这次补迁完成（`ensureMigratedLocked`、`ensureAllRecentTabsMigrated`）。写入同时维护一份最多 20 条的旧格式影子。
@@ -96,8 +101,9 @@ verified_at: 009a3f4f7
 - `frontend/hooks/useRecentTabs.ts`（分页读、乐观更新、撤销提示、`user:recent_tabs_delta` 帧的合并）与 `useRecentTabsWS.ts`（订阅叙述者状态/标题等列表事件）；`recent-tabs-utils.ts`、`recent-tab-folders.ts`（把平铺列表按文件夹分组成渲染行；排布规则本身在 `shared/recent-tab-layout.ts`，前后端共用）。
 - 去哪：`recent-tabs-utils.ts:recentTabHref`（会话 `/narrators/:id`、项目 `/projects/:id`、团队 `/projects/:projectId/teams/:id`），`isTabActive`、行的点击、键盘 Enter（行上的 `data-tab-href`，`navRowHref`）和「在窗口中打开」（`recentTabWindowHref`）都按它。
 - 实时：`recentTabLiveNarratorId` 让团队标签跟随协调者，套接字订阅和运行时读取都带上它（同一个协调者的会话标签与团队标签各占一个键）；套接字补丁对团队标签只取标题和状态（`teamTabPatch`）；协调者状态一变，2 秒后合并重读一次运行时以刷新待批数。提醒（声音、favicon、PWA、`above_idle` 提前）只认会话标签：只固定了团队的人不会因协调者等待而被提醒。
-- 固定按钮：`PinToSidebarButton.tsx`（项目页标题旁、团队页顶栏标题旁、项目团队列表每行；团队只在活跃时给，见[团队页与审批](teams/page.md)）。是否已置顶：标签在侧栏已载入的行里就直接用那一行（`recent-tab-page-pin.ts:loadedSidebarPin`，跟着侧栏即时变）；不在（可能排在第 50 行之后）就用 React Query 读 `GET /recent-tabs/state`（键 `recentTabStateQueryKey`，60 秒内算新鲜），读到之前按钮禁用，免得把已置顶的再置顶一次（`resolvePagePin`）。这个读在三种时候被标为过期（`useRecentTabs.ts:invalidateRecentTabStates`）：任何 delta（本页的写入或别的客户端的 `user:recent_tabs_delta` 帧，都经 `applyRecentTabsDeltaAndFollowUp`）碰到该键；列表因缺口或重连从第一页重载（`refreshRecentTabsLoadedWindow` 的 `reset`、`refreshRecentTabsAfterReconnect`）；按钮自己点完。点了走 `useRecentTabs.ts:setRecentTabPinnedFromPage`（置顶 = 带 `pin: true` 的 upsert，取消 = 普通 unpin，标签留着），失败（含 409 `RECENT_TAB_REFUSED`）弹红色提示。测试 `PinToSidebarButton.test.tsx`。项目列表卡片没有菜单，没加。
+- 固定按钮：`PinToSidebarButton.tsx`（项目页标题旁、团队页顶栏标题旁、项目团队列表每行；团队只在活跃时给，见[团队页与审批](teams/page.md)）。是否已置顶：标签在侧栏已载入的行里就直接用那一行（`recent-tab-page-pin.ts:loadedSidebarPin`，跟着侧栏即时变）；不在（可能排在第 50 行之后）就用 React Query 读 `GET /recent-tabs/state`（键 `recentTabStateQueryKey(userId, key)`，根 `RECENT_TAB_STATE_QUERY_ROOT` = `["user-preferences", "recent-tab-state"]`，60 秒内算新鲜）。这是按用户的数据：键里带用户 id，且挂在 `["user-preferences"]` 下，换账号时 `useAuth.ts:applySession` 与 `useUserPreferences.ts` 的 token 观察者整体移除这一前缀，新账号不会看到上一个账号的置顶状态（测试见 `PinToSidebarButton.test.tsx` 的换账号用例），读到之前按钮禁用，免得把已置顶的再置顶一次（`resolvePagePin`）。这个读在三种时候被标为过期（`useRecentTabs.ts:invalidateRecentTabStates`）：任何 delta（本页的写入或别的客户端的 `user:recent_tabs_delta` 帧，都经 `applyRecentTabsDeltaAndFollowUp`）碰到该键；列表因缺口或重连从第一页重载（`refreshRecentTabsLoadedWindow` 的 `reset`、`refreshRecentTabsAfterReconnect`）；按钮自己点完。点了走 `useRecentTabs.ts:setRecentTabPinnedFromPage`（置顶 = 带 `pin: true` 的 upsert，取消 = 普通 unpin，标签留着），失败（含 409 `RECENT_TAB_REFUSED`）弹红色提示。测试 `PinToSidebarButton.test.tsx`。项目列表卡片没有菜单，没加。
 - 团队标签的图标：协调者的 `NarratorStatusIcon` 加团队角标，成员有待批时右上角显示数量（`RecentTabs.tsx:TeamTabIcon`）；悬停卡片显示同样的状态和待批数。
+- 协调者的会话标签和团队标签可能并排、同名：会话标签保持原样（它的 `represented_narrator_id` 决定通知收件人，不能去掉或合并），行标题后加一个暗色「协调者」小字（`RecentTabs.tsx:RecentTabTitle`，判定 `recent-tabs-utils.ts:isCoordinatorSessionTab` = `narrator` 类型且运行时补丁的 `teamSession` 为真；团队里只有协调者是 primary），悬停卡片多一行说明。`teamSession` 列入 `RECENT_TAB_RUNTIME_KEYS`，列表重取时沿用，标签不闪。
 - `frontend/components/nav/RecentTabs.tsx` 是侧栏主体；拖拽模型 `recent-tab-drag-model.ts`/`recent-tab-drop-target.ts`/`useRecentTabsDrag.ts`，外部拖入 `useRecentTabExternalDrop.ts`，键盘导航 `recent-tab-keyboard-nav.ts`，触摸滑动 `useRowSwipe.tsx`（右滑关闭、左滑开菜单）。
 - 文件夹的折叠/预览/展开是每台设备的显示状态，存 localStorage，不上服务器（`useFolderDisplay.ts`）；预览条数才是文件夹行上的设置（`RECENT_TAB_FOLDER_DEFAULT_PREVIEW` = 3）。
 - 侧栏在会话完成/等待时触发浏览器声音与 PWA 通知；服务器标记了 `backgroundWorkActive` 的 done 转换保持静默，权限等待始终通知（`recent-tabs-logic.ts:isBackgroundWorkSilencedStatus`，`recent-tabs-silence.test.ts`）。

@@ -10,6 +10,7 @@
 
 import {
 	hasDirectorySubtitle,
+	isCoordinatorSessionTab,
 	type RecentTab,
 	type RecentTabViewer,
 } from "@frontend/hooks/recent-tabs-utils";
@@ -21,7 +22,10 @@ import {
 	IconArchive,
 	IconClock,
 	IconCopy,
+	IconFolder,
 	IconFolderPlus,
+	IconHourglass,
+	IconMessages,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
@@ -29,6 +33,7 @@ import {
 	IconShieldQuestion,
 	IconSubtask,
 	IconTerminal2,
+	IconUsersGroup,
 	IconWindowMaximize,
 	IconX,
 } from "@tabler/icons-react";
@@ -96,6 +101,60 @@ function DetailLine({ icon, children }: { icon: React.ReactNode; children: React
 	);
 }
 
+/** A count as shown: `12`, or `12+` when the server's read hit its cap. */
+function countLabel(count: number, capped: boolean | undefined): string {
+	return capped ? `${count}+` : String(count);
+}
+
+/**
+ * A project tab's details (runtime state, `recent-tab-projects.ts`): its directory, the sessions
+ * running or waiting there that this user can read, and its teams. Nothing until the runtime
+ * patch arrives, and nothing for a project the user can no longer read.
+ */
+function ProjectTabDetails({ tab, t }: { tab: RecentTab; t: T }) {
+	const active = tab.activeSessionCount;
+	const waiting = tab.waitingSessionCount ?? 0;
+	const teams = tab.teamCount;
+	const capped = tab.projectCountsCapped;
+	return (
+		<>
+			{tab.projectPath && (
+				<Group gap={6} wrap="nowrap" align="flex-start" data-testid="recent-tab-project-path">
+					<Box style={{ display: "flex", flexShrink: 0, opacity: 0.6, paddingTop: 2 }}>
+						<IconFolder size={12} />
+					</Box>
+					<Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
+						{tab.projectPath}
+					</Text>
+				</Group>
+			)}
+			{typeof active === "number" && (
+				<DetailLine icon={<IconMessages size={12} />}>
+					{active > 0
+						? t("recentTabProjectActiveSessions", {
+								count: active,
+								countLabel: countLabel(active, capped),
+							})
+						: t("recentTabProjectNoActiveSessions")}
+				</DetailLine>
+			)}
+			{waiting > 0 && (
+				<DetailLine icon={<IconHourglass size={12} />}>
+					{t("recentTabProjectWaitingSessions", {
+						count: waiting,
+						countLabel: countLabel(waiting, capped),
+					})}
+				</DetailLine>
+			)}
+			{typeof teams === "number" && teams > 0 && (
+				<DetailLine icon={<IconUsersGroup size={12} />}>
+					{t("recentTabProjectTeams", { count: teams, countLabel: countLabel(teams, capped) })}
+				</DetailLine>
+			)}
+		</>
+	);
+}
+
 /**
  * The details block itself. `compact` drops the title for the menu header, where the
  * row the user swiped is right next to it.
@@ -146,6 +205,12 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 				>
 					{tab.subtitle}
 				</Text>
+			)}
+			{tab.type === "project" && <ProjectTabDetails tab={tab} t={tt} />}
+			{isCoordinatorSessionTab(tab) && (
+				<DetailLine icon={<IconUsersGroup size={12} />}>
+					{tt("recentTabCoordinatorSession")}
+				</DetailLine>
 			)}
 			{pendingApprovals > 0 && (
 				<DetailLine icon={<IconShieldQuestion size={12} />}>
