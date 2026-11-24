@@ -4,6 +4,7 @@ title: Agent Loop
 summary: 一轮请求如何构造历史、流式处理、工具调用与重试。
 anchors:
   - server/lib/agent/loop.ts
+  - server/lib/agent/pending-plan-reflection.ts
   - server/lib/agent/history-build.ts
   - server/lib/agent/pipeline-rules.ts
   - server/lib/agent/pipeline-state.ts
@@ -57,7 +58,7 @@ keywords:
   - 首 token 超时
   - tool-output 截断
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 ---
 # Agent Loop
 
@@ -72,6 +73,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 反思循环（危险操作、ExitPlanMode、任务状态变更）由 `runReflectionLoop` 以嵌套的 `agentLoop` 运行，`maxTurns` 被钳在 1–2，复用父请求的行以保持缓存前缀。
 - 重试（`loop.ts` 的 `chatRetryCount` 循环）：仅无状态提供商在循环内重试同一次 `provider.chat()`；有状态模型（`usesStatefulModel`）或本轮已有图片生成时 `getMaxChatRetries()` 为 0，由外层运行时重放。重试次数来自 `config.maxTransientRetries`（-1 表示无限），退避上限默认 20s。是否可重试由 `error-handling.ts:isRetryableError` 判定：策略违规（policy violation）与 TokenDance 恢复动作一律不重试，排在自定义重试规则之前。
 - 空响应：默认最多重放 3 次；上游已确认服务过的 `usage_only` / `stop_without_content` 只重放 1 次（`loop.ts:maxEmptyResponseRetriesFor`）。畸形请求重放上限 2 次（`MAX_MALFORMED_REPLAYS`）。
+- 按需计划反思：`executeToolAfterReflections` 在 ExitPlanMode 走「本次不反思」分支（且非反思循环内）时，把 `createPendingPlanReflectionRunner` 生成的运行器按 narrator + tool_use 注册到 `pending-plan-reflection.ts`，审批等待结束即注销（闭包持有本轮 `config`/`rows`）。
+- 运行器 `runPendingExitPlanReflection`：只用审批卡已解析的输入；无法形成决策时交回人工（`handOverExitPlanReflection`），不 fail-closed 驳回；等待先被人工决定或本轮中止时，`discardExitPlanReflection` 丢弃合成 gate、不落库覆盖真实记录；登记的 gate 带 `onDemand: true`，审查过程不写 `narrator_tool_calls` 行（那一行仍是人的待批审批），结论只经 `resolvePermission` 落到该行，详见[反思门](../security/tool-permissions/reflection.md)。
 - 辅助 AI 调用（摘要、标题、反思等）的重试次数被硬限在 10（`error-handling.ts:getAuxiliaryMaxRetries`）。
 - 流水线（Pipeline）：`pipeline-rules.ts` 校验并执行对工具输出的类 shell 管道规则，规则 4096 字符、最多 16 条命令、执行预算 250ms、输出 50000 字符；`pipeline-state.ts` 保存每个叙述者的捕获（最多 64 条），有控制工具集合 `isPipelineControlTool`。
 

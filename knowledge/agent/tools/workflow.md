@@ -43,7 +43,7 @@ keywords:
   - expectedRevision
   - missing_working_directory
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 ---
 # 流程与协作工具
 
@@ -51,7 +51,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 关键规则
 - 计划模式（`plan-mode.ts`）：`EnterPlanMode` 带可选 `plan_name`，计划文件落在工作目录 `.narrafork/plans/`（`lib/plan-file-path.ts:PLAN_DIR_REL`）；outline 会话改在会话空间里建或恢复计划根，不写文件（`services/outline-plan-mode`）。
-- `ExitPlanMode` 必填 `mode`：`inline`、`file`、`outline`。声明 `inline` 却无正文即报错，不会去读计划文件；`inline` 还要 `settings.agent.planModeAllowInlinePlan` 开启，内容像路径引用也不算正文。严格计划模式下已有计划文件时拒绝 inline 提交；只有宽松计划模式才采用 `plan_file_path`。缺 `mode` 的旧调用退回按字段推断（`narrator-permission.ts:resolveExitPlanModeInputWithBackend`）。`allowedPrompts` 已退役，不授予任何权限。
+- `ExitPlanMode` 必填 `mode`：`inline`、`file`、`outline`。声明 `inline` 却无正文即报错，不会去读计划文件；`inline` 还要 `settings.agent.planModeAllowInlinePlan` 开启，内容像路径引用也不算正文。严格计划模式下已有计划文件时拒绝 inline 提交；只有宽松计划模式才采用 `plan_file_path`。缺 `mode` 的旧调用退回按字段推断（`narrator-permission.ts:resolveExitPlanModeInputWithBackend`）。`allowedPrompts` 已退役，不授予任何权限。`ExitPlanMode` 挂在审批卡上等人时还可按需触发计划反思，由权限层处理（`narrator-permission.ts:reflectPendingExitPlanMode`，见 [反思门](../../security/tool-permissions/reflection.md)）。
 - `ScheduledTask`：actions 为 list/get/create/update/enable/disable/delete/run_now/runs，`runs` 单页最多 50 条、默认 10；create 必填 name/cronExpr/prompt，校验 cron 与项目上下文，任务以当前用户身份创建。读动作只有 list/get/runs，其余一律视为写：判定在 `narrator-permission.ts`，位于 bypassPermissions 快捷路径之上，所以绕过模式也要确认，readOnly/dontAsk 直接拒绝。
 - `Skill`：按名字（`skill` 或 `name`）加载技能全文，返回 `<skill_content>`、技能目录与附带文件列表；被 trait 屏蔽（`blockedSkills`）的技能报错。可用技能清单以 `<available_skills>` 注入提示词，不含 disabled 与 `allowImplicitInvocation: false` 的技能；清单缓存按技能上下文键存放，会话创建时预热。
 - 知识包 `PackList`/`PackActivate`/`PackDeactivate`：激活把包解压到隔离目录并作为读写白名单登记，与激活记录在同一次存储操作里完成；`settings.knowledge.packActivateRequiresPermission`（默认 true）为真时激活要用户批准。停用删除目录并撤销白名单，没激活也安全。

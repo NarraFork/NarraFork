@@ -15,7 +15,7 @@ keywords:
   - bypassPermissions
   - permission_request
 status: draft
-verified_at: 776dbf07e
+verified_at: 878917e97
 ---
 # 工具调用审批
 
@@ -24,7 +24,7 @@ Agent 每次调用工具前都经过 `narrator-permission.ts:handlePermission`�
 ## 由哪几部分组成
 - **审批流程**：权限模式（`default`、`acceptEdits`、`bypassPermissions`、`readOnly`、`dontAsk`；plan 是 trait，不是模式）与判定顺序；请求挂起后写进 `narrator_tool_calls`（不另设表）；用户经 HTTP 路由或 WebSocket 批准/拒绝；受保护路径和 OAuth 硬上限也在这条线上。
 - **规则与执行策略**：目录/命令的白黑名单（来源 global/project/narrator，带目标选择器）如何存储、编译、改动后失效；Agent 用 `RequestPermissionRule` 为自己申请规则；预置规则；规则管理页。
-- **反思门**：把“先让模型自己复核再打扰人”做成暂停点，有危险反思、任务反思、问题反思三种，另含评审边界。
+- **反思门**：把“先让模型自己复核再打扰人”做成暂停点，有危险反思、任务反思、问题反思三种，另含评审边界；挂在审批卡上的 `ExitPlanMode` 还可按需触发计划反思（「计划反思」按钮）。
 
 ## 怎么配合
 1. 工具调用进入 `handlePermission`，`resolvePermissionDecision` 读取【规则与执行策略】编译出的策略，按固定顺序判定（灾难性命令恒 `fatal`，受保护路径与评审边界先于白名单，目录黑名单先于白名单，然后才是各模式）。
@@ -36,6 +36,7 @@ Agent 每次调用工具前都经过 `narrator-permission.ts:handlePermission`�
 ## 读哪一篇
 - “为什么这个调用被拒/被问”“有哪些模式”“批准接口在哪”“请求有没有超时”→ [审批流程](flow.md)。
 - “怎么加一条白名单”“规则为什么没生效”“Agent 能不能改自己的权限”“robotDiagnostic 预置”→ [规则与执行策略](rules.md)。
+- “计划反思按钮”“按需计划反思”“开关打开后挂起的计划”→ [反思门](reflection.md)。
 - “DangerConfirm 是什么”“危险等级怎么配”“AskUserQuestion 自动作答”“评审边界”→ [反思门](reflection.md)。
 
 ## 不变量

@@ -15,6 +15,7 @@ anchors:
   - server/lib/agent/question-model-input.ts
   - server/lib/agent/strip-plan-body.ts
   - server/lib/agent/tools/exit-plan-reflection.ts
+  - server/lib/agent/pending-plan-reflection.ts
   - server/lib/agent/tools/question.ts
   - server/services/ask-user-question-coerce.ts
   - server/services/ask-user-question-reflection.ts
@@ -36,6 +37,8 @@ keywords:
   - ExitPlanConfirm
   - ExitPlanRevise
   - 计划反思
+  - reflect-plan
+  - planReflectionAvailable
   - 异步提问
   - 顺带提问
   - ask-in-passing
@@ -43,7 +46,7 @@ keywords:
   - .narrafork/plans
   - Question 工具
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 ---
 # 提问与计划模式
 
@@ -64,6 +67,7 @@ Agent 向人提问有两档：同步（阻塞等待）和异步（不停工，�
 - 提问反思：`generateAskUserQuestionAnswers` 用模型根据最近的对话（只取顶层消息，最多 24000 字符）替人回答 `AskUserQuestion`，答案按问题 `header` 为键；`mode: "suggest"`（`POST /:id/suggest-answers`，给人当建议）与 `mode: "reflection"`（权限闸里无人应答时自动代答，`narrator-permission.ts`；`POST /permissions/:requestId/reflect-question` 触发、`disarm-question-reflection` 取消）两种，缺省 reflection（`ask-user-question-reflection.ts`）。入参 `coerceAskQuestions` 把模型传来的各种形状归一为 `header` + `description` + 选项，前后端共用 `shared/ask-user-question-shape.ts`；`ask-user-question-coerce.ts` 无副作用，便于单测。
 - 计划批准归因：批准后的“开始执行”回合以 `role: "user"` 落库，作者按强到弱判定——带反馈文本则归反馈者；有真人批准者 ID 则归他（压过反思标记）；来源是 reflection 则标“计划反思”、无账号；都没有则是系统自动续跑（`plan-approval-attribution.ts:resolvePlanApprovalAttribution`）。
 - 计划反思：spec 会话的计划由反思循环评审，工具为 `ExitPlanConfirm`、`ExitPlanConfirmAndCompact`、`ExitPlanRevise`；outline 会话改用单个评审工具（留评论而非退回），状态 running / awaiting_user / confirmed / cancelled / failed / aborted（`lib/agent/tools/exit-plan-reflection.ts`）。
+- 按需计划反思：反思门没触发、计划已挂在审批卡上时，卡片上的「计划反思」按钮（`POST /permissions/:requestId/reflect-plan`）或把计划反思开关显式置为开，都可对挂起的非 outline `ExitPlanMode` 再跑一次审查，通过后以 `decidedBy: "reflection"` 自动批准（含 `confirm_compact`），要修改则按拒绝带反馈退回；无法判定则仍归人。审查不写人的待批行，运行器只在内存里（`pending-plan-reflection.ts`），重启后恢复出的请求没有按钮。完整规则见 [反思门](../security/tool-permissions/reflection.md)。
 - 模型侧瘦身：文件型 `ExitPlanMode` 的计划全文在重建的模型历史中被短引用句替换，`isModelPlanReference` 等判断前后端共用，卡片遇到引用句要回退显示权威计划正文（`lib/agent/strip-plan-body.ts`、`shared/plan-reference.ts`）；AskUserQuestion 输入/回执投影给模型时只保留作者字段（`lib/agent/question-model-input.ts`）。
 - 历史回退时的提问对账：回退/删除消息时按固定行程序删除对应提问事件、必要时把提问置为 withdrawn（原因 `Question creation was removed from history.`），并取消指向被删消息的缓冲收件；单次最多处理 2048 个提问、4 MiB（`narrator-question-history.ts`，由 `narrator-messages.ts` 与 `revert-history-commit.ts` 调用）。
 - 异步提问路由：`/api/narrators/questions`、`/questions/all`（跨会话收件箱）、`/:id/questions`、`/:id/questions/:questionId` 及 `supplement` / `answer` / `dismiss` / `ignore`；前端 `useAsyncQuestions` 同时刷新会话内表单与全局收件箱，“顺带提问”事件走 `lib/ask-in-passing-events.ts`（start / resolved / deleted）。
@@ -83,3 +87,4 @@ Agent 向人提问有两档：同步（阻塞等待）和异步（不停工，�
 ## 相关
 - [Bot 叙述者](bot.md)
 - [中断与恢复](recovery.md)
+- [反思门](../security/tool-permissions/reflection.md)

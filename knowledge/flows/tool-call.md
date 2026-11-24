@@ -28,7 +28,7 @@ keywords:
   - 审批卡片
   - PreToolUse
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 ---
 # 一次工具调用
 
@@ -37,7 +37,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 路径
 1. 参数流：provider 流式给出 tool_use，`loop.ts` 产出 `tool_use_chunk`；`narrator-event-handler.ts:processEvent` 在 `block_complete` 的 tool 块上经 `writeAttemptItem` 先落一行 `narrator_tool_calls`（初始状态），并广播。见 [消息存储](../narrator/messages/index.md)。
 2. 分组：同一轮的调用经 `groupToolExecutions` 分成并行组与串行屏障；参数流已成形的调用可由 `selectStreamingToolExecutions` 提前启动（`shouldEagerExecuteTool`）。见 [Agent Loop](../agent/loop.md)。
-3. 反思前置：`loop.ts:executeToolAfterReflections` 在进入执行器前处理 ExitPlanMode 的计划反思；反思确认则带 `preGrantedPermission` 直接执行，要人工则走普通审批。
+3. 反思前置：`loop.ts:executeToolAfterReflections` 在进入执行器前处理 ExitPlanMode 的计划反思；反思确认则带 `preGrantedPermission` 直接执行，要人工则走普通审批。计划走到人工审批卡时，`loop.ts` 还为这次等待注册一个按需反思运行器（卡片的「计划反思」按钮经 `POST /api/narrators/permissions/:requestId/reflect-plan` 触发，开关设为 on 时自动触发），结论 confirm 则直接批准、revise 则把反馈退回模型、无法决策则保留审批卡。见 [Agent Loop](../agent/loop.md)。
 4. 准入与查表：`tool-executor.ts:executeTool` 先做更新准入（`preAdmitToolExecution`），再 `toolRegistry.get(name)`；不存在、MCP 工具被禁用或未加载、可选工具未加载，都直接返回错误结果（"Tool is not loaded in this session…"），不进入权限。见 [工具体系](../agent/tools/index.md)。
 5. 冻结执行目标：需要路由的工具在审批**前**解析并持久化 `ToolExecutionTarget`（设备、cwd、规范路径）；审批后返回的输入必须与冻结的目标一致，否则报错。见 [执行后端](../agent/execution.md)。
 6. 权限判定：`config.permissionHandler` → `narrator-permission.ts:handlePermission`，内部 `resolvePermissionDecision` 给出 allow / deny / ask / fatal。见 [工具调用审批](../security/tool-permissions/index.md)。

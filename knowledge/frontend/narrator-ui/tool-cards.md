@@ -40,7 +40,7 @@ keywords:
   - LeakedToolCallModal
   - DiffView
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 ---
 # 工具卡片
 
@@ -62,6 +62,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - 能力不支持（`useNarratorPermissionsCapability` 的 `approveDeny` 为假）或 `readOnly`：只读展示。
   - 决策回调 `onDecision(requestId, "allow"|"deny", feedback?, compactAfter?, updatedPlan?)`；ExitPlanMode 且带反馈文本的允许先弹确认，选“修改”则按 deny 发送。
   - 草稿存 session-store 的 `permission-draft`，决策后清除。
+  - 「计划反思」按钮：`shouldShowPlanReflectButton` 决定是否显示，要求同时满足：有 `onPlanReflect` 回调、`ExitPlanMode`、服务端标了 `planReflectionAvailable`、不是 outline 计划审批（`isOutlinePlanApproval`）、没在编辑、计划没被人改过（改过则审查读到的仍是原提交）。点击调 `onPlanReflect(permission.id)`，回调经 `vlist-permission-bridge` 与全局收件箱（`GlobalQuestionInbox` 的 `api.reflectPlan`）传入。
   - 同一表单承载提问（`onQuestionSubmit/Reflect/Deny/Defer`），Defer 把阻塞的提问转入异步收件箱。
   - 表单交互性强，vlist 不做零 DOM 副本，而是经 `vlist-permission-bridge` 挂真实组件。
 - 按钮条键盘规则（`PermButtonBar.tsx`）：⏎ 高亮与浏览器焦点保持在同一个按钮上；Enter 在活动条上执行高亮决策；焦点在别处自己拥有 Enter 的控件或有模态框时隐藏提示。

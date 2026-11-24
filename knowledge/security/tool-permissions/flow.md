@@ -32,10 +32,12 @@ keywords:
   - /api/narrators/permissions/:requestId/deny
   - /api/narrators/permissions/:requestId/plan
   - /api/narrators/permissions/:requestId/defer
+  - /api/narrators/permissions/:requestId/reflect-plan
+  - planReflectionAvailable
   - 待批权限
   - 应急批准
 status: draft
-verified_at: 776dbf07e
+verified_at: 878917e97
 ---
 # 审批流程
 
@@ -54,7 +56,8 @@ Agent 每次调用工具前都经过 `narrator-permission.ts:handlePermission`�
 - OAuth 任务有运行时权限约束，作为硬上限，不继承宽松计划（`handlePermission` 的 `runtimeConstraint`，`recheckFinalToolExecutionPermission` 在执行前最后复核），约束来源见 [OAuth 服务端](../oauth-api/oauth-server.md)。
 
 ## 审批入口
-- HTTP：`POST /api/narrators/permissions/:requestId/{approve,deny,plan,defer,reflect-question}`；每次决定前都要求对所属叙述者有 write 权限，并在决定时再校验一次（`routes/narrators.ts:prepareDecision`、`assertStillAllowed`）。
+- HTTP：`POST /api/narrators/permissions/:requestId/{approve,deny,plan,defer,reflect-question,reflect-plan}`；每次决定前都要求对所属叙述者有 write 权限，并在决定时再校验一次（`routes/narrators.ts:prepareDecision`、`assertStillAllowed`）。
+- `reflect-plan`：对已挂起的 `ExitPlanMode` 按需启动计划反思，立即返回 `started: true`，不可用时 409；审查结论经 `resolvePermission` 以 `decidedBy: "reflection"` 落到该请求，生效前再复查发起人写权限（见 [反思门](reflection.md)）。`GET /:id/permissions` 对 `ExitPlanMode` 请求附带 `planReflectionAvailable`。
 - approve/deny 路由与 WebSocket 的决定入口（`websocket/narrator-ws.ts`）最终都调用 `resolvePermissionOrDangerReflection(requestId, "allow"|"deny", opts)`：请求挂在待决权限表里就按普通审批解除，挂在危险反思表里则解除反思（反思分支见 [反思门](reflection.md)）。
 - 前端：`hooks/usePermissions.ts` 用 query key `["permissions", narratorId]` 读待审批列表，不轮询；注释称靠 `permission_request` / `permission_resolved` 事件触发失效，`useNarratorPanelWS.ts` 的危险反思开始回调确实会对该 key 调用 `invalidateQueries`，其他事件是否逐一覆盖未核实。
 - `server/scripts/approve-all.ts`（`bun run approve [--watch]`）：前端不可用时的应急脚本。它直接往库里写一条管理员会话（只存令牌哈希，退出时吊销），读出 `narrator_tool_calls` 里待审批的请求，再用该令牌逐个调 `POST /api/narrators/permissions/:id/approve`。它借管理员身份批准所有请求，只用于应急。

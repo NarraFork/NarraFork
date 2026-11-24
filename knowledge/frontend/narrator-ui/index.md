@@ -16,7 +16,7 @@ anchors:
   - frontend/components/narrator/knowledge/
   - frontend/components/narrator/mock/
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 878917e97
 keywords:
   - NarratorPanel
   - useNarratorPanelWS
@@ -46,6 +46,7 @@ keywords:
 
 ## 本节点直接覆盖的部分
 - `narrator-panel-types.ts`：面板对外属性与快照类型；`narrator-panel-overrides.ts`：每叙述者设置的三态（跟随默认 `inherit` / 开 / 关）归一化，未知的存储值回落为“跟随默认”而不是当成显式覆盖；`narrator-panel-visibility.tsx`：嵌套的面板可见性上下文（父级与自身都可见才算可见）。
+- `useNarratorPanelWS.ts:handlePlanReflect`：「计划反思」按钮的回调（`PermissionCallbacks.onPlanReflect`，类型在 `narrator-panel-types.ts`）。调 `api.reflectPlan`，先隐藏按钮、不乐观移除权限；409 时触发面板对账，其他错误恢复按钮并提示 `planReflectFailed`。
 - `panel-source.ts`：给面板源码守卫测试读取源文件的辅助（面板本身无法单元挂载，若干不变量靠读源码断言）；移动 `NarratorPanel.tsx` 前要全仓搜旧路径。
 - `list/`：叙述者列表页的卡片与筛选（`NarratorListCard`、`narrator-list-utils`），被 `routes/narrators/index.tsx`、`archived.tsx` 使用。
 - `knowledge/`：把知识库条目嵌入面板的内容视图（`KnowledgeEntryPanelContent`）。
