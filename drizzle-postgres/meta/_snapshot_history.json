@@ -640,6 +640,14 @@
 			"prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
 			"version": "7",
 			"snapshotDigest": "e4f307ddcee16da5f22769fe557dc9b1889f3af55d102e00a52e36d9bebcc5c4"
+		},
+		{
+			"idx": 80,
+			"tag": "0080_terminal_executor_session",
+			"id": "2d01d23f-bef1-494b-9f01-397c4ed461aa",
+			"prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+			"version": "7",
+			"snapshotDigest": "6333c0c33902a7d0cae1a231be1006d366be62421aace0b9af27ad6e4dc89f98"
 		}
 	]
 }

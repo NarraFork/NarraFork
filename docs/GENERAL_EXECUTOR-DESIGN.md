@@ -150,10 +150,12 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 
 ## 8. NarraFork 侧改造
 
-**远端终端**（第一期第二步）
-- `server/terminal/runtime-remote.ts`：设备支持 `session.durable.v1` 时改用 `session.open` + `session.attach`，记录已消费序号。
-- 终端行记录 `sessionId` 和已消费序号（需要 schema 变更：`terminals` 增加可空列，迁移按 CLAUDE.md 流程生成）。
-- 设备重连（`device-connection-service`）后对每个仍在运行的远端终端发起 `attach(since)`，把补回的字节喂进原 xterm buffer。
+**远端终端**（第一期第二步，已实现）
+- 新运行时 `server/terminal/remote-session.ts`：设备支持 `session.durable.v1` 时 `terminal-service` 改用它（`session.open` + `session.attach`），不支持时仍走 `runtime-remote.ts` 的 `pty.open`。
+- 会话 ID 固定为 `nf-term-<终端id>`，存进新增的可空列 `terminals.executor_session_id`（SQLite 0263、PG 0080）。
+- **已消费序号不存数据库，而是和缓冲快照存在一起**（`.buf` 的 `streamSeq` 字段）：`BufferManager` 只记录 xterm 已解析的位置，所以快照内容和序号严格对应，重启续读不重复、不遗漏。快照没有这个字段时丢弃快照、从 0 重放。
+- 设备断线时等 `device:status` 上线后 `attach(since)` 续读；输入带 `writeId` 顺序发送；设备离线时的 kill 在设备上线后补发。
+- NarraFork 关闭时只脱离、不杀；启动时 `recoverOnStartup` 恢复这些终端（设备不在线也恢复，等设备上线）。
 
 **本地终端**（第二期）
 - NarraFork 启动时查找/拉起本地执行器（决策 1），通过本机回环 + 一次性令牌连接。
@@ -167,7 +169,7 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 
 **第一期：远端执行器的持久会话**
 1. ✅ 执行器端会话核心：进程级会话管理器、内存输出日志与序号、`session.*` 方法、`session.durable.v1` 特性、Go 单元与集成测试。旧方法不动。实现见 `remote-executor/internal/session/`、`remote-executor/internal/handlers/session*.go`；TS 侧协议类型已同步到 `server/lib/agent/execution/rpc-types.ts`。
-2. NarraFork 远端终端改用会话协议：重连后补齐输出；终端行记录会话 ID。
+2. ✅ NarraFork 远端终端改用会话协议：断线/重启后补齐输出；终端行记录会话 ID，续读位置随缓冲快照保存。
 3. 后台 Bash（`kind:"exec"`）走同一会话核心，替换 `exec.start` 的长 RPC。
 4. 日志落盘（§7）。
 

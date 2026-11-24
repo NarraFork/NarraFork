@@ -1,0 +1,1 @@
+ALTER TABLE "terminals" ADD COLUMN "executor_session_id" text;

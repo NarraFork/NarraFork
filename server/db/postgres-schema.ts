@@ -1205,6 +1205,7 @@ export const terminals = pgTable(
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
 		deviceId: text("device_id"),
+		executorSessionId: text("executor_session_id"),
 		status: text("status").notNull().default("running"),
 		exitCode: integer("exit_code"),
 		createdAt: text("created_at").notNull(),
@@ -4600,7 +4601,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1961,
+  "columnCount": 1962,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11351,6 +11352,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "deviceId",
           "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "executorSessionId",
+          "name": "executor_session_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,

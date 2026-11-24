@@ -2161,6 +2161,12 @@ export const terminals = sqliteTable(
 		dtachSocket: text("dtach_socket"),
 		/** Remote executor device this terminal runs on. null → local server. */
 		deviceId: text("device_id"),
+		/**
+		 * Durable executor session (`session.durable.v1`) backing a remote terminal.
+		 * Set: the shell outlives NarraFork and device reconnects, and is resumed by
+		 * id. NULL: a local terminal or a legacy `pty.open` remote terminal.
+		 */
+		executorSessionId: text("executor_session_id"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),

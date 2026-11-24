@@ -18,6 +18,11 @@ import {
 	getDescendantPids,
 	ProcessSnapshot,
 } from "../terminal/dtach-service";
+import {
+	SESSION_DURABLE_FEATURE,
+	spawnRemoteSession,
+	terminalSessionId,
+} from "../terminal/remote-session";
 import type { TerminalRuntime, TerminalSpawnOptions } from "../terminal/runtime";
 import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
@@ -149,6 +154,11 @@ interface ActiveTerminal {
 	terminalId: string;
 	buffer: BufferManager;
 	useDtach: boolean;
+	/**
+	 * Backed by a durable executor session: like dtach, the shell outlives this
+	 * process, so shutdown detaches instead of killing.
+	 */
+	executorSession?: boolean;
 	/** Serializes geometry changes so the emulator resizes before the PTY. */
 	resizeChain?: Promise<void>;
 }
@@ -189,13 +199,74 @@ async function markTerminalExited(
 	});
 }
 
-function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
+function onData(id: string, buffer: BufferManager, data: string | Uint8Array, streamSeq?: number) {
 	const text = typeof data === "string" ? data : new TextDecoder().decode(data);
 	if (text) {
-		buffer.append(text);
+		buffer.append(text, streamSeq);
 		sendToTerminal(id, { type: "output", terminalId: id, data: text });
 		notifyTerminalOutput(id);
 	}
+}
+
+/**
+ * A runtime whose end means the shell itself ended (direct and remote PTYs,
+ * executor sessions). dtach attach processes use monitorAttachProcess instead.
+ */
+function monitorShellExit(terminalId: string, runtime: TerminalRuntime, narratorId: string | null) {
+	runtime.exited.then(async (code) => {
+		const active = activeTerminals.get(terminalId);
+		if (!active || active.runtime !== runtime) return;
+		await active.buffer.dispose();
+		activeTerminals.delete(terminalId);
+		runtime.close();
+		await markTerminalExited(terminalId, code ?? 0, narratorId);
+		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
+		logger.info("Terminal exited", { terminalId, code });
+	});
+}
+
+/**
+ * Resume a remote terminal whose shell lives in a durable executor session.
+ * The snapshot on disk records how much output it contains, so reading resumes
+ * at exactly that byte; a snapshot without that record cannot be matched to the
+ * stream and is replaced by replaying what the device retained. The device may
+ * still be offline: the runtime waits for it and leaves the row running.
+ */
+async function resumeExecutorSession(
+	terminalId: string,
+	deviceId: string,
+	sessionId: string,
+	narratorId: string | null,
+): Promise<void> {
+	if (activeTerminals.has(terminalId)) return;
+	let runtime: TerminalRuntime | undefined;
+	let buffer = createBufferManager(terminalId, undefined, undefined, () => runtime);
+	const loaded = await buffer.loadFromDisk();
+	let since = buffer.restoredStreamSeq;
+	if (loaded && since === undefined) {
+		await buffer.dispose();
+		buffer = createBufferManager(terminalId, undefined, undefined, () => runtime);
+	}
+	since ??= 0;
+	if (activeTerminals.has(terminalId)) {
+		await buffer.dispose();
+		return;
+	}
+	buffer.startPeriodicFlush();
+	const resumed = spawnRemoteSession(deviceId, sessionId, {
+		since,
+		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),
+	});
+	runtime = resumed;
+	activeTerminals.set(terminalId, {
+		runtime: resumed,
+		terminalId,
+		buffer,
+		useDtach: false,
+		executorSession: true,
+	});
+	resetCursorForTerminal(terminalId);
+	monitorShellExit(terminalId, resumed, narratorId);
 }
 
 /**
@@ -338,7 +409,14 @@ async function recoverTerminalsOnStartup(): Promise<void> {
 	const queryStarted = performance.now();
 	const running = await db.query.terminals.findMany({
 		where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-		columns: { id: true, narratorId: true, dtachSocket: true, worktreeResourceId: true },
+		columns: {
+			id: true,
+			narratorId: true,
+			dtachSocket: true,
+			worktreeResourceId: true,
+			deviceId: true,
+			executorSessionId: true,
+		},
 	});
 	const queryMs = Math.round(performance.now() - queryStarted);
 	stats.tracked = running.length;
@@ -349,6 +427,17 @@ async function recoverTerminalsOnStartup(): Promise<void> {
 	await batches(running, (terminal) =>
 		isolated(terminal.id, async () => {
 			if (terminal.worktreeResourceId != null || activeTerminals.has(terminal.id)) return;
+			if (terminal.deviceId && terminal.executorSessionId) {
+				// The shell lives on the device; reattach (or wait for the device).
+				await resumeExecutorSession(
+					terminal.id,
+					terminal.deviceId,
+					terminal.executorSessionId,
+					terminal.narratorId,
+				);
+				stats.recovered++;
+				return;
+			}
 			const state =
 				terminal.dtachSocket && available
 					? await (await getProbe()).check(dtachService.getSocketPath(terminal.id))
@@ -456,6 +545,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 	}
 
 	let remoteShell: string | null = null;
+	let durableRemote = false;
 	if (deviceId) {
 		const device = await requireAuthorizedDeviceForProject(deviceId, projectId);
 		if (!isDeviceOnline(deviceId)) {
@@ -487,6 +577,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 		}
 		cwd = hello?.defaultCwd || device.defaultCwd || "/";
 		remoteShell = hello?.platform.shellPath || device.shellPath || "/bin/sh";
+		durableRemote = deviceHasFeature(capabilities, SESSION_DURABLE_FEATURE);
 	}
 
 	// All remote authorization/capability checks above must finish before any terminal side effect.
@@ -502,8 +593,21 @@ async function createTerminal(opts: CreateTerminalOptions) {
 	const useDtach = !useRemote && (await dtachService.isAvailable());
 
 	let dtachSocket: string | null = null;
+	const executorSessionId = useRemote && durableRemote ? terminalSessionId(id) : null;
 
-	if (useRemote && deviceId && remoteShell) {
+	if (useRemote && deviceId && remoteShell && executorSessionId) {
+		runtime = spawnRemoteSession(deviceId, executorSessionId, {
+			open: {
+				cmd: [remoteShell, "-l"],
+				cwd,
+				env: { HISTFILE: "/dev/null", TERM: "xterm-256color" },
+				cols,
+				rows,
+			},
+			since: 0,
+			onData: (data, streamSeq) => onData(id, buffer, data, streamSeq),
+		});
+	} else if (useRemote && deviceId && remoteShell) {
 		runtime = spawnRemotePty(deviceId, {
 			cmd: [remoteShell, "-l"],
 			cwd,
@@ -571,22 +675,19 @@ async function createTerminal(opts: CreateTerminalOptions) {
 		}
 	}
 
-	activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
+	activeTerminals.set(id, {
+		runtime,
+		terminalId: id,
+		buffer,
+		useDtach,
+		...(executorSessionId ? { executorSession: true } : {}),
+	});
 
 	if (useDtach) {
 		monitorAttachProcess(id, runtime, narratorId ?? null);
 	} else {
-		// Direct mode: process exit means the shell exited
-		runtime.exited.then(async (code) => {
-			const active = activeTerminals.get(id);
-			if (!active) return;
-			await active.buffer.dispose();
-			activeTerminals.delete(id);
-			runtime.close();
-			await markTerminalExited(id, code ?? 0, narratorId ?? null);
-			sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
-			logger.info("Terminal exited", { terminalId: id, code });
-		});
+		// Direct, remote and executor-session modes: runtime exit means the shell exited.
+		monitorShellExit(id, runtime, narratorId ?? null);
 	}
 
 	const [terminal] = await db
@@ -598,6 +699,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 			cwd,
 			dtachSocket,
 			deviceId: deviceId ?? null,
+			executorSessionId,
 			status: "running",
 			createdAt: now,
 		})
@@ -1118,7 +1220,13 @@ export const terminalService = {
 		for (const [id, active] of activeTerminals) {
 			promises.push(
 				(async () => {
-					if (active.useDtach) {
+					if (active.executorSession) {
+						// The shell lives in the executor: save the snapshot (with its stream
+						// position) and stop reading. The row stays running for recovery.
+						await active.buffer.saveToDisk();
+						active.buffer.stopPeriodicFlush();
+						active.runtime.close();
+					} else if (active.useDtach) {
 						// dtach mode: save buffer and close the attach process,
 						// but do NOT kill the dtach session — it should survive restart.
 						// DB status stays "running" so recoverOnStartup can find it.

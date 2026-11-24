@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 147 tables and 1961 columns", () => {
+	test("covers 147 tables and 1962 columns", () => {
 		expect(target.tables.length).toBe(147);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -573,7 +573,7 @@ describe("real schema parity", () => {
 		// Per-user plugin overlay visibility adds user_preferences.hidden_plugin_overlays.
 		// Project teams (P1) add project_teams (9), team_work_items (21) and team_work_events (8).
 		// Ask-in-passing groups add two nullable narrator links.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1961);
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1962);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_preferences")

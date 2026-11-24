@@ -1,6 +1,6 @@
 {
-  "id": "c9d8eed4-015f-4e6c-9274-610534f33c08",
-  "prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
+  "id": "2d01d23f-bef1-494b-9f01-397c4ed461aa",
+  "prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -24832,6 +24832,12 @@
         },
         "device_id": {
           "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "executor_session_id": {
+          "name": "executor_session_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false

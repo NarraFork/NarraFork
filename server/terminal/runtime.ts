@@ -28,5 +28,9 @@ export interface TerminalSpawnOptions {
 	env: Record<string, string | undefined>;
 	cols: number;
 	rows: number;
-	onData: (data: string) => void;
+	/**
+	 * Decoded output. `streamSeq` is the source's byte position after this text,
+	 * for runtimes whose source numbers its output (executor sessions).
+	 */
+	onData: (data: string, streamSeq?: number) => void;
 }
