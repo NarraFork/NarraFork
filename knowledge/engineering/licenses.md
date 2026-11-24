@@ -9,6 +9,7 @@ anchors:
   - server/lib/licenses/__tests__/manifest-extra.test.ts
   - scripts/lib/build-materials.ts
   - frontend/routes/licenses.tsx
+  - frontend/hooks/use-licenses.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

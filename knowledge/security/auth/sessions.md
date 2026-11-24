@@ -11,6 +11,9 @@ anchors:
   - server/lib/manager-token.ts
   - server/websocket/ws-handler.ts
   - server/http-dispatcher.ts
+  - server/lib/auth-read-admission.ts
+  - server/lib/client-ip.ts
+  - server/lib/public-origin.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

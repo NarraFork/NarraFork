@@ -29,3 +29,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [Bot 叙述者](bot.md)：bot trait、聊天房间、Send({ user })、监控视图。
 - [会话运行时](runtime/index.md)：agent-runtime：一次运行怎么被调度和执行，收件箱与唤醒，输出发布，模型历史。
 - [工作区布局](workspaces.md)：多个会话的面板布局：服务端存储、成员、版本号与 409 冲突规则。
+- [动态 Spec](spec.md)：会话的 Spec：spec:// 虚拟文件、任务、提醒、广播与编辑插话，以及行为边界 SOP。
+- [会话导入导出](session-interchange.md)：把会话转换成 Claude Code / Codex 的会话文件，或从它们导入。
+- [会话特性层](traits.md)：trait 层：会话能力与策略的分层叠加、解析与自定义 trait。

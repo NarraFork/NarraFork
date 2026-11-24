@@ -15,6 +15,13 @@ anchors:
   - frontend/components/narrator/useNarratorAsyncQuestionSlots.ts
   - frontend/components/narrator/useToolEditNavigation.tsx
   - frontend/components/narrator/subagent-output-count-store.ts
+  - shared/prefer-open-tool.ts
+  - shared/tool-display-duration.ts
+  - shared/tool-edit-preview.ts
+  - shared/tool-parallel-groups.ts
+  - shared/tool-progress.ts
+  - shared/tool-row-status.ts
+  - shared/tool-shimmer.ts
 keywords:
   - ToolCallInspector
   - ToolCategory

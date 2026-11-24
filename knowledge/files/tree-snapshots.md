@@ -10,6 +10,8 @@ anchors:
   - server/services/tree-snapshot-paths.ts
   - server/services/narrator-tree-snapshot-hooks.ts
   - server/services/tool-edit-preview.ts
+  - server/services/snapshot-capture-receipts.ts
+  - server/services/struct-sed-remote-change.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

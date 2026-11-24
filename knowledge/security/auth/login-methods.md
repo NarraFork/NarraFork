@@ -17,6 +17,14 @@ anchors:
   - server/services/registration-code-service.ts
   - server/lib/ldap/
   - server/services/registration/
+  - frontend/components/settings/RegistrationCodesSection.tsx
+  - frontend/components/settings/StepUpFields.tsx
+  - server/lib/auth-settings.ts
+  - server/lib/oidc.ts
+  - server/lib/validators/auth.ts
+  - server/lib/webauthn-rp.ts
+  - server/lib/webauthn.ts
+  - shared/identity-providers.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

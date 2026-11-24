@@ -7,6 +7,10 @@ anchors:
   - server/routes/mcp.ts
   - shared/mcp-loading-mode.ts
   - server/services/tool-loading-service.ts
+  - frontend/hooks/useMcp.ts
+  - frontend/lib/mcp-import.ts
+  - frontend/lib/mcp-json-draft.ts
+  - frontend/lib/mcp-secrets.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -6,6 +6,9 @@ anchors:
   - server/gateway/
   - server/routes/gateway.ts
   - server/db/schema.ts
+  - frontend/components/settings/GatewaySection.tsx
+  - frontend/routes/settings/gateway.tsx
+  - frontend/routes/settings/integrations.tsx
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

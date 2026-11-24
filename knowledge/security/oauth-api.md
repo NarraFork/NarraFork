@@ -14,6 +14,26 @@ anchors:
   - server/services/oauth-narrator-runtime-policy.ts
   - server/services/oauth-runtime-revocation.ts
   - server/middleware/auth.ts
+  - frontend/lib/api/oauth-apps.ts
+  - frontend/lib/api/oauth-grants.ts
+  - frontend/routes/admin/oauth-apps.tsx
+  - frontend/routes/oauth/authorize.tsx
+  - frontend/routes/settings/connected-apps.tsx
+  - frontend/routes/settings/oauth-apps.tsx
+  - server/lib/integrations/
+  - server/lib/oauth-client-manifest.ts
+  - server/lib/oauth-rate-limit.ts
+  - server/lib/oauth-security-observability.ts
+  - server/lib/validators/external-websocket.ts
+  - server/lib/validators/external.ts
+  - server/lib/validators/integrations.ts
+  - server/routes/integrations.ts
+  - server/services/external-message-projection.ts
+  - server/services/external-resource-service.ts
+  - server/services/oauth-device-runtime-policy.ts
+  - server/services/oauth-resource-access.ts
+  - shared/external/
+  - shared/integrations/
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

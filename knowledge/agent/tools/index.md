@@ -11,6 +11,8 @@ anchors:
   - server/lib/agent/tool-name.ts
   - server/services/tool-loading-service.ts
   - shared/routine-modes.ts
+  - server/lib/agent/tools/learning-guide.ts
+  - server/lib/agent/tools/number-param.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -41,5 +43,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [与人交互的工具](interaction.md)：Notification、Send、ShareFile、GenUI。
 - [流程与协作工具](workflow.md)：计划模式、定时任务、技能、知识包、团队、worktree 与设备切换、回忆、生图。
 - [管理工具](admin.md)：让会话管理 NarraFork 自身的工具：各类 *Admin、插件安装、引导设置。
+- [工具执行日志](execution-log.md)：工具调用的执行日志：记录、游标分页读取与设置页展示。
 
 其余工具（子代理 Task/Agent、知识库读写与审阅、MCP 服务器提供的工具等）不在本层子节点内，分别见 [子代理](../subagents.md)、[MCP 集成](../mcp.md) 等。

@@ -8,6 +8,19 @@ anchors:
   - server/services/file-change-apply-result.ts
   - server/services/file-history-policy.ts
   - shared/file-change-protocol.ts
+  - server/lib/agent/tools/track-file-change.ts
+  - server/lib/fs-write-boundary.ts
+  - server/lib/validators/fs.ts
+  - server/services/file-change-diagnostics.ts
+  - server/services/file-change-execution-segments.ts
+  - server/services/file-change-history-diagnostics.ts
+  - server/services/file-change-identity.ts
+  - server/services/file-change-local-io-evidence.ts
+  - server/services/file-change-local-io.ts
+  - server/services/file-change-merge.ts
+  - server/services/file-change-platform-capability.ts
+  - server/services/file-change-write-footprint.ts
+  - server/services/workspace-context-transition.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -11,6 +11,46 @@ anchors:
   - server/routes/usage-history.ts
   - server/lib/cost-estimate.ts
   - shared/token-accounting.ts
+  - frontend/components/usage-history/
+  - frontend/hooks/useOutputStats.ts
+  - frontend/lib/token-recalculation-api.ts
+  - frontend/lib/usage-cost.ts
+  - frontend/lib/usage-history-api.ts
+  - frontend/lib/usage-history-csv.ts
+  - frontend/lib/usage-history-cursor-window.ts
+  - frontend/lib/usage-history-user.ts
+  - frontend/routes/admin/usage-history.tsx
+  - frontend/routes/settings/usage.tsx
+  - frontend/types/usage-history.ts
+  - server/lib/agent/estimate-json-tokens.ts
+  - server/lib/agent/estimate-tokens.ts
+  - server/lib/agent/request-dump.ts
+  - server/lib/agent/request-json-worker.ts
+  - server/lib/agent/request-json.ts
+  - server/lib/agent/request-url-tracker.ts
+  - server/lib/api-request-tracker.ts
+  - server/lib/model-pricing.ts
+  - server/lib/reference-usage-cost.ts
+  - server/lib/request-recorder-protocol.ts
+  - server/lib/request-recorder-sanitize.ts
+  - server/lib/request-recorder-store.ts
+  - server/lib/request-recorder-worker.ts
+  - server/lib/request-recorder.ts
+  - server/lib/request-source.ts
+  - server/lib/usage-history-cursor.ts
+  - server/lib/usage-tracking.ts
+  - server/lib/validators/token-recalculation.ts
+  - server/routes/request-recordings.ts
+  - server/services/output-stats.ts
+  - server/services/token-recalculation-postgres.ts
+  - server/services/token-recalculation-protocol.ts
+  - server/services/token-recalculation-sqlite.ts
+  - server/services/token-recalculation-worker-client.ts
+  - server/services/token-recalculation-worker.ts
+  - server/services/usage-bucket-sql.ts
+  - shared/request-recording.ts
+  - shared/token-recalculation.ts
+  - shared/usage-time-zone.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

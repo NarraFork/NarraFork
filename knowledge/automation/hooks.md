@@ -7,6 +7,8 @@ anchors:
   - server/services/attention-hook-bridge.ts
   - server/routes/hooks.ts
   - server/services/agent-runtime/orchestrator.ts
+  - frontend/hooks/useHooks.ts
+  - server/lib/validators/hooks.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

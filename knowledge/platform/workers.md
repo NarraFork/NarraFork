@@ -8,6 +8,8 @@ anchors:
   - server/lib/fs-scan-worker/
   - server/db/worker-read.ts
   - server/lib/fs-scan-worker/__tests__/client-failures.test.ts
+  - server/db/worker-read-adapter.ts
+  - server/lib/compiled-worker.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

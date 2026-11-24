@@ -13,6 +13,10 @@ anchors:
   - server/routes/narrators.ts
   - server/websocket/narrator-ws.ts
   - frontend/hooks/useNarratorWS.ts
+  - server/services/tool-edit-preview-reader.ts
+  - server/services/tool-final-start-authorization.ts
+  - server/services/tool-input-stream-source-worker.ts
+  - server/services/tool-input-stream-source.ts
 keywords:
   - 工具调用
   - 权限审批

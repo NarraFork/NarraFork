@@ -3,7 +3,6 @@ id: agent
 title: 代理运行时
 summary: 自定义 Agent Loop、多模型提供商、工具体系、子代理与执行后端。
 anchors:
-  - server/lib/agent/
   - server/lib/agent/index.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
@@ -30,3 +29,5 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [程序化执行与沙箱](programmatic.md)：程序化工具调用、沙箱与 VM 运行时。
 - [用量与费用](usage.md)：api_requests、token 记账、费用、额度。
 - [模型目录与来源](model-catalog.md)：模型卡分层解析、目录更新与本地覆盖、来源组、auto 模型列表。
+- [模型鉴别（ModelTrace）](modeltrace.md)：抽样上游请求、判断模型是否货真价实的打分流程。
+- [供应商余额与额度](provider-quota.md)：各供应商（Codex、Kimi、DeepSeek、OpenCode、NUG 等）的余额、额度查询与缓存。

@@ -10,6 +10,18 @@ anchors:
   - server/lib/plan-file-path.ts
   - shared/question-protocol.ts
   - server/services/__tests__/narrator-question-service.test.ts
+  - frontend/hooks/useAsyncQuestions.ts
+  - frontend/lib/ask-in-passing-events.ts
+  - server/lib/agent/question-model-input.ts
+  - server/lib/agent/strip-plan-body.ts
+  - server/lib/agent/tools/exit-plan-reflection.ts
+  - server/lib/agent/tools/question.ts
+  - server/services/ask-user-question-coerce.ts
+  - server/services/ask-user-question-reflection.ts
+  - server/services/narrator-question-history.ts
+  - server/services/plan-approval-attribution.ts
+  - shared/ask-user-question-shape.ts
+  - shared/plan-reference.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -4,6 +4,7 @@ title: 会话运行时
 summary: agent-runtime：一次运行怎么被调度和执行，收件箱与唤醒，输出发布，模型历史。
 anchors:
   - server/services/agent-runtime/orchestrator.ts
+  - server/lib/validators/runtime-registration.ts
 keywords:
   - agent-runtime
   - startNarratorRun

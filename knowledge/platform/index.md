@@ -32,3 +32,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [终端运行时](terminal.md)：PTY 抽象（Bun.Terminal / bun-pty）、dtach、终端生命周期。
 - [错误与校验](errors-validation.md)：AppError 子类与全局序列化、Zod 校验器目录约定。
 - [实例锁、完整性与重启恢复](instance-recovery.md)：单实例锁、正常关闭标记、SQLite 完整性检查与修复、进程重启和更新后的恢复。
+- [出站网络与代理](network.md)：服务端发出的请求：代理环境变量、TLS 错误、局域网地址、监听地址、诊断信息脱敏。
+- [操作系统集成](os-integration.md)：narrafork:// 在文件管理器中定位、关机与关闭后钩子等与宿主系统打交道的部分。
+- [后端通用工具](utils.md)：没有业务归属的小工具：互斥、HMR 安全的单例、UTF-8 预算、压缩包、slug 等。
+- [无人值守模式](unattended-mode.md)：所有会话空闲后自动关闭 NarraFork 并关机的模式。

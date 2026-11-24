@@ -10,6 +10,26 @@ anchors:
   - server/lib/attachment-staging.ts
   - server/routes/uploads.ts
   - shared/text-file-types.ts
+  - frontend/lib/api/file-references.ts
+  - frontend/lib/api/media-upload-validation.ts
+  - server/lib/agent/file-reference-projection.ts
+  - server/lib/attached-files.ts
+  - server/lib/chat-attachments.ts
+  - server/lib/file-reference-input.ts
+  - server/lib/fs-download-ticket.ts
+  - server/lib/legacy-file-attachments.ts
+  - server/lib/media-uploads.ts
+  - server/lib/uploads.ts
+  - server/lib/validators/file-references.ts
+  - server/routes/fs.ts
+  - server/services/file-clipboard.ts
+  - server/services/file-reference-context.ts
+  - server/services/narrator-media-access.ts
+  - shared/document-file-extensions.ts
+  - shared/file-reference-context.ts
+  - shared/file-reference-display.ts
+  - shared/file-reference-image.ts
+  - shared/media-attachments.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

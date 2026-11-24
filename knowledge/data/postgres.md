@@ -10,6 +10,10 @@ anchors:
   - server/services/postgres-composition.ts
   - server/services/storage/postgres-database-storage.ts
   - server/db/__tests__/sqlite-backend-baseline.test.ts
+  - server/db/backend/
+  - server/db/pg-errors.ts
+  - server/db/pg-retry.ts
+  - server/db/postgres-schema.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

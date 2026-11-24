@@ -11,6 +11,13 @@ anchors:
   - server/services/workspace-modification-view.ts
   - shared/file-change-protocol.ts
   - server/routes/git.ts
+  - frontend/components/git/attribution-label.ts
+  - server/services/attribution-actors.ts
+  - server/services/file-attribution-service.ts
+  - server/services/file-change-physical-audit-worker.ts
+  - server/services/postgres-file-change-blob-catalog.ts
+  - server/services/postgres-file-change-evidence-store.ts
+  - shared/streaming-edit-origin.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

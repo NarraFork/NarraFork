@@ -11,6 +11,23 @@ anchors:
   - server/services/database-cleanup-utils.ts
   - server/services/storage-history-service.ts
   - server/db/backend/sqlite-maintenance.ts
+  - frontend/components/settings/BlockBackfillCard.tsx
+  - frontend/components/settings/StorageRetentionSection.tsx
+  - frontend/components/settings/StorageSection.tsx
+  - frontend/routes/admin/storage.tsx
+  - frontend/routes/settings/storage.tsx
+  - server/db/resource-protection-index.ts
+  - server/lib/agent/disk-safety.ts
+  - server/lib/disk-safety-config.ts
+  - server/lib/disk-safety.ts
+  - server/routes/storage-history.ts
+  - server/services/legacy-request-dump-cleanup.ts
+  - server/services/storage-history-mutations.ts
+  - server/services/storage-history-runtime.ts
+  - server/services/storage-scan-queries.ts
+  - shared/storage-categories.ts
+  - shared/storage-retention.ts
+  - shared/storage-transfer.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

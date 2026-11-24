@@ -9,6 +9,13 @@ anchors:
   - server/lib/browser/
   - server/lib/web-fetch/
   - server/lib/search/router.ts
+  - frontend/hooks/useBrowserSessions.ts
+  - server/lib/agent/tools/browser-memory-profile.ts
+  - server/lib/agent/tools/browser-memory.ts
+  - server/lib/search/
+  - server/services/browser-session-recovery.ts
+  - shared/browser-paths.ts
+  - shared/citations.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -12,6 +12,8 @@ anchors:
   - server/services/narrator-prefix-tool-snapshots.ts
   - shared/prefix-context.ts
   - server/services/narrator-prefix-state.test.ts
+  - server/services/narrator-prefix-snapshot-values.ts
+  - server/services/narrator-prefix-snapshots-worker.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

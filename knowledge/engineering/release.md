@@ -12,6 +12,40 @@ anchors:
   - server/services/update-service.ts
   - server/services/github-release-update.ts
   - shared/update-index.ts
+  - frontend/components/UpdateBadge.tsx
+  - frontend/components/UpdateModal.tsx
+  - frontend/components/VersionUpdateBanner.tsx
+  - frontend/hooks/use-changelogs.ts
+  - frontend/hooks/useUpdateCheck.ts
+  - frontend/hooks/useUpdateSchedule.ts
+  - frontend/hooks/useUpdateSourcePrompt.ts
+  - frontend/lib/update-source.ts
+  - frontend/lib/update-state.ts
+  - frontend/lib/version-match.ts
+  - frontend/lib/version-refresh.ts
+  - frontend/routes/changelog.tsx
+  - frontend/routes/settings/about.tsx
+  - server/lib/changelog.ts
+  - server/lib/net/update-fetch.ts
+  - server/lib/release-baseline.ts
+  - server/lib/update-server-url.ts
+  - server/lib/version.ts
+  - server/lib/zstd-patch.ts
+  - server/routes/changelog.ts
+  - server/routes/update.ts
+  - server/services/github-release-patch-apply.ts
+  - server/services/github-release-patch-planner.ts
+  - server/services/update-mirror-client.ts
+  - shared/helper-distribution.ts
+  - shared/independent-update-mirror.ts
+  - shared/mirror-relay.ts
+  - shared/release-patch.ts
+  - shared/release-version.ts
+  - shared/update-identity.ts
+  - shared/update-index-types.ts
+  - shared/update-server-child-env.ts
+  - shared/update-settings.ts
+  - shared/webdav-transport.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

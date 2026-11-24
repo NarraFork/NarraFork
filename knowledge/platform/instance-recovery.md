@@ -12,6 +12,20 @@ anchors:
   - server/services/update-coordinator.ts
   - tests/server/lib/instance-lock.test.ts
   - server/db/backend/__tests__/sqlite-lifecycle.test.ts
+  - frontend/components/StartupRecoveryAlert.tsx
+  - frontend/hooks/useSystemLifecycleStatus.ts
+  - frontend/lib/api/system-lifecycle.ts
+  - server/db/integrity-probe-worker.ts
+  - server/db/integrity-protocol.ts
+  - server/lib/db-resilience.ts
+  - server/lib/instance-process-identity.ts
+  - server/lib/replacement-launch.ts
+  - server/lib/restart-handoff.ts
+  - server/lib/server-restart.ts
+  - server/lib/shutdown-activity.ts
+  - server/lib/system-lifecycle.ts
+  - server/lib/windows-replacement-process.ts
+  - server/routes/system-lifecycle.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

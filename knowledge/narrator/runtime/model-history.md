@@ -12,6 +12,8 @@ anchors:
   - server/services/agent-runtime/model-history-json.ts
   - server/services/agent-runtime/model-history-fixture.ts
   - server/services/agent-runtime/history.ts
+  - server/lib/model-history-preparation.ts
+  - server/services/narrator-epochs.ts
 keywords:
   - model_history_revision
   - model_history_revision_contracts

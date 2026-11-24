@@ -13,6 +13,13 @@ anchors:
   - server/services/plugin-mcp-adapter.ts
   - server/routes/plugin-ui.ts
   - server/lib/plugins/manifest.ts
+  - server/services/integration-event-dispatcher.ts
+  - server/services/plugin-event-gateway.ts
+  - server/services/plugin-public-api.ts
+  - server/services/plugin-search-source.ts
+  - server/services/plugin-ui-assets.ts
+  - server/services/plugin-ui-session.ts
+  - server/services/user-plugin-theme-service.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

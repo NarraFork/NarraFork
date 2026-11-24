@@ -9,6 +9,10 @@ anchors:
   - server/db/snapshot-build.ts
   - server/routes/storage-transfer.ts
   - server/services/__tests__/data-portability.test.ts
+  - frontend/components/settings/DataPortabilityCard.tsx
+  - frontend/lib/api/storage-transfer.ts
+  - server/db/snapshot-builder-worker.ts
+  - shared/export-turn-range.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

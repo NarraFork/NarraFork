@@ -12,6 +12,21 @@ anchors:
   - server/services/context-ask-service.ts
   - server/services/__tests__/compact-timeout-failure.test.ts
   - server/services/__tests__/compact-queue-drain.test.ts
+  - frontend/components/settings/SummaryModelPickerHost.tsx
+  - frontend/components/settings/SummaryModelPickerModal.tsx
+  - frontend/lib/api/context-composition.ts
+  - frontend/lib/compact-live-stream.ts
+  - server/lib/agent/input-characters.ts
+  - server/lib/agent/tools/context-ask.ts
+  - server/lib/context-characters.ts
+  - server/lib/context-usage-snapshot.ts
+  - server/services/context-composition-projection.ts
+  - server/services/context-display-refiners.ts
+  - server/services/context-numeric-cache.ts
+  - shared/compact-message.ts
+  - shared/context-composition.ts
+  - shared/context-thresholds.ts
+  - shared/context-usage.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

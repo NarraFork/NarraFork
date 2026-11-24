@@ -8,6 +8,16 @@ anchors:
   - server/services/git-identities.ts
   - server/lib/git-identity.ts
   - shared/git-branches.ts
+  - frontend/components/git/GitBranchBar.tsx
+  - frontend/components/git/GitBranchModal.tsx
+  - frontend/components/git/git-branch-list.ts
+  - frontend/components/nav/FolderGitIdentityMenu.tsx
+  - frontend/components/nav/GitIdentityMenuList.tsx
+  - frontend/components/nav/TabGitIdentityMenu.tsx
+  - frontend/components/settings/GitIdentitiesSection.tsx
+  - frontend/hooks/git-identity-query-keys.ts
+  - frontend/hooks/useGitIdentities.ts
+  - frontend/hooks/useGitIdentityVisibility.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

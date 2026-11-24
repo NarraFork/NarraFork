@@ -8,6 +8,15 @@ anchors:
   - server/routes/workspaces.ts
   - shared/workspace-panels.ts
   - frontend/components/dockview/
+  - frontend/components/nav/WorkspaceSwitcher.tsx
+  - frontend/hooks/useWorkspace.ts
+  - frontend/routes/narrators/workspace/$workspaceId.tsx
+  - frontend/routes/windows/workspaces/$workspaceId.tsx
+  - server/lib/validators/workspaces.ts
+  - server/routes/narrator-workspace-context.ts
+  - shared/workspace-context.ts
+  - shared/workspace-directories.ts
+  - shared/workspace-events.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

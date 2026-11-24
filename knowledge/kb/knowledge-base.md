@@ -16,6 +16,41 @@ anchors:
   - server/routes/knowledge.ts
   - server/routes/knowledge-packs.ts
   - server/lib/agent/tools/knowledge.ts
+  - frontend/components/knowledge/CollectionAclPanel.tsx
+  - frontend/components/knowledge/DriftBanner.tsx
+  - frontend/components/knowledge/EntryAclPanel.tsx
+  - frontend/components/knowledge/EntryMetaPanel.tsx
+  - frontend/components/knowledge/PersonalEntryRequests.tsx
+  - frontend/components/knowledge/ReviewScopeNotice.tsx
+  - frontend/components/knowledge/SubmissionAuthorActions.tsx
+  - frontend/components/knowledge/SubmissionBody.tsx
+  - frontend/components/knowledge/SubmissionFindings.tsx
+  - frontend/components/knowledge/SubmissionReviewPanel.tsx
+  - frontend/components/knowledge/SubmissionStatusBadge.tsx
+  - frontend/components/knowledge/SubmissionTimeline.tsx
+  - frontend/components/knowledge/TransferOwnerModal.tsx
+  - frontend/components/knowledge/UserAclModal.tsx
+  - frontend/components/knowledge/admin/
+  - frontend/components/knowledge/browse/
+  - frontend/components/knowledge/editor/
+  - frontend/components/knowledge/entry/
+  - frontend/components/knowledge/personal/
+  - frontend/components/knowledge/request-actions.ts
+  - frontend/components/knowledge/router-links.tsx
+  - frontend/hooks/useKnowledge.ts
+  - frontend/lib/api/knowledge-types.ts
+  - frontend/lib/api/knowledge.ts
+  - frontend/lib/knowledge-admin-nav.ts
+  - frontend/lib/knowledge-browse-search.ts
+  - frontend/lib/knowledge-review-nav.ts
+  - frontend/routes/knowledge/
+  - server/lib/agent/tools/knowledge-edit.ts
+  - server/lib/agent/tools/knowledge-kind.ts
+  - server/lib/agent/tools/knowledge-review.ts
+  - server/lib/pack-archives.ts
+  - server/lib/validators/knowledge-packs.ts
+  - server/lib/validators/knowledge.ts
+  - shared/knowledge-excerpt.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

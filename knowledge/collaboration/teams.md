@@ -9,6 +9,22 @@ anchors:
   - frontend/components/teams/
   - shared/project-teams.ts
   - server/db/schema.ts
+  - frontend/hooks/team-onlooker-refresh.ts
+  - frontend/hooks/useTaskBoard.ts
+  - frontend/hooks/useTeams.ts
+  - frontend/lib/api/teams.ts
+  - frontend/routes/projects/$projectId_.teams.$teamId.tsx
+  - server/lib/agent/tools/team-status.ts
+  - server/lib/coordinator-outputs-path.ts
+  - server/lib/validators/project-teams.ts
+  - server/services/task-source/backend.ts
+  - server/services/task-source/index.ts
+  - server/services/task-source/outline-behavior.ts
+  - server/services/task-source/outline-plugin-rules.ts
+  - server/services/task-source/outline-read.ts
+  - server/services/task-source/outline-views.ts
+  - server/services/task-source/outline.ts
+  - server/services/task-source/types.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

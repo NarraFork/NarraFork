@@ -10,6 +10,20 @@ anchors:
   - server/services/human-attention-service.ts
   - server/routes/notifications.ts
   - shared/notification-center.ts
+  - frontend/components/AppNotifications.tsx
+  - frontend/components/notifications/
+  - frontend/components/settings/NotificationSection.tsx
+  - frontend/hooks/useHumanAttention.ts
+  - frontend/lib/api/integrations.ts
+  - frontend/lib/api/notifications.ts
+  - frontend/lib/notification-sound.ts
+  - frontend/lib/notification.ts
+  - frontend/routes/settings/notifications.tsx
+  - server/lib/validators/notifications.ts
+  - server/routes/notification-sounds.ts
+  - server/services/human-attention-events.ts
+  - server/services/notification-center-maintenance.ts
+  - shared/human-attention.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

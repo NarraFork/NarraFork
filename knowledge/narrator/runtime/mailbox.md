@@ -13,6 +13,13 @@ anchors:
   - server/services/agent-runtime/runtime-queue-port.ts
   - server/services/agent-runtime/postgres-runtime-queue.ts
   - server/services/agent-runtime/read-options.ts
+  - server/services/agent-message-delivery.ts
+  - server/services/agent-message-origin.ts
+  - server/services/parent-inbound-queue.ts
+  - server/services/parent-injection-queue.ts
+  - server/services/send-delivery-resolution.ts
+  - shared/agent-inbox.ts
+  - shared/buffer-queue-mode.ts
 keywords:
   - narrator_buffered_messages
   - MAILBOX_LIMITS

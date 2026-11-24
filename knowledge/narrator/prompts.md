@@ -10,6 +10,19 @@ anchors:
   - server/services/narrator-session.ts
   - server/services/__tests__/narrator-prompt.test.ts
   - server/services/__tests__/narrator-injection.test.ts
+  - frontend/hooks/usePromptLibrary.ts
+  - server/lib/agent/sender-context.ts
+  - server/lib/agent/sender-projection.ts
+  - server/lib/global-prompt-paths.ts
+  - server/lib/injection-cadence.ts
+  - server/lib/instruction-file-cache.ts
+  - server/lib/prompt-i18n.ts
+  - server/lib/sidecar-templates.ts
+  - server/routes/prompt-library.ts
+  - server/routes/prompt-optimize.ts
+  - server/services/prompt-library.ts
+  - shared/native-injection.ts
+  - shared/sidecar-body.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -13,6 +13,10 @@ anchors:
   - server/services/plugin-provider-config-service.ts
   - server/services/plugin-provider-proxy-policy.ts
   - server/main.ts
+  - server/lib/agent/remote-provider-adapter.ts
+  - server/services/plugin-provider-model-source.ts
+  - server/services/plugin-provider-rpc.ts
+  - shared/apikey-quota-plugin.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

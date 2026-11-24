@@ -7,6 +7,11 @@ anchors:
   - server/routes/terminals.ts
   - server/services/terminal-service.ts
   - server/websocket/terminal-ws.ts
+  - frontend/hooks/useTerminals.ts
+  - frontend/lib/api/terminals.ts
+  - frontend/routes/admin/terminals.tsx
+  - frontend/routes/settings/terminals.tsx
+  - server/lib/validators/terminals.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

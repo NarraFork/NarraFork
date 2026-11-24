@@ -8,6 +8,7 @@ anchors:
   - vscode-extension/src/discovery.ts
   - vscode-extension/src/panel.ts
   - server/lib/cors-origin.ts
+  - frontend/lib/host-bridge.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -11,6 +11,10 @@ anchors:
   - frontend/build/remote-boundaries.ts
   - frontend/remote/
   - frontend/public/
+  - frontend/lib/build-target.ts
+  - frontend/lib/remote-resource-policy.ts
+  - server/lib/branding/
+  - server/lib/spa-base-href.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

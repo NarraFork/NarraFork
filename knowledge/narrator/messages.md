@@ -10,6 +10,31 @@ anchors:
   - server/db/schema.ts
   - server/services/__tests__/narrator-block-page.test.ts
   - server/services/__tests__/narrator-messages-history.test.ts
+  - frontend/lib/api/narrator-timeline.ts
+  - frontend/lib/block-protocol.ts
+  - server/lib/message-language-read.ts
+  - server/lib/narrator-bodies.ts
+  - server/lib/narrator-body-length.ts
+  - server/lib/validators/narrator-timeline.ts
+  - server/routes/narrator-timeline.ts
+  - server/scripts/benchmark-narrator-history.ts
+  - server/services/narrator-conversation-identity.ts
+  - server/services/narrator-display-page-reader.ts
+  - server/services/narrator-export.ts
+  - server/services/narrator-history-token-estimate.ts
+  - server/services/narrator-message-count.ts
+  - server/services/narrator-persistence.ts
+  - server/services/narrator-refs-backfill.ts
+  - server/services/narrator-reply-context.ts
+  - server/services/narrator-store.ts
+  - server/services/narrator-surface-reads.ts
+  - server/services/narrator-tool-detail.ts
+  - server/services/narrator-turn-timing.ts
+  - server/services/narrator-turns.ts
+  - shared/message-origin.ts
+  - shared/narrator-blocks/
+  - shared/narrator-timeline.ts
+  - shared/reply-context.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

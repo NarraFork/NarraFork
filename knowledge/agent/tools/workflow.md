@@ -14,6 +14,15 @@ anchors:
   - server/lib/agent/tools/recall.ts
   - server/lib/agent/tools/image-gen.ts
   - server/services/narrator-permission.ts
+  - server/lib/agent/image-generation-api.ts
+  - server/lib/agent/image-generation-response-protocol.ts
+  - server/lib/agent/image-generation-response-worker.ts
+  - server/lib/agent/image-generation-response.ts
+  - server/lib/agent/image-generation.ts
+  - server/lib/agent/recall-tool-summary.ts
+  - server/lib/agent/tools/switch-working-directory.ts
+  - server/lib/agent/tools/working-directory-recovery.ts
+  - server/lib/validators/workspace-context.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

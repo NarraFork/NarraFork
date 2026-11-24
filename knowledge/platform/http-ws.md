@@ -3,13 +3,13 @@ id: platform.http-ws
 title: HTTP 路由与 WebSocket
 summary: Hono 路由注册、鉴权中间件、请求分发、WebSocket 订阅模型。
 anchors:
-  - server/routes/
   - server/websocket/
   - server/http-dispatcher.ts
   - server/middleware/
   - server/app.ts
   - server/websocket/ws-handler.ts
   - server/http-request-lifecycle.ts
+  - server/lib/validators/websocket.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

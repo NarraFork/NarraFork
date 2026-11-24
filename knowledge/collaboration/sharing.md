@@ -9,6 +9,20 @@ anchors:
   - server/routes/public-narrator-shares.ts
   - server/routes/shares.ts
   - server/lib/shares.ts
+  - frontend/components/public-share/
+  - frontend/hooks/useNarratorPublicShares.ts
+  - frontend/hooks/usePublicSharedNarrator.ts
+  - frontend/lib/public-share-api.ts
+  - frontend/lib/public-share-session.ts
+  - frontend/routes/shared.narrators.$shareId.tsx
+  - server/lib/share-preview-html.ts
+  - server/lib/share-preview-worker.ts
+  - server/lib/svg-sanitize.ts
+  - server/lib/validators/public-narrator-shares.ts
+  - server/services/public-narrator-share-gen-ui.ts
+  - server/services/public-narrator-share-rate-limit.ts
+  - shared/public-narrator-share.ts
+  - shared/share-preview.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

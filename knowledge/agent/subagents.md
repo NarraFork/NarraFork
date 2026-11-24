@@ -11,6 +11,36 @@ anchors:
   - server/services/delegation-depth.ts
   - server/services/agent-runtime/policy.ts
   - server/lib/agent/fork-narrator-depth.ts
+  - frontend/hooks/useCustomSubagents.ts
+  - frontend/hooks/useSubagentOutputCounts.ts
+  - server/lib/validators/subagent-models.ts
+  - server/routes/custom-subagents.ts
+  - server/services/agent-resource-caps.ts
+  - server/services/legacy-delegation-materializer.ts
+  - server/services/narrator-runtime-registration.ts
+  - server/services/nested-subagent-routing.ts
+  - server/services/subagent-activity.ts
+  - server/services/subagent-alias.ts
+  - server/services/subagent-communication-policy.ts
+  - server/services/subagent-execution-boundary.ts
+  - server/services/subagent-executor.ts
+  - server/services/subagent-extract.ts
+  - server/services/subagent-file-changes.ts
+  - server/services/subagent-knowledge-injection.ts
+  - server/services/subagent-label.ts
+  - server/services/subagent-model-switch.ts
+  - server/services/subagent-model.ts
+  - server/services/subagent-nested.ts
+  - server/services/subagent-takeover-broadcast.ts
+  - server/services/subagent-team.ts
+  - server/services/subagent-terminals.ts
+  - server/services/subagent-tools.ts
+  - shared/agent-reference.ts
+  - shared/subagent-model-policy.ts
+  - shared/subagent-nested.ts
+  - shared/subagent-output-counts.ts
+  - shared/subagent-result-text.ts
+  - shared/subagent-tool-summary.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

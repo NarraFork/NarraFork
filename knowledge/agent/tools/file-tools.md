@@ -12,6 +12,13 @@ anchors:
   - server/lib/agent/tools/struct-sed/
   - server/lib/agent/structural/
   - server/services/file-change-runtime.ts
+  - frontend/components/settings/StructuralGrammarsSection.tsx
+  - server/lib/agent/tools/encoding-core.ts
+  - server/lib/agent/tools/encoding.ts
+  - server/lib/agent/tools/file-diff-stats.ts
+  - server/lib/ripgrep.ts
+  - server/lib/vfs-grep.ts
+  - server/services/file-read-snapshots.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

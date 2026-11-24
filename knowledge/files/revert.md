@@ -11,6 +11,19 @@ anchors:
   - server/services/revert-blockers.ts
   - server/services/narrator-scoped-revert.ts
   - server/services/file-history-policy.ts
+  - frontend/lib/revert-result.ts
+  - frontend/lib/revert-warnings.ts
+  - server/services/file-change-local-restore.ts
+  - server/services/file-change-reversal.ts
+  - server/services/file-snapshot-service.ts
+  - server/services/file-state-rebuild.ts
+  - server/services/postgres-revert-journal-store.ts
+  - server/services/postgres-revert-plan-store.ts
+  - server/services/revert-planner-local-access.ts
+  - server/services/revert-planner-service.ts
+  - server/services/revert-transaction-manifest-worker.ts
+  - server/services/revert-transaction-worker-protocol.ts
+  - server/services/revert-transaction-worker.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

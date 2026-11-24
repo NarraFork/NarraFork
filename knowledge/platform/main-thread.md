@@ -9,6 +9,9 @@ anchors:
   - server/lib/event-loop-monitor.ts
   - server/lib/spawn.ts
   - server/websocket/git-workspace-ws.ts
+  - server/lib/read-fanout-diagnostics.ts
+  - server/lib/read-file-capped.ts
+  - server/lib/sql-trace.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

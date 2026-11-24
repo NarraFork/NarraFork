@@ -10,6 +10,25 @@ anchors:
   - server/lib/agent/tools/request-permission-rule.ts
   - server/lib/permission-modes.ts
   - server/routes/narrators.ts
+  - frontend/components/permissions/
+  - frontend/hooks/usePermissions.ts
+  - frontend/lib/localize-danger-copy.ts
+  - frontend/routes/routines/tool-permissions.tsx
+  - server/lib/agent/tools/reflection-description.ts
+  - server/lib/agent/tools/task-reflection.ts
+  - server/lib/boolean-override.ts
+  - server/lib/fs-secret-paths.ts
+  - server/lib/robot-diagnostic-policy.ts
+  - server/lib/validators/diagnostics.ts
+  - server/lib/validators/permission-rule-requests.ts
+  - server/scripts/approve-all.ts
+  - server/services/narrator-review-boundary.ts
+  - server/services/pending-permission-visibility.ts
+  - server/services/permission-rule-service.ts
+  - server/services/reflection-broadcast.ts
+  - shared/danger-copy.ts
+  - shared/permission-policy-events.ts
+  - shared/permission-rule-request.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

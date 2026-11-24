@@ -7,6 +7,32 @@ anchors:
   - shared/recent-tabs.ts
   - server/routes/user-preferences.ts
   - server/db/schema.ts
+  - frontend/components/nav/NarratorStatusIcon.tsx
+  - frontend/components/nav/RecentTabBackgroundBubble.tsx
+  - frontend/components/nav/RecentTabDetailCard.tsx
+  - frontend/components/nav/RecentTabDropIndicator.tsx
+  - frontend/components/nav/RecentTabFolderEditModal.tsx
+  - frontend/components/nav/RecentTabFolderRows.tsx
+  - frontend/components/nav/RecentTabMenu.tsx
+  - frontend/components/nav/RecentTabs.tsx
+  - frontend/components/nav/narrator-status-icon-logic.ts
+  - frontend/components/nav/recent-tab-drag-model.ts
+  - frontend/components/nav/recent-tab-drop-target.ts
+  - frontend/components/nav/recent-tab-folder-icons.ts
+  - frontend/components/nav/recent-tab-hover.ts
+  - frontend/components/nav/recent-tab-keyboard-nav.ts
+  - frontend/components/nav/recent-tab-new-session.ts
+  - frontend/components/nav/recent-tabs-logic.ts
+  - frontend/components/nav/useRecentTabExternalDrop.ts
+  - frontend/components/nav/useRecentTabsDrag.ts
+  - frontend/components/nav/useRowSwipe.tsx
+  - frontend/hooks/recent-tab-folders.ts
+  - frontend/hooks/recent-tabs-utils.ts
+  - frontend/hooks/useFolderDisplay.ts
+  - frontend/hooks/useRecentTabKeyboardNav.ts
+  - frontend/hooks/useRecentTabs.ts
+  - frontend/hooks/useRecentTabsWS.ts
+  - shared/recent-tab-layout.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

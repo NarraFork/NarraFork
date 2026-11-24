@@ -10,6 +10,15 @@ anchors:
   - server/services/narrator-worktree-journal.ts
   - server/lib/agent/tools/worktree.ts
   - server/routes/narrator-worktrees.ts
+  - server/lib/validators/narrator-worktrees.ts
+  - server/services/legacy-chapter-resource-cleanup.ts
+  - server/services/narrator-worktree-runtime.ts
+  - server/services/resource-protection-index.ts
+  - server/services/worktree-lifecycle-guard.ts
+  - server/services/worktree-resource-metadata-store.ts
+  - server/services/worktree-resource-owner.ts
+  - shared/fork-worktree-source.ts
+  - shared/narrator-worktrees.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

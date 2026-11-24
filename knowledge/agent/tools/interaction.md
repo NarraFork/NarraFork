@@ -9,6 +9,18 @@ anchors:
   - server/lib/agent/tools/gen-ui.ts
   - server/services/notification-service.ts
   - server/services/bot-chat.ts
+  - frontend/components/gen-ui/
+  - server/routes/gen-ui.ts
+  - server/services/agent-communication.ts
+  - server/services/gen-ui/
+  - server/services/legacy-send-await.ts
+  - shared/communication-tool.ts
+  - shared/gen-ui-files.ts
+  - shared/gen-ui-kit.ts
+  - shared/gen-ui-markup.ts
+  - shared/gen-ui-preview-shell.ts
+  - shared/gen-ui-public.ts
+  - shared/gen-ui-tool-policy.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

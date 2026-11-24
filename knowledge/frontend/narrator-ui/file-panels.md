@@ -9,6 +9,8 @@ anchors:
   - frontend/components/narrator/file-viewer/
   - frontend/components/narrator/file-panel/
   - shared/editor-document.ts
+  - frontend/hooks/useGenUI.ts
+  - frontend/lib/reveal-directory.ts
 keywords:
   - FileEditorContent
   - MonacoEditor

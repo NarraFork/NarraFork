@@ -18,6 +18,8 @@ anchors:
   - server/services/agent-runtime/prepare-prefix-request.ts
   - server/services/agent-runtime/finalization-reads.ts
   - server/services/agent-runtime/prompt-characters.ts
+  - server/services/turn-continuation-decisions.ts
+  - server/services/turn-continuation-registry.ts
 keywords:
   - startNarratorRun
   - runAgentLoopUnlocked

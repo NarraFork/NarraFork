@@ -11,6 +11,24 @@ anchors:
   - frontend/components/narrator/CreateNarratorLazyModal.tsx
   - frontend/components/narrator/ProjectPromptModal.tsx
   - frontend/components/narrator/NarratorInteractionArea.tsx
+  - frontend/hooks/useCommands.ts
+  - frontend/hooks/useInputHistory.ts
+  - frontend/hooks/useInputMenu.ts
+  - frontend/hooks/usePromptOptimize.ts
+  - frontend/hooks/usePromptOptimizeTask.ts
+  - frontend/hooks/useResizableBottomSpacing.ts
+  - frontend/lib/composer-append-queue.ts
+  - frontend/lib/dashboard-composer-focus.ts
+  - frontend/lib/image-actions.ts
+  - frontend/lib/prompt-optimize-tasks.ts
+  - server/lib/composer-document.ts
+  - server/lib/speech-settings.ts
+  - server/lib/validators/speech-requests.ts
+  - server/lib/validators/speech.ts
+  - server/routes/speech.ts
+  - server/services/speech/
+  - shared/composer-document.ts
+  - shared/speech.ts
 keywords:
   - NarratorComposer
   - InlineComposerEditor

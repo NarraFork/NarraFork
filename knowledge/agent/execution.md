@@ -6,6 +6,10 @@ anchors:
   - server/lib/agent/execution/
   - server/lib/agent/tool-executor.ts
   - server/services/device-connection-service.ts
+  - server/lib/platform-path.ts
+  - server/lib/runtime-source.ts
+  - server/lib/runtime-target.ts
+  - server/lib/tool-execution-target-projection.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

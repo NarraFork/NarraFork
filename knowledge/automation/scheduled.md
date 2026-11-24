@@ -8,6 +8,15 @@ anchors:
   - server/services/scheduled-task-cleanup.ts
   - server/routes/scheduled-tasks.ts
   - server/db/schema.ts
+  - frontend/hooks/useScheduledTasks.ts
+  - frontend/lib/api/scheduled-tasks.ts
+  - frontend/lib/cron-presets.ts
+  - frontend/routes/scheduled-tasks/$taskId.tsx
+  - frontend/routes/scheduled-tasks/index.tsx
+  - server/lib/cron.ts
+  - server/lib/validators/scheduled-tasks.ts
+  - shared/scheduled-task-cleanup.ts
+  - shared/scheduled-task-run-context.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

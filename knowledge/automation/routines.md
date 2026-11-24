@@ -8,6 +8,9 @@ anchors:
   - server/routes/routines.ts
   - server/lib/builtin-routines.ts
   - server/services/tool-loading-service.ts
+  - frontend/hooks/useRoutines.ts
+  - frontend/routes/routines/index.tsx
+  - server/routes/narrator-manual-resources.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

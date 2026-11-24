@@ -12,6 +12,8 @@ anchors:
   - frontend/vite.config.ts
   - frontend/vite.remote.config.ts
   - frontend/build/
+  - shared/build-repository.ts
+  - shared/windows-pe.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -13,6 +13,32 @@ anchors:
   - server/lib/agent/execution/device-auth.ts
   - server/lib/agent/execution/rpc-types.ts
   - remote-executor/
+  - frontend/components/settings/DevicePathRulesEditor.tsx
+  - frontend/components/settings/ExecutorInstallModal.tsx
+  - frontend/components/settings/executor-install-command.ts
+  - frontend/lib/api/devices.ts
+  - frontend/lib/device-config.ts
+  - frontend/lib/device-install-url.ts
+  - frontend/routes/settings/devices.tsx
+  - server/lib/agent/tools/transfer-file.ts
+  - server/lib/agent/tools/transfer-progress.ts
+  - server/lib/crc32c.ts
+  - server/lib/device-url.ts
+  - server/lib/executor-binaries.ts
+  - server/lib/executor-bootstrap-ticket.ts
+  - server/lib/executor-enrollment-policy.ts
+  - server/lib/executor-install-ca.ts
+  - server/lib/executor-install-script.ts
+  - server/lib/helper-binaries.ts
+  - server/lib/helper-binary-platform.ts
+  - server/lib/helper-distribution-runtime.ts
+  - server/lib/validators/devices.ts
+  - shared/executor-path-rules.ts
+  - shared/remote-executor-manifest.ts
+  - shared/remote-executor.ts
+  - shared/remote-peer-distribution.ts
+  - shared/remote-peer-manifest.ts
+  - shared/remote-peer.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -10,6 +10,8 @@ anchors:
   - server/services/skill-write-scope.ts
   - server/routes/skills.ts
   - server/lib/agent/tools/skill.ts
+  - frontend/hooks/useSkills.ts
+  - server/lib/validators/skills.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

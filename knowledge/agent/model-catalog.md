@@ -10,6 +10,48 @@ anchors:
   - server/routes/model-catalog.ts
   - server/routes/sourcing.ts
   - shared/model-catalog/resolve.ts
+  - frontend/components/providers/AutoParticipationSwitch.tsx
+  - frontend/components/providers/ContextWindowField.tsx
+  - frontend/components/providers/InlineCustomModels.tsx
+  - frontend/components/providers/ModelList.tsx
+  - frontend/components/providers/ModelOverviewTab.tsx
+  - frontend/components/providers/ModelProtocolSelect.tsx
+  - frontend/components/providers/ModelRow.tsx
+  - frontend/components/providers/ModelTestDialog.tsx
+  - frontend/components/providers/auto-participation.ts
+  - frontend/components/settings/BrokenModelMigrationHost.tsx
+  - frontend/components/settings/BrokenModelMigrationModal.tsx
+  - frontend/components/settings/ModelAggregationsSection.tsx
+  - frontend/components/settings/ModelCatalogSection.tsx
+  - frontend/components/settings/ModelOverrideEditor.tsx
+  - frontend/components/settings/ModelsSection.tsx
+  - frontend/components/settings/broken-model-selection.ts
+  - frontend/hooks/useModelCatalog.ts
+  - frontend/hooks/useModels.ts
+  - frontend/lib/api/model-catalog.ts
+  - frontend/lib/api/sourcing.ts
+  - frontend/lib/model-network-error.ts
+  - frontend/lib/model-search.ts
+  - frontend/lib/nug-model-refresh.ts
+  - frontend/routes/settings/models.tsx
+  - server/lib/agent/auto-route-signals.ts
+  - server/lib/fast-mode.ts
+  - server/lib/nug-availability-poller.ts
+  - server/lib/nug-model-availability.ts
+  - server/lib/nug-model-cache.ts
+  - server/lib/nug-model-refresh-coordinator.ts
+  - server/lib/nug-model-sync.ts
+  - server/services/aggregation-migration-service.ts
+  - server/services/auto-sticky-source.ts
+  - server/services/broken-model-migration-service.ts
+  - server/services/provider-prefix-migration-service.ts
+  - shared/auto-model.ts
+  - shared/auto-route-strategy.ts
+  - shared/model-catalog/
+  - shared/model-context-window.ts
+  - shared/model-id.ts
+  - shared/model-inheritance.ts
+  - shared/sourcing/
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

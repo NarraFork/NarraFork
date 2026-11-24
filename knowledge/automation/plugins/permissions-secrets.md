@@ -12,6 +12,23 @@ anchors:
   - server/services/plugin-manager.ts
   - server/lib/plugins/permissions.ts
   - server/routes/plugins.ts
+  - server/lib/plugin-credentials.ts
+  - server/lib/secret-store.ts
+  - server/scripts/repair-plugin-authority.ts
+  - server/services/integration-audit-service.ts
+  - server/services/integration-authority-invalidation.ts
+  - server/services/integration-authority-service.ts
+  - server/services/integration-authorization-service.ts
+  - server/services/integration-resource-binding-service.ts
+  - server/services/integration-resource-service.ts
+  - server/services/integration-summary-service.ts
+  - server/services/plugin-command-config-writes.ts
+  - server/services/plugin-command-secret-writes.ts
+  - server/services/plugin-host-dispatcher.ts
+  - server/services/plugin-host-services.ts
+  - server/services/plugin-integration-authority-service.ts
+  - server/services/plugin-lifecycle-revoke-coordinator.ts
+  - server/services/plugin-sbom.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

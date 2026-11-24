@@ -24,6 +24,15 @@ anchors:
   - frontend/components/narrator/OutlineDrawerHost.tsx
   - frontend/components/narrator/details-panel-lifecycle.tsx
   - frontend/components/narrator/ManualResourceForms.tsx
+  - frontend/hooks/narrator-toolbar-layout.ts
+  - frontend/hooks/useFirstScreenActivity.ts
+  - frontend/hooks/useNarratorToolbarLayout.ts
+  - frontend/hooks/useSpec.ts
+  - frontend/hooks/useSpecImport.ts
+  - frontend/hooks/useSpecLoss.ts
+  - frontend/lib/narrator-loading-metrics.ts
+  - frontend/lib/narrator-panel-state.ts
+  - shared/narrator-toolbar.ts
 keywords:
   - NarratorDock
   - dockview

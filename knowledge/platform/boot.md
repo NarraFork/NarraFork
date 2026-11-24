@@ -11,6 +11,25 @@ anchors:
   - server/lib/startup-status/
   - server/dev-all.ts
   - server/db/index.ts
+  - frontend/components/SystemMaintenanceBadge.tsx
+  - frontend/components/settings/RuntimeSection.tsx
+  - frontend/components/settings/SystemShutdownCard.tsx
+  - server/lib/db-reader-readiness.ts
+  - server/lib/db-reader-startup.ts
+  - server/lib/http-listener-rebind.ts
+  - server/lib/logger.ts
+  - server/lib/manager-control-server.ts
+  - server/lib/open-frontend.ts
+  - server/lib/platform.ts
+  - server/lib/startup-readiness.ts
+  - server/lib/windows-excluded-ports.ts
+  - server/routes/dependencies.ts
+  - server/routes/diagnostics.ts
+  - server/routes/runtime.ts
+  - server/services/dependency-service.ts
+  - server/services/system-lifecycle-service.ts
+  - shared/server-host.ts
+  - shared/startup-status.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

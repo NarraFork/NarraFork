@@ -13,6 +13,30 @@ anchors:
   - server/services/narrator-subagent.ts
   - server/services/workspace-context-service.ts
   - server/db/schema.ts
+  - frontend/hooks/useNamedNarrator.ts
+  - frontend/hooks/useNarrator.ts
+  - frontend/hooks/useNarratorReadable.ts
+  - frontend/hooks/useWorkspaceContext.ts
+  - frontend/lib/agent-reference-store.ts
+  - frontend/lib/api/narrators.ts
+  - frontend/lib/api/workspace-context.ts
+  - frontend/routes/narrators/
+  - frontend/types/narrator.ts
+  - server/lib/narrator-utils.ts
+  - server/lib/validators/manual-narrator-resources.ts
+  - server/lib/validators/narrators.ts
+  - server/services/command-service.ts
+  - server/services/narrator-composer-document.ts
+  - server/services/narrator-cwd.ts
+  - server/services/narrator-draft-service.ts
+  - server/services/narrator-fast-mode.ts
+  - server/services/narrator-navigation-summary.ts
+  - server/services/narrator-panel-state.ts
+  - server/services/narrator-timeline.ts
+  - server/services/narrator-title.ts
+  - server/services/standalone-narrator-cwd.ts
+  - shared/narrator-handle.ts
+  - shared/narrator-limits.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

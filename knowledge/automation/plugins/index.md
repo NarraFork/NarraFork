@@ -11,6 +11,14 @@ anchors:
   - server/routes/plugins.ts
   - server/routes/plugin-ui.ts
   - server/services/plugin-platform-services.ts
+  - frontend/components/plugins-admin/
+  - frontend/components/settings/PluginOverlaySettings.tsx
+  - frontend/hooks/usePluginEventRefresh.ts
+  - frontend/hooks/usePlugins.ts
+  - frontend/lib/api/plugins.ts
+  - frontend/routes/settings/plugins.$pluginId.tsx
+  - frontend/routes/settings/plugins.index.tsx
+  - frontend/routes/settings/plugins.tsx
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

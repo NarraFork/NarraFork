@@ -7,6 +7,37 @@ anchors:
   - server/lib/narrafork-home.ts
   - server/lib/settings-file-lock.ts
   - server/db/connection.ts
+  - frontend/components/DataDirectorySecurityAlert.tsx
+  - frontend/components/settings/AboutSection.tsx
+  - frontend/components/settings/ServerSystemSection.tsx
+  - frontend/components/settings/SetupAssistantAuthorizationModal.tsx
+  - frontend/components/settings/SetupWizard.tsx
+  - frontend/components/settings/TlsSection.tsx
+  - frontend/hooks/useInstanceSettings.ts
+  - frontend/hooks/useUserPreferences.ts
+  - frontend/hooks/useUserPreferencesChangeSync.ts
+  - frontend/lib/api/settings.ts
+  - frontend/lib/proxy.ts
+  - frontend/routes/admin/index.tsx
+  - frontend/routes/admin/runtime.tsx
+  - frontend/routes/settings.tsx
+  - frontend/routes/settings/agent.tsx
+  - frontend/routes/settings/index.tsx
+  - frontend/routes/settings/proxy.tsx
+  - frontend/routes/settings/runtime.tsx
+  - frontend/routes/settings/server.tsx
+  - frontend/routes/settings/workspace.tsx
+  - server/lib/data-directory-security.ts
+  - server/lib/installation-id.ts
+  - server/lib/settings-address-watcher.ts
+  - server/lib/settings-file-watcher.ts
+  - server/lib/settings-manager-fields.ts
+  - server/lib/tls.ts
+  - server/lib/validators/settings.ts
+  - server/routes/data-directory-security.ts
+  - server/services/user-preferences-service.ts
+  - shared/data-directory-security.ts
+  - shared/proxy-settings.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

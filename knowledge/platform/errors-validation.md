@@ -4,10 +4,11 @@ title: 错误与校验
 summary: AppError 子类与全局序列化、Zod 校验器目录约定。
 anchors:
   - server/lib/errors.ts
-  - server/lib/validators/
   - server/lib/app-error-response.ts
   - shared/error-catalog.ts
   - server/lib/__tests__/error-catalog-reachability.test.ts
+  - server/lib/validators/common.ts
+  - server/lib/validators/index.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

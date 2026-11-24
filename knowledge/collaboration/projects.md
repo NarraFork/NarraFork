@@ -8,6 +8,21 @@ anchors:
   - server/services/project-membership.ts
   - server/services/narrator-project.ts
   - server/routes/projects.ts
+  - frontend/components/project/
+  - frontend/components/settings/ProjectDirChooser.tsx
+  - frontend/hooks/useFavoriteDirectories.ts
+  - frontend/hooks/useProjectDirStatus.ts
+  - frontend/hooks/useProjects.ts
+  - frontend/lib/api/projects.ts
+  - frontend/routes/chapters/$chapterId.tsx
+  - frontend/routes/projects/$projectId.tsx
+  - frontend/routes/projects/index.tsx
+  - frontend/routes/settings/chapters.tsx
+  - server/lib/narrator-project-sql.ts
+  - server/lib/validators/projects.ts
+  - server/routes/favorites.ts
+  - server/services/project-dir.ts
+  - server/services/read/
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

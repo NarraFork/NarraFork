@@ -9,6 +9,15 @@ anchors:
   - server/services/__tests__/context-overflow-recovery.test.ts
   - server/services/__tests__/narrator-output-recovery.test.ts
   - server/services/__tests__/narrator-subagent-recovery.test.ts
+  - server/lib/agent/recovery-gate.ts
+  - server/services/abandoned-tool-cleanup.ts
+  - server/services/recovery-handoff.ts
+  - server/services/recovery-observation.ts
+  - server/services/subagent-recovery-observation.ts
+  - server/services/tool-continuation-service.ts
+  - shared/continue-tail.ts
+  - shared/narrator-catch-up.ts
+  - shared/retry-rule-keyword.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

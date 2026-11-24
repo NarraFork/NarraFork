@@ -6,9 +6,6 @@ anchors:
   - package.json
   - server/db/schema.ts
   - server/index.ts
-  - server/
-  - frontend/
-  - shared/
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

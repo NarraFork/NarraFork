@@ -7,6 +7,8 @@ anchors:
   - frontend/components/plugins/
   - frontend/build/plugin-ui-runtime.ts
   - frontend/App.tsx
+  - frontend/hooks/usePluginContributions.ts
+  - frontend/hooks/usePluginOverlayVisibility.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

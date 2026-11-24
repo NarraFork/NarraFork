@@ -12,6 +12,43 @@ anchors:
   - server/services/git-discovery-cache.ts
   - server/services/git-current-diff-view.ts
   - server/routes/git.ts
+  - frontend/components/GitMissingAlert.tsx
+  - frontend/components/git/GitCommitDetailModal.tsx
+  - frontend/components/git/GitCommitFileTree.tsx
+  - frontend/components/git/GitCommitGraph.tsx
+  - frontend/components/git/GitCommitPreview.tsx
+  - frontend/components/git/GitCommitPreviewPage.tsx
+  - frontend/components/git/GitCommitsTab.tsx
+  - frontend/components/git/GitFileDiff.tsx
+  - frontend/components/git/GitPanel.tsx
+  - frontend/components/git/GitPatchView.tsx
+  - frontend/components/git/GitSplitDiff.tsx
+  - frontend/components/git/GitStashTab.tsx
+  - frontend/components/git/git-graph-layout.ts
+  - frontend/components/git/split-diff.ts
+  - frontend/hooks/useGit.ts
+  - frontend/hooks/useGitStatusPageStats.ts
+  - frontend/hooks/useGitStatusPages.ts
+  - frontend/lib/git-commit-preview-navigation.ts
+  - frontend/routes/git/narrators/$narratorId/commits/$sha.tsx
+  - frontend/routes/windows/git/narrators/$narratorId/commits/$sha.tsx
+  - server/lib/git-merge-limiter.ts
+  - server/lib/git-status.ts
+  - server/lib/validators/git.ts
+  - server/services/git-current-baseline-session.ts
+  - server/services/git-current-baseline-worker.ts
+  - server/services/git-current-baseline.ts
+  - server/services/git-line-stats-cache.ts
+  - server/services/git-line-stats.ts
+  - server/services/git-status-page-engine.ts
+  - server/services/git-status-page-parser.ts
+  - server/services/git-status-page-process.ts
+  - server/services/git-status-page-protocol.ts
+  - server/services/git-status-page-stats.ts
+  - server/services/git-tool-refresh-policy.ts
+  - server/services/git-untracked-line-worker.ts
+  - server/services/remote-git-service.ts
+  - shared/github-repository.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

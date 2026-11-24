@@ -9,6 +9,7 @@ anchors:
   - server/db/ensure-columns.ts
   - server/db/connection.ts
   - server/lib/id.ts
+  - server/db/type-level-claims.probe.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

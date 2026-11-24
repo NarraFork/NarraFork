@@ -10,6 +10,26 @@ anchors:
   - frontend/lib/palette-apply.ts
   - frontend/hooks/useAuthenticatedAppearance.ts
   - scripts/check-style-tokens.ts
+  - frontend/components/ThemeSwitcher.tsx
+  - frontend/components/settings/AppearanceSection.tsx
+  - frontend/components/settings/AppearanceSyncControl.tsx
+  - frontend/components/settings/BackgroundCard.tsx
+  - frontend/components/settings/BrandingSection.tsx
+  - frontend/components/settings/ThemeColorCard.tsx
+  - frontend/hooks/useAppearanceSync.ts
+  - frontend/hooks/usePaletteChoice.ts
+  - frontend/hooks/usePluginThemes.ts
+  - frontend/hooks/useSharedComputedColorScheme.ts
+  - frontend/lib/appearance-preference-store.ts
+  - frontend/lib/favicon.ts
+  - frontend/lib/palette-presets.ts
+  - frontend/lib/plugin-theme-pref-store.ts
+  - frontend/lib/theme-color-sync.ts
+  - frontend/lib/typography-css-vars.ts
+  - frontend/routes/settings/appearance.tsx
+  - server/lib/plugins/theme-compiler.ts
+  - shared/appearance-preferences.ts
+  - shared/identicon.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

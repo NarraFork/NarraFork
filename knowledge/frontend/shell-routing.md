@@ -5,11 +5,53 @@ summary: 入口启动顺序、根路由与公开页/登录后外壳的分流、T
 anchors:
   - frontend/main.tsx
   - frontend/App.tsx
-  - frontend/routes/
   - frontend/components/AppRootLayout.tsx
   - frontend/components/AuthenticatedAppLayout.tsx
   - frontend/components/nav/nav-items.tsx
   - shared/nav-layout.ts
+  - frontend/components/nav/HeaderPullToRefresh.tsx
+  - frontend/components/nav/MobileNavButton.tsx
+  - frontend/components/nav/NavBottomBar.tsx
+  - frontend/components/nav/NavHoverPanel.tsx
+  - frontend/components/nav/NavOverflowMenu.tsx
+  - frontend/components/nav/NavTopSection.tsx
+  - frontend/components/nav/NavUserMenu.tsx
+  - frontend/components/nav/nav-bottom-bar-logic.ts
+  - frontend/components/nav/nav-hover-expand.ts
+  - frontend/components/nav/nav-render-context.ts
+  - frontend/components/nav/use-nav-badges.ts
+  - frontend/hooks/nav-layout.ts
+  - frontend/hooks/useNavLayout.ts
+  - frontend/hooks/useResizableNav.ts
+  - frontend/hooks/useSetupAssistant.ts
+  - frontend/hooks/useSetupWizardGuard.ts
+  - frontend/lib/app-path-classify.ts
+  - frontend/lib/app-shell-scroll.ts
+  - frontend/lib/base-path.ts
+  - frontend/lib/dom-mutation-guard.ts
+  - frontend/lib/fullscreen-escape.ts
+  - frontend/lib/history-entry.ts
+  - frontend/lib/history-state.ts
+  - frontend/lib/hmr-guard.ts
+  - frontend/lib/ios-scroll-to-top.ts
+  - frontend/lib/lazy-with-retry.ts
+  - frontend/lib/legacy-browser-polyfills.ts
+  - frontend/lib/pinch-zoom-guard.ts
+  - frontend/lib/settings-nav.ts
+  - frontend/lib/smooth-scroll.ts
+  - frontend/lib/standalone-window.ts
+  - frontend/routes/__root.tsx
+  - frontend/routes/index.tsx
+  - frontend/routes/learn.tsx
+  - frontend/routes/tutorial/$lessonId.tsx
+  - frontend/routes/tutorial/index.tsx
+  - frontend/routes/windows.tsx
+  - server/routes/branding.ts
+  - server/routes/dashboard.ts
+  - server/routes/learning.ts
+  - server/routes/tutorial.ts
+  - shared/branding.ts
+  - shared/learning-content.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

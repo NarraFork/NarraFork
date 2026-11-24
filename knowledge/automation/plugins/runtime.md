@@ -12,6 +12,17 @@ anchors:
   - server/services/plugin-manager.ts
   - server/builtin-plugins/registry.ts
   - server/lib/plugins/manifest.ts
+  - server/lib/plugins/index.ts
+  - server/lib/plugins/protocol.ts
+  - server/lib/plugins/windows-plugin-job.ts
+  - server/lib/plugins/windows-plugin-launcher.ts
+  - server/lib/plugins/windows-plugin-process.ts
+  - server/services/plugin-health.ts
+  - server/services/plugin-rpc-connection.ts
+  - server/services/plugin-spec-compat-telemetry.ts
+  - server/services/plugin-spec-compat.ts
+  - server/services/plugin-state-store.ts
+  - server/services/plugin-storage.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -8,6 +8,11 @@ anchors:
   - server/services/bot-chat.ts
   - server/routes/chat.ts
   - shared/chat-room-kinds.ts
+  - frontend/components/chat/
+  - frontend/hooks/useChat.ts
+  - frontend/lib/api/chat.ts
+  - frontend/routes/messages.tsx
+  - server/lib/validators/chat.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

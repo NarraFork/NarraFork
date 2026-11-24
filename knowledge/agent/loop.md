@@ -11,6 +11,28 @@ anchors:
   - server/lib/agent/tool-executor.ts
   - server/lib/agent/tool-execution-groups.ts
   - server/lib/agent/error-handling.ts
+  - frontend/components/settings/AgentSection.tsx
+  - server/lib/agent/abortable-sleep.ts
+  - server/lib/agent/citation-stream.ts
+  - server/lib/agent/diagnostic-fetch.ts
+  - server/lib/agent/error-diagnostics.ts
+  - server/lib/agent/execution-timeout.ts
+  - server/lib/agent/generate-first-token-timeout.ts
+  - server/lib/agent/malformed-request.ts
+  - server/lib/agent/output-content.ts
+  - server/lib/agent/retry-after.ts
+  - server/lib/agent/stream-progress.ts
+  - server/lib/agent/stream-wakeups.ts
+  - server/lib/agent/strip-citation-markers.ts
+  - server/lib/agent/tool-input-stream.ts
+  - server/lib/agent/tool-use-id-dedup.ts
+  - server/lib/agent/truncate.ts
+  - server/lib/agent/types.ts
+  - server/lib/stream-timeout.ts
+  - server/services/reasoning-translation-activity.ts
+  - server/services/reasoning-translation-runtime.ts
+  - server/services/reasoning-translation-scheduler.ts
+  - shared/stream-timeout.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

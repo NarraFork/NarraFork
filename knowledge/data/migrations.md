@@ -12,6 +12,13 @@ anchors:
   - scripts/lib/postgres-migration-transaction.ts
   - server/db/run-migrations.ts
   - server/db/migrate.ts
+  - server/db/data-backfills.ts
+  - server/db/legacy-request-storage.ts
+  - server/db/migrate-narrator-drafts.ts
+  - server/db/migrate-role-to-disp.ts
+  - server/db/test-role-migration.ts
+  - server/services/migration-db.ts
+  - shared/aggregation-migration.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -14,6 +14,12 @@ anchors:
   - server/services/git-workspace-attribution.test.ts
   - server/services/git-workspace-watch.test.ts
   - server/services/git-workspace-access-scan.test.ts
+  - frontend/lib/api/git.ts
+  - frontend/lib/git-workspace-subscription.ts
+  - server/lib/watcher/
+  - server/services/narrator-git-summary.ts
+  - shared/git-workspace-events.ts
+  - shared/git-workspace.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

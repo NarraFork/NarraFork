@@ -10,6 +10,16 @@ anchors:
   - server/services/container-service.ts
   - server/routes/benchmarks.ts
   - server/routes/containers.ts
+  - frontend/components/container/
+  - frontend/components/settings/DependencyInstallTerminal.tsx
+  - frontend/components/settings/DependencyStatus.tsx
+  - frontend/components/settings/WorkspaceContainersSection.tsx
+  - frontend/components/settings/dependency-install-progress.ts
+  - frontend/lib/api/containers.ts
+  - frontend/routes/admin/containers.tsx
+  - server/services/benchmark-read.ts
+  - server/services/benchmark-suite-stream.ts
+  - server/services/runtime-service.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

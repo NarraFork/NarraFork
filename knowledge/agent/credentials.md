@@ -6,6 +6,62 @@ anchors:
   - server/lib/agent/credential-pool.ts
   - server/lib/agent/pooled-provider.ts
   - server/lib/sourcing/quota-store.ts
+  - frontend/components/providers/CodexUsageDisplay.tsx
+  - frontend/components/providers/CredentialMigrationAlert.tsx
+  - frontend/components/providers/CredentialNetworkEditor.tsx
+  - frontend/components/providers/ProviderKeysPanel.tsx
+  - frontend/components/providers/channel-health.ts
+  - frontend/components/providers/credential-page-selection.ts
+  - frontend/components/settings/CredentialTransferCard.tsx
+  - frontend/hooks/useOpencodeUsage.ts
+  - frontend/lib/api/commandcode.ts
+  - frontend/lib/api/credential-transfer.ts
+  - frontend/lib/api/provider-import.ts
+  - frontend/lib/api/provider-keys.ts
+  - frontend/lib/api/tokendance.ts
+  - frontend/lib/codex-credits.ts
+  - frontend/lib/codex-tiers.ts
+  - frontend/lib/codex-usage-windows.ts
+  - frontend/lib/tokendance-recovery.ts
+  - frontend/routes/admin/providers.tsx
+  - frontend/routes/settings/providers.add.tsx
+  - frontend/routes/settings/providers.tokendance.callback.tsx
+  - frontend/routes/settings/providers.tsx
+  - server/lib/agent/credential-report.ts
+  - server/lib/codex-agent-identity.ts
+  - server/lib/codex-auth.ts
+  - server/lib/codex-manager.ts
+  - server/lib/codex-pat.ts
+  - server/lib/codex-usage-queue.ts
+  - server/lib/codex-usage-summary.ts
+  - server/lib/codex-usage.ts
+  - server/lib/commandcode-manager.ts
+  - server/lib/commandcode-usage.ts
+  - server/lib/credential-backup.ts
+  - server/lib/credential-display-name.ts
+  - server/lib/credential-migration.ts
+  - server/lib/credential-state.ts
+  - server/lib/credential-store.ts
+  - server/lib/credential-transfer/
+  - server/lib/kimi-usage-cache.ts
+  - server/lib/opencode-usage-cache.ts
+  - server/lib/persisted-credential-cache.ts
+  - server/lib/provider-availability-error.ts
+  - server/lib/provider-key-subjects.ts
+  - server/lib/provider-keys.ts
+  - server/routes/codex.ts
+  - server/routes/commandcode.ts
+  - server/routes/credential-transfer.ts
+  - server/routes/deepseek.ts
+  - server/routes/kimi.ts
+  - server/routes/nug.ts
+  - server/routes/opencode.ts
+  - server/routes/provider-keys.ts
+  - server/routes/tokendance.ts
+  - server/services/credential-usage-totals.ts
+  - server/services/tokendance-service.ts
+  - shared/credential-network.ts
+  - shared/tokendance.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

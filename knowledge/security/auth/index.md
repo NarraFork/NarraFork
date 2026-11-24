@@ -13,6 +13,25 @@ anchors:
   - server/lib/ldap/
   - server/services/step-up-service.ts
   - shared/session-auth.ts
+  - frontend/components/AvatarCropModal.tsx
+  - frontend/components/UserAvatar.tsx
+  - frontend/components/settings/CreateUserModal.tsx
+  - frontend/components/settings/ProfileSection.tsx
+  - frontend/hooks/useAuth.ts
+  - frontend/hooks/useAuthenticatedSession.ts
+  - frontend/hooks/useAvatarBlobUrl.ts
+  - frontend/hooks/useCurrentUser.ts
+  - frontend/lib/api/auth.ts
+  - frontend/lib/current-user-cache.ts
+  - frontend/lib/random-password.ts
+  - frontend/lib/session-store.ts
+  - frontend/routes/admin/users.tsx
+  - frontend/routes/login.tsx
+  - frontend/routes/settings/authentication.tsx
+  - frontend/routes/settings/profile.tsx
+  - frontend/routes/settings/security.tsx
+  - frontend/routes/settings/users.tsx
+  - server/services/user-deletion.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

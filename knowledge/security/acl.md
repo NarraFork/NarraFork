@@ -11,6 +11,12 @@ anchors:
   - server/services/terminal-access.ts
   - server/websocket/terminal-ws.ts
   - server/routes/terminals.ts
+  - frontend/hooks/useNarratorAccess.ts
+  - frontend/hooks/useProjectAccess.ts
+  - server/lib/narrator-access.ts
+  - server/lib/narrator-audiences.ts
+  - server/lib/project-access.ts
+  - server/routes/admin.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

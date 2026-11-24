@@ -12,6 +12,24 @@ anchors:
   - server/services/watch-observation.ts
   - server/lib/agent/bash-analyze.ts
   - server/lib/agent/shell.ts
+  - server/lib/agent/tools/pipeline.ts
+  - server/lib/agent/tools/terminal-escapes.ts
+  - server/services/await-agent-resolution.ts
+  - server/services/background-bash-result.ts
+  - server/services/background-occupancy-index.ts
+  - server/services/background-occupancy-startup.ts
+  - server/services/background-occupancy-store.ts
+  - server/services/background-task-service.ts
+  - server/services/bg-completion-queue.ts
+  - server/services/manual-background-task.ts
+  - server/services/stop-task-policy.ts
+  - server/services/terminal-view-service.ts
+  - server/services/terminal-watch-constants.ts
+  - server/services/terminal-watch-service.ts
+  - server/services/watch-service.ts
+  - server/services/watch-source.ts
+  - shared/background-task-list.ts
+  - shared/watch-command.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

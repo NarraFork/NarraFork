@@ -3,7 +3,6 @@ id: frontend
 title: 前端
 summary: React 19 + Mantine 单页应用：框架与路由、数据流、国际化、会话界面、组件与主题。
 anchors:
-  - frontend/
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -25,3 +24,6 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [面板与布局](panels.md)：dockview 面板、拖放与布局、终端面板、编辑器面板。
 - [插件界面宿主](plugin-host.md)：前端如何加载和承载插件界面、插件运行时约定。
 - [PWA 与远程前端](pwa-remote.md)：Service Worker、安装为应用、远程访问用的独立前端入口。
+- [前端排版引擎](layout-engine.md)：pretext 排版：不量 DOM 就算出文字和块的高度，供虚拟列表等使用。
+- [首页](dashboard.md)：首页：待处理的会话与决定、快速输入、各会话最近的工具活动。
+- [前端通用工具](utils.md)：没有业务归属的前端小工具：格式化、剪贴板、安全区、窗口控件覆盖等。

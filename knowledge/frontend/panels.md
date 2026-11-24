@@ -9,6 +9,12 @@ anchors:
   - frontend/components/narrator/workspace/
   - frontend/hooks/useTerminalWS.ts
   - frontend/hooks/useTerminalViewState.ts
+  - frontend/components/StandaloneWindowLayout.tsx
+  - frontend/components/window/
+  - frontend/hooks/useMobileTerminalDrawerOpen.ts
+  - frontend/lib/panel-drag.ts
+  - frontend/routes/windows/panel.tsx
+  - shared/narrator-panel-state.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

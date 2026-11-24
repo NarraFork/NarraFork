@@ -13,6 +13,45 @@ anchors:
   - server/services/git-changelist-observer.ts
   - server/services/git-changelist-commit.ts
   - shared/git-staging-lists.ts
+  - frontend/components/git/GitChangesTab.tsx
+  - frontend/components/git/GitLineStatsSummary.tsx
+  - frontend/components/git/GitStagingDiffPreview.tsx
+  - frontend/components/git/GitStagingLists.tsx
+  - frontend/components/git/GitStagingRows.tsx
+  - frontend/components/git/GitTreeRow.tsx
+  - frontend/components/git/git-changes-list-client.ts
+  - frontend/components/git/git-changes-list-model.ts
+  - frontend/components/git/git-changes-list-test-fixture.ts
+  - frontend/components/git/git-changes-list-worker-protocol.ts
+  - frontend/components/git/git-changes-list.worker.ts
+  - frontend/components/git/git-changes.browser-fixture.assets.ts
+  - frontend/components/git/git-changes.browser-fixture.tsx
+  - frontend/components/git/git-changes.browser-network.ts
+  - frontend/components/git/git-file-status.ts
+  - frontend/components/git/git-file-tree.ts
+  - frontend/components/git/git-folder-prefs.ts
+  - frontend/components/git/git-staging-diff-mappings.ts
+  - frontend/components/git/git-staging-list-display.ts
+  - frontend/components/git/git-status-counts.ts
+  - frontend/components/git/git-status-filter.ts
+  - frontend/components/git/git-view-prefs.ts
+  - frontend/components/git/useGitChangesList.ts
+  - frontend/hooks/useGitFolderPrefs.ts
+  - frontend/hooks/useGitGraphCollapsed.ts
+  - frontend/hooks/useGitGraphHeight.ts
+  - frontend/hooks/useGitStagingFolderPrefs.ts
+  - frontend/hooks/useGitStagingLists.ts
+  - frontend/hooks/useGitStatusFilter.ts
+  - frontend/hooks/useGitViewMode.ts
+  - server/services/git-changelist-cli.ts
+  - server/services/git-commit-boundary-cache.ts
+  - server/services/git-commit-preview-parse.ts
+  - server/services/git-staging-process.ts
+  - server/services/git-staging-stats.ts
+  - server/services/git-staging-unit-diff.ts
+  - shared/git-commit-preview.ts
+  - shared/git-line-stats.ts
+  - shared/git-status-page.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

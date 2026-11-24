@@ -9,6 +9,15 @@ anchors:
   - server/services/search-service.ts
   - server/services/search/
   - server/services/search/__tests__/search-backend-contract.test.ts
+  - frontend/components/search/
+  - frontend/hooks/useNarratorMessageSearch.ts
+  - frontend/hooks/useSearch.ts
+  - frontend/lib/search-page-focus.ts
+  - frontend/lib/search-utils.tsx
+  - frontend/routes/search.tsx
+  - frontend/routes/settings/search.tsx
+  - server/lib/sql-like.ts
+  - server/lib/validators/search.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

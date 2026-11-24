@@ -3,14 +3,22 @@ id: frontend.data-flow
 title: 数据获取与实时同步
 summary: api 客户端与令牌、React Query 默认值与错误提示、业务传输抽象、叙述者 WebSocket 单连接管理器与 hooks。
 anchors:
-  - frontend/lib/api/
   - frontend/lib/query-client.ts
   - frontend/lib/business-transport.ts
   - frontend/build/remote-boundaries.ts
   - frontend/lib/ws.ts
   - frontend/lib/narrator-ws-manager.ts
   - frontend/hooks/useNarratorWS.ts
-  - frontend/hooks/
+  - frontend/components/WSConnectionAlert.tsx
+  - frontend/hooks/usePlatform.ts
+  - frontend/lib/api-error.ts
+  - frontend/lib/api/client.ts
+  - frontend/lib/api/index.ts
+  - frontend/lib/api/misc.ts
+  - frontend/lib/api/types.ts
+  - frontend/lib/page-lifecycle.ts
+  - frontend/lib/ws-status.ts
+  - frontend/lib/ws-test-utils.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

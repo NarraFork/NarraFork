@@ -29,6 +29,28 @@ anchors:
   - frontend/components/narrator/preload-panel-tail.ts
   - frontend/components/narrator/TurnElapsedTime.tsx
   - frontend/hooks/useNarratorLod.ts
+  - frontend/hooks/scroll-parent.ts
+  - frontend/hooks/useLodAnchor.ts
+  - frontend/hooks/useLodIndicatorTrigger.ts
+  - frontend/hooks/useShikiTokens.ts
+  - frontend/lib/file-link-target.ts
+  - frontend/lib/markdown-anchor-scroll.ts
+  - frontend/lib/narrator-content-column.ts
+  - frontend/lib/shiki-lang.ts
+  - frontend/lib/shiki-language-aliases.ts
+  - frontend/lib/shiki-language-loader.ts
+  - frontend/lib/shiki-loader.ts
+  - frontend/lib/shiki-token-cache.ts
+  - frontend/lib/shiki-token-worker-client.ts
+  - frontend/lib/shiki-token-worker-protocol.ts
+  - frontend/lib/shiki-token.worker.ts
+  - frontend/lib/stream-anim-duration.ts
+  - frontend/lib/struct-view-tokens.ts
+  - frontend/routes/dev-vlist-harness.tsx
+  - shared/markdown-emphasis-compat.ts
+  - shared/markdown-file-path.ts
+  - shared/reasoning-content.ts
+  - shared/reasoning-translation.ts
 keywords:
   - PretextExactMessageList
   - 虚拟列表

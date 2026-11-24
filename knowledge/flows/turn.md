@@ -14,6 +14,7 @@ anchors:
   - server/websocket/narrator-ws.ts
   - frontend/lib/narrator-ws-manager.ts
   - frontend/hooks/useNarratorWS.ts
+  - shared/progress-phase.ts
 keywords:
   - 发送消息
   - 消息排队
