@@ -133,7 +133,7 @@ test("default main direct stays within an old server's two upload slots without 
 	expect(rejected).toBe(0);
 	expect(active).toBe(0);
 	expect(result.uploaded).toEqual(
-		mirrorAssetsForTarget(f.index, f.release.version, 2).map((a) => a.name),
+		mirrorAssetsForTarget(f.index, f.release.version, 1).map((a) => a.name),
 	);
 });
 
@@ -153,7 +153,7 @@ for (const transport of ["direct", "webdav"] as const)
 			const accepted: string[] = [];
 			const firstAccepted = Promise.withResolvers<void>();
 			const peerPending = Promise.withResolvers<void>();
-			const descriptors = mirrorAssetsForTarget(f.index, f.release.version, 2);
+			const descriptors = mirrorAssetsForTarget(f.index, f.release.version, 1);
 			const names = new Map(descriptors.map((a) => [a.sha256, a.name]));
 			const download = f.downloadAsset;
 			f.downloadAsset = async (options) => {

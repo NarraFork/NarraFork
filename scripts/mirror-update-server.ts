@@ -8,6 +8,7 @@ import {
 	validateMirrorJobTimeoutMs,
 } from "../shared/mirror-relay";
 import { validateWebDavConfig } from "../shared/webdav-transport";
+import { resolveMirrorPatchProxyOrigin } from "./lib/mirror-patch-proxy";
 import { resolveMirrorRelayConfig, resolveMirrorTransport } from "./lib/mirror-relay-stage";
 import {
 	readMirrorDataFile,
@@ -36,6 +37,9 @@ export async function mirrorPublishedGitHubRelease(
 	options: MirrorPublishedOptions,
 ): Promise<IndependentMirrorReceipt> {
 	try {
+		if (options.kind === "main") resolveMirrorPatchProxyOrigin(options.patchProxyOrigin);
+		if (options.patchOnly && options.kind !== "main")
+			throw new Error("Patch-only mirror is only supported for main releases");
 		validateMirrorJobTimeoutMs(options.totalTimeoutMs ?? mirrorJobTimeoutMs(options.kind));
 		mirrorUploadConcurrency(options.uploadConcurrency);
 		const transport = resolveMirrorTransport({ NF_MIRROR_TRANSPORT: options.transport });
@@ -179,6 +183,8 @@ async function main() {
 			tag: { type: "string" },
 			repository: { type: "string" },
 			"dry-run": { type: "boolean" },
+			"patch-only": { type: "boolean" },
+			"include-full": { type: "boolean" },
 			"resolve-trigger": { type: "boolean" },
 			"event-file": { type: "string" },
 			"receipt-file": { type: "string" },
@@ -246,6 +252,11 @@ async function main() {
 		throw new Error(
 			"Use --kind=main|helpers|executor|remote-peer --tag=exact-public-tag --repository=owner/repo",
 		);
+	if (
+		(values["patch-only"] || values["include-full"]) &&
+		(kind !== "main" || publications.length || (values["patch-only"] && values["include-full"]))
+	)
+		throw new Error("Select at most one projection flag for a manually selected main release");
 	const controller = new AbortController();
 	const cancel = () => controller.abort();
 	process.once("SIGINT", cancel);
@@ -255,6 +266,7 @@ async function main() {
 		repository,
 		tag,
 		dryRun: values["dry-run"],
+		patchOnly: values["include-full"] ? false : values["patch-only"],
 		signal: controller.signal,
 	};
 	let targets = publications.length
@@ -290,6 +302,8 @@ async function main() {
 				kind: target.kind,
 				tag: target.tag,
 				publication: target.publication,
+				patchProxyOrigin:
+					target.kind === "main" ? process.env.NF_MIRROR_PATCH_PROXY_ORIGIN : undefined,
 			}));
 		} catch {
 			receipts = targets.map((target) => ({

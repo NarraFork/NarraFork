@@ -343,6 +343,10 @@ describe("independent mirror trigger provenance", () => {
 			.split("- name: Preserve independent mirror result")[0];
 		expect(direct).toContain("NF_MIRROR_TRANSPORT: direct");
 		expect(direct).toContain("secrets.NF_UPDATE_TOKEN");
+		for (const step of [direct, dav])
+			expect(step).toContain(
+				`NF_MIRROR_PATCH_PROXY_ORIGIN: \${{ vars.NF_MIRROR_PATCH_PROXY_ORIGIN }}`,
+			);
 		expect(direct).not.toContain("NF_MIRROR_WEBDAV_");
 		expect(direct).not.toContain("NF_MIRROR_RELAY_SIGNING_KEY");
 		expect(dav).toContain("if: vars.NF_MIRROR_TRANSPORT == 'webdav'");

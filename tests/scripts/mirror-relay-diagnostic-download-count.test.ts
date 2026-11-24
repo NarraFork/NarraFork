@@ -82,6 +82,7 @@ describe("main staging final authority regression", () => {
 			};
 			const operation = mirrorPublishedGitHubRelease({
 				kind: "main",
+				patchOnly: false,
 				repository,
 				tag: "v1.2.0",
 				transport: "webdav",

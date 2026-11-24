@@ -101,10 +101,18 @@ describe("release CLI canonical mirror", () => {
 				repository: "SourceOwner/SourceFork",
 				tag: "v0.9.2",
 				platforms: ["linux-x64"],
+				patchOnly: true,
 				dryRun: true,
 				signal: "bounded",
 			},
 		]);
+	});
+	test("include-full is an explicit mirror-only override", () => {
+		const result = mirrorFixture(["0.9.2", "--preview", "--include-full"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.calls[0].patchOnly).toBe(false);
+		expect(mirrorFixture(["0.9.2", "--include-full", "--patch-only"]).exitCode).not.toBe(0);
+		expect(mirrorFixture(["0.9.2", "--target=github", "--include-full"]).exitCode).not.toBe(0);
 	});
 	test("normal mirror and upload-only need no dist and retain configured server", () => {
 		const result = mirrorFixture(["0.9.2", "--upload-only", "--github-repository=Other/Fork"]);
