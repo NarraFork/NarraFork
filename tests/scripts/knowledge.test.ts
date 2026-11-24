@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -148,6 +148,22 @@ describe("knowledge tree tool", () => {
 		const files = changedFiles(root, "main");
 		expect(files).toContain("server/services/alpha.ts");
 		expect(affected(loadNodes(root), files).nodes.map((n) => n.node.id)).toContain("area.alpha");
+		// Once the anchor follows the rename, the gone old path is not a coverage gap.
+		write("knowledge/area/alpha.md", node("area.alpha", ["server/services/alpha-renamed.ts"]));
+		const exists = (f: string) => existsSync(join(root, f));
+		expect(affected(loadNodes(root), changedFiles(root, "main"), exists).unanchored).toEqual([]);
+	});
+
+	test("an edit made inside a merge commit makes the node stale", () => {
+		git("checkout", "-qb", "side");
+		write("server/services/gamma.ts", "export const g = 2;\n");
+		git("commit", "-qam", "side change");
+		git("checkout", "-q", "main");
+		git("merge", "-q", "--no-ff", "--no-commit", "side");
+		write("server/services/alpha.ts", "export const a = 'merge';\n");
+		git("add", "-A");
+		git("commit", "-qm", "merge side, editing alpha in the merge");
+		expect(stale(root, loadNodes(root)).map((x) => x.node.id)).toEqual(["area.alpha"]);
 	});
 
 	test("a node anchored to a knowledge file goes stale when that file changes", () => {

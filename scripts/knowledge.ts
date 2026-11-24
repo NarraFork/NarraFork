@@ -224,11 +224,14 @@ export function stale(root: string, nodes: KnowledgeNode[]): StaleNode[] {
 		let entries = history.get(since);
 		if (!entries) {
 			entries = [];
+			// --diff-merges=combined: a merge reports the paths its result changed relative to every
+			// parent (conflict resolutions, edits made in the merge), not the branches it brings in.
 			const out = git(root, [
 				"log",
 				"--format=@@%H",
 				"--name-only",
 				"--no-renames",
+				"--diff-merges=combined",
 				`${since}..HEAD`,
 			]);
 			for (const l of lines(out)) {
@@ -263,7 +266,11 @@ export interface Affected {
 	unanchored: string[];
 }
 
-export function affected(nodes: KnowledgeNode[], changed: string[]): Affected {
+export function affected(
+	nodes: KnowledgeNode[],
+	changed: string[],
+	exists?: (path: string) => boolean,
+): Affected {
 	const result: Affected = { nodes: [], unanchored: [] };
 	const covered = new Set<string>();
 	for (const node of nodes) {
@@ -276,6 +283,8 @@ export function affected(nodes: KnowledgeNode[], changed: string[]): Affected {
 	result.unanchored = changed.filter(
 		(f) =>
 			!covered.has(f) &&
+			// The old side of a rename is kept to match nodes, but nothing can anchor a gone file.
+			(exists === undefined || exists(f)) &&
 			SOURCE_ROOTS.some((r) => f.startsWith(`${r}/`)) &&
 			SOURCE_FILE.test(f) &&
 			!NOT_SOURCE.test(f),
@@ -420,7 +429,7 @@ function main(argv: string[]): number {
 		}
 		case "affected": {
 			const base = args[0] ?? "origin/main";
-			const res = affected(nodes, changedFiles(root, base));
+			const res = affected(nodes, changedFiles(root, base), (f) => existsSync(join(root, f)));
 			if (res.nodes.length === 0) console.log("这次改动没有碰到任何节点的锚点。");
 			for (const { node, files } of res.nodes) {
 				console.log(line(node));
