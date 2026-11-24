@@ -659,7 +659,7 @@ describe("bounded worktree snapshot pagination", () => {
 		expect(total).toBe(141);
 	});
 
-	test("listing output budget exceeds mutation budget but still reports byte truncation", async () => {
+	test("inventory output budget is bounded and explicitly reports byte truncation", async () => {
 		const { rows } = inventory(80, "x".repeat(3000));
 		const page = await service.list(
 			"actor",
@@ -878,7 +878,7 @@ describe("bounded worktree snapshot pagination", () => {
 		).rejects.toMatchObject({ code: "WORKTREE_CURSOR_EXPIRED" });
 	});
 
-	test("listing cap is explicit and mutation inventory still fails closed at 128", async () => {
+	test("listing cap is explicit and the low-level parser default remains bounded", async () => {
 		inventory(WORKTREE_LIST_MAX_ENTRIES + 1);
 		const page = await service.list(
 			"actor",
@@ -1255,6 +1255,49 @@ describe("local worktree list/create fixtures", () => {
 		const result = await service.create("actor", "narrator", request, signal());
 		expect(result.outcome).toBe("created");
 		expect(result.worktree?.head).toBe(await git(["rev-parse", "refs/heads/existing"]));
+	});
+
+	test("creates and reconciles with a large inventory without missing a checked-out branch", async () => {
+		const run = ports.runGit;
+		let inventorySize = WORKTREE_MAX_ENTRIES + 1;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			const result = await run(workspace, args, abort, writing);
+			if (args[0] !== "worktree" || args[1] !== "list" || result.exitCode !== 0) return result;
+			const prefix = Array.from(
+				{ length: inventorySize },
+				(_, index) =>
+					`worktree ${source}/fixture-${index}\0HEAD ${(index + 1).toString(16).padStart(40, "0")}\0branch refs/heads/fixture-${index}\0\0`,
+			).join("");
+			return { ...result, stdout: `${prefix}${result.stdout}` };
+		};
+
+		const request = proposal("large-inventory");
+		expect(await service.create("actor", "narrator", request, signal())).toMatchObject({
+			outcome: "created",
+			worktree: { path: request.destinationPath },
+		});
+		expect(writes).toBe(1);
+		expect(
+			await service.create(
+				"actor",
+				"narrator",
+				proposal("large-inventory-checked-out", "main", "existing"),
+				signal(),
+			),
+		).toMatchObject({ outcome: "failed", error: { code: "WORKTREE_BRANCH_CHECKED_OUT" } });
+		expect(writes).toBe(1);
+
+		inventorySize = WORKTREE_LIST_MAX_ENTRIES + 1;
+		expect(
+			await service.create(
+				"actor",
+				"narrator",
+				proposal("large-inventory-overflow", "overflow-feature"),
+				signal(),
+			),
+		).toMatchObject({ outcome: "failed", error: { code: "WORKTREE_LIST_TRUNCATED" } });
+		expect(writes).toBe(1);
 	});
 
 	test("persistent same-ID replay survives service/journal recreation; a different proposal conflicts", async () => {
