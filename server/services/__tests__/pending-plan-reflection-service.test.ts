@@ -316,6 +316,49 @@ describe("reflecting on a pending plan approval", () => {
 		expect(pendingPlanApproverSource.has(NARRATOR_ID)).toBe(false);
 	});
 
+	test("a verdict is dropped when its initiator lost write access during the review", async () => {
+		for (const decision of [
+			{ action: "confirm" as const, reflection: "Ready" },
+			{ action: "revise" as const, feedback: "Split step 3." },
+		]) {
+			const fixture = registerPending();
+			fixture.setRunner(async () => ({ decision, input: PLAN_INPUT }));
+			let checks = 0;
+			const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID, {
+				assertStillAllowed: async () => {
+					checks += 1;
+					throw new Error("Narrator not found");
+				},
+			});
+			expect(outcome).toEqual({
+				status: "awaiting_user",
+				reason: "The person who started this reflection may no longer decide it",
+			});
+			expect(checks).toBe(1);
+			// Nothing was decided: the plan stays with whoever may still decide it.
+			expect(fixture.resolved).toHaveLength(0);
+			expect(pendingPermissions.has(TOOL_CALL_ID)).toBe(true);
+			expect(pendingPlanApproverSource.has(NARRATOR_ID)).toBe(false);
+			expect((await toolCallRow())?.status).toBe("pending");
+			expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
+			pendingPermissions.delete(TOOL_CALL_ID);
+		}
+	});
+
+	test("an initiator who keeps write access gets the verdict applied", async () => {
+		const fixture = registerPending();
+		fixture.setRunner(async () => ({ decision: { action: "confirm" }, input: PLAN_INPUT }));
+		let checks = 0;
+		const outcome = await reflectPendingExitPlanMode(TOOL_CALL_ID, {
+			assertStillAllowed: async () => {
+				checks += 1;
+			},
+		});
+		expect(outcome).toEqual({ status: "approved", decision: "confirm" });
+		expect(checks).toBe(1);
+		expect(fixture.resolved).toEqual([{ behavior: "allow", updatedInput: PLAN_INPUT }]);
+	});
+
 	test("turning the switch on reflects every blocked plan of the session", async () => {
 		const fixture = registerPending();
 		let calls = 0;

@@ -343,6 +343,7 @@ import {
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
+	loadNarratorForAccess,
 	NARRATOR_ACL_COLUMNS,
 	type NarratorPrincipal,
 	narratorReadableWhere,
@@ -6199,7 +6200,14 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	// release it without a click: turning it on is this session asking for exactly that.
 	// Fire-and-forget — a review takes minutes and must not hold the settings write open.
 	if (updates.planReflectionAutoApproveOverride === "on") {
-		startAutomaticPlanReflectionForNarrator(id);
+		// Whoever turned the switch on must still be allowed to drive this session when a review's
+		// verdict lands, minutes later.
+		const principal = narratorPrincipalOf(c);
+		startAutomaticPlanReflectionForNarrator(id, {
+			assertStillAllowed: async () => {
+				await loadNarratorForAccess(id, principal, "write");
+			},
+		});
 	}
 	return c.json({ ok: true });
 });
@@ -7198,7 +7206,16 @@ narratorRoutes.post("/permissions/:requestId/reflect-plan", async (c) => {
 	if (!isPendingPlanReflectionAvailable(requestId)) {
 		return c.json({ error: "Plan reflection is not available for this request" }, 409);
 	}
-	void reflectPendingExitPlanMode(requestId).catch((err) => {
+	// The middleware above checked write access when the review STARTED; its verdict lands
+	// minutes later, so the same check runs again right before it is applied. The principal is
+	// captured now: this request has long been answered by then.
+	const principal = narratorPrincipalOf(c);
+	const assertStillAllowed = async () => {
+		const narratorId = await resolveDecisionNarratorId(requestId);
+		if (!narratorId) throw new NotFoundError("Narrator", "unknown");
+		await loadNarratorForAccess(narratorId, principal, "write");
+	};
+	void reflectPendingExitPlanMode(requestId, { assertStillAllowed }).catch((err) => {
 		logger.warn("Plan reflection request failed", {
 			requestId,
 			error: err instanceof Error ? err.message : String(err),

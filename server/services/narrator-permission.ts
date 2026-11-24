@@ -2581,7 +2581,16 @@ export type PendingPlanReflectionOutcome =
  */
 export async function reflectPendingExitPlanMode(
 	requestId: string,
-	opts: { automatic?: boolean } = {},
+	opts: {
+		automatic?: boolean;
+		/**
+		 * Re-checks that whoever started this review may still decide the request. It runs once
+		 * more right before the verdict is applied: a review takes minutes, and access revoked
+		 * meanwhile (a member removed from a team) must not let its verdict through — the same
+		 * rule a person's own approval follows (`resolvePermissionOrDangerReflection`).
+		 */
+		assertStillAllowed?: () => Promise<void>;
+	} = {},
 ): Promise<PendingPlanReflectionOutcome> {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) return { status: "unavailable", reason: "Permission request not found" };
@@ -2626,6 +2635,26 @@ export async function reflectPendingExitPlanMode(
 		// from `resolvePermission` (which reads the entry synchronously).
 		const { pendingPlanApproverSource } = await import("./narrator-session-state");
 		const { buildExitPlanReflectionDeniedToolResult } = await import("../lib/agent/loop");
+		const decides =
+			reviewed.decision.action === "confirm" ||
+			reviewed.decision.action === "confirm_compact" ||
+			reviewed.decision.action === "revise";
+		if (decides && opts.assertStillAllowed) {
+			try {
+				await opts.assertStillAllowed();
+			} catch (err) {
+				// The verdict is dropped, not the request: the plan stays with whoever may decide it.
+				logger.warn("Plan reflection verdict dropped: its initiator may no longer decide", {
+					requestId,
+					narratorId: pending.narratorId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				return {
+					status: "awaiting_user",
+					reason: "The person who started this reflection may no longer decide it",
+				};
+			}
+		}
 		if (pendingPermissions.get(requestId) !== pending) {
 			// The person decided, or the request was reprocessed into a new wait under the same id
 			// (possibly with a re-read plan), while the review ran: its verdict describes a wait
@@ -2685,13 +2714,19 @@ export async function reflectPendingExitPlanMode(
  * that switch was off, and only a live review can release them without a person's click. Each
  * review runs in the background — it takes minutes, and the settings write must not wait for it.
  */
-export function startAutomaticPlanReflectionForNarrator(narratorId: string): number {
+export function startAutomaticPlanReflectionForNarrator(
+	narratorId: string,
+	opts: { assertStillAllowed?: () => Promise<void> } = {},
+): number {
 	let started = 0;
 	for (const [requestId, pending] of [...pendingPermissions.entries()]) {
 		if (pending.narratorId !== narratorId || pending.toolName !== "ExitPlanMode") continue;
 		if (!isPendingPlanReflectionAvailable(requestId)) continue;
 		started += 1;
-		void reflectPendingExitPlanMode(requestId, { automatic: true }).catch((err) => {
+		void reflectPendingExitPlanMode(requestId, {
+			automatic: true,
+			assertStillAllowed: opts.assertStillAllowed,
+		}).catch((err) => {
 			logger.warn("Automatic plan reflection failed", {
 				requestId,
 				narratorId,
