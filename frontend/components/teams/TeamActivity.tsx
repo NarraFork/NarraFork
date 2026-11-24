@@ -26,6 +26,7 @@ function ActivityRow({ event }: { event: TeamActivityEvent }) {
 						: "teams.activity.unknownAgent",
 				));
 	const note = eventNote(event);
+	const labelKey = eventLabelKey(event.kind);
 	return (
 		<Group
 			gap="xs"
@@ -39,8 +40,14 @@ function ActivityRow({ event }: { event: TeamActivityEvent }) {
 			</ThemeIcon>
 			<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
 				<Group gap={6} justify="space-between" wrap="nowrap">
-					<Text size="sm" fw={500} style={{ minWidth: 0, overflowWrap: "anywhere" }}>
-						{t(`teams.event.${eventLabelKey(event.kind)}`, { kind: event.kind })}
+					{/* An unknown kind reads as the generic headline; its name stays a tooltip. */}
+					<Text
+						size="sm"
+						fw={500}
+						style={{ minWidth: 0, overflowWrap: "anywhere" }}
+						title={labelKey === "other" ? event.kind : undefined}
+					>
+						{t(`teams.event.${labelKey}`)}
 					</Text>
 					<Text size="xs" c="dimmed" style={{ flexShrink: 0 }} title={event.createdAt}>
 						{formatSmartTime(event.createdAt)}

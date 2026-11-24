@@ -126,13 +126,16 @@ export const TEAM_EVENT_DETAIL_MAX_BYTES = 8 * 1024;
 export const TEAM_EVENT_ACTOR_KINDS = ["person", "agent", "system"] as const;
 export type TeamEventActorKind = (typeof TEAM_EVENT_ACTOR_KINDS)[number];
 
-/** Team-level event kinds recorded by P1. Later PRs add their own. */
+/** Team-level event kinds recorded by P1 (overruns and decisions aside). Later PRs add their own. */
+export const TEAM_LEVEL_EVENT_KINDS = [
+	"team.created",
+	"team.brief",
+	"team.settings",
+	"team.archived",
+	"team.unarchived",
+] as const;
 export type TeamEventKind =
-	| "team.created"
-	| "team.brief"
-	| "team.settings"
-	| "team.archived"
-	| "team.unarchived"
+	| (typeof TEAM_LEVEL_EVENT_KINDS)[number]
 	| CoordinatorOverrunEventKind
 	| typeof TEAM_DECISION_EVENT_KIND;
 
@@ -205,18 +208,23 @@ export const TEAM_CHECKIN_MAX_MINUTES = 24 * 60;
 /** Most work items one `work.list` returns (open ones first). */
 export const TEAM_WORK_LIST_LIMIT = 30;
 
-/** Work item and team events written by P3, each with its person or agent. */
-export type TeamWorkEventKind =
-	| "work.created"
-	| "work.started"
-	| "work.start_failed"
-	| "work.review"
-	| "work.ready"
-	| "work.sync"
-	| "work.cancelled"
-	| "work.cleanup"
-	| "team.checkin"
-	| typeof TEAM_DECISION_EVENT_KIND;
+/**
+ * Work item and team events written by P3, each with its person or agent. A runtime list so the
+ * activity feed can prove every kind has its own wording.
+ */
+export const TEAM_WORK_EVENT_KINDS = [
+	"work.created",
+	"work.started",
+	"work.start_failed",
+	"work.review",
+	"work.ready",
+	"work.sync",
+	"work.cancelled",
+	"work.cleanup",
+	"team.checkin",
+	TEAM_DECISION_EVENT_KIND,
+] as const;
+export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
 // ── P4: the team page ────────────────────────────────────────────────────────
 
@@ -448,12 +456,14 @@ export interface TeamProjectSettings {
 }
 
 /** Events written by X. */
-export type TeamOverlapEventKind =
-	| "work.merged"
-	| "work.overlap"
-	| "work.exclusive_taken"
-	| "work.exclusive_refused"
-	| "work.exclusive_released";
+export const TEAM_OVERLAP_EVENT_KINDS = [
+	"work.merged",
+	"work.overlap",
+	"work.exclusive_taken",
+	"work.exclusive_refused",
+	"work.exclusive_released",
+] as const;
+export type TeamOverlapEventKind = (typeof TEAM_OVERLAP_EVENT_KINDS)[number];
 
 /** How much of a work item the reader may see. */
 export type TeamOverlapAccess = "member" | "reader" | "hidden";
