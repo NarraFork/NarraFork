@@ -37,6 +37,7 @@ import {
 	isNull,
 	lt,
 	ne,
+	notInArray,
 	or,
 	type SQL,
 	sql,
@@ -325,6 +326,11 @@ type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
 type BlockDeleteOptions = ScopedRevertOptions & {
 	skipRevert?: boolean;
+	/**
+	 * Range deletion only: rows inside the range that stay (Retry keeps host-written rows that
+	 * are nobody's turn, `narrator-session.ts:retryKeptHostRowIds`). Bounded by the caller.
+	 */
+	keepMessageIds?: readonly string[];
 	skipNarratorUpdate?: boolean;
 	preserveConversationId?: boolean;
 	scope?: RevertScope;
@@ -1544,6 +1550,9 @@ function planMessageRangeDeletion(
 				inclusive
 					? gte(narratorMessageRefs.seq, boundary.seq)
 					: gt(narratorMessageRefs.seq, boundary.seq),
+				opts?.keepMessageIds?.length
+					? notInArray(narratorMessageRefs.messageId, [...opts.keepMessageIds])
+					: undefined,
 				// A history-only action must retain previously detached file evidence,
 				// not delete/recreate its IDs on every retry. Match only our internal
 				// checkpoint shape, never all hidden/compacted refs. File rollback still

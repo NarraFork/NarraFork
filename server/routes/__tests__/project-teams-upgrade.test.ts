@@ -45,9 +45,21 @@ const { teamIdOfNarrator } = await import("../../services/teams/team-membership"
 const { isTeamSessionCached, forgetTeamSessions } = await import(
 	"../../services/teams/team-session-memo"
 );
-const { teamConversionNoteId, upgradeSessionToTeam, TEAM_UPGRADE_NOTE_SOURCE } = await import(
-	"../../services/teams/team-conversion"
-);
+const {
+	teamConversionNoteId,
+	teamConversionTestHooks,
+	upgradeSessionToTeam,
+	TEAM_DISBAND_NOTE_SOURCE,
+	TEAM_UPGRADE_NOTE_SOURCE,
+} = await import("../../services/teams/team-conversion");
+const { narratorPersistence } = await import("../../services/narrator-persistence");
+const { narratorStore } = await import("../../services/narrator-store");
+const {
+	hasTrailingInjectionRow,
+	resolveContinuationTail,
+	resolveRetryTarget,
+	rewindHistoryForRetry,
+} = await import("../../services/narrator-session");
 const { TEAM_STATUS_SOURCE, writeTeamStatusAtPass } = await import(
 	"../../services/teams/team-status"
 );
@@ -673,5 +685,188 @@ describe("the reader's labels", () => {
 			expect(json.sidecar.sources.team_upgrade).toBe(upgradeText);
 			expect(json.sidecar.sources.team_disband).toBe(disbandText);
 		}
+	});
+});
+
+describe("review fixes: repository identity, ownership, Retry and Continue around the notes", () => {
+	test("a session in a submodule of the project is refused; a linked worktree is not", async () => {
+		const library = join(testHome, "library-src");
+		mkdirSync(library, { recursive: true });
+		const inLibrary = async (...args: string[]) => {
+			const result = await safeSpawn({
+				cmd: ["git", "-c", "user.name=F", "-c", "user.email=f@example.invalid", ...args],
+				cwd: library,
+				timeout: 10_000,
+				maxOutputBytes: 64 * 1024,
+			});
+			if (result.exitCode) throw new Error(result.stderr);
+		};
+		await inLibrary("init", "-q", "-b", "trunk");
+		await inLibrary("commit", "-q", "--allow-empty", "-m", "library");
+		await git(
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			"-q",
+			library,
+			"vendor/library",
+		);
+		await git("commit", "-q", "-m", "add library submodule");
+
+		const id = await session("In a submodule", { cwd: join(repo, "vendor/library") });
+		const response = await upgrade(OWNER, { fromNarratorId: id });
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe("TEAM_WORKSPACE_UNAVAILABLE");
+		expect(response.body.details).toEqual({ reason: "other-repository" });
+		expect(parseTraitsOf(await row(id))).not.toContain("team");
+		expect(
+			await db.query.projectTeams.findFirst({ where: eq(projectTeams.narratorId, id) }),
+		).toBeUndefined();
+		expect(await notes(id, TEAM_UPGRADE_NOTE_SOURCE)).toHaveLength(0);
+
+		// A linked worktree of the project's own repository shares its identity.
+		const worktree = join(testHome, "linked-worktree-2");
+		await git("worktree", "add", "-q", "-b", "feature/linked-2", worktree);
+		const linked = await session("Linked again", { cwd: worktree });
+		expect((await upgrade(OWNER, { fromNarratorId: linked })).status).toBe(201);
+	});
+
+	test("ownership handed over after the first check: upgrade and disband are refused", async () => {
+		const handOver = async (narratorId: string) =>
+			db.update(narrators).set({ ownerUserId: MEMBER }).where(eq(narrators.id, narratorId));
+
+		const id = await session("Handed over before upgrade");
+		teamConversionTestHooks.beforeTransaction = async (kind, narratorId) => {
+			if (kind === "upgrade" && narratorId === id) await handOver(id);
+		};
+		try {
+			const refused = await upgrade(OWNER, { fromNarratorId: id });
+			expect(refused.status).toBe(403);
+		} finally {
+			teamConversionTestHooks.beforeTransaction = undefined;
+		}
+		expect(parseTraitsOf(await row(id))).not.toContain("team");
+		expect(
+			await db.query.projectTeams.findFirst({ where: eq(projectTeams.narratorId, id) }),
+		).toBeUndefined();
+		expect(await notes(id, TEAM_UPGRADE_NOTE_SOURCE)).toHaveLength(0);
+
+		const team = await session("Handed over before disband");
+		expect((await upgrade(OWNER, { fromNarratorId: team })).status).toBe(201);
+		teamConversionTestHooks.beforeTransaction = async (kind, narratorId) => {
+			if (kind === "disband" && narratorId === team) await handOver(team);
+		};
+		try {
+			expect((await disband(OWNER, team)).status).toBe(403);
+		} finally {
+			teamConversionTestHooks.beforeTransaction = undefined;
+		}
+		expect(parseTraitsOf(await row(team))).toContain("team");
+		expect(
+			await db.query.projectTeams.findFirst({ where: eq(projectTeams.narratorId, team) }),
+		).toBeDefined();
+		expect(await notes(team, TEAM_DISBAND_NOTE_SOURCE)).toHaveLength(0);
+		// The new owner may.
+		expect((await disband(MEMBER, team)).status).toBe(200);
+	});
+
+	/** The rebaseline notice `requestToolDeclarationRebaseline` writes on a `replace_tools` epoch. */
+	async function rebaselineNotice(narratorId: string) {
+		return narratorStore.appendToolChange(
+			narratorId,
+			{
+				type: "tool_loaded",
+				toolName: "Team",
+				toolNames: ["Team"],
+				text: "Tool loaded: Team",
+				rebaseline: true,
+			},
+			"system",
+		);
+	}
+
+	async function refIds(narratorId: string) {
+		return (
+			await db
+				.select({ id: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+		).map((ref) => ref.id);
+	}
+
+	test("Retry after an upgrade re-runs the person's message and keeps the note and notice", async () => {
+		const id = await session("Retry across an upgrade");
+		const asked = await narratorPersistence.persistUserMessage(id, "Refactor the payments module");
+		// The failed run's leftovers, which Retry discards.
+		const leftover = await narratorPersistence.persistDisplayMessage(id, "The provider failed");
+		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
+		const notice = await rebaselineNotice(id);
+		const [note] = await notes(id, TEAM_UPGRADE_NOTE_SOURCE);
+		if (!note) throw new Error("no upgrade note");
+
+		const { lastMsg, prompt } = await rewindHistoryForRetry(id);
+		expect(lastMsg.id).toBe(asked.id);
+		expect(prompt).toBe("Refactor the payments module");
+		const kept = await refIds(id);
+		expect(kept).toContain(note.id);
+		expect(kept).toContain(notice.id);
+		expect(kept).not.toContain(leftover.id);
+	});
+
+	test("Retry after a disband keeps the disband note", async () => {
+		const id = await session("Retry across a disband");
+		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
+		const asked = await narratorPersistence.persistUserMessage(id, "Ship the release");
+		const leftover = await narratorPersistence.persistDisplayMessage(id, "The provider failed");
+		expect((await disband(OWNER, id)).status).toBe(200);
+		const [note] = await notes(id, TEAM_DISBAND_NOTE_SOURCE);
+		if (!note) throw new Error("no disband note");
+
+		const { lastMsg } = await rewindHistoryForRetry(id);
+		expect(lastMsg.id).toBe(asked.id);
+		const kept = await refIds(id);
+		expect(kept).toContain(note.id);
+		expect(kept).not.toContain(leftover.id);
+	});
+
+	test("Continue looks past the notes and the notice; a genuine injection is still input", async () => {
+		const note = (source: string) => ({
+			role: "sys",
+			contentJson: [{ type: "system_injection", source, modelText: "note" }],
+		});
+		const notice = {
+			role: "user",
+			contentJson: [
+				{ type: "tool_loaded", toolName: "Team", toolNames: ["Team"], rebaseline: true },
+			],
+		};
+		const reply = { id: "a1", role: "assistant", contentJson: [{ type: "text", text: "Half" }] };
+		for (const source of ["team_upgrade", "team_disband"]) {
+			const history = [reply, note(source), notice];
+			expect(hasTrailingInjectionRow(history)).toBe(false);
+			expect(resolveContinuationTail(history).tail).toBe(reply);
+		}
+		expect(hasTrailingInjectionRow([reply, note("bg_agent")])).toBe(true);
+		expect(hasTrailingInjectionRow([reply, note("team_upgrade"), note("bg_agent")])).toBe(true);
+
+		// The retry target skips the notice to the person's message.
+		const person = { id: "u1", role: "user", contentJson: [{ type: "text", text: "Go" }] };
+		const target = resolveRetryTarget([person, { id: "r1", ...notice }]);
+		expect(target.target?.id).toBe("u1");
+
+		// On real history: an upgraded session's tail is its last reply, not the note.
+		const id = await session("Continue across an upgrade");
+		await narratorPersistence.persistUserMessage(id, "Explain the module");
+		await narratorPersistence.persistAssistantMessage(id, {
+			uuid: generateId(),
+			session_id: "continue",
+			message: { content: [{ type: "text", text: "It has three parts" }] },
+		});
+		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
+		await rebaselineNotice(id);
+		const history = await narratorService.getModelHistorySinceLastCompact(id);
+		expect(hasTrailingInjectionRow(history)).toBe(false);
+		expect(resolveContinuationTail(history).tail?.role).toBe("assistant");
 	});
 });

@@ -48,23 +48,62 @@ const NON_TURN_INJECTION_SOURCES: ReadonlySet<string> = new Set([
 	TEAM_DISBAND_NOTE_SOURCE,
 ]);
 
+function isRecord(element: unknown): element is Record<string, unknown> {
+	return !!element && typeof element === "object";
+}
+
 /** True when a `sys` row holds only informational injections (`NON_TURN_INJECTION_SOURCES`). */
 export function isNonTurnInjectionRow(
 	role: string | null | undefined,
 	elements: readonly unknown[],
 ): boolean {
-	if (role !== "sys") return false;
-	const injections = elements.filter(
-		(element): element is { type: "system_injection"; source?: unknown } =>
-			!!element &&
-			typeof element === "object" &&
-			(element as { type?: unknown }).type === "system_injection",
-	);
 	return (
-		injections.length > 0 &&
-		injections.every(
+		role === "sys" &&
+		elements.length > 0 &&
+		elements.every(
 			(element) =>
-				typeof element.source === "string" && NON_TURN_INJECTION_SOURCES.has(element.source),
+				isRecord(element) &&
+				element.type === "system_injection" &&
+				typeof element.source === "string" &&
+				NON_TURN_INJECTION_SOURCES.has(element.source),
 		)
 	);
+}
+
+/**
+ * The tool-declaration rebaseline notice (`tool-loading-service.ts:
+ * requestToolDeclarationRebaseline`, e.g. `Team` after an upgrade on a `replace_tools` epoch):
+ * a `user`-role `tool_loaded` row with `rebaseline: true` that the host writes, not a person.
+ * It must stay in history (`rebaselineRequests` reads it to declare the tool on the next
+ * request), but it is nobody's turn: Retry must not re-run it as if a person had typed it.
+ */
+export function isRebaselineNoticeRow(
+	role: string | null | undefined,
+	elements: readonly unknown[],
+): boolean {
+	return (
+		role === "user" &&
+		elements.length > 0 &&
+		elements.every(
+			(element) =>
+				isRecord(element) &&
+				(element.type === "tool_loaded" || element.type === "tool_unloaded") &&
+				element.rebaseline === true,
+		)
+	);
+}
+
+/**
+ * Host-written rows that are no turn of the conversation: the team conversion notes and the
+ * rebaseline notice. One predicate for the composer (Retry / Continue targets,
+ * `vlist-tail-meta.ts`) and the server (`narrator-session.ts`: the retry target, the
+ * continuation tail and the trailing-injection check), so the button and the endpoint agree.
+ * They stay in history; Retry keeps them (`retryKeptHostRowIds`) instead of deleting them with
+ * the discarded output.
+ */
+export function isNonTurnHostRow(
+	role: string | null | undefined,
+	elements: readonly unknown[],
+): boolean {
+	return isNonTurnInjectionRow(role, elements) || isRebaselineNoticeRow(role, elements);
 }

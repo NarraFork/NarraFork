@@ -9,8 +9,11 @@
  * Upgrade (`POST /api/projects/:projectId/teams` with `fromNarratorId`):
  * - who: project write (the route) plus the session's owner or an admin (`canManageNarratorAcl`);
  * - what: an idle, non-archived ordinary primary session of this project whose working directory
- *   is a local Git checkout (any checkout of the project, linked worktrees included), and whose
- *   capability ceiling lets it start subagents;
+ *   is a local Git checkout of the project's repository (same repository identity, so linked
+ *   worktrees pass and a nested repository or submodule under the project directory does not),
+ *   and whose capability ceiling lets it start subagents;
+ * - owner/admin is checked again inside the transaction, against the re-read row, for upgrade
+ *   and disband alike (`managesInTransaction`);
  * - the project: the same git checks as `createTeam` (`assertTeamProjectUsable`: the directory is
  *   a git work tree, the base branch resolves), run before anything is written; the transaction
  *   refuses with `TEAM_PROJECT_CHANGED` if the directory or default branch changed meanwhile;
@@ -155,6 +158,37 @@ function archivedTeamError(): AppError {
 		"TEAM_ARCHIVED",
 	);
 }
+
+/**
+ * `canManageNarratorAcl` for the row a transaction just re-read, synchronously: an admin, or the
+ * row's owner. Upgrade and disband act only on primary sessions, whose judged row is the row
+ * itself; any other row fails closed. Checked again inside the transaction so ownership that
+ * changed after the first check cannot let the former owner's request commit.
+ */
+function managesInTransaction(
+	row: { type: string; ownerUserId: string | null },
+	principal: NarratorPrincipal,
+): boolean {
+	if (principal.isAdmin) return true;
+	return row.type === "primary" && row.ownerUserId !== null && row.ownerUserId === principal.userId;
+}
+
+function notManagerError(action: "upgrade" | "disband"): ForbiddenError {
+	return new ForbiddenError(
+		action === "upgrade"
+			? "Only the session's owner or an admin can turn it into a team"
+			: "Only the session's owner or an admin can disband its team",
+	);
+}
+
+/**
+ * Test seam: runs after every check outside the transaction and before the lock and the
+ * transaction, so a test can change the rows in between (e.g. transfer ownership). Unset in
+ * production.
+ */
+export const teamConversionTestHooks: {
+	beforeTransaction?: (kind: "upgrade" | "disband", narratorId: string) => void | Promise<void>;
+} = {};
 
 function isBusy(row: { id: string; status: string }): boolean {
 	return row.status === "working" || row.status === "waiting" || !!getExecutionOwner(row.id);
@@ -344,10 +378,14 @@ export interface UpgradeSessionInput {
 	settings?: TeamSettings;
 }
 
-/** The checks that need I/O outside the transaction: OAuth binding, ceiling, workspace. */
+/**
+ * The checks that need I/O outside the transaction: OAuth binding, ceiling, workspace, and that
+ * the workspace is a checkout of the project's repository.
+ */
 async function prepareUpgrade(
 	narratorId: string,
 	actingUserId: string | null,
+	gitPath: string,
 ): Promise<{ revision: number; cwd: string; rootPath: string }> {
 	const { resolveOAuthNarratorRuntimePolicy } = await import("../oauth-narrator-runtime-policy");
 	let oauth: unknown = null;
@@ -378,6 +416,27 @@ async function prepareUpgrade(
 		throw error;
 	}
 	if (workspace.deviceId !== "local" || !workspace.git?.workspaceKey) throw unavailable();
+	// The project index matches paths, so a nested repository or an unregistered submodule
+	// under the project directory passes as "this project" while its work items would branch
+	// from another repository. Compare repository identity (the common git directory, as the
+	// workspace probe keys it): linked worktrees of the project's repository share it and pass.
+	const [{ probeLocalGitWorkspace, gitWorkspaceIdentity }, { localBackend }] = await Promise.all([
+		import("../git-workspace"),
+		import("../../lib/agent/execution/registry"),
+	]);
+	const projectProbe = await probeLocalGitWorkspace(gitPath);
+	const projectRepositoryKey =
+		projectProbe.state === "ready" && projectProbe.repositoryPath
+			? gitWorkspaceIdentity(localBackend, projectProbe.repositoryPath)
+			: null;
+	if (!projectRepositoryKey || projectRepositoryKey !== workspace.git.repositoryKey)
+		throw new AppError(
+			"The session's working directory is not a checkout of the project's repository",
+			409,
+			"TEAM_WORKSPACE_UNAVAILABLE",
+			undefined,
+			{ reason: "other-repository" },
+		);
 	return { revision: workspace.revision, cwd: workspace.cwd, rootPath: workspace.git.rootPath };
 }
 
@@ -416,8 +475,7 @@ export async function upgradeSessionToTeam(
 	});
 	if (!session || !(await canReadNarrator(session, principal)))
 		throw new NotFoundError("Narrator", narratorId);
-	if (!(await canManageNarratorAcl(session, principal)))
-		throw new ForbiddenError("Only the session's owner or an admin can turn it into a team");
+	if (!(await canManageNarratorAcl(session, principal))) throw notManagerError("upgrade");
 	if (project.status === "archived")
 		throw new AppError("An archived project cannot get a new team", 409, "PROJECT_ARCHIVED");
 	const gitPath = project.gitPath;
@@ -430,6 +488,10 @@ export async function upgradeSessionToTeam(
 		if (resolvedProjectIn(db, row) !== project.id) throw otherProjectError();
 	};
 	checkProject(session as SessionRow);
+	// A working directory the index puts in another project is that project's session: say so
+	// before the repository check below would call it an unusable workspace (rechecked in the
+	// transaction).
+	if (workingDirectoryElsewhere(db, narratorId, project.id)) throw otherProjectError();
 	const refusal = upgradeRefusal(session as SessionRow, hasTeamRow(db, narratorId));
 	if (refusal) throw refusal;
 
@@ -445,14 +507,16 @@ export async function upgradeSessionToTeam(
 	const baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
 	await assertTeamProjectUsable({ gitPath }, baseBranch);
 
-	const workspace = await prepareUpgrade(narratorId, actingUserId);
+	const workspace = await prepareUpgrade(narratorId, actingUserId, gitPath);
 	const brief = input.brief ?? "";
 	const teamSettings = input.settings ?? {};
 
+	await teamConversionTestHooks.beforeTransaction?.("upgrade", narratorId);
 	const committed = await narratorTraitsLock.acquire(narratorId, async () =>
 		db.transaction((tx) => {
 			const fresh = readSession(tx, narratorId);
 			if (!fresh) throw new NotFoundError("Narrator", narratorId);
+			if (!managesInTransaction(fresh, principal)) throw notManagerError("upgrade");
 			const currentProject = tx
 				.select({
 					status: projects.status,
@@ -569,16 +633,17 @@ export async function disbandTeam(
 ): Promise<{ narratorId: string }> {
 	const actingUserId = principal.userId || null;
 	const { team, coordinator } = await loadTeamForAccess(teamId, principal, "write", projectId);
-	if (!(await canManageNarratorAcl(coordinator, principal)))
-		throw new ForbiddenError("Only the session's owner or an admin can disband its team");
+	if (!(await canManageNarratorAcl(coordinator, principal))) throw notManagerError("disband");
 	if (coordinator.status === "archived") throw archivedTeamError();
 	if (isBusy(coordinator)) throw busyError();
 	assertTeamRemovable(teamId);
 
+	await teamConversionTestHooks.beforeTransaction?.("disband", teamId);
 	const traits = await narratorTraitsLock.acquire(teamId, async () =>
 		db.transaction((tx) => {
 			const fresh = readSession(tx, teamId);
 			if (!fresh || !hasTeamRow(tx, teamId)) throw new NotFoundError("Team", teamId);
+			if (!managesInTransaction(fresh, principal)) throw notManagerError("disband");
 			if (fresh.status === "archived") throw archivedTeamError();
 			if (isBusy(fresh)) throw busyError();
 			// Re-checks live work against the same rows; work items and events cascade.

@@ -46,6 +46,9 @@ keywords:
   - TEAM_BASE_BRANCH_UNRESOLVED
   - assertTeamProjectUsable
   - TEAM_PROJECT_CHANGED
+  - other-repository
+  - managesInTransaction
+  - teamConversionTestHooks
   - checkTeamDraft
   - teamBaseBranchSchema
   - 升级为团队
@@ -63,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: cb1094caa
+verified_at: 7fab16d5b
 ---
 # 团队与成员
 
@@ -119,16 +122,19 @@ verified_at: cb1094caa
   - 已归档 → 409 `TEAM_SESSION_ARCHIVED`。
   - `working`/`waiting` 或持有执行权 → 409 `NARRATOR_EXECUTION_BUSY`。
   - 工作目录不是本机 Git 检出（`workspaceContextService.get` 读不到、设备不是 local、没有 `git.workspaceKey`）→ 409 `TEAM_WORKSPACE_UNAVAILABLE`；项目的任何检出都行，包括 linked worktree。事务内工作区 revision 变了也回这个码。
+  - 工作目录的仓库不是项目的仓库 → 409 `TEAM_WORKSPACE_UNAVAILABLE`，`details.reason: "other-repository"`（`prepareUpgrade`）：项目索引按路径前缀匹配，项目目录下的嵌套仓库或没登记的 submodule 会被当成本项目，工作项却会从别的仓库开分支。比较的是仓库身份（`probeLocalGitWorkspace(gitPath)` 的公共 git 目录经 `gitWorkspaceIdentity`，对上工作区的 `git.repositoryKey`），不是检出根，所以 linked worktree 仍可升级。工作目录被索引到别的项目时先回 `TEAM_SESSION_OTHER_PROJECT`（事务外先查一次 `workingDirectoryElsewhere`）。
   - 没给 `name` 而标题为空或超过 120 → 400 `TEAM_NAME_INVALID`。
   - 项目的两项 git 检查（与 `createTeam` 同一个 `assertTeamProjectUsable`，基线分支取给定的、项目 `defaultBranch`、再缺省 `main`）→ 409 `TEAM_PROJECT_NOT_GIT` / `TEAM_BASE_BRANCH_UNRESOLVED`。排在会话检查之后（别的项目的会话先得到 `TEAM_SESSION_OTHER_PROJECT`）、工作区检查之前。
-- 写入：`narratorTraitsLock` 内一个同步事务，重读会话与项目、重查上面的拒绝（git 检查不在事务里重跑：项目的 `gitPath`，或没给 `baseBranch` 时的 `defaultBranch`，与检查时不同 → 409 `TEAM_PROJECT_CHANGED`），然后追加 `team` trait、把 `contextProjectId` 钉成这个项目、改名时写标题、插团队行、记 `team.created` 事件（`detail: { baseBranch, fromSession: true }`）。插行失败则 trait 也不写。
+- 写入：`narratorTraitsLock` 内一个同步事务，重读会话与项目、重查上面的拒绝；owner/管理员也按重读的行再判一次（`managesInTransaction`，同 `canManageNarratorAcl` 对 primary 的规则），事务外检查之后所有权被转走 → 403，什么都不写（git 检查不在事务里重跑：项目的 `gitPath`，或没给 `baseBranch` 时的 `defaultBranch`，与检查时不同 → 409 `TEAM_PROJECT_CHANGED`），然后追加 `team` trait、把 `contextProjectId` 钉成这个项目、改名时写标题、插团队行、记 `team.created` 事件（`detail: { baseBranch, fromSession: true }`）。插行失败则 trait 也不写。
 - 提交后：`forgetTeamSessions()`；广播 `custom_traits_changed`（改名时加 `title_updated` 与 `narrator:title_updated`）；重算项目链接；`announceTeamChange` 通知最近标签页持有者（见访问控制）；写一条 `team_upgrade` 说明（`schedule: "none"`，不唤醒，人发下一条消息才开始第一轮协调；这条说明不算对话末尾，发送按钮不会因它变成「继续」，`team_disband` 同理，见[恢复](../../narrator/recovery.md)）；`replace_tools` epoch 上写重建基线的 `tool_loaded` 通知（`tool-loading-service.ts:requestToolDeclarationRebaseline`），下一次请求开新 epoch 声明 `Team`。已经派出的子代理随 ACL 根立即算进团队。
+- 测试接缝 `teamConversionTestHooks.beforeTransaction`：事务外检查都做完、拿锁之前调用，测试用它在两次检查之间改行（如转移所有权）；生产不设。
+- 说明与重建基线通知都不是谁的回合：重试会保留它们，「继续」与重试目标都跳过它们（见[中断与恢复](../../narrator/recovery.md)）。
 - 说明的消息 id 由（会话、种类、团队行 `createdAt`）派生，写过就不再写；正文给出团队名、谁升级的、实际工作目录以及它是否在主检出里（`lib/prompts/team-lead.ts:teamUpgradeNote`）。
 
 解散团队、保留会话（`disbandTeam`，`POST /api/projects/:projectId/teams/:teamId/disband`）：
 - 谁能解散：项目写权限 + 会话 owner 或管理员。读不到 → 404；能写不能管 → 403。
 - 拒绝：协调者已归档 → 409 `TEAM_ARCHIVED`（先取消归档）；`working`/`waiting` 或持有执行权 → 409 `NARRATOR_EXECUTION_BUSY`；还有未收尾或仍记录 worktree 的工作项 → 409 `TEAM_HAS_LIVE_WORK`。
-- 写入：`narratorTraitsLock` 内一个事务，`deleteTeamOfNarratorInTransaction` 删团队行（工作项与事件级联删除），去掉 `team` trait。标题、受众、消息和钉住的 `contextProjectId` 都不动。
+- 写入：`narratorTraitsLock` 内一个事务，先按重读的协调者行再判 owner/管理员（`managesInTransaction`，否则 403），再 `deleteTeamOfNarratorInTransaction` 删团队行（工作项与事件级联删除），去掉 `team` trait。标题、受众、消息和钉住的 `contextProjectId` 都不动。
 - 提交后：`forgetTeamSessions()`、`forgetTeamStatus`、`forgetCoordinatorRun`、`cancelCheckin`、异步删 `coordinator-outputs/<id>`；广播 `custom_traits_changed` 与 `announceTeamChange`；写一条 `team_disband` 说明（同样的确定 id 规则）。`Team` 工具由运行时的卸载对账从下一次请求里去掉，不需要重建基线。
 
 生命周期：
@@ -151,7 +157,7 @@ verified_at: cb1094caa
 - 它们不在数据导出清单里：保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
 - 不要加团队成员表；成员判定变化要同步 `team-members.ts` 的拼装来源与 `team-status-members.test.ts`。
 - 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改；两个创建入口共用 `TeamCreateFields.tsx`，新字段加在那里。人填的字段规则改在 `shared/project-team-draft.ts`，不要在前端另写一份正则（`team-draft.test.ts` 用路由校验器对照）。
-- `createTeam` 的 git 检查必须在 `narratorService.create` 之前；新增从零创建团队的入口也只能经 `createTeam`。「升级为团队」（`team-conversion.ts:upgradeSessionToTeam`）是另一条路径，不经过 `createTeam`，但调同一个 `assertTeamProjectUsable`；新增别的建团队路径同样要调它，并在事务里复核检查所依据的项目字段。`project-teams-upgrade.test.ts` 覆盖两个拒绝码（不写 trait、团队行、事件和说明）与 `TEAM_PROJECT_CHANGED`。
+- `createTeam` 的 git 检查必须在 `narratorService.create` 之前；新增从零创建团队的入口也只能经 `createTeam`。「升级为团队」（`team-conversion.ts:upgradeSessionToTeam`）是另一条路径，不经过 `createTeam`，但调同一个 `assertTeamProjectUsable`；新增别的建团队路径同样要调它，并在事务里复核检查所依据的项目字段。`project-teams-upgrade.test.ts` 覆盖两个拒绝码（不写 trait、团队行、事件和说明）与 `TEAM_PROJECT_CHANGED`，以及 submodule 会话被拒、linked worktree 通过、检查后所有权转移时升级/解散都 403。
 - 新建会话弹窗的团队部分：`CreateNarratorModal` 的测试大量 `mock.module` 了 `@mantine/core`、`@tanstack/react-query`、`@tanstack/react-router`，弹窗静态导入链里只能用这些 mock 已提供的导出；所以 `create-narrator-team.ts` 不导入路由与 `useTeams`，用到路由的 `CreateTeamFromDirectory.tsx` 懒加载。测试：`create-narrator-team.test.ts`（各原因）、`create-team-start.browser.test.ts`（Chromium，真实路由）。
 - 改升级/解散：`team` trait 与团队行必须在同一事务、同一 `narratorTraitsLock` 下一起变；提交后清 `team-session-memo` 的缓存；`project-teams-upgrade.test.ts` 覆盖每个拒绝码、事务原子性、并发 trait 写入、说明只写一次与「升级→解散→再升级」。
 - IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。

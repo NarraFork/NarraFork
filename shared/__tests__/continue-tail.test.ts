@@ -15,7 +15,9 @@
 import { describe, expect, test } from "bun:test";
 import {
 	isInjectionTailRole,
+	isNonTurnHostRow,
 	isNonTurnInjectionRow,
+	isRebaselineNoticeRow,
 	tailRoleAllowsContinue,
 } from "../continue-tail";
 
@@ -66,11 +68,33 @@ describe("isNonTurnInjectionRow", () => {
 		expect(isNonTurnInjectionRow("sys", [note("bg_agent")])).toBe(false);
 		expect(isNonTurnInjectionRow("sys", [note("team_upgrade"), note("bg_agent")])).toBe(false);
 		expect(isNonTurnInjectionRow("sys", [{ type: "text", text: "x" }])).toBe(false);
+		expect(isNonTurnInjectionRow("sys", [note("team_upgrade"), { type: "text", text: "x" }])).toBe(
+			false,
+		);
 		expect(isNonTurnInjectionRow("sys", [])).toBe(false);
 	});
 
 	test("only sys rows qualify", () => {
 		expect(isNonTurnInjectionRow("user", [note("team_upgrade")])).toBe(false);
 		expect(isNonTurnInjectionRow("assistant", [note("team_upgrade")])).toBe(false);
+	});
+});
+
+describe("isRebaselineNoticeRow / isNonTurnHostRow", () => {
+	const notice = { type: "tool_loaded", toolName: "Team", toolNames: ["Team"], rebaseline: true };
+
+	test("the host-written rebaseline notice is no turn; a typed /load is", () => {
+		expect(isRebaselineNoticeRow("user", [notice])).toBe(true);
+		expect(isNonTurnHostRow("user", [notice])).toBe(true);
+		expect(isRebaselineNoticeRow("user", [{ ...notice, rebaseline: undefined }])).toBe(false);
+		expect(isRebaselineNoticeRow("user", [notice, { type: "text", text: "hi" }])).toBe(false);
+		expect(isRebaselineNoticeRow("assistant", [notice])).toBe(false);
+	});
+
+	test("the conversion notes are host rows too; other injections are not", () => {
+		const note = (source: string) => ({ type: "system_injection", source });
+		expect(isNonTurnHostRow("sys", [note("team_upgrade")])).toBe(true);
+		expect(isNonTurnHostRow("sys", [note("bg_agent")])).toBe(false);
+		expect(isNonTurnHostRow("user", [{ type: "text", text: "go" }])).toBe(false);
 	});
 });

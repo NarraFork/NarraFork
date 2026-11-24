@@ -72,6 +72,34 @@ describe("buildTailMeta", () => {
 		});
 	}
 
+	it("after an upgrade on a replace_tools epoch: note + rebaseline notice are no tail", () => {
+		const note = rowWithElements({ id: "note", role: "sys" }, [
+			{ type: "system_injection", source: "team_upgrade", modelText: "Team upgrade: ..." },
+		]);
+		// The host-written `user`-role notice that declares `Team` on the next request.
+		const notice = rowWithElements({ id: "notice", role: "user" }, [
+			{ type: "tool_loaded", toolName: "Team", toolNames: ["Team"], rebaseline: true },
+		]);
+		// An unanswered person's message before them: Retry targets it, not the notice.
+		const unanswered = buildTailMeta([{ id: "u1", role: "user" }, note, notice], OPTS);
+		expect(unanswered.lastRealMessage).toEqual({ id: "u1", role: "user" });
+		expect(unanswered.lastUserMessageId).toBe("u1");
+		// A finished reply before them: the composer offers what it offered before the upgrade.
+		const answered = buildTailMeta(
+			[{ id: "u1", role: "user" }, { id: "a1", role: "assistant" }, note, notice],
+			OPTS,
+		);
+		expect(answered.lastRealMessage).toEqual({ id: "a1", role: "assistant" });
+		// A `/load` someone typed is still a user row.
+		const typed = rowWithElements({ id: "load", role: "user" }, [
+			{ type: "tool_loaded", toolName: "Team", toolNames: ["Team"] },
+		]);
+		expect(buildTailMeta([{ id: "a1", role: "assistant" }, typed], OPTS).lastRealMessage).toEqual({
+			id: "load",
+			role: "user",
+		});
+	});
+
 	it("any other trailing injection stays the tail (Continue)", () => {
 		const note = rowWithElements({ id: "bg", role: "sys" }, [
 			{ type: "system_injection", source: "bg_agent", modelText: "done" },
