@@ -36,7 +36,7 @@ keywords:
   - rewindHistoryForRetry
   - keepMessageIds
 status: draft
-verified_at: 7fab16d5b
+verified_at: 4ab684e28
 ---
 # 中断与恢复
 
@@ -55,6 +55,7 @@ verified_at: 7fab16d5b
   - 例外：宿主写的、不是任何人回合的行（`continue-tail.ts:isNonTurnHostRow`）——只含团队升级/解散说明的 `sys` 行（`team_upgrade`/`team_disband`，不唤醒，`isNonTurnInjectionRow`），以及重建工具声明的通知（`user` 角色、`tool_loaded` 带 `rebaseline: true`、origin `system`，`requestToolDeclarationRebaseline` 写，`isRebaselineNoticeRow`）。两边用同一个判定：
     - 前端尾部摘要（`vlist/vlist-tail-meta.ts`）跳过它们，重试/继续都看它们前面那一行；`lastUserMessageId` 也跳过通知。
     - 服务端 `resolveRetryTarget`、`resolveContinuationTail`、`hasTrailingInjectionRow` 都跳过它们：重试不会把通知当成人写的消息重跑；「继续」不会去回答说明，而是接着下面的回复；真正的注入（如 `bg_agent`）仍按末尾输入直接起循环。
+    - 当前输入的选取（`findCurrentSenderMessage`）也跳过通知，所以重试后被保留的通知不会让原提示被当成未持久化的输入再发一次（见[提示词与注入](prompts.md)）。
     - 重试删除目标之后的行时保留它们（`narrator-session.ts:retryKeptHostRowIds` 读目标之后最多 200 行 `sys`/`user`，`deleteMessagesAfter` 的 `keepMessageIds` 让范围删除跳过这些 ref），被丢弃的输出照删；团队变更和工具声明仍然成立，`rebaselineRequests` 仍能读到通知。
     - 测试：`shared/__tests__/continue-tail.test.ts`、`vlist-tail-meta.test.ts`、`project-teams-upgrade.test.ts`（`rewindHistoryForRetry` 是重试的历史步骤，导出给测试）。新增不唤醒的说明类注入，若不该让人点“继续”，把来源加进 `NON_TURN_INJECTION_SOURCES`。
 - 重试规则关键词：错误卡片显示的是带 `Error: ` / `[Error] ` 前缀的装饰串，而规则匹配用原始 provider 消息，所以“标记为可重试”预填的关键词先经 `stripErrorDisplayPrefix` 去前缀（`shared/retry-rule-keyword.ts`，设置路由、`RetryRuleModal`、`lib/agent/error-handling.ts` 共用）。

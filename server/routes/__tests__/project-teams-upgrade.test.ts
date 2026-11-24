@@ -814,6 +814,51 @@ describe("review fixes: repository identity, ownership, Retry and Continue aroun
 		expect(kept).not.toContain(leftover.id);
 	});
 
+	test("after Retry the provider input carries the person's prompt once, and the notice", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { buildRuntimeHistory } = await import("../../services/agent-runtime/history");
+		const previousProviders = settings.anthropicProviders;
+		settings.anthropicProviders = [
+			{
+				id: "upgrade-retry",
+				name: "Upgrade retry test",
+				prefix: "upgrade-retry",
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "claude-sonnet-4",
+				officialApi: false,
+			},
+		] as typeof settings.anthropicProviders;
+		try {
+			const id = await session("Provider input after Retry");
+			const prompt = "Summarize the open invoices for the payments team";
+			await narratorPersistence.persistUserMessage(id, prompt);
+			expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
+			await rebaselineNotice(id);
+			const rewound = await rewindHistoryForRetry(id);
+			expect(rewound.prompt).toBe(prompt);
+
+			// What the retried run assembles: the retry passes the prompt as current input.
+			const prepared = await buildRuntimeHistory({
+				narratorId: id,
+				model: "claude-sonnet-4",
+				provider: "upgrade-retry",
+				currentInput: rewound.prompt,
+			});
+			// The persisted message carries it; nothing travels again as separate input.
+			expect(prepared.currentText).toBe("");
+			expect(prepared.currentInputText).toContain(prompt);
+			const text = JSON.stringify(prepared.history);
+			expect(text.split(prompt).length - 1).toBe(1);
+			// The notice and the note stay in what the model reads.
+			expect(text).toContain("Tool loaded: Team");
+			// The upgrade note names the team (the session's title).
+			expect(text).toContain("Provider input after Retry");
+		} finally {
+			settings.anthropicProviders = previousProviders;
+		}
+	});
+
 	test("Retry after a disband keeps the disband note", async () => {
 		const id = await session("Retry across a disband");
 		expect((await upgrade(OWNER, { fromNarratorId: id })).status).toBe(201);
