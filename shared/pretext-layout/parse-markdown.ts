@@ -46,6 +46,7 @@ import type {
 	PreparedBlock,
 	PreparedBlockBase,
 	PreparedCodeBlock,
+	PreparedFixedBlock,
 	PreparedInlineBlock,
 	PreparedRuleBlock,
 	PreparedTableBlock,
@@ -85,6 +86,8 @@ const LIST_INDENT = emToPx(1.5, FONT_SIZE.sm); // padding-inline-start 1.5em @14
 const BLOCKQUOTE_PADDING = 10; // spacing xs
 const BLOCKQUOTE_BORDER = 3;
 const CODE_LANG_EXTRA_TOP = 12; // codeBlockWithLang: pad-top = xs + 12px (12px extra)
+// Preview geometry is independent of downloads, decoding and intrinsic dimensions.
+const IMAGE_PREVIEW_HEIGHT = 200;
 /**
  * Upper bound used to measure a cell's max-content width. Large enough that no
  * realistic cell wraps, small enough to stay far from float-precision trouble.
@@ -877,8 +880,38 @@ function buildInlineBlocks(
 	variant: InlineVariant,
 	ctx: ParseContext,
 ): PreparedBlock[] {
-	const lines = collectInlineLines(tokens, variant, ctx);
-	return buildPreparedInline(lines, variant, ctx);
+	if (variant !== "body") {
+		return buildPreparedInline(collectInlineLines(tokens, variant, ctx), variant, ctx);
+	}
+	const blocks: PreparedBlock[] = [];
+	const flush = (lines: InlinePiece[][], aroundImage: boolean) => {
+		// Whitespace between consecutive images is not a separate text row. Keep
+		// every nonempty run (and its original marks), including surrounding spaces.
+		const prose = aroundImage
+			? lines.filter((line) => line.some((piece) => piece.text.trim().length > 0 || piece.math))
+			: lines;
+		appendGroup(blocks, buildPreparedInline(prose, variant, ctx), 4);
+	};
+	const lines = collectInlineLines(tokens, variant, ctx, (image, pending) => {
+		const src = parseImageSource(image.href);
+		if (src === null) return false;
+		flush(pending.splice(0), true);
+		const block: PreparedFixedBlock = {
+			...blockBase(ctx),
+			kind: "fixed",
+			tag: "markdown-image",
+			height: IMAGE_PREVIEW_HEIGHT,
+			data: {
+				src,
+				alt: decodeCharacterReferences(image.text),
+				...(image.title != null ? { title: decodeCharacterReferences(image.title) } : {}),
+			},
+		};
+		appendGroup(blocks, [block], 4);
+		return true;
+	});
+	flush(lines, blocks.length > 0);
+	return blocks;
 }
 
 function buildPreparedInline(
@@ -966,6 +999,9 @@ function collectInlineLines(
 	tokens: readonly Token[],
 	variant: InlineVariant,
 	ctx: ParseContext,
+	// Emit from this existing walk so nested emphasis/links retain their marks on
+	// both sides, without a second recursive token traversal. Tables/headings omit it.
+	emitImage?: (image: Tokens.Image, pending: InlinePiece[][]) => boolean,
 ): InlinePiece[][] {
 	const lines: InlinePiece[][] = [[]];
 	const current = (): InlinePiece[] => {
@@ -1047,7 +1083,14 @@ function collectInlineLines(
 					if (agentId) {
 						// The whole authored title is one body-font atom, never a status item
 						// followed by separately wrapping bold/code/link-label fragments.
-						let label = agentReferenceLabel(link.tokens ?? []);
+						const imageState = emitImage ? { found: false } : undefined;
+						let label = agentReferenceLabel(link.tokens ?? [], imageState);
+						if (imageState?.found) {
+							// An image is body content, even inside a reference label. Do not
+							// flatten it into the otherwise atomic agent-title chip.
+							walk(link.tokens ?? [], linkMarks);
+							continue;
+						}
 						if (ctx.formulas) {
 							label = label.replace(MATH_SENTINEL_RE, (source, index) => {
 								const latex = ctx.formulas?.[Number(index)];
@@ -1071,6 +1114,7 @@ function collectInlineLines(
 				}
 				case "image": {
 					const img = token as Tokens.Image;
+					if (emitImage?.(img, lines)) continue;
 					push(textPiece(img.text.length > 0 ? img.text : (img.href ?? "image"), marks, variant));
 					continue;
 				}
@@ -1100,13 +1144,14 @@ function collectInlineLines(
 }
 
 /** Keep explicit Markdown breaks as word boundaries while discarding label styling. */
-function agentReferenceLabel(tokens: readonly Token[]): string {
+function agentReferenceLabel(tokens: readonly Token[], imageState?: { found: boolean }): string {
 	return inlineTokensToPlainText(
 		tokens.map((token) => {
+			if (imageState && token.type === "image") imageState.found = true;
 			if (token.type === "br") return { type: "text", text: " " };
 			const nested = "tokens" in token ? token.tokens : undefined;
 			if (Array.isArray(nested) && nested.length > 0 && token.type !== "codespan") {
-				return { type: token.type, text: agentReferenceLabel(nested) };
+				return { type: token.type, text: agentReferenceLabel(nested, imageState) };
 			}
 			return token;
 		}),
@@ -1722,6 +1767,21 @@ function hrefScheme(value: string): string | null {
 }
 
 /**
+ * Image destinations follow MarkdownContent's defaultUrlTransform allow-list,
+ * plus document assets and validated device-qualified file references. Never use
+ * parseHref here: it canonicalizes URLs and turns file paths into link markers.
+ * The renderer owns source resolution; this layer only returns inert source data.
+ */
+function parseImageSource(href: string): string | null {
+	const source = decodeCharacterReferences(href);
+	if (source.trim().length === 0) return null;
+	const scheme = hrefScheme(source);
+	if (scheme === null) return source;
+	if (/^nf-file$/i.test(scheme)) return parseLocalFilePath(source) ? source : null;
+	return /^(?:https?|ircs?|mailto|xmpp|nf-doc-asset)$/i.test(scheme) ? source : null;
+}
+
+/**
  * Normalize a link target, or return null when it must not be rendered as a link.
  *
  * Absolute http(s) URLs are canonicalized through `URL` (that is what the chunked
@@ -1812,6 +1872,7 @@ export const MARKDOWN_CONSTANTS = {
 	BLOCKQUOTE_PADDING,
 	BLOCKQUOTE_BORDER,
 	CODE_LANG_EXTRA_TOP,
+	IMAGE_PREVIEW_HEIGHT,
 	INLINE_CODE_EXTRA_WIDTH,
 	MERMAID_PLACEHOLDER_HEIGHT,
 	KATEX_PLACEHOLDER_HEIGHT,
