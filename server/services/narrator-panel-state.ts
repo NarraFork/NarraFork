@@ -28,7 +28,10 @@ import { logger } from "../lib/logger";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { projectMailboxUserMessage, toBufferSummary } from "./narrator-buffer";
 import { getNarratorDraftMetadata } from "./narrator-draft-service";
-import { getQuestionReflectionDeadline } from "./narrator-permission";
+import {
+	getQuestionReflectionDeadline,
+	isPendingPlanReflectionAvailable,
+} from "./narrator-permission";
 import {
 	type NarratorSurfaceReadBudget,
 	narratorSurfaceReadOptions,
@@ -236,6 +239,10 @@ async function permissionPage(
 			parentToolUseId: row.ownerNarratorId === narratorId ? null : row.parentToolUseId,
 			subagentNarratorId: row.ownerNarratorId === narratorId ? null : row.ownerNarratorId,
 			...(reflectionDeadline !== null ? { reflectionDeadline } : {}),
+			// The card renders 计划反思 only where the raising loop still holds a runner.
+			...(row.toolName === "ExitPlanMode"
+				? { planReflectionAvailable: isPendingPlanReflectionAvailable(row.id) }
+				: {}),
 		});
 	});
 	const hasMore = metadata.length > selected.length;

@@ -20,6 +20,7 @@ import {
 	toolCallWithExecutionTargets,
 } from "../lib/tool-execution-target-projection";
 import { canWriteNarrator, type NarratorPrincipal, narratorReadableWhere } from "./narrator-acl";
+import { isPendingPlanReflectionAvailable } from "./narrator-permission";
 import {
 	type AsyncQuestionRecord,
 	getBoundedOpenAsyncQuestion,
@@ -54,6 +55,8 @@ export interface HumanAttentionPermission {
 	executionPlan?: Record<string, unknown> | null;
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	reflectionDeadline?: number;
+	/** ExitPlanMode only: the raising loop still holds a reflection runner (计划反思 button). */
+	planReflectionAvailable?: boolean;
 }
 
 export interface HumanAttentionDetail {
@@ -688,6 +691,9 @@ async function permissionDetail(
 		reflectionDeadline: live.pending?.questionReflectionStoppedByUser
 			? undefined
 			: live.pending?.questionReflectionDeadline,
+		...(item.toolName === "ExitPlanMode"
+			? { planReflectionAvailable: isPendingPlanReflectionAvailable(item.requestId) }
+			: {}),
 	};
 	return boundedJsonCopy({ item, permission })?.value ?? { item, tooLarge: true };
 }

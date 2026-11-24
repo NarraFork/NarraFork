@@ -88,6 +88,7 @@ const changes = {
 	deviceSelectionSource: "explicit",
 	suppressNotifications: true,
 	reflectionDeadline: 1234,
+	planReflectionAvailable: true,
 } satisfies Required<PendingPermission>;
 
 describe("reconcilePendingPermissions", () => {
